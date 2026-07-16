@@ -1,7 +1,7 @@
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 ART_SERVING_PROTOCOL_VERSION = 2
 
@@ -26,7 +26,6 @@ class ServingCapabilities(BaseModel):
     in_flight_lora_updates: bool = False
     policy_token_spans: bool = False
     exact_lora_worker_state: bool = False
-    prefix_hash_block_size: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _validate_protocol(self) -> "ServingCapabilities":

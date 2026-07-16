@@ -34,7 +34,7 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
 import httpx
 import numpy as np
 import polars as pl
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictFloat, StrictInt
+from pydantic import BaseModel, ConfigDict
 import torch
 from tqdm import auto as tqdm
 from transformers import AutoTokenizer
@@ -126,22 +126,6 @@ class _PackedTrainingBatch(BaseModel):
     logical_tokens: int
     physical_tokens: int
     include_moe_routing: bool
-
-
-class _VllmReplicaMetrics(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    replica_id: str = Field(min_length=1)
-    generation: StrictInt = Field(ge=0)
-    metrics: dict[str, StrictFloat]
-
-
-class _VllmGatewayMetrics(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    metrics: dict[str, StrictFloat]
-    replicas: tuple[_VllmReplicaMetrics, ...]
-    incomplete: StrictBool
 
 
 def _prometheus_values(text: str, name: str) -> list[float]:
@@ -457,25 +441,21 @@ class LocalBackend:
                 f"{metrics_root}/art/metrics."
             ) from exc
 
-        scrape: _VllmGatewayMetrics | None = None
-        if isinstance(payload, dict) and "replicas" in payload:
-            try:
-                scrape = _VllmGatewayMetrics.model_validate(payload)
-            except ValueError as exc:
-                raise RuntimeError(
-                    "ART vLLM gateway returned an invalid metrics payload."
-                ) from exc
-        raw_metrics = (
-            scrape.metrics
-            if scrape is not None
-            else payload.get("metrics")
-            if isinstance(payload, dict)
-            else None
+        raw_metrics = payload.get("metrics") if isinstance(payload, dict) else None
+        process_uuid = (
+            payload.get("process_uuid") if isinstance(payload, dict) else None
         )
-        if not isinstance(raw_metrics, dict):
+        generation = payload.get("generation") if isinstance(payload, dict) else None
+        if (
+            not isinstance(raw_metrics, dict)
+            or not isinstance(process_uuid, str)
+            or not process_uuid
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 0
+        ):
             raise RuntimeError(
-                "ART vLLM metrics endpoint returned an invalid payload: expected "
-                "a top-level metrics object."
+                "ART vLLM metrics endpoint returned an invalid direct-runtime payload."
             )
 
         def required_metric(name: str) -> float:
@@ -506,9 +486,6 @@ class LocalBackend:
             "num_preemptions_total": required_metric("num_preempted_reqs_total"),
         }
         metrics: dict[str, float] = {
-            "vllm/metrics_incomplete": float(scrape.incomplete if scrape else False)
-        }
-        gauges = {
             "vllm/num_requests_running": required_metric("num_requests_running"),
             "vllm/num_requests_waiting": required_metric("num_requests_waiting"),
             "vllm/num_requests_waiting_capacity": required_metric(
@@ -517,9 +494,6 @@ class LocalBackend:
             "vllm/kv_cache_usage_perc": required_metric("kv_cache_usage_perc"),
             "vllm/num_preemptions_total": snapshot["num_preemptions_total"],
         }
-        for key, value in gauges.items():
-            if value is not None:
-                metrics[key] = value
         for name in (
             "max_num_seqs",
             "max_num_batched_tokens",
@@ -531,79 +505,53 @@ class LocalBackend:
             if value is not None:
                 metrics[f"vllm/{name}"] = value
 
-        replicas = (
-            scrape.replicas
-            if scrape is not None
-            else (
-                _VllmReplicaMetrics(
-                    replica_id=metrics_root, generation=0, metrics=raw_metrics
-                ),
-            )
-        )
+        current = {name: snapshot[name] for name in counter_names}
         now = time.monotonic()
-        prompt_rates: list[float] = []
-        completion_rates: list[float] = []
+        key = (model.name, process_uuid, generation)
+        previous = self._vllm_metric_snapshots.get(key)
+        self._vllm_metric_snapshots[key] = (now, current)
+        for stale in tuple(self._vllm_metric_snapshots):
+            if stale[0] == model.name and stale != key:
+                del self._vllm_metric_snapshots[stale]
         delta_queries = 0.0
-        delta_hits = 0.0
-        current_keys: set[tuple[str, str, int]] = set()
-        for replica in replicas:
-            current = {
-                name: float(replica.metrics[name])
-                for name in counter_names
-                if name in replica.metrics
-            }
-            if len(current) != len(counter_names):
-                raise RuntimeError(
-                    f"ART vLLM replica {replica.replica_id!r} metrics are missing counters."
-                )
-            key = (model.name, replica.replica_id, replica.generation)
-            current_keys.add(key)
-            previous = self._vllm_metric_snapshots.get(key)
-            self._vllm_metric_snapshots[key] = (now, current)
-            if previous is None:
-                continue
+        if previous is not None:
             previous_time, previous_snapshot = previous
             elapsed = now - previous_time
             if elapsed > 0:
-                prompt_rates.append(
-                    max(
-                        0.0,
-                        (
-                            current["prompt_tokens_total"]
-                            - previous_snapshot["prompt_tokens_total"]
-                        )
-                        / elapsed,
+                metrics["vllm/prompt_tok_per_s"] = max(
+                    0.0,
+                    (
+                        current["prompt_tokens_total"]
+                        - previous_snapshot["prompt_tokens_total"]
                     )
+                    / elapsed,
                 )
-                completion_rates.append(
-                    max(
-                        0.0,
-                        (
-                            current["generation_tokens_total"]
-                            - previous_snapshot["generation_tokens_total"]
-                        )
-                        / elapsed,
+                metrics["vllm/completion_tok_per_s"] = max(
+                    0.0,
+                    (
+                        current["generation_tokens_total"]
+                        - previous_snapshot["generation_tokens_total"]
                     )
+                    / elapsed,
                 )
-            delta_queries += max(
+            delta_queries = max(
                 0.0,
                 current["prefix_cache_queries_total"]
                 - previous_snapshot["prefix_cache_queries_total"],
             )
-            delta_hits += max(
+            delta_hits = max(
                 0.0,
                 current["prefix_cache_hits_total"]
                 - previous_snapshot["prefix_cache_hits_total"],
             )
-        for key in tuple(self._vllm_metric_snapshots):
-            if key[0] == model.name and key not in current_keys:
-                del self._vllm_metric_snapshots[key]
-        if prompt_rates:
-            metrics["vllm/prompt_tok_per_s"] = math.fsum(prompt_rates)
-            metrics["vllm/completion_tok_per_s"] = math.fsum(completion_rates)
-        if delta_queries > 0:
-            metrics["vllm/prefix_cache_hit_rate"] = min(1.0, delta_hits / delta_queries)
-        elif not prompt_rates and snapshot["prefix_cache_queries_total"] > 0:
+            if delta_queries > 0:
+                metrics["vllm/prefix_cache_hit_rate"] = min(
+                    1.0, delta_hits / delta_queries
+                )
+        if (
+            "vllm/prefix_cache_hit_rate" not in metrics
+            and snapshot["prefix_cache_queries_total"] > 0
+        ):
             metrics["vllm/prefix_cache_hit_rate"] = max(
                 0.0,
                 min(

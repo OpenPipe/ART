@@ -1,12 +1,15 @@
+from __future__ import annotations
+
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from typing import Any
 
 import pytest
 
 from art.distributed.specs import (
     EndpointSpec,
     ModelServiceMemberSpec,
-    ModelServiceReplicaSpec,
+    ModelServiceSpec,
     VllmParallelSpec,
 )
 from art.distributed.vllm_replica import (
@@ -15,44 +18,46 @@ from art.distributed.vllm_replica import (
     ReplicaManager,
     ReplicaState,
 )
+from art.megatron import distributed_service as service_module
+from art.megatron.distributed_service import DistributedMegatronService
 
 
-def manager() -> ReplicaManager:
+def manager(*, engine_args: dict[str, object] | None = None) -> ReplicaManager:
     members = tuple(
         ModelServiceMemberSpec(
             member_id=f"node{rank}",
             host_id=f"host{rank}",
             node_rank=rank,
             gpu_ids=(0, 1),
-            leader=rank == 0,
         )
         for rank in range(2)
     )
-    spec = ModelServiceReplicaSpec(
-        service_name="model",
-        replica_id="replica",
+    spec = ModelServiceSpec(
+        name="model",
         members=members,
         leader_endpoint=EndpointSpec(host="10.0.0.1", port=8000),
         rendezvous=EndpointSpec(host="10.0.0.1", port=29500),
         base_model="base",
         model_revision="revision",
         runtime_fingerprint="runtime",
-        parallel=VllmParallelSpec(tp=2, pp=2),
+        parallel=VllmParallelSpec(tp=1, pp=2, dp=2, enable_expert_parallel=True),
         update_mode="lora",
     )
     value = ReplicaManager(
         spec,
         {"host0": SimpleNamespace(), "host1": SimpleNamespace()},
-        ReplicaLaunchTemplate(served_model_name="model@1"),
+        ReplicaLaunchTemplate(
+            served_model_name="model@1", engine_args=engine_args or {}
+        ),
     )
     value._state = ReplicaState(
-        replica_id="replica",
+        replica_id="model",
         generation=0,
         generation_digest=value.state.generation_digest,
         phase="ready",
         members=tuple(
             HostMemberState(
-                replica_id="replica",
+                replica_id="model",
                 member_id=member.member_id,
                 generation=0,
                 generation_digest=value.state.generation_digest,
@@ -63,6 +68,11 @@ def manager() -> ReplicaManager:
         ),
     )
     return value
+
+
+def test_one_service_is_the_deployment_contract() -> None:
+    assert "replicas" not in ModelServiceSpec.model_fields
+    assert "leader" not in ModelServiceMemberSpec.model_fields
 
 
 def test_expected_worker_identities_follow_physical_rank_order() -> None:
@@ -105,37 +115,84 @@ def test_expected_worker_identities_reject_incomplete_membership() -> None:
         value.expected_worker_identities()
 
 
-def test_launch_pins_model_and_tokenizer_revisions() -> None:
-    value = manager()
-    request = value._launch_request(value.spec.members[0])
-    assert request.launch_config.engine_args["revision"] == "revision"
-    assert request.launch_config.engine_args["tokenizer_revision"] == "revision"
-
-
-def test_effective_hash_block_size_requires_runtime_confirmation() -> None:
-    value = manager()
-    with pytest.raises(RuntimeError, match="not confirmed"):
-        _ = value.prefix_hash_block_size
-
-    value.confirm_prefix_hash_block_size(64)
-    assert value.prefix_hash_block_size == 64
-    value.confirm_prefix_hash_block_size(64)
-    with pytest.raises(ValueError, match="positive"):
-        value.confirm_prefix_hash_block_size(0)
-    with pytest.raises(RuntimeError, match="changed"):
-        value.confirm_prefix_hash_block_size(32)
-
-
 @pytest.mark.asyncio
-async def test_stop_invalidates_effective_hash_block_size() -> None:
+async def test_service_acknowledges_every_worker_through_leader(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     value = manager()
-    value.confirm_prefix_hash_block_size(64)
-    value._stop_current_members = AsyncMock()
+    runtime = SimpleNamespace(
+        topology=SimpleNamespace(cluster=SimpleNamespace(rpc_timeout_s=5)),
+        model_service=lambda name: value if name == "model" else None,
+    )
+    service = DistributedMegatronService(
+        model_name="model",
+        base_model="base",
+        config={},
+        output_dir=str(tmp_path),
+        runtime=runtime,
+        enable_expert_replay=False,
+    )
+    calls: list[tuple[str, dict[str, Any], dict[str, str] | None]] = []
 
-    await value.stop()
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
 
-    with pytest.raises(RuntimeError, match="not confirmed"):
-        _ = value.prefix_hash_block_size
+    class Client:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> Client:
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def post(self, url: str, *, json: dict[str, Any], headers):
+            calls.append((url, json, headers))
+            return Response()
+
+    monkeypatch.setattr(service_module.httpx, "AsyncClient", Client)
+    await service._acknowledge_lora_workers(
+        lora_name="model@1",
+        lora_path="/step/0001",
+        step=1,
+        service_name="model",
+        base_url="http://leader.test:8000",
+        api_key="secret",
+    )
+
+    assert calls[0][0] == "http://leader.test:8000/art/lora_worker_state"
+    assert calls[0][1]["expected_workers"] == value.expected_worker_identities()
+    assert calls[0][2] == {"Authorization": "Bearer secret"}
+
+
+def test_launch_preserves_user_args_and_owns_native_gang_topology() -> None:
+    value = manager(
+        engine_args={
+            "enable_prefix_caching": False,
+            "block_size": 32,
+            "prefill_context_parallel_size": 2,
+        }
+    )
+    leader = value._launch_request(value.spec.members[0]).launch_config
+    follower = value._launch_request(value.spec.members[1]).launch_config
+
+    assert leader.engine_args == {
+        "enable_prefix_caching": False,
+        "block_size": 32,
+        "prefill_context_parallel_size": 2,
+        "revision": "revision",
+        "tokenizer_revision": "revision",
+        "tensor_parallel_size": 1,
+        "pipeline_parallel_size": 2,
+        "data_parallel_size": 2,
+        "enable_expert_parallel": True,
+    }
+    assert leader.host == "10.0.0.1" and not leader.headless
+    assert follower.host == "127.0.0.1" and follower.headless
+    assert leader.nnodes == follower.nnodes == 2
+    assert "kv_events_config" not in leader.engine_args
 
 
 def test_conflicting_untyped_revision_is_rejected() -> None:

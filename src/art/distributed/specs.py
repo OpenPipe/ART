@@ -1,26 +1,12 @@
 from __future__ import annotations
 
 from collections import Counter
-import hashlib
 from ipaddress import ip_address
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..types import MegatronTopologyConfig
-
-VLLM_KV_EVENT_BUFFER_STEPS = 16_384
-VLLM_KV_EVENT_HWM = 16_384
-VLLM_KV_EVENT_SCHEMA_VERSION = "vllm-0.23/sha256-pickle-v5/bytes"
-VLLM_PREFIX_HASH_BLOCK_SIZE = 16
-VLLM_PREFIX_HASH_SEED = "0"
-
-
-def vllm_kv_event_topic(
-    replica_id: str, generation: int, generation_digest: str
-) -> str:
-    identity = f"{replica_id}\0{generation}\0{generation_digest}".encode()
-    return f"art.kv.{hashlib.sha256(identity).hexdigest()}"
 
 
 class _Spec(BaseModel):
@@ -157,7 +143,6 @@ class ModelServiceMemberSpec(_Spec):
     host_id: str = Field(min_length=1)
     node_rank: int = Field(ge=0)
     gpu_ids: tuple[int, ...]
-    leader: bool = False
 
     @model_validator(mode="after")
     def _validate_gpu_ids(self) -> "ModelServiceMemberSpec":
@@ -170,10 +155,9 @@ class ModelServiceMemberSpec(_Spec):
         return self
 
 
-class ModelServiceReplicaSpec(_Spec):
-    service_name: str = Field(min_length=1)
-    replica_id: str = Field(min_length=1)
-    generation: int = Field(default=0, ge=0)
+class ModelServiceSpec(_Spec):
+    name: str = Field(min_length=1)
+    capabilities: frozenset[str] = frozenset()
     members: tuple[ModelServiceMemberSpec, ...]
     leader_endpoint: EndpointSpec
     rendezvous: EndpointSpec
@@ -182,26 +166,21 @@ class ModelServiceReplicaSpec(_Spec):
     runtime_fingerprint: str = Field(min_length=1)
     parallel: VllmParallelSpec
     update_mode: Literal["lora", "merged"]
-    kv_event_port: int | None = Field(default=None, ge=1, le=65535)
-    kv_replay_port: int | None = Field(default=None, ge=1, le=65535)
 
     @model_validator(mode="after")
-    def _validate_members(self) -> "ModelServiceReplicaSpec":
+    def _validate_members(self) -> "ModelServiceSpec":
         if not self.members:
-            raise ValueError("replica members must not be empty")
+            raise ValueError("model service members must not be empty")
         member_ids = [member.member_id for member in self.members]
         node_ranks = [member.node_rank for member in self.members]
         if len(set(member_ids)) != len(member_ids):
-            raise ValueError("member_id values must be unique within a replica")
+            raise ValueError("member_id values must be unique within a model service")
         if node_ranks != list(range(len(self.members))):
             raise ValueError(
                 "members must be ordered by contiguous node_rank from zero"
             )
         if len({member.host_id for member in self.members}) != len(self.members):
             raise ValueError("native vLLM members must occupy distinct hosts")
-        leaders = [member for member in self.members if member.leader]
-        if len(leaders) != 1 or leaders[0].node_rank != 0:
-            raise ValueError("exactly node_rank 0 must be the replica leader")
         local_world_sizes = {len(member.gpu_ids) for member in self.members}
         if len(local_world_sizes) != 1:
             raise ValueError("native vLLM members must have equal local world sizes")
@@ -209,7 +188,7 @@ class ModelServiceReplicaSpec(_Spec):
             sum(len(member.gpu_ids) for member in self.members)
             != self.parallel.world_size
         ):
-            raise ValueError("vLLM TP * PP * DP must equal the replica GPU count")
+            raise ValueError("vLLM TP * PP * DP must equal the service GPU count")
         if len(self.members) > 1 and not self.rendezvous.is_routable:
             raise ValueError("multi-host vLLM rendezvous must be routable")
         local_world_size = len(self.members[0].gpu_ids)
@@ -224,52 +203,9 @@ class ModelServiceReplicaSpec(_Spec):
             raise ValueError(
                 "native vLLM DP groups must pack evenly within or span whole members"
             )
-        event_ports = range(
-            self.kv_event_base_port,
-            self.kv_event_base_port + self.parallel.dp,
-        )
-        replay_ports = range(
-            self.kv_replay_base_port,
-            self.kv_replay_base_port + self.parallel.dp,
-        )
-        if event_ports.stop > 65536 or replay_ports.stop > 65536:
-            raise ValueError("vLLM KV event port range exceeds 65535")
-        endpoints = [
-            (leaders[0].host_id, self.leader_endpoint.port),
-            (leaders[0].host_id, self.rendezvous.port),
-            *(
-                (self.kv_event_member(rank).host_id, port)
-                for rank, port in enumerate(event_ports)
-            ),
-            *(
-                (self.kv_event_member(rank).host_id, port)
-                for rank, port in enumerate(replay_ports)
-            ),
-        ]
-        if len(set(endpoints)) != len(endpoints):
-            raise ValueError("replica control and KV event ports must not overlap")
+        if self.leader_endpoint.port == self.rendezvous.port:
+            raise ValueError("model-service API and rendezvous ports must not overlap")
         return self
-
-    @property
-    def kv_event_base_port(self) -> int:
-        return self.kv_event_port or self.leader_endpoint.port + 1
-
-    @property
-    def kv_replay_base_port(self) -> int:
-        return self.kv_replay_port or self.kv_event_base_port + self.parallel.dp
-
-    def kv_event_member(self, publisher_rank: int) -> ModelServiceMemberSpec:
-        if not 0 <= publisher_rank < self.parallel.dp:
-            raise ValueError("publisher_rank is outside the vLLM DP world")
-        local_world_size = len(self.members[0].gpu_ids)
-        world_size_within_dp = self.parallel.tp * self.parallel.pp
-        if local_world_size >= world_size_within_dp:
-            local_dp = local_world_size // world_size_within_dp
-            node_rank = publisher_rank // local_dp
-        else:
-            nodes_per_dp = world_size_within_dp // local_world_size
-            node_rank = publisher_rank * nodes_per_dp
-        return next(member for member in self.members if member.node_rank == node_rank)
 
     @property
     def gpu_placements(self) -> tuple[GpuPlacement, ...]:
@@ -278,23 +214,6 @@ class ModelServiceReplicaSpec(_Spec):
             for member in self.members
             for gpu_id in member.gpu_ids
         )
-
-
-class ModelServiceSpec(_Spec):
-    name: str = Field(min_length=1)
-    capabilities: frozenset[str] = frozenset()
-    replicas: tuple[ModelServiceReplicaSpec, ...]
-
-    @model_validator(mode="after")
-    def _validate_replicas(self) -> "ModelServiceSpec":
-        if not self.replicas:
-            raise ValueError("model services require at least one replica")
-        replica_ids = [replica.replica_id for replica in self.replicas]
-        if len(set(replica_ids)) != len(replica_ids):
-            raise ValueError("replica_id values must be unique within a service")
-        if any(replica.service_name != self.name for replica in self.replicas):
-            raise ValueError("replica service_name must match its model service")
-        return self
 
 
 class RuntimeTopology(_Spec):
@@ -352,44 +271,31 @@ class RuntimeTopology(_Spec):
         service_names = [service.name for service in self.model_services]
         if len(set(service_names)) != len(service_names):
             raise ValueError("model service names must be unique")
-        replica_ids = [
-            replica.replica_id
-            for service in self.model_services
-            for replica in service.replicas
-        ]
-        if len(set(replica_ids)) != len(replica_ids):
-            raise ValueError("replica_id values must be unique across model services")
 
         endpoints: list[tuple[str, int, str]] = []
         for service in self.model_services:
-            for replica in service.replicas:
-                placements.extend(
-                    (placement.host_id, placement.gpu_id, replica.replica_id)
-                    for placement in replica.gpu_placements
-                )
-                leader = next(member for member in replica.members if member.leader)
-                endpoints.extend(
+            placements.extend(
+                (placement.host_id, placement.gpu_id, service.name)
+                for placement in service.gpu_placements
+            )
+            endpoints.extend(
+                (
                     (
-                        (leader.host_id, replica.leader_endpoint.port, "leader"),
-                        (leader.host_id, replica.rendezvous.port, "rendezvous"),
-                    )
+                        service.members[0].host_id,
+                        service.leader_endpoint.port,
+                        "leader",
+                    ),
+                    (
+                        service.members[0].host_id,
+                        service.rendezvous.port,
+                        "rendezvous",
+                    ),
                 )
-                for rank in range(replica.parallel.dp):
-                    host_id = replica.kv_event_member(rank).host_id
-                    endpoints.extend(
-                        (
-                            (host_id, replica.kv_event_base_port + rank, "kv_event"),
-                            (host_id, replica.kv_replay_base_port + rank, "kv_replay"),
-                        )
-                    )
+            )
         spans_hosts = (
             self.trainer is not None
             and len({rank.host_id for rank in self.trainer.ranks}) > 1
-        ) or any(
-            len(replica.members) > 1
-            for service in self.model_services
-            for replica in service.replicas
-        )
+        ) or any(len(service.members) > 1 for service in self.model_services)
         if spans_hosts and self.cluster.nccl_transport is None:
             raise ValueError("multi-host GPU workloads require nccl_transport")
         for host_id, gpu_id, owner in placements:
@@ -432,10 +338,6 @@ class ArtRuntimeConfig(_Spec):
     trajectory_capacity_records: int = Field(default=16_384, ge=1)
     trajectory_capacity_bytes: int = Field(default=4 << 30, ge=1)
     vllm_output_root: str = "/tmp/art-vllm"
-    gateway_bind_host: str = "0.0.0.0"
-    gateway_advertise_host: str | None = None
-    gateway_max_queued: int = Field(default=128, ge=0)
-    gateway_route_timeout_s: float = Field(default=1200.0, gt=0)
 
 
 class HostServiceHealth(_Spec):

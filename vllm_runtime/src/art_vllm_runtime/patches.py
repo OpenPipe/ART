@@ -21,7 +21,6 @@ def apply_vllm_runtime_patches() -> None:
     from art_vllm_runtime.policy_spans import patch_policy_token_spans
 
     patch_transformers_v5_compat()
-    patch_engine_kv_hash_config()
     patch_flashinfer_oneshot_pdl_completion()
     patch_policy_token_spans()
     patch_gemma4_moe_lora_support()
@@ -43,18 +42,6 @@ def apply_vllm_runtime_patches() -> None:
     patch_pipeline_routed_experts_validation()
     patch_pipeline_routed_experts()
     patch_binary_routed_experts_response()
-
-
-def patch_engine_kv_hash_config() -> None:
-    from vllm.v1.engine.core import EngineCore
-
-    if hasattr(EngineCore, "art_kv_cache_hash_block_size"):
-        return
-
-    def art_kv_cache_hash_block_size(self: Any) -> int:
-        return int(self.scheduler.kv_cache_manager.block_pool.hash_block_size)
-
-    EngineCore.art_kv_cache_hash_block_size = art_kv_cache_hash_block_size  # type: ignore[attr-defined]
 
 
 def patch_flashinfer_oneshot_pdl_completion() -> None:

@@ -60,7 +60,7 @@ from .specs import (
     ArtRuntimeConfig,
     GpuPlacement,
     HostServiceHealth,
-    ModelServiceReplicaSpec,
+    ModelServiceSpec,
     RuntimeTopology,
 )
 from .vllm_replica import (
@@ -88,7 +88,7 @@ class DistributedPackedBatch(BaseModel):
 
 
 class ArtRuntime:
-    """Run-scoped owner of ART host services, trainer meshes, and vLLM replicas."""
+    """Run-scoped owner of ART host services, trainer meshes, and vLLM services."""
 
     def __init__(
         self,
@@ -109,7 +109,7 @@ class ArtRuntime:
         self._rollout_actors: dict[str, Any] = {}
         self._trainer_runs: set[Any] = set()
         self._live_batches: dict[str, tuple[str, ...]] = {}
-        self._replicas: dict[str, ReplicaManager] = {}
+        self._model_services: dict[str, ReplicaManager] = {}
         self._closeables: set[Any] = set()
         self._next_packing_host = 0
         self._nccl_preflight_lock = asyncio.Lock()
@@ -813,23 +813,21 @@ class ArtRuntime:
         self._require_open()
         self._closeables.add(closeable)
 
-    async def start_replica(
+    async def start_model_service(
         self,
-        spec: ModelServiceReplicaSpec,
+        spec: ModelServiceSpec,
         template: ReplicaLaunchTemplate,
         *,
         on_failure: Callable[[ReplicaFailure], Awaitable[None]] | None = None,
     ) -> ReplicaState:
         self._require_open()
-        configured = {
-            replica.replica_id: replica
-            for service in self.topology.model_services
-            for replica in service.replicas
-        }
-        if configured.get(spec.replica_id) != spec:
-            raise ValueError("replica does not match the compiled runtime topology")
-        if spec.replica_id in self._replicas:
-            raise RuntimeError(f"replica {spec.replica_id!r} is already managed")
+        configured = {service.name: service for service in self.topology.model_services}
+        if configured.get(spec.name) != spec:
+            raise ValueError(
+                "model service does not match the compiled runtime topology"
+            )
+        if spec.name in self._model_services:
+            raise RuntimeError(f"model service {spec.name!r} is already managed")
         await self._preflight_launch(
             runtime_kind="vllm",
             placements=tuple(
@@ -850,25 +848,25 @@ class ArtRuntime:
             startup_timeout_s=self.topology.cluster.startup_timeout_s,
             rpc_timeout_s=self.topology.cluster.rpc_timeout_s,
         )
-        self._replicas[spec.replica_id] = manager
+        self._model_services[spec.name] = manager
         try:
             return await manager.start()
         except BaseException:
-            self._replicas.pop(spec.replica_id, None)
+            self._model_services.pop(spec.name, None)
             raise
 
-    def replica(self, replica_id: str) -> ReplicaManager:
+    def model_service(self, name: str) -> ReplicaManager:
         try:
-            return self._replicas[replica_id]
+            return self._model_services[name]
         except KeyError:
-            raise RuntimeError(f"replica {replica_id!r} is not managed") from None
+            raise RuntimeError(f"model service {name!r} is not managed") from None
 
-    async def stop_replica(self, replica_id: str) -> ReplicaState:
-        manager = self.replica(replica_id)
+    async def stop_model_service(self, name: str) -> ReplicaState:
+        manager = self.model_service(name)
         try:
             return await manager.stop()
         finally:
-            self._replicas.pop(replica_id, None)
+            self._model_services.pop(name, None)
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -910,8 +908,10 @@ class ArtRuntime:
             "dependent shutdown", *(value.aclose() for value in self._closeables)
         )
         self._closeables.clear()
-        await collect("replica shutdown", *(m.stop() for m in self._replicas.values()))
-        self._replicas.clear()
+        await collect(
+            "model-service shutdown", *(m.stop() for m in self._model_services.values())
+        )
+        self._model_services.clear()
         await collect("trainer shutdown", *(run.close() for run in self._trainer_runs))
         self._trainer_runs.clear()
         await collect(

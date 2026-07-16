@@ -20,7 +20,6 @@ if TYPE_CHECKING:
         HostServiceHealth,
         HostSpec,
         ModelServiceMemberSpec,
-        ModelServiceReplicaSpec,
         ModelServiceSpec,
         NcclTransportSpec,
         RuntimeTopology,
@@ -28,7 +27,6 @@ if TYPE_CHECKING:
         VllmParallelSpec,
     )
     from .topology import compile_topology
-    from .vllm_gateway import VllmGateway
     from .vllm_replica import (
         HostMemberLaunchRequest,
         HostMemberState,
@@ -38,22 +36,7 @@ if TYPE_CHECKING:
         ReplicaLaunchTemplate,
         ReplicaManager,
         ReplicaState,
-    )
-    from .vllm_router import (
-        KvCacheEvent,
-        PolicyGenerationCommitError,
-        PrefixBlockHashes,
-        PreparedRoutingTable,
-        ReplicaRouter,
-        ReplicaTelemetry,
         ReplicaUpdateReport,
-        RoutableReplica,
-        RouteReservation,
-        RoutingDeadlineExceededError,
-        RoutingInput,
-        RoutingQueueFullError,
-        RoutingTable,
-        RoutingUnavailableError,
     )
 
 _EXPORTS = {
@@ -70,39 +53,24 @@ _EXPORTS = {
     "HostSpec": ".specs",
     "InProcessRolloutHost": ".rollout",
     "InstalledAsyncCallable": ".rollout",
-    "KvCacheEvent": ".vllm_router",
     "LocalRolloutExecutor": ".rollout",
     "ManagedVllmHostLauncher": ".vllm_replica",
     "ModelServiceMemberSpec": ".specs",
-    "ModelServiceReplicaSpec": ".specs",
     "ModelServiceSpec": ".specs",
     "NcclTransportSpec": ".specs",
     "PackingRequest": ".packing",
     "PackedBatchRef": ".data_plane",
-    "PolicyGenerationCommitError": ".vllm_router",
-    "PrefixBlockHashes": ".vllm_router",
-    "PreparedRoutingTable": ".vllm_router",
     "ReplicaHostLauncher": ".vllm_replica",
     "ReplicaFailure": ".vllm_replica",
     "ReplicaLaunchTemplate": ".vllm_replica",
     "ReplicaManager": ".vllm_replica",
-    "ReplicaRouter": ".vllm_router",
     "ReplicaState": ".vllm_replica",
-    "ReplicaTelemetry": ".vllm_router",
     "ReplicaUpdateReport": ".vllm_replica",
-    "RoutableReplica": ".vllm_router",
-    "RouteReservation": ".vllm_router",
-    "RoutingDeadlineExceededError": ".vllm_router",
-    "RoutingInput": ".vllm_router",
-    "RoutingQueueFullError": ".vllm_router",
-    "RoutingTable": ".vllm_router",
-    "RoutingUnavailableError": ".vllm_router",
     "RolloutExecutor": ".rollout",
     "RuntimeTopology": ".specs",
     "TensorSpec": ".data_plane",
     "TrainerMeshSpec": ".specs",
     "VllmParallelSpec": ".specs",
-    "VllmGateway": ".vllm_gateway",
     "compile_topology": ".topology",
 }
 

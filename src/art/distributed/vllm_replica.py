@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 import hashlib
 import json
-import os
 from pathlib import Path
 from typing import Literal, Protocol
 import uuid
@@ -13,39 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..utils.lifecycle import ChildProcessSupervisor
 from ..vllm_runtime import ManagedVllmRuntime, VllmRuntimeLaunchConfig
-from .specs import (
-    VLLM_KV_EVENT_BUFFER_STEPS,
-    VLLM_KV_EVENT_HWM,
-    VLLM_PREFIX_HASH_BLOCK_SIZE,
-    VLLM_PREFIX_HASH_SEED,
-    ModelServiceMemberSpec,
-    ModelServiceReplicaSpec,
-    vllm_kv_event_topic,
-)
-
-_VLLM_HASH_ENV = {
-    "PYTHONHASHSEED": VLLM_PREFIX_HASH_SEED,
-    "VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES": "0",
-}
-
-
-def _configure_vllm_hash_environment() -> None:
-    for name, expected in _VLLM_HASH_ENV.items():
-        configured = os.environ.get(name)
-        if configured not in (None, expected):
-            raise ValueError(f"{name}={configured!r} conflicts with {expected!r}")
-        os.environ[name] = expected
-
-
-def _prefix_hash_block_size(engine_args: Mapping[str, object]) -> int:
-    value = engine_args.get("hash_block_size")
-    if value is None:
-        value = engine_args.get("block_size")
-    if value is None:
-        return VLLM_PREFIX_HASH_BLOCK_SIZE
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError("vLLM hash_block_size must be a positive integer")
-    return value
+from .specs import ModelServiceMemberSpec, ModelServiceSpec
 
 
 class _Message(BaseModel):
@@ -157,7 +124,6 @@ class ManagedVllmHostLauncher:
         key = (request.replica_id, request.member.member_id, request.generation)
         if key in self._members:
             raise RuntimeError(f"vLLM member already exists: {key}")
-        _configure_vllm_hash_environment()
         managed = _ManagedMember(request)
         self._members[key] = managed
         output_dir = self._output_root / request.replica_id / str(request.generation)
@@ -234,7 +200,7 @@ class ReplicaManager:
 
     def __init__(
         self,
-        spec: ModelServiceReplicaSpec,
+        spec: ModelServiceSpec,
         launchers: Mapping[str, ReplicaHostLauncher],
         template: ReplicaLaunchTemplate,
         *,
@@ -255,60 +221,30 @@ class ReplicaManager:
             configured = template.engine_args.get(key)
             if configured not in (None, spec.model_revision):
                 raise ValueError(f"{key} conflicts with the replica model revision")
-        if "kv_events_config" in template.engine_args:
-            raise ValueError("kv_events_config is owned by the ART replica runtime")
-        hash_block_size = _prefix_hash_block_size(template.engine_args)
-        managed_args = {
-            "enable_prefix_caching": True,
-            "prefix_caching_hash_algo": "sha256",
-            "hash_block_size": hash_block_size,
-            "prefill_context_parallel_size": 1,
-            "decode_context_parallel_size": 1,
-        }
-        for key, expected in managed_args.items():
-            configured = template.engine_args.get(key)
-            if configured not in (None, expected):
-                raise ValueError(f"{key} conflicts with ART prefix-cache routing")
-        _configure_vllm_hash_environment()
         self._spec = spec
         self._launchers = launchers
         self._template = template
-        self._requested_hash_block_size = hash_block_size
-        self._hash_block_size: int | None = None
         self._on_failure = on_failure
         self._startup_timeout_s = startup_timeout_s
         self._rpc_timeout_s = rpc_timeout_s
         self._monitor_interval_s = monitor_interval_s
         self._lock = asyncio.Lock()
         self._monitor_task: asyncio.Task[None] | None = None
-        digest = self._generation_digest(spec)
+        digest = self._generation_digest(spec, 0)
         self._state = ReplicaState(
-            replica_id=spec.replica_id,
-            generation=spec.generation,
+            replica_id=spec.name,
+            generation=0,
             generation_digest=digest,
             phase="stopped",
         )
 
     @property
-    def spec(self) -> ModelServiceReplicaSpec:
+    def spec(self) -> ModelServiceSpec:
         return self._spec
 
     @property
     def state(self) -> ReplicaState:
         return self._state
-
-    @property
-    def prefix_hash_block_size(self) -> int:
-        if self._hash_block_size is None:
-            raise RuntimeError("vLLM effective hash block size is not confirmed")
-        return self._hash_block_size
-
-    def confirm_prefix_hash_block_size(self, value: int) -> None:
-        if isinstance(value, bool) or value <= 0:
-            raise ValueError("vLLM effective hash block size must be positive")
-        if self._hash_block_size not in (None, value):
-            raise RuntimeError("vLLM effective hash block size changed")
-        self._hash_block_size = value
 
     def expected_worker_identities(self) -> tuple[dict[str, int | str], ...]:
         if self._state.phase not in {"ready", "updating"}:
@@ -391,7 +327,6 @@ class ReplicaManager:
             )
             raise
         self._state = self._state.model_copy(update={"phase": "stopped", "members": ()})
-        self._hash_block_size = None
         return self._state
 
     async def restart(self, *, served_model_name: str, lora_path: str) -> ReplicaState:
@@ -400,12 +335,11 @@ class ReplicaManager:
             self._template = self._template.model_copy(
                 update={"served_model_name": served_model_name, "lora_path": lora_path}
             )
-            generation = self._spec.generation + 1
-            self._spec = self._spec.model_copy(update={"generation": generation})
+            generation = self._state.generation + 1
             self._state = ReplicaState(
-                replica_id=self._spec.replica_id,
+                replica_id=self._spec.name,
                 generation=generation,
-                generation_digest=self._generation_digest(self._spec),
+                generation_digest=self._generation_digest(self._spec, generation),
                 phase="stopped",
             )
             return await self._start_locked()
@@ -455,9 +389,9 @@ class ReplicaManager:
                 *(
                     asyncio.wait_for(
                         self._launchers[member.host_id].member_state(
-                            self._spec.replica_id,
+                            self._spec.name,
                             member.member_id,
-                            self._spec.generation,
+                            self._state.generation,
                         ),
                         self._rpc_timeout_s,
                     )
@@ -483,29 +417,19 @@ class ReplicaManager:
             generation_digest = self._state.generation_digest
             self.quarantine(reason)
             failure_event = ReplicaFailure(
-                replica_id=self._spec.replica_id,
+                replica_id=self._spec.name,
                 generation=generation,
                 generation_digest=generation_digest,
                 reason=reason,
             )
-        notification_error: BaseException | None = None
-        if self._on_failure is not None:
             try:
-                await self._on_failure(failure_event)
+                await self._stop_current_members()
             except BaseException as error:
-                notification_error = error
-        async with self._lock:
-            if (
-                self._state.generation == failure_event.generation
-                and self._state.phase == "quarantined"
-            ):
-                try:
-                    await self._stop_current_members()
-                except BaseException as error:
-                    reason += f"; teardown failure: {error}"
-                    self.quarantine(reason)
-        if notification_error is not None:
-            raise notification_error
+                reason += f"; teardown failure: {error}"
+                self.quarantine(reason)
+                failure_event = failure_event.model_copy(update={"reason": reason})
+        if self._on_failure is not None:
+            await self._on_failure(failure_event)
         return self._state
 
     async def _monitor(self) -> None:
@@ -532,9 +456,9 @@ class ReplicaManager:
             tuple(
                 (
                     self._launchers[member.host_id],
-                    self._spec.replica_id,
+                    self._spec.name,
                     member.member_id,
-                    self._spec.generation,
+                    self._state.generation,
                 )
                 for member in self._spec.members
             )
@@ -588,30 +512,10 @@ class ReplicaManager:
         self, member: ModelServiceMemberSpec
     ) -> HostMemberLaunchRequest:
         parallel = self._spec.parallel
-        kv_events_config = {
-            "enable_kv_cache_events": True,
-            "publisher": "zmq",
-            "endpoint": f"tcp://*:{self._spec.kv_event_base_port}",
-            "replay_endpoint": f"tcp://*:{self._spec.kv_replay_base_port}",
-            "buffer_steps": VLLM_KV_EVENT_BUFFER_STEPS,
-            "hwm": VLLM_KV_EVENT_HWM,
-            "max_queue_size": VLLM_KV_EVENT_HWM,
-            "topic": vllm_kv_event_topic(
-                self._spec.replica_id,
-                self._state.generation,
-                self._state.generation_digest,
-            ),
-        }
         engine_args = {
             **self._template.engine_args,
             "revision": self._spec.model_revision,
             "tokenizer_revision": self._spec.model_revision,
-            "enable_prefix_caching": True,
-            "prefix_caching_hash_algo": "sha256",
-            "hash_block_size": self._requested_hash_block_size,
-            "prefill_context_parallel_size": 1,
-            "decode_context_parallel_size": 1,
-            "kv_events_config": kv_events_config,
             "tensor_parallel_size": parallel.tp,
             "pipeline_parallel_size": parallel.pp,
             "data_parallel_size": parallel.dp,
@@ -621,7 +525,11 @@ class ReplicaManager:
         launch = VllmRuntimeLaunchConfig(
             base_model=self._spec.base_model,
             port=self._spec.leader_endpoint.port,
-            host=self._spec.leader_endpoint.host if member.leader else "127.0.0.1",
+            host=(
+                self._spec.leader_endpoint.host
+                if member.node_rank == 0
+                else "127.0.0.1"
+            ),
             local_gpu_ids=member.gpu_ids,
             lora_path=self._template.lora_path,
             served_model_name=self._template.served_model_name,
@@ -636,21 +544,24 @@ class ReplicaManager:
             master_port=self._spec.rendezvous.port
             if len(self._spec.members) > 1
             else None,
-            headless=not member.leader,
-            replica_generation=self._spec.generation,
+            headless=member.node_rank != 0,
+            replica_generation=self._state.generation,
             process_uuid=process_uuid,
             update_identity=self._state.update_identity,
         )
         return HostMemberLaunchRequest(
-            replica_id=self._spec.replica_id,
+            replica_id=self._spec.name,
             member=member,
-            generation=self._spec.generation,
+            generation=self._state.generation,
             generation_digest=self._state.generation_digest,
             process_uuid=process_uuid,
             launch_config=launch,
         )
 
     @staticmethod
-    def _generation_digest(spec: ModelServiceReplicaSpec) -> str:
-        payload = json.dumps(spec.model_dump(mode="json"), sort_keys=True).encode()
+    def _generation_digest(spec: ModelServiceSpec, generation: int) -> str:
+        payload = json.dumps(
+            {"generation": generation, "spec": spec.model_dump(mode="json")},
+            sort_keys=True,
+        ).encode()
         return hashlib.sha256(payload).hexdigest()

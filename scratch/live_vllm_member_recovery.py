@@ -16,7 +16,6 @@ from art.distributed import (
     EndpointSpec,
     HostSpec,
     ModelServiceMemberSpec,
-    ModelServiceReplicaSpec,
     ModelServiceSpec,
     VllmParallelSpec,
     compile_topology,
@@ -27,7 +26,6 @@ from art.megatron.distributed_service import DistributedMegatronService
 
 REDUCED_MODEL = "/mnt/ws_pvc/ws/projects/worktrees/art/glm52_cp/scratch/glm52_e2e_hf_home/hub/models--zai-org--GLM-5.2/snapshots/e2e_12l_full_dims"
 MODEL_NAME = "glm52-vllm-recovery"
-REPLICA_ID = "glm52-recovery-tp4-pp2"
 HOSTS = ("10.0.9.49", "10.0.7.93")
 MONARCH_PORT = int(os.environ.get("ART_MONARCH_PORT", "22242"))
 SERVICE_PORT = int(os.environ.get("ART_SERVICE_PORT", "18114"))
@@ -68,16 +66,14 @@ def _cluster() -> ClusterSpec:
 
 
 def _service() -> ModelServiceSpec:
-    replica = ModelServiceReplicaSpec(
-        service_name=MODEL_NAME,
-        replica_id=REPLICA_ID,
+    return ModelServiceSpec(
+        name=MODEL_NAME,
         members=tuple(
             ModelServiceMemberSpec(
                 member_id=f"node{rank}",
                 host_id=f"host{rank}",
                 node_rank=rank,
                 gpu_ids=tuple(range(4, 8)),
-                leader=rank == 0,
             )
             for rank in range(2)
         ),
@@ -93,7 +89,6 @@ def _service() -> ModelServiceSpec:
         ),
         update_mode="lora",
     )
-    return ModelServiceSpec(name=MODEL_NAME, replicas=(replica,))
 
 
 async def _completion(client: httpx.AsyncClient, base_url: str, model: str) -> Any:
@@ -154,7 +149,7 @@ async def main(hosts: Any | None = None) -> None:
     try:
         await model.register(backend)
         service = cast(DistributedMegatronService, backend._services[MODEL_NAME])
-        manager = runtime.replica(REPLICA_ID)
+        manager = runtime.model_service(MODEL_NAME)
         initial = manager.state
         base_url = str(model.inference_base_url).removesuffix("/v1")
         inference_name = model.inference_model_name
@@ -165,7 +160,7 @@ async def main(hosts: Any | None = None) -> None:
             READY.write_text(
                 json.dumps(
                     {
-                        "replica_id": REPLICA_ID,
+                        "service_name": MODEL_NAME,
                         "generation": initial.generation,
                         "members": [
                             member.model_dump(mode="json") for member in initial.members
@@ -180,12 +175,12 @@ async def main(hosts: Any | None = None) -> None:
             ):
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        f"replica did not recover: {manager.state.model_dump()}"
+                        f"model service did not recover: {manager.state.model_dump()}"
                     )
                 await asyncio.sleep(0.25)
             while service._recovery_tasks:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("replica recovery task did not finish")
+                    raise TimeoutError("model-service recovery task did not finish")
                 await asyncio.sleep(0.25)
             after = await _completion(client, base_url, inference_name)
             state = (await client.get(f"{base_url}/art/state")).json()

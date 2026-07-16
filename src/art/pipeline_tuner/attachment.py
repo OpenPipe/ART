@@ -197,15 +197,6 @@ class PipelineAutotunerAttachment:
             raise RuntimeError(
                 "Pipeline autotuning expected ART vLLM metrics as a dictionary."
             )
-        incomplete = metrics.get("vllm/metrics_incomplete")
-        if incomplete is not None and not isinstance(incomplete, (int, float)):
-            raise RuntimeError(
-                "Pipeline autotuning expected a numeric vLLM scrape completeness flag."
-            )
-        if incomplete:
-            raise ArtVllmMetricsTimeoutError(
-                "ART vLLM metrics scrape omitted one or more replicas."
-            )
         missing = sorted(_REQUIRED_AUTOTUNE_VLLM_METRICS.difference(metrics))
         if missing:
             raise RuntimeError(

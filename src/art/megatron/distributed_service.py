@@ -17,17 +17,11 @@ import httpx
 from art import dev, types
 from art.dev.get_model_config import default_target_modules
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
-from art.distributed.specs import ModelServiceSpec, vllm_kv_event_topic
+from art.distributed.specs import ModelServiceSpec
 from art.distributed.vllm_replica import (
     ReplicaFailure,
     ReplicaLaunchTemplate,
     ReplicaUpdateReport,
-)
-from art.distributed.vllm_router import (
-    ReplicaTelemetry,
-    RoutableReplica,
-    RoutingTable,
-    VllmPrefixHashConfig,
 )
 from art.serving_capabilities import (
     ServingCapabilities,
@@ -113,11 +107,8 @@ class DistributedMegatronService:
         self._training_session_id = uuid.uuid4().hex
         self._trainer: Any = None
         self._mutation_lock = asyncio.Lock()
-        self._replica_ids: tuple[str, ...] = ()
-        self._base_urls: tuple[str, ...] = ()
-        self._gateway: Any = None
-        self._gateway_endpoint: tuple[str, int] | None = None
-        self._policy_generation = 0
+        self._managed_service_name: str | None = None
+        self._base_url: str | None = None
         self._serving_capabilities: ServingCapabilities | None = None
         self._api_key_value: str | None = None
         self._current_lora_name: str | None = None
@@ -308,7 +299,7 @@ class DistributedMegatronService:
                 raise cancelled
         previous_step = self._latest_step
         current, cancelled = await complete_to_thread(self._resolve_current_lora_path)
-        if self._base_urls and self._latest_step != previous_step:
+        if self._base_url and self._latest_step != previous_step:
             await self._reconcile_serving_locked(current)
         if cancelled is not None:
             raise cancelled
@@ -323,8 +314,6 @@ class DistributedMegatronService:
             if step > self._latest_step
         }
         for step in sorted(invalid_exact):
-            if self._gateway is not None:
-                await self._gateway.remove_policy(str(step))
             name = (
                 f"{self.model_name}:eval@{step}"
                 if self.rollout_weight_update_mode == "in_flight_lora"
@@ -486,8 +475,8 @@ class DistributedMegatronService:
     ) -> tuple[str, int]:
         async with self._mutation_lock:
             self._require_open()
-            if self._base_urls:
-                return self._gateway_endpoint or _host_port(self._base_urls[0])
+            if self._base_url:
+                return _host_port(self._base_url)
             return await self._start_openai_server_locked(config)
 
     async def _start_openai_server_locked(
@@ -509,19 +498,16 @@ class DistributedMegatronService:
                 headers=headers,
                 allow_openai_compatible=True,
             )
-            base_urls = (base_url,)
             lora_name, _ = await self._load_adapter_at(
                 lora_path,
                 self._latest_step,
-                base_urls=base_urls,
+                base_url=base_url,
                 api_key=api_key,
                 latest_step=self._latest_step,
             )
             self._publish_serving_state(
-                replica_ids=(),
-                base_urls=base_urls,
-                gateway=None,
-                gateway_endpoint=None,
+                managed_service_name=None,
+                base_url=base_url,
                 capabilities=capabilities,
                 api_key=api_key,
                 current_lora_name=lora_name,
@@ -549,164 +535,76 @@ class DistributedMegatronService:
             engine_args=self._engine_args(config),
             server_args=self._server_args(config),
         )
-        replica_ids = tuple(replica.replica_id for replica in service.replicas)
-        start_tasks = tuple(
-            asyncio.create_task(
-                self.runtime.start_replica(
-                    replica, template, on_failure=self._replica_failed
-                )
-            )
-            for replica in service.replicas
+        await self.runtime.start_model_service(
+            service, template, on_failure=self._replica_failed
         )
+        base_url = service.leader_endpoint.url
         try:
-            starts = await asyncio.gather(*start_tasks, return_exceptions=True)
-        except BaseException as error:
-            for task in start_tasks:
-                task.cancel()
-            starts = await asyncio.gather(*start_tasks, return_exceptions=True)
-            started = tuple(
-                replica_id
-                for replica_id, value in zip(replica_ids, starts, strict=True)
-                if not isinstance(value, BaseException)
+            capabilities = await discover_serving_capabilities(
+                base_url=base_url,
+                headers=_headers(api_key),
+                allow_openai_compatible=False,
             )
-            cleanup = await self._rollback_server_start_safely(None, started)
-            if cleanup:
-                raise BaseExceptionGroup(
-                    "vLLM replica startup cancellation and rollback failed",
-                    [error, *cleanup],
-                ) from None
-            raise
-        failures = [value for value in starts if isinstance(value, BaseException)]
-        if failures:
-            started = tuple(
-                replica_id
-                for replica_id, value in zip(replica_ids, starts, strict=True)
-                if not isinstance(value, BaseException)
-            )
-            failures.extend(await self._rollback_server_start_safely(None, started))
-            raise BaseExceptionGroup("vLLM replica startup failed", failures)
-        base_urls = tuple(
-            f"http://{replica.leader_endpoint.host}:{replica.leader_endpoint.port}"
-            for replica in service.replicas
-        )
-        gateway: Any = None
-        try:
-            capabilities = await asyncio.gather(
-                *(
-                    discover_serving_capabilities(
-                        base_url=url,
-                        headers=_headers(api_key),
-                        allow_openai_compatible=False,
-                    )
-                    for url in base_urls
-                )
-            )
-            if len(set(capabilities)) != 1:
-                raise RuntimeError("vLLM replicas expose different ART capabilities")
-            capabilities[0].require(
+            capabilities.require(
                 "exact_lora_worker_state", operation="distributed LoRA publication"
             )
-            for replica_id, capability in zip(replica_ids, capabilities, strict=True):
-                hash_block_size = capability.prefix_hash_block_size
-                if hash_block_size is None:
-                    raise RuntimeError(
-                        "distributed prefix routing requires the effective vLLM "
-                        "hash block size"
-                    )
-                self.runtime.replica(replica_id).confirm_prefix_hash_block_size(
-                    hash_block_size
-                )
             digest = await self._checkpoint_digest(lora_path, self._latest_step)
             update_identity = uuid.uuid4().hex
-            states = {
-                replica_id: self.runtime.replica(replica_id).prepare_update(
-                    update_identity=update_identity
-                )
-                for replica_id in replica_ids
-            }
+            manager = self.runtime.model_service(service.name)
+            state = manager.prepare_update(update_identity=update_identity)
             await self._acknowledge_lora_workers(
                 lora_name=template.served_model_name,
                 lora_path=lora_path,
                 step=self._latest_step,
-                replica_ids=replica_ids,
-                base_urls=base_urls,
+                service_name=service.name,
+                base_url=base_url,
                 api_key=api_key,
             )
-            for replica_id, state in states.items():
-                manager = self.runtime.replica(replica_id)
-                report = ReplicaUpdateReport(
-                    replica_id=replica_id,
-                    generation=state.generation,
-                    generation_digest=state.generation_digest,
-                    policy_version=str(self._latest_step),
-                    policy_digest=digest,
-                    update_identity=update_identity,
-                )
-                if manager.verify_update(report).phase != "ready":
-                    raise RuntimeError(
-                        f"replica {replica_id!r} rejected initial policy"
-                    )
-            from art.distributed.vllm_gateway import VllmGateway
-
-            gateway = VllmGateway(
-                self._routing_table(
-                    service,
-                    policy_version=self._latest_step,
-                    policy_digest=digest,
-                    update_identity=update_identity,
-                    lora_name=template.served_model_name,
-                    replica_ids=replica_ids,
-                ),
-                upstream_headers=_headers(api_key),
-                max_queued=self.runtime.config.gateway_max_queued,
-                route_timeout_s=self.runtime.config.gateway_route_timeout_s,
-                kv_event_sources=self._kv_event_sources(service, replica_ids),
+            report = ReplicaUpdateReport(
+                replica_id=service.name,
+                generation=state.generation,
+                generation_digest=state.generation_digest,
+                policy_version=str(self._latest_step),
+                policy_digest=digest,
+                update_identity=update_identity,
             )
-            port = await gateway.start(self.runtime.config.gateway_bind_host)
-            gateway_endpoint = (self._gateway_advertise_host(), port)
+            if manager.verify_update(report).phase != "ready":
+                raise RuntimeError("model service rejected its initial policy")
         except BaseException as error:
-            cleanup = await self._rollback_server_start_safely(gateway, replica_ids)
+            cleanup = await self._rollback_server_start_safely(service.name)
             if cleanup:
                 raise BaseExceptionGroup(
                     "vLLM startup validation and rollback failed", [error, *cleanup]
                 ) from None
             raise
         self._publish_serving_state(
-            replica_ids=replica_ids,
-            base_urls=base_urls,
-            gateway=gateway,
-            gateway_endpoint=gateway_endpoint,
-            capabilities=capabilities[0],
+            managed_service_name=service.name,
+            base_url=base_url,
+            capabilities=capabilities,
             api_key=api_key,
             current_lora_name=template.served_model_name,
         )
-        return gateway_endpoint or _host_port(base_urls[0])
+        return _host_port(base_url)
 
     def _publish_serving_state(
         self,
         *,
-        replica_ids: tuple[str, ...],
-        base_urls: tuple[str, ...],
-        gateway: Any,
-        gateway_endpoint: tuple[str, int] | None,
+        managed_service_name: str | None,
+        base_url: str,
         capabilities: ServingCapabilities,
         api_key: str | None,
         current_lora_name: str,
     ) -> None:
-        self._replica_ids = replica_ids
-        self._base_urls = base_urls
-        self._gateway = gateway
-        self._gateway_endpoint = gateway_endpoint
+        self._managed_service_name = managed_service_name
+        self._base_url = base_url
         self._serving_capabilities = capabilities
         self._api_key_value = api_key
         self._current_lora_name = current_lora_name
         self._loaded_adapter_steps.add(self._latest_step)
 
     def _clear_serving_state(self) -> None:
-        self._replica_ids = ()
-        self._base_urls = ()
-        self._gateway = None
-        self._gateway_endpoint = None
+        self._managed_service_name = None
+        self._base_url = None
         self._serving_capabilities = None
         self._api_key_value = None
         self._current_lora_name = None
@@ -715,12 +613,8 @@ class DistributedMegatronService:
         self._exact_adapter_refcounts.clear()
 
     async def _replica_failed(self, failure: ReplicaFailure) -> None:
-        if self._closed or failure.replica_id not in self._replica_ids:
+        if self._closed or failure.replica_id != self._managed_service_name:
             return
-        if self._gateway is not None:
-            self._policy_generation = await self._gateway.quarantine_replica(
-                failure.replica_id, failure.generation, failure.reason
-            )
         task = asyncio.create_task(self._recover_failed_replica(failure))
         self._recovery_tasks.add(task)
         task.add_done_callback(self._recovery_tasks.discard)
@@ -729,9 +623,9 @@ class DistributedMegatronService:
     async def _recover_failed_replica(self, failure: ReplicaFailure) -> None:
         try:
             async with self._mutation_lock:
-                if self._closed or failure.replica_id not in self._replica_ids:
+                if self._closed or failure.replica_id != self._managed_service_name:
                     return
-                manager = self.runtime.replica(failure.replica_id)
+                manager = self.runtime.model_service(failure.replica_id)
                 state = manager.state
                 if (
                     state.generation != failure.generation
@@ -751,16 +645,14 @@ class DistributedMegatronService:
 
     async def _recover_replica_locked(self, failure: ReplicaFailure) -> None:
         service = self._model_service_spec()
-        specs = {replica.replica_id: replica for replica in service.replicas}
-        spec = specs[failure.replica_id]
-        manager = self.runtime.replica(failure.replica_id)
+        manager = self.runtime.model_service(failure.replica_id)
         checkpoint = get_step_checkpoint_dir(self.output_dir, self._latest_step)
         digest = await self._checkpoint_digest(checkpoint, self._latest_step)
         current_lora_name = self._current_lora_name or (
             f"{self.model_name}@{self._latest_step}"
         )
         bootstrap_name = f"{self.model_name}@{self._latest_step}"
-        base_url = spec.leader_endpoint.url
+        base_url = service.leader_endpoint.url
         try:
             state = await manager.restart(
                 served_model_name=bootstrap_name, lora_path=checkpoint
@@ -772,21 +664,15 @@ class DistributedMegatronService:
             )
             if capability != self._serving_capabilities:
                 raise RuntimeError("restarted vLLM replica capabilities changed")
-            hash_block_size = capability.prefix_hash_block_size
-            if hash_block_size is None:
-                raise RuntimeError(
-                    "restarted vLLM replica omitted its prefix hash block size"
-                )
-            manager.confirm_prefix_hash_block_size(hash_block_size)
             update_identity = uuid.uuid4().hex
-            prepared = manager.prepare_update(update_identity=update_identity)
+            manager.prepare_update(update_identity=update_identity)
             lora_name = bootstrap_name
             lora_path = checkpoint
             if current_lora_name != bootstrap_name:
                 lora_name, lora_path = await self._load_adapter_at(
                     checkpoint,
                     self._latest_step,
-                    base_urls=(base_url,),
+                    base_url=base_url,
                     api_key=self._api_key(),
                     latest_step=self._latest_step - 1,
                 )
@@ -794,8 +680,8 @@ class DistributedMegatronService:
                 lora_name=lora_name,
                 lora_path=lora_path,
                 step=self._latest_step,
-                replica_ids=(failure.replica_id,),
-                base_urls=(base_url,),
+                service_name=failure.replica_id,
+                base_url=base_url,
                 api_key=self._api_key(),
             )
             report = ReplicaUpdateReport(
@@ -809,7 +695,7 @@ class DistributedMegatronService:
             if manager.verify_update(report).phase != "ready":
                 raise RuntimeError("restarted vLLM replica rejected current policy")
             if current_lora_name != bootstrap_name:
-                await self._unload_adapter_at(bootstrap_name, (base_url,))
+                await self._unload_adapter_at(bootstrap_name, base_url)
             for step in sorted(self._loaded_exact_adapter_steps):
                 if step == self._latest_step and self.rollout_weight_update_mode != (
                     "in_flight_lora"
@@ -819,7 +705,7 @@ class DistributedMegatronService:
                     get_step_checkpoint_dir(self.output_dir, step),
                     step,
                     exact=True,
-                    base_urls=(base_url,),
+                    base_url=base_url,
                     api_key=self._api_key(),
                     latest_step=self._latest_step,
                 )
@@ -827,20 +713,9 @@ class DistributedMegatronService:
                     lora_name=exact_name,
                     lora_path=exact_path,
                     step=step,
-                    replica_ids=(failure.replica_id,),
-                    base_urls=(base_url,),
+                    service_name=failure.replica_id,
+                    base_url=base_url,
                     api_key=self._api_key(),
-                )
-            if self._gateway is not None:
-                self._policy_generation = await self._gateway.replace_replica(
-                    replica_id=failure.replica_id,
-                    previous_generation=failure.generation,
-                    generation=state.generation,
-                    generation_digest=state.generation_digest,
-                    endpoint=spec.leader_endpoint,
-                    kv_event_sources=self._kv_event_sources(
-                        service, (failure.replica_id,)
-                    ),
                 )
         except BaseException as error:
             manager.quarantine(f"replica recovery failed: {error}")
@@ -865,155 +740,25 @@ class DistributedMegatronService:
         return services[0]
 
     async def _rollback_server_start(
-        self, gateway: Any, replica_ids: tuple[str, ...]
+        self, service_name: str | None
     ) -> list[BaseException]:
-        failures = []
-        if gateway is not None:
-            try:
-                await gateway.close()
-            except BaseException as error:
-                failures.append(error)
-        failures.extend(
-            result
-            for result in await asyncio.gather(
-                *(self.runtime.stop_replica(replica_id) for replica_id in replica_ids),
-                return_exceptions=True,
-            )
-            if isinstance(result, BaseException)
-        )
-        return failures
+        if service_name is None:
+            return []
+        try:
+            await self.runtime.stop_model_service(service_name)
+        except BaseException as error:
+            return [error]
+        return []
 
     async def _rollback_server_start_safely(
-        self, gateway: Any, replica_ids: tuple[str, ...]
+        self, service_name: str | None
     ) -> list[BaseException]:
         failures, cancelled = await complete_task(
-            asyncio.create_task(self._rollback_server_start(gateway, replica_ids))
+            asyncio.create_task(self._rollback_server_start(service_name))
         )
         if cancelled is not None:
             failures.append(cancelled)
         return failures
-
-    def _routing_table(
-        self,
-        service: Any,
-        *,
-        policy_version: int,
-        policy_digest: str,
-        update_identity: str,
-        lora_name: str,
-        replica_ids: tuple[str, ...] | None = None,
-        policy_generation: int | None = None,
-    ) -> RoutingTable:
-        now = asyncio.get_running_loop().time()
-        specs = {replica.replica_id: replica for replica in service.replicas}
-        replicas = []
-        for replica_id in self._replica_ids if replica_ids is None else replica_ids:
-            manager = self.runtime.replica(replica_id)
-            state = manager.state
-            spec = specs[replica_id]
-            if state.phase != "ready":
-                raise RuntimeError(
-                    f"replica {replica_id!r} is not routable: {state.phase}"
-                )
-            replicas.append(
-                RoutableReplica(
-                    replica_id=replica_id,
-                    endpoint=spec.leader_endpoint,
-                    phase="ready",
-                    generation=state.generation,
-                    generation_digest=state.generation_digest,
-                    committed_version=str(policy_version),
-                    policy_digest=policy_digest,
-                    update_identity=update_identity,
-                    telemetry=ReplicaTelemetry(
-                        observed_at=now,
-                        in_flight=0,
-                        capacity=int(
-                            self.config.get("engine_args", {}).get("max_num_seqs")
-                            or 256
-                        ),
-                    ),
-                    kv_event_publishers=spec.parallel.dp,
-                )
-            )
-        target_replica_ids = self._replica_ids if replica_ids is None else replica_ids
-        hash_block_sizes = {
-            self.runtime.replica(replica_id).prefix_hash_block_size
-            for replica_id in target_replica_ids
-        }
-        if len(hash_block_sizes) != 1:
-            raise RuntimeError("vLLM replicas use inconsistent hash block sizes")
-        policy_cache_key = (
-            f"{lora_name}:{policy_version}"
-            if lora_name == f"{self.model_name}:active"
-            else None
-        )
-        return RoutingTable(
-            policy_generation=(
-                self._policy_generation
-                if policy_generation is None
-                else policy_generation
-            ),
-            policy_version=str(policy_version),
-            policy_digest=policy_digest,
-            update_identity=update_identity,
-            replicas=tuple(replicas),
-            prefix_hash=VllmPrefixHashConfig(
-                block_size=hash_block_sizes.pop(),
-                lora_name=lora_name,
-                policy_cache_key=policy_cache_key,
-            ),
-        )
-
-    def _kv_event_sources(
-        self, service: Any, replica_ids: tuple[str, ...]
-    ) -> tuple[Any, ...]:
-        from art.distributed.vllm_kv_events import KvEventSource
-
-        hosts = {
-            host.host_id: _worker_hostname(host.worker_address)
-            for host in self.runtime.topology.cluster.hosts
-        }
-        sources = []
-        specs = {replica.replica_id: replica for replica in service.replicas}
-        for replica_id in replica_ids:
-            spec = specs[replica_id]
-            state = self.runtime.replica(replica_id).state
-            topic = vllm_kv_event_topic(
-                replica_id, state.generation, state.generation_digest
-            )
-            for publisher_rank in range(spec.parallel.dp):
-                host = hosts[spec.kv_event_member(publisher_rank).host_id]
-                sources.append(
-                    KvEventSource(
-                        replica_id=replica_id,
-                        generation=state.generation,
-                        publisher_rank=publisher_rank,
-                        endpoint=_zmq_endpoint(
-                            host, spec.kv_event_base_port + publisher_rank
-                        ),
-                        replay_endpoint=_zmq_endpoint(
-                            host, spec.kv_replay_base_port + publisher_rank
-                        ),
-                        topic=topic,
-                    )
-                )
-        return tuple(sources)
-
-    def _gateway_advertise_host(self) -> str:
-        if host := self.runtime.config.gateway_advertise_host:
-            return host
-        controller = next(
-            host
-            for host in self.runtime.topology.cluster.hosts
-            if host.host_id == self.runtime.topology.cluster.controller_host_id
-        )
-        from urllib.parse import urlparse
-
-        host = urlparse(controller.worker_address).hostname
-        if host is None:
-            raise ValueError("controller worker address has no routable hostname")
-        return host
 
     def _engine_args(self, server: dev.OpenAIServerConfig | None) -> dict[str, object]:
         handler = get_model_support_handler(
@@ -1055,11 +800,13 @@ class DistributedMegatronService:
     async def _load_adapter(
         self, checkpoint: str, step: int, *, exact: bool = False
     ) -> tuple[str, str]:
+        if self._base_url is None:
+            raise RuntimeError("vLLM serving has not started")
         return await self._load_adapter_at(
             checkpoint,
             step,
             exact=exact,
-            base_urls=self._base_urls,
+            base_url=self._base_url,
             api_key=self._api_key(),
             latest_step=self._latest_step,
         )
@@ -1069,7 +816,7 @@ class DistributedMegatronService:
         checkpoint: str,
         step: int,
         *,
-        base_urls: tuple[str, ...],
+        base_url: str,
         api_key: str | None,
         latest_step: int,
         exact: bool = False,
@@ -1099,18 +846,12 @@ class DistributedMegatronService:
             else {"lora_name": name, "lora_path": path}
         )
         async with httpx.AsyncClient(timeout=60.0) as client:
-            responses = await asyncio.gather(
-                *(
-                    client.post(
-                        f"{url}{endpoint}",
-                        json=payload,
-                        headers=_headers(api_key),
-                    )
-                    for url in base_urls
-                )
+            response = await client.post(
+                f"{base_url}{endpoint}",
+                json=payload,
+                headers=_headers(api_key),
             )
-        for response in responses:
-            response.raise_for_status()
+        response.raise_for_status()
         return str(payload.get("lora_slot", name)), path
 
     async def _acknowledge_lora_workers(
@@ -1119,46 +860,37 @@ class DistributedMegatronService:
         lora_name: str,
         lora_path: str,
         step: int,
-        replica_ids: tuple[str, ...] | None = None,
-        base_urls: tuple[str, ...] | None = None,
+        service_name: str | None = None,
+        base_url: str | None = None,
         api_key: str | None = None,
     ) -> None:
-        replica_ids = self._replica_ids if replica_ids is None else replica_ids
-        base_urls = self._base_urls if base_urls is None else base_urls
-        if not replica_ids:
+        service_name = service_name or self._managed_service_name
+        base_url = base_url or self._base_url
+        if service_name is None:
             return
-        if len(replica_ids) != len(base_urls):
-            raise RuntimeError("replica IDs and endpoints are inconsistent")
-        payloads = tuple(
-            {
-                "expected_workers": self.runtime.replica(
-                    replica_id
-                ).expected_worker_identities(),
-                "expected_lora": {
-                    "lora_name": lora_name,
-                    "lora_path": lora_path,
-                    "policy_version": step,
-                },
-            }
-            for replica_id in replica_ids
-        )
+        if base_url is None:
+            raise RuntimeError("managed model service has no leader endpoint")
+        payload = {
+            "expected_workers": self.runtime.model_service(
+                service_name
+            ).expected_worker_identities(),
+            "expected_lora": {
+                "lora_name": lora_name,
+                "lora_path": lora_path,
+                "policy_version": step,
+            },
+        }
         timeout_s = self.runtime.topology.cluster.rpc_timeout_s
         async with asyncio.timeout(timeout_s):
             async with httpx.AsyncClient(timeout=timeout_s) as client:
-                responses = await asyncio.gather(
-                    *(
-                        client.post(
-                            f"{url}/art/lora_worker_state",
-                            json=payload,
-                            headers=_headers(
-                                api_key if api_key is not None else self._api_key()
-                            ),
-                        )
-                        for url, payload in zip(base_urls, payloads, strict=True)
-                    )
+                response = await client.post(
+                    f"{base_url}/art/lora_worker_state",
+                    json=payload,
+                    headers=_headers(
+                        api_key if api_key is not None else self._api_key()
+                    ),
                 )
-        for response in responses:
-            response.raise_for_status()
+        response.raise_for_status()
 
     async def register_lora_for_step(self, step: int, checkpoint: str) -> None:
         async with self._mutation_lock:
@@ -1341,36 +1073,30 @@ class DistributedMegatronService:
             )
 
     async def _register_lora_for_step_locked(self, step: int, checkpoint: str) -> None:
-        if not self._base_urls:
+        if self._base_url is None:
             return
         digest = await self._checkpoint_digest(checkpoint, step)
         update_identity = uuid.uuid4().hex
+        manager = (
+            self.runtime.model_service(self._managed_service_name)
+            if self._managed_service_name is not None
+            else None
+        )
         try:
-            states = {
-                replica_id: self.runtime.replica(replica_id).prepare_update(
-                    update_identity=update_identity
-                )
-                for replica_id in self._replica_ids
-            }
-            if (
-                self._gateway is not None
-                and self.rollout_weight_update_mode == "in_flight_lora"
-            ):
-                self._policy_generation = await self._gateway.pause(
-                    "in-flight LoRA update"
-                )
+            state = (
+                manager.prepare_update(update_identity=update_identity)
+                if manager is not None
+                else None
+            )
             lora_name, lora_path = await self._load_adapter(checkpoint, step)
             await self._acknowledge_lora_workers(
                 lora_name=lora_name,
                 lora_path=lora_path,
                 step=step,
             )
-            reports = []
-            for replica_id in self._replica_ids:
-                manager = self.runtime.replica(replica_id)
-                state = states[replica_id]
+            if manager is not None and state is not None:
                 report = ReplicaUpdateReport(
-                    replica_id=replica_id,
+                    replica_id=manager.spec.name,
                     generation=state.generation,
                     generation_digest=state.generation_digest,
                     policy_version=str(step),
@@ -1378,34 +1104,13 @@ class DistributedMegatronService:
                     update_identity=update_identity,
                 )
                 if manager.verify_update(report).phase != "ready":
-                    raise RuntimeError(f"replica {replica_id!r} rejected LoRA update")
-                reports.append(report)
-            if self._gateway is not None:
-                service = next(
-                    service
-                    for service in self.runtime.topology.model_services
-                    if service.name == self.model_name
-                )
-                policy_generation = self._policy_generation + 1
-                self._policy_generation = await self._gateway.commit(
-                    self._routing_table(
-                        service,
-                        policy_version=step,
-                        policy_digest=digest,
-                        update_identity=update_identity,
-                        lora_name=lora_name,
-                        policy_generation=policy_generation,
-                    ),
-                    tuple(reports),
-                )
+                    raise RuntimeError("model service rejected its LoRA update")
         except BaseException as error:
-            for replica_id in self._replica_ids:
-                self.runtime.replica(replica_id).quarantine(
-                    "partial or failed LoRA update"
-                )
+            if manager is not None:
+                manager.quarantine("partial or failed LoRA update")
             try:
                 cleanup = await self._rollback_server_start_safely(
-                    self._gateway, self._replica_ids
+                    self._managed_service_name
                 )
             finally:
                 self._clear_serving_state()
@@ -1448,22 +1153,6 @@ class DistributedMegatronService:
                     )
                 self._loaded_exact_adapter_steps.add(step)
                 self._exact_adapter_refcounts[step] = 0
-                if self._gateway is not None:
-                    service = next(
-                        service
-                        for service in self.runtime.topology.model_services
-                        if service.name == self.model_name
-                    )
-                    digest = await self._checkpoint_digest(checkpoint, step)
-                    await self._gateway.add_policy(
-                        self._routing_table(
-                            service,
-                            policy_version=step,
-                            policy_digest=digest,
-                            update_identity=f"exact:{step}:{digest}",
-                            lora_name=lora_name,
-                        )
-                    )
             self._exact_adapter_refcounts[step] += 1
         return (
             f"{self.model_name}:eval@{step}"
@@ -1477,8 +1166,6 @@ class DistributedMegatronService:
             count = self._exact_adapter_refcounts.get(step, 0)
             if count <= 1:
                 self._exact_adapter_refcounts.pop(step, None)
-                if self._gateway is not None:
-                    await self._gateway.remove_policy(str(step))
                 if self.rollout_weight_update_mode == "in_flight_lora":
                     await self._unload_adapter(f"{self.model_name}:eval@{step}")
                 self._loaded_exact_adapter_steps.discard(step)
@@ -1493,27 +1180,21 @@ class DistributedMegatronService:
             ):
                 await self._unload_adapter(f"{self.model_name}@{step}")
                 self._loaded_adapter_steps.discard(step)
-                if self._gateway is not None:
-                    await self._gateway.remove_policy(str(step))
 
     async def _unload_adapter(self, name: str) -> None:
-        await self._unload_adapter_at(name, self._base_urls)
+        if self._base_url is None:
+            raise RuntimeError("vLLM serving has not started")
+        await self._unload_adapter_at(name, self._base_url)
 
-    async def _unload_adapter_at(self, name: str, base_urls: tuple[str, ...]) -> None:
+    async def _unload_adapter_at(self, name: str, base_url: str) -> None:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            responses = await asyncio.gather(
-                *(
-                    client.post(
-                        f"{url}/v1/unload_lora_adapter",
-                        json={"lora_name": name},
-                        headers=_headers(self._api_key()),
-                    )
-                    for url in base_urls
-                )
+            response = await client.post(
+                f"{base_url}/v1/unload_lora_adapter",
+                json={"lora_name": name},
+                headers=_headers(self._api_key()),
             )
-        for response in responses:
-            if response.status_code != 404:
-                response.raise_for_status()
+        if response.status_code != 404:
+            response.raise_for_status()
 
     async def get_serving_capabilities(self) -> ServingCapabilities:
         if self._serving_capabilities is None:
@@ -1539,18 +1220,13 @@ class DistributedMegatronService:
             if recovery_tasks:
                 await asyncio.gather(*recovery_tasks, return_exceptions=True)
             self._recovery_tasks.clear()
-            if self._gateway is not None:
-                try:
-                    await self._gateway.close()
-                except BaseException as error:
-                    failures.append(error)
             operations = []
             if self._trainer is not None:
                 operations.append(self.runtime.stop_trainer(self._trainer))
-            operations.extend(
-                self.runtime.stop_replica(replica_id)
-                for replica_id in self._replica_ids
-            )
+            if self._managed_service_name is not None:
+                operations.append(
+                    self.runtime.stop_model_service(self._managed_service_name)
+                )
             results = await asyncio.gather(*operations, return_exceptions=True)
             failures.extend(
                 result for result in results if isinstance(result, BaseException)
@@ -1615,19 +1291,6 @@ def _art_source_revision() -> str:
 
 def _headers(api_key: str | None) -> dict[str, str] | None:
     return {"Authorization": f"Bearer {api_key}"} if api_key else None
-
-
-def _worker_hostname(worker_address: str) -> str:
-    from urllib.parse import urlparse
-
-    parsed = urlparse(worker_address)
-    if parsed.scheme != "tcp" or parsed.hostname is None:
-        raise ValueError("model-service worker addresses must use routable tcp:// URLs")
-    return parsed.hostname
-
-
-def _zmq_endpoint(host: str, port: int) -> str:
-    return f"tcp://[{host}]:{port}" if ":" in host else f"tcp://{host}:{port}"
 
 
 def _host_port(base_url: str) -> tuple[str, int]:

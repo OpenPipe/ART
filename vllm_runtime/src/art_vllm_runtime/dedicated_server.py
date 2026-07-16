@@ -163,21 +163,15 @@ def _patch_art_runtime_routes() -> None:
         async def art_metrics() -> JSONResponse:
             from art_vllm_runtime.metrics import get_art_metrics_snapshot
 
-            return JSONResponse(content=get_art_metrics_snapshot())
+            snapshot = get_art_metrics_snapshot()
+            snapshot.update(
+                process_uuid=_runtime_state["process_uuid"],
+                generation=_runtime_state["generation"],
+            )
+            return JSONResponse(content=snapshot)
 
         @router.get("/art/capabilities")
-        async def art_capabilities(raw_request: Request) -> JSONResponse:
-            from art_vllm_runtime.engine_core import query_engine_cores
-
-            hash_block_sizes = await query_engine_cores(
-                engine(raw_request), "art_kv_cache_hash_block_size"
-            )
-            if any(type(value) is not int or value <= 0 for value in hash_block_sizes):
-                raise RuntimeError(
-                    "vLLM returned an invalid effective KV hash block size"
-                )
-            if len(set(hash_block_sizes)) != 1:
-                raise RuntimeError("vLLM DP engines use different KV hash block sizes")
+        async def art_capabilities() -> JSONResponse:
             return JSONResponse(
                 content={
                     "runtime": "art_vllm",
@@ -188,7 +182,6 @@ def _patch_art_runtime_routes() -> None:
                     "in_flight_lora_updates": True,
                     "policy_token_spans": True,
                     "exact_lora_worker_state": True,
-                    "prefix_hash_block_size": hash_block_sizes[0],
                 }
             )
 
@@ -365,34 +358,21 @@ def _append_cli_arg(vllm_args: list[str], key: str, value: object) -> None:
             assert False, f"Unsupported CLI arg for {key}: {type(value)}"
 
 
-def _take_hash_block_size(engine_args: dict[str, object]) -> int | None:
-    value = engine_args.pop("hash_block_size", None)
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError("hash_block_size must be a positive integer")
-    return value
-
-
 def _patch_engine_config(
     engine_args_type: Any,
     *,
-    hash_block_size: int | None,
     pipeline_route_capture: bool,
 ) -> None:
     current = engine_args_type.create_engine_config
     create_engine_config = getattr(current, "__art_original__", current)
-    if hash_block_size is None and not pipeline_route_capture:
+    if not pipeline_route_capture:
         setattr(engine_args_type, "create_engine_config", create_engine_config)
         return
 
     def create(self: Any, *args: Any, **kwargs: Any) -> Any:
         config = create_engine_config(self, *args, **kwargs)
-        if hash_block_size is not None:
-            config.cache_config.hash_block_size = hash_block_size
-        if pipeline_route_capture:
-            config.model_config.enable_return_routed_experts = True
-            _validate_pipeline_route_config(config)
+        config.model_config.enable_return_routed_experts = True
+        _validate_pipeline_route_config(config)
         return config
 
     create.__art_original__ = create_engine_config  # type: ignore[attr-defined]
@@ -426,7 +406,6 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--lora-path is required for merged rollout weights")
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
-    hash_block_size = _take_hash_block_size(engine_args)
     route_capture = engine_args.get("enable_return_routed_experts", False)
     pp_size = engine_args.get("pipeline_parallel_size", 1)
     if not isinstance(route_capture, bool):
@@ -514,7 +493,6 @@ def main(argv: list[str] | None = None) -> None:
     _patch_art_runtime_routes()
     _patch_engine_config(
         AsyncEngineArgs,
-        hash_block_size=hash_block_size,
         pipeline_route_capture=pipeline_route_capture,
     )
 

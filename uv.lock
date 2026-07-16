@@ -4816,7 +4816,6 @@ backend = [
 distributed = [
     { name = "aiohttp" },
     { name = "msgspec" },
-    { name = "pyzmq" },
     { name = "torch", version = "2.11.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'linux' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (sys_platform == 'win32' and extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux' or sys_platform == 'win32' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "torchmonarch" },
@@ -4941,7 +4940,6 @@ requires-dist = [
     { name = "pybind11", marker = "extra == 'megatron'", specifier = ">=2.13.6" },
     { name = "pydantic", marker = "extra == 'tinker'", specifier = ">=2.12.5" },
     { name = "pytest", marker = "extra == 'backend'", specifier = ">=8.4.1" },
-    { name = "pyzmq", marker = "extra == 'distributed'", specifier = ">=27.1.0" },
     { name = "quack-kernels", marker = "extra == 'megatron'", specifier = "==0.3.7" },
     { name = "scipy", marker = "extra == 'megatron'", specifier = ">=1.17.0" },
     { name = "seaborn", marker = "extra == 'plotting'", specifier = ">=0.13.2" },
