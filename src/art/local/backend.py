@@ -384,6 +384,13 @@ class LocalBackend:
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
 
+    def _supports_concurrent_training_and_inference(
+        self, model: AnyTrainableModel
+    ) -> bool:
+        from ..dev.validate import is_dedicated_mode
+
+        return is_dedicated_mode(model._internal_config or dev.InternalModelConfig())
+
     def automatic_gpu_cost_per_hour_usd(self, model: Model) -> float | None:
         per_gpu_cost = self._resolve_gpu_cost_per_hour_usd()
         if per_gpu_cost is None:

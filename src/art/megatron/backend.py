@@ -78,6 +78,14 @@ class MegatronBackend(LocalBackend):
             **kwargs,
         )
 
+    def _supports_concurrent_training_and_inference(
+        self, model: AnyTrainableModel
+    ) -> bool:
+        return (
+            self._runtime is not None
+            or super()._supports_concurrent_training_and_inference(model)
+        )
+
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
 

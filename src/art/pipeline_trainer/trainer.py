@@ -623,7 +623,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 await attachment.on_packed_group(observation)
 
     def _validate_backend_support(self) -> None:
-        from art.dev.validate import is_dedicated_mode
         from art.local.backend import LocalBackend
 
         if self.eval_fn is not None and not callable(
@@ -637,7 +636,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return
 
         model_config = self.model._internal_config or art.dev.InternalModelConfig()
-        if not is_dedicated_mode(model_config):
+        if not self.backend._supports_concurrent_training_and_inference(self.model):
             raise ValueError(
                 "PipelineTrainer only supports LocalBackend in dedicated mode. "
                 "Shared LocalBackend pauses inference during training and is not "
