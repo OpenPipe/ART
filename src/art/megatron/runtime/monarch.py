@@ -161,13 +161,14 @@ class MonarchTrainerActor(Actor):
         batch_json: str,
         event_port: Port[dict[str, Any]],
     ) -> dict[str, Any]:
-        if not self._valid:
-            raise RuntimeError("trainer actor runtime is invalid")
-        job = TrainJobSpec.model_validate_json(job_json)
-        leases = PackedBatchLeaseSet.model_validate_json(batch_json)
-        batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
-        coordinator = self._runtime.rank == 0
+        batch = None
         try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = TrainJobSpec.model_validate_json(job_json)
+            leases = PackedBatchLeaseSet.model_validate_json(batch_json)
+            batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
+            coordinator = self._runtime.rank == 0
             with self._weight_offload.job():
                 metrics = self._executor.execute(
                     job,
@@ -182,11 +183,20 @@ class MonarchTrainerActor(Actor):
                 "learner_version": job.learner_version,
                 "metrics": metrics if coordinator else {},
             }
-        except BaseException:
+        except BaseException as error:
             self._valid = False
+            event_port.send(
+                {
+                    "kind": "rank_failed",
+                    "rank": self._runtime.rank,
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                }
+            )
             raise
         finally:
-            batch.close()
+            if batch is not None:
+                batch.close()
 
     @endpoint
     def close(self) -> None:
@@ -357,6 +367,11 @@ class MonarchTrainerRun:
                         if receive not in done:
                             continue
                     payload = receive.result()
+                    if payload["kind"] == "rank_failed":
+                        raise RuntimeError(
+                            f"trainer rank {payload['rank']} failed: "
+                            f"{payload['error_type']}: {payload['message']}"
+                        )
                     if payload["kind"] == "progress":
                         event = TrainProgress(
                             job_id=job.job_id,
@@ -374,7 +389,7 @@ class MonarchTrainerRun:
                             learner_version=payload["learner_version"],
                             adapter_path=payload["adapter_path"],
                         )
-                    else:
+                    elif payload["kind"] == "actor_completed":
                         values = await collective
                         results = list(values.values())
                         versions = {result["learner_version"] for result in results}
@@ -398,6 +413,10 @@ class MonarchTrainerRun:
                         emit(completed)
                         self._clear_active(job.job_id)
                         break
+                    else:
+                        raise RuntimeError(
+                            f"trainer rank sent unknown event {payload['kind']!r}"
+                        )
                     yield emit(TRAIN_EVENT_ADAPTER.validate_python(event))
                     receive = asyncio.ensure_future(receiver.recv())
                     self._active_receive = receive
