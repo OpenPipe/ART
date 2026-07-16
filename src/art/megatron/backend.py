@@ -260,22 +260,17 @@ class MegatronBackend(LocalBackend):
 
         distributed_batch = cast(DistributedPackedBatch, batch.payload)
         distributed_service = cast(DistributedMegatronService, service)
-        training_error: BaseException | None = None
-        try:
-            async for result in distributed_service.train_packed(
-                distributed_batch, config, service_dev_config
-            ):
-                yield result
-        except BaseException as error:
-            training_error = error
-            raise
-        finally:
-            try:
-                await self._runtime.release_batch(distributed_batch)
-            except BaseException as error:
-                if training_error is None:
-                    raise
-                training_error.add_note(f"packed batch release also failed: {error}")
+        async for result in distributed_service.train_packed(
+            distributed_batch, config, service_dev_config
+        ):
+            yield result
+
+    async def _release_training_batch(self, batch: _PackedTrainingBatch) -> None:
+        if self._runtime is None:
+            return await super()._release_training_batch(batch)
+        from ..distributed.art_runtime import DistributedPackedBatch
+
+        await self._runtime.release_batch(cast(DistributedPackedBatch, batch.payload))
 
     async def _advance_skipped_step(
         self,

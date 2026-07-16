@@ -1538,82 +1538,111 @@ class LocalBackend:
                 TRAIN_GRADIENT_STEPS_KEY: 0.0,
             }
             return
-        base_metrics["data/step_trainable_assistant_tokens"] = float(
-            packed_batch.trainable_assistant_tokens
-        )
-        packed_sequences = packed_batch.num_sequences
-        packed_sequence_length = packed_batch.sequence_length
-        non_padding_tokens = packed_batch.non_padding_tokens
-        service_dev_config = cast(dev.TrainConfig, {**dev_config})
-        grad_accumulation_sequences = await self._resolve_grad_accumulation_sequences(
-            service,
-            config,
-        )
-        fallback_gradient_steps = math.ceil(
-            packed_sequences / grad_accumulation_sequences
-        )
-        packed_train_tokens = int(
-            fallback_gradient_steps
-            * grad_accumulation_sequences
-            * packed_sequence_length
-        )
-        base_metrics.update(
-            {
-                "data/step_packed_sequences": float(packed_sequences),
-                "data/step_packed_train_tokens": float(packed_train_tokens),
-                "data/step_non_padding_train_tokens": float(non_padding_tokens),
-                "data/step_padding_ratio": (
-                    float(packed_train_tokens - non_padding_tokens)
-                    / packed_train_tokens
-                ),
-                "prefix_tree/logical_tokens": float(packed_batch.logical_tokens),
-                "prefix_tree/physical_tokens": float(packed_batch.physical_tokens),
-                "prefix_tree/compression_ratio": (
-                    packed_batch.logical_tokens / packed_batch.physical_tokens
-                ),
-            }
-        )
-        # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
-        reported_gradient_steps: int | None = None
-        try:
-            async for result in self._stream_prepared_training(
-                model,
-                service,
-                packed_batch,
-                config,
-                service_dev_config,
-                grad_accumulation_sequences,
-                verbose,
-            ):
-                raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
-                if raw_num_gradient_steps is not None:
-                    num_gradient_steps = int(raw_num_gradient_steps)
-                    if reported_gradient_steps is None:
-                        reported_gradient_steps = num_gradient_steps
-                        if pbar.total != num_gradient_steps:
-                            pbar.total = num_gradient_steps
-                            pbar.refresh()
-                    else:
-                        assert num_gradient_steps == reported_gradient_steps, (
-                            f"num_gradient_steps {num_gradient_steps} != reported_gradient_steps {reported_gradient_steps}"
-                        )
-                else:
-                    num_gradient_steps = (
-                        reported_gradient_steps or fallback_gradient_steps
-                    )
-                yield {
-                    **base_metrics,
-                    **result,
-                    TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
+        async with self._training_batch_lifecycle(packed_batch):
+            base_metrics["data/step_trainable_assistant_tokens"] = float(
+                packed_batch.trainable_assistant_tokens
+            )
+            packed_sequences = packed_batch.num_sequences
+            packed_sequence_length = packed_batch.sequence_length
+            non_padding_tokens = packed_batch.non_padding_tokens
+            service_dev_config = cast(dev.TrainConfig, {**dev_config})
+            grad_accumulation_sequences = (
+                await self._resolve_grad_accumulation_sequences(service, config)
+            )
+            fallback_gradient_steps = math.ceil(
+                packed_sequences / grad_accumulation_sequences
+            )
+            packed_train_tokens = int(
+                fallback_gradient_steps
+                * grad_accumulation_sequences
+                * packed_sequence_length
+            )
+            base_metrics.update(
+                {
+                    "data/step_packed_sequences": float(packed_sequences),
+                    "data/step_packed_train_tokens": float(packed_train_tokens),
+                    "data/step_non_padding_train_tokens": float(non_padding_tokens),
+                    "data/step_padding_ratio": (
+                        float(packed_train_tokens - non_padding_tokens)
+                        / packed_train_tokens
+                    ),
+                    "prefix_tree/logical_tokens": float(packed_batch.logical_tokens),
+                    "prefix_tree/physical_tokens": float(packed_batch.physical_tokens),
+                    "prefix_tree/compression_ratio": (
+                        packed_batch.logical_tokens / packed_batch.physical_tokens
+                    ),
                 }
-                pbar.update(1)
-                pbar.set_postfix(result)
+            )
+            # The frontend applies reward scaling and logs the resulting metrics.
+            pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
+            reported_gradient_steps: int | None = None
+            try:
+                async for result in self._stream_prepared_training(
+                    model,
+                    service,
+                    packed_batch,
+                    config,
+                    service_dev_config,
+                    grad_accumulation_sequences,
+                    verbose,
+                ):
+                    raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
+                    if raw_num_gradient_steps is not None:
+                        num_gradient_steps = int(raw_num_gradient_steps)
+                        if reported_gradient_steps is None:
+                            reported_gradient_steps = num_gradient_steps
+                            if pbar.total != num_gradient_steps:
+                                pbar.total = num_gradient_steps
+                                pbar.refresh()
+                        else:
+                            assert num_gradient_steps == reported_gradient_steps, (
+                                f"num_gradient_steps {num_gradient_steps} != "
+                                f"reported_gradient_steps {reported_gradient_steps}"
+                            )
+                    else:
+                        num_gradient_steps = (
+                            reported_gradient_steps or fallback_gradient_steps
+                        )
+                    yield {
+                        **base_metrics,
+                        **result,
+                        TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
+                    }
+                    pbar.update(1)
+                    pbar.set_postfix(result)
+            finally:
+                pbar.close()
+            if verbose:
+                print("_train_model complete")
+
+    @asynccontextmanager
+    async def _training_batch_lifecycle(
+        self, batch: _PackedTrainingBatch
+    ) -> AsyncIterator[None]:
+        primary: BaseException | None = None
+        try:
+            yield
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            pbar.close()
-        # Note: Metrics logging is now handled by the frontend (Model.train())
-        if verbose:
-            print("_train_model complete")
+            try:
+                _, cancelled = await complete_task(
+                    asyncio.create_task(self._release_training_batch(batch))
+                )
+                if cancelled is not None:
+                    raise cancelled
+            except BaseException as release_error:
+                if primary is None:
+                    raise
+                if release_error is not primary:
+                    primary.add_note(
+                        "training-batch release also failed: "
+                        f"{type(release_error).__name__}: {release_error}"
+                    )
+
+    async def _release_training_batch(self, batch: _PackedTrainingBatch) -> None:
+        pass
 
     async def _prepare_training_batch(
         self,

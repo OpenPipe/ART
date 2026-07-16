@@ -228,7 +228,7 @@ class RolloutHostService(Actor):
             await self._vllm_launcher.stop_member(replica_id, member_id, generation)
 
     @resilient_endpoint
-    async def pack_batch(self, request: PackingRequest) -> PackingResult:
+    async def pack_batch(self, request: PackingRequest, batch_id: str) -> PackingResult:
         if self._packer is None:
             from art.megatron.backend import MegatronBackend
 
@@ -256,6 +256,7 @@ class RolloutHostService(Actor):
         non_padding_tokens = int((packed["group_ids"] != -1).sum().item())
         ref = self.inbox.store.create(
             packed,
+            batch_id=batch_id,
             group_ids=request.group_ids,
             record_ids=request.record_ids,
             min_source_version=request.min_source_version,
@@ -297,15 +298,18 @@ class RolloutHostService(Actor):
     async def note_batch_transmitted(self, byte_count: int) -> None:
         self.inbox.store.note_transmitted(byte_count)
 
-    async def _drop_batch(self, batch_id: str) -> None:
+    async def _drop_batch(self, batch_id: str) -> bool:
+        published = self._rdma_batches.pop(batch_id, None)
+        if published is None:
+            return False
+        handle, tensor, shm = published
         try:
-            handle, tensor, shm = self._rdma_batches.pop(batch_id)
-        except KeyError:
-            raise RuntimeError(f"packed batch {batch_id!r} is not published") from None
-        await handle.drop()
-        del tensor
-        gc.collect()
-        shm.close()
+            await handle.drop()
+        finally:
+            del tensor
+            gc.collect()
+            shm.close()
+        return True
 
     @resilient_endpoint
     async def receive_rdma_batch(
@@ -316,6 +320,19 @@ class RolloutHostService(Actor):
     @resilient_endpoint
     async def drop_batch_ref(self, ref: PackedBatchRef) -> None:
         await self.inbox.drop(ref)
+
+    @resilient_endpoint
+    async def reclaim_batch(self, batch_id: str, fence: bool) -> bool:
+        published = False
+        failure: BaseException | None = None
+        try:
+            published = await self._drop_batch(batch_id)
+        except BaseException as error:
+            failure = error
+        reclaimed = self.inbox.store.reclaim(batch_id, fence=fence)
+        if failure is not None:
+            raise failure
+        return published or reclaimed
 
     @resilient_endpoint
     async def stats(self):

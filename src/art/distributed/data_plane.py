@@ -217,7 +217,6 @@ class _Entry:
     def __init__(self, shm: shared_memory.SharedMemory, ref: PackedBatchRef) -> None:
         self.shm = shm
         self.ref = ref
-        self.leases = {ref.lease_id}
 
 
 class SharedMemoryPackedBatchStore:
@@ -229,8 +228,8 @@ class SharedMemoryPackedBatchStore:
         self.owner_actor_id = owner_actor_id
         self.capacity_bytes = capacity_bytes
         self._entries: dict[str, _Entry] = {}
-        self._lease_to_batch: dict[str, str] = {}
         self._reservations: dict[str, BatchReservation] = {}
+        self._reclaimed: set[str] = set()
         self._used_bytes = 0
         self._reserved_bytes = 0
         self._peak_bytes = 0
@@ -243,7 +242,7 @@ class SharedMemoryPackedBatchStore:
         self,
         tensors: Any,
         *,
-        batch_id: str | None = None,
+        batch_id: str,
         group_ids: tuple[str, ...] = (),
         record_ids: tuple[str, ...] = (),
         min_source_version: int = 0,
@@ -251,7 +250,8 @@ class SharedMemoryPackedBatchStore:
     ) -> PackedBatchRef:
         flat, metadata = _flatten_packed_tensors(tensors)
         manifest, storage_bytes = _layout(flat)
-        batch_id = batch_id or secrets.token_hex(16)
+        if batch_id in self._reclaimed:
+            raise PackedBatchLeaseError(f"packed batch {batch_id!r} was reclaimed")
         if batch_id in self._entries or any(
             reservation.batch_id == batch_id
             for reservation in self._reservations.values()
@@ -289,7 +289,6 @@ class SharedMemoryPackedBatchStore:
             shm.unlink()
             raise
         self._entries[batch_id] = _Entry(shm, ref)
-        self._lease_to_batch[lease_id] = batch_id
         self._used_bytes += storage_bytes
         self._peak_bytes = max(
             self._peak_bytes, self._used_bytes + self._reserved_bytes
@@ -300,6 +299,10 @@ class SharedMemoryPackedBatchStore:
         return ref
 
     def reserve(self, source: PackedBatchRef) -> BatchReservation:
+        if source.batch_id in self._reclaimed:
+            raise PackedBatchLeaseError(
+                f"packed batch {source.batch_id!r} was reclaimed"
+            )
         if source.batch_id in self._entries or any(
             reservation.batch_id == source.batch_id
             for reservation in self._reservations.values()
@@ -360,63 +363,50 @@ class SharedMemoryPackedBatchStore:
         if reservation is not None:
             self._reserved_bytes -= reservation.storage_byte_count
 
-    def acquire(self, batch_id: str, consumer_id: str) -> PackedBatchRef:
-        if not consumer_id:
-            raise ValueError("consumer_id must not be empty")
-        entry = self._entry(batch_id)
-        lease_id = secrets.token_hex(16)
-        entry.leases.add(lease_id)
-        self._lease_to_batch[lease_id] = batch_id
-        return entry.ref.model_copy(update={"lease_id": lease_id})
-
-    def release(self, lease_id: str) -> None:
-        batch_id = self._lease_to_batch.pop(lease_id, None)
-        if batch_id is None:
-            raise PackedBatchLeaseError(f"unknown packed-batch lease {lease_id!r}")
-        self._entry(batch_id).leases.remove(lease_id)
-
     def drop(self, ref: PackedBatchRef) -> None:
-        """Idempotently release one lease and unlink storage after the last lease."""
+        """Idempotently reclaim one host-owned packed batch."""
 
-        batch_id = self._lease_to_batch.get(ref.lease_id)
-        if batch_id is not None and batch_id != ref.batch_id:
-            raise PackedBatchLeaseError("packed-batch lease identifies another batch")
         entry = self._entries.get(ref.batch_id)
         if entry is None:
-            if batch_id is not None:
-                raise PackedBatchLeaseError("packed-batch lease has no storage")
             return
-        if batch_id is not None:
-            self.release(ref.lease_id)
-        if not entry.leases:
-            self.unlink(ref.batch_id)
+        if entry.ref.lease_id != ref.lease_id:
+            raise PackedBatchLeaseError("packed-batch reference has a stale lease")
+        self.reclaim(ref.batch_id)
+
+    def reclaim(self, batch_id: str, *, fence: bool = True) -> bool:
+        """Release committed or in-flight storage and optionally fence late writes."""
+
+        if fence:
+            self._reclaimed.add(batch_id)
+        found = False
+        for reservation_id, reservation in tuple(self._reservations.items()):
+            if reservation.batch_id == batch_id:
+                self.abort(reservation_id)
+                found = True
+        entry = self._entries.pop(batch_id, None)
+        if entry is not None:
+            self._used_bytes -= entry.ref.storage_byte_count
+            entry.shm.close()
+            entry.shm.unlink()
+            found = True
+        return found
 
     def map(self, ref: PackedBatchRef) -> "MappedPackedBatch":
-        if self._lease_to_batch.get(ref.lease_id) != ref.batch_id:
+        entry = self._entries.get(ref.batch_id)
+        if entry is None or entry.ref.lease_id != ref.lease_id:
             raise PackedBatchLeaseError("packed-batch reference has no active lease")
         return MappedPackedBatch.open(ref)
 
     def note_transmitted(self, byte_count: int) -> None:
         self._transmitted_bytes += byte_count
 
-    def unlink(self, batch_id: str) -> None:
-        entry = self._entry(batch_id)
-        if entry.leases:
-            raise PackedBatchLeaseError(
-                f"packed batch {batch_id!r} still has {len(entry.leases)} active leases"
-            )
-        self._entries.pop(batch_id)
-        self._used_bytes -= entry.ref.storage_byte_count
-        entry.shm.close()
-        entry.shm.unlink()
-
     def close(self) -> None:
-        if self._reservations:
-            raise PackedBatchLeaseError("cannot close with active reservations")
-        if any(entry.leases for entry in self._entries.values()):
-            raise PackedBatchLeaseError("cannot close with active packed-batch leases")
-        for batch_id in tuple(self._entries):
-            self.unlink(batch_id)
+        batch_ids = set(self._entries)
+        batch_ids.update(
+            reservation.batch_id for reservation in self._reservations.values()
+        )
+        for batch_id in batch_ids:
+            self.reclaim(batch_id, fence=True)
 
     def stats(self) -> DataPlaneStats:
         return DataPlaneStats(
@@ -429,7 +419,7 @@ class SharedMemoryPackedBatchStore:
             transmitted_bytes=self._transmitted_bytes,
             copy_count=self._copy_count,
             batches=len(self._entries),
-            leases=len(self._lease_to_batch),
+            leases=len(self._entries),
         )
 
     def _require_capacity(self, byte_count: int) -> None:
@@ -444,18 +434,16 @@ class SharedMemoryPackedBatchStore:
                 f"packed batch requires {byte_count} bytes, only {available} available"
             )
 
-    def _entry(self, batch_id: str) -> _Entry:
-        try:
-            return self._entries[batch_id]
-        except KeyError:
-            raise PackedBatchLeaseError(f"unknown packed batch {batch_id!r}") from None
-
     def _finish_commit(
         self,
         reservation: BatchReservation,
         source: PackedBatchRef,
         shm: shared_memory.SharedMemory,
     ) -> PackedBatchRef:
+        if self._reservations.get(reservation.reservation_id) != reservation:
+            raise PackedBatchLeaseError(
+                f"packed batch {source.batch_id!r} was reclaimed during transfer"
+            )
         lease_id = secrets.token_hex(16)
         ref = source.model_copy(
             update={
@@ -468,7 +456,6 @@ class SharedMemoryPackedBatchStore:
         self._reservations.pop(reservation.reservation_id)
         self._reserved_bytes -= reservation.storage_byte_count
         self._entries[ref.batch_id] = _Entry(shm, ref)
-        self._lease_to_batch[lease_id] = ref.batch_id
         self._used_bytes += ref.storage_byte_count
         self._created_bytes += ref.storage_byte_count
         self._copied_bytes += ref.storage_byte_count
@@ -545,6 +532,9 @@ class PackedBatchInbox:
 
     async def drop(self, ref: PackedBatchRef) -> None:
         self.store.drop(ref)
+
+    async def reclaim(self, batch_id: str, *, fence: bool = True) -> bool:
+        return self.store.reclaim(batch_id, fence=fence)
 
 
 class RDMABatchSourceEndpoint(Protocol):

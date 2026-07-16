@@ -301,7 +301,7 @@ class DistributedMegatronService:
             return self._resolve_current_lora_path()
         if self._trainer is not None:
             _, cancelled = await complete_task(
-                asyncio.create_task(self._trainer.close())
+                asyncio.create_task(self.runtime.stop_trainer(self._trainer))
             )
             self._trainer = None
             if cancelled is not None:
@@ -1184,7 +1184,7 @@ class DistributedMegatronService:
         async with self._mutation_lock:
             self._require_open()
             if self._trainer is not None and not self._trainer_is_current():
-                await self._trainer.close()
+                await self.runtime.stop_trainer(self._trainer)
                 self._trainer = None
             if not self._resume_prepared and self._trainer is None:
                 _, cancelled = await complete_to_thread(self._resolve_current_lora_path)
@@ -1318,7 +1318,7 @@ class DistributedMegatronService:
                     transition_started or durable or not self._trainer_is_current()
                 ):
                     try:
-                        await trainer.close()
+                        await self.runtime.stop_trainer(trainer)
                     except BaseException as cleanup_error:
                         failures.append(cleanup_error)
                     self._trainer = None
@@ -1544,7 +1544,7 @@ class DistributedMegatronService:
                     failures.append(error)
             operations = []
             if self._trainer is not None:
-                operations.append(self._trainer.close())
+                operations.append(self.runtime.stop_trainer(self._trainer))
             operations.extend(
                 self.runtime.stop_replica(replica_id)
                 for replica_id in self._replica_ids

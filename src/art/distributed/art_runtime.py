@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 import logging
 from typing import Any
 import uuid
@@ -10,6 +10,7 @@ import uuid
 from pydantic import BaseModel, ConfigDict
 
 from art.megatron.runtime.specs import TrainerRuntimeSpec, TrainingRunSpec
+from art.utils.lifecycle import complete_task
 
 from .artifact_preflight import (
     ArtifactProbeCommand,
@@ -98,6 +99,7 @@ class ArtRuntime:
         self._rollout_procs: dict[str, Any] = {}
         self._rollout_actors: dict[str, Any] = {}
         self._trainer_runs: set[Any] = set()
+        self._live_batches: dict[str, tuple[str, ...]] = {}
         self._replicas: dict[str, ReplicaManager] = {}
         self._closeables: set[Any] = set()
         self._next_packing_host = 0
@@ -429,16 +431,23 @@ class ArtRuntime:
         source_host = trainer_hosts[self._next_packing_host % len(trainer_hosts)]
         self._next_packing_host += 1
         source_actor = self._host_actors[source_host]
-        result: PackingResult = await MonarchPackingEndpoint(source_actor).pack(request)
-        if result.ref is None:
-            return None
-        host_refs = {source_host: result.ref}
-        destinations = {
-            host_id: MonarchPackedBatchInbox(self._host_actors[host_id])
-            for host_id in trainer_hosts
-            if host_id != source_host
-        }
+        batch_id = uuid.uuid4().hex
+        self._live_batches[batch_id] = trainer_hosts
         try:
+            result: PackingResult = await MonarchPackingEndpoint(source_actor).pack(
+                request, batch_id
+            )
+            if result.ref is None:
+                self._live_batches.pop(batch_id)
+                return None
+            if result.ref.batch_id != batch_id:
+                raise RuntimeError("packing host returned the wrong batch ID")
+            host_refs = {source_host: result.ref}
+            destinations = {
+                host_id: MonarchPackedBatchInbox(self._host_actors[host_id])
+                for host_id in trainer_hosts
+                if host_id != source_host
+            }
             if destinations:
                 host_refs.update(
                     await fanout_rdma_packed_batch(
@@ -449,8 +458,8 @@ class ArtRuntime:
                     )
                 )
             leases = PackedBatchLeaseSet(ref=result.ref, host_refs=host_refs)
-        except BaseException:
-            await self._release_refs(host_refs)
+        except BaseException as error:
+            await self._reclaim_after_failure(batch_id, error)
             raise
         return DistributedPackedBatch(
             leases=leases,
@@ -460,20 +469,41 @@ class ArtRuntime:
         )
 
     async def release_batch(self, batch: DistributedPackedBatch) -> None:
-        await self._release_refs(batch.leases.host_refs)
+        await self._reclaim_batch(batch.leases.ref.batch_id, fence=False)
 
-    async def _release_refs(self, refs: Mapping[str, Any]) -> None:
-        async def release(host_id: str, ref: Any) -> None:
+    async def _reclaim_batch(self, batch_id: str, *, fence: bool) -> None:
+        hosts = self._live_batches.get(batch_id)
+        if hosts is None:
+            return
+
+        async def reclaim(host_id: str) -> None:
             inbox = MonarchPackedBatchInbox(self._host_actors[host_id])
-            await inbox.drop(ref)
+            await inbox.reclaim(batch_id, fence=fence)
 
         results = await asyncio.gather(
-            *(release(host_id, ref) for host_id, ref in refs.items()),
+            *(reclaim(host_id) for host_id in hosts),
             return_exceptions=True,
         )
         failures = [result for result in results if isinstance(result, BaseException)]
         if failures:
-            raise BaseExceptionGroup("failed to release packed batch", failures)
+            raise BaseExceptionGroup("failed to reclaim packed batch", failures)
+        if self._live_batches.get(batch_id) == hosts:
+            self._live_batches.pop(batch_id)
+
+    async def _reclaim_after_failure(
+        self, batch_id: str, primary: BaseException
+    ) -> None:
+        try:
+            _, cancelled = await complete_task(
+                asyncio.create_task(self._reclaim_batch(batch_id, fence=True))
+            )
+            if cancelled is not None:
+                primary.add_note("packed-batch reclamation observed cancellation")
+        except BaseException as cleanup_error:
+            primary.add_note(
+                "packed-batch reclamation also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
 
     async def start_trainer(
         self, runtime_spec: TrainerRuntimeSpec, run_spec: TrainingRunSpec
@@ -531,6 +561,12 @@ class ArtRuntime:
         run = MonarchTrainerRun(runtime_spec, run_spec, actors, proc)
         self._trainer_runs.add(run)
         return run
+
+    async def stop_trainer(self, run: Any) -> None:
+        try:
+            await run.close()
+        finally:
+            self._trainer_runs.discard(run)
 
     def register_closeable(self, closeable: Any) -> None:
         self._require_open()
@@ -631,6 +667,13 @@ class ArtRuntime:
         await collect("trainer shutdown", *(run.close() for run in self._trainer_runs))
         self._trainer_runs.clear()
         await collect(
+            "packed batch reclamation",
+            *(
+                self._reclaim_batch(batch_id, fence=True)
+                for batch_id in tuple(self._live_batches)
+            ),
+        )
+        await collect(
             "rollout actor shutdown",
             *(
                 call_remote(actor.slice(rollout=slot).close)
@@ -654,6 +697,7 @@ class ArtRuntime:
         )
         self._host_actors.clear()
         self._host_procs.clear()
+        self._live_batches.clear()
         if self.owns_host_mesh:
             await collect("host mesh shutdown", self.host_mesh.shutdown())
         worker, self._local_worker = self._local_worker, None

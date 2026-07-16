@@ -171,6 +171,9 @@ class MonarchPackedBatchInbox:
     async def drop(self, ref: PackedBatchRef) -> None:
         await call_remote(self.actor.drop_batch_ref, ref)
 
+    async def reclaim(self, batch_id: str, *, fence: bool) -> bool:
+        return await call_remote(self.actor.reclaim_batch, batch_id, fence)
+
 
 class MonarchPackedBatchSource:
     def __init__(self, actor: Any) -> None:
@@ -190,5 +193,5 @@ class MonarchPackingEndpoint:
     def __init__(self, actor: Any) -> None:
         self.actor = actor
 
-    async def pack(self, request: PackingRequest) -> PackingResult:
-        return await call_remote(self.actor.pack_batch, request)
+    async def pack(self, request: PackingRequest, batch_id: str) -> PackingResult:
+        return await call_remote(self.actor.pack_batch, request, batch_id)
