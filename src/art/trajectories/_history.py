@@ -272,7 +272,7 @@ def completions_history(
             prompt = _exact_token_ids(
                 request_prompt, field="Completions request prompt"
             )
-        if prompt is None:
+        if prompt is None or completion is None:
             raise ValueError(
                 "Completions history requires exact prompt and output token IDs"
             )

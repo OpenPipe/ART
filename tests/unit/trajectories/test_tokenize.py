@@ -117,11 +117,14 @@ def test_exact_tokens_form_one_append_only_history_without_tokenizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = "wandb-artifact:///entity/project/run:step0"
+    empty = _chat_exchange([1, 2, 3, 4], [], model=model, offset=2)
+    empty.response.choices[0].message.content = ""
     trajectory = art.Trajectory(
         exchanges=TrajectoryExchanges(
             chat_completions=[
                 _chat_exchange([1], [2], model=model, offset=0),
                 _chat_exchange([1, 2, 3], [4], model=model, offset=1),
+                empty,
             ]
         )
     )

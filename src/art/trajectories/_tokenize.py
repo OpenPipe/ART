@@ -162,7 +162,7 @@ def _logprob_values(values: object) -> list[float]:
 
 def _chat_choice_tokens(
     choice: Choice, response_data: dict[str, Any]
-) -> tuple[list[int] | None, list[int], list[float]]:
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
     choice_data = _dump(choice)
     prompt = choice_data.get("prompt_token_ids")
     if prompt is None:
@@ -176,20 +176,25 @@ def _chat_choice_tokens(
     if choice.logprobs is not None:
         logprob_values = choice.logprobs.content or choice.logprobs.refusal
     values = list(logprob_values or [])
+    message = _dump(choice.message)
+    if token_ids == [] and (
+        values or any(message.get(key) for key in ("content", "refusal", "tool_calls"))
+    ):
+        token_ids = None
     pair_ids, logprobs = _pairs(values, field="Chat Completions logprobs")
-    token_ids = token_ids or []
-    if token_ids and pair_ids and token_ids != pair_ids:
+    if token_ids is not None and pair_ids and token_ids != pair_ids:
         raise ValueError("Response token IDs disagree with choice logprobs")
+    selected = token_ids if token_ids is not None else pair_ids or None
     return (
         prompt_ids,
-        token_ids or pair_ids,
-        logprobs or _logprob_values(values) or [math.nan] * len(token_ids),
+        selected,
+        logprobs or _logprob_values(values) or [math.nan] * len(selected or []),
     )
 
 
 def _chat_tokens(
     response: ChatCompletion,
-) -> tuple[list[int] | None, list[int], list[float]]:
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
     if len(response.choices) != 1:
         raise ValueError("Trajectory tokenization requires exactly one response choice")
     return _chat_choice_tokens(response.choices[0], _dump(response))
@@ -197,7 +202,7 @@ def _chat_tokens(
 
 def _completion_tokens(
     response: Completion,
-) -> tuple[list[int] | None, list[int], list[float]]:
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
     if len(response.choices) != 1:
         raise ValueError("Trajectory tokenization requires exactly one response choice")
     choice = response.choices[0]
@@ -210,9 +215,10 @@ def _completion_tokens(
     token_ids = _exact_token_ids(
         choice_data.get("token_ids"), field="Completions token_ids"
     )
-    token_ids = token_ids or []
     logprobs = _dump(choice.logprobs)
     tokens = logprobs.get("tokens") or []
+    if token_ids == [] and (choice.text or tokens):
+        token_ids = None
     pair_ids: list[int] = []
     complete_pairs = True
     for value in tokens:
@@ -231,15 +237,17 @@ def _completion_tokens(
         float(value) if isinstance(value, (int, float)) else math.nan
         for value in logprobs.get("token_logprobs") or []
     ]
-    if token_ids and pair_ids and token_ids != pair_ids:
+    if token_ids is not None and pair_ids and token_ids != pair_ids:
         raise ValueError("Response token IDs disagree with completion logprobs")
-    selected = token_ids or pair_ids
-    if selected and len(pair_logprobs) != len(selected):
+    selected = token_ids if token_ids is not None else pair_ids or None
+    if selected is not None and len(pair_logprobs) != len(selected):
         pair_logprobs = [math.nan] * len(selected)
     return prompt_ids, selected, pair_logprobs
 
 
-def _responses_tokens(response: Response) -> tuple[None, list[int], list[float]]:
+def _responses_tokens(
+    response: Response,
+) -> tuple[None, list[int] | None, list[float]]:
     data = _dump(response)
     if "raw_output_tokens" in data:
         token_ids, logprobs = _pairs(
@@ -273,20 +281,22 @@ def _responses_tokens(response: Response) -> tuple[None, list[int], list[float]]
             logprobs.extend(pair_logprobs)
     if saw_rendered_output and complete:
         return None, token_ids, logprobs
-    return None, [], []
+    return None, None, []
 
 
-def _messages_tokens(response: Message) -> tuple[None, list[int], list[float]]:
+def _messages_tokens(
+    response: Message,
+) -> tuple[None, list[int] | None, list[float]]:
     data = _dump(response)
-    token_ids = (
-        _exact_token_ids(data.get("token_ids"), field="Messages token_ids") or []
-    )
+    token_ids = _exact_token_ids(data.get("token_ids"), field="Messages token_ids")
+    if token_ids == [] and data.get("content"):
+        token_ids = None
     logprobs = [
         float(value) if isinstance(value, (int, float)) else math.nan
         for value in data.get("logprobs") or []
     ]
-    if len(logprobs) != len(token_ids):
-        logprobs = [math.nan] * len(token_ids)
+    if token_ids is None or len(logprobs) != len(token_ids):
+        logprobs = [math.nan] * len(token_ids or [])
     return None, token_ids, logprobs
 
 
@@ -782,7 +792,7 @@ def _template_ids(
 
 def _exchange_tokens(
     exchange: Exchange,
-) -> tuple[list[int] | None, list[int], list[float]]:
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
     if isinstance(exchange, ChatCompletionsExchange):
         return _chat_tokens(exchange.response)
     if isinstance(exchange, CompletionsExchange):
@@ -1033,7 +1043,7 @@ def tokenize_one(
                 chat_template_kwargs=chat_template_kwargs,
                 messages_override=messages_override,
             )
-        if not completion:
+        if completion is None:
             resolved_config = fallback_config()
             if tokenizer is None:
                 tokenizer = _load_tokenizer(resolved_config)
