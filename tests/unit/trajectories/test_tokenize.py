@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from datetime import datetime, timedelta
 import math
 from types import SimpleNamespace
@@ -112,15 +113,27 @@ def _completion_exchange(
     )
 
 
-def test_exact_tokens_form_one_append_only_history_without_tokenizer() -> None:
+def test_exact_tokens_form_one_append_only_history_without_tokenizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = "wandb-artifact:///entity/project/run:step0"
     trajectory = art.Trajectory(
         exchanges=TrajectoryExchanges(
             chat_completions=[
-                _chat_exchange([1], [2], offset=0),
-                _chat_exchange([1, 2, 3], [4], offset=1),
+                _chat_exchange([1], [2], model=model, offset=0),
+                _chat_exchange([1, 2, 3], [4], model=model, offset=1),
             ]
         )
     )
+    real_import = builtins.__import__
+
+    def import_without_tokenizer_dependencies(name: str, *args: Any, **kwargs: Any):
+        if name.partition(".")[0] in {"transformers", "wandb"}:
+            raise AssertionError(f"unexpected import: {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setattr(builtins, "__import__", import_without_tokenizer_dependencies)
 
     tokenized = art.tokenize_trajectory(trajectory)
 
@@ -255,7 +268,7 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
     start = datetime(2026, 1, 1)
     exchange = MessagesExchange(
         request=MessagesRequest(
-            model="test/model",
+            model="wandb-artifact:///entity/project/run:step0",
             messages=[{"role": "user", "content": "question"}],
             chat_template="request-template",
             chat_template_kwargs={"request": True},
@@ -266,8 +279,14 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
         end_time=start + timedelta(seconds=1),
     )
     tokenizer = _FakeTokenizer()
+    loaded_base_models: list[str] = []
     monkeypatch.setattr(
-        "art.trajectories._tokenize._load_tokenizer", lambda _config: tokenizer
+        "art.trajectories._tokenize._load_tokenizer",
+        lambda config: loaded_base_models.append(config.base_model) or tokenizer,
+    )
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._artifact_config",
+        lambda _model: pytest.fail("explicit base_model should bypass W&B"),
     )
 
     result = art.tokenize_trajectory(
@@ -278,6 +297,7 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
     )
 
     assert result.token_ids == [10, 11]
+    assert loaded_base_models == ["base/model"]
     assert result.assistant_mask == [False, True]
     assert math.isnan(result.logprobs[1])
     assert tokenizer.calls == [
@@ -304,8 +324,17 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
     ]
 
 
-def test_checkpoint_fallback_uses_latest_artifact_renderer(
+@pytest.mark.parametrize(
+    ("model", "artifact_name"),
+    [
+        ("wandb-artifact:///entity/project/run", "entity/project/run:latest"),
+        ("wandb-artifact:///entity/project/run:step0", "entity/project/run:step0"),
+    ],
+)
+def test_checkpoint_fallback_preserves_artifact_version_and_renderer(
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    artifact_name: str,
 ) -> None:
     artifact_names: list[str] = []
 
@@ -326,9 +355,9 @@ def test_checkpoint_fallback_uses_latest_artifact_renderer(
     monkeypatch.setattr("wandb.apis.public.Api", Api)
     from art.trajectories._tokenize import _tokenizer_config
 
-    config = _tokenizer_config("wandb-artifact:///entity/project/run", None)
+    config = _tokenizer_config(model, None)
 
-    assert artifact_names == ["entity/project/run:latest"]
+    assert artifact_names == [artifact_name]
     assert config.base_model == "base/model"
     assert config.revision == "revision"
     assert config.chat_template == "template"
@@ -929,11 +958,15 @@ def test_responses_previous_response_id_resolves_local_history(
         art.tokenize_trajectory(trajectory, base_model="base/model")
 
 
-def test_exchange_trajectories_feed_existing_training_tokenizer() -> None:
+def test_exchange_trajectories_feed_existing_training_tokenizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from art.preprocessing.tokenize import tokenize_trajectory_groups
 
+    model = "wandb-artifact:///entity/project/run:step0"
+
     class Tokenizer:
-        name_or_path = "test/model"
+        name_or_path = model
 
         def decode(self, token_id: int) -> str:
             return str(token_id)
@@ -942,17 +975,21 @@ def test_exchange_trajectories_feed_existing_training_tokenizer() -> None:
         [
             art.Trajectory(
                 exchanges=TrajectoryExchanges(
-                    chat_completions=[_chat_exchange([1], [2])]
+                    chat_completions=[_chat_exchange([1], [2], model=model)]
                 ),
                 reward=1,
             ),
             art.Trajectory(
                 exchanges=TrajectoryExchanges(
-                    chat_completions=[_chat_exchange([1], [3])]
+                    chat_completions=[_chat_exchange([1], [3], model=model)]
                 ),
                 reward=0,
             ),
         ]
+    )
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._artifact_config",
+        lambda _model: pytest.fail("supplied tokenizer should bypass W&B"),
     )
 
     results = list(

@@ -12,7 +12,6 @@ from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
 from openai.types.responses import Response
 from pydantic import BaseModel
-from transformers import PreTrainedTokenizerBase
 
 from . import (
     ChatCompletionsExchange,
@@ -318,7 +317,9 @@ def _artifact_config(model: str) -> _TokenizerConfig:
     from wandb.apis.public import Api
 
     artifact_path = model.removeprefix("wandb-artifact:///")
-    artifact = Api().artifact(f"{artifact_path}:latest")
+    if ":" not in artifact_path.rsplit("/", 1)[-1]:
+        artifact_path = f"{artifact_path}:latest"
+    artifact = Api().artifact(artifact_path)
     metadata = artifact.metadata
     base_model = metadata.get("base_model") or metadata.get("wandb.base_model")
     if not isinstance(base_model, str):
@@ -343,15 +344,10 @@ def _artifact_config(model: str) -> _TokenizerConfig:
 
 
 def _tokenizer_config(model: str, base_model: str | None) -> _TokenizerConfig:
-    if model.startswith("wandb-artifact:///"):
-        config = _artifact_config(model)
-        if base_model is not None:
-            if base_model != config.base_model:
-                config.revision = None
-            config.base_model = base_model
-        return config
     if base_model is not None:
         return _TokenizerConfig(base_model)
+    if model.startswith("wandb-artifact:///"):
+        return _artifact_config(model)
     return _TokenizerConfig(model)
 
 
@@ -959,7 +955,12 @@ def tokenize_one(
     selected_model = exchanges[0].model
     if selected_model is None:
         raise AssertionError("_exchange_list returned an exchange without a model")
-    config = _tokenizer_config(selected_model, base_model)
+    exact_tokens = [_exchange_tokens(exchange) for exchange in exchanges]
+    config = (
+        _TokenizerConfig(base_model if base_model is not None else selected_model)
+        if base_model is not None or tokenizer_instance is not None
+        else None
+    )
     tokenizer = tokenizer_instance
     token_ids: list[int] = []
     logprobs: list[float] = []
@@ -969,22 +970,30 @@ def tokenize_one(
         str, tuple[list[dict[str, Any]] | None, ResponsesExchange]
     ] = {}
 
-    for exchange in exchanges:
+    def fallback_config() -> _TokenizerConfig:
+        nonlocal config
+        if config is None:
+            config = _tokenizer_config(selected_model, base_model)
+        return config
+
+    for exchange, (prompt, completion, completion_logprobs) in zip(
+        exchanges, exact_tokens, strict=True
+    ):
         if isinstance(exchange, CompletionsExchange):
-            prompt = exchange.request.get("prompt")
-            if isinstance(prompt, list) and not all(
-                isinstance(item, int) and not isinstance(item, bool) for item in prompt
+            request_prompt = exchange.request.get("prompt")
+            if isinstance(request_prompt, list) and not all(
+                isinstance(item, int) and not isinstance(item, bool)
+                for item in request_prompt
             ):
                 raise ValueError(
                     "Trajectory tokenization does not support batched Completions prompts"
                 )
-            if not isinstance(prompt, (str, list)):
+            if not isinstance(request_prompt, (str, list)):
                 raise ValueError("Completions prompt must be text or one token ID list")
             if exchange.request.get("echo") is True:
                 raise ValueError(
                     "Trajectory tokenization does not support Completions echo=True"
                 )
-        prompt, completion, completion_logprobs = _exchange_tokens(exchange)
         messages_override: list[dict[str, Any]] | None = None
         if isinstance(exchange, ResponsesExchange):
             request = exchange.request
@@ -1012,25 +1021,27 @@ def tokenize_one(
                     ]
             response_histories[exchange.response.id] = (messages_override, exchange)
         if prompt is None:
+            resolved_config = fallback_config()
             if tokenizer is None:
-                tokenizer = _load_tokenizer(config)
+                tokenizer = _load_tokenizer(resolved_config)
             prompt = _template_ids(
                 tokenizer,
                 exchange,
                 completed=False,
-                config=config,
+                config=resolved_config,
                 chat_template=chat_template,
                 chat_template_kwargs=chat_template_kwargs,
                 messages_override=messages_override,
             )
         if not completion:
+            resolved_config = fallback_config()
             if tokenizer is None:
-                tokenizer = _load_tokenizer(config)
+                tokenizer = _load_tokenizer(resolved_config)
             completed = _template_ids(
                 tokenizer,
                 exchange,
                 completed=True,
-                config=config,
+                config=resolved_config,
                 chat_template=chat_template,
                 chat_template_kwargs=chat_template_kwargs,
                 messages_override=messages_override,
