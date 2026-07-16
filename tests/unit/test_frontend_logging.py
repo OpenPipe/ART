@@ -119,7 +119,11 @@ class TestFrontendLoggingCompatibility:
 
         # Check expected columns exist
         expected_columns = [
+            "format_version",
             "group_index",
+            "trajectory_index",
+            "group_json",
+            "trajectory_json",
             "group_metadata",
             "group_metrics",
             "group_logs",

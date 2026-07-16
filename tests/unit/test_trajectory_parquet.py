@@ -35,7 +35,7 @@ from openai.types.chat.chat_completion_user_message_param import (
 )
 import pytest
 
-from art import Trajectory, TrajectoryGroup
+from art import History, Trajectory, TrajectoryGroup
 from art.types import MessageOrChoice
 from art.utils.trajectory_logging import (
     read_trajectory_groups_parquet,
@@ -43,6 +43,7 @@ from art.utils.trajectory_logging import (
 )
 from art.utils.trajectory_migration import (
     MigrationResult,
+    auto_migrate_on_register,
     deserialize_trajectory_groups,
     message_or_choice_to_dict,
     migrate_jsonl_to_parquet,
@@ -54,6 +55,191 @@ from art.utils.trajectory_migration import (
 
 # Path to test fixtures
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "trajectories"
+
+
+def _exchange_trajectory() -> Trajectory:
+    return Trajectory.model_validate(
+        {
+            "reward": 1.25,
+            "initial_policy_version": 3,
+            "final_policy_version": 4,
+            "metadata": {"nested": {"unicode": "你好"}},
+            "exchanges": {
+                "chat_completions": [
+                    {
+                        "request": {
+                            "model": "test/model",
+                            "messages": [{"role": "user", "content": "chat"}],
+                            "cache_salt": "salt",
+                            "provider_extension": {"enabled": True},
+                        },
+                        "response": {
+                            "id": "chat-1",
+                            "object": "chat.completion",
+                            "created": 1,
+                            "model": "test/model",
+                            "prompt_token_ids": [1, 2],
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "finish_reason": "stop",
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "answer",
+                                    },
+                                    "token_ids": [3],
+                                }
+                            ],
+                        },
+                        "start_time": "2026-01-01T00:00:00",
+                        "end_time": "2026-01-01T00:00:01",
+                    }
+                ],
+                "completions": [
+                    {
+                        "request": {"model": "test/model", "prompt": [10, 11]},
+                        "response": {
+                            "id": "completion-1",
+                            "object": "text_completion",
+                            "created": 1,
+                            "model": "test/model",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "finish_reason": "stop",
+                                    "text": "x",
+                                    "prompt_token_ids": [10, 11],
+                                    "token_ids": [12],
+                                    "logprobs": {
+                                        "tokens": ["x"],
+                                        "token_logprobs": [-0.2],
+                                        "top_logprobs": [{}],
+                                        "text_offset": [0],
+                                    },
+                                }
+                            ],
+                        },
+                        "start_time": "2026-01-01T00:00:02",
+                        "end_time": "2026-01-01T00:00:03",
+                    }
+                ],
+                "responses": [
+                    {
+                        "request": {
+                            "model": "test/model",
+                            "input": "respond",
+                            "provider_extension": True,
+                        },
+                        "response": {
+                            "id": "response-1",
+                            "created_at": 1.0,
+                            "model": "test/model",
+                            "object": "response",
+                            "output": [
+                                {
+                                    "id": "response-message-1",
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "status": "completed",
+                                    "content": [
+                                        {
+                                            "type": "output_text",
+                                            "text": "done",
+                                            "annotations": [],
+                                            "logprobs": [],
+                                        }
+                                    ],
+                                }
+                            ],
+                            "parallel_tool_calls": True,
+                            "tool_choice": "auto",
+                            "tools": [],
+                            "raw_output_tokens": [{"token_id": 20, "logprob": -0.3}],
+                        },
+                        "start_time": "2026-01-01T00:00:04",
+                        "end_time": "2026-01-01T00:00:05",
+                    }
+                ],
+                "messages": [
+                    {
+                        "request": {
+                            "model": "test/model",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "max_tokens": 8,
+                        },
+                        "response": {
+                            "id": "message-1",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "test/model",
+                            "content": [{"type": "text", "text": "hi"}],
+                            "stop_reason": "end_turn",
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": 1, "output_tokens": 1},
+                            "token_ids": [30],
+                            "logprobs": [-0.4],
+                        },
+                        "start_time": "2026-01-01T00:00:06",
+                        "end_time": "2026-01-01T00:00:07",
+                    }
+                ],
+            },
+        }
+    )
+
+
+def _write_v1_parquet(path: Path, *, include_group_fields: bool) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    message_type = pa.struct(
+        [
+            ("role", pa.string()),
+            ("content", pa.string()),
+            ("tool_calls", pa.string()),
+            ("tool_call_id", pa.string()),
+            ("trainable", pa.bool_()),
+        ]
+    )
+    fields = [
+        ("reward", pa.float64()),
+        ("metrics", pa.string()),
+        ("metadata", pa.string()),
+        ("tools", pa.string()),
+        ("logs", pa.list_(pa.string())),
+        ("messages", pa.list_(message_type)),
+    ]
+    row: dict[str, object] = {
+        "reward": 0.75,
+        "metrics": '{"score":1}',
+        "metadata": '{"source":"v1"}',
+        "tools": None,
+        "logs": ["legacy"],
+        "messages": [
+            {
+                "role": "user",
+                "content": "old data",
+                "tool_calls": None,
+                "tool_call_id": None,
+                "trainable": False,
+            }
+        ],
+    }
+    if include_group_fields:
+        fields = [
+            ("group_index", pa.int64()),
+            ("group_metadata", pa.string()),
+            ("group_metrics", pa.string()),
+            ("group_logs", pa.list_(pa.string())),
+            *fields,
+        ]
+        row.update(
+            group_index=0,
+            group_metadata='{"fixture":"runtime-v1"}',
+            group_metrics='{"judge":0.5}',
+            group_logs=["legacy group"],
+        )
+    pq.write_table(pa.Table.from_pylist([row], schema=pa.schema(fields)), path)
 
 
 def test_legacy_choice_serialization_omits_unset_fields() -> None:
@@ -231,8 +417,207 @@ class TestParquetRoundTrip:
         assert group.metrics == {"judge_score": 0.7, "pass_rate": 1}
         assert group.logs == ["group log 1", "group log 2"]
 
+    def test_complete_models_round_trip(self, tmp_path: Path) -> None:
+        legacy = Trajectory(
+            messages_and_choices=[
+                {"role": "user", "content": "legacy"},
+                Choice.model_validate(
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "preserved"},
+                        "logprobs": {
+                            "content": [
+                                {
+                                    "token": "preserved",
+                                    "logprob": -0.25,
+                                    "bytes": None,
+                                    "top_logprobs": [],
+                                    "token_id": 42,
+                                }
+                            ]
+                        },
+                    }
+                ),
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "lookup", "parameters": {}},
+                }
+            ],
+            additional_histories=[
+                History(messages_and_choices=[{"role": "user", "content": "alternate"}])
+            ],
+            initial_policy_version=7,
+            final_policy_version=8,
+        )
+        original = [
+            TrajectoryGroup(
+                [_exchange_trajectory(), legacy],
+                exceptions=[RuntimeError("captured failure")],
+                metadata={"scenario": {"id": 7, "tags": ["a", "b"]}},
+                metrics={"pass_rate": 0.5},
+                logs=["group log"],
+            )
+        ]
+        path = tmp_path / "complete.parquet"
+
+        write_trajectory_groups_parquet(original, path)
+        loaded = read_trajectory_groups_parquet(path)
+
+        assert [
+            group.model_dump(mode="json", exclude_defaults=False, warnings="error")
+            for group in loaded
+        ] == [
+            group.model_dump(mode="json", exclude_defaults=False, warnings="error")
+            for group in original
+        ]
+        import pyarrow.parquet as pq
+
+        rows = pq.read_table(path).to_pylist()
+        assert rows[0]["messages"] is None
+        assert rows[1]["messages"] is not None
+        exchange_payload = json.loads(rows[0]["trajectory_json"])
+        assert "model" not in exchange_payload["exchanges"]["chat_completions"][0]
+
+    def test_multipart_legacy_content_does_not_block_canonical_write(
+        self, tmp_path: Path
+    ) -> None:
+        trajectory = Trajectory(
+            messages_and_choices=[
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello"}],
+                }
+            ]
+        )
+        path = tmp_path / "multipart.parquet"
+
+        write_trajectory_groups_parquet([TrajectoryGroup([trajectory])], path)
+        [loaded] = read_trajectory_groups_parquet(path)
+
+        assert (
+            loaded.trajectories[0].messages_and_choices
+            == trajectory.messages_and_choices
+        )
+        import pyarrow.parquet as pq
+
+        assert pq.read_table(path).to_pylist()[0]["messages"] is None
+
+    def test_empty_and_exception_only_groups_round_trip(self, tmp_path: Path) -> None:
+        original = [
+            TrajectoryGroup(metadata={"empty": True}),
+            TrajectoryGroup(
+                exceptions=[ValueError("bad rollout")], logs=["failed group"]
+            ),
+        ]
+        path = tmp_path / "empty-groups.parquet"
+
+        write_trajectory_groups_parquet(original, path)
+        loaded = read_trajectory_groups_parquet(path)
+
+        assert [group.model_dump(mode="json") for group in loaded] == [
+            group.model_dump(mode="json") for group in original
+        ]
+
+    @pytest.mark.parametrize("include_group_fields", [False, True])
+    def test_reads_unversioned_v1_files(
+        self, tmp_path: Path, include_group_fields: bool
+    ) -> None:
+        path = tmp_path / "v1.parquet"
+        _write_v1_parquet(path, include_group_fields=include_group_fields)
+
+        [group] = read_trajectory_groups_parquet(path)
+
+        assert group.trajectories[0].reward == 0.75
+        assert group.trajectories[0].metrics == {"score": 1}
+        assert group.trajectories[0].metadata == {"source": "v1"}
+        assert group.trajectories[0].logs == ["legacy"]
+        assert group.metadata == (
+            {"fixture": "runtime-v1"} if include_group_fields else {}
+        )
+
+    def test_v2_rows_are_restored_by_trajectory_index(self, tmp_path: Path) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        path = tmp_path / "reordered.parquet"
+        group = TrajectoryGroup(
+            [Trajectory(reward=1), Trajectory(reward=2), Trajectory(reward=3)]
+        )
+        write_trajectory_groups_parquet([group], path)
+        table = pq.read_table(path)
+        pq.write_table(table.take(pa.array([2, 0, 1])), path)
+
+        [loaded] = read_trajectory_groups_parquet(path)
+
+        assert [trajectory.reward for trajectory in loaded] == [1, 2, 3]
+
+    def test_rejects_unknown_empty_v2_format(self, tmp_path: Path) -> None:
+        import pyarrow.parquet as pq
+
+        source = tmp_path / "source.parquet"
+        future = tmp_path / "future.parquet"
+        write_trajectory_groups_parquet([], source)
+        table = pq.read_table(source).replace_schema_metadata(
+            {b"art.trajectory_parquet.version": b"3"}
+        )
+        pq.write_table(table, future)
+
+        with pytest.raises(ValueError, match="Unsupported trajectory Parquet version"):
+            read_trajectory_groups_parquet(future)
+
+    def test_rejects_duplicate_trajectory_indexes(self, tmp_path: Path) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        path = tmp_path / "duplicate.parquet"
+        write_trajectory_groups_parquet(
+            [TrajectoryGroup([Trajectory(reward=1), Trajectory(reward=2)])], path
+        )
+        table = pq.read_table(path)
+        index = table.schema.get_field_index("trajectory_index")
+        table = table.set_column(
+            index,
+            "trajectory_index",
+            pa.array([0, 0], type=table.schema.field(index).type),
+        )
+        pq.write_table(table, path)
+
+        with pytest.raises(ValueError, match="duplicate or missing trajectories"):
+            read_trajectory_groups_parquet(path)
+
+    def test_rejects_missing_v2_markers_and_group_rows(self, tmp_path: Path) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        source = tmp_path / "source.parquet"
+        write_trajectory_groups_parquet(
+            [TrajectoryGroup([_exchange_trajectory()]), TrajectoryGroup()], source
+        )
+        table = pq.read_table(source)
+
+        markerless = tmp_path / "markerless.parquet"
+        format_index = table.schema.get_field_index("format_version")
+        pq.write_table(
+            table.remove_column(format_index).replace_schema_metadata(None), markerless
+        )
+        with pytest.raises(ValueError, match="missing its version marker"):
+            read_trajectory_groups_parquet(markerless)
+
+        empty_markerless = tmp_path / "empty-markerless.parquet"
+        pq.write_table(table.slice(0, 0).remove_column(format_index), empty_markerless)
+        with pytest.raises(ValueError, match="missing format_version"):
+            read_trajectory_groups_parquet(empty_markerless)
+
+        missing_group = tmp_path / "missing-group.parquet"
+        pq.write_table(table.take(pa.array([1])), missing_group)
+        with pytest.raises(ValueError, match="group indexes.*non-contiguous"):
+            read_trajectory_groups_parquet(missing_group)
+
     def test_choice_format(self, tmp_path: Path):
-        """Test trajectories with Choice format (finish_reason) are flattened to messages."""
+        """Choice-shaped legacy entries retain their generated-response identity."""
         original = [
             TrajectoryGroup(
                 trajectories=[
@@ -264,20 +649,35 @@ class TestParquetRoundTrip:
         loaded = read_trajectory_groups_parquet(parquet_path)
 
         traj = loaded[0].trajectories[0]
-        # Choice format is flattened to a simple message dict
-        # The inner message content is preserved
         user_msg = _ensure_user_message(traj.messages_and_choices[0])
-        assistant_msg = _ensure_assistant_message(traj.messages_and_choices[1])
+        assistant_choice = traj.messages_and_choices[1]
 
         assert user_msg["role"] == "user"
         user_content = user_msg["content"]
         assert isinstance(user_content, str)
         assert user_content == "Hello"
 
-        assert assistant_msg["role"] == "assistant"
-        assistant_content = assistant_msg.get("content")
-        assert isinstance(assistant_content, str)
-        assert assistant_content == "Hi!"
+        assert isinstance(assistant_choice, Choice)
+        assert assistant_choice.finish_reason == "stop"
+        assert assistant_choice.index == 0
+        assert assistant_choice.message.role == "assistant"
+        assert assistant_choice.message.content == "Hi!"
+
+    def test_nonstandard_choice_dict_round_trips_verbatim(self, tmp_path: Path) -> None:
+        choice = {
+            "finish_reason": "eos",
+            "index": 0,
+            "message": {"role": "assistant", "content": "done"},
+        }
+        original = TrajectoryGroup.model_validate(
+            {"trajectories": [{"messages_and_choices": [choice], "reward": 1.0}]}
+        )
+        path = tmp_path / "nonstandard-choice.parquet"
+
+        write_trajectory_groups_parquet([original], path)
+        [loaded] = read_trajectory_groups_parquet(path)
+
+        assert loaded.trajectories[0].messages_and_choices == [choice]
 
     def test_unicode_content(self, tmp_path: Path):
         """Test trajectories with unicode and special characters."""
@@ -468,6 +868,40 @@ class TestParquetRoundTrip:
 class TestMigration:
     """Test JSONL to Parquet migration."""
 
+    def test_migrate_complete_exchange_group(self, tmp_path: Path) -> None:
+        group = TrajectoryGroup(
+            [_exchange_trajectory()],
+            exceptions=[ValueError("captured")],
+            metadata={"source": "exchange-jsonl"},
+        )
+        jsonl_path = tmp_path / "exchange.jsonl"
+        jsonl_path.write_text(group.model_dump_json())
+
+        result = migrate_jsonl_to_parquet(jsonl_path)
+        [loaded] = read_trajectory_groups_parquet(jsonl_path.with_suffix(".parquet"))
+
+        assert result.errors == []
+        assert loaded.model_dump(mode="json") == group.model_dump(mode="json")
+
+    def test_migrate_nonstandard_choice_dict(self, tmp_path: Path) -> None:
+        choice = {
+            "finish_reason": "eos",
+            "index": 0,
+            "message": {"role": "assistant", "content": "done"},
+        }
+        jsonl_path = tmp_path / "nonstandard-choice.jsonl"
+        jsonl_path.write_text(
+            json.dumps(
+                {"trajectories": [{"messages_and_choices": [choice], "reward": 1.0}]}
+            )
+        )
+
+        result = migrate_jsonl_to_parquet(jsonl_path)
+        [group] = read_trajectory_groups_parquet(jsonl_path.with_suffix(".parquet"))
+
+        assert result.errors == []
+        assert group.trajectories[0].messages_and_choices == [choice]
+
     def test_migrate_simple_jsonl(self, tmp_path: Path):
         """Test migrating a simple JSONL file."""
         # Create a JSONL file with enough content to benefit from compression
@@ -510,6 +944,11 @@ class TestMigration:
         parquet_path = tmp_path / "0001.parquet"
         assert parquet_path.exists()
         assert not jsonl_path.exists()
+        import pyarrow.parquet as pq
+
+        schema = pq.read_schema(parquet_path)
+        assert "format_version" in schema.names
+        assert schema.metadata == {b"art.trajectory_parquet.version": b"2"}
 
         # Verify content
         loaded = read_trajectory_groups_parquet(parquet_path)
@@ -761,6 +1200,16 @@ class TestEdgeCases:
 
         result = migrate_jsonl_to_parquet(bad_file)
         assert result.files_migrated == 0
+        assert len(result.errors) == 1
+
+    def test_auto_migration_warns_on_errors(self, tmp_path: Path) -> None:
+        trajectories = tmp_path / "trajectories"
+        trajectories.mkdir()
+        (trajectories / "bad.jsonl").write_text("not valid json{{{")
+
+        with pytest.warns(RuntimeWarning, match="Error migrating"):
+            result = auto_migrate_on_register(tmp_path)
+
         assert len(result.errors) == 1
 
     def test_empty_file(self, tmp_path: Path):

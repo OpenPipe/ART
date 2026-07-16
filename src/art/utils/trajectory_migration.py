@@ -14,11 +14,14 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 from typing import Any, Callable, Iterator, cast
+import warnings
 
+import pydantic
 import yaml
 
 from art.trajectories import History, Trajectory, TrajectoryGroup
 from art.types import Choice, Message, MessageOrChoice
+from art.utils.trajectory_logging import write_trajectory_groups_parquet
 
 # ============================================================================
 # Legacy JSONL serialization helpers
@@ -108,30 +111,34 @@ def deserialize_trajectory_groups(serialized: str) -> list[TrajectoryGroup]:
 
 
 def dict_to_trajectory_group(d: dict[str, Any]) -> TrajectoryGroup:
-    return TrajectoryGroup(
-        trajectories=[
-            dict_to_trajectory(trajectory) for trajectory in d["trajectories"]
-        ],
-        exceptions=[],
+    return TrajectoryGroup.model_validate(
+        {
+            **d,
+            "trajectories": [
+                dict_to_trajectory(trajectory) for trajectory in d["trajectories"]
+            ],
+        }
     )
 
 
 def dict_to_trajectory(d: dict[str, Any]) -> Trajectory:
-    return Trajectory(
-        messages_and_choices=[
-            dict_to_message_or_choice(message_or_choice)
-            for message_or_choice in d["messages_and_choices"]
-        ],
-        reward=d["reward"],
-        metrics=d["metrics"],
-        metadata=d["metadata"],
-        logs=d["logs"],
+    return Trajectory.model_validate(
+        {
+            **d,
+            "messages_and_choices": [
+                dict_to_message_or_choice(message_or_choice)
+                for message_or_choice in d.get("messages_and_choices", [])
+            ],
+        }
     )
 
 
 def dict_to_message_or_choice(d: dict[str, Any]) -> MessageOrChoice:
     if "message" in d:
-        return Choice(**d)
+        try:
+            return Choice(**d)
+        except pydantic.ValidationError:
+            return cast(Message, d)
     else:
         return cast(Message, d)
 
@@ -190,9 +197,6 @@ def migrate_jsonl_to_parquet(
     Returns:
         MigrationResult with statistics about the migration.
     """
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
     jsonl_path = Path(jsonl_path)
     result = MigrationResult()
 
@@ -217,102 +221,15 @@ def migrate_jsonl_to_parquet(
         return result
 
     try:
-        # Read JSONL file
-        trajectory_groups_data = []
+        trajectory_groups_data: list[dict[str, Any]] = []
         with open(jsonl_path, "r") as f:
             for line in f:
                 if line.strip():
                     trajectory_groups_data.append(json.loads(line))
-
-        # Convert to flat rows for Parquet
-        rows = []
-        for group_index, group in enumerate(trajectory_groups_data):
-            for traj in group.get("trajectories", []):
-                # Flatten messages
-                messages = []
-                for msg in traj.get("messages_and_choices", []):
-                    if "finish_reason" in msg:
-                        # Choice format - extract inner message, mark as trainable
-                        inner = msg.get("message", {})
-                        messages.append(
-                            {
-                                "role": inner.get("role"),
-                                "content": inner.get("content"),
-                                "tool_calls": json.dumps(inner.get("tool_calls"))
-                                if inner.get("tool_calls")
-                                else None,
-                                "tool_call_id": None,
-                                "trainable": True,
-                            }
-                        )
-                    else:
-                        # Regular message
-                        messages.append(
-                            {
-                                "role": msg.get("role"),
-                                "content": msg.get("content"),
-                                "tool_calls": json.dumps(msg.get("tool_calls"))
-                                if msg.get("tool_calls")
-                                else None,
-                                "tool_call_id": msg.get("tool_call_id"),
-                                "trainable": False,
-                            }
-                        )
-
-                rows.append(
-                    {
-                        "group_index": group_index,
-                        "reward": traj.get("reward"),
-                        "metrics": json.dumps(traj.get("metrics"))
-                        if traj.get("metrics")
-                        else None,
-                        "metadata": json.dumps(traj.get("metadata"))
-                        if traj.get("metadata")
-                        else None,
-                        "tools": json.dumps(traj.get("tools"))
-                        if traj.get("tools")
-                        else None,
-                        "logs": traj.get("logs"),
-                        "additional_histories": json.dumps(
-                            traj.get("additional_histories")
-                        )
-                        if traj.get("additional_histories")
-                        else None,
-                        "messages": messages,
-                    }
-                )
-
-        # Define the message struct schema
-        message_type = pa.struct(
-            [
-                ("role", pa.string()),
-                ("content", pa.string()),
-                ("tool_calls", pa.string()),
-                ("tool_call_id", pa.string()),
-                ("trainable", pa.bool_()),
-            ]
+        write_trajectory_groups_parquet(
+            [dict_to_trajectory_group(group) for group in trajectory_groups_data],
+            parquet_path,
         )
-
-        schema = pa.schema(
-            [
-                ("group_index", pa.int64()),
-                ("reward", pa.float64()),
-                ("metrics", pa.string()),
-                ("metadata", pa.string()),
-                ("tools", pa.string()),
-                ("logs", pa.list_(pa.string())),
-                ("additional_histories", pa.string()),
-                ("messages", pa.list_(message_type)),
-            ]
-        )
-
-        # Handle empty case
-        if not rows:
-            table = pa.table({name: [] for name in schema.names}, schema=schema)
-            pq.write_table(table, parquet_path, compression="zstd")
-        else:
-            table = pa.Table.from_pylist(rows, schema=schema)
-            pq.write_table(table, parquet_path, compression="zstd")
 
         # Get new size
         new_size = parquet_path.stat().st_size
@@ -476,5 +393,7 @@ def auto_migrate_on_register(model_dir: Path | str) -> MigrationResult:
             f"Migrated {result.files_migrated} trajectory files to Parquet "
             f"(saved {result.space_saved / 1024 / 1024:.1f} MB)"
         )
+    if result.errors:
+        warnings.warn("\n".join(result.errors), RuntimeWarning, stacklevel=2)
 
     return result
