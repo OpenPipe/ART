@@ -317,16 +317,12 @@ def read_adapter_publication(
 ) -> OptimizerAdapter | None:
     canonical = _canonical_adapter_path(adapter_path, step)
     acknowledgment = canonical / ADAPTER_PUBLICATION_ACK
-    if not acknowledgment.is_file():
-        if acknowledgment.exists():
-            raise RuntimeError(
-                f"Invalid adapter publication acknowledgment: {acknowledgment}"
-            )
+    try:
+        payload = acknowledgment.read_text("utf-8")
+    except FileNotFoundError:
         return None
     try:
-        adapter = OptimizerAdapter.model_validate_json(
-            acknowledgment.read_text("utf-8")
-        )
+        adapter = OptimizerAdapter.model_validate_json(payload)
     except Exception as exc:
         raise RuntimeError(
             f"Invalid adapter publication acknowledgment: {acknowledgment}"
