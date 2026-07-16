@@ -44,7 +44,7 @@ def main(
     depths: str = "0,1,2,3,4",
     performance_depth: int = 1,
     chunks: str = "17,512,8192",
-    workload: Literal["regular", "austin", "varied"] = "regular",
+    workload: Literal["regular", "austin", "varied", "unequal_slots"] = "regular",
     request: Literal["target", "multi", "topk", "logits", "hidden", "mixed"] = "target",
     families: int = 8,
     prefix_tokens: int = 128,
@@ -397,15 +397,27 @@ def _performance(
         families, prefix_tokens, branches, completion_tokens = 30, 5000, 16, 100
     rank = TrainerRank(runtime, shared_prefix_max_depth=depth, head_chunk_tokens=8192)
     slot_names = load_random_checkpoint_slots(runtime, rank, slots)
-    requests = _performance_requests(
-        request=request,
-        families=families,
-        prefix_tokens=prefix_tokens,
-        branches=branches,
-        completion_tokens=completion_tokens,
-        varied=workload == "varied",
-        slots=slot_names,
-    )
+    if workload == "unequal_slots":
+        if len(slot_names) < 2:
+            raise ValueError("--workload unequal_slots requires --slots >= 2")
+        requests = [
+            ForwardInput(
+                input_tokens=(tokens := _tokens(index * 1009, length)),
+                target_tokens=(tokens * 7 + 3) % 32_000,
+                checkpoint=slot_names[index],
+            )
+            for index, length in enumerate((256, 64))
+        ]
+    else:
+        requests = _performance_requests(
+            request=request,
+            families=families,
+            prefix_tokens=prefix_tokens,
+            branches=branches,
+            completion_tokens=completion_tokens,
+            varied=workload == "varied",
+            slots=slot_names,
+        )
     dp_rank, dp_size = rank._dp_rank_and_size()
     plan = rank._plan_flat_forward(requests)
     assert workload != "austin" or plan.packed_tokens == 198_000
