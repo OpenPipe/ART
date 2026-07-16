@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Iterable, cast
 
 from openai.types.chat.chat_completion import Choice
@@ -8,7 +9,14 @@ import tinker
 from tinker_cookbook import renderers
 import torch
 
-from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
+from ..trajectories import (
+    History,
+    TokenizedTrajectory,
+    Trajectory,
+    TrajectoryGroup,
+    get_messages,
+    tokenize_trajectory,
+)
 from ..types import MessagesAndChoices
 
 
@@ -132,6 +140,8 @@ def trajectory_groups_to_datums(
     renderer: Any,
     tokenizer: Any,
     normalize_advantages: bool = True,
+    *,
+    base_model: str | None = None,
 ) -> list[tinker.Datum]:
     datums: list[tinker.Datum] = []
 
@@ -139,7 +149,7 @@ def trajectory_groups_to_datums(
         if not group.trajectories:
             continue
         for trajectory in group.trajectories:
-            if not _trajectory_has_choice(trajectory):
+            if not trajectory.exchanges and not _trajectory_has_choice(trajectory):
                 raise ValueError(
                     "Trajectory is missing a Choice object. Training requires at least one Choice "
                     "to compute logprobs. Ensure your rollout includes an OpenAI Choice in "
@@ -151,6 +161,13 @@ def trajectory_groups_to_datums(
         if all(advantage == 0.0 for advantage in advantages):
             continue
         for trajectory, advantage in zip(group.trajectories, advantages):
+            if trajectory.exchanges:
+                datum = _tokenized_trajectory_to_datum(
+                    tokenize_trajectory(trajectory, base_model=base_model), advantage
+                )
+                if datum is not None:
+                    datums.append(datum)
+                continue
             for history in iter_trajectory_histories(trajectory):
                 datum = history_to_datum(history, advantage, renderer, tokenizer)
                 if datum is not None:
@@ -255,24 +272,73 @@ def build_datum(
     padded_advantages = [0.0] * ob_len + [advantage] * len(completion_tokens)
     action_mask = [0.0] * ob_len + [1.0] * len(completion_tokens)
 
+    return _build_datum(
+        input_tokens,
+        target_tokens,
+        padded_logprobs,
+        padded_advantages,
+        action_mask,
+    )
+
+
+def _tokenized_trajectory_to_datum(
+    tokenized: TokenizedTrajectory, advantage: float
+) -> tinker.Datum | None:
     if not (
+        len(tokenized.token_ids)
+        == len(tokenized.logprobs)
+        == len(tokenized.assistant_mask)
+    ):
+        raise ValueError("Tokenized trajectory fields differ in length")
+    if len(tokenized.token_ids) < 2 or not any(tokenized.assistant_mask):
+        return None
+    if tokenized.assistant_mask[0]:
+        raise ValueError("A trainable trajectory cannot start with an assistant token")
+
+    action_mask = tokenized.assistant_mask[1:]
+    if any(
+        trainable and math.isnan(logprob)
+        for trainable, logprob in zip(action_mask, tokenized.logprobs[1:], strict=True)
+    ):
+        raise ValueError("Tinker training requires logprobs for every assistant token")
+    return _build_datum(
+        tokenized.token_ids[:-1],
+        tokenized.token_ids[1:],
+        [
+            logprob if trainable else 0.0
+            for trainable, logprob in zip(
+                action_mask, tokenized.logprobs[1:], strict=True
+            )
+        ],
+        [advantage if trainable else 0.0 for trainable in action_mask],
+        [float(trainable) for trainable in action_mask],
+    )
+
+
+def _build_datum(
+    input_tokens: list[int],
+    target_tokens: list[int],
+    logprobs: list[float],
+    advantages: list[float],
+    action_mask: list[float],
+) -> tinker.Datum | None:
+    if not input_tokens or not (
         len(input_tokens)
         == len(target_tokens)
-        == len(padded_logprobs)
-        == len(padded_advantages)
+        == len(logprobs)
+        == len(advantages)
         == len(action_mask)
     ):
         return None
-
     return tinker.Datum(
         model_input=tinker.ModelInput.from_ints(tokens=input_tokens),
         loss_fn_inputs={
             "target_tokens": tinker.TensorData.from_torch(torch.tensor(target_tokens)),
             "logprobs": tinker.TensorData.from_torch(
-                torch.tensor(padded_logprobs, dtype=torch.float32)
+                torch.tensor(logprobs, dtype=torch.float32)
             ),
             "advantages": tinker.TensorData.from_torch(
-                torch.tensor(padded_advantages, dtype=torch.float32)
+                torch.tensor(advantages, dtype=torch.float32)
             ),
             "mask": tinker.TensorData.from_torch(
                 torch.tensor(action_mask, dtype=torch.float32)

@@ -5,7 +5,12 @@ description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "aiohttp>=3.10.0",
+    "anthropic>=0.77.0",
     "openai>=2.14.0",
+    "pydantic>=2.12",
+    "requests>=2.32.0",
+    "typing-extensions>=4.13",
     "typer>=0.15.2",
     "litellm>=1.71.1,<=1.82.0",
     "weave>=0.52.41",
@@ -45,6 +50,8 @@ megatron = [
     "numpy<2",
     "torch==2.11.0",
     "flash-attn-4==4.0.0b5",
+    "flashinfer-cubin==0.6.8.post1",
+    "flashinfer-python==0.6.8.post1",
     "ninja>=1.11.1",
     "quack-kernels==0.3.7",
     "apex",
@@ -168,7 +175,6 @@ conflicts = [
 ]
 override-dependencies = [
     "click==8.2.0",
-    "flashinfer-python==0.6.8.post1",
     "megatron-core==0.17.0",
     "numpy<2",
     "nvidia-resiliency-ext<0.5",

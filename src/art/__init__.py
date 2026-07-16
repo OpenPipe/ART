@@ -59,7 +59,6 @@ except ImportError:
 
 
 from . import dev
-from .auto_trajectory import auto_trajectory, capture_auto_trajectory
 from .backend import Backend
 from .batches import trajectory_group_batches
 from .dev import LoRAConfig
@@ -78,7 +77,33 @@ from .metrics import (
 from .model import Model, TrainableModel
 from .pipeline_tuner import PipelineAutotuneConfig, PipelineRuntimeConfig
 from .serverless import ServerlessBackend
-from .trajectories import Trajectory, TrajectoryGroup
+from .trajectories import (
+    AnthropicMessagesHistory,
+    ChatCompletionsExchange,
+    ChatCompletionsHistory,
+    CompletionsExchange,
+    CompletionsHistory,
+    History,
+    MessagesExchange,
+    ResponsesExchange,
+    ResponsesHistory,
+    TokenizedTrajectory,
+    TokenizedTrajectoryGroup,
+    Trajectory,
+    TrajectoryExchanges,
+    TrajectoryGroup,
+    TrajectoryHistory,
+    auto_trajectory,  # ty: ignore[deprecated]
+    capture_auto_trajectory,  # ty: ignore[deprecated]
+    current_trajectory,
+    current_trajectory_group,
+    tokenize_trajectories,
+    tokenize_trajectory,
+    tokenize_trajectory_group,
+    tokenize_trajectory_groups,
+    trajectory,
+    trajectory_group,
+)
 from .types import (
     LocalTrainResult,
     MegatronRuntimeConfig,
@@ -98,6 +123,8 @@ __all__ = [
     "dev",
     "auto_trajectory",
     "capture_auto_trajectory",
+    "current_trajectory",
+    "current_trajectory_group",
     "gather_trajectories",
     "gather_trajectory_groups",
     "trajectory_group_batches",
@@ -127,7 +154,26 @@ __all__ = [
     "TrainConfig",
     "TrainResult",
     "Trajectory",
+    "TrajectoryExchanges",
     "TrajectoryGroup",
+    "History",
+    "TrajectoryHistory",
+    "ChatCompletionsExchange",
+    "ChatCompletionsHistory",
+    "CompletionsExchange",
+    "CompletionsHistory",
+    "ResponsesExchange",
+    "ResponsesHistory",
+    "MessagesExchange",
+    "AnthropicMessagesHistory",
+    "TokenizedTrajectory",
+    "TokenizedTrajectoryGroup",
+    "trajectory",
+    "trajectory_group",
+    "tokenize_trajectory",
+    "tokenize_trajectories",
+    "tokenize_trajectory_group",
+    "tokenize_trajectory_groups",
     "capture_yielded_trajectory",
     "yield_trajectory",
 ]

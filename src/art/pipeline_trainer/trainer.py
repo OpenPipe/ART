@@ -1606,6 +1606,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     @staticmethod
     def _trajectory_messages_and_choices(trajectory: art.Trajectory) -> Iterable[Any]:
+        for exchange in trajectory.exchanges.chat_completions:
+            yield from exchange.response.choices
         yield from trajectory.messages_and_choices
         for history in trajectory.additional_histories:
             yield from history.messages_and_choices

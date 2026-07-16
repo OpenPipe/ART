@@ -334,6 +334,7 @@ class TinkerNativeBackend:
             state.renderer,
             state.tokenizer,
             normalize_advantages,
+            base_model=model.base_model,
         )
 
         metrics: dict[str, float] = {
@@ -347,14 +348,17 @@ class TinkerNativeBackend:
         if not datums:
             return TrainResult(step=state.current_step, metrics=metrics)
 
-        train_tokens = 0
-        for datum in datums:
-            train_tokens += len(datum.model_input.to_ints())
-        metrics["data/step_trainable_assistant_tokens"] = float(train_tokens)
+        flattened_tokens = sum(len(datum.model_input.to_ints()) for datum in datums)
+        assistant_tokens = sum(
+            float(datum.loss_fn_inputs["mask"].to_torch().sum().item())
+            for datum in datums
+        )
+        metrics["data/step_trainable_assistant_tokens"] = assistant_tokens
+        metrics["data/step_flattened_train_tokens"] = float(flattened_tokens)
         pricing = get_model_pricing(model.base_model)
         if pricing is not None:
             metrics["costs/train/tinker_train"] = compute_train_cost(
-                train_tokens, pricing
+                flattened_tokens, pricing
             )
         trainer_started = time.monotonic()
         sampled_kl_policy_ref: float | None = None
@@ -614,6 +618,8 @@ class TinkerNativeBackend:
                                 )
                             ]
                         ),
+                        prompt_token_ids=prompt_tokens,
+                        token_ids=list(sequence.tokens),
                     )
                 )
 

@@ -280,44 +280,23 @@ async def test_auto_trajectory(test_server: None) -> None:
         ):
             pass
         # Add ART support with a couple lines of optional code
-        if trajectory := art.auto_trajectory():
+        if trajectory := art.auto_trajectory():  # ty: ignore[deprecated]
             trajectory.reward = 1.0
         return chat_completion.choices[0].message.content
 
     # Use the capture_auto_trajectory utility to capture a trajectory automatically
-    trajectory = await art.capture_auto_trajectory(say_hi())
-    assert trajectory.messages_and_choices == [
-        message,
-        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
-        message,
-        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
-    ]
-    assert trajectory.tools == tools
-    assert trajectory.additional_histories[0].messages_and_choices == [
-        message,
-        {
-            "content": "Hello! How can I assist you today?",
-            "role": "assistant",
-        },
-        message,
-        {
-            "content": "Hello! How can I assist you today?",
-            "role": "assistant",
-        },
-        message,
-        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
-    ]
-    assert trajectory.additional_histories[0].tools is None
-    assert trajectory.additional_histories[1].messages_and_choices == [
-        message,
-        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
-    ]
-    assert trajectory.additional_histories[1].tools == tools
-    assert trajectory.additional_histories[2].messages_and_choices == [
-        message,
-        mock_stream_choice,
-    ]
-    assert trajectory.additional_histories[2].tools == tools
+    trajectory = await art.capture_auto_trajectory(  # ty: ignore[deprecated]
+        say_hi()
+    )
+    exchanges = trajectory.exchanges.chat_completions
+    assert len(exchanges) == 5
+    assert exchanges[0].request["messages"] == [message]
+    assert exchanges[0].request["tools"] == tools
+    choices = mock_response["choices"]
+    assert isinstance(choices, list)
+    assert exchanges[0].response.choices[0] == Choice.model_validate(choices[0])
+    assert exchanges[-1].response.choices[0] == mock_stream_choice
+    assert all(exchange.model == "test" for exchange in exchanges)
 
 
 @pytest.mark.filterwarnings("ignore::UserWarning:pydantic")
@@ -379,20 +358,16 @@ async def test_litellm_auto_trajectory(test_server: None) -> None:
         async for _ in stream:
             pass
         # Add ART support with a couple lines of optional code
-        if trajectory := art.auto_trajectory():
+        if trajectory := art.auto_trajectory():  # ty: ignore[deprecated]
             trajectory.reward = 1.0
         return choice.message.content
 
     # Use the capture_auto_trajectory utility to capture a trajectory automatically
-    trajectory = await art.capture_auto_trajectory(say_hi())
-    assert trajectory.messages_and_choices == [
-        message,
-        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
-        message,
-        Choice(**mock_response["choices"][0]),  # ty:ignore[invalid-argument-type, not-subscriptable]
-    ]
-    assert trajectory.additional_histories[0].messages_and_choices == [
-        message,
-        mock_stream_choice,
-    ]
-    assert trajectory.additional_histories[0].tools == tools
+    trajectory = await art.capture_auto_trajectory(  # ty: ignore[deprecated]
+        say_hi()
+    )
+    exchanges = trajectory.exchanges.chat_completions
+    assert len(exchanges) == 3
+    assert exchanges[0].request["messages"] == [message]
+    assert exchanges[-1].response.choices[0] == mock_stream_choice
+    assert all(exchange.model == "test" for exchange in exchanges)

@@ -177,27 +177,54 @@ async def wrap_trajectories_awaitable(
 
 
 def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
-    choices = [
-        item
-        for history in (
-            trajectory.messages_and_choices,
-            *(
-                history.messages_and_choices
-                for history in trajectory.additional_histories
-            ),
-        )
-        for item in history
-        if isinstance(item, Choice)
-    ]
-    completion_tokens = [choice_completion_tokens(choice) for choice in choices]
-    if choices and all(count is not None and count > 0 for count in completion_tokens):
-        trajectory.metrics["completion_tokens"] = sum(
-            count for count in completion_tokens if count is not None
-        )
+    if trajectory.exchanges:
+        completion_tokens = _exchange_completion_tokens(trajectory)
+        if completion_tokens is not None:
+            trajectory.metrics["completion_tokens"] = completion_tokens
+    else:
+        choices = [
+            item
+            for history in (
+                trajectory.messages_and_choices,
+                *(
+                    history.messages_and_choices
+                    for history in trajectory.additional_histories
+                ),
+            )
+            for item in history
+            if isinstance(item, Choice)
+        ]
+        completion_tokens = [choice_completion_tokens(choice) for choice in choices]
+        if choices and all(
+            count is not None and count > 0 for count in completion_tokens
+        ):
+            trajectory.metrics["completion_tokens"] = sum(
+                count for count in completion_tokens if count is not None
+            )
     context.metric_sums["reward"] += trajectory.reward
     context.metric_divisors["reward"] += 1
     context.metric_sums.update(trajectory.metrics)
     context.metric_divisors.update(trajectory.metrics.keys())
+
+
+def _exchange_completion_tokens(trajectory: Trajectory) -> int | None:
+    counts: list[int | None] = []
+    for exchange in trajectory.exchanges.chat_completions:
+        usage = exchange.response.usage
+        counts.append(usage.completion_tokens if usage is not None else None)
+    for exchange in trajectory.exchanges.completions:
+        usage = exchange.response.usage
+        counts.append(usage.completion_tokens if usage is not None else None)
+    for exchange in trajectory.exchanges.responses:
+        usage = exchange.response.usage
+        counts.append(usage.output_tokens if usage is not None else None)
+    counts.extend(
+        exchange.response.usage.output_tokens
+        for exchange in trajectory.exchanges.messages
+    )
+    if not counts or any(count is None for count in counts):
+        return None
+    return sum(count for count in counts if count is not None)
 
 
 @dataclass

@@ -17,7 +17,13 @@ from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokeni
 if TYPE_CHECKING:
     from transformers.image_processing_utils import BaseImageProcessor
 
-from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
+from ..trajectories import (
+    ChatCompletionsExchange,
+    History,
+    Trajectory,
+    TrajectoryGroup,
+    get_messages,
+)
 from ..types import MessagesAndChoices
 from ..utils.chat_template import (
     default_chat_template_kwargs_for_tokenizer,
@@ -28,6 +34,7 @@ from .moe_routing import (
     MoeRouteSegments,
     MoeRoutingAlignmentStats,
     align_choice_routes_to_tokenized_result,
+    choice_moe_routing_metadata,
 )
 from .response_masking import (
     _TemplatePartTokenizer,
@@ -543,19 +550,96 @@ def tokenize_trajectory_groups(
                 advantage /= reward_std + 1e-6
             if advantage == 0 and drop_zero_advantage_trajectories:
                 continue
-            trajectory_results = tokenize_vllm_trajectory_histories(
-                tokenizer=tokenizer,
-                histories=[
-                    History(
-                        messages_and_choices=trajectory.messages_and_choices,
-                        tools=trajectory.tools,
-                    ),
-                    *trajectory.additional_histories,
-                ],
-                advantage=advantage,
-                allow_training_without_logprobs=allow_training_without_logprobs,
-                trajectory=trajectory,
-            )
+            if trajectory.exchanges:
+                from ..trajectories._tokenize import (
+                    _as_tokenizer,
+                    _exchange_list,
+                    tokenize_one,
+                )
+
+                exchange_result = tokenize_one(
+                    trajectory,
+                    tokenizer.name_or_path,
+                    model=None,
+                    chat_template=None,
+                    chat_template_kwargs=chat_template_kwargs,
+                    tokenizer_instance=_as_tokenizer(tokenizer),
+                )
+                if not allow_training_without_logprobs and any(
+                    trainable and math.isnan(logprob)
+                    for trainable, logprob in zip(
+                        exchange_result.assistant_mask,
+                        exchange_result.logprobs,
+                        strict=True,
+                    )
+                ):
+                    raise RuntimeError(
+                        "Exchange trajectory is missing logprobs for trainable tokens"
+                    )
+                exchanges = _exchange_list(trajectory, None)
+                chat_choices = [
+                    exchange.response.choices[0]
+                    for exchange in exchanges
+                    if isinstance(exchange, ChatCompletionsExchange)
+                ]
+                if len(chat_choices) == len(exchanges):
+                    moe_routes, moe_stats = align_choice_routes_to_tokenized_result(
+                        token_ids=exchange_result.token_ids,
+                        choices=chat_choices,
+                        choice_offsets=[
+                            start for start, _ in exchange_result.sampled_spans
+                        ],
+                        choice_token_lengths=[
+                            end - start for start, end in exchange_result.sampled_spans
+                        ],
+                    )
+                else:
+                    if any(
+                        choice_moe_routing_metadata(choice) is not None
+                        for choice in chat_choices
+                    ):
+                        raise RuntimeError(
+                            "MoE routing replay requires an all-Chat-Completions "
+                            "exchange trajectory"
+                        )
+                    moe_routes = None
+                    moe_stats = MoeRoutingAlignmentStats()
+                trajectory_results = [
+                    TokenizedResult(
+                        advantage=advantage,
+                        chat="",
+                        token_ids=exchange_result.token_ids,
+                        input_pos=list(range(len(exchange_result.token_ids))),
+                        assistant_mask=[
+                            int(value) for value in exchange_result.assistant_mask
+                        ],
+                        logprobs=exchange_result.logprobs,
+                        pixel_values=None,
+                        image_grid_thw=None,
+                        trajectory=trajectory,
+                        choice_offsets=[
+                            start for start, _ in exchange_result.sampled_spans
+                        ],
+                        extra_logprobs={},
+                        moe_routed_experts=moe_routes,
+                        moe_routing_alignment_stats=moe_stats,
+                        _tokenizer=tokenizer,
+                    )
+                ]
+            else:
+                trajectory_results = tokenize_vllm_trajectory_histories(
+                    tokenizer=tokenizer,
+                    histories=[
+                        History(
+                            messages_and_choices=trajectory.messages_and_choices,
+                            tools=trajectory.tools,
+                        ),
+                        *trajectory.additional_histories,
+                    ],
+                    advantage=advantage,
+                    allow_training_without_logprobs=allow_training_without_logprobs,
+                    trajectory=trajectory,
+                )
             weight = 1 / (
                 sum(sum(result.assistant_mask) for result in trajectory_results) + 1e-6
             )
