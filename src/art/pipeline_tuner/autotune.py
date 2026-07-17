@@ -44,7 +44,6 @@ def _ceil_to_multiple(value: float, multiple: int, *, minimum: int = 1) -> int:
 
 
 _VLLM_SCRAPE_GROUP_TOLERANCE_S = 0.05
-_TRAINER_PADDING_EPSILON = 1e-9
 
 
 class PackingProjection(pydantic.BaseModel):
@@ -56,14 +55,6 @@ class PackingOutcome(pydantic.BaseModel):
     step: int
     groups: int = pydantic.Field(ge=1)
     packed_sequences: int = pydantic.Field(ge=1)
-
-
-def _trainer_underfeed_score(*, idle_frac: float, padding_ratio: float) -> float:
-    denominator = max(
-        _TRAINER_PADDING_EPSILON,
-        1.0 + _TRAINER_PADDING_EPSILON - max(0.0, min(1.0, padding_ratio)),
-    )
-    return max(0.0, idle_frac) / denominator
 
 
 class PipelineAutotuner:
@@ -98,6 +89,9 @@ class PipelineAutotuner:
         self._target_candidate: int | None = None
         self._target_candidate_count = 0
         self._stale_backlog_active = False
+        self._min_batch_trial_baseline_collect_s: float | None = None
+        self._min_batch_trial_batch_size: int | None = None
+        self._min_batch_trial_failed_windows = 0
         self._emitted_recommendations: set[str] = set()
 
     def on_metric(self, rec: PipelineMetric) -> TunerDecision | None:
@@ -221,10 +215,8 @@ class PipelineAutotuner:
             end_step=window_steps[-1],
             window_start_s=t0,
             window_end_s=t1,
-            trainer_underfeed_score=_trainer_underfeed_score(
-                idle_frac=trainer_idle_frac,
-                padding_ratio=padding_ratio_mean,
-            ),
+            collect_batch_s=collect / len(window_steps),
+            trainer_underfeed_score=max(0.0, trainer_idle_frac),
             vllm_pressure=_vllm_pressure(
                 vllm_metrics, window_start_s=t0, window_end_s=t1
             ),
@@ -314,6 +306,8 @@ class PipelineAutotuner:
         target_changed = (
             updated.target_groups_per_step != previous.target_groups_per_step
         )
+        if target_changed:
+            self._clear_min_batch_trial()
         stale_backlog_active = self._update_stale_backlog_state(stats)
         action = "hold"
         reason = "inside hysteresis band or already balanced"
@@ -361,7 +355,7 @@ class PipelineAutotuner:
             reason = "both sides are loaded; no throughput-safe online change"
 
         if not target_changed and not stale_backlog_active:
-            min_update = self._min_batch_adjustment(updated, stats, state, action)
+            min_update = self._min_batch_adjustment(updated, stats, action)
             if min_update is not None:
                 updated, action, reason = min_update
 
@@ -397,9 +391,38 @@ class PipelineAutotuner:
         self,
         settings: PipelineTuneSettings,
         stats: TunerWindowStats,
-        state: str,
         action: str,
     ) -> tuple[PipelineTuneSettings, str, str] | None:
+        if self._min_batch_trial_baseline_collect_s is not None:
+            if settings.min_batch_size != self._min_batch_trial_batch_size:
+                self._clear_min_batch_trial()
+            elif (
+                stats.trainer_underfeed_score
+                <= self.config.trainer_min_batch_raise_score
+            ):
+                self._clear_min_batch_trial()
+                return self._raise_min_batch(
+                    settings,
+                    "trainer collection idle fell below the min-batch threshold",
+                )
+            elif stats.collect_batch_s >= (
+                self._min_batch_trial_baseline_collect_s
+                * self.config.min_batch_collect_improvement_ratio
+            ):
+                self._min_batch_trial_failed_windows += 1
+                if (
+                    self._min_batch_trial_failed_windows
+                    >= self.config.min_batch_trial_windows
+                ):
+                    self._clear_min_batch_trial()
+                    return self._raise_min_batch(
+                        settings,
+                        "smaller batches did not reduce collection time enough",
+                    )
+                return None
+            else:
+                self._clear_min_batch_trial()
+
         if (
             action != "increase_workers"
             and stats.trainer_underfeed_score
@@ -414,6 +437,9 @@ class PipelineAutotuner:
             )
             new_min = max(floor, round(settings.min_batch_size * 0.85))
             if new_min < settings.min_batch_size:
+                self._min_batch_trial_baseline_collect_s = stats.collect_batch_s
+                self._min_batch_trial_batch_size = new_min
+                self._min_batch_trial_failed_windows = 0
                 return (
                     settings.model_copy(
                         update={"min_batch_size": min(new_min, settings.max_batch_size)}
@@ -421,22 +447,34 @@ class PipelineAutotuner:
                     "lower_min_batch_size",
                     "trainer is severely underfed and rollout workers are not being increased",
                 )
-        should_raise = action == "decrease_workers" or state in {
-            "inference_under_train_over",
-            "inference_balanced_train_over",
-        }
-        if should_raise and settings.min_batch_size < settings.max_batch_size:
-            new_min = min(
-                settings.max_batch_size,
-                max(settings.min_batch_size + 1, round(settings.min_batch_size * 1.15)),
+        if stats.trainer_underfeed_score <= self.config.trainer_min_batch_raise_score:
+            return self._raise_min_batch(
+                settings,
+                "trainer collection idle is low enough to use denser batches",
             )
-            if new_min > settings.min_batch_size:
-                return (
-                    settings.model_copy(update={"min_batch_size": new_min}),
-                    "raise_min_batch_size",
-                    "trainer is saturated enough to use denser batches before reducing workers",
-                )
         return None
+
+    def _raise_min_batch(
+        self,
+        settings: PipelineTuneSettings,
+        reason: str,
+    ) -> tuple[PipelineTuneSettings, str, str] | None:
+        if settings.min_batch_size >= settings.max_batch_size:
+            return None
+        new_min = min(
+            settings.max_batch_size,
+            max(settings.min_batch_size + 1, round(settings.min_batch_size * 1.15)),
+        )
+        return (
+            settings.model_copy(update={"min_batch_size": new_min}),
+            "raise_min_batch_size",
+            reason,
+        )
+
+    def _clear_min_batch_trial(self) -> None:
+        self._min_batch_trial_baseline_collect_s = None
+        self._min_batch_trial_batch_size = None
+        self._min_batch_trial_failed_windows = 0
 
     def _emit_stable_recommendations(self, decision: TunerDecision) -> None:
         recommendations = self._stable_recommendations()
@@ -539,10 +577,11 @@ class PipelineAutotuner:
             if adapt_target
             else settings.target_groups_per_step
         )
-        min_batch = min(settings.min_batch_size, target)
+        floor = math.ceil(target * self.config.freshness_min_batch_floor_fraction)
+        min_batch = max(floor, min(settings.min_batch_size, target))
         if adapt_target and target > settings.target_groups_per_step:
             ratio = settings.min_batch_size / max(1, settings.max_batch_size)
-            min_batch = min(target, max(1, round(target * ratio)))
+            min_batch = max(floor, min(target, max(1, round(target * ratio))))
         # Packed sequence length is the user's cap on target/max batch size. If a
         # run should never use larger train batches, lower packed_sequence_length.
         queue = recommended_queue_size(
@@ -828,6 +867,10 @@ def build_initial_settings(
     min_batch = min(
         int(config.initial_min_groups_per_packed_sequence) * target_slots,
         max_batch,
+    )
+    min_batch = max(
+        min_batch,
+        math.ceil(max_batch * config.freshness_min_batch_floor_fraction),
     )
     queue = recommended_queue_size(
         target_groups_per_step=max_batch,

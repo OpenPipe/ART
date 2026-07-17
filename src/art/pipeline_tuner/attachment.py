@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import time
 from typing import Any
 import warnings
@@ -334,12 +335,19 @@ class PipelineAutotunerAttachment:
     ) -> PipelineTuneSettings:
         return settings.model_copy(
             update={
+                "min_batch_size": max(
+                    settings.min_batch_size,
+                    math.ceil(
+                        settings.target_groups_per_step
+                        * self.config.freshness_min_batch_floor_fraction
+                    ),
+                ),
                 "queue_maxsize": recommended_queue_size(
                     target_groups_per_step=settings.target_groups_per_step,
                     limit_steps_off_policy=policy_age_limit_steps,
                     num_rollout_workers=settings.num_rollout_workers,
                     running_reserve_fraction=self.config.queue_running_reserve_fraction,
-                )
+                ),
             }
         )
 
