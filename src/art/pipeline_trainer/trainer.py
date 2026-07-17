@@ -56,9 +56,6 @@ from .status import StatusReporter
 from .types import ConfigT, EvalFn, RolloutFn, ScenarioT, SingleRolloutFn  # noqa: F401
 
 PIPELINE_STATE_KEY = "_pipeline_trainer"
-_ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
-_ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
-_QUEUE_WAIT_TIME_KEY = "_art_queue_wait_s"
 _SCORE_FRESHNESS_TAU_STEPS = 8.0
 # Rollout critical batch size from the best current GRPO/RLVR evidence. This is
 # grounded in reported experiments, not a well-validated universal constant.
@@ -291,6 +288,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         )
         self._scenario_source_exhausted = False
         self._output_queue: asyncio.Queue[TrajectoryGroup | None] | None = None
+        self._producer_rollout_timings = (0.0, 0.0, 0.0)
+        self._reported_producer_rollout_timings = (0.0, 0.0, 0.0)
         self._eval_queue: asyncio.Queue[int] | None = None
         self._rollout_worker_controller = RolloutWorkerController(
             self, self.num_rollout_workers
@@ -830,9 +829,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 if self.state.done:
                     break
                 queue_wait_s = await self._put_output_group(group)
-                group.metadata[_ROLLOUT_WALL_TIME_KEY] = rollout_wall_s
-                group.metadata[_QUEUE_WAIT_TIME_KEY] = queue_wait_s
-                group.metadata[_ACTOR_IDLE_TIME_KEY] = actor_idle_s + queue_wait_s
+                self._record_producer_rollout_timings(
+                    rollout_wall_s, actor_idle_s + queue_wait_s, queue_wait_s
+                )
             except asyncio.CancelledError:
                 raise
             except LocalServingUnavailableError:
@@ -883,17 +882,18 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 break
             step_start = time.monotonic()
             collect_started = time.monotonic()
+            zero_variance_before = self.state.discarded_zero_variance_groups
             batch, discarded, saw_sentinel = await self._collect_batch(current_step)
             trainer_idle_s = time.monotonic() - collect_started
+            zero_variance_discarded = (
+                self.state.discarded_zero_variance_groups - zero_variance_before
+            )
+            dequeued_groups = len(batch) + discarded + zero_variance_discarded
             self.state.discarded_stale_groups += discarded
             if discarded:
                 self._status.note_stale(discarded)
             if not batch:
                 break
-
-            actor_wall_s, actor_idle_s, queue_wait_s = (
-                self._consume_batch_rollout_timings(batch)
-            )
 
             training_policy_step = current_step
             expected_step = current_step + 1
@@ -959,6 +959,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 await self._run_checkpoint_retention(current_step)
 
                 step_seconds = time.monotonic() - step_start
+                actor_wall_s, actor_idle_s, queue_wait_s = (
+                    self._consume_producer_rollout_timings()
+                )
                 self._status.note_training_batch(
                     batch, step=current_step, step_seconds=step_seconds
                 )
@@ -975,6 +978,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "discarded/cum/stale_groups": stale_groups,
                     "discarded/cum/zero_variance_groups": zero_variance_groups,
                     "discarded/step/stale_groups": float(discarded),
+                    "discarded/step/zero_variance_groups": float(
+                        zero_variance_discarded
+                    ),
                     "discarded/rate/stale_groups": stale_groups
                     / max(generated_groups_cum, 1.0),
                     "discarded/rate/zero_variance_groups": zero_variance_groups
@@ -982,14 +988,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "time/step_wall_s": step_seconds,
                     "time/step_collect_batch_s": trainer_idle_s,
                     "time/step_trainer_idle_s": trainer_idle_s,
+                    "time/step_rollout_s": actor_wall_s,
+                    "time/step_rollout_idle_s": actor_idle_s,
+                    "queue/put_wait_s": queue_wait_s,
+                    "queue/put_wait_frac": queue_wait_s
+                    / max(queue_wait_s + actor_wall_s, 1e-9),
+                    "queue/actual_stale_fraction": discarded / max(dequeued_groups, 1),
                 }
                 metrics.setdefault("time/step_backend_train_s", train_call_elapsed)
-                if actor_wall_s > 0:
-                    metrics["time/step_rollout_s"] = actor_wall_s
-                if actor_idle_s > 0:
-                    metrics["time/step_rollout_idle_s"] = actor_idle_s
-                if queue_wait_s > 0 and actor_wall_s > 0:
-                    metrics["queue/put_wait_frac"] = queue_wait_s / actor_wall_s
                 metrics.update(result.metrics)
                 attachment_metrics, attachment_owns_vllm_metrics = (
                     self._collect_attachment_train_step_metrics()
@@ -1826,21 +1832,22 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 continue
         return time.monotonic() - queue_wait_started
 
-    def _consume_batch_rollout_timings(
-        self, batch: list[TrajectoryGroup]
-    ) -> tuple[float, float, float]:
-        rollout_wall_s = 0.0
-        actor_idle_s = 0.0
-        queue_wait_s = 0.0
-        for group in batch:
-            rollout_wall_s += self._pop_float_metadata(group, _ROLLOUT_WALL_TIME_KEY)
-            actor_idle_s += self._pop_float_metadata(group, _ACTOR_IDLE_TIME_KEY)
-            queue_wait_s += self._pop_float_metadata(group, _QUEUE_WAIT_TIME_KEY)
-        return rollout_wall_s, actor_idle_s, queue_wait_s
+    def _record_producer_rollout_timings(
+        self, rollout_wall_s: float, actor_idle_s: float, queue_wait_s: float
+    ) -> None:
+        previous = self._producer_rollout_timings
+        self._producer_rollout_timings = (
+            previous[0] + rollout_wall_s,
+            previous[1] + actor_idle_s,
+            previous[2] + queue_wait_s,
+        )
 
-    @staticmethod
-    def _pop_float_metadata(group: TrajectoryGroup, key: str) -> float:
-        value = group.metadata.pop(key, 0.0)
-        if isinstance(value, (int, float)):
-            return float(value)
-        return 0.0
+    def _consume_producer_rollout_timings(self) -> tuple[float, float, float]:
+        current = self._producer_rollout_timings
+        previous = self._reported_producer_rollout_timings
+        self._reported_producer_rollout_timings = current
+        return (
+            max(0.0, current[0] - previous[0]),
+            max(0.0, current[1] - previous[1]),
+            max(0.0, current[2] - previous[2]),
+        )
