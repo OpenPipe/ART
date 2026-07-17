@@ -12,7 +12,6 @@ class PipelineRuntimeConfig(pydantic.BaseModel):
     num_rollout_workers: int = pydantic.Field(default=16, ge=1)
     min_batch_size: int = pydantic.Field(default=4, ge=1)
     max_batch_size: int | None = pydantic.Field(default=None, ge=1)
-    max_steps_off_policy: int | None = pydantic.Field(default=4, ge=0)
     queue_maxsize: int | None = pydantic.Field(default=None, ge=1)
     score_reference_groups_per_step: float | None = pydantic.Field(default=8.0, gt=0.0)
     score_reference_rollouts_per_group: float | None = pydantic.Field(

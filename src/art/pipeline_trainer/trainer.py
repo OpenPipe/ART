@@ -152,7 +152,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         num_rollout_workers: int | None = None,
         min_batch_size: int | None = None,
         max_batch_size: int | None = None,
-        max_steps_off_policy: int | None = None,
         queue_maxsize: int | None = None,
         pipeline: PipelineRuntimeConfig | None = None,
         autotune: PipelineAutotuneConfig | None = None,
@@ -167,6 +166,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         max_steps: int | None = None,
         # Discard handling
         discard_queue_multiplier: int = 100,
+        max_steps_off_policy: int | None = 4,
         limit_mean_steps_off_policy: float | None = None,
         score_reference_groups_per_step: float | None = None,
         score_reference_rollouts_per_group: float | None = None,
@@ -191,7 +191,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 "num_rollout_workers": num_rollout_workers,
                 "min_batch_size": min_batch_size,
                 "max_batch_size": max_batch_size,
-                "max_steps_off_policy": max_steps_off_policy,
                 "queue_maxsize": queue_maxsize,
             }.items()
             if value is not None
@@ -223,6 +222,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("log_interval_seconds must be > 0")
         if discard_queue_multiplier <= 0:
             raise ValueError("discard_queue_multiplier must be > 0")
+        if max_steps_off_policy is not None and max_steps_off_policy < 0:
+            raise ValueError("max_steps_off_policy must be >= 0")
         if limit_mean_steps_off_policy is not None and limit_mean_steps_off_policy < 0:
             raise ValueError("limit_mean_steps_off_policy must be >= 0")
         if checkpoint_retention_interval <= 0:
@@ -246,7 +247,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             else 10 * pipeline.min_batch_size
         )
         self.target_groups_per_step = self.max_batch_size
-        self.max_steps_off_policy = pipeline.max_steps_off_policy
+        self.max_steps_off_policy = max_steps_off_policy
         self.limit_mean_steps_off_policy = limit_mean_steps_off_policy
         self.queue_maxsize = pipeline.queue_maxsize
         self.learning_rate = learning_rate

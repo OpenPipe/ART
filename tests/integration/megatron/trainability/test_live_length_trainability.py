@@ -829,8 +829,8 @@ async def run_length_trainability_async(
                 num_rollout_workers=rollout_workers,
                 min_batch_size=1,
                 max_batch_size=1,
-                max_steps_off_policy=max_steps_off_policy,
             ),
+            max_steps_off_policy=max_steps_off_policy,
             learning_rate=_get_env_float(
                 "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
                 _default_learning_rate(base_model),

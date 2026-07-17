@@ -55,8 +55,8 @@ async def test_training_records_stale_and_zero_variance_discards(
             num_rollout_workers=1,
             min_batch_size=1,
             max_batch_size=1,
-            max_steps_off_policy=0,
         ),
+        max_steps_off_policy=0,
         eval_fn=None,
         max_steps=1,
     )
