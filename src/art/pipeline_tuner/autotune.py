@@ -304,6 +304,16 @@ class PipelineAutotuner:
 
         if stats.queue_put_wait_frac >= self.config.queue_put_severe_frac:
             reason = "completed-group queue backpressure is active"
+        elif predicted_stale_high:
+            updated = updated.model_copy(
+                update={
+                    "num_rollout_workers": self._move_workers(
+                        updated.num_rollout_workers, -1
+                    )
+                }
+            )
+            action = "decrease_workers"
+            reason = "predicted stale backlog exceeds the freshness target"
         elif state in {
             "inference_under_train_under",
             "inference_balanced_train_under",
@@ -317,23 +327,6 @@ class PipelineAutotuner:
             )
             action = "increase_workers"
             reason = "vLLM pressure is low and trainer is underfed"
-        elif state in {
-            "inference_under_train_over",
-            "inference_balanced_train_over",
-        }:
-            if (
-                updated.min_batch_size >= updated.max_batch_size
-                and predicted_stale_high
-            ):
-                updated = updated.model_copy(
-                    update={
-                        "num_rollout_workers": self._move_workers(
-                            updated.num_rollout_workers, -1
-                        )
-                    }
-                )
-                action = "decrease_workers"
-                reason = "trainer saturated with predicted stale backlog"
         elif state == "inference_over_train_over":
             reason = "both sides are loaded; no throughput-safe online change"
 
