@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, cast
 from openai.types.chat.chat_completion import Choice
 import pydantic
 
+from art.openai import ART_MOE_ROUTING_METADATA_KEY
 from art.trajectories import History, Trajectory, TrajectoryGroup
 
 if TYPE_CHECKING:
@@ -57,7 +58,9 @@ def _compact_json(value: object) -> str:
 
 def _choice_data(item: object) -> dict[str, Any] | None:
     if isinstance(item, Choice):
-        raw = item.model_dump(mode="json", warnings="error")
+        raw = item.model_dump(
+            mode="json", exclude={ART_MOE_ROUTING_METADATA_KEY}, warnings="error"
+        )
     elif (
         isinstance(item, Mapping)
         and {
@@ -69,7 +72,9 @@ def _choice_data(item: object) -> dict[str, Any] | None:
     ):
         raw = dict(item)
         try:
-            return Choice.model_validate(raw).model_dump(mode="json", warnings="error")
+            return Choice.model_validate(raw).model_dump(
+                mode="json", exclude={ART_MOE_ROUTING_METADATA_KEY}, warnings="error"
+            )
         except pydantic.ValidationError:
             return None
     else:
@@ -78,7 +83,9 @@ def _choice_data(item: object) -> dict[str, Any] | None:
         if not isinstance(item, Choices):
             return None
         raw = item.model_dump(mode="json", warnings="error")
-    return Choice.model_validate(raw).model_dump(mode="json", warnings="error")
+    return Choice.model_validate(raw).model_dump(
+        mode="json", exclude={ART_MOE_ROUTING_METADATA_KEY}, warnings="error"
+    )
 
 
 def _history_data(history: History) -> dict[str, Any]:
