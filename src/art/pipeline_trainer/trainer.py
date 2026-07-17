@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
 import inspect
@@ -282,6 +282,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._scheduled_eval_leases: dict[int, AsyncExitStack] = {}
 
         self.state = PipelineState()
+        self._stop_event = asyncio.Event()
         self._scenario_lock = asyncio.Lock()
         self._scenario_iter: AsyncIterator[ScenarioT] | None = _to_async_iterator(
             scenarios
@@ -466,28 +467,23 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     def request_stop(self) -> None:
         """Request a clean shutdown of the pipeline stages."""
-        if self.state.done:
-            return
         self.state.done = True
+        self._stop_event.set()
 
-        async def _notify_policy() -> None:
-            async with self.state.policy_updated:
-                self.state.policy_updated.notify_all()
-
+    async def _await_or_stop(self, awaitable: Awaitable[T]) -> tuple[bool, T | None]:
+        operation = asyncio.ensure_future(awaitable)
+        stop_wait = asyncio.create_task(self._stop_event.wait())
+        tasks = (operation, stop_wait)
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop is None:
-            return
-
-        loop.create_task(_notify_policy())
-        if self._output_queue is not None:
-            try:
-                self._output_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                loop.create_task(self._output_queue.put(None))
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if operation in done:
+                return True, operation.result()
+            return False, None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _finalize_backend_training(self) -> None:
         if not self._backend_training_completed:
@@ -677,13 +673,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if self._scenario_source_exhausted:
                 return None
             try:
-                scenario = await anext(self._scenario_iter)
+                completed, scenario = await self._await_or_stop(
+                    anext(self._scenario_iter)
+                )
             except StopAsyncIteration:
                 self._scenario_source_exhausted = True
                 return None
+            if not completed:
+                return None
             self.state.scenario_offset += 1
             self.state.total_scenarios_consumed += 1
-            return scenario
+            return cast(ScenarioT, scenario)
 
     async def _wait_for_policy(self) -> None:
         if self.max_steps_off_policy is None:
@@ -694,7 +694,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 and self.state.policy_version
                 < self.state.next_training_step - self.max_steps_off_policy
             ):
-                await self.state.policy_updated.wait()
+                completed, _ = await self._await_or_stop(
+                    self.state.policy_updated.wait()
+                )
+                if not completed:
+                    return
 
     @asynccontextmanager
     async def _checkpoint_lease(self, step: int) -> AsyncIterator[None]:
@@ -854,10 +858,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             and self._output_queue is not None
         ):
             print("Scenario source exhausted; draining completed rollouts.")
-            try:
-                self._output_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                await self._output_queue.put(None)
+            await self._await_or_stop(self._output_queue.put(None))
 
     async def _training_stage(self) -> None:
         if self._output_queue is None:
@@ -868,10 +869,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             current_step + self.max_steps if self.max_steps is not None else None
         )
         if stop_at_step is not None and current_step >= stop_at_step:
-            self.state.done = True
             self._persist_state(current_step)
-            async with self.state.policy_updated:
-                self.state.policy_updated.notify_all()
+            self.request_stop()
             return
         stop_after_batch = False
 
@@ -1049,10 +1048,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if stop_after_batch:
                 break
 
-        self.state.done = True
         self._persist_state(current_step)
-        async with self.state.policy_updated:
-            self.state.policy_updated.notify_all()
+        self.request_stop()
 
     async def _collect_batch(
         self, current_step: int
@@ -1063,7 +1060,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         saw_sentinel = False
 
         while len(batch) < self.min_batch_size:
-            item = await self._output_queue.get()
+            completed, item = await self._await_or_stop(self._output_queue.get())
+            if not completed:
+                saw_sentinel = True
+                break
             if item is None:
                 saw_sentinel = True
                 break
@@ -1113,11 +1113,16 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return
 
         pending_eval: asyncio.Task[None] | None = None
-        while not self.state.done or not self._eval_queue.empty():
+        while True:
             try:
-                step = await asyncio.wait_for(self._eval_queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
+                step = self._eval_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                if self.state.done:
+                    break
+                completed, step = await self._await_or_stop(self._eval_queue.get())
+                if not completed:
+                    continue
+            assert step is not None
 
             if pending_eval is not None and not pending_eval.done():
                 try:
@@ -1137,7 +1142,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         sleep_seconds = min(1.0, max(0.2, self._status_log_interval_seconds / 10))
         while not self.state.done:
             self._status.log_if_due()
-            await asyncio.sleep(sleep_seconds)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=sleep_seconds)
+            except asyncio.TimeoutError:
+                continue
 
     async def _run_eval(self, step: int) -> None:
         assert self.eval_fn is not None
@@ -1310,7 +1318,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if self._collapse_triggered:
             return
         self._collapse_triggered = True
-        self.state.done = True
+        self.request_stop()
         print(
             "\n"
             "========================================\n"
@@ -1819,13 +1827,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     async def _put_output_group(self, group: TrajectoryGroup) -> float:
         assert self._output_queue is not None
         queue_wait_started = time.monotonic()
-        while not self.state.done:
-            try:
-                await asyncio.wait_for(self._output_queue.put(group), timeout=1.0)
-                self._status.note_group_enqueued(group)
-                return time.monotonic() - queue_wait_started
-            except asyncio.TimeoutError:
-                continue
+        completed, _ = await self._await_or_stop(self._output_queue.put(group))
+        if completed:
+            self._status.note_group_enqueued(group)
         return time.monotonic() - queue_wait_started
 
     def _record_producer_rollout_timings(
