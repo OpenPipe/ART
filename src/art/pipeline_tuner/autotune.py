@@ -355,7 +355,12 @@ class PipelineAutotuner:
             reason = "both sides are loaded; no throughput-safe online change"
 
         if not target_changed and not stale_backlog_active:
-            min_update = self._min_batch_adjustment(updated, stats, action)
+            min_update = self._min_batch_adjustment(
+                updated,
+                stats,
+                action,
+                inference_over=inference_over,
+            )
             if min_update is not None:
                 updated, action, reason = min_update
 
@@ -392,12 +397,15 @@ class PipelineAutotuner:
         settings: PipelineTuneSettings,
         stats: TunerWindowStats,
         action: str,
+        *,
+        inference_over: bool,
     ) -> tuple[PipelineTuneSettings, str, str] | None:
         if self._min_batch_trial_baseline_collect_s is not None:
             if settings.min_batch_size != self._min_batch_trial_batch_size:
                 self._clear_min_batch_trial()
             elif (
-                stats.trainer_underfeed_score
+                not inference_over
+                and stats.trainer_underfeed_score
                 <= self.config.trainer_min_batch_raise_score
             ):
                 self._clear_min_batch_trial()
@@ -409,6 +417,8 @@ class PipelineAutotuner:
                 self._min_batch_trial_baseline_collect_s
                 * self.config.min_batch_collect_improvement_ratio
             ):
+                if inference_over:
+                    return None
                 self._min_batch_trial_failed_windows += 1
                 if (
                     self._min_batch_trial_failed_windows
@@ -447,7 +457,11 @@ class PipelineAutotuner:
                     "lower_min_batch_size",
                     "trainer is severely underfed and rollout workers are not being increased",
                 )
-        if stats.trainer_underfeed_score <= self.config.trainer_min_batch_raise_score:
+        if (
+            not inference_over
+            and stats.trainer_underfeed_score
+            <= self.config.trainer_min_batch_raise_score
+        ):
             return self._raise_min_batch(
                 settings,
                 "trainer collection idle is low enough to use denser batches",
