@@ -114,10 +114,22 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         dashboard_default=True,
     ),
     MetricDefinition(
+        key="data/step_executed_packed_train_tokens",
+        title="Megatron executed packed train tokens",
+        description=(
+            "packed token rows included in Megatron throughput; CP excludes "
+            "configured packed-row padding that is not dispatched"
+        ),
+        kind="counter",
+        unit="tokens",
+        higher_is_better=None,
+    ),
+    MetricDefinition(
         key="throughput/train_packed_tok_per_s",
         title="Megatron packed train tokens per second",
         description=(
-            "physical packed training-token throughput reported by the Megatron worker"
+            "physical training-token throughput reported by the Megatron worker; "
+            "CP excludes configured packed-row padding that is not dispatched"
         ),
         kind="rate",
         unit="tok/s",

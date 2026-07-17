@@ -340,6 +340,7 @@ WANDB_CANONICAL_METRIC_KEYS = frozenset(
         "offpolicy/token_weighted_policy_age_p95_steps",
         "throughput/accepted_train_tok_per_s",
         "throughput/train_packed_tok_per_s",
+        "data/step_executed_packed_train_tokens",
         "data/step_trainable_assistant_tokens",
         "data/step_non_padding_train_tokens",
         "data/step_padding_ratio",

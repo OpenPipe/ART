@@ -108,6 +108,7 @@ from art.megatron.training.microbatches import (
     _zero_contribution_inputs,
     _zero_contribution_sft_inputs,
     build_micro_sample_indices,
+    build_micro_sample_indices_by_dp_rank,
     build_rl_hybridep_token_counts,
     build_sft_hybridep_token_counts,
     resolve_global_grad_accumulation_sequences,
@@ -649,7 +650,12 @@ def run_megatron_rl_job(
                 hybridep_token_counts=hybridep_token_counts,
             )
             train_step_s = time.perf_counter() - train_step_started
-            global_packed_train_tokens = _global_packed_train_tokens(micro_inputs)
+            global_packed_train_tokens = _global_packed_train_tokens(
+                packed_tensors,
+                step_index=step_index,
+                num_sequences=num_sequences,
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            )
             print0(
                 runtime.rank,
                 "Correlation between old and new probabilities:",
@@ -1108,6 +1114,7 @@ def _log_rl_step_result(
             "loss/grad_norm": step_result.grad_norm,
             "loss/probs_corr": step_result.probs_corr,
             TRAIN_GRADIENT_STEPS_KEY: num_gradient_steps,
+            "data/step_executed_packed_train_tokens": packed_train_tokens,
             "throughput/train_packed_tok_per_s": train_packed_tok_per_s,
         }
         if step_result.kl_policy_ref is not None:
@@ -1118,9 +1125,30 @@ def _log_rl_step_result(
         log_file.write(log_msg + "\n")
 
 
-def _global_packed_train_tokens(micro_inputs: list[PackedTensors]) -> int:
-    local_tokens = sum(int(micro["tokens"].numel()) for micro in micro_inputs)
-    return local_tokens * ps.get_data_parallel_world_size(with_context_parallel=False)
+def _global_packed_train_tokens(
+    packed_tensors: PackedTensors,
+    *,
+    step_index: int,
+    num_sequences: int,
+    global_grad_accumulation_sequences: int | None,
+) -> int:
+    sample_rows = build_micro_sample_indices_by_dp_rank(
+        step_index=step_index,
+        num_sequences=num_sequences,
+        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+    )
+    sequence_length = int(packed_tensors["tokens"].shape[1])
+    if ps.get_context_parallel_world_size() <= 1:
+        return sum(len(row) for row in sample_rows) * sequence_length
+    return sum(
+        int(
+            (packed_tensors["group_ids"][0 if index is None else index] != -1)
+            .sum()
+            .item()
+        )
+        for row in sample_rows
+        for index in row
+    )
 
 
 def _save_optimizer(
