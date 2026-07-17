@@ -55,8 +55,9 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     trainer_load_over_score: float = pydantic.Field(default=0.04, ge=0.0)
     vllm_pressure_over_ratio: float = pydantic.Field(default=0.80, ge=0.0)
     vllm_pressure_under_ratio: float = pydantic.Field(default=0.50, ge=0.0)
-    queue_put_severe_frac: float = pydantic.Field(default=0.50, ge=0.0, le=1.0)
+    queue_put_severe_frac: float = pydantic.Field(default=1.0 / 3.0, ge=0.0, le=1.0)
     stale_high_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
+    stale_clear_frac: float = pydantic.Field(default=0.10, ge=0.0, le=1.0)
     padding_high_frac: float = pydantic.Field(default=0.25, ge=0.0, le=1.0)
     trainer_min_batch_lower_score: float = pydantic.Field(default=0.15, ge=0.0)
     recommendation_min_windows: int = pydantic.Field(default=5, ge=1)
@@ -77,6 +78,12 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     vllm_metric_timeout_window_frac: float = pydantic.Field(
         default=0.35, ge=0.0, le=1.0
     )
+
+    @pydantic.model_validator(mode="after")
+    def validate_stale_hysteresis(self) -> "PipelineAutotuneConfig":
+        if self.stale_clear_frac > self.stale_high_frac:
+            raise ValueError("stale_clear_frac must be <= stale_high_frac")
+        return self
 
 
 class PipelineTuneSettings(pydantic.BaseModel):
@@ -127,6 +134,7 @@ class TunerWindowStats(pydantic.BaseModel):
     vllm_pressure: float = 0.0
     queue_put_wait_frac: float = 0.0
     predicted_stale_frac: float = 0.0
+    actual_stale_frac: float = 0.0
     padding_ratio_mean: float = 0.0
 
 

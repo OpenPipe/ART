@@ -97,6 +97,7 @@ class PipelineAutotuner:
         self._last_decision_step = self._warmup_end_step
         self._target_candidate: int | None = None
         self._target_candidate_count = 0
+        self._stale_backlog_active = False
         self._emitted_recommendations: set[str] = set()
 
     def on_metric(self, rec: PipelineMetric) -> TunerDecision | None:
@@ -164,6 +165,18 @@ class PipelineAutotuner:
         groups = _required_step_values(
             by_step, window_steps, "data/step_num_groups_trainable"
         )
+        stale_groups = _required_step_values(
+            by_step, window_steps, "discarded/step/stale_groups"
+        )
+        zero_variance_groups = _required_step_values(
+            by_step, window_steps, "discarded/step/zero_variance_groups"
+        )
+        rollout_s = sum(
+            _required_step_values(by_step, window_steps, "time/step_rollout_s")
+        )
+        queue_put_wait_s = sum(
+            _required_step_values(by_step, window_steps, "queue/put_wait_s")
+        )
         train_capacity_tokens = _required_step_values(
             by_step, window_steps, "data/step_packed_train_tokens"
         )
@@ -215,8 +228,11 @@ class PipelineAutotuner:
             vllm_pressure=_vllm_pressure(
                 vllm_metrics, window_start_s=t0, window_end_s=t1
             ),
-            queue_put_wait_frac=_mean(step_values("queue/put_wait_frac")),
+            queue_put_wait_frac=queue_put_wait_s
+            / max(queue_put_wait_s + rollout_s, 1e-9),
             predicted_stale_frac=_mean(step_values("queue/predicted_stale_fraction")),
+            actual_stale_frac=sum(stale_groups)
+            / max(sum(groups) + sum(stale_groups) + sum(zero_variance_groups), 1.0),
             padding_ratio_mean=padding_ratio_mean,
         )
 
@@ -298,13 +314,25 @@ class PipelineAutotuner:
         target_changed = (
             updated.target_groups_per_step != previous.target_groups_per_step
         )
-        predicted_stale_high = stats.predicted_stale_frac >= self.config.stale_high_frac
+        stale_backlog_active = self._update_stale_backlog_state(stats)
         action = "hold"
         reason = "inside hysteresis band or already balanced"
 
-        if stats.queue_put_wait_frac >= self.config.queue_put_severe_frac:
-            reason = "completed-group queue backpressure is active"
-        elif predicted_stale_high:
+        if stale_backlog_active and updated.min_batch_size < updated.max_batch_size:
+            updated = updated.model_copy(
+                update={
+                    "min_batch_size": min(
+                        updated.max_batch_size,
+                        max(
+                            updated.min_batch_size + 1,
+                            round(updated.min_batch_size * 1.15),
+                        ),
+                    )
+                }
+            )
+            action = "raise_min_batch_size"
+            reason = "stale backlog requires dense batches before reducing workers"
+        elif stale_backlog_active:
             updated = updated.model_copy(
                 update={
                     "num_rollout_workers": self._move_workers(
@@ -313,7 +341,9 @@ class PipelineAutotuner:
                 }
             )
             action = "decrease_workers"
-            reason = "predicted stale backlog exceeds the freshness target"
+            reason = "predicted or actual stale backlog exceeds the freshness target"
+        elif stats.queue_put_wait_frac >= self.config.queue_put_severe_frac:
+            reason = "completed-group queue backpressure is active"
         elif state in {
             "inference_under_train_under",
             "inference_balanced_train_under",
@@ -330,7 +360,7 @@ class PipelineAutotuner:
         elif state == "inference_over_train_over":
             reason = "both sides are loaded; no throughput-safe online change"
 
-        if not target_changed:
+        if not target_changed and not stale_backlog_active:
             min_update = self._min_batch_adjustment(updated, stats, state, action)
             if min_update is not None:
                 updated, action, reason = min_update
@@ -350,6 +380,18 @@ class PipelineAutotuner:
             updated=updated,
             stats=stats,
         )
+
+    def _update_stale_backlog_state(self, stats: TunerWindowStats) -> bool:
+        stale_fractions = (stats.predicted_stale_frac, stats.actual_stale_frac)
+        if self._stale_backlog_active:
+            self._stale_backlog_active = any(
+                fraction > self.config.stale_clear_frac for fraction in stale_fractions
+            )
+        else:
+            self._stale_backlog_active = any(
+                fraction >= self.config.stale_high_frac for fraction in stale_fractions
+            )
+        return self._stale_backlog_active
 
     def _min_batch_adjustment(
         self,
