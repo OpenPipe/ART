@@ -75,7 +75,6 @@ def _build_identity() -> tuple[str, str]:
         platform.machine(),
         torch.__version__,
         str(torch.version.cuda),
-        torch.__config__.show(),
         version("nvidia-cuda-cccl-cu12"),
         version("nvidia-nvtx-cu12"),
         _output([str(cuda_home / "bin" / "nvcc"), "--version"]),
