@@ -21,6 +21,7 @@ from .data_plane import InMemoryPackedBatch
 from .specs import (
     TRAIN_EVENT_ADAPTER,
     AdapterReady,
+    HybridEpRuntimeSpec,
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
@@ -65,6 +66,37 @@ _SUPERVISION_LOCK = Lock()
 _SUPERVISION_HANDLERS: dict[str, "MonarchTrainerSupervision"] = {}
 _SUPERVISION_MESHES: dict[str, "MonarchTrainerSupervision"] = {}
 _PREVIOUS_FAULT_HOOK: Callable[[MeshFailure], None] | None = None
+
+
+def _configure_hybrid_ep_env(
+    spec: HybridEpRuntimeSpec, *, run_id: str | None = None
+) -> None:
+    os.environ["NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN"] = str(
+        spec.ranks_per_nvlink_domain
+    )
+    transport = spec.nixl_transport
+    values = {
+        "HYBRID_EP_MULTINODE": "1" if transport else None,
+        "USE_NIXL": "1" if transport else None,
+        "DEEPEP_NIXL_RUN_ID": (run_id or spec.run_id) if transport else None,
+        "NIXL_ETCD_ENDPOINTS": transport.metadata_store.url if transport else None,
+        "NIXL_HOME": transport.nixl_home if transport else None,
+        "UCX_HOME": transport.ucx_home if transport else None,
+        "NIXL_PLUGIN_DIR": transport.nixl_plugin_dir if transport else None,
+        "UCX_MODULE_DIR": transport.ucx_module_dir if transport else None,
+        "UCX_NET_DEVICES": transport.ucx_net_devices if transport else None,
+        "UCX_TLS": transport.ucx_tls if transport else None,
+        "UCX_CUDA_COPY_ENABLE_FABRIC": (
+            "yes" if transport and transport.enable_cuda_fabric else "no"
+        )
+        if transport
+        else None,
+    }
+    for name, value in values.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
 
 class _TrainerRankReady(BaseModel):
@@ -172,6 +204,7 @@ class MonarchTrainerActor(Actor):
     def __init__(
         self,
         runtime_spec_json: str,
+        trainer_generation: str,
     ) -> None:
         runtime_spec = TrainerRuntimeSpec.model_validate_json(runtime_spec_json)
         topology = runtime_spec.trainer_mesh.topology
@@ -225,7 +258,17 @@ class MonarchTrainerActor(Actor):
         if topology.ep > 1:
             from art.megatron.hybrid_ep_setup import validate_hybrid_ep
 
-            validate_hybrid_ep()
+            hybrid_ep = runtime_spec.hybrid_ep
+            if hybrid_ep is None:
+                raise RuntimeError(
+                    "expert parallelism requires a HybridEP runtime spec"
+                )
+            group_index = rank // (topology.etp * topology.ep)
+            _configure_hybrid_ep_env(
+                hybrid_ep,
+                run_id=f"{hybrid_ep.run_id}-{trainer_generation}-g{group_index}",
+            )
+            validate_hybrid_ep(require_multinode=hybrid_ep.multinode)
         from art.megatron.train import build_training_runtime
 
         dtype = {
@@ -381,6 +424,7 @@ async def spawn_monarch_trainer_actors(
         f"art_megatron_trainer_{supervision.token}",
         MonarchTrainerActor,
         runtime_spec.model_dump_json(),
+        supervision.token,
     )
     supervision.own_mesh(await actors._name)
     await actors.initialized
@@ -507,15 +551,20 @@ class MonarchTrainerRun:
                     waiters = {receive, supervision}
                     if not collective.done():
                         waiters.add(collective)
+                    event_timeout_s = (
+                        self.run_spec.initial_event_timeout_s
+                        if len(events) == 1
+                        and self.run_spec.initial_event_timeout_s is not None
+                        else self.run_spec.event_timeout_s
+                    )
                     done, _ = await asyncio.wait(
                         waiters,
-                        timeout=self.run_spec.event_timeout_s,
+                        timeout=event_timeout_s,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     if not done:
                         raise TimeoutError(
-                            "trainer ranks produced no event for "
-                            f"{self.run_spec.event_timeout_s:g}s"
+                            f"trainer ranks produced no event for {event_timeout_s:g}s"
                         )
                     if supervision in done:
                         raise RuntimeError(

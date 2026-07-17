@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import hashlib
+from itertools import groupby
 import json
 import logging
 import os
@@ -17,7 +18,7 @@ import httpx
 from art import dev, types
 from art.dev.get_model_config import default_target_modules
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
-from art.distributed.specs import ModelServiceSpec
+from art.distributed.specs import ModelServiceSpec, NixlTransportSpec, TrainerMeshSpec
 from art.distributed.vllm_replica import (
     ReplicaFailure,
     ReplicaLaunchTemplate,
@@ -61,6 +62,7 @@ from .runtime.specs import (
     CurrentTrainConfig,
     DurableTrainOutput,
     ExperimentalTrainConfig,
+    HybridEpRuntimeSpec,
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
@@ -78,6 +80,40 @@ logger = logging.getLogger(__name__)
 def _consume_task_result(task: asyncio.Future[Any]) -> None:
     if not task.cancelled():
         task.exception()
+
+
+def _hybrid_ep_runtime_spec(
+    mesh: TrainerMeshSpec,
+    *,
+    run_id: str,
+    transport: NixlTransportSpec | None,
+) -> HybridEpRuntimeSpec | None:
+    if mesh.topology.ep <= 1:
+        return None
+    group_size = mesh.topology.etp * mesh.topology.ep
+    domain_sizes: set[int] = set()
+    multinode = False
+    for offset in range(0, len(mesh.ranks), group_size):
+        group = mesh.ranks[offset : offset + group_size]
+        domains = [
+            (host_id, tuple(ranks))
+            for host_id, ranks in groupby(group, key=lambda rank: rank.host_id)
+        ]
+        if len({host_id for host_id, _ in domains}) != len(domains):
+            raise ValueError("HybridEP ranks for each host must be contiguous")
+        domain_sizes.update(len(ranks) for _, ranks in domains)
+        multinode |= len(domains) > 1
+    if len(domain_sizes) != 1:
+        raise ValueError(
+            "HybridEP TP x EP groups require equal ranks per NVLink domain"
+        )
+    if multinode and transport is None:
+        raise ValueError("cross-host expert parallelism requires NIXL transport")
+    return HybridEpRuntimeSpec(
+        ranks_per_nvlink_domain=domain_sizes.pop(),
+        run_id=run_id,
+        nixl_transport=transport if multinode else None,
+    )
 
 
 class DistributedMegatronService:
@@ -229,6 +265,11 @@ class DistributedMegatronService:
         compile_enabled = os.environ.get(
             "ART_DISABLE_MEGATRON_COMPILE", "0"
         ).lower() not in {"1", "true", "yes", "on"}
+        hybrid_ep = _hybrid_ep_runtime_spec(
+            mesh,
+            run_id=self.runtime.runtime_id,
+            transport=self.runtime.topology.cluster.nixl_transport,
+        )
         identity = {
             "art": _art_source_revision(),
             "model": self._model_identifier,
@@ -262,6 +303,7 @@ class DistributedMegatronService:
             ),
             streaming_weight_offload=runtime_config.streaming_weight_offload,
             random_state=self._random_state(),
+            hybrid_ep=hybrid_ep,
         )
 
     async def _ensure_trainer_locked(self) -> Any:
@@ -277,6 +319,7 @@ class DistributedMegatronService:
             initial_learner_version=self._latest_step,
             initial_adapter_path=current,
             optimizer_state_path=self._optimizer_state_path,
+            initial_event_timeout_s=self.runtime.topology.cluster.startup_timeout_s,
         )
         self._trainer = await self.runtime.start_trainer(runtime_spec, run_spec)
         return self._trainer

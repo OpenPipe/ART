@@ -8,13 +8,23 @@ from typing import Annotated, Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from art.distributed.data_plane import PackedBatchRef
-from art.distributed.specs import TrainerMeshSpec
+from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
 from art.megatron.runtime.jobs import MergedWeightTransferSpec
 from art.types import TrainConfig
 
 
 class _Spec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class HybridEpRuntimeSpec(_Spec):
+    ranks_per_nvlink_domain: int = Field(ge=1)
+    run_id: str = Field(min_length=1)
+    nixl_transport: NixlTransportSpec | None = None
+
+    @property
+    def multinode(self) -> bool:
+        return self.nixl_transport is not None
 
 
 class TrainerRuntimeSpec(_Spec):
@@ -36,6 +46,7 @@ class TrainerRuntimeSpec(_Spec):
     enable_moe_routing_replay: bool = False
     streaming_weight_offload: bool = False
     random_state: int | None = None
+    hybrid_ep: HybridEpRuntimeSpec | None = None
 
     @model_validator(mode="after")
     def _validate_lora_targets(self) -> "TrainerRuntimeSpec":
@@ -59,6 +70,7 @@ class TrainingRunSpec(_Spec):
     initial_learner_version: int = Field(ge=0)
     initial_adapter_path: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
+    initial_event_timeout_s: float | None = Field(default=None, gt=0)
     event_timeout_s: float = Field(default=300.0, gt=0)
     shutdown_timeout_s: float = Field(default=30.0, gt=0)
 

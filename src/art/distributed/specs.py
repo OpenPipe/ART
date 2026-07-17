@@ -43,11 +43,62 @@ class NcclTransportSpec(_Spec):
         return self
 
 
+class EndpointSpec(_Spec):
+    host: str = Field(min_length=1)
+    port: int = Field(ge=1, le=65535)
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    @property
+    def is_loopback(self) -> bool:
+        if self.host.lower() == "localhost":
+            return True
+        try:
+            return ip_address(self.host.strip("[]")).is_loopback
+        except ValueError:
+            return False
+
+    @property
+    def is_routable(self) -> bool:
+        if self.host.lower() == "localhost":
+            return False
+        try:
+            address = ip_address(self.host.strip("[]"))
+        except ValueError:
+            return self.host not in {"0.0.0.0", "::"}
+        return not (
+            address.is_loopback
+            or address.is_unspecified
+            or address.is_link_local
+            or address.is_multicast
+        )
+
+
+class NixlTransportSpec(_Spec):
+    metadata_store: EndpointSpec
+    nixl_home: str = Field(default="/usr/local/nixl", min_length=1)
+    ucx_home: str = Field(default="/usr", min_length=1)
+    nixl_plugin_dir: str | None = Field(default=None, min_length=1)
+    ucx_module_dir: str | None = Field(default=None, min_length=1)
+    ucx_net_devices: str | None = Field(default=None, min_length=1)
+    ucx_tls: str = Field(default="^cuda_ipc", min_length=1)
+    enable_cuda_fabric: bool = False
+
+    @model_validator(mode="after")
+    def _validate_metadata_store(self) -> "NixlTransportSpec":
+        if not self.metadata_store.is_routable:
+            raise ValueError("NIXL metadata store must be routable across hosts")
+        return self
+
+
 class ClusterSpec(_Spec):
     hosts: tuple[HostSpec, ...]
     controller_host_id: str
     artifact_root: str | None = None
     nccl_transport: NcclTransportSpec | None = None
+    nixl_transport: NixlTransportSpec | None = None
     startup_timeout_s: float = Field(default=300.0, gt=0)
     rpc_timeout_s: float = Field(default=60.0, gt=0)
 
@@ -92,39 +143,6 @@ class TrainerMeshSpec(_Spec):
         if world_size % (topology.etp * topology.ep * topology.pp):
             raise ValueError("trainer world size must be divisible by ETP * EP * PP")
         return self
-
-
-class EndpointSpec(_Spec):
-    host: str = Field(min_length=1)
-    port: int = Field(ge=1, le=65535)
-
-    @property
-    def url(self) -> str:
-        return f"http://{self.host}:{self.port}"
-
-    @property
-    def is_loopback(self) -> bool:
-        if self.host.lower() == "localhost":
-            return True
-        try:
-            return ip_address(self.host.strip("[]")).is_loopback
-        except ValueError:
-            return False
-
-    @property
-    def is_routable(self) -> bool:
-        if self.host.lower() == "localhost":
-            return False
-        try:
-            address = ip_address(self.host.strip("[]"))
-        except ValueError:
-            return self.host not in {"0.0.0.0", "::"}
-        return not (
-            address.is_loopback
-            or address.is_unspecified
-            or address.is_link_local
-            or address.is_multicast
-        )
 
 
 class VllmParallelSpec(_Spec):

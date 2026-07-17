@@ -65,10 +65,18 @@ def _source_hash() -> str:
     return digest.hexdigest()
 
 
-def _build_identity() -> tuple[str, str]:
+def _build_identity(
+    *, enable_multinode: bool | None = None, use_nixl: bool | None = None
+) -> tuple[str, str]:
     cuda_home = _cuda_home()
     arch_list = _arch_list()
     digest = sha256()
+    if enable_multinode is None:
+        enable_multinode = os.environ.get("HYBRID_EP_MULTINODE", "0") == "1"
+    if use_nixl is None:
+        use_nixl = os.environ.get("USE_NIXL", "0") == "1"
+    if use_nixl and not enable_multinode:
+        raise ValueError("NIXL HybridEP requires multi-node support")
     values = [
         _source_hash(),
         sys.implementation.cache_tag,
@@ -80,8 +88,8 @@ def _build_identity() -> tuple[str, str]:
         _output([str(cuda_home / "bin" / "nvcc"), "--version"]),
         _output([os.environ.get("CXX", "c++"), "--version"]),
         arch_list,
-        os.environ.get("HYBRID_EP_MULTINODE", "0"),
-        os.environ.get("USE_NIXL", "0"),
+        str(int(enable_multinode)),
+        str(int(use_nixl)),
     ]
     for value in values:
         digest.update(value.encode())
@@ -181,12 +189,14 @@ def setup_hybrid_ep() -> str:
     return build_version
 
 
-def validate_hybrid_ep() -> None:
-    expected, _ = _build_identity()
-    if (installed := _installed_version()) != expected:
+def validate_hybrid_ep(*, require_multinode: bool = False) -> None:
+    candidates = [_build_identity(enable_multinode=True, use_nixl=True)[0]]
+    if not require_multinode:
+        candidates.append(_build_identity(enable_multinode=False, use_nixl=False)[0])
+    if (installed := _installed_version()) not in candidates:
         raise RuntimeError(
             "HybridEP is not built for this ART source and Megatron environment "
-            f"(expected {expected}, found {installed}). Run Megatron setup."
+            f"(expected one of {candidates}, found {installed}). Run Megatron setup."
         )
 
 
