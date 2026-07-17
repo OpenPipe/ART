@@ -855,10 +855,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             and self._output_queue is not None
         ):
             print("Scenario source exhausted; draining completed rollouts.")
-            try:
-                self._output_queue.put_nowait(None)
-            except asyncio.QueueFull:
-                await self._output_queue.put(None)
+            while not self.state.done:
+                try:
+                    await asyncio.wait_for(self._output_queue.put(None), timeout=1.0)
+                    break
+                except asyncio.TimeoutError:
+                    continue
 
     async def _training_stage(self) -> None:
         if self._output_queue is None:
