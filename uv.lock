@@ -4780,6 +4780,7 @@ source = { editable = "." }
 dependencies = [
     { name = "litellm" },
     { name = "nest-asyncio" },
+    { name = "numpy" },
     { name = "openai" },
     { name = "polars" },
     { name = "setproctitle" },
@@ -4922,6 +4923,7 @@ requires-dist = [
     { name = "nbmake", marker = "extra == 'backend'", specifier = ">=1.5.5" },
     { name = "nest-asyncio", specifier = ">=1.6.0" },
     { name = "ninja", marker = "extra == 'megatron'", specifier = ">=1.11.1" },
+    { name = "numpy", specifier = "<2" },
     { name = "numpy", marker = "extra == 'megatron'", specifier = "<2" },
     { name = "numpy", marker = "extra == 'tinker'", specifier = "<2" },
     { name = "nvidia-cuda-cccl-cu12", marker = "sys_platform == 'linux' and extra == 'megatron'", specifier = "==12.9.27" },
