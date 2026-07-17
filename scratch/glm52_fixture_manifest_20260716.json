@@ -1,0 +1,18 @@
+{
+  "algorithm": "sha256(sorted(relative_file_sha256_manifest))",
+  "bytes": 183895569805,
+  "file_count": 30,
+  "fixture": "/mnt/ws_pvc/ws/projects/worktrees/art/monarch_multinode_training/scratch/glm52_e2e_hf_home/hub/models--zai-org--GLM-5.2/snapshots/e2e_12l_full_dims_serialized",
+  "manifest_sha256": "26fcd5b38da2a44fdd88cdecd31e7986ea129b3d04068435288ec3add665f737",
+  "state": {
+    "bytes": 183873818112,
+    "layers": 12,
+    "shards": 24,
+    "tensors": 7102,
+    "values": 91936906752
+  },
+  "validation": {
+    "10.0.7.93": "native PP1 physical load and LoRA registration",
+    "10.0.9.49": "full manifest, exact serialized shape audit, and native PP0 physical load"
+  }
+}
