@@ -1631,7 +1631,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return False
         if self.eval_every_n_steps <= 0:
             return False
-        return (step - self.state.last_eval_step) >= self.eval_every_n_steps
+        return (step // self.eval_every_n_steps) > (
+            self.state.last_eval_step // self.eval_every_n_steps
+        )
 
     def _read_pipeline_state(self) -> dict[str, Any]:
         state = self.model.read_state() or {}
