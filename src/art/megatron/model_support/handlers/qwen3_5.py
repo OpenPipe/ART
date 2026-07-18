@@ -57,6 +57,9 @@ class Qwen35BaseHandler(DefaultDenseHandler):
     build_gdn_execution_spec = True
     native_vllm_lora_status = "validated"
 
+    def vllm_server_args(self) -> dict[str, object]:
+        return {"tool_call_parser": "qwen3_xml"}
+
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return getattr(base_config, "text_config", base_config)
 
