@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 from ..trajectories import (
     ChatCompletionsExchange,
     History,
+    TokenFlag,
     Trajectory,
     TrajectoryGroup,
     get_messages,
@@ -45,6 +46,20 @@ from .vllm_tokens import choice_vllm_token_metadata
 
 ChatTemplateTool = dict[Any, Any] | Callable[..., Any]
 ChatTemplateToolSchemaFormat = Literal["default", "vllm_openai"]
+
+
+def _flag_spans(flags: list[TokenFlag], flag: TokenFlag) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(flags):
+        if value & flag:
+            start = index if start is None else start
+        elif start is not None:
+            spans.append((start, index))
+            start = None
+    if start is not None:
+        spans.append((start, len(flags)))
+    return spans
 
 
 def _slice_moe_routes(
@@ -555,6 +570,7 @@ def tokenize_trajectory_groups(
                 from ..trajectories._tokenize import (
                     _as_tokenizer,
                     _exchange_list,
+                    _exchange_tokens,
                     tokenize_one,
                 )
 
@@ -566,10 +582,15 @@ def tokenize_trajectory_groups(
                     chat_template_kwargs=chat_template_kwargs,
                     tokenizer_instance=_as_tokenizer(tokenizer),
                 )
+                sampled = [
+                    bool(flag & TokenFlag.SAMPLED) for flag in exchange_result.flags
+                ]
+                sampled_spans = _flag_spans(exchange_result.flags, TokenFlag.SAMPLED)
+                choice_spans = sampled_spans
                 if not allow_training_without_logprobs and any(
                     trainable and math.isnan(logprob)
                     for trainable, logprob in zip(
-                        exchange_result.assistant_mask,
+                        sampled,
                         exchange_result.logprobs,
                         strict=True,
                     )
@@ -584,14 +605,20 @@ def tokenize_trajectory_groups(
                     if isinstance(exchange, ChatCompletionsExchange)
                 ]
                 if len(chat_choices) == len(exchanges):
+                    exact_spans: list[tuple[int, int]] = []
+                    for exchange in exchanges:
+                        prompt, completion, _ = _exchange_tokens(exchange)
+                        if prompt is None or completion is None:
+                            exact_spans = []
+                            break
+                        exact_spans.append((len(prompt), len(prompt) + len(completion)))
+                    choice_spans = exact_spans or choice_spans
                     moe_routes, moe_stats = align_choice_routes_to_tokenized_result(
                         token_ids=exchange_result.token_ids,
                         choices=chat_choices,
-                        choice_offsets=[
-                            start for start, _ in exchange_result.sampled_spans
-                        ],
+                        choice_offsets=[start for start, _ in choice_spans],
                         choice_token_lengths=[
-                            end - start for start, end in exchange_result.sampled_spans
+                            end - start for start, end in choice_spans
                         ],
                     )
                 else:
@@ -611,16 +638,12 @@ def tokenize_trajectory_groups(
                         chat="",
                         token_ids=exchange_result.token_ids,
                         input_pos=list(range(len(exchange_result.token_ids))),
-                        assistant_mask=[
-                            int(value) for value in exchange_result.assistant_mask
-                        ],
+                        assistant_mask=[int(value) for value in sampled],
                         logprobs=exchange_result.logprobs,
                         pixel_values=None,
                         image_grid_thw=None,
                         trajectory=trajectory,
-                        choice_offsets=[
-                            start for start, _ in exchange_result.sampled_spans
-                        ],
+                        choice_offsets=[start for start, _ in choice_spans],
                         extra_logprobs={},
                         moe_routed_experts=moe_routes,
                         moe_routing_alignment_stats=moe_stats,

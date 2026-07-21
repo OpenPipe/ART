@@ -141,7 +141,12 @@ def test_exact_tokens_form_one_append_only_history_without_tokenizer(
     tokenized = art.tokenize_trajectory(trajectory)
 
     assert tokenized.token_ids == [1, 2, 3, 4]
-    assert tokenized.assistant_mask == [False, True, False, True]
+    assert tokenized.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
     assert math.isnan(tokenized.logprobs[0])
     assert tokenized.logprobs[1] == -0.2
     assert math.isnan(tokenized.logprobs[2])
@@ -301,7 +306,7 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
 
     assert result.token_ids == [10, 11]
     assert loaded_base_models == ["base/model"]
-    assert result.assistant_mask == [False, True]
+    assert result.flags == [art.TokenFlag(0), art.TokenFlag.SAMPLED]
     assert math.isnan(result.logprobs[1])
     assert tokenizer.calls == [
         {

@@ -18,6 +18,7 @@ from . import (
     CompletionsExchange,
     MessagesExchange,
     ResponsesExchange,
+    TokenFlag,
     TokenizedTrajectory,
     Trajectory,
 )
@@ -904,8 +905,7 @@ def _legacy_tokenize(
         raise ValueError("Tokenization requires one history")
     token_ids: list[int] = []
     logprobs: list[float] = []
-    assistant_mask: list[bool] = []
-    sampled_spans: list[tuple[int, int]] = []
+    flags: list[TokenFlag] = []
     for item in trajectory.messages_and_choices:
         if not isinstance(item, Choice):
             continue
@@ -917,28 +917,25 @@ def _legacy_tokenize(
         if not token_ids:
             token_ids.extend(prompt)
             logprobs.extend([math.nan] * len(prompt))
-            assistant_mask.extend([False] * len(prompt))
+            flags.extend([TokenFlag.EXACT] * len(prompt))
         elif prompt[: len(token_ids)] != token_ids:
             raise ValueError("Legacy trajectory does not form one append-only history")
         else:
             suffix = prompt[len(token_ids) :]
             token_ids.extend(suffix)
             logprobs.extend([math.nan] * len(suffix))
-            assistant_mask.extend([False] * len(suffix))
-        start = len(token_ids)
+            flags.extend([TokenFlag.EXACT] * len(suffix))
         token_ids.extend(completion)
-        sampled_spans.append((start, len(token_ids)))
         if len(completion_logprobs) != len(completion):
             completion_logprobs = [math.nan] * len(completion)
         logprobs.extend(completion_logprobs)
-        assistant_mask.extend([True] * len(completion))
+        flags.extend([TokenFlag.EXACT | TokenFlag.SAMPLED] * len(completion))
     if not token_ids:
         raise ValueError("Trajectory contains no trainable choices")
     return TokenizedTrajectory(
         token_ids=token_ids,
         logprobs=logprobs,
-        assistant_mask=assistant_mask,
-        sampled_spans=sampled_spans,
+        flags=flags,
         underlying=trajectory,
     )
 
@@ -985,8 +982,7 @@ def tokenize_one(
     tokenizer = tokenizer_instance
     token_ids: list[int] = []
     logprobs: list[float] = []
-    assistant_mask: list[bool] = []
-    sampled_spans: list[tuple[int, int]] = []
+    flags: list[TokenFlag] = []
     response_histories: dict[
         str, tuple[list[dict[str, Any]] | None, ResponsesExchange]
     ] = {}
@@ -1000,6 +996,8 @@ def tokenize_one(
     for exchange, (prompt, completion, completion_logprobs) in zip(
         exchanges, exact_tokens, strict=True
     ):
+        prompt_is_exact = prompt is not None
+        completion_is_exact = completion is not None
         if isinstance(exchange, CompletionsExchange):
             request_prompt = exchange.request.get("prompt")
             if isinstance(request_prompt, list) and not all(
@@ -1078,7 +1076,9 @@ def tokenize_one(
         if not token_ids:
             token_ids.extend(prompt)
             logprobs.extend([math.nan] * len(prompt))
-            assistant_mask.extend([False] * len(prompt))
+            flags.extend(
+                [TokenFlag.EXACT if prompt_is_exact else TokenFlag(0)] * len(prompt)
+            )
         elif len(prompt) < len(token_ids) or prompt[: len(token_ids)] != token_ids:
             raise ValueError(
                 "Exchanges do not resolve to one append-only token history"
@@ -1087,21 +1087,25 @@ def tokenize_one(
             suffix = prompt[len(token_ids) :]
             token_ids.extend(suffix)
             logprobs.extend([math.nan] * len(suffix))
-            assistant_mask.extend([False] * len(suffix))
+            if prompt_is_exact:
+                flags = [flag | TokenFlag.EXACT for flag in flags]
+            flags.extend(
+                [TokenFlag.EXACT if prompt_is_exact else TokenFlag(0)] * len(suffix)
+            )
         if len(completion_logprobs) != len(completion):
             completion_logprobs = _align_visible_logprobs(
                 tokenizer, completion, exchange
             ) or [math.nan] * len(completion)
-        start = len(token_ids)
         token_ids.extend(completion)
-        sampled_spans.append((start, len(token_ids)))
         logprobs.extend(completion_logprobs)
-        assistant_mask.extend([True] * len(completion))
+        completion_flag = TokenFlag.SAMPLED
+        if completion_is_exact:
+            completion_flag |= TokenFlag.EXACT
+        flags.extend([completion_flag] * len(completion))
 
     return TokenizedTrajectory(
         token_ids=token_ids,
         logprobs=logprobs,
-        assistant_mask=assistant_mask,
-        sampled_spans=sampled_spans,
+        flags=flags,
         underlying=trajectory,
     )

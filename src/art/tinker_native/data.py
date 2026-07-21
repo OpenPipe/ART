@@ -11,6 +11,7 @@ import torch
 
 from ..trajectories import (
     History,
+    TokenFlag,
     TokenizedTrajectory,
     Trajectory,
     TrajectoryGroup,
@@ -284,18 +285,15 @@ def build_datum(
 def _tokenized_trajectory_to_datum(
     tokenized: TokenizedTrajectory, advantage: float
 ) -> tinker.Datum | None:
-    if not (
-        len(tokenized.token_ids)
-        == len(tokenized.logprobs)
-        == len(tokenized.assistant_mask)
-    ):
+    sampled = [bool(flag & TokenFlag.SAMPLED) for flag in tokenized.flags]
+    if not (len(tokenized.token_ids) == len(tokenized.logprobs) == len(sampled)):
         raise ValueError("Tokenized trajectory fields differ in length")
-    if len(tokenized.token_ids) < 2 or not any(tokenized.assistant_mask):
+    if len(tokenized.token_ids) < 2 or not any(sampled):
         return None
-    if tokenized.assistant_mask[0]:
-        raise ValueError("A trainable trajectory cannot start with an assistant token")
+    if sampled[0]:
+        raise ValueError("A trainable trajectory cannot start with a sampled token")
 
-    action_mask = tokenized.assistant_mask[1:]
+    action_mask = sampled[1:]
     if any(
         trainable and math.isnan(logprob)
         for trainable, logprob in zip(action_mask, tokenized.logprobs[1:], strict=True)

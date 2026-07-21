@@ -10,6 +10,7 @@ from collections.abc import (
 )
 from contextlib import asynccontextmanager
 from datetime import datetime
+from enum import IntFlag
 import time
 from types import TracebackType
 from typing import Annotated, Any, Literal, TypeAlias, overload
@@ -54,6 +55,15 @@ from ._serialization import (
 
 # Deliberately open: Pydantic enforces serializability when callers dump in JSON mode.
 MetadataValue = Any
+
+
+class TokenFlag(IntFlag):
+    """Independent facts about a token; members may be combined."""
+
+    # The ID came from inference metadata rather than client-side tokenization.
+    EXACT = 1 << 0
+    # The token belongs to a model-sampled response rather than its prompt.
+    SAMPLED = 1 << 1
 
 
 class ChatCompletionsRequest(TypedDict, total=False, extra_items=Any):
@@ -521,8 +531,7 @@ class TrajectoryGroup(_CompactModel):
 class TokenizedTrajectory(pydantic.BaseModel):
     token_ids: list[int]
     logprobs: list[float]
-    assistant_mask: list[bool]
-    sampled_spans: list[tuple[int, int]]
+    flags: list[TokenFlag]
     underlying: Trajectory
 
 
@@ -708,6 +717,7 @@ __all__ = [
     "TrajectoryGroup",
     "TokenizedTrajectory",
     "TokenizedTrajectoryGroup",
+    "TokenFlag",
     "MetadataValue",
     "current_trajectory",
     "current_trajectory_group",
