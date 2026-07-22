@@ -67,6 +67,7 @@
           "features/checkpoint-forking",
           "features/checkpoint-deletion",
           "features/additional-histories",
+          "features/token-content-attribution",
           "features/tracking-metrics",
           "features/mcp-rl"
         ]

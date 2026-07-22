@@ -248,8 +248,11 @@ def _completion_tokens(
 
 def _responses_tokens(
     response: Response,
-) -> tuple[None, list[int] | None, list[float]]:
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
     data = _dump(response)
+    prompt_ids = _exact_token_ids(
+        data.get("prompt_token_ids"), field="Responses prompt_token_ids"
+    )
     if "raw_output_tokens" in data:
         token_ids, logprobs = _pairs(
             data["raw_output_tokens"],
@@ -257,7 +260,7 @@ def _responses_tokens(
             field="Responses raw_output_tokens",
         )
         if token_ids or not data.get("output"):
-            return None, token_ids, logprobs
+            return prompt_ids, token_ids, logprobs
     token_ids: list[int] = []
     logprobs: list[float] = []
     saw_rendered_output = False
@@ -282,14 +285,17 @@ def _responses_tokens(
             token_ids.extend(pair_ids)
             logprobs.extend(pair_logprobs)
     if saw_rendered_output and complete:
-        return None, token_ids, logprobs
-    return None, None, []
+        return prompt_ids, token_ids, logprobs
+    return prompt_ids, None, []
 
 
 def _messages_tokens(
     response: Message,
-) -> tuple[None, list[int] | None, list[float]]:
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
     data = _dump(response)
+    prompt_ids = _exact_token_ids(
+        data.get("prompt_token_ids"), field="Messages prompt_token_ids"
+    )
     token_ids = _exact_token_ids(data.get("token_ids"), field="Messages token_ids")
     if token_ids == [] and data.get("content"):
         token_ids = None
@@ -299,7 +305,7 @@ def _messages_tokens(
     ]
     if token_ids is None or len(logprobs) != len(token_ids):
         logprobs = [math.nan] * len(token_ids or [])
-    return None, token_ids, logprobs
+    return prompt_ids, token_ids, logprobs
 
 
 def _exchange_list(trajectory: Trajectory, model: str | None) -> list[Exchange]:
@@ -983,9 +989,25 @@ def tokenize_one(
     token_ids: list[int] = []
     logprobs: list[float] = []
     flags: list[TokenFlag] = []
+    content_mask: list[bool] | None = []
+    content_renderer: str | None = None
+    content_base_model = base_model or (
+        selected_model if not selected_model.startswith("wandb-artifact:///") else None
+    )
+    if content_base_model is None or any(
+        isinstance(exchange, CompletionsExchange) for exchange in exchanges
+    ):
+        content_mask = None
+    else:
+        from ._content import _renderer_name
+
+        content_renderer = _renderer_name(content_base_model)
+        if content_renderer is None:
+            content_mask = None
     response_histories: dict[
         str, tuple[list[dict[str, Any]] | None, ResponsesExchange]
     ] = {}
+    artifact_content_config: _TokenizerConfig | None = None
 
     def fallback_config() -> _TokenizerConfig:
         nonlocal config
@@ -1052,6 +1074,109 @@ def tokenize_one(
                 chat_template_kwargs=chat_template_kwargs,
                 messages_override=messages_override,
             )
+        prompt_content_mask: list[bool] | None = None
+        if content_mask is not None:
+            if isinstance(exchange, CompletionsExchange):
+                raise AssertionError("raw Completions cannot have CONTENT attribution")
+            if not prompt_is_exact or content_base_model is None:
+                content_mask = None
+            else:
+                try:
+                    # Reuse the same revision/template metadata as fallback
+                    # tokenization. In particular, artifact-backed trajectories
+                    # must not load an unpinned base-model tokenizer or hide an
+                    # artifact-provided custom template from the fail-closed
+                    # CONTENT check.
+                    if selected_model.startswith("wandb-artifact:///"):
+                        if artifact_content_config is None:
+                            artifact_content_config = _tokenizer_config(
+                                selected_model, base_model
+                            )
+                        resolved_content_config = artifact_content_config
+                        config = resolved_content_config
+                    else:
+                        resolved_content_config = fallback_config()
+                    if tokenizer is None:
+                        tokenizer = _load_tokenizer(resolved_content_config)
+                except Exception:
+                    content_mask = None
+                if content_mask is not None and tokenizer is not None:
+                    from ._content import content_mask_for_exact_prompt
+
+                    request_kwargs = exchange.request.get("chat_template_kwargs")
+                    content_kwargs = {
+                        **(
+                            config.chat_template_kwargs
+                            if config is not None and config.chat_template_kwargs
+                            else {}
+                        ),
+                        **(request_kwargs if isinstance(request_kwargs, dict) else {}),
+                        **(chat_template_kwargs or {}),
+                    }
+                    if isinstance(exchange, MessagesExchange) and isinstance(
+                        thinking := exchange.request.get("thinking"), dict
+                    ):
+                        content_kwargs.setdefault(
+                            "enable_thinking", thinking.get("type") == "enabled"
+                        )
+                        if budget := thinking.get("budget_tokens"):
+                            content_kwargs.setdefault("thinking_budget", budget)
+                    reasoning_effort: object = exchange.request.get("reasoning_effort")
+                    if isinstance(exchange, ResponsesExchange) and isinstance(
+                        reasoning := exchange.request.get("reasoning"), dict
+                    ):
+                        reasoning_effort = reasoning.get("effort")
+                    if isinstance(exchange, MessagesExchange):
+                        if (
+                            isinstance(
+                                output_config := exchange.request.get("output_config"),
+                                dict,
+                            )
+                            and output_config.get("effort") is not None
+                        ):
+                            reasoning_effort = output_config["effort"]
+                        elif isinstance(
+                            thinking := exchange.request.get("thinking"), dict
+                        ):
+                            reasoning_effort = (
+                                "high" if thinking.get("type") == "enabled" else "none"
+                            )
+                    if isinstance(reasoning_effort, str):
+                        if content_renderer == "gpt-oss":
+                            content_kwargs.setdefault(
+                                "reasoning_effort", reasoning_effort
+                            )
+                        else:
+                            content_kwargs.setdefault(
+                                "enable_thinking", reasoning_effort != "none"
+                            )
+                    if content_renderer == "gpt-oss":
+                        content_kwargs.setdefault(
+                            "conversation_start_date",
+                            exchange.start_time.strftime("%Y-%m-%d"),
+                        )
+                    messages, tools = _request_messages(exchange, messages_override)
+                    prompt_content_mask = content_mask_for_exact_prompt(
+                        tokenizer=tokenizer,
+                        base_model=content_base_model,
+                        messages=messages,
+                        tools=tools,
+                        expected_prompt_ids=prompt,
+                        chat_template_kwargs=content_kwargs,
+                        has_custom_chat_template=bool(
+                            getattr(tokenizer, "_art_custom_chat_template", False)
+                        )
+                        or any(
+                            value is not None
+                            for value in (
+                                chat_template,
+                                exchange.request.get("chat_template"),
+                                config.chat_template if config is not None else None,
+                            )
+                        ),
+                    )
+                    if prompt_content_mask is None:
+                        content_mask = None
         if completion is None:
             resolved_config = fallback_config()
             if tokenizer is None:
@@ -1092,6 +1217,14 @@ def tokenize_one(
             flags.extend(
                 [TokenFlag.EXACT if prompt_is_exact else TokenFlag(0)] * len(suffix)
             )
+        if content_mask is not None:
+            if (
+                prompt_content_mask is None
+                or prompt_content_mask[: len(content_mask)] != content_mask
+            ):
+                content_mask = None
+            else:
+                content_mask.extend(prompt_content_mask[len(content_mask) :])
         if len(completion_logprobs) != len(completion):
             completion_logprobs = _align_visible_logprobs(
                 tokenizer, completion, exchange
@@ -1102,10 +1235,31 @@ def tokenize_one(
         if completion_is_exact:
             completion_flag |= TokenFlag.EXACT
         flags.extend([completion_flag] * len(completion))
+        if content_mask is not None and not completion_is_exact:
+            # A rendered completion may contain template-added turn wrappers in
+            # addition to the visible assistant body. Without engine output IDs
+            # ART cannot prove where that sampled/body boundary falls.
+            content_mask = None
+        if content_mask is not None:
+            # Preserve the established SAMPLED boundary: every token the engine
+            # reports as model-sampled is assistant content, including a sampled
+            # turn-close token. Renderer-added post-turn separators are prompt
+            # scaffold and are classified on the next exact prompt.
+            content_mask.extend([True] * len(completion))
+
+    content_attribution_complete = content_mask is not None and len(
+        content_mask
+    ) == len(flags)
+    if content_attribution_complete:
+        flags = [
+            flag | TokenFlag.CONTENT if is_content else flag
+            for flag, is_content in zip(flags, content_mask, strict=True)
+        ]
 
     return TokenizedTrajectory(
         token_ids=token_ids,
         logprobs=logprobs,
         flags=flags,
+        content_attribution_complete=content_attribution_complete,
         underlying=trajectory,
     )

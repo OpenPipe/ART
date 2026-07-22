@@ -96,6 +96,8 @@ def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
     response: ChatCompletion | None = None
     choices: dict[int, ChatCompletion] = {}
     done = False
+    prompt_token_ids: list[int] | None = None
+    prompt_ids_invalid = False
     for _, payload in _sse_events(body):
         if payload == "[DONE]":
             done = True
@@ -121,6 +123,17 @@ def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
             ):
                 continue
             raise
+        raw_prompt = getattr(chunk, "prompt_token_ids", None)
+        if raw_prompt is not None:
+            if not isinstance(raw_prompt, list) or not all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in raw_prompt
+            ):
+                prompt_ids_invalid = True
+            elif prompt_token_ids is not None and raw_prompt != prompt_token_ids:
+                prompt_ids_invalid = True
+            else:
+                prompt_token_ids = raw_prompt
         if response is None:
             response = init_chat_completion(chunk.model_copy(update={"choices": []}))
         update_chat_completion(response, chunk.model_copy(update={"choices": []}))
@@ -134,6 +147,10 @@ def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
     if response is None or not done:
         raise ValueError("Incomplete Chat Completions stream")
     response.choices = [choices[index].choices[0] for index in sorted(choices)]
+    if prompt_ids_invalid:
+        (response.model_extra or {}).pop("prompt_token_ids", None)
+        for choice in response.choices:
+            (choice.model_extra or {}).pop("prompt_token_ids", None)
     return response
 
 
@@ -200,17 +217,42 @@ def _responses_response(body: bytes, *, stream: bool) -> Response:
     if not stream:
         return Response.model_validate_json(body)
     completed: dict[str, Any] | None = None
+    exact_metadata: dict[str, object] = {}
+    invalid_exact_metadata: set[str] = set()
     for event_name, payload in _sse_events(body):
-        if isinstance(payload, dict) and (
+        if not isinstance(payload, dict):
+            continue
+        nested = payload.get("response")
+        for candidate in (payload, nested if isinstance(nested, dict) else {}):
+            for field in ("prompt_token_ids", "raw_output_tokens"):
+                if field in candidate:
+                    value = candidate[field]
+                    valid = isinstance(value, list)
+                    if field == "prompt_token_ids":
+                        valid = valid and all(
+                            isinstance(token_id, int) and not isinstance(token_id, bool)
+                            for token_id in value
+                        )
+                    if (
+                        not valid
+                        or field in exact_metadata
+                        and exact_metadata[field] != value
+                    ):
+                        invalid_exact_metadata.add(field)
+                        exact_metadata.pop(field, None)
+                    elif field not in invalid_exact_metadata:
+                        exact_metadata[field] = value
+        if (
             event_name == "response.completed"
             or payload.get("type") == "response.completed"
-        ):
-            value = payload.get("response")
-            if isinstance(value, dict):
-                completed = value
+        ) and isinstance(nested, dict):
+            completed = nested
     if completed is None:
         raise ValueError("Incomplete Responses stream")
-    return Response.model_validate(completed)
+    completed = dict(completed)
+    for field in invalid_exact_metadata:
+        completed.pop(field, None)
+    return Response.model_validate({**completed, **exact_metadata})
 
 
 def _messages_response(body: bytes, *, stream: bool) -> Message:
@@ -221,11 +263,31 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
     complete = False
     token_ids: list[int] = []
     logprobs: list[float] = []
+    prompt_token_ids: list[int] = []
+    prompt_ids_invalid = False
     for event_name, payload in _sse_events(body):
         if not isinstance(payload, dict):
             continue
         if event_name and "type" not in payload:
             payload = {**payload, "type": event_name}
+        nested_message = payload.get("message")
+        candidates = (
+            payload,
+            nested_message if isinstance(nested_message, dict) else {},
+        )
+        for candidate in candidates:
+            if "prompt_token_ids" not in candidate:
+                continue
+            values = candidate["prompt_token_ids"]
+            if not isinstance(values, list) or not all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in values
+            ):
+                prompt_ids_invalid = True
+            elif prompt_token_ids and values != prompt_token_ids:
+                prompt_ids_invalid = True
+            else:
+                prompt_token_ids = values
         event = adapter.validate_python(payload)
         snapshot = accumulate_event(
             event=event,
@@ -247,10 +309,13 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
     if snapshot is None or not complete:
         raise ValueError("Incomplete Messages stream")
     data = snapshot.model_dump(mode="python")
+    data.pop("prompt_token_ids", None)
     if token_ids:
         data["token_ids"] = token_ids
     if logprobs:
         data["logprobs"] = logprobs
+    if prompt_token_ids and not prompt_ids_invalid:
+        data["prompt_token_ids"] = prompt_token_ids
     return Message.model_validate(data)
 
 

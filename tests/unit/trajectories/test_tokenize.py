@@ -153,6 +153,329 @@ def test_exact_tokens_form_one_append_only_history_without_tokenizer(
     assert tokenized.logprobs[3] == -0.4
 
 
+def test_content_flags_require_complete_exact_prompt_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = "Qwen/Qwen3-0.6B"
+    first = _chat_exchange([1, 2], [3], model=model, offset=0)
+    second = _chat_exchange([1, 2, 3, 4, 5], [6], model=model, offset=1)
+    second.request["messages"] = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "tool", "content": "result", "tool_call_id": "call-1"},
+    ]
+    prompt_masks = {
+        (1, 2): [False, True],
+        (1, 2, 3, 4, 5): [False, True, True, False, True],
+    }
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: object()
+    )
+    monkeypatch.setattr(
+        "art.trajectories._content.content_mask_for_exact_prompt",
+        lambda **kwargs: prompt_masks[tuple(kwargs["expected_prompt_ids"])],
+    )
+
+    tokenized = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=[first, second]))
+    )
+
+    assert tokenized.token_ids == [1, 2, 3, 4, 5, 6]
+    assert tokenized.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.CONTENT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED | art.TokenFlag.CONTENT,
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.CONTENT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED | art.TokenFlag.CONTENT,
+    ]
+    assert tokenized.content_attribution_complete is True
+
+
+def test_gpt_oss_content_uses_sampling_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _chat_exchange([1, 2], [3], model="openai/gpt-oss-20b", offset=0)
+    exchange.start_time = datetime(2024, 7, 3, 23, 59)
+    seen_kwargs: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: object()
+    )
+
+    def content_mask(**kwargs: object) -> list[bool]:
+        template_kwargs = kwargs["chat_template_kwargs"]
+        assert isinstance(template_kwargs, dict)
+        for key, value in template_kwargs.items():
+            assert isinstance(key, str)
+            seen_kwargs[key] = value
+        expected = kwargs["expected_prompt_ids"]
+        assert isinstance(expected, list)
+        return [True] * len(expected)
+
+    monkeypatch.setattr(
+        "art.trajectories._content.content_mask_for_exact_prompt", content_mask
+    )
+
+    tokenized = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=[exchange]))
+    )
+
+    assert seen_kwargs["conversation_start_date"] == "2024-07-03"
+    assert tokenized.content_attribution_complete is True
+
+
+def test_artifact_content_reuses_pinned_renderer_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = "wandb-artifact:///entity/project/run:step0"
+    exchanges = [
+        _chat_exchange([1], [2], model=model),
+        _chat_exchange([1, 2, 3], [4], model=model, offset=1),
+    ]
+    loaded_configs: list[object] = []
+    seen: dict[str, object] = {}
+    artifact_lookups = 0
+
+    def artifact_config(_model: str) -> SimpleNamespace:
+        nonlocal artifact_lookups
+        artifact_lookups += 1
+        return SimpleNamespace(
+            base_model="Qwen/Qwen3-0.6B",
+            revision="pinned-revision",
+            chat_template="artifact-template",
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._artifact_config",
+        artifact_config,
+    )
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer",
+        lambda config: loaded_configs.append(config) or object(),
+    )
+
+    def content_mask(**kwargs: object) -> list[bool]:
+        seen.update(kwargs)
+        expected = kwargs["expected_prompt_ids"]
+        assert isinstance(expected, list)
+        return [True] * len(expected)
+
+    monkeypatch.setattr(
+        "art.trajectories._content.content_mask_for_exact_prompt", content_mask
+    )
+
+    tokenized = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=exchanges)),
+        base_model="Qwen/Qwen3-0.6B",
+    )
+
+    assert artifact_lookups == 1
+    assert len(loaded_configs) == 1
+    config = loaded_configs[0]
+    assert getattr(config, "revision") == "pinned-revision"
+    assert seen["chat_template_kwargs"] == {"enable_thinking": False}
+    assert seen["has_custom_chat_template"] is True
+    assert tokenized.content_attribution_complete is True
+
+
+def test_content_attribution_fails_closed_on_any_prompt_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = "Qwen/Qwen3-0.6B"
+    first = _chat_exchange([1], [2], model=model, offset=0)
+    second = _chat_exchange([1, 2, 3], [4], model=model, offset=1)
+    calls = 0
+
+    def content_mask(**kwargs: object) -> list[bool] | None:
+        nonlocal calls
+        calls += 1
+        expected = kwargs["expected_prompt_ids"]
+        assert isinstance(expected, list)
+        return [True] * len(expected) if calls == 1 else None
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: object()
+    )
+    monkeypatch.setattr(
+        "art.trajectories._content.content_mask_for_exact_prompt", content_mask
+    )
+
+    tokenized = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=[first, second]))
+    )
+
+    assert tokenized.content_attribution_complete is False
+    assert all(not flag & art.TokenFlag.CONTENT for flag in tokenized.flags)
+
+
+def test_content_attribution_fails_closed_on_inconsistent_history_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = "Qwen/Qwen3-0.6B"
+    first = _chat_exchange([1], [2], model=model, offset=0)
+    second = _chat_exchange([1, 2, 3], [4], model=model, offset=1)
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: object()
+    )
+    monkeypatch.setattr(
+        "art.trajectories._content.content_mask_for_exact_prompt",
+        lambda **kwargs: (
+            [False] if kwargs["expected_prompt_ids"] == [1] else [True, False, True]
+        ),
+    )
+
+    tokenized = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=[first, second]))
+    )
+
+    assert tokenized.content_attribution_complete is False
+    assert all(not flag & art.TokenFlag.CONTENT for flag in tokenized.flags)
+
+
+def test_content_attribution_requires_exact_sampled_token_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = "Qwen/Qwen3-0.6B"
+    exchange = _chat_exchange([1], [2], model=model)
+    choice = exchange.response.choices[0]
+    assert choice.model_extra is not None
+    choice.model_extra.pop("token_ids")
+    choice.logprobs = None
+
+    class Tokenizer:
+        def apply_chat_template(
+            self, _messages: object, *, add_generation_prompt: bool, **_kwargs: object
+        ) -> list[int]:
+            return [1] if add_generation_prompt else [1, 2]
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
+    )
+    monkeypatch.setattr(
+        "art.trajectories._content.content_mask_for_exact_prompt",
+        lambda **_kwargs: [True],
+    )
+
+    tokenized = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=[exchange]))
+    )
+
+    assert tokenized.token_ids == [1, 2]
+    assert tokenized.flags == [art.TokenFlag.EXACT, art.TokenFlag.SAMPLED]
+    assert tokenized.content_attribution_complete is False
+
+
+def test_content_attribution_is_unavailable_for_base_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _chat_exchange([1], [2], model="Qwen/Qwen3-0.6B-Base")
+    monkeypatch.setattr(
+        "art.trajectories._content.content_mask_for_exact_prompt",
+        lambda **_kwargs: pytest.fail("base models must not use a CONTENT renderer"),
+    )
+
+    tokenized = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=[exchange]))
+    )
+
+    assert tokenized.content_attribution_complete is False
+    assert all(not flag & art.TokenFlag.CONTENT for flag in tokenized.flags)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "google/gemma-4-31B-it",
+        "google/gemma-4-26B-A4B-it",
+        "deepseek-ai/DeepSeek-V4-Flash",
+        "deepseek-ai/DeepSeek-V4-Pro",
+    ],
+)
+def test_content_attribution_is_unavailable_without_a_qualified_renderer(
+    model: str,
+) -> None:
+    exchange = _chat_exchange([1], [2], model=model)
+
+    tokenized = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=[exchange]))
+    )
+
+    assert tokenized.content_attribution_complete is False
+    assert all(not flag & art.TokenFlag.CONTENT for flag in tokenized.flags)
+
+
+def test_content_attribution_is_unavailable_for_raw_completions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "art.trajectories._content.content_mask_for_exact_prompt",
+        lambda **_kwargs: pytest.fail("raw Completions have no message bodies"),
+    )
+
+    tokenized = art.tokenize_trajectory(
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(completions=[_completion_exchange()])
+        ),
+        base_model="Qwen/Qwen3-0.6B",
+    )
+
+    assert tokenized.content_attribution_complete is False
+    assert all(not flag & art.TokenFlag.CONTENT for flag in tokenized.flags)
+
+
+def test_empty_renderer_content_signal_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import renderers
+
+    class Renderer:
+        def render(self, *_args: object, **_kwargs: object) -> object:
+            return SimpleNamespace(token_ids=[1], is_content=[])
+
+    monkeypatch.setattr(renderers, "config_from_name", lambda _name: object())
+    monkeypatch.setattr(
+        renderers, "create_renderer", lambda *_args, **_kwargs: Renderer()
+    )
+
+    from art.trajectories._content import content_mask_for_exact_prompt
+
+    assert (
+        content_mask_for_exact_prompt(
+            tokenizer=object(),
+            base_model="Qwen/Qwen3-0.6B",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=None,
+            expected_prompt_ids=[1],
+            chat_template_kwargs={},
+            has_custom_chat_template=False,
+        )
+        is None
+    )
+
+
+def test_empty_content_selection_mean_is_nan() -> None:
+    np = pytest.importorskip("numpy")
+    losses = np.asarray([1.0, 2.0])
+    empty_mask = np.asarray([False, False])
+
+    with pytest.warns(RuntimeWarning):
+        mean = losses[empty_mask].mean()
+
+    assert math.isnan(mean)
+
+
+def test_empty_pytorch_content_selection_mean_is_nan() -> None:
+    torch = pytest.importorskip("torch")
+    losses = torch.tensor([1.0, 2.0])
+    empty_mask = torch.tensor([False, False])
+
+    assert torch.isnan(losses[empty_mask].mean())
+
+
 def test_malformed_explicit_exact_token_metadata_fails_closed() -> None:
     chat = _chat_exchange([1], [2])
     chat_extra = chat.response.choices[0].model_extra
@@ -743,6 +1066,119 @@ def _response_with_content_logprobs(*, exact_second: bool) -> ResponsesExchange:
     return exchange
 
 
+def test_responses_and_messages_preserve_exact_prompt_ids() -> None:
+    response = _response_exchange("response-exact-prompt", 12)
+    response_extra = response.response.model_extra
+    assert response_extra is not None
+    response_extra["prompt_token_ids"] = [10, 11]
+
+    message_response = Message.model_validate(
+        {
+            "id": "message-exact-prompt",
+            "type": "message",
+            "role": "assistant",
+            "model": "test/model",
+            "content": [{"type": "text", "text": "answer"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+            "prompt_token_ids": [20, 21],
+            "token_ids": [22],
+        }
+    )
+    start = datetime(2026, 1, 1)
+    message = MessagesExchange(
+        request=MessagesRequest(
+            model="test/model",
+            messages=[{"role": "user", "content": "question"}],
+            max_tokens=16,
+        ),
+        response=message_response,
+        start_time=start,
+        end_time=start + timedelta(milliseconds=1),
+    )
+
+    response_result = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[response]))
+    )
+    message_result = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(messages=[message]))
+    )
+
+    assert response_result.token_ids == [10, 11, 12]
+    assert message_result.token_ids == [20, 21, 22]
+    assert response_result.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+    assert message_result.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+
+
+def test_responses_and_messages_use_exact_prompts_for_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = "Qwen/Qwen3-0.6B"
+    response = _response_exchange("response-content", 12)
+    response.request["model"] = model
+    response.response.model = model
+    assert response.response.model_extra is not None
+    response.response.model_extra["prompt_token_ids"] = [10, 11]
+
+    message_response = Message.model_validate(
+        {
+            "id": "message-content",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": "answer"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+            "prompt_token_ids": [20, 21],
+            "token_ids": [22],
+        }
+    )
+    start = datetime(2026, 1, 1)
+    message = MessagesExchange(
+        request=MessagesRequest(
+            model=model,
+            messages=[{"role": "user", "content": "question"}],
+            max_tokens=16,
+        ),
+        response=message_response,
+        start_time=start,
+        end_time=start + timedelta(milliseconds=1),
+    )
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: object()
+    )
+    monkeypatch.setattr(
+        "art.trajectories._content.content_mask_for_exact_prompt",
+        lambda **kwargs: (
+            [False, True]
+            if len(kwargs["expected_prompt_ids"]) == 2
+            else pytest.fail("unexpected prompt")
+        ),
+    )
+
+    for exchange_type, exchange in (("responses", response), ("messages", message)):
+        result = art.tokenize_trajectory(
+            art.Trajectory(exchanges=TrajectoryExchanges(**{exchange_type: [exchange]}))
+        )
+        assert result.content_attribution_complete is True
+        assert result.flags == [
+            art.TokenFlag.EXACT,
+            art.TokenFlag.EXACT | art.TokenFlag.CONTENT,
+            art.TokenFlag.EXACT | art.TokenFlag.SAMPLED | art.TokenFlag.CONTENT,
+        ]
+
+
 def test_responses_aggregates_complete_exact_pairs_across_content_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1001,6 +1437,34 @@ def test_responses_previous_response_id_resolves_local_history(
     second.request["previous_response_id"] = "missing"
     with pytest.raises(ValueError, match="outside this trajectory"):
         art.tokenize_trajectory(trajectory, base_model="base/model")
+
+
+def test_content_attribution_covers_responses_continuations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = "Qwen/Qwen3-0.6B"
+    first = _response_exchange("resp-1", 20)
+    second = _response_exchange("resp-2", 30, previous_response_id="resp-1", offset=1)
+    for exchange, prompt in ((first, [10]), (second, [10, 20, 11])):
+        exchange.request["model"] = model
+        assert exchange.response.model_extra is not None
+        exchange.response.model_extra["prompt_token_ids"] = prompt
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: object()
+    )
+    monkeypatch.setattr(
+        "art.trajectories._content.content_mask_for_exact_prompt",
+        lambda **kwargs: [True] * len(kwargs["expected_prompt_ids"]),
+    )
+
+    tokenized = art.tokenize_trajectory(
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[first, second]))
+    )
+
+    assert tokenized.token_ids == [10, 20, 11, 30]
+    assert tokenized.content_attribution_complete is True
+    assert all(flag & art.TokenFlag.CONTENT for flag in tokenized.flags)
 
 
 def test_exchange_trajectories_feed_existing_training_tokenizer(

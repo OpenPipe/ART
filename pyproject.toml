@@ -45,6 +45,7 @@ backend = [
     "gql>=4.0.0",
     "nvidia-cudnn-frontend<1.21 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
+    "renderers==0.1.8",
 ]
 megatron = [
     "numpy<2",
@@ -73,6 +74,7 @@ megatron = [
     "transformers==5.12.1",
     "scipy>=1.17.0",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
+    "renderers==0.1.8",
 ]
 
 langgraph = [
@@ -332,6 +334,7 @@ dev = [
     "prek>=0.2.29",
     "uv>=0.11.7",
     "skypilot[cudo,do,fluidstack,gcp,kubernetes,lambda,paperspace,runpod]==0.11.1",
+    "renderers==0.1.8",
 ]
 
 [tool.uv.sources]

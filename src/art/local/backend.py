@@ -208,6 +208,7 @@ def _apply_configured_chat_template(
     chat_template = _configured_chat_template_value(internal_config)
     if chat_template is not None:
         tokenizer.chat_template = chat_template
+        setattr(tokenizer, "_art_custom_chat_template", True)
 
 
 def _model_support_handler(
