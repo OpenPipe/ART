@@ -9,11 +9,21 @@ from collections.abc import (
     Mapping,
 )
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from enum import IntFlag
 import time
 from types import TracebackType
-from typing import Annotated, Any, Literal, TypeAlias, overload
+from typing import (
+    Annotated,
+    Any,
+    Generic,
+    Literal,
+    Protocol,
+    TypeAlias,
+    TypeVar,
+    overload,
+)
 
 from anthropic.types import (
     Message as AnthropicMessage,
@@ -43,6 +53,9 @@ from openai.types.responses import (
 from openai.types.responses import (
     ToolParam as ResponsesToolParam,
 )
+from openai.types.responses.response_create_params import (
+    Conversation as ResponsesConversation,
+)
 import pydantic
 from typing_extensions import TypedDict, deprecated
 
@@ -55,6 +68,23 @@ from ._serialization import (
 
 # Deliberately open: Pydantic enforces serializability when callers dump in JSON mode.
 MetadataValue = Any
+
+
+class Tokenizer(Protocol):
+    """Minimal tokenizer surface used by trajectory tokenization."""
+
+    def __call__(self, text: str, *, add_special_tokens: bool = False) -> object: ...
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: object,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        chat_template: str | None = None,
+        **kwargs: object,
+    ) -> object: ...
 
 
 class TokenFlag(IntFlag):
@@ -96,6 +126,7 @@ class CompletionsRequest(TypedDict, total=False, extra_items=Any):
     echo: bool
     stop: str | list[str]
     seed: int
+    suffix: str
 
 
 class ResponsesRequest(TypedDict, total=False, extra_items=Any):
@@ -105,6 +136,7 @@ class ResponsesRequest(TypedDict, total=False, extra_items=Any):
     input: str | ResponseInputParam
     instructions: str
     previous_response_id: str
+    conversation: ResponsesConversation
     stream: bool
     tools: list[ResponsesToolParam]
     max_output_tokens: int
@@ -216,7 +248,7 @@ class PydanticException(pydantic.BaseModel):
     traceback: str
 
 
-class History(pydantic.BaseModel):
+class LegacyHistory(pydantic.BaseModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
 
@@ -227,18 +259,112 @@ class History(pydantic.BaseModel):
     def messages(self) -> Messages:
         return get_messages(self.messages_and_choices)
 
-    def as_chat_completions_history(self) -> ChatCompletionsHistory:
+    def as_chat_completions_history(
+        self, *, model: str | None = None
+    ) -> ChatCompletionsHistory:
         from ._history import legacy_as_chat_completions_history
 
-        return legacy_as_chat_completions_history(self)
+        return legacy_as_chat_completions_history(self, model=model)
+
+    def tokenize(
+        self,
+        *,
+        model: str,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+    ) -> TokenizedHistory:
+        from ._tokenize import tokenize_history
+
+        return tokenize_history(
+            self,
+            model=model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
 
-class ChatCompletionsHistory(pydantic.BaseModel):
+class History:
+    """Mutable, protocol-native view of one tokenizable sequence."""
+
     model: str | None
-    messages: Annotated[pydantic.SerializeAsAny[Messages], pydantic.SkipValidation]
-    tools: Annotated[pydantic.SerializeAsAny[Tools | None], pydantic.SkipValidation] = (
-        None
-    )
+
+    def as_chat_completions_history(self) -> ChatCompletionsHistory:
+        raise ValueError(
+            f"{type(self).__name__} cannot be represented as Chat Completions"
+        )
+
+    def tokenize(
+        self,
+        *,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+    ) -> TokenizedHistory:
+        from ._tokenize import tokenize_history
+
+        return tokenize_history(
+            self,
+            model=self.model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ChatCompletionsMessageSource:
+    exchange: ChatCompletionsExchange | MessagesExchange | ResponsesExchange
+    request_index: int | None = None
+    choice_index: int | None = None
+    output_index: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AnthropicMessageSource:
+    exchange: MessagesExchange
+    request_index: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResponsesItemSource:
+    exchange: ResponsesExchange
+    request_index: int | None = None
+    output_index: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionsSource:
+    exchange: CompletionsExchange
+    prompt_index: int
+    choice_index: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionsTokenSourceSpan:
+    start: int
+    end: int
+    source: CompletionsSource | None
+
+
+@dataclass(frozen=True, slots=True)
+class CompletionsStringSourceSpan:
+    start: int
+    end: int
+    source: CompletionsSource | None
+
+
+@dataclass
+class ChatCompletionsHistory(History):
+    model: str | None
+    messages: Messages
+    message_sources: list[ChatCompletionsMessageSource | None]
+    tools: Tools | None = None
     chat_template: str | None = None
     chat_template_kwargs: dict[str, Any] | None = None
 
@@ -246,23 +372,14 @@ class ChatCompletionsHistory(pydantic.BaseModel):
         return self
 
 
-class AnthropicMessagesHistory(pydantic.BaseModel):
+@dataclass
+class AnthropicMessagesHistory(History):
     model: str
-    system: Annotated[
-        pydantic.SerializeAsAny[str | list[AnthropicTextBlockParam] | None],
-        pydantic.SkipValidation,
-    ] = None
-    messages: Annotated[
-        pydantic.SerializeAsAny[list[AnthropicMessageParam]], pydantic.SkipValidation
-    ]
-    tools: Annotated[
-        pydantic.SerializeAsAny[list[AnthropicToolParam] | None],
-        pydantic.SkipValidation,
-    ] = None
-    thinking: Annotated[
-        pydantic.SerializeAsAny[AnthropicThinkingConfigParam | None],
-        pydantic.SkipValidation,
-    ] = None
+    messages: list[AnthropicMessageParam]
+    message_sources: list[AnthropicMessageSource | None]
+    system: str | list[AnthropicTextBlockParam] | None = None
+    system_source: MessagesExchange | None = None
+    tools: list[AnthropicToolParam] | None = None
     chat_template: str | None = None
     chat_template_kwargs: dict[str, Any] | None = None
 
@@ -272,16 +389,16 @@ class AnthropicMessagesHistory(pydantic.BaseModel):
         return anthropic_as_chat_completions_history(self)
 
 
-class ResponsesHistory(pydantic.BaseModel):
+@dataclass
+class ResponsesHistory(History):
     model: str
-    input: Annotated[
-        pydantic.SerializeAsAny[ResponseInputParam], pydantic.SkipValidation
-    ]
+    input: ResponseInputParam
+    input_sources: list[ResponsesItemSource | None]
     instructions: str | None = None
-    tools: Annotated[
-        pydantic.SerializeAsAny[list[ResponsesToolParam] | None],
-        pydantic.SkipValidation,
-    ] = None
+    instructions_source: ResponsesExchange | None = None
+    tools: list[ResponsesToolParam] | None = None
+    conversation: ResponsesConversation | None = None
+    previous_response_id: str | None = None
     chat_template: str | None = None
     chat_template_kwargs: dict[str, Any] | None = None
 
@@ -291,9 +408,22 @@ class ResponsesHistory(pydantic.BaseModel):
         return responses_as_chat_completions_history(self)
 
 
-class CompletionsHistory(pydantic.BaseModel):
+@dataclass
+class CompletionsTokenHistory(History):
     model: str
-    token_ids: list[int]
+    prompt: list[int]
+    prompt_sources: list[CompletionsTokenSourceSpan]
+    sampled_spans: list[tuple[int, int]]
+
+    def as_chat_completions_history(self) -> ChatCompletionsHistory:
+        raise ValueError("Raw Completions history has no chat-message structure")
+
+
+@dataclass
+class CompletionsStringHistory(History):
+    model: str
+    prompt: str
+    prompt_sources: list[CompletionsStringSourceSpan]
     sampled_spans: list[tuple[int, int]]
 
     def as_chat_completions_history(self) -> ChatCompletionsHistory:
@@ -301,11 +431,12 @@ class CompletionsHistory(pydantic.BaseModel):
 
 
 TrajectoryHistory: TypeAlias = (
-    History
+    LegacyHistory
     | ChatCompletionsHistory
     | AnthropicMessagesHistory
     | ResponsesHistory
-    | CompletionsHistory
+    | CompletionsTokenHistory
+    | CompletionsStringHistory
 )
 
 
@@ -316,7 +447,7 @@ class Trajectory(_CompactModel):
         exclude_if=lambda value: not value,
     )
     tools: Tools | None = None
-    additional_histories: list[History] = pydantic.Field(
+    additional_histories: list[LegacyHistory] = pydantic.Field(
         default_factory=list,
     )
     reward: float = 0.0
@@ -385,6 +516,13 @@ class Trajectory(_CompactModel):
 
         return chat_completions_history(self, model=model)
 
+    def chat_completions_histories(
+        self, *, model: str | None = None
+    ) -> list[ChatCompletionsHistory]:
+        from ._history import chat_completions_histories
+
+        return chat_completions_histories(self, model=model)
+
     def anthropic_messages_history(
         self, *, model: str | None = None
     ) -> AnthropicMessagesHistory:
@@ -392,20 +530,108 @@ class Trajectory(_CompactModel):
 
         return anthropic_messages_history(self, model=model)
 
+    def anthropic_messages_histories(
+        self, *, model: str | None = None
+    ) -> list[AnthropicMessagesHistory]:
+        from ._history import anthropic_messages_histories
+
+        return anthropic_messages_histories(self, model=model)
+
     def responses_history(self, *, model: str | None = None) -> ResponsesHistory:
         from ._history import responses_history
 
         return responses_history(self, model=model)
 
-    def completions_history(self, *, model: str | None = None) -> CompletionsHistory:
-        from ._history import completions_history
+    def responses_histories(
+        self, *, model: str | None = None
+    ) -> list[ResponsesHistory]:
+        from ._history import responses_histories
 
-        return completions_history(self, model=model)
+        return responses_histories(self, model=model)
+
+    def completions_token_history(
+        self, *, model: str | None = None
+    ) -> CompletionsTokenHistory:
+        from ._history import completions_token_history
+
+        return completions_token_history(self, model=model)
+
+    def completions_token_histories(
+        self, *, model: str | None = None
+    ) -> list[CompletionsTokenHistory]:
+        from ._history import completions_token_histories
+
+        return completions_token_histories(self, model=model)
+
+    def completions_string_history(
+        self, *, model: str | None = None
+    ) -> CompletionsStringHistory:
+        from ._history import completions_string_history
+
+        return completions_string_history(self, model=model)
+
+    def completions_string_histories(
+        self, *, model: str | None = None
+    ) -> list[CompletionsStringHistory]:
+        from ._history import completions_string_histories
+
+        return completions_string_histories(self, model=model)
 
     def history(self, *, model: str | None = None) -> TrajectoryHistory:
         from ._history import trajectory_history
 
         return trajectory_history(self, model=model)
+
+    def histories(self, *, model: str | None = None) -> list[TrajectoryHistory]:
+        from ._history import trajectory_histories
+
+        return trajectory_histories(self, model=model)
+
+    @overload
+    def tokenize(
+        self,
+        *,
+        multi_history: Literal[False] = False,
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+    ) -> TokenizedTrajectory: ...
+
+    @overload
+    def tokenize(
+        self,
+        *,
+        multi_history: Literal[True],
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+    ) -> TokenizedMultiHistoryTrajectory: ...
+
+    def tokenize(
+        self,
+        *,
+        multi_history: bool = False,
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+    ) -> TokenizedTrajectory | TokenizedMultiHistoryTrajectory:
+        from ._tokenize import tokenize_trajectory
+
+        return tokenize_trajectory(
+            self,
+            multi_history=multi_history,
+            model=model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
     def messages(self) -> Messages:
         from ._history import trajectory_messages
@@ -527,47 +753,121 @@ class TrajectoryGroup(_CompactModel):
     def __len__(self) -> int:
         return len(self.trajectories)
 
+    @overload
+    def tokenize(
+        self,
+        *,
+        multi_history: Literal[False] = False,
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+    ) -> TokenizedTrajectoryGroup[TokenizedTrajectory]: ...
 
-class TokenizedTrajectory(pydantic.BaseModel):
+    @overload
+    def tokenize(
+        self,
+        *,
+        multi_history: Literal[True],
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+    ) -> TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]: ...
+
+    def tokenize(
+        self,
+        *,
+        multi_history: bool = False,
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+    ) -> (
+        TokenizedTrajectoryGroup[TokenizedTrajectory]
+        | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
+    ):
+        from ._tokenize import tokenize_group
+
+        return tokenize_group(
+            self,
+            multi_history=multi_history,
+            model=model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+
+
+class TokenizedHistory(pydantic.BaseModel):
+    model: str
     token_ids: list[int]
     logprobs: list[float]
     flags: list[TokenFlag]
-    underlying: Trajectory
+
+    @pydantic.model_validator(mode="after")
+    def validate_tokenwise_lengths(self) -> TokenizedHistory:
+        if not (len(self.token_ids) == len(self.logprobs) == len(self.flags)):
+            raise ValueError("Tokenized history fields differ in length")
+        return self
 
 
-class TokenizedTrajectoryGroup(pydantic.BaseModel):
-    trajectories: list[TokenizedTrajectory]
-    underlying: TrajectoryGroup
+class TokenizedTrajectory(TokenizedHistory):
+    reward: float
+    metrics: dict[str, float | int | bool]
+    metadata: dict[str, MetadataValue]
+
+
+class TokenizedMultiHistoryTrajectory(pydantic.BaseModel):
+    histories: list[TokenizedHistory]
+    reward: float
+    metrics: dict[str, float | int | bool]
+    metadata: dict[str, MetadataValue]
+
+
+TokenizedTrajectoryT = TypeVar(
+    "TokenizedTrajectoryT", TokenizedTrajectory, TokenizedMultiHistoryTrajectory
+)
+
+
+class TokenizedTrajectoryGroup(pydantic.BaseModel, Generic[TokenizedTrajectoryT]):
+    trajectories: list[TokenizedTrajectoryT]
+    metrics: dict[str, float | int | bool]
+    metadata: dict[str, MetadataValue]
 
 
 @overload
-def current_trajectory(*, required: Literal[True]) -> Trajectory: ...
+def current_trajectory(*, require: Literal[True]) -> Trajectory: ...
 
 
 @overload
-def current_trajectory(*, required: Literal[False] = False) -> Trajectory | None: ...
+def current_trajectory(*, require: Literal[False] = False) -> Trajectory | None: ...
 
 
-def current_trajectory(*, required: bool = False) -> Trajectory | None:
+def current_trajectory(*, require: bool = False) -> Trajectory | None:
     from ._scope import get_current_trajectory
 
-    return get_current_trajectory(required=required)
+    return get_current_trajectory(required=require)
 
 
 @overload
-def current_trajectory_group(*, required: Literal[True]) -> TrajectoryGroup: ...
+def current_trajectory_group(*, require: Literal[True]) -> TrajectoryGroup: ...
 
 
 @overload
 def current_trajectory_group(
-    *, required: Literal[False] = False
+    *, require: Literal[False] = False
 ) -> TrajectoryGroup | None: ...
 
 
-def current_trajectory_group(*, required: bool = False) -> TrajectoryGroup | None:
+def current_trajectory_group(*, require: bool = False) -> TrajectoryGroup | None:
     from ._scope import get_current_trajectory_group
 
-    return get_current_trajectory_group(required=required)
+    return get_current_trajectory_group(required=require)
 
 
 async def trajectory(coroutine: Coroutine[Any, Any, object]) -> Trajectory:
@@ -589,98 +889,19 @@ async def trajectory_group(
     )
 
 
-def tokenize_trajectory(
-    trajectory: Trajectory,
-    *,
-    base_model: str | None = None,
-    model: str | None = None,
-    chat_template: str | None = None,
-    chat_template_kwargs: Mapping[str, object] | None = None,
-) -> TokenizedTrajectory:
-    from ._tokenize import tokenize_one
-
-    return tokenize_one(
-        trajectory,
-        base_model,
-        model=model,
-        chat_template=chat_template,
-        chat_template_kwargs=chat_template_kwargs,
-    )
-
-
-def tokenize_trajectories(
-    trajectories: Iterable[Trajectory],
-    *,
-    base_model: str | None = None,
-    model: str | None = None,
-    chat_template: str | None = None,
-    chat_template_kwargs: Mapping[str, object] | None = None,
-) -> list[TokenizedTrajectory]:
-    return [
-        tokenize_trajectory(
-            item,
-            base_model=base_model,
-            model=model,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-        )
-        for item in trajectories
-    ]
-
-
-def tokenize_trajectory_group(
-    group: TrajectoryGroup,
-    *,
-    base_model: str | None = None,
-    model: str | None = None,
-    chat_template: str | None = None,
-    chat_template_kwargs: Mapping[str, object] | None = None,
-) -> TokenizedTrajectoryGroup:
-    return TokenizedTrajectoryGroup(
-        trajectories=tokenize_trajectories(
-            group,
-            base_model=base_model,
-            model=model,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-        ),
-        underlying=group,
-    )
-
-
-def tokenize_trajectory_groups(
-    groups: Iterable[TrajectoryGroup],
-    *,
-    base_model: str | None = None,
-    model: str | None = None,
-    chat_template: str | None = None,
-    chat_template_kwargs: Mapping[str, object] | None = None,
-) -> list[TokenizedTrajectoryGroup]:
-    return [
-        tokenize_trajectory_group(
-            group,
-            base_model=base_model,
-            model=model,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-        )
-        for group in groups
-    ]
+@overload
+@deprecated("Use current_trajectory() instead.")
+def auto_trajectory(*, require: Literal[True]) -> Trajectory: ...
 
 
 @overload
 @deprecated("Use current_trajectory() instead.")
-def auto_trajectory(*, required: Literal[True]) -> Trajectory: ...
-
-
-@overload
-@deprecated("Use current_trajectory() instead.")
-def auto_trajectory(*, required: Literal[False] = False) -> Trajectory | None: ...
+def auto_trajectory(*, require: Literal[False] = False) -> Trajectory | None: ...
 
 
 @deprecated("Use current_trajectory() instead.")
-def auto_trajectory(*, required: bool = False) -> Trajectory | None:
-    return current_trajectory(required=required)
+def auto_trajectory(*, require: bool = False) -> Trajectory | None:
+    return current_trajectory(require=require)
 
 
 @deprecated("Use trajectory() instead.")
@@ -708,25 +929,32 @@ __all__ = [
     "TrajectoryExchanges",
     "PydanticException",
     "History",
+    "LegacyHistory",
+    "ChatCompletionsMessageSource",
+    "AnthropicMessageSource",
+    "ResponsesItemSource",
+    "CompletionsSource",
+    "CompletionsTokenSourceSpan",
+    "CompletionsStringSourceSpan",
     "ChatCompletionsHistory",
     "AnthropicMessagesHistory",
     "ResponsesHistory",
-    "CompletionsHistory",
+    "CompletionsTokenHistory",
+    "CompletionsStringHistory",
     "TrajectoryHistory",
     "Trajectory",
     "TrajectoryGroup",
     "TokenizedTrajectory",
+    "TokenizedHistory",
+    "TokenizedMultiHistoryTrajectory",
     "TokenizedTrajectoryGroup",
+    "Tokenizer",
     "TokenFlag",
     "MetadataValue",
     "current_trajectory",
     "current_trajectory_group",
     "trajectory",
     "trajectory_group",
-    "tokenize_trajectory",
-    "tokenize_trajectories",
-    "tokenize_trajectory_group",
-    "tokenize_trajectory_groups",
     "auto_trajectory",
     "capture_auto_trajectory",
     "get_messages",

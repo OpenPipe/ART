@@ -9,7 +9,7 @@ from openai.types.chat.chat_completion import Choice
 import pydantic
 
 from art.openai import ART_MOE_ROUTING_METADATA_KEY
-from art.trajectories import History, Trajectory, TrajectoryGroup
+from art.trajectories import LegacyHistory, Trajectory, TrajectoryGroup
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -88,7 +88,7 @@ def _choice_data(item: object) -> dict[str, Any] | None:
     )
 
 
-def _history_data(history: History) -> dict[str, Any]:
+def _history_data(history: LegacyHistory) -> dict[str, Any]:
     data = history.model_dump(
         mode="json", exclude={"messages_and_choices"}, warnings="error"
     )
@@ -123,7 +123,7 @@ def _trajectory_data(trajectory: Trajectory) -> dict[str, Any]:
     return data
 
 
-def _restore_history(data: object) -> History:
+def _restore_history(data: object) -> LegacyHistory:
     if not isinstance(data, dict):
         raise ValueError("Parquet additional history must be a JSON object")
     restored = dict(data)
@@ -136,7 +136,7 @@ def _restore_history(data: object) -> History:
         else item
         for item in messages
     ]
-    return History.model_validate(restored)
+    return LegacyHistory.model_validate(restored)
 
 
 def _restore_trajectory(payload: object) -> Trajectory:

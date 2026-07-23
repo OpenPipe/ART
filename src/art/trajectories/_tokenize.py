@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 import re
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, cast
+import warnings
 
-from anthropic.types import Message
+from anthropic.types import Message, MessageParam, TextBlock
 from openai.types import Completion
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
@@ -14,17 +16,35 @@ from openai.types.responses import Response
 from pydantic import BaseModel
 
 from . import (
+    AnthropicMessagesHistory,
     ChatCompletionsExchange,
+    ChatCompletionsHistory,
     CompletionsExchange,
+    CompletionsSource,
+    CompletionsStringHistory,
+    CompletionsTokenHistory,
+    History,
+    LegacyHistory,
     MessagesExchange,
     ResponsesExchange,
+    ResponsesHistory,
     TokenFlag,
+    TokenizedHistory,
+    TokenizedMultiHistoryTrajectory,
     TokenizedTrajectory,
+    TokenizedTrajectoryGroup,
+    Tokenizer,
     Trajectory,
+    TrajectoryGroup,
+    TrajectoryHistory,
 )
 from ._protocols import Exchange
 
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+
 _TOKEN_ID = re.compile(r"token_id:(\d+)$")
+_WARNED_PREFIX_RETOKENIZATION = False
 
 
 @dataclass
@@ -35,27 +55,12 @@ class _TokenizerConfig:
     chat_template_kwargs: Mapping[str, object] | None = None
 
 
-class _Tokenizer(Protocol):
-    def __call__(self, text: str, *, add_special_tokens: bool = False) -> object: ...
-
-    def apply_chat_template(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        tools: object,
-        tokenize: bool,
-        add_generation_prompt: bool,
-        chat_template: str | None = None,
-        **kwargs: object,
-    ) -> object: ...
-
-
-def _as_tokenizer(tokenizer: object) -> _Tokenizer:
+def _as_tokenizer(tokenizer: object) -> Tokenizer:
     # Transformers' annotation permits only string-valued message dictionaries,
     # although its runtime API supports the structured content ART must tokenize.
     # Exact-token paths may only need decode(); fallback paths exercise these
     # capabilities directly and report the missing method at that point.
-    return cast(_Tokenizer, tokenizer)
+    return cast(Tokenizer, tokenizer)
 
 
 def _string_dict(value: object) -> dict[str, Any] | None:
@@ -186,6 +191,8 @@ def _chat_choice_tokens(
     if token_ids is not None and pair_ids and token_ids != pair_ids:
         raise ValueError("Response token IDs disagree with choice logprobs")
     selected = token_ids if token_ids is not None else pair_ids or None
+    if selected is not None and values and len(logprobs) != len(selected):
+        raise ValueError("Chat Completions token IDs and logprobs differ in length")
     return (
         prompt_ids,
         selected,
@@ -201,9 +208,11 @@ def _chat_tokens(
     return _chat_choice_tokens(response.choices[0], _dump(response))
 
 
-def _completion_tokens(
+def _completion_evidence(
     response: Completion,
-) -> tuple[list[int] | None, list[int] | None, list[float]]:
+    *,
+    echo: bool = False,
+) -> tuple[list[int] | None, list[int] | None, list[float], list[float]]:
     if len(response.choices) != 1:
         raise ValueError("Trajectory tokenization requires exactly one response choice")
     choice = response.choices[0]
@@ -239,17 +248,50 @@ def _completion_tokens(
         for value in logprobs.get("token_logprobs") or []
     ]
     if token_ids is not None and pair_ids and token_ids != pair_ids:
-        raise ValueError("Response token IDs disagree with completion logprobs")
+        if not (
+            echo and prompt_ids is not None and pair_ids == [*prompt_ids, *token_ids]
+        ):
+            raise ValueError("Response token IDs disagree with completion logprobs")
     selected = token_ids if token_ids is not None else pair_ids or None
-    if selected is not None and len(pair_logprobs) != len(selected):
-        pair_logprobs = [math.nan] * len(selected)
-    return prompt_ids, selected, pair_logprobs
+    prompt_logprobs: list[float] = []
+    completion_logprobs = pair_logprobs
+    if echo and prompt_ids is not None and selected is not None:
+        if selected[: len(prompt_ids)] == prompt_ids:
+            if pair_logprobs and len(pair_logprobs) != len(selected):
+                raise ValueError("Completions token IDs and logprobs differ in length")
+            prompt_logprobs = pair_logprobs[: len(prompt_ids)]
+            selected = selected[len(prompt_ids) :]
+            completion_logprobs = pair_logprobs[len(prompt_ids) :]
+        elif len(pair_logprobs) == len(prompt_ids) + len(selected):
+            prompt_logprobs = pair_logprobs[: len(prompt_ids)]
+            completion_logprobs = pair_logprobs[len(prompt_ids) :]
+        elif pair_logprobs and len(pair_logprobs) != len(selected):
+            raise ValueError("Completions token IDs and logprobs differ in length")
+    elif selected is not None and pair_logprobs and len(pair_logprobs) != len(selected):
+        raise ValueError("Completions token IDs and logprobs differ in length")
+    if selected is not None and not completion_logprobs:
+        completion_logprobs = [math.nan] * len(selected)
+    return prompt_ids, selected, prompt_logprobs, completion_logprobs
+
+
+def _completion_tokens(
+    response: Completion,
+    *,
+    echo: bool = False,
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
+    prompt, completion, _, completion_logprobs = _completion_evidence(
+        response, echo=echo
+    )
+    return prompt, completion, completion_logprobs
 
 
 def _responses_tokens(
     response: Response,
-) -> tuple[None, list[int] | None, list[float]]:
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
     data = _dump(response)
+    prompt_ids = _exact_token_ids(
+        data.get("prompt_token_ids"), field="Responses prompt_token_ids"
+    )
     if "raw_output_tokens" in data:
         token_ids, logprobs = _pairs(
             data["raw_output_tokens"],
@@ -257,7 +299,7 @@ def _responses_tokens(
             field="Responses raw_output_tokens",
         )
         if token_ids or not data.get("output"):
-            return None, token_ids, logprobs
+            return prompt_ids, token_ids, logprobs
     token_ids: list[int] = []
     logprobs: list[float] = []
     saw_rendered_output = False
@@ -282,14 +324,17 @@ def _responses_tokens(
             token_ids.extend(pair_ids)
             logprobs.extend(pair_logprobs)
     if saw_rendered_output and complete:
-        return None, token_ids, logprobs
-    return None, None, []
+        return prompt_ids, token_ids, logprobs
+    return prompt_ids, None, []
 
 
 def _messages_tokens(
     response: Message,
-) -> tuple[None, list[int] | None, list[float]]:
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
     data = _dump(response)
+    prompt_ids = _exact_token_ids(
+        data.get("prompt_token_ids"), field="Messages prompt_token_ids"
+    )
     token_ids = _exact_token_ids(data.get("token_ids"), field="Messages token_ids")
     if token_ids == [] and data.get("content"):
         token_ids = None
@@ -297,9 +342,11 @@ def _messages_tokens(
         float(value) if isinstance(value, (int, float)) else math.nan
         for value in data.get("logprobs") or []
     ]
-    if token_ids is None or len(logprobs) != len(token_ids):
+    if token_ids is not None and logprobs and len(logprobs) != len(token_ids):
+        raise ValueError("Messages token IDs and logprobs differ in length")
+    if token_ids is None or not logprobs:
         logprobs = [math.nan] * len(token_ids or [])
-    return None, token_ids, logprobs
+    return prompt_ids, token_ids, logprobs
 
 
 def _exchange_list(trajectory: Trajectory, model: str | None) -> list[Exchange]:
@@ -325,22 +372,59 @@ def _exchange_list(trajectory: Trajectory, model: str | None) -> list[Exchange]:
     )
 
 
-def _artifact_config(model: str) -> _TokenizerConfig:
+def _artifact_name(model: str) -> str:
+    return model.removeprefix("wandb-artifact:///")
+
+
+def _artifact_identity(model: str) -> str:
+    """Return an alias/version-independent checkpoint identity for base-model cache."""
+
+    path = _artifact_name(model)
+    name = path.rsplit("/", 1)[-1]
+    return path[: -len(name)] + name.split(":", 1)[0]
+
+
+_ARTIFACT_BASE_MODELS: dict[str, str] = {}
+
+
+def _artifact_base_model(identity: str) -> str:
+    if cached := _ARTIFACT_BASE_MODELS.get(identity):
+        return cached
     from wandb.apis.public import Api
 
-    artifact_path = model.removeprefix("wandb-artifact:///")
+    artifact_path = identity
     if ":" not in artifact_path.rsplit("/", 1)[-1]:
         artifact_path = f"{artifact_path}:latest"
     artifact = Api().artifact(artifact_path)
     metadata = artifact.metadata
     base_model = metadata.get("base_model") or metadata.get("wandb.base_model")
     if not isinstance(base_model, str):
-        raise ValueError(f"Checkpoint {model!r} does not identify its base model")
+        raise ValueError(f"Checkpoint {identity!r} does not identify its base model")
+    if len(_ARTIFACT_BASE_MODELS) >= 1024:
+        _ARTIFACT_BASE_MODELS.pop(next(iter(_ARTIFACT_BASE_MODELS)))
+    _ARTIFACT_BASE_MODELS[identity] = base_model
+    return base_model
+
+
+def _artifact_config(model: str) -> _TokenizerConfig:
+    from wandb.apis.public import Api
+
+    artifact_path = _artifact_name(model)
+    if ":" not in artifact_path.rsplit("/", 1)[-1]:
+        artifact_path = f"{artifact_path}:latest"
+    artifact = Api().artifact(artifact_path)
+    metadata = artifact.metadata
+    base_model = metadata.get("base_model") or metadata.get("wandb.base_model")
+    identity = _artifact_identity(model)
+    if isinstance(base_model, str):
+        if len(_ARTIFACT_BASE_MODELS) >= 1024 and identity not in _ARTIFACT_BASE_MODELS:
+            _ARTIFACT_BASE_MODELS.pop(next(iter(_ARTIFACT_BASE_MODELS)))
+        _ARTIFACT_BASE_MODELS[identity] = base_model
     renderer = metadata.get("renderer")
     renderer = renderer if isinstance(renderer, dict) else {}
     kwargs = renderer.get("chat_template_kwargs")
     return _TokenizerConfig(
-        base_model=base_model,
+        base_model=_artifact_base_model(identity),
         revision=(
             renderer.get("tokenizer_revision")
             if isinstance(renderer.get("tokenizer_revision"), str)
@@ -368,7 +452,8 @@ def _tokenizer_config(model: str, base_model: str | None) -> _TokenizerConfig:
     return _TokenizerConfig(model)
 
 
-def _load_tokenizer(config: _TokenizerConfig) -> _Tokenizer:
+@lru_cache(maxsize=8)
+def _cached_tokenizer(base_model: str, revision: str | None) -> Tokenizer:
     try:
         from transformers import AutoTokenizer
     except ImportError as exc:
@@ -376,16 +461,23 @@ def _load_tokenizer(config: _TokenizerConfig) -> _Tokenizer:
             "Tokenizer fallback requires ART's backend or tinker dependencies"
         ) from exc
     try:
-        return _as_tokenizer(
-            AutoTokenizer.from_pretrained(
-                config.base_model,
-                revision=config.revision,
-            )
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model,
+            revision=revision,
         )
+        if base_model.startswith("deepseek-ai/DeepSeek-V4-"):
+            from ..megatron.dsv4.tokenizer import get_dsv4_tokenizer
+
+            tokenizer = get_dsv4_tokenizer(cast("PreTrainedTokenizerBase", tokenizer))
+        return _as_tokenizer(tokenizer)
     except Exception as exc:
         raise ValueError(
-            f"Could not load tokenizer for {config.base_model!r}; pass base_model explicitly"
+            f"Could not load tokenizer for {base_model!r}; pass base_model explicitly"
         ) from exc
+
+
+def _load_tokenizer(config: _TokenizerConfig) -> Tokenizer:
+    return _cached_tokenizer(config.base_model, config.revision)
 
 
 def _ids(value: object) -> list[int]:
@@ -745,7 +837,7 @@ def _response_message(
 
 
 def _template_ids(
-    tokenizer: _Tokenizer,
+    tokenizer: Tokenizer,
     exchange: Exchange,
     *,
     completed: bool,
@@ -803,7 +895,9 @@ def _exchange_tokens(
     if isinstance(exchange, ChatCompletionsExchange):
         return _chat_tokens(exchange.response)
     if isinstance(exchange, CompletionsExchange):
-        return _completion_tokens(exchange.response)
+        return _completion_tokens(
+            exchange.response, echo=exchange.request.get("echo") is True
+        )
     if isinstance(exchange, ResponsesExchange):
         return _responses_tokens(exchange.response)
     if isinstance(exchange, MessagesExchange):
@@ -849,8 +943,81 @@ def _visible_logprobs(exchange: Exchange) -> list[tuple[str, float]]:
     return values
 
 
+def _sampled_text(exchange: Exchange) -> str | None:
+    visible = "".join(text for text, _ in _visible_logprobs(exchange))
+    if visible:
+        return visible
+    if isinstance(exchange, ChatCompletionsExchange):
+        content = exchange.response.choices[0].message.content
+        return content if isinstance(content, str) else None
+    if isinstance(exchange, CompletionsExchange):
+        return exchange.response.choices[0].text
+    if isinstance(exchange, MessagesExchange):
+        parts = [
+            block.text
+            for block in exchange.response.content
+            if isinstance(block, TextBlock)
+        ]
+        return "".join(parts) if parts else None
+    if isinstance(exchange, ResponsesExchange):
+        parts: list[str] = []
+        for output in _dump(exchange.response).get("output") or []:
+            data = _dump(output)
+            if data.get("type") == "message":
+                parts.append(_responses_output_text(data.get("content")))
+        return "".join(parts) if parts else None
+    return None
+
+
+def _replace_unique(
+    values: list[int], old: list[int], new: list[int]
+) -> list[int] | None:
+    if not old:
+        return None
+    starts = [
+        index
+        for index in range(len(values) - len(old) + 1)
+        if values[index : index + len(old)] == old
+    ]
+    if len(starts) != 1:
+        return None
+    start = starts[0]
+    return [*values[:start], *new, *values[start + len(old) :]]
+
+
+def _preserve_sampled_prefix(
+    prompt: list[int],
+    canonical_prefix: list[int],
+    sampled_outputs: list[tuple[str, list[int]]],
+    tokenizer: Tokenizer,
+) -> list[int] | None:
+    repaired = prompt
+    for text, exact_ids in sampled_outputs:
+        rendered_ids = _ids(tokenizer(text, add_special_tokens=False))
+        if rendered_ids == exact_ids:
+            continue
+        replaced = _replace_unique(repaired, rendered_ids, exact_ids)
+        if replaced is None:
+            return None
+        repaired = replaced
+    return repaired if repaired[: len(canonical_prefix)] == canonical_prefix else None
+
+
+def _warn_prefix_retokenization() -> None:
+    global _WARNED_PREFIX_RETOKENIZATION
+    if _WARNED_PREFIX_RETOKENIZATION:
+        return
+    _WARNED_PREFIX_RETOKENIZATION = True
+    warnings.warn(
+        "Inference prompt token IDs retokenized an earlier sampled response; ART "
+        "preserved the original sampled token IDs and logprobs. Prefer a service "
+        "with prefix token-ID preservation, such as Caladan.",
+        stacklevel=3,
+    )
+
+
 def _align_visible_logprobs(
-    tokenizer: _Tokenizer | None, completion: list[int], exchange: Exchange
+    tokenizer: Tokenizer | None, completion: list[int], exchange: Exchange
 ) -> list[float] | None:
     values = _visible_logprobs(exchange)
     if not values or tokenizer is None:
@@ -895,18 +1062,14 @@ def _align_visible_logprobs(
 
 
 def _legacy_tokenize(
-    trajectory: Trajectory,
-    base_model: str | None,
+    history: LegacyHistory,
     *,
-    chat_template: str | None,
-    chat_template_kwargs: Mapping[str, object] | None,
-) -> TokenizedTrajectory:
-    if trajectory.additional_histories:
-        raise ValueError("Tokenization requires one history")
+    model: str,
+) -> TokenizedHistory:
     token_ids: list[int] = []
     logprobs: list[float] = []
     flags: list[TokenFlag] = []
-    for item in trajectory.messages_and_choices:
+    for item in history.messages_and_choices:
         if not isinstance(item, Choice):
             continue
         prompt, completion, completion_logprobs = _chat_choice_tokens(item, {})
@@ -932,23 +1095,23 @@ def _legacy_tokenize(
         flags.extend([TokenFlag.EXACT | TokenFlag.SAMPLED] * len(completion))
     if not token_ids:
         raise ValueError("Trajectory contains no trainable choices")
-    return TokenizedTrajectory(
+    return TokenizedHistory(
+        model=model,
         token_ids=token_ids,
         logprobs=logprobs,
         flags=flags,
-        underlying=trajectory,
     )
 
 
-def tokenize_one(
+def _tokenize_exchange_trajectory(
     trajectory: Trajectory,
     base_model: str | None,
     *,
     model: str | None,
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
-    tokenizer_instance: _Tokenizer | None = None,
-) -> TokenizedTrajectory:
+    tokenizer_instance: Tokenizer | None = None,
+) -> TokenizedHistory:
     if trajectory.exchanges and (
         trajectory.messages_and_choices
         or trajectory.tools is not None
@@ -958,11 +1121,16 @@ def tokenize_one(
             "A trajectory cannot contain both exchanges and legacy histories"
         )
     if not trajectory.exchanges:
+        if trajectory.additional_histories:
+            raise ValueError("Tokenization requires one history")
+        if model is None:
+            raise ValueError("Legacy trajectory tokenization requires model=")
         return _legacy_tokenize(
-            trajectory,
-            base_model,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
+            LegacyHistory(
+                messages_and_choices=trajectory.messages_and_choices,
+                tools=trajectory.tools,
+            ),
+            model=model,
         )
     exchanges = _exchange_list(trajectory, model)
     selected_model = exchanges[0].model
@@ -986,6 +1154,8 @@ def tokenize_one(
     response_histories: dict[
         str, tuple[list[dict[str, Any]] | None, ResponsesExchange]
     ] = {}
+    sampled_outputs: list[tuple[str, list[int]]] = []
+    previous_render_state: tuple[Exchange, list[dict[str, Any]] | None] | None = None
 
     def fallback_config() -> _TokenizerConfig:
         nonlocal config
@@ -1016,6 +1186,10 @@ def tokenize_one(
         messages_override: list[dict[str, Any]] | None = None
         if isinstance(exchange, ResponsesExchange):
             request = exchange.request
+            if request.get("conversation") is not None and prompt is None:
+                raise ValueError(
+                    "Responses conversation history requires exact prompt tokens"
+                )
             try:
                 messages_override = _responses_messages(request)
             except ValueError:
@@ -1023,21 +1197,25 @@ def tokenize_one(
                     raise
             previous = request.get("previous_response_id")
             if previous is not None:
-                if not isinstance(previous, str) or previous not in response_histories:
+                if not isinstance(previous, str):
+                    raise ValueError("Responses previous_response_id must be text")
+                if previous not in response_histories and prompt is None:
                     raise ValueError(
-                        "Responses exchange refers to a previous response outside this trajectory"
+                        "Responses exchange refers to a previous response outside this "
+                        "trajectory without exact prompt tokens"
                     )
-                previous_messages, previous_exchange = response_histories[previous]
-                if prompt is None:
-                    if previous_messages is None or messages_override is None:
-                        raise ValueError(
-                            "Responses history cannot be rendered without exact prompt tokens"
-                        )
-                    messages_override = [
-                        *previous_messages,
-                        _response_message(previous_exchange),
-                        *messages_override,
-                    ]
+                if previous in response_histories:
+                    previous_messages, previous_exchange = response_histories[previous]
+                    if prompt is None:
+                        if previous_messages is None or messages_override is None:
+                            raise ValueError(
+                                "Responses history cannot be rendered without exact prompt tokens"
+                            )
+                        messages_override = [
+                            *previous_messages,
+                            _response_message(previous_exchange),
+                            *messages_override,
+                        ]
             response_histories[exchange.response.id] = (messages_override, exchange)
         if prompt is None:
             resolved_config = fallback_config()
@@ -1080,9 +1258,57 @@ def tokenize_one(
                 [TokenFlag.EXACT if prompt_is_exact else TokenFlag(0)] * len(prompt)
             )
         elif len(prompt) < len(token_ids) or prompt[: len(token_ids)] != token_ids:
-            raise ValueError(
-                "Exchanges do not resolve to one append-only token history"
+            resolved_config = fallback_config()
+            if tokenizer is None:
+                tokenizer = _load_tokenizer(resolved_config)
+            repaired = _preserve_sampled_prefix(
+                prompt,
+                token_ids,
+                sampled_outputs,
+                tokenizer,
             )
+            if repaired is None:
+                current_render = _template_ids(
+                    tokenizer,
+                    exchange,
+                    completed=False,
+                    config=resolved_config,
+                    chat_template=chat_template,
+                    chat_template_kwargs=chat_template_kwargs,
+                    messages_override=messages_override,
+                )
+                if previous_render_state is None:
+                    repaired = [*token_ids, *current_render]
+                else:
+                    previous_exchange, previous_messages = previous_render_state
+                    previous_render = _template_ids(
+                        tokenizer,
+                        previous_exchange,
+                        completed=True,
+                        config=resolved_config,
+                        chat_template=chat_template,
+                        chat_template_kwargs=chat_template_kwargs,
+                        messages_override=previous_messages,
+                    )
+                    previous_canonical = _preserve_sampled_prefix(
+                        previous_render,
+                        token_ids,
+                        sampled_outputs,
+                        tokenizer,
+                    )
+                    suffix = (
+                        current_render[len(previous_render) :]
+                        if current_render[: len(previous_render)] == previous_render
+                        else current_render
+                    )
+                    repaired = [*(previous_canonical or token_ids), *suffix]
+            prompt = repaired
+            prompt_is_exact = False
+            _warn_prefix_retokenization()
+            suffix = prompt[len(token_ids) :]
+            token_ids.extend(suffix)
+            logprobs.extend([math.nan] * len(suffix))
+            flags.extend([TokenFlag(0)] * len(suffix))
         else:
             suffix = prompt[len(token_ids) :]
             token_ids.extend(suffix)
@@ -1102,10 +1328,975 @@ def tokenize_one(
         if completion_is_exact:
             completion_flag |= TokenFlag.EXACT
         flags.extend([completion_flag] * len(completion))
+        if completion_is_exact and (text := _sampled_text(exchange)) is not None:
+            sampled_outputs.append((text, list(completion)))
+        previous_render_state = (exchange, messages_override)
 
-    return TokenizedTrajectory(
+    return TokenizedHistory(
+        model=selected_model,
         token_ids=token_ids,
         logprobs=logprobs,
         flags=flags,
-        underlying=trajectory,
+    )
+
+
+def _unique_exchanges(history: History) -> list[Exchange]:
+    sources: Sequence[object]
+    if isinstance(history, ChatCompletionsHistory):
+        if len(history.messages) != len(history.message_sources):
+            raise ValueError("messages and message_sources differ in length")
+        sources = history.message_sources
+    elif isinstance(history, AnthropicMessagesHistory):
+        if len(history.messages) != len(history.message_sources):
+            raise ValueError("messages and message_sources differ in length")
+        sources = history.message_sources
+    elif isinstance(history, ResponsesHistory):
+        if len(history.input) != len(history.input_sources):
+            raise ValueError("input and input_sources differ in length")
+        sources = history.input_sources
+    else:
+        raise TypeError(f"Unsupported history type: {type(history).__name__}")
+
+    exchanges: list[Exchange] = []
+    seen: set[int] = set()
+    for source in sources:
+        exchange = getattr(source, "exchange", None)
+        if not isinstance(
+            exchange,
+            (
+                ChatCompletionsExchange,
+                CompletionsExchange,
+                ResponsesExchange,
+                MessagesExchange,
+            ),
+        ):
+            continue
+        identity = id(exchange)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(exchange, ChatCompletionsExchange):
+            choice_indexes = {
+                getattr(item, "choice_index", None)
+                for item in sources
+                if getattr(item, "exchange", None) is exchange
+                and getattr(item, "choice_index", None) is not None
+            }
+            if choice_indexes:
+                exchange = exchange.model_copy(
+                    update={
+                        "response": exchange.response.model_copy(
+                            update={
+                                "choices": [
+                                    choice
+                                    for choice in exchange.response.choices
+                                    if choice.index in choice_indexes
+                                ]
+                            }
+                        )
+                    }
+                )
+        exchanges.append(exchange)
+    return sorted(exchanges, key=lambda item: (item.start_time, item.end_time))
+
+
+def _validate_history_sources(history: History) -> None:
+    if isinstance(history, ChatCompletionsHistory):
+        if len(history.messages) != len(history.message_sources):
+            raise ValueError("messages and message_sources differ in length")
+        for message, source in zip(
+            history.messages, history.message_sources, strict=True
+        ):
+            if source is None:
+                continue
+            exchange = source.exchange
+            expected: list[dict[str, Any]] = []
+            if isinstance(exchange, ChatCompletionsExchange):
+                if source.choice_index is not None:
+                    choice = next(
+                        (
+                            item
+                            for item in exchange.response.choices
+                            if item.index == source.choice_index
+                        ),
+                        None,
+                    )
+                    if choice is not None:
+                        expected.append(
+                            choice.message.model_dump(mode="python", exclude_none=True)
+                        )
+                elif source.request_index is not None:
+                    request_messages = exchange.request.get("messages", [])
+                    if source.request_index < len(request_messages):
+                        expected.append(dict(request_messages[source.request_index]))
+            elif isinstance(exchange, MessagesExchange):
+                expected.extend(_anthropic_messages(_dump(exchange.request)))
+                expected.append(_response_message(exchange))
+                visible_blocks = [
+                    block.model_dump(mode="python", exclude_none=True)
+                    for block in exchange.response.content
+                    if getattr(block, "type", None)
+                    not in {"thinking", "redacted_thinking"}
+                ]
+                expected.extend(
+                    _anthropic_messages(
+                        {"messages": [{"role": "assistant", "content": visible_blocks}]}
+                    )
+                )
+            elif isinstance(exchange, ResponsesExchange):
+                expected.extend(_responses_messages(_dump(exchange.request)))
+                expected.append(_response_message(exchange))
+            if not any(dict(message) == candidate for candidate in expected):
+                raise ValueError(
+                    "Chat Completions history no longer matches its source exchange"
+                )
+        return
+    if isinstance(history, AnthropicMessagesHistory):
+        from ._history import _anthropic_message_key
+
+        if len(history.messages) != len(history.message_sources):
+            raise ValueError("messages and message_sources differ in length")
+        for message, source in zip(
+            history.messages, history.message_sources, strict=True
+        ):
+            if source is None:
+                continue
+            if source.request_index is None:
+                expected = {
+                    "role": "assistant",
+                    "content": [
+                        block.model_dump(mode="json", exclude_none=True)
+                        for block in source.exchange.response.content
+                    ],
+                }
+            else:
+                request_messages = source.exchange.request.get("messages", [])
+                expected = (
+                    request_messages[source.request_index]
+                    if source.request_index < len(request_messages)
+                    else None
+                )
+            matches = expected is not None and message == expected
+            if not matches and source.request_index is None and expected is not None:
+                matches = _anthropic_message_key(message) == _anthropic_message_key(
+                    cast(MessageParam, expected), visible_only=True
+                )
+            if not matches:
+                raise ValueError(
+                    "Anthropic Messages history no longer matches its source exchange"
+                )
+        return
+    if isinstance(history, ResponsesHistory):
+        from ._history import _responses_input
+
+        if len(history.input) != len(history.input_sources):
+            raise ValueError("input and input_sources differ in length")
+
+        for item, source in zip(history.input, history.input_sources, strict=True):
+            if source is None:
+                continue
+            if source.output_index is not None:
+                output = source.exchange.response.output
+                expected = (
+                    output[source.output_index].model_dump(
+                        mode="json", exclude_none=True
+                    )
+                    if source.output_index < len(output)
+                    else None
+                )
+            elif source.request_index is not None:
+                request_input = _responses_input(source.exchange.request.get("input"))
+                expected = (
+                    request_input[source.request_index]
+                    if source.request_index < len(request_input)
+                    else None
+                )
+            else:
+                expected = None
+            if expected is None or item != expected:
+                raise ValueError(
+                    "Responses history no longer matches its source exchange"
+                )
+
+
+def _trajectory_from_history(history: History) -> Trajectory:
+    _validate_history_sources(history)
+    exchanges = _unique_exchanges(history)
+    if not exchanges:
+        raise ValueError(
+            "History has no source exchanges; local history-only rendering is not yet possible"
+        )
+    from . import TrajectoryExchanges
+
+    return Trajectory(
+        exchanges=TrajectoryExchanges(
+            chat_completions=[
+                item for item in exchanges if isinstance(item, ChatCompletionsExchange)
+            ],
+            completions=[
+                item for item in exchanges if isinstance(item, CompletionsExchange)
+            ],
+            responses=[
+                item for item in exchanges if isinstance(item, ResponsesExchange)
+            ],
+            messages=[item for item in exchanges if isinstance(item, MessagesExchange)],
+        )
+    )
+
+
+def _last_source_exchange(sources: Sequence[object]) -> Exchange | None:
+    for source in reversed(sources):
+        exchange = getattr(source, "exchange", None)
+        if isinstance(
+            exchange,
+            (
+                ChatCompletionsExchange,
+                CompletionsExchange,
+                ResponsesExchange,
+                MessagesExchange,
+            ),
+        ):
+            return exchange
+    return None
+
+
+def _history_needs_render(history: History) -> bool:
+    if isinstance(history, ChatCompletionsHistory):
+        if any(source is None for source in history.message_sources):
+            return True
+        exchange = _last_source_exchange(history.message_sources)
+        if not isinstance(exchange, ChatCompletionsExchange):
+            return False
+        return (
+            history.tools != exchange.request.get("tools")
+            or history.chat_template != exchange.request.get("chat_template")
+            or history.chat_template_kwargs
+            != exchange.request.get("chat_template_kwargs")
+        )
+    if isinstance(history, AnthropicMessagesHistory):
+        if any(source is None for source in history.message_sources):
+            return True
+        for message, source in zip(
+            history.messages, history.message_sources, strict=True
+        ):
+            if source is None or source.request_index is not None:
+                continue
+            expected = {
+                "role": "assistant",
+                "content": [
+                    block.model_dump(mode="json", exclude_none=True)
+                    for block in source.exchange.response.content
+                ],
+            }
+            if message != expected:
+                return True
+        exchange = _last_source_exchange(history.message_sources)
+        if not isinstance(exchange, MessagesExchange):
+            return False
+        return (
+            history.system != exchange.request.get("system")
+            or history.tools != exchange.request.get("tools")
+            or history.chat_template != exchange.request.get("chat_template")
+            or history.chat_template_kwargs
+            != exchange.request.get("chat_template_kwargs")
+        )
+    if isinstance(history, ResponsesHistory):
+        if any(source is None for source in history.input_sources):
+            return True
+        exchange = _last_source_exchange(history.input_sources)
+        if not isinstance(exchange, ResponsesExchange):
+            return False
+        return (
+            history.instructions != exchange.request.get("instructions")
+            or history.tools != exchange.request.get("tools")
+            or history.chat_template != exchange.request.get("chat_template")
+            or history.chat_template_kwargs
+            != exchange.request.get("chat_template_kwargs")
+        )
+    return False
+
+
+def _chat_source_full_tokens(
+    source: object,
+) -> tuple[list[int] | None, list[float]]:
+    exchange = getattr(source, "exchange", None)
+    if isinstance(exchange, ChatCompletionsExchange):
+        choice_index = getattr(source, "choice_index", None)
+        if choice_index is None:
+            return None, []
+        choice = next(
+            item for item in exchange.response.choices if item.index == choice_index
+        )
+        _, tokens, logprobs = _chat_choice_tokens(choice, _dump(exchange.response))
+        return tokens, logprobs
+    if isinstance(exchange, (MessagesExchange, ResponsesExchange)):
+        _, tokens, logprobs = _exchange_tokens(exchange)
+        return tokens, logprobs
+    return None, []
+
+
+def _chat_source_tokens(
+    source: object,
+    text: str,
+    *,
+    part: str,
+) -> tuple[list[int] | None, list[float]]:
+    exchange = getattr(source, "exchange", None)
+    if isinstance(exchange, ChatCompletionsExchange):
+        tokens, logprobs = _chat_source_full_tokens(source)
+        if tokens is None:
+            return None, []
+        sampled_text = _sampled_text(exchange)
+        message = _dump(
+            next(
+                item
+                for item in exchange.response.choices
+                if item.index == getattr(source, "choice_index", None)
+            ).message
+        )
+        if sampled_text == text or (
+            part == "content"
+            and not any(message.get(key) for key in ("reasoning", "tool_calls"))
+        ):
+            return tokens, logprobs
+        return None, []
+    if (
+        isinstance(exchange, MessagesExchange)
+        and getattr(source, "request_index", None) is None
+    ):
+        block_type = "thinking" if part == "reasoning" else "text"
+        blocks = [
+            block
+            for block in exchange.response.content
+            if getattr(block, "type", None) == block_type
+        ]
+        block_text = "".join(
+            str(getattr(block, "thinking" if part == "reasoning" else "text", ""))
+            for block in blocks
+        )
+        if block_text == text:
+            token_ids: list[int] = []
+            logprobs: list[float] = []
+            for block in blocks:
+                extra = block.model_extra or {}
+                block_ids = _exact_token_ids(
+                    extra.get("token_ids"), field="Messages content token_ids"
+                )
+                block_logprobs = extra.get("logprobs")
+                if block_ids is None or not isinstance(block_logprobs, list):
+                    break
+                if len(block_ids) != len(block_logprobs):
+                    raise ValueError(
+                        "Messages content token IDs and logprobs differ in length"
+                    )
+                token_ids.extend(block_ids)
+                logprobs.extend(float(value) for value in block_logprobs)
+            else:
+                return token_ids, logprobs
+        if part != "content" or any(
+            getattr(block, "type", None) in {"thinking", "redacted_thinking"}
+            for block in exchange.response.content
+        ):
+            return None, []
+        _, tokens, logprobs = _messages_tokens(exchange.response)
+        return tokens, logprobs
+    if (
+        isinstance(exchange, ResponsesExchange)
+        and getattr(source, "request_index", None) is None
+    ):
+        output_index = getattr(source, "output_index", None)
+        if isinstance(output_index, int) and output_index < len(
+            exchange.response.output
+        ):
+            item = _dump(exchange.response.output[output_index])
+            if item.get("type") == "message" and part == "content":
+                item_text = _responses_output_text(item.get("content"))
+                if item_text == text:
+                    token_ids: list[int] = []
+                    logprobs: list[float] = []
+                    for content in item.get("content") or []:
+                        pairs, pair_logprobs = _pairs(
+                            _dump(content).get("logprobs"),
+                            field="Responses content logprobs",
+                        )
+                        if not pairs:
+                            break
+                        token_ids.extend(pairs)
+                        logprobs.extend(pair_logprobs)
+                    else:
+                        return token_ids, logprobs
+        if any(
+            getattr(item, "type", None) == "reasoning"
+            for item in exchange.response.output
+        ):
+            return None, []
+        _, tokens, logprobs = _responses_tokens(exchange.response)
+        return tokens, logprobs
+    return None, []
+
+
+def _tokenize_chat_view(
+    history: ChatCompletionsHistory,
+    *,
+    base_model: str | None,
+    tokenizer: Tokenizer | None,
+    chat_template: str | None,
+    chat_template_kwargs: Mapping[str, object] | None,
+) -> TokenizedHistory:
+    _validate_history_sources(history)
+    config = (
+        _TokenizerConfig(base_model or history.model or "")
+        if tokenizer is not None
+        or (base_model is not None and chat_template is not None)
+        else _tokenizer_config(history.model or "", base_model)
+    )
+    if tokenizer is None:
+        if not history.model and base_model is None:
+            raise ValueError("History tokenization requires a model or base_model")
+        tokenizer = _load_tokenizer(config)
+    messages = [dict(message) for message in history.messages]
+    kwargs = {
+        **(config.chat_template_kwargs or {}),
+        **(history.chat_template_kwargs or {}),
+        **(chat_template_kwargs or {}),
+    }
+    last_exchange = _last_source_exchange(history.message_sources)
+    if isinstance(last_exchange, MessagesExchange) and isinstance(
+        thinking := last_exchange.request.get("thinking"), dict
+    ):
+        kwargs.setdefault("enable_thinking", thinking.get("type") == "enabled")
+        if budget := thinking.get("budget_tokens"):
+            kwargs.setdefault("thinking_budget", budget)
+    template = chat_template or history.chat_template or config.chat_template
+    ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
+    rendered = _ids(
+        tokenizer.apply_chat_template(
+            messages,
+            tools=history.tools,
+            tokenize=True,
+            add_generation_prompt=not ends_with_assistant,
+            **({"chat_template": template} if template is not None else {}),
+            **kwargs,
+        )
+    )
+    replacements: list[tuple[int, int, list[int], list[float], bool]] = []
+    for index, (message, source) in enumerate(
+        zip(history.messages, history.message_sources, strict=True)
+    ):
+        if message.get("role") != "assistant" or source is None:
+            continue
+        full_exact, full_logprobs = _chat_source_full_tokens(source)
+        content = _content_text(message.get("content"))
+        reasoning = message.get("reasoning")
+        if (
+            full_exact
+            and content
+            and not reasoning
+            and not message.get("tool_calls")
+            and _ids(tokenizer(content, add_special_tokens=False)) == full_exact
+        ):
+            exact_starts = [
+                start
+                for start in range(len(rendered) - len(full_exact) + 1)
+                if rendered[start : start + len(full_exact)] == full_exact
+            ]
+            if len(exact_starts) == 1:
+                start = exact_starts[0]
+                replacements.append(
+                    (
+                        start,
+                        start + len(full_exact),
+                        full_exact,
+                        full_logprobs
+                        if len(full_logprobs) == len(full_exact)
+                        else [math.nan] * len(full_exact),
+                        True,
+                    )
+                )
+                continue
+        stable_length = min(index + 2, len(history.messages))
+        completed_prefix = (
+            rendered
+            if stable_length == len(history.messages)
+            else _ids(
+                tokenizer.apply_chat_template(
+                    [dict(item) for item in history.messages[:stable_length]],
+                    tools=history.tools,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    **({"chat_template": template} if template is not None else {}),
+                    **kwargs,
+                )
+            )
+        )
+        if rendered[: len(completed_prefix)] != completed_prefix:
+            raise ValueError(
+                "Chat template does not preserve completed message prefixes"
+            )
+        message_end = len(completed_prefix)
+        if stable_length > index + 1:
+            next_text = _content_text(history.messages[index + 1].get("content"))
+            next_ids = _ids(tokenizer(next_text, add_special_tokens=False))
+            if next_ids:
+                next_starts = [
+                    start
+                    for start in range(len(completed_prefix) - len(next_ids) + 1)
+                    if completed_prefix[start : start + len(next_ids)] == next_ids
+                ]
+                if next_starts:
+                    message_end = next_starts[-1]
+        if full_exact:
+            exact_starts = [
+                start
+                for start in range(message_end - len(full_exact) + 1)
+                if completed_prefix[start : start + len(full_exact)] == full_exact
+            ]
+            if exact_starts:
+                start = exact_starts[-1]
+                replacements.append(
+                    (
+                        start,
+                        start + len(full_exact),
+                        full_exact,
+                        full_logprobs
+                        if len(full_logprobs) == len(full_exact)
+                        else [math.nan] * len(full_exact),
+                        True,
+                    )
+                )
+                continue
+
+        parts: list[tuple[str, str]] = []
+        if isinstance(reasoning, str) and reasoning:
+            parts.append(("reasoning", reasoning))
+        if content:
+            parts.append(("content", content))
+        if not parts and isinstance(
+            exchange := getattr(source, "exchange", None),
+            (ChatCompletionsExchange, ResponsesExchange, MessagesExchange),
+        ):
+            if sampled_text := _sampled_text(exchange):
+                parts.append(("raw", sampled_text))
+
+        part_replacements: list[tuple[int, int, list[int], list[float], bool]] = []
+        search_end = message_end
+        for part, text in reversed(parts):
+            local = _ids(tokenizer(text, add_special_tokens=False))
+            if not local:
+                continue
+            starts = [
+                start
+                for start in range(search_end - len(local) + 1)
+                if completed_prefix[start : start + len(local)] == local
+            ]
+            if not starts:
+                raise ValueError(
+                    "Could not locate a sourced assistant message in the rendered history"
+                )
+            start = starts[-1]
+            exact, logprobs = _chat_source_tokens(source, text, part=part)
+            replacement = exact if exact is not None else local
+            if exact is None and not logprobs:
+                exchange = getattr(source, "exchange", None)
+                if isinstance(
+                    exchange,
+                    (ChatCompletionsExchange, ResponsesExchange, MessagesExchange),
+                ):
+                    logprobs = _align_visible_logprobs(tokenizer, local, exchange) or []
+            part_replacements.append(
+                (
+                    start,
+                    start + len(local),
+                    replacement,
+                    logprobs
+                    if len(logprobs) == len(replacement)
+                    else [math.nan] * len(replacement),
+                    exact is not None,
+                )
+            )
+            search_end = start
+        replacements.extend(reversed(part_replacements))
+
+    token_ids: list[int] = []
+    logprobs: list[float] = []
+    flags: list[TokenFlag] = []
+    cursor = 0
+    for start, end, replacement, replacement_logprobs, exact in sorted(replacements):
+        if start < cursor:
+            raise ValueError("Rendered assistant source spans overlap")
+        token_ids.extend(rendered[cursor:start])
+        logprobs.extend([math.nan] * (start - cursor))
+        flags.extend([TokenFlag(0)] * (start - cursor))
+        token_ids.extend(replacement)
+        logprobs.extend(replacement_logprobs)
+        flag = TokenFlag.SAMPLED | (TokenFlag.EXACT if exact else TokenFlag(0))
+        flags.extend([flag] * len(replacement))
+        cursor = end
+    token_ids.extend(rendered[cursor:])
+    logprobs.extend([math.nan] * (len(rendered) - cursor))
+    flags.extend([TokenFlag(0)] * (len(rendered) - cursor))
+    if history.model is None:
+        raise ValueError("History tokenization requires a model")
+    return TokenizedHistory(
+        model=history.model,
+        token_ids=token_ids,
+        logprobs=logprobs,
+        flags=flags,
+    )
+
+
+def _tokenize_completions_token_history(
+    history: CompletionsTokenHistory,
+) -> TokenizedHistory:
+    if any(
+        span.start < 0 or span.end <= span.start or span.end > len(history.prompt)
+        for span in history.prompt_sources
+    ):
+        raise ValueError("Completions token source spans are out of bounds")
+    if not _spans_are_exhaustive(len(history.prompt), history.prompt_sources):
+        raise ValueError(
+            "Completions token source spans must exhaustively cover prompt"
+        )
+
+    flags = [TokenFlag(0)] * len(history.prompt)
+    logprobs = [math.nan] * len(history.prompt)
+    for start, end in history.sampled_spans:
+        if start < 0 or end <= start or end > len(history.prompt):
+            raise ValueError("Completions sampled spans are out of bounds")
+        flags[start:end] = [TokenFlag.SAMPLED] * (end - start)
+    for span in history.prompt_sources:
+        if span.source is None:
+            continue
+        flags[span.start : span.end] = [
+            flag | TokenFlag.EXACT for flag in flags[span.start : span.end]
+        ]
+        prompt, completion, prompt_logprobs, completion_logprobs = (
+            _completion_source_evidence(span.source)
+        )
+        selected = prompt if span.source.choice_index is None else completion
+        selected_logprobs = (
+            prompt_logprobs if span.source.choice_index is None else completion_logprobs
+        )
+        if (
+            selected == history.prompt[span.start : span.end]
+            and len(selected_logprobs) == span.end - span.start
+        ):
+            logprobs[span.start : span.end] = selected_logprobs
+    return TokenizedHistory(
+        model=history.model,
+        token_ids=list(history.prompt),
+        logprobs=logprobs,
+        flags=flags,
+    )
+
+
+def _tokenize_completions_string_history(
+    history: CompletionsStringHistory,
+    *,
+    base_model: str | None,
+    tokenizer: Tokenizer | None,
+) -> TokenizedHistory:
+    if not _spans_are_exhaustive(len(history.prompt), history.prompt_sources):
+        raise ValueError(
+            "Completions string source spans must exhaustively cover prompt"
+        )
+    sampled = [False] * len(history.prompt)
+    for start, end in history.sampled_spans:
+        if start < 0 or end <= start or end > len(history.prompt):
+            raise ValueError("Completions sampled spans are out of bounds")
+        sampled[start:end] = [True] * (end - start)
+
+    config: _TokenizerConfig | None = None
+
+    def resolved_tokenizer() -> Tokenizer:
+        nonlocal config, tokenizer
+        if tokenizer is None:
+            config = config or _tokenizer_config(history.model, base_model)
+            tokenizer = _load_tokenizer(config)
+        return tokenizer
+
+    token_ids: list[int] = []
+    logprobs: list[float] = []
+    flags: list[TokenFlag] = []
+    for span in history.prompt_sources:
+        text = history.prompt[span.start : span.end]
+        source = span.source
+        exact: list[int] | None = None
+        source_logprobs: list[float] = []
+        is_sampled = any(sampled[span.start : span.end])
+        if source is not None:
+            prompt, completion, prompt_logprobs, completion_logprobs = (
+                _completion_source_evidence(source)
+            )
+            if source.choice_index is None:
+                exact = prompt
+                source_logprobs = prompt_logprobs
+            else:
+                choice = next(
+                    item
+                    for item in source.exchange.response.choices
+                    if item.index == source.choice_index
+                )
+                expected = choice.text
+                request_prompt = source.exchange.request.get("prompt")
+                if source.exchange.request.get("echo") is True and isinstance(
+                    request_prompt, str
+                ):
+                    expected = expected.removeprefix(request_prompt)
+                if text != expected:
+                    raise ValueError(
+                        "Completions history text no longer matches its source exchange"
+                    )
+                exact = completion
+                source_logprobs = completion_logprobs
+        ids = (
+            exact
+            if exact is not None
+            else _ids(resolved_tokenizer()(text, add_special_tokens=False))
+        )
+        token_ids.extend(ids)
+        if exact is not None and len(source_logprobs) == len(ids):
+            logprobs.extend(source_logprobs)
+        else:
+            logprobs.extend([math.nan] * len(ids))
+        flag = TokenFlag.SAMPLED if is_sampled else TokenFlag(0)
+        if exact is not None:
+            flag |= TokenFlag.EXACT
+        flags.extend([flag] * len(ids))
+    return TokenizedHistory(
+        model=history.model,
+        token_ids=token_ids,
+        logprobs=logprobs,
+        flags=flags,
+    )
+
+
+def _completion_source_evidence(
+    source: CompletionsSource,
+) -> tuple[list[int] | None, list[int] | None, list[float], list[float]]:
+    choices = source.exchange.response.choices
+    selected = (
+        next(choice for choice in choices if choice.index == source.choice_index)
+        if source.choice_index is not None
+        else choices[0]
+    )
+    return _completion_evidence(
+        source.exchange.response.model_copy(update={"choices": [selected]}),
+        echo=source.exchange.request.get("echo") is True,
+    )
+
+
+def _spans_are_exhaustive(length: int, spans: Sequence[object]) -> bool:
+    cursor = 0
+    for span in spans:
+        start = getattr(span, "start", None)
+        end = getattr(span, "end", None)
+        if (
+            not isinstance(start, int)
+            or not isinstance(end, int)
+            or start != cursor
+            or end <= start
+            or end > length
+        ):
+            return False
+        cursor = end
+    return cursor == length
+
+
+def tokenize_history(
+    history: History | LegacyHistory,
+    *,
+    model: str | None,
+    base_model: str | None,
+    tokenizer: Tokenizer | None,
+    chat_template: str | None,
+    chat_template_kwargs: Mapping[str, object] | None,
+) -> TokenizedHistory:
+    if isinstance(history, LegacyHistory):
+        if model is None:
+            raise ValueError("Legacy history tokenization requires model=")
+        return _legacy_tokenize(history, model=model)
+    if model is None:
+        raise ValueError("History tokenization requires a model")
+    if isinstance(history, CompletionsTokenHistory):
+        return _tokenize_completions_token_history(history)
+    if isinstance(history, CompletionsStringHistory):
+        return _tokenize_completions_string_history(
+            history,
+            base_model=base_model,
+            tokenizer=tokenizer,
+        )
+    override_requires_render = (
+        chat_template is not None
+        and chat_template != getattr(history, "chat_template", None)
+    ) or (
+        chat_template_kwargs is not None
+        and dict(chat_template_kwargs)
+        != (getattr(history, "chat_template_kwargs", None) or {})
+    )
+    if isinstance(history, ChatCompletionsHistory) and (
+        _history_needs_render(history) or override_requires_render
+    ):
+        return _tokenize_chat_view(
+            history,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+    if (
+        isinstance(history, AnthropicMessagesHistory)
+        and (_history_needs_render(history) or override_requires_render)
+    ) or (
+        isinstance(history, ResponsesHistory)
+        and (_history_needs_render(history) or override_requires_render)
+    ):
+        _validate_history_sources(history)
+        return _tokenize_chat_view(
+            history.as_chat_completions_history(),
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+    trajectory = _trajectory_from_history(history)
+    history_template = getattr(history, "chat_template", None)
+    history_kwargs = getattr(history, "chat_template_kwargs", None)
+    return _tokenize_exchange_trajectory(
+        trajectory,
+        base_model,
+        model=model,
+        chat_template=(
+            chat_template if chat_template is not None else history_template
+        ),
+        chat_template_kwargs={
+            **(history_kwargs or {}),
+            **(chat_template_kwargs or {}),
+        }
+        or None,
+        tokenizer_instance=tokenizer,
+    )
+
+
+def _materialize_trajectory(
+    tokenized: TokenizedHistory, trajectory: Trajectory
+) -> TokenizedTrajectory:
+    return TokenizedTrajectory(
+        **tokenized.model_dump(),
+        reward=trajectory.reward,
+        metrics=dict(trajectory.metrics),
+        metadata=dict(trajectory.metadata),
+    )
+
+
+def tokenize_trajectory(
+    trajectory: Trajectory,
+    *,
+    multi_history: bool,
+    model: str | None,
+    base_model: str | None,
+    tokenizer: Tokenizer | None,
+    chat_template: str | None,
+    chat_template_kwargs: Mapping[str, object] | None,
+) -> TokenizedTrajectory | TokenizedMultiHistoryTrajectory:
+    histories = trajectory.histories(model=model)
+    if not multi_history:
+        if len(histories) != 1:
+            selected_models = {
+                history.model
+                for history in histories
+                if not isinstance(history, LegacyHistory)
+            }
+            if model is None and len(selected_models) > 1:
+                raise ValueError(
+                    "Trajectory tokenization requires exactly one model; pass model= to select one"
+                )
+            raise ValueError(
+                f"Trajectory tokenization requires exactly one history; found {len(histories)}"
+            )
+        return _materialize_trajectory(
+            tokenize_history(
+                histories[0],
+                model=model
+                if isinstance(histories[0], LegacyHistory)
+                else histories[0].model,
+                base_model=base_model,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+            ),
+            trajectory,
+        )
+    tokenized = [
+        tokenize_history(
+            history,
+            model=model if isinstance(history, LegacyHistory) else history.model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        for history in histories
+    ]
+    return TokenizedMultiHistoryTrajectory(
+        histories=tokenized,
+        reward=trajectory.reward,
+        metrics=dict(trajectory.metrics),
+        metadata=dict(trajectory.metadata),
+    )
+
+
+def tokenize_group(
+    group: TrajectoryGroup,
+    *,
+    multi_history: bool,
+    model: str | None,
+    base_model: str | None,
+    tokenizer: Tokenizer | None,
+    chat_template: str | None,
+    chat_template_kwargs: Mapping[str, object] | None,
+) -> (
+    TokenizedTrajectoryGroup[TokenizedTrajectory]
+    | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
+):
+    if multi_history:
+        trajectories = [
+            cast(
+                TokenizedMultiHistoryTrajectory,
+                tokenize_trajectory(
+                    trajectory,
+                    multi_history=True,
+                    model=model,
+                    base_model=base_model,
+                    tokenizer=tokenizer,
+                    chat_template=chat_template,
+                    chat_template_kwargs=chat_template_kwargs,
+                ),
+            )
+            for trajectory in group.trajectories
+        ]
+        return TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory](
+            trajectories=trajectories,
+            metrics=dict(group.metrics),
+            metadata=dict(group.metadata),
+        )
+    single_trajectories = [
+        cast(
+            TokenizedTrajectory,
+            tokenize_trajectory(
+                trajectory,
+                multi_history=False,
+                model=model,
+                base_model=base_model,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+            ),
+        )
+        for trajectory in group.trajectories
+    ]
+    return TokenizedTrajectoryGroup[TokenizedTrajectory](
+        trajectories=single_trajectories,
+        metrics=dict(group.metrics),
+        metadata=dict(group.metadata),
     )

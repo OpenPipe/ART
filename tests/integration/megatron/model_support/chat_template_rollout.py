@@ -16,7 +16,7 @@ from art.preprocessing.tokenize import (
     tokenize_trajectory,
     tokenize_trajectory_groups,
 )
-from art.trajectories import History
+from art.trajectories import LegacyHistory
 from tests.support.chat_template_conformance_cases import (
     build_chat_template_conformance_inputs,
 )
@@ -33,8 +33,8 @@ def _artifact_dir(base_model: str) -> Path:
     return path
 
 
-def _history(trajectory: art.Trajectory) -> History:
-    return History(
+def _history(trajectory: art.Trajectory) -> LegacyHistory:
+    return LegacyHistory(
         messages_and_choices=trajectory.messages_and_choices,
         tools=trajectory.tools,
     )

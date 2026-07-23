@@ -123,6 +123,7 @@ MESSAGE: dict[str, Any] = {
     "stop_reason": "end_turn",
     "stop_sequence": None,
     "usage": {"input_tokens": 1, "output_tokens": 1},
+    "prompt_token_ids": [1],
     "token_ids": [2],
     "logprobs": [-0.2],
 }
@@ -172,7 +173,7 @@ async def endpoint_server(unused_tcp_port: int) -> AsyncIterator[str]:
 async def test_contexts_are_nested_and_task_local() -> None:
     assert art.current_trajectory() is None
     with art.Trajectory() as outer:
-        assert art.current_trajectory(required=True) is outer
+        assert art.current_trajectory(require=True) is outer
         with art.Trajectory() as inner:
             assert art.current_trajectory() is inner
         assert art.current_trajectory() is outer
@@ -187,7 +188,7 @@ async def test_contexts_are_nested_and_task_local() -> None:
         assert first is not second
     assert art.current_trajectory() is None
     with pytest.raises(RuntimeError, match="No trajectory"):
-        art.current_trajectory(required=True)
+        art.current_trajectory(require=True)
 
 
 async def test_group_context_and_async_helpers() -> None:
@@ -643,6 +644,7 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
                     "content": [],
                     "stop_reason": None,
                     "usage": {"input_tokens": 1, "output_tokens": 0},
+                    "prompt_token_ids": [1],
                 },
             },
         ),
@@ -660,6 +662,8 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
                 "type": "content_block_delta",
                 "index": 0,
                 "delta": {"type": "text_delta", "text": "hello"},
+                "token_ids": [2],
+                "logprobs": [-0.2],
             },
         ),
         ("content_block_stop", {"type": "content_block_stop", "index": 0}),
@@ -669,6 +673,7 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
                 "type": "message_delta",
                 "delta": {"stop_reason": "end_turn", "stop_sequence": None},
                 "usage": {"output_tokens": 1},
+                "prompt_token_ids": [1],
                 "token_ids": [2],
                 "logprobs": [-0.2],
             },
@@ -710,8 +715,12 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
             content = exchange.response.content[0]
             assert isinstance(content, TextBlock)
             assert content.text == "hello"
+            assert content.model_extra is not None
+            assert content.model_extra["token_ids"] == [2]
+            assert content.model_extra["logprobs"] == [-0.2]
             assert getattr(exchange.response, "token_ids") == [2]
             assert getattr(exchange.response, "logprobs") == [-0.2]
+            assert getattr(exchange.response, "prompt_token_ids") == [1]
 
 
 def test_streaming_chat_choices_are_accumulated_by_index() -> None:

@@ -221,6 +221,9 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
     complete = False
     token_ids: list[int] = []
     logprobs: list[float] = []
+    prompt_token_ids: list[int] = []
+    block_token_ids: dict[int, list[int]] = {}
+    block_logprobs: dict[int, list[float]] = {}
     for event_name, payload in _sse_events(body):
         if not isinstance(payload, dict):
             continue
@@ -232,7 +235,21 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
             current_snapshot=snapshot,
             output_format=NOT_GIVEN,
         )
-        if event.type == "message_delta":
+        if event.type == "message_start":
+            message = payload.get("message")
+            values = (
+                message.get("prompt_token_ids") if isinstance(message, dict) else None
+            )
+            if isinstance(values, list) and all(
+                isinstance(value, int) for value in values
+            ):
+                prompt_token_ids = values
+        elif event.type == "message_delta":
+            values = payload.get("prompt_token_ids")
+            if isinstance(values, list) and all(
+                isinstance(value, int) for value in values
+            ):
+                prompt_token_ids = values
             event_token_ids = payload.get("token_ids")
             event_logprobs = payload.get("logprobs")
             if isinstance(event_token_ids, list) and all(
@@ -243,14 +260,50 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
                 isinstance(value, (int, float)) for value in event_logprobs
             ):
                 logprobs = [float(value) for value in event_logprobs]
+        elif event.type in {"content_block_start", "content_block_delta"}:
+            index = payload.get("index")
+            event_token_ids = payload.get("token_ids")
+            event_logprobs = payload.get("logprobs")
+            if (
+                isinstance(index, int)
+                and isinstance(event_token_ids, list)
+                and all(isinstance(value, int) for value in event_token_ids)
+            ):
+                block_token_ids.setdefault(index, []).extend(event_token_ids)
+            if (
+                isinstance(index, int)
+                and isinstance(event_logprobs, list)
+                and all(isinstance(value, (int, float)) for value in event_logprobs)
+            ):
+                block_logprobs.setdefault(index, []).extend(
+                    float(value) for value in event_logprobs
+                )
         complete = complete or event.type == "message_stop"
     if snapshot is None or not complete:
         raise ValueError("Incomplete Messages stream")
     data = snapshot.model_dump(mode="python")
+    content = data.get("content")
+    if isinstance(content, list):
+        rebuilt_content: list[object] = []
+        for index, raw_block in enumerate(content):
+            if not isinstance(raw_block, dict):
+                rebuilt_content.append(raw_block)
+                continue
+            block: dict[str, Any] = {
+                str(key): value for key, value in raw_block.items()
+            }
+            if values := block_token_ids.get(index):
+                block["token_ids"] = values
+            if values := block_logprobs.get(index):
+                block["logprobs"] = values
+            rebuilt_content.append(block)
+        data["content"] = rebuilt_content
     if token_ids:
         data["token_ids"] = token_ids
     if logprobs:
         data["logprobs"] = logprobs
+    if prompt_token_ids:
+        data["prompt_token_ids"] = prompt_token_ids
     return Message.model_validate(data)
 
 

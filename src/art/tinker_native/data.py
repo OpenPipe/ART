@@ -10,13 +10,12 @@ from tinker_cookbook import renderers
 import torch
 
 from ..trajectories import (
-    History,
+    LegacyHistory,
     TokenFlag,
-    TokenizedTrajectory,
+    TokenizedHistory,
     Trajectory,
     TrajectoryGroup,
     get_messages,
-    tokenize_trajectory,
 )
 from ..types import MessagesAndChoices
 
@@ -163,11 +162,13 @@ def trajectory_groups_to_datums(
             continue
         for trajectory, advantage in zip(group.trajectories, advantages):
             if trajectory.exchanges:
-                datum = _tokenized_trajectory_to_datum(
-                    tokenize_trajectory(trajectory, base_model=base_model), advantage
+                tokenized = trajectory.tokenize(
+                    multi_history=True, base_model=base_model
                 )
-                if datum is not None:
-                    datums.append(datum)
+                for history in tokenized.histories:
+                    datum = _tokenized_trajectory_to_datum(history, advantage)
+                    if datum is not None:
+                        datums.append(datum)
                 continue
             for history in iter_trajectory_histories(trajectory):
                 datum = history_to_datum(history, advantage, renderer, tokenizer)
@@ -177,8 +178,8 @@ def trajectory_groups_to_datums(
     return datums
 
 
-def iter_trajectory_histories(trajectory: Trajectory) -> Iterable[History]:
-    yield History(
+def iter_trajectory_histories(trajectory: Trajectory) -> Iterable[LegacyHistory]:
+    yield LegacyHistory(
         messages_and_choices=trajectory.messages_and_choices,
         tools=trajectory.tools,
     )
@@ -222,7 +223,7 @@ def extract_logprobs_from_choice(
 
 
 def history_to_datum(
-    history: History,
+    history: LegacyHistory,
     advantage: float,
     renderer: Any,
     tokenizer: Any,
@@ -283,7 +284,7 @@ def build_datum(
 
 
 def _tokenized_trajectory_to_datum(
-    tokenized: TokenizedTrajectory, advantage: float
+    tokenized: TokenizedHistory, advantage: float
 ) -> tinker.Datum | None:
     sampled = [bool(flag & TokenFlag.SAMPLED) for flag in tokenized.flags]
     if not (len(tokenized.token_ids) == len(tokenized.logprobs) == len(sampled)):

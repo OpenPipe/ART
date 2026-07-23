@@ -19,7 +19,8 @@ if TYPE_CHECKING:
 
 from ..trajectories import (
     ChatCompletionsExchange,
-    History,
+    ChatCompletionsHistory,
+    LegacyHistory,
     TokenFlag,
     Trajectory,
     TrajectoryGroup,
@@ -448,7 +449,7 @@ def _tokenized_result_from_vllm_choices(
 def assemble_vllm_training_sequences(
     *,
     tokenizer: PreTrainedTokenizerBase,
-    histories: list[History],
+    histories: list[LegacyHistory],
     advantage: float,
     allow_training_without_logprobs: bool,
     trajectory: Trajectory,
@@ -567,94 +568,97 @@ def tokenize_trajectory_groups(
             if advantage == 0 and drop_zero_advantage_trajectories:
                 continue
             if trajectory.exchanges:
-                from ..trajectories._tokenize import (
-                    _as_tokenizer,
-                    _exchange_list,
-                    _exchange_tokens,
-                    tokenize_one,
-                )
+                from ..trajectories._tokenize import _as_tokenizer
 
-                exchange_result = tokenize_one(
-                    trajectory,
-                    tokenizer.name_or_path,
-                    model=None,
+                exchange_results = trajectory.tokenize(
+                    multi_history=True,
+                    base_model=tokenizer.name_or_path,
+                    tokenizer=_as_tokenizer(tokenizer),
                     chat_template=None,
                     chat_template_kwargs=chat_template_kwargs,
-                    tokenizer_instance=_as_tokenizer(tokenizer),
                 )
-                sampled = [
-                    bool(flag & TokenFlag.SAMPLED) for flag in exchange_result.flags
-                ]
-                sampled_spans = _flag_spans(exchange_result.flags, TokenFlag.SAMPLED)
-                choice_spans = sampled_spans
-                if not allow_training_without_logprobs and any(
-                    trainable and math.isnan(logprob)
-                    for trainable, logprob in zip(
-                        sampled,
-                        exchange_result.logprobs,
-                        strict=True,
-                    )
+                histories = trajectory.histories()
+                trajectory_results = []
+                for exchange_result, history in zip(
+                    exchange_results.histories, histories, strict=True
                 ):
-                    raise RuntimeError(
-                        "Exchange trajectory is missing logprobs for trainable tokens"
-                    )
-                exchanges = _exchange_list(trajectory, None)
-                chat_choices = [
-                    exchange.response.choices[0]
-                    for exchange in exchanges
-                    if isinstance(exchange, ChatCompletionsExchange)
-                ]
-                if len(chat_choices) == len(exchanges):
-                    exact_spans: list[tuple[int, int]] = []
-                    for exchange in exchanges:
-                        prompt, completion, _ = _exchange_tokens(exchange)
-                        if prompt is None or completion is None:
-                            exact_spans = []
-                            break
-                        exact_spans.append((len(prompt), len(prompt) + len(completion)))
-                    choice_spans = exact_spans or choice_spans
-                    moe_routes, moe_stats = align_choice_routes_to_tokenized_result(
-                        token_ids=exchange_result.token_ids,
-                        choices=chat_choices,
-                        choice_offsets=[start for start, _ in choice_spans],
-                        choice_token_lengths=[
-                            end - start for start, end in choice_spans
-                        ],
-                    )
-                else:
-                    if any(
-                        choice_moe_routing_metadata(choice) is not None
-                        for choice in chat_choices
+                    sampled = [
+                        bool(flag & TokenFlag.SAMPLED) for flag in exchange_result.flags
+                    ]
+                    choice_spans = _flag_spans(exchange_result.flags, TokenFlag.SAMPLED)
+                    if not allow_training_without_logprobs and any(
+                        trainable and math.isnan(logprob)
+                        for trainable, logprob in zip(
+                            sampled,
+                            exchange_result.logprobs,
+                            strict=True,
+                        )
                     ):
                         raise RuntimeError(
-                            "MoE routing replay requires an all-Chat-Completions "
-                            "exchange trajectory"
+                            "Exchange trajectory is missing logprobs for trainable tokens"
                         )
-                    moe_routes = None
-                    moe_stats = MoeRoutingAlignmentStats()
-                trajectory_results = [
-                    TokenizedResult(
-                        advantage=advantage,
-                        chat="",
-                        token_ids=exchange_result.token_ids,
-                        input_pos=list(range(len(exchange_result.token_ids))),
-                        assistant_mask=[int(value) for value in sampled],
-                        logprobs=exchange_result.logprobs,
-                        pixel_values=None,
-                        image_grid_thw=None,
-                        trajectory=trajectory,
-                        choice_offsets=[start for start, _ in choice_spans],
-                        extra_logprobs={},
-                        moe_routed_experts=moe_routes,
-                        moe_routing_alignment_stats=moe_stats,
-                        _tokenizer=tokenizer,
+                    chat_choices = []
+                    if isinstance(history, ChatCompletionsHistory):
+                        seen_choices: set[tuple[int, int]] = set()
+                        for source in history.message_sources:
+                            if source is None or source.choice_index is None:
+                                continue
+                            key = (id(source.exchange), source.choice_index)
+                            if key in seen_choices:
+                                continue
+                            seen_choices.add(key)
+                            if not isinstance(source.exchange, ChatCompletionsExchange):
+                                continue
+                            chat_choices.append(
+                                next(
+                                    choice
+                                    for choice in source.exchange.response.choices
+                                    if choice.index == source.choice_index
+                                )
+                            )
+                    if len(chat_choices) == len(choice_spans):
+                        moe_routes, moe_stats = align_choice_routes_to_tokenized_result(
+                            token_ids=exchange_result.token_ids,
+                            choices=chat_choices,
+                            choice_offsets=[start for start, _ in choice_spans],
+                            choice_token_lengths=[
+                                end - start for start, end in choice_spans
+                            ],
+                        )
+                    else:
+                        if any(
+                            choice_moe_routing_metadata(choice) is not None
+                            for choice in chat_choices
+                        ):
+                            raise RuntimeError(
+                                "MoE routing replay requires complete Chat Completions "
+                                "history sources"
+                            )
+                        moe_routes = None
+                        moe_stats = MoeRoutingAlignmentStats()
+                    trajectory_results.append(
+                        TokenizedResult(
+                            advantage=advantage,
+                            chat="",
+                            token_ids=exchange_result.token_ids,
+                            input_pos=list(range(len(exchange_result.token_ids))),
+                            assistant_mask=[int(value) for value in sampled],
+                            logprobs=exchange_result.logprobs,
+                            pixel_values=None,
+                            image_grid_thw=None,
+                            trajectory=trajectory,
+                            choice_offsets=[start for start, _ in choice_spans],
+                            extra_logprobs={},
+                            moe_routed_experts=moe_routes,
+                            moe_routing_alignment_stats=moe_stats,
+                            _tokenizer=tokenizer,
+                        )
                     )
-                ]
             else:
                 trajectory_results = assemble_vllm_training_sequences(
                     tokenizer=tokenizer,
                     histories=[
-                        History(
+                        LegacyHistory(
                             messages_and_choices=trajectory.messages_and_choices,
                             tools=trajectory.tools,
                         ),
@@ -707,7 +711,7 @@ def tokenize_trajectory_groups(
 def tokenize_trajectory(
     tokenizer: "PreTrainedTokenizerBase",
     image_processor: BaseImageProcessor | None,
-    history: History,
+    history: LegacyHistory,
     advantage: float,
     allow_training_without_logprobs: bool,
     trajectory: Trajectory,

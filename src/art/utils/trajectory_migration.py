@@ -19,7 +19,7 @@ import warnings
 import pydantic
 import yaml
 
-from art.trajectories import History, Trajectory, TrajectoryGroup
+from art.trajectories import LegacyHistory, Trajectory, TrajectoryGroup
 from art.types import Choice, Message, MessageOrChoice
 from art.utils.trajectory_logging import write_trajectory_groups_parquet
 
@@ -49,7 +49,7 @@ def trajectory_group_to_dict(trajectory_group: TrajectoryGroup) -> dict[str, Any
     }
 
 
-def history_to_dict(history: History) -> dict[str, Any]:
+def history_to_dict(history: LegacyHistory) -> dict[str, Any]:
     messages_and_choices = [
         message_or_choice_to_dict(message_or_choice)
         for message_or_choice in history.messages_and_choices
@@ -146,8 +146,8 @@ def dict_to_trajectory(d: dict[str, Any]) -> Trajectory:
     )
 
 
-def dict_to_history(d: dict[str, Any]) -> History:
-    return History.model_validate(
+def dict_to_history(d: dict[str, Any]) -> LegacyHistory:
+    return LegacyHistory.model_validate(
         {
             **d,
             "messages_and_choices": [
