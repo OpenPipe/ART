@@ -112,6 +112,7 @@ RESPONSE: dict[str, Any] = {
         "total_tokens": 5,
     },
     "raw_output_tokens": [{"token_id": 2, "logprob": -0.2}],
+    "prompt_token_ids": [1],
 }
 
 MESSAGE: dict[str, Any] = {
@@ -125,6 +126,7 @@ MESSAGE: dict[str, Any] = {
     "usage": {"input_tokens": 1, "output_tokens": 1},
     "token_ids": [2],
     "logprobs": [-0.2],
+    "prompt_token_ids": [1],
 }
 
 
@@ -712,6 +714,89 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
             assert content.text == "hello"
             assert getattr(exchange.response, "token_ids") == [2]
             assert getattr(exchange.response, "logprobs") == [-0.2]
+            assert getattr(exchange.response, "prompt_token_ids") == [1]
+        if isinstance(exchange, ResponsesExchange):
+            assert getattr(exchange.response, "prompt_token_ids") == [1]
+
+
+@pytest.mark.parametrize("endpoint", ["chat_completions", "responses", "messages"])
+def test_streaming_protocols_drop_conflicting_prompt_token_ids(
+    endpoint: Endpoint,
+) -> None:
+    now = datetime.now()
+    if endpoint == "chat_completions":
+
+        def chat_chunk(prompt: list[int]) -> dict[str, Any]:
+            return {
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "test/model",
+                "prompt_token_ids": prompt,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": "stop",
+                        "logprobs": None,
+                    }
+                ],
+            }
+
+        request = {"model": "test/model", "messages": [], "stream": True}
+        body = _sse(
+            [(None, chat_chunk([1])), (None, chat_chunk([2])), (None, "[DONE]")]
+        )
+    elif endpoint == "responses":
+        request = {"model": "test/model", "input": "hi", "stream": True}
+        created = {**RESPONSE, "prompt_token_ids": [1]}
+        completed = {**RESPONSE, "prompt_token_ids": [2]}
+        body = _sse(
+            [
+                ("response.created", {"type": "response.created", "response": created}),
+                (
+                    "response.completed",
+                    {"type": "response.completed", "response": completed},
+                ),
+            ]
+        )
+    else:
+        request = {"model": "test/model", "messages": [], "stream": True}
+        start_message = {
+            **MESSAGE,
+            "content": [],
+            "stop_reason": None,
+            "usage": {"input_tokens": 1, "output_tokens": 0},
+            "prompt_token_ids": [1],
+        }
+        body = _sse(
+            [
+                (
+                    "message_start",
+                    {"type": "message_start", "message": start_message},
+                ),
+                (
+                    "message_delta",
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                        "usage": {"output_tokens": 0},
+                        "prompt_token_ids": [2],
+                    },
+                ),
+                ("message_stop", {"type": "message_stop"}),
+            ]
+        )
+
+    exchange = build_exchange(
+        endpoint,
+        request,
+        body,
+        start_time=now,
+        end_time=now + timedelta(seconds=1),
+    )
+
+    assert getattr(exchange.response, "prompt_token_ids", None) is None
 
 
 def test_streaming_chat_choices_are_accumulated_by_index() -> None:

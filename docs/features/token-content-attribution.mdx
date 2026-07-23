@@ -1,0 +1,65 @@
+---
+title: "Token content attribution"
+description: "Distinguish message-body tokens from chat-template scaffolding."
+---
+
+`art.TokenFlag.CONTENT` identifies tokens that came from message bodies:
+caller-provided text, reasoning, tool-call data, or a model-sampled assistant
+emission. Renderer-added role tags, tool declarations, wrappers, separators,
+and generation prompts are scaffold and do not carry the flag. A sampled
+turn-close token is CONTENT; a separator added later while rendering the next
+prompt is not.
+
+At a text boundary, a token belongs to the segment containing its first source
+character. A character exactly on a boundary belongs to the later segment.
+This is the policy implemented by Prime Intellect `renderers==0.1.8`, whose
+`RenderedTokens.is_content` signal ART reuses.
+
+## Availability and exactness
+
+Inspect CONTENT only when `TokenizedTrajectory.content_attribution_complete`
+is `True`. ART sets it only when every prompt in the sequence has exact token
+IDs from the inference engine and the selected renderer matches each complete
+prompt ID-for-ID. If attribution is unavailable, CONTENT is unset on every
+token; that means unknown, not known scaffold.
+
+The renderer-qualified Megatron matrix is:
+
+| Model family | Qualification |
+| --- | --- |
+| Qwen3 dense and MoE chat models in ART's registry | Text, reasoning, tools, and multi-turn histories; exact parity is checked again per prompt. |
+| Qwen3.5 and Qwen3.6 dense and MoE models in ART's registry | Text, reasoning, tools, and multi-turn histories; both engine tool-argument representations are accepted only by exact match. |
+| `OpenPipe/Qwen3-14B-Instruct` | Text and tool declarations. Multi-turn assistant tool-call histories currently fail closed. |
+| `openai/gpt-oss-20b` and `openai/gpt-oss-120b` | Canonical `openai-harmony` format, including reasoning and function tools. |
+| Gemma 4 IT and DeepSeek V4 Flash/Pro | Unavailable: no exact renderer/parity path has been established. |
+
+Explicit base models, raw Completions, custom chat templates, and models outside
+that matrix also fail closed. The Prime renderer dependency is installed by
+ART's `backend` and `megatron` extras; a core-only installation reports content
+attribution as unavailable.
+
+Chat Completions, Anthropic Messages, and OpenAI Responses use the same rule.
+Their final response (including a reconstructed streamed response) must carry
+the exact `prompt_token_ids` consumed by the engine. Caladan's compatible
+vLLM/SGLang protocol patches supply this metadata; other servers qualify only
+if they provide the same exact carrier. A Responses request that performs more
+than one internal server-side generation does not have one unambiguous prompt
+sequence and therefore omits attribution.
+
+## Selecting losses safely
+
+Require both complete attribution and at least one selected token:
+
+```python
+if not tokenized.content_attribution_complete:
+    raise ValueError("CONTENT attribution is unavailable")
+
+content_mask = [bool(flag & art.TokenFlag.CONTENT) for flag in tokenized.flags]
+if not any(content_mask):
+    raise ValueError("CONTENT selection is empty")
+
+mean_content_loss = losses[content_mask].mean()
+```
+
+The second check is required because NumPy and PyTorch return NaN for
+`losses[empty_mask].mean()`.

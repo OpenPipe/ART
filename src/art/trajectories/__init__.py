@@ -64,6 +64,14 @@ class TokenFlag(IntFlag):
     EXACT = 1 << 0
     # The token belongs to a model-sampled response rather than its prompt.
     SAMPLED = 1 << 1
+    # The token comes from a message body: caller-provided content, reasoning,
+    # or tool-call data, or a model-sampled assistant emission. Renderer-added
+    # role tags, tools headers, separators, and generation prompts are not
+    # content. For tokens spanning a body/scaffold text boundary, the segment
+    # containing the token's first source character owns the token; a character
+    # exactly on a boundary belongs to the later segment. This bit is meaningful
+    # only when TokenizedTrajectory.content_attribution_complete is true.
+    CONTENT = 1 << 2
 
 
 class ChatCompletionsRequest(TypedDict, total=False, extra_items=Any):
@@ -529,9 +537,21 @@ class TrajectoryGroup(_CompactModel):
 
 
 class TokenizedTrajectory(pydantic.BaseModel):
+    """One token sequence with independent provenance flags.
+
+    Consumers selecting CONTENT tokens must first require
+    ``content_attribution_complete``, then require a nonempty selection. In
+    NumPy and PyTorch, ``losses[empty_mask].mean()`` is NaN; silently averaging
+    an unavailable or empty CONTENT mask can therefore poison a training step.
+    """
+
     token_ids: list[int]
     logprobs: list[float]
     flags: list[TokenFlag]
+    # True only when every token has a known CONTENT classification, proven by
+    # matching renderer output to every exact engine-consumed prompt in full.
+    # When false, an unset CONTENT bit is unknown, not known scaffold.
+    content_attribution_complete: bool = False
     underlying: Trajectory
 
 
