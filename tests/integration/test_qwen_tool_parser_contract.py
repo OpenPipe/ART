@@ -3,9 +3,7 @@ from pathlib import Path
 
 import pytest
 
-_vllm_protocol = pytest.importorskip(
-    "vllm.entrypoints.openai.chat_completion.protocol"
-)
+_vllm_protocol = pytest.importorskip("vllm.entrypoints.openai.chat_completion.protocol")
 _vllm_tool_parsers = pytest.importorskip("vllm.tool_parsers")
 
 
