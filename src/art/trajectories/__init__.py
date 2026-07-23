@@ -323,6 +323,7 @@ class ChatCompletionsMessageSource:
     request_index: int | None = None
     choice_index: int | None = None
     output_index: int | None = None
+    generation_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +337,7 @@ class ResponsesItemSource:
     exchange: ResponsesExchange
     request_index: int | None = None
     output_index: int | None = None
+    generation_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

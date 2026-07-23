@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 import importlib
-from typing import Any
+from typing import Any, cast
 
 from anthropic.types import Message
 from openai.types import Completion
@@ -219,6 +219,37 @@ def test_chat_history_resolves_one_model_and_append_only_sequence() -> None:
         trajectory.chat_completions_history(model="test/model")
 
 
+def test_chat_history_preserves_provider_specific_nested_fields() -> None:
+    exchange = _chat(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "one",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            }
+        ],
+        "first",
+    )
+
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    )
+    history = trajectory.chat_completions_history()
+
+    content = cast(list[dict[str, object]], history.messages[0]["content"])
+    assert content[0]["cache_control"] == {"type": "ephemeral"}
+    dumped = trajectory.model_dump(mode="json", warnings="error")
+    dumped_content = dumped["exchanges"]["chat_completions"][0]["request"]["messages"][
+        0
+    ]["content"]
+    assert dumped_content[0]["cache_control"] == {"type": "ephemeral"}
+
+
 def test_chat_choices_branch_and_identical_continuation_uses_first_choice() -> None:
     first = _chat([{"role": "user", "content": "one"}], "same")
     response = first.response.model_dump(mode="python")
@@ -247,6 +278,43 @@ def test_chat_choices_branch_and_identical_continuation_uses_first_choice() -> N
     assert histories[0].message_sources[1].choice_index == 0
     assert histories[1].message_sources[1] is not None
     assert histories[1].message_sources[1].choice_index == 1
+
+
+def test_same_content_seeded_inputs_remain_request_sourced() -> None:
+    first_chat = _chat([{"role": "user", "content": "prompt"}], "same")
+    seeded_chat = _chat([{"role": "assistant", "content": "same"}], "next", offset=1)
+    chat_histories = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first_chat, seeded_chat])
+    ).chat_completions_histories()
+    seeded_chat_source = chat_histories[1].message_sources[0]
+    assert seeded_chat_source is not None
+    assert seeded_chat_source.exchange is seeded_chat
+    assert seeded_chat_source.request_index == 0
+
+    first_message = _message()
+    seeded_message = _message()
+    seeded_message.start_time, seeded_message.end_time = _times(1)
+    seeded_message.request["messages"] = [{"role": "assistant", "content": "Hi"}]
+    message_histories = art.Trajectory(
+        exchanges=TrajectoryExchanges(messages=[first_message, seeded_message])
+    ).anthropic_messages_histories()
+    seeded_message_source = message_histories[1].message_sources[0]
+    assert seeded_message_source is not None
+    assert seeded_message_source.exchange is seeded_message
+    assert seeded_message_source.request_index == 0
+
+    first_response = _response("response-1", "same")
+    seeded_response = _response("response-2", "next", offset=1)
+    seeded_response.request["input"] = [
+        first_response.response.output[0].model_dump(mode="json", exclude_none=True)
+    ]
+    response_histories = art.Trajectory(
+        exchanges=TrajectoryExchanges(responses=[first_response, seeded_response])
+    ).responses_histories()
+    seeded_response_source = response_histories[1].input_sources[0]
+    assert seeded_response_source is not None
+    assert seeded_response_source.exchange is seeded_response
+    assert seeded_response_source.request_index == 0
 
 
 def test_history_mutation_must_keep_source_sidecar_consistent() -> None:
@@ -279,7 +347,7 @@ def test_history_accepts_user_authored_messages_with_none_source() -> None:
     class Tokenizer:
         def __call__(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
             assert not add_special_tokens
-            return {"first": [20], "next": [30]}[text]
+            return {"one": [10], "first": [20], "next": [30]}[text]
 
         def apply_chat_template(
             self,
@@ -400,6 +468,147 @@ def test_responses_history_expands_previous_response_chain() -> None:
     assert external[1].previous_response_id == "missing"
 
 
+def test_responses_history_propagates_opaque_context_and_first_sources() -> None:
+    first = _response(
+        "response-1",
+        "first",
+        previous_response_id="outside-trajectory",
+    )
+    first.request["conversation"] = "conversation-1"
+    second = _response(
+        "response-2",
+        "second",
+        previous_response_id="response-1",
+        offset=1,
+    )
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(responses=[first, second])
+    )
+
+    history = trajectory.responses_history()
+
+    assert history.previous_response_id == "outside-trajectory"
+    assert history.conversation == "conversation-1"
+    assert history.input_sources[1] is not None
+    assert history.input_sources[1].exchange is first
+    assert history.input_sources[1].output_index == 0
+
+
+def test_responses_history_maps_and_validates_generation_sources() -> None:
+    exchange = _response("response-1", "first", reasoning="think")
+    assert exchange.response.__pydantic_extra__ is not None
+    exchange.response.__pydantic_extra__["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2, "logprob": -0.1}],
+            "output_indices": [0, 1],
+        }
+    ]
+
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+    history = trajectory.responses_history()
+
+    assert {
+        source.generation_index
+        for source in history.input_sources
+        if source is not None and source.output_index is not None
+    } == {0}
+
+    exchange.response.__pydantic_extra__["token_generations"][0]["output_indices"] = [0]
+    with pytest.raises(ValueError, match="every sampled output item"):
+        trajectory.responses_history()
+
+    exchange.response.__pydantic_extra__["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2}],
+            "output_indices": [0],
+        },
+        {
+            "prompt_token_ids": [1, 2],
+            "output_tokens": [{"token_id": 3}],
+            "output_indices": [0],
+        },
+    ]
+    with pytest.raises(ValueError, match="nonoverlapping"):
+        trajectory.responses_history()
+
+
+@pytest.mark.parametrize(
+    ("second_prompt", "reasoning", "expected_histories"),
+    [([1, 2, 3], False, 1), ([1, 3], True, 2)],
+)
+def test_responses_multi_generation_history_leaves_match_tokenization(
+    second_prompt: list[int], reasoning: bool, expected_histories: int
+) -> None:
+    exchange = _response(
+        "response-1", "first", reasoning="think" if reasoning else None
+    )
+    data = exchange.response.model_dump(mode="python")
+    first_output_indices = list(range(len(data["output"])))
+    tool_output_index = len(data["output"])
+    second_output_index = tool_output_index + 1
+    data["output"].extend(
+        [
+            {
+                "id": "tool-output",
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": "result",
+                "status": "completed",
+            },
+            {
+                "id": "message-second",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "second",
+                        "annotations": [],
+                        "logprobs": [],
+                    }
+                ],
+            },
+        ]
+    )
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2, "logprob": -0.2}],
+            "output_indices": first_output_indices,
+        },
+        {
+            "prompt_token_ids": second_prompt,
+            "output_tokens": [{"token_id": 4, "logprob": -0.4}],
+            "output_indices": [second_output_index],
+        },
+    ]
+    exchange.response = Response.model_validate(data)
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+
+    histories = trajectory.responses_histories()
+    tokenized = trajectory.tokenize(multi_history=True)
+
+    assert len(histories) == expected_histories
+    assert len(tokenized.histories) == expected_histories
+    final_sources = histories[-1].input_sources
+    assert final_sources[-2] is not None
+    assert final_sources[-2].generation_index is None
+    assert final_sources[-1] is not None
+    assert final_sources[-1].generation_index == 1
+    if expected_histories == 2:
+        assert final_sources[1] is not None
+        assert final_sources[1].generation_index is None
+        assert all(item.get("type") != "reasoning" for item in histories[-1].input)
+    converted = histories[-1].as_chat_completions_history()
+    assert any(
+        source is not None and source.generation_index == 1
+        for source in converted.message_sources
+    )
+
+
 def test_completions_history_preserves_exact_tokens_and_sampled_spans() -> None:
     trajectory = art.Trajectory(
         exchanges=TrajectoryExchanges(
@@ -454,6 +663,50 @@ def test_batched_completions_create_every_prompt_choice_history() -> None:
     ]
     with pytest.raises(ValueError, match="exactly one history"):
         trajectory.history()
+
+
+def test_batched_completions_prefer_exact_prompt_association() -> None:
+    exchange = _completion([1], [10])
+    exchange.request["prompt"] = [[1], [2]]
+    response = exchange.response.model_dump(mode="python")
+    response["choices"] = [
+        {
+            "index": 0,
+            "finish_reason": "stop",
+            "text": "second",
+            "prompt_token_ids": [2],
+            "token_ids": [20],
+        },
+        {
+            "index": 1,
+            "finish_reason": "stop",
+            "text": "first",
+            "prompt_token_ids": [1],
+            "token_ids": [10],
+        },
+    ]
+    exchange.response = Completion.model_validate(response)
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(completions=[exchange]))
+
+    histories = trajectory.completions_token_histories()
+
+    assert [history.prompt for history in histories] == [[1, 10], [2, 20]]
+
+
+def test_completions_histories_never_silently_omit_mixed_evidence() -> None:
+    exact = _completion([1], [2])
+    missing = _completion([3], [4], offset=1)
+    missing.request["prompt"] = "question"
+    response = missing.response.model_dump(mode="python")
+    response["choices"][0].pop("prompt_token_ids")
+    response["choices"][0].pop("token_ids")
+    missing.response = Completion.model_validate(response)
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[exact, missing])
+    )
+
+    with pytest.raises(ValueError, match="text prompts for every choice"):
+        trajectory.histories()
 
 
 def test_completions_reject_ambiguous_batches_and_suffix() -> None:
@@ -556,11 +809,7 @@ def test_chat_template_stripped_reasoning_splits_exact_histories() -> None:
     second = _chat(
         [
             {"role": "user", "content": "one"},
-            {
-                "role": "assistant",
-                "content": "first",
-                "reasoning": "thought-one",
-            },
+            {"role": "assistant", "content": "first"},
             {"role": "user", "content": "two"},
         ],
         "second",
@@ -579,6 +828,9 @@ def test_chat_template_stripped_reasoning_splits_exact_histories() -> None:
 
     assert len(histories) == 2
     assert [len(history.messages) for history in histories] == [2, 4]
+    assert histories[1].message_sources[1] is not None
+    assert histories[1].message_sources[1].exchange is first
+    assert histories[1].message_sources[1].choice_index == 0
     with pytest.raises(ValueError, match="exactly one history"):
         trajectory.tokenize()
 

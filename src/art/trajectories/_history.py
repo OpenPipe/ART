@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import json
 from typing import Generic, Protocol, TypeVar, cast
@@ -95,6 +95,21 @@ class _ResponsesContext:
     kwargs: dict[str, object] | None
 
 
+type _ResponsesRecord = tuple[
+    ResponseInputParam,
+    list[ResponsesItemSource | None],
+    ResponsesConversation | None,
+    str | None,
+]
+
+
+@dataclass(frozen=True)
+class _ResponsesGeneration:
+    prompt_token_ids: list[int]
+    output_token_ids: list[int]
+    output_indices: list[int]
+
+
 @dataclass
 class _Branch(Generic[_ItemT, _SourceT, _ContextT]):
     items: list[_ItemT]
@@ -135,6 +150,28 @@ def _is_prefix(prefix: Sequence[object], value: Sequence[object]) -> bool:
     return len(prefix) <= len(value) and list(value[: len(prefix)]) == list(prefix)
 
 
+def _lineage_prompt_sources(
+    branches: Sequence[_Branch[_ItemT, _SourceT, _ContextT]],
+    *,
+    prompt: Sequence[_ItemT],
+    defaults: Sequence[_SourceT | None],
+    equivalent: Callable[[_ItemT, _ItemT], bool],
+) -> list[_SourceT | None]:
+    candidates = [
+        branch
+        for branch in branches
+        if len(branch.items) < len(prompt)
+        and all(
+            equivalent(existing, current)
+            for existing, current in zip(branch.items, prompt, strict=False)
+        )
+    ]
+    if not candidates:
+        return list(defaults)
+    parent = min(candidates, key=lambda branch: (-len(branch.items), branch.order))
+    return [*parent.sources, *defaults[len(parent.items) :]]
+
+
 def _extend_branches(
     branches: list[_Branch[_ItemT, _SourceT, _ContextT]],
     *,
@@ -172,7 +209,9 @@ def _extend_branches(
         regenerations = [
             branch
             for branch in branches
-            if branch.context == context and _is_prefix(prompt, branch.items)
+            if branch.context == context
+            and _is_prefix(prompt, branch.items)
+            and (continuation is None or continuation(branch))
         ]
         if regenerations:
             parent = min(regenerations, key=lambda branch: branch.order)
@@ -249,6 +288,14 @@ def _chat_retains_sampled_reasoning(
     return True
 
 
+def _chat_message_key(message: Message, *, visible_only: bool = False) -> str:
+    data = copy.deepcopy(dict(message))
+    if visible_only:
+        data.pop("reasoning", None)
+        data.pop("reasoning_content", None)
+    return json.dumps(data, sort_keys=True, default=str)
+
+
 def _require_unmixed(trajectory: Trajectory) -> None:
     if trajectory.exchanges and (
         trajectory.messages_and_choices
@@ -297,10 +344,18 @@ def chat_completions_histories(
         ] = []
         for sequence, exchange in enumerate(exchanges):
             prompt = _MESSAGES.validate_python(exchange.request.get("messages", []))
-            prompt_sources = [
-                ChatCompletionsMessageSource(exchange=exchange, request_index=index)
-                for index in range(len(prompt))
-            ]
+            prompt_sources = _lineage_prompt_sources(
+                branches,
+                prompt=prompt,
+                defaults=[
+                    ChatCompletionsMessageSource(exchange=exchange, request_index=index)
+                    for index in range(len(prompt))
+                ],
+                equivalent=lambda left, right: (
+                    _chat_message_key(left, visible_only=True)
+                    == _chat_message_key(right, visible_only=True)
+                ),
+            )
             outputs: list[
                 tuple[
                     int,
@@ -314,15 +369,14 @@ def chat_completions_histories(
                 response = _MESSAGE.validate_python(
                     choice.message.model_dump(mode="python", exclude_none=True)
                 )
+                response_source = ChatCompletionsMessageSource(
+                    exchange=exchange, choice_index=choice.index
+                )
                 outputs.append(
                     (
                         choice.index,
                         [response],
-                        [
-                            ChatCompletionsMessageSource(
-                                exchange=exchange, choice_index=choice.index
-                            )
-                        ],
+                        [response_source],
                     )
                 )
             _extend_branches(
@@ -376,7 +430,6 @@ def anthropic_messages_histories(
     for selected_model, exchanges in _selected_models(
         trajectory.exchanges.messages, model, "Anthropic Messages"
     ):
-        introduced: dict[tuple[object, ...], AnthropicMessageSource] = {}
         branches: list[
             _Branch[AnthropicMessageParam, AnthropicMessageSource, _AnthropicContext]
         ] = []
@@ -385,13 +438,18 @@ def anthropic_messages_histories(
                 copy.deepcopy(message)
                 for message in exchange.request.get("messages", [])
             ]
-            prompt_sources = [
-                introduced.get(
-                    _anthropic_message_key(message),
-                    AnthropicMessageSource(exchange=exchange, request_index=index),
-                )
-                for index, message in enumerate(prompt)
-            ]
+            prompt_sources = _lineage_prompt_sources(
+                branches,
+                prompt=prompt,
+                defaults=[
+                    AnthropicMessageSource(exchange=exchange, request_index=index)
+                    for index in range(len(prompt))
+                ],
+                equivalent=lambda left, right: (
+                    _anthropic_message_key(left, visible_only=True)
+                    == _anthropic_message_key(right, visible_only=True)
+                ),
+            )
             response = cast(
                 AnthropicMessageParam,
                 {
@@ -403,11 +461,6 @@ def anthropic_messages_histories(
                 },
             )
             response_source = AnthropicMessageSource(exchange=exchange)
-            introduced.setdefault(_anthropic_message_key(response), response_source)
-            introduced.setdefault(
-                _anthropic_message_key(response, visible_only=True),
-                response_source,
-            )
             _extend_branches(
                 branches,
                 prompt=prompt,
@@ -434,7 +487,7 @@ def anthropic_messages_histories(
                 sequence=sequence,
                 start_time=exchange.start_time,
             )
-        for branch in branches:
+        for branch in sorted(branches, key=lambda item: (item.first_time, item.order)):
             first_source = next(
                 (source for source in branch.sources if source is not None), None
             )
@@ -521,9 +574,8 @@ def responses_histories(
         branches: list[
             _Branch[ResponseInputItemParam, ResponsesItemSource, _ResponsesContext]
         ] = []
-        responses: dict[
-            str, tuple[ResponseInputParam, list[ResponsesItemSource | None]]
-        ] = {}
+        responses: dict[str, _ResponsesRecord] = {}
+        conversations: dict[str, _ResponsesRecord] = {}
         for sequence, exchange in enumerate(exchanges):
             request = exchange.request
             prompt = _responses_input(request.get("input"))
@@ -531,11 +583,36 @@ def responses_histories(
                 ResponsesItemSource(exchange=exchange, request_index=index)
                 for index in range(len(prompt))
             ]
+            requested_conversation = _RESPONSE_CONVERSATION.validate_python(
+                request.get("conversation")
+            )
             previous = request.get("previous_response_id")
+            inherited_conversation: ResponsesConversation | None = None
+            inherited_previous: str | None = None
+            prior: _ResponsesRecord | None = None
             if isinstance(previous, str) and previous in responses:
-                prior_items, prior_sources = responses[previous]
+                prior = responses[previous]
+            elif requested_conversation is not None:
+                prior = conversations.get(
+                    json.dumps(requested_conversation, sort_keys=True, default=str)
+                )
+            if prior is not None:
+                (
+                    prior_items,
+                    prior_sources,
+                    inherited_conversation,
+                    inherited_previous,
+                ) = prior
                 prompt = [*copy.deepcopy(prior_items), *prompt]
                 prompt_sources = [*copy.copy(prior_sources), *prompt_sources]
+            prompt_sources = _lineage_prompt_sources(
+                branches,
+                prompt=prompt,
+                defaults=prompt_sources,
+                equivalent=lambda left, right: (
+                    _response_item_key(left) == _response_item_key(right)
+                ),
+            )
             output = [
                 cast(
                     ResponseInputItemParam,
@@ -543,8 +620,15 @@ def responses_histories(
                 )
                 for item in exchange.response.output
             ]
+            generations, generation_indices = _responses_generations(
+                exchange, output=output
+            )
             output_sources: list[ResponsesItemSource | None] = [
-                ResponsesItemSource(exchange=exchange, output_index=index)
+                ResponsesItemSource(
+                    exchange=exchange,
+                    output_index=index,
+                    generation_index=generation_indices[index],
+                )
                 for index in range(len(output))
             ]
             instructions = request.get("instructions")
@@ -553,33 +637,132 @@ def responses_histories(
             external_previous = (
                 previous
                 if isinstance(previous, str) and previous not in responses
-                else None
+                else inherited_previous
             )
-            _extend_branches(
-                branches,
-                prompt=prompt,
-                prompt_sources=prompt_sources,
-                outputs=[(0, output, output_sources)],
-                context=_ResponsesContext(
-                    instructions=instructions,
-                    tools=_RESPONSE_TOOLS.validate_python(request.get("tools")),
-                    conversation=_RESPONSE_CONVERSATION.validate_python(
-                        request.get("conversation")
-                    ),
-                    previous_response_id=external_previous,
-                    template=request.get("chat_template"),
-                    kwargs=_CHAT_KWARGS.validate_python(
-                        request.get("chat_template_kwargs")
-                    ),
+            conversation = (
+                requested_conversation
+                if requested_conversation is not None
+                else inherited_conversation
+            )
+            context = _ResponsesContext(
+                instructions=instructions,
+                tools=_RESPONSE_TOOLS.validate_python(request.get("tools")),
+                conversation=conversation,
+                previous_response_id=external_previous,
+                template=request.get("chat_template"),
+                kwargs=_CHAT_KWARGS.validate_python(
+                    request.get("chat_template_kwargs")
                 ),
-                sequence=sequence,
-                start_time=exchange.start_time,
             )
-            responses[exchange.response.id] = (
-                [*copy.deepcopy(prompt), *copy.deepcopy(output)],
-                [*copy.copy(prompt_sources), *copy.copy(output_sources)],
+            final_items = [*copy.deepcopy(prompt), *copy.deepcopy(output)]
+            final_sources = [*copy.copy(prompt_sources), *copy.copy(output_sources)]
+            if generations:
+                for generation_index, generation in enumerate(generations):
+                    if not generation.output_indices:
+                        raise ValueError(
+                            "A Responses token generation without native output "
+                            "items cannot yet be projected as a history"
+                        )
+                    output_start = generation.output_indices[0]
+                    output_end = generation.output_indices[-1] + 1
+                    if generation_index == len(generations) - 1:
+                        output_end = len(output)
+                    generation_prompt = [
+                        *copy.deepcopy(prompt),
+                        *copy.deepcopy(output[:output_start]),
+                    ]
+                    generation_prompt_sources = [
+                        *copy.copy(prompt_sources),
+                        *copy.copy(output_sources[:output_start]),
+                    ]
+                    continuation = lambda branch, generation=generation: (
+                        _responses_generation_extends(
+                            branch,
+                            exchange=exchange,
+                            generation=generation,
+                            generations=generations,
+                        )
+                    )
+                    extends = any(
+                        branch.context == context
+                        and _is_prefix(branch.items, generation_prompt)
+                        and continuation(branch)
+                        for branch in branches
+                    )
+                    if not extends and generation_index:
+                        retained = [
+                            (item, source)
+                            for item, source in zip(
+                                generation_prompt,
+                                generation_prompt_sources,
+                                strict=True,
+                            )
+                            if not (
+                                item.get("type") == "reasoning"
+                                and source is not None
+                                and source.exchange is exchange
+                                and source.output_index is not None
+                            )
+                        ]
+                        generation_prompt = [item for item, _ in retained]
+                        generation_prompt_sources = [
+                            (
+                                replace(source, generation_index=None)
+                                if source is not None
+                                and source.exchange is exchange
+                                and source.generation_index is not None
+                                else source
+                            )
+                            for _, source in retained
+                        ]
+                    generation_output = output[output_start:output_end]
+                    generation_output_sources = output_sources[output_start:output_end]
+                    _extend_branches(
+                        branches,
+                        prompt=generation_prompt,
+                        prompt_sources=generation_prompt_sources,
+                        outputs=[
+                            (
+                                generation_index,
+                                generation_output,
+                                generation_output_sources,
+                            )
+                        ],
+                        context=context,
+                        sequence=sequence,
+                        start_time=exchange.start_time,
+                        continuation=continuation,
+                    )
+                    final_items = [
+                        *copy.deepcopy(generation_prompt),
+                        *copy.deepcopy(generation_output),
+                    ]
+                    final_sources = [
+                        *copy.copy(generation_prompt_sources),
+                        *copy.copy(generation_output_sources),
+                    ]
+            else:
+                _extend_branches(
+                    branches,
+                    prompt=prompt,
+                    prompt_sources=prompt_sources,
+                    outputs=[(0, output, output_sources)],
+                    context=context,
+                    sequence=sequence,
+                    start_time=exchange.start_time,
+                )
+            record = (
+                final_items,
+                final_sources,
+                copy.deepcopy(conversation),
+                external_previous,
             )
-        for branch in branches:
+            responses[exchange.response.id] = record
+            if conversation is not None:
+                conversations[json.dumps(conversation, sort_keys=True, default=str)] = (
+                    record
+                )
+        for branch in sorted(branches, key=lambda item: (item.first_time, item.order)):
             first_source = next(
                 (source for source in branch.sources if source is not None), None
             )
@@ -600,6 +783,64 @@ def responses_histories(
                 )
             )
     return histories
+
+
+def _response_item_key(item: ResponseInputItemParam) -> str:
+    return json.dumps(item, sort_keys=True, default=str)
+
+
+def _responses_generations(
+    exchange: ResponsesExchange, *, output: Sequence[ResponseInputItemParam]
+) -> tuple[list[_ResponsesGeneration], list[int | None]]:
+    from ._tokenize import _response_generations
+
+    generations = _response_generations(exchange.response)
+    result: list[int | None] = [None] * len(output)
+    parsed: list[_ResponsesGeneration] = []
+    for generation_index, generation in enumerate(generations):
+        if generation.prompt_token_ids is None or generation.output_token_ids is None:
+            raise AssertionError("Validated Responses generation omitted exact tokens")
+        for output_index in generation.output_indices:
+            result[output_index] = generation_index
+        parsed.append(
+            _ResponsesGeneration(
+                prompt_token_ids=generation.prompt_token_ids,
+                output_token_ids=generation.output_token_ids,
+                output_indices=generation.output_indices,
+            )
+        )
+    return parsed, result
+
+
+def _responses_generation_extends(
+    branch: _Branch[ResponseInputItemParam, ResponsesItemSource, _ResponsesContext],
+    *,
+    exchange: ResponsesExchange,
+    generation: _ResponsesGeneration,
+    generations: Sequence[_ResponsesGeneration],
+) -> bool:
+    prior_generation = next(
+        (
+            source.generation_index
+            for source in reversed(branch.sources)
+            if source is not None
+            and source.exchange is exchange
+            and source.generation_index is not None
+        ),
+        None,
+    )
+    if prior_generation is None:
+        return True
+    prior = generations[prior_generation]
+    if _is_prefix(
+        [*prior.prompt_token_ids, *prior.output_token_ids],
+        generation.prompt_token_ids,
+    ):
+        return True
+    return not any(
+        getattr(exchange.response.output[index], "type", None) == "reasoning"
+        for index in prior.output_indices
+    )
 
 
 def responses_history(trajectory: Trajectory, *, model: str | None) -> ResponsesHistory:
@@ -643,22 +884,26 @@ def completions_token_histories(
         trajectory.exchanges.completions, model, "Completions"
     ):
         branches: list[_Branch[int, CompletionsSource, tuple[()]]] = []
+        complete = True
         for sequence, exchange in enumerate(exchanges):
             if exchange.request.get("suffix") is not None:
                 raise ValueError("Completions suffix is not supported")
+            choice_groups = _completion_choice_groups(exchange)
             for prompt_index, request_prompt in enumerate(
                 _completion_prompts(exchange.request.get("prompt"))
             ):
-                choices = _completion_choices_for_prompt(exchange, prompt_index)
+                choices = choice_groups[prompt_index]
                 for choice in choices:
                     prompt, completion = _completion_exact_tokens(
                         exchange, choice.index
                     )
                     if prompt is None:
                         if not isinstance(request_prompt, list):
+                            complete = False
                             continue
                         prompt = copy.deepcopy(request_prompt)
                     if completion is None:
+                        complete = False
                         continue
                     prompt_source = CompletionsSource(
                         exchange=exchange, prompt_index=prompt_index
@@ -683,6 +928,10 @@ def completions_token_histories(
                         sequence=sequence,
                         start_time=exchange.start_time,
                     )
+        if not complete:
+            raise ValueError(
+                "Completions token history requires exact token IDs for every choice"
+            )
         for branch in branches:
             histories.append(
                 CompletionsTokenHistory(
@@ -729,28 +978,75 @@ def _completion_prompts(value: object) -> list[str | list[int]]:
 def _checked_token_ids(value: Sequence[object]) -> list[int]:
     result: list[int] = []
     for token in value:
-        if not isinstance(token, int) or isinstance(token, bool):
-            raise ValueError("Completions token prompts must contain integers")
+        if not isinstance(token, int) or isinstance(token, bool) or token < 0:
+            raise ValueError(
+                "Completions token prompts must contain non-negative integers"
+            )
         result.append(token)
     return result
 
 
-def _completion_choices_for_prompt(
-    exchange: CompletionsExchange, prompt_index: int
-) -> list[CompletionChoice]:
-    count = len(_completion_prompts(exchange.request.get("prompt")))
+def _completion_choice_groups(
+    exchange: CompletionsExchange,
+) -> list[list[CompletionChoice]]:
+    prompts = _completion_prompts(exchange.request.get("prompt"))
+    count = len(prompts)
     choices = sorted(exchange.response.choices, key=lambda item: item.index)
+    if not choices:
+        raise ValueError("Completions response contains no choices")
     if count == 1:
-        return choices
+        return [choices]
+    requested_n = exchange.request.get("n")
+    if requested_n is not None and (
+        not isinstance(requested_n, int)
+        or isinstance(requested_n, bool)
+        or requested_n < 1
+    ):
+        raise ValueError("Completions n must be a positive integer")
+
+    exact_matches: dict[int, int] = {}
+    for choice in choices:
+        prompt_ids, _ = _completion_exact_tokens(exchange, choice.index)
+        if prompt_ids is None:
+            continue
+        matches = [
+            prompt_index
+            for prompt_index, prompt in enumerate(prompts)
+            if isinstance(prompt, list) and prompt == prompt_ids
+        ]
+        if len(matches) == 1:
+            exact_matches[choice.index] = matches[0]
+
+    if len(exact_matches) == len(choices):
+        groups = [[] for _ in prompts]
+        for choice in choices:
+            groups[exact_matches[choice.index]].append(choice)
+        if all(groups) and (
+            requested_n is None or all(len(group) == requested_n for group in groups)
+        ):
+            return groups
+
     if len(choices) % count:
         raise ValueError("Cannot associate Completions choices with batched prompts")
     per_prompt = len(choices) // count
-    start = prompt_index * per_prompt
-    expected = list(range(start, start + per_prompt))
-    selected = choices[start : start + per_prompt]
-    if [choice.index for choice in selected] != expected:
+    if requested_n is not None and requested_n != per_prompt:
+        raise ValueError("Cannot associate Completions choices with batched prompts")
+    if [choice.index for choice in choices] != list(range(len(choices))):
         raise ValueError("Ambiguous Completions choice-to-prompt association")
-    return selected
+    groups = [
+        choices[prompt_index * per_prompt : (prompt_index + 1) * per_prompt]
+        for prompt_index in range(count)
+    ]
+    for prompt_index, group in enumerate(groups):
+        if any(
+            choice.index in exact_matches
+            and exact_matches[choice.index] != prompt_index
+            for choice in group
+        ):
+            raise ValueError(
+                "Completions exact prompt evidence contradicts choice indices"
+            )
+    return groups
 
 
 def completions_string_histories(
@@ -762,15 +1058,18 @@ def completions_string_histories(
         trajectory.exchanges.completions, model, "Completions"
     ):
         branches: list[_Branch[str, CompletionsSource, tuple[()]]] = []
+        complete = True
         for sequence, exchange in enumerate(exchanges):
             if exchange.request.get("suffix") is not None:
                 raise ValueError("Completions suffix is not supported")
+            choice_groups = _completion_choice_groups(exchange)
             for prompt_index, prompt in enumerate(
                 _completion_prompts(exchange.request.get("prompt"))
             ):
                 if not isinstance(prompt, str):
+                    complete = False
                     continue
-                for choice in _completion_choices_for_prompt(exchange, prompt_index):
+                for choice in choice_groups[prompt_index]:
                     text = choice.text
                     if exchange.request.get("echo") is True:
                         if not text.startswith(prompt):
@@ -801,6 +1100,10 @@ def completions_string_histories(
                         sequence=sequence,
                         start_time=exchange.start_time,
                     )
+        if not complete:
+            raise ValueError(
+                "Completions string history requires text prompts for every choice"
+            )
         histories.extend(
             CompletionsStringHistory(
                 model=selected_model,
@@ -931,6 +1234,7 @@ def responses_as_chat_completions_history(
                 exchange=source.exchange,
                 request_index=source.request_index,
                 output_index=source.output_index,
+                generation_index=source.generation_index,
             )
             if source is not None
             else None

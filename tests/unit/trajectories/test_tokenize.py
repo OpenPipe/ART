@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 from datetime import datetime, timedelta
 import math
+import random
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -23,6 +24,7 @@ from art.trajectories import (
     MessagesExchange,
     MessagesRequest,
     ResponsesExchange,
+    ResponsesItemSource,
     ResponsesRequest,
     TrajectoryExchanges,
 )
@@ -225,7 +227,7 @@ def test_malformed_explicit_exact_token_metadata_fails_closed() -> None:
     response = _response_exchange("response-invalid", 2)
     response_extra = response.response.model_extra
     assert response_extra is not None
-    response_extra["raw_output_tokens"] = [{"token_id": "invalid"}]
+    response_extra["token_generations"][0]["output_tokens"] = [{"token_id": "invalid"}]
 
     message_response = Message.model_validate(
         {
@@ -261,6 +263,19 @@ def test_malformed_explicit_exact_token_metadata_fails_closed() -> None:
     for trajectory in trajectories:
         with pytest.raises(ValueError, match="exact token"):
             trajectory.tokenize(base_model="base/model")
+
+
+@pytest.mark.parametrize("token_id", [-1, True])
+def test_exact_token_metadata_rejects_negative_ids_and_booleans(
+    token_id: object,
+) -> None:
+    exchange = _response_exchange("response-invalid-token", 2)
+    extra = exchange.response.model_extra
+    assert extra is not None
+    extra["token_generations"][0]["output_tokens"] = [{"token_id": token_id}]
+
+    with pytest.raises(ValueError, match="invalid exact token ID"):
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange])).tokenize()
 
 
 @pytest.mark.parametrize(
@@ -305,6 +320,226 @@ def test_completions_echo_preserves_prompt_logprobs_without_sampling_them(
         art.TokenFlag.EXACT,
         art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
     ]
+
+
+def test_completions_exact_ids_accept_textual_logprobs() -> None:
+    exchange = _completion_exchange()
+    payload = exchange.response.model_dump(mode="python")
+    payload["choices"][0]["logprobs"]["tokens"] = ["answer"]
+    payload["choices"][0]["logprobs"]["token_logprobs"] = [-0.75]
+    exchange.response = Completion.model_validate(payload)
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[exchange])
+    ).tokenize()
+
+    assert tokenized.token_ids == [1, 2]
+    assert tokenized.logprobs[1] == -0.75
+
+
+def test_mutated_completions_token_prompt_drops_stale_exact_evidence() -> None:
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[_completion_exchange()])
+    ).completions_token_history()
+    history.prompt[0] = 99
+
+    tokenized = history.tokenize()
+
+    assert tokenized.token_ids == [99, 2]
+    assert tokenized.flags == [
+        art.TokenFlag(0),
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+
+
+def test_completions_string_history_preserves_textual_logprobs() -> None:
+    exchange = _completion_exchange()
+    payload = exchange.response.model_dump(mode="python")
+    payload["choices"][0].pop("prompt_token_ids", None)
+    payload["choices"][0].pop("token_ids", None)
+    payload["choices"][0]["logprobs"]["tokens"] = ["answer"]
+    payload["choices"][0]["logprobs"]["token_logprobs"] = [-0.8]
+    exchange.response = Completion.model_validate(payload)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[exchange])
+    ).completions_string_history()
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"question": [1], "answer": [2]}[text]
+
+        def apply_chat_template(self, *args: object, **kwargs: object) -> list[int]:
+            raise AssertionError("Completions tokenization does not render chat")
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [1, 2]
+    assert tokenized.logprobs[1] == -0.8
+    assert tokenized.flags[1] == art.TokenFlag.SAMPLED
+
+
+def test_mutated_completions_string_prompt_retokens_without_stale_exact() -> None:
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[_completion_exchange()])
+    ).completions_string_history()
+    history.prompt = "changed" + history.prompt[len("question") :]
+    first = history.prompt_sources[0]
+    history.prompt_sources[0] = type(first)(
+        start=0,
+        end=len("changed"),
+        source=first.source,
+    )
+    shift = len("changed") - len("question")
+    second = history.prompt_sources[1]
+    history.prompt_sources[1] = type(second)(
+        start=second.start + shift,
+        end=second.end + shift,
+        source=second.source,
+    )
+    history.sampled_spans = [
+        (start + shift, end + shift) for start, end in history.sampled_spans
+    ]
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"changed": [9], "answer": [2]}[text]
+
+        def apply_chat_template(self, *args: object, **kwargs: object) -> list[int]:
+            raise AssertionError("Completions tokenization does not render chat")
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [9, 2]
+    assert tokenized.flags[0] == art.TokenFlag(0)
+
+
+def test_batched_completions_map_each_choice_to_its_prompt() -> None:
+    exchange = _completion_exchange(prompt=["first", "second"])
+    payload = exchange.response.model_dump(mode="python")
+    payload["choices"] = [
+        {
+            **payload["choices"][0],
+            "index": 0,
+            "text": "one",
+            "prompt_token_ids": [10],
+            "token_ids": [11],
+            "logprobs": {
+                "tokens": ["token_id:11"],
+                "token_logprobs": [-0.1],
+                "top_logprobs": [{}],
+                "text_offset": [0],
+            },
+        },
+        {
+            **payload["choices"][0],
+            "index": 1,
+            "text": "two",
+            "prompt_token_ids": [20],
+            "token_ids": [21],
+            "logprobs": {
+                "tokens": ["token_id:21"],
+                "token_logprobs": [-0.2],
+                "top_logprobs": [{}],
+                "text_offset": [0],
+            },
+        },
+    ]
+    exchange.response = Completion.model_validate(payload)
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[exchange])
+    ).tokenize(multi_history=True)
+
+    assert [history.token_ids for history in tokenized.histories] == [
+        [10, 11],
+        [20, 21],
+    ]
+    assert [history.flags for history in tokenized.histories] == [
+        [art.TokenFlag.EXACT, art.TokenFlag.EXACT | art.TokenFlag.SAMPLED],
+        [art.TokenFlag.EXACT, art.TokenFlag.EXACT | art.TokenFlag.SAMPLED],
+    ]
+
+
+def test_history_tokenization_rejects_negative_source_indices() -> None:
+    exchange = _response_exchange("response-negative-source", 2)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(responses=[exchange])
+    ).responses_history()
+    history.input_sources[-1] = ResponsesItemSource(
+        exchange=exchange,
+        output_index=-1,
+        generation_index=0,
+    )
+
+    with pytest.raises(ValueError, match="out of bounds"):
+        history.tokenize()
+
+
+def test_batched_completions_reject_ambiguous_choice_indices() -> None:
+    exchange = _completion_exchange(prompt=["first", "second"])
+    payload = exchange.response.model_dump(mode="python")
+    payload["choices"] = [
+        {**payload["choices"][0], "index": 0},
+        {**payload["choices"][0], "index": 2},
+    ]
+    exchange.response = Completion.model_validate(payload)
+
+    with pytest.raises(ValueError, match="Ambiguous"):
+        art.Trajectory(exchanges=TrajectoryExchanges(completions=[exchange])).tokenize(
+            multi_history=True
+        )
+
+
+def test_randomized_completions_projection_preserves_every_choice_once() -> None:
+    rng = random.Random(0)
+    for case in range(20):
+        prompt_count = rng.randint(1, 5)
+        choices_per_prompt = rng.randint(1, 4)
+        exchange = _completion_exchange(
+            prompt=[f"prompt-{case}-{index}" for index in range(prompt_count)]
+        )
+        exchange.request["n"] = choices_per_prompt
+        template = exchange.response.model_dump(mode="python")["choices"][0]
+        choices: list[dict[str, object]] = []
+        expected: list[list[int]] = []
+        for prompt_index in range(prompt_count):
+            prompt_id = 10_000 + case * 100 + prompt_index
+            for local_choice in range(choices_per_prompt):
+                choice_index = prompt_index * choices_per_prompt + local_choice
+                output_id = 20_000 + case * 100 + choice_index
+                expected.append([prompt_id, output_id])
+                choices.append(
+                    {
+                        **template,
+                        "index": choice_index,
+                        "text": f"answer-{output_id}",
+                        "prompt_token_ids": [prompt_id],
+                        "token_ids": [output_id],
+                        "logprobs": {
+                            "tokens": [f"token_id:{output_id}"],
+                            "token_logprobs": [-0.1],
+                            "top_logprobs": [{}],
+                            "text_offset": [0],
+                        },
+                    }
+                )
+        rng.shuffle(choices)
+        response = exchange.response.model_dump(mode="python")
+        response["choices"] = choices
+        exchange.response = Completion.model_validate(response)
+
+        tokenized = art.Trajectory(
+            exchanges=TrajectoryExchanges(completions=[exchange])
+        ).tokenize(multi_history=True)
+
+        assert [history.token_ids for history in tokenized.histories] == expected
+        assert all(
+            history.flags
+            == [art.TokenFlag.EXACT, art.TokenFlag.EXACT | art.TokenFlag.SAMPLED]
+            for history in tokenized.histories
+        )
 
 
 def test_branching_and_multiple_models_require_explicit_resolution() -> None:
@@ -767,6 +1002,106 @@ def test_choice_logprobs_survive_tokenizer_fallback(
     assert math.isnan(result.logprobs[2])
 
 
+def test_exact_chat_ids_accept_ordinary_positional_logprobs() -> None:
+    exchange = _chat_exchange([1], [2])
+    logprobs = exchange.response.choices[0].logprobs
+    assert logprobs is not None and logprobs.content
+    exchange.response.choices[0].logprobs = logprobs.model_copy(
+        update={
+            "content": [
+                logprobs.content[0].model_copy(
+                    update={"token": "answer", "logprob": -0.75}
+                )
+            ]
+        }
+    )
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize()
+
+    assert tokenized.token_ids == [1, 2]
+    assert tokenized.logprobs[1] == -0.75
+
+
+def test_empty_chat_prompt_ids_are_missing_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _chat_exchange([], [2])
+
+    class Tokenizer:
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            return [10, 20] if messages[-1]["role"] == "assistant" else [10]
+
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del text, kwargs
+            return [20]
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
+    )
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize(base_model="base/model")
+
+    assert tokenized.token_ids == [10, 2]
+    assert tokenized.flags == [
+        art.TokenFlag(0),
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+
+
+def test_missing_completion_renders_only_missing_region_when_prompt_is_exact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _chat_exchange([99], [])
+    extra = exchange.response.choices[0].model_extra
+    assert extra is not None
+    extra.pop("token_ids", None)
+    logprobs = exchange.response.choices[0].logprobs
+    assert logprobs is not None
+    exchange.response.choices[0].logprobs = logprobs.model_copy(
+        update={
+            "content": [
+                ChatCompletionTokenLogprob(
+                    token="answer",
+                    logprob=-0.5,
+                    bytes=list(b"answer"),
+                    top_logprobs=[],
+                )
+            ]
+        }
+    )
+
+    class Tokenizer:
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            return [10, 20] if messages[-1]["role"] == "assistant" else [10]
+
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del text, kwargs
+            return [20]
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
+    )
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize(base_model="base/model")
+
+    assert tokenized.token_ids == [99, 20]
+    assert tokenized.logprobs[1] == -0.5
+    assert tokenized.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.SAMPLED,
+    ]
+
+
 def test_ambiguous_visible_logprobs_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -938,6 +1273,7 @@ def _response_exchange(
     *,
     previous_response_id: str | None = None,
     offset: int = 0,
+    prompt_token_ids: list[int] | None = None,
 ) -> ResponsesExchange:
     response = Response.model_validate(
         {
@@ -964,7 +1300,13 @@ def _response_exchange(
             "parallel_tool_calls": True,
             "tool_choice": "auto",
             "tools": [],
-            "raw_output_tokens": [{"token_id": output_id, "logprob": -0.1}],
+            "token_generations": [
+                {
+                    "prompt_token_ids": prompt_token_ids or [10],
+                    "output_tokens": [{"token_id": output_id, "logprob": -0.1}],
+                    "output_indices": [0],
+                }
+            ],
         }
     )
     request = ResponsesRequest(model="test/model", input=f"turn {offset}")
@@ -982,7 +1324,7 @@ def _response_exchange(
 def _response_with_content_logprobs(*, exact_second: bool) -> ResponsesExchange:
     exchange = _response_exchange("response-content-logprobs", 0)
     data = exchange.response.model_dump(mode="python")
-    data.pop("raw_output_tokens", None)
+    data.pop("token_generations", None)
 
     def entry(token: str, token_id: int | None, logprob: float) -> dict[str, Any]:
         return {
@@ -1042,12 +1384,12 @@ def test_responses_aggregates_complete_exact_pairs_across_content_blocks(
     assert result.logprobs[1:] == [-0.1, -0.2]
 
 
-def test_responses_empty_raw_tokens_fall_back_for_visible_output(
+def test_responses_missing_token_generations_falls_back_for_visible_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     exchange = _response_exchange("response-empty-raw", 0)
     data = exchange.response.model_dump(mode="python")
-    data["raw_output_tokens"] = []
+    data.pop("token_generations", None)
     exchange.response = Response.model_validate(data)
     monkeypatch.setattr(
         "art.trajectories._tokenize._load_tokenizer", lambda _config: _FakeTokenizer()
@@ -1112,6 +1454,9 @@ def test_responses_rejects_only_unrenderable_prompt_history(
         "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
     )
     request_reasoning = _response_exchange("request-reasoning", 2)
+    request_data = request_reasoning.response.model_dump(mode="python")
+    request_data.pop("token_generations", None)
+    request_reasoning.response = Response.model_validate(request_data)
     request_reasoning.request["input"] = [
         {
             "id": "reasoning-1",
@@ -1129,7 +1474,7 @@ def test_responses_rejects_only_unrenderable_prompt_history(
             "type": "reasoning",
         }
     ]
-    data.pop("raw_output_tokens", None)
+    data.pop("token_generations", None)
     response_reasoning.response = Response.model_validate(data)
 
     art.Trajectory(
@@ -1152,6 +1497,9 @@ def test_responses_rejects_only_unrenderable_prompt_history(
         previous_response_id=response_reasoning.response.id,
         offset=1,
     )
+    continuation_data = continuation.response.model_dump(mode="python")
+    continuation_data.pop("token_generations", None)
+    continuation.response = Response.model_validate(continuation_data)
     assert art.Trajectory(
         exchanges=TrajectoryExchanges(responses=[response_reasoning, continuation])
     ).tokenize(
@@ -1182,7 +1530,7 @@ def test_responses_opaque_reasoning_requires_exact_tokens(
     ).token_ids == [10, 2]
 
     response = exchange.response.model_dump(mode="python")
-    response.pop("raw_output_tokens", None)
+    response.pop("token_generations", None)
     exchange.response = Response.model_validate(response)
     with pytest.raises(ValueError, match="no renderable text"):
         art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange])).tokenize(
@@ -1194,6 +1542,9 @@ def test_responses_parallel_function_calls_form_one_assistant_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     exchange = _response_exchange("parallel-tools", 2)
+    response_data = exchange.response.model_dump(mode="python")
+    response_data.pop("token_generations", None)
+    exchange.response = Response.model_validate(response_data)
     exchange.request["input"] = [
         {
             "id": "reasoning-1",
@@ -1232,6 +1583,189 @@ def test_responses_parallel_function_calls_form_one_assistant_turn(
     ]
 
 
+def test_responses_token_generations_preserve_every_generation() -> None:
+    exchange = _response_exchange("multi-generation", 2)
+    data = exchange.response.model_dump(mode="python")
+    data["output"].append(
+        {
+            "id": "message-second",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "second",
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            ],
+        }
+    )
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2, "logprob": -0.2}],
+            "output_indices": [0],
+        },
+        {
+            "prompt_token_ids": [1, 2, 3],
+            "output_tokens": [{"token_id": 4, "logprob": -0.4}],
+            "output_indices": [1],
+        },
+    ]
+    exchange.response = Response.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(responses=[exchange])
+    ).responses_history()
+
+    tokenized = history.tokenize()
+
+    assert tokenized.token_ids == [1, 2, 3, 4]
+    assert tokenized.logprobs[1] == -0.2
+    assert tokenized.logprobs[3] == -0.4
+    assert tokenized.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+
+
+def test_responses_prompt_disagreement_preserves_sampled_token_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _response_exchange("retokenized-generation", 101)
+    data = exchange.response.model_dump(mode="python")
+    data["output"].append(
+        {
+            "id": "message-second",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "dog",
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            ],
+        }
+    )
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 101, "logprob": -0.1, "text": "cat"}],
+            "output_indices": [0],
+        },
+        {
+            "prompt_token_ids": [1, 500, 3],
+            "output_tokens": [{"token_id": 4, "logprob": -0.4, "text": "dog"}],
+            "output_indices": [1],
+        },
+    ]
+    exchange.response = Response.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(responses=[exchange])
+    ).responses_history()
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"cat": [500], "dog": [4]}[text]
+
+        def apply_chat_template(self, *args: object, **kwargs: object) -> list[int]:
+            raise AssertionError("Exact Responses tokenization does not render chat")
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
+    )
+    with pytest.warns(UserWarning, match="preserved the original sampled token IDs"):
+        tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [1, 101, 3, 4]
+    assert tokenized.logprobs[1] == -0.1
+
+
+@pytest.mark.parametrize(
+    "token_generations, match",
+    [
+        ([], "must be omitted"),
+        (
+            [
+                {
+                    "output_tokens": [{"token_id": 2}],
+                    "output_indices": [0],
+                }
+            ],
+            "prompt_token_ids",
+        ),
+        (
+            [
+                {
+                    "prompt_token_ids": [1],
+                    "output_tokens": [{"token_id": True}],
+                    "output_indices": [0],
+                }
+            ],
+            "exact token ID",
+        ),
+        (
+            [
+                {
+                    "prompt_token_ids": [1],
+                    "output_tokens": [{"token_id": 2}],
+                    "output_indices": [True],
+                }
+            ],
+            "integers",
+        ),
+        (
+            [
+                {
+                    "prompt_token_ids": [1],
+                    "output_tokens": [{"token_id": 2}],
+                    "output_indices": [1],
+                }
+            ],
+            "out of bounds",
+        ),
+    ],
+)
+def test_responses_token_generations_fail_closed(
+    token_generations: list[dict[str, Any]], match: str
+) -> None:
+    exchange = _response_exchange("invalid-generation", 2)
+    data = exchange.response.model_dump(mode="python")
+    data["token_generations"] = token_generations
+    exchange.response = Response.model_validate(data)
+
+    with pytest.raises(ValueError, match=match):
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(responses=[exchange])
+        ).responses_history().tokenize()
+
+
+def test_responses_generation_without_output_items_is_not_silently_lost() -> None:
+    exchange = _response_exchange("unprojectable-generation", 2)
+    data = exchange.response.model_dump(mode="python")
+    data["output"] = []
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2, "logprob": -0.2}],
+            "output_indices": [],
+        }
+    ]
+    exchange.response = Response.model_validate(data)
+
+    with pytest.raises(ValueError, match="cannot yet be projected"):
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(responses=[exchange])
+        ).responses_history()
+
+
 def test_tokenization_rejects_mutated_mixed_representation() -> None:
     trajectory = art.Trajectory(
         messages_and_choices=[{"role": "user", "content": "hi"}]
@@ -1255,8 +1789,14 @@ def test_responses_previous_response_id_resolves_local_history(
     monkeypatch.setattr(
         "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
     )
-    first = _response_exchange("resp-1", 20)
-    second = _response_exchange("resp-2", 30, previous_response_id="resp-1", offset=1)
+    first = _response_exchange("resp-1", 20, prompt_token_ids=[10])
+    second = _response_exchange(
+        "resp-2",
+        30,
+        previous_response_id="resp-1",
+        offset=1,
+        prompt_token_ids=[10, 20, 11],
+    )
     trajectory = art.Trajectory(
         exchanges=TrajectoryExchanges(responses=[first, second])
     )
@@ -1272,8 +1812,9 @@ def test_responses_previous_response_id_resolves_local_history(
     assert len(trajectory.responses_histories()) == 2
     with pytest.raises(ValueError, match="exactly one history"):
         trajectory.tokenize(base_model="base/model")
-    with pytest.raises(ValueError, match="outside this trajectory"):
-        trajectory.responses_histories()[1].tokenize(base_model="base/model")
+    assert trajectory.responses_histories()[1].tokenize(
+        base_model="base/model"
+    ).token_ids == [10, 20, 11, 30]
 
 
 def test_prefix_retokenization_preserves_sampled_ids_and_logprobs(
@@ -1345,6 +1886,310 @@ def test_template_change_rerenders_scaffold_but_preserves_sampled_output() -> No
     assert tokenized.flags[1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
 
 
+def test_mutable_chat_history_is_authoritative_and_does_not_replay_removed_turns() -> (
+    None
+):
+    first = _chat_exchange([10], [20])
+    first.request["messages"] = [{"role": "user", "content": "first"}]
+    second = _chat_exchange([10, 20, 30], [40], offset=1)
+    second.request["messages"] = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "second"},
+    ]
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_history()
+    del history.messages[:2]
+    del history.message_sources[:2]
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"second": [31], "answer": [41]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            assert [message["content"] for message in messages] == [
+                "second",
+                "answer",
+            ]
+            return [30, 41, 50]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [30, 40, 50]
+    assert 20 not in tokenized.token_ids
+    assert tokenized.flags == [
+        art.TokenFlag(0),
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        art.TokenFlag(0),
+    ]
+
+
+def test_request_assistant_messages_are_not_marked_sampled() -> None:
+    exchange = _chat_exchange([10], [40])
+    exchange.request["messages"] = [
+        {"role": "assistant", "content": "seed"},
+        {"role": "user", "content": "question"},
+    ]
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+    history.chat_template = "rerender"
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"seed": [20], "question": [30], "answer": [41]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del messages, kwargs
+            return [5, 20, 6, 30, 7, 41, 8]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [5, 20, 6, 30, 7, 40, 8]
+    assert not tokenized.flags[1] & art.TokenFlag.SAMPLED
+    assert tokenized.flags[5] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+
+
+def test_rerender_constrains_exact_output_to_its_message_region() -> None:
+    exchange = _chat_exchange([7], [7])
+    exchange.request["messages"] = [{"role": "user", "content": "same"}]
+    exchange.response.choices[0].message.content = "same"
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+    history.chat_template = "rerender"
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            assert text == "same"
+            return [7]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del messages, kwargs
+            return [7, 99, 7]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.flags == [
+        art.TokenFlag(0),
+        art.TokenFlag(0),
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+    assert math.isnan(tokenized.logprobs[0])
+    assert tokenized.logprobs[2] == -0.7
+
+
+def test_reasoning_stripped_chat_histories_tokenize_authoritative_views() -> None:
+    first = _chat_exchange([1], [2, 3])
+    first.request["messages"] = [{"role": "user", "content": "one"}]
+    first_data = first.response.model_dump(mode="python")
+    first_data["choices"][0]["message"] = {
+        "role": "assistant",
+        "content": "first",
+        "reasoning": "thought-one",
+    }
+    first.response = ChatCompletion.model_validate(first_data)
+
+    second = _chat_exchange([1, 3, 4], [5, 6], offset=1)
+    second.request["messages"] = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "first"},
+        {"role": "user", "content": "two"},
+    ]
+    second_data = second.response.model_dump(mode="python")
+    second_data["choices"][0]["message"] = {
+        "role": "assistant",
+        "content": "second",
+        "reasoning": "thought-two",
+    }
+    second.response = ChatCompletion.model_validate(second_data)
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    )
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {
+                "one": [1],
+                "first": [3],
+                "two": [4],
+                "thought-two": [5],
+                "second": [6],
+            }[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            assert [message.get("content") for message in messages] == [
+                "one",
+                "first",
+                "two",
+                "second",
+            ]
+            return [1, 3, 4, 5, 6]
+
+    tokenized = trajectory.tokenize(multi_history=True, tokenizer=Tokenizer())
+
+    assert [history.token_ids for history in tokenized.histories] == [
+        [1, 2, 3],
+        [1, 3, 4, 5, 6],
+    ]
+    assert tokenized.histories[1].flags[1] & art.TokenFlag.SAMPLED
+    assert 2 not in tokenized.histories[1].token_ids
+
+
+def test_responses_prompt_repair_uses_native_text_and_source_position() -> None:
+    exchange = _response_exchange("repeated-retokenization", 101)
+    data = exchange.response.model_dump(mode="python")
+    data["output"].append(
+        {
+            "id": "message-second",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "dog",
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            ],
+        }
+    )
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [500],
+            "output_tokens": [{"token_id": 101, "logprob": -0.1}],
+            "output_indices": [0],
+        },
+        {
+            "prompt_token_ids": [500, 500, 3],
+            "output_tokens": [{"token_id": 4, "logprob": -0.4}],
+            "output_indices": [1],
+        },
+    ]
+    exchange.response = Response.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(responses=[exchange])
+    ).responses_history()
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"answer": [500], "dog": [4]}[text]
+
+        def apply_chat_template(self, *args: object, **kwargs: object) -> list[int]:
+            raise AssertionError("Exact Responses tokenization must not render chat")
+
+    with pytest.warns(UserWarning, match="preserved the original sampled token IDs"):
+        tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [500, 101, 3, 4]
+    assert tokenized.logprobs[1] == -0.1
+
+
+def test_rerender_marks_tool_call_only_generated_region_sampled() -> None:
+    exchange = _chat_exchange([1], [2])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice.pop("token_ids")
+    choice["logprobs"] = None
+    choice["message"] = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": '{"x":1}'},
+            }
+        ],
+    }
+    exchange.response = ChatCompletion.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+    history.chat_template = "rerender"
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {
+                "turn 0": [1],
+                "lookup": [20],
+                '{"x":1}': [30, 31],
+            }[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del messages, kwargs
+            return [1, 10, 20, 25, 30, 31, 26]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [1, 10, 20, 25, 30, 31, 26]
+    assert tokenized.flags[2:6] == [art.TokenFlag.SAMPLED] * 4
+    assert not tokenized.flags[0] & art.TokenFlag.SAMPLED
+
+
+def test_rerender_calls_chat_template_once_for_many_turns() -> None:
+    exchanges: list[ChatCompletionsExchange] = []
+    prompt: list[int] = []
+    messages: list[ChatCompletionMessageParam] = []
+    for index in range(32):
+        prompt.extend([index * 2])
+        messages.append({"role": "user", "content": f"u{index}"})
+        exchange = _chat_exchange(list(prompt), [index * 2 + 1], offset=index)
+        exchange.request["messages"] = list(messages)
+        exchanges.append(exchange)
+        prompt.append(index * 2 + 1)
+        messages.append({"role": "assistant", "content": "answer"})
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=exchanges)
+    ).chat_completions_history()
+    history.chat_template = "rerender"
+
+    class Tokenizer:
+        apply_calls = 0
+
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return [1000] if text == "answer" else [2000 + int(text[1:])]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            self.apply_calls += 1
+            result: list[int] = []
+            for message in messages:
+                content = str(message["content"])
+                result.extend(
+                    [1000] if content == "answer" else [2000 + int(content[1:])]
+                )
+            return result
+
+    tokenizer = Tokenizer()
+    history.tokenize(tokenizer=tokenizer)
+
+    assert tokenizer.apply_calls == 1
+
+
 def test_explicit_template_override_rerenders_exact_exchange_scaffold() -> None:
     trajectory = art.Trajectory(
         exchanges=TrajectoryExchanges(chat_completions=[_chat_exchange([1], [2])])
@@ -1380,6 +2225,9 @@ def test_responses_external_context_requires_or_uses_exact_prompt_tokens() -> No
     exchange = _response_exchange(
         "external", 2, previous_response_id="outside-trajectory"
     )
+    response = exchange.response.model_dump(mode="python")
+    response.pop("token_generations", None)
+    exchange.response = Response.model_validate(response)
     history = art.Trajectory(
         exchanges=TrajectoryExchanges(responses=[exchange])
     ).responses_history()
@@ -1387,7 +2235,13 @@ def test_responses_external_context_requires_or_uses_exact_prompt_tokens() -> No
         history.tokenize(base_model="base/model")
 
     response = exchange.response.model_dump(mode="python")
-    response["prompt_token_ids"] = [7, 8]
+    response["token_generations"] = [
+        {
+            "prompt_token_ids": [7, 8],
+            "output_tokens": [{"token_id": 2, "logprob": -0.1}],
+            "output_indices": [0],
+        }
+    ]
     exchange.response = Response.model_validate(response)
     tokenized = (
         art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
@@ -1406,13 +2260,22 @@ def test_responses_external_context_requires_or_uses_exact_prompt_tokens() -> No
 def test_responses_conversation_requires_exact_prompt_tokens() -> None:
     exchange = _response_exchange("conversation", 2)
     exchange.request["conversation"] = "conversation-1"
+    response = exchange.response.model_dump(mode="python")
+    response.pop("token_generations", None)
+    exchange.response = Response.model_validate(response)
     trajectory = art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
 
     with pytest.raises(ValueError, match="conversation history requires exact"):
         trajectory.tokenize(base_model="base/model")
 
     response = exchange.response.model_dump(mode="python")
-    response["prompt_token_ids"] = [5]
+    response["token_generations"] = [
+        {
+            "prompt_token_ids": [5],
+            "output_tokens": [{"token_id": 2, "logprob": -0.1}],
+            "output_indices": [0],
+        }
+    ]
     exchange.response = Response.model_validate(response)
     assert trajectory.tokenize().token_ids == [5, 2]
 
