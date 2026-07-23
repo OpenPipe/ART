@@ -142,6 +142,7 @@ def trajectory_groups_to_datums(
     normalize_advantages: bool = True,
     *,
     base_model: str | None = None,
+    model: str | None = None,
 ) -> list[tinker.Datum]:
     datums: list[tinker.Datum] = []
 
@@ -162,8 +163,13 @@ def trajectory_groups_to_datums(
             continue
         for trajectory, advantage in zip(group.trajectories, advantages):
             if trajectory.exchanges:
+                from ..trajectories._tokenize import _require_training_model
+
+                selected_model = _require_training_model(trajectory, model)
                 tokenized = trajectory.tokenize(
-                    multi_history=True, base_model=base_model
+                    multi_history=True,
+                    model=selected_model,
+                    base_model=base_model,
                 )
                 for history in tokenized.histories:
                     datum = _tokenized_trajectory_to_datum(history, advantage)

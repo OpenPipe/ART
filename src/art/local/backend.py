@@ -958,6 +958,7 @@ class LocalBackend:
                 image_processor=self._image_processors[model.base_model],
                 chat_template_kwargs=chat_template_kwargs,
                 chat_template_tool_schema_format=chat_template_tool_schema_format,
+                model=self._model_inference_name(model),
             )
         )
         if not tokenized_results:

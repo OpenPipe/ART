@@ -63,6 +63,87 @@ def _flag_spans(flags: list[TokenFlag], flag: TokenFlag) -> list[tuple[int, int]
     return spans
 
 
+@dataclass(frozen=True)
+class _ChatChoiceTrace:
+    choices: list[Choice]
+    offsets: list[int]
+    lengths: list[int]
+
+
+def _chat_choice_trace(
+    history: ChatCompletionsHistory,
+    token_ids: list[int],
+    flags: list[TokenFlag],
+) -> _ChatChoiceTrace | None:
+    """Recover per-choice boundaries that adjacent SAMPLED flags cannot represent."""
+
+    sourced_choices: list[Choice] = []
+    seen: set[tuple[int, int]] = set()
+    for source in history.message_sources:
+        if (
+            source is None
+            or source.choice_index is None
+            or not isinstance(source.exchange, ChatCompletionsExchange)
+        ):
+            continue
+        key = (id(source.exchange), source.choice_index)
+        if key in seen:
+            continue
+        seen.add(key)
+        sourced_choices.append(
+            next(
+                item
+                for item in source.exchange.response.choices
+                if item.index == source.choice_index
+            )
+        )
+    if not sourced_choices:
+        return None
+    has_routing = any(
+        choice_moe_routing_metadata(choice) is not None for choice in sourced_choices
+    )
+    if any(choice_vllm_token_metadata(choice) is None for choice in sourced_choices):
+        if has_routing:
+            raise RuntimeError(
+                "MoE routing replay requires exact token IDs for every sourced choice"
+            )
+        return None
+
+    choices: list[Choice] = []
+    offsets: list[int] = []
+    lengths: list[int] = []
+    cursor = 0
+    for choice in sourced_choices:
+        metadata = choice_vllm_token_metadata(choice)
+        assert metadata is not None
+        completion_ids = metadata[1]
+        matches = [
+            index
+            for index in range(cursor, len(token_ids) - len(completion_ids) + 1)
+            if token_ids[index : index + len(completion_ids)] == completion_ids
+            and all(
+                flag & TokenFlag.SAMPLED
+                for flag in flags[index : index + len(completion_ids)]
+            )
+        ]
+        if not matches:
+            if has_routing:
+                raise RuntimeError(
+                    "MoE routed completion tokens are absent from tokenized history"
+                )
+            return None
+        offset = matches[0]
+        choices.append(choice)
+        offsets.append(offset)
+        lengths.append(len(completion_ids))
+        cursor = offset + len(completion_ids)
+    return (
+        _ChatChoiceTrace(choices=choices, offsets=offsets, lengths=lengths)
+        if choices
+        else None
+    )
+
+
 def _slice_moe_routes(
     routes: MoeRouteArray | MoeRouteSegments | None, start: int
 ) -> MoeRouteArray | MoeRouteSegments | None:
@@ -549,6 +630,7 @@ def tokenize_trajectory_groups(
     image_processor: BaseImageProcessor | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
     chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
+    model: str | None = None,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -568,16 +650,21 @@ def tokenize_trajectory_groups(
             if advantage == 0 and drop_zero_advantage_trajectories:
                 continue
             if trajectory.exchanges:
-                from ..trajectories._tokenize import _as_tokenizer
+                from ..trajectories._tokenize import (
+                    _as_tokenizer,
+                    _require_training_model,
+                )
 
+                selected_model = _require_training_model(trajectory, model)
                 exchange_results = trajectory.tokenize(
                     multi_history=True,
+                    model=selected_model,
                     base_model=tokenizer.name_or_path,
                     tokenizer=_as_tokenizer(tokenizer),
                     chat_template=None,
                     chat_template_kwargs=chat_template_kwargs,
                 )
-                histories = trajectory.histories()
+                histories = trajectory.histories(model=selected_model)
                 trajectory_results = []
                 for exchange_result, history in zip(
                     exchange_results.histories, histories, strict=True
@@ -597,43 +684,29 @@ def tokenize_trajectory_groups(
                         raise RuntimeError(
                             "Exchange trajectory is missing logprobs for trainable tokens"
                         )
-                    chat_choices = []
+                    chat_trace = None
                     if isinstance(history, ChatCompletionsHistory):
-                        seen_choices: set[tuple[int, int]] = set()
-                        for source in history.message_sources:
-                            if source is None or source.choice_index is None:
-                                continue
-                            key = (id(source.exchange), source.choice_index)
-                            if key in seen_choices:
-                                continue
-                            seen_choices.add(key)
-                            if not isinstance(source.exchange, ChatCompletionsExchange):
-                                continue
-                            chat_choices.append(
-                                next(
-                                    choice
-                                    for choice in source.exchange.response.choices
-                                    if choice.index == source.choice_index
-                                )
-                            )
-                    if len(chat_choices) == len(choice_spans):
+                        chat_trace = _chat_choice_trace(
+                            history,
+                            exchange_result.token_ids,
+                            exchange_result.flags,
+                        )
+                    if chat_trace is not None:
                         moe_routes, moe_stats = align_choice_routes_to_tokenized_result(
                             token_ids=exchange_result.token_ids,
-                            choices=chat_choices,
-                            choice_offsets=[start for start, _ in choice_spans],
-                            choice_token_lengths=[
-                                end - start for start, end in choice_spans
-                            ],
+                            choices=chat_trace.choices,
+                            choice_offsets=chat_trace.offsets,
+                            choice_token_lengths=chat_trace.lengths,
                         )
-                    else:
-                        if any(
-                            choice_moe_routing_metadata(choice) is not None
-                            for choice in chat_choices
-                        ):
-                            raise RuntimeError(
-                                "MoE routing replay requires complete Chat Completions "
-                                "history sources"
+                        choice_spans = [
+                            (start, start + length)
+                            for start, length in zip(
+                                chat_trace.offsets,
+                                chat_trace.lengths,
+                                strict=True,
                             )
+                        ]
+                    else:
                         moe_routes = None
                         moe_stats = MoeRoutingAlignmentStats()
                     trajectory_results.append(

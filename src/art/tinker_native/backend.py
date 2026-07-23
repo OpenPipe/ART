@@ -358,6 +358,7 @@ class TinkerNativeBackend:
             state.tokenizer,
             normalize_advantages,
             base_model=model.base_model,
+            model=self._model_inference_name(model),
         )
 
         metrics: dict[str, float] = {
