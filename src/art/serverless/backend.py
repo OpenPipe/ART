@@ -548,18 +548,14 @@ class ServerlessBackend:
         Args:
             model: The trainable model to fine-tune.
             trajectories: Iterable of Trajectory objects.
-            config: SFT configuration with batch_size and learning rates.
+            config: SFT configuration with batch size, learning rates, and assistant
+                turn selection.
             dev_config: Developer configuration.
             verbose: Whether to print detailed logs.
 
         Yields:
             Dictionary containing training metrics for each batch.
         """
-        if config.assistant_turns == "last":
-            raise NotImplementedError(
-                "assistant_turns='last' currently requires LocalBackend"
-            )
-
         import json
         import tempfile
         import uuid
@@ -670,6 +666,7 @@ class ServerlessBackend:
             )
             sft_config["batch_size"] = batch_size
         sft_config["learning_rate"] = config.learning_rate
+        sft_config["assistant_turns"] = config.assistant_turns
         metric_logging = cast(
             SFTMetricLoggingConfig,
             dict(dev_config.get("metric_logging", {}) or {}),
