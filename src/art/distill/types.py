@@ -428,6 +428,20 @@ class TopKTargetRow(ImmutableModel):
     token_space_fingerprint: Annotated[str, Field(min_length=1)]
     request_id: Annotated[str, Field(min_length=1)]
     forced_token_sha256: Annotated[str, Field(min_length=1)]
+    provenance: CanonicalJsonObject = Field(
+        default_factory=lambda: CanonicalJsonObject.from_value({})
+    )
+
+    @field_validator("provenance", mode="before")
+    @classmethod
+    def _normalize_provenance(cls, value: Any) -> CanonicalJsonObject:
+        if isinstance(value, CanonicalJsonObject):
+            return value
+        if isinstance(value, Mapping) and set(value) == {"canonical_json"}:
+            return CanonicalJsonObject.model_validate(value)
+        if not isinstance(value, Mapping):
+            raise ValueError("target provenance must be a JSON object")
+        return CanonicalJsonObject.from_value(value)
 
     @model_validator(mode="after")
     def _valid_distribution(self) -> Self:
@@ -465,16 +479,42 @@ class TopKTargetRow(ImmutableModel):
         return self
 
 
+class PreparationIssue(ImmutableModel):
+    """Sanitized preparation failure persisted with a partial artifact."""
+
+    generation_id: Annotated[str, Field(min_length=1)]
+    teacher_name: Annotated[str, Field(min_length=1)]
+    selected_positions: tuple[Annotated[int, Field(ge=0)], ...]
+    code: Literal["teacher_scoring_failed"] = "teacher_scoring_failed"
+    detail: Literal["Teacher distribution acquisition or validation failed."] = (
+        "Teacher distribution acquisition or validation failed."
+    )
+
+    @field_validator("selected_positions")
+    @classmethod
+    def _canonical_positions(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if not value:
+            raise ValueError("preparation issue must identify selected positions")
+        if tuple(sorted(set(value))) != value:
+            raise ValueError(
+                "preparation issue positions must be unique and canonically ordered"
+            )
+        return value
+
+
 class PreparationReport(ImmutableModel):
     selected_generations: Annotated[int, Field(ge=0)]
     selected_tokens: Annotated[int, Field(ge=0)]
     prepared_tokens: Annotated[int, Field(ge=0)]
     issue_count: Annotated[int, Field(ge=0)] = 0
+    issues: tuple[PreparationIssue, ...] = ()
 
     @model_validator(mode="after")
     def _valid_counts(self) -> Self:
         if self.prepared_tokens > self.selected_tokens:
             raise ValueError("prepared token count exceeds selected token count")
+        if self.issue_count != len(self.issues):
+            raise ValueError("issue count must equal the persisted issue ledger")
         return self
 
 

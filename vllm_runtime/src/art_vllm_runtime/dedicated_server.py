@@ -2,9 +2,11 @@
 
 import argparse
 import asyncio
+import hashlib
 from http import HTTPStatus
 import json
 import os
+from typing import Any
 
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -45,6 +47,34 @@ class _InFlightLoraUpdateRequest(BaseModel):
     lora_slot: str | None = Field(default=None, min_length=1)
     base_model_name: str | None = None
     is_3d_lora_weight: bool = False
+
+
+def _token_space_identity(render_handler: Any) -> tuple[str, int]:
+    model_config = render_handler.model_config
+    logical_vocab_size = int(model_config.get_vocab_size())
+    tokenizer = render_handler.renderer.tokenizer
+    vocabulary = sorted(tokenizer.get_vocab().items())
+    if any(
+        not isinstance(token, str)
+        or not isinstance(token_id, int)
+        or token_id < 0
+        or token_id >= logical_vocab_size
+        for token, token_id in vocabulary
+    ):
+        raise RuntimeError("tokenizer vocabulary is incompatible with model vocabulary")
+    projection = {
+        "logical_vocab_size": logical_vocab_size,
+        "special_token_ids": sorted(set(tokenizer.all_special_ids)),
+        "vocabulary": vocabulary,
+    }
+    encoded = json.dumps(
+        projection,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    fingerprint = hashlib.sha256(b"art-token-space-v1\0" + encoded).hexdigest()
+    return fingerprint, logical_vocab_size
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -152,7 +182,21 @@ def _patch_art_runtime_routes() -> None:
             return JSONResponse(content=get_art_metrics_snapshot())
 
         @router.get("/art/capabilities")
-        async def art_capabilities() -> JSONResponse:
+        async def art_capabilities(raw_request: Request) -> JSONResponse:
+            render_handler = raw_request.app.state.openai_serving_render
+            identity = getattr(
+                raw_request.app.state,
+                "_art_token_space_identity",
+                None,
+            )
+            if identity is None:
+                identity = _token_space_identity(render_handler)
+                raw_request.app.state._art_token_space_identity = identity
+            token_space_fingerprint, logical_vocab_size = identity
+            max_prompt_logprobs = raw_request.app.state.args.max_logprobs
+            full_prompt_distribution = max_prompt_logprobs == -1
+            if full_prompt_distribution:
+                max_prompt_logprobs = logical_vocab_size
             return JSONResponse(
                 content={
                     "runtime": "art_vllm",
@@ -162,6 +206,13 @@ def _patch_art_runtime_routes() -> None:
                     "inplace_lora_load": True,
                     "in_flight_lora_updates": True,
                     "policy_token_spans": True,
+                    "prompt_token_distributions": True,
+                    "prompt_token_distribution_version": 1,
+                    "max_prompt_logprobs": max_prompt_logprobs,
+                    "full_prompt_distribution": full_prompt_distribution,
+                    "prompt_distribution_temperature": "unit_only",
+                    "token_space_fingerprint": token_space_fingerprint,
+                    "logical_vocab_size": logical_vocab_size,
                 }
             )
 

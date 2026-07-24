@@ -9,6 +9,7 @@ ServingFeature = Literal[
     "inplace_lora_load",
     "in_flight_lora_updates",
     "policy_token_spans",
+    "prompt_token_distributions",
 ]
 
 
@@ -22,6 +23,48 @@ class ServingCapabilities(BaseModel):
     inplace_lora_load: bool = False
     in_flight_lora_updates: bool = False
     policy_token_spans: bool = False
+    prompt_token_distributions: bool = False
+    prompt_token_distribution_version: int | None = None
+    max_prompt_logprobs: int | None = None
+    full_prompt_distribution: bool = False
+    prompt_distribution_temperature: Literal["unit_only"] | None = None
+    token_space_fingerprint: str | None = None
+    logical_vocab_size: int | None = None
+
+    @classmethod
+    def _prompt_distribution_fields(cls) -> tuple[str, ...]:
+        return (
+            "prompt_token_distribution_version",
+            "max_prompt_logprobs",
+            "prompt_distribution_temperature",
+            "token_space_fingerprint",
+            "logical_vocab_size",
+        )
+
+    def model_post_init(self, __context: object) -> None:
+        values = tuple(
+            getattr(self, field) for field in self._prompt_distribution_fields()
+        )
+        if self.prompt_token_distributions:
+            if any(value is None for value in values):
+                raise ValueError(
+                    "prompt-token distributions require a version, capacity, "
+                    "and temperature contract"
+                )
+            if self.prompt_token_distribution_version != 1:
+                raise ValueError(
+                    "unsupported prompt-token distribution protocol version"
+                )
+            if self.max_prompt_logprobs is None or self.max_prompt_logprobs <= 0:
+                raise ValueError("max_prompt_logprobs must be positive")
+            if not self.token_space_fingerprint:
+                raise ValueError("token_space_fingerprint must not be empty")
+            if self.logical_vocab_size is None or self.logical_vocab_size <= 0:
+                raise ValueError("logical_vocab_size must be positive")
+        elif (
+            any(value is not None for value in values) or self.full_prompt_distribution
+        ):
+            raise ValueError("prompt-token distribution details require the capability")
 
     @classmethod
     def openai_compatible(cls) -> "ServingCapabilities":

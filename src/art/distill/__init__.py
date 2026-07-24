@@ -1,7 +1,27 @@
 """Backend-neutral contracts for distribution-based training in ART."""
 
 from .artifact import PreparedTrainingBatch
-from .prepare import BatchPreparer, PreparationContext
+from .candidate import CandidateTrainingBatch
+from .capture import (
+    append_message,
+    captured_context,
+    generations,
+    last_generation,
+    with_tools,
+)
+from .prepare import (
+    BatchPreparer,
+    PreparationContext,
+    all_generations,
+    prepare,
+    same_context,
+)
+from .preparer import (
+    AllCapturedGenerations,
+    DistillationPreparationError,
+    FailurePolicy,
+    SameContext,
+)
 from .types import (
     AnyRevision,
     CapturedGeneration,
@@ -12,6 +32,7 @@ from .types import (
     GenerationPart,
     Loss,
     PartSpan,
+    PreparationIssue,
     PreparationReport,
     PreparedConstraints,
     RolloutRevisionSpan,
@@ -28,21 +49,34 @@ from .types import (
 
 __all__ = [
     "AnyRevision",
+    "all_generations",
+    "AllCapturedGenerations",
+    "append_message",
     "BatchPreparer",
+    "CandidateTrainingBatch",
     "CapturedGeneration",
+    "captured_context",
     "CurrentStep",
     "Example",
     "ForwardKL",
     "Frozen",
     "GenerationPart",
+    "generations",
+    "DistillationPreparationError",
+    "FailurePolicy",
+    "last_generation",
     "Loss",
     "PartSpan",
+    "prepare",
     "PreparationContext",
     "PreparationReport",
+    "PreparationIssue",
     "PreparedConstraints",
     "PreparedTrainingBatch",
     "RolloutRevisionSpan",
     "StudentOnPolicy",
+    "same_context",
+    "SameContext",
     "TeacherView",
     "TeacherRevision",
     "TokenSpan",
@@ -51,4 +85,5 @@ __all__ = [
     "TrainingGroupSnapshot",
     "TrainingObjectives",
     "TrainingTrajectorySnapshot",
+    "with_tools",
 ]

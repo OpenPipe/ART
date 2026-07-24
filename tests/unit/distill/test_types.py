@@ -130,6 +130,27 @@ def test_target_validation_and_training_objectives() -> None:
         TrainingObjectives()
 
 
+def test_preparation_report_requires_complete_issue_ledger() -> None:
+    issue = distill.PreparationIssue(
+        generation_id="generation-1",
+        teacher_name="teacher",
+        selected_positions=(0,),
+    )
+    report = distill.PreparationReport(
+        selected_generations=2,
+        selected_tokens=2,
+        prepared_tokens=1,
+        issue_count=1,
+        issues=(issue,),
+    )
+    assert report.issues == (issue,)
+
+    with pytest.raises(ValidationError, match="issue count"):
+        report.model_copy(update={"issue_count": 0}).model_validate(
+            report.model_copy(update={"issue_count": 0}).model_dump()
+        )
+
+
 def test_public_values_are_frozen() -> None:
     target = distill.TopK()
     with pytest.raises(ValidationError):
