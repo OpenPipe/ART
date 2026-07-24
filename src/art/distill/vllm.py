@@ -30,17 +30,12 @@ class VLLMRetryableScoringError(
     """Transient vLLM failure safe to retry with the identical request."""
 
 
-# vLLM emits prompt log-probabilities from float32 model outputs. A sum of
-# ``width`` positive float32 probabilities can exceed one by at most the
-# standard sequential-accumulation bound gamma_width = width*u/(1-width*u),
-# where u is binary32 unit roundoff. Keep this local to the wire parser: the
-# prepared target remains an ordinary normalized distribution.
-_FLOAT32_UNIT_ROUNDOFF = 2.0**-24
-
-
-def _float32_accumulation_tolerance(width: int) -> float:
-    scaled_roundoff = width * _FLOAT32_UNIT_ROUNDOFF
-    return scaled_roundoff / (1.0 - scaled_roundoff)
+# vLLM emits float32-rounded log-softmax values, which this parser reconstructs
+# with binary64 exp/fsum. Real vLLM rows have exceeded unit mass by up to
+# 1.11357044e-7 after that reconstruction. One binary32 machine epsilon is a
+# deliberately narrow wire-interoperability allowance around those observations,
+# not an error bound on vLLM's upstream computation.
+_VLLM_FLOAT32_MASS_OVERFLOW_ALLOWANCE = 2.0**-23
 
 
 class VLLMTeacherScorer:
@@ -371,18 +366,17 @@ def _parse_position(
             tail_logprob = math.log(tail_mass)
         else:
             over_mass = -tail_mass
-            tolerance = _float32_accumulation_tolerance(expected_width)
-            if over_mass > tolerance:
+            if over_mass > _VLLM_FLOAT32_MASS_OVERFLOW_ALLOWANCE:
                 raise VLLMScoringError(
                     "sparse prompt distribution has invalid residual mass"
                 )
 
-            # A sparse distribution must retain a positive tail. One binary32
-            # unit roundoff is the smallest meaningful probability-scale mass
-            # for this float32 wire contract. Renormalizing by a common factor
-            # preserves the supplied rank order while making explicit entries
-            # plus the synthetic tail a valid full-vocabulary distribution.
-            synthetic_tail_mass = _FLOAT32_UNIT_ROUNDOFF
+            # Sparse targets structurally require a positive tail for the
+            # forward-KL complement bucket. math.ulp(1.0) is the smallest
+            # unit-scale mass increment in this parser's binary64 arithmetic,
+            # minimizing invented teacher tail mass. A common normalization
+            # preserves explicit rank order and makes the complete target valid.
+            synthetic_tail_mass = math.ulp(1.0)
             log_normalizer = math.log(explicit_mass + synthetic_tail_mass)
             ordered = tuple(
                 (token_id, logprob - log_normalizer) for token_id, logprob in ordered

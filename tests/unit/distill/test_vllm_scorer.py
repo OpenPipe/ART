@@ -9,14 +9,16 @@ from typing import Any
 import httpx
 from pydantic import ValidationError
 import pytest
+import torch
 
+from art.distill.reference_loss import topk_plus_tail_forward_kl
 from art.distill.scorer import TeacherScoringRequest
 from art.distill.types import TeacherView, TopK
 from art.distill.vllm import (
+    _VLLM_FLOAT32_MASS_OVERFLOW_ALLOWANCE,
     VLLMRetryableScoringError,
     VLLMScoringError,
     VLLMTeacherScorer,
-    _float32_accumulation_tolerance,
     _parse_position,
 )
 from art.serving_capabilities import ServingCapabilities
@@ -166,32 +168,67 @@ async def test_scores_exact_forced_tokens_and_retains_residual_tail() -> None:
     assert math.exp(second.tail_logprob or 0.0) == pytest.approx(0.15)
 
 
-def _uniform_wire_distribution(*, width: int, total_mass: float) -> dict[str, Any]:
-    logprob = math.log(total_mass / width)
+_OBSERVED_VLLM_TOP32 = (
+    (902, -0.16369986534118652),
+    (9834, -1.9136998653411865),
+    (7196, -5.663700103759766),
+    (21639, -16.038700103759766),
+    (59565, -18.038700103759766),
+    (1231, -19.163700103759766),
+    (18581, -19.663700103759766),
+    (8365, -20.288700103759766),
+    (537, -20.413700103759766),
+    (30315, -20.538700103759766),
+    (72104, -20.538700103759766),
+    (18341, -21.288700103759766),
+    (220, -22.163700103759766),
+    (6857, -22.288700103759766),
+    (11891, -22.288700103759766),
+    (66479, -22.413700103759766),
+    (4658, -22.538700103759766),
+    (2581, -23.413700103759766),
+    (2152, -23.413700103759766),
+    (84198, -23.538700103759766),
+    (39205, -23.788700103759766),
+    (2578, -24.163700103759766),
+    (21502, -24.163700103759766),
+    (13866, -24.413700103759766),
+    (308, -24.538700103759766),
+    (33100, -24.538700103759766),
+    (4302, -24.538700103759766),
+    (6536, -24.663700103759766),
+    (9693, -24.788700103759766),
+    (834, -24.788700103759766),
+    (28366, -24.913700103759766),
+    (3204, -24.913700103759766),
+)
+
+
+def _observed_vllm_wire_distribution() -> dict[str, Any]:
     return {
-        str(token_id): {"logprob": logprob, "rank": token_id + 1}
-        for token_id in range(width)
+        str(token_id): {"logprob": logprob, "rank": rank}
+        for rank, (token_id, logprob) in enumerate(_OBSERVED_VLLM_TOP32, start=1)
     }
 
 
-def test_accepts_float32_scale_sparse_overflow_and_normalizes_deterministically() -> (
-    None
-):
-    wire = _uniform_wire_distribution(width=32, total_mass=1.0 + 1.11e-7)
+def test_accepts_observed_vllm_overflow_and_normalizes_deterministically() -> None:
+    wire = _observed_vllm_wire_distribution()
+    observed_mass = math.fsum(math.exp(entry["logprob"]) for entry in wire.values())
+    assert observed_mass - 1.0 == pytest.approx(1.113570438e-7, rel=1e-8)
 
     first = _parse_position(
         wire,
         position=0,
-        forced_token_id=0,
+        forced_token_id=9693,
         k=32,
-        logical_vocab_size=64,
+        logical_vocab_size=151936,
     )
     second = _parse_position(
         wire,
         position=0,
-        forced_token_id=0,
+        forced_token_id=9693,
         k=32,
-        logical_vocab_size=64,
+        logical_vocab_size=151936,
     )
 
     assert first == second
@@ -209,36 +246,102 @@ def test_accepts_float32_scale_sparse_overflow_and_normalizes_deterministically(
     )
 
 
+def _unit_plus_overflow_wire(total_mass: float) -> dict[str, Any]:
+    return {
+        "0": {"logprob": 0.0, "rank": 1},
+        "1": {"logprob": math.log(total_mass - 1.0), "rank": 2},
+    }
+
+
+def test_accepts_exact_vllm_float32_overflow_boundary() -> None:
+    total_mass = 1.0 + _VLLM_FLOAT32_MASS_OVERFLOW_ALLOWANCE
+    result = _parse_position(
+        _unit_plus_overflow_wire(total_mass),
+        position=0,
+        forced_token_id=0,
+        k=2,
+        logical_vocab_size=3,
+    )
+
+    assert result.tail_logprob is not None
+    assert math.fsum(
+        [
+            *(math.exp(entry.logprob) for entry in result.entries),
+            math.exp(result.tail_logprob),
+        ]
+    ) == pytest.approx(1.0, abs=2e-15)
+
+
 @pytest.mark.parametrize(
-    "over_mass",
+    "total_mass",
     [
-        _float32_accumulation_tolerance(32) * 1.01,
-        1e-3,
+        math.nextafter(
+            1.0 + _VLLM_FLOAT32_MASS_OVERFLOW_ALLOWANCE,
+            math.inf,
+        ),
+        1.001,
     ],
 )
-def test_rejects_boundary_and_material_sparse_overflow(over_mass: float) -> None:
+def test_rejects_beyond_boundary_and_material_sparse_overflow(
+    total_mass: float,
+) -> None:
     with pytest.raises(VLLMScoringError, match="invalid residual"):
         _parse_position(
-            _uniform_wire_distribution(
-                width=32,
-                total_mass=1.0 + over_mass,
-            ),
+            _unit_plus_overflow_wire(total_mass),
             position=0,
             forced_token_id=0,
-            k=32,
-            logical_vocab_size=64,
+            k=2,
+            logical_vocab_size=3,
         )
 
 
 def test_sparse_overflow_still_requires_forced_token_observation() -> None:
     with pytest.raises(VLLMScoringError, match="omitted the forced token"):
         _parse_position(
-            _uniform_wire_distribution(width=32, total_mass=1.0 + 1.11e-7),
+            _observed_vllm_wire_distribution(),
             position=0,
-            forced_token_id=63,
+            forced_token_id=42,
             k=32,
-            logical_vocab_size=64,
+            logical_vocab_size=151936,
         )
+
+
+def test_synthetic_tail_has_negligible_finite_forward_kl_effect() -> None:
+    parsed = _parse_position(
+        _observed_vllm_wire_distribution(),
+        position=0,
+        forced_token_id=9693,
+        k=32,
+        logical_vocab_size=151936,
+    )
+    explicit = torch.tensor(
+        [[math.exp(entry.logprob) for entry in parsed.entries]],
+        dtype=torch.float64,
+    )
+    tail = torch.tensor([math.exp(parsed.tail_logprob or 0.0)], dtype=torch.float64)
+    ids = torch.tensor(
+        [[entry.token_id for entry in parsed.entries]],
+        dtype=torch.int64,
+    )
+    logits = torch.zeros((1, 151936), dtype=torch.float64)
+    repaired = topk_plus_tail_forward_kl(
+        logits,
+        teacher_topk_ids=ids,
+        teacher_topk_probs=explicit,
+        teacher_tail_prob=tail,
+        mask=torch.tensor([True]),
+    )
+    no_tail = topk_plus_tail_forward_kl(
+        logits,
+        teacher_topk_ids=ids,
+        teacher_topk_probs=explicit / explicit.sum(),
+        teacher_tail_prob=torch.zeros(1, dtype=torch.float64),
+        mask=torch.tensor([True]),
+    )
+
+    assert torch.isfinite(repaired.loss_sum)
+    assert tail.item() > 0.0
+    assert abs(repaired.loss_sum.item() - no_tail.loss_sum.item()) < 1e-12
 
 
 def test_positive_sparse_residual_preserves_explicit_logprobs() -> None:
