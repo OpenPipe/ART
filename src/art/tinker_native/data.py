@@ -17,6 +17,7 @@ from ..trajectories import (
     TrajectoryGroup,
     get_messages,
 )
+from ..trajectories._selection import ModelSelector, resolve_training_model
 from ..types import MessagesAndChoices
 
 
@@ -142,7 +143,7 @@ def trajectory_groups_to_datums(
     normalize_advantages: bool = True,
     *,
     base_model: str | None = None,
-    model: str | None = None,
+    model: ModelSelector | str | None = None,
 ) -> list[tinker.Datum]:
     datums: list[tinker.Datum] = []
 
@@ -163,9 +164,7 @@ def trajectory_groups_to_datums(
             continue
         for trajectory, advantage in zip(group.trajectories, advantages):
             if trajectory.exchanges:
-                from ..trajectories._tokenize import _require_training_model
-
-                selected_model = _require_training_model(trajectory, model)
+                selected_model = resolve_training_model(trajectory, model)
                 tokenized = trajectory.tokenize(
                     multi_history=True,
                     model=selected_model,

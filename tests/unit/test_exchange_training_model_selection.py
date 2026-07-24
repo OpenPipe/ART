@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta
-from typing import cast
+from typing import SupportsIndex, cast, overload
 
 import numpy as np
+from openai.types import Completion
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 import pytest
 from transformers import PreTrainedTokenizerBase
@@ -15,8 +16,13 @@ from art.trajectories import (
     ChatCompletionsHistory,
     ChatCompletionsMessageSource,
     ChatCompletionsRequest,
+    CompletionsExchange,
+    CompletionsRequest,
 )
-from art.trajectories._tokenize import _training_model_pattern
+from art.trajectories._selection import (
+    automatic_training_model_selector,
+    resolve_training_model,
+)
 
 
 def _exchange(model: str, output_token: int) -> ChatCompletionsExchange:
@@ -124,7 +130,7 @@ class _Tokenizer:
 
 def test_preprocessing_requires_model_selection() -> None:
     tokenizer = cast(PreTrainedTokenizerBase, _Tokenizer())
-    with pytest.raises(ValueError, match="exactly one model"):
+    with pytest.raises(ValueError, match="exactly one concrete model"):
         list(
             tokenize_trajectory_groups(
                 tokenizer,
@@ -148,7 +154,7 @@ def test_preprocessing_requires_model_selection() -> None:
 
 
 def test_tinker_requires_model_selection() -> None:
-    with pytest.raises(ValueError, match="exactly one model"):
+    with pytest.raises(ValueError, match="exactly one concrete model"):
         trajectory_groups_to_datums([_group()], renderer=None, tokenizer=None)
 
     datums = trajectory_groups_to_datums(
@@ -161,27 +167,26 @@ def test_tinker_requires_model_selection() -> None:
     assert all(datum.model_input.to_ints() == [1] for datum in datums)
 
 
-def test_training_model_patterns_select_all_policy_versions() -> None:
+def test_training_rejects_multiple_concrete_policy_versions() -> None:
     group = _versioned_group()
-    results = list(
-        tokenize_trajectory_groups(
-            cast(PreTrainedTokenizerBase, _Tokenizer()),
+    with pytest.raises(ValueError, match="exactly one concrete model"):
+        list(
+            tokenize_trajectory_groups(
+                cast(PreTrainedTokenizerBase, _Tokenizer()),
+                [group],
+                allow_training_without_logprobs=False,
+                scale_rewards=False,
+                model="policy@*",
+            )
+        )
+
+    with pytest.raises(ValueError, match="exactly one concrete model"):
+        trajectory_groups_to_datums(
             [group],
-            allow_training_without_logprobs=False,
-            scale_rewards=False,
+            renderer=None,
+            tokenizer=None,
             model="policy@*",
         )
-    )
-    assert len(results) == 4
-    assert {result.token_ids[-1] for result in results} == {2, 4}
-
-    datums = trajectory_groups_to_datums(
-        [group],
-        renderer=None,
-        tokenizer=None,
-        model="policy@*",
-    )
-    assert len(datums) == 4
 
     trajectory = group.trajectories[0]
     with pytest.raises(ValueError, match="exactly one history"):
@@ -194,19 +199,87 @@ def test_training_model_patterns_select_all_policy_versions() -> None:
 
 
 @pytest.mark.parametrize(
-    ("model", "pattern"),
+    ("model", "matches", "misses"),
     [
-        ("policy@12", "policy@*"),
+        ("policy@12", ("policy@0", "policy@12"), ("policy@x", "policy@12x")),
         (
             "wandb-artifact:///entity/project/run:step12",
-            "wandb-artifact:///entity/project/run:step*",
+            (
+                "wandb-artifact:///entity/project/run:step0",
+                "wandb-artifact:///entity/project/run:step12",
+            ),
+            ("wandb-artifact:///entity/project/run:stepx",),
         ),
-        ("policy:active", "policy:active"),
-        ("base/model", "base/model"),
+        ("policy:active", ("policy:active",), ("policy:active2",)),
+        ("base/model", ("base/model",), ("base/model@1",)),
     ],
 )
-def test_automatic_training_model_pattern(model: str, pattern: str) -> None:
-    assert _training_model_pattern(model) == pattern
+def test_automatic_training_model_selector(
+    model: str, matches: tuple[str, ...], misses: tuple[str, ...]
+) -> None:
+    selector = automatic_training_model_selector(model)
+    assert all(selector.matches(candidate) for candidate in matches)
+    assert not any(selector.matches(candidate) for candidate in misses)
+
+
+def test_automatic_training_model_selector_treats_family_metacharacters_literally() -> (
+    None
+):
+    selector = automatic_training_model_selector("policy[blue]*@12")
+    assert selector.matches("policy[blue]*@13")
+    assert not selector.matches("policyb@13")
+    assert not selector.matches("policy[blue]anything@13")
+
+
+def test_public_training_selector_prefers_exact_model_over_glob_interpretation() -> (
+    None
+):
+    trajectory = art.Trajectory(
+        exchanges=art.TrajectoryExchanges(
+            chat_completions=[
+                _exchange("policy[*]", 2),
+                _exchange("policyx", 3),
+            ]
+        )
+    )
+    assert resolve_training_model(trajectory, "policy[*]") == "policy[*]"
+
+
+def test_training_selector_rejects_zero_matches() -> None:
+    with pytest.raises(ValueError, match="no exchanges"):
+        resolve_training_model(_group().trajectories[0], "missing*")
+
+
+def test_training_selector_rejects_mixed_protocols() -> None:
+    start = datetime(2026, 1, 1)
+    completion = CompletionsExchange(
+        request=CompletionsRequest(model="policy", prompt="question"),
+        response=Completion.model_validate(
+            {
+                "id": "cmpl",
+                "object": "text_completion",
+                "created": 1,
+                "model": "policy",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "text": "answer",
+                    }
+                ],
+            }
+        ),
+        start_time=start,
+        end_time=start + timedelta(seconds=1),
+    )
+    trajectory = art.Trajectory(
+        exchanges=art.TrajectoryExchanges(
+            chat_completions=[_exchange("policy", 2)],
+            completions=[completion],
+        )
+    )
+    with pytest.raises(ValueError, match="mixed protocols"):
+        resolve_training_model(trajectory, "policy")
 
 
 def test_preprocessing_preserves_adjacent_choice_boundaries_for_moe() -> None:
@@ -413,6 +486,87 @@ def test_ambiguous_non_moe_suffix_falls_back_to_sampled_spans() -> None:
         )
         is None
     )
+
+
+def test_chat_choice_trace_anchors_retained_suffix_at_its_prompt_boundary() -> None:
+    first = _exchange("policy", 8)
+    first_extra = first.response.choices[0].model_extra
+    assert first_extra is not None
+    first_extra["prompt_token_ids"] = [1]
+    first_extra["token_ids"] = [7, 8]
+    second = _exchange("policy", 8)
+    second_extra = second.response.choices[0].model_extra
+    assert second_extra is not None
+    second_extra["prompt_token_ids"] = [1, 8, 9]
+    second_extra["token_ids"] = [7, 8]
+    history = ChatCompletionsHistory(
+        model="policy",
+        messages=[],
+        message_sources=[
+            ChatCompletionsMessageSource(exchange=first, choice_index=0),
+            ChatCompletionsMessageSource(exchange=second, choice_index=0),
+        ],
+    )
+
+    trace = _chat_choice_trace(
+        history,
+        [1, 8, 9, 7, 8],
+        [
+            art.TokenFlag.EXACT,
+            art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+            art.TokenFlag.EXACT,
+            art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+            art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        ],
+    )
+
+    assert trace is not None
+    assert trace.offsets == [1, 3]
+    assert trace.lengths == [1, 2]
+
+
+def test_chat_choice_trace_does_bounded_work_for_a_retained_suffix() -> None:
+    class CountingList(list[int]):
+        slice_reads = 0
+
+        @overload
+        def __getitem__(self, key: SupportsIndex, /) -> int: ...
+
+        @overload
+        def __getitem__(self, key: slice[SupportsIndex | None], /) -> list[int]: ...
+
+        def __getitem__(
+            self, key: SupportsIndex | slice[SupportsIndex | None], /
+        ) -> int | list[int]:
+            if isinstance(key, slice):
+                self.slice_reads += 1
+            return super().__getitem__(key)
+
+    exchange = _exchange("policy", 7)
+    extra = exchange.response.choices[0].model_extra
+    assert extra is not None
+    extra["prompt_token_ids"] = [1]
+    extra["token_ids"] = [*([8] * 510), 7]
+    history = ChatCompletionsHistory(
+        model="policy",
+        messages=[],
+        message_sources=[
+            ChatCompletionsMessageSource(exchange=exchange, choice_index=0)
+        ],
+    )
+    token_ids = CountingList([1, 7, *([0] * 510)])
+    flags = [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        *([art.TokenFlag.EXACT] * 510),
+    ]
+
+    trace = _chat_choice_trace(history, token_ids, flags)
+
+    assert trace is not None
+    assert trace.offsets == [1]
+    assert trace.lengths == [1]
+    assert token_ids.slice_reads < 10
 
 
 def test_preprocessing_rejects_partial_choice_evidence_before_moe_routes() -> None:

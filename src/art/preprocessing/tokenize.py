@@ -27,6 +27,7 @@ from ..trajectories import (
     TrajectoryGroup,
     get_messages,
 )
+from ..trajectories._selection import ModelSelector, resolve_training_model
 from ..types import MessagesAndChoices
 from ..utils.chat_template import (
     default_chat_template_kwargs_for_tokenizer,
@@ -110,47 +111,53 @@ def _chat_choice_trace(
             )
         return None
 
+    metadata = [choice_vllm_token_metadata(choice) for choice in sourced_choices]
+    if any(value is None for value in metadata):
+        raise AssertionError("choice metadata was checked above")
+    exact_metadata = cast(list[tuple[list[int], list[int]]], metadata)
+
     choices: list[Choice] = []
     offsets: list[int] = []
     lengths: list[int] = []
     cursor = 0
-    for choice in sourced_choices:
-        metadata = choice_vllm_token_metadata(choice)
-        assert metadata is not None
-        completion_ids = metadata[1]
-        retained_start = 0
-
-        def matching_offsets(values: list[int]) -> list[int]:
-            return [
-                index
-                for index in range(cursor, len(token_ids) - len(values) + 1)
-                if token_ids[index : index + len(values)] == values
-                and all(
-                    flag & TokenFlag.SAMPLED
-                    for flag in flags[index : index + len(values)]
+    for position, (choice, (prompt_ids, completion_ids)) in enumerate(
+        zip(sourced_choices, exact_metadata, strict=True)
+    ):
+        offset = len(prompt_ids)
+        if (
+            offset < cursor
+            or offset > len(token_ids)
+            or token_ids[:offset] != prompt_ids
+        ):
+            if has_routing:
+                raise RuntimeError(
+                    "MoE routed prompt tokens are absent from tokenized history"
                 )
-            ]
-
-        matches = matching_offsets(completion_ids)
-        if not matches and completion_ids:
-            for retained_start in range(1, len(completion_ids)):
-                matches = matching_offsets(completion_ids[retained_start:])
-                if matches:
-                    break
-        if not matches:
+            return None
+        next_boundary = (
+            len(exact_metadata[position + 1][0])
+            if position + 1 < len(exact_metadata)
+            else len(token_ids)
+        )
+        end = offset
+        while (
+            end < min(next_boundary, len(token_ids)) and flags[end] & TokenFlag.SAMPLED
+        ):
+            end += 1
+        retained_ids = token_ids[offset:end]
+        if not retained_ids or not completion_ids:
             if has_routing:
                 raise RuntimeError(
                     "MoE routed completion tokens are absent from tokenized history"
                 )
             return None
-        if retained_start and len(matches) != 1:
+        retained_start = len(completion_ids) - len(retained_ids)
+        if retained_start < 0 or completion_ids[retained_start:] != retained_ids:
             if has_routing:
                 raise RuntimeError(
-                    "MoE routed completion suffix is ambiguous in tokenized history"
+                    "MoE routed completion suffix disagrees with tokenized history"
                 )
             return None
-        retained_ids = completion_ids[retained_start:]
-        offset = matches[0]
         choices.append(
             _choice_with_retained_routing(choice, retained_start)
             if retained_start
@@ -687,7 +694,7 @@ def tokenize_trajectory_groups(
     image_processor: BaseImageProcessor | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
     chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
-    model: str | None = None,
+    model: ModelSelector | str | None = None,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -707,12 +714,9 @@ def tokenize_trajectory_groups(
             if advantage == 0 and drop_zero_advantage_trajectories:
                 continue
             if trajectory.exchanges:
-                from ..trajectories._tokenize import (
-                    _as_tokenizer,
-                    _require_training_model,
-                )
+                from ..trajectories._tokenize import _as_tokenizer
 
-                selected_model = _require_training_model(trajectory, model)
+                selected_model = resolve_training_model(trajectory, model)
                 exchange_results = trajectory.tokenize(
                     multi_history=True,
                     model=selected_model,

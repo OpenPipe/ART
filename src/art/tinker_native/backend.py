@@ -41,7 +41,7 @@ from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..trajectories._tokenize import _training_model_pattern
+from ..trajectories._selection import automatic_training_model_selector
 from ..types import TrainResult, TrainSFTConfig
 from ..utils.lifecycle import process_shutdown_timeout
 from ..utils.output_dirs import get_model_dir
@@ -359,7 +359,7 @@ class TinkerNativeBackend:
             state.tokenizer,
             normalize_advantages,
             base_model=model.base_model,
-            model=_training_model_pattern(self._model_inference_name(model)),
+            model=automatic_training_model_selector(self._model_inference_name(model)),
         )
 
         metrics: dict[str, float] = {

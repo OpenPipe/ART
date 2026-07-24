@@ -807,6 +807,8 @@ class TrajectoryGroup(_CompactModel):
 
 
 class TokenizedHistory(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
+
     model: str
     token_ids: list[int]
     logprobs: list[float]
