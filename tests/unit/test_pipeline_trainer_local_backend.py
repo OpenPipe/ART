@@ -769,7 +769,10 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
 
     assert packed_tensors is not None
     assert packed_tensors["tokens"].shape == (1, 4)
-    assert tokenize.call_args.kwargs["model"] == f"{model.name}@*"
+    selector = tokenize.call_args.kwargs["model"]
+    assert selector.value == f"{model.name}@0"
+    assert selector.automatic_family == (model.name, "@")
+    assert selector.allow_glob is False
 
 
 @pytest.mark.asyncio

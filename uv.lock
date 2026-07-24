@@ -4882,7 +4882,7 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.77.0" },
     { name = "apex", marker = "extra == 'megatron'", git = "https://github.com/NVIDIA/apex.git?rev=25.09" },
     { name = "awscli", marker = "extra == 'backend'", specifier = ">=1.38.1" },
-    { name = "bitsandbytes", marker = "extra == 'backend'", specifier = ">=0.45.2" },
+    { name = "bitsandbytes", marker = "extra == 'backend'", specifier = ">=0.45.2,!=0.50.0" },
     { name = "causal-conv1d", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==1.6.1" },
     { name = "datrie", marker = "extra == 'tinker'", specifier = ">=0.8.3" },
     { name = "duckdb", marker = "extra == 'backend'", specifier = ">=1.0.0" },
