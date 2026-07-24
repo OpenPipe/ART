@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 from typing import SupportsIndex, cast, overload
+from unittest.mock import patch
 
 import numpy as np
 from openai.types import Completion
@@ -11,6 +14,9 @@ import pytest
 from transformers import PreTrainedTokenizerBase
 
 import art
+from art import TrainableModel
+from art.dev.model import InternalModelConfig
+from art.local import LocalBackend
 from art.openai import ART_MOE_ROUTING_METADATA_KEY
 from art.preprocessing.moe_routing import MoeRouteSegments
 from art.preprocessing.tokenize import (
@@ -139,6 +145,75 @@ def _routed_exchange(
         ),
     }
     return exchange
+
+
+def _reasoning_stripped_group() -> art.TrajectoryGroup:
+    def set_choice(
+        exchange: ChatCompletionsExchange,
+        token_ids: list[int],
+        *,
+        content: str,
+        reasoning: str,
+    ) -> None:
+        data = exchange.response.model_dump(mode="python")
+        choice = data["choices"][0]
+        choice["message"] = {
+            "role": "assistant",
+            "content": content,
+            "reasoning": reasoning,
+        }
+        choice["token_ids"] = token_ids
+        choice["logprobs"]["content"] = [
+            {
+                "token": f"token_id:{token_id}",
+                "logprob": -0.1,
+                "bytes": [],
+                "top_logprobs": [],
+            }
+            for token_id in token_ids
+        ]
+        exchange.response = ChatCompletion.model_validate(data)
+        extra = exchange.response.choices[0].model_extra
+        assert extra is not None
+        extra.pop(ART_MOE_ROUTING_METADATA_KEY, None)
+
+    first = _routed_exchange(
+        prompt_token_ids=[1],
+        output_token=2,
+        messages=[{"role": "user", "content": "one"}],
+        content="first",
+    )
+    set_choice(
+        first,
+        [2, 101, 102, 103, 104, 9],
+        content="first",
+        reasoning="long reasoning",
+    )
+    second = _routed_exchange(
+        prompt_token_ids=[1, 9, 4],
+        output_token=5,
+        messages=[
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "first"},
+            {"role": "user", "content": "two"},
+        ],
+        content="second",
+    )
+    set_choice(
+        second,
+        [5, 6],
+        content="second",
+        reasoning="short reasoning",
+    )
+    return art.TrajectoryGroup(
+        [
+            art.Trajectory(
+                exchanges=art.TrajectoryExchanges(chat_completions=[first, second]),
+                reward=reward,
+            )
+            for reward in (1.0, 0.0)
+        ]
+    )
 
 
 def _group() -> art.TrajectoryGroup:
@@ -300,6 +375,72 @@ def test_training_tokenizes_each_exchange_trajectory_once(
         model="policy",
     )
     assert calls == len(group.trajectories)
+
+
+def test_overlength_history_does_not_claim_sources_from_fitting_history() -> None:
+    results = list(
+        tokenize_trajectory_groups(
+            cast(PreTrainedTokenizerBase, _Tokenizer()),
+            [_reasoning_stripped_group()],
+            allow_training_without_logprobs=False,
+            scale_rewards=False,
+            shuffle_group_trajectories=False,
+            drop_zero_advantage_trajectories=False,
+            model="policy",
+            _max_sequence_length=5,
+        )
+    )
+
+    long = [result for result in results if len(result.token_ids) > 5]
+    fitting = [result for result in results if len(result.token_ids) <= 5]
+    assert len(long) == len(fitting) == 2
+    assert all(result.assistant_mask == [0] * 7 for result in long)
+    assert all(result.token_ids == [1, 9, 4, 5, 6] for result in fitting)
+    assert all(result.assistant_mask == [0, 1, 0, 1, 1] for result in fitting)
+    assert all(result.weight == pytest.approx(1 / 3) for result in results)
+
+
+def test_local_backend_trains_retained_source_after_overlength_history(
+    tmp_path: Path,
+) -> None:
+    backend = LocalBackend(path=str(tmp_path))
+    model = TrainableModel(
+        run_name="reasoning-stripped-overlength",
+        name="policy",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        _internal_config=InternalModelConfig(init_args={"max_seq_length": 5}),
+    )
+    tokenizer = cast(
+        PreTrainedTokenizerBase,
+        SimpleNamespace(
+            name_or_path="test-model",
+            eos_token_id=0,
+            decode=lambda token_id: str(token_id),
+        ),
+    )
+    backend._tokenizers[("test-model", None)] = tokenizer
+    backend._image_processors["test-model"] = None
+
+    with (
+        patch.object(backend, "_model_inference_name", return_value="policy"),
+        pytest.warns(UserWarning, match="Dropping 2 tokenized results"),
+    ):
+        packed = backend._get_packed_tensors(
+            model,
+            [_reasoning_stripped_group()],
+            advantage_balance=0.0,
+            allow_training_without_logprobs=False,
+            scale_rewards=False,
+            plot_tensors=False,
+            packed_sequence_length=5,
+            logprob_calculation_chunk_size=1,
+        )
+
+    assert packed is not None
+    assert packed["tokens"].tolist() == [[1, 9, 4, 5, 6]] * 2
+    assert packed["assistant_mask"].tolist() == [[False, True, False, True, True]] * 2
 
 
 def test_training_rejects_multiple_concrete_policy_versions() -> None:

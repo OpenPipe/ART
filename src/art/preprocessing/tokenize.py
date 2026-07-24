@@ -718,6 +718,7 @@ def tokenize_trajectory_groups(
     chat_template_kwargs: dict[str, Any] | None = None,
     chat_template_tool_schema_format: ChatTemplateToolSchemaFormat = "default",
     model: ModelSelector | str | None = None,
+    _max_sequence_length: int | None = None,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -759,6 +760,36 @@ def tokenize_trajectory_groups(
                 for exchange_result, trace in zip(
                     exchange_results.histories, traces, strict=True
                 ):
+                    if (
+                        _max_sequence_length is not None
+                        and len(exchange_result.token_ids) > _max_sequence_length
+                    ):
+                        preview_seen = set(seen_source_keys)
+                        would_train = _first_introduction_mask(
+                            trace.source_keys, preview_seen
+                        )
+                        if any(would_train):
+                            trajectory_results.append(
+                                TokenizedResult(
+                                    advantage=advantage,
+                                    chat="",
+                                    token_ids=exchange_result.token_ids,
+                                    input_pos=list(
+                                        range(len(exchange_result.token_ids))
+                                    ),
+                                    assistant_mask=[0] * len(exchange_result.token_ids),
+                                    logprobs=exchange_result.logprobs,
+                                    pixel_values=None,
+                                    image_grid_thw=None,
+                                    trajectory=trajectory,
+                                    choice_offsets=[],
+                                    extra_logprobs={},
+                                    moe_routed_experts=None,
+                                    moe_routing_alignment_stats=MoeRoutingAlignmentStats(),
+                                    _tokenizer=tokenizer,
+                                )
+                            )
+                        continue
                     trainable = _first_introduction_mask(
                         trace.source_keys, seen_source_keys
                     )
