@@ -1586,7 +1586,7 @@ class MegatronService:
         payload_sha256: str,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        """Run one revision-bound standalone forward-KL optimizer transaction."""
+        """Run one revision-bound prepared KD or additive optimizer transaction."""
 
         del verbose
         if config.optimizer_save_interval != 1:
@@ -1638,7 +1638,7 @@ class MegatronService:
                 topology.etp,
             ) != (1, 1, 1, 1, 1, 1):
                 raise ValueError(
-                    "M3 Megatron distillation requires TP=DP=CP=PP=EP=ETP=1"
+                    "prepared Megatron training requires TP=DP=CP=PP=EP=ETP=1"
                 )
             if expected_source_revision != self._latest_step:
                 raise ValueError(
@@ -1647,12 +1647,17 @@ class MegatronService:
                 )
             if self.is_dedicated and self.rollout_weights_mode != "lora":
                 raise NotImplementedError(
-                    "M3 Megatron distillation requires LoRA rollout weights"
+                    "prepared Megatron training requires LoRA rollout weights"
                 )
             # Validate tensor bytes and denominator before staging a checkpoint.
             from .distillation import packed_distillation_tensors_from_dir
 
-            packed_distillation_tensors_from_dir(disk_tensors)
+            packed = packed_distillation_tensors_from_dir(disk_tensors)
+            has_policy = bool(packed["policy_mask"].any().item())
+            if has_policy != (objective.policy is not None):
+                raise ValueError(
+                    "prepared policy sidecars do not match the resolved objective"
+                )
             self._reserve_distillation_receipt(path=receipt_path, binding=binding)
             receipt_reserved = True
 

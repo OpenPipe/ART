@@ -38,6 +38,11 @@ from art.loss import (
     loss_fn,
     shift_tensor,
 )
+from art.megatron.composite_loss import (
+    PreparedDistillationSidecars,
+    PreparedPolicySidecars,
+    composite_prepared_loss_from_logits,
+)
 from art.megatron.context_parallel.types import (
     DispatchedPackedTensors,
     ParallelTopology,
@@ -47,7 +52,6 @@ from art.megatron.distillation import (
     PackedDistillationTensors,
     packed_distillation_tensors_from_dir,
 )
-from art.megatron.distillation_loss import topk_plus_tail_forward_kl
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.megatron_patches import install_fast_frozen_output_backward
 from art.megatron.model_support.lora_disk import (
@@ -215,7 +219,7 @@ class TrainStepResult(BaseModel):
 
 
 class DistillationTrainStepResult(BaseModel):
-    """One standalone-KD optimizer update and its unreduced diagnostics."""
+    """One prepared optimizer update and its independent diagnostics."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -230,6 +234,8 @@ class DistillationTrainStepResult(BaseModel):
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
+    policy_loss_sum: float = 0.0
+    policy_token_count: int = 0
 
 
 def print0(rank: int, *values: Any) -> None:
@@ -747,12 +753,14 @@ def run_megatron_distillation_job(
     runtime: TrainingRuntime,
     job: MegatronDistillationJob,
 ) -> None:
-    """Run a revision-bound standalone-KD job through the normal transaction."""
+    """Run a revision-bound prepared job through the normal transaction."""
 
     # This is the worker trust boundary. Revalidate immutable job identity,
     # topology, every planned denominator, and the sidecar bytes before loading
     # an adapter or replacing resident optimizer state.
-    packed_tensors, temperature, num_steps = _preflight_distillation_job(runtime, job)
+    packed_tensors, temperature, update_plans = _preflight_distillation_job(
+        runtime, job
+    )
     adapter_dtypes = None
     step_result = None
     job_succeeded = False
@@ -766,22 +774,7 @@ def run_megatron_distillation_job(
             optimizer_state_path=job.optimizer_state_path,
         )
         assert runtime.optimizer is not None
-        num_sequences = job.distillation_tensors["num_sequences"]
-        global_grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
-            job.config.grad_accumulation_sequences
-        )
-        for step_index in range(num_steps):
-            indices = [
-                index
-                for index in build_micro_sample_indices(
-                    step_index=step_index,
-                    num_sequences=num_sequences,
-                    global_grad_accumulation_sequences=(
-                        global_grad_accumulation_sequences
-                    ),
-                )
-                if index is not None
-            ]
+        for indices, policy_count, target_count in update_plans:
             step_result = run_megatron_distillation_step(
                 model_chunks=runtime.model,
                 provider=runtime.provider,
@@ -796,6 +789,16 @@ def run_megatron_distillation_job(
                 compensate_temperature_squared=(
                     job.objective.compensate_temperature_squared
                 ),
+                policy_config=(
+                    job.objective.policy.model_dump(
+                        mode="python",
+                        exclude={"kind", "scale_rewards", "advantage_balance"},
+                    )
+                    if job.objective.policy is not None
+                    else None
+                ),
+                expected_policy_count=policy_count,
+                expected_target_count=target_count,
             )
             _validate_distillation_step_result_finite(runtime, step_result)
             _log_distillation_step_result(
@@ -804,7 +807,7 @@ def run_megatron_distillation_job(
                 step_result,
                 coefficient=job.objective.coefficient,
                 temperature=temperature,
-                num_gradient_steps=num_steps,
+                num_gradient_steps=len(update_plans),
             )
 
         runtime.resident_optimizer_dirty = True
@@ -1045,7 +1048,7 @@ def _validate_distillation_worker_topology(model: ModelChunks) -> None:
     )
     if worker_topology != (1, 1, 1, 1, 1, 1):
         raise ValueError(
-            "M3 Megatron distillation requires TP=DP=CP=PP=EP=ETP=1; "
+            "prepared Megatron training requires TP=DP=CP=PP=EP=ETP=1; "
             f"received {worker_topology}"
         )
 
@@ -1053,7 +1056,11 @@ def _validate_distillation_worker_topology(model: ModelChunks) -> None:
 def _preflight_distillation_job(
     runtime: TrainingRuntime,
     job: MegatronDistillationJob,
-) -> tuple[PackedDistillationTensors, float, int]:
+) -> tuple[
+    PackedDistillationTensors,
+    float,
+    list[tuple[list[int], int, int]],
+]:
     """Validate the complete optimizer plan before mutable state preparation."""
 
     if job.expected_source_revision != job.source_policy_step:
@@ -1071,10 +1078,11 @@ def _preflight_distillation_job(
         )
     _validate_distillation_worker_topology(runtime.model)
     if runtime.rank != 0 or runtime.world_size != 1:
-        raise ValueError("M3 Megatron distillation requires one rank")
+        raise ValueError("prepared Megatron training requires one rank")
 
     packed = packed_distillation_tensors_from_dir(job.distillation_tensors)
     target_mask = packed["target_mask"]
+    policy_mask = packed["policy_mask"]
     token_mask = packed["token_mask"]
     sequence_length = int(token_mask.shape[1])
     prefix_mask = torch.arange(sequence_length).unsqueeze(0) < token_mask.sum(
@@ -1082,7 +1090,10 @@ def _preflight_distillation_job(
     )
     if not torch.equal(token_mask, prefix_mask):
         raise ValueError("distillation token_mask must describe contiguous prefixes")
-    if bool(torch.any(target_mask.sum(dim=1) <= 0)):
+    has_policy = job.objective.policy is not None
+    if bool(policy_mask.any().item()) != has_policy:
+        raise ValueError("prepared policy sidecars do not match the job objective")
+    if not has_policy and bool(torch.any(target_mask.sum(dim=1) <= 0)):
         raise ValueError(
             "every M3 distillation sequence must have a nonzero KD denominator"
         )
@@ -1099,6 +1110,7 @@ def _preflight_distillation_job(
     )
     num_sequences = job.distillation_tensors["num_sequences"]
     num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+    update_plans: list[tuple[list[int], int, int]] = []
     for step_index in range(num_steps):
         indices = [
             index
@@ -1109,12 +1121,22 @@ def _preflight_distillation_job(
             )
             if index is not None
         ]
-        planned_count = sum(int(target_mask[index].sum().item()) for index in indices)
-        if planned_count <= 0:
+        planned_policy_count = sum(
+            int(policy_mask[index].sum().item()) for index in indices
+        )
+        planned_target_count = sum(
+            int(target_mask[index].sum().item()) for index in indices
+        )
+        if has_policy and planned_policy_count <= 0:
+            raise ValueError(
+                "a planned prepared optimizer update has a zero policy denominator"
+            )
+        if planned_target_count <= 0:
             raise ValueError(
                 "a planned distillation optimizer update has a zero KD denominator"
             )
-    return packed, temperature, num_steps
+        update_plans.append((indices, planned_policy_count, planned_target_count))
+    return packed, temperature, update_plans
 
 
 def _prepare_rl_training_state(
@@ -1291,6 +1313,7 @@ def _validate_distillation_step_result_finite(
     values = (
         float(step_result.reduced_loss.detach().float().item()),
         step_result.raw_loss_sum,
+        step_result.policy_loss_sum,
         step_result.selected_loss_sum,
         step_result.tail_loss_sum,
         step_result.teacher_tail_mass_mean,
@@ -1381,9 +1404,10 @@ def _log_distillation_step_result(
         return
     loss_train = float(step_result.reduced_loss.item())
     target_tokens = float(step_result.target_token_count)
+    distillation_loss = step_result.raw_loss_sum * float(coefficient) / target_tokens
     metrics = {
         "loss/train": loss_train,
-        "loss/distillation": loss_train,
+        "loss/distillation": distillation_loss,
         "loss/distillation_sum": step_result.raw_loss_sum,
         "loss/distillation_selected": (step_result.selected_loss_sum / target_tokens),
         "loss/distillation_tail": step_result.tail_loss_sum / target_tokens,
@@ -1405,6 +1429,16 @@ def _log_distillation_step_result(
         "distill/numerical_clamp_count": float(step_result.numerical_clamp_count),
         TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
     }
+    if step_result.policy_token_count > 0:
+        policy_tokens = float(step_result.policy_token_count)
+        metrics.update(
+            {
+                "loss/policy": step_result.policy_loss_sum / policy_tokens,
+                "loss/policy_sum": step_result.policy_loss_sum,
+                "data/policy_tokens": policy_tokens,
+                "data/step_policy_tokens": policy_tokens,
+            }
+        )
     with open(log_path, "a+", encoding="utf-8") as log_file:
         log_msg = json.dumps(metrics)
         print("Logging distillation", log_msg)
@@ -2077,9 +2111,42 @@ def _select_distillation_micro(
             device
         )
 
+    policy_defaults = {
+        "policy_mask": torch.bool,
+        "old_logprobs": torch.float32,
+        "policy_advantages": torch.float32,
+        "policy_weights": torch.float32,
+        "policy_group_ids": torch.long,
+    }
+
+    def policy_row(name: str) -> torch.Tensor:
+        if name in tensor_map:
+            return row(name)
+        return torch.zeros(
+            (1, token_count),
+            dtype=policy_defaults[name],
+            device=device,
+        )
+
     return {
         "tokens": row("tokens"),
         "input_pos": row("input_pos"),
+        "sampled_token_ids": _shift_distillation_token_axis(row("tokens"), pad=0),
+        "policy_mask": _shift_distillation_token_axis(
+            policy_row("policy_mask"), pad=False
+        ),
+        "old_logprobs": _shift_distillation_token_axis(
+            policy_row("old_logprobs"), pad=0.0
+        ),
+        "policy_advantages": _shift_distillation_token_axis(
+            policy_row("policy_advantages"), pad=0.0
+        ),
+        "policy_weights": _shift_distillation_token_axis(
+            policy_row("policy_weights"), pad=0.0
+        ),
+        "policy_group_ids": _shift_distillation_token_axis(
+            policy_row("policy_group_ids"), pad=0
+        ),
         "target_mask": _shift_distillation_token_axis(row("target_mask"), pad=False),
         "distillation_weights": _shift_distillation_token_axis(
             row("distillation_weights"), pad=0.0
@@ -2151,22 +2218,53 @@ def run_megatron_distillation_step(
     temperature: float,
     coefficient: float,
     compensate_temperature_squared: bool,
+    policy_config: dev.TrainConfig | None = None,
+    expected_policy_count: int | None = None,
+    expected_target_count: int | None = None,
 ) -> DistillationTrainStepResult:
-    """Run one exact-denominator standalone-KD optimizer update."""
+    """Run one exact-denominator prepared optimizer update."""
 
     if not sample_indices:
         raise ValueError("distillation optimizer step requires at least one sequence")
     _validate_distillation_worker_topology(model_chunks)
+    packed_policy_mask = packed_tensors.get("policy_mask")
+    policy_count = (
+        sum(int(packed_policy_mask[index].sum().item()) for index in sample_indices)
+        if packed_policy_mask is not None
+        else 0
+    )
+    target_count = sum(
+        int(packed_tensors["target_mask"][index].sum().item())
+        for index in sample_indices
+    )
+    if policy_config is not None and policy_count <= 0:
+        raise RuntimeError("prepared optimizer step has a zero policy denominator")
+    if policy_config is None and policy_count != 0:
+        raise RuntimeError("policy sidecars are active without a policy objective")
+    if target_count <= 0:
+        raise RuntimeError("distillation optimizer step has a zero KD denominator")
+    if expected_policy_count is not None and policy_count != expected_policy_count:
+        raise RuntimeError("prepared policy denominator changed after preflight")
+    if expected_target_count is not None and target_count != expected_target_count:
+        raise RuntimeError("prepared KD denominator changed after preflight")
+
     device = next(model_chunks[0].parameters()).device
     _zero_grad_buffers(model_chunks)
 
+    policy_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
     raw_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
     selected_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
     tail_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
     teacher_tail_mass_sum = torch.zeros((), dtype=torch.float32, device=device)
     student_tail_mass_sum = torch.zeros((), dtype=torch.float32, device=device)
+    observed_policy_count = 0
     target_token_count = 0
     numerical_clamp_count = 0
+    base_denominator = policy_count if policy_count > 0 else target_count
+    policy_scale = (
+        float(base_denominator) / float(policy_count) if policy_count > 0 else 0.0
+    )
+    distillation_scale = float(base_denominator) / float(target_count)
 
     for sample_index in sample_indices:
         micro = _select_distillation_micro(
@@ -2202,41 +2300,76 @@ def run_megatron_distillation_step(
             expected_rows=1,
             expected_sequence_length=sequence_length,
         )
-        loss = topk_plus_tail_forward_kl(
-            logits,
-            teacher_topk_ids=micro["topk_token_ids"],
-            teacher_topk_logprobs=micro["teacher_logprobs"],
-            teacher_tail_logprob=micro["tail_logprobs"],
-            mask=micro["target_mask"],
-            weights=micro["distillation_weights"],
-            logical_vocab_size=logical_vocab_size,
-            temperature=temperature,
-            compensate_temperature_squared=compensate_temperature_squared,
+        policy_sidecars = (
+            PreparedPolicySidecars(
+                sampled_token_ids=micro["sampled_token_ids"],
+                old_logprobs=micro["old_logprobs"],
+                advantages=micro["policy_advantages"],
+                weights=micro["policy_weights"],
+                mask=micro["policy_mask"],
+                group_ids=micro["policy_group_ids"],
+            )
+            if bool(micro["policy_mask"].any().item())
+            else None
         )
-        objective_sum = loss.loss_sum * coefficient
+        distillation_sidecars = (
+            PreparedDistillationSidecars(
+                teacher_topk_ids=micro["topk_token_ids"],
+                teacher_topk_logprobs=micro["teacher_logprobs"],
+                teacher_tail_logprob=micro["tail_logprobs"],
+                mask=micro["target_mask"],
+                weights=micro["distillation_weights"],
+                temperature=temperature,
+                compensate_temperature_squared=compensate_temperature_squared,
+            )
+            if bool(micro["target_mask"].any().item())
+            else None
+        )
+        if policy_sidecars is None and distillation_sidecars is None:
+            continue
+        composite = composite_prepared_loss_from_logits(
+            logits,
+            logical_vocab_size=logical_vocab_size,
+            policy=policy_sidecars,
+            distillation=distillation_sidecars,
+            policy_config=policy_config,
+            distillation_coefficient=coefficient,
+        )
+        objective_sum = torch.zeros((), dtype=torch.float32, device=device)
+        if composite.policy is not None:
+            objective_sum = objective_sum + composite.policy.loss_sum * policy_scale
+        if composite.distillation is not None:
+            objective_sum = objective_sum + (
+                composite.distillation.loss_sum * coefficient * distillation_scale
+            )
         if not bool(torch.isfinite(objective_sum.detach()).item()):
             raise RuntimeError(
                 "distillation produced a non-finite loss before backward"
             )
         objective_sum.backward()
 
-        raw_loss_sum = raw_loss_sum + loss.loss_sum.detach()
-        selected_loss_sum = selected_loss_sum + loss.selected_loss_sum.detach()
-        tail_loss_sum = tail_loss_sum + loss.tail_loss_sum.detach()
-        teacher_tail_mass_sum = (
-            teacher_tail_mass_sum + loss.teacher_tail_mass_sum.detach()
-        )
-        student_tail_mass_sum = (
-            student_tail_mass_sum + loss.student_tail_mass_sum.detach()
-        )
-        target_token_count += int(loss.token_count.item())
-        numerical_clamp_count += int(loss.numerical_clamp_count.item())
+        if composite.policy is not None:
+            policy_loss_sum = policy_loss_sum + composite.policy.loss_sum.detach()
+            observed_policy_count += int(composite.policy.token_count.item())
+        if composite.distillation is not None:
+            loss = composite.distillation.details
+            raw_loss_sum = raw_loss_sum + loss.loss_sum.detach()
+            selected_loss_sum = selected_loss_sum + loss.selected_loss_sum.detach()
+            tail_loss_sum = tail_loss_sum + loss.tail_loss_sum.detach()
+            teacher_tail_mass_sum = (
+                teacher_tail_mass_sum + loss.teacher_tail_mass_sum.detach()
+            )
+            student_tail_mass_sum = (
+                student_tail_mass_sum + loss.student_tail_mass_sum.detach()
+            )
+            target_token_count += int(loss.token_count.item())
+            numerical_clamp_count += int(loss.numerical_clamp_count.item())
 
-    if target_token_count <= 0:
-        raise RuntimeError("distillation optimizer step has a zero KD denominator")
+    if observed_policy_count != policy_count or target_token_count != target_count:
+        raise RuntimeError("prepared objective counts changed during scoring")
     flush_param_grads_to_main_grads(model_chunks)
     denominator = torch.tensor(
-        [float(target_token_count)], dtype=torch.float32, device=device
+        [float(base_denominator)], dtype=torch.float32, device=device
     )
     finalize_model_grads_extended(
         as_megatron_api_chunks(model_chunks),
@@ -2250,6 +2383,8 @@ def run_megatron_distillation_step(
         model_chunks=model_chunks,
     )
     reduced_loss = (raw_loss_sum * coefficient) / target_token_count
+    if policy_count > 0:
+        reduced_loss = reduced_loss + policy_loss_sum / policy_count
 
     return DistillationTrainStepResult(
         reduced_loss=reduced_loss,
@@ -2267,6 +2402,8 @@ def run_megatron_distillation_step(
         update_successful=update_successful,
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
+        policy_loss_sum=float(policy_loss_sum.item()),
+        policy_token_count=policy_count,
     )
 
 

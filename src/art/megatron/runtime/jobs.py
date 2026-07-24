@@ -56,7 +56,7 @@ class MegatronMergedTrainingJob(_MegatronTrainingJobBase):
 
 
 class MegatronDistillationJob(BaseModel):
-    """Standalone forward-KL job with immutable prepared-artifact provenance."""
+    """Prepared KD or additive CISPO+KD job with immutable provenance."""
 
     kind: Literal["distill"] = "distill"
     step: int = Field(ge=1)

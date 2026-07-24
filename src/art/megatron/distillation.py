@@ -38,14 +38,28 @@ DISTILLATION_TENSOR_SCHEMA_VERSION = 1
 PREPARED_TENSOR_LAYOUT_VERSION = 2
 
 
+class CispoObjectiveConfig(BaseModel):
+    """Complete resolved CISPO contract supported by prepared Megatron jobs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["cispo"] = "cispo"
+    epsilon: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    epsilon_high: float = Field(default=4.0, ge=0, allow_inf_nan=False)
+    importance_sampling_level: Literal["token"] = "token"
+    scale_rewards: bool = True
+    advantage_balance: float = Field(default=0.0, ge=-1.0, le=1.0)
+
+
 class DistillationObjectiveConfig(BaseModel):
-    """Serializable optimizer-side subset of ``distill.Loss``."""
+    """Serializable complete objective contract for a prepared update."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: Literal["forward_kl"] = "forward_kl"
     coefficient: float = Field(gt=0, allow_inf_nan=False)
     compensate_temperature_squared: bool = False
+    policy: CispoObjectiveConfig | None = None
 
 
 class PolicyPackingConfig(BaseModel):

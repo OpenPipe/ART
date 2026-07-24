@@ -12,6 +12,7 @@ from art import distill
 from art.local.backend import LocalBackend
 from art.megatron.backend import MegatronBackend
 from art.megatron.distillation import (
+    CispoObjectiveConfig,
     DistillationObjectiveConfig,
     PolicyPackingConfig,
     pack_prepared_batch,
@@ -638,6 +639,45 @@ async def test_backend_returns_committed_receipt_before_stale_revision_check(
 
 
 @pytest.mark.asyncio
+async def test_backend_resolves_additive_public_objective_before_receipt_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact = _additive_artifact()
+    backend = MegatronBackend(path=str(tmp_path))
+    observed: dict[str, Any] = {}
+
+    class _Service:
+        async def committed_distillation_step(self, **kwargs: Any) -> int:
+            observed.update(kwargs)
+            return 8
+
+    async def _get_service(_: Any) -> _Service:
+        return _Service()
+
+    monkeypatch.setattr(backend, "_get_service", _get_service)
+    result = await backend.train(
+        cast(Any, SimpleNamespace()),
+        artifact,
+        objectives=distill.TrainingObjectives(
+            policy="cispo",
+            distillation=distill.Loss(coefficient=0.4),
+        ),
+        epsilon=0.2,
+        epsilon_high=0.3,
+        importance_sampling_level="token",
+        idempotency_key="additive-key",
+        save_checkpoint=False,
+    )
+
+    assert result.step == 8
+    assert observed["objective"].coefficient == 0.4
+    assert observed["objective"].policy is not None
+    assert observed["objective"].policy.epsilon == 0.2
+    assert observed["objective"].policy.epsilon_high == 0.3
+
+
+@pytest.mark.asyncio
 async def test_backend_rejects_non_durable_optimizer_interval_before_service(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -705,6 +745,44 @@ def test_receipt_identity_rejects_changed_resolved_training_config(
             binding=changed,
         )
     assert original["train_config"][field] != changed["train_config"][field]
+
+
+def test_receipt_identity_rejects_changed_resolved_policy_config(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "receipt.json"
+    common = {
+        "idempotency_key": "stable",
+        "expected_source_revision": 7,
+        "preparation_id": "preparation",
+        "payload_sha256": "payload",
+        "config": TrainConfig(optimizer_save_interval=1),
+    }
+    original = MegatronService._distillation_receipt_binding(
+        **common,
+        objective=DistillationObjectiveConfig(
+            coefficient=1.0,
+            policy=CispoObjectiveConfig(epsilon=0.2),
+        ),
+    )
+    changed = MegatronService._distillation_receipt_binding(
+        **common,
+        objective=DistillationObjectiveConfig(
+            coefficient=1.0,
+            policy=CispoObjectiveConfig(epsilon=0.4),
+        ),
+    )
+    MegatronService._write_json_atomic(
+        path,
+        {"binding": original, "state": "committed", "committed_step": 8},
+    )
+
+    with pytest.raises(ValueError, match="different distillation job"):
+        MegatronService._read_distillation_receipt(
+            cast(MegatronService, object()),
+            path=path,
+            binding=changed,
+        )
 
 
 def test_receipt_reservation_is_atomic_and_never_overwrites(tmp_path: Path) -> None:

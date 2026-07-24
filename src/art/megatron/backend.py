@@ -17,8 +17,11 @@ from ..types import LocalTrainResult, TrainConfig
 from ..utils.lifecycle import process_shutdown_timeout
 from ..utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 from .distillation import (
+    CispoObjectiveConfig,
     DistillationObjectiveConfig,
+    PolicyPackingConfig,
     pack_prepared_batch,
+    validate_prepared_forward_kl,
     validate_standalone_forward_kl,
 )
 from .migrations import apply_megatron_migrations, optimizer_state_path
@@ -96,6 +99,11 @@ class MegatronBackend(LocalBackend):
             "optimizer_save_interval",
             "save_checkpoint",
             "verbose",
+            "epsilon",
+            "epsilon_high",
+            "importance_sampling_level",
+            "scale_rewards",
+            "advantage_balance",
         }
         unexpected = sorted(set(kwargs) - allowed)
         if unexpected:
@@ -142,15 +150,37 @@ class MegatronBackend(LocalBackend):
         if not isinstance(verbose, bool):
             raise TypeError("verbose must be a bool")
 
-        if objectives.policy is not None or objectives.distillation is None:
-            raise ValueError(
-                "M3 Megatron prepared-batch training supports standalone "
-                "distillation only"
+        if objectives.policy not in (None, "cispo"):
+            raise ValueError("prepared Megatron training supports CISPO only")
+        if objectives.distillation is None:
+            raise ValueError("prepared Megatron training requires distillation")
+        policy_objective: CispoObjectiveConfig | None = None
+        policy_packing: PolicyPackingConfig | None = None
+        if objectives.policy is not None:
+            importance_sampling_level = kwargs.get("importance_sampling_level", "token")
+            if importance_sampling_level != "token":
+                raise ValueError(
+                    "prepared Megatron CISPO currently supports "
+                    "importance_sampling_level='token' only"
+                )
+            epsilon = kwargs.get("epsilon")
+            epsilon_high = kwargs.get("epsilon_high")
+            policy_objective = CispoObjectiveConfig(
+                epsilon=1.0 if epsilon is None else epsilon,
+                epsilon_high=4.0 if epsilon_high is None else epsilon_high,
+                importance_sampling_level=importance_sampling_level,
+                scale_rewards=kwargs.get("scale_rewards", True),
+                advantage_balance=kwargs.get("advantage_balance", 0.0),
+            )
+            policy_packing = PolicyPackingConfig(
+                scale_rewards=policy_objective.scale_rewards,
+                advantage_balance=policy_objective.advantage_balance,
             )
         objective = objectives.distillation
         objective_config = DistillationObjectiveConfig(
             coefficient=objective.coefficient,
             compensate_temperature_squared=(objective.compensate_temperature_squared),
+            policy=policy_objective,
         )
         config = TrainConfig(
             learning_rate=learning_rate,
@@ -188,17 +218,39 @@ class MegatronBackend(LocalBackend):
         runtime = get_megatron_runtime_config()
         topology = runtime.topology
         expected_source_revision = await self._get_step(model)
-        payload = validate_standalone_forward_kl(
-            batch=batch,
-            objectives=objectives,
-            expected_source_revision=expected_source_revision,
-            packed_sequence_length=runtime.packed_sequence_length,
-            tensor_parallel_size=topology.tp,
-            context_parallel_size=topology.cp,
-            pipeline_parallel_size=topology.pp,
-            expert_parallel_size=topology.ep,
-            expert_tensor_parallel_size=topology.etp,
-        )
+        if objectives.policy is None:
+            payload = validate_standalone_forward_kl(
+                batch=batch,
+                objectives=objectives,
+                expected_source_revision=expected_source_revision,
+                packed_sequence_length=runtime.packed_sequence_length,
+                tensor_parallel_size=topology.tp,
+                context_parallel_size=topology.cp,
+                pipeline_parallel_size=topology.pp,
+                expert_parallel_size=topology.ep,
+                expert_tensor_parallel_size=topology.etp,
+            )
+        else:
+            topology_tuple = (
+                topology.tp,
+                topology.cp,
+                topology.pp,
+                topology.ep,
+                topology.etp,
+            )
+            if topology_tuple != (1, 1, 1, 1, 1):
+                raise ValueError(
+                    "additive prepared Megatron training requires "
+                    "TP=CP=PP=EP=ETP=1; "
+                    f"received {topology_tuple}"
+                )
+            payload = validate_prepared_forward_kl(
+                batch=batch,
+                objectives=objectives,
+                expected_source_revision=expected_source_revision,
+                packed_sequence_length=runtime.packed_sequence_length,
+                policy_config=policy_packing,
+            )
         capabilities = model._serving_capabilities
         if capabilities is None:
             raise RuntimeError(
@@ -225,6 +277,8 @@ class MegatronBackend(LocalBackend):
             payload=payload,
             sequence_length=runtime.packed_sequence_length,
             output_dir=tensor_dir,
+            objectives=objectives,
+            policy_config=policy_packing,
         )
         metric_samples: list[dict[str, float]] = []
         started = time.monotonic()
@@ -245,6 +299,11 @@ class MegatronBackend(LocalBackend):
             "data/step_distillation_target_tokens",
             float(disk_tensors["target_count"]),
         )
+        if objective_config.policy is not None:
+            metrics.setdefault(
+                "data/step_policy_tokens",
+                float(disk_tensors.get("policy_count", 0)),
+            )
         step = await self._get_step(model)
         checkpoint_path: str | None = None
         if save_checkpoint:
