@@ -1026,7 +1026,7 @@ def _save_lora_and_optimizer(
     optimizer_ready_log_path: str | None = None,
 ) -> None:
     assert runtime.optimizer is not None
-    save_vllm_lora_from_model(
+    publish_metrics = save_vllm_lora_from_model(
         model=runtime.model,
         adapter_dtypes=adapter_dtypes,
         handler=runtime.model_support_handler,
@@ -1036,7 +1036,13 @@ def _save_lora_and_optimizer(
         world_size=runtime.world_size,
     )
     if lora_ready_log_path is not None and runtime.rank == 0:
-        _write_job_event(lora_ready_log_path, LORA_READY_EVENT, step=step)
+        assert publish_metrics is not None
+        _write_job_event(
+            lora_ready_log_path,
+            LORA_READY_EVENT,
+            step=step,
+            **publish_metrics.as_training_metrics(),
+        )
     if _should_save_optimizer(
         runtime,
         step=step,

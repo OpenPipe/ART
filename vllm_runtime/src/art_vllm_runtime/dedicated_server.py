@@ -5,6 +5,7 @@ import asyncio
 from http import HTTPStatus
 import json
 import os
+import time
 
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -227,8 +228,12 @@ def _patch_art_runtime_routes() -> None:
             models = raw_request.app.state.openai_serving_models
             engine_client = engine(raw_request)
             coordinator = lora_update_coordinator(models, engine_client)
+            update_started = time.perf_counter()
+            begin_started = update_started
             await coordinator.begin_update(lora_slot)
+            begin_s = time.perf_counter() - begin_started
             try:
+                load_started = time.perf_counter()
                 load_result = await models.load_lora_adapter(
                     LoadLoRAAdapterRequest(
                         lora_name=lora_slot,
@@ -238,23 +243,38 @@ def _patch_art_runtime_routes() -> None:
                     ),
                     base_model_name=body.base_model_name,
                 )
+                load_s = time.perf_counter() - load_started
                 if isinstance(load_result, ErrorResponse):
                     await coordinator.fail_update(lora_slot)
                     return JSONResponse(
                         content=load_result.model_dump(mode="python"),
                         status_code=load_result.error.code,
                     )
+                cache_started = time.perf_counter()
                 waiting_cache_salt = await engine_client.engine_core.call_utility_async(
                     "art_update_waiting_lora_cache_salt",
                     lora_slot,
                     policy_version,
                 )
+                update_waiting_cache_s = time.perf_counter() - cache_started
+                commit_started = time.perf_counter()
                 await coordinator.commit_update(
                     lora_slot,
                     policy_version,
                     models.lora_requests[lora_slot],
                 )
-                from art_vllm_runtime.metrics import record_policy_cache_waiting_update
+                commit_s = time.perf_counter() - commit_started
+                timing_s = {
+                    "begin_update": begin_s,
+                    "load_adapter": load_s,
+                    "update_waiting_cache": update_waiting_cache_s,
+                    "commit_update": commit_s,
+                    "total": time.perf_counter() - update_started,
+                }
+                from art_vllm_runtime.metrics import (
+                    record_policy_cache_waiting_update,
+                    record_weight_update,
+                )
 
                 record_policy_cache_waiting_update(
                     updated=int(waiting_cache_salt["updated_waiting_requests"]),
@@ -262,6 +282,7 @@ def _patch_art_runtime_routes() -> None:
                         waiting_cache_salt["skipped_started_waiting_requests"]
                     ),
                 )
+                record_weight_update(timing_s)
             except BaseException:
                 await coordinator.fail_update(lora_slot)
                 raise
@@ -272,6 +293,7 @@ def _patch_art_runtime_routes() -> None:
                     "lora_slot": lora_slot,
                     "policy_version": policy_version,
                     "waiting_cache_salt": waiting_cache_salt,
+                    "timing_s": timing_s,
                 }
             )
 

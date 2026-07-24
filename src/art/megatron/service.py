@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from typing import Any, AsyncIterator, Literal, TypedDict, cast
 from urllib.parse import urlparse
 import uuid
@@ -767,7 +768,9 @@ class MegatronService:
         self._latest_step = step
         self._loaded_adapter_steps.add(step)
 
-    async def _update_in_flight_adapter(self, checkpoint_path: str, step: int) -> None:
+    async def _update_in_flight_adapter(
+        self, checkpoint_path: str, step: int
+    ) -> dict[str, float]:
         import httpx
 
         self._raise_if_child_failed()
@@ -777,6 +780,7 @@ class MegatronService:
         self.serving_capabilities.require(
             "policy_token_spans", operation="In-flight LoRA updates"
         )
+        rpc_started = time.perf_counter()
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/art/in_flight_lora_update",
@@ -790,16 +794,37 @@ class MegatronService:
                 timeout=60.0,
             )
             response.raise_for_status()
+        rpc_s = time.perf_counter() - rpc_started
+        json_response = getattr(response, "json", None)
+        response_body = json_response() if callable(json_response) else {}
+        runtime_timing = response_body.get("timing_s", {})
+        if not isinstance(runtime_timing, dict):
+            runtime_timing = {}
         self._latest_step = step
         self._loaded_adapter_steps.add(step)
+        metrics = {
+            "time/weight_update_service_rpc_s": rpc_s,
+            "weight_update/policy_version": float(step),
+        }
+        for phase in (
+            "begin_update",
+            "load_adapter",
+            "update_waiting_cache",
+            "commit_update",
+            "total",
+        ):
+            value = runtime_timing.get(phase)
+            if isinstance(value, (int, float)):
+                metrics[f"time/weight_update_vllm_{phase}_s"] = float(value)
+        return metrics
 
     async def _load_rollout_lora_for_step(
         self, checkpoint_path: str, step: int
-    ) -> None:
+    ) -> dict[str, float]:
         if self.rollout_weight_update_mode == "in_flight_lora":
-            await self._update_in_flight_adapter(checkpoint_path, step)
-        else:
-            await self._reload_adapter(checkpoint_path, step)
+            return await self._update_in_flight_adapter(checkpoint_path, step)
+        await self._reload_adapter(checkpoint_path, step)
+        return {}
 
     async def acquire_exact_adapter(self, step: int, checkpoint_path: str) -> str:
         if self.rollout_weights_mode != "lora":
@@ -1156,16 +1181,27 @@ class MegatronService:
         checkpoint_dir: str | None,
         staging_lora_path: str,
         step: int,
-    ) -> str:
+    ) -> tuple[str, dict[str, float]]:
+        metrics: dict[str, float] = {}
         if checkpoint_dir is None:
             checkpoint_dir = self._publish_staged_training_checkpoint(
                 staging_lora_path=staging_lora_path,
                 step=step,
             )
         if self.is_dedicated and self.rollout_weights_mode == "lora":
-            await self._load_rollout_lora_for_step(checkpoint_dir, step)
+            metrics = await self._load_rollout_lora_for_step(checkpoint_dir, step)
             self._status(f"Loaded checkpoint {step} into vLLM")
-        return checkpoint_dir
+        return checkpoint_dir, metrics
+
+    @staticmethod
+    def _weight_update_metrics_from_event(
+        result: dict[str, Any],
+    ) -> dict[str, float]:
+        return {
+            key: float(value)
+            for key, value in result.items()
+            if key not in {"event", "step"} and isinstance(value, (int, float))
+        }
 
     async def _finish_training_checkpoint(
         self,
@@ -1326,6 +1362,7 @@ class MegatronService:
                 write_megatron_job(job, job_path=job_path)
                 checkpoint_dir: str | None = None
                 optimizer_world_size: int | None = None
+                pending_metrics: dict[str, float] | None = None
                 async for result in stream_megatron_job(
                     job,
                     job_path=job_path,
@@ -1333,11 +1370,20 @@ class MegatronService:
                     process_log_path=self._megatron_log_path,
                 ):
                     if result.get("event") == LORA_READY_EVENT:
-                        checkpoint_dir = await self._handle_training_lora_ready(
+                        (
+                            checkpoint_dir,
+                            install_metrics,
+                        ) = await self._handle_training_lora_ready(
                             checkpoint_dir=checkpoint_dir,
                             staging_lora_path=staging_lora_path,
                             step=next_step,
                         )
+                        if pending_metrics is None:
+                            pending_metrics = {}
+                        pending_metrics.update(
+                            self._weight_update_metrics_from_event(result)
+                        )
+                        pending_metrics.update(install_metrics)
                         continue
                     if (
                         world_size := self._optimizer_ready_world_size(
@@ -1346,7 +1392,14 @@ class MegatronService:
                     ) is not None:
                         optimizer_world_size = world_size
                         continue
-                    yield {key: float(value) for key, value in result.items()}
+                    if pending_metrics is not None:
+                        yield pending_metrics
+                    pending_metrics = {
+                        key: float(value) for key, value in result.items()
+                    }
+
+                if pending_metrics is not None:
+                    yield pending_metrics
 
                 await self._finish_training_checkpoint(
                     checkpoint_dir=checkpoint_dir,
@@ -1386,6 +1439,7 @@ class MegatronService:
 
             checkpoint_dir = None
             optimizer_world_size = None
+            pending_metrics = None
             async for result in stream_megatron_job(
                 job,
                 job_path=job_path,
@@ -1393,11 +1447,20 @@ class MegatronService:
                 process_log_path=self._megatron_log_path,
             ):
                 if result.get("event") == LORA_READY_EVENT:
-                    checkpoint_dir = await self._handle_training_lora_ready(
+                    (
+                        checkpoint_dir,
+                        install_metrics,
+                    ) = await self._handle_training_lora_ready(
                         checkpoint_dir=checkpoint_dir,
                         staging_lora_path=staging_lora_path,
                         step=next_step,
                     )
+                    if pending_metrics is None:
+                        pending_metrics = {}
+                    pending_metrics.update(
+                        self._weight_update_metrics_from_event(result)
+                    )
+                    pending_metrics.update(install_metrics)
                     continue
                 if (
                     world_size := self._optimizer_ready_world_size(
@@ -1406,7 +1469,12 @@ class MegatronService:
                 ) is not None:
                     optimizer_world_size = world_size
                     continue
-                yield {key: float(value) for key, value in result.items()}
+                if pending_metrics is not None:
+                    yield pending_metrics
+                pending_metrics = {key: float(value) for key, value in result.items()}
+
+            if pending_metrics is not None:
+                yield pending_metrics
 
             await self._finish_training_checkpoint(
                 checkpoint_dir=checkpoint_dir,
