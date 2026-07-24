@@ -4028,20 +4028,6 @@ def tokenize_trajectory(
             raise ValueError(
                 f"Trajectory tokenization requires exactly one history; found {len(histories)}"
             )
-        return _materialize_trajectory(
-            tokenize_history(
-                histories[0],
-                model=model
-                if isinstance(histories[0], LegacyHistory)
-                else histories[0].model,
-                base_model=base_model,
-                tokenizer=tokenizer,
-                chat_template=chat_template,
-                chat_template_kwargs=chat_template_kwargs,
-                _projection_validated=not isinstance(histories[0], LegacyHistory),
-            ),
-            trajectory,
-        )
     tokenized = [
         tokenize_history(
             history,
@@ -4054,6 +4040,8 @@ def tokenize_trajectory(
         )
         for history in histories
     ]
+    if not multi_history:
+        return _materialize_trajectory(tokenized[0], trajectory)
     return TokenizedMultiHistoryTrajectory(
         histories=tokenized,
         reward=trajectory.reward,
@@ -4123,44 +4111,24 @@ def tokenize_group(
     TokenizedTrajectoryGroup[TokenizedTrajectory]
     | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
 ):
-    if multi_history:
-        trajectories = [
-            cast(
-                TokenizedMultiHistoryTrajectory,
-                tokenize_trajectory(
-                    trajectory,
-                    multi_history=True,
-                    model=model,
-                    base_model=base_model,
-                    tokenizer=tokenizer,
-                    chat_template=chat_template,
-                    chat_template_kwargs=chat_template_kwargs,
-                ),
-            )
-            for trajectory in group.trajectories
-        ]
-        return TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory](
-            trajectories=trajectories,
-            metrics=dict(group.metrics),
-            metadata=dict(group.metadata),
-        )
-    single_trajectories = [
-        cast(
-            TokenizedTrajectory,
-            tokenize_trajectory(
-                trajectory,
-                multi_history=False,
-                model=model,
-                base_model=base_model,
-                tokenizer=tokenizer,
-                chat_template=chat_template,
-                chat_template_kwargs=chat_template_kwargs,
-            ),
+    trajectories = [
+        tokenize_trajectory(
+            trajectory,
+            multi_history=multi_history,
+            model=model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
         )
         for trajectory in group.trajectories
     ]
-    return TokenizedTrajectoryGroup[TokenizedTrajectory](
-        trajectories=single_trajectories,
-        metrics=dict(group.metrics),
-        metadata=dict(group.metadata),
+    return cast(
+        TokenizedTrajectoryGroup[TokenizedTrajectory]
+        | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory],
+        TokenizedTrajectoryGroup(
+            trajectories=trajectories,
+            metrics=dict(group.metrics),
+            metadata=dict(group.metadata),
+        ),
     )

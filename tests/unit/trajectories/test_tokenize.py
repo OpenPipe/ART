@@ -129,6 +129,38 @@ def _completion_exchange(
     )
 
 
+def _message_exchange(
+    request: MessagesRequest,
+    *,
+    identifier: str = "message-1",
+    content: list[dict[str, object]] | None = None,
+    duration: timedelta = timedelta(milliseconds=1),
+    offset: int = 0,
+    response_model: str = "test/model",
+    **response_extra: object,
+) -> MessagesExchange:
+    start = datetime(2026, 1, 1) + timedelta(seconds=offset)
+    response = Message.model_validate(
+        {
+            "id": identifier,
+            "type": "message",
+            "role": "assistant",
+            "model": response_model,
+            "content": content or [{"type": "text", "text": "answer"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            **response_extra,
+        }
+    )
+    return MessagesExchange(
+        request=request,
+        response=response,
+        start_time=start,
+        end_time=start + duration,
+    )
+
+
 def test_exact_tokens_form_one_append_only_history_without_tokenizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -187,34 +219,19 @@ def test_empty_tool_calls_normalization_preserves_exact_continuation() -> None:
 def test_messages_exact_prompt_and_output_do_not_load_a_tokenizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    response = Message.model_validate(
-        {
-            "id": "message-exact",
-            "type": "message",
-            "role": "assistant",
-            "model": "test/model",
-            "content": [{"type": "text", "text": "answer"}],
-            "stop_reason": "end_turn",
-            "stop_sequence": None,
-            "usage": {"input_tokens": 2, "output_tokens": 1},
-            "prompt_token_ids": [1, 2],
-            "token_ids": [3],
-            "logprobs": [-0.3],
-        }
-    )
-    start = datetime(2026, 1, 1)
     trajectory = art.Trajectory(
         exchanges=TrajectoryExchanges(
             messages=[
-                MessagesExchange(
-                    request=MessagesRequest(
+                _message_exchange(
+                    MessagesRequest(
                         model="test/model",
                         messages=[{"role": "user", "content": "question"}],
                         max_tokens=16,
                     ),
-                    response=response,
-                    start_time=start,
-                    end_time=start + timedelta(milliseconds=1),
+                    identifier="message-exact",
+                    prompt_token_ids=[1, 2],
+                    token_ids=[3],
+                    logprobs=[-0.3],
                 )
             ]
         )
@@ -237,8 +254,6 @@ def test_messages_exact_prompt_and_output_do_not_load_a_tokenizer(
 
 
 def test_anthropic_cache_control_change_starts_new_source_lineage() -> None:
-    start = datetime(2026, 1, 1)
-
     def exchange(
         *,
         identifier: str,
@@ -247,34 +262,18 @@ def test_anthropic_cache_control_change_starts_new_source_lineage() -> None:
         output_token_id: int,
         offset: int,
     ) -> MessagesExchange:
-        response = Message.model_validate(
-            {
-                "id": identifier,
-                "type": "message",
-                "role": "assistant",
-                "model": "test/model",
-                "content": [{"type": "text", "text": f"answer {offset}"}],
-                "stop_reason": "end_turn",
-                "stop_sequence": None,
-                "usage": {
-                    "input_tokens": len(prompt_token_ids),
-                    "output_tokens": 1,
-                },
-                "prompt_token_ids": prompt_token_ids,
-                "token_ids": [output_token_id],
-                "logprobs": [-0.1],
-            }
-        )
-        timestamp = start + timedelta(seconds=offset)
-        return MessagesExchange(
-            request=MessagesRequest(
+        return _message_exchange(
+            MessagesRequest(
                 model="test/model",
                 messages=messages,
                 max_tokens=16,
             ),
-            response=response,
-            start_time=timestamp,
-            end_time=timestamp + timedelta(milliseconds=1),
+            identifier=identifier,
+            content=[{"type": "text", "text": f"answer {offset}"}],
+            offset=offset,
+            prompt_token_ids=prompt_token_ids,
+            token_ids=[output_token_id],
+            logprobs=[-0.1],
         )
 
     first = exchange(
@@ -324,32 +323,17 @@ def test_anthropic_cache_control_change_starts_new_source_lineage() -> None:
 def test_converted_anthropic_system_history_preserves_exact_assistant_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    response = Message.model_validate(
-        {
-            "id": "message-system-exact",
-            "type": "message",
-            "role": "assistant",
-            "model": "test/model",
-            "content": [{"type": "text", "text": "answer"}],
-            "stop_reason": "end_turn",
-            "stop_sequence": None,
-            "usage": {"input_tokens": 2, "output_tokens": 1},
-            "prompt_token_ids": [10, 11],
-            "token_ids": [12],
-            "logprobs": [-0.12],
-        }
-    )
-    start = datetime(2026, 1, 1)
-    exchange = MessagesExchange(
-        request=MessagesRequest(
+    exchange = _message_exchange(
+        MessagesRequest(
             model="test/model",
             system="system",
             messages=[{"role": "user", "content": "question"}],
             max_tokens=16,
         ),
-        response=response,
-        start_time=start,
-        end_time=start + timedelta(milliseconds=1),
+        identifier="message-system-exact",
+        prompt_token_ids=[10, 11],
+        token_ids=[12],
+        logprobs=[-0.12],
     )
     trajectory = art.Trajectory(exchanges=TrajectoryExchanges(messages=[exchange]))
     monkeypatch.setattr(
@@ -370,32 +354,17 @@ def test_converted_anthropic_system_history_preserves_exact_assistant_evidence(
 
 
 def test_converted_anthropic_system_source_rejects_sampled_response_mutation() -> None:
-    response = Message.model_validate(
-        {
-            "id": "message-system-source",
-            "type": "message",
-            "role": "assistant",
-            "model": "test/model",
-            "content": [{"type": "text", "text": "answer"}],
-            "stop_reason": "end_turn",
-            "stop_sequence": None,
-            "usage": {"input_tokens": 2, "output_tokens": 1},
-            "prompt_token_ids": [10, 11],
-            "token_ids": [12],
-            "logprobs": [-0.12],
-        }
-    )
-    start = datetime(2026, 1, 1)
-    exchange = MessagesExchange(
-        request=MessagesRequest(
+    exchange = _message_exchange(
+        MessagesRequest(
             model="test/model",
             system="system",
             messages=[{"role": "user", "content": "question"}],
             max_tokens=16,
         ),
-        response=response,
-        start_time=start,
-        end_time=start + timedelta(milliseconds=1),
+        identifier="message-system-source",
+        prompt_token_ids=[10, 11],
+        token_ids=[12],
+        logprobs=[-0.12],
     )
     history = (
         art.Trajectory(exchanges=TrajectoryExchanges(messages=[exchange]))
@@ -448,29 +417,14 @@ def test_malformed_explicit_exact_token_metadata_fails_closed() -> None:
     assert response_extra is not None
     response_extra["token_generations"][0]["output_tokens"] = [{"token_id": "invalid"}]
 
-    message_response = Message.model_validate(
-        {
-            "id": "message-invalid",
-            "type": "message",
-            "role": "assistant",
-            "model": "test/model",
-            "content": [{"type": "text", "text": "answer"}],
-            "stop_reason": "end_turn",
-            "stop_sequence": None,
-            "usage": {"input_tokens": 1, "output_tokens": 1},
-            "token_ids": [2, "invalid"],
-        }
-    )
-    start = datetime(2026, 1, 1)
-    message = MessagesExchange(
-        request=MessagesRequest(
+    message = _message_exchange(
+        MessagesRequest(
             model="test/model",
             messages=[{"role": "user", "content": "question"}],
             max_tokens=16,
         ),
-        response=message_response,
-        start_time=start,
-        end_time=start + timedelta(milliseconds=1),
+        identifier="message-invalid",
+        token_ids=[2, "invalid"],
     )
 
     trajectories = [
@@ -1071,30 +1025,15 @@ class _FakeTokenizer:
 def test_fallback_uses_template_overrides_and_nan_logprobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    response = Message.model_validate(
-        {
-            "id": "msg_1",
-            "type": "message",
-            "role": "assistant",
-            "model": "test/model",
-            "content": [{"type": "text", "text": "answer"}],
-            "stop_reason": "end_turn",
-            "stop_sequence": None,
-            "usage": {"input_tokens": 1, "output_tokens": 1},
-        }
-    )
-    start = datetime(2026, 1, 1)
-    exchange = MessagesExchange(
-        request=MessagesRequest(
+    exchange = _message_exchange(
+        MessagesRequest(
             model="wandb-artifact:///entity/project/run:step0",
             messages=[{"role": "user", "content": "question"}],
             chat_template="request-template",
             chat_template_kwargs={"request": True},
             thinking={"type": "enabled", "budget_tokens": 128},
         ),
-        response=response,
-        start_time=start,
-        end_time=start + timedelta(seconds=1),
+        duration=timedelta(seconds=1),
     )
     tokenizer = _FakeTokenizer()
     loaded_base_models: list[str] = []
@@ -1648,19 +1587,6 @@ def test_legacy_token_and_logprob_length_mismatch_raises() -> None:
 def test_anthropic_fallback_rejects_unknown_content_blocks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    response = Message.model_validate(
-        {
-            "id": "msg_1",
-            "type": "message",
-            "role": "assistant",
-            "model": "test/model",
-            "content": [{"type": "text", "text": "answer"}],
-            "stop_reason": "end_turn",
-            "stop_sequence": None,
-            "usage": {"input_tokens": 1, "output_tokens": 1},
-        }
-    )
-    start = datetime(2026, 1, 1)
     image: ImageBlockParam = {
         "type": "image",
         "source": {
@@ -1670,14 +1596,12 @@ def test_anthropic_fallback_rejects_unknown_content_blocks(
         },
     }
     message: MessageParam = {"role": "user", "content": [image]}
-    exchange = MessagesExchange(
-        request=MessagesRequest(
+    exchange = _message_exchange(
+        MessagesRequest(
             model="test/model",
             messages=[message],
         ),
-        response=response,
-        start_time=start,
-        end_time=start + timedelta(seconds=1),
+        duration=timedelta(seconds=1),
     )
     monkeypatch.setattr(
         "art.trajectories._tokenize._load_tokenizer", lambda _config: _FakeTokenizer()
@@ -3624,22 +3548,6 @@ def test_tokenized_results_materialize_metadata_and_group_shape() -> None:
 def test_private_trace_covers_sampled_tokens_for_every_protocol() -> None:
     from art.trajectories._tokenize import _tokenize_trajectory_with_trace
 
-    message_response = Message.model_validate(
-        {
-            "id": "message-trace",
-            "type": "message",
-            "role": "assistant",
-            "model": "test/model",
-            "content": [{"type": "text", "text": "answer"}],
-            "stop_reason": "end_turn",
-            "stop_sequence": None,
-            "usage": {"input_tokens": 1, "output_tokens": 1},
-            "prompt_token_ids": [1],
-            "token_ids": [2],
-            "logprobs": [-0.2],
-        }
-    )
-    start = datetime(2026, 1, 1)
     trajectories = [
         art.Trajectory(
             exchanges=TrajectoryExchanges(chat_completions=[_chat_exchange([1], [2])])
@@ -3655,15 +3563,16 @@ def test_private_trace_covers_sampled_tokens_for_every_protocol() -> None:
         art.Trajectory(
             exchanges=TrajectoryExchanges(
                 messages=[
-                    MessagesExchange(
-                        request=MessagesRequest(
+                    _message_exchange(
+                        MessagesRequest(
                             model="test/model",
                             messages=[{"role": "user", "content": "question"}],
                             max_tokens=16,
                         ),
-                        response=message_response,
-                        start_time=start,
-                        end_time=start + timedelta(milliseconds=1),
+                        identifier="message-trace",
+                        prompt_token_ids=[1],
+                        token_ids=[2],
+                        logprobs=[-0.2],
                     )
                 ]
             )

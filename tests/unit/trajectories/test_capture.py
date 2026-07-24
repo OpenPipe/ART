@@ -344,27 +344,7 @@ async def test_httpx_requests_and_aiohttp_capture_once(endpoint_server: str) -> 
 def test_httpx_sync_stream_consumption_captures_decoded_body_once(
     encoding: str, mode: str
 ) -> None:
-    body = _sse(
-        [
-            (
-                None,
-                {
-                    "id": "chatcmpl-1",
-                    "object": "chat.completion.chunk",
-                    "created": 1,
-                    "model": "test/model",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": "hello"},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                },
-            ),
-            (None, "[DONE]"),
-        ]
-    )
+    body = _streaming_chat_body()
     compressed = _encoded(body, encoding)
 
     def response(_: httpx.Request) -> httpx.Response:
@@ -396,27 +376,7 @@ def test_httpx_sync_stream_consumption_captures_decoded_body_once(
 async def test_httpx_async_stream_consumption_captures_decoded_body_once(
     encoding: str, mode: str
 ) -> None:
-    body = _sse(
-        [
-            (
-                None,
-                {
-                    "id": "chatcmpl-1",
-                    "object": "chat.completion.chunk",
-                    "created": 1,
-                    "model": "test/model",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": "hello"},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                },
-            ),
-            (None, "[DONE]"),
-        ]
-    )
+    body = _streaming_chat_body()
     compressed = _encoded(body, encoding)
 
     async def response(_: httpx.Request) -> httpx.Response:
