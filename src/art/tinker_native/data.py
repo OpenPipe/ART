@@ -164,14 +164,30 @@ def trajectory_groups_to_datums(
             continue
         for trajectory, advantage in zip(group.trajectories, advantages):
             if trajectory.exchanges:
+                from ..trajectories._tokenize import (
+                    _as_tokenizer,
+                    _first_introduction_mask,
+                    _SampledSourceKey,
+                    _tokenize_trajectory_with_trace,
+                )
+
                 selected_model = resolve_training_model(trajectory, model)
-                tokenized = trajectory.tokenize(
-                    multi_history=True,
+                tokenized, traces = _tokenize_trajectory_with_trace(
+                    trajectory,
                     model=selected_model,
                     base_model=base_model,
+                    tokenizer=_as_tokenizer(tokenizer)
+                    if tokenizer is not None
+                    else None,
                 )
-                for history in tokenized.histories:
-                    datum = _tokenized_trajectory_to_datum(history, advantage)
+                seen_source_keys: set[_SampledSourceKey] = set()
+                for history, trace in zip(tokenized.histories, traces, strict=True):
+                    trainable = _first_introduction_mask(
+                        trace.source_keys, seen_source_keys
+                    )
+                    datum = _tokenized_trajectory_to_datum(
+                        history, advantage, trainable=trainable
+                    )
                     if datum is not None:
                         datums.append(datum)
                 continue
@@ -289,17 +305,31 @@ def build_datum(
 
 
 def _tokenized_trajectory_to_datum(
-    tokenized: TokenizedHistory, advantage: float
+    tokenized: TokenizedHistory,
+    advantage: float,
+    *,
+    trainable: list[bool] | None = None,
 ) -> tinker.Datum | None:
-    sampled = [bool(flag & TokenFlag.SAMPLED) for flag in tokenized.flags]
-    if not (len(tokenized.token_ids) == len(tokenized.logprobs) == len(sampled)):
+    if trainable is None:
+        trainable = [bool(flag & TokenFlag.SAMPLED) for flag in tokenized.flags]
+    if not (
+        len(tokenized.token_ids)
+        == len(tokenized.logprobs)
+        == len(tokenized.flags)
+        == len(trainable)
+    ):
         raise ValueError("Tokenized trajectory fields differ in length")
-    if len(tokenized.token_ids) < 2 or not any(sampled):
+    if any(
+        selected and not flag & TokenFlag.SAMPLED
+        for selected, flag in zip(trainable, tokenized.flags, strict=True)
+    ):
+        raise ValueError("Only sampled tokens can be selected for Tinker training")
+    if len(tokenized.token_ids) < 2 or not any(trainable):
         return None
-    if sampled[0]:
+    if trainable[0]:
         raise ValueError("A trainable trajectory cannot start with a sampled token")
 
-    action_mask = sampled[1:]
+    action_mask = trainable[1:]
     if any(
         trainable and math.isnan(logprob)
         for trainable, logprob in zip(action_mask, tokenized.logprobs[1:], strict=True)

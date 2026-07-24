@@ -99,6 +99,16 @@ class _HistoryTokenizationTrace:
                 raise AssertionError("Tokenization trace source key is unresolved")
 
 
+def _first_introduction_mask(
+    source_keys: Sequence[_SampledSourceKey | None],
+    seen: set[_SampledSourceKey],
+) -> list[bool]:
+    keys = {key for key in source_keys if key is not None}
+    new_keys = keys - seen
+    seen.update(keys)
+    return [key in new_keys if key is not None else False for key in source_keys]
+
+
 @dataclass
 class _TraceBuilder:
     trace: _HistoryTokenizationTrace | None = None

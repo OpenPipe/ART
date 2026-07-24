@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import cached_property
 from itertools import takewhile
@@ -21,6 +21,7 @@ from ..openai import ART_MOE_ROUTING_METADATA_KEY
 from ..trajectories import (
     ChatCompletionsExchange,
     ChatCompletionsHistory,
+    ChatCompletionsMessageSource,
     LegacyHistory,
     TokenFlag,
     Trajectory,
@@ -65,6 +66,13 @@ def _flag_spans(flags: list[TokenFlag], flag: TokenFlag) -> list[tuple[int, int]
     return spans
 
 
+def _true_spans(mask: list[bool]) -> list[tuple[int, int]]:
+    return _flag_spans(
+        [TokenFlag.SAMPLED if value else TokenFlag(0) for value in mask],
+        TokenFlag.SAMPLED,
+    )
+
+
 @dataclass(frozen=True)
 class _ChatChoiceTrace:
     choices: list[Choice]
@@ -77,26 +85,41 @@ def _chat_choice_trace(
     token_ids: list[int],
     flags: list[TokenFlag],
 ) -> _ChatChoiceTrace | None:
+    return _chat_source_choice_trace(
+        (
+            (source, source.choice_index)
+            for source in history.message_sources
+            if source is not None
+        ),
+        token_ids,
+        flags,
+    )
+
+
+def _chat_source_choice_trace(
+    sources: Iterable[tuple[object, int | None]],
+    token_ids: list[int],
+    flags: list[TokenFlag],
+) -> _ChatChoiceTrace | None:
     """Recover per-choice boundaries that adjacent SAMPLED flags cannot represent."""
 
     sourced_choices: list[Choice] = []
     seen: set[tuple[int, int]] = set()
-    for source in history.message_sources:
-        if (
-            source is None
-            or source.choice_index is None
-            or not isinstance(source.exchange, ChatCompletionsExchange)
-        ):
+    for source, choice_index in sources:
+        exchange = (
+            source.exchange
+            if isinstance(source, ChatCompletionsMessageSource)
+            else source
+        )
+        if not isinstance(exchange, ChatCompletionsExchange) or choice_index is None:
             continue
-        key = (id(source.exchange), source.choice_index)
+        key = (id(exchange), choice_index)
         if key in seen:
             continue
         seen.add(key)
         sourced_choices.append(
             next(
-                item
-                for item in source.exchange.response.choices
-                if item.index == source.choice_index
+                item for item in exchange.response.choices if item.index == choice_index
             )
         )
     if not sourced_choices:
@@ -714,30 +737,37 @@ def tokenize_trajectory_groups(
             if advantage == 0 and drop_zero_advantage_trajectories:
                 continue
             if trajectory.exchanges:
-                from ..trajectories._tokenize import _as_tokenizer
+                from ..trajectories._tokenize import (
+                    _as_tokenizer,
+                    _first_introduction_mask,
+                    _SampledSourceKey,
+                    _tokenize_trajectory_with_trace,
+                )
 
                 selected_model = resolve_training_model(trajectory, model)
-                exchange_results = trajectory.tokenize(
-                    multi_history=True,
+                exchange_results, traces = _tokenize_trajectory_with_trace(
+                    trajectory,
                     model=selected_model,
                     base_model=tokenizer.name_or_path,
                     tokenizer=_as_tokenizer(tokenizer),
                     chat_template=None,
                     chat_template_kwargs=chat_template_kwargs,
                 )
-                histories = trajectory.histories(model=selected_model)
                 trajectory_results = []
-                for exchange_result, history in zip(
-                    exchange_results.histories, histories, strict=True
+                seen_source_keys: set[_SampledSourceKey] = set()
+                for exchange_result, trace in zip(
+                    exchange_results.histories, traces, strict=True
                 ):
-                    sampled = [
-                        bool(flag & TokenFlag.SAMPLED) for flag in exchange_result.flags
-                    ]
-                    choice_spans = _flag_spans(exchange_result.flags, TokenFlag.SAMPLED)
+                    trainable = _first_introduction_mask(
+                        trace.source_keys, seen_source_keys
+                    )
+                    if not any(trainable):
+                        continue
+                    choice_spans = _true_spans(trainable)
                     if not allow_training_without_logprobs and any(
-                        trainable and math.isnan(logprob)
-                        for trainable, logprob in zip(
-                            sampled,
+                        selected and math.isnan(logprob)
+                        for selected, logprob in zip(
+                            trainable,
                             exchange_result.logprobs,
                             strict=True,
                         )
@@ -745,27 +775,47 @@ def tokenize_trajectory_groups(
                         raise RuntimeError(
                             "Exchange trajectory is missing logprobs for trainable tokens"
                         )
-                    chat_trace = None
-                    if isinstance(history, ChatCompletionsHistory):
-                        chat_trace = _chat_choice_trace(
-                            history,
-                            exchange_result.token_ids,
-                            exchange_result.flags,
-                        )
+                    ordered_source_keys = dict.fromkeys(
+                        key for key in trace.source_keys if key is not None
+                    )
+                    chat_trace = _chat_source_choice_trace(
+                        (
+                            (trace.sources[key], key.index)
+                            for key in ordered_source_keys
+                        ),
+                        exchange_result.token_ids,
+                        exchange_result.flags,
+                    )
                     if chat_trace is not None:
+                        selected_choices = [
+                            index
+                            for index, (start, length) in enumerate(
+                                zip(
+                                    chat_trace.offsets,
+                                    chat_trace.lengths,
+                                    strict=True,
+                                )
+                            )
+                            if any(trainable[start : start + length])
+                        ]
                         moe_routes, moe_stats = align_choice_routes_to_tokenized_result(
                             token_ids=exchange_result.token_ids,
-                            choices=chat_trace.choices,
-                            choice_offsets=chat_trace.offsets,
-                            choice_token_lengths=chat_trace.lengths,
+                            choices=[
+                                chat_trace.choices[index] for index in selected_choices
+                            ],
+                            choice_offsets=[
+                                chat_trace.offsets[index] for index in selected_choices
+                            ],
+                            choice_token_lengths=[
+                                chat_trace.lengths[index] for index in selected_choices
+                            ],
                         )
                         choice_spans = [
-                            (start, start + length)
-                            for start, length in zip(
-                                chat_trace.offsets,
-                                chat_trace.lengths,
-                                strict=True,
+                            (
+                                chat_trace.offsets[index],
+                                chat_trace.offsets[index] + chat_trace.lengths[index],
                             )
+                            for index in selected_choices
                         ]
                     else:
                         moe_routes = None
@@ -776,7 +826,7 @@ def tokenize_trajectory_groups(
                             chat="",
                             token_ids=exchange_result.token_ids,
                             input_pos=list(range(len(exchange_result.token_ids))),
-                            assistant_mask=[int(value) for value in sampled],
+                            assistant_mask=[int(value) for value in trainable],
                             logprobs=exchange_result.logprobs,
                             pixel_values=None,
                             image_grid_thw=None,

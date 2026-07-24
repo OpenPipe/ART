@@ -11,7 +11,11 @@ from transformers import PreTrainedTokenizerBase
 
 import art
 from art.openai import ART_MOE_ROUTING_METADATA_KEY
-from art.preprocessing.tokenize import _chat_choice_trace, tokenize_trajectory_groups
+from art.preprocessing.moe_routing import MoeRouteSegments
+from art.preprocessing.tokenize import (
+    _chat_choice_trace,
+    tokenize_trajectory_groups,
+)
 from art.tinker_native.data import trajectory_groups_to_datums
 from art.trajectories import (
     ChatCompletionsExchange,
@@ -21,10 +25,12 @@ from art.trajectories import (
     CompletionsExchange,
     CompletionsRequest,
 )
+from art.trajectories import _tokenize as trajectory_tokenization
 from art.trajectories._selection import (
     automatic_training_model_selector,
     resolve_training_model,
 )
+from art.trajectories._tokenize import _first_introduction_mask
 
 
 def _exchange(model: str, output_token: int) -> ChatCompletionsExchange:
@@ -130,6 +136,36 @@ class _Tokenizer:
     name_or_path = "base/model"
 
 
+def test_first_introduction_mask_trains_repeated_sources_once_across_histories() -> (
+    None
+):
+    seen: set[str] = set()
+    assert _first_introduction_mask([None, "a", "a"], seen) == [
+        False,
+        True,
+        True,
+    ]
+    assert _first_introduction_mask([None, "a", "a", None, "b"], seen) == [
+        False,
+        False,
+        False,
+        False,
+        True,
+    ]
+    assert _first_introduction_mask(
+        [None, "a", "a", None, "b", None, "c", "c"], seen
+    ) == [
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+        True,
+    ]
+
+
 def test_preprocessing_requires_model_selection() -> None:
     tokenizer = cast(PreTrainedTokenizerBase, _Tokenizer())
     with pytest.raises(ValueError, match="exactly one concrete model"):
@@ -167,6 +203,42 @@ def test_tinker_requires_model_selection() -> None:
     )
     assert len(datums) == 2
     assert all(datum.model_input.to_ints() == [1] for datum in datums)
+
+
+def test_training_tokenizes_each_exchange_trajectory_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original = trajectory_tokenization._tokenize_trajectory_with_trace
+
+    def counted(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        trajectory_tokenization, "_tokenize_trajectory_with_trace", counted
+    )
+    group = _group()
+    list(
+        tokenize_trajectory_groups(
+            cast(PreTrainedTokenizerBase, _Tokenizer()),
+            [group],
+            allow_training_without_logprobs=False,
+            scale_rewards=False,
+            model="policy",
+        )
+    )
+    assert calls == len(group.trajectories)
+
+    calls = 0
+    trajectory_groups_to_datums(
+        [group],
+        renderer=None,
+        tokenizer=None,
+        model="policy",
+    )
+    assert calls == len(group.trajectories)
 
 
 def test_training_rejects_multiple_concrete_policy_versions() -> None:
@@ -246,12 +318,21 @@ def test_public_training_selector_prefers_exact_model_over_glob_interpretation()
     trajectory = art.Trajectory(
         exchanges=art.TrajectoryExchanges(
             chat_completions=[
-                _exchange("policy[*]", 2),
+                _exchange("policy*", 2),
                 _exchange("policyx", 3),
             ]
         )
     )
-    assert resolve_training_model(trajectory, "policy[*]") == "policy[*]"
+    assert resolve_training_model(trajectory, "policy*") == "policy*"
+    assert [history.model for history in trajectory.histories(model="policy*")] == [
+        "policy*"
+    ]
+    assert [
+        history.model
+        for history in trajectory.tokenize(
+            model="policy*", multi_history=True
+        ).histories
+    ] == ["policy*"]
 
 
 def test_training_selector_rejects_zero_matches() -> None:
@@ -455,16 +536,37 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
         )
     )
 
+    initial = [result for result in results if result.token_ids[1] == 2]
     stripped = [result for result in results if result.token_ids[1] == 101]
+    assert len(initial) == 2
     assert len(stripped) == 2
-    assert all(result.choice_offsets == [1, 5] for result in stripped)
+    assert all(result.choice_offsets == [1] for result in initial)
+    assert all(result.choice_offsets == [5] for result in stripped)
+    assert all(result.assistant_mask == [0, 1, 1, 1, 1] for result in initial)
+    assert all(result.assistant_mask == [0, 0, 0, 0, 0, 1, 1] for result in stripped)
+    assert all(result.weight == pytest.approx(1 / 6) for result in results)
     expected_routes = np.asarray(
         [[[10]], [[1010]], [[1020]], [[90]], [[40]], [[50]], [[60]]],
         dtype=np.int32,
     )
     for result in stripped:
-        assert isinstance(result.moe_routed_experts, np.ndarray)
-        assert np.array_equal(result.moe_routed_experts, expected_routes)
+        assert isinstance(result.moe_routed_experts, MoeRouteSegments)
+        assert np.array_equal(
+            np.concatenate(result.moe_routed_experts.segments),
+            expected_routes,
+        )
+
+    datums = trajectory_groups_to_datums(
+        [group],
+        renderer=None,
+        tokenizer=Tokenizer(),
+        normalize_advantages=False,
+        base_model="base/model",
+        model="policy",
+    )
+    masks = [datum.loss_fn_inputs["mask"].to_torch().tolist() for datum in datums]
+    assert masks.count([1, 1, 1, 1]) == 2
+    assert masks.count([0, 0, 0, 0, 1, 1]) == 2
 
 
 def test_ambiguous_non_moe_suffix_falls_back_to_sampled_spans() -> None:
