@@ -553,6 +553,13 @@ def test_completions_echo_does_not_strip_repeated_prompt_token_from_completion()
             del kwargs
             return {"question": [1], "questionanswer": [1, 2]}[text]
 
+        def apply_chat_template(
+            self, messages: list[dict[str, object]], **kwargs: object
+        ) -> list[int]:
+            raise AssertionError(
+                "Completions tokenization must not render chat messages"
+            )
+
     tokenized = art.Trajectory(
         exchanges=TrajectoryExchanges(completions=[exchange])
     ).tokenize(tokenizer=Tokenizer())

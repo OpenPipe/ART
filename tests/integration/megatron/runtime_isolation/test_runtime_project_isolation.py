@@ -53,7 +53,7 @@ def test_runtime_server_source_contains_only_required_custom_routes() -> None:
         assert route in source
 
 
-def test_runtime_patch_always_returns_token_ids(
+def test_runtime_patch_defaults_evidence_on_and_honors_opt_out(
     artifact_dir: Path,
 ) -> None:
     payload = _runtime_python(
