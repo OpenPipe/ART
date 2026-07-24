@@ -280,7 +280,7 @@ def _sampled_source_key(source: object) -> _SampledSourceKey:
     if isinstance(exchange, ResponsesExchange):
         index = getattr(source, "generation_index", None)
         if index is None and not _response_generations(exchange.response):
-            index = getattr(source, "output_index", None)
+            index = 0
         if not isinstance(index, int) or isinstance(index, bool):
             raise ValueError("Sampled Responses source has no generation identity")
         return _source_key(exchange, protocol="responses", index=index)

@@ -3698,6 +3698,109 @@ def test_private_trace_keys_do_not_collide_for_repeated_empty_response_ids() -> 
     assert len(trace.sources) == 2
 
 
+def test_responses_fallback_trace_does_not_retrain_echoed_output_items() -> None:
+    from art.trajectories._tokenize import (
+        _first_introduction_mask,
+        _tokenize_trajectory_with_trace,
+    )
+
+    def output(item_id: str, text: str) -> dict[str, Any]:
+        return {
+            "id": item_id,
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }
+
+    def response(
+        response_id: str, items: list[dict[str, Any]], offset: int
+    ) -> Response:
+        return Response.model_validate(
+            {
+                "id": response_id,
+                "created_at": float(offset),
+                "model": "test/model",
+                "object": "response",
+                "output": items,
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+            }
+        )
+
+    user = {"role": "user", "content": "question"}
+    first_response = response(
+        "response-fallback",
+        [output("one", "first"), output("two", "second")],
+        0,
+    )
+    first_request = ResponsesRequest(model="test/model", input=[user])
+    first_request["chat_template_kwargs"] = {"enable_thinking": False}
+    first = ResponsesExchange(
+        request=first_request,
+        response=first_response,
+        start_time=datetime(2026, 1, 1),
+        end_time=datetime(2026, 1, 1, 0, 0, 0, 1000),
+    )
+    echoed = [
+        item.model_dump(mode="json", exclude_none=True)
+        for item in first_response.output
+    ]
+    second = ResponsesExchange(
+        request=ResponsesRequest(
+            model="test/model",
+            input=[user, *echoed, {"role": "user", "content": "continue"}],
+        ),
+        response=response("response-final", [output("final", "final")], 1),
+        start_time=datetime(2026, 1, 1, 0, 0, 1),
+        end_time=datetime(2026, 1, 1, 0, 0, 1, 1000),
+    )
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {
+                "question": [1],
+                "first": [2],
+                "second": [3],
+                "firstsecond": [2, 3],
+                "continue": [4],
+                "final": [5],
+            }[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            return [
+                token for message in messages for token in self(str(message["content"]))
+            ]
+
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(responses=[first, second])
+    )
+    tokenized, traces = _tokenize_trajectory_with_trace(
+        trajectory,
+        tokenizer=Tokenizer(),
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    assert len(tokenized.histories) == len(traces) == 2
+    seen: set[object] = set()
+    trained_first_response = 0
+    first_response_indices: set[int] = set()
+    for trace in traces:
+        trainable = _first_introduction_mask(trace.source_keys, seen)
+        for selected, key in zip(trainable, trace.source_keys, strict=True):
+            if key is not None and key.response_id == first_response.id:
+                first_response_indices.add(key.index)
+                trained_first_response += selected
+
+    assert first_response_indices == {0}
+    assert trained_first_response == 2
+
+
 def test_completions_history_requires_exhaustive_source_spans() -> None:
     history = art.CompletionsTokenHistory(
         model="test/model",
