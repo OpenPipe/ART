@@ -5,6 +5,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
+from hashlib import sha256
+import json
 import math
 import re
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -75,7 +77,7 @@ class _SampledSourceKey:
     end_time: datetime
     index: int
     prompt_index: int | None
-    exchange_identity: int
+    evidence_fingerprint: str
 
 
 @dataclass
@@ -112,6 +114,72 @@ class _TraceBuilder:
         self.trace = trace
 
 
+def _fingerprint(value: object) -> str:
+    serialized = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(serialized.encode()).hexdigest()
+
+
+def _sampled_evidence_fingerprint(
+    exchange: Exchange,
+    *,
+    protocol: Literal["chat_completions", "responses", "messages", "completions"],
+    index: int,
+) -> str:
+    if protocol == "chat_completions":
+        if not isinstance(exchange, ChatCompletionsExchange):
+            raise TypeError("Chat source has the wrong exchange type")
+        evidence = next(
+            choice.model_dump(mode="json")
+            for choice in exchange.response.choices
+            if choice.index == index
+        )
+    elif protocol == "completions":
+        if not isinstance(exchange, CompletionsExchange):
+            raise TypeError("Completions source has the wrong exchange type")
+        evidence = next(
+            choice.model_dump(mode="json")
+            for choice in exchange.response.choices
+            if choice.index == index
+        )
+    elif protocol == "responses":
+        if not isinstance(exchange, ResponsesExchange):
+            raise TypeError("Responses source has the wrong exchange type")
+        response = exchange.response.model_dump(mode="json")
+        generations = response.get("token_generations")
+        if isinstance(generations, list) and 0 <= index < len(generations):
+            generation = generations[index]
+            output_indices = (
+                generation.get("output_indices")
+                if isinstance(generation, dict)
+                else None
+            )
+            outputs = response.get("output")
+            evidence = {
+                "generation": generation,
+                "outputs": [
+                    outputs[output_index]
+                    for output_index in output_indices
+                    if isinstance(output_index, int)
+                    and isinstance(outputs, list)
+                    and 0 <= output_index < len(outputs)
+                ]
+                if isinstance(output_indices, list)
+                else [],
+            }
+        else:
+            evidence = response.get("output")
+    else:
+        if not isinstance(exchange, MessagesExchange):
+            raise TypeError("Messages source has the wrong exchange type")
+        evidence = exchange.response.model_dump(mode="json")
+    return _fingerprint(evidence)
+
+
 def _source_key(
     exchange: Exchange,
     *,
@@ -126,10 +194,12 @@ def _source_key(
         end_time=exchange.end_time,
         index=index,
         prompt_index=prompt_index,
-        # The trace is private and consumed during this tokenization call. Object
-        # identity makes repeated empty provider IDs collision-free while keeping
-        # all histories projected from one exchange on the same source key.
-        exchange_identity=id(exchange),
+        # Internal projection may copy an exchange to isolate one choice. A
+        # source-specific identity remains stable across those copies without
+        # hashing a growing request or unrelated choices.
+        evidence_fingerprint=_sampled_evidence_fingerprint(
+            exchange, protocol=protocol, index=index
+        ),
     )
 
 
@@ -2295,16 +2365,35 @@ def _source_signature(source: object) -> tuple[object, ...] | None:
     ):
         return None
     response_id = getattr(exchange.response, "id", None)
+    choice_index = getattr(source, "choice_index", None)
+    generation_index = getattr(source, "generation_index", None)
+    evidence_fingerprint: str | None = None
+    if isinstance(exchange, ChatCompletionsExchange) and isinstance(choice_index, int):
+        evidence_fingerprint = _sampled_evidence_fingerprint(
+            exchange, protocol="chat_completions", index=choice_index
+        )
+    elif isinstance(exchange, ResponsesExchange) and isinstance(generation_index, int):
+        evidence_fingerprint = _sampled_evidence_fingerprint(
+            exchange, protocol="responses", index=generation_index
+        )
+    elif (
+        isinstance(exchange, MessagesExchange)
+        and getattr(source, "request_index", None) is None
+    ):
+        evidence_fingerprint = _sampled_evidence_fingerprint(
+            exchange, protocol="messages", index=0
+        )
     return (
         type(source),
         type(exchange),
         exchange.start_time,
         exchange.end_time,
         response_id,
+        evidence_fingerprint,
         getattr(source, "request_index", None),
-        getattr(source, "choice_index", None),
+        choice_index,
         getattr(source, "output_index", None),
-        getattr(source, "generation_index", None),
+        generation_index,
         getattr(source, "prompt_index", None),
     )
 
@@ -2348,7 +2437,22 @@ def _history_matches_projection(history: History) -> bool:
         except ValueError as error:
             if "no Chat Completions exchanges" not in str(error):
                 raise
-            return False
+            if trajectory.exchanges.messages and not trajectory.exchanges.responses:
+                candidates = [
+                    candidate.as_chat_completions_history()
+                    for candidate in anthropic_messages_histories(
+                        trajectory, model=history.model
+                    )
+                ]
+            elif trajectory.exchanges.responses and not trajectory.exchanges.messages:
+                candidates = [
+                    candidate.as_chat_completions_history()
+                    for candidate in responses_histories(
+                        trajectory, model=history.model
+                    )
+                ]
+            else:
+                return False
         return any(
             isinstance(candidate, ChatCompletionsHistory)
             and candidate.messages == history.messages
@@ -3593,6 +3697,7 @@ def tokenize_history(
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
     _trace: _TraceBuilder | None = None,
+    _projection_validated: bool = False,
 ) -> TokenizedHistory:
     if isinstance(history, LegacyHistory):
         if model is None:
@@ -3618,31 +3723,42 @@ def tokenize_history(
         and dict(chat_template_kwargs)
         != (getattr(history, "chat_template_kwargs", None) or {})
     )
-    render_state = _history_render_state(history)
+    render_state = (
+        _HistoryRenderState(needs_render=False, projection_matches=True)
+        if _projection_validated
+        else _history_render_state(history)
+    )
     needs_render = render_state.needs_render or override_requires_render
     if isinstance(history, ResponsesHistory) and not needs_render:
         if exact := _tokenize_exact_responses_history(
             history, base_model=base_model, tokenizer=tokenizer, _trace=_trace
         ):
             return exact
-    if isinstance(history, ChatCompletionsHistory) and (needs_render):
+    if isinstance(history, ChatCompletionsHistory):
         if (
             not override_requires_render
             and not render_state.context_changed
             and render_state.projection_matches is not False
             and (
-                exact := _tokenize_exact_projected_chat_history(history, _trace=_trace)
+                exact := _tokenize_exact_projected_chat_history(
+                    history,
+                    projection_validated=(
+                        _projection_validated or render_state.projection_matches is True
+                    ),
+                    _trace=_trace,
+                )
             )
         ):
             return exact
-        return _tokenize_chat_view(
-            history,
-            base_model=base_model,
-            tokenizer=tokenizer,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-            _trace=_trace,
-        )
+        if needs_render:
+            return _tokenize_chat_view(
+                history,
+                base_model=base_model,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+                _trace=_trace,
+            )
     if isinstance(history, AnthropicMessagesHistory) and needs_render:
         converted = history.as_chat_completions_history()
         if (
@@ -3745,6 +3861,7 @@ def tokenize_trajectory(
                 tokenizer=tokenizer,
                 chat_template=chat_template,
                 chat_template_kwargs=chat_template_kwargs,
+                _projection_validated=not isinstance(histories[0], LegacyHistory),
             ),
             trajectory,
         )
@@ -3756,6 +3873,7 @@ def tokenize_trajectory(
             tokenizer=tokenizer,
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
+            _projection_validated=not isinstance(history, LegacyHistory),
         )
         for history in histories
     ]
@@ -3798,6 +3916,7 @@ def _tokenize_trajectory_with_trace(
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
             _trace=trace_builder,
+            _projection_validated=True,
         )
         if trace_builder.trace is None:
             raise AssertionError("Exchange tokenization did not produce a source trace")

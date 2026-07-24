@@ -4,7 +4,9 @@ import builtins
 from datetime import datetime, timedelta
 import math
 import random
+from statistics import median
 import sys
+from time import perf_counter
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -226,6 +228,78 @@ def test_messages_exact_prompt_and_output_do_not_load_a_tokenizer(
         art.TokenFlag.EXACT,
         art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
     ]
+
+
+def test_converted_anthropic_system_history_preserves_exact_assistant_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = Message.model_validate(
+        {
+            "id": "message-system-exact",
+            "type": "message",
+            "role": "assistant",
+            "model": "test/model",
+            "content": [{"type": "text", "text": "answer"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+            "prompt_token_ids": [10, 11],
+            "token_ids": [12],
+            "logprobs": [-0.12],
+        }
+    )
+    start = datetime(2026, 1, 1)
+    exchange = MessagesExchange(
+        request=MessagesRequest(
+            model="test/model",
+            system="system",
+            messages=[{"role": "user", "content": "question"}],
+            max_tokens=16,
+        ),
+        response=response,
+        start_time=start,
+        end_time=start + timedelta(milliseconds=1),
+    )
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(messages=[exchange]))
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer",
+        lambda _config: pytest.fail("exact converted history loaded a tokenizer"),
+    )
+
+    history = trajectory.anthropic_messages_history().as_chat_completions_history()
+    assert all(
+        source is None or source.exchange is exchange
+        for source in history.message_sources
+    )
+    tokenized = history.tokenize()
+
+    assert tokenized.token_ids == [10, 11, 12]
+    assert tokenized.logprobs[-1] == pytest.approx(-0.12)
+    assert tokenized.flags[-1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+
+
+def test_converted_responses_history_tokenizes_without_native_chat_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _response_exchange(
+        "response-converted-exact", 12, prompt_token_ids=[10, 11]
+    )
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer",
+        lambda _config: pytest.fail("exact converted history loaded a tokenizer"),
+    )
+
+    history = trajectory.responses_history().as_chat_completions_history()
+    assert all(
+        source is None or source.exchange is exchange
+        for source in history.message_sources
+    )
+    tokenized = history.tokenize()
+
+    assert tokenized.token_ids == [10, 11, 12]
+    assert tokenized.logprobs[-1] == pytest.approx(-0.1)
+    assert tokenized.flags[-1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
 
 
 def test_malformed_explicit_exact_token_metadata_fails_closed() -> None:
@@ -2264,6 +2338,59 @@ def test_responses_generation_evidence_is_atomic_and_partial_edits_do_not_replay
     assert math.isnan(partial.logprobs[1])
 
 
+def test_responses_generation_source_rejects_content_from_another_generation() -> None:
+    exchange = _response_exchange("generation-provenance", 2)
+    data = exchange.response.model_dump(mode="python")
+    data["output"].append(
+        {
+            "id": "message-second-generation",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "second",
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            ],
+        }
+    )
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2, "logprob": -0.2}],
+            "output_indices": [0],
+        },
+        {
+            "prompt_token_ids": [1, 2, 3],
+            "output_tokens": [{"token_id": 4, "logprob": -0.4}],
+            "output_indices": [1],
+        },
+    ]
+    exchange.response = Response.model_validate(data)
+    history = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+    first_generation = next(
+        index
+        for index, source in enumerate(history.message_sources)
+        if source is not None
+        and source.generation_index == 0
+        and history.messages[index].get("role") == "assistant"
+    )
+    history.messages[first_generation] = {
+        "role": "assistant",
+        "content": "second",
+    }
+
+    with pytest.raises(ValueError, match="no longer matches its source exchange"):
+        history.tokenize()
+
+
 def test_mutable_chat_history_is_authoritative_and_does_not_replay_removed_turns() -> (
     None
 ):
@@ -2849,11 +2976,11 @@ def test_rerender_marks_tool_call_only_generated_region_sampled() -> None:
     assert not tokenized.flags[0] & art.TokenFlag.SAMPLED
 
 
-def test_rerender_calls_chat_template_once_for_many_turns() -> None:
+def _repeated_text_rerender_history(turn_count: int) -> art.ChatCompletionsHistory:
     exchanges: list[ChatCompletionsExchange] = []
     prompt: list[int] = []
     messages: list[ChatCompletionMessageParam] = []
-    for index in range(32):
+    for index in range(turn_count):
         prompt.extend([index * 2])
         messages.append({"role": "user", "content": f"u{index}"})
         exchange = _chat_exchange(list(prompt), [index * 2 + 1], offset=index)
@@ -2865,31 +2992,116 @@ def test_rerender_calls_chat_template_once_for_many_turns() -> None:
         exchanges=TrajectoryExchanges(chat_completions=exchanges)
     ).chat_completions_history()
     history.chat_template = "rerender"
+    return history
 
-    class Tokenizer:
-        apply_calls = 0
 
-        def __call__(self, text: str, **kwargs: object) -> list[int]:
-            del kwargs
-            return [1000] if text == "answer" else [2000 + int(text[1:])]
+class _RepeatedTextTokenizer:
+    def __init__(self) -> None:
+        self.apply_calls = 0
 
-        def apply_chat_template(
-            self, messages: list[dict[str, Any]], **kwargs: object
-        ) -> list[int]:
-            del kwargs
-            self.apply_calls += 1
-            result: list[int] = []
-            for message in messages:
-                content = str(message["content"])
-                result.extend(
-                    [1000] if content == "answer" else [2000 + int(content[1:])]
-                )
-            return result
+    def __call__(self, text: str, **kwargs: object) -> list[int]:
+        del kwargs
+        return [1000] if text == "answer" else [2000 + int(text[1:])]
 
-    tokenizer = Tokenizer()
+    def apply_chat_template(
+        self, messages: list[dict[str, Any]], **kwargs: object
+    ) -> list[int]:
+        del kwargs
+        self.apply_calls += 1
+        result: list[int] = []
+        for message in messages:
+            content = str(message["content"])
+            result.extend([1000] if content == "answer" else [2000 + int(content[1:])])
+        return result
+
+
+def test_rerender_calls_chat_template_once_for_many_turns() -> None:
+    history = _repeated_text_rerender_history(32)
+
+    tokenizer = _RepeatedTextTokenizer()
     history.tokenize(tokenizer=tokenizer)
 
     assert tokenizer.apply_calls == 1
+
+
+def test_repeated_text_rerender_scaling_is_near_linear() -> None:
+    medians: list[float] = []
+    for turn_count in (32, 64, 128):
+        history = _repeated_text_rerender_history(turn_count)
+        samples: list[float] = []
+        for _ in range(5):
+            tokenizer = _RepeatedTextTokenizer()
+            started = perf_counter()
+            history.tokenize(tokenizer=tokenizer)
+            samples.append(perf_counter() - started)
+            assert tokenizer.apply_calls == 1
+        medians.append(median(samples))
+
+    assert medians[1] < medians[0] * 3
+    assert medians[2] < medians[1] * 3
+
+
+def test_reasoning_split_trajectory_reuses_prevalidated_projections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchanges: list[ChatCompletionsExchange] = []
+    request_messages: list[ChatCompletionMessageParam] = []
+    prompt: list[int] = []
+    for index in range(40):
+        request_messages.append({"role": "user", "content": f"u{index}"})
+        prompt.append(3000 + index)
+        exchange = _chat_exchange(
+            list(prompt), [1000 + index, 2000 + index], offset=index
+        )
+        exchange.request["messages"] = list(request_messages)
+        payload = exchange.response.model_dump(mode="python")
+        payload["choices"][0]["message"] = {
+            "role": "assistant",
+            "reasoning": f"r{index}",
+            "content": f"a{index}",
+        }
+        exchange.response = ChatCompletion.model_validate(payload)
+        exchanges.append(exchange)
+        request_messages.append({"role": "assistant", "content": f"a{index}"})
+        prompt.append(2000 + index)
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=exchanges)
+    )
+    projected = trajectory.chat_completions_histories()
+    assert len(projected) == 40
+    for history in projected:
+        for source in history.message_sources:
+            if source is not None:
+                assert any(source.exchange is exchange for exchange in exchanges)
+    assert all(
+        any(
+            source is not None
+            and source.choice_index == 0
+            and source.exchange is exchanges[0]
+            for source in history.message_sources
+        )
+        for history in projected
+    )
+
+    from art.trajectories import _tokenize
+
+    original = _tokenize._history_matches_projection
+    calls = 0
+
+    def counted(history: art.History) -> bool:
+        nonlocal calls
+        calls += 1
+        return original(history)
+
+    monkeypatch.setattr(_tokenize, "_history_matches_projection", counted)
+
+    tokenized = trajectory.tokenize(multi_history=True)
+    _, traces = _tokenize._tokenize_trajectory_with_trace(trajectory)
+    first_key = next(key for key in traces[0].source_keys if key is not None)
+
+    assert len(tokenized.histories) == 40
+    assert all(first_key in trace.sources for trace in traces)
+    assert calls == 0
 
 
 def test_explicit_template_override_rerenders_exact_exchange_scaffold() -> None:
