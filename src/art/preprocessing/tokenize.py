@@ -740,6 +740,7 @@ def tokenize_trajectory_groups(
                 from ..trajectories._tokenize import (
                     _as_tokenizer,
                     _first_introduction_mask,
+                    _require_causal_predecessor,
                     _SampledSourceKey,
                     _tokenize_trajectory_with_trace,
                 )
@@ -761,6 +762,7 @@ def tokenize_trajectory_groups(
                     trainable = _first_introduction_mask(
                         trace.source_keys, seen_source_keys
                     )
+                    _require_causal_predecessor(trainable)
                     if not any(trainable):
                         continue
                     choice_spans = _true_spans(trainable)

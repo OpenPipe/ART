@@ -14,6 +14,7 @@ import art
 from art.openai import ART_MOE_ROUTING_METADATA_KEY
 from art.preprocessing.moe_routing import MoeRouteSegments
 from art.preprocessing.tokenize import (
+    TokenizedResult,
     _chat_choice_trace,
     tokenize_trajectory_groups,
 )
@@ -74,6 +75,42 @@ def _exchange(model: str, output_token: int) -> ChatCompletionsExchange:
             messages=[{"role": "user", "content": "question"}],
         ),
         response=response,
+        start_time=start,
+        end_time=start + timedelta(seconds=1),
+    )
+
+
+def _empty_prompt_completion_exchange(
+    output_token_ids: list[int],
+) -> CompletionsExchange:
+    start = datetime(2026, 1, 1)
+    return CompletionsExchange(
+        request=CompletionsRequest(model="policy", prompt=""),
+        response=Completion.model_validate(
+            {
+                "id": "cmpl-empty",
+                "object": "text_completion",
+                "created": 1,
+                "model": "policy",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "text": "answer",
+                        "prompt_token_ids": [],
+                        "token_ids": output_token_ids,
+                        "logprobs": {
+                            "tokens": [
+                                f"token_id:{token_id}" for token_id in output_token_ids
+                            ],
+                            "token_logprobs": [-0.1] * len(output_token_ids),
+                            "top_logprobs": [{}] * len(output_token_ids),
+                            "text_offset": list(range(len(output_token_ids))),
+                        },
+                    }
+                ],
+            }
+        ),
         start_time=start,
         end_time=start + timedelta(seconds=1),
     )
@@ -397,6 +434,57 @@ def test_training_selector_rejects_mixed_protocols() -> None:
     )
     with pytest.raises(ValueError, match="mixed protocols"):
         resolve_training_model(trajectory, "policy")
+
+
+@pytest.mark.parametrize("output_token_ids", [[2], [2, 3]])
+def test_training_rejects_sampled_token_without_causal_predecessor(
+    output_token_ids: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exchange = _empty_prompt_completion_exchange(output_token_ids)
+    group = art.TrajectoryGroup(
+        [
+            art.Trajectory(
+                exchanges=art.TrajectoryExchanges(completions=[exchange]),
+                reward=reward,
+            )
+            for reward in (1.0, 0.0)
+        ]
+    )
+    tokenized = group.trajectories[0].tokenize()
+    assert tokenized.token_ids == output_token_ids
+    assert all(flag & art.TokenFlag.SAMPLED for flag in tokenized.flags)
+
+    weight_writes = 0
+    original_setattr = TokenizedResult.__setattr__
+
+    def tracked_setattr(result: TokenizedResult, name: str, value: object) -> None:
+        nonlocal weight_writes
+        if name == "weight":
+            weight_writes += 1
+        original_setattr(result, name, value)
+
+    monkeypatch.setattr(TokenizedResult, "__setattr__", tracked_setattr)
+    with pytest.raises(ValueError, match="cannot start with a sampled token"):
+        list(
+            tokenize_trajectory_groups(
+                cast(PreTrainedTokenizerBase, _Tokenizer()),
+                [group],
+                allow_training_without_logprobs=False,
+                scale_rewards=False,
+                model="policy",
+            )
+        )
+    assert weight_writes == 0
+
+    with pytest.raises(ValueError, match="cannot start with a sampled token"):
+        trajectory_groups_to_datums(
+            [group],
+            renderer=None,
+            tokenizer=None,
+            normalize_advantages=False,
+            model="policy",
+        )
 
 
 def test_preprocessing_preserves_adjacent_choice_boundaries_for_moe() -> None:

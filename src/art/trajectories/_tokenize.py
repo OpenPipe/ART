@@ -112,6 +112,11 @@ def _first_introduction_mask(
     return [key in new_keys if key is not None else False for key in source_keys]
 
 
+def _require_causal_predecessor(trainable: Sequence[bool]) -> None:
+    if trainable and trainable[0]:
+        raise ValueError("A trainable trajectory cannot start with a sampled token")
+
+
 @dataclass
 class _TraceBuilder:
     trace: _HistoryTokenizationTrace | None = None

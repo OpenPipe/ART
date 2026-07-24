@@ -324,10 +324,10 @@ def _tokenized_trajectory_to_datum(
         for selected, flag in zip(trainable, tokenized.flags, strict=True)
     ):
         raise ValueError("Only sampled tokens can be selected for Tinker training")
+    if trainable and trainable[0]:
+        raise ValueError("A trainable trajectory cannot start with a sampled token")
     if len(tokenized.token_ids) < 2 or not any(trainable):
         return None
-    if trainable[0]:
-        raise ValueError("A trainable trajectory cannot start with a sampled token")
 
     action_mask = trainable[1:]
     if any(
