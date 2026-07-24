@@ -64,9 +64,13 @@ def test_runtime_patch_always_returns_token_ids(
         "default_request = protocol.ChatCompletionRequest("
         "model='m', messages=[{'role': 'user', 'content': 'x'}]"
         "); "
-        "explicit_request = protocol.ChatCompletionRequest("
+        "explicit_false = protocol.ChatCompletionRequest("
         "model='m', messages=[{'role': 'user', 'content': 'x'}], "
-        "logprobs=False, top_logprobs=None, return_token_ids=None"
+        "logprobs=False, top_logprobs=None, return_token_ids=False"
+        "); "
+        "explicit_none = protocol.ChatCompletionRequest("
+        "model='m', messages=[{'role': 'user', 'content': 'x'}], "
+        "return_token_ids=None"
         "); "
         "print(json.dumps({"
         "'default': {"
@@ -75,12 +79,14 @@ def test_runtime_patch_always_returns_token_ids(
         "'return_token_ids': default_request.return_token_ids"
         "}, "
         "'default_fields_set': sorted(default_request.model_fields_set), "
-        "'explicit': {"
-        "'logprobs': explicit_request.logprobs, "
-        "'top_logprobs': explicit_request.top_logprobs, "
-        "'return_token_ids': explicit_request.return_token_ids"
+        "'explicit_false': {"
+        "'logprobs': explicit_false.logprobs, "
+        "'top_logprobs': explicit_false.top_logprobs, "
+        "'return_token_ids': explicit_false.return_token_ids"
         "}, "
-        "'explicit_fields_set': sorted(explicit_request.model_fields_set)"
+        "'explicit_false_fields_set': sorted(explicit_false.model_fields_set), "
+        "'explicit_none_return_token_ids': explicit_none.return_token_ids, "
+        "'explicit_none_fields_set': sorted(explicit_none.model_fields_set)"
         "}))",
         artifact_dir,
         "route_token_ids",
@@ -92,18 +98,20 @@ def test_runtime_patch_always_returns_token_ids(
             "return_token_ids": True,
         },
         "default_fields_set": ["messages", "model"],
-        "explicit": {
+        "explicit_false": {
             "logprobs": False,
             "top_logprobs": None,
-            "return_token_ids": None,
+            "return_token_ids": False,
         },
-        "explicit_fields_set": [
+        "explicit_false_fields_set": [
             "logprobs",
             "messages",
             "model",
             "return_token_ids",
             "top_logprobs",
         ],
+        "explicit_none_return_token_ids": None,
+        "explicit_none_fields_set": ["messages", "model", "return_token_ids"],
     }
 
 
