@@ -113,7 +113,15 @@ RESPONSE: dict[str, Any] = {
         "output_tokens_details": {"reasoning_tokens": 0},
         "total_tokens": 5,
     },
-    "raw_output_tokens": [{"token_id": 2, "logprob": -0.2}],
+    "token_generations": [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [
+                {"token_id": 2, "logprob": -0.2, "text": "hello"}
+            ],
+            "output_indices": [0],
+        }
+    ],
 }
 
 MESSAGE: dict[str, Any] = {

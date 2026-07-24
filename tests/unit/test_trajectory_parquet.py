@@ -154,7 +154,19 @@ def _exchange_trajectory() -> Trajectory:
                             "parallel_tool_calls": True,
                             "tool_choice": "auto",
                             "tools": [],
-                            "raw_output_tokens": [{"token_id": 20, "logprob": -0.3}],
+                            "token_generations": [
+                                {
+                                    "prompt_token_ids": [10],
+                                    "output_tokens": [
+                                        {
+                                            "token_id": 20,
+                                            "logprob": -0.3,
+                                            "text": "done",
+                                        }
+                                    ],
+                                    "output_indices": [0],
+                                }
+                            ],
                         },
                         "start_time": "2026-01-01T00:00:04",
                         "end_time": "2026-01-01T00:00:05",
