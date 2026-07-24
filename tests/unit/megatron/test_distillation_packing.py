@@ -13,8 +13,10 @@ from art.local.backend import LocalBackend
 from art.megatron.backend import MegatronBackend
 from art.megatron.distillation import (
     DistillationObjectiveConfig,
+    PolicyPackingConfig,
     pack_prepared_batch,
     packed_distillation_tensors_from_dir,
+    validate_prepared_forward_kl,
     validate_standalone_forward_kl,
 )
 from art.megatron.runtime.jobs import (
@@ -104,6 +106,121 @@ def _artifact(*, revision: int = 7) -> distill.PreparedTrainingBatch:
     )
 
 
+def _additive_artifact(
+    *,
+    revision: int = 7,
+    successful_generation_ids: tuple[str, ...] = ("generation-0", "generation-1"),
+    failed_generation_ids: tuple[str, ...] = (),
+    rollout_revisions: tuple[int, int, int] | None = None,
+    missing_logprob: tuple[int, int] | None = None,
+    rewards: tuple[float, float, float] = (-1.0, 0.0, 1.0),
+) -> distill.PreparedTrainingBatch:
+    view = distill.TeacherView.from_request(
+        "chat_completions",
+        {"messages": [{"content": "question", "role": "user"}]},
+    )
+    resolved_revisions = rollout_revisions or (revision, revision, revision)
+    trajectories = []
+    generations: dict[str, distill.CapturedGeneration] = {}
+    for index, (reward, rollout_revision) in enumerate(
+        zip(rewards, resolved_revisions, strict=True)
+    ):
+        generation_id = f"generation-{index}"
+        fingerprint = f"trajectory-{index}"
+        continuation = (10 + index * 2, 11 + index * 2)
+        generation = distill.CapturedGeneration.create(
+            generation_id=generation_id,
+            trajectory_fingerprint=fingerprint,
+            event_index=0,
+            trajectory_token_start=1,
+            protocol="chat_completions",
+            continuation_token_ids=continuation,
+            context=view,
+            part_spans=(
+                distill.PartSpan(
+                    part=distill.GenerationPart.ASSISTANT_TEXT,
+                    start=0,
+                    end=2,
+                ),
+            ),
+            rollout_spans=(
+                distill.RolloutRevisionSpan(
+                    start=0,
+                    end=2,
+                    revision=rollout_revision,
+                ),
+            ),
+        )
+        generations[generation_id] = generation
+        logprobs: list[float | None] = [None, -0.2, -0.3]
+        if missing_logprob is not None and missing_logprob[0] == index:
+            logprobs[1 + missing_logprob[1]] = None
+        trajectories.append(
+            distill.TrainingTrajectorySnapshot(
+                trajectory_fingerprint=fingerprint,
+                token_ids=(1, *continuation),
+                logprobs=tuple(logprobs),
+                token_flags=(int(1), int(3), int(3)),
+                reward=reward,
+                advantage=reward,
+                generations=(generation,),
+            )
+        )
+
+    group = distill.TrainingGroupSnapshot(
+        group_id="group-0",
+        trajectories=tuple(trajectories),
+    )
+    targets = tuple(
+        distill.TopKTargetRow(
+            generation_id=generation_id,
+            position=0,
+            sampled_token_id=generations[generation_id].continuation_token_ids[0],
+            token_ids=(0, 2),
+            teacher_logprobs=(
+                -1.6094379124341003,
+                -0.6931471805599453,
+            ),
+            tail_logprob=-1.2039728043259361,
+            logical_vocab_size=32,
+            temperature=1.0,
+            teacher_name="teacher",
+            teacher_revision="frozen",
+            token_space_fingerprint="token-space",
+            request_id=f"request-{generation_id}",
+            forced_token_sha256=generations[generation_id].continuation_sha256,
+        )
+        for generation_id in successful_generation_ids
+    )
+    issues = tuple(
+        distill.PreparationIssue(
+            generation_id=generation_id,
+            teacher_name="teacher",
+            selected_positions=(0,),
+        )
+        for generation_id in failed_generation_ids
+    )
+    return distill.PreparedTrainingBatch.create(
+        groups=(group,),
+        targets=targets,
+        report=distill.PreparationReport(
+            selected_generations=len(targets) + len(issues),
+            prepared_generations=len(targets),
+            selected_tokens=len(targets) + len(issues),
+            prepared_tokens=len(targets),
+            issue_count=len(issues),
+            issues=issues,
+        ),
+        constraints=distill.PreparedConstraints(
+            learner_revision=revision,
+            token_space_fingerprint="token-space",
+            logical_vocab_size=32,
+            rollout_requirement=distill.StudentOnPolicy(),
+            consistency=distill.Frozen(revision="frozen"),
+        ),
+    )
+
+
 def _validated_payload(
     artifact: distill.PreparedTrainingBatch,
     *,
@@ -126,6 +243,38 @@ def _validated_payload(
     )
 
 
+def _validated_additive_payload(
+    artifact: distill.PreparedTrainingBatch,
+    *,
+    sequence_length: int = 8,
+):
+    return validate_prepared_forward_kl(
+        batch=artifact,
+        objectives=distill.TrainingObjectives(
+            policy="cispo",
+            distillation=distill.Loss(),
+        ),
+        expected_source_revision=7,
+        packed_sequence_length=sequence_length,
+    )
+
+
+def _rebind_tensor_checksum(
+    disk: dict[str, Any],
+    directory: Path,
+) -> None:
+    hashes = [
+        (path.stem, hashlib.sha256(path.read_bytes()).hexdigest())
+        for path in sorted(directory.iterdir())
+    ]
+    manifest = json.dumps(
+        hashes, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    disk["tensors_sha256"] = hashlib.sha256(
+        b"art-distill-tensors-v1\0" + manifest
+    ).hexdigest()
+
+
 def test_pack_is_exact_token_aligned_fixed_k_and_round_trips(tmp_path: Path) -> None:
     artifact = _artifact()
     disk = pack_prepared_batch(
@@ -145,6 +294,181 @@ def test_pack_is_exact_token_aligned_fixed_k_and_round_trips(tmp_path: Path) -> 
     assert packed["topk_token_ids"][0, 0].tolist() == [-1, -1]
     assert packed["topk_token_ids"][0, 1].tolist() == [0, 2]
     assert int(packed["target_mask"].sum()) == len(artifact.parsed_payload().targets)
+    assert disk["policy_count"] == 0
+    assert "policy_kind" not in disk
+    assert not bool(packed["policy_mask"].any())
+    assert bool(torch.all(torch.isnan(packed["old_logprobs"])))
+
+
+def test_additive_pack_has_independent_policy_and_kd_masks(tmp_path: Path) -> None:
+    artifact = _additive_artifact()
+    objectives = distill.TrainingObjectives(
+        policy="cispo",
+        distillation=distill.Loss(),
+    )
+    disk = pack_prepared_batch(
+        batch=artifact,
+        payload=_validated_additive_payload(artifact),
+        sequence_length=8,
+        output_dir=str(tmp_path / "packed"),
+        objectives=objectives,
+    )
+
+    packed = packed_distillation_tensors_from_dir(disk)
+
+    assert disk["policy_kind"] == "cispo"
+    assert disk["policy_count"] == 4
+    assert disk["target_count"] == 2
+    assert packed["tokens"].shape == (3, 8)
+    assert packed["policy_mask"].nonzero().tolist() == [
+        [0, 1],
+        [0, 2],
+        [2, 1],
+        [2, 2],
+    ]
+    assert packed["target_mask"].nonzero().tolist() == [[0, 1], [1, 1]]
+    assert packed["source_group_ids"].tolist() == [0, 0, 0]
+    assert packed["policy_group_ids"][packed["policy_mask"]].tolist() == [
+        0,
+        0,
+        2,
+        2,
+    ]
+    torch.testing.assert_close(
+        packed["policy_advantages"][0, 1:3],
+        torch.tensor([-1.0, -1.0]),
+    )
+    torch.testing.assert_close(
+        packed["policy_advantages"][2, 1:3],
+        torch.tensor([1.0, 1.0]),
+    )
+    torch.testing.assert_close(
+        packed["policy_weights"][packed["policy_mask"]],
+        torch.ones(4),
+    )
+    assert not bool(packed["policy_mask"][1].any())
+    assert bool(packed["target_mask"][1, 1])
+    assert bool(torch.all(torch.isnan(packed["old_logprobs"][1])))
+
+
+def test_teacher_failure_does_not_change_policy_projection(tmp_path: Path) -> None:
+    failed = _additive_artifact(failed_generation_ids=("generation-2",))
+    unselected = _additive_artifact()
+    objectives = distill.TrainingObjectives(
+        policy="cispo",
+        distillation=distill.Loss(),
+    )
+    failed_disk = pack_prepared_batch(
+        batch=failed,
+        payload=_validated_additive_payload(failed),
+        sequence_length=8,
+        output_dir=str(tmp_path / "failed"),
+        objectives=objectives,
+    )
+    unselected_disk = pack_prepared_batch(
+        batch=unselected,
+        payload=_validated_additive_payload(unselected),
+        sequence_length=8,
+        output_dir=str(tmp_path / "unselected"),
+        objectives=objectives,
+    )
+
+    failed_tensors = packed_distillation_tensors_from_dir(failed_disk)
+    unselected_tensors = packed_distillation_tensors_from_dir(unselected_disk)
+    for name in (
+        "tokens",
+        "token_mask",
+        "source_group_ids",
+        "policy_mask",
+        "old_logprobs",
+        "policy_advantages",
+        "policy_weights",
+        "policy_group_ids",
+    ):
+        torch.testing.assert_close(
+            failed_tensors[name],
+            unselected_tensors[name],
+            equal_nan=True,
+        )
+    assert failed_disk["policy_count"] == unselected_disk["policy_count"] == 4
+    assert not bool(failed_tensors["target_mask"][2].any())
+    assert bool(failed_tensors["policy_mask"][2].all().item()) is False
+    assert failed_tensors["policy_mask"][2, 1:3].tolist() == [True, True]
+
+
+def test_zero_variance_rows_remain_eligible_for_kd_only(tmp_path: Path) -> None:
+    artifact = _additive_artifact(rewards=(0.0, 0.0, 0.0))
+    payload = validate_prepared_forward_kl(
+        batch=artifact,
+        objectives=distill.TrainingObjectives(distillation=distill.Loss()),
+        expected_source_revision=7,
+        packed_sequence_length=8,
+    )
+    disk = pack_prepared_batch(
+        batch=artifact,
+        payload=payload,
+        sequence_length=8,
+        output_dir=str(tmp_path / "packed"),
+        objectives=distill.TrainingObjectives(distillation=distill.Loss()),
+    )
+    packed = packed_distillation_tensors_from_dir(disk)
+
+    assert disk["target_count"] == 2
+    assert disk["policy_count"] == 0
+    assert packed["tokens"].shape[0] == 2
+    assert packed["target_mask"].nonzero().tolist() == [[0, 1], [1, 1]]
+    assert not bool(packed["policy_mask"].any())
+
+    with pytest.raises(ValueError, match="zero token denominator"):
+        validate_prepared_forward_kl(
+            batch=artifact,
+            objectives=distill.TrainingObjectives(
+                policy="cispo",
+                distillation=distill.Loss(),
+            ),
+            expected_source_revision=7,
+            packed_sequence_length=8,
+        )
+
+
+def test_policy_validation_covers_unselected_trajectories() -> None:
+    stale = _additive_artifact(rollout_revisions=(7, 7, 6))
+    with pytest.raises(ValueError, match="rollout revision"):
+        _validated_additive_payload(stale)
+
+    missing = _additive_artifact(missing_logprob=(2, 1))
+    with pytest.raises(ValueError, match="missing its rollout logprob"):
+        _validated_additive_payload(missing)
+
+    # The same missing value is legal on a zero-advantage, policy-inactive row.
+    inactive_missing = _additive_artifact(missing_logprob=(1, 1))
+    _validated_additive_payload(inactive_missing)
+
+
+def test_loader_rejects_rebound_policy_sidecar_corruption(tmp_path: Path) -> None:
+    artifact = _additive_artifact()
+    directory = tmp_path / "packed"
+    disk = pack_prepared_batch(
+        batch=artifact,
+        payload=_validated_additive_payload(artifact),
+        sequence_length=8,
+        output_dir=str(directory),
+        objectives=distill.TrainingObjectives(
+            policy="cispo",
+            distillation=distill.Loss(),
+        ),
+    )
+    values = torch.from_file(
+        str(directory / "policy_mask.pt"),
+        shared=True,
+        size=3 * 8,
+        dtype=torch.bool,
+    ).view(3, 8)
+    values[0, 1] = False
+    _rebind_tensor_checksum(cast(dict[str, Any], disk), directory)
+
+    with pytest.raises(ValueError, match="policy denominator mismatch"):
+        packed_distillation_tensors_from_dir(disk)
 
 
 def test_pack_is_byte_deterministic(tmp_path: Path) -> None:
