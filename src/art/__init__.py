@@ -58,10 +58,11 @@ except ImportError:
     pass
 
 
-from . import dev
+from . import dev, distill
 from .backend import Backend
 from .batches import trajectory_group_batches
 from .dev import LoRAConfig
+from .distill import CapturedGeneration, PreparedTrainingBatch, TrainingObjectives
 from .errors import LocalServingUnavailableError
 from .gather import gather_trajectories, gather_trajectory_groups
 from .megatron.runtime_config import (
@@ -122,6 +123,7 @@ from .yield_trajectory import capture_yielded_trajectory, yield_trajectory
 
 __all__ = [
     "dev",
+    "distill",
     "auto_trajectory",
     "capture_auto_trajectory",
     "current_trajectory",
@@ -154,6 +156,9 @@ __all__ = [
     "TrainSFTConfig",
     "TrainConfig",
     "TrainResult",
+    "TrainingObjectives",
+    "CapturedGeneration",
+    "PreparedTrainingBatch",
     "Trajectory",
     "TrajectoryExchanges",
     "TrajectoryGroup",
