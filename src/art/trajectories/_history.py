@@ -719,14 +719,18 @@ def responses_histories(
             final_sources = [*copy.copy(prompt_sources), *copy.copy(output_sources)]
             if generations:
                 for generation_index, generation in enumerate(generations):
-                    if not generation.output_indices:
+                    outputless = not generation.output_indices
+                    if outputless and generation_index != len(generations) - 1:
                         raise ValueError(
-                            "A Responses token generation without native output "
-                            "items cannot yet be projected as a history"
+                            "A nonterminal Responses token generation without "
+                            "native output items cannot be projected as a history"
                         )
-                    output_start = generation.output_indices[0]
-                    output_end = generation.output_indices[-1] + 1
-                    if generation_index == len(generations) - 1:
+                    if outputless:
+                        output_start = output_end = len(output)
+                    else:
+                        output_start = generation.output_indices[0]
+                        output_end = generation.output_indices[-1] + 1
+                    if not outputless and generation_index == len(generations) - 1:
                         output_end = len(output)
                     generation_prompt = [
                         *copy.deepcopy(prompt),
@@ -774,8 +778,24 @@ def responses_histories(
                             )
                             for _, source in retained
                         ]
-                    generation_output = output[output_start:output_end]
-                    generation_output_sources = output_sources[output_start:output_end]
+                    if outputless:
+                        generation_output = [
+                            cast(
+                                ResponseInputItemParam,
+                                {"role": "assistant", "content": ""},
+                            )
+                        ]
+                        generation_output_sources = [
+                            ResponsesItemSource(
+                                exchange=exchange,
+                                generation_index=generation_index,
+                            )
+                        ]
+                    else:
+                        generation_output = output[output_start:output_end]
+                        generation_output_sources = output_sources[
+                            output_start:output_end
+                        ]
                     _extend_branches(
                         branches,
                         prompt=generation_prompt,

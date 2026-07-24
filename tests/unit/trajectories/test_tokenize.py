@@ -1839,8 +1839,8 @@ def test_responses_token_generations_fail_closed(
         ).responses_history().tokenize()
 
 
-def test_responses_generation_without_output_items_is_not_silently_lost() -> None:
-    exchange = _response_exchange("unprojectable-generation", 2)
+def test_responses_terminal_generation_without_output_items_is_tokenized() -> None:
+    exchange = _response_exchange("terminal-eos", 2)
     data = exchange.response.model_dump(mode="python")
     data["output"] = []
     data["token_generations"] = [
@@ -1852,7 +1852,46 @@ def test_responses_generation_without_output_items_is_not_silently_lost() -> Non
     ]
     exchange.response = Response.model_validate(data)
 
-    with pytest.raises(ValueError, match="cannot yet be projected"):
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(responses=[exchange])
+    ).responses_history()
+    tokenized = history.tokenize()
+
+    assert history.input[-1] == {"role": "assistant", "content": ""}
+    assert history.input_sources[-1] == ResponsesItemSource(
+        exchange=exchange, generation_index=0
+    )
+    assert tokenized.token_ids == [1, 2]
+    assert math.isnan(tokenized.logprobs[0])
+    assert tokenized.logprobs[1] == pytest.approx(-0.2)
+    assert tokenized.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+    assert history.as_chat_completions_history().messages[-1] == {
+        "role": "assistant",
+        "content": "",
+    }
+
+
+def test_responses_nonterminal_generation_without_output_items_raises() -> None:
+    exchange = _response_exchange("hidden-control", 2)
+    data = exchange.response.model_dump(mode="python")
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2, "logprob": -0.2}],
+            "output_indices": [],
+        },
+        {
+            "prompt_token_ids": [1, 2],
+            "output_tokens": [{"token_id": 3, "logprob": -0.3}],
+            "output_indices": [0],
+        },
+    ]
+    exchange.response = Response.model_validate(data)
+
+    with pytest.raises(ValueError, match="nonterminal"):
         art.Trajectory(
             exchanges=TrajectoryExchanges(responses=[exchange])
         ).responses_history()

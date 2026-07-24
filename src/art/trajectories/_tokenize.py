@@ -1949,7 +1949,25 @@ def _validate_history_sources(history: History) -> None:
                     raise ValueError("Responses request source has a generation index")
                 expected = request_input[request_index]
             else:
-                raise ValueError("Responses source has no request or output index")
+                generations = _response_generations(source.exchange.response)
+                if source.generation_index is None:
+                    raise ValueError(
+                        "Responses source has no request, output, or generation index"
+                    )
+                generation_index = _source_index(
+                    source.generation_index,
+                    length=len(generations),
+                    field="Responses generation source index",
+                )
+                if (
+                    generation_index != len(generations) - 1
+                    or generations[generation_index].output_indices
+                ):
+                    raise ValueError(
+                        "Responses generation-only source must refer to a terminal "
+                        "generation without native output items"
+                    )
+                expected = {"role": "assistant", "content": ""}
             if expected is None or item != expected:
                 raise ValueError(
                     "Responses history no longer matches its source exchange"
