@@ -4,6 +4,7 @@ from dataclasses import replace
 import json
 import multiprocessing
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -278,6 +279,140 @@ def test_crash_after_bind_is_ambiguous_but_committed_crash_is_recoverable(
     next_lease = committed_reopen.acquire_current_step(revision=11, ttl_s=30.0)
     assert next_lease.fence == committed.fence + 1
     committed_reopen.release(next_lease)
+
+
+@pytest.mark.parametrize("kind", ["current_step", "ordinary"])
+def test_exact_committed_receipt_reconciles_bound_crash_before_later_writer(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    operation = _operation()
+    owner = _store(tmp_path)
+    if kind == "current_step":
+        crashed = owner.acquire_current_step(revision=10, ttl_s=30.0)
+        owner.bind(crashed, operation_identity=operation)
+    else:
+        crashed = owner.acquire_ordinary(
+            revision=10,
+            ttl_s=30.0,
+            operation_identity=operation,
+        )
+    owner._release_gate(crashed.session_id)
+    observed: list[tuple[dict[str, object], int]] = []
+
+    def _resolve(
+        candidate: dict[str, Any],
+        result_revision: int,
+    ) -> bool:
+        observed.append((candidate, result_revision))
+        return candidate == operation and result_revision == 11
+
+    recovered = WriterSessionStore(
+        root=tmp_path,
+        model_identity="project/model",
+        clock=FakeClock(),
+        secret_factory=lambda _size: b"r" * 32,
+        committed_operation_resolver=_resolve,
+    )
+    later = recovered.acquire_ordinary_open(revision=11, ttl_s=30.0)
+
+    assert observed == [(operation, 11)]
+    assert later.fence == crashed.fence + 1
+    recovered.release(later)
+
+
+def test_explicit_reconciliation_closes_only_exact_committed_operation(
+    tmp_path: Path,
+) -> None:
+    operation = _operation()
+    owner = _store(tmp_path)
+    crashed = owner.acquire_current_step(revision=4, ttl_s=30.0)
+    owner.bind(crashed, operation_identity=operation)
+    owner._release_gate(crashed.session_id)
+
+    recovered = WriterSessionStore(
+        root=tmp_path,
+        model_identity="project/model",
+        clock=FakeClock(),
+        committed_operation_resolver=(
+            lambda candidate, result: candidate == operation and result == 5
+        ),
+    )
+    result = recovered.reconcile()
+
+    assert result.action == "closed_committed"
+    journal = recovered.inspect()
+    assert journal is not None
+    assert journal["state"] == "closed"
+    assert journal["operation_identity"] == operation
+    assert journal["result_revision"] == 5
+    assert journal["close_reason"] == "recovered_committed"
+
+
+def test_missing_committed_receipt_keeps_bound_crash_fail_closed(
+    tmp_path: Path,
+) -> None:
+    operation = _operation()
+    owner = _store(tmp_path)
+    crashed = owner.acquire_current_step(revision=4, ttl_s=30.0)
+    owner.bind(crashed, operation_identity=operation)
+    owner._release_gate(crashed.session_id)
+
+    recovered = WriterSessionStore(
+        root=tmp_path,
+        model_identity="project/model",
+        committed_operation_resolver=lambda _candidate, _result: False,
+    )
+
+    assert recovered.reconcile().action == "ambiguous_after_bind"
+    assert recovered.recovery_status().action == "ambiguous_after_bind"
+    with pytest.raises(AmbiguousWriterSessionError, match="receipt reconciliation"):
+        recovered.acquire_ordinary_open(revision=5, ttl_s=30.0)
+    journal = recovered.inspect()
+    assert journal is not None
+    assert journal["state"] == "bound"
+    assert journal["result_revision"] is None
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        (WriterBindingMismatchError("receipt binding mismatch"), "binding mismatch"),
+        (
+            WriterSessionValidationError("receipt revision mismatch"),
+            "revision mismatch",
+        ),
+    ],
+)
+def test_receipt_mismatch_during_reconciliation_fails_closed(
+    tmp_path: Path,
+    failure: Exception,
+    message: str,
+) -> None:
+    owner = _store(tmp_path)
+    crashed = owner.acquire_ordinary(
+        revision=4,
+        ttl_s=30.0,
+        operation_identity=_operation(),
+    )
+    owner._release_gate(crashed.session_id)
+
+    def _reject(
+        _candidate: dict[str, Any],
+        _result_revision: int,
+    ) -> bool:
+        raise failure
+
+    recovered = WriterSessionStore(
+        root=tmp_path,
+        model_identity="project/model",
+        committed_operation_resolver=_reject,
+    )
+
+    with pytest.raises(type(failure), match=message):
+        recovered.acquire_current_step(revision=5, ttl_s=30.0)
+    assert recovered.recovery_status().action == "ambiguous_after_bind"
+    assert recovered.fence_path.read_text(encoding="ascii") == str(crashed.fence)
 
 
 def test_heartbeat_is_durable_and_old_lease_is_fenced(tmp_path: Path) -> None:

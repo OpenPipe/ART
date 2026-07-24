@@ -314,6 +314,7 @@ class MegatronService:
                 f"{self.model_name}\0{self.base_model}\0"
                 f"{Path(self.output_dir).resolve()}"
             ),
+            committed_operation_resolver=self._resolve_committed_writer_operation,
         )
         self._validate_megatron_dependencies()
 
@@ -647,6 +648,74 @@ class MegatronService:
                 raise RuntimeError("distillation receipt has an invalid state")
             return cast(dict[str, Any], receipt)
         return None
+
+    def _resolve_committed_writer_operation(
+        self,
+        operation: dict[str, Any],
+        expected_result_revision: int,
+    ) -> bool:
+        """Prove a crashed prepared writer committed its exact ``R -> R+1`` job."""
+
+        if operation.get("route") != "prepared":
+            # Legacy RL and SFT do not yet have independently durable receipts.
+            return False
+        expected_fields = {
+            "route",
+            "model_name",
+            "base_model",
+            "source_revision",
+            "target_revision",
+            "identity",
+        }
+        if set(operation) != expected_fields:
+            raise WriterSessionValidationError(
+                "prepared writer operation has an invalid identity"
+            )
+        source_revision = operation["source_revision"]
+        target_revision = operation["target_revision"]
+        identity = operation["identity"]
+        if (
+            operation["model_name"] != self.model_name
+            or operation["base_model"] != self.base_model
+            or not isinstance(source_revision, int)
+            or isinstance(source_revision, bool)
+            or not isinstance(target_revision, int)
+            or isinstance(target_revision, bool)
+            or target_revision != source_revision + 1
+            or target_revision != expected_result_revision
+            or not isinstance(identity, dict)
+            or set(identity) != {"receipt_binding"}
+            or not isinstance(identity["receipt_binding"], dict)
+        ):
+            raise WriterSessionValidationError(
+                "prepared writer operation does not match its expected revision"
+            )
+        binding = cast(dict[str, Any], identity["receipt_binding"])
+        idempotency_key = binding.get("idempotency_key")
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key
+            or binding.get("source_revision") != source_revision
+        ):
+            raise WriterSessionValidationError(
+                "prepared writer receipt binding does not match its operation"
+            )
+        receipt = self._read_distillation_receipt(
+            path=self._distillation_receipt_path(idempotency_key),
+            binding=binding,
+        )
+        if receipt is None or receipt["state"] != "committed":
+            return False
+        committed_step = receipt.get("committed_step")
+        if (
+            not isinstance(committed_step, int)
+            or isinstance(committed_step, bool)
+            or committed_step != expected_result_revision
+        ):
+            raise WriterSessionValidationError(
+                "committed distillation receipt has an unexpected revision"
+            )
+        return True
 
     def _reserve_distillation_receipt(
         self,
@@ -1852,6 +1921,10 @@ class MegatronService:
                 existing_receipt is not None
                 and existing_receipt["state"] == "committed"
             ):
+                # A process may have crashed after committing this receipt but
+                # before committing/releasing its writer journal. Reconcile the
+                # exact receipt-bound operation before returning the replay.
+                self._writer_sessions.reconcile()
                 shutil.rmtree(disk_tensors["dir"])
                 yield {
                     "distill/idempotent_replay": 1.0,

@@ -27,6 +27,7 @@ import uuid
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 SessionKind = Literal["current_step", "ordinary"]
 SessionState = Literal["open", "bound", "committed", "closed"]
+CommittedOperationResolver = Callable[[dict[str, JsonValue], int], bool]
 
 _SCHEMA_VERSION = 1
 _CAPABILITY_BYTES = 32
@@ -95,12 +96,14 @@ class WriterSessionStore:
         model_identity: str,
         clock: Callable[[], float] = time.time,
         secret_factory: Callable[[int], bytes] = secrets.token_bytes,
+        committed_operation_resolver: CommittedOperationResolver | None = None,
     ) -> None:
         if not model_identity:
             raise ValueError("model_identity must not be empty")
         self.model_identity = model_identity
         self._clock = clock
         self._secret_factory = secret_factory
+        self._committed_operation_resolver = committed_operation_resolver
         digest = hashlib.sha256(model_identity.encode()).hexdigest()
         self._directory = root / "writer_sessions" / digest
         self._lock_path = self._directory / "writer.lock"
@@ -381,6 +384,40 @@ class WriterSessionStore:
             return WriterRecovery(action="none")
         return self._classify_recovery(journal)
 
+    def reconcile(self) -> WriterRecovery:
+        """Reconcile recoverable durable state while holding the model gate.
+
+        A bound session is closed only when the configured resolver proves that
+        its exact immutable operation has a committed receipt for ``R + 1``.
+        Missing evidence returns ``ambiguous_after_bind``; resolver errors,
+        including identity or revision mismatches, propagate and fail closed.
+        """
+
+        self._acquire_gate()
+        try:
+            journal = self._read_journal()
+            if journal is None or journal["state"] == "closed":
+                return WriterRecovery(action="none")
+            recovery = self._classify_recovery(journal)
+            if recovery.action == "abandoned_before_submit":
+                self._close_abandoned(journal)
+                return recovery
+            if recovery.action == "closed_committed":
+                self._close_committed(journal, recovered=True)
+                return recovery
+            if recovery.action == "ambiguous_after_bind":
+                if not self._reconcile_bound(journal):
+                    return recovery
+                return WriterRecovery(
+                    action="closed_committed",
+                    session_id=recovery.session_id,
+                    revision=recovery.revision,
+                    fence=recovery.fence,
+                )
+            return recovery
+        finally:
+            self._release_gate(None)
+
     def _acquire(
         self,
         *,
@@ -447,23 +484,53 @@ class WriterSessionStore:
             return
         recovery = self._classify_recovery(journal)
         if recovery.action == "abandoned_before_submit":
-            journal["state"] = "closed"
-            journal["closed_at"] = self._now()
-            journal["close_reason"] = "abandoned_before_submit"
-            self._write_journal(journal)
+            self._close_abandoned(journal)
             return
         if recovery.action == "closed_committed":
-            journal["state"] = "closed"
-            journal["closed_at"] = self._now()
-            journal["close_reason"] = "recovered_committed"
-            self._write_journal(journal)
+            self._close_committed(journal, recovered=True)
             return
         if recovery.action == "ambiguous_after_bind":
+            if self._reconcile_bound(journal):
+                return
             raise AmbiguousWriterSessionError(
                 "bound writer operation has an ambiguous outcome and requires "
                 "receipt reconciliation"
             )
         raise WriterBusyError("an unexpired durable writer session is still open")
+
+    def _reconcile_bound(self, journal: dict[str, JsonValue]) -> bool:
+        resolver = self._committed_operation_resolver
+        if resolver is None:
+            return False
+        operation = cast(dict[str, JsonValue], journal["operation_identity"])
+        result_revision = cast(int, journal["revision"]) + 1
+        if not resolver(operation, result_revision):
+            return False
+        now = self._now()
+        journal["state"] = "closed"
+        journal["result_revision"] = result_revision
+        journal["committed_at"] = now
+        journal["closed_at"] = now
+        journal["close_reason"] = "recovered_committed"
+        self._write_journal(journal)
+        return True
+
+    def _close_abandoned(self, journal: dict[str, JsonValue]) -> None:
+        journal["state"] = "closed"
+        journal["closed_at"] = self._now()
+        journal["close_reason"] = "abandoned_before_submit"
+        self._write_journal(journal)
+
+    def _close_committed(
+        self,
+        journal: dict[str, JsonValue],
+        *,
+        recovered: bool,
+    ) -> None:
+        journal["state"] = "closed"
+        journal["closed_at"] = self._now()
+        journal["close_reason"] = "recovered_committed" if recovered else "committed"
+        self._write_journal(journal)
 
     def _classify_recovery(
         self,
