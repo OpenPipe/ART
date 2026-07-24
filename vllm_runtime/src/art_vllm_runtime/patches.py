@@ -110,12 +110,9 @@ def subclass_chat_completion_request() -> None:
         return
 
     class ChatCompletionRequest(protocol.ChatCompletionRequest):
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            super().__init__(*args, **kwargs)  # ty:ignore[invalid-argument-type]
-            self.logprobs = True
-            if self.top_logprobs is None:
-                self.top_logprobs = 0
-            self.return_token_ids = True
+        logprobs: bool | None = True
+        top_logprobs: int | None = 0
+        return_token_ids: bool | None = True
 
     protocol.ChatCompletionRequest = ChatCompletionRequest  # ty:ignore[invalid-assignment]
     setattr(protocol, "_art_chat_completion_request_patched", True)

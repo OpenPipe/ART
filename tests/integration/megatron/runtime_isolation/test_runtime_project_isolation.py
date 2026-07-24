@@ -58,24 +58,52 @@ def test_runtime_patch_always_returns_token_ids(
 ) -> None:
     payload = _runtime_python(
         "import json; "
-        "from art_vllm_runtime.patches import apply_vllm_runtime_patches; "
-        "apply_vllm_runtime_patches(); "
+        "from art_vllm_runtime.patches import subclass_chat_completion_request; "
+        "subclass_chat_completion_request(); "
         "from vllm.entrypoints.openai.chat_completion import protocol; "
-        "request = protocol.ChatCompletionRequest("
+        "default_request = protocol.ChatCompletionRequest("
         "model='m', messages=[{'role': 'user', 'content': 'x'}]"
         "); "
+        "explicit_request = protocol.ChatCompletionRequest("
+        "model='m', messages=[{'role': 'user', 'content': 'x'}], "
+        "logprobs=False, top_logprobs=None, return_token_ids=None"
+        "); "
         "print(json.dumps({"
-        "'logprobs': request.logprobs, "
-        "'top_logprobs': request.top_logprobs, "
-        "'return_token_ids': request.return_token_ids"
+        "'default': {"
+        "'logprobs': default_request.logprobs, "
+        "'top_logprobs': default_request.top_logprobs, "
+        "'return_token_ids': default_request.return_token_ids"
+        "}, "
+        "'default_fields_set': sorted(default_request.model_fields_set), "
+        "'explicit': {"
+        "'logprobs': explicit_request.logprobs, "
+        "'top_logprobs': explicit_request.top_logprobs, "
+        "'return_token_ids': explicit_request.return_token_ids"
+        "}, "
+        "'explicit_fields_set': sorted(explicit_request.model_fields_set)"
         "}))",
         artifact_dir,
         "route_token_ids",
     )
-    assert json.loads(payload) == {
-        "logprobs": True,
-        "top_logprobs": 0,
-        "return_token_ids": True,
+    assert json.loads(payload.splitlines()[-1]) == {
+        "default": {
+            "logprobs": True,
+            "top_logprobs": 0,
+            "return_token_ids": True,
+        },
+        "default_fields_set": ["messages", "model"],
+        "explicit": {
+            "logprobs": False,
+            "top_logprobs": None,
+            "return_token_ids": None,
+        },
+        "explicit_fields_set": [
+            "logprobs",
+            "messages",
+            "model",
+            "return_token_ids",
+            "top_logprobs",
+        ],
     }
 
 
