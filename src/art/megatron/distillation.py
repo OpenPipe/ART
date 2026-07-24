@@ -76,6 +76,7 @@ class DiskPackedDistillationTensors(TypedDict):
     layout_version: NotRequired[Literal[2]]
     dir: str
     num_sequences: int
+    source_group_count: NotRequired[int]
     sequence_length: int
     top_k_width: int
     target_count: int
@@ -578,6 +579,7 @@ def pack_prepared_batch(
         "layout_version": PREPARED_TENSOR_LAYOUT_VERSION,
         "dir": str(destination),
         "num_sequences": num_sequences,
+        "source_group_count": len(payload.groups),
         "sequence_length": sequence_length,
         "top_k_width": top_k_width,
         "target_count": len(payload.targets),
@@ -706,13 +708,15 @@ def _validate_common_sidecars(
     source_group_ids = tensors["source_group_ids"]
     if bool(torch.any(source_group_ids < 0)):
         raise ValueError("source group IDs must be non-negative")
+    source_group_count = disk.get("source_group_count")
+    if disk.get("layout_version") == PREPARED_TENSOR_LAYOUT_VERSION:
+        if source_group_count is None or source_group_count <= 0:
+            raise ValueError("prepared source group count must be positive")
+        if bool(torch.any(source_group_ids >= source_group_count)):
+            raise ValueError("source group ID exceeds prepared group bounds")
     observed_group_ids = source_group_ids.tolist()
     if observed_group_ids != sorted(observed_group_ids):
         raise ValueError("source group IDs must preserve prepared group order")
-    if observed_group_ids and set(observed_group_ids) != set(
-        range(max(observed_group_ids) + 1)
-    ):
-        raise ValueError("source group IDs must be contiguous")
 
 
 def _validate_policy_sidecars(

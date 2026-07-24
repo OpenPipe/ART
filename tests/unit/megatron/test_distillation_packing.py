@@ -10,6 +10,7 @@ import torch
 
 from art import distill
 from art.local.backend import LocalBackend
+from art.megatron import train as megatron_train
 from art.megatron.backend import MegatronBackend, _summarize_distillation_metrics
 from art.megatron.distillation import (
     CispoObjectiveConfig,
@@ -117,6 +118,56 @@ def _artifact(
             rollout_requirement=distill.StudentOnPolicy(),
             consistency=resolved_consistency,
         ),
+    )
+
+
+def _multigroup_partial_failure_artifact() -> distill.PreparedTrainingBatch:
+    original = _artifact().parsed_payload()
+    failed_group = original.groups[0]
+    failed_trajectory = failed_group.trajectories[0]
+    failed_generation = failed_trajectory.generations[0]
+    successful_generation = failed_generation.model_copy(
+        update={
+            "generation_id": "generation-2",
+            "trajectory_fingerprint": "trajectory-2",
+        }
+    )
+    successful_trajectory = failed_trajectory.model_copy(
+        update={
+            "trajectory_fingerprint": "trajectory-2",
+            "generations": (successful_generation,),
+        }
+    )
+    successful_group = failed_group.model_copy(
+        update={
+            "group_id": "group-2",
+            "trajectories": (successful_trajectory,),
+        }
+    )
+    successful_target = original.targets[0].model_copy(
+        update={
+            "generation_id": successful_generation.generation_id,
+            "request_id": "request-success",
+        }
+    )
+    return distill.PreparedTrainingBatch.create(
+        groups=(failed_group, successful_group),
+        targets=(successful_target,),
+        report=distill.PreparationReport(
+            selected_generations=2,
+            prepared_generations=1,
+            selected_tokens=3,
+            prepared_tokens=1,
+            issue_count=1,
+            issues=(
+                distill.PreparationIssue(
+                    generation_id=failed_generation.generation_id,
+                    teacher_name="teacher",
+                    selected_positions=(0, 1),
+                ),
+            ),
+        ),
+        constraints=original.constraints,
     )
 
 
@@ -371,6 +422,106 @@ def test_pack_is_exact_token_aligned_fixed_k_and_round_trips(tmp_path: Path) -> 
     assert "policy_kind" not in disk
     assert not bool(packed["policy_mask"].any())
     assert bool(torch.all(torch.isnan(packed["old_logprobs"])))
+
+
+def test_standalone_multigroup_partial_failure_preserves_source_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = _multigroup_partial_failure_artifact()
+    payload = _validated_payload(artifact)
+    disk = pack_prepared_batch(
+        batch=artifact,
+        payload=payload,
+        sequence_length=8,
+        output_dir=str(tmp_path / "packed"),
+    )
+
+    packed = packed_distillation_tensors_from_dir(disk)
+    assert disk["source_group_count"] == 2
+    assert packed["source_group_ids"].tolist() == [1]
+    assert packed["target_mask"].nonzero().tolist() == [[0, 1]]
+
+    _validate_distillation_tensors_for_objective(
+        disk,
+        DistillationObjectiveConfig(coefficient=1.0),
+    )
+    monkeypatch.setattr(
+        megatron_train,
+        "_validate_distillation_worker_topology",
+        lambda _model: None,
+    )
+    monkeypatch.setattr(
+        megatron_train,
+        "_infer_parallel_topology",
+        lambda _model: SimpleNamespace(tp=1, dp=1, cp=1),
+    )
+    monkeypatch.setattr(
+        megatron_train,
+        "resolve_global_grad_accumulation_sequences",
+        lambda _sequences: 1,
+    )
+    monkeypatch.setattr(
+        megatron_train,
+        "build_micro_sample_indices_by_dp_rank",
+        lambda **_kwargs: [[0]],
+    )
+    monkeypatch.setattr(
+        megatron_train.ps,
+        "get_data_parallel_rank",
+        lambda: 0,
+    )
+    job = MegatronDistillationJob(
+        step=8,
+        source_policy_step=7,
+        expected_source_revision=7,
+        training_session_id="session",
+        lora_path="/tmp/lora",
+        optimizer_state_path="/tmp/optimizer",
+        distillation_tensors=disk,
+        config=TrainConfig(
+            grad_accumulation_sequences=1,
+            optimizer_save_interval=1,
+        ),
+        objective=DistillationObjectiveConfig(coefficient=1.0),
+        idempotency_key="update",
+        preparation_id=artifact.preparation_id,
+        payload_sha256=artifact.payload_sha256,
+    )
+    preflight_packed, temperature, update_plans = (
+        megatron_train._preflight_distillation_job(
+            cast(Any, SimpleNamespace(model=object(), world_size=1)),
+            job,
+        )
+    )
+
+    assert preflight_packed["source_group_ids"].tolist() == [1]
+    assert temperature == 1.0
+    assert update_plans == [([0], 0, 1)]
+
+
+def test_loader_rejects_source_group_id_outside_prepared_bounds(
+    tmp_path: Path,
+) -> None:
+    artifact = _multigroup_partial_failure_artifact()
+    directory = tmp_path / "packed"
+    disk = pack_prepared_batch(
+        batch=artifact,
+        payload=_validated_payload(artifact),
+        sequence_length=8,
+        output_dir=str(directory),
+    )
+    source_group_ids = torch.from_file(
+        str(directory / "source_group_ids.pt"),
+        shared=True,
+        size=1,
+        dtype=torch.long,
+    )
+    source_group_ids[0] = 2
+    _rebind_tensor_checksum(cast(dict[str, Any], disk), directory)
+
+    with pytest.raises(ValueError, match="exceeds prepared group bounds"):
+        packed_distillation_tensors_from_dir(disk)
 
 
 def test_additive_pack_has_independent_policy_and_kd_masks(tmp_path: Path) -> None:
