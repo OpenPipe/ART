@@ -10,7 +10,7 @@ import torch
 
 from art import distill
 from art.local.backend import LocalBackend
-from art.megatron.backend import MegatronBackend
+from art.megatron.backend import MegatronBackend, _summarize_distillation_metrics
 from art.megatron.distillation import (
     CispoObjectiveConfig,
     DistillationObjectiveConfig,
@@ -298,6 +298,38 @@ def test_service_releases_validation_tensors_before_worker_submission(
 
     assert events == ["released"]
     assert packed == {}
+
+
+def test_backend_summary_preserves_exact_distillation_job_denominators() -> None:
+    metrics = _summarize_distillation_metrics(
+        [
+            {
+                "data/distillation_tokens": 2.0,
+                "data/policy_tokens": 2.0,
+                "data/step_distillation_target_tokens": 2.0,
+                "data/step_policy_tokens": 2.0,
+                "loss/train": 1.0,
+                "data/step_num_gradient_steps": 2.0,
+            },
+            {
+                "data/distillation_tokens": 0.0,
+                "data/policy_tokens": 2.0,
+                "data/step_distillation_target_tokens": 0.0,
+                "data/step_policy_tokens": 2.0,
+                "loss/train": -0.5,
+                "data/step_num_gradient_steps": 2.0,
+            },
+        ],
+        target_count=2,
+        policy_count=4,
+    )
+
+    assert metrics["data/distillation_tokens"] == 1.0
+    assert metrics["data/policy_tokens"] == 2.0
+    assert metrics["data/step_distillation_target_tokens"] == 2.0
+    assert metrics["data/step_policy_tokens"] == 4.0
+    assert metrics["loss/train"] == pytest.approx(0.25)
+    assert metrics["data/step_num_gradient_steps"] == 2.0
 
 
 def _rebind_tensor_checksum(

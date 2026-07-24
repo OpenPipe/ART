@@ -54,6 +54,21 @@ class _CurrentStepSession:
     session_id: str
 
 
+def _summarize_distillation_metrics(
+    metric_samples: list[dict[str, float]],
+    *,
+    target_count: int,
+    policy_count: int | None,
+) -> dict[str, float]:
+    """Average diagnostics while preserving exact immutable job denominators."""
+
+    metrics = average_metric_samples(metric_samples)
+    metrics["data/step_distillation_target_tokens"] = float(target_count)
+    if policy_count is not None:
+        metrics["data/step_policy_tokens"] = float(policy_count)
+    return metrics
+
+
 class MegatronBackend(LocalBackend):
     def __init__(
         self,
@@ -359,17 +374,16 @@ class MegatronBackend(LocalBackend):
             verbose=verbose,
         ):
             metric_samples.append(metrics)
-        metrics = average_metric_samples(metric_samples)
-        metrics.setdefault("time/step_backend_train_s", time.monotonic() - started)
-        metrics.setdefault(
-            "data/step_distillation_target_tokens",
-            float(disk_tensors["target_count"]),
+        metrics = _summarize_distillation_metrics(
+            metric_samples,
+            target_count=disk_tensors["target_count"],
+            policy_count=(
+                int(disk_tensors.get("policy_count", 0))
+                if objective_config.policy is not None
+                else None
+            ),
         )
-        if objective_config.policy is not None:
-            metrics.setdefault(
-                "data/step_policy_tokens",
-                float(disk_tensors.get("policy_count", 0)),
-            )
+        metrics.setdefault("time/step_backend_train_s", time.monotonic() - started)
         step = await self._get_step(model)
         checkpoint_path: str | None = None
         if save_checkpoint:
