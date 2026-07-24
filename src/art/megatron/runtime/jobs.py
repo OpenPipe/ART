@@ -59,16 +59,6 @@ class MegatronSyncJob(BaseModel):
     log_path: str = DEFAULT_TRAINING_LOG_PATH
 
 
-class MegatronLoraPublishJob(BaseModel):
-    kind: Literal["publish_lora"] = "publish_lora"
-    step: int = Field(ge=0)
-    source_lora_path: str
-    output_lora_path: str
-    content_version: int = Field(ge=0)
-    allow_unvalidated_arch: bool = False
-    log_path: str = DEFAULT_TRAINING_LOG_PATH
-
-
 class MegatronOptimizerSaveJob(BaseModel):
     kind: Literal["save_optimizer"] = "save_optimizer"
     step: int = Field(ge=0)
@@ -99,7 +89,6 @@ MegatronJob: TypeAlias = Annotated[
     MegatronTrainingJob
     | MegatronMergedTrainingJob
     | MegatronSyncJob
-    | MegatronLoraPublishJob
     | MegatronOptimizerSaveJob
     | MegatronSFTTrainingJob,
     Field(discriminator="kind"),

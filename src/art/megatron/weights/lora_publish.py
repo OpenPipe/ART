@@ -1,7 +1,4 @@
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-from pathlib import Path
-import time
 from typing import Any, NamedTuple
 
 import torch
@@ -20,34 +17,6 @@ from art.megatron.lora import (
 from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
 from art.megatron.model_support.spec import ExpertPackedLoraGroup, ExpertPackedLoraSlot
 from art.megatron.training.model_chunks import ModelChunks
-
-
-@dataclass(frozen=True)
-class LoraPublishMetrics:
-    """Phase-level measurements for one trainer-side LoRA publication."""
-
-    gather_pack_s: float
-    stage_to_cpu_s: float
-    write_s: float
-    total_s: float
-    logical_bytes: int
-    transported_bytes: int
-    tensor_count: int
-
-    def as_training_metrics(self) -> dict[str, int | float]:
-        return {
-            "time/weight_update_trainer_gather_pack_s": self.gather_pack_s,
-            "time/weight_update_trainer_stage_to_cpu_s": self.stage_to_cpu_s,
-            "time/weight_update_trainer_write_s": self.write_s,
-            "time/weight_update_trainer_publish_s": self.total_s,
-            "weight_update/logical_bytes": self.logical_bytes,
-            "weight_update/transported_bytes": self.transported_bytes,
-            "weight_update/tensor_count": self.tensor_count,
-        }
-
-
-def _tensor_bytes(tensor: torch.Tensor) -> int:
-    return tensor.numel() * tensor.element_size()
 
 
 class PackedExpertShardMeta(NamedTuple):
@@ -788,9 +757,7 @@ def save_vllm_lora_from_model(
     rank: int,
     world_size: int,
     slot_ref: LoRASlotRef | None = None,
-) -> LoraPublishMetrics | None:
-    total_started = time.perf_counter()
-    gather_pack_started = total_started
+) -> None:
     result = build_vllm_lora_tensors_from_model(
         model=model,
         adapter_dtypes=adapter_dtypes,
@@ -800,28 +767,10 @@ def save_vllm_lora_from_model(
         world_size=world_size,
         slot_ref=slot_ref,
     )
-    gather_pack_s = time.perf_counter() - gather_pack_started
     if result is None:
-        return None
+        return
     vllm_tensors, published_config = result
-    logical_bytes = sum(_tensor_bytes(tensor) for tensor in vllm_tensors.values())
-
-    stage_started = time.perf_counter()
     stager = _PinnedCpuStager()
     published_tensors = _stage_published_tensors(vllm_tensors, stager)
     stager.finish()
-    stage_to_cpu_s = time.perf_counter() - stage_started
-
-    write_started = time.perf_counter()
     save_vllm_lora_tensors(output_dir, published_tensors, published_config)
-    write_s = time.perf_counter() - write_started
-    adapter_path = Path(output_dir) / "adapter_model.safetensors"
-    return LoraPublishMetrics(
-        gather_pack_s=gather_pack_s,
-        stage_to_cpu_s=stage_to_cpu_s,
-        write_s=write_s,
-        total_s=time.perf_counter() - total_started,
-        logical_bytes=logical_bytes,
-        transported_bytes=adapter_path.stat().st_size,
-        tensor_count=len(vllm_tensors),
-    )

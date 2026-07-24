@@ -70,7 +70,6 @@ from art.megatron.runtime.jobs import (
     LORA_READY_EVENT,
     OPTIMIZER_READY_EVENT,
     MegatronJob,
-    MegatronLoraPublishJob,
     MegatronMergedTrainingJob,
     MegatronOptimizerSaveJob,
     MegatronSFTTrainingJob,
@@ -890,49 +889,6 @@ def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
             pause_generation=False,
         )
         return
-    if isinstance(job, MegatronLoraPublishJob):
-        adapter_model = _load_adapter_into_model(
-            runtime.model,
-            job.source_lora_path,
-            runtime.rank,
-            handler=runtime.model_support_handler,
-        )
-        adapter_dtypes = {key: tensor.dtype for key, tensor in adapter_model.items()}
-        del adapter_model
-        from art.megatron.weights.lora_publish import iter_lora_modules
-
-        content_value = float(job.content_version + 1) / 1024.0
-        with torch.no_grad():
-            for module in iter_lora_modules(runtime.model):
-                module.B_T.view(-1)[0] = content_value
-        publish_metrics = save_vllm_lora_from_model(
-            model=runtime.model,
-            adapter_dtypes=adapter_dtypes,
-            handler=runtime.model_support_handler,
-            adapter_config=load_adapter_config(job.source_lora_path),
-            output_dir=job.output_lora_path,
-            rank=runtime.rank,
-            world_size=runtime.world_size,
-        )
-        if runtime.rank == 0:
-            assert publish_metrics is not None
-            _write_job_event(
-                job.log_path,
-                LORA_READY_EVENT,
-                step=job.step,
-                content_version=job.content_version,
-                **{
-                    "topology/trainer_tp": ps.get_tensor_model_parallel_world_size(),
-                    "topology/trainer_pp": ps.get_pipeline_model_parallel_world_size(),
-                    "topology/trainer_cp": ps.get_context_parallel_world_size(),
-                    "topology/trainer_ep": ps.get_expert_model_parallel_world_size(),
-                    "topology/trainer_etp": (
-                        ps.get_expert_tensor_parallel_world_size()
-                    ),
-                },
-                **publish_metrics.as_training_metrics(),
-            )
-        return
     if isinstance(job, MegatronSFTTrainingJob):
         run_megatron_sft_job(runtime, job)
         return
@@ -947,9 +903,7 @@ def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
 
 
 def _job_cleanup_path(job: MegatronJob) -> str | None:
-    if isinstance(
-        job, (MegatronOptimizerSaveJob, MegatronSyncJob, MegatronLoraPublishJob)
-    ):
+    if isinstance(job, (MegatronOptimizerSaveJob, MegatronSyncJob)):
         return None
     if isinstance(job, MegatronSFTTrainingJob):
         return job.sft_data_dir
@@ -1072,7 +1026,7 @@ def _save_lora_and_optimizer(
     optimizer_ready_log_path: str | None = None,
 ) -> None:
     assert runtime.optimizer is not None
-    publish_metrics = save_vllm_lora_from_model(
+    save_vllm_lora_from_model(
         model=runtime.model,
         adapter_dtypes=adapter_dtypes,
         handler=runtime.model_support_handler,
@@ -1082,13 +1036,7 @@ def _save_lora_and_optimizer(
         world_size=runtime.world_size,
     )
     if lora_ready_log_path is not None and runtime.rank == 0:
-        assert publish_metrics is not None
-        _write_job_event(
-            lora_ready_log_path,
-            LORA_READY_EVENT,
-            step=step,
-            **publish_metrics.as_training_metrics(),
-        )
+        _write_job_event(lora_ready_log_path, LORA_READY_EVENT, step=step)
     if _should_save_optimizer(
         runtime,
         step=step,

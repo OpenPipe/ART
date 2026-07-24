@@ -101,23 +101,12 @@ class LoraUpdateCoordinator:
                 state.active_admissions -= 1
                 state.condition.notify_all()
 
-    async def begin_update(
-        self, lora_slot: str, policy_version: int | None = None
-    ) -> None:
+    async def begin_update(self, lora_slot: str) -> None:
         state = self._state(lora_slot)
         async with state.condition:
             acquired = False
             try:
                 await state.condition.wait_for(lambda: not state.update_active)
-                if (
-                    policy_version is not None
-                    and state.policy_version is not None
-                    and int(policy_version) <= state.policy_version
-                ):
-                    raise ValueError(
-                        f"LoRA slot {lora_slot!r} policy version must increase: "
-                        f"{policy_version} <= {state.policy_version}"
-                    )
                 state.update_active = True
                 state.blocked = True
                 acquired = True
@@ -139,14 +128,6 @@ class LoraUpdateCoordinator:
         async with state.condition:
             if not state.update_active:
                 raise RuntimeError(f"No active LoRA update for slot {lora_slot!r}")
-            if (
-                state.policy_version is not None
-                and int(policy_version) <= state.policy_version
-            ):
-                raise ValueError(
-                    f"LoRA slot {lora_slot!r} policy version must increase: "
-                    f"{policy_version} <= {state.policy_version}"
-                )
             state.policy_version = int(policy_version)
             state.lora_request = lora_request
             state.update_active = False
@@ -161,28 +142,6 @@ class LoraUpdateCoordinator:
             # until a retry completes publication and scheduler rehashing.
             state.blocked = True
             state.condition.notify_all()
-
-    async def committed_state(self, lora_slot: str) -> dict[str, Any]:
-        state = self._state(lora_slot)
-        async with state.condition:
-            lora_request = state.lora_request
-            return {
-                "lora_slot": lora_slot,
-                "policy_version": state.policy_version,
-                "update_active": state.update_active,
-                "admission_blocked": state.blocked,
-                "active_admissions": state.active_admissions,
-                "installed_lora_path": (
-                    str(lora_request.lora_path) if lora_request is not None else None
-                ),
-                "installed_lora_int_id": (
-                    int(lora_int_id)
-                    if lora_request is not None
-                    and (lora_int_id := getattr(lora_request, "lora_int_id", None))
-                    is not None
-                    else None
-                ),
-            }
 
 
 def lora_update_coordinator(models: Any, engine_client: Any) -> LoraUpdateCoordinator:

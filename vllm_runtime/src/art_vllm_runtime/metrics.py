@@ -32,12 +32,6 @@ class _ArtRuntimeMetricsState:
             "policy_cache_unsalted_lora_requests_total": 0.0,
             "policy_cache_waiting_requests_updated_total": 0.0,
             "policy_cache_started_waiting_requests_skipped_total": 0.0,
-            "weight_update_count_total": 0.0,
-            "weight_update_begin_s_total": 0.0,
-            "weight_update_load_adapter_s_total": 0.0,
-            "weight_update_waiting_cache_s_total": 0.0,
-            "weight_update_commit_s_total": 0.0,
-            "weight_update_s_total": 0.0,
         }
 
     def configure(self, vllm_config: Any, *, engine_idx: int) -> None:
@@ -212,18 +206,6 @@ class _ArtRuntimeMetricsState:
                 float(skipped_started)
             )
 
-    def record_weight_update(self, timing_s: dict[str, float]) -> None:
-        with self._lock:
-            self._counters["weight_update_count_total"] += 1.0
-            for phase, metric in (
-                ("begin_update", "weight_update_begin_s_total"),
-                ("load_adapter", "weight_update_load_adapter_s_total"),
-                ("update_waiting_cache", "weight_update_waiting_cache_s_total"),
-                ("commit_update", "weight_update_commit_s_total"),
-                ("total", "weight_update_s_total"),
-            ):
-                self._counters[metric] += float(timing_s.get(phase, 0.0))
-
 
 _STATE = _ArtRuntimeMetricsState()
 
@@ -264,7 +246,3 @@ def record_policy_cache_waiting_update(*, updated: int, skipped_started: int) ->
         updated=updated,
         skipped_started=skipped_started,
     )
-
-
-def record_weight_update(timing_s: dict[str, float]) -> None:
-    _STATE.record_weight_update(timing_s)
