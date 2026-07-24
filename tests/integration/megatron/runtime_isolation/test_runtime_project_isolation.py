@@ -173,6 +173,11 @@ async def main():
     blocked = not admission.done()
     await coordinator.commit_update(slot, 5, new)
     version, admitted_lora = await admission
+    stale_rejected = False
+    try:
+        await coordinator.begin_update(slot, 5)
+    except ValueError:
+        stale_rejected = True
 
     async with coordinator.admission(slot):
         cancelled_update = asyncio.create_task(coordinator.begin_update(slot))
@@ -191,6 +196,7 @@ async def main():
         "policy_version": version,
         "lora_path": admitted_lora.lora_path,
         "recovered_after_cancel": recovered,
+        "stale_rejected": stale_rejected,
     }, sort_keys=True))
 
 asyncio.run(main())
@@ -204,6 +210,7 @@ asyncio.run(main())
         "lora_path": "new",
         "policy_version": 5,
         "recovered_after_cancel": True,
+        "stale_rejected": True,
     }
 
 

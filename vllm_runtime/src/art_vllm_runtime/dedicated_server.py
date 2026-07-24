@@ -230,7 +230,7 @@ def _patch_art_runtime_routes() -> None:
             coordinator = lora_update_coordinator(models, engine_client)
             update_started = time.perf_counter()
             begin_started = update_started
-            await coordinator.begin_update(lora_slot)
+            await coordinator.begin_update(lora_slot, policy_version)
             begin_s = time.perf_counter() - begin_started
             try:
                 load_started = time.perf_counter()
