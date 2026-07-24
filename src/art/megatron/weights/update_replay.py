@@ -1,8 +1,7 @@
-"""Replay in-flight LoRA updates against an ART vLLM runtime.
+"""Receiver-only replay of pre-published LoRA updates.
 
-The replay input is a sequence of real trainer-produced checkpoints. Keeping the
-captured safetensors files intact preserves the serving tensor names, shapes,
-dtypes, and byte volume without rerunning Megatron, reward, or judging.
+This diagnostic deliberately excludes trainer publication. Use
+``MegatronService.replay_lora_update`` for end-to-end measurements.
 """
 
 from __future__ import annotations
@@ -116,6 +115,12 @@ def validate_replay_snapshots(
 ) -> None:
     if not snapshots:
         raise ValueError("At least one adapter snapshot is required")
+    paths = [snapshot.path for snapshot in snapshots]
+    hashes = [snapshot.file_sha256 for snapshot in snapshots]
+    if len(set(paths)) != len(paths):
+        raise ValueError("Receiver-only replay requires unique snapshot paths")
+    if len(set(hashes)) != len(hashes):
+        raise ValueError("Receiver-only replay requires unique snapshot contents")
     reference = snapshots[0]
     for snapshot in snapshots:
         if snapshot.rank != expected_rank:
@@ -222,6 +227,12 @@ async def replay_updates(args: argparse.Namespace) -> dict[str, Any]:
     server_paths = args.server_adapter_path or [item.path for item in snapshots]
     if len(server_paths) != len(snapshots):
         raise ValueError("--server-adapter-path must match --adapter-path count")
+    total_updates = args.warmups + args.updates
+    if len(snapshots) != total_updates:
+        raise ValueError(
+            "Receiver-only replay requires exactly one unique snapshot per update: "
+            f"{len(snapshots)} != {total_updates}"
+        )
 
     headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
     timeout = httpx.Timeout(args.timeout_s)
@@ -258,9 +269,8 @@ async def replay_updates(args: argparse.Namespace) -> dict[str, Any]:
         update_records: list[dict[str, Any]] = []
         measured_update_s = 0.0
         try:
-            total_updates = args.warmups + args.updates
             for update_index in range(total_updates):
-                snapshot_index = update_index % len(snapshots)
+                snapshot_index = update_index
                 policy_version = args.first_policy_version + update_index
                 before_load = fixed_load.snapshot() if fixed_load else LoadCounters()
                 started = time.perf_counter()
@@ -325,6 +335,7 @@ async def replay_updates(args: argparse.Namespace) -> dict[str, Any]:
     )
     return {
         "schema_version": 1,
+        "measurement_scope": "receiver_only_pre_published_snapshots",
         "mode": args.mode,
         "warmups": args.warmups,
         "measured_updates": args.updates,

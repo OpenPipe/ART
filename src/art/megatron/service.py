@@ -73,6 +73,7 @@ from .runtime.client import (
 from .runtime.jobs import (
     LORA_READY_EVENT,
     OPTIMIZER_READY_EVENT,
+    MegatronLoraPublishJob,
     MegatronMergedTrainingJob,
     MegatronOptimizerSaveJob,
     MegatronSFTTrainingJob,
@@ -934,6 +935,54 @@ class MegatronService:
         ):
             pass
         self._latest_step = step
+
+    async def replay_lora_update(
+        self,
+        *,
+        source_lora_path: str,
+        output_lora_path: str,
+        policy_version: int,
+        content_version: int,
+    ) -> dict[str, float]:
+        """Publish real resident Megatron tensors, then install that exact output."""
+        if not self.is_dedicated:
+            raise RuntimeError("LoRA update replay requires dedicated trainer GPUs")
+        if self.rollout_weight_update_mode != "in_flight_lora":
+            raise RuntimeError("LoRA update replay requires in_flight_lora mode")
+        if os.path.exists(output_lora_path):
+            raise FileExistsError(f"Replay output already exists: {output_lora_path}")
+        await self._ensure_megatron_running()
+        self._clear_pending_jobs()
+        job_path, log_path = self._create_megatron_job_paths()
+        job = MegatronLoraPublishJob(
+            step=policy_version,
+            source_lora_path=source_lora_path,
+            output_lora_path=output_lora_path,
+            content_version=content_version,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+            log_path=log_path,
+        )
+        write_megatron_job(job, job_path=job_path)
+        publish_metrics: dict[str, float] | None = None
+        async for result in stream_megatron_job(
+            job,
+            job_path=job_path,
+            process=self._megatron_process,
+            process_log_path=self._megatron_log_path,
+        ):
+            if result.get("event") != LORA_READY_EVENT:
+                raise RuntimeError(f"Unexpected replay worker event: {result!r}")
+            if int(result.get("step", -1)) != policy_version:
+                raise RuntimeError(f"Replay worker published wrong step: {result!r}")
+            if int(result.get("content_version", -1)) != content_version:
+                raise RuntimeError(f"Replay worker published wrong content: {result!r}")
+            publish_metrics = self._weight_update_metrics_from_event(result)
+        if publish_metrics is None:
+            raise RuntimeError("Replay worker produced no LoRA-ready metrics")
+        install_metrics = await self._update_in_flight_adapter(
+            output_lora_path, policy_version
+        )
+        return {**publish_metrics, **install_metrics}
 
     async def _sleep_runtime(self) -> None:
         import httpx

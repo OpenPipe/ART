@@ -5,6 +5,11 @@ import pytest
 import torch
 
 from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
+from art.megatron.runtime.jobs import (
+    MegatronLoraPublishJob,
+    dump_megatron_job,
+    load_megatron_job,
+)
 from art.megatron.service import MegatronService
 from art.megatron.weights.lora_publish import LoraPublishMetrics
 from art.megatron.weights.update_replay import (
@@ -114,6 +119,34 @@ def test_replay_snapshot_rejects_nonrepresentative_rank(tmp_path: Path) -> None:
             expected_experts=256,
             expected_model_substring="Qwen3.6-35B-A3B",
         )
+
+
+def test_receiver_replay_rejects_duplicate_snapshot_contents(tmp_path: Path) -> None:
+    first_path = tmp_path / "first"
+    second_path = tmp_path / "second"
+    _write_snapshot(first_path, value=1.0)
+    _write_snapshot(second_path, value=1.0)
+
+    with pytest.raises(ValueError, match="unique snapshot contents"):
+        validate_replay_snapshots(
+            [inspect_adapter(first_path), inspect_adapter(second_path)],
+            expected_rank=8,
+            expected_experts=256,
+            expected_model_substring="Qwen3.6-35B-A3B",
+        )
+
+
+def test_lora_publish_job_roundtrips_through_worker_protocol() -> None:
+    job = MegatronLoraPublishJob(
+        step=9,
+        source_lora_path="/checkpoints/seed",
+        output_lora_path="/scratch/replay/0009",
+        content_version=8,
+        allow_unvalidated_arch=True,
+        log_path="/scratch/replay/0009.jsonl",
+    )
+
+    assert load_megatron_job(dump_megatron_job(job)) == job
 
 
 def test_policy_version_must_match_committed_runtime_version() -> None:
