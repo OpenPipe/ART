@@ -894,14 +894,42 @@ def test_anthropic_fallback_preserves_thinking_and_tool_history() -> None:
     ]
 
 
-def test_reasoning_stripped_history_uses_stream_block_tokens() -> None:
+@pytest.mark.parametrize("top_level_only", [False, True])
+def test_reasoning_stripped_messages_history_preserves_exact_tokens(
+    top_level_only: bool,
+) -> None:
     def exchange(
         offset: int,
         request_messages: list[MessageParam],
         answer: str,
+        prompt_token_ids: list[int],
         token_ids: list[int],
     ) -> MessagesExchange:
         start = datetime(2026, 1, 1) + timedelta(seconds=offset)
+        thinking: dict[str, Any] = {
+            "type": "thinking",
+            "thinking": f"thought-{offset}",
+            "signature": "signature",
+        }
+        text: dict[str, Any] = {"type": "text", "text": answer}
+        response_extra: dict[str, Any] = {}
+        if top_level_only:
+            response_extra = {
+                "prompt_token_ids": prompt_token_ids,
+                "token_ids": [90 + offset, *token_ids],
+                "logprobs": [
+                    -9.0 - offset,
+                    *[-0.1 * token for token in token_ids],
+                ],
+            }
+        else:
+            thinking.update({"token_ids": [90 + offset], "logprobs": [-9.0 - offset]})
+            text.update(
+                {
+                    "token_ids": token_ids,
+                    "logprobs": [-0.1 * token for token in token_ids],
+                }
+            )
         return MessagesExchange(
             request=MessagesRequest(
                 model="test/model",
@@ -915,24 +943,11 @@ def test_reasoning_stripped_history_uses_stream_block_tokens() -> None:
                     "type": "message",
                     "role": "assistant",
                     "model": "test/model",
-                    "content": [
-                        {
-                            "type": "thinking",
-                            "thinking": f"thought-{offset}",
-                            "signature": "signature",
-                            "token_ids": [90 + offset],
-                            "logprobs": [-9.0 - offset],
-                        },
-                        {
-                            "type": "text",
-                            "text": answer,
-                            "token_ids": token_ids,
-                            "logprobs": [-0.1 * token for token in token_ids],
-                        },
-                    ],
+                    "content": [thinking, text],
                     "stop_reason": "end_turn",
                     "stop_sequence": None,
                     "usage": {"input_tokens": 1, "output_tokens": len(token_ids)},
+                    **response_extra,
                 }
             ),
             start_time=start,
@@ -943,6 +958,7 @@ def test_reasoning_stripped_history_uses_stream_block_tokens() -> None:
         0,
         [{"role": "user", "content": "one"}],
         "first",
+        [10],
         [101, 102],
     )
     second = exchange(
@@ -953,6 +969,7 @@ def test_reasoning_stripped_history_uses_stream_block_tokens() -> None:
             {"role": "user", "content": "two"},
         ],
         "second",
+        [10, 101, 102, 11],
         [201],
     )
 

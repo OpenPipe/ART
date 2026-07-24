@@ -511,6 +511,7 @@ class Trajectory(_CompactModel):
     def __str__(self) -> str:
         return f"Trajectory(reward={self.reward}, metrics={self.metrics}, metadata={self.metadata})"
 
+    # Every model selector accepts an exact identity or a shell-style pattern.
     def chat_completions_history(
         self, *, model: str | None = None
     ) -> ChatCompletionsHistory:

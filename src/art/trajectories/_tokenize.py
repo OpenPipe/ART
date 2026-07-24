@@ -38,6 +38,7 @@ from . import (
     TrajectoryGroup,
     TrajectoryHistory,
 )
+from ._history import _model_matches
 from ._protocols import Exchange
 
 if TYPE_CHECKING:
@@ -529,7 +530,9 @@ def _exchange_list(trajectory: Trajectory, model: str | None) -> list[Exchange]:
         *trajectory.exchanges.messages,
     ]
     if model is not None:
-        exchanges = [exchange for exchange in exchanges if exchange.model == model]
+        exchanges = [
+            exchange for exchange in exchanges if _model_matches(exchange.model, model)
+        ]
         if not exchanges:
             raise ValueError(f"Trajectory contains no exchanges for model {model!r}")
     models = {exchange.model for exchange in exchanges}
@@ -559,7 +562,7 @@ def _require_training_model(trajectory: Trajectory, model: str | None) -> str:
     if None in models:
         raise ValueError("Every training exchange must identify its model")
     if model is not None:
-        if model not in models:
+        if not any(_model_matches(candidate, model) for candidate in models):
             raise ValueError(f"Trajectory contains no exchanges for model {model!r}")
         return model
     if len(models) != 1:
@@ -567,6 +570,16 @@ def _require_training_model(trajectory: Trajectory, model: str | None) -> str:
             "Exchange training requires exactly one model; pass model= to select one"
         )
     return cast(str, next(iter(models)))
+
+
+def _training_model_pattern(model: str) -> str:
+    """Select every immutable checkpoint belonging to one automatic policy."""
+
+    if re.search(r"@\d+$", model):
+        return re.sub(r"\d+$", "*", model)
+    if re.search(r":step\d+$", model):
+        return re.sub(r"\d+$", "*", model)
+    return model
 
 
 def _artifact_name(model: str) -> str:
@@ -2386,8 +2399,10 @@ def _source_is_sampled(source: object) -> bool:
 
 def _tokenize_exact_projected_chat_history(
     history: ChatCompletionsHistory,
+    *,
+    projection_validated: bool = False,
 ) -> TokenizedHistory | None:
-    if not _history_matches_projection(history):
+    if not projection_validated and not _history_matches_projection(history):
         return None
     sampled_sources: list[object] = []
     seen: set[tuple[object, ...]] = set()
@@ -3179,9 +3194,27 @@ def tokenize_history(
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
         )
-    if (isinstance(history, AnthropicMessagesHistory) and needs_render) or (
-        isinstance(history, ResponsesHistory) and needs_render
-    ):
+    if isinstance(history, AnthropicMessagesHistory) and needs_render:
+        converted = history.as_chat_completions_history()
+        if (
+            not override_requires_render
+            and _history_matches_projection(history)
+            and (
+                exact := _tokenize_exact_projected_chat_history(
+                    converted,
+                    projection_validated=True,
+                )
+            )
+        ):
+            return exact
+        return _tokenize_chat_view(
+            converted,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+    if isinstance(history, ResponsesHistory) and needs_render:
         return _tokenize_chat_view(
             history.as_chat_completions_history(),
             base_model=base_model,

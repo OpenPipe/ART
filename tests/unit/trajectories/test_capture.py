@@ -723,6 +723,76 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
             assert getattr(exchange.response, "prompt_token_ids") == [1]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("prompt_token_ids", [True]),
+        ("prompt_token_ids", [-1]),
+        ("token_ids", [False]),
+        ("token_ids", [-1]),
+        ("logprobs", [True]),
+        ("logprobs", [float("nan")]),
+        ("logprobs", [float("inf")]),
+    ],
+)
+def test_streaming_messages_reject_malformed_token_metadata(
+    field: str, value: list[object]
+) -> None:
+    delta = {
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+        "usage": {"output_tokens": 1},
+        "prompt_token_ids": [1],
+        "token_ids": [2],
+        "logprobs": [-0.2],
+        field: value,
+    }
+    body = _sse(
+        [
+            (
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        **MESSAGE,
+                        "content": [],
+                        "stop_reason": None,
+                        "usage": {"input_tokens": 1, "output_tokens": 0},
+                    },
+                },
+            ),
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": "", "citations": None},
+                },
+            ),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "hello"},
+                },
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            ("message_delta", delta),
+            ("message_stop", {"type": "message_stop"}),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="must contain"):
+        build_exchange(
+            "messages",
+            {"model": "test/model", "messages": [], "stream": True},
+            body,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+
+
 def test_streaming_chat_choices_are_accumulated_by_index() -> None:
     now = datetime.now()
 

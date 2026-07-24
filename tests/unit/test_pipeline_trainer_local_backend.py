@@ -753,7 +753,7 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
         patch(
             "art.local.backend.tokenize_trajectory_groups",
             return_value=iter([short_result, long_result]),
-        ),
+        ) as tokenize,
         pytest.warns(UserWarning, match="Dropping 1 tokenized results"),
     ):
         packed_tensors = backend._get_packed_tensors(
@@ -769,6 +769,7 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
 
     assert packed_tensors is not None
     assert packed_tensors["tokens"].shape == (1, 4)
+    assert tokenize.call_args.kwargs["model"] == f"{model.name}@*"
 
 
 @pytest.mark.asyncio

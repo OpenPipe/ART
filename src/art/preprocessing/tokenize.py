@@ -17,6 +17,7 @@ from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokeni
 if TYPE_CHECKING:
     from transformers.image_processing_utils import BaseImageProcessor
 
+from ..openai import ART_MOE_ROUTING_METADATA_KEY
 from ..trajectories import (
     ChatCompletionsExchange,
     ChatCompletionsHistory,
@@ -117,31 +118,87 @@ def _chat_choice_trace(
         metadata = choice_vllm_token_metadata(choice)
         assert metadata is not None
         completion_ids = metadata[1]
-        matches = [
-            index
-            for index in range(cursor, len(token_ids) - len(completion_ids) + 1)
-            if token_ids[index : index + len(completion_ids)] == completion_ids
-            and all(
-                flag & TokenFlag.SAMPLED
-                for flag in flags[index : index + len(completion_ids)]
-            )
-        ]
+        retained_start = 0
+
+        def matching_offsets(values: list[int]) -> list[int]:
+            return [
+                index
+                for index in range(cursor, len(token_ids) - len(values) + 1)
+                if token_ids[index : index + len(values)] == values
+                and all(
+                    flag & TokenFlag.SAMPLED
+                    for flag in flags[index : index + len(values)]
+                )
+            ]
+
+        matches = matching_offsets(completion_ids)
+        if not matches and completion_ids:
+            for retained_start in range(1, len(completion_ids)):
+                matches = matching_offsets(completion_ids[retained_start:])
+                if matches:
+                    break
         if not matches:
             if has_routing:
                 raise RuntimeError(
                     "MoE routed completion tokens are absent from tokenized history"
                 )
             return None
+        if retained_start and len(matches) != 1:
+            if has_routing:
+                raise RuntimeError(
+                    "MoE routed completion suffix is ambiguous in tokenized history"
+                )
+            return None
+        retained_ids = completion_ids[retained_start:]
         offset = matches[0]
-        choices.append(choice)
+        choices.append(
+            _choice_with_retained_routing(choice, retained_start)
+            if retained_start
+            else choice
+        )
         offsets.append(offset)
-        lengths.append(len(completion_ids))
-        cursor = offset + len(completion_ids)
+        lengths.append(len(retained_ids))
+        cursor = offset + len(retained_ids)
     return (
         _ChatChoiceTrace(choices=choices, offsets=offsets, lengths=lengths)
         if choices
         else None
     )
+
+
+def _choice_with_retained_routing(choice: Choice, start: int) -> Choice:
+    """Copy one routed choice while retaining only a completion suffix."""
+
+    routing = choice_moe_routing_metadata(choice)
+    if routing is None:
+        return choice
+    token_metadata = choice_vllm_token_metadata(choice)
+    assert token_metadata is not None
+    prompt_ids, completion_ids = token_metadata
+    routes = routing.get("routed_experts")
+    if not isinstance(routes, np.ndarray):
+        raise RuntimeError("Missing binary routed experts")
+    completion_route_count = len(routes) - len(prompt_ids)
+    if completion_route_count not in {
+        len(completion_ids),
+        max(len(completion_ids) - 1, 0),
+    }:
+        raise RuntimeError(
+            "routed_experts length does not match prompt/completion token ids"
+        )
+    retained = choice.model_copy()
+    extra = retained.model_extra
+    if extra is None:
+        raise RuntimeError("OpenAI Choice.model_extra is unavailable for route replay")
+    extra["token_ids"] = completion_ids[start:]
+    extra[ART_MOE_ROUTING_METADATA_KEY] = {
+        **routing,
+        "completion_token_ids": completion_ids[start:],
+        "routed_experts": np.concatenate(
+            (routes[: len(prompt_ids)], routes[len(prompt_ids) + start :])
+        ),
+    }
+    return retained
 
 
 def _slice_moe_routes(

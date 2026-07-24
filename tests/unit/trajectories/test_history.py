@@ -220,6 +220,43 @@ def test_chat_history_resolves_one_model_and_append_only_sequence() -> None:
         trajectory.chat_completions_history(model="test/model")
 
 
+def test_model_patterns_select_matching_histories_only() -> None:
+    policy_12 = _chat(
+        [{"role": "user", "content": "one"}],
+        "first",
+        model="policy@12",
+    )
+    judge = _chat(
+        [{"role": "user", "content": "judge"}],
+        "score",
+        model="judge@4",
+        offset=1,
+    )
+    policy_13 = _chat(
+        [{"role": "user", "content": "two"}],
+        "second",
+        model="policy@13",
+        offset=2,
+    )
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[policy_12, judge, policy_13])
+    )
+
+    histories = trajectory.chat_completions_histories(model="policy@*")
+    assert [history.model for history in histories] == ["policy@12", "policy@13"]
+    generic_histories = trajectory.histories(model="policy@*")
+    assert all(isinstance(history, art.History) for history in generic_histories)
+    assert [cast(art.History, history).model for history in generic_histories] == [
+        "policy@12",
+        "policy@13",
+    ]
+    assert trajectory.chat_completions_history(model="policy@12").model == "policy@12"
+    with pytest.raises(ValueError, match="exactly one history"):
+        trajectory.history(model="policy@*")
+    with pytest.raises(ValueError, match="no Chat Completions exchanges"):
+        trajectory.chat_completions_histories(model="foreign@*")
+
+
 def test_chat_history_preserves_provider_specific_nested_fields() -> None:
     exchange = _chat(
         [

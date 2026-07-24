@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import math
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -224,6 +225,35 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
     prompt_token_ids: list[int] = []
     block_token_ids: dict[int, list[int]] = {}
     block_logprobs: dict[int, list[float]] = {}
+
+    def parsed_token_ids(value: object, field: str) -> list[int] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must contain integer token IDs")
+        result: list[int] = []
+        for item in value:
+            if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+                raise ValueError(f"{field} must contain integer token IDs")
+            result.append(item)
+        return result
+
+    def token_logprobs(value: object, field: str) -> list[float] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must contain numeric logprobs")
+        result: list[float] = []
+        for item in value:
+            if (
+                not isinstance(item, (int, float))
+                or isinstance(item, bool)
+                or not math.isfinite(item)
+            ):
+                raise ValueError(f"{field} must contain numeric logprobs")
+            result.append(float(item))
+        return result
+
     for event_name, payload in _sse_events(body):
         if not isinstance(payload, dict):
             continue
@@ -240,44 +270,49 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
             values = (
                 message.get("prompt_token_ids") if isinstance(message, dict) else None
             )
-            if isinstance(values, list) and all(
-                isinstance(value, int) for value in values
-            ):
+            if (
+                values := parsed_token_ids(values, "Messages prompt_token_ids")
+            ) is not None:
                 prompt_token_ids = values
         elif event.type == "message_delta":
-            values = payload.get("prompt_token_ids")
-            if isinstance(values, list) and all(
-                isinstance(value, int) for value in values
-            ):
+            if (
+                values := parsed_token_ids(
+                    payload.get("prompt_token_ids"), "Messages prompt_token_ids"
+                )
+            ) is not None:
                 prompt_token_ids = values
-            event_token_ids = payload.get("token_ids")
-            event_logprobs = payload.get("logprobs")
-            if isinstance(event_token_ids, list) and all(
-                isinstance(value, int) for value in event_token_ids
-            ):
+            if (
+                event_token_ids := parsed_token_ids(
+                    payload.get("token_ids"), "Messages token_ids"
+                )
+            ) is not None:
                 token_ids = event_token_ids
-            if isinstance(event_logprobs, list) and all(
-                isinstance(value, (int, float)) for value in event_logprobs
-            ):
-                logprobs = [float(value) for value in event_logprobs]
+            if (
+                event_logprobs := token_logprobs(
+                    payload.get("logprobs"), "Messages logprobs"
+                )
+            ) is not None:
+                logprobs = event_logprobs
         elif event.type in {"content_block_start", "content_block_delta"}:
             index = payload.get("index")
-            event_token_ids = payload.get("token_ids")
-            event_logprobs = payload.get("logprobs")
+            event_token_ids = parsed_token_ids(
+                payload.get("token_ids"), "Messages content token_ids"
+            )
+            event_logprobs = token_logprobs(
+                payload.get("logprobs"), "Messages content logprobs"
+            )
             if (
                 isinstance(index, int)
-                and isinstance(event_token_ids, list)
-                and all(isinstance(value, int) for value in event_token_ids)
+                and not isinstance(index, bool)
+                and event_token_ids
             ):
                 block_token_ids.setdefault(index, []).extend(event_token_ids)
             if (
                 isinstance(index, int)
-                and isinstance(event_logprobs, list)
-                and all(isinstance(value, (int, float)) for value in event_logprobs)
+                and not isinstance(index, bool)
+                and event_logprobs
             ):
-                block_logprobs.setdefault(index, []).extend(
-                    float(value) for value in event_logprobs
-                )
+                block_logprobs.setdefault(index, []).extend(event_logprobs)
         complete = complete or event.type == "message_stop"
     if snapshot is None or not complete:
         raise ValueError("Incomplete Messages stream")

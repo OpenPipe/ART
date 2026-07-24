@@ -91,6 +91,7 @@ from ..preprocessing.tokenize import (
 )
 from ..serving_capabilities import ServingCapabilities
 from ..trajectories import Trajectory, TrajectoryGroup
+from ..trajectories._tokenize import _training_model_pattern
 from ..types import (
     Choice,
     LocalTrainResult,
@@ -958,7 +959,7 @@ class LocalBackend:
                 image_processor=self._image_processors[model.base_model],
                 chat_template_kwargs=chat_template_kwargs,
                 chat_template_tool_schema_format=chat_template_tool_schema_format,
-                model=self._model_inference_name(model),
+                model=_training_model_pattern(self._model_inference_name(model)),
             )
         )
         if not tokenized_results:
