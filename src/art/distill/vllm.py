@@ -30,6 +30,19 @@ class VLLMRetryableScoringError(
     """Transient vLLM failure safe to retry with the identical request."""
 
 
+# vLLM emits prompt log-probabilities from float32 model outputs. A sum of
+# ``width`` positive float32 probabilities can exceed one by at most the
+# standard sequential-accumulation bound gamma_width = width*u/(1-width*u),
+# where u is binary32 unit roundoff. Keep this local to the wire parser: the
+# prepared target remains an ordinary normalized distribution.
+_FLOAT32_UNIT_ROUNDOFF = 2.0**-24
+
+
+def _float32_accumulation_tolerance(width: int) -> float:
+    scaled_roundoff = width * _FLOAT32_UNIT_ROUNDOFF
+    return scaled_roundoff / (1.0 - scaled_roundoff)
+
+
 class VLLMTeacherScorer:
     """Score exact continuation IDs through vLLM 0.23 prompt log-probabilities.
 
@@ -343,14 +356,38 @@ def _parse_position(
     if expected_width == logical_vocab_size:
         if not math.isclose(explicit_mass, 1.0, rel_tol=1e-7, abs_tol=1e-9):
             raise VLLMScoringError("full prompt distribution does not normalize to one")
+        log_normalizer = math.log(explicit_mass)
+        ordered = tuple(
+            (token_id, logprob - log_normalizer) for token_id, logprob in ordered
+        )
         tail_logprob = None
     else:
         tail_mass = 1.0 - explicit_mass
-        if not math.isfinite(tail_mass) or tail_mass <= 0.0:
+        if not math.isfinite(tail_mass):
             raise VLLMScoringError(
                 "sparse prompt distribution has invalid residual mass"
             )
-        tail_logprob = math.log(tail_mass)
+        if tail_mass > 0.0:
+            tail_logprob = math.log(tail_mass)
+        else:
+            over_mass = -tail_mass
+            tolerance = _float32_accumulation_tolerance(expected_width)
+            if over_mass > tolerance:
+                raise VLLMScoringError(
+                    "sparse prompt distribution has invalid residual mass"
+                )
+
+            # A sparse distribution must retain a positive tail. One binary32
+            # unit roundoff is the smallest meaningful probability-scale mass
+            # for this float32 wire contract. Renormalizing by a common factor
+            # preserves the supplied rank order while making explicit entries
+            # plus the synthetic tail a valid full-vocabulary distribution.
+            synthetic_tail_mass = _FLOAT32_UNIT_ROUNDOFF
+            log_normalizer = math.log(explicit_mass + synthetic_tail_mass)
+            ordered = tuple(
+                (token_id, logprob - log_normalizer) for token_id, logprob in ordered
+            )
+            tail_logprob = math.log(synthetic_tail_mass) - log_normalizer
 
     return ScoredPosition(
         position=position,

@@ -16,6 +16,8 @@ from art.distill.vllm import (
     VLLMRetryableScoringError,
     VLLMScoringError,
     VLLMTeacherScorer,
+    _float32_accumulation_tolerance,
+    _parse_position,
 )
 from art.serving_capabilities import ServingCapabilities
 
@@ -162,6 +164,121 @@ async def test_scores_exact_forced_tokens_and_retains_residual_tail() -> None:
     assert math.exp(first.tail_logprob or 0.0) == pytest.approx(0.2)
     assert tuple(entry.token_id for entry in second.entries) == (3, 4)
     assert math.exp(second.tail_logprob or 0.0) == pytest.approx(0.15)
+
+
+def _uniform_wire_distribution(*, width: int, total_mass: float) -> dict[str, Any]:
+    logprob = math.log(total_mass / width)
+    return {
+        str(token_id): {"logprob": logprob, "rank": token_id + 1}
+        for token_id in range(width)
+    }
+
+
+def test_accepts_float32_scale_sparse_overflow_and_normalizes_deterministically() -> (
+    None
+):
+    wire = _uniform_wire_distribution(width=32, total_mass=1.0 + 1.11e-7)
+
+    first = _parse_position(
+        wire,
+        position=0,
+        forced_token_id=0,
+        k=32,
+        logical_vocab_size=64,
+    )
+    second = _parse_position(
+        wire,
+        position=0,
+        forced_token_id=0,
+        k=32,
+        logical_vocab_size=64,
+    )
+
+    assert first == second
+    assert first.model_dump_json() == second.model_dump_json()
+    assert first.tail_logprob is not None
+    assert math.exp(first.tail_logprob) > 0.0
+    masses = [
+        *(math.exp(entry.logprob) for entry in first.entries),
+        math.exp(first.tail_logprob),
+    ]
+    assert math.fsum(masses) == pytest.approx(1.0, abs=2e-15)
+    assert all(
+        left.logprob >= right.logprob
+        for left, right in zip(first.entries, first.entries[1:])
+    )
+
+
+@pytest.mark.parametrize(
+    "over_mass",
+    [
+        _float32_accumulation_tolerance(32) * 1.01,
+        1e-3,
+    ],
+)
+def test_rejects_boundary_and_material_sparse_overflow(over_mass: float) -> None:
+    with pytest.raises(VLLMScoringError, match="invalid residual"):
+        _parse_position(
+            _uniform_wire_distribution(
+                width=32,
+                total_mass=1.0 + over_mass,
+            ),
+            position=0,
+            forced_token_id=0,
+            k=32,
+            logical_vocab_size=64,
+        )
+
+
+def test_sparse_overflow_still_requires_forced_token_observation() -> None:
+    with pytest.raises(VLLMScoringError, match="omitted the forced token"):
+        _parse_position(
+            _uniform_wire_distribution(width=32, total_mass=1.0 + 1.11e-7),
+            position=0,
+            forced_token_id=63,
+            k=32,
+            logical_vocab_size=64,
+        )
+
+
+def test_positive_sparse_residual_preserves_explicit_logprobs() -> None:
+    first_logprob = math.log(0.6)
+    second_logprob = math.log(0.3)
+    result = _parse_position(
+        {
+            "0": {"logprob": first_logprob, "rank": 1},
+            "1": {"logprob": second_logprob, "rank": 2},
+        },
+        position=0,
+        forced_token_id=0,
+        k=2,
+        logical_vocab_size=5,
+    )
+
+    assert tuple(entry.logprob for entry in result.entries) == (
+        first_logprob,
+        second_logprob,
+    )
+    expected_tail = 1.0 - math.fsum((math.exp(first_logprob), math.exp(second_logprob)))
+    assert result.tail_logprob == math.log(expected_tail)
+
+
+def test_full_distribution_normalizes_without_synthesizing_a_tail() -> None:
+    result = _parse_position(
+        {
+            "0": {"logprob": math.log(0.6), "rank": 1},
+            "1": {"logprob": math.log(0.40000004), "rank": 2},
+        },
+        position=0,
+        forced_token_id=0,
+        k=2,
+        logical_vocab_size=2,
+    )
+
+    assert result.tail_logprob is None
+    assert math.fsum(math.exp(entry.logprob) for entry in result.entries) == (
+        pytest.approx(1.0, abs=2e-15)
+    )
 
 
 @pytest.mark.asyncio
