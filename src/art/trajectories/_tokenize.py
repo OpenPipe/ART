@@ -837,41 +837,6 @@ def _exchange_list(trajectory: Trajectory, model: str | None) -> list[Exchange]:
     )
 
 
-def _require_training_model(trajectory: Trajectory, model: str | None) -> str:
-    """Resolve one exchange model without guessing which policy should train."""
-
-    models = {
-        exchange.model
-        for exchange in (
-            *trajectory.exchanges.chat_completions,
-            *trajectory.exchanges.completions,
-            *trajectory.exchanges.responses,
-            *trajectory.exchanges.messages,
-        )
-    }
-    if None in models:
-        raise ValueError("Every training exchange must identify its model")
-    if model is not None:
-        if not any(_model_matches(candidate, model) for candidate in models):
-            raise ValueError(f"Trajectory contains no exchanges for model {model!r}")
-        return model
-    if len(models) != 1:
-        raise ValueError(
-            "Exchange training requires exactly one model; pass model= to select one"
-        )
-    return cast(str, next(iter(models)))
-
-
-def _training_model_pattern(model: str) -> str:
-    """Select every immutable checkpoint belonging to one automatic policy."""
-
-    if re.search(r"@\d+$", model):
-        return re.sub(r"\d+$", "*", model)
-    if re.search(r":step\d+$", model):
-        return re.sub(r"\d+$", "*", model)
-    return model
-
-
 def _artifact_name(model: str) -> str:
     return model.removeprefix("wandb-artifact:///")
 

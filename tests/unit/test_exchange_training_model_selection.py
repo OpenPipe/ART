@@ -366,6 +366,23 @@ def test_automatic_training_model_selector_treats_family_metacharacters_literall
     assert not selector.matches("policy[blue]anything@13")
 
 
+def test_automatic_training_model_selector_treats_non_family_metacharacters_literally() -> (
+    None
+):
+    selector = automatic_training_model_selector("policy*")
+    assert selector.matches("policy*")
+    assert not selector.matches("policy-judge")
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+def test_training_model_selector_rejects_empty_value(automatic: bool) -> None:
+    with pytest.raises(ValueError, match="cannot be empty"):
+        if automatic:
+            automatic_training_model_selector("")
+        else:
+            resolve_training_model(_group().trajectories[0], "")
+
+
 def test_automatic_training_selector_rejects_multiple_numeric_steps() -> None:
     trajectory = _versioned_group().trajectories[0]
     selector = automatic_training_model_selector("policy@12")

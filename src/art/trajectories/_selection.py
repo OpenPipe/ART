@@ -15,6 +15,11 @@ class ModelSelector:
 
     value: str
     automatic_family: tuple[str, str] | None = None
+    allow_glob: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.value:
+            raise ValueError("A model selector cannot be empty")
 
     def matches(self, candidate: str) -> bool:
         if self.automatic_family is not None:
@@ -25,11 +30,15 @@ class ModelSelector:
                     candidate,
                 )
             )
-        return fnmatchcase(candidate, self.value)
+        return (
+            fnmatchcase(candidate, self.value)
+            if self.allow_glob
+            else candidate == self.value
+        )
 
 
 def public_model_selector(value: str) -> ModelSelector:
-    return ModelSelector(value)
+    return ModelSelector(value, allow_glob=True)
 
 
 def automatic_training_model_selector(value: str) -> ModelSelector:
