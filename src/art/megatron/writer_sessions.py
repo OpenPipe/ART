@@ -419,9 +419,14 @@ class WriterSessionStore:
             if journal is None or journal["state"] == "closed":
                 return WriterRecovery(action="none")
             recovery = self._classify_recovery(journal)
-            if recovery.action == "abandoned_before_submit":
+            if recovery.action in {"abandoned_before_submit", "busy_open"}:
                 self._close_abandoned(journal)
-                return recovery
+                return WriterRecovery(
+                    action="abandoned_before_submit",
+                    session_id=recovery.session_id,
+                    revision=recovery.revision,
+                    fence=recovery.fence,
+                )
             if recovery.action == "closed_committed":
                 self._close_committed(journal, recovered=True)
                 return recovery
@@ -457,7 +462,16 @@ class WriterSessionStore:
         ttl = _positive_finite_ttl(ttl_s)
         self._acquire_gate()
         try:
-            self._recover_before_acquire()
+            recovery = self._recover_before_acquire()
+            if (
+                recovery.action == "closed_committed"
+                and recovery.revision is not None
+                and revision != recovery.revision + 1
+            ):
+                raise WriterSessionValidationError(
+                    "writer revision is stale after recovering a committed update; "
+                    f"authoritative revision is {recovery.revision + 1}"
+                )
             fence = self._next_fence()
             session_id = uuid.uuid4().hex
             capability = self._secret_factory(_CAPABILITY_BYTES)
@@ -504,28 +518,50 @@ class WriterSessionStore:
             self._release_gate(None)
             raise
 
-    def _recover_before_acquire(self) -> None:
+    def _recover_before_acquire(self) -> WriterRecovery:
         journal = self._read_journal()
-        if journal is None or journal["state"] == "closed":
-            return
+        if journal is None:
+            return WriterRecovery(action="none")
+        if journal["state"] == "closed":
+            if journal["close_reason"] in {"committed", "recovered_committed"}:
+                return WriterRecovery(
+                    action="closed_committed",
+                    session_id=cast(str, journal["session_id"]),
+                    revision=cast(int, journal["revision"]),
+                    fence=cast(int, journal["fence"]),
+                )
+            return WriterRecovery(action="none")
         recovery = self._classify_recovery(journal)
-        if recovery.action == "abandoned_before_submit":
+        if recovery.action in {"abandoned_before_submit", "busy_open"}:
             self._close_abandoned(journal)
-            return
+            return WriterRecovery(
+                action="abandoned_before_submit",
+                session_id=recovery.session_id,
+                revision=recovery.revision,
+                fence=recovery.fence,
+            )
         if recovery.action == "closed_committed":
             self._close_committed(journal, recovered=True)
-            return
+            return recovery
         if recovery.action == "ambiguous_after_bind":
-            if (
-                self._reconcile_bound(journal)
-                is not BoundOperationResolution.UNRESOLVED
-            ):
-                return
+            resolution = self._reconcile_bound(journal)
+            if resolution is not BoundOperationResolution.UNRESOLVED:
+                action = (
+                    "closed_committed"
+                    if resolution is BoundOperationResolution.COMMITTED
+                    else "closed_abandoned"
+                )
+                return WriterRecovery(
+                    action=action,
+                    session_id=recovery.session_id,
+                    revision=recovery.revision,
+                    fence=recovery.fence,
+                )
             raise AmbiguousWriterSessionError(
                 "bound writer operation has an ambiguous outcome and requires "
                 "receipt reconciliation"
             )
-        raise WriterBusyError("an unexpired durable writer session is still open")
+        raise AssertionError(f"unexpected writer recovery action: {recovery.action}")
 
     def _reconcile_bound(
         self,

@@ -330,6 +330,7 @@ class MegatronService:
     ) -> WriterLease:
         """Acquire service-owned writer authority before exact-current rollout."""
 
+        await self._reconcile_writer_authority()
         if revision != self._latest_step:
             raise ValueError(
                 "current-step source revision does not match the service revision"
@@ -787,25 +788,11 @@ class MegatronService:
             ) from exc
 
         if marker.state == "submitted":
-            if checkpoint_marker is not None:
-                return BoundOperationResolution.UNRESOLVED
-            source_is_authoritative = (
-                optimizer_commit is None and source_revision == 0
-            ) or (
-                optimizer_commit is not None
-                and optimizer_commit.step == source_revision
-            )
-            if not source_is_authoritative or checkpoint_dir.exists():
-                return BoundOperationResolution.UNRESOLVED
-            self._write_json_atomic(
-                self._distillation_receipt_path(idempotency_key),
-                {
-                    "binding": binding,
-                    "state": "failed",
-                    "failure": "recovered_abandoned",
-                },
-            )
-            return BoundOperationResolution.ABANDONED
+            # The service process can die while its spawned Megatron worker
+            # remains alive. A submitted marker therefore proves possible
+            # mutation, not abandonment. Only output evidence or an explicit
+            # failed receipt may resolve this operation.
+            return BoundOperationResolution.UNRESOLVED
 
         assert marker.world_size is not None and marker.files is not None
         optimizer_dir = Path(optimizer_path)
@@ -929,6 +916,88 @@ class MegatronService:
             step=step,
         )
 
+    async def _reconcile_writer_authority(self) -> None:
+        """Activate any exact prepared commit before admitting more work."""
+
+        recovery = self._writer_sessions.reconcile()
+        if recovery.action == "closed_committed":
+            assert recovery.revision is not None
+            await self._activate_committed_distillation_step(recovery.revision + 1)
+
+    def _owns_exact_committed_current_operation(
+        self,
+        *,
+        binding: dict[str, Any],
+        committed_step: int,
+    ) -> bool:
+        lease = self._current_writer_lease
+        if lease is None:
+            return False
+        journal = self._writer_sessions.inspect()
+        if (
+            journal is None
+            or journal["state"] != "committed"
+            or journal["session_id"] != lease.session_id
+            or journal["revision"] != binding["source_revision"]
+            or journal["result_revision"] != committed_step
+        ):
+            return False
+        operation = journal["operation_identity"]
+        return (
+            isinstance(operation, dict)
+            and operation.get("route") == "prepared"
+            and operation.get("source_revision") == binding["source_revision"]
+            and operation.get("target_revision") == committed_step
+            and operation.get("identity") == {"receipt_binding": binding}
+        )
+
+    def _recover_pending_before_submission(
+        self,
+        *,
+        path: Path,
+        binding: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Fail a pending receipt only when an unbound writer was abandoned."""
+
+        recovery = self._writer_sessions.reconcile()
+        receipt = self._read_distillation_receipt(path=path, binding=binding)
+        assert receipt is not None
+        abandoned_revision = (
+            recovery.revision if recovery.action == "abandoned_before_submit" else None
+        )
+        if abandoned_revision is None and recovery.action == "none":
+            journal = self._writer_sessions.inspect()
+            if (
+                journal is not None
+                and journal["state"] == "closed"
+                and journal["close_reason"] == "abandoned_before_submit"
+                and journal["operation_identity"] is None
+            ):
+                abandoned_revision = cast(int, journal["revision"])
+        if (
+            receipt["state"] == "pending"
+            and abandoned_revision == binding["source_revision"]
+        ):
+            target_revision = cast(int, binding["source_revision"]) + 1
+            staging_marker = read_prepared_checkpoint_commit(
+                self._staging_lora_dir(target_revision)
+            )
+            checkpoint_marker = read_prepared_checkpoint_commit(
+                get_step_checkpoint_dir(self.output_dir, target_revision)
+            )
+            if staging_marker is None and checkpoint_marker is None:
+                self._write_json_atomic(
+                    path,
+                    {
+                        "binding": binding,
+                        "state": "failed",
+                        "failure": "recovered_before_submit",
+                    },
+                )
+                receipt = self._read_distillation_receipt(path=path, binding=binding)
+                assert receipt is not None
+        return receipt
+
     async def committed_distillation_step(
         self,
         *,
@@ -954,10 +1023,13 @@ class MegatronService:
         if receipt is None:
             return None
         if receipt["state"] == "pending":
-            self._writer_sessions.reconcile()
-            receipt = self._read_distillation_receipt(path=path, binding=binding)
-            assert receipt is not None
+            receipt = self._recover_pending_before_submission(
+                path=path,
+                binding=binding,
+            )
         if receipt["state"] == "failed":
+            if receipt["failure"] == "recovered_before_submit":
+                return None
             raise RuntimeError(
                 "the distillation operation was abandoned before durable optimizer "
                 "commit; retry with a new idempotency key at the source revision"
@@ -969,9 +1041,14 @@ class MegatronService:
             )
         # A process may have crashed after committing this receipt but before
         # committing or releasing its exact receipt-bound writer journal.
-        self._writer_sessions.reconcile()
         committed_step = cast(int, receipt["committed_step"])
-        await self._activate_committed_distillation_step(committed_step)
+        if not self._owns_exact_committed_current_operation(
+            binding=binding,
+            committed_step=committed_step,
+        ):
+            self._writer_sessions.reconcile()
+        if self._latest_step != committed_step:
+            await self._activate_committed_distillation_step(committed_step)
         return committed_step
 
     def _staging_lora_dir(self, step: int) -> str:
@@ -1121,12 +1198,26 @@ class MegatronService:
     def _resolve_resume_step(self) -> MegatronResumeStep:
         if self._resume_step is not None:
             return self._resume_step
+        recovery = self._writer_sessions.reconcile()
+        if recovery.action in {"ambiguous_after_bind", "busy_open"}:
+            raise AmbiguousWriterSessionError(
+                "writer recovery must resolve before Megatron resume can quarantine "
+                "checkpoint evidence"
+            )
         info = prepare_megatron_resume_state(
             output_dir=self.output_dir,
             optimizer_state_path=self._get_optimizer_state_path(),
         )
         self._resume_step = info
         self._status(format_megatron_resume_message(info))
+        return info
+
+    async def prepare_resume_state(self) -> MegatronResumeStep:
+        """Reconcile prepared commits before selecting/quarantining resume state."""
+
+        info = self._resolve_resume_step()
+        if self._latest_step < info.step:
+            self._latest_step = info.step
         return info
 
     def _default_lora_adapter_config(self) -> LoraConfig:
@@ -1840,6 +1931,7 @@ class MegatronService:
         writer_completed = False
         try:
             self._raise_if_child_failed()
+            await self._reconcile_writer_authority()
             if _config.get("moe_routing_replay_bundle") is not None:
                 raise RuntimeError(
                     "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
@@ -2087,6 +2179,7 @@ class MegatronService:
         receipt_path: Path | None = None
         binding: dict[str, Any] | None = None
         receipt_reserved = False
+        reuse_unsubmitted_receipt = False
         job_submitted = False
         writer_holder: list[WriterLease] | None = None
         writer_heartbeat: asyncio.Task[None] | None = None
@@ -2100,6 +2193,8 @@ class MegatronService:
                     "current-step session identity and capability must be provided "
                     "together"
                 )
+            if current_step_session_id is None:
+                await self._reconcile_writer_authority()
             receipt_path = self._distillation_receipt_path(idempotency_key)
             binding = self._distillation_receipt_binding(
                 idempotency_key=idempotency_key,
@@ -2120,10 +2215,14 @@ class MegatronService:
                 # A process may have crashed after committing this receipt but
                 # before committing/releasing its writer journal. Reconcile the
                 # exact receipt-bound operation before returning the replay.
-                self._writer_sessions.reconcile()
-                await self._activate_committed_distillation_step(
-                    cast(int, existing_receipt["committed_step"])
-                )
+                committed_step = cast(int, existing_receipt["committed_step"])
+                if not self._owns_exact_committed_current_operation(
+                    binding=binding,
+                    committed_step=committed_step,
+                ):
+                    self._writer_sessions.reconcile()
+                if self._latest_step != committed_step:
+                    await self._activate_committed_distillation_step(committed_step)
                 shutil.rmtree(disk_tensors["dir"])
                 yield {
                     "distillation/idempotent_replay": 1.0,
@@ -2134,21 +2233,23 @@ class MegatronService:
                 }
                 return
             if existing_receipt is not None and existing_receipt["state"] == "failed":
-                raise RuntimeError(
-                    "the distillation operation was abandoned before durable optimizer "
-                    "commit; retry with a new idempotency key at the source revision"
-                )
+                if existing_receipt["failure"] == "recovered_before_submit":
+                    reuse_unsubmitted_receipt = True
+                else:
+                    raise RuntimeError(
+                        "the distillation operation was abandoned before durable "
+                        "optimizer commit; retry with a new idempotency key at the "
+                        "source revision"
+                    )
             if existing_receipt is not None and existing_receipt["state"] == "pending":
-                self._writer_sessions.reconcile()
-                existing_receipt = self._read_distillation_receipt(
+                existing_receipt = self._recover_pending_before_submission(
                     path=receipt_path,
                     binding=binding,
                 )
-                assert existing_receipt is not None
                 if existing_receipt["state"] == "committed":
-                    await self._activate_committed_distillation_step(
-                        cast(int, existing_receipt["committed_step"])
-                    )
+                    committed_step = cast(int, existing_receipt["committed_step"])
+                    if self._latest_step != committed_step:
+                        await self._activate_committed_distillation_step(committed_step)
                     shutil.rmtree(disk_tensors["dir"])
                     yield {
                         "distillation/idempotent_replay": 1.0,
@@ -2159,16 +2260,20 @@ class MegatronService:
                     }
                     return
                 if existing_receipt["state"] == "failed":
+                    if existing_receipt["failure"] == "recovered_before_submit":
+                        reuse_unsubmitted_receipt = True
+                    else:
+                        raise RuntimeError(
+                            "the distillation operation was abandoned before durable "
+                            "optimizer commit; retry with a new idempotency key at the "
+                            "source revision"
+                        )
+                else:
                     raise RuntimeError(
-                        "the distillation operation was abandoned before durable "
-                        "optimizer commit; retry with a new idempotency key at the "
-                        "source revision"
+                        "an identical distillation job is pending with an ambiguous "
+                        "outcome; exact submitted/output evidence is incomplete or "
+                        "mismatched"
                     )
-                raise RuntimeError(
-                    "an identical distillation job is pending with an ambiguous "
-                    "outcome; exact submitted/output evidence is incomplete or "
-                    "mismatched"
-                )
             topology = self.runtime_config.topology
             prepared_topology = (
                 topology.tp,
@@ -2196,8 +2301,6 @@ class MegatronService:
             # Validate tensor bytes and denominators, then release mmap-backed
             # validation tensors before the worker takes cleanup ownership.
             _validate_distillation_tensors_for_objective(disk_tensors, objective)
-            self._reserve_distillation_receipt(path=receipt_path, binding=binding)
-            receipt_reserved = True
 
             if current_step_session_id is not None:
                 assert current_step_capability is not None
@@ -2217,6 +2320,14 @@ class MegatronService:
                 )
                 ordinary_writer = True
             writer_holder = [lease]
+            if reuse_unsubmitted_receipt:
+                self._write_json_atomic(
+                    receipt_path,
+                    {"binding": binding, "state": "pending"},
+                )
+            else:
+                self._reserve_distillation_receipt(path=receipt_path, binding=binding)
+            receipt_reserved = True
             writer_heartbeat = asyncio.create_task(
                 self._heartbeat_bound_writer(
                     writer_holder,
@@ -2406,6 +2517,7 @@ class MegatronService:
         writer_completed = False
         try:
             self._raise_if_child_failed()
+            await self._reconcile_writer_authority()
             if self.is_dedicated:
                 raise NotImplementedError(
                     "train_sft is not yet supported in dedicated mode"

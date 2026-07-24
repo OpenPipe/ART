@@ -1006,7 +1006,7 @@ async def test_backend_committed_replay_reconciles_writer_before_returning(
 
 
 @pytest.mark.asyncio
-async def test_backend_current_step_requires_explicit_single_use_session(
+async def test_backend_current_step_requires_session_only_for_new_submission(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1021,6 +1021,7 @@ async def test_backend_current_step_requires_explicit_single_use_session(
         def __init__(self) -> None:
             self.capability = b"c" * 32
             self.released = False
+            self.committed = False
 
         async def acquire_current_step(
             self,
@@ -1041,8 +1042,8 @@ async def test_backend_current_step_requires_explicit_single_use_session(
         async def heartbeat_current_step(self, **_kwargs: Any) -> float:
             return 1_000.0
 
-        async def committed_distillation_step(self, **_kwargs: Any) -> int:
-            return 8
+        async def committed_distillation_step(self, **_kwargs: Any) -> int | None:
+            return 8 if self.committed else None
 
         async def release_current_step(self, **_kwargs: Any) -> None:
             self.released = True
@@ -1072,7 +1073,19 @@ async def test_backend_current_step_requires_explicit_single_use_session(
                 save_checkpoint=False,
             )
 
+        service.committed = True
+        # An exact durable replay is a query/recovery operation, not a new
+        # optimizer submission, so it remains usable after restart without the
+        # original in-memory current-step capability.
         result = await backend.train(
+            cast(Any, model),
+            batch,
+            objectives=distill.TrainingObjectives(distillation=distill.Loss()),
+            idempotency_key="current",
+            save_checkpoint=False,
+        )
+        assert result.step == 8
+        repeated = await backend.train(
             cast(Any, model),
             batch,
             objectives=distill.TrainingObjectives(distillation=distill.Loss()),
@@ -1080,18 +1093,48 @@ async def test_backend_current_step_requires_explicit_single_use_session(
             session=current,
             save_checkpoint=False,
         )
-        assert result.step == 8
-        with pytest.raises(RuntimeError, match="exactly one"):
-            await backend.train(
-                cast(Any, model),
-                batch,
-                objectives=distill.TrainingObjectives(distillation=distill.Loss()),
-                idempotency_key="current",
-                session=current,
-                save_checkpoint=False,
-            )
+        assert repeated.step == 8
 
     assert service.released
+
+
+@pytest.mark.asyncio
+async def test_backend_current_step_committed_replay_survives_process_restart(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    backend = MegatronBackend(path=str(tmp_path))
+    artifact = _artifact(
+        revision=7,
+        consistency=distill.CurrentStep(
+            revision=7,
+            session_id="session-from-the-original-process",
+        ),
+    )
+
+    class _Service:
+        async def committed_distillation_step(self, **_kwargs: Any) -> int:
+            return 8
+
+    async def _get_service(_: Any) -> _Service:
+        return _Service()
+
+    async def _get_step(_: Any) -> int:
+        raise AssertionError("a committed replay must not inspect current revision")
+
+    monkeypatch.setattr(backend, "_get_service", _get_service)
+    monkeypatch.setattr(backend, "_get_step", _get_step)
+
+    result = await backend.train(
+        cast(Any, SimpleNamespace()),
+        artifact,
+        objectives=distill.TrainingObjectives(distillation=distill.Loss()),
+        idempotency_key="original-operation-key",
+        save_checkpoint=False,
+    )
+
+    assert result.step == 8
+    assert result.metrics["distillation/idempotent_replay"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -1535,9 +1578,13 @@ async def test_competing_prepared_stage_cannot_mutate_or_delete_active_sidecars(
         session_id=current.session_id,
         capability=current.capability,
     )
-    for key in ("current-operation", "ordinary-operation"):
-        receipt = json.loads(service._distillation_receipt_path(key).read_text())
-        assert receipt["state"] == "failed"
+    current_receipt = json.loads(
+        service._distillation_receipt_path("current-operation").read_text()
+    )
+    assert current_receipt["state"] == "failed"
+    # Writer admission now precedes receipt reservation, so a competing call
+    # that never owned the gate leaves no idempotency record to poison.
+    assert not service._distillation_receipt_path("ordinary-operation").exists()
 
 
 @pytest.mark.asyncio

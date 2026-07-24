@@ -31,7 +31,6 @@ from .distillation import (
 from .migrations import apply_megatron_migrations, optimizer_state_path
 from .optimizer_state import (
     format_megatron_resume_message,
-    prepare_megatron_resume_state,
     read_optimizer_commit,
 )
 from .runtime_config import get_megatron_runtime_config
@@ -288,29 +287,7 @@ class MegatronBackend(LocalBackend):
             else None
         )
         active_current: _ActiveCurrentStep | None = None
-        if current_step is not None:
-            active_current = self._require_active_current_step(
-                model,
-                current_step,
-                kwargs.get("session"),
-            )
-            if active_current.consumed:
-                raise RuntimeError(
-                    "a current-step writer session permits exactly one backend.train call"
-                )
-            if active_current.heartbeat_error is not None:
-                raise RuntimeError("the current-step writer heartbeat failed") from (
-                    active_current.heartbeat_error
-                )
-            # The service owns heartbeat renewal while the bound optimizer job runs.
-            # Stop the orchestration heartbeat before handing over the capability.
-            active_current.heartbeat_task.cancel()
-            try:
-                await active_current.heartbeat_task
-            except asyncio.CancelledError:
-                pass
-            active_current.consumed = True
-        elif kwargs.get("session") is not None:
+        if current_step is None and kwargs.get("session") is not None:
             raise ValueError("session= is valid only for CurrentStep prepared batches")
         config = TrainConfig(
             learning_rate=learning_rate,
@@ -319,12 +296,6 @@ class MegatronBackend(LocalBackend):
         )
         artifact_source_revision = batch.constraints.learner_revision
         service = await self._get_service(cast(TrainableModel, model))
-        if active_current is not None:
-            await cast(Any, service).heartbeat_current_step(
-                session_id=active_current.consistency.session_id,
-                capability=active_current.capability,
-                ttl_s=600.0,
-            )
         committed_step = await cast(Any, service).committed_distillation_step(
             idempotency_key=idempotency_key,
             expected_source_revision=artifact_source_revision,
@@ -349,6 +320,40 @@ class MegatronBackend(LocalBackend):
                     "data/step_num_gradient_steps": 0.0,
                 },
                 checkpoint_path=checkpoint_path,
+            )
+
+        if current_step is not None:
+            # Receipt lookup above is intentionally session-free. It lets an
+            # application replay the exact artifact and idempotency key after a
+            # process restart to recover or query an already-submitted update.
+            # A live capability is required only when no durable submission
+            # exists and this call would start new optimizer work.
+            active_current = self._require_active_current_step(
+                model,
+                current_step,
+                kwargs.get("session"),
+            )
+            if active_current.consumed:
+                raise RuntimeError(
+                    "a current-step writer session permits exactly one new "
+                    "backend.train submission"
+                )
+            if active_current.heartbeat_error is not None:
+                raise RuntimeError("the current-step writer heartbeat failed") from (
+                    active_current.heartbeat_error
+                )
+            # The service owns heartbeat renewal while the bound optimizer job runs.
+            # Stop the orchestration heartbeat before handing over the capability.
+            active_current.heartbeat_task.cancel()
+            try:
+                await active_current.heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            active_current.consumed = True
+            await cast(Any, service).heartbeat_current_step(
+                session_id=active_current.consistency.session_id,
+                capability=active_current.capability,
+                ttl_s=600.0,
             )
 
         runtime = get_megatron_runtime_config()
@@ -622,11 +627,8 @@ class MegatronBackend(LocalBackend):
         storage_key = self._model_storage_key(model)
         if storage_key in self._resume_prepared_models:
             return await super()._get_step(model)
-        output_dir = get_model_dir(model=model, art_path=self._path)
-        info = prepare_megatron_resume_state(
-            output_dir=output_dir,
-            optimizer_state_path=optimizer_state_path(output_dir),
-        )
+        service = await self._get_service(cast(TrainableModel, model))
+        info = await cast(Any, service).prepare_resume_state()
         print(format_megatron_resume_message(info))
         self._resume_prepared_models.add(storage_key)
         return await super()._get_step(model)

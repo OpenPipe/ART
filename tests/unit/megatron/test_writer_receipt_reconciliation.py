@@ -4,6 +4,7 @@ from typing import Any, cast
 
 import pytest
 
+from art.megatron.backend import MegatronBackend
 from art.megatron.distillation import DistillationObjectiveConfig
 from art.megatron.optimizer_state import (
     PreparedCheckpointCommit,
@@ -298,7 +299,6 @@ def test_pre_receipt_crash_boundaries_remain_fail_closed(
 @pytest.mark.parametrize(
     ("crash_boundary", "resolution"),
     [
-        ("submitted", "abandoned"),
         ("outputs_ready", "committed"),
         ("checkpoint_published", "committed"),
         ("optimizer_published", "committed"),
@@ -356,40 +356,22 @@ async def test_train_crash_recovery_never_resubmits_worker_work(
         preparation_id="prepared-4",
         payload_sha256="a" * 64,
     )
-    if resolution == "abandoned":
-        with pytest.raises(RuntimeError, match="new idempotency key"):
-            async for _metrics in retry:
-                pass
-        assert activated == []
-        crashed_operation = cast(
-            dict[str, Any],
-            crashed_journal["operation_identity"],
-        )
-        crashed_identity = cast(dict[str, Any], crashed_operation["identity"])
-        receipt = recovered._read_distillation_receipt(
-            path=recovered._distillation_receipt_path("update-4"),
-            binding=cast(dict[str, Any], crashed_identity["receipt_binding"]),
-        )
-        assert receipt is not None
-        assert receipt["state"] == "failed"
-        next_revision = 4
-    else:
-        metrics = [sample async for sample in retry]
-        assert metrics == [
-            {
-                "distillation/idempotent_replay": 1.0,
-                "distillation/committed_step": 5.0,
-                "data/step_num_gradient_steps": 0.0,
-            }
-        ]
-        assert activated == [5]
-        assert not retry_sidecars.exists()
-        commit = read_optimizer_commit(recovered._get_optimizer_state_path())
-        assert commit is not None
-        assert commit.schema_version == 2
-        assert commit.step == 5
-        assert commit.operation_identity == crashed_journal["operation_identity"]
-        next_revision = 5
+    metrics = [sample async for sample in retry]
+    assert metrics == [
+        {
+            "distillation/idempotent_replay": 1.0,
+            "distillation/committed_step": 5.0,
+            "data/step_num_gradient_steps": 0.0,
+        }
+    ]
+    assert activated == [5]
+    assert not retry_sidecars.exists()
+    commit = read_optimizer_commit(recovered._get_optimizer_state_path())
+    assert commit is not None
+    assert commit.schema_version == 2
+    assert commit.step == 5
+    assert commit.operation_identity == crashed_journal["operation_identity"]
+    next_revision = 5
 
     later = recovered._writer_sessions.acquire_ordinary_open(
         revision=next_revision,
@@ -533,7 +515,65 @@ async def test_idempotent_replay_reconciles_receipt_before_returning(
 
 
 @pytest.mark.asyncio
-async def test_current_step_submitted_recovery_abandons_at_source_revision(
+async def test_exact_committed_replay_uses_live_current_step_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch)
+    service._latest_step = 4
+    objective = DistillationObjectiveConfig(coefficient=1.0)
+    config = TrainConfig(optimizer_save_interval=1)
+    binding = service._distillation_receipt_binding(
+        idempotency_key="live-current",
+        expected_source_revision=4,
+        preparation_id="prepared-4",
+        payload_sha256="a" * 64,
+        objective=objective,
+        config=config,
+    )
+    lease = await service.acquire_current_step(revision=4)
+    operation = service._writer_operation_for_job(
+        route="prepared",
+        source_revision=4,
+        target_revision=5,
+        identity={"receipt_binding": binding},
+    )
+    service._writer_sessions.bind(lease, operation_identity=operation)
+    service._writer_sessions.commit(
+        lease,
+        operation_identity=operation,
+        result_revision=5,
+    )
+    service._current_writer_lease = lease
+    service._latest_step = 5
+    service._write_json_atomic(
+        service._distillation_receipt_path("live-current"),
+        {
+            "binding": binding,
+            "state": "committed",
+            "committed_step": 5,
+        },
+    )
+
+    assert (
+        await service.committed_distillation_step(
+            idempotency_key="live-current",
+            expected_source_revision=4,
+            preparation_id="prepared-4",
+            payload_sha256="a" * 64,
+            objective=objective,
+            config=config,
+        )
+        == 5
+    )
+    await service.release_current_step(
+        session_id=lease.session_id,
+        capability=lease.capability,
+    )
+
+
+@pytest.mark.asyncio
+async def test_current_step_submitted_recovery_remains_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -553,7 +593,7 @@ async def test_current_step_submitted_recovery_abandons_at_source_revision(
     owner._writer_sessions._release_gate(lease.session_id)
 
     recovered = _service(tmp_path, monkeypatch)
-    with pytest.raises(RuntimeError, match="new idempotency key"):
+    with pytest.raises(RuntimeError, match="pending with an ambiguous outcome"):
         await recovered.committed_distillation_step(
             idempotency_key="update-4",
             expected_source_revision=4,
@@ -565,16 +605,188 @@ async def test_current_step_submitted_recovery_abandons_at_source_revision(
 
     journal = recovered._writer_sessions.inspect()
     assert journal is not None
-    assert journal["state"] == "closed"
-    assert journal["close_reason"] == "recovered_abandoned"
+    assert journal["state"] == "bound"
+    assert journal["close_reason"] is None
     assert journal["revision"] == 4
     assert journal["result_revision"] is None
-    retry = recovered._writer_sessions.acquire_current_step(
+    with pytest.raises(AmbiguousWriterSessionError, match="receipt reconciliation"):
+        recovered._writer_sessions.acquire_current_step(
+            revision=4,
+            ttl_s=30.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pending_receipt_before_bind_is_recovered_without_poisoning_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _service(tmp_path, monkeypatch)
+    owner._latest_step = 4
+    config = TrainConfig(optimizer_save_interval=1)
+    objective = DistillationObjectiveConfig(coefficient=1.0)
+    binding = owner._distillation_receipt_binding(
+        idempotency_key="pre-bind-crash",
+        expected_source_revision=4,
+        preparation_id="prepared-4",
+        payload_sha256="a" * 64,
+        objective=objective,
+        config=config,
+    )
+    lease = owner._writer_sessions.acquire_ordinary_open(
+        revision=4,
+        ttl_s=600.0,
+    )
+    receipt_path = owner._distillation_receipt_path("pre-bind-crash")
+    owner._reserve_distillation_receipt(path=receipt_path, binding=binding)
+    # Simulate process death: the OS gate disappears, but neither a bound
+    # operation nor a submission marker was ever published.
+    owner._writer_sessions._release_gate(lease.session_id)
+
+    recovered = _service(tmp_path, monkeypatch)
+    recovered._latest_step = 4
+    assert (
+        await recovered.committed_distillation_step(
+            idempotency_key="pre-bind-crash",
+            expected_source_revision=4,
+            preparation_id="prepared-4",
+            payload_sha256="a" * 64,
+            objective=objective,
+            config=config,
+        )
+        is None
+    )
+
+    monkeypatch.setattr(recovered, "_data_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        "art.megatron.service._validate_distillation_tensors_for_objective",
+        lambda _tensors, _objective: None,
+    )
+
+    async def _observe_same_key_reservation() -> str:
+        receipt = recovered._read_distillation_receipt(
+            path=receipt_path,
+            binding=binding,
+        )
+        assert receipt is not None
+        assert receipt["state"] == "pending"
+        raise _InjectedCrash("stop after exact-key re-reservation")
+
+    monkeypatch.setattr(
+        recovered,
+        "_prepare_for_training",
+        _observe_same_key_reservation,
+    )
+    sidecars = tmp_path / "retry-sidecars"
+    sidecars.mkdir()
+    with pytest.raises(_InjectedCrash, match="exact-key re-reservation"):
+        async for _metrics in recovered.train_distillation(
+            cast(Any, {"dir": str(sidecars)}),
+            config,
+            objective=objective,
+            expected_source_revision=4,
+            idempotency_key="pre-bind-crash",
+            preparation_id="prepared-4",
+            payload_sha256="a" * 64,
+        ):
+            pass
+
+    receipt = recovered._read_distillation_receipt(
+        path=receipt_path,
+        binding=binding,
+    )
+    assert receipt is not None
+    assert receipt["state"] == "failed"
+    assert receipt["failure"] == "_InjectedCrash"
+    retry = recovered._writer_sessions.acquire_ordinary_open(
         revision=4,
         ttl_s=30.0,
     )
-    assert retry.fence == lease.fence + 1
     recovered._writer_sessions.release(retry)
+
+
+@pytest.mark.asyncio
+async def test_production_resume_reconciles_outputs_before_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _service(tmp_path, monkeypatch)
+    operation, _binding, _receipt_path, lease = _bound_prepared_operation(owner)
+    _write_source_optimizer(owner, 4)
+    staging = Path(owner._staging_lora_dir(5))
+    staging.mkdir(parents=True)
+    (staging / "adapter_model.safetensors").write_bytes(b"target lora")
+    optimizer_dir = Path(owner._get_optimizer_state_path())
+    files = optimizer_generation_files(5, 1)
+    (optimizer_dir / files[0]).write_bytes(b"target optimizer")
+    write_prepared_checkpoint_commit(
+        staging,
+        PreparedCheckpointCommit(
+            state="outputs_ready",
+            step=5,
+            operation_identity=operation,
+            world_size=1,
+            files=files,
+        ),
+    )
+    owner._writer_sessions._release_gate(lease.session_id)
+
+    recovered = _service(tmp_path, monkeypatch)
+    monkeypatch.setattr(recovered, "_ensure_lora_adapter_config", lambda _path: None)
+    info = await recovered.prepare_resume_state()
+
+    assert info.step == 5
+    assert recovered._latest_step == 5
+    assert info.latest_lora_step == 5
+    assert info.optimizer_step == 5
+    assert info.quarantined_lora_steps == ()
+    assert Path(get_step_checkpoint_dir(str(tmp_path), 5)).is_dir()
+    assert not (tmp_path / "unpaired_checkpoints").exists()
+    receipt = recovered._read_distillation_receipt(
+        path=recovered._distillation_receipt_path("update-4"),
+        binding=cast(
+            dict[str, Any],
+            cast(dict[str, Any], operation["identity"])["receipt_binding"],
+        ),
+    )
+    assert receipt is not None
+    assert receipt["state"] == "committed"
+
+
+@pytest.mark.asyncio
+async def test_backend_get_step_delegates_resume_recovery_to_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = MegatronBackend(path=str(tmp_path))
+    model = SimpleNamespace(
+        trainable=True,
+        project="project",
+        _storage_name=lambda: "student",
+    )
+    output_dir = tmp_path / "project" / "models" / "student"
+    calls: list[str] = []
+
+    class _Service:
+        async def prepare_resume_state(self) -> SimpleNamespace:
+            calls.append("prepare")
+            Path(get_step_checkpoint_dir(str(output_dir), 5)).mkdir(
+                parents=True,
+            )
+            return SimpleNamespace(
+                step=5,
+                latest_lora_step=5,
+                optimizer_step=5,
+                used_unpaired_override=False,
+                quarantined_lora_steps=(),
+            )
+
+    async def _get_service(_model: Any) -> _Service:
+        return _Service()
+
+    monkeypatch.setattr(backend, "_get_service", _get_service)
+    assert await backend._get_step(cast(Any, model)) == 5
+    assert calls == ["prepare"]
 
 
 @pytest.mark.parametrize("failure", ["incomplete", "mismatch"])

@@ -324,6 +324,34 @@ def test_exact_committed_receipt_reconciles_bound_crash_before_later_writer(
     recovered.release(later)
 
 
+def test_recovery_rejects_stale_revision_before_creating_a_new_lease(
+    tmp_path: Path,
+) -> None:
+    operation = _operation()
+    owner = _store(tmp_path)
+    crashed = owner.acquire_current_step(revision=10, ttl_s=30.0)
+    owner.bind(crashed, operation_identity=operation)
+    owner._release_gate(crashed.session_id)
+
+    recovered = WriterSessionStore(
+        root=tmp_path,
+        model_identity="project/model",
+        committed_operation_resolver=(
+            lambda _candidate, _result: BoundOperationResolution.COMMITTED
+        ),
+    )
+    with pytest.raises(
+        WriterSessionValidationError, match="authoritative revision is 11"
+    ):
+        recovered.acquire_ordinary_open(revision=10, ttl_s=30.0)
+
+    journal = recovered.inspect()
+    assert journal is not None
+    assert journal["state"] == "closed"
+    assert journal["result_revision"] == 11
+    assert recovered.fence_path.read_text() == str(crashed.fence)
+
+
 def test_explicit_reconciliation_closes_only_exact_committed_operation(
     tmp_path: Path,
 ) -> None:
