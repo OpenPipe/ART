@@ -56,7 +56,12 @@ class _ModelledExchange(Protocol):
     def model(self) -> str | None: ...
 
 
+class _Indexed(Protocol):
+    index: int
+
+
 _ExchangeT = TypeVar("_ExchangeT", bound=_ModelledExchange)
+_IndexedT = TypeVar("_IndexedT", bound=_Indexed)
 _ItemT = TypeVar("_ItemT")
 _SourceT = TypeVar("_SourceT")
 _ContextT = TypeVar("_ContextT")
@@ -117,6 +122,7 @@ class _Branch(Generic[_ItemT, _SourceT, _ContextT]):
     context: _ContextT
     order: tuple[int, ...]
     first_time: datetime
+    context_source: _ModelledExchange | None
 
 
 def _selected_models(
@@ -144,6 +150,20 @@ def _one(history: Sequence[_ItemT], protocol: str) -> _ItemT:
             f"{protocol} requires exactly one history; found {len(history)}"
         )
     return history[0]
+
+
+def _ordered_choices(choices: Sequence[_IndexedT], *, protocol: str) -> list[_IndexedT]:
+    if not choices:
+        raise ValueError(f"{protocol} response contains no choices")
+    indices = [choice.index for choice in choices]
+    if any(
+        not isinstance(index, int) or isinstance(index, bool) or index < 0
+        for index in indices
+    ):
+        raise ValueError(f"{protocol} choice indices must be non-negative integers")
+    if len(set(indices)) != len(indices):
+        raise ValueError(f"{protocol} response contains duplicate choice indices")
+    return sorted(choices, key=lambda choice: choice.index)
 
 
 def _is_prefix(prefix: Sequence[object], value: Sequence[object]) -> bool:
@@ -181,6 +201,7 @@ def _extend_branches(
     context: _ContextT,
     sequence: int,
     start_time: datetime,
+    context_source: _ModelledExchange | None = None,
     continuation: Callable[[_Branch[_ItemT, _SourceT, _ContextT]], bool] | None = None,
 ) -> None:
     if len(prompt) != len(prompt_sources):
@@ -228,6 +249,7 @@ def _extend_branches(
             context=copy.deepcopy(context),
             order=(*base_order, choice_index),
             first_time=first_time,
+            context_source=context_source,
         )
         for choice_index, output, output_sources in outputs
     ]
@@ -289,11 +311,22 @@ def _chat_retains_sampled_reasoning(
 
 
 def _chat_message_key(message: Message, *, visible_only: bool = False) -> str:
-    data = copy.deepcopy(dict(message))
+    data = normalize_chat_message(message)
     if visible_only:
         data.pop("reasoning", None)
         data.pop("reasoning_content", None)
     return json.dumps(data, sort_keys=True, default=str)
+
+
+def normalize_chat_message(message: Mapping[str, object]) -> dict[str, object]:
+    """Return the canonical history form of an OpenAI chat message."""
+
+    data = copy.deepcopy(dict(message))
+    if data.get("content") is None:
+        data.pop("content", None)
+    if data.get("tool_calls") == []:
+        data.pop("tool_calls")
+    return data
 
 
 def _require_unmixed(trajectory: Trajectory) -> None:
@@ -343,7 +376,12 @@ def chat_completions_histories(
             _Branch[Message, ChatCompletionsMessageSource, _ChatContext]
         ] = []
         for sequence, exchange in enumerate(exchanges):
-            prompt = _MESSAGES.validate_python(exchange.request.get("messages", []))
+            prompt = [
+                cast(Message, normalize_chat_message(message))
+                for message in _MESSAGES.validate_python(
+                    exchange.request.get("messages", [])
+                )
+            ]
             prompt_sources = _lineage_prompt_sources(
                 branches,
                 prompt=prompt,
@@ -363,11 +401,13 @@ def chat_completions_histories(
                     list[ChatCompletionsMessageSource | None],
                 ]
             ] = []
-            for choice in sorted(
-                exchange.response.choices, key=lambda item: item.index
+            for choice in _ordered_choices(
+                exchange.response.choices, protocol="Chat Completions"
             ):
                 response = _MESSAGE.validate_python(
-                    choice.message.model_dump(mode="python", exclude_none=True)
+                    normalize_chat_message(
+                        choice.message.model_dump(mode="python", exclude_none=True)
+                    )
                 )
                 response_source = ChatCompletionsMessageSource(
                     exchange=exchange, choice_index=choice.index
@@ -434,10 +474,7 @@ def anthropic_messages_histories(
             _Branch[AnthropicMessageParam, AnthropicMessageSource, _AnthropicContext]
         ] = []
         for sequence, exchange in enumerate(exchanges):
-            prompt = [
-                copy.deepcopy(message)
-                for message in exchange.request.get("messages", [])
-            ]
+            prompt = _anthropic_prompt(exchange.request.get("messages", []))
             prompt_sources = _lineage_prompt_sources(
                 branches,
                 prompt=prompt,
@@ -486,11 +523,11 @@ def anthropic_messages_histories(
                 ),
                 sequence=sequence,
                 start_time=exchange.start_time,
+                context_source=(
+                    exchange if exchange.request.get("system") is not None else None
+                ),
             )
         for branch in sorted(branches, key=lambda item: (item.first_time, item.order)):
-            first_source = next(
-                (source for source in branch.sources if source is not None), None
-            )
             histories.append(
                 AnthropicMessagesHistory(
                     model=selected_model,
@@ -498,7 +535,9 @@ def anthropic_messages_histories(
                     message_sources=copy.copy(branch.sources),
                     system=copy.deepcopy(branch.context.system),
                     system_source=(
-                        first_source.exchange if first_source is not None else None
+                        cast(MessagesExchange, branch.context_source)
+                        if branch.context_source is not None
+                        else None
                     ),
                     tools=copy.deepcopy(branch.context.tools),
                     chat_template=branch.context.template,
@@ -508,13 +547,31 @@ def anthropic_messages_histories(
     return histories
 
 
+def _anthropic_prompt(value: object) -> list[AnthropicMessageParam]:
+    if not isinstance(value, list):
+        raise ValueError("Anthropic messages must be a list")
+    messages: list[AnthropicMessageParam] = []
+    for message in value:
+        if not isinstance(message, Mapping):
+            raise ValueError("Anthropic messages must be JSON objects")
+        content = message.get("content")
+        if not isinstance(content, (str, list)):
+            raise ValueError("Anthropic message content must be text or a list")
+        if isinstance(content, list) and any(
+            not isinstance(block, (Mapping, pydantic.BaseModel)) for block in content
+        ):
+            raise ValueError("Anthropic message content blocks must be JSON objects")
+        messages.append(cast(AnthropicMessageParam, copy.deepcopy(dict(message))))
+    return messages
+
+
 def _anthropic_message_key(
     message: AnthropicMessageParam, *, visible_only: bool = False
 ) -> tuple[object, ...]:
     content = message.get("content")
     if isinstance(content, str):
         blocks: tuple[object, ...] = (("text", content),)
-    else:
+    elif isinstance(content, list):
         normalized: list[object] = []
         for block in content:
             if isinstance(block, pydantic.BaseModel):
@@ -522,7 +579,9 @@ def _anthropic_message_key(
             elif isinstance(block, Mapping):
                 data = dict(block)
             else:
-                data = {"type": type(block).__name__, "value": str(block)}
+                raise ValueError(
+                    "Anthropic message content blocks must be JSON objects"
+                )
             kind = data.get("type")
             if visible_only and kind in {"thinking", "redacted_thinking"}:
                 continue
@@ -531,6 +590,8 @@ def _anthropic_message_key(
             else:
                 normalized.append(json.dumps(data, sort_keys=True, default=str))
         blocks = tuple(normalized)
+    else:
+        raise ValueError("Anthropic message content must be text or a list")
     return (message.get("role"), *blocks)
 
 
@@ -678,9 +739,7 @@ def responses_histories(
                     continuation = lambda branch, generation=generation: (
                         _responses_generation_extends(
                             branch,
-                            exchange=exchange,
                             generation=generation,
-                            generations=generations,
                         )
                     )
                     extends = any(
@@ -689,7 +748,7 @@ def responses_histories(
                         and continuation(branch)
                         for branch in branches
                     )
-                    if not extends and generation_index:
+                    if not extends:
                         retained = [
                             (item, source)
                             for item, source in zip(
@@ -700,8 +759,8 @@ def responses_histories(
                             if not (
                                 item.get("type") == "reasoning"
                                 and source is not None
-                                and source.exchange is exchange
                                 and source.output_index is not None
+                                and source.generation_index is not None
                             )
                         ]
                         generation_prompt = [item for item, _ in retained]
@@ -731,6 +790,7 @@ def responses_histories(
                         context=context,
                         sequence=sequence,
                         start_time=exchange.start_time,
+                        context_source=(exchange if instructions is not None else None),
                         continuation=continuation,
                     )
                     final_items = [
@@ -750,6 +810,7 @@ def responses_histories(
                     context=context,
                     sequence=sequence,
                     start_time=exchange.start_time,
+                    context_source=exchange if instructions is not None else None,
                 )
             record = (
                 final_items,
@@ -763,9 +824,6 @@ def responses_histories(
                     record
                 )
         for branch in sorted(branches, key=lambda item: (item.first_time, item.order)):
-            first_source = next(
-                (source for source in branch.sources if source is not None), None
-            )
             histories.append(
                 ResponsesHistory(
                     model=selected_model,
@@ -773,7 +831,9 @@ def responses_histories(
                     input_sources=copy.copy(branch.sources),
                     instructions=branch.context.instructions,
                     instructions_source=(
-                        first_source.exchange if first_source is not None else None
+                        cast(ResponsesExchange, branch.context_source)
+                        if branch.context_source is not None
+                        else None
                     ),
                     tools=copy.deepcopy(branch.context.tools),
                     conversation=copy.deepcopy(branch.context.conversation),
@@ -798,8 +858,15 @@ def _responses_generations(
     result: list[int | None] = [None] * len(output)
     parsed: list[_ResponsesGeneration] = []
     for generation_index, generation in enumerate(generations):
-        if generation.prompt_token_ids is None or generation.output_token_ids is None:
-            raise AssertionError("Validated Responses generation omitted exact tokens")
+        if generation.prompt_token_ids is None:
+            raise ValueError(
+                "Responses generation without an exact prompt cannot be projected"
+            )
+        if generation.output_token_ids is None:
+            raise ValueError(
+                "Responses generation without exact output tokens cannot yet be "
+                "projected as a history"
+            )
         for output_index in generation.output_indices:
             result[output_index] = generation_index
         parsed.append(
@@ -815,30 +882,37 @@ def _responses_generations(
 def _responses_generation_extends(
     branch: _Branch[ResponseInputItemParam, ResponsesItemSource, _ResponsesContext],
     *,
-    exchange: ResponsesExchange,
     generation: _ResponsesGeneration,
-    generations: Sequence[_ResponsesGeneration],
 ) -> bool:
-    prior_generation = next(
+    prior_source = next(
         (
-            source.generation_index
+            source
             for source in reversed(branch.sources)
-            if source is not None
-            and source.exchange is exchange
-            and source.generation_index is not None
+            if source is not None and source.generation_index is not None
         ),
         None,
     )
-    if prior_generation is None:
+    if prior_source is None or prior_source.generation_index is None:
         return True
-    prior = generations[prior_generation]
+    prior_exchange = prior_source.exchange
+    prior_output = [
+        cast(
+            ResponseInputItemParam,
+            item.model_dump(mode="json", exclude_none=True),
+        )
+        for item in prior_exchange.response.output
+    ]
+    prior_generations, _ = _responses_generations(prior_exchange, output=prior_output)
+    if not 0 <= prior_source.generation_index < len(prior_generations):
+        raise ValueError("Responses generation source index is out of bounds")
+    prior = prior_generations[prior_source.generation_index]
     if _is_prefix(
         [*prior.prompt_token_ids, *prior.output_token_ids],
         generation.prompt_token_ids,
     ):
         return True
     return not any(
-        getattr(exchange.response.output[index], "type", None) == "reasoning"
+        getattr(prior_exchange.response.output[index], "type", None) == "reasoning"
         for index in prior.output_indices
     )
 
@@ -991,9 +1065,7 @@ def _completion_choice_groups(
 ) -> list[list[CompletionChoice]]:
     prompts = _completion_prompts(exchange.request.get("prompt"))
     count = len(prompts)
-    choices = sorted(exchange.response.choices, key=lambda item: item.index)
-    if not choices:
-        raise ValueError("Completions response contains no choices")
+    choices = _ordered_choices(exchange.response.choices, protocol="Completions")
     if count == 1:
         return [choices]
     requested_n = exchange.request.get("n")

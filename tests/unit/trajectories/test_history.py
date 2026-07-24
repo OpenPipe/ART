@@ -13,6 +13,7 @@ from art.trajectories import (
     ChatCompletionsExchange,
     CompletionsExchange,
     MessagesExchange,
+    MessagesRequest,
     ResponsesExchange,
     TrajectoryExchanges,
 )
@@ -280,6 +281,47 @@ def test_chat_choices_branch_and_identical_continuation_uses_first_choice() -> N
     assert histories[1].message_sources[1].choice_index == 1
 
 
+def test_chat_history_normalizes_empty_response_only_fields() -> None:
+    first = _chat([{"role": "user", "content": "one"}], "first")
+    data = first.response.model_dump(mode="python")
+    data["choices"][0]["message"]["tool_calls"] = []
+    first.response = ChatCompletion.model_validate(data)
+    second = _chat(
+        [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "first"},
+            {"role": "user", "content": "two"},
+        ],
+        "second",
+        offset=1,
+    )
+
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_history()
+
+    assert len(history.messages) == 4
+    assert "tool_calls" not in history.messages[1]
+    assert history.message_sources[1] is not None
+    assert history.message_sources[1].exchange is first
+
+
+@pytest.mark.parametrize("indices", [[], [0, 0]])
+def test_chat_history_rejects_missing_or_duplicate_choice_indices(
+    indices: list[int],
+) -> None:
+    exchange = _chat([{"role": "user", "content": "one"}], "first")
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    data["choices"] = [{**choice, "index": index} for index in indices]
+    exchange.response = ChatCompletion.model_validate(data)
+
+    with pytest.raises(ValueError, match="choices|choice indices"):
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(chat_completions=[exchange])
+        ).chat_completions_histories()
+
+
 def test_same_content_seeded_inputs_remain_request_sourced() -> None:
     first_chat = _chat([{"role": "user", "content": "prompt"}], "same")
     seeded_chat = _chat([{"role": "assistant", "content": "same"}], "next", offset=1)
@@ -494,6 +536,40 @@ def test_responses_history_propagates_opaque_context_and_first_sources() -> None
     assert history.input_sources[1].output_index == 0
 
 
+def test_branch_context_sources_follow_the_request_that_supplied_the_context() -> None:
+    first_message = _message()
+    second_message = _message()
+    second_message.start_time, second_message.end_time = _times(1)
+    second_message.request["system"] = "New instructions"
+    second_message.request["messages"] = [
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi"},
+        {"role": "user", "content": "Again"},
+    ]
+    message_histories = art.Trajectory(
+        exchanges=TrajectoryExchanges(messages=[first_message, second_message])
+    ).anthropic_messages_histories()
+
+    assert message_histories[-1].system == "New instructions"
+    assert message_histories[-1].system_source is second_message
+
+    first_response = _response("response-1", "first")
+    first_response.request["instructions"] = "Old instructions"
+    second_response = _response(
+        "response-2",
+        "second",
+        previous_response_id="response-1",
+        offset=1,
+    )
+    second_response.request["instructions"] = "New instructions"
+    response_histories = art.Trajectory(
+        exchanges=TrajectoryExchanges(responses=[first_response, second_response])
+    ).responses_histories()
+
+    assert response_histories[-1].instructions == "New instructions"
+    assert response_histories[-1].instructions_source is second_response
+
+
 def test_responses_history_maps_and_validates_generation_sources() -> None:
     exchange = _response("response-1", "first", reasoning="think")
     assert exchange.response.__pydantic_extra__ is not None
@@ -532,6 +608,49 @@ def test_responses_history_maps_and_validates_generation_sources() -> None:
     ]
     with pytest.raises(ValueError, match="nonoverlapping"):
         trajectory.responses_history()
+
+
+def test_cross_exchange_responses_reasoning_stripping_splits_histories() -> None:
+    first = _response("response-1", "first", reasoning="think")
+    first_data = first.response.model_dump(mode="python")
+    first_data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [
+                {"token_id": 2, "logprob": -0.2},
+                {"token_id": 3, "logprob": -0.3},
+            ],
+            "output_indices": [0, 1],
+        }
+    ]
+    first.response = Response.model_validate(first_data)
+    second = _response(
+        "response-2",
+        "second",
+        previous_response_id="response-1",
+        offset=1,
+    )
+    second_data = second.response.model_dump(mode="python")
+    second_data["token_generations"] = [
+        {
+            "prompt_token_ids": [1, 3, 4],
+            "output_tokens": [{"token_id": 5, "logprob": -0.5}],
+            "output_indices": [0],
+        }
+    ]
+    second.response = Response.model_validate(second_data)
+
+    histories = art.Trajectory(
+        exchanges=TrajectoryExchanges(responses=[first, second])
+    ).responses_histories()
+
+    assert len(histories) == 2
+    assert any(item.get("type") == "reasoning" for item in histories[0].input)
+    assert all(item.get("type") != "reasoning" for item in histories[1].input)
+    first_answer_source = histories[1].input_sources[1]
+    assert first_answer_source is not None
+    assert first_answer_source.exchange is first
+    assert first_answer_source.generation_index == 0
 
 
 @pytest.mark.parametrize(
@@ -725,6 +844,57 @@ def test_completions_reject_ambiguous_batches_and_suffix() -> None:
         ).histories()
 
 
+def test_completions_reject_duplicate_choice_indices() -> None:
+    exchange = _completion([1], [10])
+    data = exchange.response.model_dump(mode="python")
+    data["choices"].append(dict(data["choices"][0]))
+    exchange.response = Completion.model_validate(data)
+
+    with pytest.raises(ValueError, match="choice indices"):
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(completions=[exchange])
+        ).completions_token_histories()
+
+
+def test_malformed_anthropic_content_raises_value_error() -> None:
+    exchange = _message()
+    exchange.request = cast(
+        MessagesRequest,
+        {"messages": [{"role": "user", "content": None}]},
+    )
+
+    with pytest.raises(ValueError, match="Anthropic message content"):
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(messages=[exchange])
+        ).anthropic_messages_histories()
+
+
+def test_tokenless_responses_generation_raises_value_error() -> None:
+    exchange = _response("response-1", "first")
+    data = exchange.response.model_dump(mode="python")
+    data["output"] = [
+        {
+            "id": "tool-output",
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "result",
+            "status": "completed",
+        }
+    ]
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_indices": [0],
+        }
+    ]
+    exchange.response = Response.model_validate(data)
+
+    with pytest.raises(ValueError, match="without exact output tokens"):
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(responses=[exchange])
+        ).responses_histories()
+
+
 def test_reasoning_stripping_produces_truthful_history_per_generation() -> None:
     def exchange(
         offset: int,
@@ -833,6 +1003,48 @@ def test_chat_template_stripped_reasoning_splits_exact_histories() -> None:
     assert histories[1].message_sources[1].choice_index == 0
     with pytest.raises(ValueError, match="exactly one history"):
         trajectory.tokenize()
+
+
+def test_reasoning_stripped_tool_call_keeps_first_sampled_source() -> None:
+    first = _chat([{"role": "user", "content": "one"}], "")
+    first_data = first.response.model_dump(mode="python")
+    first_data["choices"][0]["message"] = {
+        "role": "assistant",
+        "content": None,
+        "reasoning": "thought",
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }
+        ],
+    }
+    first.response = ChatCompletion.model_validate(first_data)
+    second = _chat(
+        [
+            {"role": "user", "content": "one"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": first_data["choices"][0]["message"]["tool_calls"],
+            },
+            {"role": "user", "content": "two"},
+        ],
+        "second",
+        offset=1,
+    )
+
+    histories = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_histories()
+
+    assert len(histories) == 2
+    source = histories[1].message_sources[1]
+    assert source is not None
+    assert source.exchange is first
+    assert source.choice_index == 0
+    assert source.request_index is None
 
 
 def test_history_rejects_mutated_mixed_representation() -> None:
