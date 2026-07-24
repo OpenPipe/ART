@@ -19,7 +19,11 @@ _REQUEST_HASH_DOMAIN = "art-distill-teacher-scoring-request-v1"
 _REQUEST_ID_PREFIX = "teacher-score-"
 
 
-class RetryableTeacherScoringError(RuntimeError):
+class MaskableTeacherScoringError(RuntimeError):
+    """Availability failure eligible for explicit distillation masking."""
+
+
+class RetryableTeacherScoringError(MaskableTeacherScoringError):
     """Operational scoring failure safe to retry with the identical request."""
 
 

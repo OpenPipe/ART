@@ -18,6 +18,7 @@ from art.distill.preparer import (
     strict,
 )
 from art.distill.scorer import (
+    MaskableTeacherScoringError,
     RankedTokenLogprob,
     RetryableTeacherScoringError,
     ScoredPosition,
@@ -380,7 +381,7 @@ async def test_strict_and_partial_failure_coverage_are_explicit_and_sanitized() 
             request: TeacherScoringRequest,
         ) -> TeacherScoringResult:
             if request.generation_id == "generation-1":
-                raise RuntimeError("authorization: secret-value")
+                raise MaskableTeacherScoringError("authorization: secret-value")
             return _result(request)
 
     with pytest.raises(DistillationPreparationError) as strict:
@@ -431,6 +432,26 @@ async def test_strict_and_partial_failure_coverage_are_explicit_and_sanitized() 
         ).prepare(_candidate(), _context())
 
 
+async def test_masking_cannot_hide_a_mismatched_scoring_result() -> None:
+    class MismatchedScorer:
+        async def score(
+            self,
+            request: TeacherScoringRequest,
+        ) -> TeacherScoringResult:
+            return _result(request).model_copy(
+                update={"teacher_revision": "wrong-revision"}
+            )
+
+    with pytest.raises(DistillationPreparationError, match="violated"):
+        await _all_preparer(
+            MismatchedScorer(),
+            failure_policy=FailurePolicy.mask_failed_generation(
+                min_generation_coverage=0.0,
+                min_token_coverage=0.0,
+            ),
+        ).prepare(_candidate(), _context())
+
+
 async def test_cancellation_propagates_and_cancels_sibling_scoring() -> None:
     started = 0
     both_started = asyncio.Event()
@@ -466,7 +487,7 @@ async def test_cancellation_propagates_and_cancels_sibling_scoring() -> None:
     assert cancelled == 2
 
 
-async def test_malformed_scorer_echo_is_a_generation_failure() -> None:
+async def test_malformed_scorer_echo_is_a_fatal_contract_violation() -> None:
     class BadEchoScorer:
         async def score(
             self,
@@ -475,14 +496,10 @@ async def test_malformed_scorer_echo_is_a_generation_failure() -> None:
             result = _result(request)
             return result.model_copy(update={"teacher_revision": "wrong"})
 
-    with pytest.raises(DistillationPreparationError) as raised:
+    with pytest.raises(DistillationPreparationError, match="violated") as raised:
         await _all_preparer(BadEchoScorer()).prepare(_candidate(), _context())
 
-    assert len(raised.value.issues) == 2
-    assert {issue.generation_id for issue in raised.value.issues} == {
-        "generation-1",
-        "generation-2",
-    }
+    assert raised.value.issues == ()
 
 
 async def test_current_step_and_student_on_policy_are_enforced() -> None:

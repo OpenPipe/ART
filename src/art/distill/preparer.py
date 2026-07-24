@@ -12,6 +12,7 @@ from .artifact import PreparedTrainingBatch
 from .candidate import CandidateTrainingBatch
 from .prepare import PreparationContext
 from .scorer import (
+    MaskableTeacherScoringError,
     RetryableTeacherScoringError,
     TeacherDistributionScorer,
     TeacherScoringRequest,
@@ -136,6 +137,7 @@ class _Outcome:
     request: TeacherScoringRequest
     result: TeacherScoringResult | None = None
     issue: PreparationIssue | None = None
+    fatal_contract_violation: bool = False
 
 
 class DistillationPreparer:
@@ -202,6 +204,10 @@ class DistillationPreparer:
         _validate_rollout_revisions(candidate_batch, requests, context)
 
         outcomes = await self._score_all(requests)
+        if any(outcome.fatal_contract_violation for outcome in outcomes):
+            raise DistillationPreparationError(
+                "Teacher scoring violated the request or distribution contract."
+            )
         issues = tuple(
             outcome.issue for outcome in outcomes if outcome.issue is not None
         )
@@ -351,7 +357,7 @@ class DistillationPreparer:
                         selected_positions=request.selected_positions,
                     ),
                 )
-            except Exception:
+            except MaskableTeacherScoringError:
                 return _Outcome(
                     request=request,
                     issue=PreparationIssue(
@@ -359,6 +365,11 @@ class DistillationPreparer:
                         teacher_name=request.teacher_name,
                         selected_positions=request.selected_positions,
                     ),
+                )
+            except Exception:
+                return _Outcome(
+                    request=request,
+                    fatal_contract_violation=True,
                 )
         raise AssertionError("retry loop must return an outcome")
 
