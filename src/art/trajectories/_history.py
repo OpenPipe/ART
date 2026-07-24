@@ -129,10 +129,18 @@ class _Branch(Generic[_ItemT, _SourceT, _ContextT]):
 def _selected_models(
     exchanges: Sequence[_ExchangeT], model: str | None, protocol: str
 ) -> list[tuple[str, list[_ExchangeT]]]:
+    has_exact_match = model is not None and any(
+        exchange.model == model for exchange in exchanges
+    )
     selected = [
         exchange
         for exchange in exchanges
-        if model is None or _model_matches(exchange.model, model)
+        if model is None
+        or (
+            exchange.model == model
+            if has_exact_match
+            else _model_matches(exchange.model, model)
+        )
     ]
     if not selected:
         suffix = f" for model {model!r}" if model is not None else ""
@@ -148,7 +156,9 @@ def _selected_models(
 
 
 def _model_matches(candidate: str | None, pattern: str) -> bool:
-    return candidate is not None and fnmatchcase(candidate, pattern)
+    return candidate is not None and (
+        candidate == pattern or fnmatchcase(candidate, pattern)
+    )
 
 
 def _one(history: Sequence[_ItemT], protocol: str) -> _ItemT:

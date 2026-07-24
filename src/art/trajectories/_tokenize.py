@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 import math
 import re
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 import warnings
 
 from anthropic.types import Message, MessageParam, TextBlock
@@ -22,7 +24,9 @@ from . import (
     CompletionsExchange,
     CompletionsSource,
     CompletionsStringHistory,
+    CompletionsStringSourceSpan,
     CompletionsTokenHistory,
+    CompletionsTokenSourceSpan,
     History,
     LegacyHistory,
     MessagesExchange,
@@ -61,6 +65,125 @@ class _SampledOutput:
     text: str | None
     token_ids: list[int]
     start: int
+
+
+@dataclass(frozen=True)
+class _SampledSourceKey:
+    protocol: Literal["chat_completions", "responses", "messages", "completions"]
+    response_id: str
+    start_time: datetime
+    end_time: datetime
+    index: int
+    prompt_index: int | None
+    exchange_identity: int
+
+
+@dataclass
+class _HistoryTokenizationTrace:
+    source_keys: list[_SampledSourceKey | None]
+    sources: dict[_SampledSourceKey, object]
+
+    def validate(self, tokenized: TokenizedHistory) -> None:
+        if len(self.source_keys) != len(tokenized.token_ids):
+            raise AssertionError(
+                "Tokenization trace differs in length from tokenized data"
+            )
+        for flag, source_key in zip(tokenized.flags, self.source_keys, strict=True):
+            if bool(flag & TokenFlag.SAMPLED) != (source_key is not None):
+                raise AssertionError(
+                    "Tokenization trace must identify every sampled token exactly once"
+                )
+            if source_key is not None and source_key not in self.sources:
+                raise AssertionError("Tokenization trace source key is unresolved")
+
+
+@dataclass
+class _TraceBuilder:
+    trace: _HistoryTokenizationTrace | None = None
+
+    def set(
+        self,
+        tokenized: TokenizedHistory,
+        source_keys: list[_SampledSourceKey | None],
+        sources: dict[_SampledSourceKey, object],
+    ) -> None:
+        trace = _HistoryTokenizationTrace(source_keys=source_keys, sources=sources)
+        trace.validate(tokenized)
+        self.trace = trace
+
+
+def _source_key(
+    exchange: Exchange,
+    *,
+    protocol: Literal["chat_completions", "responses", "messages", "completions"],
+    index: int,
+    prompt_index: int | None = None,
+) -> _SampledSourceKey:
+    return _SampledSourceKey(
+        protocol=protocol,
+        response_id=str(getattr(exchange.response, "id", "")),
+        start_time=exchange.start_time,
+        end_time=exchange.end_time,
+        index=index,
+        prompt_index=prompt_index,
+        # The trace is private and consumed during this tokenization call. Object
+        # identity makes repeated empty provider IDs collision-free while keeping
+        # all histories projected from one exchange on the same source key.
+        exchange_identity=id(exchange),
+    )
+
+
+def _sampled_source_key(source: object) -> _SampledSourceKey:
+    exchange = getattr(source, "exchange", None)
+    if isinstance(exchange, ChatCompletionsExchange):
+        index = getattr(source, "choice_index", None)
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise ValueError("Sampled Chat source has no choice index")
+        return _source_key(exchange, protocol="chat_completions", index=index)
+    if isinstance(exchange, ResponsesExchange):
+        index = getattr(source, "generation_index", None)
+        if index is None and getattr(source, "output_index", None) is not None:
+            index = 0
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise ValueError("Sampled Responses source has no generation identity")
+        return _source_key(exchange, protocol="responses", index=index)
+    if isinstance(exchange, MessagesExchange):
+        return _source_key(exchange, protocol="messages", index=0)
+    if isinstance(exchange, CompletionsExchange):
+        index = getattr(source, "choice_index", None)
+        prompt_index = getattr(source, "prompt_index", None)
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise ValueError("Sampled Completions source has no choice index")
+        if not isinstance(prompt_index, int) or isinstance(prompt_index, bool):
+            raise ValueError("Sampled Completions source has no prompt index")
+        return _source_key(
+            exchange,
+            protocol="completions",
+            index=index,
+            prompt_index=prompt_index,
+        )
+    raise ValueError("Sampled token source has an unsupported exchange")
+
+
+def _exchange_sampled_source_key(exchange: Exchange) -> _SampledSourceKey:
+    if isinstance(exchange, ChatCompletionsExchange):
+        return _source_key(
+            exchange,
+            protocol="chat_completions",
+            index=exchange.response.choices[0].index,
+        )
+    if isinstance(exchange, CompletionsExchange):
+        return _source_key(
+            exchange,
+            protocol="completions",
+            index=exchange.response.choices[0].index,
+            prompt_index=0,
+        )
+    if isinstance(exchange, ResponsesExchange):
+        return _source_key(exchange, protocol="responses", index=0)
+    if isinstance(exchange, MessagesExchange):
+        return _source_key(exchange, protocol="messages", index=0)
+    raise TypeError(f"Unsupported sampled exchange: {type(exchange).__name__}")
 
 
 def _as_tokenizer(tokenizer: object) -> Tokenizer:
@@ -289,12 +412,22 @@ def _completion_evidence(
         elif len(pair_logprobs) == len(prompt_ids) + len(selected):
             prompt_logprobs = pair_logprobs[: len(prompt_ids)]
             completion_logprobs = pair_logprobs[len(prompt_ids) :]
-        elif selected[: len(prompt_ids)] == prompt_ids:
+        elif selected[: len(prompt_ids)] == prompt_ids and (
+            pair_ids == selected
+            or (
+                len(tokens) == len(selected)
+                and all(isinstance(value, str) for value in tokens)
+                and "".join(cast(str, value) for value in tokens) == choice.text
+            )
+        ):
             if pair_logprobs and len(pair_logprobs) != len(selected):
                 raise ValueError("Completions token IDs and logprobs differ in length")
             prompt_logprobs = pair_logprobs[: len(prompt_ids)]
             selected = selected[len(prompt_ids) :]
             completion_logprobs = pair_logprobs[len(prompt_ids) :]
+        elif selected[: len(prompt_ids)] == prompt_ids:
+            selected = None
+            completion_logprobs = []
         elif pair_logprobs and len(pair_logprobs) != len(selected):
             raise ValueError("Completions token IDs and logprobs differ in length")
     elif selected is not None and pair_logprobs and len(pair_logprobs) != len(selected):
@@ -1340,6 +1473,7 @@ def _tokenize_exchange_trajectory(
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
     tokenizer_instance: Tokenizer | None = None,
+    _trace: _TraceBuilder | None = None,
 ) -> TokenizedHistory:
     if trajectory.exchanges and (
         trajectory.messages_and_choices
@@ -1380,6 +1514,8 @@ def _tokenize_exchange_trajectory(
     token_ids: list[int] = []
     logprobs: list[float] = []
     flags: list[TokenFlag] = []
+    source_keys: list[_SampledSourceKey | None] = []
+    sources: dict[_SampledSourceKey, object] = {}
     response_histories: dict[
         str, tuple[list[dict[str, Any]] | None, ResponsesExchange]
     ] = {}
@@ -1499,6 +1635,7 @@ def _tokenize_exchange_trajectory(
             flags.extend(
                 [TokenFlag.EXACT if prompt_is_exact else TokenFlag(0)] * len(prompt)
             )
+            source_keys.extend([None] * len(prompt))
         elif len(prompt) < len(token_ids) or prompt[: len(token_ids)] != token_ids:
             resolved_config = fallback_config()
             if tokenizer is None:
@@ -1557,6 +1694,7 @@ def _tokenize_exchange_trajectory(
             token_ids.extend(suffix)
             logprobs.extend([math.nan] * len(suffix))
             flags.extend([TokenFlag(0)] * len(suffix))
+            source_keys.extend([None] * len(suffix))
         else:
             suffix = prompt[len(token_ids) :]
             token_ids.extend(suffix)
@@ -1566,6 +1704,7 @@ def _tokenize_exchange_trajectory(
             flags.extend(
                 [TokenFlag.EXACT if prompt_is_exact else TokenFlag(0)] * len(suffix)
             )
+            source_keys.extend([None] * len(suffix))
         if len(completion_logprobs) != len(completion):
             completion_logprobs = _align_visible_logprobs(
                 tokenizer, completion, exchange
@@ -1576,6 +1715,9 @@ def _tokenize_exchange_trajectory(
         if completion_is_exact:
             completion_flag |= TokenFlag.EXACT
         flags.extend([completion_flag] * len(completion))
+        source_key = _exchange_sampled_source_key(exchange)
+        source_keys.extend([source_key] * len(completion))
+        sources[source_key] = exchange
         if completion_is_exact:
             sampled_outputs.append(
                 _SampledOutput(
@@ -1586,12 +1728,15 @@ def _tokenize_exchange_trajectory(
             )
         previous_render_state = (exchange, messages_override)
 
-    return TokenizedHistory(
+    tokenized = TokenizedHistory(
         model=selected_model,
         token_ids=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
+    if _trace is not None:
+        _trace.set(tokenized, source_keys, sources)
+    return tokenized
 
 
 def _unique_exchanges(history: History) -> list[Exchange]:
@@ -1848,6 +1993,22 @@ def _validate_history_sources(history: History) -> None:
                                     "Responses output source does not belong to "
                                     "its generation"
                                 )
+                            expected.extend(
+                                _responses_messages(
+                                    {
+                                        "input": [
+                                            exchange.response.output[
+                                                generation_output_index
+                                            ].model_dump(
+                                                mode="python", exclude_none=True
+                                            )
+                                            for generation_output_index in generations[
+                                                generation_index
+                                            ].output_indices
+                                        ]
+                                    }
+                                )
+                            )
                         expected.extend(
                             _responses_messages(
                                 {
@@ -1865,16 +2026,8 @@ def _validate_history_sources(history: History) -> None:
                                 {"instructions": exchange.request.get("instructions")}
                             )
                         )
-                    expected.extend(
-                        _responses_messages(
-                            {
-                                "input": [
-                                    item.model_dump(mode="python", exclude_none=True)
-                                    for item in exchange.response.output
-                                ]
-                            }
-                        )
-                    )
+                    elif source.generation_index is not None:
+                        expected.append({"role": "assistant", "content": ""})
             actual = normalize_chat_message(message)
             if not any(
                 actual == normalize_chat_message(candidate) for candidate in expected
@@ -2028,10 +2181,17 @@ def _last_source_exchange(sources: Sequence[object]) -> Exchange | None:
     return None
 
 
-def _history_needs_render(history: History) -> bool:
+@dataclass(frozen=True)
+class _HistoryRenderState:
+    needs_render: bool
+    context_changed: bool = False
+    projection_matches: bool | None = None
+
+
+def _history_render_state(history: History) -> _HistoryRenderState:
     if isinstance(history, ChatCompletionsHistory):
         if any(source is None for source in history.message_sources):
-            return True
+            return _HistoryRenderState(needs_render=True, projection_matches=False)
         for message, source in zip(
             history.messages, history.message_sources, strict=True
         ):
@@ -2040,20 +2200,26 @@ def _history_needs_render(history: History) -> bool:
             if dict(message) != original and dict(message) == _without_reasoning(
                 original
             ):
-                return True
+                return _HistoryRenderState(needs_render=True)
         exchange = _last_source_exchange(history.message_sources)
         if not isinstance(exchange, ChatCompletionsExchange):
-            return True
+            return _HistoryRenderState(needs_render=True)
         context_changed = (
             history.tools != exchange.request.get("tools")
             or history.chat_template != exchange.request.get("chat_template")
             or history.chat_template_kwargs
             != exchange.request.get("chat_template_kwargs")
         )
-        return context_changed or not _history_matches_projection(history)
+        if context_changed:
+            return _HistoryRenderState(needs_render=True, context_changed=True)
+        projection_matches = _history_matches_projection(history)
+        return _HistoryRenderState(
+            needs_render=not projection_matches,
+            projection_matches=projection_matches,
+        )
     if isinstance(history, AnthropicMessagesHistory):
         if any(source is None for source in history.message_sources):
-            return True
+            return _HistoryRenderState(needs_render=True, projection_matches=False)
         for message, source in zip(
             history.messages, history.message_sources, strict=True
         ):
@@ -2067,10 +2233,10 @@ def _history_needs_render(history: History) -> bool:
                 ],
             }
             if message != expected:
-                return True
+                return _HistoryRenderState(needs_render=True)
         exchange = _last_source_exchange(history.message_sources)
         if not isinstance(exchange, MessagesExchange):
-            return False
+            return _HistoryRenderState(needs_render=False)
         context_changed = (
             history.system != exchange.request.get("system")
             or history.tools != exchange.request.get("tools")
@@ -2078,13 +2244,19 @@ def _history_needs_render(history: History) -> bool:
             or history.chat_template_kwargs
             != exchange.request.get("chat_template_kwargs")
         )
-        return context_changed or not _history_matches_projection(history)
+        if context_changed:
+            return _HistoryRenderState(needs_render=True, context_changed=True)
+        projection_matches = _history_matches_projection(history)
+        return _HistoryRenderState(
+            needs_render=not projection_matches,
+            projection_matches=projection_matches,
+        )
     if isinstance(history, ResponsesHistory):
         if any(source is None for source in history.input_sources):
-            return True
+            return _HistoryRenderState(needs_render=True, projection_matches=False)
         exchange = _last_source_exchange(history.input_sources)
         if not isinstance(exchange, ResponsesExchange):
-            return False
+            return _HistoryRenderState(needs_render=False)
         context_changed = (
             history.instructions != exchange.request.get("instructions")
             or history.tools != exchange.request.get("tools")
@@ -2092,8 +2264,14 @@ def _history_needs_render(history: History) -> bool:
             or history.chat_template_kwargs
             != exchange.request.get("chat_template_kwargs")
         )
-        return context_changed or not _history_matches_projection(history)
-    return False
+        if context_changed:
+            return _HistoryRenderState(needs_render=True, context_changed=True)
+        projection_matches = _history_matches_projection(history)
+        return _HistoryRenderState(
+            needs_render=not projection_matches,
+            projection_matches=projection_matches,
+        )
+    return _HistoryRenderState(needs_render=False)
 
 
 def _source_signature(source: object) -> tuple[object, ...] | None:
@@ -2157,9 +2335,14 @@ def _history_matches_projection(history: History) -> bool:
         )
     )
     if isinstance(history, ChatCompletionsHistory):
-        candidates: Sequence[History] = chat_completions_histories(
-            trajectory, model=history.model
-        )
+        try:
+            candidates: Sequence[History] = chat_completions_histories(
+                trajectory, model=history.model
+            )
+        except ValueError as error:
+            if "no Chat Completions exchanges" not in str(error):
+                raise
+            return False
         return any(
             isinstance(candidate, ChatCompletionsHistory)
             and candidate.messages == history.messages
@@ -2219,6 +2402,7 @@ def _tokenize_exact_responses_history(
     *,
     base_model: str | None,
     tokenizer: Tokenizer | None,
+    _trace: _TraceBuilder | None = None,
 ) -> TokenizedHistory | None:
     generation_keys: list[tuple[ResponsesExchange, int]] = []
     retained_output_indices: dict[tuple[int, int], set[int]] = {}
@@ -2238,6 +2422,8 @@ def _tokenize_exact_responses_history(
     token_ids: list[int] = []
     logprobs: list[float] = []
     flags: list[TokenFlag] = []
+    source_keys: list[_SampledSourceKey | None] = []
+    sources: dict[_SampledSourceKey, object] = {}
     sampled_outputs: list[_SampledOutput] = []
     for position, (exchange, generation_index) in enumerate(generation_keys):
         generations = _response_generations(exchange.response)
@@ -2278,12 +2464,14 @@ def _tokenize_exact_responses_history(
             token_ids.extend(prompt)
             logprobs.extend([math.nan] * len(prompt))
             flags.extend([TokenFlag.EXACT] * len(prompt))
+            source_keys.extend([None] * len(prompt))
         elif prompt[: len(token_ids)] == token_ids:
             suffix = prompt[len(token_ids) :]
             token_ids.extend(suffix)
             logprobs.extend([math.nan] * len(suffix))
             flags = [flag | TokenFlag.EXACT for flag in flags]
             flags.extend([TokenFlag.EXACT] * len(suffix))
+            source_keys.extend([None] * len(suffix))
         else:
             if tokenizer is None and sampled_outputs:
                 tokenizer = _load_tokenizer(
@@ -2303,9 +2491,25 @@ def _tokenize_exact_responses_history(
             token_ids.extend(suffix)
             logprobs.extend([math.nan] * len(suffix))
             flags.extend([TokenFlag.EXACT] * len(suffix))
+            source_keys.extend([None] * len(suffix))
         token_ids.extend(output)
         logprobs.extend(output_logprobs)
         flags.extend([TokenFlag.EXACT | TokenFlag.SAMPLED] * len(output))
+        source = next(
+            (
+                item
+                for item in history.input_sources
+                if item is not None
+                and item.exchange is exchange
+                and item.generation_index == generation_index
+            ),
+            None,
+        )
+        if source is None:
+            raise AssertionError("Responses generation has no history source")
+        source_key = _sampled_source_key(source)
+        source_keys.extend([source_key] * len(output))
+        sources[source_key] = source
         sampled_outputs.append(
             _SampledOutput(
                 text=output_text,
@@ -2313,12 +2517,15 @@ def _tokenize_exact_responses_history(
                 start=len(token_ids) - len(output),
             )
         )
-    return TokenizedHistory(
+    tokenized = TokenizedHistory(
         model=history.model,
         token_ids=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
+    if _trace is not None:
+        _trace.set(tokenized, source_keys, sources)
+    return tokenized
 
 
 def _chat_source_full_tokens(
@@ -2401,15 +2608,17 @@ def _tokenize_exact_projected_chat_history(
     history: ChatCompletionsHistory,
     *,
     projection_validated: bool = False,
+    _trace: _TraceBuilder | None = None,
 ) -> TokenizedHistory | None:
     if not projection_validated and not _history_matches_projection(history):
         return None
     sampled_sources: list[object] = []
     seen: set[tuple[object, ...]] = set()
-    for source in history.message_sources:
+    for message, source in zip(history.messages, history.message_sources, strict=True):
         signature = _source_signature(source)
         if (
-            source is not None
+            message.get("role") == "assistant"
+            and source is not None
             and signature is not None
             and signature not in seen
             and _source_is_sampled(source)
@@ -2438,6 +2647,12 @@ def _tokenize_exact_projected_chat_history(
         *([TokenFlag.EXACT] * len(final_prompt)),
         *([TokenFlag.EXACT | TokenFlag.SAMPLED] * len(final_output)),
     ]
+    final_key = _sampled_source_key(final_source)
+    source_keys: list[_SampledSourceKey | None] = [
+        *([None] * len(final_prompt)),
+        *([final_key] * len(final_output)),
+    ]
+    sources: dict[_SampledSourceKey, object] = {final_key: final_source}
     for index, source in enumerate(sampled_sources[:-1]):
         prompt = _chat_source_prompt_tokens(source)
         output, output_logprobs = _chat_source_full_tokens(source)
@@ -2474,14 +2689,20 @@ def _tokenize_exact_projected_chat_history(
             return None
         flags[start:end] = [TokenFlag.EXACT | TokenFlag.SAMPLED] * len(retained_ids)
         logprobs[start:end] = retained_logprobs
+        source_key = _sampled_source_key(source)
+        source_keys[start:end] = [source_key] * len(retained_ids)
+        sources[source_key] = source
     if history.model is None:
         raise ValueError("History tokenization requires a model")
-    return TokenizedHistory(
+    tokenized = TokenizedHistory(
         model=history.model,
         token_ids=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
+    if _trace is not None:
+        _trace.set(tokenized, source_keys, sources)
+    return tokenized
 
 
 def _chat_message_parts(message: Mapping[str, object]) -> list[tuple[str, str]]:
@@ -2588,7 +2809,6 @@ def _chat_source_tokens(
                 raise ValueError(
                     "Responses source output index does not belong to its generation"
                 )
-            return generation.output_token_ids, generation.output_logprobs
         output_index = getattr(source, "output_index", None)
         if isinstance(output_index, int) and output_index < len(
             exchange.response.output
@@ -2620,6 +2840,48 @@ def _chat_source_tokens(
     return None, []
 
 
+def _source_covers_complete_sampled_message(
+    message: Mapping[str, object], source: object
+) -> bool:
+    from ._history import normalize_chat_message
+
+    exchange = getattr(source, "exchange", None)
+    if isinstance(exchange, ChatCompletionsExchange):
+        expected = _chat_choice_message(source)
+        return expected is not None and normalize_chat_message(
+            message
+        ) == normalize_chat_message(expected)
+    if isinstance(exchange, MessagesExchange):
+        if getattr(source, "request_index", None) is not None:
+            return False
+        return normalize_chat_message(message) == normalize_chat_message(
+            _response_message(exchange)
+        )
+    if not isinstance(exchange, ResponsesExchange):
+        return False
+    generation_index = getattr(source, "generation_index", None)
+    if not isinstance(generation_index, int):
+        return False
+    generations = _response_generations(exchange.response)
+    if not 0 <= generation_index < len(generations):
+        raise ValueError("Responses source generation index is out of bounds")
+    if not generations[generation_index].output_indices:
+        return message.get("role") == "assistant" and not _chat_message_parts(message)
+    projected = _responses_messages(
+        {
+            "input": [
+                exchange.response.output[index].model_dump(
+                    mode="python", exclude_none=True
+                )
+                for index in generations[generation_index].output_indices
+            ]
+        }
+    )
+    return len(projected) == 1 and normalize_chat_message(
+        message
+    ) == normalize_chat_message(projected[0])
+
+
 def _tokenize_chat_view(
     history: ChatCompletionsHistory,
     *,
@@ -2627,6 +2889,7 @@ def _tokenize_chat_view(
     tokenizer: Tokenizer | None,
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
+    _trace: _TraceBuilder | None = None,
 ) -> TokenizedHistory:
     _validate_history_sources(history)
     config = (
@@ -2656,27 +2919,55 @@ def _tokenize_chat_view(
             kwargs.setdefault("thinking_budget", budget)
     template = chat_template or history.chat_template or config.chat_template
     ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
-    rendered = _ids(
-        tokenizer.apply_chat_template(
-            messages,
-            tools=history.tools,
-            tokenize=True,
-            add_generation_prompt=not ends_with_assistant,
-            **({"chat_template": template} if template is not None else {}),
-            **kwargs,
+
+    def render(
+        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    ) -> list[int]:
+        return _ids(
+            resolved_tokenizer.apply_chat_template(
+                selected_messages,
+                tools=history.tools,
+                tokenize=True,
+                add_generation_prompt=add_generation_prompt,
+                **({"chat_template": template} if template is not None else {}),
+                **kwargs,
+            )
         )
+
+    rendered = render(
+        messages,
+        add_generation_prompt=not ends_with_assistant,
     )
+
+    positions_by_first_token: dict[int, list[int]] = {}
+    for index, token_id in enumerate(rendered):
+        positions_by_first_token.setdefault(token_id, []).append(index)
+    locations_by_needle: dict[tuple[int, ...], list[tuple[int, int]]] = {}
 
     def locations(needle: Sequence[int], start: int) -> list[tuple[int, int]]:
         if not needle:
             return []
-        return [
-            (index, index + len(needle))
-            for index in range(start, len(rendered) - len(needle) + 1)
-            if rendered[index : index + len(needle)] == list(needle)
-        ]
+        key = tuple(needle)
+        if key not in locations_by_needle:
+            locations_by_needle[key] = [
+                (index, index + len(key))
+                for index in positions_by_first_token.get(key[0], [])
+                if rendered[index : index + len(key)] == list(key)
+            ]
+        spans = locations_by_needle[key]
+        return spans[bisect_left(spans, (start, -1)) :]
 
-    replacements: list[tuple[int, int, list[int], list[float], bool]] = []
+    replacements: list[
+        tuple[
+            int,
+            int,
+            list[int],
+            list[float],
+            bool,
+            _SampledSourceKey,
+            object,
+        ]
+    ] = []
     search_cursor = 0
     sampled_texts = {
         text
@@ -2708,7 +2999,9 @@ def _tokenize_chat_view(
         for _, text in _chat_message_parts(message)
     ]
     sampled_part_cursor = 0
-    for message, source in zip(history.messages, history.message_sources, strict=True):
+    for message_index, (message, source) in enumerate(
+        zip(history.messages, history.message_sources, strict=True)
+    ):
         parts = _chat_message_parts(message)
         sampled = (
             message.get("role") == "assistant"
@@ -2717,6 +3010,11 @@ def _tokenize_chat_view(
         )
         full_exact, full_logprobs = (
             _chat_source_full_tokens(source) if sampled else (None, [])
+        )
+        complete_sampled_message = (
+            sampled
+            and source is not None
+            and _source_covers_complete_sampled_message(message, source)
         )
         source_boundary = False
         if sampled and source is not None:
@@ -2740,11 +3038,21 @@ def _tokenize_chat_view(
         full_matches = (
             locations(full_exact, search_cursor) if sampled and full_exact else []
         )
+        first_part_matches = (
+            locations(part_ids(parts[0][1]), search_cursor) if parts else []
+        )
         if (
             full_exact is not None
             and full_matches
-            and source_boundary
-            and full_matches[0][0] == search_cursor
+            and (
+                (source_boundary and full_matches[0][0] == search_cursor)
+                or (
+                    complete_sampled_message
+                    and len(full_matches) == 1
+                    and first_part_matches
+                    and full_matches[0][0] == first_part_matches[0][0]
+                )
+            )
         ):
             span = full_matches[0]
             start, end = span
@@ -2757,9 +3065,45 @@ def _tokenize_chat_view(
                     if len(full_logprobs) == len(full_exact)
                     else [math.nan] * len(full_exact),
                     True,
+                    _sampled_source_key(source),
+                    source,
                 )
             )
             search_cursor = end
+            sampled_part_cursor += len(parts)
+            continue
+
+        if (
+            complete_sampled_message
+            and full_exact is not None
+            and (len(parts) != 1 or len(full_exact) != len(part_ids(parts[0][1])))
+        ):
+            prompt_render = render(messages[:message_index], add_generation_prompt=True)
+            completed_render = render(
+                messages[: message_index + 1], add_generation_prompt=False
+            )
+            if (
+                len(completed_render) <= len(prompt_render)
+                or completed_render[: len(prompt_render)] != prompt_render
+                or rendered[: len(completed_render)] != completed_render
+            ):
+                raise ValueError(
+                    "Could not locate a complete sampled message in the rendered history"
+                )
+            replacements.append(
+                (
+                    len(prompt_render),
+                    len(completed_render),
+                    full_exact,
+                    full_logprobs
+                    if len(full_logprobs) == len(full_exact)
+                    else [math.nan] * len(full_exact),
+                    True,
+                    _sampled_source_key(source),
+                    source,
+                )
+            )
+            search_cursor = len(completed_render)
             sampled_part_cursor += len(parts)
             continue
 
@@ -2810,9 +3154,6 @@ def _tokenize_chat_view(
             if exact is not None and rendered[start : start + len(exact)] == exact:
                 end = start + len(exact)
                 search_cursor = end
-            elif exact is not None and exact[: len(local)] == local:
-                exact = exact[: len(local)]
-                logprobs = logprobs[: len(local)]
             replacement = exact if exact is not None else local
             if exact is None and not logprobs:
                 exchange = getattr(source, "exchange", None)
@@ -2830,6 +3171,8 @@ def _tokenize_chat_view(
                     if len(logprobs) == len(replacement)
                     else [math.nan] * len(replacement),
                     exact is not None,
+                    _sampled_source_key(source),
+                    source,
                 )
             )
         message_replacements = replacements[replacement_start:]
@@ -2859,6 +3202,8 @@ def _tokenize_chat_view(
                     rendered[start:end],
                     [math.nan] * (end - start),
                     False,
+                    message_replacements[0][5],
+                    message_replacements[0][6],
                 )
             )
         if sampled and not parts and full_exact is not None:
@@ -2869,33 +3214,52 @@ def _tokenize_chat_view(
     token_ids: list[int] = []
     logprobs: list[float] = []
     flags: list[TokenFlag] = []
+    source_keys: list[_SampledSourceKey | None] = []
+    sources: dict[_SampledSourceKey, object] = {}
     cursor = 0
-    for start, end, replacement, replacement_logprobs, exact in sorted(replacements):
+    for (
+        start,
+        end,
+        replacement,
+        replacement_logprobs,
+        exact,
+        source_key,
+        source,
+    ) in sorted(replacements, key=lambda item: (item[0], item[1])):
         if start < cursor:
             raise ValueError("Rendered assistant source spans overlap")
         token_ids.extend(rendered[cursor:start])
         logprobs.extend([math.nan] * (start - cursor))
         flags.extend([TokenFlag(0)] * (start - cursor))
+        source_keys.extend([None] * (start - cursor))
         token_ids.extend(replacement)
         logprobs.extend(replacement_logprobs)
         flag = TokenFlag.SAMPLED | (TokenFlag.EXACT if exact else TokenFlag(0))
         flags.extend([flag] * len(replacement))
+        source_keys.extend([source_key] * len(replacement))
+        sources[source_key] = source
         cursor = end
     token_ids.extend(rendered[cursor:])
     logprobs.extend([math.nan] * (len(rendered) - cursor))
     flags.extend([TokenFlag(0)] * (len(rendered) - cursor))
+    source_keys.extend([None] * (len(rendered) - cursor))
     if history.model is None:
         raise ValueError("History tokenization requires a model")
-    return TokenizedHistory(
+    tokenized = TokenizedHistory(
         model=history.model,
         token_ids=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
+    if _trace is not None:
+        _trace.set(tokenized, source_keys, sources)
+    return tokenized
 
 
 def _tokenize_completions_token_history(
     history: CompletionsTokenHistory,
+    *,
+    _trace: _TraceBuilder | None = None,
 ) -> TokenizedHistory:
     if any(
         span.start < 0 or span.end <= span.start or span.end > len(history.prompt)
@@ -2906,9 +3270,16 @@ def _tokenize_completions_token_history(
         raise ValueError(
             "Completions token source spans must exhaustively cover prompt"
         )
+    _validate_completions_sources(
+        model=history.model,
+        source_spans=history.prompt_sources,
+        sampled_spans=history.sampled_spans,
+    )
 
     flags = [TokenFlag(0)] * len(history.prompt)
     logprobs = [math.nan] * len(history.prompt)
+    source_keys: list[_SampledSourceKey | None] = [None] * len(history.prompt)
+    sources: dict[_SampledSourceKey, object] = {}
     for start, end in history.sampled_spans:
         if start < 0 or end <= start or end > len(history.prompt):
             raise ValueError("Completions sampled spans are out of bounds")
@@ -2916,6 +3287,10 @@ def _tokenize_completions_token_history(
     for span in history.prompt_sources:
         if span.source is None:
             continue
+        if span.source.choice_index is not None:
+            source_key = _sampled_source_key(span.source)
+            source_keys[span.start : span.end] = [source_key] * (span.end - span.start)
+            sources[source_key] = span.source
         flags[span.start : span.end] = [
             flag | TokenFlag.EXACT for flag in flags[span.start : span.end]
         ]
@@ -2933,12 +3308,15 @@ def _tokenize_completions_token_history(
             continue
         if len(selected_logprobs) == span.end - span.start:
             logprobs[span.start : span.end] = selected_logprobs
-    return TokenizedHistory(
+    tokenized = TokenizedHistory(
         model=history.model,
         token_ids=list(history.prompt),
         logprobs=logprobs,
         flags=flags,
     )
+    if _trace is not None:
+        _trace.set(tokenized, source_keys, sources)
+    return tokenized
 
 
 def _completion_visible_logprobs(
@@ -2958,7 +3336,10 @@ def _completion_visible_logprobs(
     if not isinstance(raw_tokens, list) or not isinstance(raw_logprobs, list):
         return None
     values = list(zip(raw_tokens, raw_logprobs, strict=False))
-    request_prompt = source.exchange.request.get("prompt")
+    from ._history import _completion_prompts
+
+    request_prompts = _completion_prompts(source.exchange.request.get("prompt"))
+    request_prompt = request_prompts[source.prompt_index]
     if source.exchange.request.get("echo") is True and isinstance(request_prompt, str):
         consumed = ""
         cursor = 0
@@ -2998,11 +3379,17 @@ def _tokenize_completions_string_history(
     *,
     base_model: str | None,
     tokenizer: Tokenizer | None,
+    _trace: _TraceBuilder | None = None,
 ) -> TokenizedHistory:
     if not _spans_are_exhaustive(len(history.prompt), history.prompt_sources):
         raise ValueError(
             "Completions string source spans must exhaustively cover prompt"
         )
+    _validate_completions_sources(
+        model=history.model,
+        source_spans=history.prompt_sources,
+        sampled_spans=history.sampled_spans,
+    )
     sampled = [False] * len(history.prompt)
     for start, end in history.sampled_spans:
         if start < 0 or end <= start or end > len(history.prompt):
@@ -3021,6 +3408,8 @@ def _tokenize_completions_string_history(
     token_ids: list[int] = []
     logprobs: list[float] = []
     flags: list[TokenFlag] = []
+    source_keys: list[_SampledSourceKey | None] = []
+    sources: dict[_SampledSourceKey, object] = {}
     for span in history.prompt_sources:
         text = history.prompt[span.start : span.end]
         source = span.source
@@ -3052,11 +3441,20 @@ def _tokenize_completions_string_history(
                     if item.index == source.choice_index
                 )
                 expected = choice.text
-                request_prompt = source.exchange.request.get("prompt")
-                if source.exchange.request.get("echo") is True and isinstance(
-                    request_prompt, str
-                ):
-                    expected = expected.removeprefix(request_prompt)
+                from ._history import _completion_prompts
+
+                request_prompts = _completion_prompts(
+                    source.exchange.request.get("prompt")
+                )
+                request_prompt = request_prompts[source.prompt_index]
+                if source.exchange.request.get("echo") is True:
+                    if not isinstance(request_prompt, str) or not expected.startswith(
+                        request_prompt
+                    ):
+                        raise ValueError(
+                            "Cannot locate echoed Completions prompt boundary"
+                        )
+                    expected = expected[len(request_prompt) :]
                 if text != expected:
                     raise ValueError(
                         "Completions history text no longer matches its source exchange"
@@ -3082,12 +3480,23 @@ def _tokenize_completions_string_history(
         if exact is not None:
             flag |= TokenFlag.EXACT
         flags.extend([flag] * len(ids))
-    return TokenizedHistory(
+        if is_sampled:
+            if source is None:
+                raise AssertionError("Sampled Completions span has no source")
+            source_key = _sampled_source_key(source)
+            source_keys.extend([source_key] * len(ids))
+            sources[source_key] = source
+        else:
+            source_keys.extend([None] * len(ids))
+    tokenized = TokenizedHistory(
         model=history.model,
         token_ids=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
+    if _trace is not None:
+        _trace.set(tokenized, source_keys, sources)
+    return tokenized
 
 
 def _completion_source_evidence(
@@ -3127,6 +3536,31 @@ def _completion_source_evidence(
     )
 
 
+def _validate_completions_sources(
+    *,
+    model: str,
+    source_spans: Sequence[CompletionsTokenSourceSpan | CompletionsStringSourceSpan],
+    sampled_spans: Sequence[tuple[int, int]],
+) -> None:
+    expected_sampled: list[tuple[int, int]] = []
+    for span in source_spans:
+        source = getattr(span, "source", None)
+        if source is None:
+            continue
+        if not isinstance(source, CompletionsSource):
+            raise ValueError("Completions history has an invalid source")
+        if source.exchange.model != model:
+            raise ValueError(
+                "Completions history model no longer matches its source exchange"
+            )
+        if source.choice_index is not None:
+            expected_sampled.append((span.start, span.end))
+    if list(sampled_spans) != expected_sampled:
+        raise ValueError(
+            "Completions sampled spans must exactly match choice-backed source spans"
+        )
+
+
 def _spans_are_exhaustive(length: int, spans: Sequence[object]) -> bool:
     cursor = 0
     for span in spans:
@@ -3152,6 +3586,7 @@ def tokenize_history(
     tokenizer: Tokenizer | None,
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
+    _trace: _TraceBuilder | None = None,
 ) -> TokenizedHistory:
     if isinstance(history, LegacyHistory):
         if model is None:
@@ -3160,12 +3595,13 @@ def tokenize_history(
     if model is None:
         raise ValueError("History tokenization requires a model")
     if isinstance(history, CompletionsTokenHistory):
-        return _tokenize_completions_token_history(history)
+        return _tokenize_completions_token_history(history, _trace=_trace)
     if isinstance(history, CompletionsStringHistory):
         return _tokenize_completions_string_history(
             history,
             base_model=base_model,
             tokenizer=tokenizer,
+            _trace=_trace,
         )
     _validate_history_sources(history)
     override_requires_render = (
@@ -3176,15 +3612,21 @@ def tokenize_history(
         and dict(chat_template_kwargs)
         != (getattr(history, "chat_template_kwargs", None) or {})
     )
-    needs_render = _history_needs_render(history) or override_requires_render
+    render_state = _history_render_state(history)
+    needs_render = render_state.needs_render or override_requires_render
     if isinstance(history, ResponsesHistory) and not needs_render:
         if exact := _tokenize_exact_responses_history(
-            history, base_model=base_model, tokenizer=tokenizer
+            history, base_model=base_model, tokenizer=tokenizer, _trace=_trace
         ):
             return exact
     if isinstance(history, ChatCompletionsHistory) and (needs_render):
-        if not override_requires_render and (
-            exact := _tokenize_exact_projected_chat_history(history)
+        if (
+            not override_requires_render
+            and not render_state.context_changed
+            and render_state.projection_matches is not False
+            and (
+                exact := _tokenize_exact_projected_chat_history(history, _trace=_trace)
+            )
         ):
             return exact
         return _tokenize_chat_view(
@@ -3193,16 +3635,23 @@ def tokenize_history(
             tokenizer=tokenizer,
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
+            _trace=_trace,
         )
     if isinstance(history, AnthropicMessagesHistory) and needs_render:
         converted = history.as_chat_completions_history()
         if (
             not override_requires_render
-            and _history_matches_projection(history)
+            and not render_state.context_changed
+            and (
+                render_state.projection_matches
+                if render_state.projection_matches is not None
+                else _history_matches_projection(history)
+            )
             and (
                 exact := _tokenize_exact_projected_chat_history(
                     converted,
                     projection_validated=True,
+                    _trace=_trace,
                 )
             )
         ):
@@ -3213,6 +3662,7 @@ def tokenize_history(
             tokenizer=tokenizer,
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
+            _trace=_trace,
         )
     if isinstance(history, ResponsesHistory) and needs_render:
         return _tokenize_chat_view(
@@ -3221,6 +3671,7 @@ def tokenize_history(
             tokenizer=tokenizer,
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
+            _trace=_trace,
         )
     trajectory = _trajectory_from_history(history)
     history_template = getattr(history, "chat_template", None)
@@ -3238,6 +3689,7 @@ def tokenize_history(
         }
         or None,
         tokenizer_instance=tokenizer,
+        _trace=_trace,
     )
 
 
@@ -3306,6 +3758,53 @@ def tokenize_trajectory(
         reward=trajectory.reward,
         metrics=dict(trajectory.metrics),
         metadata=dict(trajectory.metadata),
+    )
+
+
+def _tokenize_trajectory_with_trace(
+    trajectory: Trajectory,
+    *,
+    model: str | None = None,
+    base_model: str | None = None,
+    tokenizer: Tokenizer | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+) -> tuple[
+    TokenizedMultiHistoryTrajectory,
+    list[_HistoryTokenizationTrace],
+]:
+    if not trajectory.exchanges:
+        raise ValueError("Private exchange tokenization trace requires exchanges")
+    histories = trajectory.histories(model=model)
+    tokenized_histories: list[TokenizedHistory] = []
+    traces: list[_HistoryTokenizationTrace] = []
+    for history in histories:
+        if isinstance(history, LegacyHistory):
+            raise AssertionError(
+                "Exchange trajectories cannot produce legacy histories"
+            )
+        trace_builder = _TraceBuilder()
+        tokenized = tokenize_history(
+            history,
+            model=history.model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+            _trace=trace_builder,
+        )
+        if trace_builder.trace is None:
+            raise AssertionError("Exchange tokenization did not produce a source trace")
+        tokenized_histories.append(tokenized)
+        traces.append(trace_builder.trace)
+    return (
+        TokenizedMultiHistoryTrajectory(
+            histories=tokenized_histories,
+            reward=trajectory.reward,
+            metrics=dict(trajectory.metrics),
+            metadata=dict(trajectory.metadata),
+        ),
+        traces,
     )
 
 
