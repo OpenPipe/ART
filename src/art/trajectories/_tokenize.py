@@ -401,7 +401,13 @@ def _completion_evidence(
     selected = token_ids if token_ids is not None else pair_ids or None
     prompt_logprobs: list[float] = []
     completion_logprobs = pair_logprobs
-    if echo and prompt_ids is not None and selected is not None:
+    if echo and prompt_ids is None and token_ids is None:
+        # A combined logprobs.tokens carrier does not reveal where an echoed
+        # prompt ends. Let the string history tokenize prompt and completion
+        # independently rather than mislabeling the prompt as sampled output.
+        selected = None
+        completion_logprobs = []
+    elif echo and prompt_ids is not None and selected is not None:
         pair_includes_prompt = token_ids is not None and pair_ids == [
             *prompt_ids,
             *token_ids,

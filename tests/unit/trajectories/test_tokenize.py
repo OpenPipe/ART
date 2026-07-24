@@ -362,6 +362,40 @@ def test_completions_echo_prefers_full_logprob_carrier_to_id_prefix_heuristic() 
     ]
 
 
+def test_completions_echo_without_prompt_ids_falls_back_without_sampling_prompt() -> (
+    None
+):
+    exchange = _completion_exchange(echo=True)
+    payload = exchange.response.model_dump(mode="python")
+    payload["choices"][0].pop("prompt_token_ids")
+    payload["choices"][0].pop("token_ids")
+    payload["choices"][0]["logprobs"] = {
+        "tokens": ["token_id:1", "token_id:2"],
+        "token_logprobs": [-0.1, -0.2],
+        "top_logprobs": [{}, {}],
+        "text_offset": [0, 8],
+    }
+    exchange.response = Completion.model_validate(payload)
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"question": [1], "answer": [2]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            raise AssertionError((messages, kwargs))
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[exchange])
+    ).tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [1, 2]
+    assert tokenized.flags == [art.TokenFlag(0), art.TokenFlag.SAMPLED]
+    assert all(math.isnan(logprob) for logprob in tokenized.logprobs)
+
+
 def test_batched_completions_echo_uses_selected_prompt_boundary() -> None:
     exchange = _completion_exchange(prompt=["p0", "p1"], echo=True)
     payload = exchange.response.model_dump(mode="python")
