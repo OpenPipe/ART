@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
-from openai.types.completion_usage import CompletionUsage
+from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletion
 import pytest
 
 import art
@@ -251,16 +252,25 @@ class FakeTauBenchClient(TauBenchClient):
 class FakeCompletions:
     async def create(self, **kwargs: Any) -> Any:
         self.kwargs = kwargs
-        choice = SimpleNamespace(
-            message=SimpleNamespace(content="hello", tool_calls=None)
-        )
-        return SimpleNamespace(
-            choices=[choice],
-            usage=CompletionUsage(
-                prompt_tokens=10,
-                completion_tokens=5,
-                total_tokens=15,
-            ),
+        return ChatCompletion.model_validate(
+            {
+                "id": "chat-1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "default",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "hello"},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            }
         )
 
 
@@ -318,6 +328,167 @@ async def test_rollout_supports_art_model_like_args() -> None:
 
     assert trajectory.metadata["scenario_id"] == "task_001"
     assert trajectory.metrics["num_turns"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rollout_captures_two_turn_tool_exchange_with_exact_tokens() -> None:
+    rollout_module = importlib.import_module("art.tau_bench.rollout")
+    rollout_module.openai_clients.clear()
+    request_bodies: list[dict[str, Any]] = []
+
+    class ToolTauBenchClient(FakeTauBenchClient):
+        async def step_environment(
+            self, env_id: str, action: str
+        ) -> StepEnvironmentResponse:
+            if action == "lookup(key='x')":
+                return StepEnvironmentResponse(
+                    id=env_id,
+                    observation="tool: result",
+                    reward=0.25,
+                    terminated=False,
+                    truncated=False,
+                    info={},
+                )
+            assert action == "hello"
+            return StepEnvironmentResponse(
+                id=env_id,
+                observation="user: done",
+                reward=0.75,
+                terminated=True,
+                truncated=False,
+                info={"user_message_cost": 0.25},
+            )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads(request.content))
+        if len(request_bodies) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chat-tool",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "default",
+                    "prompt_token_ids": [10, 11],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call-1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"key":"x"}',
+                                        },
+                                    }
+                                ],
+                            },
+                            "token_ids": [12],
+                            "logprobs": {
+                                "content": [
+                                    {
+                                        "token": "token_id:12",
+                                        "logprob": -0.25,
+                                        "bytes": None,
+                                        "top_logprobs": [],
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1,
+                        "total_tokens": 3,
+                    },
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat-exact",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "default",
+                "prompt_token_ids": [10, 11, 12, 13],
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "hello"},
+                        "token_ids": [14],
+                        "logprobs": {
+                            "content": [
+                                {
+                                    "token": "token_id:14",
+                                    "logprob": -0.5,
+                                    "bytes": [104, 101, 108, 108, 111],
+                                    "top_logprobs": [],
+                                }
+                            ]
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 4,
+                    "completion_tokens": 1,
+                    "total_tokens": 5,
+                },
+            },
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    openai_client = AsyncOpenAI(
+        api_key="model-key",
+        base_url="http://model.test/v1",
+        http_client=http_client,
+    )
+    rollout_module.openai_clients[("http://model.test/v1", "model-key")] = openai_client
+    try:
+        trajectory = await rollout_module.rollout(
+            Scenario(domain="banking_knowledge", task=Task(id="task_001")),
+            "http://model.test/v1",
+            "model-key",
+            "default",
+            client=ToolTauBenchClient(),
+            max_turns=2,
+        )
+    finally:
+        await openai_client.close()
+        await http_client.aclose()
+        rollout_module.openai_clients.clear()
+
+    assert request_bodies[0]["messages"] == [
+        {"role": "system", "content": "policy"},
+        {"role": "user", "content": "hello"},
+    ]
+    assert request_bodies[1]["messages"][2]["tool_calls"][0]["id"] == "call-1"
+    assert request_bodies[1]["messages"][3] == {
+        "role": "tool",
+        "content": "result",
+        "tool_call_id": "call-1",
+    }
+    assert len(trajectory.exchanges.chat_completions) == 2
+    assert not trajectory.messages_and_choices
+    assert trajectory.tools is None
+    restored = art.Trajectory.model_validate_json(trajectory.model_dump_json())
+    tokenized = restored.tokenize()
+    assert tokenized.token_ids == [10, 11, 12, 13, 14]
+    assert tokenized.logprobs[2] == -0.25
+    assert tokenized.logprobs[3] != tokenized.logprobs[3]
+    assert tokenized.logprobs[4] == -0.5
+    assert tokenized.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
 
 
 class FakeBadRequestError(Exception):
@@ -382,16 +553,25 @@ async def test_rollout_stops_on_max_tokens_bad_request(
 
 class NearContextLimitCompletions:
     async def create(self, **kwargs: Any) -> Any:
-        choice = SimpleNamespace(
-            message=SimpleNamespace(content="hello", tool_calls=None)
-        )
-        return SimpleNamespace(
-            choices=[choice],
-            usage=CompletionUsage(
-                prompt_tokens=32_000,
-                completion_tokens=700,
-                total_tokens=32_700,
-            ),
+        return ChatCompletion.model_validate(
+            {
+                "id": "chat-near-limit",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "default",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "hello"},
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 32_000,
+                    "completion_tokens": 700,
+                    "total_tokens": 32_700,
+                },
+            }
         )
 
 

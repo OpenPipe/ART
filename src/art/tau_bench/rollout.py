@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 import json
 import os
-from typing import Any, overload
+from typing import Any, cast, overload
 
 from openai import AsyncOpenAI, BadRequestError
+from openai.types.chat import ChatCompletionMessageParam
 from openai.types.completion_usage import CompletionUsage
 
 from art.costs import get_model_pricing, tokens_to_cost
@@ -94,12 +95,12 @@ async def rollout(
             model=model,
             base_model=base_model,
         )
+        messages: list[ChatCompletionMessageParam] = [
+            {"role": "system", "content": env.info["policy"]},
+            {"role": "user", "content": env.observation.removeprefix("user: ")},
+        ]
+        tools = env.info.get("tools") or []
         trajectory = Trajectory(
-            messages_and_choices=[
-                {"role": "system", "content": env.info["policy"]},
-                {"role": "user", "content": env.observation.removeprefix("user: ")},
-            ],
-            tools=env.info.get("tools"),
             reward=0,
             metrics={
                 "cost/tinker/prefill": 0.0,
@@ -110,65 +111,76 @@ async def rollout(
         )
         terminated = False
         num_turns = 0
-        while not terminated:
-            if max_turns is not None and num_turns >= max_turns:
-                break
-            try:
-                chat_completion = await openai_client.chat.completions.create(
-                    messages=trajectory.messages(),
-                    model=model_name,
-                    stream=False,
-                    tool_choice="auto",
-                    tools=trajectory.tools or [],
-                    **chat_completion_kwargs,
-                )
-            except BadRequestError as exc:
-                if _is_max_tokens_error(exc):
+        with trajectory:
+            while not terminated:
+                if max_turns is not None and num_turns >= max_turns:
                     break
-                raise
-            _record_tinker_costs(
-                trajectory,
-                cost_model,
-                chat_completion.usage,
-                assert_costs=assert_costs,
-            )
-            choice = chat_completion.choices[0]
-            trajectory.messages_and_choices.append(choice)
-            tool_calls = getattr(choice.message, "tool_calls", None)
-            if tool_calls:
-                for tool_call in tool_calls:
-                    action = _tool_call_action(tool_call)
-                    step = await client.step_environment(env.id, action)
-                    trajectory.messages_and_choices.append(
+                try:
+                    chat_completion = await openai_client.chat.completions.create(
+                        messages=messages,
+                        model=model_name,
+                        stream=False,
+                        tool_choice="auto",
+                        tools=tools,
+                        **chat_completion_kwargs,
+                    )
+                except BadRequestError as exc:
+                    if _is_max_tokens_error(exc):
+                        break
+                    raise
+                _record_tinker_costs(
+                    trajectory,
+                    cost_model,
+                    chat_completion.usage,
+                    assert_costs=assert_costs,
+                )
+                choice = chat_completion.choices[0]
+                messages.append(
+                    cast(
+                        ChatCompletionMessageParam,
+                        choice.message.model_dump(exclude_none=True),
+                    )
+                )
+                tool_calls = getattr(choice.message, "tool_calls", None)
+                if tool_calls:
+                    for tool_call in tool_calls:
+                        action = _tool_call_action(tool_call)
+                        step = await client.step_environment(env.id, action)
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "content": step.observation.removeprefix("tool: "),
+                                "tool_call_id": tool_call.id,
+                            }
+                        )
+                        trajectory.reward += step.reward
+                        terminated = step.terminated
+                else:
+                    step = await client.step_environment(
+                        env.id,
+                        choice.message.content or "",
+                    )
+                    if "user_message_cost" in step.info:
+                        trajectory.metrics["cost/user"] += step.info[
+                            "user_message_cost"
+                        ]
+                    elif assert_costs:
+                        raise ValueError("Costs are not supported for the user model")
+                    messages.append(
                         {
-                            "role": "tool",
-                            "content": step.observation.removeprefix("tool: "),
-                            "tool_call_id": tool_call.id,
+                            "role": "user",
+                            "content": step.observation.removeprefix("user: "),
                         }
                     )
                     trajectory.reward += step.reward
                     terminated = step.terminated
-            else:
-                step = await client.step_environment(
-                    env.id,
-                    choice.message.content or "",
-                )
-                if "user_message_cost" in step.info:
-                    trajectory.metrics["cost/user"] += step.info["user_message_cost"]
-                elif assert_costs:
-                    raise ValueError("Costs are not supported for the user model")
-                trajectory.messages_and_choices.append(
-                    {"role": "user", "content": step.observation.removeprefix("user: ")}
-                )
-                trajectory.reward += step.reward
-                terminated = step.terminated
-            num_turns += 1
-            usage = chat_completion.usage
-            if usage is not None and _would_exceed_context_limit(
-                usage.total_tokens,
-                _requested_completion_tokens(chat_completion_kwargs),
-            ):
-                break
+                num_turns += 1
+                usage = chat_completion.usage
+                if usage is not None and _would_exceed_context_limit(
+                    usage.total_tokens,
+                    _requested_completion_tokens(chat_completion_kwargs),
+                ):
+                    break
         trajectory.metrics["num_turns"] = num_turns
         return trajectory
 
