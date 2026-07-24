@@ -16,6 +16,7 @@ from art.megatron import train as megatron_train
 from art.megatron.backend import MegatronBackend, _summarize_distillation_metrics
 from art.megatron.distillation import (
     CispoObjectiveConfig,
+    DiskPackedDistillationTensors,
     DistillationObjectiveConfig,
     PolicyPackingConfig,
     pack_prepared_batch,
@@ -1173,7 +1174,7 @@ def test_receipt_reservation_is_atomic_and_never_overwrites(tmp_path: Path) -> N
 
 async def _collect_distillation_metrics(
     service: MegatronService,
-    disk_tensors: dict[str, Any],
+    disk_tensors: DiskPackedDistillationTensors,
     config: TrainConfig,
     *,
     objective: DistillationObjectiveConfig,
@@ -1184,7 +1185,7 @@ async def _collect_distillation_metrics(
     return [
         metrics
         async for metrics in service.train_distillation(
-            cast(Any, disk_tensors),
+            disk_tensors,
             config,
             objective=objective,
             expected_source_revision=7,
