@@ -33,19 +33,31 @@ run: |
     --output scratch/lora-update-replay/inputs
 
   request_jsonl="$PWD/scratch/lora-update-replay/inputs/requests.jsonl"
+  mkdir -p scratch/lora-update-replay/fixed-load
   uv run --no-sync python scripts/benchmarks/service_lora_update_replay.py \
     --request-jsonl "$request_jsonl" \
     --mode fixed-load \
     --warmups 5 \
     --updates 30 \
-    --output scratch/lora-update-replay/fixed-load
+    --output scratch/lora-update-replay/fixed-load \
+    > scratch/lora-update-replay/fixed-load/stdout.log \
+    2> scratch/lora-update-replay/fixed-load/stderr.log
+  uv run --no-sync python scripts/benchmarks/upload_lora_update_replay.py \
+    --input scratch/lora-update-replay/fixed-load \
+    --mode fixed-load
 
+  mkdir -p scratch/lora-update-replay/idle
   uv run --no-sync python scripts/benchmarks/service_lora_update_replay.py \
     --request-jsonl "$request_jsonl" \
     --mode idle \
     --warmups 5 \
     --updates 30 \
-    --output scratch/lora-update-replay/idle
+    --output scratch/lora-update-replay/idle \
+    > scratch/lora-update-replay/idle/stdout.log \
+    2> scratch/lora-update-replay/idle/stderr.log
+  uv run --no-sync python scripts/benchmarks/upload_lora_update_replay.py \
+    --input scratch/lora-update-replay/idle \
+    --mode idle
 
 config:
   kubernetes:

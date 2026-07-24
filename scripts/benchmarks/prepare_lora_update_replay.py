@@ -54,6 +54,8 @@ def main() -> None:
                 "temperature": 0.8,
                 "max_tokens": 256,
                 "logprobs": True,
+                "stream": True,
+                "stream_options": {"include_usage": True},
                 "chat_template_kwargs": {"enable_thinking": False},
             }
             if row.get("tools"):

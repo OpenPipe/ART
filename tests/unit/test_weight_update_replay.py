@@ -162,3 +162,29 @@ def test_snapshot_config_is_machine_readable(tmp_path: Path) -> None:
 
     config = json.loads((path / "adapter_config.json").read_text())
     assert config["art_lora_format"] == "vllm"
+
+
+def test_h200_replay_launcher_preserves_evidence_contract() -> None:
+    root = Path(__file__).parents[2]
+    launcher = (
+        root / "scripts/benchmarks/lora-update-replay-h200.sky.yaml"
+    ).read_text()
+    service = (root / "scripts/benchmarks/service_lora_update_replay.py").read_text()
+    uploader = (root / "scripts/benchmarks/upload_lora_update_replay.py").read_text()
+
+    assert "accelerators: H200:4" in launcher
+    assert "name: vivek-dev-api-keys" in launcher
+    assert "--mode fixed-load" in launcher
+    assert "--mode idle" in launcher
+    assert 'max_model_len": 32769' in service
+    assert "control_seconds" in service
+    for filename in (
+        "manifest.json",
+        "request-trace.json",
+        "tensor-manifest.json",
+        "samples.jsonl",
+        "summary.json",
+        "stdout.log",
+        "stderr.log",
+    ):
+        assert filename in uploader
