@@ -14,7 +14,12 @@ from anthropic.types import ImageBlockParam, Message, MessageParam
 from openai.types import Completion
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 from openai.types.chat.chat_completion_token_logprob import ChatCompletionTokenLogprob
-from openai.types.responses import Response
+from openai.types.responses import (
+    EasyInputMessageParam,
+    Response,
+    ResponseInputParam,
+    ResponseOutputMessageParam,
+)
 import pytest
 
 import art
@@ -3704,7 +3709,7 @@ def test_responses_fallback_trace_does_not_retrain_echoed_output_items() -> None
         _tokenize_trajectory_with_trace,
     )
 
-    def output(item_id: str, text: str) -> dict[str, Any]:
+    def output(item_id: str, text: str) -> ResponseOutputMessageParam:
         return {
             "id": item_id,
             "type": "message",
@@ -3714,7 +3719,7 @@ def test_responses_fallback_trace_does_not_retrain_echoed_output_items() -> None
         }
 
     def response(
-        response_id: str, items: list[dict[str, Any]], offset: int
+        response_id: str, items: list[ResponseOutputMessageParam], offset: int
     ) -> Response:
         return Response.model_validate(
             {
@@ -3729,13 +3734,15 @@ def test_responses_fallback_trace_does_not_retrain_echoed_output_items() -> None
             }
         )
 
-    user = {"role": "user", "content": "question"}
+    user = EasyInputMessageParam(role="user", content="question")
+    first_outputs = [output("one", "first"), output("two", "second")]
     first_response = response(
         "response-fallback",
-        [output("one", "first"), output("two", "second")],
+        first_outputs,
         0,
     )
-    first_request = ResponsesRequest(model="test/model", input=[user])
+    first_input: ResponseInputParam = [user]
+    first_request = ResponsesRequest(model="test/model", input=first_input)
     first_request["chat_template_kwargs"] = {"enable_thinking": False}
     first = ResponsesExchange(
         request=first_request,
@@ -3743,14 +3750,16 @@ def test_responses_fallback_trace_does_not_retrain_echoed_output_items() -> None
         start_time=datetime(2026, 1, 1),
         end_time=datetime(2026, 1, 1, 0, 0, 0, 1000),
     )
-    echoed = [
-        item.model_dump(mode="json", exclude_none=True)
-        for item in first_response.output
+    echoed: ResponseInputParam = [*first_outputs]
+    second_input: ResponseInputParam = [
+        user,
+        *echoed,
+        EasyInputMessageParam(role="user", content="continue"),
     ]
     second = ResponsesExchange(
         request=ResponsesRequest(
             model="test/model",
-            input=[user, *echoed, {"role": "user", "content": "continue"}],
+            input=second_input,
         ),
         response=response("response-final", [output("final", "final")], 1),
         start_time=datetime(2026, 1, 1, 0, 0, 1),
