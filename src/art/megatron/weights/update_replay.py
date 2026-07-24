@@ -156,9 +156,144 @@ def validate_replay_snapshots(
 def validate_committed_policy_version(
     response_body: dict[str, Any], *, expected: int
 ) -> None:
-    committed = int(response_body.get("policy_version", -1))
+    committed_state = response_body.get("committed_state")
+    if not isinstance(committed_state, dict):
+        raise RuntimeError("Runtime response has no committed receiver state")
+    committed = int(committed_state.get("policy_version", -1))
     if committed != expected:
         raise RuntimeError(f"Runtime committed policy {committed}; expected {expected}")
+    if committed_state.get("update_active") or committed_state.get("admission_blocked"):
+        raise RuntimeError(f"Runtime did not finish policy commit: {committed_state!r}")
+
+
+def validate_receiver_update_receipt(
+    response_body: dict[str, Any],
+    *,
+    expected_policy_version: int,
+    expected_safetensors_sha256: str,
+) -> dict[str, Any]:
+    validate_committed_policy_version(response_body, expected=expected_policy_version)
+    installed_content = response_body.get("installed_content")
+    if not isinstance(installed_content, dict):
+        raise RuntimeError("Runtime response has no installed-content receipt")
+    source = str(installed_content.get("source_safetensors_sha256", ""))
+    installed = str(installed_content.get("installed_safetensors_sha256", ""))
+    if (
+        source != expected_safetensors_sha256
+        or installed != expected_safetensors_sha256
+    ):
+        raise RuntimeError(
+            "Runtime installed checksum does not match the published adapter: "
+            f"published={expected_safetensors_sha256}, source={source}, "
+            f"installed={installed}"
+        )
+    return {
+        "committed_state": dict(response_body["committed_state"]),
+        "installed_content": dict(installed_content),
+    }
+
+
+def validate_bench_request_trace(
+    request_jsonl: str | Path,
+    manifest_path: str | Path,
+    *,
+    bench_commit: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if len(bench_commit) != 40 or any(
+        character not in "0123456789abcdef" for character in bench_commit.lower()
+    ):
+        raise ValueError("--bench-commit must be an exact 40-character Git commit")
+    trace_path = Path(request_jsonl)
+    trace_payload = trace_path.read_bytes()
+    manifest = json.loads(Path(manifest_path).read_text())
+    requests = manifest.get("requests")
+    if not isinstance(requests, dict):
+        raise ValueError("Bench trace manifest has no requests object")
+    digest = hashlib.sha256(trace_payload).hexdigest()
+    if digest != requests.get("sha256"):
+        raise ValueError(
+            f"Bench request trace digest is {digest}; expected {requests.get('sha256')}"
+        )
+    rows = [
+        json.loads(line) for line in trace_payload.decode("utf-8").splitlines() if line
+    ]
+    expected_hashes = requests.get("hashes")
+    selected_ids = manifest.get("selection", {}).get("selected_ids")
+    if (
+        not isinstance(expected_hashes, list)
+        or not isinstance(selected_ids, list)
+        or len(rows) != len(expected_hashes)
+        or len(rows) != len(selected_ids)
+    ):
+        raise ValueError("Bench trace row IDs and hashes do not align")
+    validated: list[dict[str, Any]] = []
+    for request, expected, datapoint_id in zip(
+        rows, expected_hashes, selected_ids, strict=True
+    ):
+        if not isinstance(expected, dict):
+            raise ValueError("Bench request hash entry is not an object")
+        if str(expected.get("datapoint_id")) != str(datapoint_id):
+            raise ValueError("Bench request hash IDs do not align with selected IDs")
+        canonical = json.dumps(
+            request, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode()
+        request_sha256 = hashlib.sha256(canonical).hexdigest()
+        if request_sha256 != expected.get("sha256"):
+            raise ValueError(
+                f"Bench request {datapoint_id} hash is {request_sha256}; "
+                f"expected {expected.get('sha256')}"
+            )
+        validated.append(
+            {
+                "id": str(datapoint_id),
+                "canonical_request_sha256": request_sha256,
+                "request": request,
+            }
+        )
+    return validated, {
+        "bench_commit": bench_commit,
+        "trace_sha256": digest,
+        "manifest": manifest,
+    }
+
+
+def evaluate_replay_acceptance(
+    measured_metrics: list[dict[str, float]],
+) -> dict[str, Any]:
+    if len(measured_metrics) != 30:
+        raise RuntimeError(
+            f"Acceptance requires exactly 30 measured updates; got {len(measured_metrics)}"
+        )
+    combined = [
+        row["time/weight_update_trainer_publish_s"]
+        + row["time/weight_update_service_rpc_s"]
+        for row in measured_metrics
+    ]
+    trainer = [row["time/weight_update_trainer_publish_s"] for row in measured_metrics]
+    receiver = [row["time/weight_update_vllm_total_s"] for row in measured_metrics]
+    gates = {
+        "combined_mean": {
+            "value_s": statistics.fmean(combined),
+            "lower_s": 5.001 * 0.85,
+            "upper_s": 5.001 * 1.15,
+        },
+        "trainer_publish_mean": {
+            "value_s": statistics.fmean(trainer),
+            "lower_s": 2.672 * 0.75,
+            "upper_s": 2.672 * 1.25,
+        },
+        "receiver_install_mean": {
+            "value_s": statistics.fmean(receiver),
+            "lower_s": 2.320 * 0.75,
+            "upper_s": 2.320 * 1.25,
+        },
+    }
+    failures = [
+        name
+        for name, gate in gates.items()
+        if not gate["lower_s"] <= gate["value_s"] <= gate["upper_s"]
+    ]
+    return {"passed": not failures, "failures": failures, "gates": gates}
 
 
 class FixedLoad:

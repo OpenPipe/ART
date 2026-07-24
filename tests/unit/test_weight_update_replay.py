@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -13,8 +14,11 @@ from art.megatron.runtime.jobs import (
 from art.megatron.service import MegatronService
 from art.megatron.weights.lora_publish import LoraPublishMetrics
 from art.megatron.weights.update_replay import (
+    evaluate_replay_acceptance,
     inspect_adapter,
+    validate_bench_request_trace,
     validate_committed_policy_version,
+    validate_receiver_update_receipt,
     validate_replay_snapshots,
 )
 
@@ -150,10 +154,60 @@ def test_lora_publish_job_roundtrips_through_worker_protocol() -> None:
 
 
 def test_policy_version_must_match_committed_runtime_version() -> None:
-    validate_committed_policy_version({"policy_version": 12}, expected=12)
+    validate_committed_policy_version(
+        {
+            "policy_version": 999,
+            "committed_state": {
+                "policy_version": 12,
+                "update_active": False,
+                "admission_blocked": False,
+            },
+        },
+        expected=12,
+    )
 
     with pytest.raises(RuntimeError, match="committed policy 11; expected 12"):
-        validate_committed_policy_version({"policy_version": 11}, expected=12)
+        validate_committed_policy_version(
+            {
+                "committed_state": {
+                    "policy_version": 11,
+                    "update_active": False,
+                    "admission_blocked": False,
+                }
+            },
+            expected=12,
+        )
+
+
+def test_receiver_receipt_requires_committed_state_and_installed_checksum() -> None:
+    receipt = {
+        "committed_state": {
+            "policy_version": 7,
+            "update_active": False,
+            "admission_blocked": False,
+        },
+        "installed_content": {
+            "source_safetensors_sha256": "abc",
+            "installed_safetensors_sha256": "abc",
+        },
+    }
+
+    assert (
+        validate_receiver_update_receipt(
+            receipt,
+            expected_policy_version=7,
+            expected_safetensors_sha256="abc",
+        )["committed_state"]["policy_version"]
+        == 7
+    )
+
+    receipt["installed_content"]["installed_safetensors_sha256"] = "stale"
+    with pytest.raises(RuntimeError, match="installed checksum"):
+        validate_receiver_update_receipt(
+            receipt,
+            expected_policy_version=7,
+            expected_safetensors_sha256="abc",
+        )
 
 
 def test_snapshot_config_is_machine_readable(tmp_path: Path) -> None:
@@ -164,23 +218,67 @@ def test_snapshot_config_is_machine_readable(tmp_path: Path) -> None:
     assert config["art_lora_format"] == "vllm"
 
 
-def test_h200_replay_launcher_preserves_evidence_contract() -> None:
+def test_bench_trace_requires_exact_external_provenance(tmp_path: Path) -> None:
+    request = {
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    canonical = json.dumps(
+        request, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    trace = tmp_path / "request-trace.jsonl"
+    trace.write_bytes(canonical + b"\n")
+    digest = hashlib.sha256(trace.read_bytes()).hexdigest()
+    request_digest = hashlib.sha256(canonical).hexdigest()
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "selection": {"selected_ids": ["row-1"]},
+                "requests": {
+                    "sha256": digest,
+                    "hashes": [{"datapoint_id": "row-1", "sha256": request_digest}],
+                },
+            }
+        )
+    )
+
+    rows, provenance = validate_bench_request_trace(
+        trace, manifest, bench_commit="a" * 40
+    )
+
+    assert rows[0]["id"] == "row-1"
+    assert provenance["trace_sha256"] == digest
+    assert provenance["bench_commit"] == "a" * 40
+
+
+def test_replay_acceptance_enforces_combined_and_component_gates() -> None:
+    passing = [
+        {
+            "time/weight_update_trainer_publish_s": 2.672,
+            "time/weight_update_service_rpc_s": 2.329,
+            "time/weight_update_vllm_total_s": 2.320,
+        }
+        for _ in range(30)
+    ]
+    assert evaluate_replay_acceptance(passing)["passed"] is True
+
+    failing = [dict(row) for row in passing]
+    failing[0]["time/weight_update_vllm_total_s"] = 100.0
+    assert evaluate_replay_acceptance(failing)["passed"] is False
+
+
+def test_replay_uploader_matches_bench_required_files() -> None:
     root = Path(__file__).parents[2]
-    launcher = (
-        root / "scripts/benchmarks/lora-update-replay-h200.sky.yaml"
-    ).read_text()
     service = (root / "scripts/benchmarks/service_lora_update_replay.py").read_text()
     uploader = (root / "scripts/benchmarks/upload_lora_update_replay.py").read_text()
 
-    assert "accelerators: H200:4" in launcher
-    assert "name: vivek-dev-api-keys" in launcher
-    assert "--mode fixed-load" in launcher
-    assert "--mode idle" in launcher
     assert 'max_model_len": 32769' in service
-    assert "control_seconds" in service
+    assert "validate_bench_request_trace" in service
+    assert "--bench-commit" in service
     for filename in (
         "manifest.json",
-        "request-trace.json",
+        "request-trace.jsonl",
         "tensor-manifest.json",
         "samples.jsonl",
         "summary.json",

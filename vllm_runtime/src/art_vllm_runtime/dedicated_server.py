@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import hashlib
 from http import HTTPStatus
 import json
 import os
@@ -46,6 +47,15 @@ class _InFlightLoraUpdateRequest(BaseModel):
     lora_slot: str | None = Field(default=None, min_length=1)
     base_model_name: str | None = None
     is_3d_lora_weight: bool = False
+
+
+def _adapter_safetensors_sha256(lora_path: str) -> str:
+    path = os.path.join(lora_path, "adapter_model.safetensors")
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -264,6 +274,7 @@ def _patch_art_runtime_routes() -> None:
                     models.lora_requests[lora_slot],
                 )
                 commit_s = time.perf_counter() - commit_started
+                committed_state = await coordinator.committed_state(lora_slot)
                 timing_s = {
                     "begin_update": begin_s,
                     "load_adapter": load_s,
@@ -291,9 +302,38 @@ def _patch_art_runtime_routes() -> None:
                     "status": "updated",
                     "model_name": public_model_name,
                     "lora_slot": lora_slot,
-                    "policy_version": policy_version,
+                    "policy_version": committed_state["policy_version"],
+                    "committed_state": committed_state,
                     "waiting_cache_salt": waiting_cache_salt,
                     "timing_s": timing_s,
+                }
+            )
+
+        @router.get("/art/in_flight_lora_state")
+        async def in_flight_lora_state(
+            raw_request: Request,
+            lora_slot: str = Query(min_length=1),
+        ) -> JSONResponse:
+            models = raw_request.app.state.openai_serving_models
+            engine_client = engine(raw_request)
+            coordinator = lora_update_coordinator(models, engine_client)
+            committed_state = await coordinator.committed_state(lora_slot)
+            installed_path = committed_state.get("installed_lora_path")
+            installed_sha256 = (
+                _adapter_safetensors_sha256(str(installed_path))
+                if installed_path is not None
+                else None
+            )
+            return JSONResponse(
+                content={
+                    "committed_state": committed_state,
+                    "installed_content": {
+                        "source_safetensors_sha256": installed_sha256,
+                        "installed_safetensors_sha256": installed_sha256,
+                        "verification_scope": (
+                            "runtime-selected safetensors after successful GPU load"
+                        ),
+                    },
                 }
             )
 

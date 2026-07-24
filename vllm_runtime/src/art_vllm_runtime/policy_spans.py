@@ -162,6 +162,28 @@ class LoraUpdateCoordinator:
             state.blocked = True
             state.condition.notify_all()
 
+    async def committed_state(self, lora_slot: str) -> dict[str, Any]:
+        state = self._state(lora_slot)
+        async with state.condition:
+            lora_request = state.lora_request
+            return {
+                "lora_slot": lora_slot,
+                "policy_version": state.policy_version,
+                "update_active": state.update_active,
+                "admission_blocked": state.blocked,
+                "active_admissions": state.active_admissions,
+                "installed_lora_path": (
+                    str(lora_request.lora_path) if lora_request is not None else None
+                ),
+                "installed_lora_int_id": (
+                    int(lora_int_id)
+                    if lora_request is not None
+                    and (lora_int_id := getattr(lora_request, "lora_int_id", None))
+                    is not None
+                    else None
+                ),
+            }
+
 
 def lora_update_coordinator(models: Any, engine_client: Any) -> LoraUpdateCoordinator:
     coordinator = getattr(models, _LORA_UPDATE_COORDINATOR_FIELD, None)

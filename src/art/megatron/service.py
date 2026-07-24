@@ -772,7 +772,23 @@ class MegatronService:
     async def _update_in_flight_adapter(
         self, checkpoint_path: str, step: int
     ) -> dict[str, float]:
+        metrics, _receipt = await self._install_in_flight_adapter(checkpoint_path, step)
+        return metrics
+
+    async def _install_in_flight_adapter(
+        self,
+        checkpoint_path: str,
+        step: int,
+        *,
+        verify_receiver_content: bool = False,
+    ) -> tuple[dict[str, float], dict[str, Any]]:
         import httpx
+
+        from art.megatron.weights.update_replay import (
+            inspect_adapter,
+            validate_committed_policy_version,
+            validate_receiver_update_receipt,
+        )
 
         self._raise_if_child_failed()
         self.serving_capabilities.require(
@@ -798,6 +814,38 @@ class MegatronService:
         rpc_s = time.perf_counter() - rpc_started
         json_response = getattr(response, "json", None)
         response_body = json_response() if callable(json_response) else {}
+        verification_s = 0.0
+        receipt: dict[str, Any]
+        if verify_receiver_content:
+            verification_started = time.perf_counter()
+            async with httpx.AsyncClient() as client:
+                verification_response = await client.get(
+                    f"{self._vllm_base_url}/art/in_flight_lora_state",
+                    params={"lora_slot": self._in_flight_lora_slot},
+                    **self._runtime_request_kwargs(),
+                    timeout=60.0,
+                )
+                verification_response.raise_for_status()
+            verification_body = verification_response.json()
+            response_body = {
+                **response_body,
+                "committed_state": verification_body.get("committed_state"),
+                "installed_content": verification_body.get("installed_content"),
+            }
+            verification_s = time.perf_counter() - verification_started
+        if verify_receiver_content:
+            snapshot = inspect_adapter(checkpoint_path)
+            receipt = validate_receiver_update_receipt(
+                response_body,
+                expected_policy_version=step,
+                expected_safetensors_sha256=snapshot.file_sha256,
+            )
+        else:
+            validate_committed_policy_version(response_body, expected=step)
+            receipt = {
+                "committed_state": dict(response_body["committed_state"]),
+                "installed_content": None,
+            }
         runtime_timing = response_body.get("timing_s", {})
         if not isinstance(runtime_timing, dict):
             runtime_timing = {}
@@ -805,8 +853,12 @@ class MegatronService:
         self._loaded_adapter_steps.add(step)
         metrics = {
             "time/weight_update_service_rpc_s": rpc_s,
-            "weight_update/policy_version": float(step),
+            "weight_update/policy_version": float(
+                receipt["committed_state"]["policy_version"]
+            ),
         }
+        if verify_receiver_content:
+            metrics["time/weight_update_receiver_verification_s"] = verification_s
         for phase in (
             "begin_update",
             "load_adapter",
@@ -817,7 +869,7 @@ class MegatronService:
             value = runtime_timing.get(phase)
             if isinstance(value, (int, float)):
                 metrics[f"time/weight_update_vllm_{phase}_s"] = float(value)
-        return metrics
+        return metrics, receipt
 
     async def _load_rollout_lora_for_step(
         self, checkpoint_path: str, step: int
@@ -943,7 +995,7 @@ class MegatronService:
         output_lora_path: str,
         policy_version: int,
         content_version: int,
-    ) -> dict[str, float]:
+    ) -> dict[str, Any]:
         """Publish real resident Megatron tensors, then install that exact output."""
         if not self.is_dedicated:
             raise RuntimeError("LoRA update replay requires dedicated trainer GPUs")
@@ -979,10 +1031,15 @@ class MegatronService:
             publish_metrics = self._weight_update_metrics_from_event(result)
         if publish_metrics is None:
             raise RuntimeError("Replay worker produced no LoRA-ready metrics")
-        install_metrics = await self._update_in_flight_adapter(
-            output_lora_path, policy_version
+        install_metrics, receiver_receipt = await self._install_in_flight_adapter(
+            output_lora_path,
+            policy_version,
+            verify_receiver_content=True,
         )
-        return {**publish_metrics, **install_metrics}
+        return {
+            "metrics": {**publish_metrics, **install_metrics},
+            "receiver": receiver_receipt,
+        }
 
     async def _sleep_runtime(self) -> None:
         import httpx

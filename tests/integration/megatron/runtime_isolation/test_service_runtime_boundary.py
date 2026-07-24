@@ -40,6 +40,19 @@ class _AsyncOkResponse:
     def raise_for_status(self) -> None:
         return None
 
+    def json(self) -> dict[str, object]:
+        return {
+            "committed_state": {
+                "policy_version": 4,
+                "update_active": False,
+                "admission_blocked": False,
+            },
+            "installed_content": {
+                "source_safetensors_sha256": "abc",
+                "installed_safetensors_sha256": "abc",
+            },
+        }
+
 
 class _RecordingAsyncClient:
     def __init__(
@@ -62,6 +75,16 @@ class _RecordingAsyncClient:
         timeout: float,
     ) -> _AsyncOkResponse:
         self._posts.append((url, json if json is not None else params, timeout))
+        return _AsyncOkResponse()
+
+    async def get(
+        self,
+        url: str,
+        *,
+        params: dict[str, object] | None = None,
+        timeout: float,
+    ) -> _AsyncOkResponse:
+        self._posts.append((url, params, timeout))
         return _AsyncOkResponse()
 
 
@@ -103,6 +126,10 @@ async def test_megatron_in_flight_eval_uses_immutable_adapter_slot(
     service._vllm_runtime.port = 8123
     posts: list[tuple[str, dict[str, object] | None, float]] = []
     monkeypatch.setattr(httpx, "AsyncClient", lambda: _RecordingAsyncClient(posts))
+    monkeypatch.setattr(
+        "art.megatron.weights.update_replay.inspect_adapter",
+        lambda _path: SimpleNamespace(file_sha256="abc"),
+    )
 
     checkpoint_path = str(tmp_path / "checkpoints" / "4")
     assert (
@@ -152,6 +179,9 @@ async def test_external_in_flight_update_maps_checkpoint_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     local_root = str(tmp_path / "local")
+    monkeypatch.setattr(
+        MegatronService, "_validate_megatron_dependencies", lambda _self: None
+    )
     service = MegatronService(
         model_name="test-model",
         base_model="Qwen/Qwen3-0.6B",

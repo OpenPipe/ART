@@ -173,6 +173,7 @@ async def main():
     blocked = not admission.done()
     await coordinator.commit_update(slot, 5, new)
     version, admitted_lora = await admission
+    committed_state = await coordinator.committed_state(slot)
     stale_rejected = False
     try:
         await coordinator.begin_update(slot, 5)
@@ -197,6 +198,7 @@ async def main():
         "lora_path": admitted_lora.lora_path,
         "recovered_after_cancel": recovered,
         "stale_rejected": stale_rejected,
+        "committed_state": committed_state,
     }, sort_keys=True))
 
 asyncio.run(main())
@@ -211,6 +213,15 @@ asyncio.run(main())
         "policy_version": 5,
         "recovered_after_cancel": True,
         "stale_rejected": True,
+        "committed_state": {
+            "active_admissions": 0,
+            "admission_blocked": False,
+            "installed_lora_int_id": None,
+            "installed_lora_path": "new",
+            "lora_slot": "model:active",
+            "policy_version": 5,
+            "update_active": False,
+        },
     }
 
 

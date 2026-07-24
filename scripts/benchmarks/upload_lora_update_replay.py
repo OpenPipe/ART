@@ -9,7 +9,7 @@ from pathlib import Path
 
 REQUIRED_FILES = {
     "manifest.json",
-    "request-trace.json",
+    "request-trace.jsonl",
     "tensor-manifest.json",
     "samples.jsonl",
     "summary.json",
@@ -29,6 +29,24 @@ def main() -> None:
     )
     if missing:
         raise RuntimeError(f"Refusing to upload incomplete evidence: {missing}")
+    manifest = json.loads((args.input / "manifest.json").read_text())
+    claimed = set(manifest.get("required_result_files", ()))
+    if claimed != REQUIRED_FILES:
+        raise RuntimeError(
+            f"Result manifest claims {sorted(claimed)}; expected {sorted(REQUIRED_FILES)}"
+        )
+    summary = json.loads((args.input / "summary.json").read_text())
+    acceptance = summary.get("acceptance")
+    if not isinstance(acceptance, dict) or acceptance.get("passed") is not True:
+        raise RuntimeError("Refusing to upload a result that failed acceptance gates")
+    additional = set(manifest.get("additional_result_files", ()))
+    missing_additional = sorted(
+        name for name in additional if not (args.input / name).is_file()
+    )
+    if missing_additional:
+        raise RuntimeError(
+            f"Result manifest claims missing additional files: {missing_additional}"
+        )
 
     import wandb
 
@@ -42,9 +60,10 @@ def main() -> None:
     artifact = wandb.Artifact(
         name=f"art-lora-update-replay-{args.mode}",
         type="lora-update-replay-result",
-        metadata=json.loads((args.input / "summary.json").read_text()),
+        metadata=summary,
     )
-    artifact.add_dir(str(args.input))
+    for name in sorted(REQUIRED_FILES | additional):
+        artifact.add_file(str(args.input / name), name=name)
     logged = run.log_artifact(artifact)
     logged.wait()
     artifact_ref = f"{logged.entity}/{logged.project}/{logged.name}"
