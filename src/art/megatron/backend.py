@@ -1,16 +1,26 @@
 import asyncio
+import math
+import os
+import time
 from typing import Any, Iterable, cast
 
 from mp_actors import move_to_child_process
 
 from ..backend import AnyTrainableModel
+from ..distill import PreparedTrainingBatch, TrainingObjectives
 from ..local.backend import LocalBackend
 from ..local.service import ModelService
+from ..metrics_taxonomy import average_metric_samples
 from ..model import Model, TrainableModel
 from ..trajectories import TrajectoryGroup
-from ..types import LocalTrainResult
+from ..types import LocalTrainResult, TrainConfig
 from ..utils.lifecycle import process_shutdown_timeout
-from ..utils.output_dirs import get_model_dir
+from ..utils.output_dirs import get_model_dir, get_step_checkpoint_dir
+from .distillation import (
+    DistillationObjectiveConfig,
+    pack_prepared_batch,
+    validate_standalone_forward_kl,
+)
 from .migrations import apply_megatron_migrations, optimizer_state_path
 from .optimizer_state import (
     format_megatron_resume_message,
@@ -47,7 +57,7 @@ class MegatronBackend(LocalBackend):
     async def train(
         self,
         model: AnyTrainableModel,
-        trajectory_groups: Iterable[TrajectoryGroup],
+        trajectory_groups: Iterable[TrajectoryGroup] | PreparedTrainingBatch,
         **kwargs: Any,
     ) -> LocalTrainResult:
         for removed_kwarg in ("packed_sequence_length", "megatron_topology"):
@@ -56,11 +66,197 @@ class MegatronBackend(LocalBackend):
                     f"MegatronBackend.train gets {removed_kwarg} from "
                     "art.init_megatron_runtime_config(...)."
                 )
+        if isinstance(trajectory_groups, PreparedTrainingBatch):
+            return await self._train_prepared_distillation(
+                model, trajectory_groups, **kwargs
+            )
+        if "objectives" in kwargs or "idempotency_key" in kwargs:
+            raise TypeError(
+                "objectives and idempotency_key are only valid with a "
+                "PreparedTrainingBatch"
+            )
         return await super().train(
             model,
             trajectory_groups,
             packed_sequence_length=get_megatron_runtime_config().packed_sequence_length,
             **kwargs,
+        )
+
+    async def _train_prepared_distillation(
+        self,
+        model: AnyTrainableModel,
+        batch: PreparedTrainingBatch,
+        **kwargs: Any,
+    ) -> LocalTrainResult:
+        allowed = {
+            "objectives",
+            "idempotency_key",
+            "learning_rate",
+            "grad_accumulation_sequences",
+            "optimizer_save_interval",
+            "save_checkpoint",
+            "verbose",
+        }
+        unexpected = sorted(set(kwargs) - allowed)
+        if unexpected:
+            raise TypeError(
+                "unsupported prepared-batch training arguments: "
+                + ", ".join(unexpected)
+            )
+        objectives = kwargs.get("objectives")
+        if not isinstance(objectives, TrainingObjectives):
+            raise TypeError(
+                "PreparedTrainingBatch training requires objectives="
+                "distill.TrainingObjectives(...)"
+            )
+        idempotency_key = kwargs.get("idempotency_key")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise TypeError(
+                "PreparedTrainingBatch training requires a stable, non-empty "
+                "idempotency_key"
+            )
+        learning_rate = float(kwargs.get("learning_rate", 5e-6))
+        if not math.isfinite(learning_rate) or learning_rate <= 0:
+            raise ValueError("learning_rate must be finite and positive")
+        grad_accumulation_sequences = kwargs.get("grad_accumulation_sequences")
+        if grad_accumulation_sequences is not None and (
+            not isinstance(grad_accumulation_sequences, int)
+            or isinstance(grad_accumulation_sequences, bool)
+            or grad_accumulation_sequences < 1
+        ):
+            raise ValueError("grad_accumulation_sequences must be a positive integer")
+        optimizer_save_interval = kwargs.get("optimizer_save_interval", 5)
+        if (
+            not isinstance(optimizer_save_interval, int)
+            or isinstance(optimizer_save_interval, bool)
+            or optimizer_save_interval < 1
+        ):
+            raise ValueError("optimizer_save_interval must be a positive integer")
+        save_checkpoint = kwargs.get("save_checkpoint", True)
+        if not isinstance(save_checkpoint, bool):
+            raise TypeError("save_checkpoint must be a bool")
+        verbose = kwargs.get("verbose", False)
+        if not isinstance(verbose, bool):
+            raise TypeError("verbose must be a bool")
+
+        if objectives.policy is not None or objectives.distillation is None:
+            raise ValueError(
+                "M3 Megatron prepared-batch training supports standalone "
+                "distillation only"
+            )
+        objective = objectives.distillation
+        objective_config = DistillationObjectiveConfig(
+            coefficient=objective.coefficient,
+            compensate_temperature_squared=(objective.compensate_temperature_squared),
+        )
+        artifact_source_revision = batch.constraints.learner_revision
+        service = await self._get_service(cast(TrainableModel, model))
+        committed_step = await cast(Any, service).committed_distillation_step(
+            idempotency_key=idempotency_key,
+            expected_source_revision=artifact_source_revision,
+            preparation_id=batch.preparation_id,
+            payload_sha256=batch.payload_sha256,
+            objective=objective_config,
+        )
+        if committed_step is not None:
+            checkpoint_path: str | None = None
+            if save_checkpoint:
+                candidate = get_step_checkpoint_dir(
+                    get_model_dir(model=model, art_path=self._path), committed_step
+                )
+                if os.path.exists(candidate):
+                    checkpoint_path = candidate
+            return LocalTrainResult(
+                step=committed_step,
+                metrics={
+                    "distill/idempotent_replay": 1.0,
+                    "distill/committed_step": float(committed_step),
+                    "data/step_num_gradient_steps": 0.0,
+                },
+                checkpoint_path=checkpoint_path,
+            )
+
+        runtime = get_megatron_runtime_config()
+        topology = runtime.topology
+        expected_source_revision = await self._get_step(model)
+        payload = validate_standalone_forward_kl(
+            batch=batch,
+            objectives=objectives,
+            expected_source_revision=expected_source_revision,
+            packed_sequence_length=runtime.packed_sequence_length,
+            tensor_parallel_size=topology.tp,
+            context_parallel_size=topology.cp,
+            pipeline_parallel_size=topology.pp,
+            expert_parallel_size=topology.ep,
+            expert_tensor_parallel_size=topology.etp,
+        )
+        capabilities = model._serving_capabilities
+        if capabilities is None:
+            raise RuntimeError(
+                "prepared-batch training requires discovered student token-space "
+                "capabilities"
+            )
+        if (
+            capabilities.token_space_fingerprint
+            != payload.constraints.token_space_fingerprint
+            or capabilities.logical_vocab_size != payload.constraints.logical_vocab_size
+        ):
+            raise ValueError(
+                "prepared token-space identity does not match the learner runtime"
+            )
+
+        tensor_dir = os.path.join(
+            get_model_dir(model=model, art_path=self._path),
+            "tensors",
+            "distillation",
+            batch.preparation_id,
+        )
+        disk_tensors = pack_prepared_batch(
+            batch=batch,
+            payload=payload,
+            sequence_length=runtime.packed_sequence_length,
+            output_dir=tensor_dir,
+        )
+        config = TrainConfig(
+            learning_rate=learning_rate,
+            grad_accumulation_sequences=grad_accumulation_sequences,
+            optimizer_save_interval=optimizer_save_interval,
+        )
+
+        metric_samples: list[dict[str, float]] = []
+        started = time.monotonic()
+        async for metrics in cast(Any, service).train_distillation(
+            disk_tensors,
+            config,
+            objective=objective_config,
+            expected_source_revision=expected_source_revision,
+            idempotency_key=idempotency_key,
+            preparation_id=batch.preparation_id,
+            payload_sha256=batch.payload_sha256,
+            verbose=verbose,
+        ):
+            metric_samples.append(metrics)
+        metrics = average_metric_samples(metric_samples)
+        metrics.setdefault("time/step_backend_train_s", time.monotonic() - started)
+        metrics.setdefault(
+            "data/step_distillation_target_tokens",
+            float(disk_tensors["target_count"]),
+        )
+        step = await self._get_step(model)
+        checkpoint_path: str | None = None
+        if save_checkpoint:
+            candidate = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path), step
+            )
+            if os.path.exists(candidate):
+                checkpoint_path = candidate
+        wandb_run = model._get_wandb_run()
+        if wandb_run is not None:
+            self._record_provenance_nonblocking(wandb_run, "megatron-distillation")
+        return LocalTrainResult(
+            step=step,
+            metrics=metrics,
+            checkpoint_path=checkpoint_path,
         )
 
     async def _get_service(self, model: TrainableModel) -> ModelService:

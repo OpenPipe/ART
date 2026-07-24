@@ -4,6 +4,10 @@ from pydantic import BaseModel, Field, TypeAdapter
 
 from ... import types
 from ...preprocessing.pack import DiskPackedTensors
+from ..distillation import (
+    DiskPackedDistillationTensors,
+    DistillationObjectiveConfig,
+)
 
 DEFAULT_TRAINING_LOG_PATH = "/tmp/megatron_training_log.jsonl"
 DEFAULT_JOBS_DIR = "/tmp/megatron_training_jobs"
@@ -51,6 +55,26 @@ class MegatronMergedTrainingJob(_MegatronTrainingJobBase):
     merged_weight_transfer: MergedWeightTransferSpec
 
 
+class MegatronDistillationJob(BaseModel):
+    """Standalone forward-KL job with immutable prepared-artifact provenance."""
+
+    kind: Literal["distill"] = "distill"
+    step: int = Field(ge=1)
+    source_policy_step: int = Field(ge=0)
+    expected_source_revision: int = Field(ge=0)
+    training_session_id: str
+    lora_path: str
+    allow_unvalidated_arch: bool = False
+    optimizer_state_path: str
+    distillation_tensors: DiskPackedDistillationTensors
+    config: types.TrainConfig
+    objective: DistillationObjectiveConfig
+    idempotency_key: str = Field(min_length=1)
+    preparation_id: str = Field(min_length=1)
+    payload_sha256: str = Field(min_length=1)
+    log_path: str = DEFAULT_TRAINING_LOG_PATH
+
+
 class MegatronSyncJob(BaseModel):
     kind: Literal["sync"] = "sync"
     lora_path: str
@@ -88,6 +112,7 @@ class MegatronSFTTrainingJob(BaseModel):
 MegatronJob: TypeAlias = Annotated[
     MegatronTrainingJob
     | MegatronMergedTrainingJob
+    | MegatronDistillationJob
     | MegatronSyncJob
     | MegatronOptimizerSaveJob
     | MegatronSFTTrainingJob,

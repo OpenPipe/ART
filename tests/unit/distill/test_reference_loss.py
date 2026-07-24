@@ -104,7 +104,7 @@ def test_aggregated_tail_matches_coarsened_dense_reference() -> None:
 
 def test_topk_order_does_not_change_result() -> None:
     logits = torch.tensor([[0.2, 1.0, -0.4, 0.7]], dtype=torch.float64)
-    kwargs = {
+    kwargs: dict[str, Any] = {
         "student_logits": logits,
         "teacher_tail_prob": torch.tensor([0.3]),
         "mask": torch.tensor([True]),
@@ -218,7 +218,7 @@ def test_rejects_malformed_inputs(overrides: dict[str, object], match: str) -> N
 
 
 def test_rejects_nonzero_full_vocab_tail_and_zero_token_mask() -> None:
-    common = {
+    common: dict[str, Any] = {
         "student_logits": torch.zeros((1, 2)),
         "teacher_topk_ids": torch.tensor([[0, 1]]),
         "teacher_topk_probs": torch.tensor([[0.4, 0.5]]),

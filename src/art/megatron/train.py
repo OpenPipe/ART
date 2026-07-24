@@ -43,6 +43,11 @@ from art.megatron.context_parallel.types import (
     ParallelTopology,
     PreparedMegatronBatch,
 )
+from art.megatron.distillation import (
+    PackedDistillationTensors,
+    packed_distillation_tensors_from_dir,
+)
+from art.megatron.distillation_loss import topk_plus_tail_forward_kl
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.megatron_patches import install_fast_frozen_output_backward
 from art.megatron.model_support.lora_disk import (
@@ -69,6 +74,7 @@ from art.megatron.runtime.jobs import (
     DEFAULT_VLLM_WAKE_LOCK_PATH,
     LORA_READY_EVENT,
     OPTIMIZER_READY_EVENT,
+    MegatronDistillationJob,
     MegatronJob,
     MegatronMergedTrainingJob,
     MegatronOptimizerSaveJob,
@@ -90,6 +96,7 @@ from art.megatron.training.microbatches import (
     CpBatchLookaheadState,
     PreparedRLMicroInputs,
     PreparedSFTMicroInputs,
+    _art_flex_sliding_windows,
     _causal_attention_state,
     _clone_packed_tensors,
     _clone_sft_tensors,
@@ -147,6 +154,7 @@ __all__ = [
     "build_training_runtime",
     "run_megatron_worker_loop",
     "run_megatron_rl_job",
+    "run_megatron_distillation_job",
     "run_megatron_sft_job",
     "finalize_megatron_job",
 ]
@@ -204,6 +212,24 @@ class TrainStepResult(BaseModel):
     grad_norm: float
     num_zeros_in_grad: int | None
     loss_metrics: dict[str, float] = Field(default_factory=dict)
+
+
+class DistillationTrainStepResult(BaseModel):
+    """One standalone-KD optimizer update and its unreduced diagnostics."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    reduced_loss: torch.Tensor
+    raw_loss_sum: float
+    selected_loss_sum: float
+    tail_loss_sum: float
+    target_token_count: int
+    teacher_tail_mass_mean: float
+    student_tail_mass_mean: float
+    numerical_clamp_count: int
+    update_successful: bool
+    grad_norm: float
+    num_zeros_in_grad: int | None
 
 
 def print0(rank: int, *values: Any) -> None:
@@ -717,6 +743,98 @@ def run_megatron_rl_job(
             del cp_lookahead_state
 
 
+def run_megatron_distillation_job(
+    runtime: TrainingRuntime,
+    job: MegatronDistillationJob,
+) -> None:
+    """Run a revision-bound standalone-KD job through the normal transaction."""
+
+    # This is the worker trust boundary. Revalidate immutable job identity,
+    # topology, every planned denominator, and the sidecar bytes before loading
+    # an adapter or replacing resident optimizer state.
+    packed_tensors, temperature, num_steps = _preflight_distillation_job(runtime, job)
+    adapter_dtypes = None
+    step_result = None
+    job_succeeded = False
+    try:
+        configure_moe_routing_replay(runtime)
+        adapter_dtypes = _prepare_training_state(
+            runtime,
+            training_session_id=job.training_session_id,
+            source_policy_step=job.source_policy_step,
+            lora_path=job.lora_path,
+            optimizer_state_path=job.optimizer_state_path,
+        )
+        assert runtime.optimizer is not None
+        num_sequences = job.distillation_tensors["num_sequences"]
+        global_grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
+            job.config.grad_accumulation_sequences
+        )
+        for step_index in range(num_steps):
+            indices = [
+                index
+                for index in build_micro_sample_indices(
+                    step_index=step_index,
+                    num_sequences=num_sequences,
+                    global_grad_accumulation_sequences=(
+                        global_grad_accumulation_sequences
+                    ),
+                )
+                if index is not None
+            ]
+            step_result = run_megatron_distillation_step(
+                model_chunks=runtime.model,
+                provider=runtime.provider,
+                model_support_handler=runtime.model_support_handler,
+                optimizer=runtime.optimizer,
+                learning_rate=job.config.learning_rate,
+                packed_tensors=packed_tensors,
+                sample_indices=indices,
+                logical_vocab_size=job.distillation_tensors["logical_vocab_size"],
+                temperature=temperature,
+                coefficient=job.objective.coefficient,
+                compensate_temperature_squared=(
+                    job.objective.compensate_temperature_squared
+                ),
+            )
+            _validate_distillation_step_result_finite(runtime, step_result)
+            _log_distillation_step_result(
+                runtime.rank,
+                job.log_path,
+                step_result,
+                coefficient=job.objective.coefficient,
+                temperature=temperature,
+                num_gradient_steps=num_steps,
+            )
+
+        runtime.resident_optimizer_dirty = True
+        _save_lora_and_optimizer(
+            runtime,
+            adapter_dtypes=adapter_dtypes,
+            lora_path=job.lora_path,
+            optimizer_state_path=job.optimizer_state_path,
+            step=job.step,
+            optimizer_save_interval=job.config.optimizer_save_interval,
+            lora_ready_log_path=job.log_path,
+            optimizer_ready_log_path=job.log_path,
+        )
+        runtime.resident_training_session_id = job.training_session_id
+        runtime.resident_optimizer_state_path = os.path.realpath(
+            job.optimizer_state_path
+        )
+        runtime.resident_policy_step = job.step
+        runtime.optimizer_state_loaded = True
+        job_succeeded = True
+    finally:
+        if not job_succeeded:
+            _clear_resident_optimizer(runtime)
+        del packed_tensors
+        if adapter_dtypes is not None:
+            del adapter_dtypes
+        if step_result is not None:
+            del step_result
+
+
 def run_megatron_sft_job(
     runtime: TrainingRuntime,
     job: MegatronSFTTrainingJob,
@@ -892,6 +1010,9 @@ def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
     if isinstance(job, MegatronSFTTrainingJob):
         run_megatron_sft_job(runtime, job)
         return
+    if isinstance(job, MegatronDistillationJob):
+        run_megatron_distillation_job(runtime, job)
+        return
     run_megatron_rl_job(runtime, job)
     if isinstance(job, MegatronMergedTrainingJob):
         _sync_merged_weights_to_vllm(
@@ -907,7 +1028,88 @@ def _job_cleanup_path(job: MegatronJob) -> str | None:
         return None
     if isinstance(job, MegatronSFTTrainingJob):
         return job.sft_data_dir
+    if isinstance(job, MegatronDistillationJob):
+        return job.distillation_tensors["dir"]
     return job.disk_packed_tensors["dir"]
+
+
+def _validate_distillation_worker_topology(model: ModelChunks) -> None:
+    topology = _infer_parallel_topology(model)
+    worker_topology = (
+        int(topology.tp),
+        int(topology.dp),
+        int(topology.cp),
+        int(topology.pp),
+        int(ps.get_expert_model_parallel_world_size()),
+        int(ps.get_expert_tensor_parallel_world_size()),
+    )
+    if worker_topology != (1, 1, 1, 1, 1, 1):
+        raise ValueError(
+            "M3 Megatron distillation requires TP=DP=CP=PP=EP=ETP=1; "
+            f"received {worker_topology}"
+        )
+
+
+def _preflight_distillation_job(
+    runtime: TrainingRuntime,
+    job: MegatronDistillationJob,
+) -> tuple[PackedDistillationTensors, float, int]:
+    """Validate the complete optimizer plan before mutable state preparation."""
+
+    if job.expected_source_revision != job.source_policy_step:
+        raise ValueError(
+            "distillation expected_source_revision must equal source_policy_step"
+        )
+    if job.step != job.source_policy_step + 1:
+        raise ValueError("distillation job must advance exactly one ART revision")
+    if not math.isfinite(job.config.learning_rate) or job.config.learning_rate <= 0:
+        raise ValueError("distillation learning_rate must be finite and positive")
+    _validate_distillation_worker_topology(runtime.model)
+    if runtime.rank != 0 or runtime.world_size != 1:
+        raise ValueError("M3 Megatron distillation requires one rank")
+
+    packed = packed_distillation_tensors_from_dir(job.distillation_tensors)
+    target_mask = packed["target_mask"]
+    token_mask = packed["token_mask"]
+    sequence_length = int(token_mask.shape[1])
+    prefix_mask = torch.arange(sequence_length).unsqueeze(0) < token_mask.sum(
+        dim=1, keepdim=True
+    )
+    if not torch.equal(token_mask, prefix_mask):
+        raise ValueError("distillation token_mask must describe contiguous prefixes")
+    if bool(torch.any(target_mask.sum(dim=1) <= 0)):
+        raise ValueError(
+            "every M3 distillation sequence must have a nonzero KD denominator"
+        )
+
+    active_temperatures = packed["temperatures"][target_mask]
+    temperature = float(active_temperatures[0].item())
+    if not bool(torch.all(active_temperatures == active_temperatures[0])):
+        raise ValueError(
+            "M3 Megatron distillation requires one exact temperature per job"
+        )
+
+    global_grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
+        job.config.grad_accumulation_sequences
+    )
+    num_sequences = job.distillation_tensors["num_sequences"]
+    num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+    for step_index in range(num_steps):
+        indices = [
+            index
+            for index in build_micro_sample_indices(
+                step_index=step_index,
+                num_sequences=num_sequences,
+                global_grad_accumulation_sequences=(global_grad_accumulation_sequences),
+            )
+            if index is not None
+        ]
+        planned_count = sum(int(target_mask[index].sum().item()) for index in indices)
+        if planned_count <= 0:
+            raise ValueError(
+                "a planned distillation optimizer update has a zero KD denominator"
+            )
+    return packed, temperature, num_steps
 
 
 def _prepare_rl_training_state(
@@ -1072,6 +1274,42 @@ def _validate_train_step_result_finite(
     )
 
 
+def _validate_distillation_step_result_finite(
+    runtime: TrainingRuntime,
+    step_result: DistillationTrainStepResult,
+) -> None:
+    if not step_result.update_successful:
+        raise RuntimeError(
+            "Megatron distillation optimizer step was not successful; refusing "
+            "to save LoRA"
+        )
+    values = (
+        float(step_result.reduced_loss.detach().float().item()),
+        step_result.raw_loss_sum,
+        step_result.selected_loss_sum,
+        step_result.tail_loss_sum,
+        step_result.teacher_tail_mass_mean,
+        step_result.student_tail_mass_mean,
+        step_result.grad_norm,
+    )
+    finite = torch.tensor(
+        float(all(math.isfinite(value) for value in values)),
+        dtype=torch.float32,
+        device=step_result.reduced_loss.device,
+    )
+    if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
+            finite,
+            op=torch.distributed.ReduceOp.MIN,  # ty: ignore[possibly-missing-attribute]
+        )
+    if bool(finite.item()):
+        return
+    raise RuntimeError(
+        "Megatron distillation produced a non-finite result; refusing to save "
+        f"LoRA, rank={runtime.rank}, values={values!r}"
+    )
+
+
 def _should_save_optimizer(
     runtime: TrainingRuntime,
     *,
@@ -1122,6 +1360,49 @@ def _log_rl_step_result(
         metrics.update(step_result.loss_metrics)
         log_msg = json.dumps(metrics)
         print("Logging", log_msg)
+        log_file.write(log_msg + "\n")
+
+
+def _log_distillation_step_result(
+    rank: int,
+    log_path: str,
+    step_result: DistillationTrainStepResult,
+    *,
+    coefficient: float,
+    temperature: float,
+    num_gradient_steps: int,
+) -> None:
+    if rank != 0:
+        return
+    loss_train = float(step_result.reduced_loss.item())
+    target_tokens = float(step_result.target_token_count)
+    metrics = {
+        "loss/train": loss_train,
+        "loss/distillation": loss_train,
+        "loss/distillation_sum": step_result.raw_loss_sum,
+        "loss/distillation_selected": (step_result.selected_loss_sum / target_tokens),
+        "loss/distillation_tail": step_result.tail_loss_sum / target_tokens,
+        "loss/distillation_raw_sum": step_result.raw_loss_sum,
+        "loss/distillation_selected_sum": step_result.selected_loss_sum,
+        "loss/distillation_tail_sum": step_result.tail_loss_sum,
+        "loss/grad_norm": float(step_result.grad_norm),
+        "data/distillation_tokens": target_tokens,
+        "data/step_distillation_target_tokens": target_tokens,
+        "distillation/coefficient": float(coefficient),
+        "distillation/temperature": float(temperature),
+        "distillation/teacher_tail_mass_mean": (step_result.teacher_tail_mass_mean),
+        "distillation/student_tail_mass_mean": (step_result.student_tail_mass_mean),
+        "distillation/numerical_clamp_count": float(step_result.numerical_clamp_count),
+        "distill/coefficient": float(coefficient),
+        "distill/temperature": float(temperature),
+        "distill/teacher_tail_mass_mean": step_result.teacher_tail_mass_mean,
+        "distill/student_tail_mass_mean": step_result.student_tail_mass_mean,
+        "distill/numerical_clamp_count": float(step_result.numerical_clamp_count),
+        TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
+    }
+    with open(log_path, "a+", encoding="utf-8") as log_file:
+        log_msg = json.dumps(metrics)
+        print("Logging distillation", log_msg)
         log_file.write(log_msg + "\n")
 
 
@@ -1760,6 +2041,228 @@ def _prepare_kl_reference_logprobs(
                 runtime.optimizer,
                 model_support_handler=runtime.model_support_handler,
             )
+
+
+def _shift_distillation_token_axis(
+    tensor: torch.Tensor,
+    *,
+    pad: int | float | bool,
+) -> torch.Tensor:
+    """Align target-at-token ``t`` with causal logits at position ``t - 1``."""
+
+    if tensor.ndim < 2:
+        raise ValueError("distillation token-aligned tensors must have rank >= 2")
+    padding = torch.full_like(tensor[:, :1, ...], pad)
+    return torch.cat((tensor[:, 1:, ...], padding), dim=1)
+
+
+def _select_distillation_micro(
+    packed_tensors: PackedDistillationTensors,
+    *,
+    sample_index: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    token_count = int(packed_tensors["token_mask"][sample_index].sum().item())
+    if token_count <= 1:
+        raise ValueError("distillation trajectories require at least two tokens")
+    tensor_map = cast(dict[str, torch.Tensor], packed_tensors)
+
+    def row(name: str) -> torch.Tensor:
+        return tensor_map[name][sample_index : sample_index + 1, :token_count, ...].to(
+            device
+        )
+
+    return {
+        "tokens": row("tokens"),
+        "input_pos": row("input_pos"),
+        "target_mask": _shift_distillation_token_axis(row("target_mask"), pad=False),
+        "distillation_weights": _shift_distillation_token_axis(
+            row("distillation_weights"), pad=0.0
+        ),
+        "topk_token_ids": _shift_distillation_token_axis(row("topk_token_ids"), pad=-1),
+        "teacher_logprobs": _shift_distillation_token_axis(
+            row("teacher_logprobs"), pad=0.0
+        ),
+        "tail_logprobs": _shift_distillation_token_axis(row("tail_logprobs"), pad=0.0),
+    }
+
+
+def _normalize_distillation_logits(
+    logits: torch.Tensor,
+    *,
+    expected_rows: int,
+    expected_sequence_length: int,
+) -> torch.Tensor:
+    """Normalize Megatron ``[S,B,V]`` or ``[B,S,V]`` output to batch-first."""
+
+    if logits.ndim != 3:
+        raise ValueError(
+            "distillation model output must be rank-three raw logits, "
+            f"got {tuple(logits.shape)}"
+        )
+    batch_first_shape = (expected_rows, expected_sequence_length)
+    if tuple(logits.shape[:2]) == batch_first_shape:
+        return logits
+    sequence_first_shape = (expected_sequence_length, expected_rows)
+    if tuple(logits.shape[:2]) == sequence_first_shape:
+        return logits.transpose(0, 1).contiguous()
+    raise ValueError(
+        "distillation raw-logit layout does not match model inputs: "
+        f"logits={tuple(logits.shape)}, expected [B,S,V] with "
+        f"B={expected_rows}, S={expected_sequence_length}"
+    )
+
+
+def _ensure_distillation_gradients_finite(model_chunks: ModelChunks) -> None:
+    found_gradient = False
+    for chunk in model_chunks:
+        for parameter in chunk.parameters():
+            if not parameter.requires_grad:
+                continue
+            main_grad = getattr(parameter, "main_grad", None)
+            gradient = main_grad if main_grad is not None else parameter.grad
+            if gradient is None:
+                continue
+            found_gradient = True
+            if not bool(torch.all(torch.isfinite(gradient))):
+                raise RuntimeError(
+                    "distillation produced a non-finite gradient before optimizer "
+                    "mutation"
+                )
+    if not found_gradient:
+        raise RuntimeError("distillation backward produced no trainable gradients")
+
+
+def run_megatron_distillation_step(
+    *,
+    model_chunks: ModelChunks,
+    provider: Any,
+    model_support_handler: Any,
+    optimizer: Any,
+    learning_rate: float,
+    packed_tensors: PackedDistillationTensors,
+    sample_indices: list[int],
+    logical_vocab_size: int,
+    temperature: float,
+    coefficient: float,
+    compensate_temperature_squared: bool,
+) -> DistillationTrainStepResult:
+    """Run one exact-denominator standalone-KD optimizer update."""
+
+    if not sample_indices:
+        raise ValueError("distillation optimizer step requires at least one sequence")
+    _validate_distillation_worker_topology(model_chunks)
+    device = next(model_chunks[0].parameters()).device
+    _zero_grad_buffers(model_chunks)
+
+    raw_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+    selected_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+    tail_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+    teacher_tail_mass_sum = torch.zeros((), dtype=torch.float32, device=device)
+    student_tail_mass_sum = torch.zeros((), dtype=torch.float32, device=device)
+    target_token_count = 0
+    numerical_clamp_count = 0
+
+    for sample_index in sample_indices:
+        micro = _select_distillation_micro(
+            packed_tensors,
+            sample_index=sample_index,
+            device=device,
+        )
+        sequence_length = int(micro["tokens"].shape[1])
+        attention_state = _causal_attention_state(
+            sequence_length,
+            device,
+            provider=provider,
+            model_support_handler=model_support_handler,
+            sliding_windows=_art_flex_sliding_windows(provider),
+            build_gdn_execution_spec=bool(
+                getattr(model_support_handler, "build_gdn_execution_spec", False)
+            ),
+            attention_head_dim=getattr(provider, "kv_channels", None),
+            attention_value_head_dim=getattr(provider, "kv_channels", None),
+        )
+        raw_logits = model_chunks[0](
+            input_ids=micro["tokens"],
+            position_ids=micro["input_pos"],
+            attention_mask=_placeholder_attention_mask(device),
+            labels=None,
+            **model_support_handler.get_forward_kwargs(
+                model_chunks[0],
+                attention_bias=attention_state,
+            ),
+        )
+        logits = _normalize_distillation_logits(
+            raw_logits,
+            expected_rows=1,
+            expected_sequence_length=sequence_length,
+        )
+        loss = topk_plus_tail_forward_kl(
+            logits,
+            teacher_topk_ids=micro["topk_token_ids"],
+            teacher_topk_logprobs=micro["teacher_logprobs"],
+            teacher_tail_logprob=micro["tail_logprobs"],
+            mask=micro["target_mask"],
+            weights=micro["distillation_weights"],
+            logical_vocab_size=logical_vocab_size,
+            temperature=temperature,
+            compensate_temperature_squared=compensate_temperature_squared,
+        )
+        objective_sum = loss.loss_sum * coefficient
+        if not bool(torch.isfinite(objective_sum.detach()).item()):
+            raise RuntimeError(
+                "distillation produced a non-finite loss before backward"
+            )
+        objective_sum.backward()
+
+        raw_loss_sum = raw_loss_sum + loss.loss_sum.detach()
+        selected_loss_sum = selected_loss_sum + loss.selected_loss_sum.detach()
+        tail_loss_sum = tail_loss_sum + loss.tail_loss_sum.detach()
+        teacher_tail_mass_sum = (
+            teacher_tail_mass_sum + loss.teacher_tail_mass_sum.detach()
+        )
+        student_tail_mass_sum = (
+            student_tail_mass_sum + loss.student_tail_mass_sum.detach()
+        )
+        target_token_count += int(loss.token_count.item())
+        numerical_clamp_count += int(loss.numerical_clamp_count.item())
+
+    if target_token_count <= 0:
+        raise RuntimeError("distillation optimizer step has a zero KD denominator")
+    flush_param_grads_to_main_grads(model_chunks)
+    denominator = torch.tensor(
+        [float(target_token_count)], dtype=torch.float32, device=device
+    )
+    finalize_model_grads_extended(
+        as_megatron_api_chunks(model_chunks),
+        num_tokens=denominator,
+    )
+    _ensure_distillation_gradients_finite(model_chunks)
+    update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
+        optimizer,
+        learning_rate,
+        model_support_handler=model_support_handler,
+        model_chunks=model_chunks,
+    )
+    reduced_loss = (raw_loss_sum * coefficient) / target_token_count
+
+    return DistillationTrainStepResult(
+        reduced_loss=reduced_loss,
+        raw_loss_sum=float(raw_loss_sum.item()),
+        selected_loss_sum=float(selected_loss_sum.item()),
+        tail_loss_sum=float(tail_loss_sum.item()),
+        target_token_count=target_token_count,
+        teacher_tail_mass_mean=float(
+            (teacher_tail_mass_sum / target_token_count).item()
+        ),
+        student_tail_mass_mean=float(
+            (student_tail_mass_sum / target_token_count).item()
+        ),
+        numerical_clamp_count=numerical_clamp_count,
+        update_successful=update_successful,
+        grad_norm=grad_norm,
+        num_zeros_in_grad=num_zeros_in_grad,
+    )
 
 
 def run_megatron_sft_step(

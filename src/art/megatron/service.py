@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass, field
+import hashlib
 import importlib
 import json
 import os
@@ -44,6 +45,10 @@ from ..vllm_runtime import (
     normalize_vllm_server_url,
     wait_for_vllm_http_runtime,
 )
+from .distillation import (
+    DiskPackedDistillationTensors,
+    DistillationObjectiveConfig,
+)
 from .lora import (
     LORA_ALPHA,
     MEGATRON_LORA_RANK_ENV,
@@ -72,6 +77,7 @@ from .runtime.client import (
 from .runtime.jobs import (
     LORA_READY_EVENT,
     OPTIMIZER_READY_EVENT,
+    MegatronDistillationJob,
     MegatronMergedTrainingJob,
     MegatronOptimizerSaveJob,
     MegatronSFTTrainingJob,
@@ -407,6 +413,139 @@ class MegatronService:
             str(training_log_dir),
             str(runtime_dir / "vllm_waking.lock"),
         )
+
+    def _distillation_receipt_path(self, idempotency_key: str) -> Path:
+        digest = hashlib.sha256(idempotency_key.encode()).hexdigest()
+        path = Path(self.output_dir) / "megatron_runtime" / "distillation_receipts"
+        return path / f"{digest}.json"
+
+    @staticmethod
+    def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        with temporary.open("wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        MegatronService._fsync_parent_directory(path)
+
+    @staticmethod
+    def _fsync_parent_directory(path: Path) -> None:
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    @staticmethod
+    def _distillation_receipt_binding(
+        *,
+        idempotency_key: str,
+        expected_source_revision: int,
+        preparation_id: str,
+        payload_sha256: str,
+        objective: DistillationObjectiveConfig,
+    ) -> dict[str, Any]:
+        return {
+            "idempotency_key": idempotency_key,
+            "source_revision": expected_source_revision,
+            "preparation_id": preparation_id,
+            "payload_sha256": payload_sha256,
+            "objective": objective.model_dump(mode="json"),
+        }
+
+    def _read_distillation_receipt(
+        self,
+        *,
+        path: Path,
+        binding: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if path.exists():
+            try:
+                receipt = json.loads(path.read_text())
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("distillation receipt is unreadable") from exc
+            if receipt.get("binding") != binding:
+                raise ValueError(
+                    "idempotency_key is already bound to a different distillation job"
+                )
+            if receipt.get("state") not in {"committed", "pending", "failed"}:
+                raise RuntimeError("distillation receipt has an invalid state")
+            return cast(dict[str, Any], receipt)
+        return None
+
+    def _reserve_distillation_receipt(
+        self,
+        *,
+        path: Path,
+        binding: dict[str, Any],
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        encoded = json.dumps(
+            {"binding": binding, "state": "pending"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError as exc:
+            # Another service/process won the reservation race. It is never
+            # safe for this call to submit a second optimizer job.
+            raise RuntimeError(
+                "distillation idempotency reservation already exists; re-read "
+                "the receipt before retry"
+            ) from exc
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        MegatronService._fsync_parent_directory(path)
+
+    async def committed_distillation_step(
+        self,
+        *,
+        idempotency_key: str,
+        expected_source_revision: int,
+        preparation_id: str,
+        payload_sha256: str,
+        objective: DistillationObjectiveConfig,
+    ) -> int | None:
+        """Return a committed idempotent result, or fail closed on pending work."""
+
+        path = self._distillation_receipt_path(idempotency_key)
+        binding = self._distillation_receipt_binding(
+            idempotency_key=idempotency_key,
+            expected_source_revision=expected_source_revision,
+            preparation_id=preparation_id,
+            payload_sha256=payload_sha256,
+            objective=objective,
+        )
+        receipt = self._read_distillation_receipt(path=path, binding=binding)
+        if receipt is None:
+            return None
+        if receipt["state"] == "failed":
+            raise RuntimeError(
+                "a prior distillation attempt failed after reservation; use a "
+                "new idempotency key after confirming no optimizer mutation"
+            )
+        if receipt["state"] == "pending":
+            raise RuntimeError(
+                "an identical distillation job is pending with an ambiguous "
+                "outcome; reconciliation is required before retry"
+            )
+        return int(receipt["committed_step"])
 
     def _staging_lora_dir(self, step: int) -> str:
         return str(
@@ -1425,6 +1564,183 @@ class MegatronService:
                 exc,
                 self.aclose,
                 message="Megatron training and cleanup failed.",
+            )
+            raise
+
+    async def train_distillation(
+        self,
+        disk_tensors: DiskPackedDistillationTensors,
+        config: types.TrainConfig,
+        *,
+        objective: DistillationObjectiveConfig,
+        expected_source_revision: int,
+        idempotency_key: str,
+        preparation_id: str,
+        payload_sha256: str,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Run one revision-bound standalone forward-KL optimizer transaction."""
+
+        del verbose
+        receipt_path: Path | None = None
+        binding: dict[str, Any] | None = None
+        receipt_reserved = False
+        job_submitted = False
+        try:
+            self._raise_if_child_failed()
+            receipt_path = self._distillation_receipt_path(idempotency_key)
+            binding = self._distillation_receipt_binding(
+                idempotency_key=idempotency_key,
+                expected_source_revision=expected_source_revision,
+                preparation_id=preparation_id,
+                payload_sha256=payload_sha256,
+                objective=objective,
+            )
+            existing_receipt = self._read_distillation_receipt(
+                path=receipt_path,
+                binding=binding,
+            )
+            if (
+                existing_receipt is not None
+                and existing_receipt["state"] == "committed"
+            ):
+                yield {
+                    "distill/idempotent_replay": 1.0,
+                    "distill/committed_step": float(existing_receipt["committed_step"]),
+                    "data/step_num_gradient_steps": 0.0,
+                }
+                return
+            if existing_receipt is not None and existing_receipt["state"] == "pending":
+                raise RuntimeError(
+                    "an identical distillation job is pending with an ambiguous "
+                    "outcome; reconciliation is required before retry"
+                )
+            topology = self.runtime_config.topology
+            if (
+                topology.tp,
+                self._data_parallel_world_size(),
+                topology.cp,
+                topology.pp,
+                topology.ep,
+                topology.etp,
+            ) != (1, 1, 1, 1, 1, 1):
+                raise ValueError(
+                    "M3 Megatron distillation requires TP=DP=CP=PP=EP=ETP=1"
+                )
+            if expected_source_revision != self._latest_step:
+                raise ValueError(
+                    "distillation source revision no longer matches the current "
+                    "learner revision"
+                )
+            if self.is_dedicated and self.rollout_weights_mode != "lora":
+                raise NotImplementedError(
+                    "M3 Megatron distillation requires LoRA rollout weights"
+                )
+            # Validate tensor bytes and denominator before staging a checkpoint.
+            from .distillation import packed_distillation_tensors_from_dir
+
+            packed_distillation_tensors_from_dir(disk_tensors)
+            self._reserve_distillation_receipt(path=receipt_path, binding=binding)
+            receipt_reserved = True
+
+            if self.is_dedicated:
+                await self._ensure_megatron_running()
+                lora_path = self._resolve_active_lora_path()
+                self._clear_pending_jobs()
+            else:
+                lora_path = await self._prepare_for_training()
+            next_step = self._latest_step + 1
+            staging_lora_path = self._prepare_training_lora_dir(
+                lora_path,
+                next_step,
+            )
+            job_path, log_path = self._create_megatron_job_paths()
+            job = MegatronDistillationJob(
+                step=next_step,
+                source_policy_step=self._latest_step,
+                expected_source_revision=expected_source_revision,
+                training_session_id=self._training_session_id,
+                lora_path=staging_lora_path,
+                allow_unvalidated_arch=self._allow_unvalidated_arch,
+                optimizer_state_path=self._get_optimizer_state_path(),
+                distillation_tensors=disk_tensors,
+                config=config,
+                objective=objective,
+                idempotency_key=idempotency_key,
+                preparation_id=preparation_id,
+                payload_sha256=payload_sha256,
+                log_path=log_path,
+            )
+            # From this point onward, failure is ambiguous and must remain pending.
+            job_submitted = True
+            write_megatron_job(job, job_path=job_path)
+            checkpoint_dir: str | None = None
+            optimizer_world_size: int | None = None
+            async for result in stream_megatron_job(
+                job,
+                job_path=job_path,
+                process=self._megatron_process,
+                process_log_path=self._megatron_log_path,
+            ):
+                if result.get("event") == LORA_READY_EVENT:
+                    checkpoint_dir = await self._handle_training_lora_ready(
+                        checkpoint_dir=checkpoint_dir,
+                        staging_lora_path=staging_lora_path,
+                        step=next_step,
+                    )
+                    continue
+                if (
+                    world_size := self._optimizer_ready_world_size(
+                        result, expected_step=next_step
+                    )
+                ) is not None:
+                    optimizer_world_size = world_size
+                    continue
+                yield {key: float(value) for key, value in result.items()}
+            await self._finish_training_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                staging_lora_path=staging_lora_path,
+                step=next_step,
+            )
+            if optimizer_world_size is None:
+                raise RuntimeError(
+                    "Megatron distillation job did not persist its optimizer"
+                )
+            self._commit_optimizer_checkpoint(
+                step=next_step, world_size=optimizer_world_size
+            )
+            assert receipt_path is not None and binding is not None
+            self._write_json_atomic(
+                receipt_path,
+                {
+                    "binding": binding,
+                    "state": "committed",
+                    "committed_step": next_step,
+                },
+            )
+        except GeneratorExit:
+            raise
+        except BaseException as exc:
+            if (
+                not job_submitted
+                and receipt_reserved
+                and receipt_path is not None
+                and binding is not None
+                and receipt_path.exists()
+            ):
+                self._write_json_atomic(
+                    receipt_path,
+                    {
+                        "binding": binding,
+                        "state": "failed",
+                        "failure": type(exc).__name__,
+                    },
+                )
+            self._status(f"Megatron distillation failed: {type(exc).__name__}: {exc}")
+            await cleanup_after_failure(
+                exc,
+                self.aclose,
+                message="Megatron distillation and cleanup failed.",
             )
             raise
 
