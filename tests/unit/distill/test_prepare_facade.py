@@ -75,9 +75,18 @@ class _Backend:
     def __init__(self) -> None:
         self.lease_active = False
         self.lease_calls: list[tuple[object, int]] = []
+        self.current: distill.CurrentStep | None = None
 
     async def _get_step(self, _model: object) -> int:
         return 7
+
+    async def _validate_current_step(
+        self,
+        _model: object,
+        consistency: distill.CurrentStep,
+    ) -> None:
+        if consistency != self.current:
+            raise ValueError("CurrentStep is not active")
 
     @asynccontextmanager
     async def exact_adapter_lease(self, model: object, step: int):
@@ -319,7 +328,7 @@ async def test_capability_mismatch_rejects_before_scoring(
     assert backend.lease_calls == []
 
 
-async def test_v1_rejects_current_step_and_non_unit_temperature_before_io(
+async def test_current_step_requires_active_session_and_non_unit_temperature_fails(
     facade: CandidateTrainingBatch,
 ) -> None:
     backend = _Backend()
@@ -329,14 +338,30 @@ async def test_v1_rejects_current_step_and_non_unit_temperature_before_io(
         capabilities=_capabilities(),
     )
 
-    with pytest.raises(NotImplementedError, match="Frozen"):
+    with pytest.raises(ValueError, match="not active"):
         await distill.prepare(
             cast(TrainableModel[Any, Any], student),
             (),
             teacher=cast(Model[Any, Any], student),
+            select=distill.all_generations(),
+            teacher_view=distill.same_context(),
             target=distill.TopK(k=2),
             consistency=distill.CurrentStep(revision=7, session_id="session"),
         )
+    backend.current = distill.CurrentStep(revision=7, session_id="session")
+    prepared = await distill.prepare(
+        cast(TrainableModel[Any, Any], student),
+        (),
+        teacher=cast(Model[Any, Any], student),
+        select=distill.all_generations(),
+        teacher_view=distill.same_context(),
+        target=distill.TopK(k=2),
+        consistency=backend.current,
+    )
+    assert prepared.constraints.consistency == backend.current
+    assert prepared.constraints.learner_revision == 7
+    assert _RecordingScorer.instances[0].requests[0].teacher_revision == 7
+    _RecordingScorer.instances.clear()
     with pytest.raises(ValueError, match="temperature 1.0"):
         await distill.prepare(
             cast(TrainableModel[Any, Any], student),
@@ -356,4 +381,4 @@ async def test_v1_rejects_current_step_and_non_unit_temperature_before_io(
         )
 
     assert not _RecordingScorer.instances
-    assert backend.lease_calls == []
+    assert backend.lease_calls == [(student, 7)]

@@ -43,6 +43,10 @@ from art.megatron.composite_loss import (
     PreparedPolicySidecars,
     composite_prepared_loss_from_logits,
 )
+from art.megatron.context_parallel.runtime import (
+    dispatch_context_parallel_tensor,
+    prepare_cp_micro,
+)
 from art.megatron.context_parallel.types import (
     DispatchedPackedTensors,
     ParallelTopology,
@@ -100,13 +104,16 @@ from art.megatron.training.microbatches import (
     CpBatchLookaheadState,
     PreparedRLMicroInputs,
     PreparedSFTMicroInputs,
+    _art_flex_cp_block_mask_variants,
     _art_flex_sliding_windows,
     _causal_attention_state,
     _clone_packed_tensors,
     _clone_sft_tensors,
+    _context_parallel_config_for_provider,
     _count_sft_trainable_tokens,
     _count_trainable_tokens,
     _empty_new_logprobs_from_logits,
+    _gdn_planner_config_for_provider,
     _local_trainable_sft_token_count_tensor,
     _local_trainable_token_count_tensor,
     _next_micro_lookahead,
@@ -139,6 +146,9 @@ from art.megatron.training.trace import (
     prepare_replay_local_input_token_uids,
 )
 from art.megatron.training.weight_offload import WeightOffloadManager
+from art.megatron.vocab_parallel import (
+    vocabulary_parallel_composite_prepared_loss,
+)
 from art.megatron.weights.lora_publish import save_vllm_lora_from_model
 from art.megatron.weights.merged_weight_export import (
     sync_merged_weights_to_vllm,
@@ -1046,9 +1056,11 @@ def _validate_distillation_worker_topology(model: ModelChunks) -> None:
         int(ps.get_expert_model_parallel_world_size()),
         int(ps.get_expert_tensor_parallel_world_size()),
     )
-    if worker_topology != (1, 1, 1, 1, 1, 1):
+    tp, dp, cp, pp, ep, etp = worker_topology
+    if min(tp, dp, cp) <= 0 or (pp, ep, etp) != (1, 1, 1):
         raise ValueError(
-            "prepared Megatron training requires TP=DP=CP=PP=EP=ETP=1; "
+            "prepared Megatron training supports positive TP/DP/CP with "
+            "PP=EP=ETP=1; "
             f"received {worker_topology}"
         )
 
@@ -1059,7 +1071,7 @@ def _preflight_distillation_job(
 ) -> tuple[
     PackedDistillationTensors,
     float,
-    list[tuple[list[int], int, int]],
+    list[tuple[list[int | None], int, int]],
 ]:
     """Validate the complete optimizer plan before mutable state preparation."""
 
@@ -1077,8 +1089,13 @@ def _preflight_distillation_job(
             "preparing mutable training state"
         )
     _validate_distillation_worker_topology(runtime.model)
-    if runtime.rank != 0 or runtime.world_size != 1:
-        raise ValueError("prepared Megatron training requires one rank")
+    topology = _infer_parallel_topology(runtime.model)
+    expected_world_size = int(topology.tp) * int(topology.dp) * int(topology.cp)
+    if runtime.world_size != expected_world_size:
+        raise ValueError(
+            "prepared Megatron worker world size does not match TP*DP*CP: "
+            f"{runtime.world_size} != {expected_world_size}"
+        )
 
     packed = packed_distillation_tensors_from_dir(job.distillation_tensors)
     target_mask = packed["target_mask"]
@@ -1110,22 +1127,25 @@ def _preflight_distillation_job(
     )
     num_sequences = job.distillation_tensors["num_sequences"]
     num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
-    update_plans: list[tuple[list[int], int, int]] = []
+    update_plans: list[tuple[list[int | None], int, int]] = []
     for step_index in range(num_steps):
-        indices = [
-            index
-            for index in build_micro_sample_indices(
-                step_index=step_index,
-                num_sequences=num_sequences,
-                global_grad_accumulation_sequences=(global_grad_accumulation_sequences),
-            )
-            if index is not None
-        ]
+        sample_rows = build_micro_sample_indices_by_dp_rank(
+            step_index=step_index,
+            num_sequences=num_sequences,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+        indices = [row[int(ps.get_data_parallel_rank())] for row in sample_rows]
         planned_policy_count = sum(
-            int(policy_mask[index].sum().item()) for index in indices
+            int(policy_mask[index].sum().item())
+            for row in sample_rows
+            for index in row
+            if index is not None
         )
         planned_target_count = sum(
-            int(target_mask[index].sum().item()) for index in indices
+            int(target_mask[index].sum().item())
+            for row in sample_rows
+            for index in row
+            if index is not None
         )
         if has_policy and planned_policy_count <= 0:
             raise ValueError(
@@ -2100,6 +2120,7 @@ def _select_distillation_micro(
     *,
     sample_index: int,
     device: torch.device,
+    zero_objectives: bool = False,
 ) -> dict[str, torch.Tensor]:
     token_count = int(packed_tensors["token_mask"][sample_index].sum().item())
     if token_count <= 1:
@@ -2128,7 +2149,7 @@ def _select_distillation_micro(
             device=device,
         )
 
-    return {
+    selected = {
         "tokens": row("tokens"),
         "input_pos": row("input_pos"),
         "sampled_token_ids": _shift_distillation_token_axis(row("tokens"), pad=0),
@@ -2157,6 +2178,162 @@ def _select_distillation_micro(
         ),
         "tail_logprobs": _shift_distillation_token_axis(row("tail_logprobs"), pad=0.0),
     }
+    if zero_objectives:
+        selected["policy_mask"].zero_()
+        selected["target_mask"].zero_()
+        selected["policy_weights"].zero_()
+        selected["distillation_weights"].zero_()
+    return selected
+
+
+def _prepare_distillation_micro(
+    packed_tensors: PackedDistillationTensors,
+    *,
+    sample_index: int | None,
+    device: torch.device,
+    topology: ParallelTopology,
+    provider: Any,
+    model_support_handler: Any,
+) -> tuple[dict[str, torch.Tensor], Any, Any | None]:
+    """Select and optionally context-parallel-dispatch one prepared sequence."""
+
+    selected_index = 0 if sample_index is None else sample_index
+    if int(topology.cp) <= 1:
+        micro = _select_distillation_micro(
+            packed_tensors,
+            sample_index=selected_index,
+            device=device,
+            zero_objectives=sample_index is None,
+        )
+        sequence_length = int(micro["tokens"].shape[1])
+        attention_state = _causal_attention_state(
+            sequence_length,
+            device,
+            provider=provider,
+            model_support_handler=model_support_handler,
+            sliding_windows=_art_flex_sliding_windows(provider),
+            build_gdn_execution_spec=bool(
+                getattr(model_support_handler, "build_gdn_execution_spec", False)
+            ),
+            attention_head_dim=getattr(provider, "kv_channels", None),
+            attention_value_head_dim=getattr(provider, "kv_channels", None),
+        )
+        return micro, attention_state, None
+
+    token_count = int(packed_tensors["token_mask"][selected_index].sum().item())
+    if token_count <= 1:
+        raise ValueError("distillation trajectories require at least two tokens")
+    tensor_map = cast(dict[str, torch.Tensor], packed_tensors)
+
+    def cpu_row(name: str) -> torch.Tensor:
+        return tensor_map[name][
+            selected_index : selected_index + 1, :token_count, ...
+        ].clone()
+
+    policy_mask = cpu_row("policy_mask")
+    target_mask = cpu_row("target_mask")
+    if sample_index is None:
+        policy_mask.zero_()
+        target_mask.zero_()
+    tokens = cpu_row("tokens")
+    group_ids = torch.zeros_like(tokens)
+    packed_micro = cast(
+        PackedTensors,
+        {
+            "tokens": tokens,
+            "group_ids": group_ids,
+            "parent_ids": group_ids.clone(),
+            "input_pos": cpu_row("input_pos"),
+            "assistant_mask": policy_mask,
+            "logprobs": cpu_row("old_logprobs"),
+            "advantages": cpu_row("policy_advantages"),
+            "weights": (
+                torch.zeros_like(cpu_row("policy_weights"))
+                if sample_index is None
+                else cpu_row("policy_weights")
+            ),
+            "moe_routing_replay": None,
+            "pixel_values": [None],
+            "image_grid_thw": [None],
+        },
+    )
+    prepared = prepare_cp_micro(
+        micro=packed_micro,
+        topology=topology,
+        config=_context_parallel_config_for_provider(provider, device),
+        cp_group=ps.get_context_parallel_group(check_initialized=False),
+        cp_rank=ps.get_context_parallel_rank(),
+        build_gdn_execution_spec=bool(
+            getattr(model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
+        ),
+        block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
+        target_device=device,
+    )
+    rank_plan = prepared.rank_plan
+    assert rank_plan is not None
+
+    def dispatch(
+        tensor: torch.Tensor,
+        pad: int | float | bool,
+    ) -> torch.Tensor:
+        return dispatch_context_parallel_tensor(
+            tensor,
+            rank_plan=rank_plan,
+            pad_value=pad,
+            pad_multiple=prepared.pad_multiple,
+            target_device=device,
+        )
+
+    shifted_targets = {
+        "policy_group_ids": _shift_distillation_token_axis(
+            cpu_row("policy_group_ids"), pad=0
+        ),
+        "target_mask": _shift_distillation_token_axis(target_mask, pad=False),
+        "distillation_weights": _shift_distillation_token_axis(
+            (
+                torch.zeros_like(cpu_row("distillation_weights"))
+                if sample_index is None
+                else cpu_row("distillation_weights")
+            ),
+            pad=0.0,
+        ),
+        "topk_token_ids": _shift_distillation_token_axis(
+            cpu_row("topk_token_ids"), pad=-1
+        ),
+        "teacher_logprobs": _shift_distillation_token_axis(
+            cpu_row("teacher_logprobs"), pad=0.0
+        ),
+        "tail_logprobs": _shift_distillation_token_axis(
+            cpu_row("tail_logprobs"), pad=0.0
+        ),
+    }
+    dispatched = prepared.tensors
+    micro = {
+        "tokens": dispatched.tokens,
+        "input_pos": dispatched.input_pos,
+        "sampled_token_ids": dispatched.labels.masked_fill(
+            ~dispatched.assistant_mask, 0
+        ),
+        "policy_mask": dispatched.assistant_mask,
+        "old_logprobs": torch.where(
+            dispatched.assistant_mask,
+            dispatched.old_logprobs,
+            torch.zeros_like(dispatched.old_logprobs),
+        ),
+        "policy_advantages": dispatched.advantages,
+        "policy_weights": dispatched.weights,
+        "policy_group_ids": dispatch(shifted_targets["policy_group_ids"], 0),
+        "target_mask": dispatch(shifted_targets["target_mask"], False).bool(),
+        "distillation_weights": dispatch(shifted_targets["distillation_weights"], 0.0),
+        "topk_token_ids": dispatch(shifted_targets["topk_token_ids"], -1),
+        "teacher_logprobs": dispatch(shifted_targets["teacher_logprobs"], 0.0),
+        "tail_logprobs": dispatch(shifted_targets["tail_logprobs"], 0.0),
+    }
+    return micro, prepared.attention_state, prepared.packed_seq_params
 
 
 def _normalize_distillation_logits(
@@ -2205,6 +2382,41 @@ def _ensure_distillation_gradients_finite(model_chunks: ModelChunks) -> None:
         raise RuntimeError("distillation backward produced no trainable gradients")
 
 
+def _reduce_prepared_counts(
+    *,
+    local_policy_count: int,
+    local_target_count: int,
+    device: torch.device,
+    topology: ParallelTopology,
+) -> tuple[int, int]:
+    counts = torch.tensor(
+        [local_policy_count, local_target_count],
+        device=device,
+        dtype=torch.int64,
+    )
+    if int(topology.dp) * int(topology.cp) > 1:
+        torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
+            counts,
+            op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
+            group=ps.get_data_parallel_group(with_context_parallel=True),
+        )
+    return int(counts[0].item()), int(counts[1].item())
+
+
+def _reduce_prepared_statistics(
+    values: torch.Tensor,
+    *,
+    topology: ParallelTopology,
+) -> torch.Tensor:
+    if int(topology.dp) * int(topology.cp) > 1:
+        torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
+            values,
+            op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
+            group=ps.get_data_parallel_group(with_context_parallel=True),
+        )
+    return values
+
+
 def run_megatron_distillation_step(
     *,
     model_chunks: ModelChunks,
@@ -2213,7 +2425,7 @@ def run_megatron_distillation_step(
     optimizer: Any,
     learning_rate: float,
     packed_tensors: PackedDistillationTensors,
-    sample_indices: list[int],
+    sample_indices: list[int | None],
     logical_vocab_size: int,
     temperature: float,
     coefficient: float,
@@ -2227,15 +2439,33 @@ def run_megatron_distillation_step(
     if not sample_indices:
         raise ValueError("distillation optimizer step requires at least one sequence")
     _validate_distillation_worker_topology(model_chunks)
-    packed_policy_mask = packed_tensors.get("policy_mask")
-    policy_count = (
-        sum(int(packed_policy_mask[index].sum().item()) for index in sample_indices)
-        if packed_policy_mask is not None
-        else 0
+
+    device = next(model_chunks[0].parameters()).device
+    topology = _infer_parallel_topology(model_chunks)
+    prepared_micros = [
+        _prepare_distillation_micro(
+            packed_tensors,
+            sample_index=sample_index,
+            device=device,
+            topology=topology,
+            provider=provider,
+            model_support_handler=model_support_handler,
+        )
+        for sample_index in sample_indices
+    ]
+    local_policy_count = sum(
+        int(micro["policy_mask"].sum().item())
+        for micro, _attention_state, _packed_seq_params in prepared_micros
     )
-    target_count = sum(
-        int(packed_tensors["target_mask"][index].sum().item())
-        for index in sample_indices
+    local_target_count = sum(
+        int(micro["target_mask"].sum().item())
+        for micro, _attention_state, _packed_seq_params in prepared_micros
+    )
+    policy_count, target_count = _reduce_prepared_counts(
+        local_policy_count=local_policy_count,
+        local_target_count=local_target_count,
+        device=device,
+        topology=topology,
     )
     if policy_config is not None and policy_count <= 0:
         raise RuntimeError("prepared optimizer step has a zero policy denominator")
@@ -2248,7 +2478,6 @@ def run_megatron_distillation_step(
     if expected_target_count is not None and target_count != expected_target_count:
         raise RuntimeError("prepared KD denominator changed after preflight")
 
-    device = next(model_chunks[0].parameters()).device
     _zero_grad_buffers(model_chunks)
 
     policy_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
@@ -2260,36 +2489,21 @@ def run_megatron_distillation_step(
     observed_policy_count = 0
     target_token_count = 0
     numerical_clamp_count = 0
-    base_denominator = policy_count if policy_count > 0 else target_count
-    policy_scale = (
-        float(base_denominator) / float(policy_count) if policy_count > 0 else 0.0
+    distillation_scale = (
+        float(policy_count) / float(target_count) if policy_count > 0 else 1.0
     )
-    distillation_scale = float(base_denominator) / float(target_count)
+    tp_world_size = int(topology.tp)
+    tp_rank = int(ps.get_tensor_model_parallel_rank())
+    tp_group = ps.get_tensor_model_parallel_group(check_initialized=False)
 
-    for sample_index in sample_indices:
-        micro = _select_distillation_micro(
-            packed_tensors,
-            sample_index=sample_index,
-            device=device,
-        )
+    for micro, attention_state, packed_seq_params in prepared_micros:
         sequence_length = int(micro["tokens"].shape[1])
-        attention_state = _causal_attention_state(
-            sequence_length,
-            device,
-            provider=provider,
-            model_support_handler=model_support_handler,
-            sliding_windows=_art_flex_sliding_windows(provider),
-            build_gdn_execution_spec=bool(
-                getattr(model_support_handler, "build_gdn_execution_spec", False)
-            ),
-            attention_head_dim=getattr(provider, "kv_channels", None),
-            attention_value_head_dim=getattr(provider, "kv_channels", None),
-        )
         raw_logits = model_chunks[0](
             input_ids=micro["tokens"],
             position_ids=micro["input_pos"],
             attention_mask=_placeholder_attention_mask(device),
             labels=None,
+            packed_seq_params=packed_seq_params,
             **model_support_handler.get_forward_kwargs(
                 model_chunks[0],
                 attention_bias=attention_state,
@@ -2326,18 +2540,33 @@ def run_megatron_distillation_step(
             else None
         )
         if policy_sidecars is None and distillation_sidecars is None:
+            (logits.float().sum() * 0.0).backward()
             continue
-        composite = composite_prepared_loss_from_logits(
-            logits,
-            logical_vocab_size=logical_vocab_size,
-            policy=policy_sidecars,
-            distillation=distillation_sidecars,
-            policy_config=policy_config,
-            distillation_coefficient=coefficient,
+        composite = (
+            composite_prepared_loss_from_logits(
+                logits,
+                logical_vocab_size=logical_vocab_size,
+                policy=policy_sidecars,
+                distillation=distillation_sidecars,
+                policy_config=policy_config,
+                distillation_coefficient=coefficient,
+            )
+            if tp_world_size == 1
+            else vocabulary_parallel_composite_prepared_loss(
+                logits,
+                logical_vocab_size=logical_vocab_size,
+                tensor_parallel_group=tp_group,
+                tensor_parallel_rank=tp_rank,
+                tensor_parallel_world_size=tp_world_size,
+                policy=policy_sidecars,
+                distillation=distillation_sidecars,
+                policy_config=policy_config,
+                distillation_coefficient=coefficient,
+            )
         )
         objective_sum = torch.zeros((), dtype=torch.float32, device=device)
         if composite.policy is not None:
-            objective_sum = objective_sum + composite.policy.loss_sum * policy_scale
+            objective_sum = objective_sum + composite.policy.loss_sum
         if composite.distillation is not None:
             objective_sum = objective_sum + (
                 composite.distillation.loss_sum * coefficient * distillation_scale
@@ -2365,11 +2594,20 @@ def run_megatron_distillation_step(
             target_token_count += int(loss.token_count.item())
             numerical_clamp_count += int(loss.numerical_clamp_count.item())
 
-    if observed_policy_count != policy_count or target_token_count != target_count:
-        raise RuntimeError("prepared objective counts changed during scoring")
+    if (
+        observed_policy_count != local_policy_count
+        or target_token_count != local_target_count
+    ):
+        raise RuntimeError("local prepared objective counts changed during scoring")
     flush_param_grads_to_main_grads(model_chunks)
     denominator = torch.tensor(
-        [float(base_denominator)], dtype=torch.float32, device=device
+        [
+            float(
+                local_policy_count if policy_config is not None else local_target_count
+            )
+        ],
+        dtype=torch.float32,
+        device=device,
     )
     finalize_model_grads_extended(
         as_megatron_api_chunks(model_chunks),
@@ -2382,27 +2620,50 @@ def run_megatron_distillation_step(
         model_support_handler=model_support_handler,
         model_chunks=model_chunks,
     )
-    reduced_loss = (raw_loss_sum * coefficient) / target_token_count
+    statistics = torch.tensor(
+        [
+            float(policy_loss_sum.item()),
+            float(raw_loss_sum.item()),
+            float(selected_loss_sum.item()),
+            float(tail_loss_sum.item()),
+            float(teacher_tail_mass_sum.item()),
+            float(student_tail_mass_sum.item()),
+            float(numerical_clamp_count),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    statistics = _reduce_prepared_statistics(statistics, topology=topology)
+    (
+        global_policy_loss_sum,
+        global_raw_loss_sum,
+        global_selected_loss_sum,
+        global_tail_loss_sum,
+        global_teacher_tail_mass_sum,
+        global_student_tail_mass_sum,
+        global_numerical_clamp_count,
+    ) = (float(value.item()) for value in statistics)
+    reduced_loss = torch.tensor(
+        global_raw_loss_sum * coefficient / target_count,
+        dtype=torch.float32,
+        device=device,
+    )
     if policy_count > 0:
-        reduced_loss = reduced_loss + policy_loss_sum / policy_count
+        reduced_loss = reduced_loss + global_policy_loss_sum / policy_count
 
     return DistillationTrainStepResult(
         reduced_loss=reduced_loss,
-        raw_loss_sum=float(raw_loss_sum.item()),
-        selected_loss_sum=float(selected_loss_sum.item()),
-        tail_loss_sum=float(tail_loss_sum.item()),
-        target_token_count=target_token_count,
-        teacher_tail_mass_mean=float(
-            (teacher_tail_mass_sum / target_token_count).item()
-        ),
-        student_tail_mass_mean=float(
-            (student_tail_mass_sum / target_token_count).item()
-        ),
-        numerical_clamp_count=numerical_clamp_count,
+        raw_loss_sum=global_raw_loss_sum,
+        selected_loss_sum=global_selected_loss_sum,
+        tail_loss_sum=global_tail_loss_sum,
+        target_token_count=target_count,
+        teacher_tail_mass_mean=float(global_teacher_tail_mass_sum / target_count),
+        student_tail_mass_mean=float(global_student_tail_mass_sum / target_count),
+        numerical_clamp_count=int(global_numerical_clamp_count),
         update_successful=update_successful,
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
-        policy_loss_sum=float(policy_loss_sum.item()),
+        policy_loss_sum=global_policy_loss_sum,
         policy_token_count=policy_count,
     )
 

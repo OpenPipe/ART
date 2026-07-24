@@ -150,6 +150,28 @@ class WriterSessionStore:
         )
         return lease
 
+    def acquire_ordinary_open(
+        self,
+        *,
+        revision: int,
+        ttl_s: float,
+    ) -> WriterLease:
+        """Acquire a short ordinary writer without declaring submission.
+
+        Services use this after read-only preflight but before shared staging,
+        then call :meth:`bind` immediately before publishing the durable job.
+        An exception between acquisition and binding is therefore safely
+        classified as ``abandoned_before_submit`` instead of an ambiguous
+        optimizer update.
+        """
+
+        return self._acquire(
+            revision=revision,
+            ttl_s=ttl_s,
+            kind="ordinary",
+            operation_identity=None,
+        )
+
     @contextmanager
     def current_step(
         self,
@@ -276,7 +298,10 @@ class WriterSessionStore:
         """Record the sole valid transition ``R -> R + 1`` durably."""
 
         operation = _canonical_operation(operation_identity)
-        journal = self._validated_active_journal(lease, require_unexpired=True)
+        # Expiry protects admission and pre-submit binding. Once a service has
+        # bound the operation while retaining the OS writer gate, a delayed
+        # heartbeat cannot make a known successful R -> R+1 result ambiguous.
+        journal = self._validated_active_journal(lease, require_unexpired=False)
         self._require_same_operation(journal, operation)
         expected_result = lease.revision + 1
         if result_revision != expected_result:

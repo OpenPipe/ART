@@ -1,4 +1,7 @@
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import math
 import os
 import time
@@ -7,7 +10,7 @@ from typing import Any, Iterable, cast
 from mp_actors import move_to_child_process
 
 from ..backend import AnyTrainableModel
-from ..distill import PreparedTrainingBatch, TrainingObjectives
+from ..distill import CurrentStep, PreparedTrainingBatch, TrainingObjectives
 from ..local.backend import LocalBackend
 from ..local.service import ModelService
 from ..metrics_taxonomy import average_metric_samples
@@ -33,6 +36,24 @@ from .optimizer_state import (
 from .runtime_config import get_megatron_runtime_config
 
 
+@dataclass(slots=True)
+class _ActiveCurrentStep:
+    consistency: CurrentStep
+    session: "_CurrentStepSession"
+    capability: bytes
+    heartbeat_task: asyncio.Task[None]
+    heartbeat_error: BaseException | None = None
+    consumed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _CurrentStepSession:
+    """Opaque backend-issued authority. Only revision and session ID are public."""
+
+    revision: int
+    session_id: str
+
+
 class MegatronBackend(LocalBackend):
     def __init__(
         self,
@@ -50,6 +71,7 @@ class MegatronBackend(LocalBackend):
         self._packed_sequence_length_requires_chunk_alignment = False
         self._supports_result_packing = True
         self._resume_prepared_models: set[tuple[str, str]] = set()
+        self._active_current_steps: dict[tuple[str, str], _ActiveCurrentStep] = {}
 
     async def register(self, model: Model) -> None:
         await super().register(model)
@@ -73,10 +95,10 @@ class MegatronBackend(LocalBackend):
             return await self._train_prepared_distillation(
                 model, trajectory_groups, **kwargs
             )
-        if "objectives" in kwargs or "idempotency_key" in kwargs:
+        if any(name in kwargs for name in ("objectives", "idempotency_key", "session")):
             raise TypeError(
-                "objectives and idempotency_key are only valid with a "
-                "PreparedTrainingBatch"
+                "objectives, idempotency_key, and session are only valid with "
+                "a PreparedTrainingBatch"
             )
         return await super().train(
             model,
@@ -104,6 +126,7 @@ class MegatronBackend(LocalBackend):
             "importance_sampling_level",
             "scale_rewards",
             "advantage_balance",
+            "session",
         }
         unexpected = sorted(set(kwargs) - allowed)
         if unexpected:
@@ -182,6 +205,36 @@ class MegatronBackend(LocalBackend):
             compensate_temperature_squared=(objective.compensate_temperature_squared),
             policy=policy_objective,
         )
+        current_step = (
+            batch.constraints.consistency
+            if isinstance(batch.constraints.consistency, CurrentStep)
+            else None
+        )
+        active_current: _ActiveCurrentStep | None = None
+        if current_step is not None:
+            active_current = self._require_active_current_step(
+                model,
+                current_step,
+                kwargs.get("session"),
+            )
+            if active_current.consumed:
+                raise RuntimeError(
+                    "a current-step writer session permits exactly one backend.train call"
+                )
+            if active_current.heartbeat_error is not None:
+                raise RuntimeError("the current-step writer heartbeat failed") from (
+                    active_current.heartbeat_error
+                )
+            # The service owns heartbeat renewal while the bound optimizer job runs.
+            # Stop the orchestration heartbeat before handing over the capability.
+            active_current.heartbeat_task.cancel()
+            try:
+                await active_current.heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            active_current.consumed = True
+        elif kwargs.get("session") is not None:
+            raise ValueError("session= is valid only for CurrentStep prepared batches")
         config = TrainConfig(
             learning_rate=learning_rate,
             grad_accumulation_sequences=grad_accumulation_sequences,
@@ -189,6 +242,12 @@ class MegatronBackend(LocalBackend):
         )
         artifact_source_revision = batch.constraints.learner_revision
         service = await self._get_service(cast(TrainableModel, model))
+        if active_current is not None:
+            await cast(Any, service).heartbeat_current_step(
+                session_id=active_current.consistency.session_id,
+                capability=active_current.capability,
+                ttl_s=600.0,
+            )
         committed_step = await cast(Any, service).committed_distillation_step(
             idempotency_key=idempotency_key,
             expected_source_revision=artifact_source_revision,
@@ -238,10 +297,11 @@ class MegatronBackend(LocalBackend):
                 topology.ep,
                 topology.etp,
             )
-            if topology_tuple != (1, 1, 1, 1, 1):
+            tp, cp, pp, ep, etp = topology_tuple
+            if min(tp, cp) <= 0 or (pp, ep, etp) != (1, 1, 1):
                 raise ValueError(
-                    "additive prepared Megatron training requires "
-                    "TP=CP=PP=EP=ETP=1; "
+                    "additive prepared Megatron training supports positive "
+                    "TP/CP with PP=EP=ETP=1; "
                     f"received {topology_tuple}"
                 )
             payload = validate_prepared_forward_kl(
@@ -290,6 +350,12 @@ class MegatronBackend(LocalBackend):
             idempotency_key=idempotency_key,
             preparation_id=batch.preparation_id,
             payload_sha256=batch.payload_sha256,
+            current_step_session_id=(
+                current_step.session_id if current_step is not None else None
+            ),
+            current_step_capability=(
+                active_current.capability if active_current is not None else None
+            ),
             verbose=verbose,
         ):
             metric_samples.append(metrics)
@@ -320,6 +386,131 @@ class MegatronBackend(LocalBackend):
             metrics=metrics,
             checkpoint_path=checkpoint_path,
         )
+
+    @asynccontextmanager
+    async def current_step(
+        self,
+        model: AnyTrainableModel,
+        *,
+        ttl_s: float = 600.0,
+    ) -> AsyncIterator[_CurrentStepSession]:
+        """Freeze one learner revision across rollout, preparation, and one update."""
+
+        if not model.trainable:
+            raise TypeError("current_step requires a trainable model")
+        if not math.isfinite(ttl_s) or ttl_s <= 0:
+            raise ValueError("ttl_s must be finite and positive")
+        storage_key = self._model_storage_key(model)
+        if storage_key in self._active_current_steps:
+            raise RuntimeError(
+                "this backend already has an active current-step session"
+            )
+        service = await self._get_service(cast(TrainableModel, model))
+        revision = await self._get_step(model)
+        lease = await cast(Any, service).acquire_current_step(
+            revision=revision,
+            ttl_s=ttl_s,
+        )
+        session = _CurrentStepSession(
+            revision=revision,
+            session_id=lease.session_id,
+        )
+        consistency = CurrentStep(
+            revision=session.revision,
+            session_id=session.session_id,
+        )
+        active: _ActiveCurrentStep
+
+        async def _heartbeat() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(max(min(ttl_s / 3.0, 60.0), 0.05))
+                    await cast(Any, service).heartbeat_current_step(
+                        session_id=session.session_id,
+                        capability=lease.capability,
+                        ttl_s=ttl_s,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                active.heartbeat_error = exc
+
+        task = asyncio.create_task(_heartbeat())
+        active = _ActiveCurrentStep(
+            consistency=consistency,
+            session=session,
+            capability=lease.capability,
+            heartbeat_task=task,
+        )
+        self._active_current_steps[storage_key] = active
+        body_error: BaseException | None = None
+        try:
+            yield session
+        except BaseException as exc:
+            body_error = exc
+            raise
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            self._active_current_steps.pop(storage_key, None)
+            release_error: BaseException | None = None
+            try:
+                await cast(Any, service).release_current_step(
+                    session_id=consistency.session_id,
+                    capability=lease.capability,
+                )
+            except BaseException as exc:
+                release_error = exc
+            if release_error is not None:
+                if body_error is not None:
+                    raise BaseExceptionGroup(
+                        "Current-step work failed and its writer outcome is ambiguous.",
+                        [body_error, release_error],
+                    ) from None
+                raise release_error
+            if active.heartbeat_error is not None and body_error is None:
+                raise RuntimeError("the current-step writer heartbeat failed") from (
+                    active.heartbeat_error
+                )
+
+    def _require_active_current_step(
+        self,
+        model: AnyTrainableModel,
+        consistency: CurrentStep,
+        session: Any,
+    ) -> _ActiveCurrentStep:
+        active = self._active_current_steps.get(self._model_storage_key(model))
+        if (
+            active is None
+            or active.consistency != consistency
+            or session is not active.session
+        ):
+            raise ValueError(
+                "CurrentStep and session= must come from the same active "
+                "backend.current_step(model) context owned by this backend and model"
+            )
+        return active
+
+    async def _validate_current_step(
+        self,
+        model: AnyTrainableModel,
+        consistency: CurrentStep,
+    ) -> None:
+        active = self._active_current_steps.get(self._model_storage_key(model))
+        if active is None or active.consistency != consistency:
+            raise ValueError(
+                "CurrentStep must come from an active backend.current_step(model) "
+                "context owned by this backend and model"
+            )
+        if active.consumed:
+            raise RuntimeError("the current-step session has already been consumed")
+        if active.heartbeat_error is not None:
+            raise RuntimeError("the current-step writer heartbeat failed") from (
+                active.heartbeat_error
+            )
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config

@@ -1,6 +1,7 @@
 import asyncio
 from dataclasses import dataclass, field
 import hashlib
+import hmac
 import importlib
 import json
 import os
@@ -89,10 +90,18 @@ from .runtime.jobs import (
 from .runtime.te_cutlass_grouped_gemm import force_te_cutlass_grouped_gemm_env
 from .runtime_config import get_megatron_runtime_config
 from .training.sft_batches import materialize_sft_batches
+from .writer_sessions import (
+    AmbiguousWriterSessionError,
+    WriterLease,
+    WriterSessionStore,
+    WriterSessionValidationError,
+)
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
 OFFLOAD_BETWEEN_JOBS_ENV = "ART_MEGATRON_OFFLOAD_BETWEEN_JOBS"
+WRITER_SESSION_TTL_S = 600.0
+WRITER_HEARTBEAT_INTERVAL_S = 60.0
 
 
 class _RuntimeRequestKwargs(TypedDict, total=False):
@@ -268,10 +277,141 @@ class MegatronService:
         init=False,
         repr=False,
     )
+    _writer_sessions: WriterSessionStore = field(init=False, repr=False)
+    _current_writer_lease: WriterLease | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._child_processes = ChildProcessSupervisor(self._on_child_process_exit)
+        self._writer_sessions = WriterSessionStore(
+            root=Path(self.output_dir),
+            model_identity=(
+                f"{self.model_name}\0{self.base_model}\0"
+                f"{Path(self.output_dir).resolve()}"
+            ),
+        )
         self._validate_megatron_dependencies()
+
+    async def acquire_current_step(
+        self,
+        *,
+        revision: int,
+        ttl_s: float = WRITER_SESSION_TTL_S,
+    ) -> WriterLease:
+        """Acquire service-owned writer authority before exact-current rollout."""
+
+        if revision != self._latest_step:
+            raise ValueError(
+                "current-step source revision does not match the service revision"
+            )
+        if self._current_writer_lease is not None:
+            raise RuntimeError("this service already owns a current-step session")
+        lease = self._writer_sessions.acquire_current_step(
+            revision=revision,
+            ttl_s=ttl_s,
+        )
+        self._current_writer_lease = lease
+        return lease
+
+    def _authorized_current_writer(
+        self,
+        *,
+        session_id: str,
+        capability: bytes,
+    ) -> WriterLease:
+        lease = self._current_writer_lease
+        if (
+            lease is None
+            or lease.session_id != session_id
+            or not hmac.compare_digest(lease.capability, capability)
+        ):
+            raise WriterSessionValidationError(
+                "current-step capability is not owned by this model service"
+            )
+        return lease
+
+    async def heartbeat_current_step(
+        self,
+        *,
+        session_id: str,
+        capability: bytes,
+        ttl_s: float = WRITER_SESSION_TTL_S,
+    ) -> float:
+        lease = self._authorized_current_writer(
+            session_id=session_id,
+            capability=capability,
+        )
+        renewed = self._writer_sessions.heartbeat(lease, ttl_s=ttl_s)
+        self._current_writer_lease = renewed
+        return renewed.expires_at
+
+    async def release_current_step(
+        self,
+        *,
+        session_id: str,
+        capability: bytes,
+    ) -> None:
+        lease = self._authorized_current_writer(
+            session_id=session_id,
+            capability=capability,
+        )
+        recovery = self._writer_sessions.release(lease)
+        self._current_writer_lease = None
+        if recovery.action == "ambiguous_after_bind":
+            raise AmbiguousWriterSessionError(
+                "current-step optimizer outcome is ambiguous; reconcile its receipt "
+                "before another writer is admitted"
+            )
+
+    def _writer_operation_for_job(
+        self,
+        *,
+        route: str,
+        source_revision: int,
+        target_revision: int,
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "route": route,
+            "model_name": self.model_name,
+            "base_model": self.base_model,
+            "source_revision": source_revision,
+            "target_revision": target_revision,
+            "identity": identity,
+        }
+
+    async def _heartbeat_bound_writer(
+        self,
+        lease_holder: list[WriterLease],
+        *,
+        current_step: bool,
+    ) -> None:
+        while True:
+            await asyncio.sleep(WRITER_HEARTBEAT_INTERVAL_S)
+            renewed = self._writer_sessions.heartbeat(
+                lease_holder[0],
+                ttl_s=WRITER_SESSION_TTL_S,
+            )
+            lease_holder[0] = renewed
+            if current_step:
+                self._current_writer_lease = renewed
+
+    @staticmethod
+    async def _stop_writer_heartbeat(task: asyncio.Task[None] | None) -> None:
+        """Stop renewal; the authoritative journal is revalidated by commit."""
+
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            # A successful commit revalidates the bound journal while the OS gate
+            # is still held. A failed commit remains fail-closed and ambiguous.
+            pass
 
     def _on_child_process_exit(self, error: RuntimeError) -> None:
         self._status(f"Child process exited unexpectedly: {error}")
@@ -1228,7 +1368,6 @@ class MegatronService:
         await self._ensure_megatron_running()
 
         lora_path = self._resolve_training_lora_path()
-        self._clear_pending_jobs()
         return lora_path
 
     def _publish_staged_training_checkpoint(
@@ -1408,6 +1547,10 @@ class MegatronService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        writer_holder: list[WriterLease] | None = None
+        writer_operation: dict[str, Any] | None = None
+        writer_heartbeat: asyncio.Task[None] | None = None
+        writer_completed = False
         try:
             self._raise_if_child_failed()
             if _config.get("moe_routing_replay_bundle") is not None:
@@ -1415,6 +1558,18 @@ class MegatronService:
                     "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
                     "MegatronService subprocess jobs must use moe_routing_replay_path."
                 )
+            writer_holder = [
+                self._writer_sessions.acquire_ordinary_open(
+                    revision=self._latest_step,
+                    ttl_s=WRITER_SESSION_TTL_S,
+                )
+            ]
+            writer_heartbeat = asyncio.create_task(
+                self._heartbeat_bound_writer(
+                    writer_holder,
+                    current_step=False,
+                )
+            )
             if self.is_dedicated:
                 await self._ensure_megatron_running()
                 lora_path = self._resolve_active_lora_path()
@@ -1469,6 +1624,16 @@ class MegatronService:
                         ),
                         log_path=log_path,
                     )
+                writer_operation = self._writer_operation_for_job(
+                    route="rl",
+                    source_revision=self._latest_step,
+                    target_revision=next_step,
+                    identity={"job": job.model_dump(mode="json")},
+                )
+                self._writer_sessions.bind(
+                    writer_holder[0],
+                    operation_identity=writer_operation,
+                )
                 write_megatron_job(job, job_path=job_path)
                 checkpoint_dir: str | None = None
                 optimizer_world_size: int | None = None
@@ -1503,9 +1668,20 @@ class MegatronService:
                     self._commit_optimizer_checkpoint(
                         step=next_step, world_size=optimizer_world_size
                     )
+                if writer_heartbeat is not None:
+                    await self._stop_writer_heartbeat(writer_heartbeat)
+                    writer_heartbeat = None
+                self._writer_sessions.commit(
+                    writer_holder[0],
+                    operation_identity=writer_operation,
+                    result_revision=next_step,
+                )
+                self._writer_sessions.release(writer_holder[0])
+                writer_completed = True
                 return
 
             lora_path = await self._prepare_for_training()
+            self._clear_pending_jobs()
             next_step = self._latest_step + 1
             staging_lora_path = self._prepare_training_lora_dir(
                 lora_path,
@@ -1527,6 +1703,16 @@ class MegatronService:
                     "moe_routing_replay_strict", True
                 ),
                 log_path=log_path,
+            )
+            writer_operation = self._writer_operation_for_job(
+                route="rl",
+                source_revision=self._latest_step,
+                target_revision=next_step,
+                identity={"job": job.model_dump(mode="json")},
+            )
+            self._writer_sessions.bind(
+                writer_holder[0],
+                operation_identity=writer_operation,
             )
             write_megatron_job(job, job_path=job_path)
 
@@ -1563,6 +1749,16 @@ class MegatronService:
                 self._commit_optimizer_checkpoint(
                     step=next_step, world_size=optimizer_world_size
                 )
+            if writer_heartbeat is not None:
+                await self._stop_writer_heartbeat(writer_heartbeat)
+                writer_heartbeat = None
+            self._writer_sessions.commit(
+                writer_holder[0],
+                operation_identity=writer_operation,
+                result_revision=next_step,
+            )
+            self._writer_sessions.release(writer_holder[0])
+            writer_completed = True
         except GeneratorExit:
             raise
         except BaseException as exc:
@@ -1573,6 +1769,11 @@ class MegatronService:
                 message="Megatron training and cleanup failed.",
             )
             raise
+        finally:
+            if writer_heartbeat is not None:
+                await self._stop_writer_heartbeat(writer_heartbeat)
+            if not writer_completed and writer_holder is not None:
+                self._writer_sessions.release(writer_holder[0])
 
     async def train_distillation(
         self,
@@ -1584,6 +1785,8 @@ class MegatronService:
         idempotency_key: str,
         preparation_id: str,
         payload_sha256: str,
+        current_step_session_id: str | None = None,
+        current_step_capability: bytes | None = None,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         """Run one revision-bound prepared KD or additive optimizer transaction."""
@@ -1598,8 +1801,17 @@ class MegatronService:
         binding: dict[str, Any] | None = None
         receipt_reserved = False
         job_submitted = False
+        writer_holder: list[WriterLease] | None = None
+        writer_heartbeat: asyncio.Task[None] | None = None
+        ordinary_writer = False
+        writer_completed = False
         try:
             self._raise_if_child_failed()
+            if (current_step_session_id is None) != (current_step_capability is None):
+                raise ValueError(
+                    "current-step session identity and capability must be provided "
+                    "together"
+                )
             receipt_path = self._distillation_receipt_path(idempotency_key)
             binding = self._distillation_receipt_binding(
                 idempotency_key=idempotency_key,
@@ -1629,16 +1841,19 @@ class MegatronService:
                     "outcome; reconciliation is required before retry"
                 )
             topology = self.runtime_config.topology
-            if (
+            prepared_topology = (
                 topology.tp,
                 self._data_parallel_world_size(),
                 topology.cp,
                 topology.pp,
                 topology.ep,
                 topology.etp,
-            ) != (1, 1, 1, 1, 1, 1):
+            )
+            tp, dp, cp, pp, ep, etp = prepared_topology
+            if min(tp, dp, cp) <= 0 or (pp, ep, etp) != (1, 1, 1):
                 raise ValueError(
-                    "prepared Megatron training requires TP=DP=CP=PP=EP=ETP=1"
+                    "prepared Megatron training supports positive TP/DP/CP with "
+                    f"PP=EP=ETP=1; received {prepared_topology}"
                 )
             if expected_source_revision != self._latest_step:
                 raise ValueError(
@@ -1661,12 +1876,36 @@ class MegatronService:
             self._reserve_distillation_receipt(path=receipt_path, binding=binding)
             receipt_reserved = True
 
+            if current_step_session_id is not None:
+                assert current_step_capability is not None
+                lease = self._authorized_current_writer(
+                    session_id=current_step_session_id,
+                    capability=current_step_capability,
+                )
+                if lease.revision != expected_source_revision:
+                    raise ValueError(
+                        "current-step writer revision does not match the prepared "
+                        "learner source"
+                    )
+            else:
+                lease = self._writer_sessions.acquire_ordinary_open(
+                    revision=expected_source_revision,
+                    ttl_s=WRITER_SESSION_TTL_S,
+                )
+                ordinary_writer = True
+            writer_holder = [lease]
+            writer_heartbeat = asyncio.create_task(
+                self._heartbeat_bound_writer(
+                    writer_holder,
+                    current_step=not ordinary_writer,
+                )
+            )
             if self.is_dedicated:
                 await self._ensure_megatron_running()
                 lora_path = self._resolve_active_lora_path()
-                self._clear_pending_jobs()
             else:
                 lora_path = await self._prepare_for_training()
+            self._clear_pending_jobs()
             next_step = self._latest_step + 1
             staging_lora_path = self._prepare_training_lora_dir(
                 lora_path,
@@ -1689,7 +1928,17 @@ class MegatronService:
                 payload_sha256=payload_sha256,
                 log_path=log_path,
             )
+            operation = self._writer_operation_for_job(
+                route="prepared",
+                source_revision=expected_source_revision,
+                target_revision=next_step,
+                identity={"receipt_binding": binding},
+            )
             # From this point onward, failure is ambiguous and must remain pending.
+            self._writer_sessions.bind(
+                writer_holder[0],
+                operation_identity=operation,
+            )
             job_submitted = True
             write_megatron_job(job, job_path=job_path)
             checkpoint_dir: str | None = None
@@ -1736,6 +1985,20 @@ class MegatronService:
                     "committed_step": next_step,
                 },
             )
+            if writer_heartbeat is not None:
+                await self._stop_writer_heartbeat(writer_heartbeat)
+                writer_heartbeat = None
+            committed_lease = writer_holder[0]
+            self._writer_sessions.commit(
+                committed_lease,
+                operation_identity=operation,
+                result_revision=next_step,
+            )
+            if ordinary_writer:
+                self._writer_sessions.release(committed_lease)
+            else:
+                self._current_writer_lease = committed_lease
+            writer_completed = True
         except GeneratorExit:
             raise
         except BaseException as exc:
@@ -1755,12 +2018,18 @@ class MegatronService:
                     },
                 )
             self._status(f"Megatron distillation failed: {type(exc).__name__}: {exc}")
-            await cleanup_after_failure(
-                exc,
-                self.aclose,
-                message="Megatron distillation and cleanup failed.",
-            )
+            if job_submitted:
+                await cleanup_after_failure(
+                    exc,
+                    self.aclose,
+                    message="Megatron distillation and cleanup failed.",
+                )
             raise
+        finally:
+            if writer_heartbeat is not None:
+                await self._stop_writer_heartbeat(writer_heartbeat)
+            if ordinary_writer and not writer_completed and writer_holder is not None:
+                self._writer_sessions.release(writer_holder[0])
 
     async def train_sft(
         self,
@@ -1768,13 +2037,30 @@ class MegatronService:
         config: types.TrainSFTConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        writer_holder: list[WriterLease] | None = None
+        writer_operation: dict[str, Any] | None = None
+        writer_heartbeat: asyncio.Task[None] | None = None
+        writer_completed = False
         try:
             self._raise_if_child_failed()
             if self.is_dedicated:
                 raise NotImplementedError(
                     "train_sft is not yet supported in dedicated mode"
                 )
+            writer_holder = [
+                self._writer_sessions.acquire_ordinary_open(
+                    revision=self._latest_step,
+                    ttl_s=WRITER_SESSION_TTL_S,
+                )
+            ]
+            writer_heartbeat = asyncio.create_task(
+                self._heartbeat_bound_writer(
+                    writer_holder,
+                    current_step=False,
+                )
+            )
             lora_path = await self._prepare_for_training()
+            self._clear_pending_jobs()
             next_step = self._latest_step + 1
             staging_lora_path = self._prepare_training_lora_dir(
                 lora_path,
@@ -1797,6 +2083,16 @@ class MegatronService:
                 learning_rates=serialized_batches.learning_rates,
                 grad_accumulation_sequences=grad_accumulation_sequences,
                 log_path=log_path,
+            )
+            writer_operation = self._writer_operation_for_job(
+                route="sft",
+                source_revision=self._latest_step,
+                target_revision=next_step,
+                identity={"job": job.model_dump(mode="json")},
+            )
+            self._writer_sessions.bind(
+                writer_holder[0],
+                operation_identity=writer_operation,
             )
             write_megatron_job(job, job_path=job_path)
             self._status(
@@ -1843,6 +2139,16 @@ class MegatronService:
                 checkpoint_dir=new_checkpoint_dir,
                 step=next_step,
             )
+            if writer_heartbeat is not None:
+                await self._stop_writer_heartbeat(writer_heartbeat)
+                writer_heartbeat = None
+            self._writer_sessions.commit(
+                writer_holder[0],
+                operation_identity=writer_operation,
+                result_revision=next_step,
+            )
+            self._writer_sessions.release(writer_holder[0])
+            writer_completed = True
         except GeneratorExit:
             raise
         except BaseException as exc:
@@ -1853,6 +2159,11 @@ class MegatronService:
                 message="Megatron SFT training and cleanup failed.",
             )
             raise
+        finally:
+            if writer_heartbeat is not None:
+                await self._stop_writer_heartbeat(writer_heartbeat)
+            if not writer_completed and writer_holder is not None:
+                self._writer_sessions.release(writer_holder[0])
 
     async def finalize_training_session(self) -> None:
         path = self._get_optimizer_state_path()

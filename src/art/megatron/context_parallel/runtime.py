@@ -2219,6 +2219,25 @@ def _to_target_device(
     return tensor.to(device=target_device, non_blocking=True)
 
 
+def dispatch_context_parallel_tensor(
+    tensor: torch.Tensor,
+    *,
+    rank_plan: RankRuntimePlan,
+    pad_value: int | float | bool,
+    pad_multiple: int = 1,
+    target_device: torch.device | None = None,
+) -> torch.Tensor:
+    """Dispatch a token-aligned tensor while preserving payload dimensions."""
+
+    local = _dispatch_tensor(
+        tensor,
+        rank_plan=rank_plan,
+        pad_value=pad_value,
+        pad_multiple=pad_multiple,
+    )
+    return _to_target_device(local, target_device)
+
+
 def _dispatch_tensor(
     tensor: torch.Tensor,
     *,
@@ -2233,15 +2252,17 @@ def _dispatch_tensor(
         | None
     ) = None,
 ) -> torch.Tensor:
-    """Gather local rows without branching on CUDA tensor values.
+    """Gather local token rows without branching on CUDA tensor values.
 
     The old `bool(valid_mask.all())` branch synchronized whenever dispatch ran
     on CUDA. Use the rank plan's Python length metadata to decide whether a pad
-    mask is needed.
+    mask is needed. Trailing dimensions are payload dimensions and are
+    preserved; only the packed-token axis (dimension one) is dispatched.
     """
-    if tensor.ndim != 2:
+    if tensor.ndim < 2:
         raise RuntimeError(
-            f"_dispatch_tensor expected a rank-2 tensor, got shape {tuple(tensor.shape)}"
+            "_dispatch_tensor expected a batch and packed-token dimension, "
+            f"got shape {tuple(tensor.shape)}"
         )
     if int(tensor.shape[0]) != 1:
         raise RuntimeError(
@@ -2264,9 +2285,16 @@ def _dispatch_tensor(
         device=tensor.device,
         dispatch_meta_cache=dispatch_meta_cache,
     )
-    output = torch.gather(tensor, dim=1, index=gather_index)
+    trailing_shape = tuple(int(size) for size in tensor.shape[2:])
+    expanded_index = gather_index.reshape(
+        (*gather_index.shape, *((1,) * len(trailing_shape)))
+    ).expand((*gather_index.shape, *trailing_shape))
+    output = torch.gather(tensor, dim=1, index=expanded_index)
     if int(rank_plan.local_valid_lengths[0]) < max_local_len:
-        output = output.masked_fill(~valid_mask, pad_value)
+        expanded_mask = valid_mask.reshape(
+            (*valid_mask.shape, *((1,) * len(trailing_shape)))
+        )
+        output = output.masked_fill(~expanded_mask, pad_value)
     return output
 
 

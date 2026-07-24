@@ -108,8 +108,8 @@ async def prepare(
 ) -> PreparedTrainingBatch:
     """Prepare immutable teacher targets for a later ``backend.train`` call.
 
-    V1 supports a frozen teacher revision. A self-teacher is pinned under the
-    student's backend lease for the complete render-and-score operation.
+    A self-teacher is pinned at the declared frozen revision or protected by an
+    active backend current-step writer session for the complete operation.
     """
 
     from art.serving_capabilities import discover_serving_capabilities
@@ -118,11 +118,6 @@ async def prepare(
     from .preparer import DistillationPreparer, FailurePolicy
     from .vllm import VLLMTeacherScorer
 
-    if not isinstance(consistency, Frozen):
-        raise NotImplementedError(
-            "distill.prepare V1 supports Frozen consistency; "
-            "CurrentStep orchestration is planned for the asynchronous pipeline"
-        )
     if target.temperature != 1.0:
         raise ValueError(
             "distill.prepare V1 supports TopK temperature 1.0 because vLLM "
@@ -153,7 +148,22 @@ async def prepare(
     learner_revision = await backend._get_step(student)
     self_teacher = teacher is student
     teacher_name = teacher.name
-    teacher_revision = consistency.revision_for(teacher_name)
+    if isinstance(consistency, CurrentStep):
+        if not self_teacher:
+            raise ValueError("CurrentStep distillation requires the student as teacher")
+        validate_current_step = getattr(backend, "_validate_current_step", None)
+        if validate_current_step is None:
+            raise NotImplementedError(
+                "the student's backend does not support CurrentStep distillation"
+            )
+        await validate_current_step(student, consistency)
+        if consistency.revision != learner_revision:
+            raise ValueError(
+                "CurrentStep revision no longer matches the learner revision"
+            )
+        teacher_revision: int | str = consistency.revision
+    else:
+        teacher_revision = consistency.revision_for(teacher_name)
     if self_teacher and not isinstance(teacher_revision, int):
         raise ValueError(
             "student self-distillation requires a frozen integer teacher revision"

@@ -153,6 +153,17 @@ def _patch_single_rank_worker(
         "_validate_distillation_worker_topology",
         lambda _model: None,
     )
+    monkeypatch.setattr(
+        train,
+        "_infer_parallel_topology",
+        lambda _model: ParallelTopology(tp=1, dp=1, cp=1, pp=1),
+    )
+    monkeypatch.setattr(train.ps, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        train.ps,
+        "get_tensor_model_parallel_group",
+        lambda check_initialized=False: None,
+    )
     monkeypatch.setattr(train, "as_megatron_api_chunks", lambda chunks: chunks)
     monkeypatch.setattr(
         train,
@@ -344,7 +355,113 @@ def test_additive_zero_denominator_fails_before_forward_or_optimizer(
     assert model.logits.grad is None
 
 
-def test_worker_topology_rejects_nonunit_data_parallel(
+def test_additive_uses_global_ratio_with_uneven_rank_eligibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_single_rank_worker(monkeypatch)
+    monkeypatch.setattr(
+        train,
+        "_infer_parallel_topology",
+        lambda _model: ParallelTopology(tp=1, dp=2, cp=1, pp=1),
+    )
+    monkeypatch.setattr(
+        train,
+        "_reduce_prepared_counts",
+        lambda **_kwargs: (3, 2),
+    )
+    monkeypatch.setattr(
+        train,
+        "_reduce_prepared_statistics",
+        lambda values, **_kwargs: values,
+    )
+    finalized_local_denominators: list[float] = []
+
+    def _emulate_global_finalize(chunks: Any, num_tokens: torch.Tensor) -> None:
+        finalized_local_denominators.append(float(num_tokens.item()))
+        for chunk in chunks:
+            for parameter in chunk.parameters():
+                assert parameter.grad is not None
+                parameter.grad.div_(3.0)
+
+    monkeypatch.setattr(
+        train,
+        "finalize_model_grads_extended",
+        _emulate_global_finalize,
+    )
+    packed = _additive_packed()
+    model = _FakeModel()
+    optimizer = _FakeOptimizer(model.logits)
+    train.run_megatron_distillation_step(
+        model_chunks=cast(Any, [model]),
+        provider=object(),
+        model_support_handler=_FakeHandler(),
+        optimizer=optimizer,
+        learning_rate=0.0,
+        packed_tensors=packed,
+        sample_indices=[0],
+        logical_vocab_size=4,
+        temperature=1.0,
+        coefficient=0.5,
+        compensate_temperature_squared=False,
+        policy_config=cast(
+            Any,
+            {
+                "epsilon": 1.0,
+                "epsilon_high": 4.0,
+                "importance_sampling_level": "token",
+            },
+        ),
+        expected_policy_count=3,
+        expected_target_count=2,
+    )
+    assert optimizer.last_gradient is not None
+
+    reference_logits = model.logits.detach().clone().requires_grad_(True)
+    micro = train._select_distillation_micro(
+        packed,
+        sample_index=0,
+        device=torch.device("cpu"),
+    )
+    composite = composite_prepared_loss_from_logits(
+        reference_logits.unsqueeze(0),
+        logical_vocab_size=4,
+        policy=PreparedPolicySidecars(
+            sampled_token_ids=micro["sampled_token_ids"],
+            old_logprobs=micro["old_logprobs"],
+            advantages=micro["policy_advantages"],
+            weights=micro["policy_weights"],
+            mask=micro["policy_mask"],
+            group_ids=micro["policy_group_ids"],
+        ),
+        distillation=PreparedDistillationSidecars(
+            teacher_topk_ids=micro["topk_token_ids"],
+            teacher_topk_logprobs=micro["teacher_logprobs"],
+            teacher_tail_logprob=micro["tail_logprobs"],
+            mask=micro["target_mask"],
+            weights=micro["distillation_weights"],
+        ),
+        policy_config=cast(
+            Any,
+            {
+                "epsilon": 1.0,
+                "epsilon_high": 4.0,
+                "importance_sampling_level": "token",
+            },
+        ),
+        distillation_coefficient=0.5,
+    )
+    assert composite.policy is not None
+    assert composite.distillation is not None
+    local_contribution = (
+        composite.policy.loss_sum + composite.distillation.loss_sum * 0.5 * (3.0 / 2.0)
+    )
+    (local_contribution / 3.0).backward()
+    assert reference_logits.grad is not None
+    torch.testing.assert_close(optimizer.last_gradient, reference_logits.grad)
+    assert finalized_local_denominators == [2.0]
+
+
+def test_worker_topology_accepts_data_parallel_and_rejects_pipeline_parallel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -355,7 +472,14 @@ def test_worker_topology_rejects_nonunit_data_parallel(
     monkeypatch.setattr(train.ps, "get_expert_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(train.ps, "get_expert_tensor_parallel_world_size", lambda: 1)
 
-    with pytest.raises(ValueError, match="TP=DP=CP=PP=EP=ETP=1"):
+    train._validate_distillation_worker_topology(cast(Any, []))
+
+    monkeypatch.setattr(
+        train,
+        "_infer_parallel_topology",
+        lambda _model: ParallelTopology(tp=1, dp=1, cp=1, pp=2),
+    )
+    with pytest.raises(ValueError, match="PP=EP=ETP=1"):
         train._validate_distillation_worker_topology(cast(Any, []))
 
 

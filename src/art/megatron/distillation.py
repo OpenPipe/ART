@@ -209,9 +209,11 @@ def validate_standalone_forward_kl(
         expert_parallel_size,
         expert_tensor_parallel_size,
     )
-    if topology != (1, 1, 1, 1, 1):
+    tp, cp, pp, ep, etp = topology
+    if min(tp, cp) <= 0 or (pp, ep, etp) != (1, 1, 1):
         raise ValueError(
-            f"M3 Megatron distillation requires TP=CP=PP=EP=ETP=1; received {topology}"
+            "prepared Megatron distillation supports positive TP/CP with "
+            f"PP=EP=ETP=1; received {topology}"
         )
     return payload
 

@@ -28,10 +28,16 @@ from art.megatron.runtime.jobs import (
     load_megatron_job,
 )
 from art.megatron.service import MegatronService
+from art.megatron.writer_sessions import WriterLease
 from art.types import LocalTrainResult, TrainConfig
 
 
-def _artifact(*, revision: int = 7) -> distill.PreparedTrainingBatch:
+def _artifact(
+    *,
+    revision: int = 7,
+    consistency: distill.Frozen | distill.CurrentStep | None = None,
+) -> distill.PreparedTrainingBatch:
+    resolved_consistency = consistency or distill.Frozen(revision="frozen")
     view = distill.TeacherView.from_request(
         "chat_completions",
         {"messages": [{"content": "question", "role": "user"}]},
@@ -81,7 +87,11 @@ def _artifact(*, revision: int = 7) -> distill.PreparedTrainingBatch:
             logical_vocab_size=4,
             temperature=1.0,
             teacher_name="teacher",
-            teacher_revision="frozen",
+            teacher_revision=(
+                revision
+                if isinstance(resolved_consistency, distill.CurrentStep)
+                else "frozen"
+            ),
             token_space_fingerprint="token-space",
             request_id=f"request-{position}",
             forced_token_sha256=generation.continuation_sha256,
@@ -102,7 +112,7 @@ def _artifact(*, revision: int = 7) -> distill.PreparedTrainingBatch:
             token_space_fingerprint="token-space",
             logical_vocab_size=4,
             rollout_requirement=distill.StudentOnPolicy(),
-            consistency=distill.Frozen(revision="frozen"),
+            consistency=resolved_consistency,
         ),
     )
 
@@ -531,6 +541,37 @@ def test_preflight_rejects_stale_revision_oversize_and_additive_policy() -> None
         )
 
 
+def test_standalone_preflight_accepts_tp_cp_and_rejects_pipeline_parallel() -> None:
+    artifact = _artifact()
+    objective = distill.TrainingObjectives(distillation=distill.Loss())
+
+    payload = validate_standalone_forward_kl(
+        batch=artifact,
+        objectives=objective,
+        expected_source_revision=7,
+        packed_sequence_length=8,
+        tensor_parallel_size=2,
+        context_parallel_size=2,
+        pipeline_parallel_size=1,
+        expert_parallel_size=1,
+        expert_tensor_parallel_size=1,
+    )
+    assert payload.constraints.learner_revision == 7
+
+    with pytest.raises(ValueError, match="PP=EP=ETP=1"):
+        validate_standalone_forward_kl(
+            batch=artifact,
+            objectives=objective,
+            expected_source_revision=7,
+            packed_sequence_length=8,
+            tensor_parallel_size=2,
+            context_parallel_size=2,
+            pipeline_parallel_size=2,
+            expert_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+
 def test_loader_rejects_tampered_active_distribution(tmp_path: Path) -> None:
     artifact = _artifact()
     disk = pack_prepared_batch(
@@ -636,6 +677,95 @@ async def test_backend_returns_committed_receipt_before_stale_revision_check(
     assert result.step == 8
     assert result.metrics["distill/idempotent_replay"] == 1.0
     assert observed["config"] == TrainConfig(optimizer_save_interval=1)
+
+
+@pytest.mark.asyncio
+async def test_backend_current_step_requires_explicit_single_use_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    backend = MegatronBackend(path=str(tmp_path))
+    model = SimpleNamespace(
+        trainable=True,
+        project="project",
+        _storage_name=lambda: "student",
+    )
+
+    class _Service:
+        def __init__(self) -> None:
+            self.capability = b"c" * 32
+            self.released = False
+
+        async def acquire_current_step(
+            self,
+            *,
+            revision: int,
+            ttl_s: float,
+        ) -> WriterLease:
+            return WriterLease(
+                model_identity="project/student",
+                revision=revision,
+                session_id="current-session",
+                fence=1,
+                expires_at=ttl_s,
+                kind="current_step",
+                capability=self.capability,
+            )
+
+        async def heartbeat_current_step(self, **_kwargs: Any) -> float:
+            return 1_000.0
+
+        async def committed_distillation_step(self, **_kwargs: Any) -> int:
+            return 8
+
+        async def release_current_step(self, **_kwargs: Any) -> None:
+            self.released = True
+
+    service = _Service()
+
+    async def _get_service(_: Any) -> _Service:
+        return service
+
+    async def _get_step(_: Any) -> int:
+        return 7
+
+    monkeypatch.setattr(backend, "_get_service", _get_service)
+    monkeypatch.setattr(backend, "_get_step", _get_step)
+
+    async with backend.current_step(cast(Any, model)) as current:
+        batch = _artifact(
+            revision=7,
+            consistency=distill.CurrentStep(current),
+        )
+        with pytest.raises(ValueError, match="same active"):
+            await backend.train(
+                cast(Any, model),
+                batch,
+                objectives=distill.TrainingObjectives(distillation=distill.Loss()),
+                idempotency_key="current",
+                save_checkpoint=False,
+            )
+
+        result = await backend.train(
+            cast(Any, model),
+            batch,
+            objectives=distill.TrainingObjectives(distillation=distill.Loss()),
+            idempotency_key="current",
+            session=current,
+            save_checkpoint=False,
+        )
+        assert result.step == 8
+        with pytest.raises(RuntimeError, match="exactly one"):
+            await backend.train(
+                cast(Any, model),
+                batch,
+                objectives=distill.TrainingObjectives(distillation=distill.Loss()),
+                idempotency_key="current",
+                session=current,
+                save_checkpoint=False,
+            )
+
+    assert service.released
 
 
 @pytest.mark.asyncio
@@ -891,7 +1021,12 @@ async def test_two_distillation_updates_each_commit_optimizer_ready_revision(
     config = TrainConfig(optimizer_save_interval=1)
     objective = DistillationObjectiveConfig(coefficient=1.0)
 
-    async def _run(*, source_revision: int, key: str) -> list[dict[str, float]]:
+    async def _run(
+        *,
+        source_revision: int,
+        key: str,
+        current_lease: Any = None,
+    ) -> list[dict[str, float]]:
         return [
             metrics
             async for metrics in service.train_distillation(
@@ -902,10 +1037,29 @@ async def test_two_distillation_updates_each_commit_optimizer_ready_revision(
                 idempotency_key=key,
                 preparation_id=artifact.preparation_id,
                 payload_sha256=artifact.payload_sha256,
+                current_step_session_id=(
+                    current_lease.session_id if current_lease is not None else None
+                ),
+                current_step_capability=(
+                    current_lease.capability if current_lease is not None else None
+                ),
             )
         ]
 
-    first_metrics = await _run(source_revision=7, key="update-7")
+    current = await service.acquire_current_step(revision=7)
+    first_metrics = await _run(
+        source_revision=7,
+        key="update-7",
+        current_lease=current,
+    )
+    current_journal = service._writer_sessions.inspect()
+    assert current_journal is not None
+    assert current_journal["state"] == "committed"
+    assert current_journal["result_revision"] == 8
+    await service.release_current_step(
+        session_id=current.session_id,
+        capability=current.capability,
+    )
     second_metrics = await _run(source_revision=8, key="update-8")
 
     assert first_metrics == [{"loss/distillation": 0.25}]

@@ -343,6 +343,25 @@ class CurrentStep(ImmutableModel):
     revision: Annotated[int, Field(ge=0)]
     session_id: Annotated[str, Field(min_length=1)]
 
+    def __init__(self, session: Any = None, **data: Any) -> None:
+        """Snapshot the serializable identity of a backend current-step session."""
+
+        if session is not None:
+            if data:
+                raise TypeError(
+                    "CurrentStep accepts either a session or explicit fields, not both"
+                )
+            try:
+                data = {
+                    "revision": session.revision,
+                    "session_id": session.session_id,
+                }
+            except AttributeError as exc:
+                raise TypeError(
+                    "CurrentStep requires a backend.current_step(...) session"
+                ) from exc
+        super().__init__(**data)
+
 
 Consistency = Frozen | CurrentStep
 

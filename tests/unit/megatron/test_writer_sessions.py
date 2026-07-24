@@ -84,6 +84,19 @@ def test_current_and_ordinary_writers_share_one_os_gate(tmp_path: Path) -> None:
     assert second.release(ordinary).action == "ambiguous_after_bind"
 
 
+def test_open_ordinary_failure_before_submission_is_safely_retryable(
+    tmp_path: Path,
+) -> None:
+    first = _store(tmp_path)
+    lease = first.acquire_ordinary_open(revision=4, ttl_s=30.0)
+
+    assert first.release(lease).action == "abandoned_before_submit"
+    retry = _store(tmp_path)
+    replacement = retry.acquire_ordinary_open(revision=4, ttl_s=30.0)
+    assert replacement.fence == lease.fence + 1
+    retry.release(replacement)
+
+
 def test_model_scoped_locks_do_not_block_another_model(tmp_path: Path) -> None:
     model_a = _store(tmp_path, model="project/a", secret=b"a" * 32)
     model_b = _store(tmp_path, model="project/b", secret=b"b" * 32)
@@ -168,6 +181,22 @@ def test_commit_allows_only_one_revision_transition_and_identical_replay(
 
     with pytest.raises(WriterSessionValidationError, match="not active"):
         store.commit(lease, operation_identity=operation, result_revision=8)
+
+
+def test_bound_owner_can_commit_known_result_after_heartbeat_expiry(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    store = _store(tmp_path, clock=clock)
+    lease = store.acquire_current_step(revision=7, ttl_s=5.0)
+    operation = _operation()
+    store.bind(lease, operation_identity=operation)
+    clock.advance(6.0)
+
+    with pytest.raises(WriterSessionValidationError, match="expired"):
+        store.heartbeat(lease, ttl_s=5.0)
+    store.commit(lease, operation_identity=operation, result_revision=8)
+    assert store.release(lease).action == "closed_committed"
 
 
 def test_fence_persists_across_reopen_and_corruption_fails_closed(
