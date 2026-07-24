@@ -123,7 +123,7 @@ def _validate_distillation_tensors_for_objective(
         # torch.from_file keeps every sidecar open for the tensor lifetime. The
         # worker owns deletion after the job, so release the service's validation
         # mappings before submission (especially important on NFS).
-        packed.clear()
+        cast(dict[str, torch.Tensor], packed).clear()
 
 
 class _RuntimeRequestKwargs(TypedDict, total=False):
