@@ -257,6 +257,11 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
     for event_name, payload in _sse_events(body):
         if not isinstance(payload, dict):
             continue
+        event_type = payload.get("type") or event_name
+        if event_name == "ping" or event_type == "ping":
+            continue
+        if event_name == "error" or event_type == "error":
+            raise ValueError("Anthropic Messages stream returned an error event")
         if event_name and "type" not in payload:
             payload = {**payload, "type": event_name}
         event = adapter.validate_python(payload)

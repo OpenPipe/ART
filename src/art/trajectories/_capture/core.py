@@ -38,6 +38,10 @@ class CaptureState:
         if not self.captured:
             self.body.extend(chunk)
 
+    def discard(self) -> None:
+        self.body.clear()
+        self.captured = True
+
     def finish(self) -> None:
         if self.captured:
             return
