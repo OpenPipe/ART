@@ -1,7 +1,9 @@
+import asyncio
 import hashlib
 import json
 import math
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -32,7 +34,7 @@ from art.megatron.service import (
     MegatronService,
     _validate_distillation_tensors_for_objective,
 )
-from art.megatron.writer_sessions import WriterLease
+from art.megatron.writer_sessions import WriterBusyError, WriterLease
 from art.types import LocalTrainResult, TrainConfig
 
 
@@ -716,6 +718,25 @@ def test_pack_is_byte_deterministic(tmp_path: Path) -> None:
         assert path.read_bytes() == (tmp_path / "second" / path.name).read_bytes()
 
 
+def test_pack_never_replaces_an_existing_sidecar_directory(tmp_path: Path) -> None:
+    artifact = _artifact()
+    destination = tmp_path / "packed"
+    destination.mkdir()
+    sentinel = destination / "active-worker-mmap.pt"
+    sentinel.write_bytes(b"do-not-mutate")
+
+    with pytest.raises(FileExistsError):
+        pack_prepared_batch(
+            batch=artifact,
+            payload=_validated_payload(artifact),
+            sequence_length=8,
+            output_dir=str(destination),
+        )
+
+    assert sentinel.read_bytes() == b"do-not-mutate"
+    assert tuple(destination.iterdir()) == (sentinel,)
+
+
 def test_loader_rejects_corruption_before_mapping(tmp_path: Path) -> None:
     artifact = _artifact()
     disk = pack_prepared_batch(
@@ -1148,6 +1169,268 @@ def test_receipt_reservation_is_atomic_and_never_overwrites(tmp_path: Path) -> N
 
     assert path.read_bytes() == first_bytes
     assert json.loads(first_bytes) == {"binding": binding, "state": "pending"}
+
+
+async def _collect_distillation_metrics(
+    service: MegatronService,
+    disk_tensors: dict[str, Any],
+    config: TrainConfig,
+    *,
+    objective: DistillationObjectiveConfig,
+    artifact: distill.PreparedTrainingBatch,
+    key: str,
+    current_lease: WriterLease | None = None,
+) -> list[dict[str, float]]:
+    return [
+        metrics
+        async for metrics in service.train_distillation(
+            cast(Any, disk_tensors),
+            config,
+            objective=objective,
+            expected_source_revision=7,
+            idempotency_key=key,
+            preparation_id=artifact.preparation_id,
+            payload_sha256=artifact.payload_sha256,
+            current_step_session_id=(
+                current_lease.session_id if current_lease is not None else None
+            ),
+            current_step_capability=(
+                current_lease.capability if current_lease is not None else None
+            ),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_backend_stages_each_prepared_call_in_a_unique_operation_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact = _artifact()
+    backend = MegatronBackend(path=str(tmp_path))
+    staged: list[dict[str, Any]] = []
+
+    class _Service:
+        async def committed_distillation_step(self, **_kwargs: Any) -> None:
+            return None
+
+        async def train_distillation(
+            self,
+            disk_tensors: dict[str, Any],
+            *_args: Any,
+            **_kwargs: Any,
+        ):
+            staged.append(dict(disk_tensors))
+            shutil.rmtree(disk_tensors["dir"])
+            yield {"loss/distillation": 0.25}
+
+    async def _get_service(_: Any) -> _Service:
+        return _Service()
+
+    async def _get_step(_: Any) -> int:
+        return 7
+
+    monkeypatch.setattr(backend, "_get_service", _get_service)
+    monkeypatch.setattr(backend, "_get_step", _get_step)
+    monkeypatch.setattr(
+        "art.megatron.backend.get_megatron_runtime_config",
+        lambda: SimpleNamespace(
+            packed_sequence_length=8,
+            topology=SimpleNamespace(tp=1, cp=1, pp=1, ep=1, etp=1),
+        ),
+    )
+    model = SimpleNamespace(
+        project="project",
+        _storage_name=lambda: "student",
+        _serving_capabilities=SimpleNamespace(
+            token_space_fingerprint="token-space",
+            logical_vocab_size=4,
+        ),
+        _get_wandb_run=lambda: None,
+    )
+    objectives = distill.TrainingObjectives(distillation=distill.Loss())
+
+    for key in ("operation-a", "operation-b"):
+        await backend.train(
+            cast(Any, model),
+            artifact,
+            objectives=objectives,
+            idempotency_key=key,
+            save_checkpoint=False,
+        )
+
+    first = Path(staged[0]["dir"])
+    second = Path(staged[1]["dir"])
+    assert first != second
+    assert first.parent.name == second.parent.name == "operations"
+    assert artifact.preparation_id not in {first.name, second.name}
+    assert staged[0]["tensors_sha256"] == staged[1]["tensors_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_competing_prepared_stage_cannot_mutate_or_delete_active_sidecars(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact = _additive_artifact()
+    standalone_dir = tmp_path / "operations" / "current"
+    additive_dir = tmp_path / "operations" / "ordinary"
+    standalone = pack_prepared_batch(
+        batch=artifact,
+        payload=_validated_payload(artifact),
+        sequence_length=8,
+        output_dir=str(standalone_dir),
+    )
+    additive_objectives = distill.TrainingObjectives(
+        policy="cispo",
+        distillation=distill.Loss(),
+    )
+    additive = pack_prepared_batch(
+        batch=artifact,
+        payload=_validated_additive_payload(artifact),
+        sequence_length=8,
+        output_dir=str(additive_dir),
+        objectives=additive_objectives,
+        policy_config=PolicyPackingConfig(),
+    )
+    active_bytes = {path.name: path.read_bytes() for path in standalone_dir.iterdir()}
+
+    monkeypatch.setattr(
+        MegatronService,
+        "_validate_megatron_dependencies",
+        lambda _self: None,
+    )
+    service = MegatronService(
+        model_name="student",
+        base_model="Qwen/Qwen3-0.6B",
+        config={},
+        output_dir=str(tmp_path),
+        runtime_config=cast(
+            Any,
+            SimpleNamespace(
+                topology=SimpleNamespace(tp=1, cp=1, pp=1, ep=1, etp=1),
+            ),
+        ),
+    )
+    service._latest_step = 7
+    monkeypatch.setattr(service, "_raise_if_child_failed", lambda: None)
+    monkeypatch.setattr(service, "_data_parallel_world_size", lambda: 1)
+    writer_active = asyncio.Event()
+    release_writer = asyncio.Event()
+
+    async def _hold_current_writer() -> str:
+        writer_active.set()
+        await release_writer.wait()
+        raise RuntimeError("intentional failure before submission")
+
+    monkeypatch.setattr(service, "_prepare_for_training", _hold_current_writer)
+    current = await service.acquire_current_step(revision=7)
+    current_task = asyncio.create_task(
+        _collect_distillation_metrics(
+            service,
+            standalone,
+            TrainConfig(learning_rate=1e-5, optimizer_save_interval=1),
+            objective=DistillationObjectiveConfig(coefficient=1.0),
+            artifact=artifact,
+            key="current-operation",
+            current_lease=current,
+        )
+    )
+    await asyncio.wait_for(writer_active.wait(), timeout=1.0)
+
+    with pytest.raises(WriterBusyError):
+        await _collect_distillation_metrics(
+            service,
+            additive,
+            TrainConfig(learning_rate=2e-5, optimizer_save_interval=1),
+            objective=DistillationObjectiveConfig(
+                coefficient=0.5,
+                policy=CispoObjectiveConfig(),
+            ),
+            artifact=artifact,
+            key="ordinary-operation",
+        )
+
+    assert not additive_dir.exists()
+    assert standalone_dir.is_dir()
+    assert {
+        path.name: path.read_bytes() for path in standalone_dir.iterdir()
+    } == active_bytes
+
+    release_writer.set()
+    with pytest.raises(RuntimeError, match="intentional failure"):
+        await current_task
+    assert not standalone_dir.exists()
+    await service.release_current_step(
+        session_id=current.session_id,
+        capability=current.capability,
+    )
+    for key in ("current-operation", "ordinary-operation"):
+        receipt = json.loads(service._distillation_receipt_path(key).read_text())
+        assert receipt["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_committed_service_replay_cleans_unsubmitted_unique_sidecars(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact = _artifact()
+    disk = pack_prepared_batch(
+        batch=artifact,
+        payload=_validated_payload(artifact),
+        sequence_length=8,
+        output_dir=str(tmp_path / "operations" / "replay"),
+    )
+    monkeypatch.setattr(
+        MegatronService,
+        "_validate_megatron_dependencies",
+        lambda _self: None,
+    )
+    service = MegatronService(
+        model_name="student",
+        base_model="Qwen/Qwen3-0.6B",
+        config={},
+        output_dir=str(tmp_path),
+        runtime_config=cast(Any, SimpleNamespace()),
+    )
+    monkeypatch.setattr(service, "_raise_if_child_failed", lambda: None)
+    config = TrainConfig(optimizer_save_interval=1)
+    objective = DistillationObjectiveConfig(coefficient=1.0)
+    binding = service._distillation_receipt_binding(
+        idempotency_key="committed-replay",
+        expected_source_revision=7,
+        preparation_id=artifact.preparation_id,
+        payload_sha256=artifact.payload_sha256,
+        objective=objective,
+        config=config,
+    )
+    service._write_json_atomic(
+        service._distillation_receipt_path("committed-replay"),
+        {
+            "binding": binding,
+            "state": "committed",
+            "committed_step": 8,
+        },
+    )
+
+    metrics = await _collect_distillation_metrics(
+        service,
+        disk,
+        config,
+        objective=objective,
+        artifact=artifact,
+        key="committed-replay",
+    )
+
+    assert metrics == [
+        {
+            "distill/idempotent_replay": 1.0,
+            "distill/committed_step": 8.0,
+            "data/step_num_gradient_steps": 0.0,
+        }
+    ]
+    assert not Path(disk["dir"]).exists()
 
 
 @pytest.mark.asyncio

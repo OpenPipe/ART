@@ -18,7 +18,6 @@ import math
 import os
 from pathlib import Path
 import shutil
-import tempfile
 from typing import Literal, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -550,15 +549,17 @@ def pack_prepared_batch(
 
     destination = Path(output_dir)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(
-        tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent)
-    )
+    # A packed directory becomes immutable once returned: the service validates
+    # it, the worker mmaps it, and only that operation may delete it. Refusing
+    # an existing destination prevents a concurrent pack from mutating an
+    # active worker's sidecars.
+    destination.mkdir()
     try:
         hashes: list[tuple[str, str]] = []
         packed_items = cast(dict[str, torch.Tensor], packed)
         for name in sorted(packed_items):
             tensor = packed_items[name].contiguous()
-            path = temporary / f"{name}.pt"
+            path = destination / f"{name}.pt"
             with path.open("wb") as handle:
                 handle.write(tensor.numpy().tobytes(order="C"))
             hashes.append((name, hashlib.sha256(path.read_bytes()).hexdigest()))
@@ -568,11 +569,8 @@ def pack_prepared_batch(
         tensors_sha256 = hashlib.sha256(
             b"art-distill-tensors-v1\0" + manifest
         ).hexdigest()
-        if destination.exists():
-            shutil.rmtree(destination)
-        os.replace(temporary, destination)
     except BaseException:
-        shutil.rmtree(temporary, ignore_errors=True)
+        shutil.rmtree(destination, ignore_errors=True)
         raise
     return {
         "schema_version": DISTILLATION_TENSOR_SCHEMA_VERSION,

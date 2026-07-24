@@ -6,6 +6,7 @@ import math
 import os
 import time
 from typing import Any, Iterable, cast
+import uuid
 
 from mp_actors import move_to_child_process
 
@@ -345,7 +346,8 @@ class MegatronBackend(LocalBackend):
             get_model_dir(model=model, art_path=self._path),
             "tensors",
             "distillation",
-            batch.preparation_id,
+            "operations",
+            uuid.uuid4().hex,
         )
         disk_tensors = pack_prepared_batch(
             batch=batch,

@@ -1827,6 +1827,7 @@ class MegatronService:
         writer_heartbeat: asyncio.Task[None] | None = None
         ordinary_writer = False
         writer_completed = False
+        sidecars_transferred = False
         try:
             self._raise_if_child_failed()
             if (current_step_session_id is None) != (current_step_capability is None):
@@ -1851,6 +1852,7 @@ class MegatronService:
                 existing_receipt is not None
                 and existing_receipt["state"] == "committed"
             ):
+                shutil.rmtree(disk_tensors["dir"])
                 yield {
                     "distill/idempotent_replay": 1.0,
                     "distill/committed_step": float(existing_receipt["committed_step"]),
@@ -1955,6 +1957,10 @@ class MegatronService:
                 writer_holder[0],
                 operation_identity=operation,
             )
+            # Binding makes the update outcome ambiguous. From this point the
+            # worker owns this operation-unique immutable directory and removes
+            # it only after all mmap-backed tensors have been released.
+            sidecars_transferred = True
             job_submitted = True
             write_megatron_job(job, job_path=job_path)
             checkpoint_dir: str | None = None
@@ -2016,6 +2022,8 @@ class MegatronService:
                 self._current_writer_lease = committed_lease
             writer_completed = True
         except GeneratorExit:
+            if not sidecars_transferred and os.path.exists(disk_tensors["dir"]):
+                shutil.rmtree(disk_tensors["dir"])
             raise
         except BaseException as exc:
             if (
@@ -2040,6 +2048,14 @@ class MegatronService:
                     self.aclose,
                     message="Megatron distillation and cleanup failed.",
                 )
+            if not sidecars_transferred and os.path.exists(disk_tensors["dir"]):
+                try:
+                    shutil.rmtree(disk_tensors["dir"])
+                except BaseException as cleanup_failure:
+                    raise BaseExceptionGroup(
+                        "Megatron distillation and sidecar cleanup failed.",
+                        [exc, cleanup_failure],
+                    ) from None
             raise
         finally:
             if writer_heartbeat is not None:
