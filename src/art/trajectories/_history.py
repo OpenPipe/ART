@@ -124,6 +124,7 @@ class _Branch(Generic[_ItemT, _SourceT, _ContextT]):
     order: tuple[int, ...]
     first_time: datetime
     context_source: _ModelledExchange | None
+    lineage_keys: list[object] | None = None
 
 
 def _selected_models(
@@ -184,7 +185,9 @@ def _ordered_choices(choices: Sequence[_IndexedT], *, protocol: str) -> list[_In
 
 
 def _is_prefix(prefix: Sequence[object], value: Sequence[object]) -> bool:
-    return len(prefix) <= len(value) and list(value[: len(prefix)]) == list(prefix)
+    return len(prefix) <= len(value) and all(
+        left == right for left, right in zip(prefix, value[: len(prefix)], strict=True)
+    )
 
 
 def _lineage_prompt_sources(
@@ -193,14 +196,19 @@ def _lineage_prompt_sources(
     prompt: Sequence[_ItemT],
     defaults: Sequence[_SourceT | None],
     equivalent: Callable[[_ItemT, _ItemT], bool],
+    prompt_keys: Sequence[object] | None = None,
 ) -> list[_SourceT | None]:
     candidates = [
         branch
         for branch in branches
         if len(branch.items) < len(prompt)
-        and all(
-            equivalent(existing, current)
-            for existing, current in zip(branch.items, prompt, strict=False)
+        and (
+            list(prompt_keys[: len(branch.items)]) == branch.lineage_keys
+            if prompt_keys is not None and branch.lineage_keys is not None
+            else all(
+                equivalent(existing, current)
+                for existing, current in zip(branch.items, prompt, strict=False)
+            )
         )
     ]
     if not candidates:
@@ -220,9 +228,22 @@ def _extend_branches(
     start_time: datetime,
     context_source: _ModelledExchange | None = None,
     continuation: Callable[[_Branch[_ItemT, _SourceT, _ContextT]], bool] | None = None,
+    prompt_lineage_keys: Sequence[object] | None = None,
+    output_lineage_keys: Sequence[Sequence[object]] | None = None,
 ) -> None:
     if len(prompt) != len(prompt_sources):
         raise AssertionError("prompt sources must parallel prompt items")
+    if (prompt_lineage_keys is None) != (output_lineage_keys is None):
+        raise AssertionError("prompt and output lineage keys must be provided together")
+    if prompt_lineage_keys is not None and len(prompt_lineage_keys) != len(prompt):
+        raise AssertionError("prompt lineage keys must parallel prompt items")
+    if output_lineage_keys is not None and len(output_lineage_keys) != len(outputs):
+        raise AssertionError("output lineage keys must parallel outputs")
+    if output_lineage_keys is not None and any(
+        len(keys) != len(output)
+        for keys, (_, output, _) in zip(output_lineage_keys, outputs, strict=True)
+    ):
+        raise AssertionError("output lineage keys must parallel output items")
     candidates = [
         (index, branch)
         for index, branch in enumerate(branches)
@@ -261,14 +282,23 @@ def _extend_branches(
     first_time = parent.first_time if parent is not None else start_time
     created = [
         _Branch(
-            items=[*copy.deepcopy(prompt), *copy.deepcopy(output)],
+            items=(
+                [*prompt, *output]
+                if prompt_lineage_keys is not None
+                else [*copy.deepcopy(prompt), *copy.deepcopy(output)]
+            ),
             sources=[*sources, *output_sources],
             context=copy.deepcopy(context),
             order=(*base_order, choice_index),
             first_time=first_time,
             context_source=context_source,
+            lineage_keys=(
+                [*prompt_lineage_keys, *output_lineage_keys[position]]
+                if prompt_lineage_keys is not None and output_lineage_keys is not None
+                else None
+            ),
         )
-        for choice_index, output, output_sources in outputs
+        for position, (choice_index, output, output_sources) in enumerate(outputs)
     ]
     if not created and remove_parent and parent is not None:
         branches.append(parent)
@@ -328,7 +358,13 @@ def _chat_retains_sampled_reasoning(
 
 
 def _chat_message_key(message: Message, *, visible_only: bool = False) -> str:
-    data = normalize_chat_message(message)
+    # History messages are already normalized and detached from the exchange.
+    # Copy only the top-level mapping because keying never mutates nested values.
+    data = dict(message)
+    if data.get("content") is None:
+        data.pop("content", None)
+    if data.get("tool_calls") == []:
+        data.pop("tool_calls")
     if visible_only:
         data.pop("reasoning", None)
         data.pop("reasoning_content", None)
@@ -399,6 +435,9 @@ def chat_completions_histories(
                     exchange.request.get("messages", [])
                 )
             ]
+            prompt_lineage_keys = [
+                _chat_message_key(message, visible_only=True) for message in prompt
+            ]
             prompt_sources = _lineage_prompt_sources(
                 branches,
                 prompt=prompt,
@@ -410,6 +449,7 @@ def chat_completions_histories(
                     _chat_message_key(left, visible_only=True)
                     == _chat_message_key(right, visible_only=True)
                 ),
+                prompt_keys=prompt_lineage_keys,
             )
             outputs: list[
                 tuple[
@@ -436,6 +476,10 @@ def chat_completions_histories(
                         [response_source],
                     )
                 )
+            output_lineage_keys = [
+                [_chat_message_key(output[0], visible_only=True)]
+                for _, output, _ in outputs
+            ]
             _extend_branches(
                 branches,
                 prompt=prompt,
@@ -453,6 +497,8 @@ def chat_completions_histories(
                 continuation=lambda branch: _chat_retains_sampled_reasoning(
                     branch, exchange, len(prompt)
                 ),
+                prompt_lineage_keys=prompt_lineage_keys,
+                output_lineage_keys=output_lineage_keys,
             )
         for branch in sorted(branches, key=lambda item: (item.first_time, item.order)):
             histories.append(

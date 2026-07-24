@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
 import importlib
+from statistics import median
+from time import perf_counter
 from typing import Any, cast
 
 from anthropic.types import Message
@@ -17,6 +19,7 @@ from art.trajectories import (
     ResponsesExchange,
     TrajectoryExchanges,
 )
+from art.types import Message as ChatMessage
 
 
 def _times(offset: int = 0) -> tuple[datetime, datetime]:
@@ -52,6 +55,16 @@ def _chat(
         start_time=start,
         end_time=end,
     )
+
+
+def _growing_chat_trajectory(turn_count: int) -> art.Trajectory:
+    exchanges: list[ChatCompletionsExchange] = []
+    messages: list[dict[str, object]] = []
+    for index in range(turn_count):
+        messages.append({"role": "user", "content": f"question {index}"})
+        exchanges.append(_chat(list(messages), f"answer {index}", offset=index))
+        messages.append({"role": "assistant", "content": f"answer {index}"})
+    return art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=exchanges))
 
 
 def _completion(
@@ -218,6 +231,58 @@ def test_chat_history_resolves_one_model_and_append_only_sequence() -> None:
     assert len(trajectory.chat_completions_histories(model="test/model")) == 2
     with pytest.raises(ValueError, match="exactly one history"):
         trajectory.chat_completions_history(model="test/model")
+
+
+def test_chat_projection_keys_each_captured_message_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history_module = importlib.import_module("art.trajectories._history")
+    original = history_module._chat_message_key
+    calls = 0
+
+    def count(message: ChatMessage, *, visible_only: bool = False) -> str:
+        nonlocal calls
+        calls += 1
+        return original(message, visible_only=visible_only)
+
+    monkeypatch.setattr(history_module, "_chat_message_key", count)
+    trajectory = _growing_chat_trajectory(16)
+
+    trajectory.chat_completions_history()
+
+    expected = sum(
+        len(exchange.request["messages"]) + len(exchange.response.choices)
+        for exchange in trajectory.exchanges.chat_completions
+    )
+    assert calls == expected
+
+
+def test_chat_projection_scales_with_captured_messages() -> None:
+    normalized_medians: list[float] = []
+    raw_medians: list[float] = []
+    for turn_count in (32, 64, 128):
+        trajectory = _growing_chat_trajectory(turn_count)
+        captured_messages = sum(
+            len(exchange.request["messages"]) + len(exchange.response.choices)
+            for exchange in trajectory.exchanges.chat_completions
+        )
+        trajectory.chat_completions_history()
+        samples: list[float] = []
+        for _ in range(5):
+            started = perf_counter()
+            trajectory.chat_completions_history()
+            samples.append(perf_counter() - started)
+        elapsed = median(samples)
+        raw_medians.append(elapsed)
+        normalized_medians.append(elapsed / captured_messages)
+
+    # A growing transcript contains O(turns²) captured messages: doubling the
+    # turn count quadruples the input that projection must validate. Projection
+    # should remain linear in that actual input, without hidden superlinear work.
+    assert raw_medians[1] < raw_medians[0] * 5
+    assert raw_medians[2] < raw_medians[1] * 5
+    assert normalized_medians[1] < normalized_medians[0] * 2
+    assert normalized_medians[2] < normalized_medians[1] * 2
 
 
 def test_model_patterns_select_matching_histories_only() -> None:
