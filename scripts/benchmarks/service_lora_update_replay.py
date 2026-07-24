@@ -100,19 +100,28 @@ def _bootstrap_ci(values: list[float]) -> list[float]:
     return [means[50], means[1949]]
 
 
-def _gpu_memory_snapshot() -> list[dict[str, int]]:
+def _gpu_memory_snapshot() -> list[dict[str, int | str]]:
     output = subprocess.check_output(
         [
             "nvidia-smi",
-            "--query-gpu=index,memory.used,memory.total",
+            "--query-gpu=index,name,memory.used,memory.total",
             "--format=csv,noheader,nounits",
         ],
         text=True,
     )
-    rows = []
+    rows: list[dict[str, int | str]] = []
     for line in output.splitlines():
-        index, used, total = (int(part.strip()) for part in line.split(","))
-        rows.append({"gpu_index": index, "used_mib": used, "total_mib": total})
+        raw_index, name, raw_used, raw_total = (
+            part.strip() for part in line.split(",", maxsplit=3)
+        )
+        rows.append(
+            {
+                "gpu_index": int(raw_index),
+                "name": name,
+                "used_mib": int(raw_used),
+                "total_mib": int(raw_total),
+            }
+        )
     return rows
 
 
@@ -159,6 +168,8 @@ async def run(args: argparse.Namespace) -> None:
         base_url=base_url, headers=headers, timeout=300.0
     ) as client:
         runtime_before = (await client.get("/art/metrics")).json()
+        if int(runtime_before.get("metrics", {}).get("world_size", 0)) != 2:
+            raise RuntimeError(f"Expected vLLM TP2 runtime: {runtime_before!r}")
         load_tasks = (
             [
                 asyncio.create_task(
@@ -189,6 +200,23 @@ async def run(args: argparse.Namespace) -> None:
                     policy_version=policy_version,
                     content_version=index,
                 )
+                expected_topology = {
+                    "topology/trainer_tp": 1.0,
+                    "topology/trainer_pp": 1.0,
+                    "topology/trainer_cp": 2.0,
+                    "topology/trainer_ep": 2.0,
+                    "topology/trainer_etp": 1.0,
+                }
+                if {
+                    key: metrics.get(key) for key in expected_topology
+                } != expected_topology:
+                    raise RuntimeError(f"Unexpected trainer topology: {metrics!r}")
+                if len(memory_before) != 4:
+                    raise RuntimeError(
+                        f"Expected four visible H200s, got {memory_before!r}"
+                    )
+                if any("H200" not in str(row["name"]) for row in memory_before):
+                    raise RuntimeError(f"Replay requires H200 GPUs: {memory_before!r}")
                 snapshot = inspect_adapter(checkpoint)
                 if snapshot.file_sha256 in hashes:
                     raise RuntimeError("Replay produced duplicate update contents")
