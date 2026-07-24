@@ -221,6 +221,7 @@ async def prepare(
                 model_name=teacher.get_inference_name(
                     cast(int, teacher_revision) if self_teacher else None
                 ),
+                render_model_name=teacher.base_model if self_teacher else None,
                 headers=_authorization_headers(teacher),
             ),
             teacher_name=teacher_name,

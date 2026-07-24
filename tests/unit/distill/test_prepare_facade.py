@@ -207,6 +207,7 @@ async def test_self_teacher_is_scored_inside_exact_revision_lease(
     scorer = _RecordingScorer.instances[0]
     assert scorer.lease_active is True
     assert scorer.kwargs["model_name"] == "student@7"
+    assert scorer.kwargs["render_model_name"] == "base"
     assert scorer.requests[0].teacher_revision == 7
 
 
@@ -237,6 +238,7 @@ async def test_advanced_learner_can_use_an_older_frozen_self_teacher(
     scorer = _RecordingScorer.instances[0]
     assert scorer.lease_active is True
     assert scorer.kwargs["model_name"] == "student@5"
+    assert scorer.kwargs["render_model_name"] == "base"
     assert scorer.requests[0].teacher_revision == 5
 
 
@@ -296,6 +298,7 @@ async def test_external_teacher_uses_asserted_revision_without_student_lease(
     assert backend.lease_calls == []
     scorer = _RecordingScorer.instances[0]
     assert scorer.kwargs["model_name"] == "teacher"
+    assert scorer.kwargs["render_model_name"] is None
     assert scorer.requests[0].teacher_revision == "checkpoint-42"
 
 

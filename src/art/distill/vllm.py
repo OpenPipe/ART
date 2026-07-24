@@ -44,6 +44,7 @@ class VLLMTeacherScorer:
         base_url: str,
         capabilities: ServingCapabilities,
         model_name: str | None = None,
+        render_model_name: str | None = None,
         headers: Mapping[str, str] | None = None,
         timeout: float = 60.0,
         client: httpx.AsyncClient | None = None,
@@ -51,6 +52,7 @@ class VLLMTeacherScorer:
         self._base_url = base_url.rstrip("/")
         self._capabilities = capabilities
         self._model_name = model_name
+        self._render_model_name = render_model_name
         self._headers = dict(headers or {})
         self._timeout = timeout
         self._client = client
@@ -123,11 +125,12 @@ class VLLMTeacherScorer:
         request: TeacherScoringRequest,
     ) -> TeacherScoringResult:
         model_name = self._model_name or request.teacher_name
+        render_model_name = self._render_model_name or model_name
         render_body = request.teacher_view.request()
         if not isinstance(render_body, dict):
             raise VLLMScoringError("teacher chat view must be a JSON object")
         render_body = dict(render_body)
-        render_body["model"] = model_name
+        render_body["model"] = render_model_name
         render_body["stream"] = False
         render_body["max_completion_tokens"] = 1
         render_body.pop("max_tokens", None)
@@ -139,7 +142,7 @@ class VLLMTeacherScorer:
         )
         self._validate_observable_identity(
             rendered,
-            expected_model=model_name,
+            expected_model=render_model_name,
             expected_revision=request.teacher_revision,
             phase="render",
         )

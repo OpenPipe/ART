@@ -120,7 +120,7 @@ async def test_scores_exact_forced_tokens_and_retains_residual_tail() -> None:
                     "request_id": "render-id",
                     "token_ids": [10, 11],
                     "sampling_params": {"max_tokens": 99, "temperature": 0.7},
-                    "model": "served-teacher",
+                    "model": "base-teacher",
                 },
             )
         return httpx.Response(200, json=_wire_response(request))
@@ -130,6 +130,7 @@ async def test_scores_exact_forced_tokens_and_retains_residual_tail() -> None:
             base_url="http://teacher.test",
             capabilities=_capabilities(),
             model_name="served-teacher",
+            render_model_name="base-teacher",
             headers={"Authorization": "Bearer secret"},
             client=client,
         )
@@ -143,10 +144,11 @@ async def test_scores_exact_forced_tokens_and_retains_residual_tail() -> None:
     teacher_view = request.teacher_view.request()
     assert isinstance(teacher_view, dict)
     assert render["messages"] == teacher_view["messages"]
-    assert render["model"] == "served-teacher"
+    assert render["model"] == "base-teacher"
     assert render["stream"] is False
 
     generate = calls[1][1]
+    assert generate["model"] == "served-teacher"
     assert generate["token_ids"] == [10, 11, 2, 3]
     assert generate["request_id"] == request.request_id
     assert generate["sampling_params"]["prompt_logprobs"] == 2
