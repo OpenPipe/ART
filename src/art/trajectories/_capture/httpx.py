@@ -29,6 +29,21 @@ def _capture_decoder(response: httpx.Response) -> ContentDecoder:
     return shadow._get_content_decoder()
 
 
+def _capture_preloaded(
+    state: CaptureState, response: httpx.Response, *, stream: bool
+) -> None:
+    if stream and not response.is_stream_consumed:
+        return
+    try:
+        content = response.content
+    except httpx.ResponseNotRead:
+        if not stream:
+            raise
+        return
+    state.add(content)
+    state.finish()
+
+
 def install() -> None:
     if getattr(httpx.Client.send, "_art_capture", False):
         return
@@ -56,9 +71,7 @@ def install() -> None:
         if state is not None:
             state.status_code = response.status_code
             setattr(response, _STATE, state)
-            if not kwargs.get("stream", False):
-                state.add(response.content)
-                state.finish()
+            _capture_preloaded(state, response, stream=kwargs.get("stream", False))
         return response
 
     async def async_send(
@@ -78,9 +91,7 @@ def install() -> None:
         if state is not None:
             state.status_code = response.status_code
             setattr(response, _STATE, state)
-            if not kwargs.get("stream", False):
-                state.add(response.content)
-                state.finish()
+            _capture_preloaded(state, response, stream=kwargs.get("stream", False))
         return response
 
     def iter_raw(

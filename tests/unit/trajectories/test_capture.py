@@ -15,7 +15,7 @@ from aiohttp import web
 from anthropic import AsyncAnthropic
 from anthropic.types import TextBlock
 import httpx
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, OpenAI
 import pytest
 import pytest_asyncio
 import requests
@@ -703,7 +703,90 @@ async def test_native_openai_chat_stream_captures_at_done_event() -> None:
     assert len(chunks) == 1
     assert chunks[0].choices[0].delta.content == "hello"
     await stream.close()
+    assert len(trajectory.exchanges.chat_completions) == 1
     await client.close()
+
+
+def test_native_openai_preloaded_chat_stream_captures_once() -> None:
+    def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_streaming_chat_body(),
+        )
+
+    http_client = httpx.Client(transport=httpx.MockTransport(response))
+    client = OpenAI(
+        base_url="https://example.test/v1",
+        api_key="test",
+        http_client=http_client,
+    )
+    with art.Trajectory() as trajectory:
+        stream = client.chat.completions.create(
+            model="test/model",
+            messages=[],
+            stream=True,
+        )
+        assert len(trajectory.exchanges.chat_completions) == 1
+        chunks = list(stream)
+        assert len(trajectory.exchanges.chat_completions) == 1
+
+    assert len(chunks) == 1
+    assert chunks[0].choices[0].delta.content == "hello"
+    stream.close()
+    assert len(trajectory.exchanges.chat_completions) == 1
+    client.close()
+
+
+async def test_native_async_openai_preloaded_chat_stream_captures_once() -> None:
+    async def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_streaming_chat_body(),
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(response))
+    client = AsyncOpenAI(
+        base_url="https://example.test/v1",
+        api_key="test",
+        http_client=http_client,
+    )
+    with art.Trajectory() as trajectory:
+        stream = await client.chat.completions.create(
+            model="test/model",
+            messages=[],
+            stream=True,
+        )
+        assert len(trajectory.exchanges.chat_completions) == 1
+        chunks = [chunk async for chunk in stream]
+        assert len(trajectory.exchanges.chat_completions) == 1
+
+    assert len(chunks) == 1
+    assert chunks[0].choices[0].delta.content == "hello"
+    await stream.close()
+    assert len(trajectory.exchanges.chat_completions) == 1
+    await client.close()
+
+
+def test_preloaded_malformed_stream_is_excluded() -> None:
+    def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse([(None, "corrupt"), (None, "[DONE]")]),
+        )
+
+    with art.Trajectory() as trajectory:
+        with httpx.Client(transport=httpx.MockTransport(response)) as client:
+            with client.stream(
+                "POST",
+                "https://example.test/v1/chat/completions",
+                json={"model": "test/model", "messages": [], "stream": True},
+            ) as result:
+                assert list(result.iter_bytes())
+
+    assert not trajectory.exchanges
 
 
 def test_stream_terminal_without_sse_boundary_is_excluded() -> None:
