@@ -655,12 +655,36 @@ class MegatronService:
             if state not in {"committed", "pending", "failed"}:
                 raise RuntimeError("distillation receipt has an invalid state")
             expected_fields = {
-                "pending": {"binding", "state"},
+                # Legacy pending receipts did not identify the writer that
+                # reserved them. They remain readable, but cannot use the
+                # replacement-writer recovery proof below.
+                "pending": (
+                    {"binding", "state"}
+                    if "writer_session" not in receipt
+                    else {"binding", "state", "writer_session"}
+                ),
                 "failed": {"binding", "state", "failure"},
                 "committed": {"binding", "state", "committed_step"},
             }[state]
             if set(receipt) != expected_fields:
                 raise RuntimeError("distillation receipt has an invalid schema")
+            if state == "pending" and "writer_session" in receipt:
+                writer_session = receipt["writer_session"]
+                if (
+                    not isinstance(writer_session, dict)
+                    or set(writer_session) != {"session_id", "revision", "fence"}
+                    or not isinstance(writer_session["session_id"], str)
+                    or not writer_session["session_id"]
+                    or not isinstance(writer_session["revision"], int)
+                    or isinstance(writer_session["revision"], bool)
+                    or writer_session["revision"] < 0
+                    or not isinstance(writer_session["fence"], int)
+                    or isinstance(writer_session["fence"], bool)
+                    or writer_session["fence"] < 1
+                ):
+                    raise RuntimeError(
+                        "pending distillation receipt has an invalid writer session"
+                    )
             if state == "failed" and (
                 not isinstance(receipt["failure"], str) or not receipt["failure"]
             ):
@@ -875,10 +899,18 @@ class MegatronService:
         *,
         path: Path,
         binding: dict[str, Any],
+        lease: WriterLease | None = None,
     ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        receipt: dict[str, Any] = {"binding": binding, "state": "pending"}
+        if lease is not None:
+            receipt["writer_session"] = {
+                "session_id": lease.session_id,
+                "revision": lease.revision,
+                "fence": lease.fence,
+            }
         encoded = json.dumps(
-            {"binding": binding, "state": "pending"},
+            receipt,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -959,13 +991,40 @@ class MegatronService:
     ) -> dict[str, Any]:
         """Fail a pending receipt only when an unbound writer was abandoned."""
 
-        recovery = self._writer_sessions.reconcile()
         receipt = self._read_distillation_receipt(path=path, binding=binding)
         assert receipt is not None
-        abandoned_revision = (
-            recovery.revision if recovery.action == "abandoned_before_submit" else None
-        )
-        if abandoned_revision is None and recovery.action == "none":
+        receipt_writer = receipt.get("writer_session")
+        lease = self._current_writer_lease
+        abandoned_revision: int | None = None
+        abandoned_session_id: str | None = None
+        if lease is not None:
+            # Re-entering reconcile while the replacement exact-current lease
+            # owns the process-local gate would raise WriterBusyError. Its
+            # higher fence is itself durable proof that the earlier writer was
+            # reconciled before this unbound replacement was admitted.
+            journal = self._writer_sessions.inspect_active(lease)
+            if (
+                receipt["state"] == "pending"
+                and isinstance(receipt_writer, dict)
+                and receipt_writer["session_id"] != lease.session_id
+                and receipt_writer["revision"] == lease.revision
+                and receipt_writer["fence"] < lease.fence
+                and lease.revision == binding["source_revision"]
+                and journal["state"] == "open"
+                and journal["operation_identity"] is None
+            ):
+                abandoned_revision = lease.revision
+                abandoned_session_id = cast(str, receipt_writer["session_id"])
+            else:
+                # A receipt owned by this lease may be between reservation and
+                # bind. Any other mismatch is not evidence of abandonment.
+                return receipt
+        else:
+            recovery = self._writer_sessions.reconcile()
+            if recovery.action == "abandoned_before_submit":
+                abandoned_revision = recovery.revision
+                abandoned_session_id = recovery.session_id
+        if abandoned_revision is None and lease is None and recovery.action == "none":
             journal = self._writer_sessions.inspect()
             if (
                 journal is not None
@@ -974,9 +1033,15 @@ class MegatronService:
                 and journal["operation_identity"] is None
             ):
                 abandoned_revision = cast(int, journal["revision"])
+                abandoned_session_id = cast(str, journal["session_id"])
+        receipt_owner_matches = (
+            not isinstance(receipt_writer, dict)
+            or receipt_writer["session_id"] == abandoned_session_id
+        )
         if (
             receipt["state"] == "pending"
             and abandoned_revision == binding["source_revision"]
+            and receipt_owner_matches
         ):
             target_revision = cast(int, binding["source_revision"]) + 1
             staging_marker = read_prepared_checkpoint_commit(
@@ -2323,10 +2388,22 @@ class MegatronService:
             if reuse_unsubmitted_receipt:
                 self._write_json_atomic(
                     receipt_path,
-                    {"binding": binding, "state": "pending"},
+                    {
+                        "binding": binding,
+                        "state": "pending",
+                        "writer_session": {
+                            "session_id": lease.session_id,
+                            "revision": lease.revision,
+                            "fence": lease.fence,
+                        },
+                    },
                 )
             else:
-                self._reserve_distillation_receipt(path=receipt_path, binding=binding)
+                self._reserve_distillation_receipt(
+                    path=receipt_path,
+                    binding=binding,
+                    lease=lease,
+                )
             receipt_reserved = True
             writer_heartbeat = asyncio.create_task(
                 self._heartbeat_bound_writer(

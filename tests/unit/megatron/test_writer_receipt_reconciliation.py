@@ -706,6 +706,190 @@ async def test_pending_receipt_before_bind_is_recovered_without_poisoning_revisi
 
 
 @pytest.mark.asyncio
+async def test_exact_current_replacement_recovers_prebind_receipt_without_reentering_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _service(tmp_path, monkeypatch)
+    owner._latest_step = 4
+    config = TrainConfig(optimizer_save_interval=1)
+    objective = DistillationObjectiveConfig(coefficient=1.0)
+    binding = owner._distillation_receipt_binding(
+        idempotency_key="replacement-pre-bind",
+        expected_source_revision=4,
+        preparation_id="prepared-4",
+        payload_sha256="a" * 64,
+        objective=objective,
+        config=config,
+    )
+    old_lease = await owner.acquire_current_step(revision=4)
+    receipt_path = owner._distillation_receipt_path("replacement-pre-bind")
+    owner._reserve_distillation_receipt(
+        path=receipt_path,
+        binding=binding,
+        lease=old_lease,
+    )
+    # The old process dies after receipt reservation but before publishing a
+    # marker or binding the writer operation.
+    owner._writer_sessions._release_gate(old_lease.session_id)
+
+    resumed = _service(tmp_path, monkeypatch)
+    resumed._latest_step = 4
+    recovery = resumed._writer_sessions.reconcile()
+    assert recovery.action == "abandoned_before_submit"
+    assert recovery.session_id == old_lease.session_id
+
+    replacement = await resumed.acquire_current_step(revision=4)
+    assert replacement.fence > old_lease.fence
+    # This query must use the replacement lease as recovery evidence instead
+    # of trying to recursively acquire the gate it already owns.
+    assert (
+        await resumed.committed_distillation_step(
+            idempotency_key="replacement-pre-bind",
+            expected_source_revision=4,
+            preparation_id="prepared-4",
+            payload_sha256="a" * 64,
+            objective=objective,
+            config=config,
+        )
+        is None
+    )
+
+    monkeypatch.setattr(resumed, "_data_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(resumed, "_status", lambda _message: None)
+    monkeypatch.setattr(
+        "art.megatron.service._validate_distillation_tensors_for_objective",
+        lambda _tensors, _objective: None,
+    )
+    source = tmp_path / "source-lora"
+    source.mkdir()
+    (source / "adapter_model.safetensors").write_bytes(b"lora")
+
+    async def _prepare_for_training() -> str:
+        return str(source)
+
+    async def _aclose() -> None:
+        return None
+
+    observed_binding: dict[str, Any] | None = None
+
+    def _observe_bound_submission(_job: Any, *, job_path: str) -> None:
+        del job_path
+        nonlocal observed_binding
+        journal = resumed._writer_sessions.inspect_active(replacement)
+        assert journal["state"] == "bound"
+        operation = cast(dict[str, Any], journal["operation_identity"])
+        observed_binding = cast(dict[str, Any], operation["identity"])[
+            "receipt_binding"
+        ]
+        receipt = resumed._read_distillation_receipt(
+            path=receipt_path,
+            binding=binding,
+        )
+        assert receipt is not None
+        assert receipt["state"] == "pending"
+        assert receipt["writer_session"] == {
+            "session_id": replacement.session_id,
+            "revision": replacement.revision,
+            "fence": replacement.fence,
+        }
+        raise _InjectedCrash("stop after replacement submission was bound")
+
+    monkeypatch.setattr(resumed, "_prepare_for_training", _prepare_for_training)
+    monkeypatch.setattr(resumed, "aclose", _aclose)
+    monkeypatch.setattr(
+        "art.megatron.service.write_megatron_job",
+        _observe_bound_submission,
+    )
+    sidecars = tmp_path / "replacement-sidecars"
+    sidecars.mkdir()
+    disk_tensors = {
+        "schema_version": 1,
+        "dir": str(sidecars),
+        "num_sequences": 1,
+        "sequence_length": 1,
+        "top_k_width": 1,
+        "target_count": 1,
+        "logical_vocab_size": 1,
+        "tensors_sha256": "b" * 64,
+    }
+    with pytest.raises(_InjectedCrash, match="replacement submission was bound"):
+        async for _metrics in resumed.train_distillation(
+            cast(Any, disk_tensors),
+            config,
+            objective=objective,
+            expected_source_revision=4,
+            idempotency_key="replacement-pre-bind",
+            preparation_id="prepared-4",
+            payload_sha256="a" * 64,
+            current_step_session_id=replacement.session_id,
+            current_step_capability=replacement.capability,
+        ):
+            pass
+    assert observed_binding == binding
+
+
+@pytest.mark.asyncio
+async def test_live_current_bound_pending_receipt_is_never_recovered_as_unsubmitted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path, monkeypatch)
+    service._latest_step = 4
+    config = TrainConfig(optimizer_save_interval=1)
+    objective = DistillationObjectiveConfig(coefficient=1.0)
+    binding = service._distillation_receipt_binding(
+        idempotency_key="live-bound",
+        expected_source_revision=4,
+        preparation_id="prepared-4",
+        payload_sha256="a" * 64,
+        objective=objective,
+        config=config,
+    )
+    lease = await service.acquire_current_step(revision=4)
+    receipt_path = service._distillation_receipt_path("live-bound")
+    service._reserve_distillation_receipt(
+        path=receipt_path,
+        binding=binding,
+        lease=lease,
+    )
+    operation = service._writer_operation_for_job(
+        route="prepared",
+        source_revision=4,
+        target_revision=5,
+        identity={"receipt_binding": binding},
+    )
+    staging = Path(service._staging_lora_dir(5))
+    staging.mkdir(parents=True)
+    write_prepared_checkpoint_commit(
+        staging,
+        PreparedCheckpointCommit(
+            state="submitted",
+            step=5,
+            operation_identity=operation,
+        ),
+    )
+    service._writer_sessions.bind(lease, operation_identity=operation)
+
+    with pytest.raises(RuntimeError, match="pending with an ambiguous outcome"):
+        await service.committed_distillation_step(
+            idempotency_key="live-bound",
+            expected_source_revision=4,
+            preparation_id="prepared-4",
+            payload_sha256="a" * 64,
+            objective=objective,
+            config=config,
+        )
+    receipt = service._read_distillation_receipt(
+        path=receipt_path,
+        binding=binding,
+    )
+    assert receipt is not None
+    assert receipt["state"] == "pending"
+    assert service._writer_sessions.inspect_active(lease)["state"] == "bound"
+
+
+@pytest.mark.asyncio
 async def test_production_resume_reconciles_outputs_before_quarantine(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

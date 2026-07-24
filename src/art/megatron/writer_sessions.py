@@ -395,6 +395,12 @@ class WriterSessionStore:
             return None
         return cast(dict[str, JsonValue], json.loads(_canonical_json(journal)))
 
+    def inspect_active(self, lease: WriterLease) -> dict[str, JsonValue]:
+        """Return the journal for the lease currently holding this store's gate."""
+
+        journal = self._validated_active_journal(lease, require_unexpired=True)
+        return cast(dict[str, JsonValue], json.loads(_canonical_json(journal)))
+
     def recovery_status(self) -> WriterRecovery:
         """Inspect whether durable state is safe, busy, or ambiguous."""
 
