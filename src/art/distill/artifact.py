@@ -46,7 +46,6 @@ class PreparedPayload(ImmutableModel):
         generations = {}
         group_ids: set[str] = set()
         trajectory_fingerprints: set[str] = set()
-        total_generation_tokens = 0
         for group in self.groups:
             if group.group_id in group_ids:
                 raise ValueError("group IDs must be unique within a prepared batch")
@@ -63,14 +62,49 @@ class PreparedPayload(ImmutableModel):
                             "generation IDs must be unique within a prepared batch"
                         )
                     generations[generation.generation_id] = generation
-                    total_generation_tokens += len(generation.continuation_token_ids)
-        if self.report.selected_generations > len(generations):
-            raise ValueError("selected generation count exceeds captured generations")
-        if self.report.selected_tokens > total_generation_tokens:
-            raise ValueError("selected token count exceeds captured generation tokens")
         targeted_generations = {target.generation_id for target in self.targets}
-        if len(targeted_generations) > self.report.selected_generations:
-            raise ValueError("targeted generations exceed selected generation count")
+        failed_generations: set[str] = set()
+        failed_token_count = 0
+        for issue in self.report.issues:
+            generation = generations.get(issue.generation_id)
+            if generation is None:
+                raise ValueError("preparation issue references an unknown generation")
+            if issue.generation_id in failed_generations:
+                raise ValueError(
+                    "preparation issues must identify unique failed generations"
+                )
+            if issue.generation_id in targeted_generations:
+                raise ValueError(
+                    "failed generation must not also contain prepared targets"
+                )
+            if any(
+                position >= len(generation.continuation_token_ids)
+                for position in issue.selected_positions
+            ):
+                raise ValueError("preparation issue position exceeds generation bounds")
+            _expected_teacher_revision(
+                self.constraints.consistency,
+                issue.teacher_name,
+            )
+            failed_generations.add(issue.generation_id)
+            failed_token_count += len(issue.selected_positions)
+
+        prepared_generation_count = len(targeted_generations)
+        selected_generation_count = prepared_generation_count + len(failed_generations)
+        selected_token_count = len(self.targets) + failed_token_count
+        if self.report.prepared_generations != prepared_generation_count:
+            raise ValueError(
+                "prepared generation count must equal targeted generation count"
+            )
+        if self.report.selected_generations != selected_generation_count:
+            raise ValueError(
+                "selected generation count must equal successful and failed "
+                "generation records"
+            )
+        if self.report.selected_tokens != selected_token_count:
+            raise ValueError(
+                "selected token count must equal target rows and failed positions"
+            )
         if (
             isinstance(self.constraints.consistency, CurrentStep)
             and self.constraints.consistency.revision
@@ -121,16 +155,23 @@ class PreparedPayload(ImmutableModel):
                 raise ValueError(
                     "prepared target vocabulary does not match constraints"
                 )
-            consistency = self.constraints.consistency
-            expected_revision = (
-                consistency.revision_for(target.teacher_name)
-                if isinstance(consistency, Frozen)
-                else consistency.revision
+            expected_revision = _expected_teacher_revision(
+                self.constraints.consistency,
+                target.teacher_name,
             )
             if target.teacher_revision != expected_revision:
                 raise ValueError(
                     "prepared target teacher revision does not match consistency"
                 )
+
+
+def _expected_teacher_revision(
+    consistency: Frozen | CurrentStep,
+    teacher_name: str,
+) -> int | str:
+    if isinstance(consistency, Frozen):
+        return consistency.revision_for(teacher_name)
+    return consistency.revision
 
 
 @dataclass(frozen=True, slots=True)

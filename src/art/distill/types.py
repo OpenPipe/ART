@@ -504,6 +504,7 @@ class PreparationIssue(ImmutableModel):
 
 class PreparationReport(ImmutableModel):
     selected_generations: Annotated[int, Field(ge=0)]
+    prepared_generations: Annotated[int, Field(ge=0)]
     selected_tokens: Annotated[int, Field(ge=0)]
     prepared_tokens: Annotated[int, Field(ge=0)]
     issue_count: Annotated[int, Field(ge=0)] = 0
@@ -511,11 +512,31 @@ class PreparationReport(ImmutableModel):
 
     @model_validator(mode="after")
     def _valid_counts(self) -> Self:
+        if self.prepared_generations > self.selected_generations:
+            raise ValueError(
+                "prepared generation count exceeds selected generation count"
+            )
         if self.prepared_tokens > self.selected_tokens:
             raise ValueError("prepared token count exceeds selected token count")
         if self.issue_count != len(self.issues):
             raise ValueError("issue count must equal the persisted issue ledger")
         return self
+
+    @property
+    def generation_coverage(self) -> float:
+        """Fraction of selected generations with complete teacher targets."""
+
+        if self.selected_generations == 0:
+            return 0.0
+        return self.prepared_generations / self.selected_generations
+
+    @property
+    def token_coverage(self) -> float:
+        """Fraction of selected token positions with teacher targets."""
+
+        if self.selected_tokens == 0:
+            return 0.0
+        return self.prepared_tokens / self.selected_tokens
 
 
 class PreparedConstraints(ImmutableModel):

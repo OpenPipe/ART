@@ -14,9 +14,12 @@ from art.distill.preparer import (
     DistillationPreparer,
     FailurePolicy,
     SameContext,
+    mask_failed_generation,
+    strict,
 )
 from art.distill.scorer import (
     RankedTokenLogprob,
+    RetryableTeacherScoringError,
     ScoredPosition,
     TeacherDistributionScorer,
     TeacherScoringRequest,
@@ -142,6 +145,7 @@ def _all_preparer(
     *,
     failure_policy: FailurePolicy | None = None,
     max_concurrency: int = 8,
+    max_retries: int = 2,
 ) -> DistillationPreparer:
     return DistillationPreparer(
         scorer=scorer,
@@ -151,7 +155,39 @@ def _all_preparer(
         view=SameContext(),
         failure_policy=failure_policy,
         max_concurrency=max_concurrency,
+        max_retries=max_retries,
     )
+
+
+def test_failure_policy_matches_public_error_and_coverage_contract() -> None:
+    strict_policy = FailurePolicy(
+        on_teacher_error="raise",
+        min_generation_coverage=1.0,
+        min_token_coverage=1.0,
+    )
+    assert strict() == FailurePolicy.strict() == strict_policy
+    masked_policy = FailurePolicy(
+        on_teacher_error="mask_distillation",
+        min_generation_coverage=0.8,
+        min_token_coverage=0.6,
+    )
+    assert (
+        mask_failed_generation(
+            min_generation_coverage=0.8,
+            min_token_coverage=0.6,
+        )
+        == FailurePolicy.mask_failed_generation(
+            min_generation_coverage=0.8,
+            min_token_coverage=0.6,
+        )
+        == masked_policy
+    )
+    with pytest.raises(ValueError, match="complete coverage"):
+        FailurePolicy(
+            on_teacher_error="raise",
+            min_generation_coverage=0.9,
+            min_token_coverage=1.0,
+        )
 
 
 async def test_all_mode_builds_exact_local_requests_and_valid_artifact() -> None:
@@ -183,6 +219,9 @@ async def test_all_mode_builds_exact_local_requests_and_valid_artifact() -> None
     ]
     assert payload.report.selected_generations == 2
     assert payload.report.selected_tokens == payload.report.prepared_tokens == 2
+    assert payload.report.prepared_generations == 2
+    assert payload.report.generation_coverage == 1.0
+    assert payload.report.token_coverage == 1.0
 
 
 async def test_materialized_hint_is_teacher_only_and_modes_are_exclusive() -> None:
@@ -260,6 +299,80 @@ async def test_retry_produces_byte_identical_prepared_artifact() -> None:
     assert first.to_bytes() == second.to_bytes()
 
 
+async def test_transient_scoring_failure_retries_the_same_immutable_request() -> None:
+    attempts: dict[str, list[TeacherScoringRequest]] = {}
+
+    class TransientScorer:
+        async def score(
+            self,
+            request: TeacherScoringRequest,
+        ) -> TeacherScoringResult:
+            seen = attempts.setdefault(request.generation_id, [])
+            seen.append(request)
+            if len(seen) == 1:
+                raise RetryableTeacherScoringError("transient")
+            return _result(request)
+
+    prepared = await _all_preparer(
+        TransientScorer(),
+        max_retries=1,
+    ).prepare(_candidate(), _context())
+
+    assert prepared.report.prepared_tokens == 2
+    assert set(attempts) == {"generation-1", "generation-2"}
+    assert all(len(seen) == 2 and seen[0] is seen[1] for seen in attempts.values())
+    assert all(seen[0].request_id == seen[1].request_id for seen in attempts.values())
+
+
+async def test_retry_exhaustion_obeys_partial_failure_policy() -> None:
+    failed_requests: list[TeacherScoringRequest] = []
+
+    class ExhaustingScorer:
+        async def score(
+            self,
+            request: TeacherScoringRequest,
+        ) -> TeacherScoringResult:
+            if request.generation_id == "generation-1":
+                failed_requests.append(request)
+                raise RetryableTeacherScoringError("still unavailable")
+            return _result(request)
+
+    prepared = await _all_preparer(
+        ExhaustingScorer(),
+        failure_policy=FailurePolicy.mask_failed_generation(
+            min_generation_coverage=0.5,
+            min_token_coverage=0.5,
+        ),
+        max_retries=2,
+    ).prepare(_candidate(), _context())
+
+    assert prepared.report.prepared_tokens == 1
+    assert prepared.report.issue_count == 1
+    assert len(failed_requests) == 3
+    assert all(request is failed_requests[0] for request in failed_requests)
+
+
+async def test_non_retryable_scoring_failure_is_attempted_once() -> None:
+    attempts = 0
+
+    class InvalidResultScorer:
+        async def score(
+            self,
+            request: TeacherScoringRequest,
+        ) -> TeacherScoringResult:
+            nonlocal attempts
+            attempts += 1
+            raise ValueError("malformed teacher result")
+
+    with pytest.raises(DistillationPreparationError):
+        await _all_preparer(
+            InvalidResultScorer(),
+            max_retries=3,
+        ).prepare(_candidate(), _context())
+
+    assert attempts == 2
+
+
 async def test_strict_and_partial_failure_coverage_are_explicit_and_sanitized() -> None:
     class FailingScorer:
         async def score(
@@ -279,11 +392,16 @@ async def test_strict_and_partial_failure_coverage_are_explicit_and_sanitized() 
     partial = await _all_preparer(
         FailingScorer(),
         failure_policy=FailurePolicy.mask_failed_generation(
-            min_prepared_token_fraction=0.5
+            min_generation_coverage=0.5,
+            min_token_coverage=0.5,
         ),
     ).prepare(_candidate(), _context())
     assert partial.report.selected_tokens == 2
     assert partial.report.prepared_tokens == 1
+    assert partial.report.selected_generations == 2
+    assert partial.report.prepared_generations == 1
+    assert partial.report.generation_coverage == 0.5
+    assert partial.report.token_coverage == 0.5
     assert partial.report.issue_count == 1
     assert len(partial.report.issues) == 1
     assert partial.report.issues[0].generation_id == "generation-1"
@@ -298,7 +416,17 @@ async def test_strict_and_partial_failure_coverage_are_explicit_and_sanitized() 
         await _all_preparer(
             FailingScorer(),
             failure_policy=FailurePolicy.mask_failed_generation(
-                min_prepared_token_fraction=0.75
+                min_generation_coverage=0.75,
+                min_token_coverage=0.5,
+            ),
+        ).prepare(_candidate(), _context())
+
+    with pytest.raises(DistillationPreparationError, match="coverage"):
+        await _all_preparer(
+            FailingScorer(),
+            failure_policy=FailurePolicy.mask_failed_generation(
+                min_generation_coverage=0.5,
+                min_token_coverage=0.75,
             ),
         ).prepare(_candidate(), _context())
 

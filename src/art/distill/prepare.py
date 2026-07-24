@@ -104,6 +104,7 @@ async def prepare(
     examples: Iterable[Example] = (),
     failures: "FailurePolicy | None" = None,
     max_concurrency: int = 8,
+    max_scoring_retries: int = 2,
 ) -> PreparedTrainingBatch:
     """Prepare immutable teacher targets for a later ``backend.train`` call.
 
@@ -127,6 +128,18 @@ async def prepare(
             "distill.prepare V1 supports TopK temperature 1.0 because vLLM "
             "prompt distributions expose raw model log-probabilities"
         )
+    if (
+        not isinstance(max_concurrency, int)
+        or isinstance(max_concurrency, bool)
+        or max_concurrency <= 0
+    ):
+        raise ValueError("max_concurrency must be a positive integer")
+    if (
+        not isinstance(max_scoring_retries, int)
+        or isinstance(max_scoring_retries, bool)
+        or max_scoring_retries < 0
+    ):
+        raise ValueError("max_scoring_retries must be a non-negative integer")
     materialized_examples = tuple(examples)
     if (select is None) != (teacher_view is None):
         raise ValueError("select and teacher_view must be provided together")
@@ -141,12 +154,9 @@ async def prepare(
     self_teacher = teacher is student
     teacher_name = teacher.name
     teacher_revision = consistency.revision_for(teacher_name)
-    if self_teacher and (
-        not isinstance(teacher_revision, int) or teacher_revision != learner_revision
-    ):
+    if self_teacher and not isinstance(teacher_revision, int):
         raise ValueError(
-            "student self-distillation requires a frozen integer revision equal "
-            "to the student's current learner revision"
+            "student self-distillation requires a frozen integer teacher revision"
         )
 
     rollout_requirement = rollouts or StudentOnPolicy()
@@ -190,7 +200,7 @@ async def prepare(
 
     lease: AbstractAsyncContextManager[None]
     if self_teacher:
-        lease = backend.exact_adapter_lease(student, learner_revision)
+        lease = backend.exact_adapter_lease(student, cast(int, teacher_revision))
     else:
         lease = nullcontext()
     async with lease:
@@ -209,6 +219,7 @@ async def prepare(
             view=teacher_view,
             failure_policy=failures,
             max_concurrency=max_concurrency,
+            max_retries=max_scoring_retries,
         )
         return await _prepare_with(preparer, candidate, context)
 

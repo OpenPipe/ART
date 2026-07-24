@@ -19,6 +19,10 @@ _REQUEST_HASH_DOMAIN = "art-distill-teacher-scoring-request-v1"
 _REQUEST_ID_PREFIX = "teacher-score-"
 
 
+class RetryableTeacherScoringError(RuntimeError):
+    """Operational scoring failure safe to retry with the identical request."""
+
+
 class TeacherScoringRequest(ImmutableModel):
     """One idempotent request to score a complete forced continuation."""
 

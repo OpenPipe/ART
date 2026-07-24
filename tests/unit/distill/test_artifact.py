@@ -1,4 +1,7 @@
+from collections.abc import Callable
+import hashlib
 import json
+from typing import Any
 
 import pytest
 
@@ -46,6 +49,41 @@ def _group() -> distill.TrainingGroupSnapshot:
     )
 
 
+def _two_generation_group() -> distill.TrainingGroupSnapshot:
+    first = _generation()
+    second = distill.CapturedGeneration.create(
+        generation_id="generation-2",
+        trajectory_fingerprint="trajectory-1",
+        event_index=1,
+        trajectory_token_start=3,
+        protocol="chat_completions",
+        continuation_token_ids=(4, 5),
+        context=first.context,
+        part_spans=(
+            distill.PartSpan(
+                part=distill.GenerationPart.ASSISTANT_TEXT,
+                start=0,
+                end=2,
+            ),
+        ),
+        rollout_spans=(distill.RolloutRevisionSpan(start=0, end=2, revision=7),),
+    )
+    return distill.TrainingGroupSnapshot(
+        group_id="group-1",
+        trajectories=(
+            distill.TrainingTrajectorySnapshot(
+                trajectory_fingerprint="trajectory-1",
+                token_ids=(1, 2, 3, 4, 5),
+                logprobs=(None, -0.2, -0.3, -0.4, -0.5),
+                token_flags=(0, 1, 1, 1, 1),
+                reward=1.0,
+                advantage=0.5,
+                generations=(first, second),
+            ),
+        ),
+    )
+
+
 def _target(position: int = 0) -> distill.TopKTargetRow:
     generation = _generation()
     return distill.TopKTargetRow(
@@ -76,6 +114,7 @@ def _artifact(
         targets=target_values,
         report=distill.PreparationReport(
             selected_generations=1,
+            prepared_generations=1,
             selected_tokens=len(target_values),
             prepared_tokens=len(target_values),
         ),
@@ -88,6 +127,63 @@ def _artifact(
             consistency=distill.Frozen(revision="revision-1"),
         ),
     )
+
+
+def _partial_artifact() -> distill.PreparedTrainingBatch:
+    issue = distill.PreparationIssue(
+        generation_id="generation-2",
+        teacher_name="teacher",
+        selected_positions=(0,),
+    )
+    return distill.PreparedTrainingBatch.create(
+        groups=(_two_generation_group(),),
+        targets=(_target(),),
+        report=distill.PreparationReport(
+            selected_generations=2,
+            prepared_generations=1,
+            selected_tokens=2,
+            prepared_tokens=1,
+            issue_count=1,
+            issues=(issue,),
+        ),
+        constraints=distill.PreparedConstraints(
+            learner_revision=7,
+            token_space_fingerprint="token-space",
+            logical_vocab_size=4,
+            rollout_requirement=distill.StudentOnPolicy(),
+            consistency=distill.Frozen(
+                revisions=(
+                    distill.TeacherRevision(
+                        teacher_name="teacher",
+                        revision="revision-1",
+                    ),
+                )
+            ),
+        ),
+    )
+
+
+def _resign_payload(
+    artifact: distill.PreparedTrainingBatch,
+    mutate: Callable[[dict[str, Any]], None],
+) -> bytes:
+    raw = json.loads(artifact.to_bytes())
+    payload = json.loads(raw["payload"])
+    mutate(payload)
+    payload_text = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    payload_bytes = payload_text.encode()
+    raw["payload"] = payload_text
+    raw["payload_sha256"] = hashlib.sha256(payload_bytes).hexdigest()
+    raw["preparation_id"] = hashlib.sha256(
+        b"art-distill-preparation-v1\0" + payload_bytes
+    ).hexdigest()
+    return json.dumps(raw, separators=(",", ":"), sort_keys=True).encode()
 
 
 def test_artifact_round_trip_is_byte_identical_and_validated() -> None:
@@ -117,6 +213,110 @@ def test_artifact_rejects_payload_checksum_and_semantic_id_tampering() -> None:
         distill.PreparedTrainingBatch.from_bytes(
             json.dumps(raw, separators=(",", ":"), sort_keys=True).encode()
         )
+
+
+def test_partial_artifact_reconciles_successes_failures_and_coverage() -> None:
+    loaded = distill.PreparedTrainingBatch.from_bytes(_partial_artifact().to_bytes())
+
+    assert loaded.report.selected_generations == 2
+    assert loaded.report.prepared_generations == 1
+    assert loaded.report.selected_tokens == 2
+    assert loaded.report.prepared_tokens == 1
+    assert loaded.report.generation_coverage == 0.5
+    assert loaded.report.token_coverage == 0.5
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (
+            lambda payload: payload["report"].update(
+                {
+                    "selected_generations": 3,
+                }
+            ),
+            "selected generation count",
+        ),
+        (
+            lambda payload: payload["report"].update(
+                {
+                    "prepared_generations": 2,
+                }
+            ),
+            "prepared generation count",
+        ),
+        (
+            lambda payload: payload["report"].update(
+                {
+                    "selected_tokens": 3,
+                }
+            ),
+            "selected token count",
+        ),
+        (
+            lambda payload: payload["report"]["issues"][0].update(
+                {
+                    "generation_id": "generation-1",
+                }
+            ),
+            "must not also contain prepared targets",
+        ),
+        (
+            lambda payload: payload["report"]["issues"][0].update(
+                {
+                    "generation_id": "missing",
+                }
+            ),
+            "unknown generation",
+        ),
+        (
+            lambda payload: payload["report"]["issues"][0].update(
+                {
+                    "selected_positions": [2],
+                }
+            ),
+            "position exceeds generation bounds",
+        ),
+        (
+            lambda payload: payload["report"]["issues"][0].update(
+                {
+                    "selected_positions": [0, 0],
+                }
+            ),
+            "positions must be unique",
+        ),
+        (
+            lambda payload: payload["report"]["issues"][0].update(
+                {
+                    "teacher_name": "unrecognized-teacher",
+                }
+            ),
+            "absent from frozen revision constraints",
+        ),
+        (
+            lambda payload: payload["report"].update(
+                {
+                    "issues": [
+                        payload["report"]["issues"][0],
+                        payload["report"]["issues"][0],
+                    ],
+                    "issue_count": 2,
+                    "selected_generations": 3,
+                    "selected_tokens": 3,
+                }
+            ),
+            "unique failed generations",
+        ),
+    ],
+)
+def test_checksum_valid_canonical_artifact_rejects_fabricated_issue_ledger(
+    mutate: Callable[[dict[str, Any]], None],
+    match: str,
+) -> None:
+    encoded = _resign_payload(_partial_artifact(), mutate)
+
+    with pytest.raises(ValueError, match=match):
+        distill.PreparedTrainingBatch.from_bytes(encoded)
 
 
 def test_preparation_id_is_stable_and_order_sensitive() -> None:
@@ -153,6 +353,7 @@ def test_artifact_rejects_report_mismatch_and_duplicate_positions() -> None:
             targets=(_target(),),
             report=distill.PreparationReport(
                 selected_generations=1,
+                prepared_generations=1,
                 selected_tokens=2,
                 prepared_tokens=2,
             ),
@@ -168,6 +369,7 @@ def test_artifact_rejects_report_mismatch_and_duplicate_positions() -> None:
             targets=(),
             report=distill.PreparationReport(
                 selected_generations=0,
+                prepared_generations=0,
                 selected_tokens=0,
                 prepared_tokens=0,
             ),

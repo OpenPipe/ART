@@ -12,7 +12,11 @@ import pytest
 
 from art.distill.scorer import TeacherScoringRequest
 from art.distill.types import TeacherView, TopK
-from art.distill.vllm import VLLMScoringError, VLLMTeacherScorer
+from art.distill.vllm import (
+    VLLMRetryableScoringError,
+    VLLMScoringError,
+    VLLMTeacherScorer,
+)
 from art.serving_capabilities import ServingCapabilities
 
 
@@ -32,21 +36,32 @@ def _capabilities(**updates: Any) -> ServingCapabilities:
     return ServingCapabilities.model_validate(values)
 
 
-def _request(*, k: int = 2, temperature: float = 1.0) -> TeacherScoringRequest:
+_MISSING = object()
+
+
+def _request(
+    *,
+    k: int = 2,
+    temperature: float = 1.0,
+    truncate_prompt_tokens: Any = _MISSING,
+) -> TeacherScoringRequest:
+    teacher_request: dict[str, Any] = {
+        "messages": [
+            {"content": "Choose a card.", "role": "user"},
+            {
+                "content": "Hint: the private label is blue.",
+                "role": "system",
+            },
+        ],
+        "model": "student",
+    }
+    if truncate_prompt_tokens is not _MISSING:
+        teacher_request["truncate_prompt_tokens"] = truncate_prompt_tokens
     return TeacherScoringRequest.create(
         generation_id="generation-1",
         teacher_view=TeacherView.from_request(
             "chat_completions",
-            {
-                "messages": [
-                    {"content": "Choose a card.", "role": "user"},
-                    {
-                        "content": "Hint: the private label is blue.",
-                        "role": "system",
-                    },
-                ],
-                "model": "student",
-            },
+            teacher_request,
         ),
         forced_token_ids=(2, 3),
         selected_positions=(0, 1),
@@ -186,6 +201,39 @@ async def test_rejects_unsupported_capabilities_before_network(
         )
         with pytest.raises(VLLMScoringError, match=message):
             await scorer.score(scoring_request)
+
+
+@pytest.mark.asyncio
+async def test_classifies_transient_http_status_for_bounded_retry() -> None:
+    async def unavailable(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "temporarily unavailable"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(unavailable)) as client:
+        scorer = VLLMTeacherScorer(
+            base_url="http://teacher.test",
+            capabilities=_capabilities(),
+            client=client,
+        )
+        with pytest.raises(VLLMRetryableScoringError, match="transiently"):
+            await scorer.score(_request())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("truncate_prompt_tokens", [1, 0])
+async def test_rejects_prompt_truncation_before_network(
+    truncate_prompt_tokens: int,
+) -> None:
+    async def unexpected(_: httpx.Request) -> httpx.Response:
+        raise AssertionError("prompt-truncation rejection must happen before I/O")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(unexpected)) as client:
+        scorer = VLLMTeacherScorer(
+            base_url="http://teacher.test",
+            capabilities=_capabilities(),
+            client=client,
+        )
+        with pytest.raises(VLLMScoringError, match="does not allow prompt truncation"):
+            await scorer.score(_request(truncate_prompt_tokens=truncate_prompt_tokens))
 
 
 @pytest.mark.asyncio

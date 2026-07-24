@@ -8,6 +8,7 @@ from art import distill
 from art.distill.candidate import CandidateTrainingBatch
 from art.distill.scorer import (
     RankedTokenLogprob,
+    RetryableTeacherScoringError,
     ScoredPosition,
     TeacherScoringRequest,
     TeacherScoringResult,
@@ -117,6 +118,7 @@ class _Model:
 class _RecordingScorer:
     instances: list["_RecordingScorer"] = []
     backend: _Backend | None = None
+    failures_remaining = 0
 
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
@@ -128,6 +130,9 @@ class _RecordingScorer:
         self.requests.append(request)
         backend = getattr(self, "backend", None)
         self.lease_active = backend.lease_active if backend is not None else None
+        if self.__class__.failures_remaining:
+            self.__class__.failures_remaining -= 1
+            raise RetryableTeacherScoringError("transient teacher failure")
         return TeacherScoringResult.create(
             request=request,
             positions=(
@@ -162,6 +167,7 @@ def facade(monkeypatch: pytest.MonkeyPatch) -> CandidateTrainingBatch:
         lambda *_args, **_kwargs: candidate,
     )
     _RecordingScorer.instances.clear()
+    _RecordingScorer.failures_remaining = 0
     monkeypatch.setattr("art.distill.vllm.VLLMTeacherScorer", _RecordingScorer)
     return candidate
 
@@ -193,6 +199,66 @@ async def test_self_teacher_is_scored_inside_exact_revision_lease(
     assert scorer.lease_active is True
     assert scorer.kwargs["model_name"] == "student@7"
     assert scorer.requests[0].teacher_revision == 7
+
+
+async def test_advanced_learner_can_use_an_older_frozen_self_teacher(
+    facade: CandidateTrainingBatch,
+) -> None:
+    backend = _Backend()
+    student = _Model(
+        name="student",
+        backend=backend,
+        capabilities=_capabilities(),
+    )
+    _RecordingScorer.backend = backend
+
+    prepared = await distill.prepare(
+        cast(TrainableModel[Any, Any], student),
+        (),
+        teacher=cast(Model[Any, Any], student),
+        select=distill.all_generations(),
+        teacher_view=distill.same_context(),
+        target=distill.TopK(k=2),
+        consistency=distill.Frozen(revision=5),
+    )
+
+    assert prepared.constraints.learner_revision == 7
+    assert prepared.constraints.consistency == distill.Frozen(revision=5)
+    assert backend.lease_calls == [(student, 5)]
+    scorer = _RecordingScorer.instances[0]
+    assert scorer.lease_active is True
+    assert scorer.kwargs["model_name"] == "student@5"
+    assert scorer.requests[0].teacher_revision == 5
+
+
+async def test_public_retry_count_retries_the_same_scoring_request(
+    facade: CandidateTrainingBatch,
+) -> None:
+    backend = _Backend()
+    student = _Model(
+        name="student",
+        backend=backend,
+        capabilities=_capabilities(),
+    )
+    _RecordingScorer.backend = backend
+    _RecordingScorer.failures_remaining = 1
+
+    prepared = await distill.prepare(
+        cast(TrainableModel[Any, Any], student),
+        (),
+        teacher=cast(Model[Any, Any], student),
+        select=distill.all_generations(),
+        teacher_view=distill.same_context(),
+        target=distill.TopK(k=2),
+        consistency=distill.Frozen(revision=5),
+        max_scoring_retries=1,
+    )
+
+    assert prepared.report.prepared_tokens == 1
+    requests = _RecordingScorer.instances[0].requests
+    assert len(requests) == 2
+    assert requests[0] is requests[1]
+    assert requests[0].request_id == requests[1].request_id
 
 
 async def test_external_teacher_uses_asserted_revision_without_student_lease(
@@ -278,6 +344,15 @@ async def test_v1_rejects_current_step_and_non_unit_temperature_before_io(
             teacher=cast(Model[Any, Any], student),
             target=distill.TopK(k=2, temperature=2.0),
             consistency=distill.Frozen(revision=7),
+        )
+    with pytest.raises(ValueError, match="max_scoring_retries"):
+        await distill.prepare(
+            cast(TrainableModel[Any, Any], student),
+            (),
+            teacher=cast(Model[Any, Any], student),
+            target=distill.TopK(k=2),
+            consistency=distill.Frozen(revision=7),
+            max_scoring_retries=-1,
         )
 
     assert not _RecordingScorer.instances

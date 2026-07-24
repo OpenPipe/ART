@@ -12,6 +12,7 @@ from .artifact import PreparedTrainingBatch
 from .candidate import CandidateTrainingBatch
 from .prepare import PreparationContext
 from .scorer import (
+    RetryableTeacherScoringError,
     TeacherDistributionScorer,
     TeacherScoringRequest,
     TeacherScoringResult,
@@ -55,15 +56,20 @@ class SameContext(ImmutableModel):
 
 
 class FailurePolicy(ImmutableModel):
-    """Control whether a failed generation rejects or reduces a preparation."""
+    """Control teacher-error handling and minimum accepted coverage."""
 
-    mode: Literal["strict", "mask_failed_generation"] = "strict"
-    min_prepared_token_fraction: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
+    on_teacher_error: Literal["raise", "mask_distillation"] = "raise"
+    min_generation_coverage: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
+    min_token_coverage: Annotated[float, Field(ge=0.0, le=1.0)] = 1.0
 
     @model_validator(mode="after")
     def _strict_requires_complete_coverage(self) -> Self:
-        if self.mode == "strict" and self.min_prepared_token_fraction != 1.0:
-            raise ValueError("strict failure policy always requires complete coverage")
+        if self.on_teacher_error == "raise" and (
+            self.min_generation_coverage != 1.0 or self.min_token_coverage != 1.0
+        ):
+            raise ValueError(
+                "raise-on-teacher-error policy always requires complete coverage"
+            )
         return self
 
     @classmethod
@@ -74,12 +80,33 @@ class FailurePolicy(ImmutableModel):
     def mask_failed_generation(
         cls,
         *,
-        min_prepared_token_fraction: float,
+        min_generation_coverage: float,
+        min_token_coverage: float,
     ) -> Self:
         return cls(
-            mode="mask_failed_generation",
-            min_prepared_token_fraction=min_prepared_token_fraction,
+            on_teacher_error="mask_distillation",
+            min_generation_coverage=min_generation_coverage,
+            min_token_coverage=min_token_coverage,
         )
+
+
+def strict() -> FailurePolicy:
+    """Require every selected generation and token to receive teacher targets."""
+
+    return FailurePolicy.strict()
+
+
+def mask_failed_generation(
+    *,
+    min_generation_coverage: float,
+    min_token_coverage: float,
+) -> FailurePolicy:
+    """Mask failed KD generations when both coverage floors remain satisfied."""
+
+    return FailurePolicy.mask_failed_generation(
+        min_generation_coverage=min_generation_coverage,
+        min_token_coverage=min_token_coverage,
+    )
 
 
 class DistillationPreparationError(RuntimeError):
@@ -124,6 +151,7 @@ class DistillationPreparer:
         view: SameContext | None = None,
         failure_policy: FailurePolicy | None = None,
         max_concurrency: int = 8,
+        max_retries: int = 2,
     ) -> None:
         if not teacher_name:
             raise ValueError("teacher_name must not be empty")
@@ -133,6 +161,12 @@ class DistillationPreparer:
             )
         if max_concurrency <= 0:
             raise ValueError("max_concurrency must be positive")
+        if (
+            not isinstance(max_retries, int)
+            or isinstance(max_retries, bool)
+            or max_retries < 0
+        ):
+            raise ValueError("max_retries must be a non-negative integer")
         self._scorer = scorer
         self._teacher_name = teacher_name
         self._target = target
@@ -140,6 +174,7 @@ class DistillationPreparer:
         self._view = view
         self._failure_policy = failure_policy or FailurePolicy.strict()
         self._max_concurrency = max_concurrency
+        self._max_retries = max_retries
 
     async def prepare(
         self,
@@ -170,7 +205,7 @@ class DistillationPreparer:
         issues = tuple(
             outcome.issue for outcome in outcomes if outcome.issue is not None
         )
-        if issues and self._failure_policy.mode == "strict":
+        if issues and self._failure_policy.on_teacher_error == "raise":
             raise DistillationPreparationError(
                 "Teacher scoring failed under the strict failure policy.",
                 issues=issues,
@@ -185,12 +220,17 @@ class DistillationPreparer:
         prepared_tokens = sum(
             len(outcome.request.selected_positions) for outcome in successful
         )
-        coverage = prepared_tokens / selected_tokens
-        if prepared_tokens == 0 or (
-            coverage < self._failure_policy.min_prepared_token_fraction
+        prepared_generations = len(successful)
+        generation_coverage = prepared_generations / len(requests)
+        token_coverage = prepared_tokens / selected_tokens
+        if (
+            prepared_tokens == 0
+            or generation_coverage < self._failure_policy.min_generation_coverage
+            or token_coverage < self._failure_policy.min_token_coverage
         ):
             raise DistillationPreparationError(
-                "Prepared-token coverage is below the configured threshold.",
+                "Prepared generation or token coverage is below the configured "
+                "threshold.",
                 issues=issues,
             )
 
@@ -211,6 +251,7 @@ class DistillationPreparer:
             targets=targets,
             report=PreparationReport(
                 selected_generations=len(requests),
+                prepared_generations=prepared_generations,
                 selected_tokens=selected_tokens,
                 prepared_tokens=prepared_tokens,
                 issue_count=len(issues),
@@ -292,21 +333,34 @@ class DistillationPreparer:
         request: TeacherScoringRequest,
         semaphore: asyncio.Semaphore,
     ) -> _Outcome:
-        try:
-            async with semaphore:
-                result = await self._scorer.score(request)
-            return _Outcome(request=request, result=result.validate_for(request))
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return _Outcome(
-                request=request,
-                issue=PreparationIssue(
-                    generation_id=request.generation_id,
-                    teacher_name=request.teacher_name,
-                    selected_positions=request.selected_positions,
-                ),
-            )
+        for attempt in range(self._max_retries + 1):
+            try:
+                async with semaphore:
+                    result = await self._scorer.score(request)
+                return _Outcome(request=request, result=result.validate_for(request))
+            except asyncio.CancelledError:
+                raise
+            except RetryableTeacherScoringError:
+                if attempt < self._max_retries:
+                    continue
+                return _Outcome(
+                    request=request,
+                    issue=PreparationIssue(
+                        generation_id=request.generation_id,
+                        teacher_name=request.teacher_name,
+                        selected_positions=request.selected_positions,
+                    ),
+                )
+            except Exception:
+                return _Outcome(
+                    request=request,
+                    issue=PreparationIssue(
+                        generation_id=request.generation_id,
+                        teacher_name=request.teacher_name,
+                        selected_positions=request.selected_positions,
+                    ),
+                )
+        raise AssertionError("retry loop must return an outcome")
 
 
 def _selected_positions(

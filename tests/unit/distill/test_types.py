@@ -138,12 +138,15 @@ def test_preparation_report_requires_complete_issue_ledger() -> None:
     )
     report = distill.PreparationReport(
         selected_generations=2,
+        prepared_generations=1,
         selected_tokens=2,
         prepared_tokens=1,
         issue_count=1,
         issues=(issue,),
     )
     assert report.issues == (issue,)
+    assert report.generation_coverage == 0.5
+    assert report.token_coverage == 0.5
 
     with pytest.raises(ValidationError, match="issue count"):
         report.model_copy(update={"issue_count": 0}).model_validate(
@@ -155,6 +158,15 @@ def test_public_values_are_frozen() -> None:
     target = distill.TopK()
     with pytest.raises(ValidationError):
         target.k = 8  # ty: ignore[invalid-assignment]
+
+    assert distill.strict() == distill.FailurePolicy.strict()
+    assert distill.mask_failed_generation(
+        min_generation_coverage=0.8,
+        min_token_coverage=0.7,
+    ) == distill.FailurePolicy.mask_failed_generation(
+        min_generation_coverage=0.8,
+        min_token_coverage=0.7,
+    )
 
     context = distill.PreparationContext(
         learner_revision=0,

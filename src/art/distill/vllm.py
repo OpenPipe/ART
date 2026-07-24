@@ -12,6 +12,7 @@ from art.serving_capabilities import ServingCapabilities
 
 from .scorer import (
     RankedTokenLogprob,
+    RetryableTeacherScoringError,
     ScoredPosition,
     TeacherScoringRequest,
     TeacherScoringResult,
@@ -20,6 +21,13 @@ from .scorer import (
 
 class VLLMScoringError(RuntimeError):
     """The vLLM endpoint cannot produce a trustworthy teacher target."""
+
+
+class VLLMRetryableScoringError(
+    VLLMScoringError,
+    RetryableTeacherScoringError,
+):
+    """Transient vLLM failure safe to retry with the identical request."""
 
 
 class VLLMTeacherScorer:
@@ -57,6 +65,14 @@ class VLLMTeacherScorer:
         if request.teacher_view.protocol != "chat_completions":
             raise VLLMScoringError(
                 "vLLM teacher scoring currently requires a chat-completions view"
+            )
+        teacher_view = request.teacher_view.request()
+        if not isinstance(teacher_view, dict):
+            raise VLLMScoringError("teacher chat view must be a JSON object")
+        truncate_prompt_tokens = teacher_view.get("truncate_prompt_tokens")
+        if truncate_prompt_tokens is not None and truncate_prompt_tokens is not False:
+            raise VLLMScoringError(
+                "vLLM teacher scoring does not allow prompt truncation"
             )
 
         if self._client is not None:
@@ -208,9 +224,18 @@ class VLLMTeacherScorer:
                 json=body,
                 timeout=self._timeout,
             )
+        except httpx.RequestError as exc:
+            raise VLLMRetryableScoringError(
+                f"vLLM request to {path} failed transiently"
+            ) from exc
+        if response.status_code in {408, 425, 429} or response.status_code >= 500:
+            raise VLLMRetryableScoringError(
+                f"vLLM request to {path} failed transiently"
+            )
+        try:
             response.raise_for_status()
             value = response.json()
-        except httpx.HTTPError as exc:
+        except httpx.HTTPStatusError as exc:
             raise VLLMScoringError(f"vLLM request to {path} failed") from exc
         except ValueError as exc:
             raise VLLMScoringError(

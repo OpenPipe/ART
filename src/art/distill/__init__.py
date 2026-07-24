@@ -21,6 +21,8 @@ from .preparer import (
     DistillationPreparationError,
     FailurePolicy,
     SameContext,
+    mask_failed_generation,
+    strict,
 )
 from .types import (
     AnyRevision,
@@ -66,6 +68,7 @@ __all__ = [
     "FailurePolicy",
     "last_generation",
     "Loss",
+    "mask_failed_generation",
     "PartSpan",
     "prepare",
     "PreparationContext",
@@ -75,6 +78,7 @@ __all__ = [
     "PreparedTrainingBatch",
     "RolloutRevisionSpan",
     "StudentOnPolicy",
+    "strict",
     "same_context",
     "SameContext",
     "TeacherView",
