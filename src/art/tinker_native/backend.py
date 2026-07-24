@@ -30,6 +30,7 @@ import torch
 import uvicorn
 
 from .. import dev
+from .._backend_training import reject_unsupported_prepared_batch
 from ..adapter_leases import pin_inference_step, pinned_inference_step
 from ..backend import Backend
 from ..costs import build_cost_calculator, compute_train_cost, get_model_pricing
@@ -344,6 +345,10 @@ class TinkerNativeBackend:
         kl_penalty_source: Literal["sample"] = "sample",
         **kwargs: Any,
     ) -> TrainResult:
+        reject_unsupported_prepared_batch(
+            trajectory_groups,
+            backend_name=type(self).__name__,
+        )
         assert kl_penalty_source == "sample", (
             "TinkerNativeBackend only supports kl_penalty_source='sample'."
         )

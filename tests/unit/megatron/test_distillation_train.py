@@ -631,15 +631,23 @@ def test_distillation_metrics_include_stable_public_keys(tmp_path: Path) -> None
     )
 
     metrics = json.loads(log_path.read_text())
-    assert metrics["loss/distillation_sum"] == 3.0
-    assert metrics["loss/distillation_selected"] == 1.0
-    assert metrics["loss/distillation_tail"] == 0.5
-    assert metrics["data/distillation_tokens"] == 2.0
-    assert metrics["distillation/coefficient"] == 0.5
-    assert metrics["distillation/temperature"] == 1.0
-    assert metrics["distillation/teacher_tail_mass_mean"] == 0.2
-    assert metrics["distillation/student_tail_mass_mean"] == 0.3
-    assert metrics["distillation/numerical_clamp_count"] == 1.0
+    assert metrics == {
+        "data/step_distillation_target_tokens": 2.0,
+        "data/step_num_gradient_steps": 1.0,
+        "distillation/coefficient": 0.5,
+        "distillation/numerical_clamp_count": 1.0,
+        "distillation/student_tail_mass_mean": 0.3,
+        "distillation/teacher_tail_mass_mean": 0.2,
+        "distillation/temperature": 1.0,
+        "loss/distillation": 0.75,
+        "loss/distillation_selected": 1.0,
+        "loss/distillation_selected_sum": 2.0,
+        "loss/distillation_sum": 3.0,
+        "loss/distillation_tail": 0.5,
+        "loss/distillation_tail_sum": 1.0,
+        "loss/grad_norm": 0.4,
+        "loss/train": 0.75,
+    }
 
 
 def test_policy_only_distillation_metrics_remain_finite(tmp_path: Path) -> None:
@@ -670,11 +678,26 @@ def test_policy_only_distillation_metrics_remain_finite(tmp_path: Path) -> None:
     )
 
     metrics = json.loads(log_path.read_text())
-    assert metrics["loss/train"] == 0.25
-    assert metrics["loss/policy"] == 0.25
-    assert metrics["loss/distillation"] == 0.0
-    assert metrics["loss/distillation_selected"] == 0.0
-    assert metrics["loss/distillation_tail"] == 0.0
+    assert metrics == {
+        "data/step_distillation_target_tokens": 0.0,
+        "data/step_num_gradient_steps": 2.0,
+        "data/step_policy_tokens": 1.0,
+        "distillation/coefficient": 0.5,
+        "distillation/numerical_clamp_count": 0.0,
+        "distillation/student_tail_mass_mean": 0.0,
+        "distillation/teacher_tail_mass_mean": 0.0,
+        "distillation/temperature": 1.0,
+        "loss/distillation": 0.0,
+        "loss/distillation_selected": 0.0,
+        "loss/distillation_selected_sum": 0.0,
+        "loss/distillation_sum": 0.0,
+        "loss/distillation_tail": 0.0,
+        "loss/distillation_tail_sum": 0.0,
+        "loss/grad_norm": 0.4,
+        "loss/policy": 0.25,
+        "loss/policy_sum": 0.25,
+        "loss/train": 0.25,
+    }
     assert all(math.isfinite(value) for value in metrics.values())
 
 

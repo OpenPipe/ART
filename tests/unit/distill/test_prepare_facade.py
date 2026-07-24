@@ -242,6 +242,72 @@ async def test_advanced_learner_can_use_an_older_frozen_self_teacher(
     assert scorer.requests[0].teacher_revision == 5
 
 
+async def test_materialized_opsd_example_keeps_hint_out_of_learner_artifact(
+    facade: CandidateTrainingBatch,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _Backend()
+    student = _Model(
+        name="student",
+        backend=backend,
+        capabilities=_capabilities(),
+    )
+    _RecordingScorer.backend = backend
+    generation = facade.generation("generation-1")
+    hint = "private review: choose token 2"
+    provenance = {
+        "feedback_id": "feedback-42",
+        "source": {"trace_id": "trace-17"},
+    }
+    example = distill.Example.create(
+        generation=generation,
+        teacher_view=distill.prepend_message(
+            distill.captured_context(generation),
+            {"role": "system", "content": hint},
+        ),
+        parts={distill.GenerationPart.ASSISTANT_TEXT},
+        provenance=provenance,
+    )
+    candidate = CandidateTrainingBatch.create(
+        groups=facade.groups,
+        examples=(example,),
+    )
+    monkeypatch.setattr(
+        "art.distill.candidate.snapshot_groups",
+        lambda *_args, **_kwargs: candidate,
+    )
+
+    prepared = await distill.prepare(
+        cast(TrainableModel[Any, Any], student),
+        (),
+        teacher=cast(Model[Any, Any], student),
+        examples=(example,),
+        target=distill.TopK(k=2),
+        consistency=distill.Frozen(revision=7),
+    )
+
+    scorer_request = _RecordingScorer.instances[0].requests[0]
+    teacher_request = cast(dict[str, Any], scorer_request.teacher_view.request())
+    assert teacher_request["messages"] == [
+        {"role": "system", "content": hint},
+        {"content": "choose", "role": "user"},
+    ]
+    assert scorer_request.teacher_revision == 7
+    assert prepared.constraints.learner_revision == 7
+    assert prepared.constraints.consistency == distill.Frozen(revision=7)
+
+    payload = prepared.parsed_payload()
+    learner_generation = payload.groups[0].trajectories[0].generations[0]
+    learner_request = cast(dict[str, Any], learner_generation.context.request())
+    assert learner_request["messages"] == [{"content": "choose", "role": "user"}]
+    assert learner_generation.rollout_spans == (
+        distill.RolloutRevisionSpan(start=0, end=1, revision=7),
+    )
+    assert hint.encode() not in prepared.to_bytes()
+    assert payload.targets[0].provenance.to_dict() == provenance
+    assert payload.targets[0].teacher_revision == 7
+
+
 async def test_public_retry_count_retries_the_same_scoring_request(
     facade: CandidateTrainingBatch,
 ) -> None:

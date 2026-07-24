@@ -95,7 +95,8 @@
       {
         "group": "Experimental",
         "pages": [
-          "experimental/gspo"
+          "experimental/gspo",
+          "experimental/on-policy-distillation"
         ]
       }
     ]

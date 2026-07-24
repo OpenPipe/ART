@@ -12,7 +12,13 @@ import pytest
 import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
+from art import (
+    PipelineRuntimeConfig,
+    PreparedTrainingBatch,
+    TrainableModel,
+    Trajectory,
+    TrajectoryGroup,
+)
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
 from art.megatron import MegatronBackend
@@ -321,6 +327,30 @@ async def test_local_backend_train_translates_loss_fn(tmp_path: Path) -> None:
     assert seen["config"].learning_rate == 5e-6
     assert seen["dev_config"]["ppo"] is True
     assert seen["dev_config"]["packed_sequence_length"] == 2048
+
+
+@pytest.mark.asyncio
+async def test_local_backend_rejects_prepared_batch_before_training(
+    tmp_path: Path,
+) -> None:
+    backend = LocalBackend(path=str(tmp_path))
+    train_model = MagicMock()
+    setattr(backend, "_train_model", train_model)
+    prepared = PreparedTrainingBatch(
+        schema_version=1,
+        batch_id="unused",
+        preparation_id="unused",
+        payload=b"unused",
+        payload_sha256="unused",
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match="LocalBackend does not support PreparedTrainingBatch",
+    ):
+        await backend.train(cast(Any, object()), cast(Any, prepared))
+
+    train_model.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -1439,22 +1439,15 @@ def _log_distillation_step_result(
         "loss/distillation_tail": (
             step_result.tail_loss_sum / target_tokens if target_tokens > 0 else 0.0
         ),
-        "loss/distillation_raw_sum": step_result.raw_loss_sum,
         "loss/distillation_selected_sum": step_result.selected_loss_sum,
         "loss/distillation_tail_sum": step_result.tail_loss_sum,
         "loss/grad_norm": float(step_result.grad_norm),
-        "data/distillation_tokens": target_tokens,
         "data/step_distillation_target_tokens": target_tokens,
         "distillation/coefficient": float(coefficient),
         "distillation/temperature": float(temperature),
         "distillation/teacher_tail_mass_mean": (step_result.teacher_tail_mass_mean),
         "distillation/student_tail_mass_mean": (step_result.student_tail_mass_mean),
         "distillation/numerical_clamp_count": float(step_result.numerical_clamp_count),
-        "distill/coefficient": float(coefficient),
-        "distill/temperature": float(temperature),
-        "distill/teacher_tail_mass_mean": step_result.teacher_tail_mass_mean,
-        "distill/student_tail_mass_mean": step_result.student_tail_mass_mean,
-        "distill/numerical_clamp_count": float(step_result.numerical_clamp_count),
         TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
     }
     if step_result.policy_token_count > 0:
@@ -1463,7 +1456,6 @@ def _log_distillation_step_result(
             {
                 "loss/policy": step_result.policy_loss_sum / policy_tokens,
                 "loss/policy_sum": step_result.policy_loss_sum,
-                "data/policy_tokens": policy_tokens,
                 "data/step_policy_tokens": policy_tokens,
             }
         )

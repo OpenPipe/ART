@@ -7,6 +7,7 @@ from .capture import (
     captured_context,
     generations,
     last_generation,
+    prepend_message,
     with_tools,
 )
 from .prepare import (
@@ -70,6 +71,7 @@ __all__ = [
     "Loss",
     "mask_failed_generation",
     "PartSpan",
+    "prepend_message",
     "prepare",
     "PreparationContext",
     "PreparationReport",

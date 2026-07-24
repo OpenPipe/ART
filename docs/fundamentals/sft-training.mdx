@@ -5,7 +5,7 @@ sidebarTitle: "SFT Training"
 icon: "graduation-cap"
 ---
 
-**Supervised fine-tuning (SFT)** trains a model on labeled chat examples rather than through trial-and-error with rewards. It's useful for **distillation** (training a smaller model on outputs from a larger teacher model), **teaching a specific output style or format**, and **warming up** a model before RL training so it starts from a stronger baseline.
+**Supervised fine-tuning (SFT)** trains a model on labeled chat examples rather than through trial-and-error with rewards. It's useful for **response-level distillation** (training on outputs sampled from a teacher), **teaching a specific output style or format**, and **warming up** a model before RL training so it starts from a stronger baseline.
 
 ART supports SFT on both `LocalBackend` and `ServerlessBackend`.
 
@@ -123,9 +123,9 @@ Set `assistant_turns="last"` to calculate loss only on the final assistant
 message in each JSONL row. Earlier assistant messages remain available as
 context. If omitted, the helper trains on all assistant turns.
 
-## Distillation
+## Response-level distillation
 
-Distillation trains a smaller model on completions from a larger teacher model. Generate responses from the teacher, wrap them as trajectories, and fine-tune:
+Response-level distillation trains a student on completions sampled from a teacher. It is ordinary SFT: generate responses from the teacher, wrap them as trajectories, and fine-tune. To train on token-level teacher distributions with OPD or OPSD instead, see [On-Policy Distillation](/experimental/on-policy-distillation).
 
 ```python
 import asyncio

@@ -14,6 +14,7 @@ from .. import dev
 from .._backend_training import (
     aggregate_rl_training_metrics,
     build_rl_train_configs,
+    reject_unsupported_prepared_batch,
 )
 from ..backend import AnyTrainableModel
 from ..metrics_taxonomy import (
@@ -345,6 +346,10 @@ class ServerlessBackend:
             # Optionally log training metrics:
             # await model.log(metrics=result.metrics, step=result.step)
         """
+        reject_unsupported_prepared_batch(
+            trajectory_groups,
+            backend_name=type(self).__name__,
+        )
         del optimizer_save_interval
         groups_list = list(trajectory_groups)
         if loss_fn is None:

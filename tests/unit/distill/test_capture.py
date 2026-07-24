@@ -178,6 +178,24 @@ def test_teacher_view_edits_are_functional_and_mutation_isolated() -> None:
     assert patched.fingerprint != hinted.fingerprint != original.fingerprint
 
 
+def test_prepend_message_is_system_first_and_does_not_mutate_source_view() -> None:
+    original = distill.captured_context(distill.last_generation(_trajectory()))
+
+    hinted = distill.prepend_message(
+        original,
+        {"role": "system", "content": "private hint"},
+    )
+
+    original_request = cast(dict[str, Any], original.request())
+    hinted_request = cast(dict[str, Any], hinted.request())
+    assert original_request["messages"] == [{"role": "user", "content": "question-1"}]
+    assert hinted_request["messages"] == [
+        {"role": "system", "content": "private hint"},
+        {"role": "user", "content": "question-1"},
+    ]
+    assert hinted.fingerprint != original.fingerprint
+
+
 def test_missing_exact_metadata_is_rejected() -> None:
     exchange = _exchange(prompt=[1], completion=[2], offset=0)
     extra = exchange.response.choices[0].model_extra

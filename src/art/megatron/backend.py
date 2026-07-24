@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import math
 import os
 import time
-from typing import Any, Iterable, cast
+from typing import Any, Iterable, Literal, cast, overload
 import uuid
 
 from mp_actors import move_to_child_process
@@ -95,7 +95,68 @@ class MegatronBackend(LocalBackend):
             # Keep durable Megatron state migrations centralized behind this call.
             apply_megatron_migrations(get_model_dir(model=model, art_path=self._path))
 
+    @overload
     async def train(
+        self,
+        model: AnyTrainableModel,
+        trajectory_groups: PreparedTrainingBatch,
+        *,
+        objectives: TrainingObjectives,
+        idempotency_key: str,
+        learning_rate: float = 5e-6,
+        grad_accumulation_sequences: int | None = None,
+        optimizer_save_interval: Literal[1] = 1,
+        save_checkpoint: bool = True,
+        verbose: bool = False,
+        epsilon: float | None = None,
+        epsilon_high: float | None = None,
+        importance_sampling_level: Literal["token"] = "token",
+        scale_rewards: bool = True,
+        advantage_balance: float = 0.0,
+        session: object | None = None,
+    ) -> LocalTrainResult: ...
+
+    @overload
+    async def train(
+        self,
+        model: AnyTrainableModel,
+        trajectory_groups: Iterable[TrajectoryGroup],
+        *,
+        learning_rate: float = 5e-6,
+        loss_fn: Literal["cispo", "ppo"] = "cispo",
+        loss_fn_config: dict | None = None,
+        normalize_advantages: bool = True,
+        adam_params: object | None = None,
+        kl_penalty_coef: float = 0.0,
+        kl_penalty_reference_step: int | None = None,
+        kl_ref_adapter_path: str | None = None,
+        kl_penalty_source: Literal["current_learner", "sample"] = "current_learner",
+        epsilon: float | None = None,
+        epsilon_high: float | None = None,
+        advantage_balance: float = 0.0,
+        scale_rewards: bool = True,
+        importance_sampling_level: Literal[
+            "token",
+            "sequence",
+            "average",
+            "geometric_average",
+        ] = "token",
+        max_negative_advantage_importance_sampling_weight: float | None = None,
+        mask_prob_ratio: bool = False,
+        kimi_k2_tau: float | None = None,
+        precalculate_logprobs: bool = False,
+        allow_training_without_logprobs: bool = False,
+        plot_tensors: bool = False,
+        truncated_importance_sampling: float | None = None,
+        scale_learning_rate_by_reward_std_dev: bool = False,
+        logprob_calculation_chunk_size: int = 1024,
+        num_trajectories_learning_rate_multiplier_power: float = 0.0,
+        save_checkpoint: bool = True,
+        optimizer_save_interval: int = 5,
+        verbose: bool = False,
+    ) -> LocalTrainResult: ...
+
+    async def train(  # type: ignore[override, ty:invalid-method-override]
         self,
         model: AnyTrainableModel,
         trajectory_groups: Iterable[TrajectoryGroup] | PreparedTrainingBatch,
@@ -283,8 +344,8 @@ class MegatronBackend(LocalBackend):
             return LocalTrainResult(
                 step=committed_step,
                 metrics={
-                    "distill/idempotent_replay": 1.0,
-                    "distill/committed_step": float(committed_step),
+                    "distillation/idempotent_replay": 1.0,
+                    "distillation/committed_step": float(committed_step),
                     "data/step_num_gradient_steps": 0.0,
                 },
                 checkpoint_path=checkpoint_path,

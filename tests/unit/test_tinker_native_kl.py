@@ -1,7 +1,10 @@
+from typing import Any, cast
+from unittest.mock import patch
+
 import pytest
 import tinker
 
-from art import TrainableModel
+from art import PreparedTrainingBatch, TrainableModel
 from art.tinker_native.backend import TinkerNativeBackend, _apply_kl_penalty
 from art.tinker_native.data import build_datum
 
@@ -76,3 +79,28 @@ async def test_tinker_native_backend_rejects_current_learner_kl_source(
             kl_penalty_coef=0.25,
             kl_penalty_source="current_learner",  # ty:ignore[invalid-argument-type]
         )
+
+
+@pytest.mark.asyncio
+async def test_tinker_native_backend_rejects_prepared_batch_before_training(
+    tmp_path,
+) -> None:
+    backend = TinkerNativeBackend(tinker_api_key="test-key", path=str(tmp_path))
+    prepared = PreparedTrainingBatch(
+        schema_version=1,
+        batch_id="unused",
+        preparation_id="unused",
+        payload=b"unused",
+        payload_sha256="unused",
+    )
+
+    with (
+        patch("art.tinker_native.backend.trajectory_groups_to_datums") as to_datums,
+        pytest.raises(
+            NotImplementedError,
+            match="TinkerNativeBackend does not support PreparedTrainingBatch",
+        ),
+    ):
+        await backend.train(cast(Any, object()), cast(Any, prepared))
+
+    to_datums.assert_not_called()

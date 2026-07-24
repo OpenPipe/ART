@@ -1,10 +1,10 @@
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from art import TrainableModel, Trajectory, TrajectoryGroup
+from art import PreparedTrainingBatch, TrainableModel, Trajectory, TrajectoryGroup
 from art.serverless.backend import ServerlessBackend
 from art.types import TrainConfig, TrainSFTConfig
 
@@ -106,6 +106,28 @@ async def test_serverless_train_accepts_pipeline_trainer_kwargs() -> None:
         "scale_rewards": False,
         "truncated_importance_sampling": 2.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_serverless_backend_rejects_prepared_batch_before_training() -> None:
+    backend = _make_backend()
+    train_model = MagicMock()
+    setattr(backend, "_train_model", train_model)
+    prepared = PreparedTrainingBatch(
+        schema_version=1,
+        batch_id="unused",
+        preparation_id="unused",
+        payload=b"unused",
+        payload_sha256="unused",
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match="ServerlessBackend does not support PreparedTrainingBatch",
+    ):
+        await backend.train(cast(Any, object()), cast(Any, prepared))
+
+    train_model.assert_not_called()
 
 
 @pytest.mark.asyncio

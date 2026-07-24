@@ -190,11 +190,11 @@ def validate_standalone_forward_kl(
     expert_parallel_size: int,
     expert_tensor_parallel_size: int,
 ) -> PreparedPayload:
-    """Validate every M3 capability before disk/service/optimizer mutation."""
+    """Validate standalone prepared-batch capabilities before any mutation."""
 
     if objectives.policy is not None:
         raise ValueError(
-            "M3 Megatron prepared-batch training supports standalone distillation only"
+            "standalone Megatron prepared-batch training requires policy=None"
         )
     payload = validate_prepared_forward_kl(
         batch=batch,
@@ -224,18 +224,21 @@ def _validate_fixed_sparse_targets(payload: PreparedPayload) -> None:
 
     widths = {len(target.token_ids) for target in payload.targets}
     if len(widths) != 1:
-        raise ValueError("M3 Megatron distillation requires a fixed top-k width")
+        raise ValueError(
+            "standalone Megatron distillation requires a fixed top-k width"
+        )
     width = next(iter(widths))
     if width >= payload.constraints.logical_vocab_size:
         raise ValueError(
-            "M3 Megatron distillation requires sparse top-k targets with a tail"
+            "standalone Megatron distillation requires sparse top-k targets with a tail"
         )
     if any(target.tail_logprob is None for target in payload.targets):
         raise ValueError("every sparse top-k target must include tail mass")
     temperatures = {target.temperature for target in payload.targets}
     if len(temperatures) != 1:
         raise ValueError(
-            "M3 Megatron distillation requires one temperature per prepared batch"
+            "standalone Megatron distillation requires one temperature per "
+            "prepared batch"
         )
 
 
@@ -380,7 +383,7 @@ def pack_prepared_batch(
 ) -> DiskPackedDistillationTensors:
     """Join immutable policy/KD projections into deterministic fixed-K sidecars.
 
-    Omitting ``objectives`` preserves the M3 standalone-KD packing behavior.
+    Omitting ``objectives`` preserves standalone-KD packing behavior.
     Supplying an additive CISPO objective retains every original trajectory so a
     teacher failure or unselected generation cannot change the policy cohort.
     """
@@ -661,7 +664,7 @@ def _empty_policy_sidecars(
     num_sequences: int,
     sequence_length: int,
 ) -> dict[str, torch.Tensor]:
-    """Adapt an original M3 sidecar directory to the extended in-memory shape."""
+    """Adapt legacy standalone sidecars to the extended in-memory shape."""
 
     return {
         "source_group_ids": torch.arange(num_sequences, dtype=torch.long),
@@ -742,7 +745,7 @@ def _validate_policy_sidecars(
     else:
         raise ValueError("unsupported prepared policy objective")
     if not extended_layout and (declared_count != 0 or policy_kind is not None):
-        raise ValueError("original M3 sidecars cannot declare a policy objective")
+        raise ValueError("legacy standalone sidecars cannot declare a policy objective")
 
     old_logprobs = tensors["old_logprobs"]
     active_logprobs = old_logprobs[policy_mask]

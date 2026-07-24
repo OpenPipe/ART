@@ -1,0 +1,341 @@
+---
+title: "On-Policy Distillation"
+description: "Train with token-level teacher distributions using OPD or OPSD."
+sidebarTitle: "On-Policy Distillation"
+icon: "flask"
+---
+
+<Note>
+Distribution distillation is experimental. V1 uses synchronous orchestration and prepared batches on `MegatronBackend`.
+</Note>
+
+ART separates distillation into two steps:
+
+1. `distill.prepare(...)` captures exact student generations and acquires immutable teacher targets.
+2. `backend.train(...)` consumes that prepared batch with standalone forward KL or additive CISPO and forward KL.
+
+This supports two common modes:
+
+- **On-policy distillation (OPD):** transfer behavior from a frozen external teacher to student-on-policy generations.
+- **On-policy self-distillation (OPSD):** score student-on-policy generations with a frozen or exact-current revision of the student, optionally after the application adds feedback as a teacher hint.
+
+The application owns rollout collection, feedback lookup, hint text, and artifact storage. ART owns exact token capture, revision checks, teacher scoring, target validation, and training.
+
+## Shared setup
+
+The examples below assume `collect_student_rollouts(student)` is your application rollout function. It must use `await art.trajectory(...)` or another exchange-backed capture path; legacy `messages_and_choices` trajectories do not contain the exact inference metadata required here.
+
+```python
+from pathlib import Path
+
+import art
+from art import TrainingObjectives, distill
+from art.megatron.backend import MegatronBackend
+
+backend = MegatronBackend()
+student = art.TrainableModel(
+    name="student",
+    project="distillation",
+    base_model="Qwen/Qwen3.5-4B",
+)
+await student.register(backend)
+
+target = distill.TopK(k=32, temperature=1.0)
+kd = distill.Loss(
+    divergence=distill.ForwardKL(),
+    coefficient=1.0,
+)
+
+
+def persist_prepared(
+    batch: distill.PreparedTrainingBatch,
+    path: Path,
+) -> distill.PreparedTrainingBatch:
+    """Atomically publish and validate the exact bytes that will be submitted."""
+    payload = batch.to_bytes()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_bytes(payload)
+    temporary.replace(path)
+    return distill.PreparedTrainingBatch.from_bytes(path.read_bytes())
+```
+
+Always persist `PreparedTrainingBatch.to_bytes()` before training. If a frozen-teacher submission has an ambiguous outcome, retry by loading those exact bytes with `PreparedTrainingBatch.from_bytes(...)` and reuse the same `idempotency_key`. Do not prepare a replacement batch for the retry.
+
+## External-teacher OPD
+
+An external teacher is an `art.Model`; it does not use a special distillation model class. Its server must satisfy the [teacher endpoint contract](#teacher-endpoint-contract).
+
+```python
+teacher = art.Model(
+    name="teacher",
+    project="distillation",
+    inference_model_name="Qwen/Qwen3.5-32B",
+    inference_base_url="http://teacher-vllm:8000/v1",
+    inference_api_key="local",
+)
+
+for update in range(num_updates):
+    groups = await collect_student_rollouts(student)
+
+    batch = await distill.prepare(
+        student,
+        groups,
+        teacher=teacher,
+        select=distill.all_generations(
+            parts=[distill.GenerationPart.ASSISTANT_TEXT],
+        ),
+        teacher_view=distill.same_context(),
+        target=target,
+        consistency=distill.Frozen(revision="teacher-v1"),
+        rollouts=distill.StudentOnPolicy(),
+        failures=distill.strict(),
+    )
+    batch = persist_prepared(batch, Path(f"prepared/opd-{update}.json"))
+
+    result = await backend.train(
+        student,
+        batch,
+        objectives=TrainingObjectives(
+            policy=None,
+            distillation=kd,
+        ),
+        idempotency_key=f"opd-{update}",
+    )
+```
+
+The frozen revision is persisted as target provenance. For an external teacher, this value is a caller assertion: use a stable identifier that names the weights served for the entire preparation and keep the endpoint pinned to them. ART rejects a different revision when the endpoint returns observable revision identity, but V1 cannot prove an external revision when the endpoint omits it. Frozen self-distillation is stronger because the Megatron backend holds an exact adapter lease.
+
+## Frozen OPSD with application-owned feedback
+
+Keep feedback selection outside ART. The application decides which generation the feedback applies to and constructs an `Example` only for that generation. `prepend_message(...)` returns a new teacher view, placing a system hint before the original conversation without mutating the captured view.
+
+```python
+teacher_revision = await student.get_step()
+
+for update in range(num_updates):
+    groups = await collect_student_rollouts(student)
+    examples = []
+
+    for group in groups:
+        for trajectory in group.trajectories:
+            for generation in distill.generations(trajectory):
+                # Application-owned lookup. Return None when this generation
+                # has no reviewed feedback.
+                feedback = feedback_for(generation)
+                if feedback is None:
+                    continue
+
+                teacher_view = distill.prepend_message(
+                    distill.captured_context(generation),
+                    {
+                        "role": "system",
+                        "content": feedback.hint,
+                    },
+                )
+                examples.append(
+                    distill.Example.create(
+                        generation=generation,
+                        teacher_view=teacher_view,
+                        parts={distill.GenerationPart.ASSISTANT_TEXT},
+                        provenance={"feedback_id": feedback.id},
+                    )
+                )
+
+    if not examples:
+        continue
+
+    batch = await distill.prepare(
+        student,
+        groups,
+        teacher=student,
+        examples=examples,
+        target=target,
+        consistency=distill.Frozen(revision=teacher_revision),
+        rollouts=distill.StudentOnPolicy(),
+        failures=distill.strict(),
+    )
+    batch = persist_prepared(batch, Path(f"prepared/frozen-opsd-{update}.json"))
+
+    result = await backend.train(
+        student,
+        batch,
+        objectives=TrainingObjectives(
+            policy=None,
+            distillation=kd,
+        ),
+        idempotency_key=f"frozen-opsd-{update}",
+    )
+```
+
+This example fixes the teacher at one historical student revision while fresh rollouts come from each current student revision. Feedback may come from Weave or another application store; ART does not interpret trajectory-level feedback or decide which turn it supervises.
+
+## Exact-current OPSD
+
+`backend.current_step(student)` holds one learner revision across rollout, preparation, and exactly one update. `CurrentStep` is valid only inside that context and must be passed back with the same `session` object.
+
+```python
+for update in range(num_updates):
+    async with backend.current_step(student) as session:
+        groups = await collect_student_rollouts(student)
+
+        batch = await distill.prepare(
+            student,
+            groups,
+            teacher=student,
+            select=distill.all_generations(
+                parts=[distill.GenerationPart.ASSISTANT_TEXT],
+            ),
+            teacher_view=distill.same_context(),
+            target=target,
+            consistency=distill.CurrentStep(session),
+            rollouts=distill.StudentOnPolicy(),
+            failures=distill.strict(),
+        )
+        batch = persist_prepared(batch, Path(f"prepared/current-opsd-{update}.json"))
+
+        result = await backend.train(
+            student,
+            batch,
+            objectives=TrainingObjectives(
+                policy=None,
+                distillation=kd,
+            ),
+            idempotency_key=f"current-opsd-{update}",
+            session=session,
+        )
+```
+
+A current-step session is deliberately single-use: do not make a second `backend.train` call in the same context. If the update outcome is ambiguous, preserve the artifact and idempotency key for recovery rather than preparing new targets or silently treating a later revision as “current.”
+
+## Standalone KD
+
+The three complete flows above use standalone KD. It is independent of whether the teacher is external, frozen-self, or exact-current: prepare with the appropriate consistency contract, persist the artifact, then disable the policy objective:
+
+```python
+batch = persist_prepared(batch, Path("prepared/update.json"))
+
+result = await backend.train(
+    student,
+    batch,
+    objectives=TrainingObjectives(
+        policy=None,
+        distillation=distill.Loss(
+            divergence=distill.ForwardKL(),
+            coefficient=1.0,
+        ),
+    ),
+    idempotency_key="update-kd",
+)
+```
+
+Only selected, successfully prepared generation tokens contribute to KD.
+
+## Additive CISPO and KD
+
+The same prepared batch retains the rollout rewards, advantages, behavior log probabilities, and independent KD target mask. Enable CISPO alongside forward KL:
+
+```python
+groups = await collect_student_rollouts(student)
+batch = await distill.prepare(
+    student,
+    groups,
+    teacher=teacher,
+    select=distill.all_generations(
+        parts=[distill.GenerationPart.ASSISTANT_TEXT],
+    ),
+    teacher_view=distill.same_context(),
+    target=target,
+    consistency=distill.Frozen(revision="teacher-v1"),
+    rollouts=distill.StudentOnPolicy(),
+    failures=distill.strict(),
+)
+batch = persist_prepared(batch, Path("prepared/cispo-kd.json"))
+
+result = await backend.train(
+    student,
+    batch,
+    objectives=TrainingObjectives(
+        policy="cispo",
+        distillation=distill.Loss(
+            divergence=distill.ForwardKL(),
+            coefficient=0.5,
+        ),
+    ),
+    idempotency_key="cispo-kd-update",
+    epsilon=1.0,
+    epsilon_high=4.0,
+    importance_sampling_level="token",
+)
+```
+
+CISPO and KD use independent masks and denominators, then ART adds their normalized losses. A generation may contribute to CISPO even when its KD target is masked by the configured preparation failure policy. Prepared-batch PPO is not supported in V1.
+
+## Capture and target contract
+
+V1 capture is intentionally strict:
+
+- Rollouts must be exchange-backed Chat Completions with exact prompt IDs, completion IDs, and rollout revision provenance. Additive CISPO also requires usable behavior-policy log probabilities and rewards.
+- Capture currently supports one choice and assistant text only. Mixed reasoning, refusal, and tool-call output are rejected because their token-part boundaries are not yet trustworthy.
+- `StudentOnPolicy()` requires every selected rollout span to match the learner revision used to prepare the batch. `AnyRevision()` exists for explicit off-policy transfer, but should not be used to bypass stale-rollout errors accidentally.
+- `TopK(k=..., temperature=1.0)` stores the teacher's top-k token log probabilities plus the aggregate probability mass of the remaining vocabulary. Forward KL includes both selected tokens and this tail bucket.
+- Teacher and student must expose identical token-space fingerprints and logical vocabulary sizes. The teacher must advertise at least the requested top-k capacity.
+
+`distill.strict()` rejects any teacher scoring failure. To tolerate operational failures, use explicit coverage floors:
+
+```python
+failures = distill.mask_failed_generation(
+    min_generation_coverage=0.95,
+    min_token_coverage=0.95,
+)
+```
+
+Masking applies to complete failed generations and records sanitized issues in `batch.report`. Contract violations, token misalignment, revision mismatch, invalid distributions, and coverage below either floor still fail closed.
+
+## Teacher endpoint contract
+
+An ordinary OpenAI-compatible endpoint is not enough for distribution distillation. V1 teacher scoring discovers `/art/capabilities` and requires the ART prompt-distribution protocol, including:
+
+- `POST /v1/chat/completions/render` to render the exact teacher prefix;
+- `POST /inference/v1/generate` to force the captured continuation IDs and return prompt log probabilities;
+- observable model identity, token-space fingerprint, logical vocabulary size, unit-temperature support, and maximum prompt-logprob width.
+
+ART's vLLM runtime implements this contract. External services may implement the same routes and capabilities. If render or generate responses include `revision` or `teacher_revision`, ART verifies it against `Frozen(...)`; otherwise the application remains responsible for pinning the asserted external revision. Standard OpenAI endpoints that return only sampled completion log probabilities cannot serve as V1 teachers.
+
+V1 does not route individual examples to different teachers within one prepared batch. For specialist consolidation, run sequential batches: collect a fresh student-on-policy batch, prepare it against one frozen specialist, train it, then repeat for the next specialist.
+
+## What to monitor
+
+Before training, inspect:
+
+```python
+print(batch.report.generation_coverage)
+print(batch.report.token_coverage)
+print(batch.report.issue_count)
+```
+
+Training returns the normal `LocalTrainResult`. Useful metrics include:
+
+- `loss/train`, `loss/distillation`, and, for additive training, `loss/policy`;
+- `data/step_distillation_target_tokens` and `data/step_policy_tokens`;
+- `distillation/teacher_tail_mass_mean` and `distillation/student_tail_mass_mean`;
+- `distillation/numerical_clamp_count`;
+- `distillation/idempotent_replay` when a stable retry returns an already committed update.
+
+Also run an application behavior evaluation after each update. Falling KD loss alone does not show that feedback changed the desired behavior.
+
+## V1 support matrix
+
+| Capability | V1 |
+| --- | --- |
+| Backend training | `MegatronBackend` only |
+| External frozen OPD | Supported with an ART-compatible teacher endpoint |
+| Frozen self-teacher OPSD | Supported |
+| Exact-current OPSD | Supported with a single-use current-step session |
+| Objective | Standalone forward KL or additive CISPO + forward KL |
+| Distribution | Top-k plus aggregate tail, temperature 1 |
+| Feedback and hint selection | Application-owned; `Example` and teacher-view helpers are provided |
+| Multiple specialists | Sequential prepared batches only; no routed teacher |
+| `PipelineTrainer` | Not integrated in V1 |
+
+The synchronous boundary is intentional: gather rollouts, await `distill.prepare(...)`, persist the immutable artifact, then await `backend.train(...)`. A future `PipelineTrainer` integration can schedule preparation asynchronously because teacher acquisition is already separated from backend mutation; it must preserve the same artifact, revision, masking, and idempotency contracts.

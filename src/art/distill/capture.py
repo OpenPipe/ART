@@ -138,6 +138,22 @@ def captured_context(generation: CapturedGeneration) -> TeacherView:
     return generation.context
 
 
+def prepend_message(
+    view: TeacherView,
+    message: Mapping[str, Any],
+) -> TeacherView:
+    """Return a new teacher view with one message prepended."""
+
+    request = _chat_request(view)
+    messages = request.get("messages")
+    if messages is None:
+        messages = []
+    if not isinstance(messages, list):
+        raise ValueError("Chat Completions teacher view messages must be a list")
+    request["messages"] = [dict(message), *messages]
+    return TeacherView.from_request("chat_completions", request)
+
+
 def append_message(
     view: TeacherView,
     message: Mapping[str, Any],

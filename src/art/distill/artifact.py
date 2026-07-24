@@ -269,6 +269,8 @@ class PreparedTrainingBatch:
             payload_sha256=raw["payload_sha256"],
         )
         artifact._validate_envelope()
+        if artifact.to_bytes() != value:
+            raise ValueError("prepared batch envelope is not canonical")
         return artifact
 
     def _validate_envelope(self) -> None:

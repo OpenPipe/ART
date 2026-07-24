@@ -197,6 +197,30 @@ def test_artifact_round_trip_is_byte_identical_and_validated() -> None:
     assert loaded.parsed_payload().targets == (_target(),)
 
 
+def test_artifact_rejects_noncanonical_envelope_encoding() -> None:
+    artifact = _artifact()
+    encoded = artifact.to_bytes()
+    raw = json.loads(encoded)
+    reverse_ordered = {key: raw[key] for key in reversed(raw)}
+
+    batch_id_prefix = b'{"batch_id":'
+    assert encoded.startswith(batch_id_prefix)
+    envelope_tail = encoded[len(batch_id_prefix) :]
+    batch_id_end = envelope_tail.index(b",")
+    duplicate_batch_id = (
+        batch_id_prefix + envelope_tail[:batch_id_end] + b',"batch_id":' + envelope_tail
+    )
+
+    noncanonical_encodings = (
+        json.dumps(raw, indent=2, sort_keys=True).encode(),
+        json.dumps(reverse_ordered, separators=(",", ":")).encode(),
+        duplicate_batch_id,
+    )
+    for noncanonical in noncanonical_encodings:
+        with pytest.raises(ValueError, match="envelope is not canonical"):
+            distill.PreparedTrainingBatch.from_bytes(noncanonical)
+
+
 def test_artifact_rejects_payload_checksum_and_semantic_id_tampering() -> None:
     raw = json.loads(_artifact().to_bytes())
     raw["payload"] = raw["payload"].replace(

@@ -12,6 +12,22 @@ from .trajectories import TrajectoryGroup
 from .types import TrainConfig
 
 
+def reject_unsupported_prepared_batch(
+    training_data: object,
+    *,
+    backend_name: str,
+) -> None:
+    """Reject prepared distillation data before an unsupported backend does work."""
+
+    from .distill.artifact import PreparedTrainingBatch
+
+    if isinstance(training_data, PreparedTrainingBatch):
+        raise NotImplementedError(
+            f"{backend_name} does not support PreparedTrainingBatch; "
+            "use MegatronBackend for prepared distillation training."
+        )
+
+
 def build_rl_train_configs(
     *,
     learning_rate: float,
