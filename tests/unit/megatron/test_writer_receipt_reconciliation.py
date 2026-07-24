@@ -743,17 +743,16 @@ async def test_exact_current_replacement_recovers_prebind_receipt_without_reente
     assert replacement.fence > old_lease.fence
     # This query must use the replacement lease as recovery evidence instead
     # of trying to recursively acquire the gate it already owns.
-    assert (
-        await resumed.committed_distillation_step(
-            idempotency_key="replacement-pre-bind",
-            expected_source_revision=4,
-            preparation_id="prepared-4",
-            payload_sha256="a" * 64,
-            objective=objective,
-            config=config,
-        )
-        is None
+    resolution = await resumed.resolve_distillation_receipt(
+        idempotency_key="replacement-pre-bind",
+        expected_source_revision=4,
+        preparation_id="prepared-4",
+        payload_sha256="a" * 64,
+        objective=objective,
+        config=config,
     )
+    assert resolution.disposition == "recovered_before_submit"
+    assert resolution.committed_step is None
 
     monkeypatch.setattr(resumed, "_data_parallel_world_size", lambda: 1)
     monkeypatch.setattr(resumed, "_status", lambda _message: None)

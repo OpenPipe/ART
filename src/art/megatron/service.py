@@ -108,6 +108,20 @@ WRITER_SESSION_TTL_S = 600.0
 WRITER_HEARTBEAT_INTERVAL_S = 60.0
 
 
+@dataclass(frozen=True, slots=True)
+class DistillationReceiptResolution:
+    """Exact durable receipt state returned to the public backend boundary."""
+
+    disposition: Literal["absent", "recovered_before_submit", "committed"]
+    committed_step: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.disposition == "committed") != (self.committed_step is not None):
+            raise ValueError(
+                "committed_step is required only for a committed receipt resolution"
+            )
+
+
 def _validate_distillation_tensors_for_objective(
     disk_tensors: DiskPackedDistillationTensors,
     objective: DistillationObjectiveConfig,
@@ -1063,7 +1077,7 @@ class MegatronService:
                 assert receipt is not None
         return receipt
 
-    async def committed_distillation_step(
+    async def resolve_distillation_receipt(
         self,
         *,
         idempotency_key: str,
@@ -1072,8 +1086,8 @@ class MegatronService:
         payload_sha256: str,
         objective: DistillationObjectiveConfig,
         config: types.TrainConfig,
-    ) -> int | None:
-        """Return a committed idempotent result, or fail closed on pending work."""
+    ) -> DistillationReceiptResolution:
+        """Resolve one exact receipt, preserving proof of safe pre-submit recovery."""
 
         path = self._distillation_receipt_path(idempotency_key)
         binding = self._distillation_receipt_binding(
@@ -1086,7 +1100,7 @@ class MegatronService:
         )
         receipt = self._read_distillation_receipt(path=path, binding=binding)
         if receipt is None:
-            return None
+            return DistillationReceiptResolution(disposition="absent")
         if receipt["state"] == "pending":
             receipt = self._recover_pending_before_submission(
                 path=path,
@@ -1094,7 +1108,9 @@ class MegatronService:
             )
         if receipt["state"] == "failed":
             if receipt["failure"] == "recovered_before_submit":
-                return None
+                return DistillationReceiptResolution(
+                    disposition="recovered_before_submit"
+                )
             raise RuntimeError(
                 "the distillation operation was abandoned before durable optimizer "
                 "commit; retry with a new idempotency key at the source revision"
@@ -1114,7 +1130,32 @@ class MegatronService:
             self._writer_sessions.reconcile()
         if self._latest_step != committed_step:
             await self._activate_committed_distillation_step(committed_step)
-        return committed_step
+        return DistillationReceiptResolution(
+            disposition="committed",
+            committed_step=committed_step,
+        )
+
+    async def committed_distillation_step(
+        self,
+        *,
+        idempotency_key: str,
+        expected_source_revision: int,
+        preparation_id: str,
+        payload_sha256: str,
+        objective: DistillationObjectiveConfig,
+        config: types.TrainConfig,
+    ) -> int | None:
+        """Compatibility query returning only an exact committed revision."""
+
+        resolution = await self.resolve_distillation_receipt(
+            idempotency_key=idempotency_key,
+            expected_source_revision=expected_source_revision,
+            preparation_id=preparation_id,
+            payload_sha256=payload_sha256,
+            objective=objective,
+            config=config,
+        )
+        return resolution.committed_step
 
     def _staging_lora_dir(self, step: int) -> str:
         return str(

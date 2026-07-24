@@ -32,10 +32,15 @@ from art.megatron.runtime.jobs import (
     load_megatron_job,
 )
 from art.megatron.service import (
+    DistillationReceiptResolution,
     MegatronService,
     _validate_distillation_tensors_for_objective,
 )
-from art.megatron.writer_sessions import WriterBusyError, WriterLease
+from art.megatron.writer_sessions import (
+    AmbiguousWriterSessionError,
+    WriterBusyError,
+    WriterLease,
+)
 from art.types import LocalTrainResult, TrainConfig
 
 
@@ -883,9 +888,11 @@ async def test_backend_returns_committed_receipt_before_stale_revision_check(
     observed: dict[str, Any] = {}
 
     class _Service:
-        async def committed_distillation_step(self, **kwargs: Any) -> int:
+        async def resolve_distillation_receipt(
+            self, **kwargs: Any
+        ) -> DistillationReceiptResolution:
             observed.update(kwargs)
-            return 8
+            return DistillationReceiptResolution("committed", committed_step=8)
 
     async def _get_service(_: Any) -> _Service:
         return _Service()
@@ -1042,8 +1049,12 @@ async def test_backend_current_step_requires_session_only_for_new_submission(
         async def heartbeat_current_step(self, **_kwargs: Any) -> float:
             return 1_000.0
 
-        async def committed_distillation_step(self, **_kwargs: Any) -> int | None:
-            return 8 if self.committed else None
+        async def resolve_distillation_receipt(
+            self, **_kwargs: Any
+        ) -> DistillationReceiptResolution:
+            if self.committed:
+                return DistillationReceiptResolution("committed", committed_step=8)
+            return DistillationReceiptResolution("absent")
 
         async def release_current_step(self, **_kwargs: Any) -> None:
             self.released = True
@@ -1099,6 +1110,308 @@ async def test_backend_current_step_requires_session_only_for_new_submission(
 
 
 @pytest.mark.asyncio
+async def test_backend_exact_recovered_current_retry_uses_replacement_session_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    backend = MegatronBackend(path=str(tmp_path))
+    model = SimpleNamespace(
+        trainable=True,
+        project="project",
+        _storage_name=lambda: "student",
+        _serving_capabilities=SimpleNamespace(
+            token_space_fingerprint="token-space",
+            logical_vocab_size=4,
+        ),
+        _get_wandb_run=lambda: None,
+    )
+
+    class _Service:
+        def __init__(self) -> None:
+            self.capability = b"r" * 32
+            self.disposition = "recovered_before_submit"
+            self.revision = 7
+            self.submissions: list[dict[str, Any]] = []
+
+        async def acquire_current_step(
+            self,
+            *,
+            revision: int,
+            ttl_s: float,
+        ) -> WriterLease:
+            return WriterLease(
+                model_identity="project/student",
+                revision=revision,
+                session_id="replacement-session",
+                fence=2,
+                expires_at=ttl_s,
+                kind="current_step",
+                capability=self.capability,
+            )
+
+        async def heartbeat_current_step(self, **_kwargs: Any) -> float:
+            return 1_000.0
+
+        async def resolve_distillation_receipt(
+            self, **_kwargs: Any
+        ) -> DistillationReceiptResolution:
+            return DistillationReceiptResolution(cast(Any, self.disposition))
+
+        async def train_distillation(
+            self,
+            disk_tensors: dict[str, Any],
+            *_args: Any,
+            **kwargs: Any,
+        ):
+            self.submissions.append(kwargs)
+            self.revision = 8
+            shutil.rmtree(disk_tensors["dir"])
+            yield {"loss/distillation": 0.25}
+
+        async def release_current_step(self, **_kwargs: Any) -> None:
+            return None
+
+    service = _Service()
+
+    async def _get_service(_: Any) -> _Service:
+        return service
+
+    async def _get_step(_: Any) -> int:
+        return service.revision
+
+    monkeypatch.setattr(backend, "_get_service", _get_service)
+    monkeypatch.setattr(backend, "_get_step", _get_step)
+    monkeypatch.setattr(
+        "art.megatron.backend.get_megatron_runtime_config",
+        lambda: SimpleNamespace(
+            packed_sequence_length=8,
+            topology=SimpleNamespace(tp=1, cp=1, pp=1, ep=1, etp=1),
+        ),
+    )
+    objectives = distill.TrainingObjectives(distillation=distill.Loss())
+    original = _artifact(
+        revision=7,
+        consistency=distill.CurrentStep(
+            revision=7,
+            session_id="dead-original-session",
+        ),
+    )
+
+    async with backend.current_step(cast(Any, model)) as replacement:
+        with pytest.raises(ValueError, match="same active"):
+            await backend.train(
+                cast(Any, model),
+                original,
+                objectives=objectives,
+                idempotency_key="exact-key",
+                session=object(),
+                save_checkpoint=False,
+            )
+
+        service.disposition = "absent"
+        with pytest.raises(ValueError, match="same active"):
+            await backend.train(
+                cast(Any, model),
+                original,
+                objectives=objectives,
+                idempotency_key="exact-key",
+                session=replacement,
+                save_checkpoint=False,
+            )
+
+        service.disposition = "recovered_before_submit"
+        wrong_revision = _artifact(
+            revision=6,
+            consistency=distill.CurrentStep(
+                revision=6,
+                session_id="dead-original-session",
+            ),
+        )
+        with pytest.raises(ValueError, match="same active"):
+            await backend.train(
+                cast(Any, model),
+                wrong_revision,
+                objectives=objectives,
+                idempotency_key="exact-key",
+                session=replacement,
+                save_checkpoint=False,
+            )
+
+        result = await backend.train(
+            cast(Any, model),
+            original,
+            objectives=objectives,
+            idempotency_key="exact-key",
+            session=replacement,
+            save_checkpoint=False,
+        )
+        assert result.step == 8
+        assert len(service.submissions) == 1
+        assert (
+            service.submissions[0]["current_step_session_id"] == "replacement-session"
+        )
+        assert service.submissions[0]["current_step_capability"] == service.capability
+
+        with pytest.raises(RuntimeError, match="exactly one new"):
+            await backend.train(
+                cast(Any, model),
+                original,
+                objectives=objectives,
+                idempotency_key="exact-key",
+                session=replacement,
+                save_checkpoint=False,
+            )
+        assert len(service.submissions) == 1
+
+
+@pytest.mark.asyncio
+async def test_backend_exact_recovered_current_retry_binds_replacement_durably(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        MegatronService,
+        "_validate_megatron_dependencies",
+        lambda _self: None,
+    )
+
+    def new_service() -> MegatronService:
+        return MegatronService(
+            model_name="student",
+            base_model="Qwen/Qwen3-0.6B",
+            config={},
+            output_dir=str(tmp_path / "service"),
+            runtime_config=cast(
+                Any,
+                SimpleNamespace(
+                    topology=SimpleNamespace(tp=1, cp=1, pp=1, ep=1, etp=1),
+                ),
+            ),
+        )
+
+    owner = new_service()
+    owner._latest_step = 7
+    old_lease = await owner.acquire_current_step(revision=7)
+    objective = DistillationObjectiveConfig(coefficient=1.0)
+    config = TrainConfig(optimizer_save_interval=1)
+    artifact = _artifact(
+        revision=7,
+        consistency=distill.CurrentStep(
+            revision=7,
+            session_id=old_lease.session_id,
+        ),
+    )
+    binding = owner._distillation_receipt_binding(
+        idempotency_key="exact-replacement-key",
+        expected_source_revision=7,
+        preparation_id=artifact.preparation_id,
+        payload_sha256=artifact.payload_sha256,
+        objective=objective,
+        config=config,
+    )
+    owner._reserve_distillation_receipt(
+        path=owner._distillation_receipt_path("exact-replacement-key"),
+        binding=binding,
+        lease=old_lease,
+    )
+    owner._writer_sessions._release_gate(old_lease.session_id)
+
+    resumed = new_service()
+    resumed._latest_step = 7
+    monkeypatch.setattr(resumed, "_data_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(resumed, "_status", lambda _message: None)
+    monkeypatch.setattr(
+        "art.megatron.service._validate_distillation_tensors_for_objective",
+        lambda _tensors, _objective: None,
+    )
+    source = tmp_path / "source-lora"
+    source.mkdir()
+    (source / "adapter_model.safetensors").write_bytes(b"lora")
+
+    async def _prepare_for_training() -> str:
+        return str(source)
+
+    monkeypatch.setattr(resumed, "_prepare_for_training", _prepare_for_training)
+    submissions: list[str] = []
+
+    class _BoundSubmission(RuntimeError):
+        pass
+
+    def _observe_bound_submission(_job: Any, *, job_path: str) -> None:
+        del job_path
+        lease = resumed._current_writer_lease
+        assert lease is not None
+        journal = resumed._writer_sessions.inspect_active(lease)
+        assert journal["state"] == "bound"
+        operation = cast(dict[str, Any], journal["operation_identity"])
+        assert operation["identity"] == {"receipt_binding": binding}
+        receipt = resumed._read_distillation_receipt(
+            path=resumed._distillation_receipt_path("exact-replacement-key"),
+            binding=binding,
+        )
+        assert receipt is not None
+        assert receipt["writer_session"] == {
+            "session_id": lease.session_id,
+            "revision": 7,
+            "fence": lease.fence,
+        }
+        assert lease.session_id != old_lease.session_id
+        submissions.append(lease.session_id)
+        raise _BoundSubmission("stop after durable replacement bind")
+
+    monkeypatch.setattr(
+        "art.megatron.service.write_megatron_job",
+        _observe_bound_submission,
+    )
+    monkeypatch.setattr(
+        "art.megatron.backend.get_megatron_runtime_config",
+        lambda: SimpleNamespace(
+            packed_sequence_length=8,
+            topology=SimpleNamespace(tp=1, cp=1, pp=1, ep=1, etp=1),
+        ),
+    )
+    backend = MegatronBackend(path=str(tmp_path / "backend"))
+    model = SimpleNamespace(
+        trainable=True,
+        project="project",
+        _storage_name=lambda: "student",
+        _serving_capabilities=SimpleNamespace(
+            token_space_fingerprint="token-space",
+            logical_vocab_size=4,
+        ),
+        _get_wandb_run=lambda: None,
+    )
+
+    async def _get_service(_: Any) -> MegatronService:
+        return resumed
+
+    async def _get_step(_: Any) -> int:
+        return resumed._latest_step
+
+    monkeypatch.setattr(backend, "_get_service", _get_service)
+    monkeypatch.setattr(backend, "_get_step", _get_step)
+    context = backend.current_step(cast(Any, model))
+    replacement = await context.__aenter__()
+    try:
+        with pytest.raises(_BoundSubmission, match="durable replacement bind"):
+            await backend.train(
+                cast(Any, model),
+                artifact,
+                objectives=distill.TrainingObjectives(distillation=distill.Loss()),
+                idempotency_key="exact-replacement-key",
+                session=replacement,
+                save_checkpoint=False,
+            )
+        assert submissions == [replacement.session_id]
+    finally:
+        with pytest.raises(
+            AmbiguousWriterSessionError,
+            match="reconcile its receipt",
+        ):
+            await context.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
 async def test_backend_current_step_committed_replay_survives_process_restart(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1113,8 +1426,10 @@ async def test_backend_current_step_committed_replay_survives_process_restart(
     )
 
     class _Service:
-        async def committed_distillation_step(self, **_kwargs: Any) -> int:
-            return 8
+        async def resolve_distillation_receipt(
+            self, **_kwargs: Any
+        ) -> DistillationReceiptResolution:
+            return DistillationReceiptResolution("committed", committed_step=8)
 
     async def _get_service(_: Any) -> _Service:
         return _Service()
@@ -1147,9 +1462,11 @@ async def test_backend_resolves_additive_public_objective_before_receipt_lookup(
     observed: dict[str, Any] = {}
 
     class _Service:
-        async def committed_distillation_step(self, **kwargs: Any) -> int:
+        async def resolve_distillation_receipt(
+            self, **kwargs: Any
+        ) -> DistillationReceiptResolution:
             observed.update(kwargs)
-            return 8
+            return DistillationReceiptResolution("committed", committed_step=8)
 
     async def _get_service(_: Any) -> _Service:
         return _Service()
@@ -1424,8 +1741,10 @@ async def test_backend_stages_each_prepared_call_in_a_unique_operation_directory
     staged: list[dict[str, Any]] = []
 
     class _Service:
-        async def committed_distillation_step(self, **_kwargs: Any) -> None:
-            return None
+        async def resolve_distillation_receipt(
+            self, **_kwargs: Any
+        ) -> DistillationReceiptResolution:
+            return DistillationReceiptResolution("absent")
 
         async def train_distillation(
             self,

@@ -296,7 +296,7 @@ class MegatronBackend(LocalBackend):
         )
         artifact_source_revision = batch.constraints.learner_revision
         service = await self._get_service(cast(TrainableModel, model))
-        committed_step = await cast(Any, service).committed_distillation_step(
+        receipt_resolution = await cast(Any, service).resolve_distillation_receipt(
             idempotency_key=idempotency_key,
             expected_source_revision=artifact_source_revision,
             preparation_id=batch.preparation_id,
@@ -304,6 +304,7 @@ class MegatronBackend(LocalBackend):
             objective=objective_config,
             config=config,
         )
+        committed_step = receipt_resolution.committed_step
         if committed_step is not None:
             checkpoint_path: str | None = None
             if save_checkpoint:
@@ -332,6 +333,9 @@ class MegatronBackend(LocalBackend):
                 model,
                 current_step,
                 kwargs.get("session"),
+                allow_recovered_replacement=(
+                    receipt_resolution.disposition == "recovered_before_submit"
+                ),
             )
             if active_current.consumed:
                 raise RuntimeError(
@@ -434,7 +438,9 @@ class MegatronBackend(LocalBackend):
             preparation_id=batch.preparation_id,
             payload_sha256=batch.payload_sha256,
             current_step_session_id=(
-                current_step.session_id if current_step is not None else None
+                active_current.consistency.session_id
+                if active_current is not None
+                else None
             ),
             current_step_capability=(
                 active_current.capability if active_current is not None else None
@@ -563,12 +569,21 @@ class MegatronBackend(LocalBackend):
         model: AnyTrainableModel,
         consistency: CurrentStep,
         session: Any,
+        *,
+        allow_recovered_replacement: bool = False,
     ) -> _ActiveCurrentStep:
         active = self._active_current_steps.get(self._model_storage_key(model))
         if (
             active is None
-            or active.consistency != consistency
             or session is not active.session
+            or (
+                active.consistency != consistency
+                and not (
+                    allow_recovered_replacement
+                    and active.consistency.revision == consistency.revision
+                    and active.consistency.session_id != consistency.session_id
+                )
+            )
         ):
             raise ValueError(
                 "CurrentStep and session= must come from the same active "
