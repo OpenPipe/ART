@@ -279,8 +279,8 @@ def _sampled_source_key(source: object) -> _SampledSourceKey:
         return _source_key(exchange, protocol="chat_completions", index=index)
     if isinstance(exchange, ResponsesExchange):
         index = getattr(source, "generation_index", None)
-        if index is None and getattr(source, "output_index", None) is not None:
-            index = 0
+        if index is None and not _response_generations(exchange.response):
+            index = getattr(source, "output_index", None)
         if not isinstance(index, int) or isinstance(index, bool):
             raise ValueError("Sampled Responses source has no generation identity")
         return _source_key(exchange, protocol="responses", index=index)
@@ -3351,10 +3351,19 @@ def _tokenize_chat_view(
             sampled_part_cursor += len(parts)
             continue
 
+        source_exchange = getattr(source, "exchange", None)
+        multi_generation_response = (
+            isinstance(source_exchange, ResponsesExchange)
+            and len(_response_generations(source_exchange.response)) > 1
+        )
         if (
             complete_sampled_message
             and full_exact is not None
-            and (len(parts) != 1 or len(full_exact) != len(part_ids(parts[0][1])))
+            and (
+                multi_generation_response
+                or len(parts) != 1
+                or len(full_exact) != len(part_ids(parts[0][1]))
+            )
         ):
             prompt_render = render(messages[:message_index], add_generation_prompt=True)
             completed_render = render(

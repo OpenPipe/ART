@@ -20,6 +20,7 @@ import pytest
 import art
 from art.trajectories import (
     ChatCompletionsExchange,
+    ChatCompletionsMessageSource,
     ChatCompletionsRequest,
     CompletionsExchange,
     CompletionsRequest,
@@ -2593,6 +2594,114 @@ def test_responses_generation_source_rejects_content_from_another_generation() -
 
     with pytest.raises(ValueError, match="no longer matches its source exchange"):
         history.tokenize()
+
+
+def test_responses_chat_rerender_preserves_equal_length_generation_evidence() -> None:
+    exchange = _response_exchange("equal-length-generations", 2)
+    data = exchange.response.model_dump(mode="python")
+    data["output"].append(
+        {
+            "id": "message-second-generation",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "second",
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            ],
+        }
+    )
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2, "logprob": -0.2}],
+            "output_indices": [0],
+        },
+        {
+            "prompt_token_ids": [1, 2, 3],
+            "output_tokens": [{"token_id": 4, "logprob": -0.4}],
+            "output_indices": [1],
+        },
+    ]
+    exchange.response = Response.model_validate(data)
+    history = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"turn 0": [10], "answer": [20], "second": [40]}[text]
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> list[int]:
+            del kwargs
+            result: list[int] = []
+            for index, message in enumerate(messages):
+                result.extend(self(str(message["content"])))
+                if index == 1 and (len(messages) > 2 or add_generation_prompt):
+                    result.append(30)
+            return result
+
+    tokenized = history.tokenize(tokenizer=Tokenizer(), chat_template="custom")
+
+    assert tokenized.token_ids == [10, 2, 30, 4]
+    assert 20 not in tokenized.token_ids
+    assert 40 not in tokenized.token_ids
+    assert tokenized.logprobs[1::2] == pytest.approx([-0.2, -0.4])
+    assert tokenized.flags == [
+        art.TokenFlag(0),
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        art.TokenFlag(0),
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+
+
+def test_responses_chat_sampled_source_requires_generation_identity() -> None:
+    exchange = _response_exchange("missing-generation-identity", 2)
+    history = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+    assistant_index = next(
+        index
+        for index, source in enumerate(history.message_sources)
+        if source is not None and source.output_index is not None
+    )
+    source = history.message_sources[assistant_index]
+    assert source is not None
+    history.message_sources[assistant_index] = ChatCompletionsMessageSource(
+        exchange=source.exchange,
+        output_index=source.output_index,
+    )
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"turn 0": [1], "answer": [2]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            return [
+                token for message in messages for token in self(str(message["content"]))
+            ]
+
+    with pytest.raises(ValueError, match="no generation identity"):
+        history.tokenize(tokenizer=Tokenizer())
 
 
 def _multi_output_responses_chat_history() -> art.ChatCompletionsHistory:
