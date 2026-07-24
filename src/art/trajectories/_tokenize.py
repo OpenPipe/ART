@@ -788,8 +788,15 @@ def _exchange_list(trajectory: Trajectory, model: str | None) -> list[Exchange]:
         *trajectory.exchanges.messages,
     ]
     if model is not None:
+        has_exact_match = any(exchange.model == model for exchange in exchanges)
         exchanges = [
-            exchange for exchange in exchanges if _model_matches(exchange.model, model)
+            exchange
+            for exchange in exchanges
+            if (
+                exchange.model == model
+                if has_exact_match
+                else _model_matches(exchange.model, model)
+            )
         ]
         if not exchanges:
             raise ValueError(f"Trajectory contains no exchanges for model {model!r}")

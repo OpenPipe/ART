@@ -1409,15 +1409,30 @@ def trajectory_histories(
             *copy.deepcopy(trajectory.additional_histories),
         ]
 
+    all_exchanges = [
+        *trajectory.exchanges.chat_completions,
+        *trajectory.exchanges.completions,
+        *trajectory.exchanges.responses,
+        *trajectory.exchanges.messages,
+    ]
+    has_exact_match = model is not None and any(
+        exchange.model == model for exchange in all_exchanges
+    )
+
+    def is_selected(exchange: _ModelledExchange) -> bool:
+        if model is None:
+            return True
+        if has_exact_match:
+            return exchange.model == model
+        return _model_matches(exchange.model, model)
+
     candidates: list[TrajectoryHistory] = []
     if any(
-        model is None or _model_matches(exchange.model, model)
-        for exchange in trajectory.exchanges.chat_completions
+        is_selected(exchange) for exchange in trajectory.exchanges.chat_completions
     ):
         candidates.extend(chat_completions_histories(trajectory, model=model))
     if any(
-        model is None or _model_matches(exchange.model, model)
-        for exchange in trajectory.exchanges.completions
+        is_selected(exchange) for exchange in trajectory.exchanges.completions
     ):
         try:
             candidates.extend(completions_token_histories(trajectory, model=model))
@@ -1426,13 +1441,11 @@ def trajectory_histories(
                 raise
             candidates.extend(completions_string_histories(trajectory, model=model))
     if any(
-        model is None or _model_matches(exchange.model, model)
-        for exchange in trajectory.exchanges.responses
+        is_selected(exchange) for exchange in trajectory.exchanges.responses
     ):
         candidates.extend(responses_histories(trajectory, model=model))
     if any(
-        model is None or _model_matches(exchange.model, model)
-        for exchange in trajectory.exchanges.messages
+        is_selected(exchange) for exchange in trajectory.exchanges.messages
     ):
         candidates.extend(anthropic_messages_histories(trajectory, model=model))
     if not candidates:
