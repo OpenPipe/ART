@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from collections.abc import Mapping
 from typing import SupportsIndex, cast, overload
 
 import numpy as np
@@ -24,13 +25,18 @@ from art.trajectories import (
     ChatCompletionsRequest,
     CompletionsExchange,
     CompletionsRequest,
+    TokenizedMultiHistoryTrajectory,
+    Tokenizer,
 )
 from art.trajectories import _tokenize as trajectory_tokenization
 from art.trajectories._selection import (
     automatic_training_model_selector,
     resolve_training_model,
 )
-from art.trajectories._tokenize import _first_introduction_mask
+from art.trajectories._tokenize import (
+    _first_introduction_mask,
+    _HistoryTokenizationTrace,
+)
 
 
 def _exchange(model: str, output_token: int) -> ChatCompletionsExchange:
@@ -211,10 +217,28 @@ def test_training_tokenizes_each_exchange_trajectory_once(
     calls = 0
     original = trajectory_tokenization._tokenize_trajectory_with_trace
 
-    def counted(*args: object, **kwargs: object) -> object:
+    def counted(
+        trajectory: art.Trajectory,
+        *,
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+    ) -> tuple[
+        TokenizedMultiHistoryTrajectory,
+        list[_HistoryTokenizationTrace],
+    ]:
         nonlocal calls
         calls += 1
-        return original(*args, **kwargs)
+        return original(
+            trajectory,
+            model=model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
     monkeypatch.setattr(
         trajectory_tokenization, "_tokenize_trajectory_with_trace", counted
@@ -324,9 +348,12 @@ def test_public_training_selector_prefers_exact_model_over_glob_interpretation()
         )
     )
     assert resolve_training_model(trajectory, "policy*") == "policy*"
-    assert [history.model for history in trajectory.histories(model="policy*")] == [
-        "policy*"
-    ]
+    histories = trajectory.histories(model="policy*")
+    assert [
+        history.model
+        for history in histories
+        if not isinstance(history, art.LegacyHistory)
+    ] == ["policy*"]
     assert [
         history.model
         for history in trajectory.tokenize(

@@ -1427,26 +1427,18 @@ def trajectory_histories(
         return _model_matches(exchange.model, model)
 
     candidates: list[TrajectoryHistory] = []
-    if any(
-        is_selected(exchange) for exchange in trajectory.exchanges.chat_completions
-    ):
+    if any(is_selected(exchange) for exchange in trajectory.exchanges.chat_completions):
         candidates.extend(chat_completions_histories(trajectory, model=model))
-    if any(
-        is_selected(exchange) for exchange in trajectory.exchanges.completions
-    ):
+    if any(is_selected(exchange) for exchange in trajectory.exchanges.completions):
         try:
             candidates.extend(completions_token_histories(trajectory, model=model))
         except ValueError as error:
             if "requires exact token IDs" not in str(error):
                 raise
             candidates.extend(completions_string_histories(trajectory, model=model))
-    if any(
-        is_selected(exchange) for exchange in trajectory.exchanges.responses
-    ):
+    if any(is_selected(exchange) for exchange in trajectory.exchanges.responses):
         candidates.extend(responses_histories(trajectory, model=model))
-    if any(
-        is_selected(exchange) for exchange in trajectory.exchanges.messages
-    ):
+    if any(is_selected(exchange) for exchange in trajectory.exchanges.messages):
         candidates.extend(anthropic_messages_histories(trajectory, model=model))
     if not candidates:
         suffix = f" for model {model!r}" if model is not None else ""

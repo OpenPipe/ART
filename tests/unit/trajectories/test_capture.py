@@ -116,9 +116,7 @@ RESPONSE: dict[str, Any] = {
     "token_generations": [
         {
             "prompt_token_ids": [1],
-            "output_tokens": [
-                {"token_id": 2, "logprob": -0.2, "text": "hello"}
-            ],
+            "output_tokens": [{"token_id": 2, "logprob": -0.2, "text": "hello"}],
             "output_indices": [0],
         }
     ],

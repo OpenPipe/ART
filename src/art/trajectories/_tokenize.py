@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
@@ -9,7 +9,7 @@ from hashlib import sha256
 import json
 import math
 import re
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 import warnings
 
 from anthropic.types import Message, MessageParam, TextBlock
@@ -99,9 +99,12 @@ class _HistoryTokenizationTrace:
                 raise AssertionError("Tokenization trace source key is unresolved")
 
 
+_SourceKeyT = TypeVar("_SourceKeyT", bound=Hashable)
+
+
 def _first_introduction_mask(
-    source_keys: Sequence[_SampledSourceKey | None],
-    seen: set[_SampledSourceKey],
+    source_keys: Sequence[_SourceKeyT | None],
+    seen: set[_SourceKeyT],
 ) -> list[bool]:
     keys = {key for key in source_keys if key is not None}
     new_keys = keys - seen
