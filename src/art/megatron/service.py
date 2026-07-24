@@ -104,6 +104,28 @@ WRITER_SESSION_TTL_S = 600.0
 WRITER_HEARTBEAT_INTERVAL_S = 60.0
 
 
+def _validate_distillation_tensors_for_objective(
+    disk_tensors: DiskPackedDistillationTensors,
+    objective: DistillationObjectiveConfig,
+) -> None:
+    """Validate sidecars without retaining their mmap-backed tensors."""
+
+    from .distillation import packed_distillation_tensors_from_dir
+
+    packed = packed_distillation_tensors_from_dir(disk_tensors)
+    try:
+        has_policy = bool(packed["policy_mask"].any().item())
+        if has_policy != (objective.policy is not None):
+            raise ValueError(
+                "prepared policy sidecars do not match the resolved objective"
+            )
+    finally:
+        # torch.from_file keeps every sidecar open for the tensor lifetime. The
+        # worker owns deletion after the job, so release the service's validation
+        # mappings before submission (especially important on NFS).
+        packed.clear()
+
+
 class _RuntimeRequestKwargs(TypedDict, total=False):
     headers: dict[str, str]
 
@@ -1864,15 +1886,9 @@ class MegatronService:
                 raise NotImplementedError(
                     "prepared Megatron training requires LoRA rollout weights"
                 )
-            # Validate tensor bytes and denominator before staging a checkpoint.
-            from .distillation import packed_distillation_tensors_from_dir
-
-            packed = packed_distillation_tensors_from_dir(disk_tensors)
-            has_policy = bool(packed["policy_mask"].any().item())
-            if has_policy != (objective.policy is not None):
-                raise ValueError(
-                    "prepared policy sidecars do not match the resolved objective"
-                )
+            # Validate tensor bytes and denominators, then release mmap-backed
+            # validation tensors before the worker takes cleanup ownership.
+            _validate_distillation_tensors_for_objective(disk_tensors, objective)
             self._reserve_distillation_receipt(path=receipt_path, binding=binding)
             receipt_reserved = True
 

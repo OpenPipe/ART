@@ -27,7 +27,10 @@ from art.megatron.runtime.jobs import (
     dump_megatron_job,
     load_megatron_job,
 )
-from art.megatron.service import MegatronService
+from art.megatron.service import (
+    MegatronService,
+    _validate_distillation_tensors_for_objective,
+)
 from art.megatron.writer_sessions import WriterLease
 from art.types import LocalTrainResult, TrainConfig
 
@@ -268,6 +271,33 @@ def _validated_additive_payload(
         expected_source_revision=7,
         packed_sequence_length=sequence_length,
     )
+
+
+def test_service_releases_validation_tensors_before_worker_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class _TrackingPacked(dict[str, torch.Tensor]):
+        def clear(self) -> None:
+            events.append("released")
+            super().clear()
+
+    packed = _TrackingPacked(
+        policy_mask=torch.zeros((1, 1), dtype=torch.bool),
+    )
+    monkeypatch.setattr(
+        "art.megatron.distillation.packed_distillation_tensors_from_dir",
+        lambda _disk: packed,
+    )
+
+    _validate_distillation_tensors_for_objective(
+        cast(Any, {"dir": "/unused"}),
+        DistillationObjectiveConfig(coefficient=1.0),
+    )
+
+    assert events == ["released"]
+    assert packed == {}
 
 
 def _rebind_tensor_checksum(
