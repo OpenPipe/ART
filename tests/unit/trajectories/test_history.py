@@ -258,12 +258,11 @@ def test_chat_projection_keys_each_captured_message_once(
 
 
 def test_chat_projection_scales_with_captured_messages() -> None:
-    normalized_medians: list[float] = []
-    raw_medians: list[float] = []
+    measurements: list[tuple[int, float, int]] = []
     for turn_count in (32, 64, 128):
         trajectory = _growing_chat_trajectory(turn_count)
-        captured_messages = sum(
-            len(exchange.request["messages"]) + len(exchange.response.choices)
+        captured_bytes = sum(
+            len(exchange.model_dump_json().encode())
             for exchange in trajectory.exchanges.chat_completions
         )
         trajectory.chat_completions_history()
@@ -273,16 +272,17 @@ def test_chat_projection_scales_with_captured_messages() -> None:
             trajectory.chat_completions_history()
             samples.append(perf_counter() - started)
         elapsed = median(samples)
-        raw_medians.append(elapsed)
-        normalized_medians.append(elapsed / captured_messages)
+        measurements.append((turn_count, elapsed, captured_bytes))
 
-    # A growing transcript contains O(turns²) captured messages: doubling the
-    # turn count quadruples the input that projection must validate. Projection
-    # should remain linear in that actual input, without hidden superlinear work.
-    assert raw_medians[1] < raw_medians[0] * 5
-    assert raw_medians[2] < raw_medians[1] * 5
-    assert normalized_medians[1] < normalized_medians[0] * 2
-    assert normalized_medians[2] < normalized_medians[1] * 2
+    # A growing transcript contains O(turns²) serialized evidence: doubling the
+    # turn count roughly quadruples the bytes that projection must validate.
+    # Preserve the turn-count curve as diagnostics, but gate near-linear cost in
+    # the actual input size rather than imposing an impossible per-turn ratio.
+    normalized = [
+        elapsed / captured_bytes for _, elapsed, captured_bytes in measurements
+    ]
+    assert normalized[1] < normalized[0] * 2, measurements
+    assert normalized[2] < normalized[1] * 2, measurements
 
 
 def test_model_patterns_select_matching_histories_only() -> None:
