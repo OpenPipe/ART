@@ -69,9 +69,11 @@ def resolve_training_model(
         selector = (
             public_model_selector(selector) if isinstance(selector, str) else selector
         )
-        exact = {
-            candidate for candidate in concrete_models if candidate == selector.value
-        }
+        exact = (
+            {candidate for candidate in concrete_models if candidate == selector.value}
+            if selector.automatic_family is None
+            else set()
+        )
         matches = exact or {
             candidate
             for candidate in concrete_models

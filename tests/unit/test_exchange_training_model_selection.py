@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import datetime, timedelta
 from typing import SupportsIndex, cast, overload
 
@@ -229,6 +231,13 @@ def test_automatic_training_model_selector_treats_family_metacharacters_literall
     assert selector.matches("policy[blue]*@13")
     assert not selector.matches("policyb@13")
     assert not selector.matches("policy[blue]anything@13")
+
+
+def test_automatic_training_selector_rejects_multiple_numeric_steps() -> None:
+    trajectory = _versioned_group().trajectories[0]
+    selector = automatic_training_model_selector("policy@12")
+    with pytest.raises(ValueError, match="exactly one concrete model"):
+        resolve_training_model(trajectory, selector)
 
 
 def test_public_training_selector_prefers_exact_model_over_glob_interpretation() -> (
