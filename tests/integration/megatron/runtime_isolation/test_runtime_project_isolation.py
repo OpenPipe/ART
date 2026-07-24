@@ -53,6 +53,70 @@ def test_runtime_server_source_contains_only_required_custom_routes() -> None:
         assert route in source
 
 
+def test_runtime_art_auth_supports_built_and_unbuilt_middleware_stacks(
+    artifact_dir: Path,
+) -> None:
+    payload = json.loads(
+        _runtime_python(
+            """
+import asyncio
+import json
+
+from fastapi import FastAPI
+import httpx
+
+from art_vllm_runtime.dedicated_server import _install_art_authentication
+
+
+async def probe(prebuilt):
+    app = FastAPI()
+
+    @app.get("/art/private")
+    async def private():
+        return {"scope": "art"}
+
+    @app.get("/public")
+    async def public():
+        return {"scope": "public"}
+
+    if prebuilt:
+        app.middleware_stack = app.build_middleware_stack()
+    _install_art_authentication(app, tokens=["secret"])
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://runtime.test",
+    ) as client:
+        denied = await client.get("/art/private")
+        allowed = await client.get(
+            "/art/private",
+            headers={"Authorization": "Bearer secret"},
+        )
+        public = await client.get("/public")
+    return {
+        "denied": denied.status_code,
+        "allowed": allowed.status_code,
+        "public": public.status_code,
+    }
+
+
+async def main():
+    print(json.dumps({
+        "unbuilt": await probe(False),
+        "prebuilt": await probe(True),
+    }))
+
+
+asyncio.run(main())
+""",
+            artifact_dir,
+            "art_auth_middleware",
+        )
+    )
+    expected = {"denied": 401, "allowed": 200, "public": 200}
+    assert payload == {"unbuilt": expected, "prebuilt": expected}
+
+
 def test_runtime_patch_always_returns_token_ids(
     artifact_dir: Path,
 ) -> None:

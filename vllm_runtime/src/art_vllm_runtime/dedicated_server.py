@@ -31,6 +31,18 @@ class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
         return self.app(scope, receive, send)
 
 
+def _install_art_authentication(app: Any, *, tokens: list[str]) -> None:
+    """Protect ART routes even when upstream already built Starlette's stack."""
+
+    if app.middleware_stack is None:
+        app.add_middleware(_ArtAuthenticationMiddleware, tokens=tokens)
+        return
+    app.middleware_stack = _ArtAuthenticationMiddleware(
+        app.middleware_stack,
+        tokens=tokens,
+    )
+
+
 class _SetServedModelNameRequest(BaseModel):
     name: str = Field(min_length=1)
 
@@ -131,7 +143,7 @@ def _patch_art_runtime_routes() -> None:
         args = app.state.args
         tokens = [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]
         if tokens:
-            app.add_middleware(_ArtAuthenticationMiddleware, tokens=tokens)
+            _install_art_authentication(app, tokens=tokens)
         router = APIRouter()
 
         def engine(request: Request):
