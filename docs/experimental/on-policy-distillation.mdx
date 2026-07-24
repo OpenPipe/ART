@@ -176,7 +176,9 @@ This example fixes the teacher at one historical student revision while fresh ro
 
 ## Exact-current OPSD
 
-`backend.current_step(student)` holds one learner revision across rollout, preparation, and exactly one update. `CurrentStep` is valid only inside that context and must be passed back with the same `session` object.
+`backend.current_step(student)` holds one learner revision across rollout, preparation,
+and exactly one update. For a new operation, `CurrentStep` and `session=` must come
+from the same active context.
 
 ```python
 for update in range(num_updates):
@@ -210,7 +212,47 @@ for update in range(num_updates):
         )
 ```
 
-A current-step session is deliberately single-use for a new submission. If the update outcome is ambiguous, reload the exact persisted `PreparedTrainingBatch`, reuse the same `idempotency_key`, and call `backend.train(...)` without the original `session`. The backend queries and reconciles the existing receipt before it requires a live session for any new submission. Do not prepare new targets or silently treat a later revision as “current.”
+A current-step session is deliberately single-use. After an ambiguous
+`backend.train(...)`, recovery has two distinct paths.
+
+If the operation was submitted and committed, use the persisted batch as a durable
+query:
+
+```python
+batch = distill.PreparedTrainingBatch.from_bytes(path.read_bytes())
+result = await backend.train(
+    student,
+    batch,
+    objectives=objectives,
+    idempotency_key=original_key,
+)
+```
+
+This exact replay does not need the original in-memory session. It returns the
+committed result after the backend reconciles the receipt.
+
+If the session-free call does not return a committed result, open a replacement
+context at the same learner revision and retry the same operation:
+
+```python
+batch = distill.PreparedTrainingBatch.from_bytes(path.read_bytes())
+
+async with backend.current_step(student) as replacement:
+    result = await backend.train(
+        student,
+        batch,
+        objectives=objectives,
+        idempotency_key=original_key,
+        session=replacement,
+    )
+```
+
+The backend accepts this replacement exception to the normal same-session rule only
+when recovery durably classified the exact receipt as `recovered_before_submit`,
+proving the original operation never reached optimizer submission, and the
+persisted batch, revision, objectives, and idempotency key all match. Otherwise it
+fails closed. Never prepare new targets, change the key, or silently treat a later
+revision as “current.”
 
 ## Standalone KD
 
