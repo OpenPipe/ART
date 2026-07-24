@@ -363,6 +363,45 @@ def test_converted_anthropic_system_history_preserves_exact_assistant_evidence(
     assert tokenized.flags[-1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
 
 
+def test_converted_anthropic_system_source_rejects_sampled_response_mutation() -> None:
+    response = Message.model_validate(
+        {
+            "id": "message-system-source",
+            "type": "message",
+            "role": "assistant",
+            "model": "test/model",
+            "content": [{"type": "text", "text": "answer"}],
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+            "prompt_token_ids": [10, 11],
+            "token_ids": [12],
+            "logprobs": [-0.12],
+        }
+    )
+    start = datetime(2026, 1, 1)
+    exchange = MessagesExchange(
+        request=MessagesRequest(
+            model="test/model",
+            system="system",
+            messages=[{"role": "user", "content": "question"}],
+            max_tokens=16,
+        ),
+        response=response,
+        start_time=start,
+        end_time=start + timedelta(milliseconds=1),
+    )
+    history = (
+        art.Trajectory(exchanges=TrajectoryExchanges(messages=[exchange]))
+        .anthropic_messages_history()
+        .as_chat_completions_history()
+    )
+    history.messages[0] = {"role": "assistant", "content": "answer"}
+
+    with pytest.raises(ValueError, match="no longer matches its source exchange"):
+        history.tokenize()
+
+
 def test_converted_responses_history_tokenizes_without_native_chat_exchange(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2474,6 +2513,88 @@ def test_responses_generation_source_rejects_content_from_another_generation() -
 
     with pytest.raises(ValueError, match="no longer matches its source exchange"):
         history.tokenize()
+
+
+def _multi_output_responses_chat_history() -> art.ChatCompletionsHistory:
+    exchange = _response_exchange("multi-output-generation", 2)
+    data = exchange.response.model_dump(mode="python")
+    data["output"][0]["content"][0]["text"] = "first"
+    data["output"].append(
+        {
+            "id": "message-second-output",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "second",
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            ],
+        }
+    )
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [
+                {"token_id": 2, "logprob": -0.2},
+                {"token_id": 3, "logprob": -0.3},
+            ],
+            "output_indices": [0, 1],
+        }
+    ]
+    exchange.response = Response.model_validate(data)
+    return (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+
+
+def test_responses_output_source_rejects_sibling_generation_output() -> None:
+    history = _multi_output_responses_chat_history()
+    first_output = next(
+        index
+        for index, source in enumerate(history.message_sources)
+        if source is not None and source.output_index == 0
+    )
+    history.messages[first_output] = {
+        "role": "assistant",
+        "content": "second",
+    }
+
+    with pytest.raises(ValueError, match="no longer matches its source exchange"):
+        history.tokenize()
+
+
+def test_responses_multi_output_generation_exact_evidence_is_consumed_once() -> None:
+    history = _multi_output_responses_chat_history()
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"turn 0": [1], "first": [20], "second": [30]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            result: list[int] = []
+            for message in messages:
+                result.extend(self(str(message["content"])))
+            return result
+
+    tokenized = history.tokenize(tokenizer=Tokenizer(), chat_template="custom")
+
+    assert tokenized.token_ids == [1, 2, 3]
+    assert tokenized.logprobs[1:] == pytest.approx([-0.2, -0.3])
+    assert tokenized.flags == [
+        art.TokenFlag(0),
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
 
 
 def test_mutable_chat_history_is_authoritative_and_does_not_replay_removed_turns() -> (

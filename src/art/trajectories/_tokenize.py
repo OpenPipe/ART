@@ -2046,11 +2046,12 @@ def _validate_history_sources(history: History) -> None:
             elif isinstance(exchange, MessagesExchange):
                 if (
                     source.choice_index is not None
-                    or source.output_index is not None
                     or source.generation_index is not None
                 ):
                     raise ValueError("Anthropic-to-Chat source has invalid indices")
                 if source.request_index is not None:
+                    if source.output_index is not None:
+                        raise ValueError("Anthropic-to-Chat source has invalid indices")
                     request_messages = exchange.request.get("messages", [])
                     request_index = _source_index(
                         source.request_index,
@@ -2062,16 +2063,16 @@ def _validate_history_sources(history: History) -> None:
                             {"messages": [request_messages[request_index]]}
                         )
                     )
-                else:
-                    if message.get("role") == "system":
-                        expected.extend(
-                            _anthropic_messages(
-                                {
-                                    "system": exchange.request.get("system"),
-                                    "messages": [],
-                                }
-                            )
+                elif source.output_index is None:
+                    expected.extend(
+                        _anthropic_messages(
+                            {
+                                "system": exchange.request.get("system"),
+                                "messages": [],
+                            }
                         )
+                    )
+                elif source.output_index == 0:
                     expected.append(_response_message(exchange))
                     visible_blocks = [
                         block.model_dump(mode="python", exclude_none=True)
@@ -2088,6 +2089,8 @@ def _validate_history_sources(history: History) -> None:
                             }
                         )
                     )
+                else:
+                    raise ValueError("Anthropic response source index is out of bounds")
             elif isinstance(exchange, ResponsesExchange):
                 if source.request_index is not None:
                     if (
@@ -2143,22 +2146,20 @@ def _validate_history_sources(history: History) -> None:
                                     "Responses output source does not belong to "
                                     "its generation"
                                 )
-                            expected.extend(
-                                _responses_messages(
-                                    {
-                                        "input": [
-                                            exchange.response.output[
-                                                generation_output_index
-                                            ].model_dump(
-                                                mode="python", exclude_none=True
-                                            )
-                                            for generation_output_index in generations[
-                                                generation_index
-                                            ].output_indices
-                                        ]
-                                    }
-                                )
+                            generation_messages = _responses_messages(
+                                {
+                                    "input": [
+                                        exchange.response.output[
+                                            generation_output_index
+                                        ].model_dump(mode="python", exclude_none=True)
+                                        for generation_output_index in generations[
+                                            generation_index
+                                        ].output_indices
+                                    ]
+                                }
                             )
+                            if len(generation_messages) == 1:
+                                expected.extend(generation_messages)
                         expected.extend(
                             _responses_messages(
                                 {
@@ -2452,7 +2453,7 @@ def _source_signature(source: object) -> tuple[object, ...] | None:
         )
     elif (
         isinstance(exchange, MessagesExchange)
-        and getattr(source, "request_index", None) is None
+        and getattr(source, "output_index", None) == 0
     ):
         evidence_fingerprint = _sampled_evidence_fingerprint(
             exchange, protocol="messages", index=0
@@ -2712,6 +2713,54 @@ def _tokenize_exact_responses_history(
     return tokenized
 
 
+def _responses_source_generation(
+    source: object,
+) -> tuple[ResponsesExchange, _ResponseGeneration] | None:
+    exchange = getattr(source, "exchange", None)
+    generation_index = getattr(source, "generation_index", None)
+    if not isinstance(exchange, ResponsesExchange) or not isinstance(
+        generation_index, int
+    ):
+        return None
+    generations = _response_generations(exchange.response)
+    if not 0 <= generation_index < len(generations):
+        raise ValueError("Responses source generation index is out of bounds")
+    generation = generations[generation_index]
+    output_index = getattr(source, "output_index", None)
+    if isinstance(output_index, int) and output_index not in generation.output_indices:
+        raise ValueError(
+            "Responses source output index does not belong to its generation"
+        )
+    return exchange, generation
+
+
+def _responses_generation_messages(source: object) -> list[dict[str, Any]] | None:
+    selected = _responses_source_generation(source)
+    if selected is None:
+        return None
+    exchange, generation = selected
+    return _responses_messages(
+        {
+            "input": [
+                exchange.response.output[index].model_dump(
+                    mode="python", exclude_none=True
+                )
+                for index in generation.output_indices
+            ]
+        }
+    )
+
+
+def _responses_generation_full_tokens(
+    source: object,
+) -> tuple[list[int] | None, list[float]]:
+    selected = _responses_source_generation(source)
+    if selected is None:
+        return None, []
+    _, generation = selected
+    return generation.output_token_ids, generation.output_logprobs
+
+
 def _chat_source_full_tokens(
     source: object,
 ) -> tuple[list[int] | None, list[float]]:
@@ -2726,25 +2775,18 @@ def _chat_source_full_tokens(
         _, tokens, logprobs = _chat_choice_tokens(choice, _dump(exchange.response))
         return tokens, logprobs
     if isinstance(exchange, ResponsesExchange):
-        generation_index = getattr(source, "generation_index", None)
+        generation_messages = _responses_generation_messages(source)
+        if generation_messages is not None:
+            if len(generation_messages) != 1:
+                return None, []
+            return _responses_generation_full_tokens(source)
         generations = _response_generations(exchange.response)
-        if isinstance(generation_index, int):
-            if not 0 <= generation_index < len(generations):
-                raise ValueError("Responses source generation index is out of bounds")
-            generation = generations[generation_index]
-            output_index = getattr(source, "output_index", None)
-            if (
-                isinstance(output_index, int)
-                and output_index not in generation.output_indices
-            ):
-                raise ValueError(
-                    "Responses source output index does not belong to its generation"
-                )
-            return generation.output_token_ids, generation.output_logprobs
         if len(generations) > 1:
             return None, []
         return _responses_tokens(exchange.response)[1:]
     if isinstance(exchange, MessagesExchange):
+        if getattr(source, "output_index", None) != 0:
+            return None, []
         _, tokens, logprobs = _exchange_tokens(exchange)
         return tokens, logprobs
     return None, []
@@ -2770,6 +2812,8 @@ def _chat_source_prompt_tokens(source: object) -> list[int] | None:
             return generations[generation_index].prompt_token_ids
         return _responses_tokens(exchange.response)[0]
     if isinstance(exchange, MessagesExchange):
+        if getattr(source, "output_index", None) != 0:
+            return None
         return _messages_tokens(exchange.response)[0]
     return None
 
@@ -2779,7 +2823,7 @@ def _source_is_sampled(source: object) -> bool:
     if isinstance(exchange, ChatCompletionsExchange):
         return getattr(source, "choice_index", None) is not None
     if isinstance(exchange, MessagesExchange):
-        return getattr(source, "request_index", None) is None
+        return getattr(source, "output_index", None) == 0
     if isinstance(exchange, ResponsesExchange):
         return (
             getattr(source, "output_index", None) is not None
@@ -2940,7 +2984,7 @@ def _chat_source_tokens(
         return None, []
     if (
         isinstance(exchange, MessagesExchange)
-        and getattr(source, "request_index", None) is None
+        and getattr(source, "output_index", None) == 0
     ):
         block_type = "thinking" if part == "reasoning" else "text"
         blocks = [
@@ -3036,7 +3080,7 @@ def _source_covers_complete_sampled_message(
             message
         ) == normalize_chat_message(expected)
     if isinstance(exchange, MessagesExchange):
-        if getattr(source, "request_index", None) is not None:
+        if getattr(source, "output_index", None) != 0:
             return False
         return normalize_chat_message(message) == normalize_chat_message(
             _response_message(exchange)
@@ -3182,10 +3226,88 @@ def _tokenize_chat_view(
         and _source_is_sampled(source)
         for _, text in _chat_message_parts(message)
     ]
+    from ._history import normalize_chat_message
+
+    atomic_generations: dict[int, tuple[int, object, list[int], list[float]]] = {}
+    seen_generations: set[tuple[int, int]] = set()
+    for message_index, source in enumerate(history.message_sources):
+        if source is None or not isinstance(
+            getattr(source, "exchange", None), ResponsesExchange
+        ):
+            continue
+        generation_index = getattr(source, "generation_index", None)
+        output_index = getattr(source, "output_index", None)
+        if not isinstance(generation_index, int) or not isinstance(output_index, int):
+            continue
+        key = (id(source.exchange), generation_index)
+        if key in seen_generations:
+            continue
+        seen_generations.add(key)
+        projected = _responses_generation_messages(source)
+        if projected is None or len(projected) <= 1:
+            continue
+        end = message_index + len(projected)
+        if end > len(messages) or [
+            normalize_chat_message(item) for item in messages[message_index:end]
+        ] != [normalize_chat_message(item) for item in projected]:
+            continue
+        group_sources = history.message_sources[message_index:end]
+        if any(
+            item is None
+            or item.exchange is not source.exchange
+            or item.generation_index != generation_index
+            for item in group_sources
+        ):
+            continue
+        exact, exact_logprobs = _responses_generation_full_tokens(source)
+        if exact is not None:
+            atomic_generations[message_index] = (
+                end,
+                source,
+                exact,
+                exact_logprobs,
+            )
+
     sampled_part_cursor = 0
+    atomic_end = 0
     for message_index, (message, source) in enumerate(
         zip(history.messages, history.message_sources, strict=True)
     ):
+        if message_index < atomic_end:
+            continue
+        atomic = atomic_generations.get(message_index)
+        if atomic is not None:
+            end, atomic_source, exact, exact_logprobs = atomic
+            prompt_render = render(messages[:message_index], add_generation_prompt=True)
+            completed_render = render(messages[:end], add_generation_prompt=False)
+            if (
+                len(completed_render) <= len(prompt_render)
+                or completed_render[: len(prompt_render)] != prompt_render
+                or rendered[: len(completed_render)] != completed_render
+            ):
+                raise ValueError(
+                    "Could not locate a complete sampled generation in the "
+                    "rendered history"
+                )
+            replacements.append(
+                (
+                    len(prompt_render),
+                    len(completed_render),
+                    exact,
+                    exact_logprobs
+                    if len(exact_logprobs) == len(exact)
+                    else [math.nan] * len(exact),
+                    True,
+                    _sampled_source_key(atomic_source),
+                    atomic_source,
+                )
+            )
+            search_cursor = len(completed_render)
+            sampled_part_cursor += sum(
+                len(_chat_message_parts(item)) for item in messages[message_index:end]
+            )
+            atomic_end = end
+            continue
         parts = _chat_message_parts(message)
         sampled = (
             message.get("role") == "assistant"

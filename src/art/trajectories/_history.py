@@ -1299,6 +1299,7 @@ def anthropic_as_chat_completions_history(
             ChatCompletionsMessageSource(
                 exchange=source.exchange,
                 request_index=source.request_index,
+                output_index=0 if source.request_index is None else None,
             )
             if source is not None
             else None
