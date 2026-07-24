@@ -584,17 +584,18 @@ def _anthropic_prompt(value: object) -> list[AnthropicMessageParam]:
 
 def _anthropic_message_key(
     message: AnthropicMessageParam, *, visible_only: bool = False
-) -> tuple[object, ...]:
+) -> str:
+    normalized = copy.deepcopy(dict(message))
     content = message.get("content")
     if isinstance(content, str):
-        blocks: tuple[object, ...] = (("text", content),)
+        blocks: list[dict[str, object]] = [{"type": "text", "text": content}]
     elif isinstance(content, list):
-        normalized: list[object] = []
+        blocks = []
         for block in content:
             if isinstance(block, pydantic.BaseModel):
                 data = block.model_dump(mode="json", exclude_none=True)
             elif isinstance(block, Mapping):
-                data = dict(block)
+                data = copy.deepcopy(dict(block))
             else:
                 raise ValueError(
                     "Anthropic message content blocks must be JSON objects"
@@ -602,14 +603,13 @@ def _anthropic_message_key(
             kind = data.get("type")
             if visible_only and kind in {"thinking", "redacted_thinking"}:
                 continue
-            if kind == "text":
-                normalized.append(("text", data.get("text")))
-            else:
-                normalized.append(json.dumps(data, sort_keys=True, default=str))
-        blocks = tuple(normalized)
+            for field in ("token_ids", "logprobs"):
+                data.pop(field, None)
+            blocks.append(data)
     else:
         raise ValueError("Anthropic message content must be text or a list")
-    return (message.get("role"), *blocks)
+    normalized["content"] = blocks
+    return json.dumps(normalized, sort_keys=True, default=str)
 
 
 def anthropic_messages_history(

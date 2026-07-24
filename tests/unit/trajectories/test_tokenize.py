@@ -230,6 +230,91 @@ def test_messages_exact_prompt_and_output_do_not_load_a_tokenizer(
     ]
 
 
+def test_anthropic_cache_control_change_starts_new_source_lineage() -> None:
+    start = datetime(2026, 1, 1)
+
+    def exchange(
+        *,
+        identifier: str,
+        messages: list[MessageParam],
+        prompt_token_ids: list[int],
+        output_token_id: int,
+        offset: int,
+    ) -> MessagesExchange:
+        response = Message.model_validate(
+            {
+                "id": identifier,
+                "type": "message",
+                "role": "assistant",
+                "model": "test/model",
+                "content": [{"type": "text", "text": f"answer {offset}"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": len(prompt_token_ids),
+                    "output_tokens": 1,
+                },
+                "prompt_token_ids": prompt_token_ids,
+                "token_ids": [output_token_id],
+                "logprobs": [-0.1],
+            }
+        )
+        timestamp = start + timedelta(seconds=offset)
+        return MessagesExchange(
+            request=MessagesRequest(
+                model="test/model",
+                messages=messages,
+                max_tokens=16,
+            ),
+            response=response,
+            start_time=timestamp,
+            end_time=timestamp + timedelta(milliseconds=1),
+        )
+
+    first = exchange(
+        identifier="message-1",
+        messages=[{"role": "user", "content": [{"type": "text", "text": "question"}]}],
+        prompt_token_ids=[1],
+        output_token_id=2,
+        offset=0,
+    )
+    second = exchange(
+        identifier="message-2",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "question",
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "answer 0"}],
+            },
+            {"role": "user", "content": "follow up"},
+        ],
+        prompt_token_ids=[1, 2, 3],
+        output_token_id=4,
+        offset=1,
+    )
+
+    histories = art.Trajectory(
+        exchanges=TrajectoryExchanges(messages=[first, second])
+    ).anthropic_messages_histories()
+
+    assert len(histories) == 2
+    updated = histories[1]
+    source = updated.message_sources[0]
+    assert source is not None
+    assert source.exchange is second
+    assert source.request_index == 0
+    assert updated.tokenize().token_ids == [1, 2, 3, 4]
+
+
 def test_converted_anthropic_system_history_preserves_exact_assistant_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
