@@ -124,6 +124,29 @@ def _fingerprint(value: object) -> str:
     return sha256(serialized.encode()).hexdigest()
 
 
+def _chat_logprob_fingerprint_evidence(choice: Choice) -> dict[str, object] | None:
+    if choice.logprobs is None:
+        return None
+
+    def values(items: Sequence[object] | None) -> list[dict[str, object]]:
+        result: list[dict[str, object]] = []
+        for item in items or []:
+            data = _dump(item)
+            result.append(
+                {
+                    key: data[key]
+                    for key in ("token", "token_id", "logprob", "bytes")
+                    if key in data
+                }
+            )
+        return result
+
+    return {
+        "content": values(choice.logprobs.content),
+        "refusal": values(choice.logprobs.refusal),
+    }
+
+
 def _sampled_evidence_fingerprint(
     exchange: Exchange,
     *,
@@ -133,50 +156,76 @@ def _sampled_evidence_fingerprint(
     if protocol == "chat_completions":
         if not isinstance(exchange, ChatCompletionsExchange):
             raise TypeError("Chat source has the wrong exchange type")
-        evidence = next(
-            choice.model_dump(mode="json")
-            for choice in exchange.response.choices
-            if choice.index == index
+        choice = next(
+            choice for choice in exchange.response.choices if choice.index == index
         )
+        choice_extra = choice.model_extra or {}
+        evidence = {
+            "message": choice.message.model_dump(
+                mode="json",
+                include={
+                    "role",
+                    "content",
+                    "refusal",
+                    "reasoning",
+                    "reasoning_content",
+                    "tool_calls",
+                    "function_call",
+                    "audio",
+                },
+                exclude_none=True,
+            ),
+            "token_ids": choice_extra.get("token_ids"),
+            "logprobs": _chat_logprob_fingerprint_evidence(choice),
+            "finish_reason": choice.finish_reason,
+        }
     elif protocol == "completions":
         if not isinstance(exchange, CompletionsExchange):
             raise TypeError("Completions source has the wrong exchange type")
-        evidence = next(
-            choice.model_dump(mode="json")
-            for choice in exchange.response.choices
-            if choice.index == index
+        choice = next(
+            choice for choice in exchange.response.choices if choice.index == index
         )
+        choice_extra = choice.model_extra or {}
+        logprobs = _dump(choice.logprobs)
+        evidence = {
+            "text": choice.text,
+            "token_ids": choice_extra.get("token_ids"),
+            "logprobs": {
+                key: logprobs[key]
+                for key in ("tokens", "token_logprobs")
+                if key in logprobs
+            },
+            "finish_reason": choice.finish_reason,
+        }
     elif protocol == "responses":
         if not isinstance(exchange, ResponsesExchange):
             raise TypeError("Responses source has the wrong exchange type")
-        response = exchange.response.model_dump(mode="json")
-        generations = response.get("token_generations")
+        generations = (exchange.response.model_extra or {}).get("token_generations")
         if isinstance(generations, list) and 0 <= index < len(generations):
-            generation = generations[index]
-            output_indices = (
-                generation.get("output_indices")
-                if isinstance(generation, dict)
-                else None
-            )
-            outputs = response.get("output")
+            generation = _string_dict(generations[index]) or {}
             evidence = {
-                "generation": generation,
-                "outputs": [
-                    outputs[output_index]
-                    for output_index in output_indices
-                    if isinstance(output_index, int)
-                    and isinstance(outputs, list)
-                    and 0 <= output_index < len(outputs)
-                ]
-                if isinstance(output_indices, list)
-                else [],
+                key: generation[key]
+                for key in ("output_tokens", "output_indices")
+                if key in generation
             }
         else:
-            evidence = response.get("output")
+            evidence = [
+                output.model_dump(mode="json", exclude_none=True)
+                for output in exchange.response.output
+            ]
     else:
         if not isinstance(exchange, MessagesExchange):
             raise TypeError("Messages source has the wrong exchange type")
-        evidence = exchange.response.model_dump(mode="json")
+        response_extra = exchange.response.model_extra or {}
+        evidence = {
+            "content": [
+                block.model_dump(mode="json", exclude_none=True)
+                for block in exchange.response.content
+            ],
+            "token_ids": response_extra.get("token_ids"),
+            "logprobs": response_extra.get("logprobs"),
+            "stop_reason": exchange.response.stop_reason,
+        }
     return _fingerprint(evidence)
 
 
