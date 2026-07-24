@@ -20,6 +20,7 @@ import requests
 
 import art
 from art.gather import GatherContext, record_metrics
+from art.preprocessing.vllm_tokens import choice_vllm_token_metadata
 from art.trajectories import (
     ChatCompletionsExchange,
     CompletionsExchange,
@@ -489,6 +490,27 @@ def test_all_protocols_reconstruct_typed_responses() -> None:
         exchange.request["model"] = "updated/model"
         assert exchange.model == "updated/model"
         assert exchange.model_dump(mode="json")["model"] == "updated/model"
+
+
+def test_chat_capture_projects_top_level_vllm_prompt_tokens_onto_choice() -> None:
+    response = copy.deepcopy(CHAT)
+    response["prompt_token_ids"] = [10, 11]
+    response["choices"][0].pop("prompt_token_ids")
+    response["choices"][0]["token_ids"] = [12]
+
+    exchange = build_exchange(
+        "chat_completions",
+        {"model": "test/model", "messages": []},
+        json.dumps(response).encode(),
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+    )
+
+    assert isinstance(exchange, ChatCompletionsExchange)
+    assert choice_vllm_token_metadata(exchange.response.choices[0]) == (
+        [10, 11],
+        [12],
+    )
 
 
 def test_gather_metrics_sum_legacy_and_exchange_completion_tokens() -> None:
