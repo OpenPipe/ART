@@ -125,13 +125,16 @@ class MegatronBackend(LocalBackend):
             or grad_accumulation_sequences < 1
         ):
             raise ValueError("grad_accumulation_sequences must be a positive integer")
-        optimizer_save_interval = kwargs.get("optimizer_save_interval", 5)
+        optimizer_save_interval = kwargs.get("optimizer_save_interval", 1)
         if (
             not isinstance(optimizer_save_interval, int)
             or isinstance(optimizer_save_interval, bool)
-            or optimizer_save_interval < 1
+            or optimizer_save_interval != 1
         ):
-            raise ValueError("optimizer_save_interval must be a positive integer")
+            raise ValueError(
+                "prepared-batch training requires optimizer_save_interval=1 "
+                "so every ART revision has durable optimizer state"
+            )
         save_checkpoint = kwargs.get("save_checkpoint", True)
         if not isinstance(save_checkpoint, bool):
             raise TypeError("save_checkpoint must be a bool")
@@ -149,6 +152,11 @@ class MegatronBackend(LocalBackend):
             coefficient=objective.coefficient,
             compensate_temperature_squared=(objective.compensate_temperature_squared),
         )
+        config = TrainConfig(
+            learning_rate=learning_rate,
+            grad_accumulation_sequences=grad_accumulation_sequences,
+            optimizer_save_interval=optimizer_save_interval,
+        )
         artifact_source_revision = batch.constraints.learner_revision
         service = await self._get_service(cast(TrainableModel, model))
         committed_step = await cast(Any, service).committed_distillation_step(
@@ -157,6 +165,7 @@ class MegatronBackend(LocalBackend):
             preparation_id=batch.preparation_id,
             payload_sha256=batch.payload_sha256,
             objective=objective_config,
+            config=config,
         )
         if committed_step is not None:
             checkpoint_path: str | None = None
@@ -217,12 +226,6 @@ class MegatronBackend(LocalBackend):
             sequence_length=runtime.packed_sequence_length,
             output_dir=tensor_dir,
         )
-        config = TrainConfig(
-            learning_rate=learning_rate,
-            grad_accumulation_sequences=grad_accumulation_sequences,
-            optimizer_save_interval=optimizer_save_interval,
-        )
-
         metric_samples: list[dict[str, float]] = []
         started = time.monotonic()
         async for metrics in cast(Any, service).train_distillation(

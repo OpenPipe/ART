@@ -452,6 +452,7 @@ class MegatronService:
         preparation_id: str,
         payload_sha256: str,
         objective: DistillationObjectiveConfig,
+        config: types.TrainConfig,
     ) -> dict[str, Any]:
         return {
             "idempotency_key": idempotency_key,
@@ -459,6 +460,10 @@ class MegatronService:
             "preparation_id": preparation_id,
             "payload_sha256": payload_sha256,
             "objective": objective.model_dump(mode="json"),
+            # Bind the complete resolved training config rather than a hand-picked
+            # subset so adding another mutation-affecting TrainConfig field cannot
+            # silently weaken idempotency.
+            "train_config": config.model_dump(mode="json"),
         }
 
     def _read_distillation_receipt(
@@ -521,6 +526,7 @@ class MegatronService:
         preparation_id: str,
         payload_sha256: str,
         objective: DistillationObjectiveConfig,
+        config: types.TrainConfig,
     ) -> int | None:
         """Return a committed idempotent result, or fail closed on pending work."""
 
@@ -531,6 +537,7 @@ class MegatronService:
             preparation_id=preparation_id,
             payload_sha256=payload_sha256,
             objective=objective,
+            config=config,
         )
         receipt = self._read_distillation_receipt(path=path, binding=binding)
         if receipt is None:
@@ -1582,6 +1589,11 @@ class MegatronService:
         """Run one revision-bound standalone forward-KL optimizer transaction."""
 
         del verbose
+        if config.optimizer_save_interval != 1:
+            raise ValueError(
+                "Megatron distillation requires optimizer_save_interval=1 "
+                "before reserving or mutating training state"
+            )
         receipt_path: Path | None = None
         binding: dict[str, Any] | None = None
         receipt_reserved = False
@@ -1595,6 +1607,7 @@ class MegatronService:
                 preparation_id=preparation_id,
                 payload_sha256=payload_sha256,
                 objective=objective,
+                config=config,
             )
             existing_receipt = self._read_distillation_receipt(
                 path=receipt_path,

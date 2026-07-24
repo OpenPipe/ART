@@ -1064,6 +1064,11 @@ def _preflight_distillation_job(
         raise ValueError("distillation job must advance exactly one ART revision")
     if not math.isfinite(job.config.learning_rate) or job.config.learning_rate <= 0:
         raise ValueError("distillation learning_rate must be finite and positive")
+    if job.config.optimizer_save_interval != 1:
+        raise ValueError(
+            "Megatron distillation requires optimizer_save_interval=1 before "
+            "preparing mutable training state"
+        )
     _validate_distillation_worker_topology(runtime.model)
     if runtime.rank != 0 or runtime.world_size != 1:
         raise ValueError("M3 Megatron distillation requires one rank")

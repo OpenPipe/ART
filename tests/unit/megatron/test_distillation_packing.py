@@ -18,6 +18,8 @@ from art.megatron.distillation import (
     validate_standalone_forward_kl,
 )
 from art.megatron.runtime.jobs import (
+    LORA_READY_EVENT,
+    OPTIMIZER_READY_EVENT,
     MegatronDistillationJob,
     dump_megatron_job,
     load_megatron_job,
@@ -283,9 +285,11 @@ async def test_backend_returns_committed_receipt_before_stale_revision_check(
 ) -> None:
     artifact = _artifact(revision=7)
     backend = MegatronBackend(path=str(tmp_path))
+    observed: dict[str, Any] = {}
 
     class _Service:
-        async def committed_distillation_step(self, **_: Any) -> int:
+        async def committed_distillation_step(self, **kwargs: Any) -> int:
+            observed.update(kwargs)
             return 8
 
     async def _get_service(_: Any) -> _Service:
@@ -306,6 +310,77 @@ async def test_backend_returns_committed_receipt_before_stale_revision_check(
 
     assert result.step == 8
     assert result.metrics["distill/idempotent_replay"] == 1.0
+    assert observed["config"] == TrainConfig(optimizer_save_interval=1)
+
+
+@pytest.mark.asyncio
+async def test_backend_rejects_non_durable_optimizer_interval_before_service(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    backend = MegatronBackend(path=str(tmp_path))
+
+    async def _get_service(_: Any) -> Any:
+        raise AssertionError("invalid config must fail before service access")
+
+    monkeypatch.setattr(backend, "_get_service", _get_service)
+    with pytest.raises(ValueError, match="optimizer_save_interval=1"):
+        await backend.train(
+            cast(Any, SimpleNamespace()),
+            _artifact(),
+            objectives=distill.TrainingObjectives(distillation=distill.Loss()),
+            idempotency_key="stable-key",
+            optimizer_save_interval=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("changed_config", "field"),
+    [
+        (TrainConfig(learning_rate=1e-5, optimizer_save_interval=1), "learning_rate"),
+        (
+            TrainConfig(
+                grad_accumulation_sequences=2,
+                optimizer_save_interval=1,
+            ),
+            "grad_accumulation_sequences",
+        ),
+    ],
+)
+def test_receipt_identity_rejects_changed_resolved_training_config(
+    tmp_path: Path,
+    changed_config: TrainConfig,
+    field: str,
+) -> None:
+    path = tmp_path / "receipt.json"
+    base_config = TrainConfig(optimizer_save_interval=1)
+    common = {
+        "idempotency_key": "stable",
+        "expected_source_revision": 7,
+        "preparation_id": "preparation",
+        "payload_sha256": "payload",
+        "objective": DistillationObjectiveConfig(coefficient=1.0),
+    }
+    original = MegatronService._distillation_receipt_binding(
+        **common,
+        config=base_config,
+    )
+    changed = MegatronService._distillation_receipt_binding(
+        **common,
+        config=changed_config,
+    )
+    MegatronService._write_json_atomic(
+        path,
+        {"binding": original, "state": "committed", "committed_step": 8},
+    )
+
+    with pytest.raises(ValueError, match="different distillation job"):
+        MegatronService._read_distillation_receipt(
+            cast(MegatronService, object()),
+            path=path,
+            binding=changed,
+        )
+    assert original["train_config"][field] != changed["train_config"][field]
 
 
 def test_receipt_reservation_is_atomic_and_never_overwrites(tmp_path: Path) -> None:
@@ -328,6 +403,119 @@ def test_receipt_reservation_is_atomic_and_never_overwrites(tmp_path: Path) -> N
 
     assert path.read_bytes() == first_bytes
     assert json.loads(first_bytes) == {"binding": binding, "state": "pending"}
+
+
+@pytest.mark.asyncio
+async def test_two_distillation_updates_each_commit_optimizer_ready_revision(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    artifact = _artifact()
+    disk = pack_prepared_batch(
+        batch=artifact,
+        payload=_validated_payload(artifact),
+        sequence_length=8,
+        output_dir=str(tmp_path / "packed"),
+    )
+    monkeypatch.setattr(
+        MegatronService,
+        "_validate_megatron_dependencies",
+        lambda _self: None,
+    )
+    service = MegatronService(
+        model_name="student",
+        base_model="Qwen/Qwen3-0.6B",
+        config={},
+        output_dir=str(tmp_path),
+        runtime_config=cast(
+            Any,
+            SimpleNamespace(
+                topology=SimpleNamespace(tp=1, cp=1, pp=1, ep=1, etp=1),
+            ),
+        ),
+    )
+    service._latest_step = 7
+    committed: list[tuple[int, int]] = []
+    submitted: list[MegatronDistillationJob] = []
+
+    monkeypatch.setattr(service, "_raise_if_child_failed", lambda: None)
+    monkeypatch.setattr(service, "_data_parallel_world_size", lambda: 1)
+
+    async def _prepare_for_training() -> str:
+        return "/unused/source"
+
+    monkeypatch.setattr(service, "_prepare_for_training", _prepare_for_training)
+    monkeypatch.setattr(
+        service,
+        "_prepare_training_lora_dir",
+        lambda _source, step: f"/unused/staging/{step}",
+    )
+    monkeypatch.setattr(
+        service,
+        "_create_megatron_job_paths",
+        lambda: ("/unused/job.json", "/unused/job.log"),
+    )
+    monkeypatch.setattr(
+        "art.megatron.service.write_megatron_job",
+        lambda job, **_kwargs: submitted.append(job),
+    )
+
+    async def _completed_job(job: MegatronDistillationJob, **_kwargs: Any):
+        yield {"event": LORA_READY_EVENT, "step": job.step}
+        yield {"loss/distillation": 0.25}
+        yield {
+            "event": OPTIMIZER_READY_EVENT,
+            "step": job.step,
+            "world_size": 1,
+        }
+
+    monkeypatch.setattr("art.megatron.service.stream_megatron_job", _completed_job)
+
+    async def _lora_ready(**kwargs: Any) -> str:
+        return f"/unused/checkpoint/{kwargs['step']}"
+
+    monkeypatch.setattr(service, "_handle_training_lora_ready", _lora_ready)
+
+    async def _finish(**kwargs: Any) -> str:
+        service._latest_step = int(kwargs["step"])
+        return f"/unused/checkpoint/{kwargs['step']}"
+
+    monkeypatch.setattr(service, "_finish_training_checkpoint", _finish)
+    monkeypatch.setattr(
+        service,
+        "_commit_optimizer_checkpoint",
+        lambda *, step, world_size: committed.append((step, world_size)),
+    )
+    config = TrainConfig(optimizer_save_interval=1)
+    objective = DistillationObjectiveConfig(coefficient=1.0)
+
+    async def _run(*, source_revision: int, key: str) -> list[dict[str, float]]:
+        return [
+            metrics
+            async for metrics in service.train_distillation(
+                disk,
+                config,
+                objective=objective,
+                expected_source_revision=source_revision,
+                idempotency_key=key,
+                preparation_id=artifact.preparation_id,
+                payload_sha256=artifact.payload_sha256,
+            )
+        ]
+
+    first_metrics = await _run(source_revision=7, key="update-7")
+    second_metrics = await _run(source_revision=8, key="update-8")
+
+    assert first_metrics == [{"loss/distillation": 0.25}]
+    assert second_metrics == [{"loss/distillation": 0.25}]
+    assert [job.config.optimizer_save_interval for job in submitted] == [1, 1]
+    assert committed == [(8, 1), (9, 1)]
+    assert service._latest_step == 9
+    for key, expected_step in (("update-7", 8), ("update-8", 9)):
+        receipt = json.loads(service._distillation_receipt_path(key).read_text())
+        assert receipt["state"] == "committed"
+        assert receipt["committed_step"] == expected_step
+        assert receipt["binding"]["train_config"] == config.model_dump(mode="json")
 
 
 @pytest.mark.asyncio
