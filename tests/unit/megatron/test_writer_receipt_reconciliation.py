@@ -5,13 +5,21 @@ from typing import Any, cast
 import pytest
 
 from art.megatron.distillation import DistillationObjectiveConfig
-from art.megatron.runtime.jobs import OPTIMIZER_READY_EVENT
+from art.megatron.optimizer_state import (
+    PreparedCheckpointCommit,
+    commit_optimizer_generation,
+    optimizer_generation_files,
+    read_optimizer_commit,
+    write_prepared_checkpoint_commit,
+)
+from art.megatron.runtime.jobs import LORA_READY_EVENT, OPTIMIZER_READY_EVENT
 from art.megatron.service import MegatronService
 from art.megatron.writer_sessions import (
     AmbiguousWriterSessionError,
     WriterSessionValidationError,
 )
 from art.types import TrainConfig
+from art.utils.output_dirs import get_step_checkpoint_dir
 
 
 class _InjectedCrash(RuntimeError):
@@ -72,6 +80,20 @@ def _bound_prepared_operation(
     return operation, binding, receipt_path, lease
 
 
+def _write_source_optimizer(service: MegatronService, revision: int) -> None:
+    checkpoint = Path(get_step_checkpoint_dir(service.output_dir, revision))
+    checkpoint.mkdir(parents=True, exist_ok=True)
+    optimizer_dir = Path(service._get_optimizer_state_path())
+    files = optimizer_generation_files(revision, 1)
+    (optimizer_dir / files[0]).write_bytes(b"source optimizer")
+    commit_optimizer_generation(
+        str(optimizer_dir),
+        step=revision,
+        world_size=1,
+        files=files,
+    )
+
+
 async def _run_with_injected_crash(
     service: MegatronService,
     monkeypatch: pytest.MonkeyPatch,
@@ -81,6 +103,8 @@ async def _run_with_injected_crash(
 ) -> None:
     service._latest_step = 4
     sidecar_dir.mkdir()
+    _write_source_optimizer(service, 4)
+    optimizer_dir = Path(service._get_optimizer_state_path())
     monkeypatch.setattr(service, "_raise_if_child_failed", lambda: None)
     monkeypatch.setattr(service, "_data_parallel_world_size", lambda: 1)
     monkeypatch.setattr(service, "_status", lambda _message: None)
@@ -92,13 +116,35 @@ async def _run_with_injected_crash(
     async def _prepare_for_training() -> str:
         return "/unused/source"
 
-    async def _finish_checkpoint(**_kwargs: Any) -> str:
+    staging_dir = Path(service._staging_lora_dir(5))
+
+    def _prepare_training_lora_dir(_source: str, _step: int) -> str:
+        staging_dir.mkdir(parents=True)
+        (staging_dir / "adapter_model.safetensors").write_bytes(b"lora")
+        return str(staging_dir)
+
+    async def _finish_checkpoint(
+        *,
+        checkpoint_dir: str | None,
+        staging_lora_path: str,
+        step: int,
+    ) -> str:
+        assert checkpoint_dir is None
+        target = Path(get_step_checkpoint_dir(service.output_dir, step))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        Path(staging_lora_path).rename(target)
         service._latest_step = 5
         if boundary == "checkpoint_published":
             raise _InjectedCrash("crash after checkpoint publication")
-        return "/unused/checkpoint/5"
+        return str(target)
 
     async def _stream_job(*_args: Any, **_kwargs: Any):
+        target_files = optimizer_generation_files(5, 1)
+        (optimizer_dir / target_files[0]).write_bytes(b"target optimizer")
+        yield {
+            "event": LORA_READY_EVENT,
+            "step": 5,
+        }
         yield {
             "event": OPTIMIZER_READY_EVENT,
             "step": 5,
@@ -112,31 +158,55 @@ async def _run_with_injected_crash(
     monkeypatch.setattr(
         service,
         "_prepare_training_lora_dir",
-        lambda _source, _step: "/unused/staging/5",
+        _prepare_training_lora_dir,
     )
     monkeypatch.setattr(
         service,
         "_create_megatron_job_paths",
         lambda: ("/unused/job.json", "/unused/job.log"),
     )
-    monkeypatch.setattr(
-        service,
-        "_get_optimizer_state_path",
-        lambda: "/unused/optimizer",
-    )
     monkeypatch.setattr(service, "_finish_training_checkpoint", _finish_checkpoint)
+    monkeypatch.setattr(service, "_ensure_lora_adapter_config", lambda _path: None)
+    from art.megatron import service as service_module
+
+    original_write_marker = service_module.write_prepared_checkpoint_commit
+
+    def _write_marker(path: str, marker: Any) -> None:
+        original_write_marker(path, marker)
+        if boundary == "outputs_ready" and marker.state == "outputs_ready":
+            raise _InjectedCrash("crash after outputs-ready marker")
+
+    monkeypatch.setattr(
+        "art.megatron.service.write_prepared_checkpoint_commit",
+        _write_marker,
+    )
     monkeypatch.setattr(service, "aclose", _aclose)
     monkeypatch.setattr(
         "art.megatron.service.MegatronDistillationJob",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
-    monkeypatch.setattr(
-        "art.megatron.service.write_megatron_job", lambda *_a, **_k: None
-    )
+
+    def _write_job(*_args: Any, **_kwargs: Any) -> None:
+        if boundary == "submitted":
+            raise _InjectedCrash("crash after submitted marker")
+
+    monkeypatch.setattr("art.megatron.service.write_megatron_job", _write_job)
     monkeypatch.setattr("art.megatron.service.stream_megatron_job", _stream_job)
 
-    def _commit_optimizer(*, step: int, world_size: int) -> None:
+    original_commit_optimizer = service._commit_optimizer_checkpoint
+
+    def _commit_optimizer(
+        *,
+        step: int,
+        world_size: int,
+        operation_identity: dict[str, Any] | None = None,
+    ) -> None:
         assert (step, world_size) == (5, 1)
+        original_commit_optimizer(
+            step=step,
+            world_size=world_size,
+            operation_identity=operation_identity,
+        )
         if boundary == "optimizer_published":
             raise _InjectedCrash("crash after optimizer publication")
 
@@ -226,20 +296,22 @@ def test_pre_receipt_crash_boundaries_remain_fail_closed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("crash_boundary", "recoverable"),
+    ("crash_boundary", "resolution"),
     [
-        ("checkpoint_published", False),
-        ("optimizer_published", False),
-        ("receipt_committed", True),
-        ("writer_committed", True),
-        ("writer_released", True),
+        ("submitted", "abandoned"),
+        ("outputs_ready", "committed"),
+        ("checkpoint_published", "committed"),
+        ("optimizer_published", "committed"),
+        ("receipt_committed", "committed"),
+        ("writer_committed", "committed"),
+        ("writer_released", "committed"),
     ],
 )
-async def test_train_crash_ordering_uses_receipt_as_reconciliation_boundary(
+async def test_train_crash_recovery_never_resubmits_worker_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     crash_boundary: str,
-    recoverable: bool,
+    resolution: str,
 ) -> None:
     owner = _service(tmp_path, monkeypatch)
     await _run_with_injected_crash(
@@ -251,26 +323,80 @@ async def test_train_crash_ordering_uses_receipt_as_reconciliation_boundary(
     crashed_journal = owner._writer_sessions.inspect()
     assert crashed_journal is not None
     assert crashed_journal["state"] in {"bound", "committed", "closed"}
-    if not recoverable:
-        assert crashed_journal["state"] == "bound", crashed_journal
 
     recovered = _service(tmp_path, monkeypatch)
-    if not recoverable:
-        with pytest.raises(
-            AmbiguousWriterSessionError,
-            match="receipt reconciliation",
-        ):
-            recovered._writer_sessions.acquire_ordinary_open(
-                revision=5,
-                ttl_s=30.0,
-            )
-        return
+    recovered._latest_step = 4
+    activated: list[int] = []
+
+    async def _activate(step: int) -> None:
+        activated.append(step)
+        recovered._latest_step = step
+
+    async def _forbid_submission(*_args: Any, **_kwargs: Any):
+        raise AssertionError("recovery must not submit another Megatron job")
+        yield {}
+
+    monkeypatch.setattr(
+        recovered,
+        "_activate_committed_distillation_step",
+        _activate,
+    )
+    monkeypatch.setattr(
+        "art.megatron.service.stream_megatron_job",
+        _forbid_submission,
+    )
+    retry_sidecars = tmp_path / "retry-sidecars"
+    retry_sidecars.mkdir()
+    retry = recovered.train_distillation(
+        cast(Any, {"dir": str(retry_sidecars)}),
+        TrainConfig(optimizer_save_interval=1),
+        objective=DistillationObjectiveConfig(coefficient=1.0),
+        expected_source_revision=4,
+        idempotency_key="update-4",
+        preparation_id="prepared-4",
+        payload_sha256="a" * 64,
+    )
+    if resolution == "abandoned":
+        with pytest.raises(RuntimeError, match="new idempotency key"):
+            async for _metrics in retry:
+                pass
+        assert activated == []
+        crashed_operation = cast(
+            dict[str, Any],
+            crashed_journal["operation_identity"],
+        )
+        crashed_identity = cast(dict[str, Any], crashed_operation["identity"])
+        receipt = recovered._read_distillation_receipt(
+            path=recovered._distillation_receipt_path("update-4"),
+            binding=cast(dict[str, Any], crashed_identity["receipt_binding"]),
+        )
+        assert receipt is not None
+        assert receipt["state"] == "failed"
+        next_revision = 4
+    else:
+        metrics = [sample async for sample in retry]
+        assert metrics == [
+            {
+                "distillation/idempotent_replay": 1.0,
+                "distillation/committed_step": 5.0,
+                "data/step_num_gradient_steps": 0.0,
+            }
+        ]
+        assert activated == [5]
+        assert not retry_sidecars.exists()
+        commit = read_optimizer_commit(recovered._get_optimizer_state_path())
+        assert commit is not None
+        assert commit.schema_version == 2
+        assert commit.step == 5
+        assert commit.operation_identity == crashed_journal["operation_identity"]
+        next_revision = 5
 
     later = recovered._writer_sessions.acquire_ordinary_open(
-        revision=5,
+        revision=next_revision,
         ttl_s=30.0,
     )
-    assert later.fence == 2
+    assert later.revision == next_revision
+    assert later.fence == cast(int, crashed_journal["fence"]) + 1
     recovered._writer_sessions.release(later)
 
 
@@ -362,6 +488,18 @@ async def test_idempotent_replay_reconciles_receipt_before_returning(
     owner._writer_sessions._release_gate(lease.session_id)
 
     recovered = _service(tmp_path, monkeypatch)
+    recovered._latest_step = 4
+    activated: list[int] = []
+
+    async def _activate(step: int) -> None:
+        activated.append(step)
+        recovered._latest_step = step
+
+    monkeypatch.setattr(
+        recovered,
+        "_activate_committed_distillation_step",
+        _activate,
+    )
     sidecars = tmp_path / "replay-sidecars"
     sidecars.mkdir()
     metrics = [
@@ -376,11 +514,12 @@ async def test_idempotent_replay_reconciles_receipt_before_returning(
             payload_sha256="a" * 64,
         )
     ]
+    assert activated == [5]
 
     assert metrics == [
         {
-            "distill/idempotent_replay": 1.0,
-            "distill/committed_step": 5.0,
+            "distillation/idempotent_replay": 1.0,
+            "distillation/committed_step": 5.0,
             "data/step_num_gradient_steps": 0.0,
         }
     ]
@@ -391,6 +530,102 @@ async def test_idempotent_replay_reconciles_receipt_before_returning(
         ttl_s=30.0,
     )
     recovered._writer_sessions.release(later)
+
+
+@pytest.mark.asyncio
+async def test_current_step_submitted_recovery_abandons_at_source_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owner = _service(tmp_path, monkeypatch)
+    operation, _binding, _receipt_path, lease = _bound_prepared_operation(owner)
+    _write_source_optimizer(owner, 4)
+    staging = Path(owner._staging_lora_dir(5))
+    staging.mkdir(parents=True)
+    write_prepared_checkpoint_commit(
+        staging,
+        PreparedCheckpointCommit(
+            state="submitted",
+            step=5,
+            operation_identity=operation,
+        ),
+    )
+    owner._writer_sessions._release_gate(lease.session_id)
+
+    recovered = _service(tmp_path, monkeypatch)
+    with pytest.raises(RuntimeError, match="new idempotency key"):
+        await recovered.committed_distillation_step(
+            idempotency_key="update-4",
+            expected_source_revision=4,
+            preparation_id="prepared-4",
+            payload_sha256="a" * 64,
+            objective=DistillationObjectiveConfig(coefficient=1.0),
+            config=TrainConfig(optimizer_save_interval=1),
+        )
+
+    journal = recovered._writer_sessions.inspect()
+    assert journal is not None
+    assert journal["state"] == "closed"
+    assert journal["close_reason"] == "recovered_abandoned"
+    assert journal["revision"] == 4
+    assert journal["result_revision"] is None
+    retry = recovered._writer_sessions.acquire_current_step(
+        revision=4,
+        ttl_s=30.0,
+    )
+    assert retry.fence == lease.fence + 1
+    recovered._writer_sessions.release(retry)
+
+
+@pytest.mark.parametrize("failure", ["incomplete", "mismatch"])
+def test_incomplete_or_mismatched_output_evidence_remains_fenced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    owner = _service(tmp_path, monkeypatch)
+    operation, _binding, _receipt_path, lease = _bound_prepared_operation(owner)
+    _write_source_optimizer(owner, 4)
+    staging = Path(owner._staging_lora_dir(5))
+    staging.mkdir(parents=True)
+    marker_operation = operation
+    if failure == "mismatch":
+        marker_operation = owner._writer_operation_for_job(
+            route="prepared",
+            source_revision=4,
+            target_revision=5,
+            identity={"receipt_binding": {"idempotency_key": "different"}},
+        )
+    target_files = optimizer_generation_files(5, 1)
+    write_prepared_checkpoint_commit(
+        staging,
+        PreparedCheckpointCommit(
+            state="outputs_ready",
+            step=5,
+            operation_identity=marker_operation,
+            world_size=1,
+            files=target_files,
+        ),
+    )
+    owner._writer_sessions._release_gate(lease.session_id)
+
+    recovered = _service(tmp_path, monkeypatch)
+    if failure == "mismatch":
+        with pytest.raises(
+            WriterSessionValidationError,
+            match="different operation",
+        ):
+            recovered._writer_sessions.reconcile()
+    else:
+        assert recovered._writer_sessions.reconcile().action == "ambiguous_after_bind"
+    journal = recovered._writer_sessions.inspect()
+    assert journal is not None
+    assert journal["state"] == "bound"
+    assert journal["result_revision"] is None
+    optimizer_commit = read_optimizer_commit(recovered._get_optimizer_state_path())
+    assert optimizer_commit is not None
+    assert optimizer_commit.step == 4
+    assert not Path(get_step_checkpoint_dir(recovered.output_dir, 5)).exists()
 
 
 @pytest.mark.parametrize("mismatch", ["binding", "revision"])

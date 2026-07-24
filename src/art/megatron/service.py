@@ -64,11 +64,14 @@ from .model_support.registry import (
 )
 from .optimizer_state import (
     MegatronResumeStep,
+    PreparedCheckpointCommit,
     commit_optimizer_generation,
     format_megatron_resume_message,
     optimizer_generation_files,
     prepare_megatron_resume_state,
     read_optimizer_commit,
+    read_prepared_checkpoint_commit,
+    write_prepared_checkpoint_commit,
 )
 from .runtime.client import (
     create_megatron_job_paths,
@@ -92,6 +95,7 @@ from .runtime_config import get_megatron_runtime_config
 from .training.sft_batches import materialize_sft_batches
 from .writer_sessions import (
     AmbiguousWriterSessionError,
+    BoundOperationResolution,
     WriterLease,
     WriterSessionStore,
     WriterSessionValidationError,
@@ -640,12 +644,39 @@ class MegatronService:
                 receipt = json.loads(path.read_text())
             except (OSError, ValueError) as exc:
                 raise RuntimeError("distillation receipt is unreadable") from exc
+            if not isinstance(receipt, dict):
+                raise RuntimeError("distillation receipt has an invalid schema")
             if receipt.get("binding") != binding:
                 raise ValueError(
                     "idempotency_key is already bound to a different distillation job"
                 )
-            if receipt.get("state") not in {"committed", "pending", "failed"}:
+            state = receipt.get("state")
+            if state not in {"committed", "pending", "failed"}:
                 raise RuntimeError("distillation receipt has an invalid state")
+            expected_fields = {
+                "pending": {"binding", "state"},
+                "failed": {"binding", "state", "failure"},
+                "committed": {"binding", "state", "committed_step"},
+            }[state]
+            if set(receipt) != expected_fields:
+                raise RuntimeError("distillation receipt has an invalid schema")
+            if state == "failed" and (
+                not isinstance(receipt["failure"], str) or not receipt["failure"]
+            ):
+                raise RuntimeError("failed distillation receipt has an invalid failure")
+            if state == "committed":
+                source_revision = binding.get("source_revision")
+                committed_step = receipt["committed_step"]
+                if (
+                    not isinstance(source_revision, int)
+                    or isinstance(source_revision, bool)
+                    or not isinstance(committed_step, int)
+                    or isinstance(committed_step, bool)
+                    or committed_step != source_revision + 1
+                ):
+                    raise RuntimeError(
+                        "committed distillation receipt has an unexpected revision"
+                    )
             return cast(dict[str, Any], receipt)
         return None
 
@@ -653,12 +684,12 @@ class MegatronService:
         self,
         operation: dict[str, Any],
         expected_result_revision: int,
-    ) -> bool:
-        """Prove a crashed prepared writer committed its exact ``R -> R+1`` job."""
+    ) -> BoundOperationResolution:
+        """Resolve one exact prepared operation without submitting worker work."""
 
         if operation.get("route") != "prepared":
             # Legacy RL and SFT do not yet have independently durable receipts.
-            return False
+            return BoundOperationResolution.UNRESOLVED
         expected_fields = {
             "route",
             "model_name",
@@ -700,22 +731,157 @@ class MegatronService:
             raise WriterSessionValidationError(
                 "prepared writer receipt binding does not match its operation"
             )
-        receipt = self._read_distillation_receipt(
-            path=self._distillation_receipt_path(idempotency_key),
-            binding=binding,
-        )
-        if receipt is None or receipt["state"] != "committed":
-            return False
-        committed_step = receipt.get("committed_step")
-        if (
-            not isinstance(committed_step, int)
-            or isinstance(committed_step, bool)
-            or committed_step != expected_result_revision
-        ):
-            raise WriterSessionValidationError(
-                "committed distillation receipt has an unexpected revision"
+        try:
+            receipt = self._read_distillation_receipt(
+                path=self._distillation_receipt_path(idempotency_key),
+                binding=binding,
             )
-        return True
+        except RuntimeError as exc:
+            raise WriterSessionValidationError(
+                "prepared writer receipt is invalid"
+            ) from exc
+        if receipt is None:
+            return BoundOperationResolution.UNRESOLVED
+        if receipt["state"] == "committed":
+            committed_step = receipt.get("committed_step")
+            if (
+                not isinstance(committed_step, int)
+                or isinstance(committed_step, bool)
+                or committed_step != expected_result_revision
+            ):
+                raise WriterSessionValidationError(
+                    "committed distillation receipt has an unexpected revision"
+                )
+            return BoundOperationResolution.COMMITTED
+        if receipt["state"] == "failed":
+            return BoundOperationResolution.ABANDONED
+
+        source_revision = cast(int, source_revision)
+        target_revision = cast(int, target_revision)
+        staging_dir = Path(self._staging_lora_dir(target_revision))
+        checkpoint_dir = Path(get_step_checkpoint_dir(self.output_dir, target_revision))
+        staging_marker = self._read_matching_prepared_marker(
+            staging_dir,
+            operation=operation,
+            target_revision=target_revision,
+        )
+        checkpoint_marker = self._read_matching_prepared_marker(
+            checkpoint_dir,
+            operation=operation,
+            target_revision=target_revision,
+        )
+        if staging_marker is not None and checkpoint_marker is not None:
+            return BoundOperationResolution.UNRESOLVED
+
+        marker = checkpoint_marker or staging_marker
+        if marker is None:
+            # Pre-marker pending receipts and any lost marker remain fail-closed.
+            return BoundOperationResolution.UNRESOLVED
+
+        optimizer_path = self._get_optimizer_state_path()
+        try:
+            optimizer_commit = read_optimizer_commit(optimizer_path)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise WriterSessionValidationError(
+                "prepared optimizer authority is invalid"
+            ) from exc
+
+        if marker.state == "submitted":
+            if checkpoint_marker is not None:
+                return BoundOperationResolution.UNRESOLVED
+            source_is_authoritative = (
+                optimizer_commit is None and source_revision == 0
+            ) or (
+                optimizer_commit is not None
+                and optimizer_commit.step == source_revision
+            )
+            if not source_is_authoritative or checkpoint_dir.exists():
+                return BoundOperationResolution.UNRESOLVED
+            self._write_json_atomic(
+                self._distillation_receipt_path(idempotency_key),
+                {
+                    "binding": binding,
+                    "state": "failed",
+                    "failure": "recovered_abandoned",
+                },
+            )
+            return BoundOperationResolution.ABANDONED
+
+        assert marker.world_size is not None and marker.files is not None
+        optimizer_dir = Path(optimizer_path)
+        if any(not (optimizer_dir / name).is_file() for name in marker.files):
+            return BoundOperationResolution.UNRESOLVED
+        if optimizer_commit is not None and optimizer_commit.step not in {
+            source_revision,
+            target_revision,
+        }:
+            return BoundOperationResolution.UNRESOLVED
+        if optimizer_commit is not None and optimizer_commit.step == target_revision:
+            if (
+                optimizer_commit.schema_version != 2
+                or optimizer_commit.operation_identity != operation
+                or optimizer_commit.world_size != marker.world_size
+                or optimizer_commit.files != marker.files
+            ):
+                raise WriterSessionValidationError(
+                    "target optimizer is committed to a different operation"
+                )
+        elif optimizer_commit is None and source_revision != 0:
+            return BoundOperationResolution.UNRESOLVED
+        elif optimizer_commit is not None and optimizer_commit.step != source_revision:
+            return BoundOperationResolution.UNRESOLVED
+
+        if checkpoint_marker is None:
+            if not staging_dir.is_dir() or checkpoint_dir.exists():
+                return BoundOperationResolution.UNRESOLVED
+            self._publish_staged_training_checkpoint(
+                staging_lora_path=str(staging_dir),
+                step=target_revision,
+            )
+        commit_optimizer_generation(
+            optimizer_path,
+            step=target_revision,
+            world_size=marker.world_size,
+            files=marker.files,
+            operation_identity=operation,
+        )
+        self._write_json_atomic(
+            self._distillation_receipt_path(idempotency_key),
+            {
+                "binding": binding,
+                "state": "committed",
+                "committed_step": target_revision,
+            },
+        )
+        self._resume_step = None
+        return BoundOperationResolution.COMMITTED
+
+    @staticmethod
+    def _read_matching_prepared_marker(
+        directory: Path,
+        *,
+        operation: dict[str, Any],
+        target_revision: int,
+    ) -> PreparedCheckpointCommit | None:
+        if not directory.exists():
+            return None
+        if not directory.is_dir():
+            raise WriterSessionValidationError(
+                "prepared checkpoint marker parent is not a directory"
+            )
+        try:
+            marker = read_prepared_checkpoint_commit(directory)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise WriterSessionValidationError(
+                "prepared checkpoint marker is invalid"
+            ) from exc
+        if marker is None:
+            return None
+        if marker.step != target_revision or marker.operation_identity != operation:
+            raise WriterSessionValidationError(
+                "prepared checkpoint marker belongs to a different operation"
+            )
+        return marker
 
     def _reserve_distillation_receipt(
         self,
@@ -749,6 +915,20 @@ class MegatronService:
             os.fsync(handle.fileno())
         MegatronService._fsync_parent_directory(path)
 
+    async def _activate_committed_distillation_step(self, step: int) -> None:
+        """Make a recovered durable checkpoint active before replay returns."""
+
+        if self._latest_step == step:
+            return
+        checkpoint_dir = get_step_checkpoint_dir(self.output_dir, step)
+        if not Path(checkpoint_dir).is_dir():
+            raise RuntimeError(f"committed distillation checkpoint {step} is missing")
+        await self._finish_training_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            staging_lora_path=checkpoint_dir,
+            step=step,
+        )
+
     async def committed_distillation_step(
         self,
         *,
@@ -773,17 +953,26 @@ class MegatronService:
         receipt = self._read_distillation_receipt(path=path, binding=binding)
         if receipt is None:
             return None
+        if receipt["state"] == "pending":
+            self._writer_sessions.reconcile()
+            receipt = self._read_distillation_receipt(path=path, binding=binding)
+            assert receipt is not None
         if receipt["state"] == "failed":
             raise RuntimeError(
-                "a prior distillation attempt failed after reservation; use a "
-                "new idempotency key after confirming no optimizer mutation"
+                "the distillation operation was abandoned before durable optimizer "
+                "commit; retry with a new idempotency key at the source revision"
             )
         if receipt["state"] == "pending":
             raise RuntimeError(
                 "an identical distillation job is pending with an ambiguous "
-                "outcome; reconciliation is required before retry"
+                "outcome; exact submitted/output evidence is incomplete or mismatched"
             )
-        return int(receipt["committed_step"])
+        # A process may have crashed after committing this receipt but before
+        # committing or releasing its exact receipt-bound writer journal.
+        self._writer_sessions.reconcile()
+        committed_step = cast(int, receipt["committed_step"])
+        await self._activate_committed_distillation_step(committed_step)
+        return committed_step
 
     def _staging_lora_dir(self, step: int) -> str:
         return str(
@@ -1482,7 +1671,13 @@ class MegatronService:
         Path(staging_lora_path).rename(checkpoint_dir)
         return checkpoint_dir
 
-    def _commit_optimizer_checkpoint(self, *, step: int, world_size: int) -> None:
+    def _commit_optimizer_checkpoint(
+        self,
+        *,
+        step: int,
+        world_size: int,
+        operation_identity: dict[str, Any] | None = None,
+    ) -> None:
         checkpoint_dir = Path(get_step_checkpoint_dir(self.output_dir, step))
         if not checkpoint_dir.is_dir():
             raise RuntimeError(
@@ -1494,6 +1689,7 @@ class MegatronService:
             step=step,
             world_size=world_size,
             files=optimizer_generation_files(step, world_size),
+            operation_identity=operation_identity,
         )
 
     @staticmethod
@@ -1925,17 +2121,53 @@ class MegatronService:
                 # before committing/releasing its writer journal. Reconcile the
                 # exact receipt-bound operation before returning the replay.
                 self._writer_sessions.reconcile()
+                await self._activate_committed_distillation_step(
+                    cast(int, existing_receipt["committed_step"])
+                )
                 shutil.rmtree(disk_tensors["dir"])
                 yield {
-                    "distill/idempotent_replay": 1.0,
-                    "distill/committed_step": float(existing_receipt["committed_step"]),
+                    "distillation/idempotent_replay": 1.0,
+                    "distillation/committed_step": float(
+                        existing_receipt["committed_step"]
+                    ),
                     "data/step_num_gradient_steps": 0.0,
                 }
                 return
+            if existing_receipt is not None and existing_receipt["state"] == "failed":
+                raise RuntimeError(
+                    "the distillation operation was abandoned before durable optimizer "
+                    "commit; retry with a new idempotency key at the source revision"
+                )
             if existing_receipt is not None and existing_receipt["state"] == "pending":
+                self._writer_sessions.reconcile()
+                existing_receipt = self._read_distillation_receipt(
+                    path=receipt_path,
+                    binding=binding,
+                )
+                assert existing_receipt is not None
+                if existing_receipt["state"] == "committed":
+                    await self._activate_committed_distillation_step(
+                        cast(int, existing_receipt["committed_step"])
+                    )
+                    shutil.rmtree(disk_tensors["dir"])
+                    yield {
+                        "distillation/idempotent_replay": 1.0,
+                        "distillation/committed_step": float(
+                            existing_receipt["committed_step"]
+                        ),
+                        "data/step_num_gradient_steps": 0.0,
+                    }
+                    return
+                if existing_receipt["state"] == "failed":
+                    raise RuntimeError(
+                        "the distillation operation was abandoned before durable "
+                        "optimizer commit; retry with a new idempotency key at the "
+                        "source revision"
+                    )
                 raise RuntimeError(
                     "an identical distillation job is pending with an ambiguous "
-                    "outcome; reconciliation is required before retry"
+                    "outcome; exact submitted/output evidence is incomplete or "
+                    "mismatched"
                 )
             topology = self.runtime_config.topology
             prepared_topology = (
@@ -2025,6 +2257,14 @@ class MegatronService:
                 target_revision=next_step,
                 identity={"receipt_binding": binding},
             )
+            write_prepared_checkpoint_commit(
+                staging_lora_path,
+                PreparedCheckpointCommit(
+                    state="submitted",
+                    step=next_step,
+                    operation_identity=operation,
+                ),
+            )
             # From this point onward, failure is ambiguous and must remain pending.
             self._writer_sessions.bind(
                 writer_holder[0],
@@ -2036,7 +2276,7 @@ class MegatronService:
             sidecars_transferred = True
             job_submitted = True
             write_megatron_job(job, job_path=job_path)
-            checkpoint_dir: str | None = None
+            lora_ready = False
             optimizer_world_size: int | None = None
             async for result in stream_megatron_job(
                 job,
@@ -2045,11 +2285,9 @@ class MegatronService:
                 process_log_path=self._megatron_log_path,
             ):
                 if result.get("event") == LORA_READY_EVENT:
-                    checkpoint_dir = await self._handle_training_lora_ready(
-                        checkpoint_dir=checkpoint_dir,
-                        staging_lora_path=staging_lora_path,
-                        step=next_step,
-                    )
+                    if int(result.get("step", -1)) != next_step:
+                        raise RuntimeError(f"Invalid LoRA-ready event: {result!r}")
+                    lora_ready = True
                     continue
                 if (
                     world_size := self._optimizer_ready_world_size(
@@ -2059,17 +2297,37 @@ class MegatronService:
                     optimizer_world_size = world_size
                     continue
                 yield {key: float(value) for key, value in result.items()}
-            await self._finish_training_checkpoint(
-                checkpoint_dir=checkpoint_dir,
-                staging_lora_path=staging_lora_path,
-                step=next_step,
-            )
+            if not lora_ready:
+                raise RuntimeError(
+                    "Megatron distillation job did not persist its LoRA checkpoint"
+                )
             if optimizer_world_size is None:
                 raise RuntimeError(
                     "Megatron distillation job did not persist its optimizer"
                 )
+            optimizer_files = optimizer_generation_files(
+                next_step,
+                optimizer_world_size,
+            )
+            write_prepared_checkpoint_commit(
+                staging_lora_path,
+                PreparedCheckpointCommit(
+                    state="outputs_ready",
+                    step=next_step,
+                    operation_identity=operation,
+                    world_size=optimizer_world_size,
+                    files=optimizer_files,
+                ),
+            )
+            await self._finish_training_checkpoint(
+                checkpoint_dir=None,
+                staging_lora_path=staging_lora_path,
+                step=next_step,
+            )
             self._commit_optimizer_checkpoint(
-                step=next_step, world_size=optimizer_world_size
+                step=next_step,
+                world_size=optimizer_world_size,
+                operation_identity=operation,
             )
             assert receipt_path is not None and binding is not None
             self._write_json_atomic(

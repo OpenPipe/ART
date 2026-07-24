@@ -1,36 +1,181 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import re
 import time
-from typing import Literal
+from typing import Any, Literal, Mapping, cast
+import uuid
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 
 ALLOW_UNPAIRED_MEGATRON_RESUME_ENV = "ART_ALLOW_UNPAIRED_MEGATRON_RESUME"
 OPTIMIZER_MANIFEST = "CURRENT.json"
+PREPARED_CHECKPOINT_MANIFEST = ".art-prepared-commit.json"
 _GENERATION_SHARD_RE = re.compile(
     r"^step-(?P<step>\d+)-(?P<rank>\d+)-of-(?P<world>\d+)\.pt$"
 )
 
+type JsonValue = (
+    None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalOperationIdentity(Mapping[str, JsonValue]):
+    """Deeply immutable operation identity backed by canonical JSON bytes."""
+
+    _encoded: str
+
+    @classmethod
+    def from_value(cls, value: Mapping[str, Any]) -> "CanonicalOperationIdentity":
+        try:
+            encoded = json.dumps(
+                dict(value),
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            decoded = json.loads(encoded)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "operation identity must be a finite canonical JSON object"
+            ) from exc
+        if not isinstance(decoded, dict) or not decoded:
+            raise ValueError("operation identity must be a non-empty JSON object")
+        return cls(encoded)
+
+    def to_dict(self) -> dict[str, JsonValue]:
+        return cast(dict[str, JsonValue], json.loads(self._encoded))
+
+    def __getitem__(self, key: str) -> JsonValue:
+        return self.to_dict()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.to_dict())
+
+    def __len__(self) -> int:
+        return len(self.to_dict())
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, CanonicalOperationIdentity):
+            return self._encoded == other._encoded
+        if isinstance(other, Mapping):
+            try:
+                return self == CanonicalOperationIdentity.from_value(
+                    cast(Mapping[str, Any], other)
+                )
+            except ValueError:
+                return False
+        return NotImplemented
+
 
 class OptimizerCommit(BaseModel):
-    schema_version: Literal[1] = 1
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+        frozen=True,
+    )
+
+    schema_version: Literal[1, 2] = 1
     step: int = Field(ge=0)
     world_size: int = Field(ge=1)
     files: tuple[str, ...]
+    operation_identity: CanonicalOperationIdentity | None = None
+
+    @field_validator("operation_identity", mode="before")
+    @classmethod
+    def validate_operation_identity(
+        cls,
+        value: Mapping[str, Any] | CanonicalOperationIdentity | None,
+    ) -> CanonicalOperationIdentity | None:
+        if value is None:
+            return None
+        if isinstance(value, CanonicalOperationIdentity):
+            return value
+        return canonical_operation_identity(value)
+
+    @field_serializer("operation_identity")
+    def serialize_operation_identity(
+        self,
+        value: CanonicalOperationIdentity | None,
+    ) -> dict[str, JsonValue] | None:
+        return None if value is None else value.to_dict()
 
     @model_validator(mode="after")
-    def validate_files(self) -> "OptimizerCommit":
+    def validate_commit(self) -> "OptimizerCommit":
         if self.files != optimizer_generation_files(self.step, self.world_size):
             raise ValueError(
                 "optimizer manifest files do not match its step/world size"
             )
+        if (self.schema_version == 1) != (self.operation_identity is None):
+            raise ValueError(
+                "optimizer schema 1 forbids operation identity and schema 2 requires it"
+            )
+        return self
+
+
+class PreparedCheckpointCommit(BaseModel):
+    """Durable exact-operation marker carried by a staged/prepared checkpoint."""
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+        frozen=True,
+    )
+
+    schema_version: Literal[1] = 1
+    state: Literal["submitted", "outputs_ready"]
+    step: int = Field(ge=1)
+    operation_identity: CanonicalOperationIdentity
+    world_size: int | None = Field(default=None, ge=1)
+    files: tuple[str, ...] | None = None
+
+    @field_validator("operation_identity", mode="before")
+    @classmethod
+    def validate_operation_identity(
+        cls,
+        value: Mapping[str, Any] | CanonicalOperationIdentity,
+    ) -> CanonicalOperationIdentity:
+        if isinstance(value, CanonicalOperationIdentity):
+            return value
+        return canonical_operation_identity(value)
+
+    @field_serializer("operation_identity")
+    def serialize_operation_identity(
+        self,
+        value: CanonicalOperationIdentity,
+    ) -> dict[str, JsonValue]:
+        return value.to_dict()
+
+    @model_validator(mode="after")
+    def validate_state(self) -> "PreparedCheckpointCommit":
+        if self.state == "submitted":
+            if self.world_size is not None or self.files is not None:
+                raise ValueError(
+                    "submitted checkpoint marker cannot declare optimizer generation"
+                )
+            return self
+        if self.world_size is None or self.files is None:
+            raise ValueError(
+                "outputs-ready checkpoint marker requires optimizer generation"
+            )
+        if self.files != optimizer_generation_files(self.step, self.world_size):
+            raise ValueError("checkpoint marker files do not match its step/world size")
         return self
 
 
@@ -49,12 +194,27 @@ def optimizer_generation_files(step: int, world_size: int) -> tuple[str, ...]:
     )
 
 
+def canonical_operation_identity(
+    value: Mapping[str, Any],
+) -> CanonicalOperationIdentity:
+    """Return one finite, key-sorted JSON representation of an operation."""
+
+    return CanonicalOperationIdentity.from_value(value)
+
+
 def read_optimizer_commit(optimizer_state_path: str) -> OptimizerCommit | None:
     path = Path(optimizer_state_path)
     manifest_path = path / OPTIMIZER_MANIFEST
     if not manifest_path.exists():
         return None
-    commit = OptimizerCommit.model_validate_json(manifest_path.read_text())
+    encoded = manifest_path.read_text()
+    commit = OptimizerCommit.model_validate_json(encoded)
+    if commit.schema_version == 2 and encoded != commit.model_dump_json(
+        exclude_none=True
+    ):
+        raise RuntimeError(
+            f"Prepared optimizer manifest {manifest_path} is not canonical"
+        )
     missing = [name for name in commit.files if not (path / name).is_file()]
     if missing:
         raise RuntimeError(
@@ -95,6 +255,7 @@ def commit_optimizer_generation(
     step: int,
     world_size: int,
     files: tuple[str, ...],
+    operation_identity: Mapping[str, Any] | None = None,
 ) -> None:
     path = Path(optimizer_state_path)
     path.mkdir(parents=True, exist_ok=True)
@@ -102,8 +263,23 @@ def commit_optimizer_generation(
     missing = [name for name in files if not (path / name).is_file()]
     if missing:
         raise RuntimeError(f"Cannot commit missing optimizer shard(s): {missing}")
-    commit = OptimizerCommit(step=step, world_size=world_size, files=files)
-    _atomic_write(path / OPTIMIZER_MANIFEST, commit.model_dump_json())
+    commit = OptimizerCommit(
+        schema_version=2 if operation_identity is not None else 1,
+        step=step,
+        world_size=world_size,
+        files=files,
+        operation_identity=operation_identity,
+    )
+    if previous is not None and previous.step == step:
+        if previous == commit:
+            return
+        raise RuntimeError(
+            f"Optimizer step {step} is already committed to a different operation"
+        )
+    _atomic_write(
+        path / OPTIMIZER_MANIFEST,
+        commit.model_dump_json(exclude_none=True),
+    )
 
     retained = set(files) | {OPTIMIZER_MANIFEST}
     obsolete = set(previous.files if previous is not None else ())
@@ -119,18 +295,78 @@ def commit_optimizer_generation(
             candidate.unlink()
 
 
+def read_prepared_checkpoint_commit(
+    checkpoint_dir: str | os.PathLike[str],
+) -> PreparedCheckpointCommit | None:
+    manifest_path = Path(checkpoint_dir) / PREPARED_CHECKPOINT_MANIFEST
+    if not manifest_path.exists():
+        return None
+    encoded = manifest_path.read_text()
+    marker = PreparedCheckpointCommit.model_validate_json(encoded)
+    if encoded != marker.model_dump_json(exclude_none=True):
+        raise RuntimeError(
+            f"Prepared checkpoint manifest {manifest_path} is not canonical"
+        )
+    return marker
+
+
+def write_prepared_checkpoint_commit(
+    checkpoint_dir: str | os.PathLike[str],
+    marker: PreparedCheckpointCommit,
+) -> None:
+    """Write once, allowing only the exact submitted-to-ready transition."""
+
+    path = Path(checkpoint_dir)
+    if not path.is_dir():
+        raise RuntimeError(
+            f"Cannot write prepared commit outside a checkpoint directory: {path}"
+        )
+    existing = read_prepared_checkpoint_commit(path)
+    if existing == marker:
+        return
+    if existing is not None:
+        valid_transition = (
+            existing.state == "submitted"
+            and marker.state == "outputs_ready"
+            and existing.step == marker.step
+            and existing.operation_identity == marker.operation_identity
+        )
+        if not valid_transition:
+            raise RuntimeError(
+                "prepared checkpoint is already bound to a different operation"
+            )
+    _atomic_write(
+        path / PREPARED_CHECKPOINT_MANIFEST,
+        marker.model_dump_json(exclude_none=True),
+    )
+
+
 def _atomic_write(path: Path, content: str) -> None:
-    temporary = path.with_name(f"{path.name}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    directory_fd = os.open(path.parent, os.O_RDONLY)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor: int | None = None
     try:
-        os.fsync(directory_fd)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     finally:
-        os.close(directory_fd)
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _allow_unpaired_resume() -> bool:

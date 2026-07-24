@@ -10,6 +10,7 @@ import pytest
 
 from art.megatron.writer_sessions import (
     AmbiguousWriterSessionError,
+    BoundOperationResolution,
     WriterBindingMismatchError,
     WriterBusyError,
     WriterJournalCorruptionError,
@@ -303,9 +304,11 @@ def test_exact_committed_receipt_reconciles_bound_crash_before_later_writer(
     def _resolve(
         candidate: dict[str, Any],
         result_revision: int,
-    ) -> bool:
+    ) -> BoundOperationResolution:
         observed.append((candidate, result_revision))
-        return candidate == operation and result_revision == 11
+        if candidate == operation and result_revision == 11:
+            return BoundOperationResolution.COMMITTED
+        return BoundOperationResolution.UNRESOLVED
 
     recovered = WriterSessionStore(
         root=tmp_path,
@@ -335,7 +338,11 @@ def test_explicit_reconciliation_closes_only_exact_committed_operation(
         model_identity="project/model",
         clock=FakeClock(),
         committed_operation_resolver=(
-            lambda candidate, result: candidate == operation and result == 5
+            lambda candidate, result: (
+                BoundOperationResolution.COMMITTED
+                if candidate == operation and result == 5
+                else BoundOperationResolution.UNRESOLVED
+            )
         ),
     )
     result = recovered.reconcile()
@@ -347,6 +354,103 @@ def test_explicit_reconciliation_closes_only_exact_committed_operation(
     assert journal["operation_identity"] == operation
     assert journal["result_revision"] == 5
     assert journal["close_reason"] == "recovered_committed"
+
+
+@pytest.mark.parametrize(
+    (
+        "resolution",
+        "expected_action",
+        "expected_close_reason",
+        "expected_result_revision",
+        "next_revision",
+    ),
+    [
+        (
+            BoundOperationResolution.COMMITTED,
+            "closed_committed",
+            "recovered_committed",
+            5,
+            5,
+        ),
+        (
+            BoundOperationResolution.ABANDONED,
+            "closed_abandoned",
+            "recovered_abandoned",
+            None,
+            4,
+        ),
+    ],
+)
+def test_typed_resolution_survives_restart_and_admits_exact_next_revision(
+    tmp_path: Path,
+    resolution: BoundOperationResolution,
+    expected_action: str,
+    expected_close_reason: str,
+    expected_result_revision: int | None,
+    next_revision: int,
+) -> None:
+    operation = _operation()
+    owner = _store(tmp_path)
+    crashed = owner.acquire_current_step(revision=4, ttl_s=30.0)
+    owner.bind(crashed, operation_identity=operation)
+    owner._release_gate(crashed.session_id)
+
+    recovered = WriterSessionStore(
+        root=tmp_path,
+        model_identity="project/model",
+        committed_operation_resolver=lambda _candidate, _result: resolution,
+    )
+    recovery = recovered.reconcile()
+
+    assert recovery.action == expected_action
+    assert recovery.revision == 4
+    assert recovery.fence == crashed.fence
+    journal = recovered.inspect()
+    assert journal is not None
+    assert journal["state"] == "closed"
+    assert journal["revision"] == 4
+    assert journal["operation_identity"] == operation
+    assert journal["result_revision"] == expected_result_revision
+    assert journal["close_reason"] == expected_close_reason
+    assert (journal["committed_at"] is not None) is (
+        resolution is BoundOperationResolution.COMMITTED
+    )
+
+    restarted = _store(tmp_path)
+    later = restarted.acquire_current_step(revision=next_revision, ttl_s=30.0)
+    assert later.revision == next_revision
+    assert later.fence == crashed.fence + 1
+    restarted.release(later)
+
+
+def test_abandoned_resolution_during_acquisition_reopens_at_source_revision(
+    tmp_path: Path,
+) -> None:
+    operation = _operation()
+    owner = _store(tmp_path)
+    crashed = owner.acquire_ordinary(
+        revision=8,
+        ttl_s=30.0,
+        operation_identity=operation,
+    )
+    owner._release_gate(crashed.session_id)
+
+    recovered = WriterSessionStore(
+        root=tmp_path,
+        model_identity="project/model",
+        committed_operation_resolver=(
+            lambda candidate, target: (
+                BoundOperationResolution.ABANDONED
+                if candidate == operation and target == 9
+                else BoundOperationResolution.UNRESOLVED
+            )
+        ),
+    )
+    retry = recovered.acquire_ordinary_open(revision=8, ttl_s=30.0)
+
+    assert retry.revision == crashed.revision
+    assert retry.fence == crashed.fence + 1
+    recovered.release(retry)
 
 
 def test_missing_committed_receipt_keeps_bound_crash_fail_closed(
@@ -361,7 +465,9 @@ def test_missing_committed_receipt_keeps_bound_crash_fail_closed(
     recovered = WriterSessionStore(
         root=tmp_path,
         model_identity="project/model",
-        committed_operation_resolver=lambda _candidate, _result: False,
+        committed_operation_resolver=(
+            lambda _candidate, _result: BoundOperationResolution.UNRESOLVED
+        ),
     )
 
     assert recovered.reconcile().action == "ambiguous_after_bind"
@@ -372,6 +478,34 @@ def test_missing_committed_receipt_keeps_bound_crash_fail_closed(
     assert journal is not None
     assert journal["state"] == "bound"
     assert journal["result_revision"] is None
+
+
+def test_invalid_resolver_disposition_fails_closed(tmp_path: Path) -> None:
+    owner = _store(tmp_path)
+    crashed = owner.acquire_current_step(revision=4, ttl_s=30.0)
+    owner.bind(crashed, operation_identity=_operation())
+    owner._release_gate(crashed.session_id)
+
+    def _invalid_resolver(
+        _candidate: dict[str, Any],
+        _result: int,
+    ) -> Any:
+        return "guessed"
+
+    recovered = WriterSessionStore(
+        root=tmp_path,
+        model_identity="project/model",
+        committed_operation_resolver=_invalid_resolver,
+    )
+
+    with pytest.raises(WriterSessionValidationError, match="invalid disposition"):
+        recovered.reconcile()
+    assert recovered.recovery_status().action == "ambiguous_after_bind"
+    journal = recovered.inspect()
+    assert journal is not None
+    assert journal["state"] == "bound"
+    assert journal["result_revision"] is None
+    assert journal["close_reason"] is None
 
 
 @pytest.mark.parametrize(
@@ -400,7 +534,7 @@ def test_receipt_mismatch_during_reconciliation_fails_closed(
     def _reject(
         _candidate: dict[str, Any],
         _result_revision: int,
-    ) -> bool:
+    ) -> BoundOperationResolution:
         raise failure
 
     recovered = WriterSessionStore(

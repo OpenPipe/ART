@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from enum import StrEnum
 import fcntl
 import hashlib
 import hmac
@@ -27,7 +28,20 @@ import uuid
 JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 SessionKind = Literal["current_step", "ordinary"]
 SessionState = Literal["open", "bound", "committed", "closed"]
-CommittedOperationResolver = Callable[[dict[str, JsonValue], int], bool]
+
+
+class BoundOperationResolution(StrEnum):
+    """Durable disposition proved by the owner of a bound operation."""
+
+    COMMITTED = "committed"
+    ABANDONED = "abandoned"
+    UNRESOLVED = "unresolved"
+
+
+BoundOperationResolver = Callable[
+    [dict[str, JsonValue], int],
+    BoundOperationResolution | bool,
+]
 
 _SCHEMA_VERSION = 1
 _CAPABILITY_BYTES = 32
@@ -78,6 +92,7 @@ class WriterRecovery:
         "none",
         "abandoned_before_submit",
         "closed_committed",
+        "closed_abandoned",
         "ambiguous_after_bind",
         "busy_open",
     ]
@@ -96,14 +111,18 @@ class WriterSessionStore:
         model_identity: str,
         clock: Callable[[], float] = time.time,
         secret_factory: Callable[[int], bytes] = secrets.token_bytes,
-        committed_operation_resolver: CommittedOperationResolver | None = None,
+        committed_operation_resolver: BoundOperationResolver | None = None,
     ) -> None:
         if not model_identity:
             raise ValueError("model_identity must not be empty")
         self.model_identity = model_identity
         self._clock = clock
         self._secret_factory = secret_factory
-        self._committed_operation_resolver = committed_operation_resolver
+        # The constructor name is retained while service callers migrate from
+        # the original committed-or-not boolean resolver. New resolvers return
+        # an explicit three-way disposition so missing evidence cannot be
+        # confused with proof that a submitted operation was abandoned.
+        self._bound_operation_resolver = committed_operation_resolver
         digest = hashlib.sha256(model_identity.encode()).hexdigest()
         self._directory = root / "writer_sessions" / digest
         self._lock_path = self._directory / "writer.lock"
@@ -388,9 +407,10 @@ class WriterSessionStore:
         """Reconcile recoverable durable state while holding the model gate.
 
         A bound session is closed only when the configured resolver proves that
-        its exact immutable operation has a committed receipt for ``R + 1``.
-        Missing evidence returns ``ambiguous_after_bind``; resolver errors,
-        including identity or revision mismatches, propagate and fail closed.
+        its exact immutable operation either committed ``R + 1`` or was abandoned
+        while durable state remained at ``R``. Missing evidence returns
+        ``ambiguous_after_bind``; resolver errors, including identity or revision
+        mismatches, propagate and fail closed.
         """
 
         self._acquire_gate()
@@ -406,10 +426,16 @@ class WriterSessionStore:
                 self._close_committed(journal, recovered=True)
                 return recovery
             if recovery.action == "ambiguous_after_bind":
-                if not self._reconcile_bound(journal):
+                resolution = self._reconcile_bound(journal)
+                if resolution is BoundOperationResolution.UNRESOLVED:
                     return recovery
+                action = (
+                    "closed_committed"
+                    if resolution is BoundOperationResolution.COMMITTED
+                    else "closed_abandoned"
+                )
                 return WriterRecovery(
-                    action="closed_committed",
+                    action=action,
                     session_id=recovery.session_id,
                     revision=recovery.revision,
                     fence=recovery.fence,
@@ -490,7 +516,10 @@ class WriterSessionStore:
             self._close_committed(journal, recovered=True)
             return
         if recovery.action == "ambiguous_after_bind":
-            if self._reconcile_bound(journal):
+            if (
+                self._reconcile_bound(journal)
+                is not BoundOperationResolution.UNRESOLVED
+            ):
                 return
             raise AmbiguousWriterSessionError(
                 "bound writer operation has an ambiguous outcome and requires "
@@ -498,22 +527,33 @@ class WriterSessionStore:
             )
         raise WriterBusyError("an unexpired durable writer session is still open")
 
-    def _reconcile_bound(self, journal: dict[str, JsonValue]) -> bool:
-        resolver = self._committed_operation_resolver
+    def _reconcile_bound(
+        self,
+        journal: dict[str, JsonValue],
+    ) -> BoundOperationResolution:
+        resolver = self._bound_operation_resolver
         if resolver is None:
-            return False
+            return BoundOperationResolution.UNRESOLVED
         operation = cast(dict[str, JsonValue], journal["operation_identity"])
         result_revision = cast(int, journal["revision"]) + 1
-        if not resolver(operation, result_revision):
-            return False
+        resolution = _normalize_bound_operation_resolution(
+            resolver(operation, result_revision)
+        )
+        if resolution is BoundOperationResolution.UNRESOLVED:
+            return resolution
         now = self._now()
         journal["state"] = "closed"
-        journal["result_revision"] = result_revision
-        journal["committed_at"] = now
         journal["closed_at"] = now
-        journal["close_reason"] = "recovered_committed"
+        if resolution is BoundOperationResolution.COMMITTED:
+            journal["result_revision"] = result_revision
+            journal["committed_at"] = now
+            journal["close_reason"] = "recovered_committed"
+        else:
+            journal["result_revision"] = None
+            journal["committed_at"] = None
+            journal["close_reason"] = "recovered_abandoned"
         self._write_journal(journal)
-        return True
+        return resolution
 
     def _close_abandoned(self, journal: dict[str, JsonValue]) -> None:
         journal["state"] = "closed"
@@ -703,6 +743,22 @@ def _positive_finite_ttl(value: float) -> float:
     return ttl
 
 
+def _normalize_bound_operation_resolution(
+    value: BoundOperationResolution | bool,
+) -> BoundOperationResolution:
+    if isinstance(value, BoundOperationResolution):
+        return value
+    # Temporary compatibility for the existing service callback: the old
+    # boolean API could prove only committed (True) or unresolved (False).
+    if value is True:
+        return BoundOperationResolution.COMMITTED
+    if value is False:
+        return BoundOperationResolution.UNRESOLVED
+    raise WriterSessionValidationError(
+        "bound-operation resolver returned an invalid disposition"
+    )
+
+
 def _canonical_operation(value: Mapping[str, Any]) -> dict[str, JsonValue]:
     try:
         encoded = _canonical_json(dict(value))
@@ -887,6 +943,7 @@ def _validate_journal(
             "abandoned_before_submit",
             "committed",
             "recovered_committed",
+            "recovered_abandoned",
         }:
             raise WriterJournalCorruptionError(
                 "closed writer session has an invalid close reason"
@@ -908,6 +965,15 @@ def _validate_journal(
         ):
             raise WriterJournalCorruptionError(
                 "closed committed writer session lacks its committed transition"
+            )
+        if reason == "recovered_abandoned" and (
+            operation is None
+            or result_revision is not None
+            or journal["bound_at"] is None
+            or journal["committed_at"] is not None
+        ):
+            raise WriterJournalCorruptionError(
+                "closed abandoned writer session lacks its bound transition"
             )
         if journal["closed_at"] is None:
             raise WriterJournalCorruptionError(

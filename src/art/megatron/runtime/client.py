@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import json
 import os
+import tempfile
 from typing import Any, AsyncIterator
 
 from .jobs import DEFAULT_JOBS_DIR, MegatronJob, dump_megatron_job
@@ -24,9 +25,32 @@ def create_megatron_job_paths(
 
 
 def write_megatron_job(job: MegatronJob, *, job_path: str) -> None:
-    os.makedirs(os.path.dirname(job_path), exist_ok=True)
-    with open(job_path, "w", encoding="utf-8") as handle:
-        handle.write(dump_megatron_job(job))
+    jobs_dir = os.path.dirname(job_path)
+    os.makedirs(jobs_dir, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        dir=jobs_dir,
+        prefix=f".{os.path.basename(job_path)}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(dump_megatron_job(job).encode())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, job_path)
+        directory_descriptor = os.open(jobs_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
 
 
 async def stream_megatron_job(

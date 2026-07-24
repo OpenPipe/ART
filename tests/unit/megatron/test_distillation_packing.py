@@ -358,16 +358,12 @@ def test_backend_summary_preserves_exact_distillation_job_denominators() -> None
     metrics = _summarize_distillation_metrics(
         [
             {
-                "data/distillation_tokens": 2.0,
-                "data/policy_tokens": 2.0,
                 "data/step_distillation_target_tokens": 2.0,
                 "data/step_policy_tokens": 2.0,
                 "loss/train": 1.0,
                 "data/step_num_gradient_steps": 2.0,
             },
             {
-                "data/distillation_tokens": 0.0,
-                "data/policy_tokens": 2.0,
                 "data/step_distillation_target_tokens": 0.0,
                 "data/step_policy_tokens": 2.0,
                 "loss/train": -0.5,
@@ -378,8 +374,6 @@ def test_backend_summary_preserves_exact_distillation_job_denominators() -> None
         policy_count=4,
     )
 
-    assert metrics["data/distillation_tokens"] == 1.0
-    assert metrics["data/policy_tokens"] == 2.0
     assert metrics["data/step_distillation_target_tokens"] == 2.0
     assert metrics["data/step_policy_tokens"] == 4.0
     assert metrics["loss/train"] == pytest.approx(0.25)
@@ -910,8 +904,105 @@ async def test_backend_returns_committed_receipt_before_stale_revision_check(
     )
 
     assert result.step == 8
-    assert result.metrics["distill/idempotent_replay"] == 1.0
+    assert result.metrics == {
+        "data/step_num_gradient_steps": 0.0,
+        "distillation/committed_step": 8.0,
+        "distillation/idempotent_replay": 1.0,
+    }
     assert observed["config"] == TrainConfig(optimizer_save_interval=1)
+
+
+@pytest.mark.asyncio
+async def test_backend_committed_replay_reconciles_writer_before_returning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        MegatronService,
+        "_validate_megatron_dependencies",
+        lambda _self: None,
+    )
+
+    def service() -> MegatronService:
+        return MegatronService(
+            model_name="student",
+            base_model="Qwen/Qwen3-0.6B",
+            config={},
+            output_dir=str(tmp_path),
+            runtime_config=cast(
+                Any,
+                SimpleNamespace(
+                    topology=SimpleNamespace(tp=1, cp=1, pp=1, ep=1, etp=1),
+                ),
+            ),
+        )
+
+    original_artifact = _artifact(revision=7)
+    artifact_bytes = original_artifact.to_bytes()
+    artifact = distill.PreparedTrainingBatch.from_bytes(artifact_bytes)
+    assert artifact.to_bytes() == artifact_bytes
+    config = TrainConfig(optimizer_save_interval=1)
+    objective = DistillationObjectiveConfig(coefficient=1.0)
+    owner = service()
+    binding = owner._distillation_receipt_binding(
+        idempotency_key="stable-key",
+        expected_source_revision=7,
+        preparation_id=artifact.preparation_id,
+        payload_sha256=artifact.payload_sha256,
+        objective=objective,
+        config=config,
+    )
+    lease = owner._writer_sessions.acquire_ordinary_open(revision=7, ttl_s=30.0)
+    operation = owner._writer_operation_for_job(
+        route="prepared",
+        source_revision=7,
+        target_revision=8,
+        identity={"receipt_binding": binding},
+    )
+    owner._writer_sessions.bind(lease, operation_identity=operation)
+    owner._write_json_atomic(
+        owner._distillation_receipt_path("stable-key"),
+        {
+            "binding": binding,
+            "state": "committed",
+            "committed_step": 8,
+        },
+    )
+    # Simulate process death after the receipt commit but before writer commit.
+    owner._writer_sessions._release_gate(lease.session_id)
+
+    recovered = service()
+    recovered._latest_step = 8
+    backend = MegatronBackend(path=str(tmp_path))
+
+    async def _get_service(_: Any) -> MegatronService:
+        return recovered
+
+    async def _get_step(_: Any) -> int:
+        raise AssertionError("committed replay must not check the current revision")
+
+    monkeypatch.setattr(backend, "_get_service", _get_service)
+    monkeypatch.setattr(backend, "_get_step", _get_step)
+    result = await backend.train(
+        cast(Any, SimpleNamespace()),
+        artifact,
+        objectives=distill.TrainingObjectives(distillation=distill.Loss()),
+        idempotency_key="stable-key",
+        save_checkpoint=False,
+    )
+
+    assert result.step == 8
+    assert result.metrics == {
+        "data/step_num_gradient_steps": 0.0,
+        "distillation/committed_step": 8.0,
+        "distillation/idempotent_replay": 1.0,
+    }
+    assert recovered._writer_sessions.recovery_status().action == "none"
+    later = recovered._writer_sessions.acquire_ordinary_open(
+        revision=8,
+        ttl_s=30.0,
+    )
+    recovered._writer_sessions.release(later)
 
 
 @pytest.mark.asyncio
@@ -1054,7 +1145,7 @@ async def test_backend_rejects_non_durable_optimizer_interval_before_service(
 
     monkeypatch.setattr(backend, "_get_service", _get_service)
     with pytest.raises(ValueError, match="optimizer_save_interval=1"):
-        await backend.train(
+        await cast(Any, backend).train(
             cast(Any, SimpleNamespace()),
             _artifact(),
             objectives=distill.TrainingObjectives(distillation=distill.Loss()),
@@ -1147,6 +1238,84 @@ def test_receipt_identity_rejects_changed_resolved_policy_config(
             cast(MegatronService, object()),
             path=path,
             binding=changed,
+        )
+
+
+@pytest.mark.parametrize(
+    ("receipt", "match"),
+    [
+        ([], "invalid schema"),
+        (
+            {
+                "binding": {"source_revision": 7},
+                "state": "pending",
+                "unexpected": True,
+            },
+            "invalid schema",
+        ),
+        (
+            {
+                "binding": {"source_revision": 7},
+                "state": "failed",
+                "failure": "",
+            },
+            "invalid failure",
+        ),
+        (
+            {
+                "binding": {"source_revision": 7},
+                "state": "committed",
+            },
+            "invalid schema",
+        ),
+        (
+            {
+                "binding": {"source_revision": 7},
+                "state": "committed",
+                "committed_step": "8",
+            },
+            "unexpected revision",
+        ),
+        (
+            {
+                "binding": {"source_revision": 7},
+                "state": "committed",
+                "committed_step": True,
+            },
+            "unexpected revision",
+        ),
+        (
+            {
+                "binding": {"source_revision": 7},
+                "state": "committed",
+                "committed_step": 9,
+            },
+            "unexpected revision",
+        ),
+        (
+            {
+                "binding": {"source_revision": 7},
+                "state": "committed",
+                "committed_step": 8,
+                "unexpected": True,
+            },
+            "invalid schema",
+        ),
+    ],
+)
+def test_receipt_read_rejects_malformed_state_schema(
+    tmp_path: Path,
+    receipt: Any,
+    match: str,
+) -> None:
+    path = tmp_path / "receipt.json"
+    path.write_text(json.dumps(receipt))
+
+    with pytest.raises(RuntimeError, match=match):
+        MegatronService._read_distillation_receipt(
+            cast(MegatronService, object()),
+            path=path,
+            binding={"source_revision": 7},
         )
 
 
@@ -1414,6 +1583,8 @@ async def test_committed_service_replay_cleans_unsubmitted_unique_sidecars(
             "committed_step": 8,
         },
     )
+    (tmp_path / "checkpoints" / "0008").mkdir(parents=True)
+    service._latest_step = 8
 
     metrics = await _collect_distillation_metrics(
         service,
@@ -1426,8 +1597,8 @@ async def test_committed_service_replay_cleans_unsubmitted_unique_sidecars(
 
     assert metrics == [
         {
-            "distill/idempotent_replay": 1.0,
-            "distill/committed_step": 8.0,
+            "distillation/idempotent_replay": 1.0,
+            "distillation/committed_step": 8.0,
             "data/step_num_gradient_steps": 0.0,
         }
     ]
@@ -1474,10 +1645,16 @@ async def test_two_distillation_updates_each_commit_optimizer_ready_revision(
         return "/unused/source"
 
     monkeypatch.setattr(service, "_prepare_for_training", _prepare_for_training)
+
+    def _prepare_training_lora_dir(_source: str, step: int) -> str:
+        staging = tmp_path / "staging" / f"{step:04d}"
+        staging.mkdir(parents=True)
+        return str(staging)
+
     monkeypatch.setattr(
         service,
         "_prepare_training_lora_dir",
-        lambda _source, step: f"/unused/staging/{step}",
+        _prepare_training_lora_dir,
     )
     monkeypatch.setattr(
         service,
@@ -1506,14 +1683,20 @@ async def test_two_distillation_updates_each_commit_optimizer_ready_revision(
     monkeypatch.setattr(service, "_handle_training_lora_ready", _lora_ready)
 
     async def _finish(**kwargs: Any) -> str:
-        service._latest_step = int(kwargs["step"])
-        return f"/unused/checkpoint/{kwargs['step']}"
+        step = int(kwargs["step"])
+        checkpoint = tmp_path / "checkpoints" / f"{step:04d}"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        Path(kwargs["staging_lora_path"]).rename(checkpoint)
+        service._latest_step = step
+        return str(checkpoint)
 
     monkeypatch.setattr(service, "_finish_training_checkpoint", _finish)
     monkeypatch.setattr(
         service,
         "_commit_optimizer_checkpoint",
-        lambda *, step, world_size: committed.append((step, world_size)),
+        lambda *, step, world_size, operation_identity: committed.append(
+            (step, world_size)
+        ),
     )
     config = TrainConfig(optimizer_save_interval=1)
     objective = DistillationObjectiveConfig(coefficient=1.0)
