@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 from collections.abc import Mapping
+from datetime import datetime, timedelta
 from typing import SupportsIndex, cast, overload
 
 import numpy as np
