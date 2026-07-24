@@ -32,6 +32,10 @@ import art
 from art import TrainingObjectives, distill
 from art.megatron.backend import MegatronBackend
 
+art.init_megatron_runtime_config(
+    topology={"tp": 1, "cp": 1, "ep": 1, "pp": 1, "etp": 1},
+    packed_sequence_length=4096,
+)
 backend = MegatronBackend()
 student = art.TrainableModel(
     name="student",
@@ -108,7 +112,7 @@ The frozen revision is persisted as target provenance. For an external teacher, 
 
 ## Frozen OPSD with application-owned feedback
 
-Keep feedback selection outside ART. The application decides which generation the feedback applies to and constructs an `Example` only for that generation. `prepend_message(...)` returns a new teacher view, placing a system hint before the original conversation without mutating the captured view.
+Keep feedback selection outside ART. The application decides which generation the feedback applies to and constructs an `Example` only for that generation. Because the captured `TeacherView` is the context immediately before that generation, `append_message(...)` returns a new teacher view with a distinct late system hint immediately before teacher scoring, without mutating the captured view. ART's default Qwen3.5 chat template supports system messages at this late position.
 
 ```python
 teacher_revision = await student.get_step()
@@ -126,7 +130,7 @@ for update in range(num_updates):
                 if feedback is None:
                     continue
 
-                teacher_view = distill.prepend_message(
+                teacher_view = distill.append_message(
                     distill.captured_context(generation),
                     {
                         "role": "system",
@@ -206,7 +210,7 @@ for update in range(num_updates):
         )
 ```
 
-A current-step session is deliberately single-use: do not make a second `backend.train` call in the same context. If the update outcome is ambiguous, preserve the artifact and idempotency key for recovery rather than preparing new targets or silently treating a later revision as “current.”
+A current-step session is deliberately single-use for a new submission. If the update outcome is ambiguous, reload the exact persisted `PreparedTrainingBatch`, reuse the same `idempotency_key`, and call `backend.train(...)` without the original `session`. The backend queries and reconciles the existing receipt before it requires a live session for any new submission. Do not prepare new targets or silently treat a later revision as “current.”
 
 ## Standalone KD
 

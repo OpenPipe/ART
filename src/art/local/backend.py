@@ -63,6 +63,7 @@ from .. import dev
 from .._backend_training import (
     aggregate_rl_training_metrics,
     build_rl_train_configs,
+    reject_prepared_batch_before_call,
     reject_unsupported_prepared_batch,
 )
 from ..backend import AnyTrainableModel
@@ -200,15 +201,6 @@ def _model_support_default_chat_template(
     if handler is None:
         return None
     return handler.default_chat_template()
-
-
-def _apply_configured_chat_template(
-    tokenizer: PreTrainedTokenizerBase,
-    internal_config: dev.InternalModelConfig,
-) -> None:
-    chat_template = _configured_chat_template_value(internal_config)
-    if chat_template is not None:
-        tokenizer.chat_template = chat_template
 
 
 def _model_support_handler(
@@ -593,8 +585,14 @@ class LocalBackend:
         model: AnyTrainableModel,
         internal_config: dev.InternalModelConfig,
     ) -> PreTrainedTokenizerBase:
-        _apply_configured_chat_template(tokenizer, internal_config)
         handler = _model_support_handler(model.base_model, internal_config)
+        configured_chat_template = _configured_chat_template_value(internal_config)
+        if configured_chat_template is not None:
+            tokenizer.chat_template = configured_chat_template
+        elif handler is not None:
+            default_chat_template = handler.default_chat_template()
+            if default_chat_template is not None:
+                tokenizer.chat_template = default_chat_template
         if handler is None:
             return tokenizer
         return handler.configure_tokenizer(tokenizer, internal_config=internal_config)
@@ -1121,7 +1119,11 @@ class LocalBackend:
     ) -> tuple[str, str]:
         config_dict: dict = dict(config or {})
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
-        _apply_configured_chat_template_server_args(config_dict, internal_config)
+        _apply_configured_chat_template_server_args(
+            config_dict,
+            internal_config,
+            base_model=model.base_model,
+        )
         if self._model_uses_expert_replay(model):
             engine_args = dict(config_dict.get("engine_args", {}))
             engine_args["enable_return_routed_experts"] = True
@@ -1190,6 +1192,7 @@ class LocalBackend:
             formatted_messages.append(format_message(message))
         return header + "\n".join(formatted_messages)
 
+    @reject_prepared_batch_before_call
     async def train(  # type: ignore[override]
         self,
         model: AnyTrainableModel,

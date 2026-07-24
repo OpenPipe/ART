@@ -2,9 +2,9 @@ import art
 from art import distill
 from art.distill.artifact import PreparedTrainingBatch
 from art.distill.capture import (
+    append_message,
     captured_context,
     generations,
-    prepend_message,
 )
 from art.distill.prepare import all_generations, prepare, same_context
 from art.distill.preparer import (
@@ -42,6 +42,7 @@ def test_distill_guide_exports() -> None:
         "all_generations": all_generations,
         "AllCapturedGenerations": AllCapturedGenerations,
         "AnyRevision": AnyRevision,
+        "append_message": append_message,
         "captured_context": captured_context,
         "CurrentStep": CurrentStep,
         "Example": Example,
@@ -54,7 +55,6 @@ def test_distill_guide_exports() -> None:
         "mask_failed_generation": mask_failed_generation,
         "prepare": prepare,
         "PreparedTrainingBatch": PreparedTrainingBatch,
-        "prepend_message": prepend_message,
         "same_context": same_context,
         "SameContext": SameContext,
         "strict": strict,

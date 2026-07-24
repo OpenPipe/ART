@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 import tinker
 
-from art import PreparedTrainingBatch, TrainableModel
+from art import PreparedTrainingBatch, TrainableModel, TrainingObjectives, distill
 from art.tinker_native.backend import TinkerNativeBackend, _apply_kl_penalty
 from art.tinker_native.data import build_datum
 
@@ -73,7 +73,7 @@ async def test_tinker_native_backend_rejects_current_learner_kl_source(
         AssertionError,
         match="only supports kl_penalty_source='sample'",
     ):
-        await backend.train(
+        await cast(Any, backend).train(
             model,
             [],
             kl_penalty_coef=0.25,
@@ -101,6 +101,11 @@ async def test_tinker_native_backend_rejects_prepared_batch_before_training(
             match="TinkerNativeBackend does not support PreparedTrainingBatch",
         ),
     ):
-        await backend.train(cast(Any, object()), cast(Any, prepared))
+        await backend.train(
+            cast(Any, object()),
+            cast(Any, prepared),
+            objectives=TrainingObjectives(distillation=distill.Loss()),
+            idempotency_key="tinker-native-prepared",
+        )
 
     to_datums.assert_not_called()

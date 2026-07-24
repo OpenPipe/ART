@@ -261,7 +261,7 @@ async def test_materialized_opsd_example_keeps_hint_out_of_learner_artifact(
     }
     example = distill.Example.create(
         generation=generation,
-        teacher_view=distill.prepend_message(
+        teacher_view=distill.append_message(
             distill.captured_context(generation),
             {"role": "system", "content": hint},
         ),
@@ -289,8 +289,8 @@ async def test_materialized_opsd_example_keeps_hint_out_of_learner_artifact(
     scorer_request = _RecordingScorer.instances[0].requests[0]
     teacher_request = cast(dict[str, Any], scorer_request.teacher_view.request())
     assert teacher_request["messages"] == [
-        {"role": "system", "content": hint},
         {"content": "choose", "role": "user"},
+        {"role": "system", "content": hint},
     ]
     assert scorer_request.teacher_revision == 7
     assert prepared.constraints.learner_revision == 7

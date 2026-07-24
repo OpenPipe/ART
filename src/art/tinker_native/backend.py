@@ -30,7 +30,10 @@ import torch
 import uvicorn
 
 from .. import dev
-from .._backend_training import reject_unsupported_prepared_batch
+from .._backend_training import (
+    reject_prepared_batch_before_call,
+    reject_unsupported_prepared_batch,
+)
 from ..adapter_leases import pin_inference_step, pinned_inference_step
 from ..backend import Backend
 from ..costs import build_cost_calculator, compute_train_cost, get_model_pricing
@@ -329,6 +332,7 @@ class TinkerNativeBackend:
         await self._wait_for_server_ready(base_url, api_key, model)
         return base_url, api_key
 
+    @reject_prepared_batch_before_call
     async def train(
         self,
         model: TrainableModel,

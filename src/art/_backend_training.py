@@ -1,6 +1,7 @@
-from collections.abc import Iterable
+from collections.abc import Callable, Coroutine, Iterable
+from functools import wraps
 import time
-from typing import Literal
+from typing import Literal, ParamSpec, TypeVar
 
 from . import dev
 from .metrics_taxonomy import (
@@ -10,6 +11,9 @@ from .metrics_taxonomy import (
 )
 from .trajectories import TrajectoryGroup
 from .types import TrainConfig
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 def reject_unsupported_prepared_batch(
@@ -26,6 +30,32 @@ def reject_unsupported_prepared_batch(
             f"{backend_name} does not support PreparedTrainingBatch; "
             "use MegatronBackend for prepared distillation training."
         )
+
+
+def reject_prepared_batch_before_call(
+    train: Callable[_P, Coroutine[object, object, _R]],
+) -> Callable[_P, Coroutine[object, object, _R]]:
+    """Keep an unsupported backend's public signature while rejecting prepared data.
+
+    The wrapper intentionally runs before Python binds the wrapped method's keyword
+    arguments. This lets the documented prepared-batch call shape produce ART's
+    capability error instead of an incidental ``TypeError`` for ``objectives`` or
+    ``idempotency_key``. ``functools.wraps`` and the generic return type preserve the
+    legacy method's runtime signature and static type.
+    """
+
+    @wraps(train)
+    async def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        training_data = args[2] if len(args) > 2 else kwargs.get("trajectory_groups")
+        if training_data is not None:
+            backend = args[0] if args else None
+            reject_unsupported_prepared_batch(
+                training_data,
+                backend_name=type(backend).__name__,
+            )
+        return await train(*args, **kwargs)
+
+    return wrapped
 
 
 def build_rl_train_configs(

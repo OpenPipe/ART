@@ -178,20 +178,36 @@ def test_teacher_view_edits_are_functional_and_mutation_isolated() -> None:
     assert patched.fingerprint != hinted.fingerprint != original.fingerprint
 
 
-def test_prepend_message_is_system_first_and_does_not_mutate_source_view() -> None:
-    original = distill.captured_context(distill.last_generation(_trajectory()))
+def test_append_message_keeps_late_system_hint_distinct_and_source_immutable() -> None:
+    original = distill.TeacherView.from_request(
+        "chat_completions",
+        {
+            "model": "Qwen/Qwen3.5-4B",
+            "messages": [
+                {"role": "system", "content": "You are a booking assistant."},
+                {"role": "user", "content": "Book dinner."},
+                {"role": "assistant", "content": "Which restaurant?"},
+                {"role": "user", "content": "The reviewed one."},
+            ],
+        },
+    )
 
-    hinted = distill.prepend_message(
+    hinted = distill.append_message(
         original,
-        {"role": "system", "content": "private hint"},
+        {"role": "system", "content": "Prefer the reviewed restaurant."},
     )
 
     original_request = cast(dict[str, Any], original.request())
     hinted_request = cast(dict[str, Any], hinted.request())
-    assert original_request["messages"] == [{"role": "user", "content": "question-1"}]
+    assert original_request["messages"] == [
+        {"role": "system", "content": "You are a booking assistant."},
+        {"role": "user", "content": "Book dinner."},
+        {"role": "assistant", "content": "Which restaurant?"},
+        {"role": "user", "content": "The reviewed one."},
+    ]
     assert hinted_request["messages"] == [
-        {"role": "system", "content": "private hint"},
-        {"role": "user", "content": "question-1"},
+        *original_request["messages"],
+        {"role": "system", "content": "Prefer the reviewed restaurant."},
     ]
     assert hinted.fingerprint != original.fingerprint
 

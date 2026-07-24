@@ -4,7 +4,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from art import PreparedTrainingBatch, TrainableModel, Trajectory, TrajectoryGroup
+from art import (
+    PreparedTrainingBatch,
+    TrainableModel,
+    TrainingObjectives,
+    Trajectory,
+    TrajectoryGroup,
+    distill,
+)
 from art.serverless.backend import ServerlessBackend
 from art.types import TrainConfig, TrainSFTConfig
 
@@ -125,7 +132,12 @@ async def test_serverless_backend_rejects_prepared_batch_before_training() -> No
         NotImplementedError,
         match="ServerlessBackend does not support PreparedTrainingBatch",
     ):
-        await backend.train(cast(Any, object()), cast(Any, prepared))
+        await cast(Any, backend).train(
+            cast(Any, object()),
+            cast(Any, prepared),
+            objectives=TrainingObjectives(distillation=distill.Loss()),
+            idempotency_key="serverless-prepared",
+        )
 
     train_model.assert_not_called()
 

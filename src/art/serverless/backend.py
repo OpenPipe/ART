@@ -14,6 +14,7 @@ from .. import dev
 from .._backend_training import (
     aggregate_rl_training_metrics,
     build_rl_train_configs,
+    reject_prepared_batch_before_call,
     reject_unsupported_prepared_batch,
 )
 from ..backend import AnyTrainableModel
@@ -225,6 +226,7 @@ class ServerlessBackend:
     # Note: _log() method has been moved to the Model class (frontend)
     # Trajectories are now saved locally by the Model.log() method
 
+    @reject_prepared_batch_before_call
     async def train(  # type: ignore[override]
         self,
         model: AnyTrainableModel,

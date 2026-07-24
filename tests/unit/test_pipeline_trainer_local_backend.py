@@ -16,8 +16,10 @@ from art import (
     PipelineRuntimeConfig,
     PreparedTrainingBatch,
     TrainableModel,
+    TrainingObjectives,
     Trajectory,
     TrajectoryGroup,
+    distill,
 )
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
@@ -348,7 +350,12 @@ async def test_local_backend_rejects_prepared_batch_before_training(
         NotImplementedError,
         match="LocalBackend does not support PreparedTrainingBatch",
     ):
-        await backend.train(cast(Any, object()), cast(Any, prepared))
+        await cast(Any, backend).train(
+            cast(Any, object()),
+            cast(Any, prepared),
+            objectives=TrainingObjectives(distillation=distill.Loss()),
+            idempotency_key="local-prepared",
+        )
 
     train_model.assert_not_called()
 

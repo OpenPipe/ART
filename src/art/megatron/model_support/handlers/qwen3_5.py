@@ -18,6 +18,9 @@ from art.megatron.model_support.handlers.default_dense import (
 from art.megatron.model_support.handlers.qwen3_common import (
     _context_parallel_world_size,
 )
+from art.megatron.model_support.qwen3_5_chat_template import (
+    QWEN3_5_DISABLE_THINKING_MULTI_SYSTEM_CHAT_TEMPLATE,
+)
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
@@ -58,7 +61,13 @@ class Qwen35BaseHandler(DefaultDenseHandler):
     native_vllm_lora_status = "validated"
 
     def vllm_server_args(self) -> dict[str, object]:
-        return {"tool_call_parser": "qwen3_xml"}
+        return {
+            "chat_template": self.default_chat_template(),
+            "tool_call_parser": "qwen3_xml",
+        }
+
+    def default_chat_template(self) -> str:
+        return QWEN3_5_DISABLE_THINKING_MULTI_SYSTEM_CHAT_TEMPLATE
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return getattr(base_config, "text_config", base_config)

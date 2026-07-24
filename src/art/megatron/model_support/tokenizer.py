@@ -31,9 +31,7 @@ def configure_tokenizer_for_model_support(
     except UnsupportedModelArchitectureError:
         return tokenizer
 
-    if not _has_configured_chat_template(internal_config) and not isinstance(
-        getattr(tokenizer, "chat_template", None), str
-    ):
+    if not _has_configured_chat_template(internal_config):
         default = handler.default_chat_template()
         if default is not None:
             tokenizer.chat_template = default
