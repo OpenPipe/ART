@@ -53,9 +53,12 @@ def endpoint_for_url(url: str) -> Endpoint | None:
 
 
 def _sse_events(body: bytes) -> list[tuple[str | None, SSEPayload]]:
-    text = body.decode("utf-8").replace("\r\n", "\n")
+    text = body.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     events: list[tuple[str | None, SSEPayload]] = []
-    for block in text.split("\n\n"):
+    blocks = text.split("\n\n")
+    if not text.endswith("\n\n"):
+        blocks.pop()
+    for block in blocks:
         event_name: str | None = None
         data_lines: list[str] = []
         for line in block.splitlines():

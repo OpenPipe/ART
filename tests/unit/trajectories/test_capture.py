@@ -449,6 +449,45 @@ async def test_httpx_async_stream_consumption_captures_decoded_body_once(
     assert len(trajectory.exchanges.chat_completions) == 1
 
 
+@pytest.mark.parametrize("encoding", ["gzip", "deflate", "br"])
+async def test_httpx_terminal_event_captures_before_response_close(
+    encoding: str,
+) -> None:
+    body = _streaming_chat_body()
+    compressed = _encoded(body, encoding)
+
+    async def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-encoding": encoding,
+                "content-type": "text/event-stream",
+            },
+            stream=_AsyncChunks(compressed),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(response))
+    request = client.build_request(
+        "POST",
+        "https://example.test/v1/chat/completions",
+        json={"model": "test/model", "messages": [], "stream": True},
+    )
+    with art.Trajectory() as trajectory:
+        result = await client.send(request, stream=True)
+        iterator = cast(AsyncGenerator[bytes, None], result.aiter_bytes())
+        received = bytearray()
+        async for chunk in iterator:
+            received.extend(chunk)
+            if b"data: [DONE]\n\n" in received:
+                break
+        assert len(trajectory.exchanges.chat_completions) == 1
+
+    assert not result.is_closed
+    await iterator.aclose()
+    await result.aclose()
+    await client.aclose()
+
+
 def test_httpx_raw_capture_failure_does_not_change_user_stream() -> None:
     malformed = b"not a gzip stream"
 
@@ -636,6 +675,53 @@ async def test_native_openai_and_anthropic_sdks(endpoint_server: str) -> None:
     assert len(trajectory.exchanges.completions) == 1
     assert len(trajectory.exchanges.responses) == 1
     assert len(trajectory.exchanges.messages) == 1
+
+
+async def test_native_openai_chat_stream_captures_at_done_event() -> None:
+    async def response(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_AsyncChunks(_streaming_chat_body()),
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(response))
+    client = AsyncOpenAI(
+        base_url="https://example.test/v1",
+        api_key="test",
+        http_client=http_client,
+    )
+    with art.Trajectory() as trajectory:
+        stream = await client.chat.completions.create(
+            model="test/model",
+            messages=[],
+            stream=True,
+        )
+        chunks = [chunk async for chunk in stream]
+        assert len(trajectory.exchanges.chat_completions) == 1
+
+    assert len(chunks) == 1
+    assert chunks[0].choices[0].delta.content == "hello"
+    await stream.close()
+    await client.close()
+
+
+def test_stream_terminal_without_sse_boundary_is_excluded() -> None:
+    body = _streaming_chat_body()[:-1]
+    with art.Trajectory() as trajectory:
+        state, token = begin(
+            "POST",
+            "https://example.test/v1/chat/completions",
+            {"model": "test/model", "messages": [], "stream": True},
+        )
+        reset(token)
+        assert state is not None
+        state.status_code = 200
+        state.add(body)
+        assert not state.captured
+        state.finish()
+
+    assert not trajectory.exchanges
 
 
 async def test_failed_and_incomplete_calls_are_excluded(endpoint_server: str) -> None:
@@ -986,19 +1072,33 @@ def test_all_streaming_protocols_reconstruct_final_responses() -> None:
             assert getattr(exchange.response, "logprobs") == [-0.2]
             assert getattr(exchange.response, "prompt_token_ids") == [1]
 
-    with art.Trajectory() as trajectory:
-        state, token = begin(
-            "POST",
-            "https://example.test/v1/messages",
-            {"model": "test/model", "messages": [], "stream": True},
-        )
-        reset(token)
-        assert state is not None
-        state.status_code = 200
-        state.add(_sse(message_events))
-        state.finish()
+        with art.Trajectory() as trajectory:
+            state, token = begin(
+                "POST",
+                f"https://example.test/v1/{endpoint.replace('_', '/')}",
+                request,
+            )
+            reset(token)
+            assert state is not None
+            state.status_code = 200
+            for byte in body[:-1]:
+                state.add(bytes([byte]))
+            assert not state.captured
+            state.add(body[-1:])
+            assert state.captured
 
-    assert len(trajectory.exchanges.messages) == 1
+        assert (
+            sum(
+                len(exchanges)
+                for exchanges in (
+                    trajectory.exchanges.chat_completions,
+                    trajectory.exchanges.completions,
+                    trajectory.exchanges.responses,
+                    trajectory.exchanges.messages,
+                )
+            )
+            == 1
+        )
 
 
 def test_streaming_messages_error_event_is_rejected_and_not_captured() -> None:

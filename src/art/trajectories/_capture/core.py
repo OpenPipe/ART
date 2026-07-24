@@ -22,6 +22,43 @@ logger = logging.getLogger(__name__)
 _adapter_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "art_capture_adapter_active", default=False
 )
+_SSE_DELIMITERS = (b"\r\n\r\n", b"\n\n", b"\r\r")
+
+
+def _terminal_sse_event(endpoint: Endpoint, block: bytes) -> bool:
+    try:
+        lines = block.decode("utf-8").splitlines()
+    except UnicodeDecodeError:
+        return False
+    event_name: str | None = None
+    data_lines: list[str] = []
+    for line in lines:
+        field, separator, value = line.partition(":")
+        if not separator:
+            continue
+        if value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            event_name = value
+        elif field == "data":
+            data_lines.append(value)
+    data = "\n".join(data_lines)
+    if endpoint in {"chat_completions", "completions"}:
+        return data == "[DONE]"
+    if endpoint == "responses" and event_name == "response.completed":
+        return True
+    if endpoint == "messages" and event_name == "message_stop":
+        return True
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    event_type = payload.get("type")
+    return (endpoint == "responses" and event_type == "response.completed") or (
+        endpoint == "messages" and event_type == "message_stop"
+    )
 
 
 @dataclass
@@ -33,10 +70,31 @@ class CaptureState:
     status_code: int | None = None
     body: bytearray = field(default_factory=bytearray)
     captured: bool = False
+    _event_start: int = field(default=0, init=False, repr=False)
+    _scan_start: int = field(default=0, init=False, repr=False)
 
     def add(self, chunk: bytes) -> None:
         if not self.captured:
             self.body.extend(chunk)
+            if self.request.get("stream") is True and self._reached_terminal_event():
+                self.finish()
+
+    def _reached_terminal_event(self) -> bool:
+        while True:
+            boundaries = [
+                (index, len(delimiter))
+                for delimiter in _SSE_DELIMITERS
+                if (index := self.body.find(delimiter, self._scan_start)) >= 0
+            ]
+            if not boundaries:
+                self._scan_start = max(self._event_start, len(self.body) - 3)
+                return False
+            index, delimiter_length = min(boundaries)
+            block = bytes(self.body[self._event_start : index])
+            self._event_start = index + delimiter_length
+            self._scan_start = self._event_start
+            if _terminal_sse_event(self.endpoint, block):
+                return True
 
     def discard(self) -> None:
         self.body.clear()
