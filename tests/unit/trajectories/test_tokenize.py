@@ -508,13 +508,10 @@ def test_completions_support_single_item_batches_and_echo(
     assert tokenized.token_ids == [1, 2]
 
 
-@pytest.mark.parametrize("response_token_ids", [[1, 2], [2]])
-def test_completions_echo_preserves_prompt_logprobs_without_sampling_them(
-    response_token_ids: list[int],
-) -> None:
+def test_completions_echo_preserves_prompt_logprobs_without_sampling_them() -> None:
     exchange = _completion_exchange(echo=True)
     payload = exchange.response.model_dump(mode="python")
-    payload["choices"][0]["token_ids"] = response_token_ids
+    payload["choices"][0]["token_ids"] = [2]
     payload["choices"][0]["logprobs"] = {
         "tokens": ["token_id:1", "token_id:2"],
         "token_logprobs": [-0.1, -0.2],
@@ -529,6 +526,89 @@ def test_completions_echo_preserves_prompt_logprobs_without_sampling_them(
 
     assert tokenized.token_ids == [1, 2]
     assert tokenized.logprobs == [-0.1, -0.2]
+    assert tokenized.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+
+
+def test_completions_echo_does_not_strip_repeated_prompt_token_from_completion() -> (
+    None
+):
+    exchange = _completion_exchange(echo=True)
+    payload = exchange.response.model_dump(mode="python")
+    payload["choices"][0]["text"] = "questionquestionanswer"
+    payload["choices"][0]["token_ids"] = [1, 2]
+    payload["choices"][0]["logprobs"] = {
+        "tokens": ["token_id:1", "token_id:2"],
+        "token_logprobs": [-0.2, -0.3],
+        "top_logprobs": [{}, {}],
+        "text_offset": [8, 16],
+    }
+    exchange.response = Completion.model_validate(payload)
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"question": [1], "questionanswer": [1, 2]}[text]
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[exchange])
+    ).tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [1, 1, 2]
+    assert tokenized.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.SAMPLED,
+        art.TokenFlag.SAMPLED,
+    ]
+    assert all(math.isnan(logprob) for logprob in tokenized.logprobs)
+
+
+def test_completions_echo_strips_prompt_from_proven_combined_token_carrier() -> None:
+    exchange = _completion_exchange(echo=True)
+    payload = exchange.response.model_dump(mode="python")
+    payload["choices"][0]["text"] = "questionquestionanswer"
+    payload["choices"][0]["token_ids"] = [1, 1, 2]
+    payload["choices"][0]["logprobs"] = {
+        "tokens": ["token_id:1", "token_id:2"],
+        "token_logprobs": [-0.2, -0.3],
+        "top_logprobs": [{}, {}],
+        "text_offset": [8, 16],
+    }
+    exchange.response = Completion.model_validate(payload)
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[exchange])
+    ).tokenize()
+
+    assert tokenized.token_ids == [1, 1, 2]
+    assert tokenized.logprobs[1:] == pytest.approx([-0.2, -0.3])
+    assert tokenized.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+
+
+def test_completions_echo_strips_prompt_from_proven_textual_carrier() -> None:
+    exchange = _completion_exchange(echo=True)
+    payload = exchange.response.model_dump(mode="python")
+    payload["choices"][0]["token_ids"] = [1, 2]
+    payload["choices"][0]["logprobs"] = {
+        "tokens": ["question", "answer"],
+        "token_logprobs": [-0.1, -0.2],
+        "top_logprobs": [{}, {}],
+        "text_offset": [0, 8],
+    }
+    exchange.response = Completion.model_validate(payload)
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[exchange])
+    ).tokenize()
+
+    assert tokenized.token_ids == [1, 2]
+    assert tokenized.logprobs == pytest.approx([-0.1, -0.2])
     assert tokenized.flags == [
         art.TokenFlag.EXACT,
         art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,

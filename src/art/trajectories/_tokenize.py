@@ -530,10 +530,21 @@ def _completion_evidence(
         else math.nan
         for value in logprobs.get("token_logprobs") or []
     ]
+    pair_includes_prompt = (
+        echo
+        and prompt_ids is not None
+        and token_ids is not None
+        and pair_ids == [*prompt_ids, *token_ids]
+    )
+    token_ids_include_prompt = (
+        echo
+        and prompt_ids is not None
+        and token_ids is not None
+        and bool(pair_ids)
+        and token_ids == [*prompt_ids, *pair_ids]
+    )
     if token_ids is not None and pair_ids and token_ids != pair_ids:
-        if not (
-            echo and prompt_ids is not None and pair_ids == [*prompt_ids, *token_ids]
-        ):
+        if not pair_includes_prompt and not token_ids_include_prompt:
             raise ValueError("Response token IDs disagree with completion logprobs")
     selected = token_ids if token_ids is not None else pair_ids or None
     prompt_logprobs: list[float] = []
@@ -545,23 +556,19 @@ def _completion_evidence(
         selected = None
         completion_logprobs = []
     elif echo and prompt_ids is not None and selected is not None:
-        pair_includes_prompt = token_ids is not None and pair_ids == [
-            *prompt_ids,
-            *token_ids,
-        ]
         if pair_includes_prompt:
             prompt_logprobs = pair_logprobs[: len(prompt_ids)]
             completion_logprobs = pair_logprobs[len(prompt_ids) :]
         elif len(pair_logprobs) == len(prompt_ids) + len(selected):
             prompt_logprobs = pair_logprobs[: len(prompt_ids)]
             completion_logprobs = pair_logprobs[len(prompt_ids) :]
+        elif token_ids_include_prompt:
+            selected = selected[len(prompt_ids) :]
+            completion_logprobs = pair_logprobs
         elif selected[: len(prompt_ids)] == prompt_ids and (
-            pair_ids == selected
-            or (
-                len(tokens) == len(selected)
-                and all(isinstance(value, str) for value in tokens)
-                and "".join(cast(str, value) for value in tokens) == choice.text
-            )
+            len(tokens) == len(selected)
+            and all(isinstance(value, str) for value in tokens)
+            and "".join(cast(str, value) for value in tokens) == choice.text
         ):
             if pair_logprobs and len(pair_logprobs) != len(selected):
                 raise ValueError("Completions token IDs and logprobs differ in length")
