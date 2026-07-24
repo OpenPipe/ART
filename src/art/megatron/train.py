@@ -1151,7 +1151,7 @@ def _preflight_distillation_job(
             raise ValueError(
                 "a planned prepared optimizer update has a zero policy denominator"
             )
-        if planned_target_count <= 0:
+        if not has_policy and planned_target_count <= 0:
             raise ValueError(
                 "a planned distillation optimizer update has a zero KD denominator"
             )
@@ -1424,13 +1424,21 @@ def _log_distillation_step_result(
         return
     loss_train = float(step_result.reduced_loss.item())
     target_tokens = float(step_result.target_token_count)
-    distillation_loss = step_result.raw_loss_sum * float(coefficient) / target_tokens
+    distillation_loss = (
+        step_result.raw_loss_sum * float(coefficient) / target_tokens
+        if target_tokens > 0
+        else 0.0
+    )
     metrics = {
         "loss/train": loss_train,
         "loss/distillation": distillation_loss,
         "loss/distillation_sum": step_result.raw_loss_sum,
-        "loss/distillation_selected": (step_result.selected_loss_sum / target_tokens),
-        "loss/distillation_tail": step_result.tail_loss_sum / target_tokens,
+        "loss/distillation_selected": (
+            step_result.selected_loss_sum / target_tokens if target_tokens > 0 else 0.0
+        ),
+        "loss/distillation_tail": (
+            step_result.tail_loss_sum / target_tokens if target_tokens > 0 else 0.0
+        ),
         "loss/distillation_raw_sum": step_result.raw_loss_sum,
         "loss/distillation_selected_sum": step_result.selected_loss_sum,
         "loss/distillation_tail_sum": step_result.tail_loss_sum,
@@ -2471,7 +2479,7 @@ def run_megatron_distillation_step(
         raise RuntimeError("prepared optimizer step has a zero policy denominator")
     if policy_config is None and policy_count != 0:
         raise RuntimeError("policy sidecars are active without a policy objective")
-    if target_count <= 0:
+    if policy_config is None and target_count <= 0:
         raise RuntimeError("distillation optimizer step has a zero KD denominator")
     if expected_policy_count is not None and policy_count != expected_policy_count:
         raise RuntimeError("prepared policy denominator changed after preflight")
@@ -2490,7 +2498,13 @@ def run_megatron_distillation_step(
     target_token_count = 0
     numerical_clamp_count = 0
     distillation_scale = (
-        float(policy_count) / float(target_count) if policy_count > 0 else 1.0
+        (
+            float(policy_count) / float(target_count)
+            if policy_config is not None
+            else 1.0
+        )
+        if target_count > 0
+        else 0.0
     )
     tp_world_size = int(topology.tp)
     tp_rank = int(ps.get_tensor_model_parallel_rank())
@@ -2643,11 +2657,9 @@ def run_megatron_distillation_step(
         global_student_tail_mass_sum,
         global_numerical_clamp_count,
     ) = (float(value.item()) for value in statistics)
-    reduced_loss = torch.tensor(
-        global_raw_loss_sum * coefficient / target_count,
-        dtype=torch.float32,
-        device=device,
-    )
+    reduced_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+    if target_count > 0:
+        reduced_loss = reduced_loss + global_raw_loss_sum * coefficient / target_count
     if policy_count > 0:
         reduced_loss = reduced_loss + global_policy_loss_sum / policy_count
 
@@ -2657,8 +2669,16 @@ def run_megatron_distillation_step(
         selected_loss_sum=global_selected_loss_sum,
         tail_loss_sum=global_tail_loss_sum,
         target_token_count=target_count,
-        teacher_tail_mass_mean=float(global_teacher_tail_mass_sum / target_count),
-        student_tail_mass_mean=float(global_student_tail_mass_sum / target_count),
+        teacher_tail_mass_mean=(
+            float(global_teacher_tail_mass_sum / target_count)
+            if target_count > 0
+            else 0.0
+        ),
+        student_tail_mass_mean=(
+            float(global_student_tail_mass_sum / target_count)
+            if target_count > 0
+            else 0.0
+        ),
         numerical_clamp_count=int(global_numerical_clamp_count),
         update_successful=update_successful,
         grad_norm=grad_norm,

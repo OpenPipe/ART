@@ -355,6 +355,84 @@ def test_additive_zero_denominator_fails_before_forward_or_optimizer(
     assert model.logits.grad is None
 
 
+def test_additive_policy_only_partition_updates_without_kd_denominator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    finalized_denominators = _patch_single_rank_worker(monkeypatch)
+    model = _FakeModel()
+    optimizer = _FakeOptimizer(model.logits)
+    before = model.logits.detach().clone()
+    packed = _additive_packed()
+    packed["target_mask"][1].zero_()
+    packed["distillation_weights"][1].zero_()
+
+    result = train.run_megatron_distillation_step(
+        model_chunks=cast(Any, [model]),
+        provider=object(),
+        model_support_handler=_FakeHandler(),
+        optimizer=optimizer,
+        learning_rate=0.1,
+        packed_tensors=packed,
+        sample_indices=[1],
+        logical_vocab_size=4,
+        temperature=1.0,
+        coefficient=0.5,
+        compensate_temperature_squared=False,
+        policy_config=cast(
+            Any,
+            {
+                "epsilon": 1.0,
+                "epsilon_high": 4.0,
+                "importance_sampling_level": "token",
+            },
+        ),
+        expected_policy_count=1,
+        expected_target_count=0,
+    )
+
+    assert model.labels_seen == [None]
+    assert finalized_denominators[-1].tolist() == [1.0]
+    assert result.policy_token_count == 1
+    assert result.target_token_count == 0
+    assert result.raw_loss_sum == 0.0
+    assert result.teacher_tail_mass_mean == 0.0
+    assert result.student_tail_mass_mean == 0.0
+    assert result.update_successful
+    assert math.isfinite(result.reduced_loss.item())
+    assert math.isfinite(result.grad_norm)
+    assert result.grad_norm > 0
+    assert not torch.equal(model.logits.detach(), before)
+
+
+def test_standalone_kd_partition_still_rejects_zero_kd_denominator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_single_rank_worker(monkeypatch)
+    model = _FakeModel()
+    optimizer = _FakeOptimizer(model.logits)
+    packed = _packed()
+    packed["target_mask"].zero_()
+    packed["distillation_weights"].zero_()
+
+    with pytest.raises(RuntimeError, match="zero KD denominator"):
+        train.run_megatron_distillation_step(
+            model_chunks=cast(Any, [model]),
+            provider=object(),
+            model_support_handler=_FakeHandler(),
+            optimizer=optimizer,
+            learning_rate=0.1,
+            packed_tensors=packed,
+            sample_indices=[0],
+            logical_vocab_size=4,
+            temperature=1.0,
+            coefficient=0.5,
+            compensate_temperature_squared=False,
+        )
+
+    assert model.labels_seen == []
+    assert model.logits.grad is None
+
+
 def test_additive_uses_global_ratio_with_uneven_rank_eligibility(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -562,6 +640,42 @@ def test_distillation_metrics_include_stable_public_keys(tmp_path: Path) -> None
     assert metrics["distillation/teacher_tail_mass_mean"] == 0.2
     assert metrics["distillation/student_tail_mass_mean"] == 0.3
     assert metrics["distillation/numerical_clamp_count"] == 1.0
+
+
+def test_policy_only_distillation_metrics_remain_finite(tmp_path: Path) -> None:
+    result = train.DistillationTrainStepResult(
+        reduced_loss=torch.tensor(0.25),
+        raw_loss_sum=0.0,
+        selected_loss_sum=0.0,
+        tail_loss_sum=0.0,
+        target_token_count=0,
+        teacher_tail_mass_mean=0.0,
+        student_tail_mass_mean=0.0,
+        numerical_clamp_count=0,
+        update_successful=True,
+        grad_norm=0.4,
+        num_zeros_in_grad=0,
+        policy_loss_sum=0.25,
+        policy_token_count=1,
+    )
+    log_path = tmp_path / "metrics.jsonl"
+
+    train._log_distillation_step_result(
+        0,
+        str(log_path),
+        result,
+        coefficient=0.5,
+        temperature=1.0,
+        num_gradient_steps=2,
+    )
+
+    metrics = json.loads(log_path.read_text())
+    assert metrics["loss/train"] == 0.25
+    assert metrics["loss/policy"] == 0.25
+    assert metrics["loss/distillation"] == 0.0
+    assert metrics["loss/distillation_selected"] == 0.0
+    assert metrics["loss/distillation_tail"] == 0.0
+    assert all(math.isfinite(value) for value in metrics.values())
 
 
 def test_unsuccessful_optimizer_step_is_rejected_before_save() -> None:
