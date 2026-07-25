@@ -358,13 +358,7 @@ def _chat_retains_sampled_reasoning(
 
 
 def _chat_message_key(message: Message, *, visible_only: bool = False) -> str:
-    # History messages are already normalized and detached from the exchange.
-    # Copy only the top-level mapping because keying never mutates nested values.
-    data = dict(message)
-    if data.get("content") is None:
-        data.pop("content", None)
-    if data.get("tool_calls") == []:
-        data.pop("tool_calls")
+    data = normalize_chat_message(message)
     if visible_only:
         data.pop("reasoning", None)
         data.pop("reasoning_content", None)
@@ -375,7 +369,10 @@ def normalize_chat_message(message: Mapping[str, object]) -> dict[str, object]:
     """Return the canonical history form of an OpenAI chat message."""
 
     data = copy.deepcopy(dict(message))
-    if data.get("content") is None:
+    data.pop("annotations", None)
+    if data.get("role") == "assistant" and data.get("content") is None:
+        data["content"] = ""
+    elif data.get("content") is None:
         data.pop("content", None)
     if data.get("tool_calls") == []:
         data.pop("tool_calls")
@@ -1149,6 +1146,23 @@ def _completion_choice_groups(
     prompts = _completion_prompts(exchange.request.get("prompt"))
     count = len(prompts)
     choices = _ordered_choices(exchange.response.choices, protocol="Completions")
+    missing_prompt_index = object()
+    explicit_matches: dict[int, int] = {}
+    for choice in choices:
+        raw_prompt_index = (choice.model_extra or {}).get(
+            "prompt_index", missing_prompt_index
+        )
+        if raw_prompt_index is missing_prompt_index:
+            continue
+        if (
+            not isinstance(raw_prompt_index, int)
+            or isinstance(raw_prompt_index, bool)
+            or not 0 <= raw_prompt_index < count
+        ):
+            raise ValueError(
+                "Completions choice prompt_index must identify a batched prompt"
+            )
+        explicit_matches[choice.index] = raw_prompt_index
     if count == 1:
         return [choices]
     requested_n = exchange.request.get("n")
@@ -1169,17 +1183,32 @@ def _completion_choice_groups(
             for prompt_index, prompt in enumerate(prompts)
             if isinstance(prompt, list) and prompt == prompt_ids
         ]
+        explicit = explicit_matches.get(choice.index)
+        if (
+            explicit is not None
+            and isinstance(prompts[explicit], list)
+            and prompts[explicit] != prompt_ids
+        ):
+            raise ValueError(
+                "Completions prompt_index contradicts exact prompt evidence"
+            )
         if len(matches) == 1:
             exact_matches[choice.index] = matches[0]
+            if explicit is not None and explicit != matches[0]:
+                raise ValueError(
+                    "Completions prompt_index contradicts exact prompt evidence"
+                )
 
-    if len(exact_matches) == len(choices):
+    evidence_matches = {**exact_matches, **explicit_matches}
+    if len(evidence_matches) == len(choices):
         groups = [[] for _ in prompts]
         for choice in choices:
-            groups[exact_matches[choice.index]].append(choice)
+            groups[evidence_matches[choice.index]].append(choice)
         if all(groups) and (
             requested_n is None or all(len(group) == requested_n for group in groups)
         ):
             return groups
+        raise ValueError("Cannot associate Completions choices with batched prompts")
 
     if len(choices) % count:
         raise ValueError("Cannot associate Completions choices with batched prompts")
@@ -1194,13 +1223,11 @@ def _completion_choice_groups(
     ]
     for prompt_index, group in enumerate(groups):
         if any(
-            choice.index in exact_matches
-            and exact_matches[choice.index] != prompt_index
+            choice.index in evidence_matches
+            and evidence_matches[choice.index] != prompt_index
             for choice in group
         ):
-            raise ValueError(
-                "Completions exact prompt evidence contradicts choice indices"
-            )
+            raise ValueError("Completions prompt evidence contradicts choice indices")
     return groups
 
 
@@ -1345,7 +1372,7 @@ def anthropic_as_chat_completions_history(
             ChatCompletionsMessageSource(
                 exchange=source.exchange,
                 request_index=source.request_index,
-                output_index=0 if source.request_index is None else None,
+                output_indices=(0,) if source.request_index is None else None,
             )
             if source is not None
             else None
@@ -1383,53 +1410,75 @@ def responses_as_chat_completions_history(
         )
 
     def converted(
-        source: ResponsesItemSource | None,
+        contributors: Sequence[ResponsesItemSource | None],
     ) -> ChatCompletionsMessageSource | None:
-        return (
-            ChatCompletionsMessageSource(
-                exchange=source.exchange,
-                request_index=source.request_index,
-                output_index=source.output_index,
-                generation_index=source.generation_index,
+        present = [source for source in contributors if source is not None]
+        if not present:
+            return None
+        exchanges = {id(source.exchange): source.exchange for source in present}
+        if len(exchanges) != 1:
+            raise ValueError(
+                "One projected Chat message cannot span multiple Responses exchanges"
             )
-            if source is not None
-            else None
+        generation_indices = {
+            source.generation_index
+            for source in present
+            if source.generation_index is not None
+        }
+        if len(generation_indices) > 1:
+            raise ValueError(
+                "One projected Chat message cannot span multiple Responses generations"
+            )
+        output_indices = tuple(
+            dict.fromkeys(
+                source.output_index
+                for source in present
+                if source.output_index is not None
+            )
+        )
+        generation_index = next(iter(generation_indices), None)
+        first = present[0]
+        if output_indices or generation_index is not None:
+            return ChatCompletionsMessageSource(
+                exchange=first.exchange,
+                output_indices=output_indices,
+                generation_index=generation_index,
+            )
+        return ChatCompletionsMessageSource(
+            exchange=first.exchange,
+            request_index=first.request_index,
         )
 
+    source_groups: list[list[ResponsesItemSource | None]] = []
     pending_reasoning: list[ResponsesItemSource | None] = []
-    tool_message_open = False
+    tool_message_sources: list[ResponsesItemSource | None] | None = None
     for item, source in zip(history.input, history.input_sources, strict=True):
         kind = item.get("type")
         if kind == "reasoning":
-            tool_message_open = False
+            tool_message_sources = None
             pending_reasoning.append(source)
             continue
         if kind == "function_call":
-            if not tool_message_open:
-                first = next(
-                    (item for item in pending_reasoning if item is not None), source
-                )
-                sources.append(converted(first))
+            if tool_message_sources is None:
+                tool_message_sources = [*pending_reasoning, source]
+                source_groups.append(tool_message_sources)
                 pending_reasoning.clear()
-                tool_message_open = True
+            else:
+                tool_message_sources.append(source)
             continue
-        tool_message_open = False
+        tool_message_sources = None
         if pending_reasoning:
-            first = next(
-                (item for item in pending_reasoning if item is not None), source
-            )
-            sources.append(converted(first))
-            if not (kind in {None, "message"} and item.get("role") == "assistant"):
-                sources.append(converted(source))
+            if kind in {None, "message"} and item.get("role") == "assistant":
+                source_groups.append([*pending_reasoning, source])
+            else:
+                source_groups.append([*pending_reasoning])
+                source_groups.append([source])
             pending_reasoning.clear()
         else:
-            sources.append(converted(source))
+            source_groups.append([source])
     if pending_reasoning:
-        sources.append(
-            converted(
-                next((item for item in pending_reasoning if item is not None), None)
-            )
-        )
+        source_groups.append(pending_reasoning)
+    sources.extend(converted(group) for group in source_groups)
     if len(sources) != len(messages):
         raise AssertionError("Responses conversion sources must parallel messages")
     tools = _TOOLS.validate_python(_openai_tools(history.tools, dialect="responses"))

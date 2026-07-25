@@ -387,6 +387,7 @@ def test_chat_history_normalizes_empty_response_only_fields() -> None:
     first = _chat([{"role": "user", "content": "one"}], "first")
     data = first.response.model_dump(mode="python")
     data["choices"][0]["message"]["tool_calls"] = []
+    data["choices"][0]["message"]["annotations"] = []
     first.response = ChatCompletion.model_validate(data)
     second = _chat(
         [
@@ -404,6 +405,41 @@ def test_chat_history_normalizes_empty_response_only_fields() -> None:
 
     assert len(history.messages) == 4
     assert "tool_calls" not in history.messages[1]
+    assert "annotations" not in history.messages[1]
+    assert history.message_sources[1] is not None
+    assert history.message_sources[1].exchange is first
+
+
+def test_chat_history_normalizes_assistant_missing_content_to_empty() -> None:
+    first = _chat([{"role": "user", "content": ""}], "")
+    data = first.response.model_dump(mode="python")
+    data["choices"][0]["message"] = {
+        "role": "assistant",
+        "content": None,
+        "annotations": [],
+    }
+    first.response = ChatCompletion.model_validate(data)
+    second = _chat(
+        [
+            {"role": "user", "content": ""},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "next"},
+        ],
+        "second",
+        offset=1,
+    )
+
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_history()
+
+    assert [message["content"] for message in history.messages] == [
+        "",
+        "",
+        "next",
+        "second",
+    ]
+    assert "annotations" not in history.messages[1]
     assert history.message_sources[1] is not None
     assert history.message_sources[1].exchange is first
 
@@ -571,6 +607,11 @@ def test_anthropic_chat_conversion_preserves_sources_for_expanded_messages() -> 
         assert source is not None
         assert source.exchange is exchange
         assert source.request_index == 0
+        assert source.output_indices is None
+    response_source = converted.message_sources[-1]
+    assert response_source is not None
+    assert response_source.exchange is exchange
+    assert response_source.output_indices == (0,)
 
     converted.messages[2] = {"role": "user", "content": "changed"}
     with pytest.raises(ValueError, match="no longer matches"):
@@ -604,7 +645,7 @@ def test_responses_history_expands_previous_response_chain() -> None:
     assert dict(chat_history.messages[1]).get("reasoning") == "think"
     assert all(source is not None for source in chat_history.message_sources)
     assert chat_history.message_sources[1] is not None
-    assert chat_history.message_sources[1].output_index == 0
+    assert chat_history.message_sources[1].output_indices == (0, 1)
 
     trajectory.exchanges.responses[1].request["previous_response_id"] = "missing"
     external = trajectory.responses_histories()
@@ -825,9 +866,37 @@ def test_responses_multi_generation_history_leaves_match_tokenization(
         assert all(item.get("type") != "reasoning" for item in histories[-1].input)
     converted = histories[-1].as_chat_completions_history()
     assert any(
-        source is not None and source.generation_index == 1
+        source is not None
+        and source.generation_index == 1
+        and source.output_indices == (second_output_index,)
         for source in converted.message_sources
     )
+
+
+def test_responses_generation_only_chat_source_has_empty_output_indices() -> None:
+    exchange = _response("response-empty-generation", "")
+    data = exchange.response.model_dump(mode="python")
+    data["output"] = []
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2, "logprob": -0.2}],
+            "output_indices": [],
+        }
+    ]
+    exchange.response = Response.model_validate(data)
+
+    converted = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+
+    source = converted.message_sources[-1]
+    assert converted.messages[-1] == {"role": "assistant", "content": ""}
+    assert source is not None
+    assert source.output_indices == ()
+    assert source.generation_index == 0
 
 
 def test_completions_history_preserves_exact_tokens_and_sampled_spans() -> None:
@@ -912,6 +981,125 @@ def test_batched_completions_prefer_exact_prompt_association() -> None:
     histories = trajectory.completions_token_histories()
 
     assert [history.prompt for history in histories] == [[1, 10], [2, 20]]
+
+
+def test_batched_completions_honor_interleaved_explicit_prompt_indices() -> None:
+    exchange = _completion([1], [10])
+    exchange.request["prompt"] = ["first", "second"]
+    response = exchange.response.model_dump(mode="python")
+    response["choices"] = [
+        {
+            "index": choice_index,
+            "finish_reason": "stop",
+            "text": text,
+            "prompt_index": prompt_index,
+        }
+        for choice_index, prompt_index, text in (
+            (0, 1, "B0"),
+            (1, 0, "A0"),
+            (2, 1, "B1"),
+            (3, 0, "A1"),
+        )
+    ]
+    exchange.response = Completion.model_validate(response)
+
+    histories = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[exchange])
+    ).completions_string_histories()
+
+    assert [history.prompt for history in histories] == [
+        "firstA0",
+        "firstA1",
+        "secondB0",
+        "secondB1",
+    ]
+
+
+@pytest.mark.parametrize(("prompt_index", "raises"), [(0, False), (1, True)])
+def test_batched_completions_validate_partial_prompt_index_fallback(
+    prompt_index: int, raises: bool
+) -> None:
+    exchange = _completion([1], [10])
+    exchange.request["prompt"] = ["first", "second"]
+    response = exchange.response.model_dump(mode="python")
+    response["choices"] = [
+        {
+            "index": index,
+            "finish_reason": "stop",
+            "text": text,
+            **({"prompt_index": prompt_index} if index == 0 else {}),
+        }
+        for index, text in enumerate(("A0", "A1", "B0", "B1"))
+    ]
+    exchange.response = Completion.model_validate(response)
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(completions=[exchange]))
+
+    if raises:
+        with pytest.raises(ValueError, match="contradicts choice indices"):
+            trajectory.completions_string_histories()
+        return
+    assert [
+        history.prompt for history in trajectory.completions_string_histories()
+    ] == ["firstA0", "firstA1", "secondB0", "secondB1"]
+
+
+@pytest.mark.parametrize("prompt_index", [-1, 2, True, None])
+def test_batched_completions_reject_invalid_explicit_prompt_index(
+    prompt_index: object,
+) -> None:
+    exchange = _completion([1], [10])
+    exchange.request["prompt"] = ["first", "second"]
+    response = exchange.response.model_dump(mode="python")
+    response["choices"] = [
+        {
+            "index": 0,
+            "finish_reason": "stop",
+            "text": "answer",
+            "prompt_index": prompt_index,
+        },
+        {
+            "index": 1,
+            "finish_reason": "stop",
+            "text": "answer",
+            "prompt_index": 1,
+        },
+    ]
+    exchange.response = Completion.model_validate(response)
+
+    with pytest.raises(ValueError, match="prompt_index"):
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(completions=[exchange])
+        ).completions_string_histories()
+
+
+def test_batched_completions_reject_prompt_index_exact_evidence_contradiction() -> None:
+    exchange = _completion([1], [10])
+    exchange.request["prompt"] = [[1], [2]]
+    response = exchange.response.model_dump(mode="python")
+    response["choices"] = [
+        {
+            "index": 0,
+            "finish_reason": "stop",
+            "text": "answer-0",
+            "prompt_index": 0,
+            "prompt_token_ids": [2],
+            "token_ids": [20],
+        },
+        {
+            "index": 1,
+            "finish_reason": "stop",
+            "text": "answer-1",
+            "prompt_index": 1,
+            "prompt_token_ids": [1],
+            "token_ids": [10],
+        },
+    ]
+    exchange.response = Completion.model_validate(response)
+
+    with pytest.raises(ValueError, match="contradicts exact prompt evidence"):
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(completions=[exchange])
+        ).completions_token_histories()
 
 
 def test_completions_histories_never_silently_omit_mixed_evidence() -> None:
