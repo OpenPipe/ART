@@ -4607,13 +4607,19 @@ def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None
     choice = data["choices"][0]
     choice.pop("prompt_token_ids")
     choice.pop("token_ids")
-    choice["message"]["content"] = " first "
+    choice["message"]["content"] = " helloworld "
     choice["logprobs"] = {
         "content": [
             {
-                "token": " first",
+                "token": " hello",
                 "logprob": -0.4,
-                "bytes": list(b" first"),
+                "bytes": list(b" hello"),
+                "top_logprobs": [],
+            },
+            {
+                "token": "world",
+                "logprob": -0.45,
+                "bytes": list(b"world"),
                 "top_logprobs": [],
             },
             {
@@ -4633,8 +4639,13 @@ def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None
     class Tokenizer:
         def __call__(self, text: str, **kwargs: object) -> object:
             if kwargs.get("return_offsets_mapping"):
-                content_start = text.index("first")
-                content_end = content_start + len("first")
+                if text == " helloworld ":
+                    return {
+                        "input_ids": [1118, 2222, 220],
+                        "offset_mapping": [(0, 6), (6, 11), (11, 12)],
+                    }
+                content_start = text.index("helloworld")
+                content_end = content_start + len("helloworld")
                 return {
                     "input_ids": [1, 3765],
                     "offset_mapping": [
@@ -4644,8 +4655,9 @@ def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None
                 }
             return {
                 "turn 0": [1],
-                " first ": [1118, 220],
-                " first": [1118],
+                " helloworld ": [1118, 2222, 220],
+                " hello": [1118],
+                "world": [3333],
                 " ": [220],
             }[text]
 
@@ -4664,14 +4676,129 @@ def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
-    assert tokenized.token_ids == [1, 1118, 220]
-    assert tokenized.logprobs[1:] == [-0.4, -0.5]
-    assert tokenized.flags[1:] == [art.TokenFlag.SAMPLED] * 2
+    assert tokenized.token_ids == [1, 1118, 2222, 220]
+    assert tokenized.logprobs[1:] == [-0.4, -0.45, -0.5]
+    assert tokenized.flags[1:] == [art.TokenFlag.SAMPLED] * 3
 
 
-@pytest.mark.parametrize(("content", "token_id"), [(" ", 220), ("\n", 198)])
+def test_textual_logprobs_reconstruct_split_utf8_bytes() -> None:
+    from art.trajectories._tokenize import _visible_token_evidence
+
+    exchange = _chat_exchange([], [])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice.pop("prompt_token_ids")
+    choice.pop("token_ids")
+    choice["message"]["content"] = "😊"
+    choice["logprobs"]["content"] = [
+        {
+            "token": "�",
+            "logprob": -0.4,
+            "bytes": [240, 159, 152],
+            "top_logprobs": [],
+        },
+        {
+            "token": "�",
+            "logprob": -0.5,
+            "bytes": [138],
+            "top_logprobs": [],
+        },
+    ]
+    exchange.response = ChatCompletion.model_validate(data)
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            assert text == "😊"
+            return [11, 12]
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tools: object,
+            tokenize: bool,
+            add_generation_prompt: bool,
+            chat_template: str | None = None,
+            **kwargs: object,
+        ) -> object:
+            del messages, tools, tokenize, add_generation_prompt, chat_template, kwargs
+            raise AssertionError("template rendering is not expected")
+
+    assert _visible_token_evidence(Tokenizer(), exchange, sampled_text="😊") == (
+        [11, 12],
+        [-0.4, -0.5],
+    )
+
+
+def test_textual_logprobs_reject_shifted_contextual_token_boundaries() -> None:
+    from art.trajectories._tokenize import _visible_token_evidence
+
+    exchange = _chat_exchange([], [])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice.pop("prompt_token_ids")
+    choice.pop("token_ids")
+    choice["message"]["content"] = " penalates"
+    choice["logprobs"]["content"] = [
+        {
+            "token": " pena",
+            "logprob": -0.4,
+            "bytes": list(b" pena"),
+            "top_logprobs": [],
+        },
+        {
+            "token": "lates",
+            "logprob": -0.5,
+            "bytes": list(b"lates"),
+            "top_logprobs": [],
+        },
+    ]
+    exchange.response = ChatCompletion.model_validate(data)
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> object:
+            if kwargs.get("return_offsets_mapping"):
+                return {
+                    "input_ids": [30, 31],
+                    "offset_mapping": [(0, 6), (6, 10)],
+                }
+            return {" pena": [11], "lates": [12]}[text]
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tools: object,
+            tokenize: bool,
+            add_generation_prompt: bool,
+            chat_template: str | None = None,
+            **kwargs: object,
+        ) -> object:
+            del messages, tools, tokenize, add_generation_prompt, chat_template, kwargs
+            raise AssertionError("template rendering is not expected")
+
+    assert _visible_token_evidence(
+        Tokenizer(), exchange, sampled_text=" penalates"
+    ) == ([11, 12], [-0.4, -0.5])
+
+
+@pytest.mark.parametrize(
+    ("content", "token_id", "trim", "adjacent_scaffold", "reject_empty"),
+    [
+        (" ", 220, True, False, False),
+        ("\n", 198, True, False, False),
+        (" ", 220, False, False, False),
+        (" ", 220, False, True, False),
+        (" ", 220, False, False, True),
+    ],
+)
 def test_trimmed_whitespace_output_inserts_authoritative_logprob_token(
-    content: str, token_id: int
+    content: str,
+    token_id: int,
+    trim: bool,
+    adjacent_scaffold: bool,
+    reject_empty: bool,
 ) -> None:
     exchange = _chat_exchange([], [])
     data = exchange.response.model_dump(mode="python")
@@ -4698,10 +4825,27 @@ def test_trimmed_whitespace_output_inserts_authoritative_logprob_token(
     class Tokenizer:
         def __call__(self, text: str, **kwargs: object) -> object:
             if kwargs.get("return_offsets_mapping"):
-                boundary = text.index("</assistant>")
+                start = text.index("<assistant>") + len("<assistant>")
+                end = text.index("</assistant>")
+                if start != end:
+                    scaffold_start = end - int(adjacent_scaffold)
+                    return {
+                        "input_ids": [
+                            1,
+                            token_id,
+                            *([token_id] if adjacent_scaffold else []),
+                            9,
+                        ],
+                        "offset_mapping": [
+                            (0, start),
+                            (start, scaffold_start),
+                            *([(scaffold_start, end)] if adjacent_scaffold else []),
+                            (end, len(text)),
+                        ],
+                    }
                 return {
                     "input_ids": [1, 9],
-                    "offset_mapping": [(0, boundary), (boundary, len(text))],
+                    "offset_mapping": [(0, start), (start, len(text))],
                 }
             return {"turn 0": [1], content: [token_id]}[text]
 
@@ -4710,17 +4854,38 @@ def test_trimmed_whitespace_output_inserts_authoritative_logprob_token(
         ) -> object:
             tokenize = kwargs.pop("tokenize")
             del kwargs
+            content_value = str(messages[-1]["content"])
+            if trim:
+                content_value = content_value.strip()
+            scaffold = " " if adjacent_scaffold else ""
             rendered = (
                 f"<user>{messages[0]['content']}</user>"
-                f"<assistant>{str(messages[-1]['content']).strip()}</assistant>"
+                f"<assistant>{content_value}{scaffold}</assistant>"
             )
-            return [1, 9] if tokenize else rendered
+            if not tokenize:
+                return rendered
+            if reject_empty and not content_value:
+                raise RuntimeError("template rejects empty assistant content")
+            rendered_id = 777 if "ART_TRAJECTORY" in content_value else token_id
+            return [
+                1,
+                *([rendered_id] if content_value else []),
+                *([token_id] if adjacent_scaffold else []),
+                9,
+            ]
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
-    assert tokenized.token_ids == [1, token_id, 9]
+    assert tokenized.token_ids == [
+        1,
+        token_id,
+        *([token_id] if adjacent_scaffold else []),
+        9,
+    ]
     assert tokenized.logprobs[1] == -0.5
     assert tokenized.flags[1] == art.TokenFlag.SAMPLED
+    if adjacent_scaffold:
+        assert tokenized.flags[2] == art.TokenFlag(0)
 
 
 def _repeated_text_rerender_history(turn_count: int) -> art.ChatCompletionsHistory:

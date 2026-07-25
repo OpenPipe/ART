@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
+import codecs
 from collections.abc import Hashable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -1416,15 +1417,24 @@ def _visible_logprobs(
         choice = (
             _chat_choice(source) if source is not None else exchange.response.choices[0]
         )
-        for entry in _chat_logprob_entries(choice):
+        entries = _chat_logprob_entries(choice)
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        for index, entry in enumerate(entries):
             data = _dump(entry)
             raw_bytes = data.get("bytes")
             if isinstance(raw_bytes, list):
                 try:
-                    text = bytes(raw_bytes).decode("utf-8")
+                    next_data = (
+                        _dump(entries[index + 1]) if index + 1 < len(entries) else {}
+                    )
+                    text = decoder.decode(
+                        bytes(raw_bytes),
+                        final=not isinstance(next_data.get("bytes"), list),
+                    )
                 except (TypeError, ValueError, UnicodeDecodeError):
                     return []
             else:
+                decoder = codecs.getincrementaldecoder("utf-8")()
                 text = data.get("token")
             logprob = data.get("logprob")
             if isinstance(text, str) and isinstance(logprob, (int, float)):
@@ -1569,29 +1579,53 @@ def _visible_token_evidence(
     if not values or tokenizer is None:
         return None
     if sampled_text is not None:
-        matches: list[list[tuple[str, float]]] = []
-        for start in range(len(values)):
-            combined = ""
-            for end in range(start, len(values)):
-                combined += values[end][0]
-                if combined == sampled_text:
-                    matches.append(values[start : end + 1])
-                    break
-                if len(combined) >= len(sampled_text):
-                    break
-        if len(matches) != 1:
-            return None
-        values = matches[0]
+        if "".join(text for text, _ in values) != sampled_text:
+            matches: list[list[tuple[str, float]]] = []
+            for start in range(len(values)):
+                combined = ""
+                for end in range(start, len(values)):
+                    combined += values[end][0]
+                    if combined == sampled_text:
+                        matches.append(values[start : end + 1])
+                        break
+                    if len(combined) >= len(sampled_text):
+                        break
+            if len(matches) != 1:
+                return None
+            values = matches[0]
+    logprobs = [logprob for _, logprob in values]
+    text = "".join(text for text, _ in values)
+    if any(not value for value, _ in values):
+        token_ids = _ids(tokenizer(text, add_special_tokens=False))
+        return (token_ids, logprobs) if len(token_ids) == len(values) else None
+    try:
+        contextual = cast(_OffsetTokenizer, tokenizer)(
+            text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+    except (TypeError, ValueError, NotImplementedError):
+        contextual = None
+    contextual_data = _string_dict(contextual)
+    offsets = (
+        contextual_data.get("offset_mapping") if contextual_data is not None else None
+    )
+    if isinstance(offsets, list) and len(offsets) == len(values):
+        boundaries: list[tuple[int, int]] = []
+        cursor = 0
+        for value, _ in values:
+            boundaries.append((cursor, cursor + len(value)))
+            cursor += len(value)
+        if offsets == boundaries:
+            token_ids = _ids(contextual)
+            if len(token_ids) == len(values):
+                return token_ids, logprobs
     token_ids: list[int] = []
-    logprobs: list[float] = []
-    for text, logprob in values:
-        if not text:
-            return None
+    for text, _ in values:
         encoded = _ids(tokenizer(text, add_special_tokens=False))
         if len(encoded) != 1:
             return None
         token_ids.append(encoded[0])
-        logprobs.append(logprob)
     return token_ids, logprobs
 
 
@@ -3512,6 +3546,24 @@ def _tokenize_chat_view(
     ):
         direct_bounds = []
 
+    def differing_span(probe: Sequence[int]) -> tuple[int, int] | None:
+        prefix = 0
+        while (
+            prefix < len(rendered)
+            and prefix < len(probe)
+            and rendered[prefix] == probe[prefix]
+        ):
+            prefix += 1
+        suffix = 0
+        while (
+            suffix < len(rendered) - prefix
+            and suffix < len(probe) - prefix
+            and rendered[-suffix - 1] == probe[-suffix - 1]
+        ):
+            suffix += 1
+        end = len(rendered) - suffix
+        return (prefix, end) if prefix < end else None
+
     marked_bounds: dict[int, tuple[int, int]] = {}
     marked_part_bounds: dict[int, list[tuple[int, int]]] = {}
     if not direct_bounds:
@@ -3688,24 +3740,46 @@ def _tokenize_chat_view(
                                     bounds[0][0],
                                     bounds[-1][1],
                                 )
-
-    def differing_span(probe: Sequence[int]) -> tuple[int, int] | None:
-        prefix = 0
-        while (
-            prefix < len(rendered)
-            and prefix < len(probe)
-            and rendered[prefix] == probe[prefix]
-        ):
-            prefix += 1
-        suffix = 0
-        while (
-            suffix < len(rendered) - prefix
-            and suffix < len(probe) - prefix
-            and rendered[-suffix - 1] == probe[-suffix - 1]
-        ):
-            suffix += 1
-        end = len(rendered) - suffix
-        return (prefix, end) if prefix < end else None
+        for message_index, bounds in list(marked_part_bounds.items()):
+            whitespace_parts = [
+                (part_index, text)
+                for part_index, (_, text) in enumerate(
+                    _chat_message_parts(messages[message_index])
+                )
+                if text and not text.strip()
+            ]
+            for part_index, _ in whitespace_parts:
+                empty_messages = deepcopy(messages)
+                groups = _chat_message_text_slot_groups(empty_messages[message_index])
+                if part_index >= len(groups):
+                    marked_bounds.pop(message_index, None)
+                    marked_part_bounds.pop(message_index, None)
+                    break
+                for container, key in groups[part_index]:
+                    container[key] = ""
+                try:
+                    empty_render = render(
+                        empty_messages,
+                        add_generation_prompt=not ends_with_assistant,
+                    )
+                except Exception:
+                    marked_bounds.pop(message_index, None)
+                    marked_part_bounds.pop(message_index, None)
+                    break
+                if empty_render == rendered:
+                    continue
+                anchor = bounds[part_index][0]
+                start = anchor - (len(rendered) - len(empty_render))
+                span = (start, anchor)
+                if (
+                    start < 0
+                    or rendered[: span[0]] + rendered[span[1] :] != empty_render
+                ):
+                    marked_bounds.pop(message_index, None)
+                    marked_part_bounds.pop(message_index, None)
+                    break
+                bounds[part_index] = span
+                marked_bounds[message_index] = (bounds[0][0], bounds[-1][1])
 
     probed_bounds: dict[int, tuple[int, int]] = {}
     if not direct_bounds:
