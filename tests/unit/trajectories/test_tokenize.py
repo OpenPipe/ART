@@ -4444,6 +4444,38 @@ def test_empty_sampled_messages_need_no_content_boundary() -> None:
     assert tokenized.flags == [art.TokenFlag(0), art.TokenFlag(0)]
 
 
+def test_empty_sampled_message_inserts_exact_control_token() -> None:
+    exchange = _chat_exchange([], [2])
+    exchange.response.choices[0].message.content = ""
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del text, kwargs
+            return []
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> list[int]:
+            del kwargs
+            if messages[-1]["role"] == "assistant":
+                return [1, 99, 9]
+            assert add_generation_prompt
+            return [1, 99]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [1, 99, 2, 9]
+    assert tokenized.logprobs[2] == -0.2
+    assert tokenized.flags[2] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+
+
 def test_renderer_ignored_refusal_is_appended_for_tokenization() -> None:
     exchange = _chat_exchange([], [])
     data = exchange.response.model_dump(mode="python")
@@ -4632,6 +4664,57 @@ def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None
     assert tokenized.token_ids == [1, 1118, 220]
     assert tokenized.logprobs[1:] == [-0.4, -0.5]
     assert tokenized.flags[1:] == [art.TokenFlag.SAMPLED] * 2
+
+
+def test_trimmed_whitespace_output_inserts_authoritative_logprob_token() -> None:
+    exchange = _chat_exchange([], [])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice.pop("prompt_token_ids")
+    choice.pop("token_ids")
+    choice["message"]["content"] = " "
+    choice["logprobs"] = {
+        "content": [
+            {
+                "token": " ",
+                "logprob": -0.5,
+                "bytes": [32],
+                "top_logprobs": [],
+            }
+        ],
+        "refusal": None,
+    }
+    exchange.response = ChatCompletion.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> object:
+            if kwargs.get("return_offsets_mapping"):
+                boundary = text.index("</assistant>")
+                return {
+                    "input_ids": [1, 9],
+                    "offset_mapping": [(0, boundary), (boundary, len(text))],
+                }
+            return {"turn 0": [1], " ": [220]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> object:
+            tokenize = kwargs.pop("tokenize")
+            del kwargs
+            rendered = (
+                f"<user>{messages[0]['content']}</user>"
+                f"<assistant>{str(messages[-1]['content']).strip()}</assistant>"
+            )
+            return [1, 9] if tokenize else rendered
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [1, 220, 9]
+    assert tokenized.logprobs[1] == -0.5
+    assert tokenized.flags[1] == art.TokenFlag.SAMPLED
 
 
 def _repeated_text_rerender_history(turn_count: int) -> art.ChatCompletionsHistory:

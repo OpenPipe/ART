@@ -3542,6 +3542,8 @@ def _tokenize_chat_view(
                 last_text = str(last[last_key])
                 leading = first_text[: len(first_text) - len(first_text.lstrip())]
                 trailing = last_text[len(last_text.rstrip()) :]
+                if first is last and first_key == last_key and not first_text.strip():
+                    trailing = ""
                 if first is last and first_key == last_key:
                     core = first_text[
                         len(leading) : len(first_text) - len(trailing)
@@ -3660,7 +3662,9 @@ def _tokenize_chat_view(
                                 and offsets[token_end][0] < char_end
                             ):
                                 token_end += 1
-                            if (
+                            if char_start == char_end:
+                                token_bounds[key] = (token_cursor, token_cursor)
+                            elif (
                                 token_end > token_cursor
                                 and offsets[token_cursor][0] >= char_start
                                 and offsets[token_end - 1][1] <= char_end
@@ -3711,6 +3715,29 @@ def _tokenize_chat_view(
             ):
                 continue
             parts = _chat_message_parts(message)
+            if not parts:
+                exact_output, _ = source_output_tokens(source)
+                if exact_output:
+                    try:
+                        prefix = render(
+                            messages[:message_index],
+                            add_generation_prompt=True,
+                        )
+                        completed = render(
+                            messages[: message_index + 1],
+                            add_generation_prompt=False,
+                        )
+                    except Exception:
+                        continue
+                    if (
+                        completed[: len(prefix)] == prefix
+                        and rendered[: len(completed)] == completed
+                    ):
+                        probed_bounds[message_index] = (
+                            len(prefix),
+                            len(prefix),
+                        )
+                continue
             if parts and all(part == "tool_call" for part, _ in parts):
                 probe_messages = deepcopy(messages)
                 tool_calls = probe_messages[message_index].get("tool_calls")
@@ -3963,10 +3990,17 @@ def _tokenize_chat_view(
         ):
             if not parts and sampled_bounds is not None:
                 start = end = sampled_bounds[0]
-            elif sampled_bounds is None or sampled_bounds[0] == sampled_bounds[1]:
+            elif sampled_bounds is None:
                 raise ValueError(
                     "Could not locate a complete sampled message in the rendered history"
                 )
+            elif sampled_bounds[0] == sampled_bounds[1]:
+                if not content_bounds_proven:
+                    raise ValueError(
+                        "Could not locate a complete sampled message in the rendered "
+                        "history"
+                    )
+                start = end = sampled_bounds[0]
             else:
                 start, end = sampled_bounds
             if parts and len(parts) == 1 and parts[0][0] == "content":
