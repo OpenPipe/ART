@@ -740,6 +740,49 @@ def test_completions_history_rejects_model_and_sampled_span_mutation() -> None:
         history.tokenize()
 
 
+@pytest.mark.parametrize(
+    "protocol",
+    ["chat_completions", "messages", "responses", "completions"],
+)
+def test_source_backed_histories_reject_model_mutation(protocol: str) -> None:
+    if protocol == "chat_completions":
+        history = art.Trajectory(
+            exchanges=TrajectoryExchanges(chat_completions=[_chat_exchange([1], [2])])
+        ).chat_completions_history()
+    elif protocol == "messages":
+        history = art.Trajectory(
+            exchanges=TrajectoryExchanges(
+                messages=[
+                    _message_exchange(
+                        MessagesRequest(
+                            model="test/model",
+                            messages=[{"role": "user", "content": "question"}],
+                            max_tokens=16,
+                        ),
+                        prompt_token_ids=[1],
+                        token_ids=[2],
+                        logprobs=[-0.2],
+                    )
+                ]
+            )
+        ).anthropic_messages_history()
+    elif protocol == "responses":
+        history = art.Trajectory(
+            exchanges=TrajectoryExchanges(
+                responses=[_response_exchange("response-model", 2)]
+            )
+        ).responses_history()
+    else:
+        history = art.Trajectory(
+            exchanges=TrajectoryExchanges(completions=[_completion_exchange()])
+        ).completions_token_history()
+
+    history.model = "other/model"
+
+    with pytest.raises(ValueError, match="model no longer matches"):
+        history.tokenize()
+
+
 def test_completions_string_history_preserves_textual_logprobs() -> None:
     exchange = _completion_exchange()
     payload = exchange.response.model_dump(mode="python")
@@ -1441,6 +1484,103 @@ def test_exact_chat_ids_accept_ordinary_positional_logprobs() -> None:
 
     assert tokenized.token_ids == [1, 2]
     assert tokenized.logprobs[1] == -0.75
+
+
+def test_chat_content_and_refusal_logprobs_are_combined_in_protocol_order() -> None:
+    exchange = _chat_exchange([1], [2, 3])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice["message"]["refusal"] = "refusal"
+    choice["logprobs"] = {
+        "content": [
+            {
+                "token": "token_id:2",
+                "logprob": -0.2,
+                "bytes": [],
+                "top_logprobs": [],
+            }
+        ],
+        "refusal": [
+            {
+                "token": "token_id:3",
+                "logprob": -0.3,
+                "bytes": [],
+                "top_logprobs": [],
+            }
+        ],
+    }
+    exchange.response = ChatCompletion.model_validate(data)
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize()
+
+    assert tokenized.token_ids == [1, 2, 3]
+    assert tokenized.logprobs[1:] == pytest.approx([-0.2, -0.3])
+
+
+def test_chat_content_and_refusal_logprobs_must_match_exact_ids() -> None:
+    exchange = _chat_exchange([1], [2, 3])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice["message"]["refusal"] = "refusal"
+    choice["logprobs"] = {
+        "content": [
+            {
+                "token": "token_id:2",
+                "logprob": -0.2,
+                "bytes": [],
+                "top_logprobs": [],
+            }
+        ],
+        "refusal": [
+            {
+                "token": "token_id:4",
+                "logprob": -0.4,
+                "bytes": [],
+                "top_logprobs": [],
+            }
+        ],
+    }
+    exchange.response = ChatCompletion.model_validate(data)
+
+    with pytest.raises(ValueError, match="disagree with choice logprobs"):
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(chat_completions=[exchange])
+        ).tokenize()
+
+
+def test_chat_visible_logprobs_include_content_and_refusal() -> None:
+    from art.trajectories._tokenize import _visible_logprobs
+
+    exchange = _chat_exchange([], [])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice["message"]["refusal"] = "refusal"
+    choice["logprobs"] = {
+        "content": [
+            {
+                "token": "answer",
+                "logprob": -0.2,
+                "bytes": list(b"answer"),
+                "top_logprobs": [],
+            }
+        ],
+        "refusal": [
+            {
+                "token": "refusal",
+                "logprob": -0.3,
+                "bytes": list(b"refusal"),
+                "top_logprobs": [],
+            }
+        ],
+    }
+    exchange.response = ChatCompletion.model_validate(data)
+
+    assert _visible_logprobs(exchange) == [
+        ("answer", -0.2),
+        ("refusal", -0.3),
+    ]
 
 
 def test_empty_chat_prompt_ids_are_missing_evidence(
@@ -2614,13 +2754,13 @@ def test_responses_chat_sampled_source_requires_generation_identity() -> None:
     assistant_index = next(
         index
         for index, source in enumerate(history.message_sources)
-        if source is not None and source.output_index is not None
+        if source is not None and source.output_indices is not None
     )
     source = history.message_sources[assistant_index]
     assert source is not None
     history.message_sources[assistant_index] = ChatCompletionsMessageSource(
         exchange=source.exchange,
-        output_index=source.output_index,
+        output_indices=source.output_indices,
     )
 
     class Tokenizer:
@@ -2638,6 +2778,53 @@ def test_responses_chat_sampled_source_requires_generation_identity() -> None:
 
     with pytest.raises(ValueError, match="no generation identity"):
         history.tokenize(tokenizer=Tokenizer())
+
+
+def test_responses_chat_output_indices_reuse_one_complete_generation() -> None:
+    exchange = _response_exchange(
+        "response-output-indices",
+        2,
+        prompt_token_ids=[1],
+    )
+    history = art.ChatCompletionsHistory(
+        model="test/model",
+        messages=[
+            {"role": "user", "content": "turn 0"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        message_sources=[
+            ChatCompletionsMessageSource(exchange=exchange, request_index=0),
+            ChatCompletionsMessageSource(
+                exchange=exchange,
+                output_indices=(0,),
+                generation_index=0,
+            ),
+        ],
+    )
+
+    tokenized = history.tokenize()
+
+    assert tokenized.token_ids == [1, 2]
+    assert tokenized.logprobs[-1] == pytest.approx(-0.1)
+    assert tokenized.flags[-1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+
+
+def test_responses_chat_output_indices_are_bounds_checked() -> None:
+    exchange = _response_exchange("response-output-indices-invalid", 2)
+    history = art.ChatCompletionsHistory(
+        model="test/model",
+        messages=[{"role": "assistant", "content": "answer"}],
+        message_sources=[
+            ChatCompletionsMessageSource(
+                exchange=exchange,
+                output_indices=(1,),
+                generation_index=0,
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="out of bounds"):
+        history.tokenize()
 
 
 def _multi_output_responses_chat_history() -> art.ChatCompletionsHistory:
@@ -2683,7 +2870,7 @@ def test_responses_output_source_rejects_sibling_generation_output() -> None:
     first_output = next(
         index
         for index, source in enumerate(history.message_sources)
-        if source is not None and source.output_index == 0
+        if source is not None and source.output_indices == (0,)
     )
     history.messages[first_output] = {
         "role": "assistant",
