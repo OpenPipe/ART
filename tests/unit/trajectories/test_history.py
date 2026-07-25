@@ -1188,6 +1188,32 @@ def test_batched_completions_reject_prompt_index_exact_evidence_contradiction() 
         ).completions_token_histories()
 
 
+def test_batched_completions_trust_explicit_string_prompt_index() -> None:
+    from art.trajectories._history import _completion_choice_groups
+
+    exchange = _completion([1], [10])
+    # Captured provider payloads can be broader than the SDK's prompt union.
+    exchange.request["prompt"] = cast(Any, ["same tokenization", [42]])
+    response = exchange.response.model_dump(mode="python")
+    response["choices"] = [
+        {
+            "index": index,
+            "finish_reason": "stop",
+            "text": f"answer-{index}",
+            "prompt_index": index,
+            "prompt_token_ids": [42],
+            "token_ids": [index + 10],
+        }
+        for index in range(2)
+    ]
+    exchange.response = Completion.model_validate(response)
+
+    assert [
+        [choice.index for choice in group]
+        for group in _completion_choice_groups(exchange)
+    ] == [[0], [1]]
+
+
 def test_completions_histories_never_silently_omit_mixed_evidence() -> None:
     exact = _completion([1], [2])
     missing = _completion([3], [4], offset=1)

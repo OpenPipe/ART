@@ -1194,10 +1194,6 @@ def _completion_choice_groups(
             )
         if len(matches) == 1:
             exact_matches[choice.index] = matches[0]
-            if explicit is not None and explicit != matches[0]:
-                raise ValueError(
-                    "Completions prompt_index contradicts exact prompt evidence"
-                )
 
     evidence_matches = {**exact_matches, **explicit_matches}
     if len(evidence_matches) == len(choices):
