@@ -4666,19 +4666,22 @@ def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None
     assert tokenized.flags[1:] == [art.TokenFlag.SAMPLED] * 2
 
 
-def test_trimmed_whitespace_output_inserts_authoritative_logprob_token() -> None:
+@pytest.mark.parametrize(("content", "token_id"), [(" ", 220), ("\n", 198)])
+def test_trimmed_whitespace_output_inserts_authoritative_logprob_token(
+    content: str, token_id: int
+) -> None:
     exchange = _chat_exchange([], [])
     data = exchange.response.model_dump(mode="python")
     choice = data["choices"][0]
     choice.pop("prompt_token_ids")
     choice.pop("token_ids")
-    choice["message"]["content"] = " "
+    choice["message"]["content"] = content
     choice["logprobs"] = {
         "content": [
             {
-                "token": " ",
+                "token": content,
                 "logprob": -0.5,
-                "bytes": [32],
+                "bytes": list(content.encode()),
                 "top_logprobs": [],
             }
         ],
@@ -4697,7 +4700,7 @@ def test_trimmed_whitespace_output_inserts_authoritative_logprob_token() -> None
                     "input_ids": [1, 9],
                     "offset_mapping": [(0, boundary), (boundary, len(text))],
                 }
-            return {"turn 0": [1], " ": [220]}[text]
+            return {"turn 0": [1], content: [token_id]}[text]
 
         def apply_chat_template(
             self, messages: list[dict[str, Any]], **kwargs: object
@@ -4712,7 +4715,7 @@ def test_trimmed_whitespace_output_inserts_authoritative_logprob_token() -> None
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
-    assert tokenized.token_ids == [1, 220, 9]
+    assert tokenized.token_ids == [1, token_id, 9]
     assert tokenized.logprobs[1] == -0.5
     assert tokenized.flags[1] == art.TokenFlag.SAMPLED
 

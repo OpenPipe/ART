@@ -3542,7 +3542,10 @@ def _tokenize_chat_view(
                 last_text = str(last[last_key])
                 leading = first_text[: len(first_text) - len(first_text.lstrip())]
                 trailing = last_text[len(last_text.rstrip()) :]
-                if first is last and first_key == last_key and not first_text.strip():
+                whitespace_only = (
+                    first is last and first_key == last_key and not first_text.strip()
+                )
+                if whitespace_only:
                     trailing = ""
                 if first is last and first_key == last_key:
                     core = first_text[
@@ -3556,7 +3559,9 @@ def _tokenize_chat_view(
                     last[last_key] = (
                         last_text[: len(last_text) - len(trailing)] + end + trailing
                     )
-                part_whitespace[(message_index, part_index)] = (leading, trailing)
+                part_whitespace[(message_index, part_index)] = (
+                    ("", "") if whitespace_only else (leading, trailing)
+                )
                 markers[start] = (message_index, part_index, "start")
                 markers[end] = (message_index, part_index, "end")
         if markers:
