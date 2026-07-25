@@ -2418,6 +2418,8 @@ def test_responses_terminal_generation_without_output_items_survives_rerender() 
 
 
 def test_responses_empty_chat_source_requires_outputless_generation() -> None:
+    from art.trajectories._tokenize import _responses_source_generation
+
     exchange = _response_exchange("nonempty-generation-empty-source", 2)
     history = (
         art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
@@ -2430,14 +2432,40 @@ def test_responses_empty_chat_source_requires_outputless_generation() -> None:
         if source is not None and source.output_indices is not None
     )
     history.messages[assistant_index] = {"role": "assistant", "content": ""}
-    history.message_sources[assistant_index] = ChatCompletionsMessageSource(
+    invalid_source = ChatCompletionsMessageSource(
         exchange=exchange,
         output_indices=(),
         generation_index=0,
     )
+    history.message_sources[assistant_index] = invalid_source
 
     with pytest.raises(ValueError, match="empty output source"):
+        _responses_source_generation(invalid_source)
+    with pytest.raises(ValueError, match="empty output source"):
         history.tokenize()
+
+
+def test_responses_request_composite_source_validation_uses_contiguous_items() -> None:
+    from art.trajectories._tokenize import _validate_history_sources
+
+    exchange = _response_exchange("request-composite", 2)
+    exchange.request["input"] = [
+        {
+            "type": "function_call",
+            "call_id": f"call-{index}",
+            "name": f"tool_{index}",
+            "arguments": "{}",
+        }
+        for index in range(2)
+    ]
+    history = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+
+    assert len(history.messages[0].get("tool_calls", [])) == 2
+    _validate_history_sources(history)
 
 
 def test_responses_nonterminal_generation_without_output_items_raises() -> None:

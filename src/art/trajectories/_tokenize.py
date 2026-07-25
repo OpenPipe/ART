@@ -2101,11 +2101,12 @@ def _validate_history_sources(history: History) -> None:
                             length=len(request_input),
                             field="Responses request source index",
                         )
-                        expected.extend(
-                            _responses_messages(
-                                {"input": [request_input[request_index]]}
+                        for end in range(request_index + 1, len(request_input) + 1):
+                            projected = _responses_messages(
+                                {"input": request_input[request_index:end]}
                             )
-                        )
+                            if len(projected) == 1:
+                                expected.extend(projected)
                     elif isinstance(request_input, str):
                         _source_index(
                             source.request_index,
@@ -2734,6 +2735,8 @@ def _responses_source_generation(
     output_indices = _chat_output_indices(source)
     if output_indices is None:
         return None
+    if bool(output_indices) != bool(generation.output_indices):
+        raise ValueError("Responses empty output source does not match its generation")
     if any(index not in generation.output_indices for index in output_indices):
         raise ValueError(
             "Responses source output index does not belong to its generation"
