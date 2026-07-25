@@ -526,9 +526,16 @@ def _patch_openai_response_policy_spans() -> None:
 
 
 def _patch_lora_update_coordinator() -> None:
-    from vllm.entrypoints.openai.engine.serving import OpenAIServing
+    try:
+        module = importlib.import_module("vllm.entrypoints.openai.engine.serving")
+        serving_base = module.OpenAIServing
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm.entrypoints.openai.engine.serving":
+            raise
+        module = importlib.import_module("vllm.entrypoints.generate.base.serving")
+        serving_base = module.GenerateBaseServing
 
-    original_init = OpenAIServing.__init__
+    original_init = serving_base.__init__
     if not getattr(original_init, "__art_lora_update_patched__", False):
 
         def __init__(self: Any, *args: Any, **kwargs: Any) -> None:
@@ -536,7 +543,7 @@ def _patch_lora_update_coordinator() -> None:
             lora_update_coordinator(self.models, self.engine_client)
 
         __init__.__art_lora_update_patched__ = True  # type: ignore[attr-defined]
-        OpenAIServing.__init__ = __init__  # type: ignore[method-assign]
+        serving_base.__init__ = __init__
 
 
 def _patch_engine_request_admission() -> None:

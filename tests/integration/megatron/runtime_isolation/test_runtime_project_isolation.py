@@ -248,6 +248,60 @@ def test_runtime_general_plugin_loads_full_patch_set() -> None:
     assert 'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject
 
 
+def test_lora_coordinator_supports_both_vllm_serving_layouts(
+    artifact_dir: Path,
+) -> None:
+    payload = _runtime_python(
+        """
+import json
+from types import SimpleNamespace
+import art_vllm_runtime.policy_spans as policy
+from vllm.entrypoints.openai.engine.serving import OpenAIServing
+
+policy._patch_lora_update_coordinator()
+legacy_patched = getattr(
+    OpenAIServing.__init__, "__art_lora_update_patched__", False
+)
+
+class GenerateBaseServing:
+    def __init__(self, models, engine_client):
+        self.models = models
+        self.engine_client = engine_client
+
+real_import_module = policy.importlib.import_module
+def import_module(name):
+    if name == "vllm.entrypoints.openai.engine.serving":
+        raise ModuleNotFoundError(name, name=name)
+    if name == "vllm.entrypoints.generate.base.serving":
+        return SimpleNamespace(GenerateBaseServing=GenerateBaseServing)
+    return real_import_module(name)
+
+policy.importlib.import_module = import_module
+policy._patch_lora_update_coordinator()
+models = SimpleNamespace()
+engine_client = SimpleNamespace()
+GenerateBaseServing(models, engine_client)
+print(json.dumps({
+    "legacy_patched": legacy_patched,
+    "new_patched": getattr(
+        GenerateBaseServing.__init__, "__art_lora_update_patched__", False
+    ),
+    "shared_coordinator": (
+        models._art_lora_update_coordinator
+        is engine_client._art_lora_update_coordinator
+    ),
+}))
+""",
+        artifact_dir,
+        "vllm_serving_layouts",
+    )
+    assert json.loads(payload.splitlines()[-1]) == {
+        "legacy_patched": True,
+        "new_patched": True,
+        "shared_coordinator": True,
+    }
+
+
 def test_runtime_patch_adds_gemma4_moe_topk_alias(artifact_dir: Path) -> None:
     payload = _runtime_python(
         "import json; "
