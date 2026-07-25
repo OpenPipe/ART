@@ -20,8 +20,12 @@ from art.trainer_rank import (
     TopK,
     TrainerRank,
     TrainerRankMemoryError,
+    TrainerRankOptimizerLayout,
+    TrainerRankOptimizerState,
     TrainerRankSlotStateError,
     Unset,
+)
+from art.trainer_rank._impl import (
     _anchor_disconnected_outputs,
     _MemoryCheck,
     _MemoryProfile,
@@ -35,6 +39,29 @@ if TYPE_CHECKING:
 
 class _Model:
     vocab_size = 8
+
+
+def test_public_types_have_canonical_module_paths() -> None:
+    import art.trainer_rank
+
+    assert {
+        "AdapterSelection",
+        "TrainerRankOptimizerLayout",
+        "TrainerRankOptimizerState",
+        "Unset",
+    } <= set(art.trainer_rank.__all__)
+    for public_type in (
+        AdamParams,
+        ForwardInput,
+        ForwardOutput,
+        TopK,
+        TrainerRank,
+        TrainerRankMemoryError,
+        TrainerRankOptimizerLayout,
+        TrainerRankOptimizerState,
+        TrainerRankSlotStateError,
+    ):
+        assert public_type.__module__ == "art.trainer_rank"
 
 
 class _FakeLoRASite(torch.nn.Module):
@@ -427,6 +454,32 @@ def test_checkpoint_slot_adapter_config_is_validated_and_copied() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("base_model_name_or_path", 1),
+        ("r", "8"),
+        ("lora_alpha", "16"),
+        ("target_modules", 1),
+    ),
+)
+def test_checkpoint_slot_adapter_config_rejects_invalid_field_types(
+    field: str,
+    value: object,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    config: dict[str, object] = {
+        "base_model_name_or_path": "Qwen/Qwen3-8B",
+        "r": 8,
+        "lora_alpha": 16,
+        "target_modules": ["q_proj"],
+    }
+    config[field] = value
+
+    with pytest.raises(TypeError, match=field):
+        trainer._validate_checkpoint_slot_adapter_config("student", config, alpha=None)
+
+
 def test_checkpoint_slot_adapter_config_rejects_cross_rank_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -741,7 +794,7 @@ def test_checkpoint_slot_optimizer_state_rejects_incompatible_state(
     state = trainer.checkpoint_slot_optimizer_state("student")
     assert state is not None
     if corruption == "layout":
-        state["layout"] = {"different": True}
+        cast(dict[str, object], state)["layout"] = {"different": True}
     elif corruption == "missing_master":
         state["master_params"] = ()
     restored, _ = _trainer_with_checkpoint(

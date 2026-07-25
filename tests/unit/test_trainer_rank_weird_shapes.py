@@ -19,6 +19,8 @@ from art.trainer_rank import (
     TrainerRank,
     TrainerRankMemoryError,
     Unset,
+)
+from art.trainer_rank._impl import (
     _flatten,
     _MemoryCheck,
     _MemoryProfile,

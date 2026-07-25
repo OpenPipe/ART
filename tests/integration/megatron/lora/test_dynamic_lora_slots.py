@@ -20,6 +20,8 @@ from art.megatron.lora import LoRA, LoRASlotRef, use_lora_slot  # noqa: E402
 from art.trainer_rank import (  # noqa: E402
     AdamParams,
     TrainerRank,
+)
+from art.trainer_rank._impl import (  # noqa: E402
     _distributed_grad_norm,
     _vocab_parallel_log_z,
     _vocab_parallel_target_logprobs,
