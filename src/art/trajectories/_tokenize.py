@@ -1419,7 +1419,16 @@ def _visible_logprobs(
                 if logprob is not None:
                     values.append((text, float(logprob)))
     elif isinstance(exchange, ResponsesExchange):
-        for output in exchange.response.output:
+        outputs = exchange.response.output
+        if source is not None:
+            selected = _responses_source_outputs(source)
+            if selected is None:
+                return []
+            selected_exchange, output_indices = selected
+            if selected_exchange is not exchange:
+                raise ValueError("Responses source belongs to a different exchange")
+            outputs = [exchange.response.output[index] for index in output_indices]
+        for output in outputs:
             for content in _dump(output).get("content") or []:
                 for entry in _dump(content).get("logprobs") or []:
                     data = _dump(entry)
@@ -1450,8 +1459,17 @@ def _sampled_text(exchange: Exchange, *, source: object | None = None) -> str | 
         ]
         return "".join(parts) if parts else None
     if isinstance(exchange, ResponsesExchange):
+        outputs = exchange.response.output
+        if source is not None:
+            selected = _responses_source_outputs(source)
+            if selected is None:
+                return None
+            selected_exchange, output_indices = selected
+            if selected_exchange is not exchange:
+                raise ValueError("Responses source belongs to a different exchange")
+            outputs = [exchange.response.output[index] for index in output_indices]
         parts: list[str] = []
-        for output in exchange.response.output:
+        for output in outputs:
             data = _dump(output)
             if data.get("type") == "message":
                 parts.append(_responses_output_text(data.get("content")))
@@ -3282,17 +3300,20 @@ def _tokenize_chat_view(
             )
         return part_ids_cache[text]
 
-    sampled_part_ids = [
-        part_ids(text)
-        for message, source in zip(
-            history.messages, history.message_sources, strict=True
-        )
-        if message.get("role") == "assistant"
-        and source is not None
-        and _source_is_sampled(source)
-        for _, text in _chat_message_parts(message)
-    ]
-    sampled_part_cursor = 0
+    direct_render: list[int] = []
+    direct_bounds: list[tuple[int, int]] = []
+    for message in messages:
+        start = len(direct_render)
+        for _, text in _chat_message_parts(message):
+            direct_render.extend(part_ids(text))
+        direct_bounds.append((start, len(direct_render)))
+    if direct_render != rendered and not (
+        exact_prefix_length
+        and len(direct_render) == len(rendered)
+        and direct_render[exact_prefix_length:] == rendered[exact_prefix_length:]
+    ):
+        direct_bounds = []
+
     for message_index, (message, source) in enumerate(
         zip(history.messages, history.message_sources, strict=True)
     ):
@@ -3322,12 +3343,45 @@ def _tokenize_chat_view(
             ):
                 search_cursor = max(search_cursor, len(source_prompt))
                 source_boundary = True
+        sampled_bounds: tuple[int, int] | None = None
+        if sampled and not source_boundary:
+            if direct_bounds:
+                sampled_bounds = direct_bounds[message_index]
+            else:
+                prompt_render = render(
+                    messages[:message_index], add_generation_prompt=True
+                )
+                completed_render = render(
+                    messages[: message_index + 1], add_generation_prompt=False
+                )
+                if (
+                    len(completed_render) < len(prompt_render)
+                    or completed_render[: len(prompt_render)] != prompt_render
+                    or rendered[: len(completed_render)] != completed_render
+                ):
+                    raise ValueError(
+                        "Could not locate a sampled history message in the "
+                        "rendered history"
+                    )
+                sampled_bounds = (len(prompt_render), len(completed_render))
         full_matches = (
             locations(full_exact, search_cursor) if sampled and full_exact else []
         )
         first_part_matches = (
             locations(part_ids(parts[0][1]), search_cursor) if parts else []
         )
+        if sampled_bounds is not None:
+            lower, upper = sampled_bounds
+            full_matches = [
+                match
+                for match in full_matches
+                if match[0] >= lower and match[1] <= upper
+            ]
+            first_part_matches = [
+                match
+                for match in first_part_matches
+                if match[0] >= lower and match[1] <= upper
+            ]
         if (
             full_exact is not None
             and full_matches
@@ -3357,7 +3411,6 @@ def _tokenize_chat_view(
                 )
             )
             search_cursor = end
-            sampled_part_cursor += len(parts)
             continue
 
         source_exchange = getattr(source, "exchange", None)
@@ -3407,7 +3460,6 @@ def _tokenize_chat_view(
             ):
                 _warn_prefix_retokenization()
             search_cursor = len(completed_render)
-            sampled_part_cursor += len(parts)
             continue
 
         replacement_start = len(replacements)
@@ -3415,16 +3467,6 @@ def _tokenize_chat_view(
             if not sampled and text not in sampled_texts:
                 continue
             local = part_ids(text)
-            same_sampled_parts = (
-                sum(
-                    candidate == local
-                    for candidate in sampled_part_ids[sampled_part_cursor:]
-                )
-                if sampled
-                else 0
-            )
-            if sampled:
-                sampled_part_cursor += 1
             if not local:
                 continue
             local_matches = locations(local, search_cursor)
@@ -3435,29 +3477,14 @@ def _tokenize_chat_view(
                 raise ValueError(
                     "Could not locate a history message in the rendered history"
                 )
-            if (
-                sampled
-                and not source_boundary
-                and len(local_matches) != same_sampled_parts
-            ):
-                prompt_render = render(
-                    messages[:message_index], add_generation_prompt=True
-                )
-                completed_render = render(
-                    messages[: message_index + 1], add_generation_prompt=False
-                )
+            if sampled_bounds is not None:
+                lower, upper = sampled_bounds
                 bounded_matches = [
                     match
-                    for match in locations(local, len(prompt_render))
-                    if match[1] <= len(completed_render)
+                    for match in locations(local, max(lower, search_cursor))
+                    if match[1] <= upper
                 ]
-                if (
-                    len(completed_render) < len(prompt_render)
-                    or completed_render[: len(prompt_render)] != prompt_render
-                    or rendered[: len(completed_render)] != completed_render
-                    or len(bounded_matches) != 1
-                    or bounded_matches[0][0] < search_cursor
-                ):
+                if len(bounded_matches) != 1:
                     raise ValueError(
                         "Could not uniquely locate a sampled history message in the "
                         "rendered history"

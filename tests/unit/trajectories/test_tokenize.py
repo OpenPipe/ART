@@ -1111,8 +1111,18 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
     assert loaded_base_models == ["base/model"]
     assert result.flags == [art.TokenFlag(0), art.TokenFlag.SAMPLED]
     assert math.isnan(result.logprobs[1])
-    assert tokenizer.calls == [
+    assert len(tokenizer.calls) == 3
+    assert [call["add_generation_prompt"] for call in tokenizer.calls] == [
+        False,
+        True,
+        False,
+    ]
+    assert all(
         {
+            **call,
+            "add_generation_prompt": False,
+        }
+        == {
             "tools": None,
             "tokenize": True,
             "add_generation_prompt": False,
@@ -1121,8 +1131,9 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
             "explicit": True,
             "enable_thinking": True,
             "thinking_budget": 128,
-        },
-    ]
+        }
+        for call in tokenizer.calls
+    )
 
 
 @pytest.mark.parametrize(
@@ -1472,6 +1483,81 @@ def test_choice_logprobs_survive_tokenizer_fallback(
     assert result.token_ids == [10, 11, 12]
     assert result.logprobs[1] == -0.7
     assert math.isnan(result.logprobs[2])
+
+
+def test_chat_fallback_rejects_unique_text_match_in_generation_scaffold() -> None:
+    exchange = _chat_exchange([], [])
+    exchange.request["messages"] = [{"role": "user", "content": "question"}]
+    choice = exchange.response.choices[0]
+    assert choice.model_extra is not None
+    choice.model_extra.pop("prompt_token_ids", None)
+    choice.model_extra.pop("token_ids", None)
+    assert choice.logprobs is not None
+    choice.logprobs = choice.logprobs.model_copy(
+        update={
+            "content": [
+                ChatCompletionTokenLogprob(
+                    token="answer",
+                    logprob=-0.7,
+                    bytes=list(b"answer"),
+                    top_logprobs=[],
+                )
+            ]
+        }
+    )
+
+    class Tokenizer:
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> list[int]:
+            del kwargs
+            if messages[-1]["role"] == "assistant":
+                return [1, 11, 12]
+            return [1, 11] if add_generation_prompt else [1]
+
+        def __call__(self, text: str, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(input_ids={"question": [1], "answer": [11]}[text])
+
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+
+    with pytest.raises(ValueError, match="uniquely locate"):
+        history.tokenize(tokenizer=Tokenizer())
+
+
+def test_chat_exact_ids_reject_unique_match_in_generation_scaffold() -> None:
+    exchange = _chat_exchange([], [11])
+    exchange.request["messages"] = [{"role": "user", "content": "question"}]
+
+    class Tokenizer:
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> list[int]:
+            del kwargs
+            if messages[-1]["role"] == "assistant":
+                return [1, 11, 12]
+            return [1, 11] if add_generation_prompt else [1]
+
+        def __call__(self, text: str, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(input_ids={"question": [1], "answer": [11]}[text])
+
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+
+    with pytest.raises(ValueError, match="uniquely locate"):
+        history.tokenize(tokenizer=Tokenizer())
 
 
 def test_each_chat_choice_preserves_its_visible_fallback_logprobs() -> None:
@@ -3314,6 +3400,59 @@ def test_responses_multi_output_generation_is_rendered_without_duplicate_evidenc
     ]
 
 
+def test_responses_multi_output_chat_conversion_preserves_item_logprobs() -> None:
+    projected = _multi_output_responses_chat_history()
+    exchange = next(
+        source.exchange
+        for source in projected.message_sources
+        if source is not None and source.output_indices == (0,)
+    )
+    assert isinstance(exchange, ResponsesExchange)
+    data = exchange.response.model_dump(mode="python")
+    data.pop("token_generations")
+    for output, (text, logprob) in zip(
+        data["output"], (("first", -0.1), ("second", -0.2)), strict=True
+    ):
+        output["content"][0]["logprobs"] = [
+            {
+                "token": text,
+                "logprob": logprob,
+                "bytes": list(text.encode()),
+                "top_logprobs": [],
+            }
+        ]
+    exchange.response = Response.model_validate(data)
+    history = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"turn 0": [1], "first": [2], "second": [3]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            return [
+                token for message in messages for token in self(str(message["content"]))
+            ]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [1, 2, 3]
+    assert math.isnan(tokenized.logprobs[0])
+    assert tokenized.logprobs[1:] == [-0.1, -0.2]
+    assert tokenized.flags == [
+        art.TokenFlag(0),
+        art.TokenFlag.SAMPLED,
+        art.TokenFlag.SAMPLED,
+    ]
+
+
 def test_mutable_chat_history_is_authoritative_and_does_not_replay_removed_turns() -> (
     None
 ):
@@ -3337,14 +3476,18 @@ def test_mutable_chat_history_is_authoritative_and_does_not_replay_removed_turns
             return {"second": [31], "answer": [41]}[text]
 
         def apply_chat_template(
-            self, messages: list[dict[str, Any]], **kwargs: object
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
         ) -> list[int]:
             del kwargs
-            assert [message["content"] for message in messages] == [
-                "second",
-                "answer",
-            ]
-            return [30, 41, 50]
+            contents = [message["content"] for message in messages]
+            if contents == ["second", "answer"]:
+                return [30, 41, 50]
+            assert contents == ["second"]
+            return [30] if add_generation_prompt else [30]
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
@@ -3374,10 +3517,17 @@ def test_request_assistant_messages_are_not_marked_sampled() -> None:
             return {"seed": [20], "question": [30], "answer": [41]}[text]
 
         def apply_chat_template(
-            self, messages: list[dict[str, Any]], **kwargs: object
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
         ) -> list[int]:
-            del messages, kwargs
-            return [5, 20, 6, 30, 7, 41, 8]
+            del kwargs
+            if messages[-1]["role"] == "assistant" and len(messages) == 3:
+                return [5, 20, 6, 30, 7, 41, 8]
+            assert add_generation_prompt
+            return [5, 20, 6, 30, 7]
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
@@ -3402,10 +3552,17 @@ def test_rerender_constrains_exact_output_to_its_message_region() -> None:
             return [7]
 
         def apply_chat_template(
-            self, messages: list[dict[str, Any]], **kwargs: object
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
         ) -> list[int]:
-            del messages, kwargs
-            return [7, 99, 7]
+            del kwargs
+            if messages[-1]["role"] == "assistant":
+                return [7, 99, 7]
+            assert add_generation_prompt
+            return [7, 99]
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
@@ -3457,10 +3614,16 @@ def test_rerender_does_not_bind_unique_exact_id_outside_sampled_message() -> Non
             return {"cat": [7], "dog": [500]}[text]
 
         def apply_chat_template(
-            self, messages: list[dict[str, Any]], **kwargs: object
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
         ) -> list[int]:
-            del messages, kwargs
-            return [42, 7, 99, 500]
+            del kwargs
+            if messages[-1]["role"] == "assistant":
+                return [42, 7, 99, 500]
+            return [42, 7, 99] if add_generation_prompt else [42, 7]
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
@@ -3510,10 +3673,17 @@ def test_rerender_does_not_duplicate_sampled_trailing_eos() -> None:
             return {"question": [1], "answer": [7]}[text]
 
         def apply_chat_template(
-            self, messages: list[dict[str, Any]], **kwargs: object
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
         ) -> list[int]:
-            del messages, kwargs
-            return [1, 99, 7, 2]
+            del kwargs
+            if messages[-1]["role"] == "assistant":
+                return [1, 99, 7, 2]
+            assert add_generation_prompt
+            return [1, 99]
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
@@ -3889,10 +4059,17 @@ def test_rerender_marks_tool_call_only_generated_region_sampled() -> None:
             }[text]
 
         def apply_chat_template(
-            self, messages: list[dict[str, Any]], **kwargs: object
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
         ) -> list[int]:
-            del messages, kwargs
-            return [1, 10, 20, 25, 30, 31, 26]
+            del kwargs
+            if messages[-1]["role"] == "assistant":
+                return [1, 10, 20, 25, 30, 31, 26]
+            assert add_generation_prompt
+            return [1, 10]
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
@@ -4044,12 +4221,16 @@ def test_explicit_template_override_rerenders_exact_exchange_scaffold() -> None:
             self,
             messages: list[dict[str, Any]],
             *,
+            add_generation_prompt: bool,
             chat_template: str | None = None,
             **kwargs: object,
         ) -> list[int]:
             del kwargs
             assert chat_template == "custom"
-            return [10, 20, 30]
+            if messages[-1]["role"] == "assistant":
+                return [10, 20, 30]
+            assert add_generation_prompt
+            return [10]
 
     tokenized = trajectory.tokenize(
         tokenizer=Tokenizer(),
