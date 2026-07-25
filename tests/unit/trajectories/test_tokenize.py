@@ -1486,6 +1486,122 @@ def test_exact_chat_ids_accept_ordinary_positional_logprobs() -> None:
     assert tokenized.logprobs[1] == -0.75
 
 
+def test_chat_view_preserves_two_turn_textual_logprobs_without_exact_ids() -> None:
+    exchanges = [_chat_exchange([], [], offset=index) for index in range(2)]
+    for index, exchange in enumerate(exchanges):
+        choice = exchange.response.choices[0]
+        assert choice.model_extra is not None
+        choice.model_extra.pop("prompt_token_ids", None)
+        choice.model_extra.pop("token_ids", None)
+        assert choice.logprobs is not None
+        choice.logprobs = choice.logprobs.model_copy(
+            update={
+                "content": [
+                    ChatCompletionTokenLogprob(
+                        token="answer",
+                        logprob=-0.4 - index / 10,
+                        bytes=list(b"answer"),
+                        top_logprobs=[],
+                    )
+                ]
+            }
+        )
+
+    class Tokenizer:
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            if len(messages) == 4:
+                return [10, 11, 20, 11]
+            if messages[-1]["role"] == "assistant":
+                return [10, 11]
+            return [10]
+
+        def __call__(self, text: str, **kwargs: object) -> SimpleNamespace:
+            del text, kwargs
+            return SimpleNamespace(input_ids=[11])
+
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=exchanges)
+    ).chat_completions_history()
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [10, 11, 20, 11]
+    assert tokenized.logprobs[1] == pytest.approx(-0.4)
+    assert tokenized.logprobs[3] == pytest.approx(-0.5)
+    assert tokenized.flags == [
+        art.TokenFlag(0),
+        art.TokenFlag.SAMPLED,
+        art.TokenFlag(0),
+        art.TokenFlag.SAMPLED,
+    ]
+
+
+def test_chat_view_uses_later_exact_prompt_when_first_is_missing() -> None:
+    first = _chat_exchange([], [11])
+    second = _chat_exchange([10, 11, 20], [], offset=1)
+    second.response.choices[0].message.content = "final"
+    choice = second.response.choices[0]
+    assert choice.model_extra is not None
+    choice.model_extra.pop("token_ids", None)
+    assert choice.logprobs is not None
+    choice.logprobs = choice.logprobs.model_copy(
+        update={
+            "content": [
+                ChatCompletionTokenLogprob(
+                    token="final",
+                    logprob=-0.5,
+                    bytes=list(b"final"),
+                    top_logprobs=[],
+                )
+            ]
+        }
+    )
+
+    class Tokenizer:
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            token_ids = {
+                "turn 0": [10],
+                "answer": [11],
+                "turn 1": [20],
+                "final": [21],
+            }
+            return [
+                token
+                for message in messages
+                for token in token_ids[str(message["content"])]
+            ]
+
+        def __call__(self, text: str, **kwargs: object) -> SimpleNamespace:
+            del kwargs
+            return SimpleNamespace(
+                input_ids={
+                    "turn 0": [10],
+                    "answer": [11],
+                    "turn 1": [20],
+                    "final": [21],
+                }[text]
+            )
+
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_history()
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [10, 11, 20, 21]
+    assert tokenized.logprobs[-1] == pytest.approx(-0.5)
+    assert tokenized.flags == [
+        art.TokenFlag.EXACT,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        art.TokenFlag.EXACT,
+        art.TokenFlag.SAMPLED,
+    ]
+
+
 def test_chat_content_and_refusal_logprobs_are_combined_in_protocol_order() -> None:
     exchange = _chat_exchange([1], [2, 3])
     data = exchange.response.model_dump(mode="python")
@@ -1779,6 +1895,10 @@ def test_undecodable_visible_token_bytes_fall_back_to_nan(
             del kwargs
             return [10, 11] if messages[-1]["role"] == "assistant" else [10]
 
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del text, kwargs
+            return [11]
+
     monkeypatch.setattr(
         "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
     )
@@ -1977,6 +2097,56 @@ def test_responses_aggregates_complete_exact_pairs_across_content_blocks(
 
     assert result.token_ids == [10, 11, 12]
     assert result.logprobs[1:] == [-0.1, -0.2]
+    assert result.flags[1:] == [
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+
+
+def test_responses_tool_output_source_is_not_sampled_without_generation() -> None:
+    from art.trajectories._tokenize import (
+        _responses_output_is_sampled,
+        _source_is_sampled,
+    )
+
+    exchange = _response_exchange("response-tool-output", 0)
+    data = exchange.response.model_dump(mode="python")
+    data.pop("token_generations", None)
+    data["output"] = [
+        {
+            "type": "function_call_output",
+            "id": "output-1",
+            "call_id": "call-1",
+            "output": "result",
+            "status": "completed",
+        }
+    ]
+    exchange.response = Response.model_validate(data)
+
+    history = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+    assert history.messages[-1]["role"] == "tool"
+    source = history.message_sources[-1]
+    assert source is not None
+    assert not _source_is_sampled(source)
+    assert not _responses_output_is_sampled({"type": "function_call_output"})
+
+
+def test_responses_source_rejects_boolean_generation_index() -> None:
+    from art.trajectories._tokenize import _responses_source_generation
+
+    exchange = _response_exchange("response-bool-generation", 2)
+    source = ChatCompletionsMessageSource(
+        exchange=exchange,
+        output_indices=(0,),
+        generation_index=True,
+    )
+
+    with pytest.raises(ValueError, match="generation index is invalid"):
+        _responses_source_generation(source)
 
 
 def test_responses_missing_token_generations_falls_back_for_visible_output(
@@ -2556,9 +2726,17 @@ def test_prefix_retokenization_preserves_sampled_ids_and_logprobs(
 
     class Tokenizer:
         def __call__(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
-            assert text == "cat"
             assert not add_special_tokens
-            return [500]
+            return {"cat": [500], "answer": [4], "turn 0": [1], "turn 1": [3]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            rendered: list[int] = []
+            for message in messages:
+                rendered.extend(self(str(message["content"])))
+            return rendered
 
     monkeypatch.setattr(
         "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
@@ -3214,7 +3392,7 @@ def test_rerender_does_not_duplicate_sampled_trailing_eos() -> None:
     assert tokenized.logprobs[-2:] == [-0.7, -0.2]
 
 
-def test_full_render_repair_rejects_non_append_only_templates() -> None:
+def test_chat_view_preserves_initial_prompt_and_ignores_later_disagreement() -> None:
     first = _chat_exchange([1], [2])
     second = _chat_exchange([9, 8, 7], [3], offset=1)
     trajectory = art.Trajectory(
@@ -3224,16 +3402,19 @@ def test_full_render_repair_rejects_non_append_only_templates() -> None:
     class Tokenizer:
         def __call__(self, text: str, **kwargs: object) -> list[int]:
             del kwargs
-            return {"answer": [2]}[text]
+            return {"turn 0": [100], "answer": [2], "turn 1": [7]}[text]
 
         def apply_chat_template(
             self, messages: list[dict[str, Any]], **kwargs: object
         ) -> list[int]:
             del kwargs
-            return [100, len(messages)]
+            return [
+                token for message in messages for token in self(str(message["content"]))
+            ]
 
-    with pytest.raises(ValueError, match="do not form one append-only history"):
-        trajectory.tokenize(tokenizer=Tokenizer())
+    tokenized = trajectory.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [1, 2, 7, 3]
 
 
 def test_reasoning_stripped_chat_histories_tokenize_authoritative_views() -> None:
