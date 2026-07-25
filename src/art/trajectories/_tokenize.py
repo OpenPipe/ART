@@ -3747,14 +3747,17 @@ def _tokenize_chat_view(
                 probe_messages = deepcopy(messages)
                 tool_calls = probe_messages[message_index].get("tool_calls")
                 if isinstance(tool_calls, list):
-                    existing_values = {
-                        value
-                        for call in tool_calls
-                        if isinstance(call, dict)
-                        and isinstance(call.get("function"), dict)
-                        for value in cast(dict[str, Any], call["function"]).values()
-                        if isinstance(value, str)
-                    }
+                    existing_values: set[str] = set()
+                    for existing_call in tool_calls:
+                        if not isinstance(existing_call, dict):
+                            continue
+                        existing_function = existing_call.get("function")
+                        if isinstance(existing_function, dict):
+                            existing_values.update(
+                                value
+                                for value in existing_function.values()
+                                if isinstance(value, str)
+                            )
                     for call_index, call in enumerate(tool_calls):
                         if not isinstance(call, dict):
                             continue

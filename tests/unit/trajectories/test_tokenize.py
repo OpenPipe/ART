@@ -4541,11 +4541,14 @@ def test_renderer_ignored_refusal_is_appended_for_tokenization() -> None:
                     f"<message>{message.get('content') or ''}</message>"
                     for message in messages
                 )
-            return [
-                token
-                for message in messages
-                for token in self(str(message.get("content") or ""))
-            ]
+            result: list[int] = []
+            for message in messages:
+                encoded = self(str(message.get("content") or ""))
+                assert isinstance(encoded, list)
+                for token in encoded:
+                    assert isinstance(token, int)
+                    result.append(token)
+            return result
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
