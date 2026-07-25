@@ -322,7 +322,7 @@ class ChatCompletionsMessageSource:
     exchange: ChatCompletionsExchange | MessagesExchange | ResponsesExchange
     request_index: int | None = None
     choice_index: int | None = None
-    output_index: int | None = None
+    output_indices: tuple[int, ...] | None = None
     generation_index: int | None = None
 
 
