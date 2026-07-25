@@ -612,6 +612,28 @@ async def test_requests_session_stream_default_is_preserved(
     assert len(trajectory.exchanges.chat_completions) == 1
 
 
+async def test_requests_decode_unicode_preserves_string_chunks(
+    endpoint_server: str,
+) -> None:
+    body = {"model": "test/model", "messages": [{"role": "user", "content": "hi"}]}
+
+    def consume() -> list[str | bytes]:
+        with requests.post(
+            f"{endpoint_server}/chat/completions",
+            json=body,
+            stream=True,
+            timeout=5,
+        ) as response:
+            return list(response.iter_content(chunk_size=5, decode_unicode=True))
+
+    with art.Trajectory() as trajectory:
+        chunks = await asyncio.to_thread(consume)
+
+    assert chunks
+    assert all(isinstance(chunk, str) for chunk in chunks)
+    assert len(trajectory.exchanges.chat_completions) == 1
+
+
 async def test_native_openai_and_anthropic_sdks(endpoint_server: str) -> None:
     openai = AsyncOpenAI(base_url=endpoint_server, api_key="test")
     anthropic = AsyncAnthropic(

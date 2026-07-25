@@ -45,8 +45,8 @@ def install() -> None:
             ):
                 if state is not None:
                     if isinstance(chunk, str):
-                        chunk = chunk.encode(self.encoding or "utf-8")
-                    if isinstance(chunk, bytes):
+                        state.add(chunk.encode(self.encoding or "utf-8"))
+                    elif isinstance(chunk, bytes):
                         state.add(chunk)
                 yield chunk
             completed = True
