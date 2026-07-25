@@ -653,6 +653,92 @@ def test_responses_history_expands_previous_response_chain() -> None:
     assert external[1].previous_response_id == "missing"
 
 
+def test_responses_chat_conversion_preserves_request_and_output_sources() -> None:
+    exchange = _response("response-mixed-source", "answer")
+    exchange.request["input"] = [
+        {
+            "id": "request-reasoning",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "prior thought"}],
+        }
+    ]
+
+    converted = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+
+    assert converted.messages == [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "prior thought",
+        }
+    ]
+    source = converted.message_sources[0]
+    assert source is not None
+    assert source.exchange is exchange
+    assert source.request_index == 0
+    assert source.output_indices == (0,)
+
+
+def test_responses_chat_conversion_splits_cross_exchange_assistant_sources() -> None:
+    first = _response("response-reasoning", "", reasoning="think")
+    first_data = first.response.model_dump(mode="python")
+    first_data["output"] = first_data["output"][:1]
+    first.response = Response.model_validate(first_data)
+    second = _response(
+        "response-answer",
+        "answer",
+        previous_response_id="response-reasoning",
+        offset=1,
+    )
+    second.request["input"] = []
+
+    converted = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[first, second]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+
+    assert converted.messages[-2:] == [
+        {"role": "assistant", "content": "", "reasoning": "think"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    first_source, second_source = converted.message_sources[-2:]
+    assert first_source is not None and first_source.exchange is first
+    assert first_source.output_indices == (0,)
+    assert second_source is not None and second_source.exchange is second
+    assert second_source.output_indices == (0,)
+
+
+def test_responses_chat_conversion_owns_request_tool_group_by_first_item() -> None:
+    exchange = _response("response-request-tools", "answer")
+    exchange.request["input"] = [
+        {
+            "type": "function_call",
+            "call_id": f"call-{index}",
+            "name": f"tool_{index}",
+            "arguments": "{}",
+        }
+        for index in range(2)
+    ]
+
+    converted = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+
+    assert len(converted.messages[0].get("tool_calls", [])) == 2
+    source = converted.message_sources[0]
+    assert source is not None
+    assert source.exchange is exchange
+    assert source.request_index == 0
+    assert source.output_indices is None
+
+
 def test_responses_history_propagates_opaque_context_and_first_sources() -> None:
     first = _response(
         "response-1",

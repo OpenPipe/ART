@@ -1398,9 +1398,7 @@ def responses_as_chat_completions_history(
         )
     from ._tokenize import _openai_tools, _responses_messages
 
-    messages = _responses_messages(
-        {"instructions": history.instructions, "input": history.input}
-    )
+    messages = _responses_messages({"instructions": history.instructions, "input": []})
     sources: list[ChatCompletionsMessageSource | None] = []
     if history.instructions:
         sources.append(
@@ -1412,9 +1410,9 @@ def responses_as_chat_completions_history(
     def converted(
         contributors: Sequence[ResponsesItemSource | None],
     ) -> ChatCompletionsMessageSource | None:
-        present = [source for source in contributors if source is not None]
-        if not present:
+        if not contributors or any(source is None for source in contributors):
             return None
+        present = [source for source in contributors if source is not None]
         exchanges = {id(source.exchange): source.exchange for source in present}
         if len(exchanges) != 1:
             raise ValueError(
@@ -1438,47 +1436,124 @@ def responses_as_chat_completions_history(
         )
         generation_index = next(iter(generation_indices), None)
         first = present[0]
+        request_index = next(
+            (
+                source.request_index
+                for source in present
+                if source.request_index is not None
+            ),
+            None,
+        )
         if output_indices or generation_index is not None:
             return ChatCompletionsMessageSource(
                 exchange=first.exchange,
+                request_index=request_index,
                 output_indices=output_indices,
                 generation_index=generation_index,
             )
         return ChatCompletionsMessageSource(
             exchange=first.exchange,
-            request_index=first.request_index,
+            request_index=request_index,
         )
 
+    no_output = object()
+
+    def compatible(
+        contributors: Sequence[ResponsesItemSource | None],
+        source: ResponsesItemSource | None,
+    ) -> bool:
+        if source is None:
+            return True
+        present = [item for item in contributors if item is not None]
+        if present and source.exchange is not present[0].exchange:
+            return False
+
+        def output_generation(item: ResponsesItemSource) -> object:
+            if item.output_index is None and item.generation_index is None:
+                return no_output
+            return item.generation_index
+
+        generations = {
+            value
+            for item in present
+            if (value := output_generation(item)) is not no_output
+        }
+        candidate = output_generation(source)
+        return candidate is no_output or not generations or candidate in generations
+
+    item_groups: list[list[ResponseInputItemParam]] = []
     source_groups: list[list[ResponsesItemSource | None]] = []
+    pending_reasoning_items: list[ResponseInputItemParam] = []
     pending_reasoning: list[ResponsesItemSource | None] = []
+    tool_message_items: list[ResponseInputItemParam] | None = None
     tool_message_sources: list[ResponsesItemSource | None] | None = None
     for item, source in zip(history.input, history.input_sources, strict=True):
         kind = item.get("type")
         if kind == "reasoning":
+            if pending_reasoning and not compatible(pending_reasoning, source):
+                item_groups.append([*pending_reasoning_items])
+                source_groups.append([*pending_reasoning])
+                pending_reasoning_items.clear()
+                pending_reasoning.clear()
+            tool_message_items = None
             tool_message_sources = None
+            pending_reasoning_items.append(item)
             pending_reasoning.append(source)
             continue
         if kind == "function_call":
             if tool_message_sources is None:
+                if pending_reasoning and not compatible(pending_reasoning, source):
+                    item_groups.append([*pending_reasoning_items])
+                    source_groups.append([*pending_reasoning])
+                    pending_reasoning_items.clear()
+                    pending_reasoning.clear()
+                tool_message_items = [*pending_reasoning_items, item]
                 tool_message_sources = [*pending_reasoning, source]
+                item_groups.append(tool_message_items)
                 source_groups.append(tool_message_sources)
+                pending_reasoning_items.clear()
                 pending_reasoning.clear()
-            else:
+            elif compatible(tool_message_sources, source):
+                assert tool_message_items is not None
+                tool_message_items.append(item)
                 tool_message_sources.append(source)
+            else:
+                tool_message_items = [item]
+                tool_message_sources = [source]
+                item_groups.append(tool_message_items)
+                source_groups.append(tool_message_sources)
             continue
+        tool_message_items = None
         tool_message_sources = None
         if pending_reasoning:
-            if kind in {None, "message"} and item.get("role") == "assistant":
+            if (
+                kind in {None, "message"}
+                and item.get("role") == "assistant"
+                and compatible(pending_reasoning, source)
+            ):
+                item_groups.append([*pending_reasoning_items, item])
                 source_groups.append([*pending_reasoning, source])
             else:
+                item_groups.append([*pending_reasoning_items])
                 source_groups.append([*pending_reasoning])
+                item_groups.append([item])
                 source_groups.append([source])
+            pending_reasoning_items.clear()
             pending_reasoning.clear()
         else:
+            item_groups.append([item])
             source_groups.append([source])
     if pending_reasoning:
+        item_groups.append(pending_reasoning_items)
         source_groups.append(pending_reasoning)
-    sources.extend(converted(group) for group in source_groups)
+    for items, group in zip(item_groups, source_groups, strict=True):
+        projected = _responses_messages({"input": items})
+        if len(projected) != 1:
+            raise AssertionError(
+                "One Responses projection group must produce one Chat message"
+            )
+        messages.extend(projected)
+        sources.append(converted(group))
     if len(sources) != len(messages):
         raise AssertionError("Responses conversion sources must parallel messages")
     tools = _TOOLS.validate_python(_openai_tools(history.tools, dialect="responses"))
