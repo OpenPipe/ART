@@ -4245,7 +4245,16 @@ def test_rerender_marks_tool_call_only_generated_region_sampled() -> None:
     assert not tokenized.flags[0] & art.TokenFlag.SAMPLED
 
 
-def test_tool_call_probe_handles_contextual_tokenization() -> None:
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("lookup", "{}"),
+        ("art_trajectory_probe_0", '{"art_trajectory_probe":true}'),
+    ],
+)
+def test_tool_call_probe_handles_contextual_tokenization(
+    name: str, arguments: str
+) -> None:
     exchange = _chat_exchange([], [])
     data = exchange.response.model_dump(mode="python")
     choice = data["choices"][0]
@@ -4259,7 +4268,7 @@ def test_tool_call_probe_handles_contextual_tokenization() -> None:
             {
                 "id": "call-1",
                 "type": "function",
-                "function": {"name": "lookup", "arguments": "{}"},
+                "function": {"name": name, "arguments": arguments},
             }
         ],
     }
@@ -4271,7 +4280,11 @@ def test_tool_call_probe_handles_contextual_tokenization() -> None:
     class Tokenizer:
         def __call__(self, text: str, **kwargs: object) -> list[int]:
             del kwargs
-            return {"turn 0": [1], "lookup": [90], "{}": [91]}[text]
+            return {
+                "turn 0": [1],
+                name: [90],
+                arguments: [91],
+            }[text]
 
         def apply_chat_template(
             self, messages: list[dict[str, Any]], **kwargs: object
@@ -4280,7 +4293,7 @@ def test_tool_call_probe_handles_contextual_tokenization() -> None:
             if messages[-1]["role"] != "assistant":
                 return [1, 10]
             function = messages[-1]["tool_calls"][0]["function"]
-            if str(function["name"]).startswith("art_trajectory_probe_"):
+            if function["name"] != name:
                 return [1, 10, 98, 25, 99, 26]
             return [1, 10, 20, 25, 30, 26]
 
@@ -4466,8 +4479,19 @@ def test_renderer_ignored_refusal_is_appended_for_tokenization() -> None:
     ).chat_completions_history()
 
     class Tokenizer:
-        def __call__(self, text: str, **kwargs: object) -> list[int]:
-            del kwargs
+        def __call__(self, text: str, **kwargs: object) -> object:
+            if kwargs.get("return_offsets_mapping"):
+                answer_start = text.index("answer")
+                declined_start = text.index("declined")
+                declined_end = declined_start + len("declined")
+                return {
+                    "input_ids": [1, 4, 5],
+                    "offset_mapping": [
+                        (0, answer_start),
+                        (answer_start, declined_start),
+                        (declined_start, declined_end),
+                    ],
+                }
             return {
                 "turn 0": [1],
                 "answer": [4],
@@ -4477,8 +4501,14 @@ def test_renderer_ignored_refusal_is_appended_for_tokenization() -> None:
 
         def apply_chat_template(
             self, messages: list[dict[str, Any]], **kwargs: object
-        ) -> list[int]:
+        ) -> object:
+            tokenize = kwargs.pop("tokenize")
             del kwargs
+            if not tokenize:
+                return "".join(
+                    f"<message>{message.get('content') or ''}</message>"
+                    for message in messages
+                )
             return [
                 token
                 for message in messages

@@ -3483,9 +3483,7 @@ def _tokenize_chat_view(
     search_cursor = 0
     sampled_texts = {
         text
-        for message, source in zip(
-            history.messages, history.message_sources, strict=True
-        )
+        for message, source in zip(messages, history.message_sources, strict=True)
         if message.get("role") == "assistant"
         and source is not None
         and _source_is_sampled(source)
@@ -3717,6 +3715,14 @@ def _tokenize_chat_view(
                 probe_messages = deepcopy(messages)
                 tool_calls = probe_messages[message_index].get("tool_calls")
                 if isinstance(tool_calls, list):
+                    existing_values = {
+                        value
+                        for call in tool_calls
+                        if isinstance(call, dict)
+                        and isinstance(call.get("function"), dict)
+                        for value in cast(dict[str, Any], call["function"]).values()
+                        if isinstance(value, str)
+                    }
                     for call_index, call in enumerate(tool_calls):
                         if not isinstance(call, dict):
                             continue
@@ -3724,8 +3730,18 @@ def _tokenize_chat_view(
                         if not isinstance(raw_function, dict):
                             continue
                         function = cast(dict[str, Any], raw_function)
-                        function["name"] = f"art_trajectory_probe_{call_index}"
-                        function["arguments"] = '{"art_trajectory_probe":true}'
+                        probe_name = (
+                            f"art_trajectory_probe_{id(probe_messages):x}_{call_index}"
+                        )
+                        probe_arguments = json.dumps({probe_name: True})
+                        while (
+                            probe_name in existing_values
+                            or probe_arguments in existing_values
+                        ):
+                            probe_name += "_"
+                            probe_arguments = json.dumps({probe_name: True})
+                        function["name"] = probe_name
+                        function["arguments"] = probe_arguments
                     try:
                         probe = render(
                             probe_messages,
@@ -3791,12 +3807,10 @@ def _tokenize_chat_view(
         message.get("role") == "assistant"
         and source is not None
         and _source_is_sampled(source)
-        for message, source in zip(
-            history.messages, history.message_sources, strict=True
-        )
+        for message, source in zip(messages, history.message_sources, strict=True)
     )
     for message_index, (message, source) in enumerate(
-        zip(history.messages, history.message_sources, strict=True)
+        zip(messages, history.message_sources, strict=True)
     ):
         parts = _chat_message_parts(message)
         sampled = (
