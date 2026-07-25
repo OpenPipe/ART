@@ -1389,10 +1389,15 @@ def _exchange_tokens(
     raise TypeError(f"Unknown exchange type: {type(exchange)!r}")
 
 
-def _visible_logprobs(exchange: Exchange) -> list[tuple[str, float]]:
+def _visible_logprobs(
+    exchange: Exchange, *, source: object | None = None
+) -> list[tuple[str, float]]:
     values: list[tuple[str, float]] = []
     if isinstance(exchange, ChatCompletionsExchange):
-        for entry in _chat_logprob_entries(exchange.response.choices[0]):
+        choice = (
+            _chat_choice(source) if source is not None else exchange.response.choices[0]
+        )
+        for entry in _chat_logprob_entries(choice):
             data = _dump(entry)
             raw_bytes = data.get("bytes")
             if isinstance(raw_bytes, list):
@@ -1414,7 +1419,7 @@ def _visible_logprobs(exchange: Exchange) -> list[tuple[str, float]]:
                 if logprob is not None:
                     values.append((text, float(logprob)))
     elif isinstance(exchange, ResponsesExchange):
-        for output in _dump(exchange.response).get("output") or []:
+        for output in exchange.response.output:
             for content in _dump(output).get("content") or []:
                 for entry in _dump(content).get("logprobs") or []:
                     data = _dump(entry)
@@ -1425,12 +1430,15 @@ def _visible_logprobs(exchange: Exchange) -> list[tuple[str, float]]:
     return values
 
 
-def _sampled_text(exchange: Exchange) -> str | None:
-    visible = "".join(text for text, _ in _visible_logprobs(exchange))
+def _sampled_text(exchange: Exchange, *, source: object | None = None) -> str | None:
+    visible = "".join(text for text, _ in _visible_logprobs(exchange, source=source))
     if visible:
         return visible
     if isinstance(exchange, ChatCompletionsExchange):
-        content = exchange.response.choices[0].message.content
+        choice = (
+            _chat_choice(source) if source is not None else exchange.response.choices[0]
+        )
+        content = choice.message.content
         return content if isinstance(content, str) else None
     if isinstance(exchange, CompletionsExchange):
         return exchange.response.choices[0].text
@@ -1443,7 +1451,7 @@ def _sampled_text(exchange: Exchange) -> str | None:
         return "".join(parts) if parts else None
     if isinstance(exchange, ResponsesExchange):
         parts: list[str] = []
-        for output in _dump(exchange.response).get("output") or []:
+        for output in exchange.response.output:
             data = _dump(output)
             if data.get("type") == "message":
                 parts.append(_responses_output_text(data.get("content")))
@@ -1514,9 +1522,13 @@ def _retained_output_suffix(
 
 
 def _align_visible_logprobs(
-    tokenizer: Tokenizer | None, completion: list[int], exchange: Exchange
+    tokenizer: Tokenizer | None,
+    completion: list[int],
+    exchange: Exchange,
+    *,
+    source: object | None = None,
 ) -> list[float] | None:
-    values = _visible_logprobs(exchange)
+    values = _visible_logprobs(exchange, source=source)
     if not values or tokenizer is None:
         return None
     token_ids: list[int] = []
@@ -3005,7 +3017,7 @@ def _chat_source_tokens(
         tokens, logprobs = _chat_source_full_tokens(source)
         if tokens is None:
             return None, []
-        sampled_text = _sampled_text(exchange)
+        sampled_text = _sampled_text(exchange, source=source)
         message = _dump(
             next(
                 item
@@ -3428,12 +3440,29 @@ def _tokenize_chat_view(
                 and not source_boundary
                 and len(local_matches) != same_sampled_parts
             ):
-                if not source_context_matches:
+                prompt_render = render(
+                    messages[:message_index], add_generation_prompt=True
+                )
+                completed_render = render(
+                    messages[: message_index + 1], add_generation_prompt=False
+                )
+                bounded_matches = [
+                    match
+                    for match in locations(local, len(prompt_render))
+                    if match[1] <= len(completed_render)
+                ]
+                if (
+                    len(completed_render) < len(prompt_render)
+                    or completed_render[: len(prompt_render)] != prompt_render
+                    or rendered[: len(completed_render)] != completed_render
+                    or len(bounded_matches) != 1
+                    or bounded_matches[0][0] < search_cursor
+                ):
                     raise ValueError(
                         "Could not uniquely locate a sampled history message in the "
                         "rendered history"
                     )
-                continue
+                span = bounded_matches[0]
             start, end = span
             search_cursor = end
             if not sampled:
@@ -3454,7 +3483,12 @@ def _tokenize_chat_view(
                     exchange,
                     (ChatCompletionsExchange, ResponsesExchange, MessagesExchange),
                 ):
-                    logprobs = _align_visible_logprobs(tokenizer, local, exchange) or []
+                    logprobs = (
+                        _align_visible_logprobs(
+                            tokenizer, local, exchange, source=source
+                        )
+                        or []
+                    )
             replacements.append(
                 (
                     start,
@@ -3597,6 +3631,10 @@ def _tokenize_completions_token_history(
             prompt_logprobs if span.source.choice_index is None else completion_logprobs
         )
         if selected != history.prompt[span.start : span.end]:
+            if span.source.choice_index is not None:
+                raise ValueError(
+                    "Completions sampled output no longer matches its source exchange"
+                )
             flags[span.start : span.end] = [
                 flag & ~TokenFlag.EXACT for flag in flags[span.start : span.end]
             ]
@@ -4133,12 +4171,14 @@ def tokenize_group(
         )
         for trajectory in group.trajectories
     ]
-    return cast(
-        TokenizedTrajectoryGroup[TokenizedTrajectory]
-        | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory],
-        TokenizedTrajectoryGroup(
+    if multi_history:
+        return TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory](
             trajectories=trajectories,
             metrics=dict(group.metrics),
             metadata=dict(group.metadata),
-        ),
+        )
+    return TokenizedTrajectoryGroup[TokenizedTrajectory](
+        trajectories=trajectories,
+        metrics=dict(group.metrics),
+        metadata=dict(group.metadata),
     )

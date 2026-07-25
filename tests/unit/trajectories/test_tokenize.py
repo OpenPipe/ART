@@ -726,6 +726,16 @@ def test_mutated_completions_token_prompt_drops_stale_exact_evidence() -> None:
     ]
 
 
+def test_mutated_completions_token_choice_is_rejected() -> None:
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[_completion_exchange()])
+    ).completions_token_history()
+    history.prompt[-1] = 99
+
+    with pytest.raises(ValueError, match="sampled output"):
+        history.tokenize()
+
+
 def test_completions_history_rejects_model_and_sampled_span_mutation() -> None:
     history = art.Trajectory(
         exchanges=TrajectoryExchanges(completions=[_completion_exchange()])
@@ -1464,6 +1474,132 @@ def test_choice_logprobs_survive_tokenizer_fallback(
     assert math.isnan(result.logprobs[2])
 
 
+def test_each_chat_choice_preserves_its_visible_fallback_logprobs() -> None:
+    exchange = _chat_exchange([], [])
+    exchange.request["messages"] = [{"role": "user", "content": "question"}]
+    data = exchange.response.model_dump(mode="python")
+    choices = []
+    for index, (text, logprob) in enumerate((("left", -0.1), ("right", -0.2))):
+        choice = data["choices"][0].copy()
+        choice.pop("prompt_token_ids", None)
+        choice.pop("token_ids", None)
+        choice["index"] = index
+        choice["message"] = {"role": "assistant", "content": text}
+        choice["logprobs"] = {
+            "content": [
+                {
+                    "token": text,
+                    "logprob": logprob,
+                    "bytes": list(text.encode()),
+                    "top_logprobs": [],
+                }
+            ]
+        }
+        choices.append(choice)
+    data["choices"] = choices
+    exchange.response = ChatCompletion.model_validate(data)
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    )
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"question": [1], "left": [2], "right": [3]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            return [
+                token for message in messages for token in self(str(message["content"]))
+            ]
+
+    histories = trajectory.chat_completions_histories()
+    direct = [history.tokenize(tokenizer=Tokenizer()) for history in histories]
+    tokenized = trajectory.tokenize(multi_history=True, tokenizer=Tokenizer())
+
+    assert [history.logprobs[-1] for history in direct] == [-0.1, -0.2]
+    assert [history.logprobs[-1] for history in tokenized.histories] == [-0.1, -0.2]
+
+    from art.trajectories._tokenize import _tokenize_trajectory_with_trace
+
+    traced, traces = _tokenize_trajectory_with_trace(trajectory, tokenizer=Tokenizer())
+    assert [history.logprobs[-1] for history in traced.histories] == [-0.1, -0.2]
+    assert [
+        {key.index for key in trace.source_keys if key is not None} for trace in traces
+    ] == [{0}, {1}]
+
+
+def test_chat_fallback_anchors_sampled_text_away_from_equal_user_text() -> None:
+    first = _chat_exchange([], [], offset=0)
+    first.request["messages"] = [{"role": "user", "content": "q"}]
+    first_data = first.response.model_dump(mode="python")
+    first_choice = first_data["choices"][0]
+    first_choice.pop("prompt_token_ids", None)
+    first_choice.pop("token_ids", None)
+    first_choice["message"]["content"] = "same"
+    first_choice["logprobs"]["content"] = [
+        {
+            "token": "same",
+            "logprob": -0.1,
+            "bytes": list(b"same"),
+            "top_logprobs": [],
+        }
+    ]
+    first.response = ChatCompletion.model_validate(first_data)
+
+    second = _chat_exchange([], [], offset=1)
+    second.request["messages"] = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "same"},
+        {"role": "user", "content": "same"},
+    ]
+    second_data = second.response.model_dump(mode="python")
+    second_choice = second_data["choices"][0]
+    second_choice.pop("prompt_token_ids", None)
+    second_choice.pop("token_ids", None)
+    second_choice["message"]["content"] = "other"
+    second_choice["logprobs"]["content"] = [
+        {
+            "token": "other",
+            "logprob": -0.2,
+            "bytes": list(b"other"),
+            "top_logprobs": [],
+        }
+    ]
+    second.response = ChatCompletion.model_validate(second_data)
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"q": [1], "same": [2], "other": [3]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            return [
+                token for message in messages for token in self(str(message["content"]))
+            ]
+
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_history()
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [1, 2, 2, 3]
+    assert tokenized.flags == [
+        art.TokenFlag(0),
+        art.TokenFlag.SAMPLED,
+        art.TokenFlag(0),
+        art.TokenFlag.SAMPLED,
+    ]
+    assert tokenized.logprobs[1] == -0.1
+    assert math.isnan(tokenized.logprobs[2])
+    assert tokenized.logprobs[3] == -0.2
+
+
 def test_exact_chat_ids_accept_ordinary_positional_logprobs() -> None:
     exchange = _chat_exchange([1], [2])
     logprobs = exchange.response.choices[0].logprobs
@@ -1777,7 +1913,7 @@ def test_missing_completion_renders_only_missing_region_when_prompt_is_exact(
     ]
 
 
-def test_ambiguous_visible_logprobs_fail_closed(
+def test_ambiguous_visible_logprobs_raise(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     exchange = _chat_exchange([], [])
@@ -1810,14 +1946,12 @@ def test_ambiguous_visible_logprobs_fail_closed(
     monkeypatch.setattr(
         "art.trajectories._tokenize._load_tokenizer", lambda _config: Tokenizer()
     )
-    result = art.Trajectory(
-        exchanges=TrajectoryExchanges(chat_completions=[exchange])
-    ).tokenize(
-        base_model="base/model",
-    )
-
-    assert result.token_ids == [10, 11, 12, 11]
-    assert all(math.isnan(logprob) for logprob in result.logprobs[1:])
+    with pytest.raises(ValueError, match="uniquely locate"):
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(chat_completions=[exchange])
+        ).tokenize(
+            base_model="base/model",
+        )
 
 
 def test_legacy_token_and_logprob_length_mismatch_raises() -> None:

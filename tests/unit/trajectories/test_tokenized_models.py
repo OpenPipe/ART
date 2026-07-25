@@ -64,3 +64,84 @@ def test_nested_tokenized_models_nan_json_round_trip() -> None:
     assert restored_trajectory.reward == trajectory.reward
     assert restored.metrics == group.metrics
     assert restored.metadata == group.metadata
+
+
+def test_public_group_tokenization_nan_json_round_trip() -> None:
+    from datetime import datetime
+
+    from openai.types.chat import ChatCompletion
+
+    from art.trajectories import (
+        ChatCompletionsExchange,
+        ChatCompletionsRequest,
+        TrajectoryExchanges,
+    )
+
+    exchange = ChatCompletionsExchange(
+        request=ChatCompletionsRequest(
+            model="policy",
+            messages=[{"role": "user", "content": "question"}],
+        ),
+        response=ChatCompletion.model_validate(
+            {
+                "id": "chat",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "policy",
+                "choices": [
+                    {
+                        "index": index,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": text},
+                        "prompt_token_ids": [1],
+                        "token_ids": [token_id],
+                        "logprobs": {
+                            "content": [
+                                {
+                                    "token": f"token_id:{token_id}",
+                                    "logprob": -0.1 * token_id,
+                                    "bytes": [],
+                                    "top_logprobs": [],
+                                }
+                            ]
+                        },
+                    }
+                    for index, (text, token_id) in enumerate(
+                        (("left", 2), ("right", 3))
+                    )
+                ],
+            }
+        ),
+        start_time=datetime(2026, 1, 1),
+        end_time=datetime(2026, 1, 1),
+    )
+    group = art.TrajectoryGroup(
+        [art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=[exchange]))]
+    )
+
+    single_exchange = exchange.model_copy(
+        update={
+            "response": exchange.response.model_copy(
+                update={"choices": [exchange.response.choices[0]]}
+            )
+        }
+    )
+    single = art.TrajectoryGroup(
+        [
+            art.Trajectory(
+                exchanges=TrajectoryExchanges(chat_completions=[single_exchange])
+            )
+        ]
+    ).tokenize()
+    single_json = single.model_dump_json()
+    assert '"NaN"' in single_json
+    art.TokenizedTrajectoryGroup[art.TokenizedTrajectory].model_validate_json(
+        single_json
+    )
+
+    multi = group.tokenize(multi_history=True)
+    multi_json = multi.model_dump_json()
+    assert '"NaN"' in multi_json
+    art.TokenizedTrajectoryGroup[
+        art.TokenizedMultiHistoryTrajectory
+    ].model_validate_json(multi_json)
