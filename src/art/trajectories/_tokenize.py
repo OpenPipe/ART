@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections.abc import Hashable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
@@ -9,7 +10,7 @@ from hashlib import sha256
 import json
 import math
 import re
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
 import warnings
 
 from anthropic.types import Message, MessageParam, TextBlock
@@ -59,6 +60,16 @@ class _TokenizerConfig:
     revision: str | None = None
     chat_template: str | None = None
     chat_template_kwargs: Mapping[str, object] | None = None
+
+
+class _OffsetTokenizer(Protocol):
+    def __call__(
+        self,
+        text: str,
+        *,
+        add_special_tokens: bool,
+        return_offsets_mapping: Literal[True],
+    ) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -331,7 +342,7 @@ def _as_tokenizer(tokenizer: object) -> Tokenizer:
 
 
 def _string_dict(value: object) -> dict[str, Any] | None:
-    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+    if not isinstance(value, Mapping) or not all(isinstance(key, str) for key in value):
         return None
     return {key: item for key, item in value.items() if isinstance(key, str)}
 
@@ -452,18 +463,10 @@ def _chat_logprob_entries(choice: Choice) -> list[object]:
     ]
 
 
-def _chat_choice_tokens(
-    choice: Choice, response_data: dict[str, Any]
-) -> tuple[list[int] | None, list[int] | None, list[float]]:
+def _chat_choice_output_tokens(
+    choice: Choice,
+) -> tuple[list[int] | None, list[float]]:
     choice_data = _dump(choice)
-    prompt = choice_data.get("prompt_token_ids")
-    if prompt is None:
-        prompt = response_data.get("prompt_token_ids")
-    prompt_ids = _exact_token_ids(
-        prompt,
-        field="Chat Completions prompt_token_ids",
-        empty_is_missing=True,
-    )
     token_ids = _exact_token_ids(
         choice_data.get("token_ids"),
         field="Chat Completions token_ids",
@@ -482,10 +485,26 @@ def _chat_choice_tokens(
     logprobs = pair_logprobs or positional_logprobs
     if selected is not None and values and len(logprobs) != len(selected):
         raise ValueError("Chat Completions token IDs and logprobs differ in length")
+    return selected, logprobs or [math.nan] * len(selected or [])
+
+
+def _chat_choice_tokens(
+    choice: Choice, response_data: dict[str, Any]
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
+    choice_data = _dump(choice)
+    prompt = choice_data.get("prompt_token_ids")
+    if prompt is None:
+        prompt = response_data.get("prompt_token_ids")
+    prompt_ids = _exact_token_ids(
+        prompt,
+        field="Chat Completions prompt_token_ids",
+        empty_is_missing=True,
+    )
+    selected, logprobs = _chat_choice_output_tokens(choice)
     return (
         prompt_ids,
         selected,
-        logprobs or [math.nan] * len(selected or []),
+        logprobs,
     )
 
 
@@ -1545,10 +1564,25 @@ def _align_visible_logprobs(
     exchange: Exchange,
     *,
     source: object | None = None,
+    sampled_text: str | None = None,
 ) -> list[float] | None:
     values = _visible_logprobs(exchange, source=source)
     if not values or tokenizer is None:
         return None
+    if sampled_text is not None:
+        matches: list[list[tuple[str, float]]] = []
+        for start in range(len(values)):
+            combined = ""
+            for end in range(start, len(values)):
+                combined += values[end][0]
+                if combined == sampled_text:
+                    matches.append(values[start : end + 1])
+                    break
+                if len(combined) >= len(sampled_text):
+                    break
+        if len(matches) != 1:
+            return None
+        values = matches[0]
     token_ids: list[int] = []
     logprobs: list[float] = []
     for text, logprob in values:
@@ -2385,6 +2419,27 @@ class _HistoryRenderState:
     projection_matches: bool | None = None
 
 
+def _matches_final_chat_exchange(history: ChatCompletionsHistory) -> bool | None:
+    from ._history import normalize_chat_message
+
+    for source in reversed(history.message_sources):
+        if (
+            source is None
+            or not isinstance(source.exchange, ChatCompletionsExchange)
+            or source.choice_index is None
+        ):
+            continue
+        choice = _chat_choice(source)
+        expected = [
+            *source.exchange.request.get("messages", []),
+            choice.message.model_dump(mode="python", exclude_none=True),
+        ]
+        return [normalize_chat_message(message) for message in history.messages] == [
+            normalize_chat_message(message) for message in expected
+        ]
+    return None
+
+
 def _history_render_state(history: History) -> _HistoryRenderState:
     if isinstance(history, ChatCompletionsHistory):
         if any(source is None for source in history.message_sources):
@@ -2409,7 +2464,9 @@ def _history_render_state(history: History) -> _HistoryRenderState:
         )
         if context_changed:
             return _HistoryRenderState(needs_render=True, context_changed=True)
-        projection_matches = _history_matches_projection(history)
+        projection_matches = _matches_final_chat_exchange(history)
+        if projection_matches is None:
+            projection_matches = _history_matches_projection(history)
         return _HistoryRenderState(
             needs_render=not projection_matches,
             projection_matches=projection_matches,
@@ -2845,8 +2902,7 @@ def _chat_source_full_tokens(
         choice = next(
             item for item in exchange.response.choices if item.index == choice_index
         )
-        _, tokens, logprobs = _chat_choice_tokens(choice, _dump(exchange.response))
-        return tokens, logprobs
+        return _chat_choice_output_tokens(choice)
     if isinstance(exchange, ResponsesExchange):
         return _responses_generation_full_tokens(source)
     if isinstance(exchange, MessagesExchange):
@@ -3024,15 +3080,61 @@ def _chat_message_parts(message: Mapping[str, object]) -> list[tuple[str, str]]:
     return parts
 
 
+def _chat_message_text_slot_groups(
+    message: dict[str, Any],
+) -> list[list[tuple[dict[str, Any], str]]]:
+    groups: list[list[tuple[dict[str, Any], str]]] = []
+    reasoning_key = (
+        "reasoning"
+        if isinstance(message.get("reasoning"), str) and message["reasoning"]
+        else "reasoning_content"
+    )
+    if isinstance(message.get(reasoning_key), str) and message[reasoning_key]:
+        groups.append([(message, reasoning_key)])
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        groups.append([(message, "content")])
+    elif isinstance(content, list):
+        content_slots = [
+            (block, "text")
+            for block in content
+            if (
+                isinstance(block, dict)
+                and block.get("type") in {"input_text", "output_text", "text"}
+                and isinstance(block.get("text"), str)
+                and block["text"]
+            )
+        ]
+        if content_slots:
+            groups.append(content_slots)
+    if isinstance(message.get("refusal"), str) and message["refusal"]:
+        groups.append([(message, "refusal")])
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            for key in ("name", "arguments"):
+                if isinstance(function.get(key), str) and function[key]:
+                    groups.append([(function, key)])
+    return groups
+
+
 def _chat_source_tokens(
     source: object,
     text: str,
     *,
     part: str,
+    full_tokens: tuple[list[int] | None, list[float]] | None = None,
 ) -> tuple[list[int] | None, list[float]]:
     exchange = getattr(source, "exchange", None)
     if isinstance(exchange, ChatCompletionsExchange):
-        tokens, logprobs = _chat_source_full_tokens(source)
+        tokens, logprobs = (
+            full_tokens if full_tokens is not None else _chat_source_full_tokens(source)
+        )
         if tokens is None:
             return None, []
         sampled_text = _sampled_text(exchange, source=source)
@@ -3212,10 +3314,89 @@ def _tokenize_chat_view(
             )
         )
 
-    rendered = render(
-        messages,
-        add_generation_prompt=not ends_with_assistant,
-    )
+    rendered = render(messages, add_generation_prompt=not ends_with_assistant)
+    if any(
+        message.get("role") == "assistant"
+        and isinstance(message.get("reasoning"), str)
+        and message["reasoning"]
+        and not message.get("reasoning_content")
+        for message in messages
+    ):
+        without_reasoning = deepcopy(messages)
+        for message in without_reasoning:
+            message.pop("reasoning", None)
+        if (
+            render(
+                without_reasoning,
+                add_generation_prompt=not ends_with_assistant,
+            )
+            == rendered
+        ):
+            messages = deepcopy(messages)
+            for message in messages:
+                reasoning = message.pop("reasoning", None)
+                if isinstance(reasoning, str) and reasoning:
+                    message.setdefault("reasoning_content", reasoning)
+            rendered = render(
+                messages,
+                add_generation_prompt=not ends_with_assistant,
+            )
+    if any(
+        message.get("role") == "assistant"
+        and isinstance(message.get("refusal"), str)
+        and message["refusal"]
+        for message in messages
+    ):
+        without_refusals = deepcopy(messages)
+        for message in without_refusals:
+            message.pop("refusal", None)
+        if (
+            render(
+                without_refusals,
+                add_generation_prompt=not ends_with_assistant,
+            )
+            == rendered
+        ):
+            messages = deepcopy(messages)
+            for message in messages:
+                refusal = message.pop("refusal", None)
+                if not isinstance(refusal, str) or not refusal:
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    message["content"] = content + refusal
+                elif isinstance(content, list):
+                    message["content"] = [
+                        *content,
+                        {"type": "text", "text": refusal},
+                    ]
+                elif content is None:
+                    message["content"] = refusal
+                else:
+                    raise ValueError(
+                        "Cannot render an assistant refusal with this content shape"
+                    )
+            rendered = render(
+                messages,
+                add_generation_prompt=not ends_with_assistant,
+            )
+
+    prompt_cache: dict[int, list[int] | None] = {}
+    output_cache: dict[int, tuple[list[int] | None, list[float]]] = {}
+
+    def source_prompt_tokens(source: object) -> list[int] | None:
+        key = id(source)
+        if key not in prompt_cache:
+            prompt_cache[key] = _chat_source_prompt_tokens(source)
+        return prompt_cache[key]
+
+    def source_output_tokens(
+        source: object,
+    ) -> tuple[list[int] | None, list[float]]:
+        key = id(source)
+        if key not in output_cache:
+            output_cache[key] = _chat_source_full_tokens(source)
+        return output_cache[key]
 
     def source_matches_context(source: object) -> bool:
         exchange = getattr(source, "exchange", None)
@@ -3238,7 +3419,7 @@ def _tokenize_chat_view(
         ):
             if message.get("role") != "assistant" or source is None:
                 continue
-            source_prompt = _chat_source_prompt_tokens(source)
+            source_prompt = source_prompt_tokens(source)
             if source_prompt and source_matches_context(source):
                 rendered_prompt = render(
                     messages[:message_index], add_generation_prompt=True
@@ -3314,6 +3495,286 @@ def _tokenize_chat_view(
     ):
         direct_bounds = []
 
+    marked_bounds: dict[int, tuple[int, int]] = {}
+    marked_part_bounds: dict[int, list[tuple[int, int]]] = {}
+    if not direct_bounds:
+        marked_messages = deepcopy(messages)
+        marker_prefix = f"ART_TRAJECTORY_{id(marked_messages):x}_"
+        markers: dict[str, tuple[int, int, Literal["start", "end"]]] = {}
+        part_counts: dict[int, int] = {}
+        part_whitespace: dict[tuple[int, int], tuple[str, str]] = {}
+        for message_index, (message, source) in enumerate(
+            zip(marked_messages, history.message_sources, strict=True)
+        ):
+            if (
+                message.get("role") != "assistant"
+                or source is None
+                or not _source_is_sampled(source)
+            ):
+                continue
+            slot_groups = _chat_message_text_slot_groups(message)
+            if not slot_groups:
+                continue
+            part_counts[message_index] = len(slot_groups)
+            for part_index, slots in enumerate(slot_groups):
+                start = f"{marker_prefix}{message_index}_{part_index}_START"
+                end = f"{marker_prefix}{message_index}_{part_index}_END"
+                first, first_key = slots[0]
+                last, last_key = slots[-1]
+                first_text = str(first[first_key])
+                last_text = str(last[last_key])
+                leading = first_text[: len(first_text) - len(first_text.lstrip())]
+                trailing = last_text[len(last_text.rstrip()) :]
+                if first is last and first_key == last_key:
+                    core = first_text[
+                        len(leading) : len(first_text) - len(trailing)
+                        if trailing
+                        else len(first_text)
+                    ]
+                    first[first_key] = leading + start + core + end + trailing
+                else:
+                    first[first_key] = leading + start + first_text[len(leading) :]
+                    last[last_key] = (
+                        last_text[: len(last_text) - len(trailing)] + end + trailing
+                    )
+                part_whitespace[(message_index, part_index)] = (leading, trailing)
+                markers[start] = (message_index, part_index, "start")
+                markers[end] = (message_index, part_index, "end")
+        if markers:
+            try:
+                marked_text = resolved_tokenizer.apply_chat_template(
+                    marked_messages,
+                    tools=history.tools,
+                    tokenize=False,
+                    add_generation_prompt=not ends_with_assistant,
+                    **({"chat_template": template} if template is not None else {}),
+                    **kwargs,
+                )
+            except (TypeError, NotImplementedError):
+                marked_text = None
+            if isinstance(marked_text, str):
+                marker_pattern = re.compile(
+                    rf"{re.escape(marker_prefix)}\d+_\d+_(?:START|END)"
+                )
+                matches = list(marker_pattern.finditer(marked_text))
+                found_markers = [match.group(0) for match in matches]
+            else:
+                matches = []
+                found_markers = []
+            if (
+                isinstance(marked_text, str)
+                and len(found_markers) == len(markers)
+                and set(found_markers) == set(markers)
+            ):
+                unmarked_parts: list[str] = []
+                char_bounds: dict[tuple[int, int], list[int]] = {}
+                source_cursor = 0
+                target_cursor = 0
+                for match in matches:
+                    position = match.start()
+                    marker = match.group(0)
+                    message_index, part_index, boundary = markers[marker]
+                    chunk = marked_text[source_cursor:position]
+                    unmarked_parts.append(chunk)
+                    target_cursor += len(chunk)
+                    char_bounds.setdefault((message_index, part_index), [0, 0])[
+                        0 if boundary == "start" else 1
+                    ] = target_cursor
+                    source_cursor = match.end()
+                unmarked_parts.append(marked_text[source_cursor:])
+                unmarked_text = "".join(unmarked_parts)
+                for key, bounds in char_bounds.items():
+                    leading, trailing = part_whitespace[key]
+                    if (
+                        leading
+                        and unmarked_text[max(0, bounds[0] - len(leading)) : bounds[0]]
+                        == leading
+                    ):
+                        bounds[0] -= len(leading)
+                    if (
+                        trailing
+                        and unmarked_text[bounds[1] : bounds[1] + len(trailing)]
+                        == trailing
+                    ):
+                        bounds[1] += len(trailing)
+                try:
+                    encoded = cast(_OffsetTokenizer, resolved_tokenizer)(
+                        unmarked_text,
+                        add_special_tokens=False,
+                        return_offsets_mapping=True,
+                    )
+                except (TypeError, NotImplementedError):
+                    encoded = None
+                encoded_data = _string_dict(encoded)
+                raw_offsets = (
+                    encoded_data.get("offset_mapping")
+                    if encoded_data is not None
+                    else None
+                )
+                if (
+                    encoded is not None
+                    and _ids(encoded) == rendered
+                    and isinstance(raw_offsets, list)
+                    and len(raw_offsets) == len(rendered)
+                ):
+                    offsets: list[tuple[int, int]] = []
+                    for value in raw_offsets:
+                        if (
+                            not isinstance(value, (list, tuple))
+                            or len(value) != 2
+                            or not all(isinstance(item, int) for item in value)
+                        ):
+                            break
+                        offsets.append((value[0], value[1]))
+                    if len(offsets) == len(rendered):
+                        token_bounds: dict[tuple[int, int], tuple[int, int]] = {}
+                        token_cursor = 0
+                        for key, (char_start, char_end) in sorted(
+                            char_bounds.items(), key=lambda item: item[1]
+                        ):
+                            while (
+                                token_cursor < len(offsets)
+                                and offsets[token_cursor][1] <= char_start
+                            ):
+                                token_cursor += 1
+                            token_end = token_cursor
+                            while (
+                                token_end < len(offsets)
+                                and offsets[token_end][0] < char_end
+                            ):
+                                token_end += 1
+                            if (
+                                token_end > token_cursor
+                                and offsets[token_cursor][0] >= char_start
+                                and offsets[token_end - 1][1] <= char_end
+                            ):
+                                token_bounds[key] = (token_cursor, token_end)
+                            token_cursor = token_end
+                        for message_index, part_count in part_counts.items():
+                            bounds = [
+                                token_bounds[(message_index, part_index)]
+                                for part_index in range(part_count)
+                                if (message_index, part_index) in token_bounds
+                            ]
+                            if len(bounds) == part_count:
+                                marked_part_bounds[message_index] = bounds
+                                marked_bounds[message_index] = (
+                                    bounds[0][0],
+                                    bounds[-1][1],
+                                )
+
+    def differing_span(probe: Sequence[int]) -> tuple[int, int] | None:
+        prefix = 0
+        while (
+            prefix < len(rendered)
+            and prefix < len(probe)
+            and rendered[prefix] == probe[prefix]
+        ):
+            prefix += 1
+        suffix = 0
+        while (
+            suffix < len(rendered) - prefix
+            and suffix < len(probe) - prefix
+            and rendered[-suffix - 1] == probe[-suffix - 1]
+        ):
+            suffix += 1
+        end = len(rendered) - suffix
+        return (prefix, end) if prefix < end else None
+
+    probed_bounds: dict[int, tuple[int, int]] = {}
+    if not direct_bounds:
+        for message_index, (message, source) in enumerate(
+            zip(messages, history.message_sources, strict=True)
+        ):
+            if (
+                message_index in marked_bounds
+                or message.get("role") != "assistant"
+                or source is None
+                or not _source_is_sampled(source)
+            ):
+                continue
+            parts = _chat_message_parts(message)
+            if parts and all(part == "tool_call" for part, _ in parts):
+                probe_messages = deepcopy(messages)
+                tool_calls = probe_messages[message_index].get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for call_index, call in enumerate(tool_calls):
+                        if not isinstance(call, dict):
+                            continue
+                        function = call.get("function")
+                        if not isinstance(function, dict):
+                            continue
+                        function["name"] = f"art_trajectory_probe_{call_index}"
+                        function["arguments"] = '{"art_trajectory_probe":true}'
+                    try:
+                        probe = render(
+                            probe_messages,
+                            add_generation_prompt=not ends_with_assistant,
+                        )
+                    except Exception:
+                        probe = []
+                    if span := differing_span(probe):
+                        probed_bounds[message_index] = span
+                        continue
+            if len(parts) == 1:
+                try:
+                    prefix = render(
+                        messages[:message_index], add_generation_prompt=True
+                    )
+                except Exception:
+                    prefix = []
+                local = part_ids(parts[0][1])
+                if rendered == [*prefix, *local]:
+                    probed_bounds[message_index] = (
+                        len(prefix),
+                        len(rendered),
+                    )
+                    continue
+                try:
+                    completed = render(
+                        messages[: message_index + 1],
+                        add_generation_prompt=False,
+                    )
+                except Exception:
+                    completed = []
+                if (
+                    completed == [*prefix, *local]
+                    and rendered[: len(completed)] == completed
+                ):
+                    probed_bounds[message_index] = (
+                        len(prefix),
+                        len(completed),
+                    )
+                    continue
+            probe_messages = deepcopy(messages)
+            slot_groups = _chat_message_text_slot_groups(probe_messages[message_index])
+            if len(slot_groups) != 1 or len(slot_groups[0]) != 1:
+                continue
+            container, key = slot_groups[0][0]
+            original = str(container[key])
+            leading = original[: len(original) - len(original.lstrip())]
+            trailing = original[len(original.rstrip()) :]
+            container[key] = (
+                leading + f"ART_TRAJECTORY_{id(probe_messages):x}_PROBE" + trailing
+            )
+            try:
+                probe = render(
+                    probe_messages,
+                    add_generation_prompt=not ends_with_assistant,
+                )
+            except Exception:
+                continue
+            if span := differing_span(probe):
+                probed_bounds[message_index] = span
+
+    sampled_message_count = sum(
+        message.get("role") == "assistant"
+        and source is not None
+        and _source_is_sampled(source)
+        for message, source in zip(
+            history.messages, history.message_sources, strict=True
+        )
+    )
     for message_index, (message, source) in enumerate(
         zip(history.messages, history.message_sources, strict=True)
     ):
@@ -3324,46 +3785,58 @@ def _tokenize_chat_view(
             and _source_is_sampled(source)
         )
         full_exact, full_logprobs = (
-            _chat_source_full_tokens(source) if sampled else (None, [])
+            source_output_tokens(source) if sampled else (None, [])
         )
+        if sampled and not parts and not full_exact:
+            continue
         complete_sampled_message = (
             sampled
             and source is not None
             and _source_covers_complete_sampled_message(message, source)
         )
         source_boundary = False
-        if sampled and source is not None:
-            source_prompt = _chat_source_prompt_tokens(source)
-            source_exchange = getattr(source, "exchange", None)
-            source_context_matches = source_matches_context(source)
-            if (
-                source_context_matches
-                and source_prompt
-                and rendered[: len(source_prompt)] == source_prompt
-            ):
-                search_cursor = max(search_cursor, len(source_prompt))
-                source_boundary = True
+        generation_start: int | None = None
         sampled_bounds: tuple[int, int] | None = None
-        if sampled and not source_boundary:
+        content_bounds_proven = False
+        if sampled:
             if direct_bounds:
                 sampled_bounds = direct_bounds[message_index]
+                content_bounds_proven = True
+            elif message_index in marked_bounds:
+                sampled_bounds = marked_bounds[message_index]
+                content_bounds_proven = True
+            elif message_index in probed_bounds:
+                sampled_bounds = probed_bounds[message_index]
+                content_bounds_proven = True
             else:
-                prompt_render = render(
-                    messages[:message_index], add_generation_prompt=True
-                )
-                completed_render = render(
-                    messages[: message_index + 1], add_generation_prompt=False
-                )
+                assert source is not None
+                source_prompt = source_prompt_tokens(source)
+                source_context_matches = source_matches_context(source)
                 if (
-                    len(completed_render) < len(prompt_render)
-                    or completed_render[: len(prompt_render)] != prompt_render
-                    or rendered[: len(completed_render)] != completed_render
+                    source_context_matches
+                    and source_prompt
+                    and rendered[: len(source_prompt)] == source_prompt
                 ):
-                    raise ValueError(
-                        "Could not locate a sampled history message in the "
-                        "rendered history"
+                    search_cursor = max(search_cursor, len(source_prompt))
+                    source_boundary = True
+                    generation_start = len(source_prompt)
+                    sampled_bounds = (generation_start, len(rendered))
+                elif sampled_message_count == 1:
+                    prompt_render = render(
+                        messages[:message_index], add_generation_prompt=True
                     )
-                sampled_bounds = (len(prompt_render), len(completed_render))
+                    if rendered[: len(prompt_render)] != prompt_render:
+                        raise ValueError(
+                            "Could not locate a sampled history message in the "
+                            "rendered history"
+                        )
+                    generation_start = len(prompt_render)
+                    sampled_bounds = (generation_start, len(rendered))
+                else:
+                    raise ValueError(
+                        "Could not prove a sampled history message boundary with this "
+                        "tokenizer"
+                    )
         full_matches = (
             locations(full_exact, search_cursor) if sampled and full_exact else []
         )
@@ -3418,6 +3891,33 @@ def _tokenize_chat_view(
             isinstance(source_exchange, ResponsesExchange)
             and len(_response_generations(source_exchange.response)) > 1
         )
+        if sampled and not content_bounds_proven:
+            raise ValueError(
+                "Could not uniquely locate or prove the sampled content boundary "
+                "with this tokenizer"
+            )
+        if (
+            sampled
+            and full_exact is None
+            and message_index in probed_bounds
+            and parts
+            and all(part == "tool_call" for part, _ in parts)
+        ):
+            assert source is not None and sampled_bounds is not None
+            start, end = sampled_bounds
+            replacements.append(
+                (
+                    start,
+                    end,
+                    rendered[start:end],
+                    [math.nan] * (end - start),
+                    False,
+                    _sampled_source_key(source),
+                    source,
+                )
+            )
+            search_cursor = end
+            continue
         if (
             complete_sampled_message
             and full_exact is not None
@@ -3427,23 +3927,38 @@ def _tokenize_chat_view(
                 or len(full_exact) != len(part_ids(parts[0][1]))
             )
         ):
-            prompt_render = render(messages[:message_index], add_generation_prompt=True)
-            completed_render = render(
-                messages[: message_index + 1], add_generation_prompt=False
-            )
-            if (
-                len(completed_render) < len(prompt_render)
-                or (parts and len(completed_render) == len(prompt_render))
-                or completed_render[: len(prompt_render)] != prompt_render
-                or rendered[: len(completed_render)] != completed_render
-            ):
+            if not parts and sampled_bounds is not None:
+                start = end = sampled_bounds[0]
+            elif sampled_bounds is None or sampled_bounds[0] == sampled_bounds[1]:
                 raise ValueError(
                     "Could not locate a complete sampled message in the rendered history"
                 )
+            else:
+                start, end = sampled_bounds
+            if parts and len(parts) == 1 and parts[0][0] == "content":
+                visible_matches = [
+                    match
+                    for match in locations(part_ids(parts[0][1]), start)
+                    if match[1] <= end
+                ]
+                if len(visible_matches) != 1 or (
+                    not content_bounds_proven
+                    and generation_start is not None
+                    and visible_matches[0][0] != generation_start
+                ):
+                    raise ValueError(
+                        "Could not prove the sampled content boundary in the "
+                        "rendered history"
+                    )
+                start, end = visible_matches[0]
+            elif generation_start is not None and (
+                multi_generation_response or len(parts) != 1 or parts[0][0] != "content"
+            ):
+                start = generation_start
             replacements.append(
                 (
-                    len(prompt_render),
-                    len(completed_render),
+                    start,
+                    end,
                     full_exact,
                     full_logprobs
                     if len(full_logprobs) == len(full_exact)
@@ -3456,21 +3971,25 @@ def _tokenize_chat_view(
             if (
                 message_index < len(messages) - 1
                 and isinstance(source_exchange, ChatCompletionsExchange)
-                and completed_render[len(prompt_render) :] != full_exact
+                and rendered[start:end] != full_exact
             ):
                 _warn_prefix_retokenization()
-            search_cursor = len(completed_render)
+            search_cursor = end
             continue
 
         replacement_start = len(replacements)
-        for part, text in parts:
+        for part_index, (part, text) in enumerate(parts):
             if not sampled and text not in sampled_texts:
                 continue
             local = part_ids(text)
             if not local:
                 continue
-            local_matches = locations(local, search_cursor)
-            span = local_matches[0] if local_matches else None
+            proven_part_bounds = marked_part_bounds.get(message_index)
+            span = (
+                proven_part_bounds[part_index]
+                if proven_part_bounds is not None
+                else next(iter(locations(local, search_cursor)), None)
+            )
             if span is None:
                 if not sampled:
                     continue
@@ -3479,17 +3998,18 @@ def _tokenize_chat_view(
                 )
             if sampled_bounds is not None:
                 lower, upper = sampled_bounds
-                bounded_matches = [
-                    match
-                    for match in locations(local, max(lower, search_cursor))
-                    if match[1] <= upper
-                ]
-                if len(bounded_matches) != 1:
-                    raise ValueError(
-                        "Could not uniquely locate a sampled history message in the "
-                        "rendered history"
-                    )
-                span = bounded_matches[0]
+                if proven_part_bounds is None:
+                    bounded_matches = [
+                        match
+                        for match in locations(local, max(lower, search_cursor))
+                        if match[1] <= upper
+                    ]
+                    if len(bounded_matches) != 1:
+                        raise ValueError(
+                            "Could not uniquely locate a sampled history message in "
+                            "the rendered history"
+                        )
+                    span = bounded_matches[0]
             start, end = span
             search_cursor = end
             if not sampled:
@@ -3499,11 +4019,12 @@ def _tokenize_chat_view(
                 source,
                 text,
                 part=part,
+                full_tokens=(full_exact, full_logprobs),
             )
             if exact is not None and rendered[start : start + len(exact)] == exact:
                 end = start + len(exact)
                 search_cursor = end
-            replacement = exact if exact is not None else local
+            replacement = exact if exact is not None else rendered[start:end]
             if exact is None and not logprobs:
                 exchange = getattr(source, "exchange", None)
                 if isinstance(
@@ -3512,7 +4033,11 @@ def _tokenize_chat_view(
                 ):
                     logprobs = (
                         _align_visible_logprobs(
-                            tokenizer, local, exchange, source=source
+                            tokenizer,
+                            replacement,
+                            exchange,
+                            source=source,
+                            sampled_text=text,
                         )
                         or []
                     )
