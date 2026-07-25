@@ -1432,24 +1432,19 @@ def responses_as_chat_completions_history(
         )
         generation_index = next(iter(generation_indices), None)
         first = present[0]
-        request_index = next(
-            (
-                source.request_index
-                for source in present
-                if source.request_index is not None
-            ),
-            None,
-        )
         if output_indices or generation_index is not None:
             return ChatCompletionsMessageSource(
                 exchange=first.exchange,
-                request_index=request_index,
                 output_indices=output_indices,
                 generation_index=generation_index,
             )
         return ChatCompletionsMessageSource(
             exchange=first.exchange,
-            request_index=request_index,
+            request_index=next(
+                source.request_index
+                for source in present
+                if source.request_index is not None
+            ),
         )
 
     no_output = object()
@@ -1458,11 +1453,24 @@ def responses_as_chat_completions_history(
         contributors: Sequence[ResponsesItemSource | None],
         source: ResponsesItemSource | None,
     ) -> bool:
+        def sampled(item: ResponsesItemSource | None) -> bool:
+            return item is not None and (
+                item.output_index is not None or item.generation_index is not None
+            )
+
+        present = [item for item in contributors if item is not None]
+        if (
+            source is not None
+            and present
+            and source.exchange is not present[0].exchange
+        ):
+            return False
+        if contributors and sampled(source) != any(
+            sampled(item) for item in contributors
+        ):
+            return False
         if source is None:
             return True
-        present = [item for item in contributors if item is not None]
-        if present and source.exchange is not present[0].exchange:
-            return False
 
         def output_generation(item: ResponsesItemSource) -> object:
             if item.output_index is None and item.generation_index is None:

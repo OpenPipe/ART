@@ -672,15 +672,23 @@ def test_responses_chat_conversion_preserves_request_and_output_sources() -> Non
     assert converted.messages == [
         {
             "role": "assistant",
-            "content": "answer",
+            "content": "",
             "reasoning": "prior thought",
-        }
+        },
+        {
+            "role": "assistant",
+            "content": "answer",
+        },
     ]
-    source = converted.message_sources[0]
-    assert source is not None
-    assert source.exchange is exchange
-    assert source.request_index == 0
-    assert source.output_indices == (0,)
+    request_source, output_source = converted.message_sources
+    assert request_source is not None
+    assert request_source.exchange is exchange
+    assert request_source.request_index == 0
+    assert request_source.output_indices is None
+    assert output_source is not None
+    assert output_source.exchange is exchange
+    assert output_source.request_index is None
+    assert output_source.output_indices == (0,)
 
 
 def test_responses_chat_conversion_splits_cross_exchange_assistant_sources() -> None:
