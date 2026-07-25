@@ -2377,6 +2377,69 @@ def test_responses_terminal_generation_without_output_items_is_tokenized() -> No
     }
 
 
+def test_responses_terminal_generation_without_output_items_survives_rerender() -> None:
+    exchange = _response_exchange("terminal-eos-rerender", 2)
+    data = exchange.response.model_dump(mode="python")
+    data["output"] = []
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2, "logprob": -0.2}],
+            "output_indices": [],
+        }
+    ]
+    exchange.response = Response.model_validate(data)
+    history = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del text, kwargs
+            return [1]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del messages, kwargs
+            return [1]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer(), chat_template="custom")
+
+    assert tokenized.token_ids == [1, 2]
+    assert math.isnan(tokenized.logprobs[0])
+    assert tokenized.logprobs[1] == pytest.approx(-0.2)
+    assert tokenized.flags == [
+        art.TokenFlag(0),
+        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+    ]
+
+
+def test_responses_empty_chat_source_requires_outputless_generation() -> None:
+    exchange = _response_exchange("nonempty-generation-empty-source", 2)
+    history = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .as_chat_completions_history()
+    )
+    assistant_index = next(
+        index
+        for index, source in enumerate(history.message_sources)
+        if source is not None and source.output_indices is not None
+    )
+    history.messages[assistant_index] = {"role": "assistant", "content": ""}
+    history.message_sources[assistant_index] = ChatCompletionsMessageSource(
+        exchange=exchange,
+        output_indices=(),
+        generation_index=0,
+    )
+
+    with pytest.raises(ValueError, match="empty output source"):
+        history.tokenize()
+
+
 def test_responses_nonterminal_generation_without_output_items_raises() -> None:
     exchange = _response_exchange("hidden-control", 2)
     data = exchange.response.model_dump(mode="python")
