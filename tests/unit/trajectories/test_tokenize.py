@@ -4536,6 +4536,74 @@ def test_renderer_reasoning_content_alias_preserves_reasoning() -> None:
     ]
 
 
+def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None:
+    exchange = _chat_exchange([], [])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice.pop("prompt_token_ids")
+    choice.pop("token_ids")
+    choice["message"]["content"] = " first "
+    choice["logprobs"] = {
+        "content": [
+            {
+                "token": " first",
+                "logprob": -0.4,
+                "bytes": list(b" first"),
+                "top_logprobs": [],
+            },
+            {
+                "token": " ",
+                "logprob": -0.5,
+                "bytes": [32],
+                "top_logprobs": [],
+            },
+        ],
+        "refusal": None,
+    }
+    exchange.response = ChatCompletion.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> object:
+            if kwargs.get("return_offsets_mapping"):
+                content_start = text.index("first")
+                content_end = content_start + len("first")
+                return {
+                    "input_ids": [1, 3765],
+                    "offset_mapping": [
+                        (0, content_start),
+                        (content_start, content_end),
+                    ],
+                }
+            return {
+                "turn 0": [1],
+                " first ": [1118, 220],
+                " first": [1118],
+                " ": [220],
+            }[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> object:
+            tokenize = kwargs.pop("tokenize")
+            del kwargs
+            rendered = (
+                f"<user>{messages[0]['content']}</user>"
+                f"<assistant>{str(messages[-1]['content']).strip()}</assistant>"
+            )
+            if not tokenize:
+                return rendered
+            return [1, 3765]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.token_ids == [1, 1118, 220]
+    assert tokenized.logprobs[1:] == [-0.4, -0.5]
+    assert tokenized.flags[1:] == [art.TokenFlag.SAMPLED] * 2
+
+
 def _repeated_text_rerender_history(turn_count: int) -> art.ChatCompletionsHistory:
     exchanges: list[ChatCompletionsExchange] = []
     prompt: list[int] = []

@@ -1558,14 +1558,13 @@ def _retained_output_suffix(
     return None
 
 
-def _align_visible_logprobs(
+def _visible_token_evidence(
     tokenizer: Tokenizer | None,
-    completion: list[int],
     exchange: Exchange,
     *,
     source: object | None = None,
     sampled_text: str | None = None,
-) -> list[float] | None:
+) -> tuple[list[int], list[float]] | None:
     values = _visible_logprobs(exchange, source=source)
     if not values or tokenizer is None:
         return None
@@ -1593,6 +1592,26 @@ def _align_visible_logprobs(
             return None
         token_ids.append(encoded[0])
         logprobs.append(logprob)
+    return token_ids, logprobs
+
+
+def _align_visible_logprobs(
+    tokenizer: Tokenizer | None,
+    completion: list[int],
+    exchange: Exchange,
+    *,
+    source: object | None = None,
+    sampled_text: str | None = None,
+) -> list[float] | None:
+    evidence = _visible_token_evidence(
+        tokenizer,
+        exchange,
+        source=source,
+        sampled_text=sampled_text,
+    )
+    if evidence is None:
+        return None
+    token_ids, logprobs = evidence
 
     left: list[int] = []
     cursor = 0
@@ -3701,9 +3720,10 @@ def _tokenize_chat_view(
                     for call_index, call in enumerate(tool_calls):
                         if not isinstance(call, dict):
                             continue
-                        function = call.get("function")
-                        if not isinstance(function, dict):
+                        raw_function = call.get("function")
+                        if not isinstance(raw_function, dict):
                             continue
+                        function = cast(dict[str, Any], raw_function)
                         function["name"] = f"art_trajectory_probe_{call_index}"
                         function["arguments"] = '{"art_trajectory_probe":true}'
                     try:
@@ -4031,16 +4051,25 @@ def _tokenize_chat_view(
                     exchange,
                     (ChatCompletionsExchange, ResponsesExchange, MessagesExchange),
                 ):
-                    logprobs = (
-                        _align_visible_logprobs(
-                            tokenizer,
-                            replacement,
-                            exchange,
-                            source=source,
-                            sampled_text=text,
-                        )
-                        or []
+                    evidence = _visible_token_evidence(
+                        tokenizer,
+                        exchange,
+                        source=source,
+                        sampled_text=text,
                     )
+                    if evidence is not None:
+                        replacement, logprobs = evidence
+                    else:
+                        logprobs = (
+                            _align_visible_logprobs(
+                                tokenizer,
+                                replacement,
+                                exchange,
+                                source=source,
+                                sampled_text=text,
+                            )
+                            or []
+                        )
             replacements.append(
                 (
                     start,
