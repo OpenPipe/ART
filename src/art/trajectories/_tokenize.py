@@ -3048,13 +3048,10 @@ def _chat_source_tokens(
                         logprobs.extend(pair_logprobs)
                     else:
                         return token_ids, logprobs
-        if any(
-            getattr(item, "type", None) == "reasoning"
-            for item in exchange.response.output
-        ):
-            return None, []
-        _, tokens, logprobs = _responses_tokens(exchange.response)
-        return tokens, logprobs
+        # Aggregate generation evidence cannot be partitioned safely across
+        # multiple projected messages. Item-local pairs above remain usable;
+        # otherwise render this message without claiming exact token identity.
+        return None, []
     return None, []
 
 

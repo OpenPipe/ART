@@ -2881,7 +2881,9 @@ def test_responses_output_source_rejects_sibling_generation_output() -> None:
         history.tokenize()
 
 
-def test_responses_multi_output_generation_exact_evidence_is_consumed_once() -> None:
+def test_responses_multi_output_generation_is_rendered_without_duplicate_evidence() -> (
+    None
+):
     history = _multi_output_responses_chat_history()
 
     class Tokenizer:
@@ -2900,12 +2902,12 @@ def test_responses_multi_output_generation_exact_evidence_is_consumed_once() -> 
 
     tokenized = history.tokenize(tokenizer=Tokenizer(), chat_template="custom")
 
-    assert tokenized.token_ids == [1, 2, 3]
-    assert tokenized.logprobs[1:] == pytest.approx([-0.2, -0.3])
+    assert tokenized.token_ids == [1, 20, 30]
+    assert all(math.isnan(value) for value in tokenized.logprobs)
     assert tokenized.flags == [
         art.TokenFlag(0),
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        art.TokenFlag.SAMPLED,
+        art.TokenFlag.SAMPLED,
     ]
 
 
