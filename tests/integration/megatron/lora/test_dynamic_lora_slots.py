@@ -341,7 +341,7 @@ def _assert_restored_dynamic_optimizer_canonicalizes_internal_padding(
     assert state is not None
     masks = trainer._dynamic_optimizer_padding_masks("A")
     masters = cast(tuple[torch.Tensor, ...], state["master_params"])
-    optimizer = cast(dict[str, object], state["optimizer"])
+    optimizer = state["optimizer"]
     optimizer_states = cast(dict[int, dict[str, object]], optimizer["state"])
     for index, (master, mask) in enumerate(zip(masters, masks, strict=True)):
         master.masked_fill_(mask.cpu(), 5)

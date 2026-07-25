@@ -443,9 +443,9 @@ class _SlotGraphSentinel(torch.autograd.Function):
 
     @staticmethod
     def backward(
-        ctx: FunctionCtx, grad_output: torch.Tensor
+        ctx: FunctionCtx, *grad_outputs: torch.Tensor
     ) -> tuple[torch.Tensor, None]:
-        return grad_output, None
+        return grad_outputs[0], None
 
 
 @dataclass(frozen=True)
