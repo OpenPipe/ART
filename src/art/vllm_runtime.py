@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -39,6 +40,9 @@ _TILELANG_PATH_MARKERS = ("/site-packages/tilelang/", "\\site-packages\\tilelang
 _FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
 _ART_FLASHINFER_WORKSPACE_ENV = "ART_VLLM_RUNTIME_FLASHINFER_WORKSPACE_BASE"
 VLLM_RUNTIME_CLOSE_TIMEOUT = process_shutdown_timeout(1)
+TRANSIENT_VLLM_STATUS_CODES = frozenset({502, 503, 504})
+
+logger = logging.getLogger(__name__)
 
 
 class VllmRuntimeLaunchConfig(BaseModel):
@@ -234,6 +238,93 @@ class ManagedVllmRuntime:
         if self.api_key is None:
             return {}
         return {"headers": {"Authorization": f"Bearer {self.api_key}"}}
+
+    def _process_status(self) -> str:
+        if self.process is None:
+            return "not managed by this process"
+        returncode = self.process.poll()
+        if returncode is None:
+            return "running"
+        return f"exited with code {returncode}"
+
+    async def post_with_retry(
+        self,
+        path: str,
+        *,
+        json: Mapping[str, Any] | None = None,
+        timeout: float,
+        max_attempts: int = 4,
+        retry_base_delay: float = 1.0,
+        before_attempt: Callable[[], None] | None = None,
+        operation: str = "vLLM request",
+        failure_context: str | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> httpx.Response:
+        """POST to vLLM, retrying failures that are safe to replay.
+
+        Connection establishment failures and gateway/service-unavailable
+        responses happen before the local runtime can reliably process a LoRA
+        reload. Read/write failures are not retried because the server may have
+        already applied a non-idempotent request.
+        """
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        if retry_base_delay < 0:
+            raise ValueError("retry_base_delay must be non-negative")
+
+        url = f"{self.base_url}{path}"
+        owns_client = http_client is None
+        client = http_client or httpx.AsyncClient()
+        last_error: Exception | None = None
+        try:
+            for attempt in range(1, max_attempts + 1):
+                if before_attempt is not None:
+                    before_attempt()
+                try:
+                    response = await client.post(
+                        url,
+                        json=json,
+                        **self.request_kwargs(),
+                        timeout=timeout,
+                    )
+                except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                    last_error = exc
+                else:
+                    if response.status_code not in TRANSIENT_VLLM_STATUS_CODES:
+                        response.raise_for_status()
+                        return response
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        last_error = exc
+                    await response.aclose()
+
+                if attempt == max_attempts:
+                    break
+                logger.warning(
+                    "%s failed on attempt %d/%d; retrying in %.1fs: %s",
+                    operation,
+                    attempt,
+                    max_attempts,
+                    retry_base_delay * (2 ** (attempt - 1)),
+                    last_error,
+                )
+                await asyncio.sleep(retry_base_delay * (2 ** (attempt - 1)))
+        finally:
+            if owns_client:
+                await client.aclose()
+
+        assert last_error is not None
+        details = [
+            f"{operation} failed after {max_attempts} attempts",
+            f"url={url}",
+            f"process={self._process_status()}",
+            f"log={self.log_path or 'unavailable'}",
+            f"last_error={last_error}",
+        ]
+        if failure_context is not None:
+            details.append(failure_context)
+        raise RuntimeError("; ".join(details)) from last_error
 
     async def start(
         self,
