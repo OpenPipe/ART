@@ -32,8 +32,8 @@ from .host_admission import (
 from .monarch_bootstrap import (
     _start_worker,
     _stop_worker,
-    activate_child_virtualenv,
     activate_cpu_child_virtualenv,
+    activate_trainer_child_virtualenv,
     attach_controller,
     monarch_identifier,
     require_local_worker_address,
@@ -798,7 +798,7 @@ class ArtRuntime:
         try:
             proc = selected.spawn_procs(
                 per_host={"trainer": next(iter(counts.values()))},
-                bootstrap=activate_child_virtualenv,
+                bootstrap=activate_trainer_child_virtualenv,
                 name=monarch_identifier(
                     f"art_trainer_{supervision.token}_{self.runtime_id}"
                 ),

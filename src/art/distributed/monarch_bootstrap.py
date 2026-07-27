@@ -326,6 +326,15 @@ def activate_child_virtualenv() -> None:
         sys.prefix = sys.exec_prefix = virtual_env
 
 
+def activate_trainer_child_virtualenv() -> None:
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        os.environ.setdefault(name, "1")
+    activate_child_virtualenv()
+    import torch
+
+    torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
+
+
 def activate_cpu_child_virtualenv() -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     activate_child_virtualenv()
