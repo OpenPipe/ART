@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_message import ChatCompletionMessage
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -28,6 +32,7 @@ from .real_path import (
     _delete_adapter_safetensors_on_pass,
     _real_path_rollout_mode,
     _real_path_rollout_weights_mode,
+    _rollout,
 )
 
 
@@ -190,6 +195,47 @@ def test_compare_rollout_reports_base_lora_and_delta_separately() -> None:
 
 def test_real_path_default_generates_16_tokens_per_rollout() -> None:
     assert RealPathConfig().max_completion_tokens == 16
+
+
+@pytest.mark.asyncio
+async def test_real_path_rollout_builds_explicit_legacy_trajectory() -> None:
+    choice = Choice(
+        index=0,
+        finish_reason="stop",
+        message=ChatCompletionMessage(role="assistant", content="answer"),
+    )
+    create = AsyncMock(return_value=SimpleNamespace(choices=[choice]))
+    model = SimpleNamespace(
+        get_inference_name=lambda: "test-model",
+        openai_client=lambda: SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+
+    trajectory = await _rollout(
+        model=model,
+        prompt="question",
+        max_completion_tokens=7,
+        reward=0.75,
+        extra_body={"fixture": True},
+    )
+
+    assert trajectory.messages_and_choices == [
+        {"role": "user", "content": "question"},
+        choice,
+    ]
+    assert trajectory.exchanges.chat_completions == []
+    assert trajectory.reward == 0.75
+    assert trajectory.metrics["completion_tokens"] == 0
+    create.assert_awaited_once_with(
+        model="test-model",
+        messages=[{"role": "user", "content": "question"}],
+        max_tokens=7,
+        temperature=0.8,
+        logprobs=True,
+        top_logprobs=TOP_K,
+        extra_body={"fixture": True},
+    )
 
 
 def test_real_path_rollout_mode_follows_config() -> None:

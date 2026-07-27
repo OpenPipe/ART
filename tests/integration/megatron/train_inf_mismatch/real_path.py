@@ -5,7 +5,6 @@ import asyncio
 from contextlib import asynccontextmanager, contextmanager
 import hashlib
 import inspect
-from itertools import chain
 import json
 import os
 from pathlib import Path
@@ -402,29 +401,28 @@ async def _rollout(
     import art
 
     messages = [{"role": "user", "content": prompt}]
-
-    async def _request() -> None:
-        request_kwargs: dict[str, Any] = {}
-        if extra_body is not None:
-            request_kwargs["extra_body"] = extra_body
-        response = await model.openai_client().chat.completions.create(
-            model=model.get_inference_name(),
-            messages=messages,
-            max_tokens=max_completion_tokens,
-            temperature=0.8,
-            logprobs=True,
-            top_logprobs=TOP_K,
-            **request_kwargs,
-        )
-        if trajectory := art.auto_trajectory():  # ty: ignore[deprecated]
-            logprobs = response.choices[0].logprobs
-            trajectory.reward = reward
-            trajectory.metrics["completion_tokens"] = (
+    request_kwargs: dict[str, Any] = {}
+    if extra_body is not None:
+        request_kwargs["extra_body"] = extra_body
+    response = await model.openai_client().chat.completions.create(
+        model=model.get_inference_name(),
+        messages=messages,
+        max_tokens=max_completion_tokens,
+        temperature=0.8,
+        logprobs=True,
+        top_logprobs=TOP_K,
+        **request_kwargs,
+    )
+    choice = response.choices[0]
+    logprobs = choice.logprobs
+    return art.Trajectory(
+        messages_and_choices=[*messages, choice],
+        reward=reward,
+        metrics={
+            "completion_tokens": (
                 len(logprobs.content or []) if logprobs is not None else 0
             )
-
-    return await art.capture_auto_trajectory(  # ty: ignore[deprecated]
-        _request()
+        },
     )
 
 
@@ -508,18 +506,9 @@ def _choice_score_index(
     indexed: dict[tuple[int, ...], Choice] = {}
     for group in trajectory_groups:
         for trajectory in group:
-            for item in chain(
-                (
-                    item
-                    for item in trajectory.messages_and_choices
-                    if isinstance(item, Choice)
-                ),
-                (
-                    choice
-                    for exchange in trajectory.exchanges.chat_completions
-                    for choice in exchange.response.choices
-                ),
-            ):
+            for item in trajectory.messages_and_choices:
+                if not isinstance(item, Choice):
+                    continue
                 metadata = choice_moe_routing_metadata(item)
                 if metadata is None:
                     if require_routing_metadata:
