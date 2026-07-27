@@ -97,6 +97,7 @@ class ClusterSpec(_Spec):
     hosts: tuple[HostSpec, ...]
     controller_host_id: str
     artifact_root: str | None = None
+    cache_root: str | None = Field(default=None, min_length=1)
     nccl_transport: NcclTransportSpec | None = None
     nixl_transport: NixlTransportSpec | None = None
     startup_timeout_s: float = Field(default=300.0, gt=0)

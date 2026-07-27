@@ -12,12 +12,20 @@ def _set_cache_dir(env_var: str, default_path: str) -> None:
     os.makedirs(os.environ[env_var], exist_ok=True)
 
 
+def _cache_path(name: str, default_path: str) -> str:
+    root = os.environ.get("ART_MEGATRON_CACHE_ROOT")
+    return os.path.join(root, name) if root else default_path
+
+
 def _set_inductor_cache_dir() -> None:
     from torch._inductor.runtime.cache_dir_utils import default_cache_dir
 
     if os.environ.get("TORCHINDUCTOR_CACHE_DIR") == default_cache_dir():
         del os.environ["TORCHINDUCTOR_CACHE_DIR"]
-    _set_cache_dir("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor")
+    _set_cache_dir(
+        "TORCHINDUCTOR_CACHE_DIR",
+        _cache_path("torchinductor", "~/.cache/torchinductor"),
+    )
 
 
 def configure_megatron_runtime_env() -> None:
@@ -32,9 +40,10 @@ def configure_megatron_runtime_env() -> None:
     # ART-side kernel special casing.
     os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
     _set_inductor_cache_dir()
-    _set_cache_dir("TRITON_CACHE_DIR", "~/.triton/cache")
+    _set_cache_dir("TRITON_CACHE_DIR", _cache_path("triton", "~/.triton/cache"))
     os.environ.setdefault("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
     _set_cache_dir(
-        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR", "~/.cache/flash_attention_cute_dsl"
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR",
+        _cache_path("flash_attention_cute_dsl", "~/.cache/flash_attention_cute_dsl"),
     )
     install_te_cutlass_grouped_gemm_guard()

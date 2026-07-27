@@ -106,6 +106,9 @@ def _installed_version() -> str | None:
 
 
 def _cache_root() -> Path:
+    root = os.environ.get("ART_MEGATRON_CACHE_ROOT")
+    if root:
+        return Path(root) / "hybrid_ep"
     return (
         Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
         / "art"

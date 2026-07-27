@@ -282,6 +282,7 @@ class DistributedMegatronService:
             art_revision=identity["art"],
             model_identifier=self._model_identifier,
             model_revision=revision,
+            cache_root=self.runtime.topology.cluster.cache_root,
             model_support_key=support_spec.key,
             handler_name=handler.key,
             lora_rank=int(lora.get("rank") or default_lora_rank_for_handler(handler)),

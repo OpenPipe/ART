@@ -208,6 +208,9 @@ class MonarchTrainerActor(Actor):
     ) -> None:
         runtime_spec = TrainerRuntimeSpec.model_validate_json(runtime_spec_json)
         topology = runtime_spec.trainer_mesh.topology
+        if runtime_spec.cache_root is not None:
+            os.environ["ART_MEGATRON_CACHE_ROOT"] = runtime_spec.cache_root
+            os.environ["XDG_CACHE_HOME"] = runtime_spec.cache_root
         os.environ.update(
             {
                 "MODEL_IDENTIFIER": runtime_spec.model_identifier,
