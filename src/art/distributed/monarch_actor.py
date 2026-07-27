@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from functools import wraps
+import json
 import os
 import socket
 import time
 import traceback
 from typing import Any
+from urllib.request import urlopen
 
 # This module is imported only by explicit distributed runtime construction.
 from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
@@ -58,6 +60,13 @@ from .trajectory_store import (
     TrajectoryQueueTake,
 )
 from .vllm_replica import HostMemberLaunchRequest
+
+
+def _require_etcd_health(url: str, timeout_s: float) -> None:
+    with urlopen(f"{url}/health", timeout=timeout_s) as response:
+        health = json.load(response).get("health")
+    if health not in (True, "true"):
+        raise RuntimeError(f"etcd health check failed: {health!r}")
 
 
 def resilient_endpoint(function: Any) -> Any:
@@ -150,6 +159,18 @@ class RolloutHostService(Actor):
         if self._admission_report is None:
             raise RuntimeError("host has not passed ART runtime admission")
         return await asyncio.to_thread(execute_artifact_probe, self.host_id, command)
+
+    @resilient_endpoint
+    async def nixl_metadata_store_health(self, url: str, timeout_s: float) -> str:
+        if self._admission_report is None:
+            raise RuntimeError("host has not passed ART runtime admission")
+        try:
+            await asyncio.to_thread(_require_etcd_health, url, timeout_s)
+        except BaseException as error:
+            raise RuntimeError(
+                f"host {self.host_id!r} cannot reach healthy NIXL metadata store {url}"
+            ) from error
+        return self.host_id
 
     @resilient_endpoint
     async def start_nccl_preflight_session(

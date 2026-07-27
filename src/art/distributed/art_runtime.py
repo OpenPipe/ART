@@ -267,6 +267,7 @@ class ArtRuntime:
             )
             self._validate_nccl_transport_environment()
             await self._preflight_artifact_root()
+            await self._preflight_nixl_metadata_store()
         self._started = True
         for report in self._admitted_hosts.values():
             gpus = ",".join(
@@ -516,6 +517,26 @@ class ArtRuntime:
                 f"{mismatches}"
             )
 
+    async def _preflight_nixl_metadata_store(self) -> None:
+        transport = self.topology.cluster.nixl_transport
+        if transport is None:
+            return
+        host_ids = tuple(self._host_actors)
+        probe_timeout_s = min(5.0, self.topology.cluster.rpc_timeout_s)
+        async with asyncio.timeout(self.topology.cluster.rpc_timeout_s):
+            results = await asyncio.gather(
+                *(
+                    call_remote(
+                        self._host_actors[host_id].nixl_metadata_store_health,
+                        transport.metadata_store.url,
+                        probe_timeout_s,
+                    )
+                    for host_id in host_ids
+                )
+            )
+        if tuple(results) != host_ids:
+            raise RuntimeError("NIXL metadata-store preflight membership changed")
+
     async def _preflight_artifact_root(self) -> None:
         if self._artifact_probe is None:
             return
@@ -760,6 +781,8 @@ class ArtRuntime:
         ]
         if indices != list(range(indices[0], indices[-1] + 1)):
             raise ValueError("trainer hosts must be contiguous in the cluster mesh")
+        if runtime_spec.hybrid_ep is not None and runtime_spec.hybrid_ep.multinode:
+            await self._preflight_nixl_metadata_store()
         await self._preflight_launch(
             runtime_kind="trainer", placements=runtime_spec.trainer_mesh.ranks
         )
