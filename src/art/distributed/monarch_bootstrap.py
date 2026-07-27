@@ -327,12 +327,13 @@ def activate_child_virtualenv() -> None:
 
 
 def activate_trainer_child_virtualenv() -> None:
+    threads = os.environ.get("MKL_NUM_THREADS", os.environ.get("OMP_NUM_THREADS", "1"))
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
-        os.environ.setdefault(name, "1")
+        os.environ.setdefault(name, threads)
     activate_child_virtualenv()
     import torch
 
-    torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
+    torch.set_num_threads(int(threads))
 
 
 def activate_cpu_child_virtualenv() -> None:
