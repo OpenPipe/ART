@@ -861,7 +861,9 @@ inline __device__ void N2N_warp_group_device_function(const int node_rank,
       }
 
       __syncwarp();
-      if (total_tokens > 0 && INTER_NODE_GROUP::thread_rank() == 0) {
+      if (INTER_NODE_GROUP::thread_rank() == 0) {
+        // The receiver waits on every source chunk before reading its routing
+        // map, including chunks with no payload.
         const unsigned channel_id = blockIdx.x % nixl_ctx->num_channels;
         nixlMemViewElem sig{nixl_ctx->remote_signal_mvh, (size_t)remote_idx, flag_offset};
         assert(nixlAtomicAdd<nixl_gpu_level_t::THREAD>(1, sig, channel_id, 0 /* NODELAY: flush all pending */) >= NIXL_SUCCESS);
@@ -1004,7 +1006,9 @@ inline __device__ void inter_node_N2N_warp_group_device_function(
     }
 
     __syncwarp();
-    if (total_tokens > 0 && INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
+    if (INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
+      // Advance every chunk's epoch so a later non-empty combine does not wait
+      // on a completion counter left behind by an earlier empty chunk.
       const size_t flag_offset = (my_node_rank_in_remote * NUM_OF_CHUNKS_PER_RANK + chunk_id) * sizeof(uint64_t);
       const unsigned channel_id = blockIdx.x % nixl_ctx->num_channels;
       nixlMemViewElem sig{nixl_ctx->remote_signal_mvh, (size_t)remote_idx, flag_offset};
