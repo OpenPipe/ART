@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Coroutine, Iterable
+from collections.abc import Coroutine, Iterable, Iterator
+from contextlib import contextmanager
 import contextvars
 from types import TracebackType
 from typing import Any
@@ -12,9 +13,6 @@ from ._compat import exception_model
 _trajectories: contextvars.ContextVar[tuple[Trajectory, ...]] = contextvars.ContextVar(
     "art_trajectories", default=()
 )
-_groups: contextvars.ContextVar[tuple[TrajectoryGroup, ...]] = contextvars.ContextVar(
-    "art_trajectory_groups", default=()
-)
 
 
 def get_current_trajectory(*, required: bool) -> Trajectory | None:
@@ -23,15 +21,6 @@ def get_current_trajectory(*, required: bool) -> Trajectory | None:
         return current[-1]
     if required:
         raise RuntimeError("No trajectory is active in this context")
-    return None
-
-
-def get_current_trajectory_group(*, required: bool) -> TrajectoryGroup | None:
-    current = _groups.get()
-    if current:
-        return current[-1]
-    if required:
-        raise RuntimeError("No trajectory group is active in this context")
     return None
 
 
@@ -46,7 +35,7 @@ def enter_trajectory(trajectory: Trajectory) -> Trajectory:
 def exit_trajectory(
     trajectory: Trajectory,
     _exc_type: type[BaseException] | None,
-    exc_value: BaseException | None,
+    _exc_value: BaseException | None,
     _traceback: TracebackType | None,
 ) -> None:
     current = _trajectories.get()
@@ -54,29 +43,17 @@ def exit_trajectory(
         raise RuntimeError("Trajectory contexts must exit in stack order")
     _trajectories.set(current[:-1])
     trajectory.finish()
-    group = get_current_trajectory_group(required=False)
-    if group is not None:
-        if exc_value is not None:
-            group.exceptions.append(exception_model(exc_value))
-        elif all(item is not trajectory for item in group.trajectories):
-            group.trajectories.append(trajectory)
 
 
-def enter_trajectory_group(group: TrajectoryGroup) -> TrajectoryGroup:
-    _groups.set((*_groups.get(), group))
-    return group
+@contextmanager
+def no_capture() -> Iterator[None]:
+    """Hide enclosing trajectory capture while allowing new nested scopes."""
 
-
-def exit_trajectory_group(
-    group: TrajectoryGroup,
-    _exc_type: type[BaseException] | None,
-    _exc_value: BaseException | None,
-    _traceback: TracebackType | None,
-) -> None:
-    current = _groups.get()
-    if not current or current[-1] is not group:
-        raise RuntimeError("TrajectoryGroup contexts must exit in stack order")
-    _groups.set(current[:-1])
+    token = _trajectories.set(())
+    try:
+        yield
+    finally:
+        _trajectories.reset(token)
 
 
 def _require_raw_coroutine(value: object) -> None:
@@ -101,9 +78,13 @@ async def capture_trajectory_group(
     coroutines = list(trajectories)
     for coroutine in coroutines:
         _require_raw_coroutine(coroutine)
+    with no_capture():
+        results = await asyncio.gather(
+            *coroutines,
+            return_exceptions=return_exceptions,
+        )
     if not return_exceptions:
-        return TrajectoryGroup(await asyncio.gather(*coroutines))
-    results = await asyncio.gather(*coroutines, return_exceptions=True)
+        return TrajectoryGroup(results)
     completed: list[Trajectory] = []
     exceptions: list[PydanticException] = []
     for result in results:

@@ -226,44 +226,138 @@ async def test_contexts_are_nested_and_task_local() -> None:
         art.current_trajectory(require=True)
 
 
-async def test_group_context_and_async_helpers() -> None:
-    with art.TrajectoryGroup() as group:
-        with art.Trajectory() as first:
-            pass
-        with art.Trajectory() as second:
-            pass
-    assert group.trajectories == [first, second]
+def test_no_capture_hides_enclosing_trajectory_but_allows_nested_capture() -> None:
+    def capture_exchange() -> None:
+        state, token = begin(
+            "POST",
+            "https://example.test/v1/chat/completions",
+            {"model": "test/model", "messages": []},
+        )
+        reset(token)
+        if state is not None:
+            state.status_code = 200
+            state.add(json.dumps(CHAT).encode())
+            state.finish()
+
+    with art.Trajectory() as outer:
+        capture_exchange()
+        with art.no_capture():
+            assert art.current_trajectory() is None
+            with pytest.raises(RuntimeError, match="No trajectory"):
+                art.current_trajectory(require=True)
+            capture_exchange()
+            with art.Trajectory() as inner:
+                capture_exchange()
+                with art.no_capture():
+                    assert art.current_trajectory() is None
+                    capture_exchange()
+                    with art.Trajectory() as nested:
+                        capture_exchange()
+                    assert art.current_trajectory() is None
+                assert art.current_trajectory() is inner
+                capture_exchange()
+            assert art.current_trajectory() is None
+        assert art.current_trajectory() is outer
+        capture_exchange()
+
+        with pytest.raises(ValueError, match="restore"):
+            with art.no_capture():
+                raise ValueError("restore")
+        assert art.current_trajectory() is outer
+
+    assert len(outer.exchanges.chat_completions) == 2
+    assert len(inner.exchanges.chat_completions) == 2
+    assert len(nested.exchanges.chat_completions) == 1
+
+
+def test_no_capture_uses_the_scope_active_when_a_request_begins() -> None:
+    with art.Trajectory() as trajectory:
+        state, token = begin(
+            "POST",
+            "https://example.test/v1/chat/completions",
+            {"model": "test/model", "messages": []},
+        )
+        reset(token)
+        assert state is not None
+
+        with art.no_capture():
+            state.status_code = 200
+            state.add(json.dumps(CHAT).encode())
+            state.finish()
+            ignored, ignored_token = begin(
+                "POST",
+                "https://example.test/v1/chat/completions",
+                {"model": "test/model", "messages": []},
+            )
+            reset(ignored_token)
+            assert ignored is None
+
+    assert len(trajectory.exchanges.chat_completions) == 1
+
+
+async def test_no_capture_context_is_copied_when_tasks_are_created() -> None:
+    async def current_after_scheduling() -> art.Trajectory | None:
+        await asyncio.sleep(0)
+        return art.current_trajectory()
+
+    with art.Trajectory() as outer:
+        inherited = asyncio.create_task(current_after_scheduling())
+        with art.no_capture():
+            detached = asyncio.create_task(current_after_scheduling())
+            assert await current_after_scheduling() is None
+        assert await inherited is outer
+        assert await detached is None
+
+
+async def test_async_helpers_and_group_aggregation_are_isolated() -> None:
+    def capture_exchange() -> None:
+        state, token = begin(
+            "POST",
+            "https://example.test/v1/chat/completions",
+            {"model": "test/model", "messages": []},
+        )
+        reset(token)
+        if state is not None:
+            state.status_code = 200
+            state.add(json.dumps(CHAT).encode())
+            state.finish()
 
     async def rollout() -> None:
         await asyncio.sleep(0)
+        capture_exchange()
 
     captured = await art.trajectory(rollout())
     assert isinstance(captured, art.Trajectory)
+    assert len(captured.exchanges.chat_completions) == 1
     task = asyncio.create_task(rollout())
     with pytest.raises(TypeError, match="raw coroutine"):
         # Passing a Task is deliberately a static type error and a runtime error.
         await art.trajectory(task)  # ty: ignore[invalid-argument-type]
     await task
 
+    async def unscoped() -> art.Trajectory:
+        assert art.current_trajectory() is None
+        capture_exchange()
+        return art.Trajectory()
+
     async def failed() -> art.Trajectory:
         raise ValueError("boom")
 
-    successful = art.trajectory(rollout())
-    result = await art.trajectory_group([successful, failed()], return_exceptions=True)
-    assert len(result.trajectories) == 1
+    with art.Trajectory() as outer:
+        successful = art.trajectory(rollout())
+        result = await art.trajectory_group(
+            [successful, unscoped(), failed()],
+            return_exceptions=True,
+        )
+        with pytest.raises(ValueError, match="boom"):
+            await art.trajectory_group([failed()])
+        assert art.current_trajectory() is outer
+
+    assert len(result.trajectories) == 2
+    assert len(result.trajectories[0].exchanges.chat_completions) == 1
+    assert not result.trajectories[1].exchanges
     assert result.exceptions[0].message == "boom"
-
-
-def test_failed_trajectory_context_records_exception_without_trajectory() -> None:
-    group = art.TrajectoryGroup()
-
-    with pytest.raises(ValueError, match="boom"):
-        with group:
-            with art.Trajectory() as failed:
-                raise ValueError("boom")
-
-    assert failed not in group.trajectories
-    assert [exception.message for exception in group.exceptions] == ["boom"]
+    assert not outer.exchanges
 
 
 def test_sync_group_generator_initializes_once(

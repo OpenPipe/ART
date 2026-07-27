@@ -108,7 +108,7 @@ from .trajectories import (
     auto_trajectory,  # ty: ignore[deprecated]
     capture_auto_trajectory,  # ty: ignore[deprecated]
     current_trajectory,
-    current_trajectory_group,
+    no_capture,
     trajectory,
     trajectory_group,
 )
@@ -132,7 +132,7 @@ __all__ = [
     "auto_trajectory",
     "capture_auto_trajectory",
     "current_trajectory",
-    "current_trajectory_group",
+    "no_capture",
     "gather_trajectories",
     "gather_trajectory_groups",
     "trajectory_group_batches",

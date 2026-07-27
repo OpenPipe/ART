@@ -8,7 +8,7 @@ from collections.abc import (
     Iterator,
     Mapping,
 )
-from contextlib import asynccontextmanager
+from contextlib import AbstractContextManager, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from enum import IntFlag
@@ -721,21 +721,6 @@ class TrajectoryGroup(_CompactModel):
             logs=logs,
         )
 
-    def __enter__(self) -> TrajectoryGroup:
-        from ._scope import enter_trajectory_group
-
-        return enter_trajectory_group(self)
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> None:
-        from ._scope import exit_trajectory_group
-
-        exit_trajectory_group(self, exc_type, exc_value, traceback)
-
     def __copy__(self) -> TrajectoryGroup:
         from ._compat import copy_trajectory_group
 
@@ -859,20 +844,12 @@ def current_trajectory(*, require: bool = False) -> Trajectory | None:
     return get_current_trajectory(required=require)
 
 
-@overload
-def current_trajectory_group(*, require: Literal[True]) -> TrajectoryGroup: ...
+def no_capture() -> AbstractContextManager[None]:
+    """Hide enclosing trajectory capture while allowing new nested scopes."""
 
+    from ._scope import no_capture as capture_barrier
 
-@overload
-def current_trajectory_group(
-    *, require: Literal[False] = False
-) -> TrajectoryGroup | None: ...
-
-
-def current_trajectory_group(*, require: bool = False) -> TrajectoryGroup | None:
-    from ._scope import get_current_trajectory_group
-
-    return get_current_trajectory_group(required=require)
+    return capture_barrier()
 
 
 async def trajectory(coroutine: Coroutine[Any, Any, object]) -> Trajectory:
@@ -957,7 +934,7 @@ __all__ = [
     "TokenFlag",
     "MetadataValue",
     "current_trajectory",
-    "current_trajectory_group",
+    "no_capture",
     "trajectory",
     "trajectory_group",
     "auto_trajectory",
