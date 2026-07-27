@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator, Generator
+from collections.abc import AsyncGenerator, AsyncIterator, Coroutine, Generator
 import copy
 from datetime import datetime, timedelta
 import gzip
@@ -343,12 +343,17 @@ async def test_async_helpers_and_group_aggregation_are_isolated() -> None:
     async def failed() -> art.Trajectory:
         raise ValueError("boom")
 
+    def generated() -> Generator[Coroutine[Any, Any, art.Trajectory], None, None]:
+        capture_exchange()
+        yield art.trajectory(rollout())
+
     with art.Trajectory() as outer:
         successful = art.trajectory(rollout())
         result = await art.trajectory_group(
             [successful, unscoped(), failed()],
             return_exceptions=True,
         )
+        generated_result = await art.trajectory_group(generated())
         with pytest.raises(ValueError, match="boom"):
             await art.trajectory_group([failed()])
         assert art.current_trajectory() is outer
@@ -357,6 +362,7 @@ async def test_async_helpers_and_group_aggregation_are_isolated() -> None:
     assert len(result.trajectories[0].exchanges.chat_completions) == 1
     assert not result.trajectories[1].exchanges
     assert result.exceptions[0].message == "boom"
+    assert len(generated_result.trajectories[0].exchanges.chat_completions) == 1
     assert not outer.exchanges
 
 

@@ -75,10 +75,10 @@ async def capture_trajectory_group(
     *,
     return_exceptions: bool,
 ) -> TrajectoryGroup:
-    coroutines = list(trajectories)
-    for coroutine in coroutines:
-        _require_raw_coroutine(coroutine)
     with no_capture():
+        coroutines = list(trajectories)
+        for coroutine in coroutines:
+            _require_raw_coroutine(coroutine)
         results = await asyncio.gather(
             *coroutines,
             return_exceptions=return_exceptions,
