@@ -136,7 +136,7 @@ def _needs_expert_slice_prefetch(task: Any) -> bool:
         int(getattr(mapping, "ep_size", 1)) > 1
         and bool(getattr(mapping, "is_expert", False))
         and bool(getattr(mapping, "is_grouped_export", False))
-        and isinstance(getattr(mapping, "hf_param", None), str)
+        and isinstance(getattr(mapping, "hf_param", None), (str, Mapping))
     )
 
 
@@ -201,6 +201,24 @@ def _direct_hf_weight_source(key: str) -> HfWeightSource:
 
 
 _HF_EXPERT_RE = re.compile(r"(?P<prefix>(?:^|\.)experts\.)(?P<expert>\d+)(?=\.|$)")
+
+
+def _remap_hf_expert_name(
+    name: str,
+    expert_ids: tuple[int | None, ...],
+) -> str:
+    def replace_expert(match: re.Match[str]) -> str:
+        expert = int(match.group("expert"))
+        if not 0 <= expert < len(expert_ids):
+            raise RuntimeError(
+                f"expert {expert} is outside remapping domain [0, {len(expert_ids)})"
+            )
+        mapped = expert_ids[expert]
+        if mapped is None:
+            raise RuntimeError(f"masked physical expert {expert} has no logical name")
+        return f"{match.group('prefix')}{mapped}"
+
+    return _HF_EXPERT_RE.sub(replace_expert, name)
 
 
 def _logical_hf_param(
@@ -361,14 +379,14 @@ def load_unique_hf_keys_once(
         if not _needs_expert_slice_prefetch(task):
             continue
         start, stop = _expert_slice_range(task)
-        key = cast(str, task.mapping.hf_param)
-        previous = expert_slice_ranges.get(key)
-        expert_slice_ranges[key] = (
-            (start, stop)
-            if previous is None
-            else (min(previous[0], start), max(previous[1], stop))
-        )
-        expert_slice_task_by_key.setdefault(key, task)
+        for key in _iter_hf_param_names(task.mapping.hf_param):
+            previous = expert_slice_ranges.get(key)
+            expert_slice_ranges[key] = (
+                (start, stop)
+                if previous is None
+                else (min(previous[0], start), max(previous[1], stop))
+            )
+            expert_slice_task_by_key.setdefault(key, task)
     cache: dict[str, torch.Tensor | ExpertTensorSlice] = {}
     direct_physical_by_logical: dict[str, str] = {}
     materialized_source_by_key: dict[str, tuple[HfWeightSource, tuple[str, ...]]] = {}
@@ -914,7 +932,7 @@ def _patch_nonuniform_expert_export() -> None:
         self: MegatronParamMapping,
         megatron_weights: torch.Tensor | None,
         megatron_module: MegatronModule | None,
-        hf_param_name: str | None,
+        hf_param_name: Any,
     ) -> dict[str, torch.Tensor]:
         if megatron_module is None:
             payload = self.broadcast_obj_from_pp_rank(
@@ -933,11 +951,19 @@ def _patch_nonuniform_expert_export() -> None:
                 None if layout is None else layout.model_dump(mode="python"),
                 "art_expert_parallel_layout",
             )
-        if (
-            layout is None
-            or hf_param_name is None
-            or not _HF_EXPERT_RE.search(hf_param_name)
-        ):
+        if layout is None or hf_param_name is None:
+            return original(self, megatron_weights, megatron_module, hf_param_name)
+        if isinstance(hf_param_name, Mapping):
+            if megatron_weights is None:
+                return {}
+            gathered = [
+                torch.empty_like(megatron_weights) for _ in range(layout.ep_size)
+            ]
+            torch.distributed.all_gather(
+                gathered, megatron_weights, group=self.ep_group
+            )
+            return {str(hf_param_name): torch.stack(gathered)}
+        if not _HF_EXPERT_RE.search(hf_param_name):
             return original(self, megatron_weights, megatron_module, hf_param_name)
         if megatron_weights is None:
             return {}

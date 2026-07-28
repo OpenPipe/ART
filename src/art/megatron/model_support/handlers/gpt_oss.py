@@ -590,33 +590,42 @@ def _gpt_oss_padded_mapping_registry(
             )
             if not converted:
                 return converted
-            tensor = _gate_up_from_etp_shard_order(
-                next(iter(converted.values())), self.tp_size
-            )
-            gate = tensor[:logical_ffn, :logical_hidden]
-            up = tensor[internal_ffn : internal_ffn + logical_ffn, :logical_hidden]
+            tensor = next(iter(converted.values()))
+            if self.ep_size > 1:
+                tensor = torch.stack(
+                    [
+                        _gate_up_from_etp_shard_order(expert, self.tp_size)
+                        for expert in tensor
+                    ]
+                )
+            else:
+                tensor = _gate_up_from_etp_shard_order(tensor, self.tp_size)
+            gate = tensor[..., :logical_ffn, :logical_hidden]
+            up = tensor[..., internal_ffn : internal_ffn + logical_ffn, :logical_hidden]
             interleaved = torch.empty(
+                *tensor.shape[:-2],
                 2 * logical_ffn,
                 logical_hidden,
                 dtype=tensor.dtype,
                 device=tensor.device,
             )
-            interleaved[::2] = gate
-            interleaved[1::2] = up
+            interleaved[..., 0::2, :] = gate
+            interleaved[..., 1::2, :] = up
             names = cast(dict[str, str], self.hf_param)
             return {
-                names["weight"]: interleaved.t().contiguous(),
+                names["weight"]: interleaved.transpose(-1, -2).contiguous(),
                 names["bias"]: torch.stack(
                     [
-                        tensor[:logical_ffn, logical_hidden],
+                        tensor[..., :logical_ffn, logical_hidden],
                         tensor[
+                            ...,
                             internal_ffn : internal_ffn + logical_ffn,
                             logical_hidden,
                         ],
                     ],
                     dim=-1,
                 )
-                .flatten()
+                .flatten(-2)
                 .contiguous(),
             }
 
@@ -703,8 +712,10 @@ def _gpt_oss_padded_mapping_registry(
             tensor = next(iter(converted.values()))
             names = cast(dict[str, str], self.hf_param)
             return {
-                names["weight"]: tensor[:logical_hidden, :logical_ffn].t().contiguous(),
-                names["bias"]: tensor[:logical_hidden, logical_ffn].contiguous(),
+                names["weight"]: tensor[..., :logical_hidden, :logical_ffn]
+                .transpose(-1, -2)
+                .contiguous(),
+                names["bias"]: tensor[..., :logical_hidden, logical_ffn].contiguous(),
             }
 
         def resolve(self, captures: tuple[str, ...]) -> Any:

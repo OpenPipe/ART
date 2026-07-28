@@ -12,7 +12,10 @@ import torch
 
 from art.megatron.expert_parallel import get_expert_parallel_layout
 from art.megatron.model_support.spec import ModelSupportHandler
-from art.megatron.runtime.bridge_runtime import _logical_hf_param
+from art.megatron.runtime.bridge_runtime import (
+    _logical_hf_param,
+    _remap_hf_expert_name,
+)
 from art.megatron.runtime.jobs import (
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
@@ -226,6 +229,12 @@ def iter_merged_vllm_weights(
             task.global_param_name
         )
         if adapter_weights is not None:
+            layout = get_expert_parallel_layout(weight_export.model_config_value)
+            if layout is not None:
+                converted_weights_dict = {
+                    _remap_hf_expert_name(key, layout.logical_to_physical): value
+                    for key, value in converted_weights_dict.items()
+                }
             try:
                 converted_weights_dict = model_bridge._merge_lora_adapter_weights(
                     weight_export.model,
@@ -255,6 +264,11 @@ def iter_merged_vllm_weights(
                     f"{task.global_param_name}: converted={converted_shapes} "
                     f"adapter_weights={adapter_summaries}"
                 ) from exc
+            if layout is not None:
+                converted_weights_dict = {
+                    _remap_hf_expert_name(key, layout.physical_to_logical): value
+                    for key, value in converted_weights_dict.items()
+                }
         if getattr(task.mapping, "is_grouped_export", False):
             merged_result = _accumulate_grouped_export(
                 weight_export,

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import functools
 import math
 from typing import Any, cast
 
+from megatron.bridge.models.conversion.param_mapping import AutoMapping
 from megatron.core.transformer.moe.router import TopKRouter
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch
@@ -116,7 +118,7 @@ def get_expert_parallel_layout(config: Any) -> ExpertParallelLayout | None:
     return layout
 
 
-class LogicalTopKRouter(TopKRouter):
+class _LogicalRouterMixin:
     def __init__(
         self,
         config: Any,
@@ -128,7 +130,8 @@ class LogicalTopKRouter(TopKRouter):
             raise RuntimeError("logical router requires a non-uniform expert layout")
         logical_config = copy.copy(config)
         logical_config.num_moe_experts = layout.logical_experts
-        super().__init__(
+        parent = cast(Any, super())
+        parent.__init__(
             config=logical_config,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
@@ -137,7 +140,7 @@ class LogicalTopKRouter(TopKRouter):
             layout.logical_experts if expert is None else expert
             for expert in layout.physical_to_logical
         ]
-        self.register_buffer(
+        cast(Any, self).register_buffer(
             "_physical_to_logical",
             torch.tensor(physical_to_logical, dtype=torch.int64),
             persistent=False,
@@ -148,12 +151,28 @@ class LogicalTopKRouter(TopKRouter):
         input: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        probabilities, routing_map = super().forward(input, padding_mask)
-        physical_to_logical = cast(torch.Tensor, self._physical_to_logical)
+        probabilities, routing_map = cast(Any, super()).forward(input, padding_mask)
+        physical_to_logical = cast(torch.Tensor, getattr(self, "_physical_to_logical"))
         return (
             _expand_logical_experts(probabilities, physical_to_logical),
             _expand_logical_experts(routing_map, physical_to_logical),
         )
+
+
+@functools.cache
+def logical_router_type(router_type: type) -> type:
+    if issubclass(router_type, _LogicalRouterMixin):
+        return router_type
+    logical_type = type(
+        f"ArtLogical{router_type.__name__}",
+        (_LogicalRouterMixin, router_type),
+        {"__module__": __name__},
+    )
+    AutoMapping.register_module_type(logical_type.__name__, "replicated")
+    return logical_type
+
+
+LogicalTopKRouter = logical_router_type(TopKRouter)
 
 
 def _expand_logical_experts(
@@ -173,6 +192,6 @@ def patch_moe_routers(block_spec: Any) -> int:
         mlp_spec = getattr(layer_submodules, "mlp", None)
         moe_submodules = getattr(mlp_spec, "submodules", None)
         if moe_submodules is not None and hasattr(moe_submodules, "router"):
-            moe_submodules.router = LogicalTopKRouter
+            moe_submodules.router = logical_router_type(moe_submodules.router)
             patched += 1
     return patched
