@@ -30,6 +30,7 @@ from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
 
+from .expert_parallel import get_expert_parallel_layout
 from .kernels.cute_grouped_lora_quack import (
     quack_grouped_lora,
     quack_grouped_lora_dual,
@@ -192,6 +193,7 @@ class _LoraPublishTemplate(NamedTuple):
     shape: tuple[int, ...]
     dtype_name: str
     num_local_experts: int
+    expert_layout: tuple[int | None, ...]
     is_expert: bool
     shard_domain: ShardDomain
     sharded: bool
@@ -199,6 +201,15 @@ class _LoraPublishTemplate(NamedTuple):
     export_shard_dim: int
     export_shard_strategy: str | None
     component_sizes: tuple[int, ...]
+
+
+def _template_expert_ids(
+    template: _LoraPublishTemplate, ep_rank: int
+) -> tuple[int | None, ...]:
+    start = ep_rank * template.num_local_experts
+    if template.expert_layout:
+        return template.expert_layout[start : start + template.num_local_experts]
+    return tuple(range(start, start + template.num_local_experts))
 
 
 def _distributed_initialized() -> bool:
@@ -498,6 +509,10 @@ class LoRA(torch.nn.Module):
             allreduce=allreduce,
         )
         self._expert_offset = ps.get_expert_model_parallel_rank() * num_local_experts
+        self._expert_ids: tuple[int | None, ...] = tuple(
+            range(self._expert_offset, self._expert_offset + num_local_experts)
+        )
+        self._expert_layout: tuple[int | None, ...] = ()
         self.reset_lora_parameters()
 
     @property
@@ -507,6 +522,26 @@ class LoRA(torch.nn.Module):
     @property
     def is_expert(self) -> bool:
         return "{expert}" in self.adapter_model_prefix
+
+    @property
+    def expert_ids(self) -> tuple[int | None, ...]:
+        return self._expert_ids
+
+    def bind_expert_layout(
+        self,
+        expert_ids: tuple[int | None, ...],
+        physical_to_logical: tuple[int | None, ...],
+    ) -> None:
+        if not self.is_expert or len(expert_ids) != self.num_local_experts:
+            raise ValueError(
+                f"{self.adapter_model_prefix}: invalid local expert layout {expert_ids}"
+            )
+        self._expert_ids = expert_ids
+        self._expert_layout = physical_to_logical
+        for local_expert, logical_expert in enumerate(expert_ids):
+            if logical_expert is None:
+                self.A_T.data[local_expert].zero_()
+                self.B_T.data[local_expert].zero_()
 
     def _broadcast_if_replicated(self, param: torch.nn.Parameter) -> None:
         if not param.lora_tp_replicated:  # ty: ignore[unresolved-attribute]
@@ -536,8 +571,11 @@ class LoRA(torch.nn.Module):
     def reset_lora_parameters(self) -> None:
         """Initialize LoRA weights (A=Kaiming, B=zeros) like PEFT defaults."""
         if self.is_expert:
-            for expert in range(self.A_T.shape[0]):
-                torch.nn.init.kaiming_uniform_(self.A_T[expert].T, a=math.sqrt(5))
+            for expert, logical_expert in enumerate(self.expert_ids):
+                if logical_expert is None:
+                    torch.nn.init.zeros_(self.A_T[expert])
+                else:
+                    torch.nn.init.kaiming_uniform_(self.A_T[expert].T, a=math.sqrt(5))
         else:
             torch.nn.init.kaiming_uniform_(self.A_T.T, a=math.sqrt(5))
         torch.nn.init.zeros_(self.B_T)
@@ -547,8 +585,9 @@ class LoRA(torch.nn.Module):
     def _expected_weight_keys(self, suffix: str) -> list[str]:
         if self.is_expert:
             return [
-                f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{suffix}.weight"
-                for expert in range(self.num_local_experts)
+                f"{self.adapter_model_prefix.format(expert=expert)}.{suffix}.weight"
+                for expert in self.expert_ids
+                if expert is not None
             ]
         return [f"{self.adapter_model_prefix}.{suffix}.weight"]
 
@@ -624,6 +663,8 @@ class LoRA(torch.nn.Module):
             for suffix in ("lora_A", "lora_B")
             for key in self._expected_weight_keys(suffix)
         ]
+        if not all_keys:
+            return torch.zeros_like(self.A_T), torch.zeros_like(self.B_T)
         missing = [key for key in all_keys if key not in adapter_model]
         if len(missing) == len(all_keys) and not require:
             return None
@@ -646,7 +687,15 @@ class LoRA(torch.nn.Module):
     ) -> torch.Tensor:
         keys = self._expected_weight_keys(suffix)
         if self.is_expert:
-            return torch.stack([adapter_model[key].T for key in keys])
+            loaded = [adapter_model[key].T for key in keys]
+            first = loaded[0]
+            real_weights = iter(loaded)
+            return torch.stack(
+                [
+                    torch.zeros_like(first) if expert is None else next(real_weights)
+                    for expert in self.expert_ids
+                ]
+            )
         return adapter_model[keys[0]].T
 
     def _localized_weight(
@@ -769,9 +818,11 @@ class LoRA(torch.nn.Module):
             if not self._should_export_parameter(param):
                 continue
             if self.is_expert:
-                for expert in range(self.num_local_experts):
-                    full_key = f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{key}"
-                    export_items.append((full_key, param, expert))
+                for local_expert, logical_expert in enumerate(self.expert_ids):
+                    if logical_expert is None:
+                        continue
+                    full_key = f"{self.adapter_model_prefix.format(expert=logical_expert)}.{key}"
+                    export_items.append((full_key, param, local_expert))
             else:
                 export_items.append((f"{self.adapter_model_prefix}.{key}", param, None))
         return export_items
@@ -840,6 +891,16 @@ class LoRA(torch.nn.Module):
         return out if scale == 1.0 else out * scale
 
 
+def _bind_expert_lora_layout(experts: Any, *loras: LoRA) -> None:
+    layout = get_expert_parallel_layout(getattr(experts, "config", None))
+    if layout is None:
+        return
+    ep_rank = int(experts.ep_group.rank())
+    expert_ids = layout.local_logical_experts(ep_rank)
+    for lora in loras:
+        lora.bind_expert_layout(expert_ids, layout.physical_to_logical)
+
+
 class LoRAPublishPlanner:
     def __init__(
         self,
@@ -892,6 +953,7 @@ class LoRAPublishPlanner:
                             shape=_exported_param_shape(module, param),
                             dtype_name=_dtype_name(param.dtype),
                             num_local_experts=module.num_local_experts,
+                            expert_layout=module._expert_layout,
                             is_expert=module.is_expert,
                             shard_domain=shard_domain,
                             sharded=sharded,
@@ -949,8 +1011,8 @@ class LoRAPublishPlanner:
                     shard_rank,
                 )
                 for ep_rank in range(ep_world_size)
-                for local_expert in range(template.num_local_experts)
-                for expert in [ep_rank * template.num_local_experts + local_expert]
+                for expert in _template_expert_ids(template, ep_rank)
+                if expert is not None
                 for shard_rank in shard_ranks
             ]
         return [
@@ -1794,6 +1856,7 @@ def wrap_grouped_moe_experts(
     alpha: int,
     fused_gate_up: bool = False,
 ) -> None:
+    expert_loras: list[LoRA] = []
     wrap_fc1 = (
         _targets_include(target_modules, "experts")
         if fused_gate_up
@@ -1814,6 +1877,7 @@ def wrap_grouped_moe_experts(
             fused_gate_up=fused_gate_up,
         )
         setattr(experts, "linear_fc1", linear_fc1_lora)
+        expert_loras.append(linear_fc1_lora.lora)
     wrap_fc2 = (
         wrap_fc1 if fused_gate_up else _targets_include(target_modules, "down_proj")
     )
@@ -1831,6 +1895,8 @@ def wrap_grouped_moe_experts(
             num_local_experts=experts.num_local_experts,
         )
         setattr(experts, "linear_fc2", linear_fc2_lora)
+        expert_loras.append(linear_fc2_lora.lora)
+    _bind_expert_lora_layout(experts, *expert_loras)
 
 
 def wrap_split_mlp_lora(

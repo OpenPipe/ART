@@ -10,6 +10,7 @@ from art.megatron.lora import (
     LoRASlotRef,
     _block_for_key,
     _dtype_name,
+    _template_expert_ids,
 )
 from art.megatron.lora import (
     _distributed_initialized as _distributed_ready,
@@ -161,8 +162,11 @@ def collect_local_packed_expert_entries(
     for module in iter_lora_modules(model_chunks):
         if not _uses_packed_expert_publish(module, packed_expert_groups, slot_ref):
             continue
-        expert_start = int(module._expert_offset)
-        expert_count = int(module.num_local_experts)
+        expert_ids = tuple(expert for expert in module.expert_ids if expert is not None)
+        if not expert_ids:
+            continue
+        expert_start = expert_ids[0]
+        expert_count = len(expert_ids)
         for suffix, param in module._lora_params(slot_ref):
             slot_match = _packed_expert_slot(
                 module.adapter_model_prefix,
@@ -173,7 +177,7 @@ def collect_local_packed_expert_entries(
                 continue
             group_prefix, slot = slot_match
             key = f"{group_prefix}.{slot.output_suffix}"
-            tensor = param.data.transpose(1, 2).contiguous()
+            tensor = param.data[:expert_count].transpose(1, 2).contiguous()
             source_keys = module._expected_weight_keys(suffix.removesuffix(".weight"))
             target_dtype = (
                 adapter_dtypes[source_keys[0]]
@@ -223,7 +227,15 @@ def _global_packed_expert_metadata(
 
             ep_world_size = ps.get_expert_model_parallel_world_size()
         for ep_rank in range(ep_world_size):
-            expert_start = ep_rank * template.num_local_experts
+            expert_ids = tuple(
+                expert
+                for expert in _template_expert_ids(template, ep_rank)
+                if expert is not None
+            )
+            if not expert_ids:
+                continue
+            expert_start = expert_ids[0]
+            expert_count = len(expert_ids)
             expert_key = (
                 f"{template.adapter_model_prefix.format(expert=expert_start)}."
                 f"{template.suffix}"
@@ -241,11 +253,11 @@ def _global_packed_expert_metadata(
                     PackedExpertShardMeta(
                         key=f"{group_prefix}.{slot.output_suffix}",
                         owner_rank=owner_rank,
-                        shape=(template.num_local_experts, *per_expert_meta.shape),
+                        shape=(expert_count, *per_expert_meta.shape),
                         dtype_name=per_expert_meta.dtype_name,
                         manifest=per_expert_meta.manifest,
                         expert_start=expert_start,
-                        expert_count=template.num_local_experts,
+                        expert_count=expert_count,
                         pack_layout=slot.pack_layout,
                     )
                 )

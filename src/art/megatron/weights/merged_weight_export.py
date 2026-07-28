@@ -4,10 +4,15 @@ import time
 from typing import Any, Iterator, cast
 
 from megatron.bridge import AutoBridge
+from megatron.bridge.models.conversion.param_mapping import (
+    extract_expert_number_from_param,
+)
 from pydantic import BaseModel, ConfigDict
 import torch
 
+from art.megatron.expert_parallel import get_expert_parallel_layout
 from art.megatron.model_support.spec import ModelSupportHandler
+from art.megatron.runtime.bridge_runtime import _logical_hf_param
 from art.megatron.runtime.jobs import (
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
@@ -41,6 +46,23 @@ def _hf_param_names(hf_param: Any) -> list[str]:
     if isinstance(hf_param, str):
         return [hf_param]
     return list(hf_param.values())
+
+
+def _checkpoint_hf_param_names(mapping: Any, model_config: Any) -> list[str]:
+    layout = get_expert_parallel_layout(model_config)
+    if layout is None or not bool(getattr(mapping, "is_expert", False)):
+        return _hf_param_names(mapping.hf_param)
+    physical_expert = extract_expert_number_from_param(mapping.megatron_param)
+    logical_expert = layout.logical_expert(physical_expert)
+    if logical_expert is None:
+        return []
+    return _hf_param_names(
+        _logical_hf_param(
+            mapping.hf_param,
+            physical_expert=physical_expert,
+            logical_expert=logical_expert,
+        )
+    )
 
 
 def build_art_conversion_tasks(*, bridge: AutoBridge, model: ModelChunks) -> list[Any]:
@@ -77,7 +99,7 @@ def build_art_conversion_tasks(*, bridge: AutoBridge, model: ModelChunks) -> lis
                 raise RuntimeError(
                     f"Missing HF conversion mapping for Megatron param {global_name}"
                 )
-            hf_params = _hf_param_names(mapping.hf_param)
+            hf_params = _checkpoint_hf_param_names(mapping, model_config)
             missing_hf_params = sorted(set(hf_params) - hf_keys)
             if missing_hf_params and not getattr(
                 mapping,
@@ -132,6 +154,62 @@ def build_merged_weight_export(
     )
 
 
+def _accumulate_grouped_export(
+    weight_export: MergedWeightExport,
+    task: Any,
+    converted_weights: dict[str, torch.Tensor],
+    grouped_buffers: dict[str, dict[int, torch.Tensor]],
+    hf_state_dict: Any,
+) -> dict[str, torch.Tensor] | None:
+    layout = get_expert_parallel_layout(weight_export.model_config_value)
+    model_bridge = weight_export.bridge._model_bridge
+    if layout is None:
+        return model_bridge._accumulate_grouped_export(
+            task,
+            converted_weights,
+            weight_export.model_config_value,
+            grouped_buffers,
+            hf_state_dict,
+        )
+
+    local_expert = (
+        extract_expert_number_from_param(task.param_name) % layout.slots_per_rank
+    )
+    result: dict[str, torch.Tensor] = {}
+    for group_key, value in converted_weights.items():
+        buffer = grouped_buffers.setdefault(group_key, {})
+        gathered = (
+            enumerate(value)
+            if value.ndim > 0 and value.shape[0] == layout.ep_size
+            else ((int(getattr(task.mapping, "ep_rank", 0)), value),)
+        )
+        for ep_rank, expert_weight in gathered:
+            logical_expert = layout.logical_expert(
+                ep_rank * layout.slots_per_rank + local_expert
+            )
+            if logical_expert is not None:
+                buffer[logical_expert] = expert_weight
+        if len(buffer) != layout.logical_experts:
+            continue
+        merged = torch.stack(
+            [buffer[expert] for expert in range(layout.logical_experts)]
+        )
+        if getattr(task.mapping, "transpose_on_export", False):
+            expected = (
+                tuple(hf_state_dict[group_key].shape)
+                if group_key in hf_state_dict
+                else None
+            )
+            transposed = merged.transpose(-1, -2).contiguous()
+            if expected is None or (
+                tuple(merged.shape) != expected and tuple(transposed.shape) == expected
+            ):
+                merged = transposed
+        del grouped_buffers[group_key]
+        result[group_key] = merged
+    return result or None
+
+
 def iter_merged_vllm_weights(
     weight_export: MergedWeightExport,
 ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -178,10 +256,10 @@ def iter_merged_vllm_weights(
                     f"adapter_weights={adapter_summaries}"
                 ) from exc
         if getattr(task.mapping, "is_grouped_export", False):
-            merged_result = model_bridge._accumulate_grouped_export(
+            merged_result = _accumulate_grouped_export(
+                weight_export,
                 task,
                 converted_weights_dict,
-                weight_export.model_config_value,
                 grouped_buffers,
                 hf_state_dict,
             )

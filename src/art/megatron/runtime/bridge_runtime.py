@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 import contextlib
+import copy
+from dataclasses import replace
 import fnmatch
+import re
 from typing import Any, cast
 
 from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
@@ -11,6 +14,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     ColumnParallelMapping,
     MegatronParamMapping,
     ReplicatedMapping,
+    extract_expert_number_from_param,
     get_module_and_param_from_name,
 )
 from megatron.bridge.models.model_provider import ModelProviderMixin
@@ -21,13 +25,22 @@ from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.utils import get_model_config
 import torch
 
+from art.megatron.expert_parallel import (
+    ExpertParallelLayout,
+    get_expert_parallel_layout,
+)
 from art.megatron.model_support.spec import HfWeightSource
 
 _Fp32PreservedTensor = tuple[torch.nn.Module, str, torch.Tensor, bool]
 
 
 class ExpertTensorSlice:
-    __slots__ = ("global_start", "global_stop", "tensor")
+    __slots__ = (
+        "global_start",
+        "global_stop",
+        "physical_to_logical",
+        "tensor",
+    )
 
     def __init__(
         self,
@@ -35,13 +48,22 @@ class ExpertTensorSlice:
         *,
         global_start: int,
         global_stop: int,
+        physical_to_logical: tuple[int | None, ...] | None = None,
     ) -> None:
         self.tensor = tensor
         self.global_start = int(global_start)
         self.global_stop = int(global_stop)
+        self.physical_to_logical = physical_to_logical
 
     def get(self, global_expert: int) -> torch.Tensor:
         global_expert = int(global_expert)
+        if self.physical_to_logical is not None:
+            logical_expert = self.physical_to_logical[global_expert]
+            if logical_expert is None:
+                raise RuntimeError(
+                    f"masked physical expert {global_expert} has no checkpoint tensor"
+                )
+            global_expert = logical_expert
         if not self.global_start <= global_expert < self.global_stop:
             raise RuntimeError(
                 "expert slice cache miss for global expert "
@@ -121,6 +143,16 @@ def _needs_expert_slice_prefetch(task: Any) -> bool:
 def _expert_slice_range(task: Any) -> tuple[int, int]:
     mapping = task.mapping
     config = getattr(task.megatron_module, "config", None)
+    layout = get_expert_parallel_layout(config)
+    if layout is not None:
+        local_experts = tuple(
+            expert
+            for expert in layout.local_logical_experts(int(mapping.ep_rank))
+            if expert is not None
+        )
+        if not local_experts:
+            raise RuntimeError(f"EP rank {mapping.ep_rank} owns no logical experts")
+        return local_experts[0], local_experts[-1] + 1
     num_experts = int(getattr(config, "num_moe_experts", 0) or 0)
     ep_size = int(getattr(mapping, "ep_size", 1))
     ep_rank = int(getattr(mapping, "ep_rank", 0))
@@ -166,6 +198,71 @@ def _load_hf_tensor_slice(
 
 def _direct_hf_weight_source(key: str) -> HfWeightSource:
     return HfWeightSource(logical_key=key, physical_key_options=((key,),))
+
+
+_HF_EXPERT_RE = re.compile(r"(?P<prefix>(?:^|\.)experts\.)(?P<expert>\d+)(?=\.|$)")
+
+
+def _logical_hf_param(
+    hf_param: Any,
+    *,
+    physical_expert: int,
+    logical_expert: int,
+) -> Any:
+    if isinstance(hf_param, str):
+        return _HF_EXPERT_RE.sub(
+            lambda match: (
+                f"{match.group('prefix')}{logical_expert}"
+                if int(match.group("expert")) == physical_expert
+                else match.group(0)
+            ),
+            hf_param,
+        )
+    if isinstance(hf_param, Mapping):
+        return {
+            key: _logical_hf_param(
+                value,
+                physical_expert=physical_expert,
+                logical_expert=logical_expert,
+            )
+            for key, value in hf_param.items()
+        }
+    return hf_param
+
+
+def _prepare_nonuniform_expert_tasks(tasks: Iterable[Any]) -> list[Any]:
+    prepared: list[Any] = []
+    for task in tasks:
+        if (
+            task is None
+            or task.megatron_module is None
+            or not bool(getattr(task.mapping, "is_expert", False))
+        ):
+            prepared.append(task)
+            continue
+        layout = get_expert_parallel_layout(
+            getattr(task.megatron_module, "config", None)
+        )
+        if layout is None:
+            prepared.append(task)
+            continue
+        physical_expert = extract_expert_number_from_param(task.mapping.megatron_param)
+        logical_expert = layout.logical_expert(physical_expert)
+        if logical_expert is None:
+            if task.param_weight is None:
+                raise RuntimeError(
+                    f"masked physical expert {physical_expert} has no target parameter"
+                )
+            task.param_weight.data.zero_()
+            continue
+        mapping = copy.copy(task.mapping)
+        mapping.hf_param = _logical_hf_param(
+            mapping.hf_param,
+            physical_expert=physical_expert,
+            logical_expert=logical_expert,
+        )
+        prepared.append(replace(task, mapping=mapping))
+    return prepared
 
 
 def _planned_hf_weight_source(
@@ -319,10 +416,14 @@ def load_unique_hf_keys_once(
             )
         )
     for key, (start, stop) in expert_slice_ranges.items():
+        task = expert_slice_task_by_key.get(key)
+        layout = get_expert_parallel_layout(
+            getattr(getattr(task, "megatron_module", None), "config", None)
+        )
         source = _planned_hf_weight_source(
             bridge,
             key,
-            task=expert_slice_task_by_key.get(key),
+            task=task,
         )
         selected_option = _select_physical_key_option(source, hf_state_dict)
         if source.kind != "direct":
@@ -341,6 +442,9 @@ def load_unique_hf_keys_once(
                 _pin_cpu_tensor(tensor[start:stop]),
                 global_start=start,
                 global_stop=stop,
+                physical_to_logical=(
+                    None if layout is None else layout.physical_to_logical
+                ),
             )
             continue
         if len(selected_option) != 1:
@@ -359,6 +463,9 @@ def load_unique_hf_keys_once(
             ),
             global_start=start,
             global_stop=stop,
+            physical_to_logical=(
+                None if layout is None else layout.physical_to_logical
+            ),
         )
     return cache
 
@@ -699,7 +806,9 @@ def _optimized_load_weights_hf_to_megatron(
             stack.enter_context(megatron_model[0].hide_teacher_model())
         if hasattr(megatron_model[0], "hide_loss_modules"):
             stack.enter_context(megatron_model[0].hide_loss_modules())
-        tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
+        tasks = _prepare_nonuniform_expert_tasks(
+            self.build_conversion_tasks(hf_pretrained, megatron_model)
+        )
     hf_state_dict = hf_pretrained.state
     raw_cache = load_unique_hf_keys_once(
         tasks,
@@ -766,6 +875,7 @@ def install_art_bridge_runtime_patches() -> None:
     _patch_router_gating_linear_empty_input()
     _patch_bias_swiglu_empty_input()
     _patch_moe_unpermute_empty_input()
+    _patch_nonuniform_expert_export()
     if not getattr(
         model_provider_module.get_model, "__art_meta_materialization__", False
     ):
@@ -793,6 +903,69 @@ def install_art_bridge_runtime_patches() -> None:
             "load_weights_hf_to_megatron",
             _optimized_load_weights_hf_to_megatron,
         )
+
+
+def _patch_nonuniform_expert_export() -> None:
+    original = MegatronParamMapping.gather_from_ep_ranks
+    if getattr(original, "__art_nonuniform_experts__", False):
+        return
+
+    def _gather_from_ep_ranks(
+        self: MegatronParamMapping,
+        megatron_weights: torch.Tensor | None,
+        megatron_module: MegatronModule | None,
+        hf_param_name: str | None,
+    ) -> dict[str, torch.Tensor]:
+        if megatron_module is None:
+            payload = self.broadcast_obj_from_pp_rank(
+                None, "art_expert_parallel_layout"
+            )
+            layout = (
+                None
+                if payload is None
+                else ExpertParallelLayout.model_validate(payload)
+            )
+        else:
+            layout = get_expert_parallel_layout(
+                getattr(megatron_module, "config", None)
+            )
+            self.broadcast_obj_from_pp_rank(
+                None if layout is None else layout.model_dump(mode="python"),
+                "art_expert_parallel_layout",
+            )
+        if (
+            layout is None
+            or hf_param_name is None
+            or not _HF_EXPERT_RE.search(hf_param_name)
+        ):
+            return original(self, megatron_weights, megatron_module, hf_param_name)
+        if megatron_weights is None:
+            return {}
+
+        physical_expert = extract_expert_number_from_param(self.megatron_param)
+        local_expert = physical_expert % layout.slots_per_rank
+        gathered = [torch.empty_like(megatron_weights) for _ in range(layout.ep_size)]
+        torch.distributed.all_gather(gathered, megatron_weights, group=self.ep_group)
+        result: dict[str, torch.Tensor] = {}
+        for ep_rank, weight in enumerate(gathered):
+            logical_expert = layout.logical_expert(
+                ep_rank * layout.slots_per_rank + local_expert
+            )
+            if logical_expert is None:
+                continue
+            key = _HF_EXPERT_RE.sub(
+                lambda match: f"{match.group('prefix')}{logical_expert}",
+                hf_param_name,
+            )
+            result[key] = weight
+        return result
+
+    setattr(_gather_from_ep_ranks, "__art_nonuniform_experts__", True)
+    setattr(
+        MegatronParamMapping,
+        "gather_from_ep_ranks",
+        _gather_from_ep_ranks,
+    )
 
 
 def _patch_router_gating_linear_empty_input() -> None:

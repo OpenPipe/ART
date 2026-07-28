@@ -13,6 +13,11 @@ from megatron.core.transformer.enums import AttnBackend
 from pydantic import BaseModel, ConfigDict
 import torch
 
+from art.megatron.expert_parallel import (
+    activate_expert_parallel_layout,
+    configure_expert_parallel_layout,
+    patch_moe_routers,
+)
 from art.megatron.model_support.registry import (
     ensure_model_support_bridge_registered_for_spec,
     get_model_support_handler_for_spec,
@@ -694,9 +699,28 @@ def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
     provider = cast(GPTModelProvider, provider_bundle.provider)
     _apply_art_training_runtime_finalize_defaults(provider)
     _enforce_art_moe_grouped_gemm_fast_path(provider)
+    configure_expert_parallel_layout(provider)
     _finalize_provider_with_art_overrides(provider)
+    if activate_expert_parallel_layout(provider) is not None:
+        _install_nonuniform_expert_parallel(provider)
     _normalize_recompute_settings(provider)
     return provider_bundle
+
+
+def _install_nonuniform_expert_parallel(provider: GPTModelProvider) -> None:
+    base_layer_spec = provider.transformer_layer_spec
+
+    def _nonuniform_expert_layer_spec(
+        config: GPTModelProvider, vp_stage: int | None = None
+    ) -> object:
+        layer_spec = resolve_layer_spec(base_layer_spec, config, vp_stage)
+        if patch_moe_routers(layer_spec) == 0:
+            raise RuntimeError(
+                "non-uniform expert parallelism found no MoE router in the layer spec"
+            )
+        return layer_spec
+
+    provider.transformer_layer_spec = cast(Any, _nonuniform_expert_layer_spec)
 
 
 def _finalize_provider_with_art_overrides(provider: GPTModelProvider) -> None:

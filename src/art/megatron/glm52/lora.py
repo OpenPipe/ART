@@ -20,6 +20,7 @@ from art.megatron.lora import (
     MLPExpertsLinearFC1LoRA,
     MLPExpertsLinearFC2LoRA,
     SelfAttentionLinearProjLoRA,
+    _bind_expert_lora_layout,
     _parallel_lora,
     _targets_include,
     _unwrap_attr,
@@ -164,7 +165,7 @@ def wrap_glm52_grouped_moe_experts_3d(
         return
     if TEColumnParallelGroupedLinear is None or TERowParallelGroupedLinear is None:
         raise RuntimeError("GLM-5.2 expert LoRA requires Transformer Engine")
-    experts.linear_fc1 = Glm52MLPExpertsLinearFC1LoRA(
+    linear_fc1 = Glm52MLPExpertsLinearFC1LoRA(
         adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
         linear_fc1=_unwrap_attr(
             experts.linear_fc1,
@@ -176,7 +177,7 @@ def wrap_glm52_grouped_moe_experts_3d(
         num_local_experts=experts.num_local_experts,
         fused_gate_up=True,
     )
-    experts.linear_fc2 = Glm52MLPExpertsLinearFC2LoRA(
+    linear_fc2 = Glm52MLPExpertsLinearFC2LoRA(
         adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
         linear_fc2=_unwrap_attr(
             experts.linear_fc2,
@@ -187,6 +188,9 @@ def wrap_glm52_grouped_moe_experts_3d(
         alpha=alpha,
         num_local_experts=experts.num_local_experts,
     )
+    experts.linear_fc1 = linear_fc1
+    experts.linear_fc2 = linear_fc2
+    _bind_expert_lora_layout(experts, linear_fc1.lora, linear_fc2.lora)
 
 
 def add_glm52_attention_adapter_weights(
