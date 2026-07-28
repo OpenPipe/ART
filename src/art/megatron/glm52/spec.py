@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from itertools import combinations
 from typing import Any, cast
 
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -21,7 +22,7 @@ from art.megatron.glm52.attention import (
 def build_glm52_pipeline_layout(
     indexer_types: tuple[str, ...], pp_size: int, vp_size: int
 ) -> list[list[str]]:
-    """Partition complete IndexShare groups across flattened PP/VPP stages."""
+    """Balance complete IndexShare groups across virtual and physical stages."""
     starts = [index for index, mode in enumerate(indexer_types) if mode == "full"]
     stages = pp_size * vp_size
     if not indexer_types or not starts or starts[0] != 0:
@@ -31,18 +32,28 @@ def build_glm52_pipeline_layout(
             f"GLM-5.2 has {len(starts)} complete IndexShare groups but {stages} "
             "PP/VPP stages were requested."
         )
-    boundaries = [0]
-    previous_group = 0
-    for stage in range(1, stages):
-        remaining = stages - stage
-        candidates = range(previous_group + 1, len(starts) - remaining + 1)
-        ideal = len(indexer_types) * stage / stages
-        previous_group = min(
-            candidates,
-            key=lambda group: (abs(starts[group] - ideal), starts[group]),
+
+    def score(boundaries: tuple[int, ...]) -> tuple[Any, ...]:
+        chunks = [
+            end - start
+            for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
+        ]
+        physical = [sum(chunks[pp_rank::pp_size]) for pp_rank in range(pp_size)]
+        return (
+            max(chunks),
+            max(physical),
+            max(physical) - min(physical),
+            max(chunks) - min(chunks),
+            boundaries,
         )
-        boundaries.append(starts[previous_group])
-    boundaries.append(len(indexer_types))
+
+    boundaries = min(
+        (
+            (0, *selected, len(indexer_types))
+            for selected in combinations(starts[1:], stages - 1)
+        ),
+        key=score,
+    )
     layout = [
         ["decoder"] * (end - start)
         for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
