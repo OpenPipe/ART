@@ -444,6 +444,11 @@ TrajectoryHistory: TypeAlias = (
 
 class Trajectory(_CompactModel):
     exchanges: TrajectoryExchanges = pydantic.Field(default_factory=TrajectoryExchanges)
+    strictly_tito: bool = pydantic.Field(
+        default=False,
+        description="Require exact inference token IDs and disable local tokenization.",
+        exclude_if=lambda value: not value,
+    )
     messages_and_choices: MessagesAndChoices = pydantic.Field(
         default_factory=list,
         exclude_if=lambda value: not value,
@@ -852,10 +857,14 @@ def no_capture() -> AbstractContextManager[None]:
     return capture_barrier()
 
 
-async def trajectory(coroutine: Coroutine[Any, Any, object]) -> Trajectory:
+async def trajectory(
+    coroutine: Coroutine[Any, Any, object],
+    *,
+    strictly_tito: bool = False,
+) -> Trajectory:
     from ._scope import capture_trajectory
 
-    return await capture_trajectory(coroutine)
+    return await capture_trajectory(coroutine, strictly_tito=strictly_tito)
 
 
 async def trajectory_group(
@@ -889,8 +898,10 @@ def auto_trajectory(*, require: bool = False) -> Trajectory | None:
 @deprecated("Use trajectory() instead.")
 async def capture_auto_trajectory(
     coroutine: Coroutine[Any, Any, object],
+    *,
+    strictly_tito: bool = False,
 ) -> Trajectory:
-    return await trajectory(coroutine)
+    return await trajectory(coroutine, strictly_tito=strictly_tito)
 
 
 def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:

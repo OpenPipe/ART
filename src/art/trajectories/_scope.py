@@ -63,9 +63,13 @@ def _require_raw_coroutine(value: object) -> None:
         raise TypeError("Expected a raw coroutine, not a Task, Future, or awaitable")
 
 
-async def capture_trajectory(coroutine: Coroutine[Any, Any, object]) -> Trajectory:
+async def capture_trajectory(
+    coroutine: Coroutine[Any, Any, object],
+    *,
+    strictly_tito: bool,
+) -> Trajectory:
     _require_raw_coroutine(coroutine)
-    with Trajectory() as captured:
+    with Trajectory(strictly_tito=strictly_tito) as captured:
         await coroutine
     return captured
 

@@ -226,6 +226,21 @@ async def test_contexts_are_nested_and_task_local() -> None:
         art.current_trajectory(require=True)
 
 
+async def test_strictly_tito_is_owned_by_the_capture_scope() -> None:
+    with art.Trajectory(strictly_tito=True) as captured:
+        assert art.current_trajectory(require=True).strictly_tito
+    assert captured.strictly_tito
+
+    async def rollout() -> None:
+        assert art.current_trajectory(require=True).strictly_tito
+
+    captured = await art.trajectory(rollout(), strictly_tito=True)
+
+    assert captured.strictly_tito
+    assert captured.model_dump(mode="json")["strictly_tito"] is True
+    assert "strictly_tito" not in art.Trajectory().model_dump(mode="json")
+
+
 def test_no_capture_hides_enclosing_trajectory_but_allows_nested_capture() -> None:
     def capture_exchange() -> None:
         state, token = begin(
@@ -326,9 +341,10 @@ async def test_async_helpers_and_group_aggregation_are_isolated() -> None:
         await asyncio.sleep(0)
         capture_exchange()
 
-    captured = await art.trajectory(rollout())
+    captured = await art.trajectory(rollout(), strictly_tito=True)
     assert isinstance(captured, art.Trajectory)
     assert len(captured.exchanges.chat_completions) == 1
+    assert captured.tokenize().token_ids == [1, 2]
     task = asyncio.create_task(rollout())
     with pytest.raises(TypeError, match="raw coroutine"):
         # Passing a Task is deliberately a static type error and a runtime error.

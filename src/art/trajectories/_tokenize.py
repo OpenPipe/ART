@@ -73,6 +73,23 @@ class _OffsetTokenizer(Protocol):
     ) -> object: ...
 
 
+class _StrictTitoTokenizer:
+    def __call__(self, *_args: object, **_kwargs: object) -> object:
+        raise ValueError(
+            "strictly_tito requires exact token IDs returned by inference; "
+            "local tokenization is disabled"
+        )
+
+    def apply_chat_template(self, *_args: object, **_kwargs: object) -> object:
+        raise ValueError(
+            "strictly_tito requires exact token IDs returned by inference; "
+            "chat-template rendering is disabled"
+        )
+
+
+_STRICT_TITO_TOKENIZER = cast(Tokenizer, _StrictTitoTokenizer())
+
+
 @dataclass(frozen=True)
 class _SampledOutput:
     text: str | None
@@ -4762,6 +4779,22 @@ def _materialize_trajectory(
     )
 
 
+def _strict_tito_options(
+    trajectory: Trajectory,
+    tokenizer: Tokenizer | None,
+    chat_template: str | None,
+    chat_template_kwargs: Mapping[str, object] | None,
+) -> tuple[Tokenizer | None, str | None, Mapping[str, object] | None]:
+    if trajectory.strictly_tito:
+        return _STRICT_TITO_TOKENIZER, None, None
+    return tokenizer, chat_template, chat_template_kwargs
+
+
+def _require_exact_tokens(history: TokenizedHistory) -> None:
+    if any(not flag & TokenFlag.EXACT for flag in history.flags):
+        raise ValueError("strictly_tito requires every token ID to come from inference")
+
+
 def tokenize_trajectory(
     trajectory: Trajectory,
     *,
@@ -4772,6 +4805,12 @@ def tokenize_trajectory(
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
 ) -> TokenizedTrajectory | TokenizedMultiHistoryTrajectory:
+    tokenizer, chat_template, chat_template_kwargs = _strict_tito_options(
+        trajectory,
+        tokenizer,
+        chat_template,
+        chat_template_kwargs,
+    )
     histories = trajectory.histories(model=model)
     if not multi_history:
         if len(histories) != 1:
@@ -4799,6 +4838,9 @@ def tokenize_trajectory(
         )
         for history in histories
     ]
+    if trajectory.strictly_tito:
+        for history in tokenized:
+            _require_exact_tokens(history)
     if not multi_history:
         return _materialize_trajectory(tokenized[0], trajectory)
     return TokenizedMultiHistoryTrajectory(
@@ -4823,6 +4865,12 @@ def _tokenize_trajectory_with_trace(
 ]:
     if not trajectory.exchanges:
         raise ValueError("Private exchange tokenization trace requires exchanges")
+    tokenizer, chat_template, chat_template_kwargs = _strict_tito_options(
+        trajectory,
+        tokenizer,
+        chat_template,
+        chat_template_kwargs,
+    )
     histories = trajectory.histories(model=model)
     tokenized_histories: list[TokenizedHistory] = []
     traces: list[_HistoryTokenizationTrace] = []
@@ -4842,6 +4890,8 @@ def _tokenize_trajectory_with_trace(
             _trace=trace_builder,
             _projection_validated=True,
         )
+        if trajectory.strictly_tito:
+            _require_exact_tokens(tokenized)
         if trace_builder.trace is None:
             raise AssertionError("Exchange tokenization did not produce a source trace")
         tokenized_histories.append(tokenized)

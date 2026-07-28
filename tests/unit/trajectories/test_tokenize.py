@@ -169,13 +169,14 @@ def test_exact_tokens_form_one_append_only_history_without_tokenizer(
     empty = _chat_exchange([1, 2, 3, 4], [], model=model, offset=2)
     empty.response.choices[0].message.content = ""
     trajectory = art.Trajectory(
+        strictly_tito=True,
         exchanges=TrajectoryExchanges(
             chat_completions=[
                 _chat_exchange([1], [2], model=model, offset=0),
                 _chat_exchange([1, 2, 3], [4], model=model, offset=1),
                 empty,
             ]
-        )
+        ),
     )
     real_import = builtins.__import__
 
@@ -437,6 +438,50 @@ def test_malformed_explicit_exact_token_metadata_fails_closed() -> None:
     for trajectory in trajectories:
         with pytest.raises(ValueError, match="exact token"):
             trajectory.tokenize(base_model="base/model")
+
+
+def test_strictly_tito_accepts_exact_metadata_from_every_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trajectories = [
+        art.Trajectory(
+            strictly_tito=True,
+            exchanges=TrajectoryExchanges(chat_completions=[_chat_exchange([1], [2])]),
+        ),
+        art.Trajectory(
+            strictly_tito=True,
+            exchanges=TrajectoryExchanges(completions=[_completion_exchange()]),
+        ),
+        art.Trajectory(
+            strictly_tito=True,
+            exchanges=TrajectoryExchanges(
+                responses=[_response_exchange("response-exact", 2)]
+            ),
+        ),
+        art.Trajectory(
+            strictly_tito=True,
+            exchanges=TrajectoryExchanges(
+                messages=[
+                    _message_exchange(
+                        MessagesRequest(
+                            model="test/model",
+                            messages=[{"role": "user", "content": "question"}],
+                        ),
+                        prompt_token_ids=[1],
+                        token_ids=[2],
+                    )
+                ]
+            ),
+        ),
+    ]
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._load_tokenizer",
+        lambda _config: pytest.fail("strictly_tito loaded a tokenizer"),
+    )
+
+    for trajectory in trajectories:
+        tokenized = trajectory.tokenize()
+        assert all(flag & art.TokenFlag.EXACT for flag in tokenized.flags)
 
 
 @pytest.mark.parametrize("token_id", [-1, True])
@@ -1135,6 +1180,31 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
         }
         for call in tokenizer.calls
     )
+
+
+def test_strictly_tito_rejects_fallback_before_using_the_tokenizer() -> None:
+    tokenizer = _FakeTokenizer()
+    trajectory = art.Trajectory(
+        strictly_tito=True,
+        exchanges=TrajectoryExchanges(
+            messages=[
+                _message_exchange(
+                    MessagesRequest(
+                        model="test/model",
+                        messages=[{"role": "user", "content": "question"}],
+                    )
+                )
+            ]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="strictly_tito"):
+        trajectory.tokenize(
+            tokenizer=tokenizer,
+            chat_template="must-not-render",
+        )
+
+    assert tokenizer.calls == []
 
 
 @pytest.mark.parametrize(
@@ -3886,33 +3956,18 @@ def test_reasoning_stripped_chat_histories_tokenize_authoritative_views() -> Non
     }
     second.response = ChatCompletion.model_validate(second_data)
     trajectory = art.Trajectory(
-        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+        strictly_tito=True,
+        exchanges=TrajectoryExchanges(chat_completions=[first, second]),
     )
 
     class Tokenizer:
         name_or_path = "test/model"
 
-        def __call__(self, text: str, **kwargs: object) -> list[int]:
-            del kwargs
-            return {
-                "one": [1],
-                "first": [500],
-                "two": [4],
-                "thought-two": [5],
-                "second": [6],
-            }[text]
+        def __call__(self, *_args: object, **_kwargs: object) -> list[int]:
+            raise AssertionError("strictly_tito used local tokenization")
 
-        def apply_chat_template(
-            self, messages: list[dict[str, Any]], **kwargs: object
-        ) -> list[int]:
-            del kwargs
-            assert [message.get("content") for message in messages] == [
-                "one",
-                "first",
-                "two",
-                "second",
-            ]
-            return [1, 500, 9, 4, 5, 6]
+        def apply_chat_template(self, *_args: object, **_kwargs: object) -> list[int]:
+            raise AssertionError("strictly_tito rendered a chat template")
 
     tokenized = trajectory.tokenize(multi_history=True, tokenizer=Tokenizer())
 
@@ -3986,6 +4041,7 @@ def test_reasoning_stripped_histories_remain_trainable_end_to_end(
     )
     trajectories = [
         art.Trajectory(
+            strictly_tito=True,
             exchanges=TrajectoryExchanges(chat_completions=[first, second]),
             reward=reward,
         )
