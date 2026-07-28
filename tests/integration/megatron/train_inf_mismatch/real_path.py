@@ -507,9 +507,14 @@ def _choice_score_index(
     indexed: dict[tuple[int, ...], Choice] = {}
     for group in trajectory_groups:
         for trajectory in group:
-            for item in trajectory.messages_and_choices:
-                if not isinstance(item, Choice):
-                    continue
+            choices = [
+                item
+                for item in trajectory.messages_and_choices
+                if isinstance(item, Choice)
+            ]
+            for exchange in trajectory.exchanges.chat_completions:
+                choices.extend(exchange.response.choices)
+            for item in choices:
                 metadata = choice_moe_routing_metadata(item)
                 if metadata is None:
                     if require_routing_metadata:
