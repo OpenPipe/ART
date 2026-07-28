@@ -31,6 +31,7 @@ from art.trajectories import (
 )
 from art.trajectories._capture.core import _append_exchange, begin, reset
 from art.trajectories._protocols import Endpoint, build_exchange, endpoint_for_url
+from art.vllm_route_transport import HEADER, MAGIC, ROUTE_HEADER
 
 CHAT: dict[str, Any] = {
     "id": "chatcmpl-1",
@@ -135,6 +136,31 @@ MESSAGE: dict[str, Any] = {
     "token_ids": [2],
     "logprobs": [-0.2],
 }
+
+
+def test_routed_chat_capture_keeps_exact_token_ids() -> None:
+    payload = {**CHAT, "prompt_token_ids": [1]}
+    encoded = json.dumps(payload).encode()
+    body = (
+        HEADER.pack(MAGIC, len(encoded), 1)
+        + encoded
+        + ROUTE_HEADER.pack(0, 1, 1, 1, 1)
+        + b"\x03"
+    )
+
+    exchange = build_exchange(
+        "chat_completions",
+        {"model": "test/model", "messages": [{"role": "user", "content": "hi"}]},
+        body,
+        start_time=datetime.now(),
+        end_time=datetime.now(),
+    )
+
+    assert isinstance(exchange, ChatCompletionsExchange)
+    extra = exchange.response.choices[0].model_extra
+    assert extra is not None
+    assert extra["prompt_token_ids"] == [1]
+    assert extra["token_ids"] == [2]
 
 
 class _SyncChunks(httpx.SyncByteStream):
