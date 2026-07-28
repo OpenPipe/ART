@@ -21,6 +21,9 @@ static constexpr int64_t HYBRID_EP_DISPATCH_TX_DEPTH_EXTRA = 1;
 
 static inline bool hybrid_ep_token_capacity_is_valid(
     int max_num_of_tokens_per_rank, int num_of_nodes, const char* config_name) {
+#ifdef USE_NIXL
+  return true;
+#else
   if (num_of_nodes <= 1) {
     return true;
   }
@@ -47,6 +50,7 @@ static inline bool hybrid_ep_token_capacity_is_valid(
           static_cast<long>(HYBRID_EP_IB_QP_MAX_TX_DEPTH));
   fflush(stderr);
   return false;
+#endif
 }
 
 static inline int hybrid_ep_pad_num_of_tokens_per_rank(
