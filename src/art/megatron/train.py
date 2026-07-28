@@ -631,10 +631,34 @@ def execute_megatron_rl_job(
         num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
         topology = _infer_parallel_topology(runtime.model)
         has_local_loss_stage = any(chunk_post_process(chunk) for chunk in runtime.model)
+        hybridep_token_counts_by_step = (
+            [
+                build_rl_hybridep_token_counts(
+                    packed_tensors=packed_tensors,
+                    step_index=step_index,
+                    num_sequences=num_sequences,
+                    global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                    topology=topology,
+                    provider=runtime.provider,
+                    model_support_handler=runtime.model_support_handler,
+                )
+                for step_index in range(num_steps)
+            ]
+            if ps.get_expert_model_parallel_world_size() > 1
+            else None
+        )
         _ensure_hybridep_capacity(
             runtime,
             packed_sequence_length=packed_sequence_length,
             context_parallel_size=topology.cp,
+            required_capacity=max(
+                (
+                    count
+                    for step_counts in hybridep_token_counts_by_step or ()
+                    for count in step_counts
+                ),
+                default=0,
+            ),
         )
         ref_logprobs_by_index = _prepare_kl_reference_logprobs(
             runtime=runtime,
@@ -651,17 +675,9 @@ def execute_megatron_rl_job(
 
                 raise TrainingCancelledError("train job was cancelled")
             hybridep_token_counts = (
-                build_rl_hybridep_token_counts(
-                    packed_tensors=packed_tensors,
-                    step_index=step_index,
-                    num_sequences=num_sequences,
-                    global_grad_accumulation_sequences=global_grad_accumulation_sequences,
-                    topology=topology,
-                    provider=runtime.provider,
-                    model_support_handler=runtime.model_support_handler,
-                )
-                if ps.get_expert_model_parallel_world_size() > 1
-                else None
+                None
+                if hybridep_token_counts_by_step is None
+                else hybridep_token_counts_by_step[step_index]
             )
             micro_indices = build_micro_sample_indices(
                 step_index=step_index,
@@ -871,13 +887,6 @@ def run_megatron_sft_job(
             template = _clone_sft_tensors(trajectory_tensors[0])
             zero_template = _zero_contribution_sft_inputs(template)
             topology = _infer_parallel_topology(runtime.model)
-            _ensure_hybridep_capacity(
-                runtime,
-                packed_sequence_length=max(
-                    int(inputs["input_ids"].numel()) for inputs in trajectory_tensors
-                ),
-                context_parallel_size=topology.cp,
-            )
             hybridep_token_counts = (
                 build_sft_hybridep_token_counts(
                     trajectory_tensors=trajectory_tensors,
@@ -889,6 +898,14 @@ def run_megatron_sft_job(
                 )
                 if ps.get_expert_model_parallel_world_size() > 1
                 else None
+            )
+            _ensure_hybridep_capacity(
+                runtime,
+                packed_sequence_length=max(
+                    int(inputs["input_ids"].numel()) for inputs in trajectory_tensors
+                ),
+                context_parallel_size=topology.cp,
+                required_capacity=max(hybridep_token_counts or (), default=0),
             )
             micro_indices = build_micro_sample_indices(
                 step_index=0,
@@ -1482,9 +1499,8 @@ def _hybridep_token_capacity(
 ) -> int:
     from art.megatron.context_parallel.types import ContextParallelConfig
 
-    # HybridEP JIT keys include this capacity. A CP tree unit is at most one
-    # mean rank load and is assigned to the least-loaded rank, so twice the
-    # rounded mean is the layout-independent upper bound. Reserve it once.
+    # Reserve the normal near-balanced extent once; cost-aware CP plans can
+    # exceed it, so callers also provide their exact maximum planned extent.
     planner_chunk = ContextParallelConfig().planner_chunk_size
     mean_rank_load = (
         math.ceil(packed_sequence_length / (planner_chunk * context_parallel_size))
@@ -1498,14 +1514,16 @@ def _ensure_hybridep_capacity(
     *,
     packed_sequence_length: int,
     context_parallel_size: int,
+    required_capacity: int = 0,
 ) -> None:
     expert_parallel_size = ps.get_expert_model_parallel_world_size()
     if expert_parallel_size <= 1:
         return
     from megatron.core.transformer.moe import fused_a2a
 
-    token_capacity = _hybridep_token_capacity(
-        packed_sequence_length, context_parallel_size
+    token_capacity = max(
+        _hybridep_token_capacity(packed_sequence_length, context_parallel_size),
+        int(required_capacity),
     )
     current = fused_a2a._hybrid_ep_buffer
     if (
