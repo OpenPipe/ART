@@ -57,6 +57,10 @@ _INT_ENV_FIELDS = (
         "virtual_pipeline_model_parallel_size",
         "ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE",
     ),
+    (
+        "microbatch_group_size_per_vp_stage",
+        "ART_MEGATRON_VPP_MICROBATCH_GROUP_SIZE",
+    ),
     ("expert_model_parallel_size", "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE"),
     ("recompute_num_layers", "ART_MEGATRON_RECOMPUTE_NUM_LAYERS"),
 )
@@ -181,6 +185,7 @@ class _ProviderRuntimeEnv(BaseModel):
     context_parallel_size: int | None = None
     pipeline_model_parallel_size: int | None = None
     virtual_pipeline_model_parallel_size: int | None = None
+    microbatch_group_size_per_vp_stage: int | None = None
     expert_model_parallel_size: int | None = None
     expert_tensor_parallel_size: int | None = None
     recompute_granularity: Literal["full", "selective"] | None = None
@@ -540,6 +545,11 @@ def _apply_runtime_env_overrides(
         provider,
         runtime_env,
         "virtual_pipeline_model_parallel_size",
+    )
+    _apply_provider_attr_if_set(
+        provider,
+        runtime_env,
+        "microbatch_group_size_per_vp_stage",
     )
     _apply_provider_attr_if_value(provider, runtime_env, "expert_model_parallel_size")
     _apply_provider_attr_if_value(provider, runtime_env, "expert_tensor_parallel_size")

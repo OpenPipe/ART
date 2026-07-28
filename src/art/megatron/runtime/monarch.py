@@ -244,6 +244,10 @@ class MonarchTrainerActor(Actor):
             os.environ["ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE"] = str(
                 topology.vpp
             )
+        if topology.vpp_microbatch_group_size is not None:
+            os.environ["ART_MEGATRON_VPP_MICROBATCH_GROUP_SIZE"] = str(
+                topology.vpp_microbatch_group_size
+            )
         world_size = int(os.environ["WORLD_SIZE"])
         if world_size != len(runtime_spec.trainer_mesh.ranks):
             raise RuntimeError(

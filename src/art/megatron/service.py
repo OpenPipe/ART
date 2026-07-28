@@ -331,6 +331,10 @@ class MegatronService:
         }
         if topology.vpp is not None:
             env["ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE"] = str(topology.vpp)
+        if topology.vpp_microbatch_group_size is not None:
+            env["ART_MEGATRON_VPP_MICROBATCH_GROUP_SIZE"] = str(
+                topology.vpp_microbatch_group_size
+            )
         return env
 
     @staticmethod
@@ -341,6 +345,7 @@ class MegatronService:
             "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE",
             "ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE",
             "ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE",
+            "ART_MEGATRON_VPP_MICROBATCH_GROUP_SIZE",
             "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE",
         )
 

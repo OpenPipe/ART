@@ -38,7 +38,18 @@ class MegatronTopologyConfig(pydantic.BaseModel):
     ep: int = pydantic.Field(default_factory=_visible_device_count, ge=1)
     pp: int = pydantic.Field(default=1, ge=1)
     vpp: int | None = pydantic.Field(default=None, ge=1)
+    vpp_microbatch_group_size: int | None = pydantic.Field(default=None, ge=1)
     etp: int = pydantic.Field(default=1, ge=1)
+
+    @pydantic.model_validator(mode="after")
+    def _validate_vpp_group(self) -> "MegatronTopologyConfig":
+        if self.vpp_microbatch_group_size is None:
+            return self
+        if self.vpp is None:
+            raise ValueError("vpp_microbatch_group_size requires vpp")
+        if self.vpp_microbatch_group_size < self.pp:
+            raise ValueError("vpp_microbatch_group_size must be at least pp")
+        return self
 
 
 class MegatronRuntimeConfig(pydantic.BaseModel):
