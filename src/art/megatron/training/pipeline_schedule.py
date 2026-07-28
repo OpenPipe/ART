@@ -288,24 +288,23 @@ def validate_pipeline_topology(
         )
 
 
-def validate_fixed_microbatch_shapes(
+def validate_microbatch_shapes(
     shapes: Sequence[tuple[int, int]],
-) -> tuple[int, int]:
+) -> tuple[int, int, bool]:
     if not shapes:
         raise ValueError("MCore schedule requires at least one microbatch")
-    expected = shapes[0]
-    mismatches = [
-        (index, shape) for index, shape in enumerate(shapes) if shape != expected
+    invalid = [
+        (index, shape)
+        for index, shape in enumerate(shapes)
+        if shape[0] != 1 or shape[1] < 1
     ]
-    if mismatches:
+    if invalid:
         raise ValueError(
-            "MCore pipeline schedules require fixed [batch, sequence] shapes; "
-            f"expected={expected}, mismatches={mismatches}"
+            "ART pipeline microbatches must have [batch=1, sequence>0] shapes; "
+            f"invalid={invalid}"
         )
-    batch, sequence = expected
-    if batch < 1 or sequence < 1:
-        raise ValueError(f"Invalid fixed microbatch shape: {expected}")
-    return batch, sequence
+    sequence_lengths = {shape[1] for shape in shapes}
+    return 1, max(sequence_lengths), len(sequence_lengths) > 1
 
 
 def chunk_pre_process(model: torch.nn.Module) -> bool:
@@ -500,7 +499,11 @@ class MCoreScheduleAdapter(Generic[_T]):
         )
         self._active_activation_key: tuple[int, int] | None = None
         self.pp_size = int(ps.get_pipeline_model_parallel_world_size())
-        self.micro_batch_size, local_seq_length = validate_fixed_microbatch_shapes(
+        (
+            self.micro_batch_size,
+            local_seq_length,
+            self.variable_seq_lengths,
+        ) = validate_microbatch_shapes(
             [(int(value.shape[0]), int(value.shape[1])) for value in model_inputs]
         )
         self.seq_length = local_seq_length * (
@@ -567,7 +570,7 @@ class MCoreScheduleAdapter(Generic[_T]):
     def _configure(self) -> None:
         vpp_group: int | None = None
         for config in _model_configs(self.model_chunks):
-            config.variable_seq_lengths = False
+            config.variable_seq_lengths = self.pp_size > 1 and self.variable_seq_lengths
             if self.vp_size > 1:
                 group = int(
                     getattr(config, "microbatch_group_size_per_vp_stage", 0)
