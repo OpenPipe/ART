@@ -15,6 +15,7 @@ from monarch.spmd import SPMDActor
 from pydantic import BaseModel, ConfigDict
 
 from art.distributed.data_plane import PackedBatchLeaseSet
+from art.utils.cache_dirs import configure_model_cache_env
 from art.utils.lifecycle import cleanup_after_failure
 
 from .data_plane import InMemoryPackedBatch
@@ -208,9 +209,7 @@ class MonarchTrainerActor(Actor):
     ) -> None:
         runtime_spec = TrainerRuntimeSpec.model_validate_json(runtime_spec_json)
         topology = runtime_spec.trainer_mesh.topology
-        if runtime_spec.cache_root is not None:
-            os.environ["ART_MEGATRON_CACHE_ROOT"] = runtime_spec.cache_root
-            os.environ["XDG_CACHE_HOME"] = runtime_spec.cache_root
+        configure_model_cache_env(cache_root=runtime_spec.cache_root)
         os.environ.update(
             {
                 "MODEL_IDENTIFIER": runtime_spec.model_identifier,

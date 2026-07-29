@@ -20,7 +20,10 @@ import os
 
 from dotenv import load_dotenv
 
+from .utils.cache_dirs import configure_model_cache_env
+
 load_dotenv()
+configure_model_cache_env()
 
 if os.getenv("SUPPRESS_LITELLM_SERIALIZATION_WARNINGS", "1") == "1":
     from art.utils.suppress_litellm_serialization_warnings import (

@@ -150,8 +150,10 @@ def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_source_runtime(
     tmp_path: Path,
 ) -> None:
     runtime_root = tmp_path / "vllm_runtime"
+    cache_root = tmp_path / "node_cache"
     runtime_root.mkdir()
     monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_root))
     monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", "/shared/flashinfer")
     monkeypatch.setenv(
         "PYTHONPATH",
@@ -167,7 +169,7 @@ def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_source_runtime(
 
     assert env["PYTHONPATH"] == "/keep"
     assert env["FLASHINFER_WORKSPACE_BASE"] == str(
-        tmp_path / "scratch" / "vllm_runtime_flashinfer"
+        cache_root / "vllm_runtime" / "flashinfer_workspace"
     )
 
 

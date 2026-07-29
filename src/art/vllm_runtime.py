@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .utils.cache_dirs import configure_model_cache_env
 from .utils.lifecycle import (
     ChildProcessSupervisor,
     managed_process_cmd,
@@ -251,6 +252,7 @@ def _vllm_runtime_subprocess_env(
     make one runtime compile kernels from another runtime's venv.
     """
     env = os.environ.copy()
+    configure_model_cache_env(env)
     service_prefixes = {
         key.removesuffix("_SERVICE_HOST")
         for key in env
@@ -498,16 +500,13 @@ def get_vllm_runtime_cache_root() -> Path:
     override = os.environ.get("ART_VLLM_RUNTIME_CACHE_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".cache" / "art" / "vllm_runtime"
+    return configure_model_cache_env(os.environ.copy()) / "vllm_runtime"
 
 
 def _vllm_runtime_flashinfer_workspace_base() -> Path:
     override = os.environ.get(_ART_FLASHINFER_WORKSPACE_ENV)
     if override:
         return Path(override).expanduser()
-    runtime_root = get_vllm_runtime_project_root()
-    if runtime_root.exists():
-        return runtime_root.resolve().parent / "scratch" / "vllm_runtime_flashinfer"
     return get_vllm_runtime_cache_root().expanduser() / "flashinfer_workspace"
 
 
@@ -767,6 +766,7 @@ def _install_managed_runtime(
 
 
 def ensure_vllm_runtime() -> Path:
+    configure_model_cache_env()
     bundle_dir = _bundled_runtime_dir()
     manifest = _load_bundled_manifest(bundle_dir)
     manifest_hash = _manifest_hash(manifest)

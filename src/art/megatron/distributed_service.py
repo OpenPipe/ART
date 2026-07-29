@@ -388,16 +388,23 @@ class DistributedMegatronService:
         staging: str,
     ) -> AsyncIterator[AsyncIterator[Any]]:
         async with async_optimizer_model_lease(job.output.optimizer_state_path):
-            _, cancelled = await complete_to_thread(
-                lambda: _copy_checkpoint(source, staging)
-            )
-            if cancelled is not None:
-                raise cancelled
-            events = trainer.train(job, leases)
             try:
-                yield events
+                _, cancelled = await complete_to_thread(
+                    lambda: _copy_checkpoint(source, staging)
+                )
+                if cancelled is not None:
+                    raise cancelled
+                events = trainer.train(job, leases)
+                try:
+                    yield events
+                finally:
+                    await events.aclose()
             finally:
-                await events.aclose()
+                _, cancelled = await complete_to_thread(
+                    lambda: _remove_staging_checkpoint(staging)
+                )
+                if cancelled is not None:
+                    raise cancelled
 
     async def train_packed(
         self,
@@ -1289,12 +1296,26 @@ class DistributedMegatronService:
                 raise BaseExceptionGroup(
                     "distributed model service close failed", failures
                 )
+            _, cancelled = await complete_to_thread(
+                lambda: _remove_staging_root(self.output_dir)
+            )
+            if cancelled is not None:
+                raise cancelled
 
 
 def _copy_checkpoint(source: str, destination: str) -> None:
     if os.path.exists(destination):
         shutil.rmtree(destination)
     shutil.copytree(source, destination)
+
+
+def _remove_staging_checkpoint(staging: str) -> None:
+    if os.path.exists(staging):
+        shutil.rmtree(staging)
+
+
+def _remove_staging_root(output_dir: str) -> None:
+    _remove_staging_checkpoint(f"{output_dir}/megatron_runtime/staging")
 
 
 def _publish_checkpoint(staging: str, output_dir: str, step: int) -> OptimizerAdapter:

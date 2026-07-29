@@ -303,6 +303,11 @@ class MegatronService:
             Path(self.output_dir) / "megatron_runtime" / "staging" / f"{step:04d}"
         )
 
+    def _clear_staging_lora_dirs(self) -> None:
+        staging_root = Path(self.output_dir) / "megatron_runtime" / "staging"
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
+
     def _prepare_training_lora_dir(self, source_path: str, step: int) -> str:
         staging_dir = self._staging_lora_dir(step)
         if os.path.exists(staging_dir):
@@ -1382,6 +1387,7 @@ class MegatronService:
             self._child_processes.close()
             self._stop_vllm_subprocess()
             self._stop_megatron_process()
+            self._clear_staging_lora_dirs()
             self._clear_wake_lock()
         finally:
             self._restore_parent_signal_cleanup()
