@@ -1450,18 +1450,20 @@ def _optimizer_step(
     return update_successful, grad_norm, num_zeros_in_grad
 
 
-def _reduce_loss(
-    loss: torch.Tensor,
-    op: Any = torch.distributed.ReduceOp.AVG,  # ty: ignore[possibly-missing-attribute]
+def _reduce_loss_sum(
+    loss_sum: torch.Tensor,
+    token_count: torch.Tensor,
     group: Any | None = None,
 ) -> torch.Tensor:
-    reduced_loss = loss.detach().clone()
+    totals = torch.stack(
+        (loss_sum.detach(), token_count.to(dtype=loss_sum.dtype)),
+    )
     torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
-        reduced_loss,
-        op=op,
+        totals,
+        op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
         group=group,
     )
-    return reduced_loss
+    return totals[0] / totals[1].clamp_min(1.0)
 
 
 def _broadcast_from_pipeline_last(value: Any) -> Any:
@@ -2182,10 +2184,9 @@ def run_megatron_sft_step(
         model_chunks=model_chunks,
     )
     num_tokens = _local_trainable_sft_token_count_tensor(prepared_micros, device=device)
-    global_num_tokens = max(num_tokens.item(), 1.0)
-    reduced_loss = _reduce_loss(
-        raw_loss_sum / global_num_tokens,
-        op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
+    reduced_loss = _reduce_loss_sum(
+        raw_loss_sum,
+        num_tokens,
         group=ps.get_data_parallel_group(with_context_parallel=True),
     )
 
@@ -2407,10 +2408,9 @@ def run_training_step(
         model_support_handler=model_support_handler,
         model_chunks=model_chunks,
     )
-    global_num_tokens = max(token_count.item(), 1.0)
-    reduced_loss = _reduce_loss(
-        raw_loss_sum / global_num_tokens,
-        op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
+    reduced_loss = _reduce_loss_sum(
+        raw_loss_sum,
+        token_count,
         group=ps.get_data_parallel_group(with_context_parallel=True),
     )
 
