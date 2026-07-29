@@ -136,7 +136,9 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                 raise RuntimeError("ART Qwen3.5 Megatron training does not use MTP.")
             preprocess = gpt_module._preprocess
 
-            def preprocess_hook(*args, _preprocess=preprocess, **kwargs):
+            def preprocess_hook(
+                *args, _preprocess=preprocess, _gpt=gpt_module, **kwargs
+            ):
                 position_ids = kwargs.get("position_ids")
                 if isinstance(position_ids, torch.Tensor) and position_ids.ndim == 2:
                     kwargs = dict(kwargs)
@@ -145,15 +147,12 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                         position_ids.shape[0],
                         position_ids.shape[1],
                     )
-                rotary_pos_emb = getattr(gpt_module, "rotary_pos_emb", None)
+                rotary_pos_emb = getattr(_gpt, "rotary_pos_emb", None)
                 rotary_cp_group = getattr(rotary_pos_emb, "cp_group", None)
                 dispatched_local_cp_positions = (
                     isinstance(position_ids, torch.Tensor)
                     and position_ids.ndim == 2
-                    and _context_parallel_world_size(
-                        getattr(gpt_module, "config", None)
-                    )
-                    > 1
+                    and _context_parallel_world_size(getattr(_gpt, "config", None)) > 1
                     and rotary_cp_group is not None
                 )
                 if dispatched_local_cp_positions:
@@ -163,8 +162,12 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                 finally:
                     if dispatched_local_cp_positions:
                         setattr(rotary_pos_emb, "cp_group", rotary_cp_group)
-                decoder_input = cast(torch.Tensor, preproc_output[0])
-                if not decoder_input.requires_grad and decoder_input.is_leaf:
+                decoder_input = cast(torch.Tensor | None, preproc_output[0])
+                if (
+                    decoder_input is not None
+                    and decoder_input.is_leaf
+                    and not decoder_input.requires_grad
+                ):
                     decoder_input.requires_grad_(True)
                 return tuple(preproc_output)
 
