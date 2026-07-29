@@ -717,7 +717,15 @@ class MCoreScheduleAdapter(Generic[_T]):
                 raise RuntimeError("MCore schedule passed an unknown local model chunk")
             start = time.perf_counter()
             try:
-                return forward_step_func(data_iterator, model, *args)
+                result = forward_step_func(data_iterator, model, *args)
+                output = result[0]
+                if (
+                    self.pp_size > 1
+                    and isinstance(output, torch.Tensor)
+                    and output._base is not None
+                ):
+                    result = (output.clone(), *result[1:])
+                return result
             finally:
                 elapsed = time.perf_counter() - start
                 self.telemetry.forward_host_s_by_chunk[chunk] = (
