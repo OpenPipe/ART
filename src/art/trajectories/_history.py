@@ -196,12 +196,14 @@ def _lineage_prompt_sources(
     prompt: Sequence[_ItemT],
     defaults: Sequence[_SourceT | None],
     equivalent: Callable[[_ItemT, _ItemT], bool],
+    continuation: Callable[[_Branch[_ItemT, _SourceT, _ContextT]], bool] | None = None,
     prompt_keys: Sequence[object] | None = None,
 ) -> list[_SourceT | None]:
     candidates = [
         branch
         for branch in branches
         if len(branch.items) < len(prompt)
+        and (continuation is None or continuation(branch))
         and (
             list(prompt_keys[: len(branch.items)]) == branch.lineage_keys
             if prompt_keys is not None and branch.lineage_keys is not None
@@ -312,6 +314,50 @@ def _contains_tokens(tokens: Sequence[int], sampled: Sequence[int]) -> bool:
     )
 
 
+def _chat_exact_generation_extends(
+    branch: _Branch[Message, ChatCompletionsMessageSource, _ChatContext],
+    exchange: ChatCompletionsExchange,
+    prompt_length: int,
+) -> bool:
+    if not exchange.response.choices:
+        return True
+    from ._tokenize import _chat_choice_tokens
+
+    response_data = exchange.response.model_dump(mode="python")
+    prompt_ids, _, _ = _chat_choice_tokens(exchange.response.choices[0], response_data)
+    if prompt_ids is None:
+        return True
+    prior_source = next(
+        (
+            source
+            for source in reversed(branch.sources[:prompt_length])
+            if source is not None
+            and isinstance(source.exchange, ChatCompletionsExchange)
+            and source.choice_index is not None
+        ),
+        None,
+    )
+    if prior_source is None:
+        return True
+    prior_exchange = prior_source.exchange
+    if not isinstance(prior_exchange, ChatCompletionsExchange):
+        raise AssertionError("Native Chat history has a non-Chat source")
+    prior_response = prior_exchange.response
+    prior_choice = next(
+        choice
+        for choice in prior_response.choices
+        if choice.index == prior_source.choice_index
+    )
+    prior_prompt, prior_output, _ = _chat_choice_tokens(
+        prior_choice, prior_response.model_dump(mode="python")
+    )
+    return (
+        prior_prompt is None
+        or prior_output is None
+        or _is_prefix([*prior_prompt, *prior_output], prompt_ids)
+    )
+
+
 def _chat_retains_sampled_reasoning(
     branch: _Branch[Message, ChatCompletionsMessageSource, _ChatContext],
     exchange: ChatCompletionsExchange,
@@ -355,6 +401,66 @@ def _chat_retains_sampled_reasoning(
         if sampled_ids and not _contains_tokens(prompt_ids, sampled_ids):
             return False
     return True
+
+
+def _chat_drops_sampled_reasoning(
+    branch: _Branch[Message, ChatCompletionsMessageSource, _ChatContext],
+    prompt: Sequence[Message],
+) -> bool:
+    return any(
+        source is not None
+        and source.choice_index is not None
+        and bool(message.get("reasoning") or message.get("reasoning_content"))
+        and not bool(current.get("reasoning") or current.get("reasoning_content"))
+        for message, current, source in zip(
+            branch.items, prompt, branch.sources, strict=False
+        )
+    )
+
+
+def _anthropic_exact_generation_extends(
+    branch: _Branch[AnthropicMessageParam, AnthropicMessageSource, _AnthropicContext],
+    exchange: MessagesExchange,
+) -> bool:
+    from ._tokenize import _messages_tokens
+
+    prompt_ids, _, _ = _messages_tokens(exchange.response)
+    if prompt_ids is None:
+        return True
+    prior_source = next(
+        (
+            source
+            for source in reversed(branch.sources)
+            if source is not None and source.request_index is None
+        ),
+        None,
+    )
+    if prior_source is None:
+        return True
+    prior_prompt, prior_output, _ = _messages_tokens(prior_source.exchange.response)
+    return (
+        prior_prompt is None
+        or prior_output is None
+        or _is_prefix([*prior_prompt, *prior_output], prompt_ids)
+    )
+
+
+def _anthropic_drops_sampled_reasoning(
+    branch: _Branch[AnthropicMessageParam, AnthropicMessageSource, _AnthropicContext],
+    prompt: Sequence[AnthropicMessageParam],
+) -> bool:
+    return any(
+        source is not None
+        and source.request_index is None
+        and message != current
+        and any(
+            getattr(block, "type", None) in {"thinking", "redacted_thinking"}
+            for block in source.exchange.response.content
+        )
+        for message, current, source in zip(
+            branch.items, prompt, branch.sources, strict=False
+        )
+    )
 
 
 def _chat_message_key(message: Message, *, visible_only: bool = False) -> str:
@@ -403,7 +509,9 @@ def legacy_as_chat_completions_history(
 
 
 def chat_completions_histories(
-    trajectory: Trajectory, *, model: str | None
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
 ) -> list[ChatCompletionsHistory]:
     _require_unmixed(trajectory)
     if not trajectory.exchanges:
@@ -426,6 +534,13 @@ def chat_completions_histories(
             _Branch[Message, ChatCompletionsMessageSource, _ChatContext]
         ] = []
         for sequence, exchange in enumerate(exchanges):
+            context = _ChatContext(
+                tools=_TOOLS.validate_python(exchange.request.get("tools")),
+                template=exchange.request.get("chat_template"),
+                kwargs=_CHAT_KWARGS.validate_python(
+                    exchange.request.get("chat_template_kwargs")
+                ),
+            )
             prompt = [
                 cast(Message, normalize_chat_message(message))
                 for message in _MESSAGES.validate_python(
@@ -435,6 +550,18 @@ def chat_completions_histories(
             prompt_lineage_keys = [
                 _chat_message_key(message, visible_only=True) for message in prompt
             ]
+            exact_continuation = lambda branch: _chat_exact_generation_extends(
+                branch, exchange, len(prompt)
+            )
+            continuation = lambda branch: (
+                _chat_retains_sampled_reasoning(branch, exchange, len(prompt))
+                and (reconcile or exact_continuation(branch))
+            )
+            source_continuation = lambda branch: (
+                reconcile
+                or exact_continuation(branch)
+                or _chat_drops_sampled_reasoning(branch, prompt)
+            )
             prompt_sources = _lineage_prompt_sources(
                 branches,
                 prompt=prompt,
@@ -446,6 +573,7 @@ def chat_completions_histories(
                     _chat_message_key(left, visible_only=True)
                     == _chat_message_key(right, visible_only=True)
                 ),
+                continuation=source_continuation,
                 prompt_keys=prompt_lineage_keys,
             )
             outputs: list[
@@ -482,18 +610,10 @@ def chat_completions_histories(
                 prompt=prompt,
                 prompt_sources=prompt_sources,
                 outputs=outputs,
-                context=_ChatContext(
-                    tools=_TOOLS.validate_python(exchange.request.get("tools")),
-                    template=exchange.request.get("chat_template"),
-                    kwargs=_CHAT_KWARGS.validate_python(
-                        exchange.request.get("chat_template_kwargs")
-                    ),
-                ),
+                context=context,
                 sequence=sequence,
                 start_time=exchange.start_time,
-                continuation=lambda branch: _chat_retains_sampled_reasoning(
-                    branch, exchange, len(prompt)
-                ),
+                continuation=continuation,
                 prompt_lineage_keys=prompt_lineage_keys,
                 output_lineage_keys=output_lineage_keys,
             )
@@ -512,9 +632,11 @@ def chat_completions_histories(
 
 
 def chat_completions_history(
-    trajectory: Trajectory, *, model: str | None
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
 ) -> ChatCompletionsHistory:
-    histories = chat_completions_histories(trajectory, model=model)
+    histories = chat_completions_histories(trajectory, model, reconcile)
     if model is None and len({history.model for history in histories}) > 1:
         raise ValueError(
             "Chat Completions history requires exactly one model; pass model= to select one"
@@ -523,7 +645,9 @@ def chat_completions_history(
 
 
 def anthropic_messages_histories(
-    trajectory: Trajectory, *, model: str | None
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
 ) -> list[AnthropicMessagesHistory]:
     _require_unmixed(trajectory)
     histories: list[AnthropicMessagesHistory] = []
@@ -535,6 +659,14 @@ def anthropic_messages_histories(
         ] = []
         for sequence, exchange in enumerate(exchanges):
             prompt = _anthropic_prompt(exchange.request.get("messages", []))
+            exact_continuation = lambda branch: _anthropic_exact_generation_extends(
+                branch, exchange
+            )
+            continuation = lambda branch: reconcile or exact_continuation(branch)
+            source_continuation = lambda branch: (
+                continuation(branch)
+                or _anthropic_drops_sampled_reasoning(branch, prompt)
+            )
             prompt_sources = _lineage_prompt_sources(
                 branches,
                 prompt=prompt,
@@ -546,6 +678,7 @@ def anthropic_messages_histories(
                     _anthropic_message_key(left, visible_only=True)
                     == _anthropic_message_key(right, visible_only=True)
                 ),
+                continuation=source_continuation,
             )
             response = cast(
                 AnthropicMessageParam,
@@ -586,6 +719,7 @@ def anthropic_messages_histories(
                 context_source=(
                     exchange if exchange.request.get("system") is not None else None
                 ),
+                continuation=continuation,
             )
         for branch in sorted(branches, key=lambda item: (item.first_time, item.order)):
             histories.append(
@@ -656,9 +790,11 @@ def _anthropic_message_key(
 
 
 def anthropic_messages_history(
-    trajectory: Trajectory, *, model: str | None
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
 ) -> AnthropicMessagesHistory:
-    histories = anthropic_messages_histories(trajectory, model=model)
+    histories = anthropic_messages_histories(trajectory, model, reconcile)
     if model is None and len({history.model for history in histories}) > 1:
         raise ValueError(
             "Anthropic Messages history requires exactly one model; pass model= to select one"
@@ -685,7 +821,9 @@ def _copy_response_item(value: object) -> ResponseInputItemParam:
 
 
 def responses_histories(
-    trajectory: Trajectory, *, model: str | None
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
 ) -> list[ResponsesHistory]:
     _require_unmixed(trajectory)
     histories: list[ResponsesHistory] = []
@@ -804,6 +942,7 @@ def responses_histories(
                         _responses_generation_extends(
                             branch,
                             generation=generation,
+                            reconcile=reconcile,
                         )
                     )
                     extends = any(
@@ -828,13 +967,14 @@ def responses_histories(
                             )
                         ]
                         generation_prompt = [item for item, _ in retained]
+                        retained_sources = [source for _, source in retained]
                         generation_prompt_sources = [
-                            (
-                                replace(source, generation_index=None)
-                                if source is not None
-                                and source.exchange is exchange
-                                and source.generation_index is not None
-                                else source
+                            _responses_split_prompt_source(
+                                source,
+                                retained_sources=retained_sources,
+                                current_exchange=exchange,
+                                current_prompt_ids=generation.prompt_token_ids,
+                                reconcile=reconcile,
                             )
                             for _, source in retained
                         ]
@@ -963,6 +1103,7 @@ def _responses_generation_extends(
     branch: _Branch[ResponseInputItemParam, ResponsesItemSource, _ResponsesContext],
     *,
     generation: _ResponsesGeneration,
+    reconcile: bool,
 ) -> bool:
     prior_source = next(
         (
@@ -991,14 +1132,68 @@ def _responses_generation_extends(
         generation.prompt_token_ids,
     ):
         return True
+    if not reconcile:
+        return False
     return not any(
         getattr(prior_exchange.response.output[index], "type", None) == "reasoning"
         for index in prior.output_indices
     )
 
 
-def responses_history(trajectory: Trajectory, *, model: str | None) -> ResponsesHistory:
-    histories = responses_histories(trajectory, model=model)
+def _responses_split_prompt_source(
+    source: ResponsesItemSource | None,
+    *,
+    retained_sources: Sequence[ResponsesItemSource | None],
+    current_exchange: ResponsesExchange,
+    current_prompt_ids: Sequence[int],
+    reconcile: bool,
+) -> ResponsesItemSource | None:
+    if source is None or source.generation_index is None:
+        return source
+    if reconcile:
+        return (
+            replace(source, generation_index=None)
+            if source.exchange is current_exchange
+            else source
+        )
+    output = [
+        cast(
+            ResponseInputItemParam,
+            item.model_dump(mode="json", exclude_none=True),
+        )
+        for item in source.exchange.response.output
+    ]
+    generations, _ = _responses_generations(source.exchange, output=output)
+    if not 0 <= source.generation_index < len(generations):
+        raise ValueError("Responses generation source index is out of bounds")
+    generation = generations[source.generation_index]
+    retained_indices = {
+        item.output_index
+        for item in retained_sources
+        if item is not None
+        and item.exchange is source.exchange
+        and item.generation_index == source.generation_index
+        and item.output_index is not None
+    }
+    if retained_indices != set(generation.output_indices):
+        if _is_prefix(generation.prompt_token_ids, current_prompt_ids):
+            continuation = current_prompt_ids[len(generation.prompt_token_ids) :]
+            if any(
+                _is_prefix(generation.output_token_ids[start:], continuation)
+                for start in range(len(generation.output_token_ids))
+            ):
+                return source
+    if source.output_index is None and source.request_index is None:
+        return None
+    return replace(source, generation_index=None)
+
+
+def responses_history(
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
+) -> ResponsesHistory:
+    histories = responses_histories(trajectory, model, reconcile)
     if model is None and len({history.model for history in histories}) > 1:
         raise ValueError(
             "Responses history requires exactly one model; pass model= to select one"
@@ -1030,8 +1225,11 @@ def _completion_exact_tokens(
 
 
 def completions_token_histories(
-    trajectory: Trajectory, *, model: str | None
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
 ) -> list[CompletionsTokenHistory]:
+    del reconcile
     _require_unmixed(trajectory)
     histories: list[CompletionsTokenHistory] = []
     for selected_model, exchanges in _selected_models(
@@ -1101,10 +1299,12 @@ def completions_token_histories(
 
 
 def completions_token_history(
-    trajectory: Trajectory, *, model: str | None
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
 ) -> CompletionsTokenHistory:
     return _one(
-        completions_token_histories(trajectory, model=model),
+        completions_token_histories(trajectory, model, reconcile),
         "Completions token history",
     )
 
@@ -1227,8 +1427,38 @@ def _completion_choice_groups(
     return groups
 
 
+def _completions_generation_extends(
+    branch: _Branch[str, CompletionsSource, tuple[()]],
+    *,
+    prompt_ids: list[int] | None,
+    reconcile: bool,
+) -> bool:
+    if reconcile or prompt_ids is None:
+        return True
+    prior_source = next(
+        (
+            source
+            for source in reversed(branch.sources)
+            if source is not None and source.choice_index is not None
+        ),
+        None,
+    )
+    if prior_source is None or prior_source.choice_index is None:
+        return True
+    prior_prompt, prior_output = _completion_exact_tokens(
+        prior_source.exchange, prior_source.choice_index
+    )
+    return (
+        prior_prompt is None
+        or prior_output is None
+        or _is_prefix([*prior_prompt, *prior_output], prompt_ids)
+    )
+
+
 def completions_string_histories(
-    trajectory: Trajectory, *, model: str | None
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
 ) -> list[CompletionsStringHistory]:
     _require_unmixed(trajectory)
     histories: list[CompletionsStringHistory] = []
@@ -1263,6 +1493,7 @@ def completions_string_histories(
                         prompt_index=prompt_index,
                         choice_index=choice.index,
                     )
+                    prompt_ids, _ = _completion_exact_tokens(exchange, choice.index)
                     _extend_branches(
                         branches,
                         prompt=list(prompt),
@@ -1277,6 +1508,11 @@ def completions_string_histories(
                         context=(),
                         sequence=sequence,
                         start_time=exchange.start_time,
+                        continuation=lambda branch: _completions_generation_extends(
+                            branch,
+                            prompt_ids=prompt_ids,
+                            reconcile=reconcile,
+                        ),
                     )
         if not complete:
             raise ValueError(
@@ -1297,10 +1533,12 @@ def completions_string_histories(
 
 
 def completions_string_history(
-    trajectory: Trajectory, *, model: str | None
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
 ) -> CompletionsStringHistory:
     return _one(
-        completions_string_histories(trajectory, model=model),
+        completions_string_histories(trajectory, model, reconcile),
         "Completions string history",
     )
 
@@ -1572,7 +1810,9 @@ def responses_as_chat_completions_history(
 
 
 def trajectory_histories(
-    trajectory: Trajectory, *, model: str | None
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
 ) -> list[TrajectoryHistory]:
     _require_unmixed(trajectory)
     if not trajectory.exchanges:
@@ -1603,18 +1843,20 @@ def trajectory_histories(
 
     candidates: list[TrajectoryHistory] = []
     if any(is_selected(exchange) for exchange in trajectory.exchanges.chat_completions):
-        candidates.extend(chat_completions_histories(trajectory, model=model))
+        candidates.extend(chat_completions_histories(trajectory, model, reconcile))
     if any(is_selected(exchange) for exchange in trajectory.exchanges.completions):
         try:
-            candidates.extend(completions_token_histories(trajectory, model=model))
+            candidates.extend(completions_token_histories(trajectory, model, reconcile))
         except ValueError as error:
             if "requires exact token IDs" not in str(error):
                 raise
-            candidates.extend(completions_string_histories(trajectory, model=model))
+            candidates.extend(
+                completions_string_histories(trajectory, model, reconcile)
+            )
     if any(is_selected(exchange) for exchange in trajectory.exchanges.responses):
-        candidates.extend(responses_histories(trajectory, model=model))
+        candidates.extend(responses_histories(trajectory, model, reconcile))
     if any(is_selected(exchange) for exchange in trajectory.exchanges.messages):
-        candidates.extend(anthropic_messages_histories(trajectory, model=model))
+        candidates.extend(anthropic_messages_histories(trajectory, model, reconcile))
     if not candidates:
         suffix = f" for model {model!r}" if model is not None else ""
         raise ValueError(f"Trajectory contains no exchanges{suffix}")
@@ -1627,9 +1869,11 @@ def trajectory_histories(
 
 
 def trajectory_history(
-    trajectory: Trajectory, *, model: str | None
+    trajectory: Trajectory,
+    model: str | None,
+    reconcile: bool = False,
 ) -> TrajectoryHistory:
-    histories = trajectory_histories(trajectory, model=model)
+    histories = trajectory_histories(trajectory, model, reconcile)
     if (
         model is None
         and len(

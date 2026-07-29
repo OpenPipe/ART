@@ -755,6 +755,15 @@ def tokenize_trajectory_groups(
                     chat_template=None,
                     chat_template_kwargs=chat_template_kwargs,
                 )
+                if any(
+                    not (flag & TokenFlag.EXACT)
+                    for history in exchange_results.histories
+                    for flag in history.flags
+                ):
+                    raise RuntimeError(
+                        "Exchange training requires exact inference-provided token IDs; "
+                        "local tokenization or chat-template rendering was required."
+                    )
                 trajectory_results = []
                 seen_source_keys: set[_SampledSourceKey] = set()
                 for exchange_result, trace in zip(

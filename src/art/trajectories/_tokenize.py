@@ -2663,24 +2663,35 @@ def _history_matches_projection(history: History) -> bool:
     )
     if isinstance(history, ChatCompletionsHistory):
         try:
-            candidates: Sequence[History] = chat_completions_histories(
-                trajectory, model=history.model
-            )
+            candidates: Sequence[History] = [
+                *chat_completions_histories(trajectory, model=history.model),
+                *chat_completions_histories(
+                    trajectory,
+                    model=history.model,
+                    reconcile=True,
+                ),
+            ]
         except ValueError as error:
             if "no Chat Completions exchanges" not in str(error):
                 raise
             if trajectory.exchanges.messages and not trajectory.exchanges.responses:
                 candidates = [
                     candidate.as_chat_completions_history()
+                    for reconcile in (False, True)
                     for candidate in anthropic_messages_histories(
-                        trajectory, model=history.model
+                        trajectory,
+                        model=history.model,
+                        reconcile=reconcile,
                     )
                 ]
             elif trajectory.exchanges.responses and not trajectory.exchanges.messages:
                 candidates = [
                     candidate.as_chat_completions_history()
+                    for reconcile in (False, True)
                     for candidate in responses_histories(
-                        trajectory, model=history.model
+                        trajectory,
+                        model=history.model,
+                        reconcile=reconcile,
                     )
                 ]
             else:
@@ -2695,7 +2706,14 @@ def _history_matches_projection(history: History) -> bool:
             for candidate in candidates
         )
     if isinstance(history, AnthropicMessagesHistory):
-        candidates = anthropic_messages_histories(trajectory, model=history.model)
+        candidates = [
+            *anthropic_messages_histories(trajectory, model=history.model),
+            *anthropic_messages_histories(
+                trajectory,
+                model=history.model,
+                reconcile=True,
+            ),
+        ]
         return any(
             isinstance(candidate, AnthropicMessagesHistory)
             and candidate.messages == history.messages
@@ -2707,7 +2725,14 @@ def _history_matches_projection(history: History) -> bool:
             for candidate in candidates
         )
     if isinstance(history, ResponsesHistory):
-        candidates = responses_histories(trajectory, model=history.model)
+        candidates = [
+            *responses_histories(trajectory, model=history.model),
+            *responses_histories(
+                trajectory,
+                model=history.model,
+                reconcile=True,
+            ),
+        ]
         return any(
             isinstance(candidate, ResponsesHistory)
             and candidate.input == history.input

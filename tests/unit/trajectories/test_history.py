@@ -4,7 +4,7 @@ from statistics import median
 from time import perf_counter
 from typing import Any, cast
 
-from anthropic.types import Message
+from anthropic.types import Message, MessageParam
 from openai.types import Completion
 from openai.types.chat import ChatCompletion
 from openai.types.responses import Response
@@ -1413,6 +1413,83 @@ def test_chat_template_stripped_reasoning_splits_exact_histories() -> None:
     assert histories[1].message_sources[1].choice_index == 0
     with pytest.raises(ValueError, match="exactly one history"):
         trajectory.tokenize()
+
+
+def test_anthropic_tokenization_disagreement_splits_unless_reconciled() -> None:
+    def exchange(
+        offset: int,
+        messages: list[MessageParam],
+        answer: str,
+        prompt_token_ids: list[int],
+        token_ids: list[int],
+    ) -> MessagesExchange:
+        start, end = _times(offset)
+        return MessagesExchange(
+            request=MessagesRequest(
+                model="test/model",
+                messages=messages,
+                max_tokens=16,
+            ),
+            response=Message.model_validate(
+                {
+                    "id": f"message-{offset}",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "test/model",
+                    "content": [{"type": "text", "text": answer}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": len(prompt_token_ids),
+                        "output_tokens": 1,
+                    },
+                    "prompt_token_ids": prompt_token_ids,
+                    "token_ids": token_ids,
+                    "logprobs": [-0.1] * len(token_ids),
+                }
+            ),
+            start_time=start,
+            end_time=end,
+        )
+
+    first = exchange(
+        0,
+        [{"role": "user", "content": "one"}],
+        "cat",
+        [1],
+        [101],
+    )
+    second = exchange(
+        1,
+        [
+            {"role": "user", "content": "one"},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "cat"}],
+            },
+            {"role": "user", "content": "two"},
+        ],
+        "dog",
+        [1, 500, 3],
+        [4],
+    )
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(messages=[first, second]))
+
+    histories = trajectory.anthropic_messages_histories()
+    assert len(histories) == 2
+    second_source = histories[1].message_sources[1]
+    assert second_source is not None
+    assert second_source.exchange is second
+    assert second_source.request_index == 1
+
+    reconciled = trajectory.anthropic_messages_history(
+        reconcile_text_equivalent_tokenizations=True
+    )
+    first_source = reconciled.message_sources[1]
+    assert first_source is not None
+    assert first_source.exchange is first
+    assert first_source.request_index is None
+    assert len(trajectory.histories(reconcile_text_equivalent_tokenizations=True)) == 1
 
 
 def test_reasoning_stripped_tool_call_keeps_first_sampled_source() -> None:

@@ -511,84 +511,145 @@ class Trajectory(_CompactModel):
     def __str__(self) -> str:
         return f"Trajectory(reward={self.reward}, metrics={self.metrics}, metadata={self.metadata})"
 
-    # Every model selector accepts an exact identity or a shell-style pattern.
+    # Model selectors accept exact identities or shell patterns. Reconciliation
+    # opts into merging text-equivalent histories with different served token IDs.
     def chat_completions_history(
-        self, *, model: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
     ) -> ChatCompletionsHistory:
         from ._history import chat_completions_history
 
-        return chat_completions_history(self, model=model)
+        return chat_completions_history(
+            self, model, reconcile_text_equivalent_tokenizations
+        )
 
     def chat_completions_histories(
-        self, *, model: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
     ) -> list[ChatCompletionsHistory]:
         from ._history import chat_completions_histories
 
-        return chat_completions_histories(self, model=model)
+        return chat_completions_histories(
+            self, model, reconcile_text_equivalent_tokenizations
+        )
 
     def anthropic_messages_history(
-        self, *, model: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
     ) -> AnthropicMessagesHistory:
         from ._history import anthropic_messages_history
 
-        return anthropic_messages_history(self, model=model)
+        return anthropic_messages_history(
+            self, model, reconcile_text_equivalent_tokenizations
+        )
 
     def anthropic_messages_histories(
-        self, *, model: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
     ) -> list[AnthropicMessagesHistory]:
         from ._history import anthropic_messages_histories
 
-        return anthropic_messages_histories(self, model=model)
+        return anthropic_messages_histories(
+            self, model, reconcile_text_equivalent_tokenizations
+        )
 
-    def responses_history(self, *, model: str | None = None) -> ResponsesHistory:
+    def responses_history(
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
+    ) -> ResponsesHistory:
         from ._history import responses_history
 
-        return responses_history(self, model=model)
+        return responses_history(self, model, reconcile_text_equivalent_tokenizations)
 
     def responses_histories(
-        self, *, model: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
     ) -> list[ResponsesHistory]:
         from ._history import responses_histories
 
-        return responses_histories(self, model=model)
+        return responses_histories(self, model, reconcile_text_equivalent_tokenizations)
 
     def completions_token_history(
-        self, *, model: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
     ) -> CompletionsTokenHistory:
         from ._history import completions_token_history
 
-        return completions_token_history(self, model=model)
+        return completions_token_history(
+            self, model, reconcile_text_equivalent_tokenizations
+        )
 
     def completions_token_histories(
-        self, *, model: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
     ) -> list[CompletionsTokenHistory]:
         from ._history import completions_token_histories
 
-        return completions_token_histories(self, model=model)
+        return completions_token_histories(
+            self, model, reconcile_text_equivalent_tokenizations
+        )
 
     def completions_string_history(
-        self, *, model: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
     ) -> CompletionsStringHistory:
         from ._history import completions_string_history
 
-        return completions_string_history(self, model=model)
+        return completions_string_history(
+            self, model, reconcile_text_equivalent_tokenizations
+        )
 
     def completions_string_histories(
-        self, *, model: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
     ) -> list[CompletionsStringHistory]:
         from ._history import completions_string_histories
 
-        return completions_string_histories(self, model=model)
+        return completions_string_histories(
+            self, model, reconcile_text_equivalent_tokenizations
+        )
 
-    def history(self, *, model: str | None = None) -> TrajectoryHistory:
+    def history(
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
+    ) -> TrajectoryHistory:
         from ._history import trajectory_history
 
-        return trajectory_history(self, model=model)
+        return trajectory_history(self, model, reconcile_text_equivalent_tokenizations)
 
-    def histories(self, *, model: str | None = None) -> list[TrajectoryHistory]:
+    def histories(
+        self,
+        *,
+        model: str | None = None,
+        reconcile_text_equivalent_tokenizations: bool = False,
+    ) -> list[TrajectoryHistory]:
         from ._history import trajectory_histories
 
-        return trajectory_histories(self, model=model)
+        return trajectory_histories(
+            self, model, reconcile_text_equivalent_tokenizations
+        )
 
     @overload
     def tokenize(

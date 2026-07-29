@@ -2698,7 +2698,7 @@ def test_responses_token_generations_preserve_every_generation() -> None:
     ]
 
 
-def test_responses_prompt_disagreement_preserves_sampled_token_identity(
+def test_responses_prompt_disagreement_splits_unless_reconciled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     exchange = _response_exchange("retokenized-generation", 101)
@@ -2732,9 +2732,16 @@ def test_responses_prompt_disagreement_preserves_sampled_token_identity(
         },
     ]
     exchange.response = Response.model_validate(data)
-    history = art.Trajectory(
-        exchanges=TrajectoryExchanges(responses=[exchange])
-    ).responses_history()
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+    histories = trajectory.responses_histories()
+    assert len(histories) == 2
+    assert [history.tokenize().token_ids for history in histories] == [
+        [1, 101],
+        [1, 500, 3, 4],
+    ]
+    with pytest.raises(ValueError, match="exactly one history"):
+        trajectory.responses_history()
+    history = trajectory.responses_history(reconcile_text_equivalent_tokenizations=True)
 
     class Tokenizer:
         def __call__(self, text: str, **kwargs: object) -> list[int]:
@@ -3013,7 +3020,7 @@ def test_responses_previous_response_id_resolves_local_history(
     ).token_ids == [10, 20, 11, 30]
 
 
-def test_prefix_retokenization_preserves_sampled_ids_and_logprobs(
+def test_chat_prefix_retokenization_splits_unless_reconciled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first = _chat_exchange([1], [101, 102])
@@ -3048,9 +3055,20 @@ def test_prefix_retokenization_preserves_sampled_ids_and_logprobs(
     trajectory = art.Trajectory(
         exchanges=TrajectoryExchanges(chat_completions=[first, second])
     )
+    histories = trajectory.chat_completions_histories()
+    assert len(histories) == 2
+    assert [history.tokenize().token_ids for history in histories] == [
+        [1, 101, 102],
+        [1, 500, 3, 4],
+    ]
+    with pytest.raises(ValueError, match="exactly one history"):
+        trajectory.history()
+    history = trajectory.chat_completions_history(
+        reconcile_text_equivalent_tokenizations=True
+    )
 
     with pytest.warns(UserWarning, match="preserved the original sampled token IDs"):
-        tokenized = trajectory.tokenize(base_model="base/model")
+        tokenized = history.tokenize(base_model="base/model")
 
     assert tokenized.token_ids == [1, 101, 102, 3, 4]
     assert tokenized.logprobs[1:3] == [-10.1, -10.2]
@@ -3856,7 +3874,10 @@ def test_chat_view_preserves_initial_prompt_and_ignores_later_disagreement() -> 
                 token for message in messages for token in self(str(message["content"]))
             ]
 
-    tokenized = trajectory.tokenize(tokenizer=Tokenizer())
+    history = trajectory.chat_completions_history(
+        reconcile_text_equivalent_tokenizations=True
+    )
+    tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.token_ids == [1, 2, 7, 3]
 
@@ -4115,7 +4136,7 @@ def test_reasoning_stripped_tool_call_keeps_exact_evidence_for_strict_training(
     assert len(datums) == 4
 
 
-def test_responses_prompt_repair_uses_native_text_and_source_position() -> None:
+def test_responses_prompt_repair_opt_in_uses_native_text_and_source_position() -> None:
     exchange = _response_exchange("repeated-retokenization", 101)
     data = exchange.response.model_dump(mode="python")
     data["output"].append(
@@ -4147,9 +4168,9 @@ def test_responses_prompt_repair_uses_native_text_and_source_position() -> None:
         },
     ]
     exchange.response = Response.model_validate(data)
-    history = art.Trajectory(
-        exchanges=TrajectoryExchanges(responses=[exchange])
-    ).responses_history()
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+    assert len(trajectory.responses_histories()) == 2
+    history = trajectory.responses_history(reconcile_text_equivalent_tokenizations=True)
 
     class Tokenizer:
         def __call__(self, text: str, **kwargs: object) -> list[int]:
@@ -5344,7 +5365,7 @@ def test_completions_history_requires_exhaustive_source_spans() -> None:
         history.tokenize()
 
 
-def test_exchange_trajectories_feed_existing_training_tokenizer(
+def test_exchange_training_rejects_locally_tokenized_exchange(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from art.preprocessing.tokenize import tokenize_trajectory_groups
@@ -5396,20 +5417,68 @@ def test_exchange_trajectories_feed_existing_training_tokenizer(
     )
     tokenizer = Tokenizer()
 
+    with pytest.raises(
+        RuntimeError,
+        match="requires exact inference-provided token IDs",
+    ):
+        list(
+            tokenize_trajectory_groups(
+                tokenizer,  # type: ignore[arg-type, ty:invalid-argument-type]
+                [group],
+                allow_training_without_logprobs=True,
+                scale_rewards=False,
+                shuffle_group_trajectories=False,
+                chat_template_kwargs={"serverless": True},
+            )
+        )
+    assert all(call["serverless"] is True for call in tokenizer.calls)
+
+
+def test_exchange_training_accepts_exact_split_tokenizations() -> None:
+    from art.preprocessing.tokenize import tokenize_trajectory_groups
+
+    def trajectory(reward: float) -> art.Trajectory:
+        first = _chat_exchange([1], [101])
+        first.response.choices[0].message.content = "cat"
+        second = _chat_exchange([1, 500, 3], [4], offset=1)
+        second.request["messages"] = [
+            {"role": "user", "content": "turn 0"},
+            {"role": "assistant", "content": "cat"},
+            {"role": "user", "content": "turn 1"},
+        ]
+        return art.Trajectory(
+            exchanges=TrajectoryExchanges(chat_completions=[first, second]),
+            reward=reward,
+        )
+
+    class Tokenizer:
+        name_or_path = "test/model"
+
+        def decode(self, token_id: int) -> str:
+            return str(token_id)
+
     results = list(
         tokenize_trajectory_groups(
-            tokenizer,  # type: ignore[arg-type, ty:invalid-argument-type]
-            [group],
-            allow_training_without_logprobs=True,
+            Tokenizer(),  # type: ignore[arg-type, ty:invalid-argument-type]
+            [art.TrajectoryGroup([trajectory(1.0), trajectory(0.0)])],
+            allow_training_without_logprobs=False,
             scale_rewards=False,
             shuffle_group_trajectories=False,
-            chat_template_kwargs={"serverless": True},
         )
     )
 
-    assert [result.token_ids for result in results] == [[1, 2], [1, 3]]
-    assert [result.assistant_mask for result in results] == [[0, 1], [0, 1]]
-    assert all(call["serverless"] is True for call in tokenizer.calls)
+    assert [result.token_ids for result in results] == [
+        [1, 101],
+        [1, 500, 3, 4],
+        [1, 101],
+        [1, 500, 3, 4],
+    ]
+    assert [result.assistant_mask for result in results] == [
+        [0, 1],
+        [0, 0, 0, 1],
+        [0, 1],
+        [0, 0, 0, 1],
+    ]
 
 
 def test_exchange_training_requires_logprobs_unless_allowed() -> None:
