@@ -174,10 +174,8 @@ def _set_deterministic_seed(seed: int) -> None:
 
 def provider_topology_env_vars(topology: Topology) -> dict[str, str]:
     return {
-        _TOPOLOGY_ENV_VARS["tp"]: str(topology.tp),
-        _TOPOLOGY_ENV_VARS["cp"]: str(topology.cp),
-        _TOPOLOGY_ENV_VARS["ep"]: str(topology.ep),
-        _TOPOLOGY_ENV_VARS["etp"]: str(topology.etp),
+        env_var: str(getattr(topology, field))
+        for field, env_var in _TOPOLOGY_ENV_VARS.items()
     }
 
 
