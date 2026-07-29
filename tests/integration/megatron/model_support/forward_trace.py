@@ -86,11 +86,13 @@ def _normalize_trace_module_name(module_name: str) -> str:
 def _global_trace_module_name(
     module_name: str,
     module_by_name: dict[str, Any],
+    *,
+    chunk_index: int,
 ) -> str:
     local_layer_index = _module_layer_index(module_name)
     normalized = _normalize_trace_module_name(module_name)
     if local_layer_index is None:
-        return normalized
+        return f"chunk{chunk_index}.{normalized}"
     marker = "decoder.layers."
     marker_index = module_name.find(marker)
     layer_name_end = marker_index + len(marker) + len(str(local_layer_index))
@@ -105,10 +107,11 @@ def _global_trace_module_name(
     normalized_marker_index = normalized.find(marker)
     normalized_layer_start = normalized_marker_index + len(marker)
     normalized_layer_end = normalized_layer_start + len(str(local_layer_index))
-    return (
-        normalized[:normalized_layer_start]
-        + str(int(layer_number) - 1)
-        + normalized[normalized_layer_end:]
+    return "chunk{}.{}{}{}".format(
+        chunk_index,
+        normalized[:normalized_layer_start],
+        int(layer_number) - 1,
+        normalized[normalized_layer_end:],
     )
 
 
@@ -382,7 +385,7 @@ class ForwardTraceCapture:
             self._hook_handles.append(
                 root_module.register_forward_hook(_trace_hook(self._root_post_hook))
             )
-        for chunk in model_chunks:
+        for chunk_index, chunk in enumerate(model_chunks):
             named_modules = list(chunk.named_modules())
             module_by_name = dict(named_modules)
             for module_name, module in named_modules:
@@ -396,6 +399,7 @@ class ForwardTraceCapture:
                 trace_module_name = _global_trace_module_name(
                     module_name,
                     module_by_name,
+                    chunk_index=chunk_index,
                 )
                 metadata = self._build_module_trace_metadata(
                     module_name=module_name,
