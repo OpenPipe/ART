@@ -176,6 +176,7 @@ def provider_topology_env_vars(topology: Topology) -> dict[str, str]:
     return {
         env_var: str(getattr(topology, field))
         for field, env_var in _TOPOLOGY_ENV_VARS.items()
+        if field != "vpp" or topology.vpp > 1
     }
 
 
