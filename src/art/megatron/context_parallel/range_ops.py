@@ -196,7 +196,7 @@ def _range_meta(
         dtype=torch.int64,
     )
     cu_range_sizes = torch.cumsum(range_sizes, dim=0)
-    total_size = int(cu_range_sizes[-1].item())
+    total_size = sum(range_.size() for range_ in compact)
     row_map = torch.repeat_interleave(
         torch.arange(len(compact), device=device, dtype=torch.int64),
         range_sizes[1:],
