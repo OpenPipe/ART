@@ -987,9 +987,10 @@ def test_oracle_topologies_are_the_compact_cp_validation_matrix() -> None:
         Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
         Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False),
         Topology(tp=2, ep=2, etp=1, dp=1, cp=2, sp=True),
+        Topology(tp=1, ep=2, etp=1, dp=1, cp=2, pp=2, vpp=2, sp=False),
         Topology(tp=2, ep=4, etp=2, dp=2, cp=2, sp=True),
     ]
-    assert [topology.world_size() for topology in TOPOLOGIES] == [1, 2, 4, 8]
+    assert [topology.world_size() for topology in TOPOLOGIES] == [1, 2, 4, 4, 8]
 
 
 def test_dense_topologies_include_vllm_separation_and_cp_coverage() -> None:
