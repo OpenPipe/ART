@@ -16,7 +16,13 @@ from rich.console import Console
 from rich.table import Table
 import torch
 
-from art.megatron.routing_replay import ROUTER_KEY_FORMAT_VERSION
+from art.megatron.routing_replay import (
+    ROUTER_KEY_FORMAT_VERSION,
+    MoeRoutingReplayBundle,
+)
+from art.megatron.routing_replay import (
+    ParallelTopology as ReplayParallelTopology,
+)
 from art.megatron.training.streaming_weight_offload import StreamingWeightOffloadConfig
 
 from ..artifacts import GitRepoState, pinned_git_state
@@ -910,6 +916,25 @@ def _replace_topology_dir(path: Path) -> None:
     (path / "traces").mkdir(parents=True, exist_ok=True)
 
 
+def _replay_bundle_for_topology(
+    source: Path,
+    *,
+    topology: Topology,
+    output_dir: Path,
+) -> Path:
+    bundle = MoeRoutingReplayBundle.from_dir(source)
+    runtime_topology = ReplayParallelTopology.model_validate(
+        topology.model_dump(
+            include={"tp", "ep", "etp", "dp", "sp", "cp", "pp", "vpp"},
+            mode="python",
+        )
+    )
+    if bundle.topology == runtime_topology:
+        return source
+    bundle.model_copy(update={"topology": runtime_topology}).to_dir(output_dir)
+    return output_dir
+
+
 def _prune_topology_artifacts(path: Path) -> None:
     """Keeps small diagnostics and removes tensors that are only needed for comparison."""
     if keep_topology_artifacts() or not path.exists():
@@ -1291,6 +1316,12 @@ class VariantRunner:
         ):
             return topology_dir
         _replace_topology_dir(topology_dir)
+        if replay_bundle_dir is not None:
+            replay_bundle_dir = _replay_bundle_for_topology(
+                replay_bundle_dir,
+                topology=topology,
+                output_dir=topology_dir / "moe_routing_replay",
+            )
         run_case_config = self.case_config
         request = WorkerRunRequest(
             git=self.git,
