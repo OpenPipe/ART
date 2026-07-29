@@ -2761,6 +2761,62 @@ def test_responses_prompt_disagreement_splits_unless_reconciled(
     assert tokenized.logprobs[1] == -0.1
 
 
+def test_responses_split_preserves_unchanged_prior_generation_provenance() -> None:
+    exchange = _response_exchange("partially-divergent-generations", 2)
+    data = exchange.response.model_dump(mode="python")
+    data["output"] = [
+        {
+            "id": f"message-{index}",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            ],
+        }
+        for index, text in enumerate(("cat", "dog", "fox"))
+    ]
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [{"token_id": 2, "logprob": -0.2, "text": "cat"}],
+            "output_indices": [0],
+        },
+        {
+            "prompt_token_ids": [1, 2, 3],
+            "output_tokens": [{"token_id": 4, "logprob": -0.4, "text": "dog"}],
+            "output_indices": [1],
+        },
+        {
+            "prompt_token_ids": [1, 2, 3, 500, 5],
+            "output_tokens": [{"token_id": 6, "logprob": -0.6, "text": "fox"}],
+            "output_indices": [2],
+        },
+    ]
+    exchange.response = Response.model_validate(data)
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+
+    histories = trajectory.responses_histories()
+    final = next(
+        history
+        for history in histories
+        if history.input_sources[-1] is not None
+        and history.input_sources[-1].generation_index == 2
+    )
+    tokenized = final.tokenize()
+
+    assert tokenized.token_ids == [1, 2, 3, 500, 5, 6]
+    assert tokenized.flags[1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+    assert tokenized.logprobs[1] == -0.2
+    assert tokenized.flags[3] == art.TokenFlag.EXACT
+    assert math.isnan(tokenized.logprobs[3])
+
+
 @pytest.mark.parametrize(
     "token_generations, match",
     [
@@ -3073,6 +3129,17 @@ def test_chat_prefix_retokenization_splits_unless_reconciled(
     assert tokenized.token_ids == [1, 101, 102, 3, 4]
     assert tokenized.logprobs[1:3] == [-10.1, -10.2]
     assert all(tokenized.flags[index] & art.TokenFlag.EXACT for index in (1, 2, 4))
+
+    direct = trajectory.tokenize(
+        reconcile_text_equivalent_tokenizations=True,
+        base_model="base/model",
+    )
+    grouped = art.TrajectoryGroup([trajectory]).tokenize(
+        reconcile_text_equivalent_tokenizations=True,
+        base_model="base/model",
+    )
+    assert direct.token_ids == tokenized.token_ids
+    assert grouped.trajectories[0].token_ids == tokenized.token_ids
 
 
 def test_template_change_rerenders_scaffold_but_preserves_sampled_output() -> None:

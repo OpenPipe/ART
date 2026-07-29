@@ -7,6 +7,7 @@ from typing import Any, cast
 from anthropic.types import Message, MessageParam
 from openai.types import Completion
 from openai.types.chat import ChatCompletion
+from openai.types.chat.chat_completion import Choice
 from openai.types.responses import Response
 import pytest
 
@@ -57,13 +58,25 @@ def _chat(
     )
 
 
-def _growing_chat_trajectory(turn_count: int) -> art.Trajectory:
+def _growing_chat_trajectory(
+    turn_count: int, *, exact_tokens: bool = False, divergent: bool = False
+) -> art.Trajectory:
     exchanges: list[ChatCompletionsExchange] = []
     messages: list[dict[str, object]] = []
+    prompt_ids: list[int] = []
     for index in range(turn_count):
         messages.append({"role": "user", "content": f"question {index}"})
-        exchanges.append(_chat(list(messages), f"answer {index}", offset=index))
+        prompt_ids.append(10_000 + index)
+        exchange = _chat(list(messages), f"answer {index}", offset=index)
+        output_id = 20_000 + index
+        if exact_tokens:
+            response = exchange.response.model_dump(mode="python")
+            response["prompt_token_ids"] = list(prompt_ids)
+            response["choices"][0]["token_ids"] = [output_id]
+            exchange.response = ChatCompletion.model_validate(response)
+        exchanges.append(exchange)
         messages.append({"role": "assistant", "content": f"answer {index}"})
+        prompt_ids.append(30_000 + index if divergent else output_id)
     return art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=exchanges))
 
 
@@ -283,6 +296,33 @@ def test_chat_projection_scales_with_captured_messages() -> None:
     ]
     assert normalized[1] < normalized[0] * 2, measurements
     assert normalized[2] < normalized[1] * 2, measurements
+
+
+def test_divergent_chat_projection_parses_each_exact_generation_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenize = importlib.import_module("art.trajectories._tokenize")
+    original = tokenize._chat_choice_tokens
+    calls = 0
+
+    def count(
+        choice: Choice, response_data: dict[str, Any]
+    ) -> tuple[list[int] | None, list[int] | None, list[float]]:
+        nonlocal calls
+        calls += 1
+        return original(choice, response_data)
+
+    monkeypatch.setattr(tokenize, "_chat_choice_tokens", count)
+    trajectory = _growing_chat_trajectory(
+        64,
+        exact_tokens=True,
+        divergent=True,
+    )
+
+    histories = trajectory.chat_completions_histories()
+
+    assert len(histories) == 64
+    assert calls == 64
 
 
 def test_model_patterns_select_matching_histories_only() -> None:
@@ -1020,6 +1060,63 @@ def test_completions_history_uses_request_token_ids() -> None:
     assert trajectory.completions_token_history().prompt == [1, 2]
 
 
+def test_completions_string_regeneration_preserves_sampled_source() -> None:
+    def exchange(
+        prompt: str,
+        answer: str,
+        prompt_ids: list[int],
+        output_id: int,
+        offset: int,
+    ) -> CompletionsExchange:
+        start, end = _times(offset)
+        return CompletionsExchange(
+            request={"model": "test/model", "prompt": prompt},
+            response=Completion.model_validate(
+                {
+                    "id": f"completion-{offset}",
+                    "object": "text_completion",
+                    "created": offset,
+                    "model": "test/model",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "text": answer,
+                            "prompt_token_ids": prompt_ids,
+                            "token_ids": [output_id],
+                        }
+                    ],
+                }
+            ),
+            start_time=start,
+            end_time=end,
+        )
+
+    first = exchange("a", "b", [1], 2, 0)
+    second = exchange("abx", "y", [1, 2, 3], 4, 1)
+    regenerated = exchange("abx", "z", [1, 2, 3], 5, 2)
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(
+            completions=[first, second, regenerated],
+        )
+    )
+
+    histories = trajectory.completions_string_histories()
+    regenerated_history = next(
+        history for history in histories if history.prompt == "abxz"
+    )
+    sampled_source = next(
+        span.source
+        for span in regenerated_history.prompt_sources
+        if span.start == 1 and span.end == 2
+    )
+
+    assert sampled_source is not None
+    assert sampled_source.exchange is first
+    assert sampled_source.choice_index == 0
+    assert (1, 2) in regenerated_history.sampled_spans
+
+
 def test_batched_completions_create_every_prompt_choice_history() -> None:
     exchange = _completion([1], [10])
     exchange.request["prompt"] = ["first", "second"]
@@ -1415,6 +1512,43 @@ def test_chat_template_stripped_reasoning_splits_exact_histories() -> None:
         trajectory.tokenize()
 
 
+def test_chat_reasoning_split_does_not_reuse_divergent_sampled_source() -> None:
+    first = _chat([{"role": "user", "content": "one"}], "first")
+    first_data = first.response.model_dump(mode="python")
+    first_data["prompt_token_ids"] = [1]
+    first_data["choices"][0]["message"]["reasoning"] = "thought-one"
+    first_data["choices"][0]["token_ids"] = [2, 101]
+    first.response = ChatCompletion.model_validate(first_data)
+
+    second = _chat(
+        [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "first"},
+            {"role": "user", "content": "two"},
+        ],
+        "second",
+        offset=1,
+    )
+    second_data = second.response.model_dump(mode="python")
+    second_data["prompt_token_ids"] = [1, 500, 3]
+    second_data["choices"][0]["token_ids"] = [4]
+    second.response = ChatCompletion.model_validate(second_data)
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    )
+
+    histories = trajectory.chat_completions_histories()
+
+    source = histories[1].message_sources[1]
+    assert source is not None
+    assert source.exchange is second
+    assert source.request_index == 1
+    assert source.choice_index is None
+    tokenized = histories[1].tokenize()
+    assert tokenized.token_ids == [1, 500, 3, 4]
+    assert not tokenized.flags[1] & art.TokenFlag.SAMPLED
+
+
 def test_anthropic_tokenization_disagreement_splits_unless_reconciled() -> None:
     def exchange(
         offset: int,
@@ -1490,6 +1624,79 @@ def test_anthropic_tokenization_disagreement_splits_unless_reconciled() -> None:
     assert first_source.exchange is first
     assert first_source.request_index is None
     assert len(trajectory.histories(reconcile_text_equivalent_tokenizations=True)) == 1
+
+
+def test_anthropic_exact_regeneration_preserves_sampled_source() -> None:
+    def exchange(
+        offset: int,
+        messages: list[MessageParam],
+        answer: str,
+        prompt_token_ids: list[int],
+        token_id: int,
+    ) -> MessagesExchange:
+        start, end = _times(offset)
+        return MessagesExchange(
+            request=MessagesRequest(
+                model="test/model",
+                messages=messages,
+                max_tokens=16,
+            ),
+            response=Message.model_validate(
+                {
+                    "id": f"message-{offset}",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "test/model",
+                    "content": [{"type": "text", "text": answer}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": len(prompt_token_ids),
+                        "output_tokens": 1,
+                    },
+                    "prompt_token_ids": prompt_token_ids,
+                    "token_ids": [token_id],
+                    "logprobs": [-float(token_id)],
+                }
+            ),
+            start_time=start,
+            end_time=end,
+        )
+
+    prompt: list[MessageParam] = [
+        cast(MessageParam, {"role": "user", "content": "one"}),
+        cast(
+            MessageParam,
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "cat"}],
+            },
+        ),
+        cast(MessageParam, {"role": "user", "content": "two"}),
+    ]
+    first = exchange(0, [prompt[0]], "cat", [1], 101)
+    second = exchange(1, prompt, "dog", [1, 101, 3], 4)
+    regenerated = exchange(2, prompt, "fox", [1, 101, 3], 5)
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(messages=[first, second, regenerated])
+    )
+
+    histories = trajectory.anthropic_messages_histories()
+    regenerated_history = next(
+        history
+        for history in histories
+        if history.message_sources[-1] is not None
+        and history.message_sources[-1].exchange is regenerated
+    )
+
+    source = regenerated_history.message_sources[1]
+    assert source is not None
+    assert source.exchange is first
+    assert source.request_index is None
+    tokenized = regenerated_history.as_chat_completions_history().tokenize()
+    assert tokenized.token_ids == [1, 101, 3, 5]
+    assert tokenized.logprobs[1] == -101.0
+    assert tokenized.flags[1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
 
 
 def test_reasoning_stripped_tool_call_keeps_first_sampled_source() -> None:

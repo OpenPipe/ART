@@ -127,6 +127,9 @@ class _Branch(Generic[_ItemT, _SourceT, _ContextT]):
     lineage_keys: list[object] | None = None
 
 
+type _GenerationTokens = tuple[list[int] | None, list[int] | None]
+
+
 def _selected_models(
     exchanges: Sequence[_ExchangeT], model: str | None, protocol: str
 ) -> list[tuple[str, list[_ExchangeT]]]:
@@ -314,19 +317,57 @@ def _contains_tokens(tokens: Sequence[int], sampled: Sequence[int]) -> bool:
     )
 
 
+def _retains_output_suffix(
+    prompt: Sequence[int] | None,
+    output: Sequence[int] | None,
+    later_prompt: Sequence[int] | None,
+) -> bool:
+    if (
+        prompt is None
+        or output is None
+        or later_prompt is None
+        or not _is_prefix(prompt, later_prompt)
+    ):
+        return False
+    continuation = later_prompt[len(prompt) :]
+    return any(_is_prefix(output[start:], continuation) for start in range(len(output)))
+
+
+def _chat_generation_tokens(
+    exchange: ChatCompletionsExchange,
+    choice_index: int,
+    cache: dict[tuple[int, int], _GenerationTokens],
+) -> _GenerationTokens:
+    key = (id(exchange), choice_index)
+    if key not in cache:
+        from ._tokenize import _chat_choice_tokens
+
+        choice = next(
+            (
+                choice
+                for choice in exchange.response.choices
+                if choice.index == choice_index
+            ),
+            None,
+        )
+        if choice is None:
+            raise ValueError("Chat choice source index is out of bounds")
+        prompt, output, _ = _chat_choice_tokens(
+            choice, exchange.response.model_dump(mode="python")
+        )
+        cache[key] = prompt, output
+    return cache[key]
+
+
 def _chat_exact_generation_extends(
     branch: _Branch[Message, ChatCompletionsMessageSource, _ChatContext],
-    exchange: ChatCompletionsExchange,
+    prompt_ids: Sequence[int] | None,
     prompt_length: int,
+    cache: dict[tuple[int, int], _GenerationTokens],
 ) -> bool:
-    if not exchange.response.choices:
-        return True
-    from ._tokenize import _chat_choice_tokens
-
-    response_data = exchange.response.model_dump(mode="python")
-    prompt_ids, _, _ = _chat_choice_tokens(exchange.response.choices[0], response_data)
     if prompt_ids is None:
         return True
+
     prior_source = next(
         (
             source
@@ -340,16 +381,13 @@ def _chat_exact_generation_extends(
     if prior_source is None:
         return True
     prior_exchange = prior_source.exchange
+    choice_index = prior_source.choice_index
     if not isinstance(prior_exchange, ChatCompletionsExchange):
         raise AssertionError("Native Chat history has a non-Chat source")
-    prior_response = prior_exchange.response
-    prior_choice = next(
-        choice
-        for choice in prior_response.choices
-        if choice.index == prior_source.choice_index
-    )
-    prior_prompt, prior_output, _ = _chat_choice_tokens(
-        prior_choice, prior_response.model_dump(mode="python")
+    if choice_index is None:
+        raise AssertionError("Sampled Chat source has no choice index")
+    prior_prompt, prior_output = _chat_generation_tokens(
+        prior_exchange, choice_index, cache
     )
     return (
         prior_prompt is None
@@ -360,19 +398,15 @@ def _chat_exact_generation_extends(
 
 def _chat_retains_sampled_reasoning(
     branch: _Branch[Message, ChatCompletionsMessageSource, _ChatContext],
-    exchange: ChatCompletionsExchange,
+    prompt_ids: Sequence[int] | None,
     prompt_length: int,
+    cache: dict[tuple[int, int], _GenerationTokens],
 ) -> bool:
     """Split histories when a template drops a prior sampled reasoning span."""
 
-    if not exchange.response.choices:
-        return True
-    from ._tokenize import _chat_choice_tokens
-
-    response_data = exchange.response.model_dump(mode="python")
-    prompt_ids, _, _ = _chat_choice_tokens(exchange.response.choices[0], response_data)
     if prompt_ids is None:
         return True
+
     for message, source in zip(
         branch.items[:prompt_length], branch.sources[:prompt_length], strict=True
     ):
@@ -384,60 +418,61 @@ def _chat_retains_sampled_reasoning(
             or not isinstance(source.exchange, ChatCompletionsExchange)
         ):
             continue
-        source_response = source.exchange.response
-        choice = next(
-            (
-                item
-                for item in source_response.choices
-                if item.index == source.choice_index
-            ),
-            None,
-        )
-        if choice is None:
-            continue
-        _, sampled_ids, _ = _chat_choice_tokens(
-            choice, source_response.model_dump(mode="python")
+        _, sampled_ids = _chat_generation_tokens(
+            source.exchange, source.choice_index, cache
         )
         if sampled_ids and not _contains_tokens(prompt_ids, sampled_ids):
             return False
     return True
 
 
-def _chat_drops_sampled_reasoning(
+def _chat_retains_sampled_suffix(
     branch: _Branch[Message, ChatCompletionsMessageSource, _ChatContext],
-    prompt: Sequence[Message],
+    prompt_ids: Sequence[int] | None,
+    prompt_length: int,
+    cache: dict[tuple[int, int], _GenerationTokens],
 ) -> bool:
-    return any(
-        source is not None
-        and source.choice_index is not None
-        and bool(message.get("reasoning") or message.get("reasoning_content"))
-        and not bool(current.get("reasoning") or current.get("reasoning_content"))
-        for message, current, source in zip(
-            branch.items, prompt, branch.sources, strict=False
-        )
+    prior_source = next(
+        (
+            source
+            for source in reversed(branch.sources[:prompt_length])
+            if source is not None
+            and isinstance(source.exchange, ChatCompletionsExchange)
+            and source.choice_index is not None
+        ),
+        None,
     )
+    if prior_source is None or prior_source.choice_index is None:
+        return False
+    if not isinstance(prior_source.exchange, ChatCompletionsExchange):
+        raise AssertionError("Native Chat history has a non-Chat source")
+    prior_prompt, prior_output = _chat_generation_tokens(
+        prior_source.exchange, prior_source.choice_index, cache
+    )
+    return _retains_output_suffix(prior_prompt, prior_output, prompt_ids)
 
 
 def _anthropic_exact_generation_extends(
     branch: _Branch[AnthropicMessageParam, AnthropicMessageSource, _AnthropicContext],
-    exchange: MessagesExchange,
+    prompt_ids: Sequence[int] | None,
+    prompt_length: int,
+    cache: dict[int, _GenerationTokens],
 ) -> bool:
-    from ._tokenize import _messages_tokens
-
-    prompt_ids, _, _ = _messages_tokens(exchange.response)
     if prompt_ids is None:
         return True
     prior_source = next(
         (
             source
-            for source in reversed(branch.sources)
+            for source in reversed(branch.sources[:prompt_length])
             if source is not None and source.request_index is None
         ),
         None,
     )
     if prior_source is None:
         return True
-    prior_prompt, prior_output, _ = _messages_tokens(prior_source.exchange.response)
+    prior_prompt, prior_output = _anthropic_generation_tokens(
+        prior_source.exchange, cache
+    )
     return (
         prior_prompt is None
         or prior_output is None
@@ -445,22 +480,39 @@ def _anthropic_exact_generation_extends(
     )
 
 
-def _anthropic_drops_sampled_reasoning(
+def _anthropic_generation_tokens(
+    exchange: MessagesExchange,
+    cache: dict[int, _GenerationTokens],
+) -> _GenerationTokens:
+    key = id(exchange)
+    if key not in cache:
+        from ._tokenize import _messages_tokens
+
+        prompt, output, _ = _messages_tokens(exchange.response)
+        cache[key] = prompt, output
+    return cache[key]
+
+
+def _anthropic_retains_sampled_suffix(
     branch: _Branch[AnthropicMessageParam, AnthropicMessageSource, _AnthropicContext],
-    prompt: Sequence[AnthropicMessageParam],
+    prompt_ids: Sequence[int] | None,
+    prompt_length: int,
+    cache: dict[int, _GenerationTokens],
 ) -> bool:
-    return any(
-        source is not None
-        and source.request_index is None
-        and message != current
-        and any(
-            getattr(block, "type", None) in {"thinking", "redacted_thinking"}
-            for block in source.exchange.response.content
-        )
-        for message, current, source in zip(
-            branch.items, prompt, branch.sources, strict=False
-        )
+    prior_source = next(
+        (
+            source
+            for source in reversed(branch.sources[:prompt_length])
+            if source is not None and source.request_index is None
+        ),
+        None,
     )
+    if prior_source is None:
+        return False
+    prior_prompt, prior_output = _anthropic_generation_tokens(
+        prior_source.exchange, cache
+    )
+    return _retains_output_suffix(prior_prompt, prior_output, prompt_ids)
 
 
 def _chat_message_key(message: Message, *, visible_only: bool = False) -> str:
@@ -530,6 +582,7 @@ def chat_completions_histories(
     for selected_model, exchanges in _selected_models(
         trajectory.exchanges.chat_completions, model, "Chat Completions"
     ):
+        token_cache: dict[tuple[int, int], _GenerationTokens] = {}
         branches: list[
             _Branch[Message, ChatCompletionsMessageSource, _ChatContext]
         ] = []
@@ -550,17 +603,27 @@ def chat_completions_histories(
             prompt_lineage_keys = [
                 _chat_message_key(message, visible_only=True) for message in prompt
             ]
+            choices = _ordered_choices(
+                exchange.response.choices, protocol="Chat Completions"
+            )
+            prompt_ids, _ = _chat_generation_tokens(
+                exchange, choices[0].index, token_cache
+            )
             exact_continuation = lambda branch: _chat_exact_generation_extends(
-                branch, exchange, len(prompt)
+                branch, prompt_ids, len(prompt), token_cache
             )
             continuation = lambda branch: (
-                _chat_retains_sampled_reasoning(branch, exchange, len(prompt))
+                _chat_retains_sampled_reasoning(
+                    branch, prompt_ids, len(prompt), token_cache
+                )
                 and (reconcile or exact_continuation(branch))
             )
             source_continuation = lambda branch: (
                 reconcile
                 or exact_continuation(branch)
-                or _chat_drops_sampled_reasoning(branch, prompt)
+                or _chat_retains_sampled_suffix(
+                    branch, prompt_ids, len(prompt), token_cache
+                )
             )
             prompt_sources = _lineage_prompt_sources(
                 branches,
@@ -583,9 +646,7 @@ def chat_completions_histories(
                     list[ChatCompletionsMessageSource | None],
                 ]
             ] = []
-            for choice in _ordered_choices(
-                exchange.response.choices, protocol="Chat Completions"
-            ):
+            for choice in choices:
                 response = _MESSAGE.validate_python(
                     normalize_chat_message(
                         choice.message.model_dump(mode="python", exclude_none=True)
@@ -654,18 +715,22 @@ def anthropic_messages_histories(
     for selected_model, exchanges in _selected_models(
         trajectory.exchanges.messages, model, "Anthropic Messages"
     ):
+        token_cache: dict[int, _GenerationTokens] = {}
         branches: list[
             _Branch[AnthropicMessageParam, AnthropicMessageSource, _AnthropicContext]
         ] = []
         for sequence, exchange in enumerate(exchanges):
             prompt = _anthropic_prompt(exchange.request.get("messages", []))
+            prompt_ids, _ = _anthropic_generation_tokens(exchange, token_cache)
             exact_continuation = lambda branch: _anthropic_exact_generation_extends(
-                branch, exchange
+                branch, prompt_ids, len(prompt), token_cache
             )
             continuation = lambda branch: reconcile or exact_continuation(branch)
             source_continuation = lambda branch: (
                 continuation(branch)
-                or _anthropic_drops_sampled_reasoning(branch, prompt)
+                or _anthropic_retains_sampled_suffix(
+                    branch, prompt_ids, len(prompt), token_cache
+                )
             )
             prompt_sources = _lineage_prompt_sources(
                 branches,
@@ -967,11 +1032,9 @@ def responses_histories(
                             )
                         ]
                         generation_prompt = [item for item, _ in retained]
-                        retained_sources = [source for _, source in retained]
                         generation_prompt_sources = [
                             _responses_split_prompt_source(
                                 source,
-                                retained_sources=retained_sources,
                                 current_exchange=exchange,
                                 current_prompt_ids=generation.prompt_token_ids,
                                 reconcile=reconcile,
@@ -1143,19 +1206,12 @@ def _responses_generation_extends(
 def _responses_split_prompt_source(
     source: ResponsesItemSource | None,
     *,
-    retained_sources: Sequence[ResponsesItemSource | None],
     current_exchange: ResponsesExchange,
     current_prompt_ids: Sequence[int],
     reconcile: bool,
 ) -> ResponsesItemSource | None:
     if source is None or source.generation_index is None:
         return source
-    if reconcile:
-        return (
-            replace(source, generation_index=None)
-            if source.exchange is current_exchange
-            else source
-        )
     output = [
         cast(
             ResponseInputItemParam,
@@ -1167,22 +1223,18 @@ def _responses_split_prompt_source(
     if not 0 <= source.generation_index < len(generations):
         raise ValueError("Responses generation source index is out of bounds")
     generation = generations[source.generation_index]
-    retained_indices = {
-        item.output_index
-        for item in retained_sources
-        if item is not None
-        and item.exchange is source.exchange
-        and item.generation_index == source.generation_index
-        and item.output_index is not None
-    }
-    if retained_indices != set(generation.output_indices):
-        if _is_prefix(generation.prompt_token_ids, current_prompt_ids):
-            continuation = current_prompt_ids[len(generation.prompt_token_ids) :]
-            if any(
-                _is_prefix(generation.output_token_ids[start:], continuation)
-                for start in range(len(generation.output_token_ids))
-            ):
-                return source
+    if _retains_output_suffix(
+        generation.prompt_token_ids,
+        generation.output_token_ids,
+        current_prompt_ids,
+    ):
+        return source
+    if reconcile:
+        return (
+            replace(source, generation_index=None)
+            if source.exchange is current_exchange
+            else source
+        )
     if source.output_index is None and source.request_index is None:
         return None
     return replace(source, generation_index=None)
@@ -1224,12 +1276,21 @@ def _completion_exact_tokens(
     return prompt, completion
 
 
+def _completion_generation_tokens(
+    exchange: CompletionsExchange,
+    choice_index: int,
+    cache: dict[tuple[int, int], _GenerationTokens],
+) -> _GenerationTokens:
+    key = (id(exchange), choice_index)
+    if key not in cache:
+        cache[key] = _completion_exact_tokens(exchange, choice_index)
+    return cache[key]
+
+
 def completions_token_histories(
     trajectory: Trajectory,
     model: str | None,
-    reconcile: bool = False,
 ) -> list[CompletionsTokenHistory]:
-    del reconcile
     _require_unmixed(trajectory)
     histories: list[CompletionsTokenHistory] = []
     for selected_model, exchanges in _selected_models(
@@ -1301,10 +1362,9 @@ def completions_token_histories(
 def completions_token_history(
     trajectory: Trajectory,
     model: str | None,
-    reconcile: bool = False,
 ) -> CompletionsTokenHistory:
     return _one(
-        completions_token_histories(trajectory, model, reconcile),
+        completions_token_histories(trajectory, model),
         "Completions token history",
     )
 
@@ -1431,22 +1491,24 @@ def _completions_generation_extends(
     branch: _Branch[str, CompletionsSource, tuple[()]],
     *,
     prompt_ids: list[int] | None,
+    prompt_length: int,
     reconcile: bool,
+    cache: dict[tuple[int, int], _GenerationTokens],
 ) -> bool:
     if reconcile or prompt_ids is None:
         return True
     prior_source = next(
         (
             source
-            for source in reversed(branch.sources)
+            for source in reversed(branch.sources[:prompt_length])
             if source is not None and source.choice_index is not None
         ),
         None,
     )
     if prior_source is None or prior_source.choice_index is None:
         return True
-    prior_prompt, prior_output = _completion_exact_tokens(
-        prior_source.exchange, prior_source.choice_index
+    prior_prompt, prior_output = _completion_generation_tokens(
+        prior_source.exchange, prior_source.choice_index, cache
     )
     return (
         prior_prompt is None
@@ -1465,6 +1527,7 @@ def completions_string_histories(
     for selected_model, exchanges in _selected_models(
         trajectory.exchanges.completions, model, "Completions"
     ):
+        token_cache: dict[tuple[int, int], _GenerationTokens] = {}
         branches: list[_Branch[str, CompletionsSource, tuple[()]]] = []
         complete = True
         for sequence, exchange in enumerate(exchanges):
@@ -1493,7 +1556,9 @@ def completions_string_histories(
                         prompt_index=prompt_index,
                         choice_index=choice.index,
                     )
-                    prompt_ids, _ = _completion_exact_tokens(exchange, choice.index)
+                    prompt_ids, _ = _completion_generation_tokens(
+                        exchange, choice.index, token_cache
+                    )
                     _extend_branches(
                         branches,
                         prompt=list(prompt),
@@ -1511,7 +1576,9 @@ def completions_string_histories(
                         continuation=lambda branch: _completions_generation_extends(
                             branch,
                             prompt_ids=prompt_ids,
+                            prompt_length=len(prompt),
                             reconcile=reconcile,
+                            cache=token_cache,
                         ),
                     )
         if not complete:
@@ -1846,7 +1913,7 @@ def trajectory_histories(
         candidates.extend(chat_completions_histories(trajectory, model, reconcile))
     if any(is_selected(exchange) for exchange in trajectory.exchanges.completions):
         try:
-            candidates.extend(completions_token_histories(trajectory, model, reconcile))
+            candidates.extend(completions_token_histories(trajectory, model))
         except ValueError as error:
             if "requires exact token IDs" not in str(error):
                 raise

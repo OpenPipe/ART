@@ -2662,89 +2662,89 @@ def _history_matches_projection(history: History) -> bool:
         )
     )
     if isinstance(history, ChatCompletionsHistory):
-        try:
-            candidates: Sequence[History] = [
-                *chat_completions_histories(trajectory, model=history.model),
-                *chat_completions_histories(
+        for reconcile in (False, True):
+            try:
+                candidates: Sequence[History] = chat_completions_histories(
                     trajectory,
                     model=history.model,
-                    reconcile=True,
-                ),
-            ]
-        except ValueError as error:
-            if "no Chat Completions exchanges" not in str(error):
-                raise
-            if trajectory.exchanges.messages and not trajectory.exchanges.responses:
-                candidates = [
-                    candidate.as_chat_completions_history()
-                    for reconcile in (False, True)
-                    for candidate in anthropic_messages_histories(
-                        trajectory,
-                        model=history.model,
-                        reconcile=reconcile,
-                    )
-                ]
-            elif trajectory.exchanges.responses and not trajectory.exchanges.messages:
-                candidates = [
-                    candidate.as_chat_completions_history()
-                    for reconcile in (False, True)
-                    for candidate in responses_histories(
-                        trajectory,
-                        model=history.model,
-                        reconcile=reconcile,
-                    )
-                ]
-            else:
-                return False
-        return any(
-            isinstance(candidate, ChatCompletionsHistory)
-            and candidate.messages == history.messages
-            and candidate.tools == history.tools
-            and candidate.chat_template == history.chat_template
-            and candidate.chat_template_kwargs == history.chat_template_kwargs
-            and _sources_match(candidate.message_sources, history.message_sources)
-            for candidate in candidates
-        )
+                    reconcile=reconcile,
+                )
+            except ValueError as error:
+                if "no Chat Completions exchanges" not in str(error):
+                    raise
+                if trajectory.exchanges.messages and not trajectory.exchanges.responses:
+                    candidates = [
+                        candidate.as_chat_completions_history()
+                        for candidate in anthropic_messages_histories(
+                            trajectory,
+                            model=history.model,
+                            reconcile=reconcile,
+                        )
+                    ]
+                elif (
+                    trajectory.exchanges.responses and not trajectory.exchanges.messages
+                ):
+                    candidates = [
+                        candidate.as_chat_completions_history()
+                        for candidate in responses_histories(
+                            trajectory,
+                            model=history.model,
+                            reconcile=reconcile,
+                        )
+                    ]
+                else:
+                    return False
+            if any(
+                isinstance(candidate, ChatCompletionsHistory)
+                and candidate.messages == history.messages
+                and candidate.tools == history.tools
+                and candidate.chat_template == history.chat_template
+                and candidate.chat_template_kwargs == history.chat_template_kwargs
+                and _sources_match(candidate.message_sources, history.message_sources)
+                for candidate in candidates
+            ):
+                return True
+        return False
     if isinstance(history, AnthropicMessagesHistory):
-        candidates = [
-            *anthropic_messages_histories(trajectory, model=history.model),
-            *anthropic_messages_histories(
+        for reconcile in (False, True):
+            candidates = anthropic_messages_histories(
                 trajectory,
                 model=history.model,
-                reconcile=True,
-            ),
-        ]
-        return any(
-            isinstance(candidate, AnthropicMessagesHistory)
-            and candidate.messages == history.messages
-            and candidate.system == history.system
-            and candidate.tools == history.tools
-            and candidate.chat_template == history.chat_template
-            and candidate.chat_template_kwargs == history.chat_template_kwargs
-            and _sources_match(candidate.message_sources, history.message_sources)
-            for candidate in candidates
-        )
+                reconcile=reconcile,
+            )
+            if any(
+                isinstance(candidate, AnthropicMessagesHistory)
+                and candidate.messages == history.messages
+                and candidate.system == history.system
+                and candidate.tools == history.tools
+                and candidate.chat_template == history.chat_template
+                and candidate.chat_template_kwargs == history.chat_template_kwargs
+                and _sources_match(candidate.message_sources, history.message_sources)
+                for candidate in candidates
+            ):
+                return True
+        return False
     if isinstance(history, ResponsesHistory):
-        candidates = [
-            *responses_histories(trajectory, model=history.model),
-            *responses_histories(
+        for reconcile in (False, True):
+            candidates = responses_histories(
                 trajectory,
                 model=history.model,
-                reconcile=True,
-            ),
-        ]
-        return any(
-            isinstance(candidate, ResponsesHistory)
-            and candidate.input == history.input
-            and candidate.instructions == history.instructions
-            and candidate.tools == history.tools
-            and candidate.conversation == history.conversation
-            and candidate.previous_response_id == history.previous_response_id
-            and candidate.chat_template == history.chat_template
-            and candidate.chat_template_kwargs == history.chat_template_kwargs
-            and _sources_match(candidate.input_sources, history.input_sources)
-            for candidate in candidates
-        )
+                reconcile=reconcile,
+            )
+            if any(
+                isinstance(candidate, ResponsesHistory)
+                and candidate.input == history.input
+                and candidate.instructions == history.instructions
+                and candidate.tools == history.tools
+                and candidate.conversation == history.conversation
+                and candidate.previous_response_id == history.previous_response_id
+                and candidate.chat_template == history.chat_template
+                and candidate.chat_template_kwargs == history.chat_template_kwargs
+                and _sources_match(candidate.input_sources, history.input_sources)
+                for candidate in candidates
+            ):
+                return True
+        return False
     return False
 
 
@@ -4791,13 +4791,17 @@ def tokenize_trajectory(
     trajectory: Trajectory,
     *,
     multi_history: bool,
+    reconcile_text_equivalent_tokenizations: bool,
     model: str | None,
     base_model: str | None,
     tokenizer: Tokenizer | None,
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
 ) -> TokenizedTrajectory | TokenizedMultiHistoryTrajectory:
-    histories = trajectory.histories(model=model)
+    histories = trajectory.histories(
+        model=model,
+        reconcile_text_equivalent_tokenizations=reconcile_text_equivalent_tokenizations,
+    )
     if not multi_history:
         if len(histories) != 1:
             selected_models = {
@@ -4886,6 +4890,7 @@ def tokenize_group(
     group: TrajectoryGroup,
     *,
     multi_history: bool,
+    reconcile_text_equivalent_tokenizations: bool,
     model: str | None,
     base_model: str | None,
     tokenizer: Tokenizer | None,
@@ -4899,6 +4904,7 @@ def tokenize_group(
         tokenize_trajectory(
             trajectory,
             multi_history=multi_history,
+            reconcile_text_equivalent_tokenizations=reconcile_text_equivalent_tokenizations,
             model=model,
             base_model=base_model,
             tokenizer=tokenizer,

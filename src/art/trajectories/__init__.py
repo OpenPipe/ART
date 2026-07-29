@@ -585,25 +585,19 @@ class Trajectory(_CompactModel):
         self,
         *,
         model: str | None = None,
-        reconcile_text_equivalent_tokenizations: bool = False,
     ) -> CompletionsTokenHistory:
         from ._history import completions_token_history
 
-        return completions_token_history(
-            self, model, reconcile_text_equivalent_tokenizations
-        )
+        return completions_token_history(self, model)
 
     def completions_token_histories(
         self,
         *,
         model: str | None = None,
-        reconcile_text_equivalent_tokenizations: bool = False,
     ) -> list[CompletionsTokenHistory]:
         from ._history import completions_token_histories
 
-        return completions_token_histories(
-            self, model, reconcile_text_equivalent_tokenizations
-        )
+        return completions_token_histories(self, model)
 
     def completions_string_history(
         self,
@@ -656,6 +650,7 @@ class Trajectory(_CompactModel):
         self,
         *,
         multi_history: Literal[False] = False,
+        reconcile_text_equivalent_tokenizations: bool = False,
         model: str | None = None,
         base_model: str | None = None,
         tokenizer: Tokenizer | None = None,
@@ -668,6 +663,7 @@ class Trajectory(_CompactModel):
         self,
         *,
         multi_history: Literal[True],
+        reconcile_text_equivalent_tokenizations: bool = False,
         model: str | None = None,
         base_model: str | None = None,
         tokenizer: Tokenizer | None = None,
@@ -679,6 +675,7 @@ class Trajectory(_CompactModel):
         self,
         *,
         multi_history: bool = False,
+        reconcile_text_equivalent_tokenizations: bool = False,
         model: str | None = None,
         base_model: str | None = None,
         tokenizer: Tokenizer | None = None,
@@ -690,6 +687,7 @@ class Trajectory(_CompactModel):
         return tokenize_trajectory(
             self,
             multi_history=multi_history,
+            reconcile_text_equivalent_tokenizations=reconcile_text_equivalent_tokenizations,
             model=model,
             base_model=base_model,
             tokenizer=tokenizer,
@@ -807,6 +805,7 @@ class TrajectoryGroup(_CompactModel):
         self,
         *,
         multi_history: Literal[False] = False,
+        reconcile_text_equivalent_tokenizations: bool = False,
         model: str | None = None,
         base_model: str | None = None,
         tokenizer: Tokenizer | None = None,
@@ -819,6 +818,7 @@ class TrajectoryGroup(_CompactModel):
         self,
         *,
         multi_history: Literal[True],
+        reconcile_text_equivalent_tokenizations: bool = False,
         model: str | None = None,
         base_model: str | None = None,
         tokenizer: Tokenizer | None = None,
@@ -830,6 +830,7 @@ class TrajectoryGroup(_CompactModel):
         self,
         *,
         multi_history: bool = False,
+        reconcile_text_equivalent_tokenizations: bool = False,
         model: str | None = None,
         base_model: str | None = None,
         tokenizer: Tokenizer | None = None,
@@ -844,6 +845,7 @@ class TrajectoryGroup(_CompactModel):
         return tokenize_group(
             self,
             multi_history=multi_history,
+            reconcile_text_equivalent_tokenizations=reconcile_text_equivalent_tokenizations,
             model=model,
             base_model=base_model,
             tokenizer=tokenizer,
