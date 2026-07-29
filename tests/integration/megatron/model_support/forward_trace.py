@@ -72,7 +72,44 @@ def _trace_hook(fn: Callable[..., Any]) -> Callable[..., Any]:
 
 def _normalize_trace_module_name(module_name: str) -> str:
     """Strips compile-wrapper path segments from trace module names."""
-    return module_name.replace("._orig_mod", "")
+    normalized = module_name.replace("._orig_mod", "")
+    chunk, separator, remainder = normalized.partition(".")
+    if (
+        separator
+        and chunk.startswith("chunk")
+        and chunk.removeprefix("chunk").isdigit()
+    ):
+        return remainder
+    return normalized
+
+
+def _global_trace_module_name(
+    module_name: str,
+    module_by_name: dict[str, Any],
+) -> str:
+    local_layer_index = _module_layer_index(module_name)
+    normalized = _normalize_trace_module_name(module_name)
+    if local_layer_index is None:
+        return normalized
+    marker = "decoder.layers."
+    marker_index = module_name.find(marker)
+    layer_name_end = marker_index + len(marker) + len(str(local_layer_index))
+    layer = module_by_name[module_name[:layer_name_end]]
+    layer_number = getattr(layer, "layer_number", None)
+    if layer_number is None:
+        layer_number = getattr(getattr(layer, "_orig_mod", None), "layer_number", None)
+    if layer_number is None:
+        raise RuntimeError(
+            f"Transformer layer has no global layer_number: {module_name}"
+        )
+    normalized_marker_index = normalized.find(marker)
+    normalized_layer_start = normalized_marker_index + len(marker)
+    normalized_layer_end = normalized_layer_start + len(str(local_layer_index))
+    return (
+        normalized[:normalized_layer_start]
+        + str(int(layer_number) - 1)
+        + normalized[normalized_layer_end:]
+    )
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -345,7 +382,7 @@ class ForwardTraceCapture:
             self._hook_handles.append(
                 root_module.register_forward_hook(_trace_hook(self._root_post_hook))
             )
-        for chunk_index, chunk in enumerate(model_chunks):
+        for chunk in model_chunks:
             named_modules = list(chunk.named_modules())
             module_by_name = dict(named_modules)
             for module_name, module in named_modules:
@@ -356,8 +393,9 @@ class ForwardTraceCapture:
                     and layer_index > self.max_layer_index
                 ):
                     continue
-                trace_module_name = _normalize_trace_module_name(
-                    f"chunk{chunk_index}.{module_name}"
+                trace_module_name = _global_trace_module_name(
+                    module_name,
+                    module_by_name,
                 )
                 metadata = self._build_module_trace_metadata(
                     module_name=module_name,
