@@ -2174,7 +2174,10 @@ def run_megatron_sft_step(
         list[dict[str, Any]], _broadcast_from_pipeline_last(forward_data_store)
     )
     raw_loss_sum = sum(
-        (cast(torch.Tensor, data["raw_loss_sum"]) for data in forward_data_store),
+        (
+            cast(torch.Tensor, data["raw_loss_sum"]).to(device)
+            for data in forward_data_store
+        ),
         torch.zeros([], device=device, dtype=torch.float32),
     )
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
