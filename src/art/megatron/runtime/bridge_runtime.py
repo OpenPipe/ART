@@ -17,6 +17,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     extract_expert_number_from_param,
     get_module_and_param_from_name,
 )
+from megatron.bridge.models.conversion.utils import unwrap_model
 from megatron.bridge.models.model_provider import ModelProviderMixin
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
@@ -811,6 +812,25 @@ def _replicated_hf_to_megatron(
     return self.broadcast_tensor_to_tp_ranks(tensor, src_rank=0)
 
 
+def _shared_embedding_broadcast_model(
+    megatron_model: list[MegatronModule],
+) -> list[MegatronModule]:
+    if len(megatron_model) == 1:
+        return megatron_model
+    for chunk in megatron_model:
+        model = unwrap_model(chunk)
+        language_model = getattr(model, "language_model", None)
+        if language_model is not None:
+            model = language_model
+        embedding = getattr(model, "embedding", None)
+        if (
+            getattr(embedding, "word_embeddings", None) is not None
+            or getattr(model, "output_layer", None) is not None
+        ):
+            return [chunk]
+    return megatron_model
+
+
 def _optimized_load_weights_hf_to_megatron(
     self: MegatronModelBridge,
     hf_pretrained: Any,
@@ -883,7 +903,7 @@ def _optimized_load_weights_hf_to_megatron(
             pending_device_copy = True
     if pending_device_copy and torch.cuda.is_available():
         torch.cuda.synchronize()
-    self._broadcast_shared_embeddings(megatron_model)
+    self._broadcast_shared_embeddings(_shared_embedding_broadcast_model(megatron_model))
     return megatron_model
 
 

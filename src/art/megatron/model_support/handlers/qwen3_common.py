@@ -81,11 +81,13 @@ def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
         )
         preprocess = gpt_module._preprocess
 
-        def preprocess_hook(*args, _preprocess=preprocess, **kwargs):
+        def preprocess_hook(
+            *args, _preprocess=preprocess, _gpt_module=gpt_module, **kwargs
+        ):
             position_ids = kwargs.get("position_ids")
-            rotary_pos_emb = getattr(gpt_module, "rotary_pos_emb", None)
+            rotary_pos_emb = getattr(_gpt_module, "rotary_pos_emb", None)
             rotary_cp_group = getattr(rotary_pos_emb, "cp_group", None)
-            config = getattr(gpt_module, "config", None)
+            config = getattr(_gpt_module, "config", None)
             cp_world_size = _context_parallel_world_size(config)
             uses_dispatched_local_cp_positions = (
                 isinstance(position_ids, torch.Tensor)
@@ -100,8 +102,12 @@ def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
             finally:
                 if uses_dispatched_local_cp_positions:
                     setattr(rotary_pos_emb, "cp_group", rotary_cp_group)
-            decoder_input = cast(torch.Tensor, preproc_output[0])
-            if not decoder_input.requires_grad and decoder_input.is_leaf:
+            decoder_input = cast(torch.Tensor | None, preproc_output[0])
+            if (
+                decoder_input is not None
+                and not decoder_input.requires_grad
+                and decoder_input.is_leaf
+            ):
                 decoder_input.requires_grad_(True)
             position_ids = cast(torch.Tensor, position_ids)
             table = cast(torch.Tensor, preproc_output[1])
@@ -110,15 +116,15 @@ def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
             embedding_dim = int(table.shape[-1])
             if (
                 rotary_pos_emb is not None
-                and getattr(gpt_module, "position_embedding_type", None) == "rope"
+                and getattr(_gpt_module, "position_embedding_type", None) == "rope"
                 and cp_world_size > 1
             ):
                 rotary_seq_len = cast(
                     int,
-                    getattr(gpt_module, "_art_qwen3_rotary_seq_len", None),
+                    getattr(_gpt_module, "_art_qwen3_rotary_seq_len", None),
                 )
                 table_source = _build_absolute_rotary_pos_emb(
-                    gpt_module,
+                    _gpt_module,
                     max_position=int(rotary_seq_len) - 1,
                     dtype=table.dtype,
                     device=table.device,
