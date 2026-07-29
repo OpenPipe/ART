@@ -320,7 +320,9 @@ class ForwardTraceCapture:
             tuple[int | None, int, int | None, torch.Tensor, torch.Tensor | None]
         ] = []
         self._trace_metadata_by_name: dict[str, dict[str, Any]] = {}
-        self._next_micro_order = 0
+        self._root_module_ids: set[int] = set()
+        self._root_output_module_ids: set[int] = set()
+        self._next_micro_order_by_root: dict[int, int] = {}
         self._inside_root_forward = False
         self._hook_handles: list[Any] = []
         if not enabled:
@@ -330,13 +332,19 @@ class ForwardTraceCapture:
     def _register_hooks(self, model_chunks: list[Any]) -> None:
         if not model_chunks:
             raise RuntimeError("Expected at least one model chunk for forward tracing")
-        root_module = model_chunks[0]
-        self._hook_handles.append(
-            root_module.register_forward_pre_hook(_trace_hook(self._root_pre_hook))
-        )
-        self._hook_handles.append(
-            root_module.register_forward_hook(_trace_hook(self._root_post_hook))
-        )
+        from art.megatron.training.pipeline_schedule import chunk_post_process
+
+        self._root_module_ids = {id(chunk) for chunk in model_chunks}
+        self._root_output_module_ids = {
+            id(chunk) for chunk in model_chunks if chunk_post_process(chunk)
+        }
+        for root_module in model_chunks:
+            self._hook_handles.append(
+                root_module.register_forward_pre_hook(_trace_hook(self._root_pre_hook))
+            )
+            self._hook_handles.append(
+                root_module.register_forward_hook(_trace_hook(self._root_post_hook))
+            )
         for chunk_index, chunk in enumerate(model_chunks):
             named_modules = list(chunk.named_modules())
             module_by_name = dict(named_modules)
@@ -682,32 +690,34 @@ class ForwardTraceCapture:
         if self.current_step_index is None:
             return
         self._inside_root_forward = True
-        micro_order = self._next_micro_order
+        micro_order = self._next_micro_order_by_root[id(_module)]
         sample_index = self._sample_index_for_micro(micro_order)
         self.begin_micro(sample_index=sample_index, micro_order=micro_order)
 
     def _root_post_hook(self, _module: Any, _inputs: Any, output: Any) -> None:
         if self.current_step_index is None:
             return
-        output_tensor = self.guess_primary_tensor(output)
-        if output_tensor is None:
-            raise RuntimeError(
-                f"Expected root forward output to contain a tensor, got {type(output)}"
+        module_id = id(_module)
+        if module_id in self._root_output_module_ids:
+            output_tensor = self.guess_primary_tensor(output)
+            if output_tensor is None:
+                raise RuntimeError(
+                    f"Expected root forward output to contain a tensor, got {type(output)}"
+                )
+            sample_index = self.current_micro_sample_index
+            micro_order = self.current_micro_order
+            self.current_step_outputs.append(
+                (
+                    sample_index,
+                    micro_order,
+                    None
+                    if sample_index is not None
+                    else _local_dummy_micro_slot(micro_order),
+                    output_tensor.float(),
+                    getattr(_module, "_art_root_output_token_uids", None),
+                )
             )
-        sample_index = self.current_micro_sample_index
-        micro_order = self.current_micro_order
-        self.current_step_outputs.append(
-            (
-                sample_index,
-                micro_order,
-                None
-                if sample_index is not None
-                else _local_dummy_micro_slot(micro_order),
-                output_tensor.float(),
-                getattr(_module, "_art_root_output_token_uids", None),
-            )
-        )
-        self._next_micro_order = micro_order + 1
+        self._next_micro_order_by_root[module_id] += 1
         self._inside_root_forward = False
 
     def set_step(
@@ -722,7 +732,9 @@ class ForwardTraceCapture:
         self.current_micro_sample_index = None
         self.current_micro_order = 0
         self.current_micro_module_call_counts = {}
-        self._next_micro_order = 0
+        self._next_micro_order_by_root = {
+            module_id: 0 for module_id in self._root_module_ids
+        }
         self._inside_root_forward = False
 
     def begin_micro(self, sample_index: int | None, micro_order: int) -> None:
