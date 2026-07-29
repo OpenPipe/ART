@@ -216,7 +216,9 @@ def build_rl_hybridep_token_counts(
         return [sequence_length for _ in sample_rows]
 
     config = _context_parallel_config_for_provider(
-        provider, torch.device("cuda", torch.cuda.current_device())
+        provider,
+        torch.device("cuda", torch.cuda.current_device()),
+        model_support_handler,
     )
     build_gdn = bool(getattr(model_support_handler, "build_gdn_execution_spec", False))
     gdn_planner_config = _gdn_planner_config_for_provider(
@@ -266,7 +268,9 @@ def build_sft_hybridep_token_counts(
         ]
 
     config = _context_parallel_config_for_provider(
-        provider, torch.device("cuda", torch.cuda.current_device())
+        provider,
+        torch.device("cuda", torch.cuda.current_device()),
+        model_support_handler,
     )
     build_gdn = bool(getattr(model_support_handler, "build_gdn_execution_spec", False))
     gdn_planner_config = _gdn_planner_config_for_provider(
@@ -417,16 +421,24 @@ def _art_flex_cp_block_mask_variants(
 def _context_parallel_config_for_provider(
     provider: Any,
     device: torch.device,
+    model_support_handler: Any,
 ) -> ContextParallelConfig:
     head_dim = getattr(provider, "kv_channels", None)
     if head_dim is None:
-        return ContextParallelConfig()
+        return ContextParallelConfig(
+            workload_profile=model_support_handler.context_parallel_workload_profile(
+                provider
+            )
+        )
     return ContextParallelConfig(
         attention_sparse_block_size=flash_sparse_block_size_for_head_dim(
             head_dim=int(head_dim),
             head_dim_v=int(head_dim),
             device=device,
-        )
+        ),
+        workload_profile=model_support_handler.context_parallel_workload_profile(
+            provider
+        ),
     )
 
 
@@ -550,7 +562,9 @@ def _prepare_rl_cp_micro_full(
     return prepare_cp_micro(
         micro=micro,
         topology=topology,
-        config=_context_parallel_config_for_provider(provider, device),
+        config=_context_parallel_config_for_provider(
+            provider, device, model_support_handler
+        ),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
@@ -776,7 +790,9 @@ def _prepare_sft_cp_micro_full(
     return prepare_cp_micro(
         micro=sparse_micro,
         topology=topology,
-        config=_context_parallel_config_for_provider(provider, device),
+        config=_context_parallel_config_for_provider(
+            provider, device, model_support_handler
+        ),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(

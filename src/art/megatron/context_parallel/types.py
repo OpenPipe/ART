@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 from art.megatron.selective_lm_head import LmHeadTokenSelection
@@ -52,6 +52,34 @@ class PackedBatchAttentionSpec:
     rows: tuple[PackedRowAttentionSpec, ...]
 
 
+class ContextParallelStageWorkProfile(BaseModel):
+    """Architecture work assigned to one physical pipeline rank."""
+
+    model_config = ConfigDict(frozen=True)
+
+    physical_pipeline_rank: int = Field(ge=0)
+    query_flops_per_token: int = Field(ge=0)
+    tile_pair_flops: int = Field(ge=0)
+    k_hbm_bytes_per_token: int = Field(ge=0)
+    k_fetch_bytes_per_token: int = Field(ge=0)
+    dkv_reduce_bytes_per_token: int = Field(ge=0)
+    query_memory_bytes_per_token: int = Field(ge=0)
+    k_memory_bytes_per_token: int = Field(ge=0)
+
+
+class ContextParallelWorkloadProfile(BaseModel):
+    """Model-specific facts used to compare low-fragmentation CP layouts."""
+
+    model_config = ConfigDict(frozen=True)
+
+    stages: tuple[ContextParallelStageWorkProfile, ...] = Field(min_length=1)
+    query_tile_size: int = Field(gt=0)
+    key_tile_size: int = Field(gt=0)
+    indexer_score_workspace_elements: int = Field(gt=0)
+    indexer_max_k_tokens: int = Field(gt=0)
+    max_ownership_ranges_per_rank: int = Field(default=2, gt=0)
+
+
 @dataclass(frozen=True)
 class ContextParallelConfig:
     block_size: int = 128
@@ -75,6 +103,7 @@ class ContextParallelConfig:
     planner_remote_stage_token_floor: int = 4096
     planner_remote_stage_pair_floor: int = 4_000_000
     planner_remote_stage_underfill_ms: float = 0.287151
+    workload_profile: ContextParallelWorkloadProfile | None = None
 
 
 @dataclass(frozen=True)

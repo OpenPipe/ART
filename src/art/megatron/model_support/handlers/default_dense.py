@@ -106,6 +106,10 @@ class DefaultDenseHandler:
         del provider
         return None
 
+    def context_parallel_workload_profile(self, provider: Any) -> Any | None:
+        del provider
+        return None
+
     def default_chat_template(self) -> str | None:
         return None
 

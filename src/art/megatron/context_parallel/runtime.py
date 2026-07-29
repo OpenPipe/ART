@@ -6,6 +6,7 @@ import hashlib
 import json
 from typing import Any, cast
 
+from pydantic import BaseModel
 import torch
 
 from art.loss import shift_tensor
@@ -19,6 +20,7 @@ from .types import (
     AttnMaskKind,
     AttnSlice,
     ContextParallelConfig,
+    ContextParallelWorkloadProfile,
     CpBlockMaskVariant,
     DispatchedPackedTensors,
     DkvReducePlan,
@@ -40,6 +42,7 @@ _PLAN_CACHE_MAX_ENTRIES = 128
 
 StagePiece = tuple[TokenRange, TokenRange, AttnMaskKind, int | None]
 StageSliceKey = tuple[int, int, int, int, int, str, int]
+ProfiledChunkPiece = tuple[int, int, int, int, int, int, str, int | None]
 
 
 @dataclass(frozen=True)
@@ -1313,7 +1316,7 @@ def _evaluate_plan(
     }
 
 
-def _search_chunk_assignment(
+def _search_generic_chunk_assignment(
     *,
     chunk_ranges: tuple[TokenRange, ...],
     pair_matrix: list[list[int]] | torch.Tensor,
@@ -1436,6 +1439,403 @@ def _search_chunk_assignment(
     if best is None:
         raise RuntimeError("Failed to evaluate any CP planner wave assignment.")
     return best
+
+
+def _folded_chunk_assignment(
+    *,
+    weights: list[float],
+    cp_size: int,
+) -> tuple[int, ...]:
+    if len(weights) < 2 * cp_size:
+        return tuple()
+    slab_owners = _contiguous_chunk_assignment(
+        q_weights=weights,
+        cp_size=2 * cp_size,
+    )
+    return tuple(min(owner, 2 * cp_size - 1 - owner) for owner in slab_owners)
+
+
+def _ownership_range_counts(
+    owners: tuple[int, ...],
+    *,
+    cp_size: int,
+) -> tuple[int, ...]:
+    counts = [0 for _ in range(cp_size)]
+    previous = -1
+    for owner in owners:
+        if owner != previous:
+            counts[int(owner)] += 1
+        previous = int(owner)
+    return tuple(counts)
+
+
+def _rounded(value: int, multiple: int) -> int:
+    return ((int(value) + int(multiple) - 1) // int(multiple)) * int(multiple)
+
+
+def _stage_indexer_tile_pairs(
+    pieces: list[ProfiledChunkPiece],
+    *,
+    profile: ContextParallelWorkloadProfile,
+) -> int:
+    queries: dict[tuple[int, int], int] = {}
+    for (
+        _q_index,
+        _k_index,
+        q_start,
+        q_end,
+        k_start,
+        k_end,
+        _mask_kind,
+        _family,
+    ) in pieces:
+        query = (q_start, q_end)
+        queries[query] = queries.get(query, 0) + k_end - k_start
+
+    tile_pairs = 0
+    for (q_start, q_end), k_tokens in queries.items():
+        if k_tokens <= 0:
+            continue
+        k_chunk = min(k_tokens, int(profile.indexer_max_k_tokens))
+        q_chunk = max(1, int(profile.indexer_score_workspace_elements) // k_chunk)
+        rounded_q = sum(
+            _rounded(
+                min(q_chunk, q_end - start),
+                int(profile.query_tile_size),
+            )
+            for start in range(q_start, q_end, q_chunk)
+        )
+        rounded_k = sum(
+            _rounded(
+                min(k_chunk, k_tokens - start),
+                int(profile.key_tile_size),
+            )
+            for start in range(0, k_tokens, k_chunk)
+        )
+        tile_pairs += rounded_q * rounded_k
+    return tile_pairs
+
+
+def _intervals_size(intervals: list[tuple[int, int]]) -> int:
+    if not intervals:
+        return 0
+    ordered = sorted(set(intervals))
+    total = 0
+    current_start, current_end = ordered[0]
+    for start, end in ordered[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            total += current_end - current_start
+            current_start, current_end = start, end
+    return total + current_end - current_start
+
+
+def _profiled_chunk_pieces(
+    row_spec: PackedRowAttentionSpec,
+    *,
+    chunk_ranges: tuple[TokenRange, ...],
+) -> tuple[ProfiledChunkPiece, ...]:
+    pieces = []
+    chunk_starts = tuple(int(range_.start) for range_ in chunk_ranges)
+    chunk_ends = tuple(int(range_.end) for range_ in chunk_ranges)
+    for slice_ in row_spec.slices:
+        q_parts = _indexed_intersections(
+            slice_.q_range,
+            chunk_ranges,
+            candidate_starts=chunk_starts,
+            candidate_ends=chunk_ends,
+        )
+        k_parts = _indexed_intersections(
+            slice_.k_range,
+            chunk_ranges,
+            candidate_starts=chunk_starts,
+            candidate_ends=chunk_ends,
+        )
+        for q_index, q_piece in q_parts:
+            for k_index, k_piece in k_parts:
+                mask_kind = _resolve_stage_mask_kind(
+                    mask_kind=slice_.mask_kind,
+                    q_piece=q_piece,
+                    k_piece=k_piece,
+                )
+                if mask_kind is not None:
+                    pieces.append(
+                        (
+                            q_index,
+                            k_index,
+                            int(q_piece.start),
+                            int(q_piece.end),
+                            int(k_piece.start),
+                            int(k_piece.end),
+                            mask_kind.value,
+                            slice_.family_index,
+                        )
+                    )
+    return tuple(dict.fromkeys(pieces))
+
+
+def _profiled_rank_statistics(
+    *,
+    chunk_pieces: tuple[ProfiledChunkPiece, ...],
+    chunk_ranges: tuple[TokenRange, ...],
+    owners: tuple[int, ...],
+    wave_assignment: tuple[int, ...],
+    cp_size: int,
+    profile: ContextParallelWorkloadProfile,
+) -> list[dict[str, int]]:
+    wave_count = max(wave_assignment, default=0) + 1 if wave_assignment else 0
+    stages: list[list[list[ProfiledChunkPiece]]] = [
+        [[] for _ in range(wave_count + 1)] for _ in range(cp_size)
+    ]
+    recv_ranges: list[list[list[list[tuple[int, int]]]]] = [
+        [[[] for _ in range(cp_size)] for _ in range(wave_count)]
+        for _ in range(cp_size)
+    ]
+    send_ranges: list[list[list[list[tuple[int, int]]]]] = [
+        [[[] for _ in range(cp_size)] for _ in range(wave_count)]
+        for _ in range(cp_size)
+    ]
+    for piece in chunk_pieces:
+        q_index, k_index, _q_start, _q_end, k_start, k_end, _mask, _family = piece
+        destination = int(owners[q_index])
+        source = int(owners[k_index])
+        if source == destination:
+            stages[destination][0].append(piece)
+            continue
+        wave = int(wave_assignment[k_index])
+        stages[destination][wave + 1].append(piece)
+        interval = (k_start, k_end)
+        recv_ranges[destination][wave][source].append(interval)
+        send_ranges[source][wave][destination].append(interval)
+
+    query_tokens = [0 for _ in range(cp_size)]
+    for range_, owner in zip(chunk_ranges, owners, strict=True):
+        query_tokens[int(owner)] += int(range_.size())
+    statistics = []
+    for rank in range(cp_size):
+        combined_k_tokens = _intervals_size(
+            [(piece[4], piece[5]) for piece in stages[rank][0]]
+        )
+        recv_tokens = 0
+        send_tokens = 0
+        remote_peers: set[int] = set()
+        for wave_recv, wave_send in zip(
+            recv_ranges[rank],
+            send_ranges[rank],
+            strict=True,
+        ):
+            for peer, (peer_recv, peer_send) in enumerate(
+                zip(wave_recv, wave_send, strict=True)
+            ):
+                recv_size = _intervals_size(peer_recv)
+                send_size = _intervals_size(peer_send)
+                recv_tokens += recv_size
+                send_tokens += send_size
+                combined_k_tokens += recv_size
+                if peer != rank and (recv_size or send_size):
+                    remote_peers.add(peer)
+        statistics.append(
+            {
+                "query_tokens": query_tokens[rank],
+                "tile_pairs": sum(
+                    _stage_indexer_tile_pairs(pieces, profile=profile)
+                    for pieces in stages[rank]
+                ),
+                "combined_k_tokens": combined_k_tokens,
+                "fetch_send_tokens": send_tokens,
+                "fetch_recv_tokens": recv_tokens,
+                "remote_peers": len(remote_peers),
+            }
+        )
+    return statistics
+
+
+def _evaluate_profiled_assignment(
+    *,
+    chunk_pieces: tuple[ProfiledChunkPiece, ...],
+    chunk_ranges: tuple[TokenRange, ...],
+    owners: tuple[int, ...],
+    wave_assignment: tuple[int, ...],
+    cp_size: int,
+    profile: ContextParallelWorkloadProfile,
+) -> dict[str, Any]:
+    rank_stats = _profiled_rank_statistics(
+        chunk_pieces=chunk_pieces,
+        chunk_ranges=chunk_ranges,
+        owners=owners,
+        wave_assignment=wave_assignment,
+        cp_size=cp_size,
+        profile=profile,
+    )
+    query_flops = 0
+    indexer_flops = 0
+    hbm_k_bytes = 0
+    peak_memory_bytes = 0
+    fetch_send_bytes = 0
+    fetch_recv_bytes = 0
+    dkv_send_bytes = 0
+    dkv_recv_bytes = 0
+    for rank in rank_stats:
+        for stage in profile.stages:
+            query_flops = max(
+                query_flops,
+                rank["query_tokens"] * int(stage.query_flops_per_token),
+            )
+            indexer_flops = max(
+                indexer_flops,
+                rank["tile_pairs"] * int(stage.tile_pair_flops),
+            )
+            hbm_k_bytes = max(
+                hbm_k_bytes,
+                rank["combined_k_tokens"] * int(stage.k_hbm_bytes_per_token),
+            )
+            peak_memory_bytes = max(
+                peak_memory_bytes,
+                rank["query_tokens"] * int(stage.query_memory_bytes_per_token)
+                + rank["combined_k_tokens"] * int(stage.k_memory_bytes_per_token),
+            )
+            fetch_send_bytes = max(
+                fetch_send_bytes,
+                rank["fetch_send_tokens"] * int(stage.k_fetch_bytes_per_token),
+            )
+            fetch_recv_bytes = max(
+                fetch_recv_bytes,
+                rank["fetch_recv_tokens"] * int(stage.k_fetch_bytes_per_token),
+            )
+            dkv_send_bytes = max(
+                dkv_send_bytes,
+                rank["fetch_recv_tokens"] * int(stage.dkv_reduce_bytes_per_token),
+            )
+            dkv_recv_bytes = max(
+                dkv_recv_bytes,
+                rank["fetch_send_tokens"] * int(stage.dkv_reduce_bytes_per_token),
+            )
+
+    range_counts = _ownership_range_counts(owners, cp_size=cp_size)
+    max_network_bytes = max(
+        fetch_send_bytes,
+        fetch_recv_bytes,
+        dkv_send_bytes,
+        dkv_recv_bytes,
+    )
+    return {
+        "score": query_flops,
+        "query_flops": query_flops,
+        "indexer_flops": indexer_flops,
+        "hbm_k_bytes": hbm_k_bytes,
+        "peak_memory_bytes": peak_memory_bytes,
+        "max_network_bytes": max_network_bytes,
+        "fetch_send_bytes": fetch_send_bytes,
+        "fetch_recv_bytes": fetch_recv_bytes,
+        "dkv_send_bytes": dkv_send_bytes,
+        "dkv_recv_bytes": dkv_recv_bytes,
+        "max_remote_peers": max(
+            (rank["remote_peers"] for rank in rank_stats),
+            default=0,
+        ),
+        "max_ownership_ranges": max(range_counts, default=0),
+        "rank_query_tokens": tuple(rank["query_tokens"] for rank in rank_stats),
+        "rank_tile_pairs": tuple(rank["tile_pairs"] for rank in rank_stats),
+        "rank_combined_k_tokens": tuple(
+            rank["combined_k_tokens"] for rank in rank_stats
+        ),
+        "rank_fetch_send_tokens": tuple(
+            rank["fetch_send_tokens"] for rank in rank_stats
+        ),
+        "rank_fetch_recv_tokens": tuple(
+            rank["fetch_recv_tokens"] for rank in rank_stats
+        ),
+        "rank_remote_peers": tuple(rank["remote_peers"] for rank in rank_stats),
+        "ownership_range_counts": range_counts,
+    }
+
+
+def _profiled_assignment_key(
+    evaluation: dict[str, Any],
+    owners: tuple[int, ...],
+) -> tuple[Any, ...]:
+    # These terms retain their own physical units; they are never added together.
+    return (
+        int(evaluation["query_flops"]),
+        int(evaluation["max_network_bytes"]),
+        int(evaluation["hbm_k_bytes"]),
+        int(evaluation["indexer_flops"]),
+        int(evaluation["max_remote_peers"]),
+        int(evaluation["max_ownership_ranges"]),
+        owners,
+    )
+
+
+def _search_chunk_assignment(
+    *,
+    row_spec: PackedRowAttentionSpec | None = None,
+    chunk_ranges: tuple[TokenRange, ...],
+    pair_matrix: list[list[int]] | torch.Tensor,
+    q_weights: list[float],
+    cp_size: int,
+    config: ContextParallelConfig,
+) -> tuple[tuple[int, ...], tuple[int, ...], dict[str, Any]]:
+    generic = _search_generic_chunk_assignment(
+        chunk_ranges=chunk_ranges,
+        pair_matrix=pair_matrix,
+        q_weights=q_weights,
+        cp_size=cp_size,
+        config=config,
+    )
+    profile = config.workload_profile
+    if profile is None:
+        return generic
+    if row_spec is None:
+        raise RuntimeError("Profile-aware CP planning requires the packed row spec.")
+
+    chunk_pieces = _profiled_chunk_pieces(row_spec, chunk_ranges=chunk_ranges)
+    lengths = [float(range_.size()) for range_ in chunk_ranges]
+    candidates = [
+        generic[0],
+        _contiguous_chunk_assignment(q_weights=lengths, cp_size=cp_size),
+        _folded_chunk_assignment(weights=lengths, cp_size=cp_size),
+    ]
+    baseline = _evaluate_profiled_assignment(
+        chunk_pieces=chunk_pieces,
+        chunk_ranges=chunk_ranges,
+        owners=generic[0],
+        wave_assignment=generic[1],
+        cp_size=cp_size,
+        profile=profile,
+    )
+    best_owners = generic[0]
+    best_eval = baseline
+    seen = {generic[0]}
+    for owners in candidates[1:]:
+        if not owners or owners in seen:
+            continue
+        seen.add(owners)
+        if len(set(owners)) != cp_size:
+            continue
+        range_counts = _ownership_range_counts(owners, cp_size=cp_size)
+        if max(range_counts, default=0) > int(profile.max_ownership_ranges_per_rank):
+            continue
+        evaluation = _evaluate_profiled_assignment(
+            chunk_pieces=chunk_pieces,
+            chunk_ranges=chunk_ranges,
+            owners=owners,
+            wave_assignment=generic[1],
+            cp_size=cp_size,
+            profile=profile,
+        )
+        if int(evaluation["peak_memory_bytes"]) > int(
+            baseline["peak_memory_bytes"]
+        ) or _profiled_assignment_key(evaluation, owners) >= _profiled_assignment_key(
+            baseline, generic[0]
+        ):
+            continue
+        if _profiled_assignment_key(evaluation, owners) < _profiled_assignment_key(
+            best_eval, best_owners
+        ):
+            best_owners = owners
+            best_eval = evaluation
+    return best_owners, generic[1], best_eval
 
 
 def _flatten_ranges_by_peer(
@@ -2095,6 +2495,7 @@ def _runtime_plan_assignment(
         chunk_ranges=chunk_ranges,
     )
     owners, wave_assignment, _planner_eval = _search_chunk_assignment(
+        row_spec=row_spec,
         chunk_ranges=chunk_ranges,
         pair_matrix=pair_matrix,
         q_weights=q_weights,
@@ -2185,7 +2586,10 @@ def _runtime_plan_cache_key(
 
 
 def _dataclass_payload(value: Any) -> dict[str, Any]:
-    return dict(value.__dict__)
+    return {
+        key: (item.model_dump(mode="json") if isinstance(item, BaseModel) else item)
+        for key, item in value.__dict__.items()
+    }
 
 
 def _attn_slice_payload(slice_: AttnSlice) -> dict[str, Any]:

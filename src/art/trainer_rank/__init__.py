@@ -2411,7 +2411,11 @@ class TrainerRank:
         prepared = prepare_cp_micro(
             micro=sparse_micro,
             topology=topology,
-            config=_context_parallel_config_for_provider(provider, self.device),
+            config=_context_parallel_config_for_provider(
+                provider,
+                self.device,
+                handler,
+            ),
             cp_group=ps.get_context_parallel_group(check_initialized=False),
             cp_rank=ps.get_context_parallel_rank(),
             build_gdn_execution_spec=handler.build_gdn_execution_spec,

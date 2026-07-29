@@ -181,6 +181,15 @@ class Glm52Handler(DefaultMoeHandler):
         provider.mtp_loss_scaling_factor = None
         provider.moe_shared_expert_overlap = False
 
+    def context_parallel_workload_profile(self, provider: Any) -> Any:
+        from art.megatron.glm52.spec import build_glm52_context_parallel_profile
+
+        profile = getattr(provider, "_art_context_parallel_workload_profile", None)
+        if profile is None:
+            profile = build_glm52_context_parallel_profile(provider)
+            provider._art_context_parallel_workload_profile = profile
+        return profile
+
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from megatron.core.models.gpt.gpt_model import GPTModel
 
