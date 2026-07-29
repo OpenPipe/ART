@@ -1400,6 +1400,14 @@ class VariantRunner:
             or not oracle_manifest.exists()
             or not self.shared_init_path.exists()
             or not _manifest_matches_current_commit(oracle_manifest)
+            or any(
+                not (
+                    self.oracle_dir
+                    / "traces"
+                    / f"forward_trace_step_{step_index:03d}.pt"
+                ).exists()
+                for step_index in range(self.case_config.num_steps)
+            )
         ):
             run_oracle_topology(
                 output_slug=self.oracle_slug,
