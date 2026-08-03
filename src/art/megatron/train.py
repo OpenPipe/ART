@@ -1624,7 +1624,7 @@ def _forward_prepared_rl_micro(
 ) -> TokenLossOutput:
     model = model_chunks[0] if model_chunk is None else model_chunk
     model_forward_kwargs = dict(
-        input_ids=prepared_micro.model_tokens if chunk_pre_process(model) else None,
+        input_ids=prepared_micro.model_tokens,
         position_ids=prepared_micro.model_input_pos,
         attention_mask=_placeholder_attention_mask(device),
         packed_seq_params=prepared_micro.packed_seq_params,
@@ -2136,7 +2136,7 @@ def run_megatron_sft_step(
         item = next(data_iterator)
         prepared = item.payload
         kwargs = dict(
-            input_ids=prepared.input_ids if chunk_pre_process(model) else None,
+            input_ids=prepared.input_ids,
             position_ids=prepared.position_ids,
             attention_mask=_placeholder_attention_mask(device),
             packed_seq_params=prepared.packed_seq_params,
