@@ -1277,8 +1277,12 @@ def _install_gemma4_preprocess_patch(model_chunks: Sequence[Any]) -> None:
                     setattr(gemma4_rotary, "cp_group", rotary_cp_group)
                     if local_rotary is not None:
                         setattr(local_rotary, "cp_group", local_rotary_cp_group)
-            decoder_input = cast(torch.Tensor, preproc_output[0])
-            if not decoder_input.requires_grad and decoder_input.is_leaf:
+            decoder_input = cast(torch.Tensor | None, preproc_output[0])
+            if (
+                decoder_input is not None
+                and not decoder_input.requires_grad
+                and decoder_input.is_leaf
+            ):
                 decoder_input.requires_grad_(True)
             rotary_pos_emb = preproc_output[1]
             if not isinstance(position_ids, torch.Tensor) or not isinstance(
