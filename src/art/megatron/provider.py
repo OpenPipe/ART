@@ -101,11 +101,12 @@ def resolve_layer_spec(
     module_spec_type = _optional_module_spec_type()
     if module_spec_type is not None and isinstance(base_layer_spec, module_spec_type):
         return copy.deepcopy(base_layer_spec)
-    kwargs = (
-        {"vp_stage": vp_stage}
-        if vp_stage in inspect.signature(base_layer_spec).parameters
-        else {}
+    parameters = inspect.signature(base_layer_spec).parameters
+    accepts_vp_stage = "vp_stage" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
     )
+    kwargs = {"vp_stage": vp_stage} if accepts_vp_stage else {}
     return base_layer_spec(config, **kwargs)
 
 
