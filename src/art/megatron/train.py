@@ -1778,6 +1778,9 @@ def _calculate_megatron_logprob_batch(
             controller=moe_routing_replay_controller,
             hybridep_token_counts=hybridep_token_counts,
             microbatch_count=len(prepared_micros),
+            model_activator=model_support_handler.build_pipeline_microbatch_activator(
+                model_chunks
+            ),
         )
         if not ps.model_parallel_is_initialized():
             # Unit/static callers do not have MCore process groups. Production
@@ -1815,6 +1818,9 @@ def _calculate_megatron_logprob_batch(
             model_inputs=[prepared.model_tokens for prepared in prepared_micros],
             moe_routing_replay_controller=moe_routing_replay_controller,
             hybridep_token_counts=hybridep_token_counts,
+            model_activator=model_support_handler.build_pipeline_microbatch_activator(
+                model_chunks
+            ),
         )
 
         def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
@@ -2130,6 +2136,9 @@ def run_megatron_sft_step(
         model_inputs=[prepared.input_ids for prepared in prepared_micros],
         moe_routing_replay_controller=moe_routing_replay_controller,
         hybridep_token_counts=hybridep_token_counts,
+        model_activator=model_support_handler.build_pipeline_microbatch_activator(
+            model_chunks
+        ),
     )
 
     def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
@@ -2309,6 +2318,9 @@ def run_training_step(
         model_inputs=[prepared.model_tokens for prepared in prepared_micros],
         moe_routing_replay_controller=moe_routing_replay_controller,
         hybridep_token_counts=hybridep_token_counts,
+        model_activator=model_support_handler.build_pipeline_microbatch_activator(
+            model_chunks
+        ),
     )
 
     def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):

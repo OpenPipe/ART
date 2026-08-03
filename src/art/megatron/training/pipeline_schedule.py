@@ -65,11 +65,13 @@ class PipelineMicrobatchState(Generic[_T]):
         controller: MoeRoutingReplayController | None,
         hybridep_token_counts: Sequence[int] | None,
         microbatch_count: int,
+        model_activator: Callable[[_T, int], None] | None,
     ) -> None:
         hybridep_enabled = _validate_hybridep_token_counts(
             hybridep_token_counts, microbatch_count
         )
         self._controller = controller
+        self._model_activator = model_activator
         self._hybridep_token_counts = (
             tuple(cast(Sequence[int], hybridep_token_counts))
             if hybridep_enabled
@@ -78,7 +80,11 @@ class PipelineMicrobatchState(Generic[_T]):
 
     @property
     def enabled(self) -> bool:
-        return self._controller is not None or self._hybridep_token_counts is not None
+        return (
+            self._controller is not None
+            or self._hybridep_token_counts is not None
+            or self._model_activator is not None
+        )
 
     def activate(self, item: ScheduleMicrobatch[_T], chunk_index: int) -> None:
         prepared = item.payload
@@ -95,6 +101,8 @@ class PipelineMicrobatchState(Generic[_T]):
             )
         if self._hybridep_token_counts is not None:
             _set_hybridep_token_count(self._hybridep_token_counts[item.order])
+        if self._model_activator is not None:
+            self._model_activator(prepared, chunk_index)
 
 
 @dataclass
@@ -490,6 +498,7 @@ class MCoreScheduleAdapter(Generic[_T]):
         model_inputs: Sequence[torch.Tensor],
         moe_routing_replay_controller: MoeRoutingReplayController | None = None,
         hybridep_token_counts: Sequence[int] | None = None,
+        model_activator: Callable[[_T, int], None] | None = None,
     ) -> None:
         if not model_chunks:
             raise ValueError("MCore schedule requires at least one model chunk")
@@ -506,6 +515,7 @@ class MCoreScheduleAdapter(Generic[_T]):
             controller=moe_routing_replay_controller,
             hybridep_token_counts=hybridep_token_counts,
             microbatch_count=len(self.microbatches),
+            model_activator=model_activator,
         )
         self._active_activation_key: tuple[int, int] | None = None
         self.pp_size = int(ps.get_pipeline_model_parallel_world_size())

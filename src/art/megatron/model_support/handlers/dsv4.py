@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from typing import Any, Literal, Sequence, cast
+from typing import Any, Callable, Literal, Sequence, cast
 
 import torch
 
@@ -272,6 +272,29 @@ class Dsv4Handler(DefaultMoeHandler):
                 return tuple(preproc_output)
 
             setattr(gpt_module, "_preprocess", preprocess_hook)
+
+    def build_pipeline_microbatch_activator(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> Callable[[Any, int], None]:
+        from art.megatron.dsv4.deepseek_v4 import DeepSeekV4Attention
+        from art.megatron.dsv4.layer import Dsv4MoELayer
+
+        chunks = tuple(model_chunks)
+
+        def activate(prepared: Any, chunk_index: int) -> None:
+            input_ids = getattr(prepared, "model_tokens", None)
+            position_ids = getattr(prepared, "model_input_pos", None)
+            if input_ids is None:
+                input_ids = prepared.input_ids
+                position_ids = prepared.position_ids
+            for child in chunks[chunk_index].modules():
+                if isinstance(child, Dsv4MoELayer):
+                    child.set_input_ids(input_ids)
+                if isinstance(child, DeepSeekV4Attention):
+                    child.set_position_ids(position_ids)
+
+        return activate
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         ratios: list[int] = list(getattr(provider, "dsv4_compress_ratios", ()) or ())

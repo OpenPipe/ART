@@ -1,4 +1,4 @@
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import torch
 
@@ -134,6 +134,13 @@ class DefaultDenseHandler:
         return {}
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def build_pipeline_microbatch_activator(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> Callable[[Any, int], None] | None:
         del model_chunks
         return None
 
