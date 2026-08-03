@@ -1877,7 +1877,11 @@ def wrap_grouped_moe_experts(
             fused_gate_up=fused_gate_up,
         )
         setattr(experts, "linear_fc1", linear_fc1_lora)
-        expert_loras.append(linear_fc1_lora.lora)
+        expert_loras.extend(
+            (linear_fc1_lora.lora,)
+            if fused_gate_up
+            else (linear_fc1_lora.gate_lora, linear_fc1_lora.up_lora)
+        )
     wrap_fc2 = (
         wrap_fc1 if fused_gate_up else _targets_include(target_modules, "down_proj")
     )
