@@ -351,6 +351,8 @@ class OracleCaseConfig(BaseModel):
     """Contains all deterministic run parameters for one oracle case."""
 
     base_model: str
+    provider_model: str | None = None
+    model_support_key: str | None = None
     precision: Literal["bf16", "fp32"] = "fp32"
     num_layers: int = 4
     seed: int = 20260304
@@ -366,6 +368,12 @@ class OracleCaseConfig(BaseModel):
 
     @property
     def is_moe(self) -> bool:
+        if self.model_support_key is not None:
+            from art.megatron.model_support.registry import (
+                get_model_support_spec_by_key,
+            )
+
+            return get_model_support_spec_by_key(self.model_support_key).is_moe
         from art.megatron.model_support import model_uses_expert_parallel
 
         return model_uses_expert_parallel(
@@ -807,12 +815,21 @@ def selected_suite_topologies(
 def stable_case_id(case_config: OracleCaseConfig) -> str:
     """Builds a deterministic case id from case config contents."""
     payload = case_config.model_dump(mode="json")
-    from art.megatron.model_support import default_target_modules_for_model
+    if case_config.model_support_key is not None:
+        from art.megatron.model_support.registry import get_model_support_spec_by_key
 
-    payload["runtime_target_modules"] = default_target_modules_for_model(
-        case_config.base_model,
-        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
-    )
+        payload["runtime_target_modules"] = list(
+            get_model_support_spec_by_key(
+                case_config.model_support_key
+            ).default_target_modules
+        )
+    else:
+        from art.megatron.model_support import default_target_modules_for_model
+
+        payload["runtime_target_modules"] = default_target_modules_for_model(
+            case_config.base_model,
+            allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+        )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
     model_tag = (

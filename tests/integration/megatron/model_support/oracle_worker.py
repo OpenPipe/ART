@@ -450,12 +450,7 @@ def _configure_provider(
         provider.attention_dropout = 0.0
     if hasattr(provider, "hidden_dropout"):
         provider.hidden_dropout = 0.0
-    from art.megatron.model_support.registry import get_model_support_handler
-
-    handler = get_model_support_handler(
-        case_config.base_model,
-        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
-    )
+    handler = provider._art_model_support_handler
     configure_oracle_provider = getattr(handler, "configure_oracle_provider", None)
     if configure_oracle_provider is not None:
         configure_oracle_provider(provider, case_config=case_config)
@@ -1385,7 +1380,9 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 else torch.bfloat16
             )
             runtime = megatron_train.build_training_runtime(
-                model_identifier=request.case_config.base_model,
+                model_identifier=(
+                    request.case_config.provider_model or request.case_config.base_model
+                ),
                 provider_torch_dtype=provider_torch_dtype,
                 provider_configure=lambda provider: _configure_provider(
                     provider, request.topology, request.case_config
@@ -1395,6 +1392,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 moe_routing_replay_strict=request.moe_routing_replay_strict,
                 print_env=False,
                 allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
+                model_support_key=request.case_config.model_support_key,
             )
         _debug("finished build_training_runtime")
     model_chunks = runtime.model
