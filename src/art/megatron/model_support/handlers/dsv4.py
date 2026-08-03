@@ -47,6 +47,34 @@ _DSV4_SPLIT_MOE_EXPERT_KEY_RE = re.compile(
 _DSV4_MOE_COMPILE_WORKAROUND_FLAGS = ("te_triton_permute_with_mask_map",)
 
 
+def _dsv4_input_activator(
+    model: Any,
+) -> Callable[[torch.Tensor | None, torch.Tensor | None], None]:
+    from art.megatron.dsv4.deepseek_v4 import DeepSeekV4Attention
+    from art.megatron.dsv4.layer import Dsv4MoELayer
+
+    modules = tuple(model.modules())
+    input_setters = tuple(
+        child.set_input_ids for child in modules if isinstance(child, Dsv4MoELayer)
+    )
+    position_setters = tuple(
+        child.set_position_ids
+        for child in modules
+        if isinstance(child, DeepSeekV4Attention)
+    )
+
+    def activate(
+        input_ids: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+    ) -> None:
+        for setter in input_setters:
+            setter(input_ids)
+        for setter in position_setters:
+            setter(position_ids)
+
+    return activate
+
+
 class Dsv4Handler(DefaultMoeHandler):
     key = "dsv4"
     is_moe = True
@@ -218,9 +246,6 @@ class Dsv4Handler(DefaultMoeHandler):
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from megatron.core.models.gpt.gpt_model import GPTModel
 
-        from art.megatron.dsv4.deepseek_v4 import DeepSeekV4Attention
-        from art.megatron.dsv4.layer import Dsv4MoELayer
-
         for chunk in list(model_chunks):
             module: Any = chunk
             while hasattr(module, "module"):
@@ -231,23 +256,20 @@ class Dsv4Handler(DefaultMoeHandler):
                 else cast(GPTModel, getattr(module, "language_model"))
             )
             preprocess = gpt_module._preprocess
+            activate = _dsv4_input_activator(gpt_module.decoder)
 
             def preprocess_hook(
-                *args: Any, _preprocess=preprocess, _gpt=gpt_module, **kwargs: Any
+                *args: Any,
+                _preprocess=preprocess,
+                _activate=activate,
+                **kwargs: Any,
             ):
                 input_ids = kwargs.get("input_ids")
                 position_ids = kwargs.get("position_ids")
-                for child in _gpt.decoder.modules():
-                    if isinstance(child, Dsv4MoELayer):
-                        child.set_input_ids(
-                            input_ids if isinstance(input_ids, torch.Tensor) else None
-                        )
-                    if isinstance(child, DeepSeekV4Attention):
-                        child.set_position_ids(
-                            position_ids
-                            if isinstance(position_ids, torch.Tensor)
-                            else None
-                        )
+                _activate(
+                    input_ids if isinstance(input_ids, torch.Tensor) else None,
+                    position_ids if isinstance(position_ids, torch.Tensor) else None,
+                )
                 preproc_output = list(_preprocess(*args, **kwargs))
                 decoder_input = cast(torch.Tensor | None, preproc_output[0])
                 if (
@@ -277,10 +299,7 @@ class Dsv4Handler(DefaultMoeHandler):
         self,
         model_chunks: Sequence[Any],
     ) -> Callable[[Any, int], None]:
-        from art.megatron.dsv4.deepseek_v4 import DeepSeekV4Attention
-        from art.megatron.dsv4.layer import Dsv4MoELayer
-
-        chunks = tuple(model_chunks)
+        activators = tuple(_dsv4_input_activator(chunk) for chunk in model_chunks)
 
         def activate(prepared: Any, chunk_index: int) -> None:
             input_ids = getattr(prepared, "model_tokens", None)
@@ -288,11 +307,7 @@ class Dsv4Handler(DefaultMoeHandler):
             if input_ids is None:
                 input_ids = prepared.input_ids
                 position_ids = prepared.position_ids
-            for child in chunks[chunk_index].modules():
-                if isinstance(child, Dsv4MoELayer):
-                    child.set_input_ids(input_ids)
-                if isinstance(child, DeepSeekV4Attention):
-                    child.set_position_ids(position_ids)
+            activators[chunk_index](input_ids, position_ids)
 
         return activate
 
