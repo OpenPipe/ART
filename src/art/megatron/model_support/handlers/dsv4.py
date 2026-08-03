@@ -29,6 +29,7 @@ _ORACLE_FFN_HIDDEN_SIZE = 256
 _ORACLE_INDEX_HEADS = 1
 _ORACLE_INDEX_TOPK = 1024
 _VALIDATION_NUM_LAYERS_ENV = "ART_DSV4_VALIDATION_NUM_LAYERS"
+_ORACLE_LAYER_RE = re.compile(r"(?P<prefix>(?:^|\.)decoder\.layers\.)(?P<layer>\d+)")
 _ORACLE_EXPERT_WEIGHT_RE = re.compile(r"\.mlp\.experts\..*\.weight(?P<expert>\d+)$")
 _DSV4_ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
@@ -582,11 +583,12 @@ class Dsv4Handler(DefaultMoeHandler):
         ep_size = ps.get_expert_model_parallel_world_size()
         with torch.no_grad():
             for chunk in model_chunks:
+                global_layers = self._oracle_global_layer_indices(chunk)
                 for name, param in chunk.named_parameters():
                     if self._is_oracle_lora_tensor(name):
                         continue
                     init_name = self._oracle_base_tensor_name(
-                        name,
+                        self._oracle_global_layer_name(name, global_layers),
                         ep_rank=ep_rank,
                         ep_size=ep_size,
                     )
@@ -596,8 +598,36 @@ class Dsv4Handler(DefaultMoeHandler):
                         seed=seed,
                     )
                 for name, buffer in chunk.named_buffers():
-                    self._initialize_oracle_buffer(name, buffer, seed=seed)
+                    self._initialize_oracle_buffer(
+                        self._oracle_global_layer_name(name, global_layers),
+                        buffer,
+                        seed=seed,
+                    )
         return model_chunks
+
+    @staticmethod
+    def _oracle_global_layer_indices(chunk: Any) -> dict[int, int]:
+        from art.megatron.dsv4.layer import Dsv4TransformerLayer
+
+        indices: dict[int, int] = {}
+        for name, module in chunk.named_modules():
+            if not isinstance(module, Dsv4TransformerLayer):
+                continue
+            match = _ORACLE_LAYER_RE.search(name)
+            if match is None:
+                raise RuntimeError(f"Cannot locate DSV4 oracle layer in {name!r}")
+            indices[int(match.group("layer"))] = int(module.layer_number) - 1
+        return indices
+
+    @staticmethod
+    def _oracle_global_layer_name(name: str, indices: dict[int, int]) -> str:
+        match = _ORACLE_LAYER_RE.search(name)
+        if match is None:
+            return name
+        global_layer = indices[int(match.group("layer"))]
+        return (
+            f"{name[: match.start('layer')]}{global_layer}{name[match.end('layer') :]}"
+        )
 
     @staticmethod
     def _is_oracle_lora_tensor(name: str) -> bool:
