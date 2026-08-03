@@ -471,7 +471,6 @@ def _patch_finalize_provider_bundle_for_oracle(
             provider.moe_token_dispatcher_type = "alltoall"
             provider.moe_flex_dispatcher_backend = None
             provider.moe_enable_deepep = False
-            provider.moe_shared_expert_overlap = True
             provider.overlap_moe_expert_parallel_comm = False
             provider.delay_wgrad_compute = False
             provider.ep_overlap_early_attn_memory_release = False

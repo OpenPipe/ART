@@ -45,6 +45,7 @@ class _FakeProvider:
         self.recompute_num_layers: int | None = None
         self.expert_model_parallel_size = 1
         self.expert_tensor_parallel_size = 1
+        self.dsv4_hc_mult = 4
 
     def _base_layer_spec(
         self, config: object, vp_stage: int | None = None
