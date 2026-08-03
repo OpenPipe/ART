@@ -247,8 +247,12 @@ class Dsv4Handler(DefaultMoeHandler):
                             else None
                         )
                 preproc_output = list(_preprocess(*args, **kwargs))
-                decoder_input = cast(torch.Tensor, preproc_output[0])
-                if not decoder_input.requires_grad and decoder_input.is_leaf:
+                decoder_input = cast(torch.Tensor | None, preproc_output[0])
+                if (
+                    decoder_input is not None
+                    and not decoder_input.requires_grad
+                    and decoder_input.is_leaf
+                ):
                     decoder_input.requires_grad_(True)
                 table = preproc_output[1]
                 if isinstance(position_ids, torch.Tensor) and torch.is_tensor(table):
