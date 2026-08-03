@@ -468,6 +468,14 @@ class _TimedP2PCommunicator:
         return timed
 
 
+class _ArtP2PCommunicator(P2PCommunicator):
+    def _communicate(self, *, tensor_shape: Any, **kwargs: Any) -> Any:
+        trailing_shape = getattr(self.config, "art_pipeline_activation_shape", None)
+        if tensor_shape is not None and trailing_shape is not None:
+            tensor_shape = torch.Size((*tensor_shape[:-1], *trailing_shape))
+        return super()._communicate(tensor_shape=cast(Any, tensor_shape), **kwargs)
+
+
 class MCoreScheduleAdapter(Generic[_T]):
     """Small ART boundary around MCore's PP1, PP and VPP schedules."""
 
@@ -745,7 +753,7 @@ class MCoreScheduleAdapter(Generic[_T]):
         pg_collection: ProcessGroupCollection | None = None
         if self.pp_size > 1:
             communicator = _TimedP2PCommunicator(
-                P2PCommunicator(
+                _ArtP2PCommunicator(
                     pp_group=ps.get_pipeline_model_parallel_group(), config=config
                 ),
                 self.telemetry,
