@@ -1,4 +1,5 @@
 #!/bin/bash
+set -eo pipefail
 
 # Load environment variables from .env file if it exists
 if [ -f .env ]; then
@@ -35,11 +36,17 @@ EOF
     chmod +x "$sudo_path"
 fi
 
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/conda/bin:$PATH"
 need_pkgs=()
 command -v git >/dev/null 2>&1 || need_pkgs+=("git")
 command -v curl >/dev/null 2>&1 || need_pkgs+=("curl")
 command -v tmux >/dev/null 2>&1 || need_pkgs+=("tmux")
 
+install_multinode=${INSTALL_MULTINODE:-false}
+if [ "$install_multinode" != "true" ] && [ "$install_multinode" != "false" ]; then
+    echo "INSTALL_MULTINODE must be true or false" >&2
+    exit 1
+fi
 if [ "${#need_pkgs[@]}" -gt 0 ]; then
     apt-get update
     apt-get install -y "${need_pkgs[@]}"
@@ -50,7 +57,7 @@ git config --global user.name "${GIT_USER_NAME}"
 git config --global user.email "${GIT_USER_EMAIL}"
 git config --global --add safe.directory "$(pwd)"
 
-if [ "${GIT_RESET_CLEAN:-true}" = "true" ]; then
+if [ "${GIT_RESET_CLEAN:-false}" = "true" ]; then
     # Reset any uncommitted changes to the last commit
     git reset --hard HEAD
 
@@ -61,8 +68,7 @@ else
 fi
 
 # Install astral-uv (standalone version)
-# Always prepend standalone install path so it takes precedence over system/conda uv
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+# Always prefer the standalone uv over system/conda installations.
 if command -v uv >/dev/null 2>&1; then
     echo "Using $(uv --version)"
 elif ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
@@ -70,9 +76,28 @@ elif ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
     exit 1
 fi
 
-# Sync the dependencies
-if [ "${INSTALL_EXTRAS:-false}" = "true" ]; then
-    uv sync --extra backend --extra tinker --extra langgraph --extra plotting --frozen
+backend_extra=backend
+if [ -f /usr/local/cuda/version.json ] &&
+    grep -Eq '"version"[[:space:]]*:[[:space:]]*"13\.' /usr/local/cuda/version.json; then
+    backend_extra=backend-cu130
+fi
+
+if [ "$install_multinode" = "true" ]; then
+    if [ "${INSTALL_EXTRAS:-false}" = "true" ]; then
+        echo "INSTALL_EXTRAS is incompatible with the Megatron environment" >&2
+        exit 1
+    fi
+    scripts/setup_multinode.sh
+    export HYBRID_EP_MULTINODE=1
+    export USE_NIXL=1
+    export NIXL_HOME=/usr/local/art-multinode/nixl
+    export UCX_HOME=/usr/local/art-multinode/ucx
+    export LD_LIBRARY_PATH="$NIXL_HOME/lib/x86_64-linux-gnu:$UCX_HOME/lib:${LD_LIBRARY_PATH:-}"
+    /bin/bash src/art/megatron/setup.sh
 else
-    uv sync --extra backend --frozen
+    sync_extras=(--extra "$backend_extra")
+    if [ "${INSTALL_EXTRAS:-false}" = "true" ]; then
+        sync_extras+=(--extra tinker --extra langgraph --extra plotting)
+    fi
+    uv sync "${sync_extras[@]}" --frozen
 fi

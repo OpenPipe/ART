@@ -78,12 +78,16 @@ class EndpointSpec(_Spec):
 
 class NixlTransportSpec(_Spec):
     metadata_store: EndpointSpec
-    nixl_home: str = Field(default="/usr/local/nixl", min_length=1)
-    ucx_home: str = Field(default="/usr", min_length=1)
-    nixl_plugin_dir: str | None = Field(default=None, min_length=1)
-    ucx_module_dir: str | None = Field(default=None, min_length=1)
-    ucx_net_devices: str | None = Field(default=None, min_length=1)
-    ucx_tls: str = Field(default="^cuda_ipc", min_length=1)
+    nixl_home: str = Field(default="/usr/local/art-multinode/nixl", min_length=1)
+    ucx_home: str = Field(default="/usr/local/art-multinode/ucx", min_length=1)
+    nixl_plugin_dir: str = Field(
+        default="/usr/local/art-multinode/nixl-ucx/lib/plugins", min_length=1
+    )
+    ucx_module_dir: str = Field(
+        default="/usr/local/art-multinode/ucx/lib/ucx", min_length=1
+    )
+    ucx_net_devices: str = Field(default="all", min_length=1)
+    ucx_tls: str = Field(default="rc,rc_gda,cuda_copy", min_length=1)
     enable_cuda_fabric: bool = False
 
     @model_validator(mode="after")

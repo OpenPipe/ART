@@ -88,6 +88,7 @@ def _configure_hybrid_ep_env(
         "UCX_MODULE_DIR": transport.ucx_module_dir if transport else None,
         "UCX_NET_DEVICES": transport.ucx_net_devices if transport else None,
         "UCX_TLS": transport.ucx_tls if transport else None,
+        "UCX_IB_GDA_RETAIN_INACTIVE_CTX": "yes" if transport else None,
         "UCX_CUDA_COPY_ENABLE_FABRIC": (
             "yes" if transport and transport.enable_cuda_fabric else "no"
         )

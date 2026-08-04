@@ -166,7 +166,12 @@ uv_bin="uv"
 if [ -x "${HOME}/.local/bin/uv" ]; then
     uv_bin="${HOME}/.local/bin/uv"
 fi
-"${uv_bin}" sync --extra "${distributed_extra}" --extra "${megatron_extra}" --no-sources-package transformer-engine --frozen --active
+"${uv_bin}" sync --extra "${distributed_extra}" --extra "${megatron_extra}" --no-sources-package transformer-engine --frozen --active --inexact
+
+for library_dir in "${repo_root}"/.venv/lib/python*/site-packages/nvidia/*/lib; do
+    [ ! -d "${library_dir}" ] || LD_LIBRARY_PATH="${library_dir}:${LD_LIBRARY_PATH}"
+done
+export LD_LIBRARY_PATH
 
 "${repo_root}/.venv/bin/python" - <<PY
 import torch
