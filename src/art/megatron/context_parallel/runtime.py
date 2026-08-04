@@ -33,6 +33,7 @@ from .types import (
     RankRuntimePlan,
     StagePlan,
     TokenRange,
+    TrainingMicrobatchWorkload,
 )
 
 _CHUNK_MASK_STATS_TORCH_THRESHOLD = 1024
@@ -2215,7 +2216,7 @@ def prepare_cp_micro(
         block_mask_variants=block_mask_variants,
         target_device=target_device,
     )
-    tensors = dispatch_megatron_context_parallel_training_tensors(
+    tensors, workload = dispatch_megatron_context_parallel_training_tensors(
         micro=micro,
         rank_plan=rank_plan,
         spec=spec,
@@ -2255,6 +2256,7 @@ def prepare_cp_micro(
         tensors=tensors,
         packed_seq_params=None,
         attention_state=state,
+        workload=workload,
         rank_plan=rank_plan,
         pad_multiple=pad_multiple,
     )
@@ -2353,7 +2355,7 @@ def dispatch_megatron_context_parallel_training_tensors(
     target_device: torch.device | None = None,
     cp_group: Any | None = None,
     ref_logprobs: torch.Tensor | None = None,
-) -> DispatchedPackedTensors:
+) -> tuple[DispatchedPackedTensors, TrainingMicrobatchWorkload]:
     """Gather this rank's training tensors and optionally move them to device.
 
     Dispatch may enqueue H2D copies when `target_device` is CUDA, but it must
@@ -2415,7 +2417,7 @@ def dispatch_megatron_context_parallel_training_tensors(
     local_token_uids = (
         None if token_uids is None else dispatch(token_uids, -1, move_to_target=False)
     )
-    return DispatchedPackedTensors(
+    tensors = DispatchedPackedTensors(
         tokens=dispatch(micro["tokens"], 0),
         labels=_to_target_device(local_labels, target_device),
         input_pos=dispatch(micro["input_pos"], 0),
@@ -2431,6 +2433,13 @@ def dispatch_megatron_context_parallel_training_tensors(
         loss_all_reduce_group=cp_group,
         token_uids=None if local_token_uids is None else local_token_uids.contiguous(),
     )
+    workload = TrainingMicrobatchWorkload(
+        logical_nonpadding_tokens=sum(rank_plan.local_valid_lengths),
+        loss_bearing_tokens=int((local_labels != -100).sum().item()),
+        executed_token_equivalents=int(local_labels.numel()),
+        nominal_schedule_capacity_tokens=rank_plan.original_seq_len,
+    )
+    return tensors, workload
 
 
 def get_or_build_runtime_plan(

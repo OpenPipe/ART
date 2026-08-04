@@ -265,4 +265,5 @@ class PackingResult(BaseModel):
     ref: PackedBatchRef | None
     packed_group_shapes: tuple[PackedGroupShape | None, ...]
     trainable_assistant_tokens: int = Field(default=0, ge=0)
+    loss_bearing_tokens: int = Field(default=0, ge=0)
     non_padding_tokens: int = Field(default=0, ge=0)

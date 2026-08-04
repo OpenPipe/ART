@@ -103,6 +103,41 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         score_component=True,
     ),
     MetricDefinition(
+        key="data/step_nonpadding_logical_tokens",
+        title="Non-padding logical train tokens",
+        description="actual non-padding tokens in real training microbatches",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=None,
+    ),
+    MetricDefinition(
+        key="data/step_loss_bearing_tokens",
+        title="Loss-bearing train tokens",
+        description="actual shifted token positions contributing to the loss",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=None,
+    ),
+    MetricDefinition(
+        key="data/step_executed_token_equivalents",
+        title="Executed token-equivalents",
+        description=(
+            "materialized per-rank token extents summed over DP and CP, including "
+            "padding and dummy microbatches"
+        ),
+        kind="counter",
+        unit="tokens",
+        higher_is_better=None,
+    ),
+    MetricDefinition(
+        key="data/step_nominal_schedule_capacity_tokens",
+        title="Nominal schedule capacity",
+        description="configured packed-row capacity before CP pruning",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=None,
+    ),
+    MetricDefinition(
         key="data/step_padding_ratio",
         title="Padding ratio",
         description=(
@@ -114,15 +149,38 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         dashboard_default=True,
     ),
     MetricDefinition(
-        key="throughput/train_packed_tok_per_s",
-        title="Megatron packed train tokens per second",
-        description=(
-            "physical packed training-token throughput reported by the Megatron worker"
-        ),
+        key="throughput/train_nonpadding_logical_tok_per_s",
+        title="Logical train tokens per second",
+        description="actual non-padding logical tokens divided by training time",
         kind="rate",
         unit="tok/s",
         higher_is_better=True,
         dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="throughput/train_loss_bearing_tok_per_s",
+        title="Loss-bearing train tokens per second",
+        description="actual loss-bearing tokens divided by training time",
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
+    ),
+    MetricDefinition(
+        key="throughput/train_executed_tok_equiv_per_s",
+        title="Executed token-equivalents per second",
+        description="executed materialized token-equivalents divided by training time",
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
+        dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="throughput/train_nominal_capacity_tok_per_s",
+        title="Nominal schedule capacity per second",
+        description="configured packed-row capacity divided by training time",
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
     ),
     MetricDefinition(
         key="loss/importance_ratio_mean",

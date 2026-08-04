@@ -46,6 +46,7 @@ from art.megatron.context_parallel.types import (
     DispatchedPackedTensors,
     ParallelTopology,
     PreparedMegatronBatch,
+    TrainingStepWorkload,
 )
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.megatron_patches import install_fast_frozen_output_backward
@@ -220,6 +221,7 @@ class TrainStepResult(BaseModel):
     update_successful: bool
     grad_norm: float
     num_zeros_in_grad: int | None
+    workload: TrainingStepWorkload
     loss_metrics: dict[str, float] = Field(default_factory=dict)
     pipeline_metrics: dict[str, float] = Field(default_factory=dict)
 
@@ -746,11 +748,6 @@ def execute_megatron_rl_job(
                 hybridep_token_counts=hybridep_token_counts,
             )
             train_step_s = time.perf_counter() - train_step_started
-            workload = _rl_step_workload(
-                packed_tensors,
-                step_index=step_index,
-                grad_accumulation_sequences=global_grad_accumulation_sequences,
-            )
             print0(
                 runtime.rank,
                 "Correlation between old and new probabilities:",
@@ -760,7 +757,6 @@ def execute_megatron_rl_job(
             final_metrics = _rl_step_metrics(
                 step_result,
                 num_gradient_steps=num_steps,
-                workload=workload,
                 train_step_s=train_step_s,
             )
             if runtime.rank == 0:
@@ -1320,22 +1316,27 @@ def _rl_step_metrics(
     step_result: TrainStepResult,
     *,
     num_gradient_steps: int,
-    workload: dict[str, int],
     train_step_s: float,
 ) -> dict[str, float]:
-    rate = 1.0 / train_step_s if train_step_s > 0 else 0.0
+    workload = step_result.workload
     metrics = {
         "loss/train": step_result.reduced_loss.item(),
         "loss/grad_norm": step_result.grad_norm,
         "loss/probs_corr": step_result.probs_corr,
         TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
-        "pipeline/global_real_microbatches": float(workload["real_microbatches"]),
-        "pipeline/global_dummy_microbatches": float(workload["dummy_microbatches"]),
-        "throughput/train_trainable_assistant_tok_per_s": (
-            workload["trainable_tokens"] * rate
+        "data/gradient_step_nonpadding_logical_tokens": float(
+            workload.logical_nonpadding_tokens
         ),
-        "throughput/train_nonpadding_tok_per_s": (workload["nonpadding_tokens"] * rate),
-        "throughput/train_packed_tok_per_s": workload["physical_tokens"] * rate,
+        "data/gradient_step_loss_bearing_tokens": float(workload.loss_bearing_tokens),
+        "data/gradient_step_executed_token_equivalents": float(
+            workload.executed_token_equivalents
+        ),
+        "data/gradient_step_nominal_schedule_capacity_tokens": float(
+            workload.nominal_schedule_capacity_tokens
+        ),
+        "pipeline/gradient_step_real_microbatches": float(workload.real_microbatches),
+        "pipeline/gradient_step_dummy_microbatches": float(workload.dummy_microbatches),
+        "time/gradient_step_train_s": train_step_s,
     }
     if step_result.kl_policy_ref is not None:
         metrics["loss/kl_policy_ref"] = step_result.kl_policy_ref
@@ -1349,33 +1350,6 @@ def _write_job_metrics(log_path: str, metrics: dict[str, float]) -> None:
         log_msg = json.dumps(metrics)
         print("Logging", log_msg)
         log_file.write(log_msg + "\n")
-
-
-def _rl_step_workload(
-    packed_tensors: PackedTensors,
-    *,
-    step_index: int,
-    grad_accumulation_sequences: int,
-) -> dict[str, int]:
-    start = step_index * grad_accumulation_sequences
-    stop = min(
-        start + grad_accumulation_sequences, int(packed_tensors["tokens"].shape[0])
-    )
-    rows = slice(start, stop)
-    real_microbatches = stop - start
-    return {
-        "real_microbatches": real_microbatches,
-        "dummy_microbatches": grad_accumulation_sequences - real_microbatches,
-        "trainable_tokens": int(
-            shift_tensor(packed_tensors["assistant_mask"][rows], False).sum().item()
-        ),
-        "nonpadding_tokens": int(
-            (packed_tensors["group_ids"][rows] != -1).sum().item()
-        ),
-        "physical_tokens": (
-            grad_accumulation_sequences * int(packed_tensors["tokens"].shape[1])
-        ),
-    }
 
 
 def finalize_megatron_job(
@@ -2209,6 +2183,7 @@ def run_megatron_sft_step(
         update_successful=update_successful,
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
+        workload=schedule.training_workload(),
         pipeline_metrics=schedule.telemetry.metrics(),
     )
 
@@ -2439,6 +2414,7 @@ def run_training_step(
         update_successful=update_successful,
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
+        workload=schedule.training_workload(),
         loss_metrics=loss_diagnostics.to_metrics(
             group=ps.get_data_parallel_group(with_context_parallel=True),
         ),

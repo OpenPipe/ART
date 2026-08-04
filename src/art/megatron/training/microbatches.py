@@ -18,8 +18,10 @@ from art.megatron.context_parallel.types import (
     DispatchedPackedTensors,
     ParallelTopology,
     PreparedMegatronBatch,
+    TrainingMicrobatchWorkload,
 )
 from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
+from art.megatron.prefix_tree import parse_prefix_tree
 from art.megatron.prefix_tree_state import create_prefix_tree_state
 from art.megatron.selective_lm_head import LmHeadTokenSelection
 from art.megatron.training.trace import (
@@ -47,6 +49,7 @@ class PreparedRLMicroInputs(BaseModel):
     lm_head_selection: LmHeadTokenSelection
     ref_logprobs: torch.Tensor | None = None
     local_token_uids: torch.Tensor | None = None
+    workload: TrainingMicrobatchWorkload
 
 
 class PreparedSFTMicroInputs(BaseModel):
@@ -60,6 +63,7 @@ class PreparedSFTMicroInputs(BaseModel):
     attention_state: Any
     packed_seq_params: Any | None = None
     local_token_uids: torch.Tensor | None = None
+    workload: TrainingMicrobatchWorkload
 
 
 def _map_packed_tensors(
@@ -529,6 +533,17 @@ def _prepare_dense_rl_micro(
         shifted_labels,
         target_device=device,
     )
+    workload = TrainingMicrobatchWorkload(
+        logical_nonpadding_tokens=sum(
+            row.valid_tokens
+            for row in parse_prefix_tree(
+                group_ids=micro["group_ids"], parent_ids=micro["parent_ids"]
+            )
+        ),
+        loss_bearing_tokens=int(shifted_assistant_mask.sum().item()),
+        executed_token_equivalents=int(micro["tokens"].numel()),
+        nominal_schedule_capacity_tokens=int(micro["tokens"].numel()),
+    )
     shifted_labels = shifted_labels.to(device)
     _move_inputs_to_device(micro, device)
     return PreparedRLMicroInputs(
@@ -540,6 +555,7 @@ def _prepare_dense_rl_micro(
         lm_head_selection=lm_head_selection,
         ref_logprobs=ref_logprobs,
         local_token_uids=packed_sequence_token_uids(micro, device=device),
+        workload=workload,
     )
 
 
@@ -601,6 +617,7 @@ def _prepared_rl_micro_from_cp_batch(
             prepared.tensors.ref_logprobs if ref_logprobs is not None else None
         ),
         local_token_uids=prepared.tensors.token_uids,
+        workload=prepared.workload,
     )
 
 
@@ -699,6 +716,12 @@ def _prepare_dense_sft_micro(
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
     shifted_labels = shift_tensor(labels, -100)
     loss_mask = shifted_labels != -100
+    workload = TrainingMicrobatchWorkload(
+        logical_nonpadding_tokens=int(attention_mask.sum().item()),
+        loss_bearing_tokens=int(loss_mask.sum().item()),
+        executed_token_equivalents=seq_len,
+        nominal_schedule_capacity_tokens=int(micro["input_ids"].numel()),
+    )
     lm_head_selection = LmHeadTokenSelection.from_labels(
         shifted_labels,
         target_device=device,
@@ -726,6 +749,7 @@ def _prepare_dense_sft_micro(
         local_token_uids=sft_sequence_token_uids(micro, device=device)[
             :, : int(input_ids.shape[1])
         ],
+        workload=workload,
     )
 
 
@@ -824,6 +848,7 @@ def _prepared_sft_micro_from_cp_batch(
         attention_state=prepared.attention_state,
         packed_seq_params=prepared.packed_seq_params,
         local_token_uids=prepared.tensors.token_uids,
+        workload=prepared.workload,
     )
 
 

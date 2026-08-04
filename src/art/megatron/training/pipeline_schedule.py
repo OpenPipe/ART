@@ -17,6 +17,10 @@ from megatron.core.timers import DummyTimer
 from megatron.core.utils import get_model_config
 import torch
 
+from art.megatron.context_parallel.types import (
+    TrainingMicrobatchWorkload,
+    TrainingStepWorkload,
+)
 from art.megatron.routing_replay import MoeRoutingReplayController
 from art.megatron.training.model_chunks import ModelChunks
 from art.megatron.training.trace import prepare_replay_local_input_token_uids
@@ -25,6 +29,7 @@ from art.megatron.training.trace import prepare_replay_local_input_token_uids
 class _PreparedMicrobatch(Protocol):
     attention_state: Any
     local_token_uids: torch.Tensor | None
+    workload: TrainingMicrobatchWorkload
 
 
 _T = TypeVar("_T", bound=_PreparedMicrobatch)
@@ -36,6 +41,27 @@ class ScheduleMicrobatch(Generic[_T]):
     sample_index: int | None
     payload: _T
     recompute_state: object | None = None
+
+
+def _local_training_workload_values(
+    microbatches: Sequence[ScheduleMicrobatch[Any]], cp_rank: int
+) -> list[int]:
+    real = tuple(item for item in microbatches if item.sample_index is not None)
+    return [
+        sum(item.payload.workload.logical_nonpadding_tokens for item in real),
+        sum(item.payload.workload.loss_bearing_tokens for item in real),
+        sum(item.payload.workload.executed_token_equivalents for item in microbatches),
+        (
+            sum(
+                item.payload.workload.nominal_schedule_capacity_tokens
+                for item in microbatches
+            )
+            if cp_rank == 0
+            else 0
+        ),
+        len(real) if cp_rank == 0 else 0,
+        len(microbatches) - len(real) if cp_rank == 0 else 0,
+    ]
 
 
 def _set_hybridep_token_count(rows: int) -> None:
@@ -625,6 +651,36 @@ class MCoreScheduleAdapter(Generic[_T]):
             return
         self._microbatch_state.activate(microbatch, chunk_index)
         self._active_activation_key = activation_key
+
+    def training_workload(self) -> TrainingStepWorkload:
+        values = torch.tensor(
+            _local_training_workload_values(
+                self.microbatches, int(ps.get_context_parallel_rank())
+            ),
+            device=torch.cuda.current_device(),
+            dtype=torch.int64,
+        )
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(
+                values,
+                group=ps.get_data_parallel_group(with_context_parallel=True),
+            )
+        (
+            logical,
+            loss_bearing,
+            executed,
+            nominal,
+            real_microbatches,
+            dummy_microbatches,
+        ) = values.cpu().tolist()
+        return TrainingStepWorkload(
+            logical_nonpadding_tokens=logical,
+            loss_bearing_tokens=loss_bearing,
+            executed_token_equivalents=executed,
+            nominal_schedule_capacity_tokens=nominal,
+            real_microbatches=real_microbatches,
+            dummy_microbatches=dummy_microbatches,
+        )
 
     @contextmanager
     def _recompute_activation_hooks(self, *, enabled: bool) -> Iterator[None]:

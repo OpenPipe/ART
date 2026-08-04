@@ -432,6 +432,7 @@ class RolloutHostService(Actor):
         if packed is None:
             return PackingResult(ref=None, packed_group_shapes=shapes)
         trainable_assistant_tokens = int(packed["assistant_mask"].sum().item())
+        loss_bearing_tokens = int(packed["assistant_mask"][:, 1:].sum().item())
         non_padding_tokens = int((packed["group_ids"] != -1).sum().item())
         ref = self.inbox.store.create(
             packed,
@@ -445,6 +446,7 @@ class RolloutHostService(Actor):
             ref=ref,
             packed_group_shapes=shapes,
             trainable_assistant_tokens=trainable_assistant_tokens,
+            loss_bearing_tokens=loss_bearing_tokens,
             non_padding_tokens=non_padding_tokens,
         )
 

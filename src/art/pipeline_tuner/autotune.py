@@ -173,10 +173,10 @@ class PipelineAutotuner:
             by_step, window_steps, "data/step_num_groups_trainable"
         )
         train_capacity_tokens = _required_step_values(
-            by_step, window_steps, "data/step_packed_train_tokens"
+            by_step, window_steps, "data/step_executed_token_equivalents"
         )
         non_padding_tokens = _required_step_values(
-            by_step, window_steps, "data/step_non_padding_train_tokens"
+            by_step, window_steps, "data/step_nonpadding_logical_tokens"
         )
         vllm_metrics = [
             rec

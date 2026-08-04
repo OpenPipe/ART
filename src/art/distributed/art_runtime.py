@@ -84,6 +84,7 @@ class DistributedPackedBatch(BaseModel):
     leases: PackedBatchLeaseSet
     packed_group_shapes: tuple[Any, ...]
     trainable_assistant_tokens: int
+    loss_bearing_tokens: int
     non_padding_tokens: int
 
 
@@ -714,6 +715,7 @@ class ArtRuntime:
             leases=leases,
             packed_group_shapes=result.packed_group_shapes,
             trainable_assistant_tokens=result.trainable_assistant_tokens,
+            loss_bearing_tokens=result.loss_bearing_tokens,
             non_padding_tokens=result.non_padding_tokens,
         )
 

@@ -235,6 +235,7 @@ class MegatronBackend(LocalBackend):
             num_sequences=ref.num_sequences,
             sequence_length=ref.sequence_length,
             trainable_assistant_tokens=packed.trainable_assistant_tokens,
+            loss_bearing_tokens=packed.loss_bearing_tokens,
             non_padding_tokens=packed.non_padding_tokens,
             logical_tokens=stats.logical_tokens,
             physical_tokens=stats.physical_tokens,

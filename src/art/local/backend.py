@@ -122,6 +122,7 @@ class _PackedTrainingBatch(BaseModel):
     num_sequences: int
     sequence_length: int
     trainable_assistant_tokens: int
+    loss_bearing_tokens: int
     non_padding_tokens: int
     logical_tokens: int
     physical_tokens: int
@@ -1552,6 +1553,11 @@ class LocalBackend:
                 **base_metrics,
                 "data/step_num_groups_trainable": 0.0,
                 "data/step_trainable_assistant_tokens": 0.0,
+                "data/step_nonpadding_logical_tokens": 0.0,
+                "data/step_loss_bearing_tokens": 0.0,
+                "data/step_executed_token_equivalents": 0.0,
+                "data/step_nominal_schedule_capacity_tokens": 0.0,
+                "data/step_padding_ratio": 0.0,
                 TRAIN_GRADIENT_STEPS_KEY: 0.0,
             }
             return
@@ -1577,8 +1583,14 @@ class LocalBackend:
             base_metrics.update(
                 {
                     "data/step_packed_sequences": float(packed_sequences),
-                    "data/step_packed_train_tokens": float(packed_train_tokens),
-                    "data/step_non_padding_train_tokens": float(non_padding_tokens),
+                    "data/step_nonpadding_logical_tokens": float(non_padding_tokens),
+                    "data/step_loss_bearing_tokens": float(
+                        packed_batch.loss_bearing_tokens
+                    ),
+                    "data/step_executed_token_equivalents": float(packed_train_tokens),
+                    "data/step_nominal_schedule_capacity_tokens": float(
+                        packed_train_tokens
+                    ),
                     "data/step_padding_ratio": (
                         float(packed_train_tokens - non_padding_tokens)
                         / packed_train_tokens
@@ -1693,6 +1705,7 @@ class LocalBackend:
             num_sequences=num_sequences,
             sequence_length=sequence_length,
             trainable_assistant_tokens=int(packed["assistant_mask"].sum().item()),
+            loss_bearing_tokens=int(packed["assistant_mask"][:, 1:].sum().item()),
             non_padding_tokens=int((packed["group_ids"] != -1).sum().item()),
             logical_tokens=packing_stats["logical_tokens"],
             physical_tokens=packing_stats["physical_tokens"],

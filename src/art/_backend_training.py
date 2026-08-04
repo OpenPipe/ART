@@ -11,6 +11,22 @@ from .metrics_taxonomy import (
 from .trajectories import TrajectoryGroup
 from .types import TrainConfig
 
+_GRADIENT_WORKLOAD_METRICS = {
+    "data/gradient_step_nonpadding_logical_tokens": (
+        "data/step_nonpadding_logical_tokens"
+    ),
+    "data/gradient_step_loss_bearing_tokens": "data/step_loss_bearing_tokens",
+    "data/gradient_step_executed_token_equivalents": (
+        "data/step_executed_token_equivalents"
+    ),
+    "data/gradient_step_nominal_schedule_capacity_tokens": (
+        "data/step_nominal_schedule_capacity_tokens"
+    ),
+    "pipeline/gradient_step_real_microbatches": "pipeline/global_real_microbatches",
+    "pipeline/gradient_step_dummy_microbatches": ("pipeline/global_dummy_microbatches"),
+}
+_GRADIENT_TRAIN_TIME = "time/gradient_step_train_s"
+
 
 def build_rl_train_configs(
     *,
@@ -102,12 +118,15 @@ def aggregate_rl_training_metrics(
 ) -> dict[str, float]:
     groups_list = list(trajectory_groups)
     avg_metrics = average_metric_samples(training_metrics)
+    _aggregate_megatron_workload(training_metrics, avg_metrics)
     tokens_per_second = avg_metrics.pop("tokens_per_second", None)
     if (
         tokens_per_second is not None
-        and "throughput/train_packed_tok_per_s" not in avg_metrics
+        and "throughput/train_executed_tok_equiv_per_s" not in avg_metrics
     ):
-        avg_metrics["throughput/train_packed_tok_per_s"] = float(tokens_per_second)
+        avg_metrics["throughput/train_executed_tok_equiv_per_s"] = float(
+            tokens_per_second
+        )
     summary = summarize_trajectory_groups(groups_list)
     avg_metrics.setdefault(
         "time/step_backend_train_s", time.monotonic() - trainer_started
@@ -123,3 +142,54 @@ def aggregate_rl_training_metrics(
         }
     )
     return avg_metrics
+
+
+def _aggregate_megatron_workload(
+    training_metrics: list[dict[str, float]],
+    output: dict[str, float],
+) -> None:
+    raw_keys = (*_GRADIENT_WORKLOAD_METRICS, _GRADIENT_TRAIN_TIME)
+    if not any(any(key in sample for key in raw_keys) for sample in training_metrics):
+        return
+    for index, sample in enumerate(training_metrics):
+        missing = [key for key in raw_keys if key not in sample]
+        if missing:
+            raise ValueError(
+                f"Megatron gradient-step metrics {index} are incomplete: {missing}"
+            )
+
+    totals = {
+        raw_key: sum(float(sample[raw_key]) for sample in training_metrics)
+        for raw_key in raw_keys
+    }
+    for raw_key in raw_keys:
+        output.pop(raw_key, None)
+    for raw_key, step_key in _GRADIENT_WORKLOAD_METRICS.items():
+        output[step_key] = totals[raw_key]
+
+    train_s = totals[_GRADIENT_TRAIN_TIME]
+    output["time/step_train_s"] = train_s
+    for raw_key, rate_key in (
+        (
+            "data/gradient_step_nonpadding_logical_tokens",
+            "throughput/train_nonpadding_logical_tok_per_s",
+        ),
+        (
+            "data/gradient_step_loss_bearing_tokens",
+            "throughput/train_loss_bearing_tok_per_s",
+        ),
+        (
+            "data/gradient_step_executed_token_equivalents",
+            "throughput/train_executed_tok_equiv_per_s",
+        ),
+        (
+            "data/gradient_step_nominal_schedule_capacity_tokens",
+            "throughput/train_nominal_capacity_tok_per_s",
+        ),
+    ):
+        output[rate_key] = totals[raw_key] / train_s if train_s > 0 else 0.0
+    executed = totals["data/gradient_step_executed_token_equivalents"]
+    logical = totals["data/gradient_step_nonpadding_logical_tokens"]
+    output["data/step_padding_ratio"] = (
+        (executed - logical) / executed if executed > 0 else 0.0
+    )

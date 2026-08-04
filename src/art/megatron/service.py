@@ -1353,7 +1353,7 @@ class MegatronService:
                     "loss/grad_norm": float(result["grad_norm"]),
                 }
                 if "tokens_per_second" in result:
-                    metrics["throughput/train_packed_tok_per_s"] = float(
+                    metrics["throughput/train_executed_tok_equiv_per_s"] = float(
                         result["tokens_per_second"]
                     )
                 yield metrics
