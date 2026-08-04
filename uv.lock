@@ -187,7 +187,7 @@ overrides = [
     { name = "numpy", specifier = "<2" },
     { name = "nvidia-cublas", marker = "sys_platform == 'linux'", specifier = "==13.2.2.2" },
     { name = "nvidia-resiliency-ext", specifier = "<0.5" },
-    { name = "quack-kernels", specifier = "==0.3.7" },
+    { name = "quack-kernels", specifier = "==0.3.9" },
 ]
 excludes = [
     "causal-conv1d",
@@ -5652,8 +5652,8 @@ requires-dist = [
     { name = "pydantic", marker = "extra == 'tinker'", specifier = ">=2.12.5" },
     { name = "pytest", marker = "extra == 'backend'", specifier = ">=8.4.1" },
     { name = "pytest", marker = "extra == 'backend-cu130'", specifier = ">=8.4.1" },
-    { name = "quack-kernels", marker = "extra == 'megatron'", specifier = "==0.3.7" },
-    { name = "quack-kernels", marker = "extra == 'megatron-cu130'", specifier = "==0.3.7" },
+    { name = "quack-kernels", marker = "extra == 'megatron'", specifier = "==0.3.9" },
+    { name = "quack-kernels", marker = "extra == 'megatron-cu130'", specifier = "==0.3.9" },
     { name = "scipy", marker = "extra == 'megatron'", specifier = ">=1.17.0" },
     { name = "scipy", marker = "extra == 'megatron-cu130'", specifier = ">=1.17.0" },
     { name = "seaborn", marker = "extra == 'plotting'", specifier = ">=0.13.2" },
@@ -7244,7 +7244,7 @@ wheels = [
 
 [[package]]
 name = "quack-kernels"
-version = "0.3.7"
+version = "0.3.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -7254,9 +7254,9 @@ dependencies = [
     { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "(sys_platform != 'darwin' and extra != 'extra-12-openpipe-art-backend-cu130' and extra == 'extra-12-openpipe-art-distributed-cu130') or (sys_platform != 'darwin' and extra != 'extra-12-openpipe-art-distributed-cu130' and extra == 'extra-12-openpipe-art-megatron-cu130') or (sys_platform != 'darwin' and extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-backend-cu130' and extra != 'extra-12-openpipe-art-distributed' and extra != 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-megatron-cu130' and extra != 'extra-12-openpipe-art-tinker') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-backend-cu130') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-distributed-cu130') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron-cu130') or (extra == 'extra-12-openpipe-art-backend-cu130' and extra == 'extra-12-openpipe-art-distributed') or (extra == 'extra-12-openpipe-art-backend-cu130' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-backend-cu130' and extra == 'extra-12-openpipe-art-megatron-cu130') or (extra == 'extra-12-openpipe-art-backend-cu130' and extra == 'extra-12-openpipe-art-tinker') or (extra == 'extra-12-openpipe-art-distributed' and extra == 'extra-12-openpipe-art-distributed-cu130') or (extra == 'extra-12-openpipe-art-distributed' and extra == 'extra-12-openpipe-art-megatron-cu130') or (extra == 'extra-12-openpipe-art-distributed-cu130' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-distributed-cu130' and extra == 'extra-12-openpipe-art-tinker') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-megatron-cu130') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (extra == 'extra-12-openpipe-art-megatron-cu130' and extra == 'extra-12-openpipe-art-tinker')" },
     { name = "torch-c-dlpack-ext" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/95/11/6b1664d0e85f91f4549403d4ca6c9248857080f571397da7cb7570338dcd/quack_kernels-0.3.7.tar.gz", hash = "sha256:1c35a3f6f8c06b38cdf6a68d95fbb52e2b75cd261d0f01abcb7cec5d1bd80ca1", size = 193338, upload-time = "2026-03-27T19:55:55.544Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7b/db/d2e480fd71c38b88ffcbf40298d604400c64e0ffcaa06d6aa61a87b2673a/quack_kernels-0.3.9.tar.gz", hash = "sha256:4fd272f52142e408a591b94be7c6a0261e222e034e599bce6da827eeae8ad04d", size = 212760, upload-time = "2026-04-05T06:34:58.642Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b0/5f/892059ed4849db5ccddb83ae01ffa33adec607e5a483c4fe05576645a4b5/quack_kernels-0.3.7-py3-none-any.whl", hash = "sha256:5931707e24fe0b87139fadd53ecf5d7156e01d3fb8cbfe7e3f6a67b52dd83127", size = 199836, upload-time = "2026-03-27T19:55:54.387Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/a8/eea5885361143c19505a8e86890a681c363ac0f9ac6ba02b5c2c82ebe44b/quack_kernels-0.3.9-py3-none-any.whl", hash = "sha256:160364a32fd72df6e934adb2bb2ae324843ddccffc88aaa6f5de4c9a00ec7ac8", size = 216038, upload-time = "2026-04-05T06:34:57.426Z" },
 ]
 
 [[package]]

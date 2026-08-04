@@ -90,7 +90,7 @@ megatron = [
     "torchvision==0.26.0 ; sys_platform == 'darwin'",
     "flash-attn-4==4.0.0b5",
     "ninja>=1.11.1",
-    "quack-kernels==0.3.7",
+    "quack-kernels==0.3.9",
     "apex",
     "transformer-engine==2.11.0",
     "transformer-engine-cu12==2.11.0",
@@ -116,7 +116,7 @@ megatron-cu130 = [
     "torchvision==0.26.0+cu130 ; sys_platform == 'linux'",
     "flash-attn-4==4.0.0b5",
     "ninja>=1.11.1",
-    "quack-kernels==0.3.7",
+    "quack-kernels==0.3.9",
     "apex",
     "transformer-engine==2.14.1",
     "transformer-engine-cu13==2.14.1",
@@ -295,7 +295,7 @@ override-dependencies = [
     "numpy<2",
     "nvidia-cublas==13.2.2.2 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5",
-    "quack-kernels==0.3.7",
+    "quack-kernels==0.3.9",
 ]
 exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d", "mamba-ssm"]
 no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-cu13", "transformer-engine-torch", "megatron-bridge", "nv-grouped-gemm"]
