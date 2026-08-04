@@ -44,10 +44,14 @@ def get_model_config(
     configured_init_args = config.get("init_args", {})
     init_args = InitArgs(
         load_in_4bit=True,
-        max_seq_length=max_seq_length_from_model_config(
-            base_model,
-            revision=configured_init_args.get("revision"),
-            token=configured_init_args.get("token"),
+        max_seq_length=(
+            configured_init_args["max_seq_length"]
+            if "max_seq_length" in configured_init_args
+            else max_seq_length_from_model_config(
+                base_model,
+                revision=configured_init_args.get("revision"),
+                token=configured_init_args.get("token"),
+            )
         ),
         model_name=base_model,
     )
