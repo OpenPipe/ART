@@ -102,11 +102,11 @@ def _raise_if_te_cutlass_grouped_gemm_would_fallback(
     if reason is None:
         return
     raise RuntimeError(
-        "ART requires Transformer Engine CUTLASS grouped GEMM, but this "
+        "ART requires optimized Transformer Engine grouped GEMM, but this "
         f"grouped GEMM call would use the fallback path: {reason}. "
-        "Required shape: Hopper SM90, BF16/FP16 A/B/out tensors with matching "
-        "dtypes, no grouped bias/GELU/debug quantizer path, and uniform B K "
-        "dimension divisible by 128."
+        "Required shape: Hopper SM90 or Blackwell SM100+, BF16/FP16 A/B/out "
+        "tensors with matching dtypes, no grouped bias/GELU/debug quantizer "
+        "path, and uniform B K dimension divisible by 128."
     )
 
 
@@ -121,16 +121,14 @@ def _te_cutlass_grouped_gemm_fallback_reason(
     use_bias: bool,
 ) -> str | None:
     torch = _torch()
-    # Keep this in sync with TE's validated CUTLASS grouped-GEMM selector. ART
-    # currently supports the TE 2.11 SM90/Hopper path; SM100/Blackwell support
-    # should come from an upgraded Transformer Engine build using this same API.
+    # TE 2.14 adds BF16 grouped GEMM through cuBLAS 13.2 on SM100 and newer.
     if not A or not B or not out:
         return "A, B, and out must all be non-empty"
     if len(layout) < 2:
         return f"invalid layout {layout!r}"
     if not torch.cuda.is_available():
         return "CUDA is not available"
-    if (device_reason := _sm90_device_reason(A[0])) is not None:
+    if (device_reason := _grouped_gemm_device_reason(A[0])) is not None:
         return device_reason
     if gelu:
         return "grouped GELU pre-activation output is not supported"
@@ -153,7 +151,7 @@ def _te_cutlass_grouped_gemm_fallback_reason(
     return _uniform_b_k128_reason(B, transb=layout[1] == "T")
 
 
-def _sm90_device_reason(tensor: torch.Tensor) -> str | None:
+def _grouped_gemm_device_reason(tensor: torch.Tensor) -> str | None:
     torch = _torch()
     device = getattr(tensor, "device", None)
     device_index = torch.cuda.current_device()
@@ -163,8 +161,11 @@ def _sm90_device_reason(tensor: torch.Tensor) -> str | None:
     if capability is None:
         capability = torch.cuda.get_device_capability(device_index)
         _DEVICE_CAPABILITIES[device_index] = capability
-    if capability != (9, 0):
-        return f"CUDA device {device_index} has capability {capability}, not SM90"
+    if capability != (9, 0) and capability < (10, 0):
+        return (
+            f"CUDA device {device_index} has capability {capability}, "
+            "not SM90 or SM100+"
+        )
     return None
 
 
