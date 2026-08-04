@@ -52,6 +52,8 @@ from .lora_config import (
 from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
 from .model_support.registry import (
     UnsupportedModelArchitectureError,
+    get_model_support_handler_for_spec,
+    get_model_support_spec,
     model_uses_expert_parallel,
 )
 from .optimizer_state import (
@@ -249,6 +251,13 @@ class MegatronService:
     @property
     def _allow_unvalidated_arch(self) -> bool:
         return bool(self.config.get("allow_unvalidated_arch", False))
+
+    @property
+    def _model_identifier(self) -> str:
+        value = self.config.get("init_args", {}).get("model_name", self.base_model)
+        if not isinstance(value, str) or not value:
+            raise ValueError("init_args.model_name must be a non-empty string")
+        return value
 
     def _model_uses_expert_replay(self) -> bool:
         if not self.enable_expert_replay:
@@ -514,13 +523,18 @@ class MegatronService:
         )
         lora_config = _lora_config_from_model_config(self.config)
         rank = lora_config.get("rank")
-        create_identity_lora(
+        support_spec = get_model_support_spec(
             self.base_model,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
+        create_identity_lora(
+            self._model_identifier,
             lora_path,
             rank=int(rank) if rank is not None else None,
             target_modules=lora_config.get("target_modules"),
             random_state=self._megatron_random_state(),
             allow_unvalidated_arch=self._allow_unvalidated_arch,
+            handler=get_model_support_handler_for_spec(support_spec),
         )
 
     def _ensure_identity_lora(
@@ -890,7 +904,12 @@ class MegatronService:
         else:
             num_gpus = torch.cuda.device_count()
         jobs_dir, _training_log_dir, wake_lock_path = self._megatron_runtime_paths()
-        env["MODEL_IDENTIFIER"] = self.base_model
+        support_spec = get_model_support_spec(
+            self.base_model,
+            allow_unvalidated_arch=self._allow_unvalidated_arch,
+        )
+        env["MODEL_IDENTIFIER"] = self._model_identifier
+        env["ART_MEGATRON_MODEL_SUPPORT_KEY"] = support_spec.key
         if self._allow_unvalidated_arch:
             env["ART_MEGATRON_ALLOW_UNVALIDATED_ARCH"] = "1"
         if self._model_uses_expert_replay():

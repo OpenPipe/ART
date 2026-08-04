@@ -2538,6 +2538,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
 def main() -> None:
     runtime = build_training_runtime(
         model_identifier=os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
+        model_support_key=os.environ.get("ART_MEGATRON_MODEL_SUPPORT_KEY"),
         build_optimizer=False,
     )
     _run_service_loop(runtime)
