@@ -235,6 +235,7 @@ def _backward(
     block_i=32,
     num_stages=0,
     threads=256,
+    use_tcgen_dq=False,
 ):
     batch = T.dynamic("batch")
     q_tokens = T.dynamic("q_tokens")
@@ -277,6 +278,11 @@ def _backward(
             grad_kv_rope_shared = T.alloc_shared(
                 [block_i // split_store, _ROPE], T.float32
             )
+            if use_tcgen_dq:
+                grad_q_tmem = T.alloc_tmem([heads, _LATENT], T.float32)
+                grad_q_rope_tmem = T.alloc_tmem([heads, _ROPE], T.float32)
+                grad_q_barrier = T.alloc_barrier(1)
+                grad_q_rope_barrier = T.alloc_barrier(1)
             valid = T.alloc_fragment([block_i], "bool")
             probabilities = T.alloc_fragment([heads, block_i], T.float32)
             grad_probabilities = T.alloc_fragment([heads, block_i], T.float32)
@@ -288,8 +294,9 @@ def _backward(
             T.copy(Q[b_i, q_i, :, :_LATENT], q_shared)
             T.copy(Q[b_i, q_i, :, _LATENT:], q_rope_shared)
             T.copy(GradOutput[b_i, q_i, :, :], grad_out_shared)
-            T.clear(grad_q)
-            T.clear(grad_q_rope)
+            if not use_tcgen_dq:
+                T.clear(grad_q)
+                T.clear(grad_q_rope)
 
             for block in T.Pipelined(blocks, num_stages=num_stages):
                 for i in T.Parallel(block_i):
@@ -348,18 +355,36 @@ def _backward(
                         * scale
                     )
                 T.copy(grad_probabilities, grad_scores_shared)
-                T.gemm(
-                    grad_scores_shared,
-                    kv_shared,
-                    grad_q,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
-                T.gemm(
-                    grad_scores_shared,
-                    kv_rope_shared,
-                    grad_q_rope,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
+                if use_tcgen_dq:
+                    T.tcgen05_gemm(
+                        grad_scores_shared,
+                        kv_shared,
+                        grad_q_tmem,
+                        mbar=grad_q_barrier,
+                        clear_accum=block == 0,
+                    )
+                    T.tcgen05_gemm(
+                        grad_scores_shared,
+                        kv_rope_shared,
+                        grad_q_rope_tmem,
+                        mbar=grad_q_rope_barrier,
+                        clear_accum=block == 0,
+                    )
+                    T.mbarrier_wait_parity(grad_q_barrier, block % 2)
+                    T.mbarrier_wait_parity(grad_q_rope_barrier, block % 2)
+                else:
+                    T.gemm(
+                        grad_scores_shared,
+                        kv_shared,
+                        grad_q,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
+                    T.gemm(
+                        grad_scores_shared,
+                        kv_rope_shared,
+                        grad_q_rope,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
                 T.gemm(
                     grad_scores_shared,
                     q_shared,
@@ -420,6 +445,9 @@ def _backward(
                             grad_kv_rope_shared[i, d],
                         )
 
+            if use_tcgen_dq:
+                T.copy(grad_q_tmem, grad_q)
+                T.copy(grad_q_rope_tmem, grad_q_rope)
             T.copy(grad_q, grad_q_shared)
             T.copy(grad_q_rope, grad_q_rope_shared)
             T.copy(grad_q_shared, GradQ[b_i, q_i, :, :_LATENT])
@@ -482,6 +510,7 @@ def backward(
             int(indices.shape[-1]),
             float(scale),
             threads=min(256, int(kernel_heads) * 8),
+            use_tcgen_dq=torch.cuda.get_device_capability(q.device)[0] == 10,
         )(q, kv_grouped, grad_output, indices_grouped, lse, delta, grad_kv)
     return (
         grad_q[:, :, :heads],
