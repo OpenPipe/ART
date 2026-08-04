@@ -1052,7 +1052,7 @@ def _load_lora_and_optimizer(
     adapter_step: int,
 ) -> dict[str, torch.dtype]:
     persistent_optimizer = runtime.optimizer if runtime.optimizer_persistent else None
-    adapter_model = _load_adapter_into_model(
+    _load_adapter_into_model(
         runtime.model,
         lora_path,
         runtime.rank,
@@ -1060,7 +1060,7 @@ def _load_lora_and_optimizer(
         optimizer=persistent_optimizer,
     )
     if persistent_optimizer is not None:
-        return {key: tensor.dtype for key, tensor in adapter_model.items()}
+        return {}
 
     runtime.optimizer = _build_optimizer(
         runtime.model,
@@ -1074,7 +1074,7 @@ def _load_lora_and_optimizer(
         adapter_step=adapter_step,
         allow_missing=True,
     )
-    return {key: tensor.dtype for key, tensor in adapter_model.items()}
+    return {}
 
 
 def _prepare_rl_training_state(
@@ -1099,7 +1099,7 @@ def _prepare_rl_training_state(
     if replacing_resident_state or not runtime.optimizer_persistent:
         runtime.optimizer = None
 
-    adapter_model = _load_adapter_into_model(
+    _load_adapter_into_model(
         runtime.model,
         job.lora_path,
         runtime.rank,
@@ -1122,9 +1122,9 @@ def _prepare_rl_training_state(
         ),
     )
 
-    runtime.adapter_export_dtypes = {
-        key: tensor.dtype for key, tensor in adapter_model.items()
-    }
+    # Serialize the live LoRA dtype instead of perpetuating a source checkpoint's
+    # PEFT-upcast FP32 dtype.
+    runtime.adapter_export_dtypes = {}
     runtime.resident_training_session_id = job.training_session_id
     runtime.resident_policy_step = job.source_policy_step
     runtime.optimizer_state_loaded = True

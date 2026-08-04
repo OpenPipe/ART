@@ -81,7 +81,11 @@ def create_identity_lora(
                 module=r"peft\.tuners\.tuners_utils",
             )
         with patch.object(torch.nn.Module, "to", _skip_meta_to):
-            peft_model = get_peft_model(model, lora_config)
+            peft_model = get_peft_model(
+                model,
+                lora_config,
+                autocast_adapter_dtype=False,
+            )
 
     os.makedirs(lora_path, exist_ok=True)
     peft_model.save_pretrained(lora_path)

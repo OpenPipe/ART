@@ -1526,7 +1526,7 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
         out_features=8,
         rank=1,
         alpha=1,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         device=torch.device("cpu"),
     )
     gate_up_lora.A_T.data.copy_(full[f"{prefix}.gate_up_proj.lora_A.weight"].T)
@@ -1537,7 +1537,7 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
         out_features=2,
         rank=1,
         alpha=1,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         device=torch.device("cpu"),
     )
     down_lora.A_T.data.copy_(full[f"{prefix}.down_proj.lora_A.weight"].T)
@@ -1546,7 +1546,7 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
     publish_dir = tmp_path / "published_from_model"
     save_vllm_lora_from_model(
         model=cast(Any, [torch.nn.Sequential(gate_up_lora, down_lora)]),
-        adapter_dtypes={key: tensor.dtype for key, tensor in full.items()},
+        adapter_dtypes={},
         handler=QWEN3_5_MOE_HANDLER,
         adapter_config=_config("Qwen/Qwen3.5-35B-A3B", rank=1, alpha=1),
         output_dir=str(publish_dir),
@@ -1559,7 +1559,10 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
         str(publish_dir),
         handler=QWEN3_5_MOE_HANDLER,
     )
-    _assert_tensors_equal(roundtrip, full)
+    _assert_tensors_equal(
+        roundtrip,
+        {key: tensor.bfloat16() for key, tensor in full.items()},
+    )
 
 
 def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
