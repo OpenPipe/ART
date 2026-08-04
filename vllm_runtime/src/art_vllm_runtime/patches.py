@@ -24,6 +24,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_flashinfer_oneshot_pdl_completion()
     patch_policy_token_spans()
     patch_gemma4_moe_lora_support()
+    patch_fp8_moe_lora_input()
     subclass_chat_completion_request()
     patch_listen_for_disconnect()
     patch_tool_parser_manager()
@@ -42,6 +43,114 @@ def apply_vllm_runtime_patches() -> None:
     patch_pipeline_routed_experts_validation()
     patch_pipeline_routed_experts()
     patch_binary_routed_experts_response()
+
+
+def patch_fp8_moe_lora_input() -> None:
+    """Backport vLLM #42120's unquantized MoE LoRA input path."""
+    from vllm.lora.punica_wrapper.punica_gpu import PunicaWrapperGPU
+    from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
+        LoRAExpertsMixin,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
+        TritonExperts,
+        moe_kernel_quantize_input,
+    )
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEKernelModularImpl,
+    )
+
+    original_modular_apply = FusedMoEKernelModularImpl.apply
+    if getattr(original_modular_apply, "__art_fp8_moe_lora_patched__", False):
+        return
+    original_experts_apply = TritonExperts.apply
+    original_w13 = LoRAExpertsMixin.apply_w13_lora
+    original_add_lora = PunicaWrapperGPU.add_lora_fused_moe
+
+    def modular_apply(self: Any, *args: Any, **kwargs: Any) -> Any:
+        hidden_states = kwargs.get("hidden_states", args[0] if args else None)
+        context = getattr(self.fused_experts, "_lora_context", None)
+        if context is not None:
+            context.original_hidden_states = hidden_states
+        try:
+            return original_modular_apply(self, *args, **kwargs)
+        finally:
+            if context is not None:
+                context.original_hidden_states = None
+
+    def expects_unquantized_inputs(self: Any) -> bool:
+        parallel = self.moe_config.moe_parallel_config
+        return (
+            self._lora_context is not None
+            and self.quant_dtype is not None
+            and parallel is not None
+            and parallel.use_all2all_kernels
+        )
+
+    def experts_apply(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not self.expects_unquantized_inputs:
+            return original_experts_apply(self, *args, **kwargs)
+
+        positional = list(args)
+        hidden_states = (
+            kwargs["hidden_states"] if "hidden_states" in kwargs else positional[1]
+        )
+        a1q_scale = kwargs["a1q_scale"] if "a1q_scale" in kwargs else positional[9]
+        if a1q_scale is not None:
+            raise RuntimeError("deferred FP8 MoE activation arrived pre-quantized")
+        quantized, scale = moe_kernel_quantize_input(
+            hidden_states,
+            self.a1_scale,
+            self.quant_dtype,
+            self.per_act_token_quant,
+            self.block_shape,
+            quantization_emulation=self.quantization_emulation,
+        )
+        if "hidden_states" in kwargs:
+            kwargs["hidden_states"] = quantized
+            kwargs["a1q_scale"] = scale
+        else:
+            positional[1], positional[9] = quantized, scale
+
+        context = self._lora_context
+        previous = context.original_hidden_states
+        context.original_hidden_states = hidden_states
+        try:
+            return original_experts_apply(self, *positional, **kwargs)
+        finally:
+            context.original_hidden_states = previous
+
+    def apply_w13_lora(
+        self: Any,
+        lora_context: Any,
+        **kwargs: Any,
+    ) -> Any:
+        original_hidden_states = lora_context.original_hidden_states
+        if (
+            original_hidden_states is not None
+            and original_hidden_states.shape[0] == kwargs["x"].shape[0]
+        ):
+            kwargs["x"] = original_hidden_states
+        return original_w13(self, lora_context, **kwargs)
+
+    def add_lora_fused_moe(self: Any, *args: Any, **kwargs: Any) -> Any:
+        inputs = kwargs["x"] if "x" in kwargs else args[1]
+        no_lora_flag = self.token_mapping_meta.meta_args(
+            inputs.size(0), self.lora_config.specialize_active_lora
+        )[5]
+        if no_lora_flag.item():
+            return None
+        return original_add_lora(self, *args, **kwargs)
+
+    setattr(modular_apply, "__art_fp8_moe_lora_patched__", True)
+    FusedMoEKernelModularImpl.apply = modular_apply
+    setattr(
+        TritonExperts,
+        "expects_unquantized_inputs",
+        property(expects_unquantized_inputs),
+    )
+    TritonExperts.apply = experts_apply
+    LoRAExpertsMixin.apply_w13_lora = apply_w13_lora
+    PunicaWrapperGPU.add_lora_fused_moe = add_lora_fused_moe
 
 
 def patch_flashinfer_oneshot_pdl_completion() -> None:
