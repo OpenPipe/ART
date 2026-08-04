@@ -7,6 +7,7 @@ import json
 import os
 import socket
 from threading import Event, Lock
+import traceback
 from typing import Any, Callable
 
 import monarch.actor as monarch_actor
@@ -359,6 +360,7 @@ class MonarchTrainerActor(Actor):
                     "rank": self._runtime.rank,
                     "error_type": type(error).__name__,
                     "message": str(error),
+                    "traceback": traceback.format_exc(),
                 }
             )
             raise
@@ -584,7 +586,8 @@ class MonarchTrainerRun:
                     if payload["kind"] == "rank_failed":
                         raise RuntimeError(
                             f"trainer rank {payload['rank']} failed: "
-                            f"{payload['error_type']}: {payload['message']}"
+                            f"{payload['error_type']}: {payload['message']}\n"
+                            f"{payload['traceback']}"
                         )
                     if payload["kind"] == "progress":
                         event = TrainProgress(
