@@ -528,6 +528,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     vllm_parser = make_arg_parser(vllm_parser)
     namespace = vllm_parser.parse_args(vllm_args)
+    if api_key := os.environ.pop("VLLM_API_KEY", None):
+        namespace.api_key = [api_key]
     validate_parsed_serve_args(namespace)
     if args.headless:
         from vllm.entrypoints.cli.serve import run_headless
