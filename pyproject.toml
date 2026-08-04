@@ -21,7 +21,15 @@ plotting = ["matplotlib>=3.10.1", "seaborn>=0.13.2"]
 distributed = [
     "aiohttp>=3.13.0",
     "msgspec>=0.21.0",
-    "torch==2.11.0",
+    "torch==2.11.0+cu128 ; sys_platform == 'linux' or sys_platform == 'win32'",
+    "torch==2.11.0 ; sys_platform == 'darwin'",
+    "torchmonarch==0.6.0",
+    "transformers>=5.2.0,<=5.12.1",
+]
+distributed-cu130 = [
+    "aiohttp>=3.13.0",
+    "msgspec>=0.21.0",
+    "torch==2.11.0+cu130 ; sys_platform == 'linux'",
     "torchmonarch==0.6.0",
     "transformers>=5.2.0,<=5.12.1",
 ]
@@ -32,7 +40,8 @@ backend = [
     "bitsandbytes>=0.45.2",
     "unsloth==2026.3.3",
     "unsloth-zoo==2026.3.1",
-    "torch==2.11.0",
+    "torch==2.11.0+cu128 ; sys_platform == 'linux' or sys_platform == 'win32'",
+    "torch==2.11.0 ; sys_platform == 'darwin'",
     "torchao==0.16.0",
     "accelerate==1.7.0",
     "awscli>=1.38.1",
@@ -49,10 +58,36 @@ backend = [
     "nvidia-cudnn-frontend<1.21 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
 ]
+backend-cu130 = [
+    "peft>=0.14.0",
+    "hf-xet>=1.1.0",
+    "bitsandbytes>=0.45.2",
+    "unsloth==2026.3.3",
+    "unsloth-zoo==2026.3.1",
+    "torch==2.11.0+cu130 ; sys_platform == 'linux'",
+    "torchao==0.16.0",
+    "accelerate==1.7.0",
+    "awscli>=1.38.1",
+    "setuptools>=78.1.0",
+    "wandb==0.28.0",
+    "transformers==5.2.0",
+    "duckdb>=1.0.0",
+    "pyarrow>=15.0.0",
+    "trl==0.20.0",
+    "nbclient>=0.10.1",
+    "pytest>=8.4.1",
+    "nbmake>=1.5.5",
+    "gql>=4.0.0",
+    "nvidia-cudnn-frontend<1.21 ; sys_platform == 'linux'",
+    "nvidia-nccl-cu13==2.28.9 ; sys_platform == 'linux'",
+    "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
+]
 megatron = [
     "numpy<2",
-    "torch==2.11.0",
-    "torchvision==0.26.0",
+    "torch==2.11.0+cu128 ; sys_platform == 'linux' or sys_platform == 'win32'",
+    "torch==2.11.0 ; sys_platform == 'darwin'",
+    "torchvision==0.26.0+cu128 ; sys_platform == 'linux' or sys_platform == 'win32'",
+    "torchvision==0.26.0 ; sys_platform == 'darwin'",
     "flash-attn-4==4.0.0b5",
     "ninja>=1.11.1",
     "quack-kernels==0.3.7",
@@ -75,6 +110,30 @@ megatron = [
     "scipy>=1.17.0",
     "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
 ]
+megatron-cu130 = [
+    "numpy<2",
+    "torch==2.11.0+cu130 ; sys_platform == 'linux'",
+    "torchvision==0.26.0+cu130 ; sys_platform == 'linux'",
+    "flash-attn-4==4.0.0b5",
+    "ninja>=1.11.1",
+    "quack-kernels==0.3.7",
+    "apex",
+    "transformer-engine==2.14.1",
+    "transformer-engine-cu13==2.14.1",
+    "transformer-engine-torch==2.14.1",
+    "megatron-core==0.17.0",
+    "pybind11>=2.13.6",
+    "setuptools>=78.1.0",
+    "megatron-bridge==0.4.0rc0",
+    "tilelang==0.1.10 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "nvidia-ml-py==13.580.82",
+    "nvidia-nccl-cu13==2.28.9 ; sys_platform == 'linux'",
+    "nvidia-modelopt>=0.42.0a0 ; sys_platform != 'darwin'",
+    "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
+    "transformers==5.12.1",
+    "scipy>=1.17.0",
+    "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
+]
 
 langgraph = [
     "langchain-core>=0.3.51",
@@ -91,7 +150,8 @@ tinker = [
     "protobuf>=6.31.1",
     "tinker-cookbook>=0.4.1,<0.5",
     "tinker>=0.21.0,<0.22",
-    "torch==2.11.0",
+    "torch==2.11.0+cu128 ; sys_platform == 'linux' or sys_platform == 'win32'",
+    "torch==2.11.0 ; sys_platform == 'darwin'",
     "transformers>=5.2.0,<=5.5.3",
     "uvicorn>=0.35.0",
     "datrie>=0.8.3",
@@ -175,20 +235,70 @@ conflicts = [
         { extra = "tinker" },
         { extra = "megatron" },
     ],
+    [
+        { extra = "distributed" },
+        { extra = "distributed-cu130" },
+    ],
+    [
+        { extra = "distributed" },
+        { extra = "backend-cu130" },
+    ],
+    [
+        { extra = "distributed" },
+        { extra = "megatron-cu130" },
+    ],
+    [
+        { extra = "distributed-cu130" },
+        { extra = "backend" },
+    ],
+    [
+        { extra = "distributed-cu130" },
+        { extra = "megatron" },
+    ],
+    [
+        { extra = "backend" },
+        { extra = "backend-cu130" },
+    ],
+    [
+        { extra = "backend" },
+        { extra = "megatron-cu130" },
+    ],
+    [
+        { extra = "backend-cu130" },
+        { extra = "megatron" },
+    ],
+    [
+        { extra = "backend-cu130" },
+        { extra = "megatron-cu130" },
+    ],
+    [
+        { extra = "megatron" },
+        { extra = "megatron-cu130" },
+    ],
+    [
+        { extra = "tinker" },
+        { extra = "backend-cu130" },
+    ],
+    [
+        { extra = "tinker" },
+        { extra = "distributed-cu130" },
+    ],
+    [
+        { extra = "tinker" },
+        { extra = "megatron-cu130" },
+    ],
 ]
 override-dependencies = [
     "click==8.2.0",
     "flashinfer-python==0.6.8.post1",
     "megatron-core==0.17.0",
     "numpy<2",
+    "nvidia-cublas==13.2.2.2 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5",
     "quack-kernels==0.3.7",
-    "transformer-engine==2.11.0",
-    "torch==2.11.0",
-    "torchvision==0.26.0",
 ]
 exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d", "mamba-ssm"]
-no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-bridge", "nv-grouped-gemm"]
+no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-cu13", "transformer-engine-torch", "megatron-bridge", "nv-grouped-gemm"]
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.11.0"]
@@ -197,7 +307,7 @@ nv-grouped-gemm = ["torch>=2.11.0"]
 transformer-engine-torch = ["torch>=2.11.0"]
 
 [tool.uv.extra-build-variables]
-apex = { APEX_CPP_EXT = "1", APEX_CUDA_EXT = "1", APEX_FAST_LAYER_NORM = "1", APEX_PARALLEL_BUILD = "16", NVCC_APPEND_FLAGS = "--threads 4" }
+apex = { APEX_CPP_EXT = "1", APEX_PARALLEL_BUILD = "16", NVCC_APPEND_FLAGS = "--threads 4" }
 transformer-engine-torch = { NVTE_NO_LOCAL_VERSION = "1" }
 
 [[tool.uv.dependency-metadata]]
@@ -340,15 +450,33 @@ dev = [
 ]
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
-torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+torch = [
+    { index = "pytorch-cu128", extra = "distributed", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu128", extra = "backend", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu128", extra = "megatron", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu128", extra = "tinker", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu130", extra = "distributed-cu130", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu130", extra = "backend-cu130", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu130", extra = "megatron-cu130", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", extra = "megatron", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { index = "pytorch-cu130", extra = "megatron-cu130", marker = "sys_platform == 'linux'" },
+]
 apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
 flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
 megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" }
 panza = { git = "https://github.com/corbt/panza.git" }
-transformer-engine-torch = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "v2.11", subdirectory = "transformer_engine/pytorch" }
+transformer-engine-torch = [
+    { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "v2.11", subdirectory = "transformer_engine/pytorch", extra = "megatron" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true

@@ -42,6 +42,31 @@ _ART_FLASHINFER_WORKSPACE_ENV = "ART_VLLM_RUNTIME_FLASHINFER_WORKSPACE_BASE"
 VLLM_RUNTIME_CLOSE_TIMEOUT = process_shutdown_timeout(1)
 
 
+def _managed_runtime_extra() -> Literal["cuda12", "cuda13"]:
+    override = os.environ.get("ART_VLLM_RUNTIME_CUDA_PROFILE")
+    if override is not None:
+        if override == "cuda12":
+            return "cuda12"
+        if override == "cuda13":
+            return "cuda13"
+        raise ValueError("ART_VLLM_RUNTIME_CUDA_PROFILE must be 'cuda12' or 'cuda13'")
+    cuda_home = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda"))
+    commands = ([str(cuda_home / "bin" / "nvcc"), "--version"], ["nvidia-smi"])
+    for command in commands:
+        try:
+            output = subprocess.run(
+                command, capture_output=True, text=True, check=False
+            ).stdout
+        except FileNotFoundError:
+            continue
+        if "release 13." in output or "CUDA Version: 13." in output:
+            return "cuda13"
+    return "cuda12"
+
+
+MANAGED_RUNTIME_EXTRA = _managed_runtime_extra()
+
+
 class VllmRuntimeLaunchConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -136,6 +161,7 @@ class VllmRuntimeInstallMarker(BaseModel):
     protocol_version: int = RUNTIME_PROTOCOL_VERSION
     manifest_hash: str
     runtime_wheel_sha256: str
+    runtime_extra: Literal["cuda12", "cuda13"] = MANAGED_RUNTIME_EXTRA
     cache_root: str
 
 
@@ -557,7 +583,10 @@ def _sha256_file(path: Path) -> str:
 
 
 def _manifest_hash(manifest: VllmRuntimeManifest) -> str:
-    payload = json.dumps(manifest.model_dump(), sort_keys=True).encode()
+    payload = json.dumps(
+        {"manifest": manifest.model_dump(), "runtime_extra": MANAGED_RUNTIME_EXTRA},
+        sort_keys=True,
+    ).encode()
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -667,6 +696,8 @@ def _validate_managed_runtime(
         return None
     if marker.runtime_wheel_sha256 != manifest.runtime_wheel_sha256:
         return None
+    if marker.runtime_extra != MANAGED_RUNTIME_EXTRA:
+        return None
     runtime_bin = _runtime_bin(runtime_dir)
     if not _is_executable_file(runtime_bin):
         return None
@@ -712,6 +743,8 @@ def _install_managed_runtime(
                 "sync",
                 "--project",
                 str(stage),
+                "--extra",
+                MANAGED_RUNTIME_EXTRA,
                 "--frozen",
                 "--no-install-project",
                 "--no-dev",
@@ -753,6 +786,7 @@ def _install_managed_runtime(
             protocol_version=manifest.protocol_version,
             manifest_hash=manifest_hash,
             runtime_wheel_sha256=manifest.runtime_wheel_sha256,
+            runtime_extra=MANAGED_RUNTIME_EXTRA,
             cache_root=str(cache_root.resolve()),
         )
         _install_marker_path(runtime_dir).write_text(
@@ -824,7 +858,7 @@ def get_vllm_runtime_nccl_so_path() -> Path:
         "import importlib.util\n"
         "spec = importlib.util.find_spec('nvidia.nccl')\n"
         "if spec is None or spec.submodule_search_locations is None:\n"
-        "    raise SystemExit('vLLM runtime is missing nvidia-nccl-cu12')\n"
+        "    raise SystemExit('vLLM runtime is missing its NVIDIA NCCL package')\n"
         "package_dir = Path(next(iter(spec.submodule_search_locations)))\n"
         "path = package_dir / 'lib' / 'libnccl.so.2'\n"
         "if not path.exists():\n"

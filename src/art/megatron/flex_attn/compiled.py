@@ -23,9 +23,18 @@ FlexBackend: TypeAlias = Literal["FLASH", "TRITON"]
 SparseBlockSize: TypeAlias = int | tuple[int, int]
 
 
-def flex_backend_for_head_dims(*, head_dim: int, head_dim_v: int) -> FlexBackend:
+def flex_backend_for_head_dims(
+    *,
+    head_dim: int,
+    head_dim_v: int,
+    device: torch.device | None = None,
+) -> FlexBackend:
     if _FORCED_FLEX_BACKEND != "FLASH":
         return "TRITON"
+    if device is not None and device.type == "cuda":
+        major, _minor = torch.cuda.get_device_capability(device)
+        if major in {10, 11}:
+            return "TRITON"
     if int(head_dim) > 256 or int(head_dim_v) > 256:
         return "TRITON"
     return "FLASH"
@@ -68,7 +77,12 @@ def flash_sparse_block_size_for_head_dim(
     head_dim_v: int,
     device: torch.device,
 ) -> tuple[int, int]:
-    if flex_backend_for_head_dims(head_dim=head_dim, head_dim_v=head_dim_v) != "FLASH":
+    if (
+        flex_backend_for_head_dims(
+            head_dim=head_dim, head_dim_v=head_dim_v, device=device
+        )
+        != "FLASH"
+    ):
         return (128, 128)
     if device.type != "cuda":
         return (128, 128)

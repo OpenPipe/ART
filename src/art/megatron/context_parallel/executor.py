@@ -669,6 +669,7 @@ class FlexAttentionKernel:
         backend = flex_backend_for_head_dims(
             head_dim=int(q.shape[-1]),
             head_dim_v=int(v.shape[-1]),
+            device=q.device,
         )
         if compile_key is None:
             _q_len, _k_len, compile_key = select_sparse_execution_family(

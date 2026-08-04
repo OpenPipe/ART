@@ -6,6 +6,7 @@ import importlib
 import shutil
 import re
 
+import torch
 from pathlib import Path
 from setuptools.command.build_py import build_py
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -22,6 +23,22 @@ def package_dir(module: str) -> Path:
     if spec is None or spec.submodule_search_locations is None:
         raise ModuleNotFoundError(f"Required build package {module!r} is not installed")
     return Path(next(iter(spec.submodule_search_locations)))
+
+
+def cuda_includes() -> tuple[Path, Path]:
+    if torch.version.cuda and torch.version.cuda.startswith("12."):
+        return (
+            package_dir("nvidia.cuda_cccl") / "include",
+            package_dir("nvidia.nvtx") / "include",
+        )
+    if torch.version.cuda and torch.version.cuda.startswith("13."):
+        cuda_home = Path(os.environ["CUDA_HOME"])
+        for include in [cuda_home / "include", *cuda_home.glob("targets/*/include")]:
+            if (include / "cccl/cuda/ptx").is_file() and (
+                include / "nvtx3/nvToolsExt.h"
+            ).is_file():
+                return include / "cccl", include
+    raise RuntimeError(f"HybridEP cannot find headers for torch CUDA {torch.version.cuda}")
 
 
 def collect_package_files(package: str, relative_dir: str):
@@ -51,8 +68,7 @@ def to_nvcc_gencode(s: str) -> str:
 
 def get_extension_hybrid_ep_cpp():
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    cccl_include = package_dir("nvidia.cuda_cccl") / "include"
-    nvtx_include = package_dir("nvidia.nvtx") / "include"
+    cccl_include, nvtx_include = cuda_includes()
     enable_multinode = os.getenv("HYBRID_EP_MULTINODE", "0").strip().lower() in {"1", "true", "t", "yes", "y", "on"}
     # NIXL is opt-in and disabled by default; the DOCA/NCCL path is the default when multinode is enabled.
     use_nixl = os.getenv("USE_NIXL", "0").strip().lower() in {"1", "true", "t", "yes", "y", "on"}
@@ -236,7 +252,6 @@ if __name__ == '__main__':
             include=['deep_ep', 'deep_ep.*']
         ),
         install_requires=[
-            'nvidia-cuda-cccl-cu12==12.9.27',
             'torch==2.11.0',
         ],
         ext_modules=[extension],

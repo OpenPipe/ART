@@ -65,6 +65,18 @@ def _source_hash() -> str:
     return digest.hexdigest()
 
 
+def _cuda_dependency_versions(cuda_home: Path) -> tuple[str, str]:
+    if torch.version.cuda and torch.version.cuda.startswith("12."):
+        return version("nvidia-cuda-cccl-cu12"), version("nvidia-nvtx-cu12")
+    if torch.version.cuda and torch.version.cuda.startswith("13."):
+        major, minor = torch.version.cuda.split(".")[:2]
+        cccl = _output(
+            ["dpkg-query", "-W", "-f=${Version}", f"cuda-cccl-{major}-{minor}"]
+        )
+        return cccl, version("nvidia-nvtx")
+    raise RuntimeError(f"HybridEP does not support torch CUDA {torch.version.cuda}")
+
+
 def _build_identity(
     *, enable_multinode: bool | None = None, use_nixl: bool | None = None
 ) -> tuple[str, str]:
@@ -77,14 +89,15 @@ def _build_identity(
         use_nixl = os.environ.get("USE_NIXL", "0") == "1"
     if use_nixl and not enable_multinode:
         raise ValueError("NIXL HybridEP requires multi-node support")
+    cccl_version, nvtx_version = _cuda_dependency_versions(cuda_home)
     values = [
         _source_hash(),
         sys.implementation.cache_tag,
         platform.machine(),
         torch.__version__,
         str(torch.version.cuda),
-        version("nvidia-cuda-cccl-cu12"),
-        version("nvidia-nvtx-cu12"),
+        cccl_version,
+        nvtx_version,
         _output([str(cuda_home / "bin" / "nvcc"), "--version"]),
         _output([os.environ.get("CXX", "c++"), "--version"]),
         arch_list,
