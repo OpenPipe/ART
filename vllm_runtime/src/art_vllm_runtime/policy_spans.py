@@ -28,6 +28,7 @@ _WORKER_LORA_UPDATE_SEQ = 0
 _POLICY_CACHE_SALT_PREFIX = "art_policy_cache_salt="
 _POLICY_CACHE_SALT_MARKER = f"|{_POLICY_CACHE_SALT_PREFIX}"
 _LORA_UPDATE_COORDINATOR_FIELD = "_art_lora_update_coordinator"
+_EXECUTING_POLICY_CONTEXT_FIELD = "_art_executing_policy_context"
 
 _MODEL_RUNNER_OUTPUT_MODULES = (
     "vllm.v1.outputs",
@@ -389,14 +390,40 @@ def _patch_worker_policy_span_capture() -> None:
     for module_name in _GPU_MODEL_RUNNER_MODULES:
         module = importlib.import_module(module_name)
         gpu_model_runner_cls = module.GPUModelRunner
+
+        original_execute_model = gpu_model_runner_cls.execute_model
+        if not getattr(original_execute_model, "__art_policy_spans_patched__", False):
+
+            def make_execute_model(original: Any):
+                def execute_model(self: Any, *args: Any, **kwargs: Any) -> Any:
+                    output = original(self, *args, **kwargs)
+                    # The input batch is current only after execute_model, and the
+                    # next serial worker RPC may replace this adapter before sampling.
+                    context = _policy_context_from_runner(self)
+                    if getattr(self, "execute_model_state", None) is not None:
+                        setattr(self, _EXECUTING_POLICY_CONTEXT_FIELD, context)
+                    elif context and hasattr(output, "req_ids"):
+                        _attach_policy_spans_to_model_output(output, context)
+                    return output
+
+                return execute_model
+
+            execute_model = make_execute_model(original_execute_model)
+            execute_model.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
+            gpu_model_runner_cls.execute_model = execute_model  # type: ignore[method-assign]
+
         original_sample_tokens = gpu_model_runner_cls.sample_tokens
         if getattr(original_sample_tokens, "__art_policy_spans_patched__", False):
             continue
 
         def make_sample_tokens(original: Any):
             def sample_tokens(self: Any, *args: Any, **kwargs: Any) -> Any:
-                context = _policy_context_from_runner(self)
-                output = original(self, *args, **kwargs)
+                context = getattr(self, _EXECUTING_POLICY_CONTEXT_FIELD, None)
+                try:
+                    output = original(self, *args, **kwargs)
+                finally:
+                    if hasattr(self, _EXECUTING_POLICY_CONTEXT_FIELD):
+                        delattr(self, _EXECUTING_POLICY_CONTEXT_FIELD)
                 if context and output is not None:
                     if hasattr(output, "get_output"):
                         _attach_policy_span_context_to_sample_output(output, context)

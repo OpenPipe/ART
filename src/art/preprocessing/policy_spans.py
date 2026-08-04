@@ -10,6 +10,14 @@ POLICY_TOKEN_SPANS_KEY = "policy_token_spans"
 
 
 class PolicyTokenSpan(BaseModel):
+    """Half-open completion-token interval scored by one executing policy state.
+
+    The version identifies the adapter used by the target model execution that
+    produced the returned token and logprob, not request admission or response
+    delivery. Adjacent intervals may merge only when all policy identity fields
+    match.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     start_token: int = Field(ge=0)
