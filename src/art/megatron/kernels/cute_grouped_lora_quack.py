@@ -36,13 +36,13 @@ def _grouped_lora_wgrad_kernel(
     BLOCK_K: tl.constexpr,
 ) -> None:
     expert = tl.program_id(2)
-    d = tl.program_id(0) * BLOCK_D + tl.arange(0, BLOCK_D)
-    r = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
+    d = (tl.program_id(0) * BLOCK_D + tl.arange(0, BLOCK_D)).to(tl.int64)
+    r = (tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)).to(tl.int64)
     start = tl.load(expert_offsets + expert)
     end = tl.load(expert_offsets + expert + 1)
     acc = tl.zeros((BLOCK_D, BLOCK_R), tl.float32)
     for k0 in tl.range(start, end, BLOCK_K, num_stages=3):
-        k = k0 + tl.arange(0, BLOCK_K)
+        k = (k0 + tl.arange(0, BLOCK_K)).to(tl.int64)
         big_tile = tl.load(
             big + d[:, None] * BIG_D_STRIDE + k[None, :] * BIG_K_STRIDE,
             mask=(d[:, None] < D) & (k[None, :] < end),
