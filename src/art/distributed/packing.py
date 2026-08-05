@@ -21,7 +21,7 @@ from art.trajectories import (
 
 from .data_plane import PackedBatchRef
 from .rollout import RolloutModelSpec
-from .trajectory_store import TrajectoryGroupBundle
+from .trajectory_store import TrajectoryBatchTransfer, TrajectoryGroupBundle
 
 if TYPE_CHECKING:
     from art.model import TrainableModel
@@ -209,6 +209,7 @@ class PackingRequest(BaseModel):
 
     model: RolloutModelSpec
     trajectory_groups: tuple[TrajectoryGroupBundle, ...]
+    trajectory_transfer: TrajectoryBatchTransfer | None = None
     advantage_balance: float = 0.0
     allow_training_without_logprobs: bool = False
     scale_rewards: bool = True

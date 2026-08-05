@@ -15,8 +15,8 @@ from .rollout import (
     RolloutResult,
 )
 from .trajectory_store import (
+    TrajectoryBatchTransfer,
     TrajectoryEnqueueResult,
-    TrajectoryGroupBundle,
     TrajectoryGroupRef,
     TrajectoryQueueItem,
     TrajectoryQueueResize,
@@ -71,8 +71,11 @@ async def call_remote(endpoint: Any, *args: Any) -> Any:
 
 
 class MonarchRolloutHostEndpoint(RolloutHostEndpoint):
-    def __init__(self, actor: Any, *, owns_actor: bool = False) -> None:
+    def __init__(
+        self, actor: Any, *, timeout_s: float, owns_actor: bool = False
+    ) -> None:
         self.actor = actor
+        self.timeout_s = timeout_s
         self.owns_actor = owns_actor
 
     async def run(self, invocation: RolloutInvocation) -> RolloutResult:
@@ -80,10 +83,17 @@ class MonarchRolloutHostEndpoint(RolloutHostEndpoint):
         return await call_remote(self.actor.run, invocation)
 
     async def materialize(self, ref: TrajectoryGroupRef) -> TrajectoryGroup:
-        bundle: TrajectoryGroupBundle = await call_remote(
+        transfer: TrajectoryBatchTransfer = await call_remote(
             self.actor.materialize_result, ref
         )
-        return bundle.build()
+        if transfer.stream.stream_id != ref.result_id:
+            raise RuntimeError("trajectory owner returned the wrong result ID")
+        if transfer.stream.byte_count != ref.descriptor.byte_count:
+            raise RuntimeError("trajectory owner returned the wrong byte count")
+        groups = await transfer.receive_groups(timeout_s=self.timeout_s)
+        if len(groups) != 1:
+            raise RuntimeError("trajectory owner returned the wrong group count")
+        return groups[0]
 
     async def drop(self, ref: TrajectoryGroupRef) -> None:
         await call_remote(self.actor.drop_result, ref)
@@ -196,5 +206,13 @@ class MonarchPackingEndpoint:
     def __init__(self, actor: Any) -> None:
         self.actor = actor
 
-    async def pack(self, request: PackingRequest, batch_id: str) -> PackingResult:
-        return await call_remote(self.actor.pack_batch, request, batch_id)
+    async def pack(
+        self,
+        request: PackingRequest,
+        batch_id: str,
+        *,
+        transfer_timeout_s: float,
+    ) -> PackingResult:
+        return await call_remote(
+            self.actor.pack_batch, request, batch_id, transfer_timeout_s
+        )

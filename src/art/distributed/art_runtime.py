@@ -625,7 +625,10 @@ class ArtRuntime:
         self._start_rollout_workers()
         hosts = {
             host_id: tuple(
-                MonarchRolloutHostEndpoint(actor.slice(rollout=slot))
+                MonarchRolloutHostEndpoint(
+                    actor.slice(rollout=slot),
+                    timeout_s=self.topology.cluster.rpc_timeout_s,
+                )
                 for slot in range(self._host(host_id).cpu_slots)
             )
             for host_id, actor in self._rollout_actors.items()
@@ -649,6 +652,9 @@ class ArtRuntime:
         for index, host in enumerate(self.topology.cluster.hosts):
             if host.host_id not in self.topology.rollout_host_ids:
                 continue
+            data_plane_host = urlparse(host.worker_address).hostname
+            if data_plane_host is None:
+                raise ValueError(f"host {host.host_id!r} has no routable address")
             proc = self.host_mesh.slice(hosts=index).spawn_procs(
                 per_host={"rollout": host.cpu_slots},
                 bootstrap=activate_cpu_child_virtualenv,
@@ -663,6 +669,7 @@ class ArtRuntime:
                 RolloutWorkerService,
                 self.config.trajectory_capacity_records,
                 self.config.trajectory_capacity_bytes,
+                data_plane_host,
             )
             self._rollout_procs[host.host_id] = proc
             self._rollout_actors[host.host_id] = actor
@@ -684,9 +691,32 @@ class ArtRuntime:
         batch_id = uuid.uuid4().hex
         self._live_batches[batch_id] = trainer_hosts
         try:
-            result: PackingResult = await MonarchPackingEndpoint(source_actor).pack(
-                request, batch_id
-            )
+            publisher = None
+            wire_request = request
+            if request.trajectory_groups:
+                from .trajectory_store import publish_trajectory_bundles
+
+                controller = self._host(self.topology.cluster.controller_host_id)
+                data_plane_host = urlparse(controller.worker_address).hostname
+                if data_plane_host is None:
+                    raise ValueError("controller has no routable address")
+                transfer, publisher = await publish_trajectory_bundles(
+                    request.trajectory_groups,
+                    stream_id=batch_id,
+                    advertise_host=data_plane_host,
+                )
+                wire_request = request.model_copy(
+                    update={"trajectory_groups": (), "trajectory_transfer": transfer}
+                )
+            try:
+                result: PackingResult = await MonarchPackingEndpoint(source_actor).pack(
+                    wire_request,
+                    batch_id,
+                    transfer_timeout_s=self.topology.cluster.rpc_timeout_s,
+                )
+            finally:
+                if publisher is not None:
+                    await publisher.close()
             if result.ref is None:
                 self._live_batches.pop(batch_id)
                 return None

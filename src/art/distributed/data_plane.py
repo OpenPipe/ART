@@ -203,6 +203,14 @@ class PackedBatchTransfer(_Contract):
     byte_count: int = Field(ge=1)
 
 
+class ByteStreamTransfer(_Contract):
+    stream_id: str = Field(min_length=1)
+    host: str = Field(min_length=1)
+    port: int = Field(ge=1, le=65535)
+    token: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=1)
+
+
 class DataPlaneStats(_Contract):
     capacity_bytes: int
     used_bytes: int
@@ -518,54 +526,26 @@ class MappedPackedBatch(BaseModel):
         self.close()
 
 
-class PackedBatchPublisher:
-    """Batch-scoped authenticated stream over the cluster's routable TCP fabric."""
-
-    def __init__(
-        self,
-        ref: PackedBatchRef,
-        advertise_host: str,
-        shm: shared_memory.SharedMemory,
-    ) -> None:
-        self.ref = ref
+class _AuthenticatedStreamPublisher:
+    def __init__(self, advertise_host: str) -> None:
         self.advertise_host = advertise_host
-        self.shm = shm
         self._token = secrets.token_bytes(32)
         self._server: Any = None
         self._handlers: set[asyncio.Task[None]] = set()
 
-    @classmethod
-    async def create(
-        cls, ref: PackedBatchRef, *, advertise_host: str
-    ) -> "PackedBatchPublisher":
-        shm = shared_memory.SharedMemory(name=ref.shared_memory_name)
-        if ref.owner_process_id != os.getpid():
-            resource_tracker.unregister(cast(Any, shm)._name, "shared_memory")
-        publisher = cls(ref, advertise_host, shm)
-        try:
-            family = socket.getaddrinfo(advertise_host, 0, type=socket.SOCK_STREAM)[0][
-                0
-            ]
-            bind_host = "::" if family == socket.AF_INET6 else "0.0.0.0"
-            publisher._server = await asyncio.start_server(
-                publisher._handle, bind_host, 0, family=family
-            )
-            return publisher
-        except BaseException:
-            shm.close()
-            raise
-
-    @property
-    def transfer(self) -> PackedBatchTransfer:
-        if self._server is None or not self._server.sockets:
-            raise RuntimeError("packed-batch publisher is not listening")
-        return PackedBatchTransfer(
-            batch_id=self.ref.batch_id,
-            host=self.advertise_host,
-            port=int(self._server.sockets[0].getsockname()[1]),
-            token=self._token.hex(),
-            byte_count=self.ref.storage_byte_count,
+    async def start(self) -> None:
+        family = socket.getaddrinfo(self.advertise_host, 0, type=socket.SOCK_STREAM)[0][
+            0
+        ]
+        bind_host = "::" if family == socket.AF_INET6 else "0.0.0.0"
+        self._server = await asyncio.start_server(
+            self._handle, bind_host, 0, family=family
         )
+
+    def _port(self) -> int:
+        if self._server is None or not self._server.sockets:
+            raise RuntimeError("byte-stream publisher is not listening")
+        return int(self._server.sockets[0].getsockname()[1])
 
     async def close(self) -> None:
         if self._server is None:
@@ -577,7 +557,6 @@ class PackedBatchPublisher:
         await asyncio.gather(*self._handlers, return_exceptions=True)
         self._handlers.clear()
         self._server = None
-        self.shm.close()
 
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -588,13 +567,7 @@ class PackedBatchPublisher:
             token = await reader.readexactly(len(self._token))
             if not secrets.compare_digest(token, self._token):
                 return
-            source = _shm_buffer(self.shm)[: self.ref.storage_byte_count]
-            try:
-                for offset in range(0, len(source), _STREAM_CHUNK_BYTES):
-                    writer.write(source[offset : offset + _STREAM_CHUNK_BYTES])
-                    await writer.drain()
-            finally:
-                source.release()
+            await self._write(writer)
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:
@@ -602,6 +575,101 @@ class PackedBatchPublisher:
             with suppress(Exception):
                 await writer.wait_closed()
             self._handlers.discard(task)
+
+    async def _write(self, writer: asyncio.StreamWriter) -> None:
+        raise NotImplementedError
+
+
+class ByteStreamPublisher(_AuthenticatedStreamPublisher):
+    """Authenticated one-shot transport for immutable byte chunks."""
+
+    def __init__(
+        self, stream_id: str, advertise_host: str, chunks: tuple[bytes, ...]
+    ) -> None:
+        super().__init__(advertise_host)
+        self.stream_id = stream_id
+        self.chunks = chunks
+        self.byte_count = sum(map(len, chunks))
+        if not stream_id or self.byte_count < 1:
+            raise ValueError("byte stream ID and payload must be non-empty")
+
+    @classmethod
+    async def create(
+        cls,
+        stream_id: str,
+        chunks: tuple[bytes, ...],
+        *,
+        advertise_host: str,
+    ) -> "ByteStreamPublisher":
+        publisher = cls(stream_id, advertise_host, chunks)
+        await publisher.start()
+        return publisher
+
+    @property
+    def transfer(self) -> ByteStreamTransfer:
+        return ByteStreamTransfer(
+            stream_id=self.stream_id,
+            host=self.advertise_host,
+            port=self._port(),
+            token=self._token.hex(),
+            byte_count=self.byte_count,
+        )
+
+    async def _write(self, writer: asyncio.StreamWriter) -> None:
+        for chunk in self.chunks:
+            await _write_stream_chunk(writer, chunk)
+
+
+class PackedBatchPublisher(_AuthenticatedStreamPublisher):
+    """Batch-scoped authenticated stream over the cluster's routable TCP fabric."""
+
+    def __init__(
+        self,
+        ref: PackedBatchRef,
+        advertise_host: str,
+        shm: shared_memory.SharedMemory,
+    ) -> None:
+        super().__init__(advertise_host)
+        self.ref = ref
+        self.shm = shm
+
+    @classmethod
+    async def create(
+        cls, ref: PackedBatchRef, *, advertise_host: str
+    ) -> "PackedBatchPublisher":
+        shm = shared_memory.SharedMemory(name=ref.shared_memory_name)
+        if ref.owner_process_id != os.getpid():
+            resource_tracker.unregister(cast(Any, shm)._name, "shared_memory")
+        publisher = cls(ref, advertise_host, shm)
+        try:
+            await publisher.start()
+            return publisher
+        except BaseException:
+            shm.close()
+            raise
+
+    @property
+    def transfer(self) -> PackedBatchTransfer:
+        return PackedBatchTransfer(
+            batch_id=self.ref.batch_id,
+            host=self.advertise_host,
+            port=self._port(),
+            token=self._token.hex(),
+            byte_count=self.ref.storage_byte_count,
+        )
+
+    async def close(self) -> None:
+        try:
+            await super().close()
+        finally:
+            self.shm.close()
+
+    async def _write(self, writer: asyncio.StreamWriter) -> None:
+        source = _shm_buffer(self.shm)[: self.ref.storage_byte_count]
+        try:
+            await _write_stream_chunk(writer, source)
+        finally:
+            source.release()
 
 
 class PackedBatchInbox:
@@ -707,9 +775,39 @@ async def _release_transferred(
             await inboxes[host_id].drop(destination_ref)
 
 
+async def receive_byte_stream(
+    transfer: ByteStreamTransfer, *, timeout_s: float
+) -> bytearray:
+    from art.utils.lifecycle import complete_to_thread
+
+    payload = bytearray(transfer.byte_count)
+    destination = memoryview(payload)
+    try:
+        _, cancelled = await complete_to_thread(
+            lambda: _receive_into_stream(transfer, destination, timeout_s)
+        )
+        if cancelled is not None:
+            raise cancelled
+        return payload
+    finally:
+        destination.release()
+
+
 def _receive_stream(
     transfer: PackedBatchTransfer,
     shm: shared_memory.SharedMemory,
+    timeout_s: float,
+) -> None:
+    destination = _shm_buffer(shm)[: transfer.byte_count]
+    try:
+        _receive_into_stream(transfer, destination, timeout_s)
+    finally:
+        destination.release()
+
+
+def _receive_into_stream(
+    transfer: PackedBatchTransfer | ByteStreamTransfer,
+    destination: memoryview,
     timeout_s: float,
 ) -> None:
     deadline = time.monotonic() + timeout_s
@@ -717,20 +815,23 @@ def _receive_stream(
         (transfer.host, transfer.port), timeout=max(0.001, timeout_s)
     ) as connection:
         connection.sendall(bytes.fromhex(transfer.token))
-        destination = _shm_buffer(shm)[: transfer.byte_count]
-        try:
-            offset = 0
-            while offset < len(destination):
-                connection.settimeout(max(0.001, deadline - time.monotonic()))
-                received = connection.recv_into(destination[offset:])
-                if not received:
-                    raise ConnectionError(
-                        f"packed-batch stream ended after {offset} of "
-                        f"{len(destination)} bytes"
-                    )
-                offset += received
-        finally:
-            destination.release()
+        offset = 0
+        while offset < len(destination):
+            connection.settimeout(max(0.001, deadline - time.monotonic()))
+            received = connection.recv_into(destination[offset:])
+            if not received:
+                raise ConnectionError(
+                    f"byte stream ended after {offset} of {len(destination)} bytes"
+                )
+            offset += received
+
+
+async def _write_stream_chunk(
+    writer: asyncio.StreamWriter, source: bytes | memoryview
+) -> None:
+    for offset in range(0, len(source), _STREAM_CHUNK_BYTES):
+        writer.write(source[offset : offset + _STREAM_CHUNK_BYTES])
+        await writer.drain()
 
 
 def _flatten_packed_tensors(

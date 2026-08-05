@@ -49,9 +49,9 @@ from .packing import PackingRequest, PackingResult
 from .rollout import RolloutInvocation, RolloutResult
 from .specs import HostServiceHealth
 from .trajectory_store import (
+    TrajectoryBatchTransfer,
     TrajectoryCapacityError,
     TrajectoryEnqueueResult,
-    TrajectoryGroupBundle,
     TrajectoryGroupRef,
     TrajectoryLeaseError,
     TrajectoryQueueItem,
@@ -59,6 +59,7 @@ from .trajectory_store import (
     TrajectoryQueueSnapshot,
     TrajectoryQueueStore,
     TrajectoryQueueTake,
+    publish_trajectory_bundles,
 )
 from .vllm_replica import HostMemberLaunchRequest
 
@@ -408,7 +409,9 @@ class RolloutHostService(Actor):
             await self._vllm_launcher.stop_member(replica_id, member_id, generation)
 
     @resilient_endpoint
-    async def pack_batch(self, request: PackingRequest, batch_id: str) -> PackingResult:
+    async def pack_batch(
+        self, request: PackingRequest, batch_id: str, transfer_timeout_s: float
+    ) -> PackingResult:
         if self._packer is None:
             from art.megatron.backend import MegatronBackend
 
@@ -417,7 +420,18 @@ class RolloutHostService(Actor):
                 path=f"/tmp/art-packing-{os.getpid()}",
                 enable_expert_replay=request.include_moe_routing,
             )
-        groups = [payload.build() for payload in request.trajectory_groups]
+        if request.trajectory_transfer is None:
+            groups = [payload.build() for payload in request.trajectory_groups]
+        else:
+            if request.trajectory_groups:
+                raise ValueError("packing request has inline and streamed trajectories")
+            if request.trajectory_transfer.stream.stream_id != batch_id:
+                raise ValueError("packing request has the wrong trajectory stream")
+            groups = list(
+                await request.trajectory_transfer.receive_groups(
+                    timeout_s=transfer_timeout_s
+                )
+            )
         packed = self._packer._get_packed_tensors(
             request.model.build(),
             groups,
@@ -512,7 +526,9 @@ class RolloutHostService(Actor):
 class RolloutWorkerService(Actor):
     """One process-isolated CPU rollout slot."""
 
-    def __init__(self, capacity_records: int, capacity_bytes: int) -> None:
+    def __init__(
+        self, capacity_records: int, capacity_bytes: int, data_plane_host: str
+    ) -> None:
         from .trajectory_store import TrajectoryRecordStore
 
         self._models = OrderedDict()
@@ -521,6 +537,8 @@ class RolloutWorkerService(Actor):
             capacity_records=capacity_records,
             capacity_bytes=capacity_bytes,
         )
+        self._data_plane_host = data_plane_host
+        self._trajectory_publishers = {}
 
     @resilient_endpoint
     async def run(self, invocation: RolloutInvocation):
@@ -554,15 +572,30 @@ class RolloutWorkerService(Actor):
     @resilient_endpoint
     async def materialize_result(
         self, ref: TrajectoryGroupRef
-    ) -> TrajectoryGroupBundle:
-        return self._results.bundle(ref)
+    ) -> TrajectoryBatchTransfer:
+        if ref.result_id in self._trajectory_publishers:
+            raise RuntimeError(f"trajectory {ref.result_id!r} is already published")
+        transfer, publisher = await publish_trajectory_bundles(
+            (self._results.bundle(ref),),
+            stream_id=ref.result_id,
+            advertise_host=self._data_plane_host,
+        )
+        self._trajectory_publishers[ref.result_id] = publisher
+        return transfer
 
     @resilient_endpoint
     async def drop_result(self, ref: TrajectoryGroupRef) -> None:
         self._results.drop(ref)
+        publisher = self._trajectory_publishers.pop(ref.result_id, None)
+        if publisher is not None:
+            await publisher.close()
 
     @resilient_endpoint
     async def close(self) -> None:
+        await asyncio.gather(
+            *(publisher.close() for publisher in self._trajectory_publishers.values())
+        )
+        self._trajectory_publishers.clear()
         for model in self._models.values():
             await model._reset_inference_runtime()
         self._models.clear()

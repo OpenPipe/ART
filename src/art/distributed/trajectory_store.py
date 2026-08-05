@@ -5,9 +5,11 @@ from collections.abc import Mapping
 import secrets
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art.trajectories import MetadataValue, Trajectory, TrajectoryGroup
+
+from .data_plane import ByteStreamPublisher, ByteStreamTransfer, receive_byte_stream
 
 if TYPE_CHECKING:
     from .packing import TrajectoryGroupPayload
@@ -84,6 +86,90 @@ class TrajectoryGroupBundle(_Contract):
 
     def build(self) -> TrajectoryGroup:
         return self.payload().build()
+
+
+class TrajectoryGroupLayout(_Contract):
+    header_byte_count: int = Field(ge=1)
+    record_byte_counts: tuple[int, ...]
+
+
+class TrajectoryBatchTransfer(_Contract):
+    stream: ByteStreamTransfer
+    groups: tuple[TrajectoryGroupLayout, ...]
+
+    @model_validator(mode="after")
+    def _validate_layout(self) -> "TrajectoryBatchTransfer":
+        if any(
+            byte_count < 0
+            for group in self.groups
+            for byte_count in group.record_byte_counts
+        ):
+            raise ValueError("trajectory record byte counts must be non-negative")
+        byte_count = sum(
+            group.header_byte_count + sum(group.record_byte_counts)
+            for group in self.groups
+        )
+        if not self.groups or byte_count != self.stream.byte_count:
+            raise ValueError("trajectory stream layout does not match its payload")
+        return self
+
+    async def receive_groups(self, *, timeout_s: float) -> tuple[TrajectoryGroup, ...]:
+        payload = await receive_byte_stream(self.stream, timeout_s=timeout_s)
+        return self._build_groups(payload)
+
+    def _build_groups(self, payload: bytearray) -> tuple[TrajectoryGroup, ...]:
+        from msgspec.msgpack import decode
+
+        from .packing import TrajectoryGroupPayload
+
+        view = memoryview(payload)
+        offset = 0
+        groups = []
+        try:
+            for layout in self.groups:
+                end = offset + layout.header_byte_count
+                header = decode(view[offset:end])
+                offset = end
+                records = []
+                for byte_count in layout.record_byte_counts:
+                    end = offset + byte_count
+                    records.append(decode(view[offset:end]))
+                    offset = end
+                header["trajectories"] = tuple(records)
+                groups.append(TrajectoryGroupPayload.model_validate(header).build())
+        finally:
+            view.release()
+        return tuple(groups)
+
+
+async def publish_trajectory_bundles(
+    bundles: tuple[TrajectoryGroupBundle, ...],
+    *,
+    stream_id: str,
+    advertise_host: str,
+) -> tuple[TrajectoryBatchTransfer, ByteStreamPublisher]:
+    publisher = await ByteStreamPublisher.create(
+        stream_id,
+        tuple(
+            chunk for bundle in bundles for chunk in (bundle.header, *bundle.records)
+        ),
+        advertise_host=advertise_host,
+    )
+    try:
+        transfer = TrajectoryBatchTransfer(
+            stream=publisher.transfer,
+            groups=tuple(
+                TrajectoryGroupLayout(
+                    header_byte_count=len(bundle.header),
+                    record_byte_counts=tuple(map(len, bundle.records)),
+                )
+                for bundle in bundles
+            ),
+        )
+    except BaseException:
+        await publisher.close()
+        raise
+    return transfer, publisher
 
 
 class TrajectoryGroupAnnotations(_Contract):
