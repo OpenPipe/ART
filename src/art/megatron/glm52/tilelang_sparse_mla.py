@@ -241,6 +241,10 @@ def _backward(
     q_tokens = T.dynamic("q_tokens")
     kv_tokens = T.dynamic("kv_tokens")
     assert topk % block_i == 0
+    assert not use_tcgen_dq or (
+        block_i in (32, 64) and threads == 256 and heads % 32 == 0
+    )
+    tcgen_group = 2 * block_i
     q_shape = [batch, q_tokens, heads, _DIM]
     kv_shape = [batch, kv_tokens, 1, _DIM]
     grad_kv_shape = [batch, dkv_splits, kv_tokens, 1, _DIM]
@@ -250,6 +254,17 @@ def _backward(
     blocks = topk // block_i
     scale_log2 = scale * _LOG2_E
     split_store = 2
+
+    @T.macro
+    def prefetch_kv(KV, Indices, shared, b_i, q_i, offset, width, dim_offset):
+        for i, d in T.Parallel(
+            block_i,
+            width,
+            prefer_async=True,
+            annotations={"parallel_async_without_async_commit_wait": True},
+        ):
+            shared[i, d] = KV[b_i, Indices[b_i, q_i, 0, offset + i], 0, dim_offset + d]
+        T.ptx_commit_group()
 
     @T.prim_func
     def main(
@@ -272,23 +287,44 @@ def _backward(
             grad_scores_shared = T.alloc_shared([heads, block_i], T.bfloat16)
             grad_q_shared = T.alloc_shared([heads, _LATENT], T.bfloat16)
             grad_q_rope_shared = T.alloc_shared([heads, _ROPE], T.bfloat16)
-            grad_kv_shared = T.alloc_shared(
-                [block_i // split_store, _LATENT], T.float32
-            )
-            grad_kv_rope_shared = T.alloc_shared(
-                [block_i // split_store, _ROPE], T.float32
-            )
+            if not use_tcgen_dq:
+                grad_kv_shared = T.alloc_shared(
+                    [block_i // split_store, _LATENT], T.float32
+                )
+                grad_kv_rope_shared = T.alloc_shared(
+                    [block_i // split_store, _ROPE], T.float32
+                )
             if use_tcgen_dq:
                 grad_q_tmem = T.alloc_tmem([heads, _LATENT], T.float32)
-                grad_q_rope_tmem = T.alloc_tmem([heads, _ROPE], T.float32)
                 grad_q_barrier = T.alloc_barrier(1)
-                grad_q_rope_barrier = T.alloc_barrier(1)
             valid = T.alloc_fragment([block_i], "bool")
             probabilities = T.alloc_fragment([heads, block_i], T.float32)
             grad_probabilities = T.alloc_fragment([heads, block_i], T.float32)
             grad_q = T.alloc_fragment([heads, _LATENT], T.float32)
             grad_q_rope = T.alloc_fragment([heads, _ROPE], T.float32)
             grad_kv = T.alloc_fragment([block_i, _LATENT], T.float32)
+            if use_tcgen_dq:
+                grad_kv_tmem = T.alloc_tmem([block_i, _LATENT], T.float32)
+                grad_kv_barrier = T.alloc_barrier(1)
+                grad_kv_add_barrier = T.alloc_barrier(1)
+                T.annotate_layout(
+                    {
+                        grad_kv_tmem: T.Layout(
+                            [block_i, _LATENT],
+                            lambda i, j: [
+                                (j % 256) // tcgen_group * block_i + i,
+                                (j // 256) * tcgen_group + j % tcgen_group,
+                            ],
+                        ),
+                        grad_kv: T.Fragment(
+                            [block_i, _LATENT],
+                            forward_fn=lambda i, j: (
+                                (j // tcgen_group) * block_i + i,
+                                j % tcgen_group,
+                            ),
+                        ),
+                    }
+                )
             grad_kv_rope = T.alloc_fragment([block_i, _ROPE], T.float32)
 
             T.copy(Q[b_i, q_i, :, :_LATENT], q_shared)
@@ -296,9 +332,16 @@ def _backward(
             T.copy(GradOutput[b_i, q_i, :, :], grad_out_shared)
             if not use_tcgen_dq:
                 T.clear(grad_q)
-                T.clear(grad_q_rope)
+            T.clear(grad_q_rope)
 
-            for block in T.Pipelined(blocks, num_stages=num_stages):
+            if use_tcgen_dq:
+                prefetch_kv(KV, Indices, kv_shared, b_i, q_i, 0, _LATENT, 0)
+                prefetch_kv(KV, Indices, kv_rope_shared, b_i, q_i, 0, _ROPE, _LATENT)
+            for block in (
+                T.serial(blocks)
+                if use_tcgen_dq
+                else T.Pipelined(blocks, num_stages=num_stages)
+            ):
                 for i in T.Parallel(block_i):
                     index = Indices[b_i, q_i, 0, block * block_i + i]
                     valid[i] = (index >= 0) & (index < kv_tokens - 1)
@@ -306,17 +349,24 @@ def _backward(
                     probabilities[h, i] = T.if_then_else(
                         valid[i], 0, -T.infinity(T.float32)
                     )
-                for i, d in T.Parallel(block_i, _LATENT):
-                    kv_shared[i, d] = KV[
-                        b_i, Indices[b_i, q_i, 0, block * block_i + i], 0, d
-                    ]
-                for i, d in T.Parallel(block_i, _ROPE):
-                    kv_rope_shared[i, d] = KV[
-                        b_i,
-                        Indices[b_i, q_i, 0, block * block_i + i],
-                        0,
-                        _LATENT + d,
-                    ]
+                if use_tcgen_dq:
+                    T.ptx_wait_group(0)
+                    T.sync_threads()
+                if not use_tcgen_dq:
+                    for i, d in T.Parallel(block_i, _LATENT):
+                        kv_shared[i, d] = KV[
+                            b_i,
+                            Indices[b_i, q_i, 0, block * block_i + i],
+                            0,
+                            d,
+                        ]
+                    for i, d in T.Parallel(block_i, _ROPE):
+                        kv_rope_shared[i, d] = KV[
+                            b_i,
+                            Indices[b_i, q_i, 0, block * block_i + i],
+                            0,
+                            _LATENT + d,
+                        ]
                 T.gemm(
                     q_shared,
                     kv_shared,
@@ -340,6 +390,15 @@ def _backward(
                         0,
                     )
                 T.copy(probabilities, probabilities_shared)
+                if use_tcgen_dq:
+                    T.tcgen05_gemm(
+                        probabilities_shared,
+                        grad_out_shared,
+                        grad_kv_tmem,
+                        transpose_A=True,
+                        clear_accum=True,
+                        mbar=grad_kv_barrier,
+                    )
                 T.gemm(
                     grad_out_shared,
                     kv_shared,
@@ -354,25 +413,47 @@ def _backward(
                         * (grad_probabilities[h, i] - Delta[b_i, q_i, h])
                         * scale
                     )
-                T.copy(grad_probabilities, grad_scores_shared)
                 if use_tcgen_dq:
+                    T.mbarrier_wait_parity(grad_kv_barrier, block % 2)
+                    T.copy(grad_probabilities, probabilities_shared)
                     T.tcgen05_gemm(
-                        grad_scores_shared,
+                        probabilities_shared,
                         kv_shared,
                         grad_q_tmem,
                         mbar=grad_q_barrier,
                         clear_accum=block == 0,
                     )
-                    T.tcgen05_gemm(
-                        grad_scores_shared,
+                    if block + 1 < blocks:
+                        prefetch_kv(
+                            KV,
+                            Indices,
+                            kv_shared,
+                            b_i,
+                            q_i,
+                            (block + 1) * block_i,
+                            _LATENT,
+                            0,
+                        )
+                    T.gemm(
+                        probabilities_shared,
                         kv_rope_shared,
-                        grad_q_rope_tmem,
-                        mbar=grad_q_rope_barrier,
-                        clear_accum=block == 0,
+                        grad_q_rope,
+                        policy=T.GemmWarpPolicy.FullCol,
                     )
+                    if block + 1 < blocks:
+                        prefetch_kv(
+                            KV,
+                            Indices,
+                            kv_rope_shared,
+                            b_i,
+                            q_i,
+                            (block + 1) * block_i,
+                            _ROPE,
+                            _LATENT,
+                        )
                     T.mbarrier_wait_parity(grad_q_barrier, block % 2)
-                    T.mbarrier_wait_parity(grad_q_rope_barrier, block % 2)
                 else:
+                    T.copy(grad_probabilities, grad_scores_shared)
                     T.gemm(
                         grad_scores_shared,
                         kv_shared,
@@ -385,73 +466,115 @@ def _backward(
                         grad_q_rope,
                         policy=T.GemmWarpPolicy.FullCol,
                     )
-                T.gemm(
-                    grad_scores_shared,
-                    q_shared,
-                    grad_kv,
-                    transpose_A=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                    clear_accum=True,
-                )
-                T.gemm(
-                    probabilities_shared,
-                    grad_out_shared,
-                    grad_kv,
-                    transpose_A=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
-                T.clear(grad_kv_rope)
-                T.gemm(
-                    grad_scores_shared,
-                    q_rope_shared,
-                    grad_kv_rope,
-                    transpose_A=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
-
-                for split in range(split_store):
+                if use_tcgen_dq:
+                    T.tcgen05_gemm(
+                        probabilities_shared,
+                        q_shared,
+                        grad_kv_tmem,
+                        transpose_A=True,
+                        mbar=grad_kv_add_barrier,
+                    )
+                    T.clear(grad_kv_rope)
+                    T.gemm(
+                        probabilities_shared,
+                        q_rope_shared,
+                        grad_kv_rope,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
+                    T.mbarrier_wait_parity(grad_kv_add_barrier, block % 2)
+                    T.copy(grad_kv_tmem, grad_kv)
                     for i, d in T.Parallel(block_i, _LATENT):
-                        if i < block_i // split_store:
-                            grad_kv_shared[i, d] = grad_kv[
-                                i + split * (block_i // split_store), d
-                            ]
+                        index = Indices[b_i, q_i, 0, block * block_i + i]
+                        if (index >= 0) & (index < kv_tokens - 1):
+                            T.atomic_add(
+                                GradKV[b_i, q_i % dkv_splits, index, 0, d],
+                                grad_kv[i, d],
+                            )
                     for i, d in T.Parallel(block_i, _ROPE):
-                        if i < block_i // split_store:
-                            grad_kv_rope_shared[i, d] = grad_kv_rope[
-                                i + split * (block_i // split_store), d
-                            ]
-                    for i, d in T.Parallel(block_i // split_store, _LATENT):
-                        source = i + split * (block_i // split_store)
-                        T.atomic_add(
-                            GradKV[
-                                b_i,
-                                q_i % dkv_splits,
-                                Indices[b_i, q_i, 0, block * block_i + source],
-                                0,
-                                d,
-                            ],
-                            grad_kv_shared[i, d],
-                        )
-                    for i, d in T.Parallel(block_i // split_store, _ROPE):
-                        source = i + split * (block_i // split_store)
-                        T.atomic_add(
-                            GradKV[
-                                b_i,
-                                q_i % dkv_splits,
-                                Indices[b_i, q_i, 0, block * block_i + source],
-                                0,
-                                _LATENT + d,
-                            ],
-                            grad_kv_rope_shared[i, d],
-                        )
+                        index = Indices[b_i, q_i, 0, block * block_i + i]
+                        if (index >= 0) & (index < kv_tokens - 1):
+                            T.atomic_add(
+                                GradKV[
+                                    b_i,
+                                    q_i % dkv_splits,
+                                    index,
+                                    0,
+                                    _LATENT + d,
+                                ],
+                                grad_kv_rope[i, d],
+                            )
+                else:
+                    T.gemm(
+                        grad_scores_shared,
+                        q_shared,
+                        grad_kv,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                        clear_accum=True,
+                    )
+                    T.gemm(
+                        probabilities_shared,
+                        grad_out_shared,
+                        grad_kv,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
+                    T.clear(grad_kv_rope)
+                    T.gemm(
+                        grad_scores_shared,
+                        q_rope_shared,
+                        grad_kv_rope,
+                        transpose_A=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
+
+                    for split in range(split_store):
+                        for i, d in T.Parallel(block_i, _LATENT):
+                            if i < block_i // split_store:
+                                grad_kv_shared[i, d] = grad_kv[
+                                    i + split * (block_i // split_store), d
+                                ]
+                        for i, d in T.Parallel(block_i, _ROPE):
+                            if i < block_i // split_store:
+                                grad_kv_rope_shared[i, d] = grad_kv_rope[
+                                    i + split * (block_i // split_store), d
+                                ]
+                        for i, d in T.Parallel(block_i // split_store, _LATENT):
+                            source = i + split * (block_i // split_store)
+                            T.atomic_add(
+                                GradKV[
+                                    b_i,
+                                    q_i % dkv_splits,
+                                    Indices[b_i, q_i, 0, block * block_i + source],
+                                    0,
+                                    d,
+                                ],
+                                grad_kv_shared[i, d],
+                            )
+                        for i, d in T.Parallel(block_i // split_store, _ROPE):
+                            source = i + split * (block_i // split_store)
+                            T.atomic_add(
+                                GradKV[
+                                    b_i,
+                                    q_i % dkv_splits,
+                                    Indices[b_i, q_i, 0, block * block_i + source],
+                                    0,
+                                    _LATENT + d,
+                                ],
+                                grad_kv_rope_shared[i, d],
+                            )
 
             if use_tcgen_dq:
                 T.copy(grad_q_tmem, grad_q)
-                T.copy(grad_q_rope_tmem, grad_q_rope)
             T.copy(grad_q, grad_q_shared)
             T.copy(grad_q_rope, grad_q_rope_shared)
             T.copy(grad_q_shared, GradQ[b_i, q_i, :, :_LATENT])
             T.copy(grad_q_rope_shared, GradQ[b_i, q_i, :, _LATENT:])
+            if use_tcgen_dq:
+                if T.get_thread_binding() // 32 == 0:
+                    T.deallocate_tmem(grad_kv_tmem)
+                    T.deallocate_tmem(grad_q_tmem)
 
     return main
 
@@ -506,13 +629,14 @@ def backward(
             dtype=torch.float32,
         )
         sm_major = torch.cuda.get_device_capability(q.device)[0]
+        use_tcgen = sm_major == 10 and kernel_heads % 32 == 0
         grad_q = _backward(
             int(kernel_heads),
             int(indices.shape[-1]),
             float(scale),
-            num_stages=int(sm_major == 10),
-            threads=min(256, int(kernel_heads) * 8),
-            use_tcgen_dq=sm_major == 10,
+            block_i=64 if use_tcgen else 32,
+            threads=256 if use_tcgen else min(256, int(kernel_heads) * 8),
+            use_tcgen_dq=use_tcgen,
         )(q, kv_grouped, grad_output, indices_grouped, lse, delta, grad_kv)
     return (
         grad_q[:, :, :heads],
