@@ -375,19 +375,6 @@ def _index_score_keys(
     return keys
 
 
-def _decode_score_keys(keys: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    invalid = keys == torch.iinfo(torch.int64).min
-    ordered = (keys >> 32) + 0x8000_0000
-    bits = torch.where(
-        (ordered & 0x8000_0000).bool(),
-        ordered ^ 0x8000_0000,
-        (~ordered) & 0xFFFF_FFFF,
-    )
-    scores = bits.to(torch.int32).view(torch.float32)
-    ids = (0xFFFF_FFFF - (keys & 0xFFFF_FFFF)).to(torch.int32)
-    return scores.masked_fill(invalid, float("-inf")), ids.masked_fill(invalid, -1)
-
-
 def _merge_topk(
     scores: torch.Tensor,
     ids: torch.Tensor,
@@ -401,48 +388,6 @@ def _merge_topk(
     keep = min(topk, int(all_scores.shape[1]))
     scores, positions = torch.topk(all_scores, keep, dim=1, sorted=False)
     return scores, torch.gather(all_ids, 1, positions)
-
-
-def _stable_topk(
-    scores: torch.Tensor,
-    global_ids: torch.Tensor,
-    *,
-    topk: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select score-descending/id-ascending top-k using an exact integer key."""
-    if scores.dtype is not torch.float32 or global_ids.dtype is not torch.int32:
-        raise TypeError("GLM-5.2 stable top-k expects fp32 scores and int32 ids.")
-    keep = min(int(topk), int(scores.shape[1]))
-    key_scores = torch.where(scores == 0, torch.zeros_like(scores), scores)
-    bits = key_scores.contiguous().view(torch.int32).to(torch.int64) & 0xFFFF_FFFF
-    ordered = torch.where(
-        (bits >> 31).bool(),
-        (~bits) & 0xFFFF_FFFF,
-        bits ^ 0x8000_0000,
-    )
-    primary = ordered - 0x8000_0000
-    secondary = torch.where(
-        global_ids >= 0,
-        0xFFFF_FFFF - global_ids.to(torch.int64),
-        torch.zeros_like(primary),
-    )
-    positions = torch.topk((primary << 32) | secondary, keep, dim=1).indices
-    return torch.gather(scores, 1, positions), torch.gather(global_ids, 1, positions)
-
-
-def _merge_stable_topk(
-    scores: torch.Tensor,
-    global_ids: torch.Tensor,
-    candidate_scores: torch.Tensor,
-    candidate_ids: torch.Tensor,
-    *,
-    topk: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _stable_topk(
-        torch.cat((scores, candidate_scores), dim=1),
-        torch.cat((global_ids, candidate_ids), dim=1),
-        topk=topk,
-    )
 
 
 def _gather_ranges(
@@ -459,8 +404,7 @@ def _stage_topk_update(
     k: torch.Tensor,
     weights: torch.Tensor,
     stage: Glm52StageState,
-    best_scores: torch.Tensor,
-    best_ids: torch.Tensor,
+    best_keys: torch.Tensor,
     *,
     topk: int,
 ) -> None:
@@ -476,32 +420,24 @@ def _stage_topk_update(
         for q_start in range(query.q_start, query.q_end, q_chunk_size):
             q_end = min(q_start + q_chunk_size, query.q_end)
             owner_rows = stage.owner_q_rows[q_start:q_end]
-            scores = best_scores.index_select(0, owner_rows)
-            ids = best_ids.index_select(0, owner_rows)
+            keys = best_keys.index_select(0, owner_rows)
             q_ids = stage.global_q_ids[q_start:q_end]
             for k_start in range(0, max_k_len, k_chunk_size):
                 k_end = min(k_start + k_chunk_size, max_k_len)
-                score_keys = _index_score_keys(
+                candidate_keys = _index_score_keys(
                     q[q_start:q_end].contiguous(),
                     candidate_k[k_start:k_end].contiguous(),
                     weights[q_start:q_end].contiguous(),
                     q_ids,
                     candidate_global_ids[k_start:k_end],
                 )
-                keep = min(topk, k_end - k_start)
-                candidate_keys = torch.topk(
-                    score_keys, keep, dim=1, sorted=False
+                keys = torch.topk(
+                    torch.cat((keys, candidate_keys), dim=1),
+                    topk,
+                    dim=1,
+                    sorted=False,
                 ).values
-                candidate_scores, candidate_ids = _decode_score_keys(candidate_keys)
-                scores, ids = _merge_stable_topk(
-                    scores,
-                    ids,
-                    candidate_scores,
-                    candidate_ids,
-                    topk=topk,
-                )
-            best_scores.index_copy_(0, owner_rows, scores)
-            best_ids.index_copy_(0, owner_rows, ids)
+            best_keys.index_copy_(0, owner_rows, keys)
         del candidate_k, candidate_global_ids
 
 
@@ -520,10 +456,10 @@ def context_parallel_tree_topk(
     q = q[:, :valid_tokens].reshape(valid_tokens, *q.shape[2:]).contiguous()
     k = k[:, :valid_tokens].reshape(valid_tokens, k.shape[-1]).contiguous()
     weights = weights[:, :valid_tokens].reshape(valid_tokens, weights.shape[-1])
-    best_scores = torch.full(
-        (valid_tokens, topk), float("-inf"), device=q.device, dtype=torch.float32
+    invalid_key = torch.iinfo(torch.int64).min
+    best_keys = torch.full(
+        (valid_tokens, topk), invalid_key, device=q.device, dtype=torch.int64
     )
-    best_ids = torch.full((valid_tokens, topk), -1, device=q.device, dtype=torch.int32)
     works = launch_remote_stage_fetches(k, cp_state)
     for stage_plan, stage in zip(
         cp_state.rank_plan.stage_plans, state.stages, strict=True
@@ -538,13 +474,15 @@ def context_parallel_tree_topk(
             k_stage,
             weights_stage,
             stage,
-            best_scores,
-            best_ids,
+            best_keys,
             topk=topk,
         )
         del q_stage, weights_stage, k_stage
     drain_stage_fetches(works)
-    del best_scores
+    invalid = best_keys == invalid_key
+    best_ids = (0xFFFF_FFFF - (best_keys & 0xFFFF_FFFF)).to(torch.int32)
+    best_ids.masked_fill_(invalid, -1)
+    del best_keys
     _canonicalize_topk_(best_ids)
     route_map = state.route_by_global_id
     if route_map is None:

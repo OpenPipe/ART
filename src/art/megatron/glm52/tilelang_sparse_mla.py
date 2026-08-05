@@ -505,12 +505,14 @@ def backward(
             device=kv.device,
             dtype=torch.float32,
         )
+        sm_major = torch.cuda.get_device_capability(q.device)[0]
         grad_q = _backward(
             int(kernel_heads),
             int(indices.shape[-1]),
             float(scale),
+            num_stages=int(sm_major == 10),
             threads=min(256, int(kernel_heads) * 8),
-            use_tcgen_dq=torch.cuda.get_device_capability(q.device)[0] == 10,
+            use_tcgen_dq=sm_major == 10,
         )(q, kv_grouped, grad_output, indices_grouped, lse, delta, grad_kv)
     return (
         grad_q[:, :, :heads],
