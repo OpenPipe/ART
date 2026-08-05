@@ -16,6 +16,7 @@ from .rollout import (
 )
 from .trajectory_store import (
     TrajectoryEnqueueResult,
+    TrajectoryGroupBundle,
     TrajectoryGroupRef,
     TrajectoryQueueItem,
     TrajectoryQueueResize,
@@ -79,8 +80,10 @@ class MonarchRolloutHostEndpoint(RolloutHostEndpoint):
         return await call_remote(self.actor.run, invocation)
 
     async def materialize(self, ref: TrajectoryGroupRef) -> TrajectoryGroup:
-        payload = await call_remote(self.actor.materialize_result, ref)
-        return payload.build()
+        bundle: TrajectoryGroupBundle = await call_remote(
+            self.actor.materialize_result, ref
+        )
+        return bundle.build()
 
     async def drop(self, ref: TrajectoryGroupRef) -> None:
         await call_remote(self.actor.drop_result, ref)

@@ -51,6 +51,7 @@ from .specs import HostServiceHealth
 from .trajectory_store import (
     TrajectoryCapacityError,
     TrajectoryEnqueueResult,
+    TrajectoryGroupBundle,
     TrajectoryGroupRef,
     TrajectoryLeaseError,
     TrajectoryQueueItem,
@@ -551,8 +552,10 @@ class RolloutWorkerService(Actor):
         return RolloutResult(value=value, metrics=await builder.drain_pending())
 
     @resilient_endpoint
-    async def materialize_result(self, ref: TrajectoryGroupRef):
-        return self._results.payload(ref)
+    async def materialize_result(
+        self, ref: TrajectoryGroupRef
+    ) -> TrajectoryGroupBundle:
+        return self._results.bundle(ref)
 
     @resilient_endpoint
     async def drop_result(self, ref: TrajectoryGroupRef) -> None:

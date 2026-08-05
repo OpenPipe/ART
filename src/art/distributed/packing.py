@@ -21,6 +21,7 @@ from art.trajectories import (
 
 from .data_plane import PackedBatchRef
 from .rollout import RolloutModelSpec
+from .trajectory_store import TrajectoryGroupBundle
 
 if TYPE_CHECKING:
     from art.model import TrainableModel
@@ -207,7 +208,7 @@ class PackingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     model: RolloutModelSpec
-    trajectory_groups: tuple[TrajectoryGroupPayload, ...]
+    trajectory_groups: tuple[TrajectoryGroupBundle, ...]
     advantage_balance: float = 0.0
     allow_training_without_logprobs: bool = False
     scale_rewards: bool = True
@@ -243,7 +244,7 @@ class PackingRequest(BaseModel):
         return cls(
             model=RolloutModelSpec.from_model(model),
             trajectory_groups=tuple(
-                TrajectoryGroupPayload.from_group(group) for group in trajectory_groups
+                TrajectoryGroupBundle.from_group(group) for group in trajectory_groups
             ),
             advantage_balance=advantage_balance,
             allow_training_without_logprobs=allow_training_without_logprobs,

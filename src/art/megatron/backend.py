@@ -169,11 +169,9 @@ class MegatronBackend(LocalBackend):
                 dev_config,
                 include_moe_routing=include_moe_routing,
             )
-        from ..distributed.packing import (
-            PackingRequest,
-            TrajectoryGroupPayload,
-        )
+        from ..distributed.packing import PackingRequest
         from ..distributed.rollout import RolloutModelSpec
+        from ..distributed.trajectory_store import TrajectoryGroupBundle
 
         versions = [
             version
@@ -199,7 +197,7 @@ class MegatronBackend(LocalBackend):
             PackingRequest(
                 model=RolloutModelSpec.from_model(model),
                 trajectory_groups=tuple(
-                    TrajectoryGroupPayload.from_group(group)
+                    TrajectoryGroupBundle.from_group(group)
                     for group in trajectory_groups
                 ),
                 advantage_balance=dev_config.get("advantage_balance", 0.0),

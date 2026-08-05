@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Mapping
 import secrets
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -43,6 +43,47 @@ class TrajectoryGroupRef(_Contract):
     format: Literal["art_trajectory_v1"] = TRAJECTORY_FORMAT
     records: tuple[TrajectoryRecordRef, ...]
     descriptor: TrajectoryGroupDescriptor
+
+
+class TrajectoryGroupBundle(_Contract):
+    """Binary trajectory records for bulk transport across actor boundaries."""
+
+    header: bytes
+    records: tuple[bytes, ...]
+
+    @classmethod
+    def from_payload(cls, payload: TrajectoryGroupPayload) -> "TrajectoryGroupBundle":
+        from msgspec.msgpack import encode
+
+        return cls(
+            header=encode(
+                payload.model_copy(update={"trajectories": ()}).model_dump(
+                    mode="python"
+                )
+            ),
+            records=tuple(
+                encode(record.model_dump(mode="python"))
+                for record in payload.trajectories
+            ),
+        )
+
+    @classmethod
+    def from_group(cls, group: TrajectoryGroup) -> "TrajectoryGroupBundle":
+        from .packing import TrajectoryGroupPayload
+
+        return cls.from_payload(TrajectoryGroupPayload.from_group(group))
+
+    def payload(self) -> TrajectoryGroupPayload:
+        from msgspec.msgpack import decode
+
+        from .packing import TrajectoryGroupPayload
+
+        header = decode(self.header)
+        header["trajectories"] = tuple(decode(record) for record in self.records)
+        return TrajectoryGroupPayload.model_validate(header)
+
+    def build(self) -> TrajectoryGroup:
+        return self.payload().build()
 
 
 class TrajectoryGroupAnnotations(_Contract):
@@ -95,7 +136,7 @@ class TrajectoryLeaseError(RuntimeError):
 
 
 class _StoredGroup:
-    def __init__(self, header: Any, ref: TrajectoryGroupRef) -> None:
+    def __init__(self, header: bytes, ref: TrajectoryGroupRef) -> None:
         self.header = header
         self.ref = ref
 
@@ -111,22 +152,17 @@ class TrajectoryRecordStore:
         self.owner_actor_id = owner_actor_id
         self.capacity_records = capacity_records
         self.capacity_bytes = capacity_bytes
-        self._records: dict[str, Any] = {}
+        self._records: dict[str, bytes] = {}
         self._groups: dict[str, _StoredGroup] = {}
         self._used_bytes = 0
 
     def put(self, group: TrajectoryGroup) -> TrajectoryGroupRef:
-        from msgspec.msgpack import encode
-
         from .packing import TrajectoryGroupPayload
 
         payload = TrajectoryGroupPayload.from_group(group)
-        record_sizes = tuple(
-            len(encode(record.model_dump(mode="python")))
-            for record in payload.trajectories
-        )
-        header = payload.model_copy(update={"trajectories": ()})
-        byte_count = sum(record_sizes) + len(encode(header.model_dump(mode="python")))
+        bundle = TrajectoryGroupBundle.from_payload(payload)
+        record_sizes = tuple(len(record) for record in bundle.records)
+        byte_count = sum(record_sizes) + len(bundle.header)
         record_count = len(payload.trajectories)
         if record_count > self.capacity_records or byte_count > self.capacity_bytes:
             raise TrajectoryCapacityError(
@@ -148,7 +184,7 @@ class TrajectoryRecordStore:
             )
             for size in record_sizes
         )
-        for record_ref, record in zip(records, payload.trajectories, strict=True):
+        for record_ref, record in zip(records, bundle.records, strict=True):
             self._records[record_ref.record_id] = record
         descriptor = TrajectoryGroupDescriptor(
             grouping_key=_grouping_key(group, result_id),
@@ -177,23 +213,21 @@ class TrajectoryRecordStore:
             records=records,
             descriptor=descriptor,
         )
-        self._groups[result_id] = _StoredGroup(header, ref)
+        self._groups[result_id] = _StoredGroup(bundle.header, ref)
         self._used_bytes += byte_count
         return ref
 
-    def payload(self, ref: TrajectoryGroupRef) -> TrajectoryGroupPayload:
-        from .packing import TrajectoryGroupPayload
-
+    def bundle(self, ref: TrajectoryGroupRef) -> TrajectoryGroupBundle:
         stored = self._entry(ref)
-        return TrajectoryGroupPayload.model_validate(
-            stored.header.model_copy(
-                update={
-                    "trajectories": tuple(
-                        self._records[record.record_id] for record in ref.records
-                    )
-                }
-            )
+        return TrajectoryGroupBundle(
+            header=stored.header,
+            records=tuple(
+                self._records[record.record_id] for record in stored.ref.records
+            ),
         )
+
+    def payload(self, ref: TrajectoryGroupRef) -> TrajectoryGroupPayload:
+        return self.bundle(ref).payload()
 
     def materialize(self, ref: TrajectoryGroupRef) -> TrajectoryGroup:
         return self.payload(ref).build()
