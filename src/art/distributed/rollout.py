@@ -535,7 +535,7 @@ class DistributedTrajectoryQueue:
                     "trajectory materialization and release failed", [error, *cleanup]
                 ) from None
             raise
-        cleanup = await self._release(item, owner)
+        cleanup = await self._release(item, owner, drop_owner=item.ref.transfer is None)
         if cleanup:
             raise BaseExceptionGroup("trajectory result release failed", cleanup)
         annotations = item.annotations
@@ -564,12 +564,17 @@ class DistributedTrajectoryQueue:
         return cast(list[TrajectoryGroup], results)
 
     async def _release(
-        self, item: TrajectoryQueueItem, owner: RolloutHostEndpoint
+        self,
+        item: TrajectoryQueueItem,
+        owner: RolloutHostEndpoint,
+        *,
+        drop_owner: bool = True,
     ) -> list[BaseException]:
-        try:
-            await owner.drop(item.ref)
-        except BaseException as error:
-            return [error]
+        if drop_owner:
+            try:
+                await owner.drop(item.ref)
+            except BaseException as error:
+                return [error]
         try:
             await self.endpoint.acknowledge(
                 self.queue_id, item.ref.result_id, self.consumer_id

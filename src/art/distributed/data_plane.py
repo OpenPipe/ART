@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 import gc
 from multiprocessing import resource_tracker, shared_memory
@@ -563,11 +563,13 @@ class _AuthenticatedStreamPublisher:
     ) -> None:
         task = cast(asyncio.Task[None], asyncio.current_task())
         self._handlers.add(task)
+        sent = False
         try:
             token = await reader.readexactly(len(self._token))
             if not secrets.compare_digest(token, self._token):
                 return
             await self._write(writer)
+            sent = True
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:
@@ -575,20 +577,30 @@ class _AuthenticatedStreamPublisher:
             with suppress(Exception):
                 await writer.wait_closed()
             self._handlers.discard(task)
+            if sent:
+                self._sent()
 
     async def _write(self, writer: asyncio.StreamWriter) -> None:
         raise NotImplementedError
+
+    def _sent(self) -> None:
+        pass
 
 
 class ByteStreamPublisher(_AuthenticatedStreamPublisher):
     """Authenticated one-shot transport for immutable byte chunks."""
 
     def __init__(
-        self, stream_id: str, advertise_host: str, chunks: tuple[bytes, ...]
+        self,
+        stream_id: str,
+        advertise_host: str,
+        chunks: tuple[bytes, ...],
+        on_sent: Callable[[], None] | None,
     ) -> None:
         super().__init__(advertise_host)
         self.stream_id = stream_id
         self.chunks = chunks
+        self.on_sent = on_sent
         self.byte_count = sum(map(len, chunks))
         if not stream_id or self.byte_count < 1:
             raise ValueError("byte stream ID and payload must be non-empty")
@@ -600,8 +612,9 @@ class ByteStreamPublisher(_AuthenticatedStreamPublisher):
         chunks: tuple[bytes, ...],
         *,
         advertise_host: str,
+        on_sent: Callable[[], None] | None = None,
     ) -> "ByteStreamPublisher":
-        publisher = cls(stream_id, advertise_host, chunks)
+        publisher = cls(stream_id, advertise_host, chunks, on_sent)
         await publisher.start()
         return publisher
 
@@ -618,6 +631,10 @@ class ByteStreamPublisher(_AuthenticatedStreamPublisher):
     async def _write(self, writer: asyncio.StreamWriter) -> None:
         for chunk in self.chunks:
             await _write_stream_chunk(writer, chunk)
+
+    def _sent(self) -> None:
+        if self.on_sent is not None:
+            self.on_sent()
 
 
 class PackedBatchPublisher(_AuthenticatedStreamPublisher):

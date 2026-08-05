@@ -49,7 +49,6 @@ from .packing import PackingRequest, PackingResult
 from .rollout import RolloutInvocation, RolloutResult
 from .specs import HostServiceHealth
 from .trajectory_store import (
-    TrajectoryBatchTransfer,
     TrajectoryCapacityError,
     TrajectoryEnqueueResult,
     TrajectoryGroupRef,
@@ -539,6 +538,7 @@ class RolloutWorkerService(Actor):
         )
         self._data_plane_host = data_plane_host
         self._trajectory_publishers = {}
+        self._trajectory_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     @resilient_endpoint
     async def run(self, invocation: RolloutInvocation):
@@ -566,34 +566,44 @@ class RolloutWorkerService(Actor):
             from art import TrajectoryGroup
 
             if isinstance(value, TrajectoryGroup):
-                value = self._results.put(value)
+                ref = self._results.put(value)
+                try:
+                    transfer, publisher = await publish_trajectory_bundles(
+                        (self._results.bundle(ref),),
+                        stream_id=ref.result_id,
+                        advertise_host=self._data_plane_host,
+                        on_sent=lambda: self._schedule_trajectory_release(ref),
+                    )
+                except BaseException:
+                    self._results.drop(ref)
+                    raise
+                self._trajectory_publishers[ref.result_id] = publisher
+                value = ref.model_copy(update={"transfer": transfer})
         return RolloutResult(value=value, metrics=await builder.drain_pending())
 
-    @resilient_endpoint
-    async def materialize_result(
-        self, ref: TrajectoryGroupRef
-    ) -> TrajectoryBatchTransfer:
-        if ref.result_id in self._trajectory_publishers:
-            raise RuntimeError(f"trajectory {ref.result_id!r} is already published")
-        transfer, publisher = await publish_trajectory_bundles(
-            (self._results.bundle(ref),),
-            stream_id=ref.result_id,
-            advertise_host=self._data_plane_host,
-        )
-        self._trajectory_publishers[ref.result_id] = publisher
-        return transfer
+    def _schedule_trajectory_release(self, ref: TrajectoryGroupRef) -> None:
+        task = asyncio.create_task(self._release_trajectory(ref))
+        self._trajectory_cleanup_tasks.add(task)
+        task.add_done_callback(self._trajectory_cleanup_tasks.discard)
 
-    @resilient_endpoint
-    async def drop_result(self, ref: TrajectoryGroupRef) -> None:
+    async def _release_trajectory(self, ref: TrajectoryGroupRef) -> None:
         self._results.drop(ref)
         publisher = self._trajectory_publishers.pop(ref.result_id, None)
         if publisher is not None:
             await publisher.close()
 
     @resilient_endpoint
+    async def drop_result(self, ref: TrajectoryGroupRef) -> None:
+        await self._release_trajectory(ref)
+
+    @resilient_endpoint
     async def close(self) -> None:
+        await asyncio.gather(*tuple(self._trajectory_cleanup_tasks))
         await asyncio.gather(
-            *(publisher.close() for publisher in self._trajectory_publishers.values())
+            *(
+                publisher.close()
+                for publisher in tuple(self._trajectory_publishers.values())
+            )
         )
         self._trajectory_publishers.clear()
         for model in self._models.values():

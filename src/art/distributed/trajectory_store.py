@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import secrets
 from typing import TYPE_CHECKING, Literal
 
@@ -36,15 +36,6 @@ class TrajectoryGroupDescriptor(_Contract):
     completion_tokens: tuple[float, ...]
     policy_token_counts: dict[int, int]
     byte_count: int = Field(ge=0)
-
-
-class TrajectoryGroupRef(_Contract):
-    result_id: str = Field(min_length=1)
-    owner_actor_id: str = Field(min_length=1)
-    lease_id: str = Field(min_length=1)
-    format: Literal["art_trajectory_v1"] = TRAJECTORY_FORMAT
-    records: tuple[TrajectoryRecordRef, ...]
-    descriptor: TrajectoryGroupDescriptor
 
 
 class TrajectoryGroupBundle(_Contract):
@@ -142,11 +133,22 @@ class TrajectoryBatchTransfer(_Contract):
         return tuple(groups)
 
 
+class TrajectoryGroupRef(_Contract):
+    result_id: str = Field(min_length=1)
+    owner_actor_id: str = Field(min_length=1)
+    lease_id: str = Field(min_length=1)
+    format: Literal["art_trajectory_v1"] = TRAJECTORY_FORMAT
+    records: tuple[TrajectoryRecordRef, ...]
+    descriptor: TrajectoryGroupDescriptor
+    transfer: TrajectoryBatchTransfer | None = None
+
+
 async def publish_trajectory_bundles(
     bundles: tuple[TrajectoryGroupBundle, ...],
     *,
     stream_id: str,
     advertise_host: str,
+    on_sent: Callable[[], None] | None = None,
 ) -> tuple[TrajectoryBatchTransfer, ByteStreamPublisher]:
     publisher = await ByteStreamPublisher.create(
         stream_id,
@@ -154,6 +156,7 @@ async def publish_trajectory_bundles(
             chunk for bundle in bundles for chunk in (bundle.header, *bundle.records)
         ),
         advertise_host=advertise_host,
+        on_sent=on_sent,
     )
     try:
         transfer = TrajectoryBatchTransfer(

@@ -15,7 +15,6 @@ from .rollout import (
     RolloutResult,
 )
 from .trajectory_store import (
-    TrajectoryBatchTransfer,
     TrajectoryEnqueueResult,
     TrajectoryGroupRef,
     TrajectoryQueueItem,
@@ -83,9 +82,9 @@ class MonarchRolloutHostEndpoint(RolloutHostEndpoint):
         return await call_remote(self.actor.run, invocation)
 
     async def materialize(self, ref: TrajectoryGroupRef) -> TrajectoryGroup:
-        transfer: TrajectoryBatchTransfer = await call_remote(
-            self.actor.materialize_result, ref
-        )
+        transfer = ref.transfer
+        if transfer is None:
+            raise RuntimeError("remote trajectory has no data-plane transfer")
         if transfer.stream.stream_id != ref.result_id:
             raise RuntimeError("trajectory owner returned the wrong result ID")
         if transfer.stream.byte_count != ref.descriptor.byte_count:
