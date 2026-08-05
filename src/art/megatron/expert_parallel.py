@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import functools
 import math
+import os
 from typing import Any, cast
 
 from megatron.bridge.models.conversion.param_mapping import AutoMapping
@@ -37,9 +38,21 @@ class ExpertParallelLayout(BaseModel):
         return self
 
     @classmethod
-    def build(cls, logical_experts: int, ep_size: int) -> ExpertParallelLayout:
-        slots_per_rank = math.ceil(logical_experts / ep_size)
-        short_rank_count = slots_per_rank * ep_size - logical_experts
+    def build(
+        cls,
+        logical_experts: int,
+        ep_size: int,
+        *,
+        slots_per_rank_multiple: int = 1,
+    ) -> ExpertParallelLayout:
+        if slots_per_rank_multiple <= 0:
+            raise ValueError("slots_per_rank_multiple must be positive")
+        logical_slots_per_rank = math.ceil(logical_experts / ep_size)
+        slots_per_rank = (
+            math.ceil(logical_slots_per_rank / slots_per_rank_multiple)
+            * slots_per_rank_multiple
+        )
+        short_rank_count = logical_slots_per_rank * ep_size - logical_experts
         short_ranks = (
             {
                 math.floor((index + 0.5) * ep_size / short_rank_count)
@@ -51,7 +64,7 @@ class ExpertParallelLayout(BaseModel):
         next_expert = 0
         physical_to_logical: list[int | None] = []
         for ep_rank in range(ep_size):
-            local_count = slots_per_rank - (ep_rank in short_ranks)
+            local_count = logical_slots_per_rank - (ep_rank in short_ranks)
             physical_to_logical.extend(range(next_expert, next_expert + local_count))
             physical_to_logical.extend([None] * (slots_per_rank - local_count))
             next_expert += local_count
@@ -95,9 +108,21 @@ class ExpertParallelLayout(BaseModel):
 def configure_expert_parallel_layout(config: Any) -> ExpertParallelLayout | None:
     logical_experts = int(getattr(config, "num_moe_experts", 0) or 0)
     ep_size = int(getattr(config, "expert_model_parallel_size", 1) or 1)
-    if logical_experts == 0 or logical_experts % ep_size == 0:
+    if logical_experts == 0:
         return None
-    layout = ExpertParallelLayout.build(logical_experts, ep_size)
+    raw_ranks_per_domain = os.environ.get("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN")
+    ranks_per_domain = int(raw_ranks_per_domain) if raw_ranks_per_domain else None
+    if ranks_per_domain is not None and ranks_per_domain <= 0:
+        raise ValueError("HybridEP ranks per NVLink domain must be positive")
+    layout = ExpertParallelLayout.build(
+        logical_experts,
+        ep_size,
+        slots_per_rank_multiple=(
+            1 if ranks_per_domain is None else 4 // math.gcd(4, ranks_per_domain)
+        ),
+    )
+    if layout.physical_experts == logical_experts:
+        return None
     config.art_expert_parallel_layout = layout
     return layout
 
