@@ -1111,45 +1111,41 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         discarded = 0
         saw_sentinel = False
 
-        while len(batch) < self.min_batch_size:
-            item = await self._output_queue.get()
-            if item is None:
-                saw_sentinel = True
-                break
-            self._status.note_group_dequeued()
-            self._check_all_failed(item)
-            if self._is_group_stale(item, current_step):
-                discarded += 1
-                continue
-            if self._group_zero_variance(item):
-                if self._record_zero_variance(item):
-                    return [], discarded, saw_sentinel
-                continue
-            batch.append(item)
-
         while not saw_sentinel and len(batch) < self.max_batch_size:
+            wait = len(batch) < self.min_batch_size
+            count = (self.min_batch_size if wait else self.max_batch_size) - len(batch)
             if isinstance(self._output_queue, DistributedTrajectoryQueue):
-                available, item = await self._output_queue.get_nowait()
-                if not available:
+                items, saw_sentinel = await self._output_queue.get_many(
+                    count, wait=wait
+                )
+                if not items:
                     break
+            elif wait:
+                item = await self._output_queue.get()
+                if item is None:
+                    saw_sentinel = True
+                    break
+                items = [item]
             else:
                 try:
                     item = self._output_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-            if item is None:
-                saw_sentinel = True
-                break
-            self._status.note_group_dequeued()
-            self._check_all_failed(item)
-            if self._is_group_stale(item, current_step):
-                discarded += 1
-                continue
-            if self._group_zero_variance(item):
-                if self._record_zero_variance(item):
-                    return [], discarded, saw_sentinel
-                continue
-            batch.append(item)
+                if item is None:
+                    saw_sentinel = True
+                    break
+                items = [item]
+            for item in items:
+                self._status.note_group_dequeued()
+                self._check_all_failed(item)
+                if self._is_group_stale(item, current_step):
+                    discarded += 1
+                    continue
+                if self._group_zero_variance(item):
+                    if self._record_zero_variance(item):
+                        return [], discarded, saw_sentinel
+                    continue
+                batch.append(item)
 
         return batch, discarded, saw_sentinel
 

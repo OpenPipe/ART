@@ -353,7 +353,20 @@ class PipelineAutotuner:
         updated = self._settings_with_recomputed_queue(
             updated, stats, adapt_target=False
         )
-        if action == "hold" and updated != previous:
+        worker_limit = freshness_worker_limit(
+            target_groups_per_step=updated.target_groups_per_step,
+            limit_steps_off_policy=self.policy_age_limit_steps,
+            running_reserve_fraction=self.config.queue_running_reserve_fraction,
+            worker_step=self.config.worker_step,
+        )
+        if (
+            worker_limit is not None
+            and previous.num_rollout_workers > worker_limit
+            and updated.num_rollout_workers <= worker_limit
+        ):
+            action = "decrease_workers"
+            reason = "running rollout reserve exceeded the policy-age budget"
+        elif action == "hold" and updated != previous:
             action = "resize_batch_queue"
             reason = "recomputed target batch size and freshness-bounded queue"
         return TunerDecision(
@@ -520,14 +533,26 @@ class PipelineAutotuner:
             min_batch = min(target, max(1, round(target * ratio)))
         # Packed sequence length is the user's cap on target/max batch size. If a
         # run should never use larger train batches, lower packed_sequence_length.
+        worker_limit = freshness_worker_limit(
+            target_groups_per_step=target,
+            limit_steps_off_policy=self.policy_age_limit_steps,
+            running_reserve_fraction=self.config.queue_running_reserve_fraction,
+            worker_step=self.config.worker_step,
+        )
+        workers = (
+            settings.num_rollout_workers
+            if worker_limit is None
+            else min(settings.num_rollout_workers, worker_limit)
+        )
         queue = recommended_queue_size(
             target_groups_per_step=target,
             limit_steps_off_policy=self.policy_age_limit_steps,
-            num_rollout_workers=settings.num_rollout_workers,
+            num_rollout_workers=workers,
             running_reserve_fraction=self.config.queue_running_reserve_fraction,
         )
         return settings.model_copy(
             update={
+                "num_rollout_workers": workers,
                 "target_groups_per_step": target,
                 "min_batch_size": min_batch,
                 "max_batch_size": target,
@@ -765,7 +790,7 @@ class PipelineAutotuner:
             decisions=self.decisions,
             notes=[
                 "The first warmup_ignore_steps are excluded from throughput decisions.",
-                "queue_maxsize is bounded so queue_size / target_groups_per_step <= the policy-age limit.",
+                "The queued batch and running-rollout reserve are bounded by the policy-age budget.",
                 *self._profile_recommendations(),
             ],
         )
@@ -790,19 +815,27 @@ def build_initial_settings(
     policy_age_limit_steps: float,
     rollout_worker_capacity: int | None,
 ) -> PipelineTuneSettings:
-    workers = _ceil_to_multiple(
-        config.initial_model_calls_per_inference_gpu * inference_gpu_count,
-        config.worker_step,
-        minimum=config.worker_step,
-    )
-    if rollout_worker_capacity is not None:
-        workers = min(workers, rollout_worker_capacity)
     target_slots = max(1, int(target_packed_sequences))
     max_batch = int(config.initial_max_groups_per_packed_sequence) * target_slots
     min_batch = min(
         int(config.initial_min_groups_per_packed_sequence) * target_slots,
         max_batch,
     )
+    workers = _ceil_to_multiple(
+        config.initial_model_calls_per_inference_gpu * inference_gpu_count,
+        config.worker_step,
+        minimum=config.worker_step,
+    )
+    worker_limit = freshness_worker_limit(
+        target_groups_per_step=max_batch,
+        limit_steps_off_policy=policy_age_limit_steps,
+        running_reserve_fraction=config.queue_running_reserve_fraction,
+        worker_step=config.worker_step,
+    )
+    if worker_limit is not None:
+        workers = min(workers, worker_limit)
+    if rollout_worker_capacity is not None:
+        workers = min(workers, rollout_worker_capacity)
     queue = recommended_queue_size(
         target_groups_per_step=max_batch,
         limit_steps_off_policy=policy_age_limit_steps,
@@ -816,6 +849,23 @@ def build_initial_settings(
         queue_maxsize=queue,
         target_groups_per_step=max_batch,
     )
+
+
+def freshness_worker_limit(
+    *,
+    target_groups_per_step: int,
+    limit_steps_off_policy: float,
+    running_reserve_fraction: float,
+    worker_step: int,
+) -> int | None:
+    """Leave one queued batch inside the completed-work freshness budget."""
+
+    if running_reserve_fraction <= 0.0:
+        return None
+    target = max(1, int(target_groups_per_step))
+    max_completed = int(math.floor(target * max(1.0, limit_steps_off_policy)))
+    raw_limit = int(math.floor((max_completed - target) / running_reserve_fraction))
+    return max(1, (raw_limit // max(1, worker_step)) * max(1, worker_step))
 
 
 def recommended_queue_size(

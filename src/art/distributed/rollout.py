@@ -9,7 +9,7 @@ import inspect
 import json
 from pathlib import Path
 import time
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -419,22 +419,30 @@ class DistributedTrajectoryQueue:
                 await self._owner(ref).drop(ref)
 
     async def get(self) -> TrajectoryGroup | None:
-        while not self._closed:
-            take = await self.endpoint.take(self.queue_id, self.consumer_id)
-            if take.item is not None:
-                return await self._consume(take.item)
-            if take.closed:
-                return None
-            await asyncio.sleep(0.01)
-        return None
+        groups, _ = await self.get_many(1, wait=True)
+        return groups[0] if groups else None
 
     async def get_nowait(self) -> tuple[bool, TrajectoryGroup | None]:
-        if self._closed:
-            return True, None
-        take = await self.endpoint.take(self.queue_id, self.consumer_id)
-        if take.item is not None:
-            return True, await self._consume(take.item)
-        return take.closed, None
+        groups, closed = await self.get_many(1, wait=False)
+        return bool(groups) or closed, groups[0] if groups else None
+
+    async def get_many(
+        self, count: int, *, wait: bool
+    ) -> tuple[list[TrajectoryGroup], bool]:
+        if count < 1:
+            raise ValueError("trajectory queue get count must be positive")
+        items: list[TrajectoryQueueItem] = []
+        closed = self._closed
+        while not closed and len(items) < count:
+            take = await self.endpoint.take(self.queue_id, self.consumer_id)
+            if take.item is not None:
+                items.append(take.item)
+                continue
+            closed = take.closed
+            if closed or not wait:
+                break
+            await asyncio.sleep(0.01)
+        return await self._materialize_many(items), closed
 
     async def finish(self) -> None:
         if self._started and not self._finished and not self._closed:
@@ -541,6 +549,19 @@ class DistributedTrajectoryQueue:
             if trajectory.final_policy_version is None:
                 trajectory.final_policy_version = annotations.final_policy_version
         return group
+
+    async def _materialize_many(
+        self, items: Sequence[TrajectoryQueueItem]
+    ) -> list[TrajectoryGroup]:
+        results = await asyncio.gather(
+            *(self._consume(item) for item in items), return_exceptions=True
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("trajectory materialization failed", failures)
+        return cast(list[TrajectoryGroup], results)
 
     async def _release(
         self, item: TrajectoryQueueItem, owner: RolloutHostEndpoint

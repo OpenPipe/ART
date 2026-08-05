@@ -10,7 +10,12 @@ import pydantic
 
 from art.errors import ArtVllmMetricsTimeoutError
 
-from .autotune import PipelineAutotuner, build_initial_settings, recommended_queue_size
+from .autotune import (
+    PipelineAutotuner,
+    build_initial_settings,
+    freshness_worker_limit,
+    recommended_queue_size,
+)
 from .config import (
     PackedGroupObservation,
     PipelineAutotuneConfig,
@@ -340,14 +345,26 @@ class PipelineAutotunerAttachment:
     def _settings_with_current_queue(
         self, settings: PipelineTuneSettings, policy_age_limit_steps: float
     ) -> PipelineTuneSettings:
+        worker_limit = freshness_worker_limit(
+            target_groups_per_step=settings.target_groups_per_step,
+            limit_steps_off_policy=policy_age_limit_steps,
+            running_reserve_fraction=self.config.queue_running_reserve_fraction,
+            worker_step=self.config.worker_step,
+        )
+        workers = (
+            settings.num_rollout_workers
+            if worker_limit is None
+            else min(settings.num_rollout_workers, worker_limit)
+        )
         return settings.model_copy(
             update={
+                "num_rollout_workers": workers,
                 "queue_maxsize": recommended_queue_size(
                     target_groups_per_step=settings.target_groups_per_step,
                     limit_steps_off_policy=policy_age_limit_steps,
-                    num_rollout_workers=settings.num_rollout_workers,
+                    num_rollout_workers=workers,
                     running_reserve_fraction=self.config.queue_running_reserve_fraction,
-                )
+                ),
             }
         )
 
