@@ -11,8 +11,60 @@ from typing import Any, cast
 
 from quack.gemm import gemm as quack_gemm
 import torch
+import triton
+import triton.language as tl
 
 _PADDED_LOW_RANK_TARGET = 8
+
+
+@triton.jit
+def _grouped_lora_wgrad_kernel(
+    big,
+    small,
+    expert_offsets,
+    out,
+    alpha,
+    BIG_D_STRIDE: tl.constexpr,
+    BIG_K_STRIDE: tl.constexpr,
+    SMALL_R_STRIDE: tl.constexpr,
+    SMALL_K_STRIDE: tl.constexpr,
+    D: tl.constexpr,
+    R: tl.constexpr,
+    TRANSPOSE_OUT: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    expert = tl.program_id(2)
+    d = tl.program_id(0) * BLOCK_D + tl.arange(0, BLOCK_D)
+    r = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
+    start = tl.load(expert_offsets + expert)
+    end = tl.load(expert_offsets + expert + 1)
+    acc = tl.zeros((BLOCK_D, BLOCK_R), tl.float32)
+    for k0 in tl.range(start, end, BLOCK_K, num_stages=3):
+        k = k0 + tl.arange(0, BLOCK_K)
+        big_tile = tl.load(
+            big + d[:, None] * BIG_D_STRIDE + k[None, :] * BIG_K_STRIDE,
+            mask=(d[:, None] < D) & (k[None, :] < end),
+            other=0.0,
+        )
+        small_tile = tl.load(
+            small + r[:, None] * SMALL_R_STRIDE + k[None, :] * SMALL_K_STRIDE,
+            mask=(r[:, None] < R) & (k[None, :] < end),
+            other=0.0,
+        )
+        acc += tl.dot(big_tile, tl.trans(small_tile))
+    base = expert * D * R
+    out_offsets = (
+        base + r[None, :] * D + d[:, None]
+        if TRANSPOSE_OUT
+        else base + d[:, None] * R + r[None, :]
+    )
+    tl.store(
+        out + out_offsets,
+        acc * alpha,
+        mask=(d[:, None] < D) & (r[None, :] < R),
+    )
 
 
 def _validate_rank(rank: int) -> None:
@@ -315,6 +367,42 @@ def _varlen_quack_gemm_k(
     tile_n: int,
     alpha: float = 1.0,
 ) -> torch.Tensor:
+    # QuACK's SM100 varlen-K scheduler can fault under the integrated async launch
+    # sequence; keep its faster grouped GEMM path on Hopper and use exact ragged
+    # spans for the small-rank LoRA parameter gradients on Blackwell.
+    if torch.cuda.get_device_capability(a.device)[0] >= 10:
+        transpose_out = out_shape_m <= out_shape_n
+        big, small = (b, a) if transpose_out else (a, b)
+        d, rank = big.shape[0], small.shape[0]
+        out = torch.empty(
+            batch_count,
+            out_shape_m,
+            out_shape_n,
+            device=a.device,
+            dtype=a.dtype,
+        )
+        block_r = min(triton.next_power_of_2(rank), 32)
+        cast(Any, _grouped_lora_wgrad_kernel)[
+            (triton.cdiv(d, 64), triton.cdiv(rank, block_r), batch_count)
+        ](
+            big,
+            small,
+            expert_offsets,
+            out,
+            alpha,
+            BIG_D_STRIDE=big.stride(0),
+            BIG_K_STRIDE=big.stride(1),
+            SMALL_R_STRIDE=small.stride(0),
+            SMALL_K_STRIDE=small.stride(1),
+            D=d,
+            R=rank,
+            TRANSPOSE_OUT=transpose_out,
+            BLOCK_D=64,
+            BLOCK_R=block_r,
+            BLOCK_K=32,
+            num_warps=4,
+        )
+        return out
     out = torch.empty(
         batch_count,
         out_shape_m,
