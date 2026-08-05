@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from functools import lru_cache
 from http import HTTPStatus
 import json
 import os
@@ -36,6 +37,77 @@ class _InFlightLoraUpdateRequest(BaseModel):
     lora_slot: str | None = Field(default=None, min_length=1)
     base_model_name: str | None = None
     is_3d_lora_weight: bool = False
+
+
+def _index_shared_pp_partition(config: Any, pp_size: int) -> tuple[int, ...] | None:
+    if pp_size <= 1 or not hasattr(config, "index_topk"):
+        return None
+    layer_count = int(config.num_hidden_layers)
+    pattern = getattr(config, "index_topk_pattern", None)
+    offset = int(getattr(config, "index_skip_topk_offset", 2))
+    frequency = int(getattr(config, "index_topk_freq", 1))
+
+    def computes_index(layer: int) -> bool:
+        if pattern is not None and layer < len(pattern):
+            return pattern[layer] != "S"
+        return max(layer - offset + 1, 0) % frequency == 0
+
+    boundaries = tuple(
+        layer for layer in range(1, layer_count) if computes_index(layer)
+    )
+
+    @lru_cache
+    def solve(start: int, remaining: int) -> tuple[int, int, tuple[int, ...]] | None:
+        if remaining == 1:
+            length = layer_count - start
+            return length + 1, length * length, (length,)
+        candidates = []
+        for end in boundaries:
+            if end <= start:
+                continue
+            suffix = solve(end, remaining - 1)
+            if suffix is None:
+                continue
+            length = end - start
+            candidates.append(
+                (
+                    max(length + (start == 0), suffix[0]),
+                    length * length + suffix[1],
+                    (length, *suffix[2]),
+                )
+            )
+        return min(candidates) if candidates else None
+
+    result = solve(0, pp_size)
+    if result is None:
+        raise ValueError(
+            f"cannot partition {layer_count} index-sharing layers across PP{pp_size}"
+        )
+    return result[2]
+
+
+def _configure_index_shared_pp(model: str, engine_args: dict[str, Any]) -> str | None:
+    pp_size = int(engine_args.get("pipeline_parallel_size", 1))
+    if pp_size <= 1:
+        return None
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(
+        model,
+        revision=engine_args.get("revision"),
+        trust_remote_code=bool(engine_args.get("trust_remote_code", False)),
+    )
+    partition = _index_shared_pp_partition(config, pp_size)
+    if partition is None:
+        return os.environ.get("VLLM_PP_LAYER_PARTITION")
+    value = ",".join(map(str, partition))
+    configured = os.environ.setdefault("VLLM_PP_LAYER_PARTITION", value)
+    if configured != value:
+        raise ValueError(
+            "VLLM_PP_LAYER_PARTITION conflicts with ART's index-sharing-safe "
+            f"partition: configured={configured!r}, required={value!r}"
+        )
+    return value
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -412,6 +484,7 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("enable_return_routed_experts must be a boolean")
     if isinstance(pp_size, bool) or not isinstance(pp_size, int):
         raise ValueError("pipeline_parallel_size must be an integer")
+    pp_layer_partition = _configure_index_shared_pp(args.model, engine_args)
     critical_engine_args = {
         "data_parallel_size",
         "decode_context_parallel_size",
@@ -474,6 +547,7 @@ def main(argv: list[str] | None = None) -> None:
             else None
         ),
         update_identity=args.update_identity,
+        pp_layer_partition=pp_layer_partition,
     )
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
