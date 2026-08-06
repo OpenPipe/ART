@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from functools import lru_cache
 import hashlib
@@ -352,7 +353,8 @@ class DistributedTrajectoryQueue:
         self._cleanup_refs: tuple[TrajectoryGroupRef, ...] = ()
         self._resize_generation = 0
         self._resize_tasks: set[asyncio.Task[None]] = set()
-        self._owner_cleanup_tasks: dict[asyncio.Task[None], TrajectoryGroupRef] = {}
+        self._owner_cleanup_refs: dict[str, deque[TrajectoryGroupRef]] = {}
+        self._owner_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
         self._owner_cleanup_failure: BaseException | None = None
 
     async def start(self) -> None:
@@ -566,9 +568,7 @@ class DistributedTrajectoryQueue:
                 except BaseException as error:
                     failures.append(error)
         if self._owner_cleanup_tasks:
-            await asyncio.gather(
-                *tuple(self._owner_cleanup_tasks), return_exceptions=True
-            )
+            await asyncio.gather(*tuple(self._owner_cleanup_tasks.values()))
         refs = self._cleanup_refs
         self._owner_cleanup_failure = None
         results = await asyncio.gather(
@@ -717,17 +717,26 @@ class DistributedTrajectoryQueue:
     def _schedule_owner_cleanup(
         self, owner: RolloutHostEndpoint, ref: TrajectoryGroupRef
     ) -> None:
-        task = asyncio.create_task(owner.drop(ref))
-        self._owner_cleanup_tasks[task] = ref
-        task.add_done_callback(self._owner_cleanup_done)
+        owner_id = ref.owner_actor_id
+        self._owner_cleanup_refs.setdefault(owner_id, deque()).append(ref)
+        if owner_id not in self._owner_cleanup_tasks:
+            self._owner_cleanup_tasks[owner_id] = asyncio.create_task(
+                self._drain_owner_cleanup(owner_id, owner)
+            )
 
-    def _owner_cleanup_done(self, task: asyncio.Task[None]) -> None:
-        ref = self._owner_cleanup_tasks.pop(task)
-        try:
-            task.result()
-        except BaseException as error:
-            self._cleanup_refs += (ref,)
-            self._owner_cleanup_failure = self._owner_cleanup_failure or error
+    async def _drain_owner_cleanup(
+        self, owner_id: str, owner: RolloutHostEndpoint
+    ) -> None:
+        refs = self._owner_cleanup_refs[owner_id]
+        while refs:
+            ref = refs.popleft()
+            try:
+                await owner.drop(ref)
+            except Exception as error:
+                self._cleanup_refs += (ref,)
+                self._owner_cleanup_failure = self._owner_cleanup_failure or error
+        del self._owner_cleanup_refs[owner_id]
+        del self._owner_cleanup_tasks[owner_id]
 
     def _raise_owner_cleanup_failure(self) -> None:
         error = self._owner_cleanup_failure
