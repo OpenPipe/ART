@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from collections.abc import Callable, Mapping
 import secrets
@@ -132,7 +133,7 @@ class TrajectoryBatchTransfer(_Contract):
 
     async def receive_groups(self, *, timeout_s: float) -> tuple[TrajectoryGroup, ...]:
         payload = await receive_byte_stream(self.stream, timeout_s=timeout_s)
-        return self._build_groups(payload)
+        return await asyncio.to_thread(self._build_groups, payload)
 
     def _build_groups(self, payload: bytearray) -> tuple[TrajectoryGroup, ...]:
         from msgspec.msgpack import decode
