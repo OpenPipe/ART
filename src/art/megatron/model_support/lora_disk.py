@@ -1,6 +1,8 @@
 import importlib
 import json
 from pathlib import Path
+import struct
+import sys
 from typing import Any
 
 import torch
@@ -11,9 +13,30 @@ ART_LORA_FORMAT_CONFIG_KEY = "art_lora_format"
 ART_LORA_FORMAT_VLLM = "vllm"
 
 safetensors = importlib.import_module("safetensors")
-safetensors_torch = importlib.import_module("safetensors.torch")
 safe_open = safetensors.safe_open
-save_file = safetensors_torch.save_file
+
+_SAFETENSORS_DTYPES = {
+    dtype: name
+    for name, dtype in {
+        "BOOL": torch.bool,
+        "U8": torch.uint8,
+        "I8": torch.int8,
+        "I16": torch.int16,
+        "I32": torch.int32,
+        "I64": torch.int64,
+        "F16": torch.float16,
+        "BF16": torch.bfloat16,
+        "F32": torch.float32,
+        "F64": torch.float64,
+        "C64": torch.complex64,
+        "U16": getattr(torch, "uint16", None),
+        "U32": getattr(torch, "uint32", None),
+        "U64": getattr(torch, "uint64", None),
+        "F8_E4M3": getattr(torch, "float8_e4m3fn", None),
+        "F8_E5M2": getattr(torch, "float8_e5m2", None),
+    }.items()
+    if dtype is not None
+}
 
 
 def _jsonable_config(value: Any) -> Any:
@@ -74,6 +97,39 @@ def load_vllm_lora_tensors(
         return {key: adapter_file.get_tensor(key) for key in adapter_file.keys()}
 
 
+def _save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
+    """Stream tensor buffers without save_file's copy into GIL-holding bytes."""
+    if sys.byteorder != "little":
+        raise RuntimeError("ART's zero-copy safetensors writer requires little endian")
+    header: dict[str, Any] = {}
+    buffers: list[memoryview] = []
+    offset = 0
+    for name, tensor in sorted(tensors.items()):
+        if tensor.device.type != "cpu" or not tensor.is_contiguous():
+            raise RuntimeError(f"LoRA tensor {name!r} must be contiguous CPU storage")
+        dtype = _SAFETENSORS_DTYPES.get(tensor.dtype)
+        if dtype is None:
+            raise RuntimeError(f"Unsupported LoRA tensor dtype: {tensor.dtype}")
+        data = memoryview(tensor.view(torch.uint8).reshape(-1).numpy())
+        header[name] = {
+            "dtype": dtype,
+            "shape": list(tensor.shape),
+            "data_offsets": [offset, offset + data.nbytes],
+        }
+        offset += data.nbytes
+        buffers.append(data)
+
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    with path.open("wb", buffering=0) as output:
+        for data in (memoryview(struct.pack("<Q", len(encoded))), encoded, *buffers):
+            while data:
+                written = output.write(data)
+                if not written:
+                    raise OSError(f"Short write while saving {path}")
+                data = data[written:]
+
+
 def save_vllm_lora_tensors(
     lora_path: str | Path,
     tensors: dict[str, torch.Tensor],
@@ -81,7 +137,7 @@ def save_vllm_lora_tensors(
 ) -> None:
     base_dir = Path(lora_path)
     base_dir.mkdir(parents=True, exist_ok=True)
-    save_file(tensors, base_dir / "adapter_model.safetensors")
+    _save_safetensors(tensors, base_dir / "adapter_model.safetensors")
     save_adapter_config(
         base_dir,
         {**adapter_config, ART_LORA_FORMAT_CONFIG_KEY: ART_LORA_FORMAT_VLLM},
