@@ -18,6 +18,8 @@ from .trajectory_store import (
     TrajectoryEnqueueResult,
     TrajectoryGroupRef,
     TrajectoryQueueItem,
+    TrajectoryQueuePacking,
+    TrajectoryQueueRelease,
     TrajectoryQueueResize,
     TrajectoryQueueSnapshot,
     TrajectoryQueueTake,
@@ -132,12 +134,11 @@ class MonarchTrajectoryQueueEndpoint:
     async def take(self, queue_id: str, consumer_id: str) -> TrajectoryQueueTake:
         return await call_remote(self.actor.take_trajectory, queue_id, consumer_id)
 
-    async def acknowledge(
-        self, queue_id: str, result_id: str, consumer_id: str
-    ) -> None:
-        await call_remote(
-            self.actor.acknowledge_trajectory, queue_id, result_id, consumer_id
-        )
+    async def mark_packed(self, operation: TrajectoryQueuePacking) -> None:
+        await call_remote(self.actor.mark_trajectories_packed, operation)
+
+    async def release(self, operation: TrajectoryQueueRelease) -> None:
+        await call_remote(self.actor.release_trajectory, operation)
 
     async def finish(self, queue_id: str) -> None:
         await call_remote(self.actor.finish_trajectory_queue, queue_id)

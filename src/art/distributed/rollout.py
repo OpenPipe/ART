@@ -24,6 +24,9 @@ from .trajectory_store import (
     TrajectoryGroupAnnotations,
     TrajectoryGroupRef,
     TrajectoryQueueItem,
+    TrajectoryQueueLease,
+    TrajectoryQueuePacking,
+    TrajectoryQueueRelease,
     TrajectoryQueueResize,
     TrajectoryQueueSnapshot,
     TrajectoryQueueStore,
@@ -251,9 +254,9 @@ class TrajectoryQueueEndpoint(Protocol):
 
     async def take(self, queue_id: str, consumer_id: str) -> TrajectoryQueueTake: ...
 
-    async def acknowledge(
-        self, queue_id: str, result_id: str, consumer_id: str
-    ) -> None: ...
+    async def mark_packed(self, operation: TrajectoryQueuePacking) -> None: ...
+
+    async def release(self, operation: TrajectoryQueueRelease) -> None: ...
 
     async def finish(self, queue_id: str) -> None: ...
 
@@ -294,10 +297,11 @@ class _InProcessTrajectoryQueueEndpoint:
     async def take(self, queue_id: str, consumer_id: str) -> TrajectoryQueueTake:
         return self._queue(queue_id).take(consumer_id)
 
-    async def acknowledge(
-        self, queue_id: str, result_id: str, consumer_id: str
-    ) -> None:
-        self._queue(queue_id).acknowledge(result_id, consumer_id)
+    async def mark_packed(self, operation: TrajectoryQueuePacking) -> None:
+        self._queue(operation.queue_id).mark_packed(operation)
+
+    async def release(self, operation: TrajectoryQueueRelease) -> None:
+        self._queue(operation.queue_id).release(operation)
 
     async def finish(self, queue_id: str) -> None:
         self._queue(queue_id).finish()
@@ -431,18 +435,18 @@ class DistributedTrajectoryQueue:
     ) -> tuple[list[TrajectoryGroup], bool]:
         if count < 1:
             raise ValueError("trajectory queue get count must be positive")
-        items: list[TrajectoryQueueItem] = []
+        leases: list[TrajectoryQueueLease] = []
         closed = self._closed
-        while not closed and len(items) < count:
+        while not closed and len(leases) < count:
             take = await self.endpoint.take(self.queue_id, self.consumer_id)
-            if take.item is not None:
-                items.append(take.item)
+            if take.lease is not None:
+                leases.append(take.lease)
                 continue
             closed = take.closed
             if closed or not wait:
                 break
             await asyncio.sleep(0.01)
-        return await self._materialize_many(items), closed
+        return await self._materialize_many(leases), closed
 
     async def finish(self) -> None:
         if self._started and not self._finished and not self._closed:
@@ -463,6 +467,9 @@ class DistributedTrajectoryQueue:
                 used_records=0,
                 used_bytes=0,
                 leased_groups=0,
+                ready_groups=0,
+                packing_groups=0,
+                packed_groups=0,
             )
         while True:
             await self._flush_resizes()
@@ -524,18 +531,21 @@ class DistributedTrajectoryQueue:
                     raise failures[0]
                 raise BaseExceptionGroup("trajectory queue resize failed", failures)
 
-    async def _consume(self, item: TrajectoryQueueItem) -> TrajectoryGroup:
+    async def _consume(self, lease: TrajectoryQueueLease) -> TrajectoryGroup:
+        item = lease.item
         owner = self._owner(item.ref)
         try:
             group = await owner.materialize(item.ref)
         except BaseException as error:
-            cleanup = await self._release(item, owner)
+            cleanup = await self._release(lease, owner)
             if cleanup:
                 raise BaseExceptionGroup(
                     "trajectory materialization and release failed", [error, *cleanup]
                 ) from None
             raise
-        cleanup = await self._release(item, owner, drop_owner=item.ref.transfer is None)
+        cleanup = await self._release(
+            lease, owner, drop_owner=item.ref.transfer is None
+        )
         if cleanup:
             raise BaseExceptionGroup("trajectory result release failed", cleanup)
         annotations = item.annotations
@@ -551,10 +561,10 @@ class DistributedTrajectoryQueue:
         return group
 
     async def _materialize_many(
-        self, items: Sequence[TrajectoryQueueItem]
+        self, leases: Sequence[TrajectoryQueueLease]
     ) -> list[TrajectoryGroup]:
         results = await asyncio.gather(
-            *(self._consume(item) for item in items), return_exceptions=True
+            *(self._consume(lease) for lease in leases), return_exceptions=True
         )
         failures = [result for result in results if isinstance(result, BaseException)]
         if len(failures) == 1:
@@ -565,19 +575,23 @@ class DistributedTrajectoryQueue:
 
     async def _release(
         self,
-        item: TrajectoryQueueItem,
+        lease: TrajectoryQueueLease,
         owner: RolloutHostEndpoint,
         *,
         drop_owner: bool = True,
     ) -> list[BaseException]:
         if drop_owner:
             try:
-                await owner.drop(item.ref)
+                await owner.drop(lease.item.ref)
             except BaseException as error:
                 return [error]
         try:
-            await self.endpoint.acknowledge(
-                self.queue_id, item.ref.result_id, self.consumer_id
+            await self.endpoint.release(
+                TrajectoryQueueRelease(
+                    queue_id=self.queue_id,
+                    lease=lease,
+                    disposition="discarded",
+                )
             )
         except BaseException as error:
             return [error]

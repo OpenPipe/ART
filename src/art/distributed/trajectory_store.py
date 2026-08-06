@@ -201,8 +201,28 @@ class TrajectoryEnqueueResult(_Contract):
 
 
 class TrajectoryQueueTake(_Contract):
-    item: TrajectoryQueueItem | None = None
+    lease: TrajectoryQueueLease | None = None
     closed: bool = False
+
+
+class TrajectoryQueueLease(_Contract):
+    claim_id: str = Field(min_length=1)
+    consumer_id: str = Field(min_length=1)
+    generation: int = Field(ge=1)
+    item: TrajectoryQueueItem
+
+
+class TrajectoryQueuePacking(_Contract):
+    queue_id: str = Field(min_length=1)
+    leases: tuple[TrajectoryQueueLease, ...]
+    generation_id: str = Field(min_length=1)
+
+
+class TrajectoryQueueRelease(_Contract):
+    queue_id: str = Field(min_length=1)
+    lease: TrajectoryQueueLease
+    generation_id: str | None = None
+    disposition: Literal["consumed", "discarded"]
 
 
 class TrajectoryQueueSnapshot(_Contract):
@@ -214,6 +234,9 @@ class TrajectoryQueueSnapshot(_Contract):
     used_records: int = Field(ge=0)
     used_bytes: int = Field(ge=0)
     leased_groups: int = Field(ge=0)
+    ready_groups: int = Field(ge=0)
+    packing_groups: int = Field(ge=0)
+    packed_groups: int = Field(ge=0)
 
 
 class TrajectoryCapacityError(RuntimeError):
@@ -361,7 +384,11 @@ class TrajectoryRecordStore:
 class _QueueEntry:
     def __init__(self, item: TrajectoryQueueItem) -> None:
         self.item = item
+        self.phase: Literal["ready", "packing", "packed"] = "ready"
         self.consumer_id: str | None = None
+        self.claim_id: str | None = None
+        self.claim_generation: int | None = None
+        self.packing_generation_id: str | None = None
 
 
 class TrajectoryQueueStore:
@@ -385,6 +412,7 @@ class TrajectoryQueueStore:
         self._used_bytes = 0
         self._finished = False
         self.generation = 0
+        self._claim_generation = 0
 
     def resize(self, *, maxsize: int, generation: int) -> None:
         if maxsize < 1 or generation < 1:
@@ -416,7 +444,7 @@ class TrajectoryQueueStore:
                 return TrajectoryEnqueueResult(status="accepted")
             raise TrajectoryLeaseError("trajectory result lease changed while queued")
         if (
-            len(self._ready) >= self.max_ready_groups
+            len(self._entries) >= self.max_ready_groups
             or self._used_records + records > self.capacity_records
             or self._used_bytes + byte_count > self.capacity_bytes
         ):
@@ -434,16 +462,41 @@ class TrajectoryQueueStore:
             return TrajectoryQueueTake(closed=self._finished)
         result_id = self._ready.popleft()
         entry = self._entries[result_id]
+        self._claim_generation += 1
+        entry.phase = "packing"
         entry.consumer_id = consumer_id
-        return TrajectoryQueueTake(item=entry.item)
-
-    def acknowledge(self, result_id: str, consumer_id: str) -> None:
-        entry = self._entries.get(result_id)
-        if entry is None or entry.consumer_id != consumer_id:
-            raise TrajectoryLeaseError(
-                "trajectory result has no matching consumer lease"
+        entry.claim_id = secrets.token_hex(16)
+        entry.claim_generation = self._claim_generation
+        return TrajectoryQueueTake(
+            lease=TrajectoryQueueLease(
+                claim_id=entry.claim_id,
+                consumer_id=consumer_id,
+                generation=self._claim_generation,
+                item=entry.item,
             )
-        self._remove(result_id)
+        )
+
+    def mark_packed(self, operation: TrajectoryQueuePacking) -> None:
+        entries = [self._leased_entry(lease) for lease in operation.leases]
+        if any(entry.phase != "packing" for entry in entries):
+            raise TrajectoryLeaseError("trajectory claim is not being packed")
+        for entry in entries:
+            entry.phase = "packed"
+            entry.packing_generation_id = operation.generation_id
+
+    def release(self, operation: TrajectoryQueueRelease) -> None:
+        entry = self._leased_entry(operation.lease)
+        if entry.phase == "packing":
+            if operation.disposition != "discarded" or operation.generation_id:
+                raise TrajectoryLeaseError("unpacked trajectory can only be discarded")
+        elif entry.phase == "packed":
+            if operation.generation_id != entry.packing_generation_id:
+                raise TrajectoryLeaseError(
+                    "trajectory packing generation does not match"
+                )
+        else:
+            raise TrajectoryLeaseError("trajectory claim was not acquired")
+        self._remove(operation.lease.item.ref.result_id)
 
     def finish(self) -> None:
         self._finished = True
@@ -459,7 +512,7 @@ class TrajectoryQueueStore:
 
     def snapshot(self) -> TrajectoryQueueSnapshot:
         return TrajectoryQueueSnapshot(
-            items=tuple(self._entries[result_id].item for result_id in self._ready),
+            items=tuple(entry.item for entry in self._entries.values()),
             max_ready_groups=self.max_ready_groups,
             generation=self.generation,
             capacity_records=self.capacity_records,
@@ -467,9 +520,30 @@ class TrajectoryQueueStore:
             used_records=self._used_records,
             used_bytes=self._used_bytes,
             leased_groups=sum(
-                entry.consumer_id is not None for entry in self._entries.values()
+                entry.phase != "ready" for entry in self._entries.values()
+            ),
+            ready_groups=sum(
+                entry.phase == "ready" for entry in self._entries.values()
+            ),
+            packing_groups=sum(
+                entry.phase == "packing" for entry in self._entries.values()
+            ),
+            packed_groups=sum(
+                entry.phase == "packed" for entry in self._entries.values()
             ),
         )
+
+    def _leased_entry(self, lease: TrajectoryQueueLease) -> _QueueEntry:
+        entry = self._entries.get(lease.item.ref.result_id)
+        if (
+            entry is None
+            or entry.item != lease.item
+            or entry.consumer_id != lease.consumer_id
+            or entry.claim_id != lease.claim_id
+            or entry.claim_generation != lease.generation
+        ):
+            raise TrajectoryLeaseError("trajectory result has no matching claim")
+        return entry
 
     def _remove(self, result_id: str) -> None:
         entry = self._entries.pop(result_id)

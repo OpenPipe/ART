@@ -54,6 +54,8 @@ from .trajectory_store import (
     TrajectoryGroupRef,
     TrajectoryLeaseError,
     TrajectoryQueueItem,
+    TrajectoryQueuePacking,
+    TrajectoryQueueRelease,
     TrajectoryQueueResize,
     TrajectoryQueueSnapshot,
     TrajectoryQueueStore,
@@ -354,10 +356,12 @@ class RolloutHostService(Actor):
         return self._trajectory_queue(queue_id).take(consumer_id)
 
     @resilient_endpoint
-    async def acknowledge_trajectory(
-        self, queue_id: str, result_id: str, consumer_id: str
-    ) -> None:
-        self._trajectory_queue(queue_id).acknowledge(result_id, consumer_id)
+    async def mark_trajectories_packed(self, operation: TrajectoryQueuePacking) -> None:
+        self._trajectory_queue(operation.queue_id).mark_packed(operation)
+
+    @resilient_endpoint
+    async def release_trajectory(self, operation: TrajectoryQueueRelease) -> None:
+        self._trajectory_queue(operation.queue_id).release(operation)
 
     @resilient_endpoint
     async def finish_trajectory_queue(self, queue_id: str) -> None:
