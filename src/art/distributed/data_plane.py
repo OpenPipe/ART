@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-from contextlib import suppress
 import gc
 from multiprocessing import resource_tracker, shared_memory
 import os
@@ -570,12 +569,22 @@ class _AuthenticatedStreamPublisher:
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:
-            writer.close()
-            with suppress(Exception):
-                await writer.wait_closed()
-            self._handlers.discard(task)
-            if sent:
-                self._sent()
+            try:
+                writer.close()
+                if task.cancelling():
+                    writer.transport.abort()
+                else:
+                    try:
+                        await writer.wait_closed()
+                    except asyncio.CancelledError:
+                        writer.transport.abort()
+                        raise
+                    except Exception:
+                        pass
+            finally:
+                self._handlers.discard(task)
+                if sent and not task.cancelling():
+                    self._sent()
 
     async def _write(self, writer: asyncio.StreamWriter) -> None:
         raise NotImplementedError
