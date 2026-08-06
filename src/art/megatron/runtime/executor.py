@@ -210,11 +210,12 @@ class _GenerationPublisher:
             commit_optimizer_policy_advance,
             read_adapter_publication,
             resolve_committed_optimizer_policy,
+            trainer_publication_path,
         )
         from art.utils.output_dirs import get_step_checkpoint_dir
 
-        coordination = (
-            Path(optimizer_state_path) / ".publications" / adapter.generation_id
+        coordination = trainer_publication_path(
+            optimizer_state_path, adapter.generation_id
         )
         try:
             initial = get_step_checkpoint_dir(str(Path(optimizer_state_path).parent), 0)
@@ -276,6 +277,7 @@ class _GenerationPublisher:
             commit_optimizer_generation,
             publish_adapter_checkpoint,
             read_committed_optimizer_pointer,
+            trainer_publication_path,
             write_optimizer_snapshot_shard,
         )
         from art.megatron.weights.lora_publish import save_vllm_lora_snapshot
@@ -283,7 +285,9 @@ class _GenerationPublisher:
         rank = int(self.runtime.rank)
         world_size = int(self.runtime.world_size)
         root = Path(optimizer_state_path)
-        coordination = root / ".publications" / generation.generation_id
+        coordination = trainer_publication_path(
+            optimizer_state_path, generation.generation_id
+        )
         coordination.mkdir(parents=True, exist_ok=True)
         try:
             if rank == 0:
@@ -424,7 +428,9 @@ def _record_generation_failure(
     rank: int,
     error: BaseException,
 ) -> None:
-    coordination = optimizer_root / ".publications" / generation_id
+    from art.megatron.optimizer_state import trainer_publication_path
+
+    coordination = trainer_publication_path(str(optimizer_root), generation_id)
     payload = {"error_type": type(error).__name__, "message": str(error)}
     _write_json_atomic(coordination / f"rank-{rank:08d}.error.json", payload)
     if rank == 0:

@@ -58,6 +58,7 @@ from .optimizer_state import (
     read_adapter_publication,
     read_committed_optimizer_pointer,
     resolve_committed_optimizer_policy,
+    trainer_publication_path,
 )
 from .runtime.specs import (
     AdapterReady,
@@ -1526,9 +1527,7 @@ def _write_generation_complete(
 ) -> None:
     pointer = read_committed_optimizer_pointer(optimizer_state_path)
     path = (
-        Path(optimizer_state_path)
-        / ".publications"
-        / generation.generation_id
+        trainer_publication_path(optimizer_state_path, generation.generation_id)
         / "complete.json"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1564,9 +1563,7 @@ def _wait_for_adapter_generation(
 ) -> OptimizerAdapter:
     deadline = time.monotonic() + timeout_s
     failed = (
-        Path(optimizer_state_path)
-        / ".publications"
-        / generation.generation_id
+        trainer_publication_path(optimizer_state_path, generation.generation_id)
         / "failed.json"
     )
     while True:
@@ -1608,9 +1605,7 @@ def _wait_for_durable_generation(
 ) -> tuple[int, int]:
     deadline = time.monotonic() + timeout_s
     complete = (
-        Path(optimizer_state_path)
-        / ".publications"
-        / generation.generation_id
+        trainer_publication_path(optimizer_state_path, generation.generation_id)
         / "complete.json"
     )
     failed = complete.with_name("failed.json")

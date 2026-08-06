@@ -205,6 +205,11 @@ def new_optimizer_generation(step: int) -> str:
     return f"step-{step:08d}-{uuid4().hex}"
 
 
+def trainer_publication_path(optimizer_state_path: str, generation: str) -> Path:
+    _validate_generation_name(generation)
+    return Path(optimizer_state_path).parent / ".trainer_publications" / generation
+
+
 def _validate_generation_name(generation: str) -> None:
     if _GENERATION_RE.fullmatch(generation) is None:
         raise ValueError(f"Invalid optimizer generation name: {generation!r}")
