@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from art_vllm_runtime.binary_routes import (
     PIPELINE_ROUTES_ENV,
     PIPELINE_ROUTES_PROTOCOL,
+    _register_model_route_layout,
 )
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
@@ -430,6 +431,7 @@ def _patch_engine_config(
     def create(self: Any, *args: Any, **kwargs: Any) -> Any:
         config = create_engine_config(self, *args, **kwargs)
         config.model_config.enable_return_routed_experts = True
+        _register_model_route_layout(config.model_config)
         _validate_pipeline_route_config(config)
         return config
 
