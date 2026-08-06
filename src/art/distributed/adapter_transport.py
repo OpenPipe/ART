@@ -258,15 +258,12 @@ class NixlAdapterReceiver:
         )
         return target
 
-    def wait(self, generation_id: str, timeout_s: float) -> AdapterReceiveResult:
+    def poll(self, generation_id: str) -> AdapterReceiveResult | None:
         pending = self._pending.get(generation_id)
         if pending is None:
             raise RuntimeError(f"Unknown adapter receive: {generation_id}")
-        deadline = time.monotonic() + timeout_s
-        while not self._take_notification(generation_id):
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"Adapter transfer timed out: {generation_id}")
-            time.sleep(0.001)
+        if not self._take_notification(generation_id):
+            return None
         from art.megatron.weights.lora_publish import (
             LoraSnapshot,
             save_vllm_lora_snapshot,

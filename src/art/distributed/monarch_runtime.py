@@ -185,9 +185,15 @@ class MonarchVllmHostLauncher:
     async def wait_adapter_receive(
         self, generation_id: str, timeout_s: float
     ) -> AdapterReceiveResult:
-        return await call_remote(
-            self.actor.wait_adapter_receive, generation_id, timeout_s
-        )
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        while True:
+            result = await call_remote(self.actor.poll_adapter_receive, generation_id)
+            if result is not None:
+                return result
+            remaining_s = deadline - asyncio.get_running_loop().time()
+            if remaining_s <= 0:
+                raise TimeoutError(f"Adapter transfer timed out: {generation_id}")
+            await asyncio.sleep(min(0.01, remaining_s))
 
     async def release_adapter_receive(self, generation_id: str) -> None:
         await call_remote(self.actor.release_adapter_receive, generation_id)

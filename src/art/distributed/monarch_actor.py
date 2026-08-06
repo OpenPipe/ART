@@ -431,8 +431,8 @@ class RolloutHostService(Actor):
         )
 
     @resilient_endpoint
-    async def wait_adapter_receive(self, generation_id: str, timeout_s: float):
-        return await asyncio.to_thread(self._receiver().wait, generation_id, timeout_s)
+    async def poll_adapter_receive(self, generation_id: str):
+        return await asyncio.to_thread(self._receiver().poll, generation_id)
 
     @resilient_endpoint
     async def release_adapter_receive(self, generation_id: str) -> None:
