@@ -352,6 +352,8 @@ class DistributedTrajectoryQueue:
         self._cleanup_refs: tuple[TrajectoryGroupRef, ...] = ()
         self._resize_generation = 0
         self._resize_tasks: set[asyncio.Task[None]] = set()
+        self._owner_cleanup_tasks: dict[asyncio.Task[None], TrajectoryGroupRef] = {}
+        self._owner_cleanup_failure: BaseException | None = None
 
     async def start(self) -> None:
         if self._started:
@@ -441,6 +443,7 @@ class DistributedTrajectoryQueue:
     ) -> tuple[list[TrajectoryGroup], bool]:
         if count < 1:
             raise ValueError("trajectory queue get count must be positive")
+        self._raise_owner_cleanup_failure()
         leases: list[TrajectoryQueueLease] = []
         closed = self._closed
         while not closed and len(leases) < count:
@@ -493,6 +496,7 @@ class DistributedTrajectoryQueue:
         )
         if cleanup:
             raise BaseExceptionGroup("trajectory result release failed", cleanup)
+        self._raise_owner_cleanup_failure()
 
     async def release_selections(
         self,
@@ -558,10 +562,15 @@ class DistributedTrajectoryQueue:
             self._closed = True
             if self._started:
                 try:
-                    self._cleanup_refs = await self.endpoint.close(self.queue_id)
+                    self._cleanup_refs += await self.endpoint.close(self.queue_id)
                 except BaseException as error:
                     failures.append(error)
+        if self._owner_cleanup_tasks:
+            await asyncio.gather(
+                *tuple(self._owner_cleanup_tasks), return_exceptions=True
+            )
         refs = self._cleanup_refs
+        self._owner_cleanup_failure = None
         results = await asyncio.gather(
             *(self._owner(ref).drop(ref) for ref in refs), return_exceptions=True
         )
@@ -692,10 +701,6 @@ class DistributedTrajectoryQueue:
         generation_id: str | None = None,
     ) -> list[BaseException]:
         try:
-            await owner.drop(lease.item.ref)
-        except BaseException as error:
-            return [error]
-        try:
             await self.endpoint.release(
                 TrajectoryQueueRelease(
                     queue_id=self.queue_id,
@@ -706,7 +711,29 @@ class DistributedTrajectoryQueue:
             )
         except BaseException as error:
             return [error]
+        self._schedule_owner_cleanup(owner, lease.item.ref)
         return []
+
+    def _schedule_owner_cleanup(
+        self, owner: RolloutHostEndpoint, ref: TrajectoryGroupRef
+    ) -> None:
+        task = asyncio.create_task(owner.drop(ref))
+        self._owner_cleanup_tasks[task] = ref
+        task.add_done_callback(self._owner_cleanup_done)
+
+    def _owner_cleanup_done(self, task: asyncio.Task[None]) -> None:
+        ref = self._owner_cleanup_tasks.pop(task)
+        try:
+            task.result()
+        except BaseException as error:
+            self._cleanup_refs += (ref,)
+            self._owner_cleanup_failure = self._owner_cleanup_failure or error
+
+    def _raise_owner_cleanup_failure(self) -> None:
+        error = self._owner_cleanup_failure
+        self._owner_cleanup_failure = None
+        if error is not None:
+            raise error
 
     def _owner(self, ref: TrajectoryGroupRef) -> RolloutHostEndpoint:
         try:
