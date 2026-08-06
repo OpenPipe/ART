@@ -47,6 +47,7 @@ def _local_training_workload_values(
     microbatches: Sequence[ScheduleMicrobatch[Any]], cp_rank: int
 ) -> list[int]:
     real = tuple(item for item in microbatches if item.sample_index is not None)
+    dummy = tuple(item for item in microbatches if item.sample_index is None)
     return [
         sum(item.payload.workload.logical_nonpadding_tokens for item in real),
         sum(item.payload.workload.loss_bearing_tokens for item in real),
@@ -55,6 +56,14 @@ def _local_training_workload_values(
             sum(
                 item.payload.workload.nominal_schedule_capacity_tokens
                 for item in microbatches
+            )
+            if cp_rank == 0
+            else 0
+        ),
+        sum(item.payload.workload.executed_token_equivalents for item in dummy),
+        (
+            sum(
+                item.payload.workload.nominal_schedule_capacity_tokens for item in dummy
             )
             if cp_rank == 0
             else 0
@@ -670,6 +679,8 @@ class MCoreScheduleAdapter(Generic[_T]):
             loss_bearing,
             executed,
             nominal,
+            dummy_executed,
+            dummy_nominal,
             real_microbatches,
             dummy_microbatches,
         ) = values.cpu().tolist()
@@ -678,6 +689,8 @@ class MCoreScheduleAdapter(Generic[_T]):
             loss_bearing_tokens=loss_bearing,
             executed_token_equivalents=executed,
             nominal_schedule_capacity_tokens=nominal,
+            dummy_executed_token_equivalents=dummy_executed,
+            dummy_schedule_capacity_tokens=dummy_nominal,
             real_microbatches=real_microbatches,
             dummy_microbatches=dummy_microbatches,
         )

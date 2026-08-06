@@ -57,7 +57,7 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     vllm_pressure_under_ratio: float = pydantic.Field(default=0.50, ge=0.0)
     queue_put_severe_frac: float = pydantic.Field(default=0.50, ge=0.0, le=1.0)
     stale_high_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
-    padding_high_frac: float = pydantic.Field(default=0.25, ge=0.0, le=1.0)
+    unused_and_dummy_high_frac: float = pydantic.Field(default=0.25, ge=0.0, le=1.0)
     trainer_min_batch_lower_score: float = pydantic.Field(default=0.15, ge=0.0)
     recommendation_min_windows: int = pydantic.Field(default=5, ge=1)
     recommendation_consecutive_holds: int = pydantic.Field(default=2, ge=1)
@@ -127,7 +127,7 @@ class TunerWindowStats(pydantic.BaseModel):
     vllm_pressure: float = 0.0
     queue_put_wait_frac: float = 0.0
     predicted_stale_frac: float = 0.0
-    padding_ratio_mean: float = 0.0
+    unused_and_dummy_ratio_mean: float = 0.0
 
 
 class TunerDecision(pydantic.BaseModel):

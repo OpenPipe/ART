@@ -1388,6 +1388,12 @@ def _rl_step_metrics(
         "data/gradient_step_nominal_schedule_capacity_tokens": float(
             workload.nominal_schedule_capacity_tokens
         ),
+        "data/gradient_step_dummy_executed_token_equivalents": float(
+            workload.dummy_executed_token_equivalents
+        ),
+        "data/gradient_step_dummy_schedule_capacity_tokens": float(
+            workload.dummy_schedule_capacity_tokens
+        ),
         "pipeline/gradient_step_real_microbatches": float(workload.real_microbatches),
         "pipeline/gradient_step_dummy_microbatches": float(workload.dummy_microbatches),
         "time/gradient_step_train_s": train_step_s,

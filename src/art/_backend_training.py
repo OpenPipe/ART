@@ -22,6 +22,12 @@ _GRADIENT_WORKLOAD_METRICS = {
     "data/gradient_step_nominal_schedule_capacity_tokens": (
         "data/step_nominal_schedule_capacity_tokens"
     ),
+    "data/gradient_step_dummy_executed_token_equivalents": (
+        "data/step_dummy_executed_token_equivalents"
+    ),
+    "data/gradient_step_dummy_schedule_capacity_tokens": (
+        "data/step_dummy_schedule_capacity_tokens"
+    ),
     "pipeline/gradient_step_real_microbatches": "pipeline/global_real_microbatches",
     "pipeline/gradient_step_dummy_microbatches": ("pipeline/global_dummy_microbatches"),
 }
@@ -188,8 +194,12 @@ def _aggregate_megatron_workload(
         ),
     ):
         output[rate_key] = totals[raw_key] / train_s if train_s > 0 else 0.0
-    executed = totals["data/gradient_step_executed_token_equivalents"]
     logical = totals["data/gradient_step_nonpadding_logical_tokens"]
-    output["data/step_padding_ratio"] = (
-        (executed - logical) / executed if executed > 0 else 0.0
+    nominal = totals["data/gradient_step_nominal_schedule_capacity_tokens"]
+    dummy = totals["data/gradient_step_dummy_schedule_capacity_tokens"]
+    output["data/step_unused_packed_capacity_tokens"] = max(
+        0.0, nominal - dummy - logical
+    )
+    output["data/step_unused_and_dummy_ratio"] = (
+        max(0.0, nominal - logical) / nominal if nominal > 0 else 0.0
     )

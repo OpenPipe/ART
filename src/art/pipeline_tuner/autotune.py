@@ -45,7 +45,7 @@ def _ceil_to_multiple(value: float, multiple: int, *, minimum: int = 1) -> int:
 
 
 _VLLM_SCRAPE_GROUP_TOLERANCE_S = 0.05
-_TRAINER_PADDING_EPSILON = 1e-9
+_TRAINER_CAPACITY_EPSILON = 1e-9
 
 
 class PackingProjection(pydantic.BaseModel):
@@ -59,10 +59,12 @@ class PackingOutcome(pydantic.BaseModel):
     packed_sequences: int = pydantic.Field(ge=1)
 
 
-def _trainer_underfeed_score(*, idle_frac: float, padding_ratio: float) -> float:
+def _trainer_underfeed_score(
+    *, idle_frac: float, unused_and_dummy_ratio: float
+) -> float:
     denominator = max(
-        _TRAINER_PADDING_EPSILON,
-        1.0 + _TRAINER_PADDING_EPSILON - max(0.0, min(1.0, padding_ratio)),
+        _TRAINER_CAPACITY_EPSILON,
+        1.0 + _TRAINER_CAPACITY_EPSILON - max(0.0, min(1.0, unused_and_dummy_ratio)),
     )
     return max(0.0, idle_frac) / denominator
 
@@ -172,8 +174,8 @@ class PipelineAutotuner:
         groups = _required_step_values(
             by_step, window_steps, "data/step_num_groups_trainable"
         )
-        train_capacity_tokens = _required_step_values(
-            by_step, window_steps, "data/step_executed_token_equivalents"
+        nominal_capacity_tokens = _required_step_values(
+            by_step, window_steps, "data/step_nominal_schedule_capacity_tokens"
         )
         non_padding_tokens = _required_step_values(
             by_step, window_steps, "data/step_nonpadding_logical_tokens"
@@ -198,15 +200,17 @@ class PipelineAutotuner:
                 "Pipeline autotuner requires packed-group observations in every "
                 f"trainable decision-window step; missing steps {missing_packed_steps}."
             )
-        padding_ratios = []
+        unused_and_dummy_ratios = []
         for capacity, non_padding in zip(
-            train_capacity_tokens, non_padding_tokens, strict=True
+            nominal_capacity_tokens, non_padding_tokens, strict=True
         ):
             if capacity <= 0:
                 continue
-            padding_ratios.append(max(0.0, (capacity - non_padding) / capacity))
+            unused_and_dummy_ratios.append(
+                max(0.0, (capacity - non_padding) / capacity)
+            )
         trainer_idle_frac = (collect / wall) if wall > 0 else 0.0
-        padding_ratio_mean = _mean(padding_ratios)
+        unused_and_dummy_ratio_mean = _mean(unused_and_dummy_ratios)
         self._record_packing_outcomes(
             by_step=by_step,
             window_steps=window_steps,
@@ -218,14 +222,14 @@ class PipelineAutotuner:
             window_end_s=t1,
             trainer_underfeed_score=_trainer_underfeed_score(
                 idle_frac=trainer_idle_frac,
-                padding_ratio=padding_ratio_mean,
+                unused_and_dummy_ratio=unused_and_dummy_ratio_mean,
             ),
             vllm_pressure=_vllm_pressure(
                 vllm_metrics, window_start_s=t0, window_end_s=t1
             ),
             queue_put_wait_frac=_mean(step_values("queue/put_wait_frac")),
             predicted_stale_frac=_mean(step_values("queue/predicted_stale_fraction")),
-            padding_ratio_mean=padding_ratio_mean,
+            unused_and_dummy_ratio_mean=unused_and_dummy_ratio_mean,
         )
 
     def _record_packing_outcomes(
@@ -486,16 +490,17 @@ class PipelineAutotuner:
                 )
             )
         if (
-            stats.padding_ratio_mean >= self.config.padding_high_frac
+            stats.unused_and_dummy_ratio_mean >= self.config.unused_and_dummy_high_frac
             and trainer_saturated
             and vllm_saturated
         ):
             recommendations.append(
                 (
                     "decrease_packed_sequence_length",
-                    "Pipeline autotuner observes high padding while Megatron and vLLM "
+                    "Pipeline autotuner observes high unused or dummy capacity while "
+                    "Megatron and vLLM "
                     "are both saturated; decrease packed_sequence_length to reduce "
-                    "padding waste.",
+                    "schedule waste.",
                 )
             )
         return recommendations

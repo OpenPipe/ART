@@ -138,11 +138,35 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         higher_is_better=None,
     ),
     MetricDefinition(
-        key="data/step_padding_ratio",
-        title="Padding ratio",
+        key="data/step_dummy_executed_token_equivalents",
+        title="Executed dummy token-equivalents",
+        description="runtime-plan token-equivalents executed by PP dummy microbatches",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="data/step_dummy_schedule_capacity_tokens",
+        title="Dummy schedule capacity",
+        description="nominal packed-token capacity assigned to PP dummy microbatches",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="data/step_unused_packed_capacity_tokens",
+        title="Unused packed capacity",
+        description="nominal real-microbatch capacity not occupied by logical tokens",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="data/step_unused_and_dummy_ratio",
+        title="Unused and dummy capacity ratio",
         description=(
-            "unused packed-token slots, including dummy data-parallel rows, "
-            "divided by executed packed-token capacity for this step"
+            "unused real packed-token capacity plus PP dummy schedule capacity, "
+            "divided by nominal schedule capacity"
         ),
         kind="ratio",
         higher_is_better=False,

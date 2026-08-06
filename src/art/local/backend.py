@@ -1560,7 +1560,10 @@ class LocalBackend:
                 "data/step_loss_bearing_tokens": 0.0,
                 "data/step_executed_token_equivalents": 0.0,
                 "data/step_nominal_schedule_capacity_tokens": 0.0,
-                "data/step_padding_ratio": 0.0,
+                "data/step_dummy_executed_token_equivalents": 0.0,
+                "data/step_dummy_schedule_capacity_tokens": 0.0,
+                "data/step_unused_packed_capacity_tokens": 0.0,
+                "data/step_unused_and_dummy_ratio": 0.0,
                 TRAIN_GRADIENT_STEPS_KEY: 0.0,
                 **advance_metrics,
             }
@@ -1595,7 +1598,12 @@ class LocalBackend:
                     "data/step_nominal_schedule_capacity_tokens": float(
                         packed_train_tokens
                     ),
-                    "data/step_padding_ratio": (
+                    "data/step_dummy_executed_token_equivalents": 0.0,
+                    "data/step_dummy_schedule_capacity_tokens": 0.0,
+                    "data/step_unused_packed_capacity_tokens": float(
+                        packed_train_tokens - non_padding_tokens
+                    ),
+                    "data/step_unused_and_dummy_ratio": (
                         float(packed_train_tokens - non_padding_tokens)
                         / packed_train_tokens
                     ),

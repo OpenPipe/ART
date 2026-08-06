@@ -196,6 +196,8 @@ class TrainingStepWorkload(BaseModel):
     loss_bearing_tokens: int = Field(ge=0)
     executed_token_equivalents: int = Field(ge=0)
     nominal_schedule_capacity_tokens: int = Field(ge=0)
+    dummy_executed_token_equivalents: int = Field(ge=0)
+    dummy_schedule_capacity_tokens: int = Field(ge=0)
     real_microbatches: int = Field(ge=0)
     dummy_microbatches: int = Field(ge=0)
 
