@@ -75,48 +75,8 @@ def test_one_service_is_the_deployment_contract() -> None:
     assert "leader" not in ModelServiceMemberSpec.model_fields
 
 
-def test_expected_worker_identities_follow_physical_rank_order() -> None:
-    assert manager().expected_worker_identities() == (
-        {
-            "rank": 0,
-            "local_rank": 0,
-            "node_rank": 0,
-            "process_uuid": "process-0",
-            "generation": 0,
-        },
-        {
-            "rank": 1,
-            "local_rank": 1,
-            "node_rank": 0,
-            "process_uuid": "process-0",
-            "generation": 0,
-        },
-        {
-            "rank": 2,
-            "local_rank": 0,
-            "node_rank": 1,
-            "process_uuid": "process-1",
-            "generation": 0,
-        },
-        {
-            "rank": 3,
-            "local_rank": 1,
-            "node_rank": 1,
-            "process_uuid": "process-1",
-            "generation": 0,
-        },
-    )
-
-
-def test_expected_worker_identities_reject_incomplete_membership() -> None:
-    value = manager()
-    value._state = value.state.model_copy(update={"members": value.state.members[:1]})
-    with pytest.raises(RuntimeError, match="membership is incomplete"):
-        value.expected_worker_identities()
-
-
 @pytest.mark.asyncio
-async def test_service_acknowledges_every_worker_through_leader(
+async def test_in_flight_update_is_the_only_acknowledgement_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     value = manager()
@@ -127,7 +87,7 @@ async def test_service_acknowledges_every_worker_through_leader(
     service = DistributedMegatronService(
         model_name="model",
         base_model="base",
-        config={},
+        config={"rollout_weight_update_mode": "in_flight_lora"},
         output_dir=str(tmp_path),
         runtime=runtime,
         enable_expert_replay=False,
@@ -153,17 +113,16 @@ async def test_service_acknowledges_every_worker_through_leader(
             return Response()
 
     monkeypatch.setattr(service_module.httpx, "AsyncClient", Client)
-    await service._acknowledge_lora_workers(
-        lora_name="model@1",
-        lora_path="/step/0001",
-        step=1,
-        service_name="model",
-        base_url="http://leader.test:8000",
-        api_key="secret",
-    )
+    service._latest_step = 1
+    service._serving_step = 0
+    service._base_url = "http://leader.test:8000"
+    service._api_key_value = "secret"
+    name, path = await service._load_adapter("/step/0001", 1)
 
-    assert calls[0][0] == "http://leader.test:8000/art/lora_worker_state"
-    assert calls[0][1]["expected_workers"] == value.expected_worker_identities()
+    assert (name, path) == ("model:active", "/step/0001")
+    assert len(calls) == 1
+    assert calls[0][0] == "http://leader.test:8000/art/in_flight_lora_update"
+    assert calls[0][1]["policy_version"] == 1
     assert calls[0][2] == {"Authorization": "Bearer secret"}
 
 

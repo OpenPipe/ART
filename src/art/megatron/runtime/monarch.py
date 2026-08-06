@@ -102,6 +102,24 @@ def _configure_hybrid_ep_env(
             os.environ[name] = value
 
 
+def _build_training_runtime(spec: TrainerRuntimeSpec, *, rank: int) -> Any:
+    import torch
+
+    from art.megatron.train import build_training_runtime
+
+    return build_training_runtime(
+        model_identifier=spec.model_identifier,
+        provider_torch_dtype={
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }[spec.dtype],
+        print_env=rank == 0,
+        model_support_key=spec.model_support_key,
+        snapshot_pool_capacity=spec.snapshot_pool_capacity,
+    )
+
+
 class _TrainerRankReady(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -277,19 +295,7 @@ class MonarchTrainerActor(Actor):
                 run_id=f"{hybrid_ep.run_id}-{trainer_generation}-g{group_index}",
             )
             validate_hybrid_ep(require_multinode=hybrid_ep.multinode)
-        from art.megatron.train import build_training_runtime
-
-        dtype = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
-        }[runtime_spec.dtype]
-        self._runtime = build_training_runtime(
-            model_identifier=runtime_spec.model_identifier,
-            provider_torch_dtype=dtype,
-            print_env=rank == 0,
-            model_support_key=runtime_spec.model_support_key,
-        )
+        self._runtime = _build_training_runtime(runtime_spec, rank=rank)
         if self._runtime.model_support_handler.key != runtime_spec.handler_name:
             raise RuntimeError(
                 "resolved model-support handler does not match TrainerRuntimeSpec: "

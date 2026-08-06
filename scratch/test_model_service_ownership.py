@@ -1,4 +1,6 @@
-from types import SimpleNamespace
+import ast
+from pathlib import Path
+from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -12,9 +14,27 @@ from art.distributed.specs import (
     VllmParallelSpec,
 )
 from art.distributed.vllm_replica import ReplicaFailure, ReplicaState
+from art.local import checkpoints as checkpoints_module
 from art.megatron import distributed_service as service_module
+from art.megatron.backend import MegatronBackend
 from art.megatron.distributed_service import DistributedMegatronService
 from art.serving_capabilities import ART_SERVING_PROTOCOL_VERSION, ServingCapabilities
+
+
+def test_dedicated_runtime_advertises_the_required_protocol() -> None:
+    source = Path("vllm_runtime/src/art_vllm_runtime/dedicated_server.py")
+    tree = ast.parse(source.read_text("utf-8"))
+    advertised = next(
+        node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "ART_SERVING_PROTOCOL_VERSION"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Constant)
+    )
+    assert advertised == ART_SERVING_PROTOCOL_VERSION == 3
 
 
 def _spec() -> ModelServiceSpec:
@@ -138,9 +158,9 @@ async def test_recovery_rebuilds_loaded_adapter_index(monkeypatch, tmp_path) -> 
     capabilities = ServingCapabilities(
         runtime="art_vllm",
         protocol_version=ART_SERVING_PROTOCOL_VERSION,
-        exact_lora_worker_state=True,
     )
     service._latest_step = 5
+    service._serving_step = 5
     service._managed_service_name = "model"
     service._base_url = spec.leader_endpoint.url
     service._serving_capabilities = capabilities
@@ -148,8 +168,10 @@ async def test_recovery_rebuilds_loaded_adapter_index(monkeypatch, tmp_path) -> 
     service._loaded_adapter_steps = {1, 3, 5}
     service._loaded_exact_adapter_steps = {2}
     service._exact_adapter_refcounts = {2: 1}
-    service._checkpoint_digest = AsyncMock(return_value="policy")
-    service._acknowledge_lora_workers = AsyncMock()
+    service._published_adapters[5] = SimpleNamespace(
+        generation_id="policy",
+        identity=str(tmp_path / "checkpoints" / "0005"),
+    )
     service._load_adapter_at = AsyncMock(return_value=("model@2", "/step/2"))
     monkeypatch.setattr(
         service_module,
@@ -170,3 +192,112 @@ async def test_recovery_rebuilds_loaded_adapter_index(monkeypatch, tmp_path) -> 
     assert service._loaded_exact_adapter_steps == {2}
     assert service._exact_adapter_refcounts == {2: 1}
     service._load_adapter_at.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recovery_uses_serving_generation_while_learner_is_ahead(
+    monkeypatch, tmp_path
+) -> None:
+    spec = _spec()
+    ready = ReplicaState(
+        replica_id="model",
+        generation=4,
+        generation_digest="restarted",
+        phase="ready",
+    )
+    manager = SimpleNamespace(
+        restart=AsyncMock(return_value=ready),
+        prepare_update=Mock(return_value=ready),
+        verify_update=Mock(return_value=ready),
+        quarantine=Mock(),
+        stop=AsyncMock(),
+    )
+    service = _service(
+        tmp_path,
+        SimpleNamespace(
+            topology=SimpleNamespace(model_services=(spec,)),
+            model_service=lambda _name: manager,
+        ),
+    )
+    capabilities = ServingCapabilities(
+        runtime="art_vllm", protocol_version=ART_SERVING_PROTOCOL_VERSION
+    )
+    serving_path = str(tmp_path / "checkpoints" / "0005")
+    service._latest_step = 6
+    service._serving_step = 5
+    service._managed_service_name = "model"
+    service._base_url = spec.leader_endpoint.url
+    service._serving_capabilities = capabilities
+    service._current_lora_name = "model@5"
+    service._published_adapters[5] = SimpleNamespace(
+        generation_id="serving-generation", identity=serving_path
+    )
+    monkeypatch.setattr(
+        service_module,
+        "discover_serving_capabilities",
+        AsyncMock(return_value=capabilities),
+    )
+
+    await service._recover_replica_locked(
+        ReplicaFailure(
+            replica_id="model",
+            generation=3,
+            generation_digest="failed",
+            reason="dead",
+        )
+    )
+
+    manager.restart.assert_awaited_once_with(
+        served_model_name="model@5", lora_path=serving_path
+    )
+    report = manager.verify_update.call_args.args[0]
+    assert report.policy_version == "5"
+    assert report.policy_digest == "serving-generation"
+    assert service._latest_step == 6
+    assert service._serving_step == 5
+    assert service._loaded_adapter_steps == {5}
+
+
+@pytest.mark.asyncio
+async def test_retention_protects_absent_learner_and_serving_steps(
+    monkeypatch, tmp_path
+) -> None:
+    model = SimpleNamespace(project="project", name="model")
+    output_dir = tmp_path / "project" / "models" / "model"
+    service = _service(output_dir, SimpleNamespace())
+    service._latest_step = 3
+    service._serving_step = 2
+    service._loaded_adapter_steps = {1, 2, 3}
+    service._unload_adapter = AsyncMock()
+
+    await service.prune_loaded_adapters(retain_steps={3})
+    assert service._loaded_adapter_steps == {2, 3}
+    service._unload_adapter.assert_awaited_once_with("model@1")
+
+    checkpoints = output_dir / "checkpoints"
+    for step in (1, 2, 4):
+        (checkpoints / f"{step:04d}").mkdir(parents=True)
+    staging = output_dir / "staging-0003"
+    staging.mkdir()
+    original_delete = checkpoints_module.delete_checkpoints
+
+    def publish_during_retention(path: str, excluding: list[int]) -> None:
+        staging.rename(checkpoints / "0003")
+        original_delete(path, excluding)
+
+    monkeypatch.setattr(
+        checkpoints_module, "delete_checkpoints", publish_during_retention
+    )
+    backend = object.__new__(MegatronBackend)
+    backend._runtime = object()
+    backend._path = str(tmp_path)
+
+    async def get_service(_self, _model):
+        return service
+
+    backend._get_service = MethodType(get_service, backend)
+    await backend._delete_checkpoint_files(model, [1])
+    assert (checkpoints / "0001").is_dir()
+    assert (checkpoints / "0002").is_dir()
+    assert (checkpoints / "0003").is_dir()
+    assert not (checkpoints / "0004").exists()

@@ -1,3 +1,4 @@
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from typing import Annotated, Literal
 
@@ -104,9 +105,14 @@ class LocalTrainResult(TrainResult):
         metrics: Aggregated training metrics (loss, gradient norms, etc.).
         checkpoint_path: Path to the saved checkpoint directory, or None if
             no checkpoint was saved.
+        checkpoint_ready: Completion signal for an asynchronously materialized
+            checkpoint. None when checkpoint_path is already usable.
     """
 
     checkpoint_path: str | None = None
+    checkpoint_ready: Awaitable[None] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass

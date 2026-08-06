@@ -9,7 +9,6 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from art.distributed.data_plane import PackedBatchRef
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
-from art.megatron.runtime.jobs import MergedWeightTransferSpec
 from art.types import TrainConfig
 
 
@@ -48,6 +47,7 @@ class TrainerRuntimeSpec(_Spec):
     streaming_weight_offload: bool = False
     random_state: int | None = None
     hybrid_ep: HybridEpRuntimeSpec | None = None
+    snapshot_pool_capacity: int = Field(default=2, ge=1, le=4)
 
     @model_validator(mode="after")
     def _validate_lora_targets(self) -> "TrainerRuntimeSpec":
@@ -108,10 +108,23 @@ class ExperimentalTrainConfig(_Spec):
     moe_routing_replay_strict: bool = True
 
 
-class DurableTrainOutput(_Spec):
+class TrainerGeneration(_Spec):
+    training_session_id: str = Field(min_length=1)
+    policy_step: int = Field(ge=0)
+    generation_id: str = Field(pattern=r"^step-\d{8,}-[0-9a-f]{32}$")
     adapter_path: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_generation_step(self) -> "TrainerGeneration":
+        if int(self.generation_id.split("-", 2)[1]) != self.policy_step:
+            raise ValueError("generation ID and policy step must match")
+        return self
+
+
+class DurableTrainOutput(_Spec):
+    generation: TrainerGeneration
+    staging_adapter_path: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
-    optimizer_lease_owner: Literal["controller", "trainer_rank_zero"]
 
 
 class TrainJobSpec(_Spec):
@@ -120,11 +133,11 @@ class TrainJobSpec(_Spec):
     training_session_id: str = Field(min_length=1)
     expected_learner_version: int = Field(ge=0)
     learner_version: int = Field(ge=1)
+    source: TrainerGeneration
     batch: PackedBatchRef
     config: CurrentTrainConfig
     experimental_config: ExperimentalTrainConfig = ExperimentalTrainConfig()
     output: DurableTrainOutput
-    merged_weight_transfer: MergedWeightTransferSpec | None = None
 
     @model_validator(mode="after")
     def _validate_versions(self) -> "TrainJobSpec":
@@ -136,6 +149,22 @@ class TrainJobSpec(_Spec):
             raise ValueError(
                 "batch source policy version cannot be newer than the learner"
             )
+        if (
+            self.source.training_session_id != self.training_session_id
+            or self.source.policy_step != self.expected_learner_version
+        ):
+            raise ValueError("source generation does not identify the expected learner")
+        if (
+            self.output.generation.training_session_id != self.training_session_id
+            or self.output.generation.policy_step != self.learner_version
+        ):
+            raise ValueError("output generation does not identify the new learner")
+        if self.source.generation_id == self.output.generation.generation_id:
+            raise ValueError("source and output generation IDs must differ")
+        if self.source.adapter_path == self.output.staging_adapter_path:
+            raise ValueError("source adapter and output staging paths must differ")
+        if self.output.generation.adapter_path == self.output.staging_adapter_path:
+            raise ValueError("final and staging adapter paths must differ")
         return self
 
     @property
@@ -152,8 +181,16 @@ class TrainJobSpec(_Spec):
         return self.expected_learner_version
 
     @property
-    def lora_path(self) -> str:
-        return self.output.adapter_path
+    def source_adapter_path(self) -> str:
+        return self.source.adapter_path
+
+    @property
+    def output_adapter_path(self) -> str:
+        return self.output.generation.adapter_path
+
+    @property
+    def output_generation_id(self) -> str:
+        return self.output.generation.generation_id
 
     @property
     def optimizer_state_path(self) -> str:

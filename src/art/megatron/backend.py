@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 import secrets
 from typing import Any, AsyncIterator, Iterable, Literal, cast
@@ -16,7 +17,7 @@ from ..local.service import ModelService
 from ..model import TrainableModel
 from ..trajectories import TrajectoryGroup
 from ..types import LocalTrainResult
-from ..utils.output_dirs import get_model_dir
+from ..utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 from ..vllm_runtime import get_external_vllm_runtime_config
 from .optimizer_state import (
     format_megatron_resume_message,
@@ -92,12 +93,23 @@ class MegatronBackend(LocalBackend):
                     f"MegatronBackend.train gets {removed_kwarg} from "
                     "art.init_megatron_runtime_config(...)."
                 )
-        return await super().train(
+        result = await super().train(
             model,
             trajectory_groups,
             packed_sequence_length=get_megatron_runtime_config().packed_sequence_length,
             **kwargs,
         )
+        if self._runtime is None or not kwargs.get("save_checkpoint", True):
+            return result
+        from .distributed_service import DistributedMegatronService
+
+        service = cast(DistributedMegatronService, await self._get_service(model))
+        result.checkpoint_path = get_step_checkpoint_dir(
+            get_model_dir(model=model, art_path=self._path), result.step
+        )
+        if not Path(result.checkpoint_path).exists():
+            result.checkpoint_ready = service.checkpoint_materialization(result.step)
+        return result
 
     def _supports_concurrent_training_and_inference(
         self, model: AnyTrainableModel
@@ -106,6 +118,34 @@ class MegatronBackend(LocalBackend):
             self._runtime is not None
             or super()._supports_concurrent_training_and_inference(model)
         )
+
+    @asynccontextmanager
+    async def adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        if self._runtime is not None:
+            from .distributed_service import DistributedMegatronService
+
+            service = cast(DistributedMegatronService, await self._get_service(model))
+            await service.wait_for_serving(step)
+        async with super().adapter_lease(model, step):
+            yield
+
+    @asynccontextmanager
+    async def exact_adapter_lease(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        if self._runtime is not None:
+            from .distributed_service import DistributedMegatronService
+
+            service = cast(DistributedMegatronService, await self._get_service(model))
+            await service.wait_for_serving(step)
+        async with super().exact_adapter_lease(model, step):
+            yield
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
@@ -530,7 +570,7 @@ class MegatronBackend(LocalBackend):
         async for result in distributed_service.train_packed(
             distributed_batch, config, service_dev_config
         ):
-            yield result
+            yield {**result, **distributed_service.drain_publication_metrics()}
 
     async def _release_training_batch(self, batch: _PackedTrainingBatch) -> None:
         if self._runtime is None:
@@ -566,6 +606,28 @@ class MegatronBackend(LocalBackend):
             raise BaseExceptionGroup(
                 "distributed training batch release failed", failures
             )
+
+    async def _delete_checkpoint_files(
+        self,
+        model: AnyTrainableModel,
+        steps_to_keep: list[int],
+    ) -> None:
+        if self._runtime is None:
+            return await super()._delete_checkpoint_files(model, steps_to_keep)
+        from ..local.checkpoints import delete_checkpoints
+        from .distributed_service import DistributedMegatronService
+        from .optimizer_state import optimizer_retention_lease
+
+        service = cast(DistributedMegatronService, await self._get_service(model))
+        output_dir = get_model_dir(model=model, art_path=self._path)
+        async with service.checkpoint_retention_lease() as active_steps:
+
+            def delete_retained() -> None:
+                retained = set(steps_to_keep) | set(active_steps)
+                with optimizer_retention_lease(output_dir, retained) as protected:
+                    delete_checkpoints(output_dir, sorted(protected))
+
+            await asyncio.to_thread(delete_retained)
 
     async def _advance_skipped_step(
         self,

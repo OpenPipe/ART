@@ -1,6 +1,7 @@
 from collections.abc import Iterable, Sequence
 from typing import Any, NamedTuple
 
+from pydantic import BaseModel, ConfigDict
 import torch
 
 from art.megatron.lora import (
@@ -46,7 +47,7 @@ class _PinnedCpuStager:
     def stage(self, tensor: torch.Tensor) -> torch.Tensor:
         source = tensor.detach()
         if self._stream is None or not source.is_cuda:
-            return source.cpu()
+            return source.to(device="cpu", copy=True)
 
         source = source.contiguous()
         target = torch.empty_like(source, device="cpu", pin_memory=True)
@@ -64,6 +65,13 @@ class _PinnedCpuStager:
         for event in self._events:
             event.synchronize()
         self._events.clear()
+
+
+class LoraSnapshot(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    tensors: dict[str, torch.Tensor]
+    adapter_config: dict[str, Any]
 
 
 def iter_lora_modules(model_chunks: ModelChunks) -> Iterable[LoRA]:
@@ -789,6 +797,30 @@ def save_vllm_lora_from_model(
     world_size: int,
     slot_ref: LoRASlotRef | None = None,
 ) -> None:
+    snapshot = snapshot_vllm_lora_from_model(
+        model=model,
+        adapter_dtypes=adapter_dtypes,
+        handler=handler,
+        adapter_config=adapter_config,
+        rank=rank,
+        world_size=world_size,
+        slot_ref=slot_ref,
+    )
+    if snapshot is None:
+        return
+    save_vllm_lora_snapshot(snapshot, output_dir)
+
+
+def snapshot_vllm_lora_from_model(
+    *,
+    model: ModelChunks,
+    adapter_dtypes: dict[str, torch.dtype],
+    handler: Any,
+    adapter_config: dict[str, Any],
+    rank: int,
+    world_size: int,
+    slot_ref: LoRASlotRef | None = None,
+) -> LoraSnapshot | None:
     result = build_vllm_lora_tensors_from_model(
         model=model,
         adapter_dtypes=adapter_dtypes,
@@ -799,9 +831,20 @@ def save_vllm_lora_from_model(
         slot_ref=slot_ref,
     )
     if result is None:
-        return
+        return None
     vllm_tensors, published_config = result
     stager = _PinnedCpuStager()
     published_tensors = _stage_published_tensors(vllm_tensors, stager)
     stager.finish()
-    save_vllm_lora_tensors(output_dir, published_tensors, published_config)
+    return LoraSnapshot(
+        tensors=published_tensors,
+        adapter_config=published_config,
+    )
+
+
+def save_vllm_lora_snapshot(snapshot: LoraSnapshot, output_dir: str) -> None:
+    save_vllm_lora_tensors(
+        output_dir,
+        snapshot.tensors,
+        snapshot.adapter_config,
+    )

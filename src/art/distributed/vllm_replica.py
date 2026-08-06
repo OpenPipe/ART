@@ -246,25 +246,6 @@ class ReplicaManager:
     def state(self) -> ReplicaState:
         return self._state
 
-    def expected_worker_identities(self) -> tuple[dict[str, int | str], ...]:
-        if self._state.phase not in {"ready", "updating"}:
-            raise RuntimeError(f"replica workers are not live: {self._state.phase}")
-        states = {member.member_id: member for member in self._state.members}
-        if states.keys() != {member.member_id for member in self._spec.members}:
-            raise RuntimeError("replica worker membership is incomplete")
-        local_world_size = len(self._spec.members[0].gpu_ids)
-        return tuple(
-            {
-                "rank": member.node_rank * local_world_size + local_rank,
-                "local_rank": local_rank,
-                "node_rank": member.node_rank,
-                "process_uuid": states[member.member_id].process_uuid,
-                "generation": self._state.generation,
-            }
-            for member in sorted(self._spec.members, key=lambda value: value.node_rank)
-            for local_rank in range(local_world_size)
-        )
-
     async def start(self) -> ReplicaState:
         async with self._lock:
             return await self._start_locked()

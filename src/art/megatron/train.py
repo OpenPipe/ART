@@ -185,6 +185,8 @@ class TrainingRuntime(BaseModel):
     resident_policy_step: int | None = None
     optimizer_state_loaded: bool = False
     adapter_export_dtypes: dict[str, torch.dtype] | None = None
+    adapter_export_config: dict[str, Any] | None = None
+    snapshot_pool_capacity: int = Field(default=2, ge=1, le=4)
     transformer_layers_compiled: bool = False
     rank: int
     world_size: int
@@ -398,6 +400,7 @@ def build_training_runtime(
     trainable_parameter_mode: Literal["lora", "base_model"] = "lora",
     allow_unvalidated_arch: bool | None = None,
     model_support_key: str | None = None,
+    snapshot_pool_capacity: int = 2,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -492,6 +495,7 @@ def build_training_runtime(
         transformer_layers_compiled=transformer_layers_compiled,
         rank=rank,
         world_size=world_size,
+        snapshot_pool_capacity=snapshot_pool_capacity,
     )
     configure_moe_routing_replay(
         runtime,
@@ -593,6 +597,11 @@ def execute_megatron_rl_job(
     *,
     progress_sink: Callable[[int, int, dict[str, float]], None],
     adapter_ready_sink: Callable[[], None] | None,
+    snapshot_sink: Callable[
+        [TrainJobSpec, dict[str, torch.dtype], dict[str, Any], bool],
+        dict[str, float],
+    ]
+    | None = None,
     cancelled: Event | None = None,
     replay_bundle: MoeRoutingReplayBundle | None = None,
 ) -> dict[str, float]:
@@ -767,29 +776,45 @@ def execute_megatron_rl_job(
 
             raise TrainingCancelledError("train job was cancelled")
 
-        published_adapter = _save_lora_and_optimizer(
-            runtime,
-            adapter_dtypes=adapter_dtypes,
-            lora_path=job.lora_path,
-            optimizer_state_path=job.optimizer_state_path,
-            step=job.step,
-            optimizer_save_interval=job.config.optimizer_save_interval,
-            final_training_step=job.config.final_training_step,
-            adapter_ready=adapter_ready_sink,
-            controller_owns_model_lease=(
-                isinstance(job, TrainJobSpec)
-                and job.output.optimizer_lease_owner == "controller"
-            ),
-        )
-        if isinstance(job, TrainJobSpec) and job.merged_weight_transfer is not None:
-            _sync_merged_weights_to_vllm(
-                runtime,
-                job.merged_weight_transfer,
-                lora_path=published_adapter.identity,
-                pause_generation=True,
+        if isinstance(job, TrainJobSpec):
+            if snapshot_sink is None or adapter_ready_sink is None:
+                raise RuntimeError("Distributed training requires a snapshot publisher")
+            if runtime.adapter_export_config is None:
+                raise RuntimeError("Trainer has no resident adapter export config")
+            final_metrics.update(
+                snapshot_sink(
+                    job,
+                    adapter_dtypes,
+                    runtime.adapter_export_config,
+                    _should_snapshot_optimizer(
+                        runtime,
+                        step=job.step,
+                        optimizer_save_interval=job.config.optimizer_save_interval,
+                        final_training_step=job.config.final_training_step,
+                    ),
+                )
             )
-        if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
-            torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
+            adapter_ready_sink()
+        else:
+            published_adapter = _save_lora_and_optimizer(
+                runtime,
+                adapter_dtypes=adapter_dtypes,
+                lora_path=job.lora_path,
+                optimizer_state_path=job.optimizer_state_path,
+                step=job.step,
+                optimizer_save_interval=job.config.optimizer_save_interval,
+                final_training_step=job.config.final_training_step,
+                adapter_ready=adapter_ready_sink,
+            )
+            if isinstance(job, MegatronMergedTrainingJob):
+                _sync_merged_weights_to_vllm(
+                    runtime,
+                    job.merged_weight_transfer,
+                    lora_path=published_adapter.identity,
+                    pause_generation=True,
+                )
+            if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
+                torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
         runtime.resident_training_session_id = job.training_session_id
         runtime.resident_policy_step = job.step
         runtime.optimizer_state_loaded = True
@@ -1082,22 +1107,27 @@ def _prepare_rl_training_state(
         and runtime.resident_training_session_id == job.training_session_id
         and runtime.resident_policy_step == job.source_policy_step
         and runtime.optimizer_state_loaded
+        and runtime.optimizer is not None
     )
     if state_is_resident:
-        if runtime.adapter_export_dtypes is None:
-            raise RuntimeError("Resident Megatron state has no LoRA export template")
+        if (
+            runtime.adapter_export_dtypes is None
+            or runtime.adapter_export_config is None
+        ):
+            raise RuntimeError("Resident Megatron state has no LoRA export metadata")
         return runtime.adapter_export_dtypes
 
     replacing_resident_state = runtime.resident_training_session_id is not None
     runtime.resident_training_session_id = None
     runtime.resident_policy_step = None
     runtime.optimizer_state_loaded = False
+    runtime.adapter_export_config = None
     if replacing_resident_state or not runtime.optimizer_persistent:
         runtime.optimizer = None
 
     _load_adapter_into_model(
         runtime.model,
-        job.lora_path,
+        job.source_adapter_path if isinstance(job, TrainJobSpec) else job.lora_path,
         runtime.rank,
         handler=runtime.model_support_handler,
         optimizer=runtime.optimizer,
@@ -1109,7 +1139,9 @@ def _prepare_rl_training_state(
     _load_optimizer(
         runtime,
         optimizer_state_path=job.optimizer_state_path,
-        adapter_path=job.lora_path,
+        adapter_path=(
+            job.source_adapter_path if isinstance(job, TrainJobSpec) else job.lora_path
+        ),
         adapter_step=job.source_policy_step,
         allow_missing=(
             job.source_policy_step == 0
@@ -1121,6 +1153,9 @@ def _prepare_rl_training_state(
     # Serialize the live LoRA dtype instead of perpetuating a source checkpoint's
     # PEFT-upcast FP32 dtype.
     runtime.adapter_export_dtypes = {}
+    runtime.adapter_export_config = load_adapter_config(
+        job.source_adapter_path if isinstance(job, TrainJobSpec) else job.lora_path
+    )
     runtime.resident_training_session_id = job.training_session_id
     runtime.resident_policy_step = job.source_policy_step
     runtime.optimizer_state_loaded = True
@@ -1281,6 +1316,22 @@ def _should_save_optimizer(
     if final_training_step is not None and step >= final_training_step:
         return True
     return step <= 1 or step % optimizer_save_interval == 0 or committed_step is None
+
+
+def _should_snapshot_optimizer(
+    runtime: TrainingRuntime,
+    *,
+    step: int,
+    optimizer_save_interval: int,
+    final_training_step: int | None,
+) -> bool:
+    return (
+        not runtime.optimizer_persistent
+        or optimizer_save_interval == 1
+        or step <= 1
+        or step % optimizer_save_interval == 0
+        or (final_training_step is not None and step >= final_training_step)
+    )
 
 
 def _should_save_optimizer_group(
@@ -1995,17 +2046,17 @@ def _prepare_kl_reference_logprobs(
             "provide kl_ref_adapter_path."
         )
 
+    current_adapter_path = (
+        job.source_adapter_path if isinstance(job, TrainJobSpec) else job.lora_path
+    )
     adapter_swapped = os.path.abspath(ref_adapter_path) != os.path.abspath(
-        job.lora_path
+        current_adapter_path
     )
     loaded_ref_adapter = False
-    restore_adapter = None
+    restore_parameters: list[tuple[torch.Tensor, torch.Tensor]] | None = None
     try:
         if adapter_swapped:
-            restore_adapter = load_lora_tensors_for_megatron(
-                job.lora_path,
-                handler=runtime.model_support_handler,
-            )
+            restore_parameters = _snapshot_trainable_parameters(runtime.model)
             _load_adapter_into_model(
                 runtime.model,
                 ref_adapter_path,
@@ -2026,13 +2077,27 @@ def _prepare_kl_reference_logprobs(
     finally:
         if loaded_ref_adapter:
             assert runtime.optimizer is not None
-            assert restore_adapter is not None
-            load_adapter_into_model(
-                runtime.model,
-                restore_adapter,
-                runtime.optimizer,
-                model_support_handler=runtime.model_support_handler,
-            )
+            assert restore_parameters is not None
+            with torch.no_grad():
+                for parameter, value in restore_parameters:
+                    parameter.copy_(value)
+                runtime.model_support_handler.zero_internal_padding_params(
+                    runtime.model
+                )
+            runtime.optimizer.reload_model_params()
+
+
+def _snapshot_trainable_parameters(
+    model_chunks: ModelChunks,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    seen: set[int] = set()
+    snapshot: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for chunk in model_chunks:
+        for parameter in chunk.parameters():
+            if parameter.requires_grad and id(parameter) not in seen:
+                seen.add(id(parameter))
+                snapshot.append((parameter, parameter.detach().clone()))
+    return snapshot
 
 
 def run_megatron_sft_step(

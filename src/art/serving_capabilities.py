@@ -3,7 +3,7 @@ from typing import Literal
 import httpx
 from pydantic import BaseModel, ConfigDict, model_validator
 
-ART_SERVING_PROTOCOL_VERSION = 2
+ART_SERVING_PROTOCOL_VERSION = 3
 
 ServingFeature = Literal[
     "binary_routed_experts",
@@ -11,7 +11,6 @@ ServingFeature = Literal[
     "inplace_lora_load",
     "in_flight_lora_updates",
     "policy_token_spans",
-    "exact_lora_worker_state",
 ]
 
 
@@ -25,7 +24,6 @@ class ServingCapabilities(BaseModel):
     inplace_lora_load: bool = False
     in_flight_lora_updates: bool = False
     policy_token_spans: bool = False
-    exact_lora_worker_state: bool = False
 
     @model_validator(mode="after")
     def _validate_protocol(self) -> "ServingCapabilities":

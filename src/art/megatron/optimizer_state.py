@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import ExitStack, asynccontextmanager, contextmanager
+import copy
 import fcntl
 import hashlib
 import json
@@ -30,6 +31,7 @@ OPTIMIZER_GENERATION_LEASE_PREFIX = ".lease-"
 OPTIMIZER_TRASH_PREFIX = ".trash-"
 OPTIMIZER_ORPHAN_GRACE_S = 3600.0
 ADAPTER_PUBLICATION_ACK = ".optimizer-published.json"
+ADAPTER_LATEST_POINTER = "latest-adapter.json"
 ADAPTER_PUBLICATION_TIMEOUT_ENV = "ART_ADAPTER_PUBLICATION_TIMEOUT_S"
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _GENERATION_PATTERN = r"step-\d{8,}-[0-9a-f]{32}"
@@ -61,10 +63,25 @@ class MegatronResumeStep(_OptimizerRecord):
     quarantined_lora_steps: tuple[int, ...] = ()
 
 
+class CheckpointFile(_OptimizerRecord):
+    name: Literal["adapter_config.json", "adapter_model.safetensors"]
+    size_bytes: int = Field(gt=0)
+
+
 class OptimizerAdapter(_OptimizerRecord):
     identity: str = Field(min_length=1)
+    training_session_id: str = Field(min_length=1)
     step: int = Field(ge=0)
-    sha256: str = Field(pattern=_SHA256_PATTERN)
+    generation_id: str = Field(pattern=f"^{_GENERATION_PATTERN}$")
+    files: tuple[CheckpointFile, ...]
+
+    @model_validator(mode="after")
+    def _validate_files(self) -> "OptimizerAdapter":
+        if _generation_step(self.generation_id) != self.step:
+            raise ValueError("adapter generation ID and policy step must match")
+        if tuple(file.name for file in self.files) != _ADAPTER_FILES:
+            raise ValueError("adapter manifest must cover every payload file once")
+        return self
 
 
 class OptimizerTopology(_OptimizerRecord):
@@ -80,7 +97,6 @@ class OptimizerTopology(_OptimizerRecord):
 class OptimizerShard(_OptimizerRecord):
     rank: int = Field(ge=0)
     size_bytes: int = Field(gt=0)
-    sha256: str = Field(pattern=_SHA256_PATTERN)
     layout_sha256: str = Field(pattern=_SHA256_PATTERN)
 
 
@@ -102,22 +118,24 @@ class _OptimizerGenerationRecord(_PairedOptimizerRecord):
     def _validate_generation_step(self) -> "_OptimizerGenerationRecord":
         if int(self.generation.split("-", 2)[1]) != self.step:
             raise ValueError("optimizer generation name and step must match")
+        if self.generation != self.adapter.generation_id:
+            raise ValueError("optimizer and adapter generation IDs must match")
         return self
 
 
 class OptimizerGenerationManifest(_OptimizerGenerationRecord):
-    format_version: Literal[2] = 2
+    format_version: Literal[3] = 3
     runtime_sha256: str = Field(pattern=_SHA256_PATTERN)
     topology: OptimizerTopology
     shards: tuple[OptimizerShard, ...]
 
 
 class OptimizerGenerationPointer(_OptimizerGenerationRecord):
-    format_version: Literal[2] = 2
+    format_version: Literal[3] = 3
 
 
 class OptimizerPolicyPointer(_OptimizerRecord):
-    format_version: Literal[1] = 1
+    format_version: Literal[2] = 2
     policy_adapter: OptimizerAdapter
     optimizer_anchor: OptimizerGenerationPointer | None
 
@@ -127,9 +145,8 @@ class OptimizerPolicyPointer(_OptimizerRecord):
             raise ValueError("policy alias must advance beyond checkpoint 0")
         if self.optimizer_anchor is not None and (
             self.policy_adapter.step <= self.optimizer_anchor.step
-            or self.policy_adapter.sha256 != self.optimizer_anchor.adapter.sha256
         ):
-            raise ValueError("policy alias does not match its optimizer anchor")
+            raise ValueError("policy alias must be newer than its optimizer anchor")
         return self
 
 
@@ -137,6 +154,27 @@ class CommittedOptimizerPolicy(_OptimizerRecord):
     policy_adapter: OptimizerAdapter
     state_adapter: OptimizerAdapter | None
     optimizer_anchor: OptimizerGenerationPointer | None
+
+
+class OptimizerStateSnapshot(_OptimizerRecord):
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    generation_id: str = Field(pattern=f"^{_GENERATION_PATTERN}$")
+    step: int = Field(ge=1)
+    rank: int = Field(ge=0)
+    world_size: int = Field(gt=0)
+    runtime_sha256: str = Field(pattern=_SHA256_PATTERN)
+    layout_sha256: str = Field(pattern=_SHA256_PATTERN)
+    topology: OptimizerTopology
+    state_dict: Any
+
+    @model_validator(mode="after")
+    def _validate_identity(self) -> "OptimizerStateSnapshot":
+        if _generation_step(self.generation_id) != self.step:
+            raise ValueError("optimizer snapshot generation and step must match")
+        if self.rank >= self.world_size or self.topology.world_size != self.world_size:
+            raise ValueError("optimizer snapshot rank/topology mismatch")
+        return self
 
 
 def optimizer_shard_name(rank: int, world_size: int) -> str:
@@ -202,6 +240,60 @@ def _generation_step(generation: str) -> int:
     return int(generation.split("-", 2)[1])
 
 
+def _adapter_generation_lease_path(output_dir: str | Path, generation: str) -> Path:
+    _validate_generation_name(generation)
+    return Path(output_dir).absolute() / "megatron_runtime" / "leases" / generation
+
+
+@contextmanager
+def adapter_generation_lease(adapter: OptimizerAdapter) -> Iterator[None]:
+    path = _adapter_generation_lease_path(
+        Path(adapter.identity).absolute().parent.parent,
+        adapter.generation_id,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as lease_file:
+        fcntl.flock(lease_file.fileno(), fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(lease_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _adapter_retention_leases(
+    output_dir: str, protected_steps: set[int]
+) -> Iterator[set[int]]:
+    checkpoints = Path(output_dir) / "checkpoints"
+    with ExitStack() as leases:
+        if checkpoints.is_dir():
+            for checkpoint in checkpoints.iterdir():
+                if (
+                    not checkpoint.is_dir()
+                    or not checkpoint.name.isdigit()
+                    or (step := int(checkpoint.name)) in protected_steps
+                ):
+                    continue
+                publication = read_adapter_publication(
+                    checkpoint, step=step, verify_files=False
+                )
+                generation = (
+                    publication.generation_id
+                    if publication is not None
+                    else _initial_generation_id(checkpoint, step)
+                )
+                path = _adapter_generation_lease_path(output_dir, generation)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                lease = leases.enter_context(path.open("a+b"))
+                try:
+                    fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    protected_steps.add(step)
+                else:
+                    leases.callback(fcntl.flock, lease.fileno(), fcntl.LOCK_UN)
+        yield protected_steps
+
+
 @contextmanager
 def optimizer_model_lease(optimizer_state_path: str | Path) -> Iterator[None]:
     with _optimizer_model_lock_path(optimizer_state_path).open("a+b") as lock_file:
@@ -239,10 +331,6 @@ def optimizer_shard_path(generation_path: Path, *, rank: int, world_size: int) -
     return generation_path / optimizer_shard_name(rank, world_size)
 
 
-def hash_optimizer_shard(path: Path) -> str:
-    return _hash_files((path,))
-
-
 def _adapter_checkpoint_files(path: str | Path) -> tuple[Path, tuple[Path, ...]]:
     adapter_path = Path(path)
     files = tuple(adapter_path / name for name in _ADAPTER_FILES)
@@ -252,19 +340,35 @@ def _adapter_checkpoint_files(path: str | Path) -> tuple[Path, tuple[Path, ...]]
     return adapter_path, files
 
 
-def hash_adapter_checkpoint(path: str | Path) -> str:
-    adapter_path, files = _adapter_checkpoint_files(path)
-    return _hash_files(files, relative_to=adapter_path)
+def _adapter_file_records(path: str | Path) -> tuple[CheckpointFile, ...]:
+    _adapter_path, files = _adapter_checkpoint_files(path)
+    return tuple(
+        CheckpointFile(name=cast(Any, file.name), size_bytes=file.stat().st_size)
+        for file in files
+    )
 
 
-def optimizer_adapter(path: str | Path, step: int) -> OptimizerAdapter:
+def _initial_generation_id(path: str | Path, step: int) -> str:
+    suffix = hashlib.sha256(str(Path(path).absolute()).encode()).hexdigest()[:32]
+    return f"step-{step:08d}-{suffix}"
+
+
+def optimizer_adapter(
+    path: str | Path,
+    step: int,
+    *,
+    training_session_id: str = "legacy",
+    generation_id: str | None = None,
+) -> OptimizerAdapter:
     if step < 0:
         raise ValueError(f"Adapter step must be non-negative, got {step}")
     identity = str(Path(path).absolute())
     return OptimizerAdapter(
         identity=identity,
+        training_session_id=training_session_id,
         step=step,
-        sha256=hash_adapter_checkpoint(identity),
+        generation_id=generation_id or _initial_generation_id(identity, step),
+        files=_adapter_file_records(identity),
     )
 
 
@@ -294,7 +398,11 @@ def _canonical_adapter_path(path: str | Path, step: int) -> Path:
 
 
 def publish_adapter_checkpoint(
-    staging_path: str | Path, *, step: int
+    staging_path: str | Path,
+    *,
+    step: int,
+    training_session_id: str = "legacy",
+    generation_id: str | None = None,
 ) -> OptimizerAdapter:
     staging = Path(staging_path).absolute()
     canonical = canonical_adapter_path(staging, step)
@@ -307,13 +415,31 @@ def publish_adapter_checkpoint(
     _fsync_directory(staging)
     adapter = OptimizerAdapter(
         identity=str(canonical),
+        training_session_id=training_session_id,
         step=step,
-        sha256=hash_adapter_checkpoint(staging),
+        generation_id=generation_id or _initial_generation_id(canonical, step),
+        files=_adapter_file_records(staging),
     )
     _write_model_atomic(staging / ADAPTER_PUBLICATION_ACK, adapter)
     canonical.parent.mkdir(parents=True, exist_ok=True)
     os.replace(staging, canonical)
     _fsync_directory(canonical.parent)
+    _write_model_atomic(
+        canonical.parent.parent / "megatron_runtime" / ADAPTER_LATEST_POINTER,
+        adapter,
+    )
+    return adapter
+
+
+def read_latest_adapter_pointer(output_dir: str | Path) -> OptimizerAdapter | None:
+    pointer = Path(output_dir) / "megatron_runtime" / ADAPTER_LATEST_POINTER
+    if not pointer.exists():
+        return None
+    try:
+        adapter = OptimizerAdapter.model_validate_json(pointer.read_text("utf-8"))
+    except Exception as error:
+        raise RuntimeError(f"Invalid adapter generation pointer: {pointer}") from error
+    _validate_adapter_publication(adapter, verify_files=True)
     return adapter
 
 
@@ -347,12 +473,12 @@ def read_adapter_publication(
             f"expected_identity={expected_identity!r}, expected_step={step}"
         )
     if verify_files:
-        current_digest = hash_adapter_checkpoint(canonical)
-        if adapter.sha256 != current_digest:
+        current_files = _adapter_file_records(canonical)
+        if adapter.files != current_files:
             raise RuntimeError(
-                "Adapter publication acknowledgment digest does not match the "
-                f"canonical adapter: acknowledged={adapter.sha256}, "
-                f"current={current_digest}"
+                "Adapter publication acknowledgment does not match canonical "
+                f"file coverage and sizes: acknowledged={adapter.files}, "
+                f"current={current_files}"
             )
     return adapter
 
@@ -375,20 +501,6 @@ def _validate_adapter_publication(
         raise RuntimeError(
             f"Optimizer adapter publication is not acknowledged: {adapter.model_dump()}"
         )
-
-
-def _hash_files(paths: tuple[Path, ...], *, relative_to: Path | None = None) -> str:
-    digest = hashlib.sha256()
-    for path in paths:
-        name = str(
-            path.relative_to(relative_to) if relative_to is not None else path.name
-        )
-        digest.update(len(name).to_bytes(8, "big"))
-        digest.update(name.encode())
-        with path.open("rb") as input_file:
-            while chunk := input_file.read(8 * 1024 * 1024):
-                digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _fsync_directory(path: Path) -> None:
@@ -483,6 +595,14 @@ def _resolve_policy_pointer(
             f"current={pointer.model_dump() if pointer else None}"
         )
     _validate_adapter_publication(policy.policy_adapter, verify_files=True)
+    if pointer is not None and any(
+        not os.path.samefile(
+            Path(policy.policy_adapter.identity) / name,
+            Path(pointer.adapter.identity) / name,
+        )
+        for name in _ADAPTER_FILES
+    ):
+        raise RuntimeError("Optimizer policy alias does not reuse its anchor payload")
     expected = Path(
         get_step_checkpoint_dir(str(path.absolute().parent), policy.policy_adapter.step)
     ).absolute()
@@ -530,12 +650,12 @@ def resolve_committed_optimizer_policy(
     path = Path(optimizer_state_path)
     with _committed_generation_lease(path) as pointer:
         if pointer is not None:
-            _validate_pointer_manifest(
-                pointer,
-                _read_manifest(
-                    optimizer_generation_path(optimizer_state_path, pointer.generation)
-                ),
+            generation_path = optimizer_generation_path(
+                optimizer_state_path, pointer.generation
             )
+            manifest = _read_manifest(generation_path)
+            _validate_pointer_manifest(pointer, manifest)
+            _validate_generation_files(generation_path, manifest, local_rank=None)
             _validate_adapter_publication(pointer.adapter, verify_files=True)
         return _committed_policy(
             path,
@@ -563,12 +683,17 @@ def commit_optimizer_policy_advance(
                 "Stale no-op policy writer: "
                 f"expected={expected_step}, current={current.policy_adapter.step}"
             )
-        if (
-            adapter.step != expected_step + 1
-            or adapter.sha256 != current.policy_adapter.sha256
+        if adapter.step != expected_step + 1:
+            raise RuntimeError("Policy checkpoint must advance exactly one step")
+        if any(
+            not os.path.samefile(
+                Path(current.policy_adapter.identity) / name,
+                Path(adapter.identity) / name,
+            )
+            for name in _ADAPTER_FILES
         ):
             raise RuntimeError(
-                "No-op policy checkpoint must advance one step without changing bytes"
+                "No-op policy checkpoint must reuse immutable adapter payloads"
             )
         _validate_adapter_publication(adapter, verify_files=True)
         policy = OptimizerPolicyPointer(
@@ -630,13 +755,14 @@ def build_optimizer_manifest(
     runtime_sha256: str,
     world_size: int,
     shards: list[OptimizerShard],
+    topology: OptimizerTopology | None = None,
 ) -> OptimizerGenerationManifest:
     manifest = OptimizerGenerationManifest(
         generation=generation,
         step=step,
         adapter=adapter,
         runtime_sha256=runtime_sha256,
-        topology=current_optimizer_topology(world_size),
+        topology=topology or current_optimizer_topology(world_size),
         shards=tuple(shards),
     )
     _ordered_manifest_shards(manifest)
@@ -692,14 +818,6 @@ def _validate_generation_files(
         if local_rank < 0 or local_rank >= len(ordered):
             raise RuntimeError(
                 f"Invalid local optimizer rank {local_rank} for {len(ordered)} shards"
-            )
-        local_shard = ordered[local_rank]
-        name = optimizer_shard_name(local_rank, manifest.topology.world_size)
-        actual_sha256 = hash_optimizer_shard(generation_path / name)
-        if actual_sha256 != local_shard.sha256:
-            raise RuntimeError(
-                f"Optimizer shard checksum mismatch for {name}: "
-                f"expected={local_shard.sha256}, actual={actual_sha256}"
             )
     return ordered
 
@@ -771,6 +889,8 @@ def commit_optimizer_generation(
     manifest: OptimizerGenerationManifest,
     *,
     expected_pointer: OptimizerGenerationPointer | None,
+    expected_policy_step: int | None = None,
+    initial_adapter_path: str | None = None,
 ) -> Path:
     path = Path(optimizer_state_path)
     pending = optimizer_pending_generation_path(
@@ -786,6 +906,20 @@ def commit_optimizer_generation(
                 f"expected={expected_pointer.model_dump() if expected_pointer else None}, "
                 f"current={current_pointer.model_dump() if current_pointer else None}"
             )
+        if expected_policy_step is not None:
+            if initial_adapter_path is None:
+                raise ValueError("initial_adapter_path is required for lineage checks")
+            current_policy = _committed_policy(
+                path,
+                current_pointer,
+                initial_adapter_path=initial_adapter_path,
+            )
+            if current_policy.policy_adapter.step != expected_policy_step:
+                raise RuntimeError(
+                    "Stale optimizer writer: policy lineage changed before publication; "
+                    f"expected={expected_policy_step}, "
+                    f"current={current_policy.policy_adapter.step}"
+                )
         if current_pointer is not None and manifest.step <= current_pointer.step:
             raise RuntimeError(
                 "Optimizer generation step must advance monotonically: "
@@ -802,6 +936,10 @@ def commit_optimizer_generation(
             adapter=manifest.adapter,
         )
         _write_model_atomic(path / OPTIMIZER_POINTER, pointer)
+        policy_path = path / OPTIMIZER_POLICY_POINTER
+        if policy_path.exists():
+            policy_path.unlink()
+            _fsync_directory(path)
     return committed
 
 
@@ -976,7 +1114,8 @@ def optimizer_retention_lease(
                     path, retain_adapter_steps=protected
                 )
             )
-        yield protected
+        with _adapter_retention_leases(output_dir, protected):
+            yield protected
 
 
 def _validate_generation(
@@ -1265,20 +1404,85 @@ def _validated_runtime_layouts(
     return runtime_digests.pop(), tuple(record["layout_sha256"] for record in records)
 
 
+def _snapshot_optimizer_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu", copy=True)
+    if isinstance(value, dict):
+        return {
+            _snapshot_optimizer_value(key): _snapshot_optimizer_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_snapshot_optimizer_value(item) for item in value]
+    if isinstance(value, tuple):
+        return (
+            type(value)(*map(_snapshot_optimizer_value, value))
+            if hasattr(value, "_fields")
+            else tuple(_snapshot_optimizer_value(item) for item in value)
+        )
+    return copy.deepcopy(value)
+
+
+def snapshot_optimizer_state(
+    runtime: Any,
+    *,
+    generation_id: str,
+    step: int,
+) -> OptimizerStateSnapshot:
+    if runtime.optimizer is None:
+        raise RuntimeError("Cannot snapshot an uninitialized optimizer")
+    records = _all_gather_objects(runtime, _runtime_layout_record(runtime))
+    runtime_sha256, layouts = _validated_runtime_layouts(runtime, records)
+    return OptimizerStateSnapshot(
+        generation_id=generation_id,
+        step=step,
+        rank=runtime.rank,
+        world_size=runtime.world_size,
+        runtime_sha256=runtime_sha256,
+        layout_sha256=layouts[runtime.rank],
+        topology=current_optimizer_topology(runtime.world_size),
+        state_dict=_snapshot_optimizer_value(runtime.optimizer.state_dict()),
+    )
+
+
+def write_optimizer_snapshot_shard(
+    snapshot: OptimizerStateSnapshot,
+    *,
+    optimizer_state_path: str,
+) -> OptimizerShard:
+    pending = optimizer_pending_generation_path(
+        optimizer_state_path, snapshot.generation_id
+    )
+    shard_path = optimizer_shard_path(
+        pending,
+        rank=snapshot.rank,
+        world_size=snapshot.world_size,
+    )
+    temporary = shard_path.with_name(f".{shard_path.name}.{os.getpid()}.tmp")
+    pending.mkdir(parents=True, exist_ok=True)
+    try:
+        with temporary.open("wb") as output:
+            torch.save(snapshot.state_dict, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, shard_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return OptimizerShard(
+        rank=snapshot.rank,
+        size_bytes=shard_path.stat().st_size,
+        layout_sha256=snapshot.layout_sha256,
+    )
+
+
 def _loaded_adapter(adapter_path: str, step: int) -> OptimizerAdapter:
     path = Path(adapter_path).absolute()
     canonical = _canonical_adapter_path(path, step)
     adapter = read_adapter_publication(canonical, step=step, verify_files=True)
     if adapter is None:
         adapter = optimizer_adapter(canonical, step)
-    if path == canonical:
-        return adapter
-    loaded_digest = hash_adapter_checkpoint(path)
-    if loaded_digest != adapter.sha256:
-        raise RuntimeError(
-            "Loaded adapter differs from its canonical checkpoint: "
-            f"loaded={loaded_digest}, canonical={adapter.sha256}"
-        )
+    if path != canonical:
+        raise RuntimeError("Optimizer state must load an immutable canonical adapter")
     return adapter
 
 
@@ -1339,7 +1543,6 @@ def _write_optimizer_shard(
     return OptimizerShard(
         rank=runtime.rank,
         size_bytes=shard_path.stat().st_size,
-        sha256=hash_optimizer_shard(shard_path),
         layout_sha256=layout_sha256,
     )
 
@@ -1366,7 +1569,7 @@ def _save_optimizer_state_locked(
                 None if expected is None else expected.model_dump(mode="json")
             )
         return (
-            new_optimizer_generation(step),
+            adapter.generation_id,
             runtime_sha256,
             layouts,
             expected_data,
@@ -1659,16 +1862,7 @@ def _validate_committed_generation(
     generation_path = optimizer_generation_path(str(path), pointer.generation)
     manifest = _read_manifest(generation_path)
     _validate_pointer_manifest(pointer, manifest)
-    for shard in _validate_generation_files(generation_path, manifest, local_rank=None):
-        shard_path = generation_path / optimizer_shard_name(
-            shard.rank, manifest.topology.world_size
-        )
-        digest = hash_optimizer_shard(shard_path)
-        if digest != shard.sha256:
-            raise RuntimeError(
-                f"Optimizer shard checksum mismatch for {shard_path.name}: "
-                f"expected={shard.sha256}, actual={digest}"
-            )
+    _validate_generation_files(generation_path, manifest, local_rank=None)
     _validate_adapter_publication(pointer.adapter, verify_files=True)
 
 
@@ -1871,7 +2065,7 @@ def _recover_uncommitted_initial_transaction(
         if _allow_unpaired_resume():
             return ()
 
-        tag = f"initial_step_0001_{adapter.sha256[:16]}"
+        tag = f"initial_step_0001_{adapter.generation_id.rsplit('-', 1)[-1][:16]}"
         previous = Path(output_dir) / "unpaired_checkpoints" / tag / checkpoint.name
         if previous.exists():
             tag = f"{tag}_{uuid4().hex}"
@@ -2035,10 +2229,22 @@ def prepare_megatron_resume_state(
     optimizer_state_path: str,
 ) -> MegatronResumeStep:
     with optimizer_model_lease(optimizer_state_path):
-        return _prepare_megatron_resume_state_locked(
+        info = _prepare_megatron_resume_state_locked(
             output_dir=output_dir,
             optimizer_state_path=optimizer_state_path,
         )
+        latest = Path(output_dir) / "megatron_runtime" / ADAPTER_LATEST_POINTER
+        if info.step == 0:
+            if latest.exists():
+                latest.unlink()
+                _fsync_directory(latest.parent)
+        else:
+            policy = resolve_committed_optimizer_policy(
+                optimizer_state_path,
+                initial_adapter_path=get_step_checkpoint_dir(output_dir, 0),
+            )
+            _write_model_atomic(latest, policy.policy_adapter)
+        return info
 
 
 def format_megatron_resume_message(info: MegatronResumeStep) -> str:

@@ -17,7 +17,7 @@ from art_vllm_runtime.binary_routes import (
 )
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
-ART_SERVING_PROTOCOL_VERSION = 2
+ART_SERVING_PROTOCOL_VERSION = 3
 _runtime_state: dict[str, object] = {}
 
 
@@ -159,11 +159,6 @@ def _patch_art_runtime_routes() -> None:
         capture_routed_experts,
         encode_routed_experts_response,
     )
-    from art_vllm_runtime.lora_state import (
-        LoraWorkerStateRequest,
-        LoraWorkerStateResponse,
-        query_lora_worker_state,
-    )
 
     if getattr(api_server, "_art_runtime_routes_patched", False):
         return
@@ -222,15 +217,6 @@ def _patch_art_runtime_routes() -> None:
         async def art_state() -> JSONResponse:
             return JSONResponse(content=dict(_runtime_state))
 
-        @router.post(
-            "/art/lora_worker_state",
-            response_model=LoraWorkerStateResponse,
-        )
-        async def lora_worker_state(
-            body: LoraWorkerStateRequest, raw_request: Request
-        ) -> LoraWorkerStateResponse:
-            return await query_lora_worker_state(engine(raw_request), body)
-
         @router.get("/art/metrics")
         async def art_metrics() -> JSONResponse:
             from art_vllm_runtime.metrics import get_art_metrics_snapshot
@@ -253,7 +239,6 @@ def _patch_art_runtime_routes() -> None:
                     "inplace_lora_load": True,
                     "in_flight_lora_updates": True,
                     "policy_token_spans": True,
-                    "exact_lora_worker_state": True,
                 }
             )
 
@@ -285,7 +270,7 @@ def _patch_art_runtime_routes() -> None:
             }
             return Response(
                 content=encode_routed_experts_response(response.body, routes),
-                media_type="application/vnd.art.routed-experts-v1",
+                media_type="application/vnd.art.routed-experts-v2",
                 headers=headers,
             )
 
@@ -321,6 +306,7 @@ def _patch_art_runtime_routes() -> None:
             coordinator = lora_update_coordinator(models, engine_client)
             await coordinator.begin_update(lora_slot)
             try:
+                # vLLM completes this collective only after every engine worker loads.
                 load_result = await models.load_lora_adapter(
                     LoadLoRAAdapterRequest(
                         lora_name=lora_slot,
@@ -512,24 +498,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         os.environ.pop(PIPELINE_ROUTES_ENV, None)
 
-    from art_vllm_runtime.lora_state import (
-        ART_LORA_WORKER_EXTENSION,
-        configure_lora_worker_identity,
-    )
-
-    if "worker_extension_cls" in server_args:
-        raise ValueError("worker_extension_cls must be an engine argument")
-    configured_extension = engine_args.get("worker_extension_cls")
-    if configured_extension not in (None, "", ART_LORA_WORKER_EXTENSION):
-        raise ValueError("ART vLLM runtime requires its LoRA state worker extension")
-    engine_args["worker_extension_cls"] = ART_LORA_WORKER_EXTENSION
     process_uuid = args.process_uuid or uuid.uuid4().hex
-    configure_lora_worker_identity(
-        process_uuid=process_uuid,
-        generation=args.replica_generation,
-        node_rank=args.node_rank,
-        data_parallel_size=int(engine_args.get("data_parallel_size", 1)),
-    )
 
     _runtime_state.update(
         runtime="art_vllm",

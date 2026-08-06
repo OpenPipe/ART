@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Awaitable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
 import inspect
@@ -309,6 +309,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._checkpoint_lease_counts: Counter[int] = Counter()
         self._scheduled_eval_steps: set[int] = set()
         self._scheduled_eval_leases: dict[int, AsyncExitStack] = {}
+        self._checkpoint_log_tasks: set[asyncio.Task[None]] = set()
+        self._checkpoint_log_failure: BaseException | None = None
 
         self.state = PipelineState()
         self._scenario_lock = asyncio.Lock()
@@ -499,6 +501,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 await self._release_all_scheduled_eval_leases()
             except BaseException as exc:
                 cleanup_failures.append(exc)
+            if self._checkpoint_log_tasks:
+                await asyncio.gather(
+                    *tuple(self._checkpoint_log_tasks), return_exceptions=True
+                )
+            if self._checkpoint_log_failure is not None:
+                cleanup_failures.append(self._checkpoint_log_failure)
             if cleanup_failures:
                 if primary_failure is not None:
                     raise BaseExceptionGroup(
@@ -1939,6 +1947,27 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if isinstance(checkpoint_path, str) and checkpoint_path
             else Path(self.model._get_output_dir()) / "checkpoints" / f"{step:04d}"
         )
+        ready = getattr(result, "checkpoint_ready", None)
+        if ready is not None:
+            task = asyncio.create_task(
+                self._log_checkpoint_when_ready(step, path, ready)
+            )
+            self._checkpoint_log_tasks.add(task)
+            task.add_done_callback(self._checkpoint_log_done)
+            return
+        self._record_checkpoint_saved(step, path)
+
+    async def _log_checkpoint_when_ready(
+        self, step: int, path: Path, ready: Awaitable[None]
+    ) -> None:
+        await ready
+        if not path.is_dir():
+            raise RuntimeError(
+                f"checkpoint {step} materialized without directory {path}"
+            )
+        self._record_checkpoint_saved(step, path)
+
+    def _record_checkpoint_saved(self, step: int, path: Path) -> None:
         if not path.exists():
             return
         self._log_checkpoint_history(
@@ -1948,6 +1977,15 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 CHECKPOINT_CREATED_AT_METRIC: path.stat().st_ctime,
             },
         )
+
+    def _checkpoint_log_done(self, task: asyncio.Task[None]) -> None:
+        self._checkpoint_log_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None and self._checkpoint_log_failure is None:
+            self._checkpoint_log_failure = error
+            self.request_stop()
 
     async def _log_checkpoint_eval_completed(self, step: int) -> None:
         self._log_checkpoint_history(
