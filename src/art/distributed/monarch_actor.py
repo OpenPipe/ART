@@ -423,9 +423,11 @@ class RolloutHostService(Actor):
             await self._vllm_launcher.stop_member(replica_id, member_id, generation)
 
     @resilient_endpoint
-    async def prepare_adapter_receive(self, generation_id: str, template_path: str):
+    async def prepare_adapter_receive(
+        self, generation_id: str, template_path: str, tensor_dtype: str
+    ):
         return await asyncio.to_thread(
-            self._receiver().prepare, generation_id, template_path
+            self._receiver().prepare, generation_id, template_path, tensor_dtype
         )
 
     @resilient_endpoint

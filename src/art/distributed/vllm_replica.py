@@ -95,7 +95,7 @@ class ReplicaHostLauncher(Protocol):
     ) -> None: ...
 
     async def prepare_adapter_receive(
-        self, generation_id: str, template_path: str
+        self, generation_id: str, template_path: str, tensor_dtype: str
     ) -> AdapterTransferTarget: ...
 
     async def wait_adapter_receive(
@@ -345,14 +345,14 @@ class ReplicaManager:
         return self._state
 
     async def prepare_adapter_transfer(
-        self, generation_id: str, template_path: str
+        self, generation_id: str, template_path: str, tensor_dtype: str
     ) -> tuple[AdapterTransferTarget, ...]:
         return tuple(
             await asyncio.gather(
                 *(
                     asyncio.wait_for(
                         self._launchers[host_id].prepare_adapter_receive(
-                            generation_id, template_path
+                            generation_id, template_path, tensor_dtype
                         ),
                         self._rpc_timeout_s,
                     )

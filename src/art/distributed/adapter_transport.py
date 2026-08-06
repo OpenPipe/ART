@@ -74,6 +74,7 @@ _SAFETENSORS_DTYPES = {
     "F64": torch.float64,
     "C64": torch.complex64,
 }
+_TRAINING_DTYPES = {"bfloat16": "BF16", "float16": "F16", "float32": "F32"}
 
 
 def _load_nixl() -> tuple[Any, Any, Any]:
@@ -116,7 +117,7 @@ def _new_agent(name: str) -> Any:
 
 
 def _read_adapter_template(
-    path: str,
+    path: str, tensor_dtype: str
 ) -> tuple[tuple[AdapterTensorSpec, ...], dict[str, Any]]:
     root = Path(path)
     with (root / "adapter_model.safetensors").open("rb") as source:
@@ -127,11 +128,17 @@ def _read_adapter_template(
         if header_length > 64 * 1024 * 1024:
             raise RuntimeError(f"Unreasonable safetensors header in {path}")
         header = json.loads(source.read(header_length))
+    try:
+        dtype = _TRAINING_DTYPES[tensor_dtype]
+    except KeyError:
+        raise RuntimeError(
+            f"Unsupported adapter transport dtype: {tensor_dtype}"
+        ) from None
     specs = tuple(
         AdapterTensorSpec(
             name=name,
             shape=tuple(int(dim) for dim in value["shape"]),
-            dtype=str(value["dtype"]),
+            dtype=dtype,
         )
         for name, value in sorted(header.items())
         if name != "__metadata__"
@@ -220,10 +227,12 @@ class NixlAdapterReceiver:
         self._notifications: set[str] = set()
         self._notification_lock = Lock()
 
-    def prepare(self, generation_id: str, template_path: str) -> AdapterTransferTarget:
+    def prepare(
+        self, generation_id: str, template_path: str, tensor_dtype: str
+    ) -> AdapterTransferTarget:
         if generation_id in self._pending:
             raise RuntimeError(f"Adapter receive already exists: {generation_id}")
-        specs, config = _read_adapter_template(template_path)
+        specs, config = _read_adapter_template(template_path, tensor_dtype)
         blocks, tensors = _allocate_blocks(specs)
         agent = self._require_agent()
         registration = agent.register_memory(blocks, backends=["UCX"])

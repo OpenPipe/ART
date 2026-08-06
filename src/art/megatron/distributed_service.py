@@ -583,6 +583,7 @@ class DistributedMegatronService:
                     ).prepare_adapter_transfer(
                         generation_id,
                         get_step_checkpoint_dir(self.output_dir, 0),
+                        trainer.runtime_spec.dtype,
                     )
                 values = {
                     key: value
