@@ -13,10 +13,11 @@ from typing import Any, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-PACKED_BATCH_FORMAT = "art_packed_rl_v1"
+PACKED_BATCH_FORMAT = "art_packed_rl_v2"
 _DTYPE_BYTES = {
     "bool": 1,
     "uint8": 1,
+    "uint16": 2,
     "int8": 1,
     "int16": 2,
     "float16": 2,
@@ -55,7 +56,7 @@ class TensorSpec(_Contract):
 class MoeRoutingReplaySpec(_Contract):
     num_layers: int = Field(ge=1)
     topk: int = Field(ge=1)
-    num_experts: int = Field(ge=1)
+    num_experts: int = Field(ge=1, le=65_536)
     packed_tokens: int = Field(ge=0)
 
 
@@ -140,22 +141,18 @@ class PackedBatchRef(_Contract):
                 or specs["original_logprobs"].shape != core_shape
             ):
                 raise ValueError("original_logprobs dtype or shape is invalid")
-        replay_names = {
-            "moe_routing_replay/expert_indices",
-            "moe_routing_replay/token_mask",
-        }
+        replay_names = {"moe_routing_replay/expert_indices"}
         if self.moe_routing_replay is not None:
             if not replay_names <= specs.keys():
                 raise ValueError("MoE routing replay manifest is incomplete")
             expected_optional |= replay_names
             replay = self.moe_routing_replay
-            if (
-                specs["moe_routing_replay/expert_indices"].dtype != "int32"
-                or specs["moe_routing_replay/expert_indices"].shape
-                != core_shape + (replay.num_layers, replay.topk)
-                or specs["moe_routing_replay/token_mask"].dtype != "bool"
-                or specs["moe_routing_replay/token_mask"].shape != core_shape
-            ):
+            replay_dtype = "uint8" if replay.num_experts <= 256 else "uint16"
+            if specs[
+                "moe_routing_replay/expert_indices"
+            ].dtype != replay_dtype or specs[
+                "moe_routing_replay/expert_indices"
+            ].shape != (replay.num_layers, *core_shape, replay.topk):
                 raise ValueError("MoE routing replay tensor dtype or shape is invalid")
         if set(specs) != set(core_dtypes) | expected_optional:
             raise ValueError("packed-batch tensor manifest has unexpected tensors")
@@ -890,10 +887,9 @@ def _flatten_packed_tensors(
     replay = tensors.get("moe_routing_replay")
     replay_spec = None
     if replay is not None:
-        for name in ("expert_indices", "token_mask"):
-            tensor = getattr(replay, name)
-            _validate_tensor(f"moe_routing_replay/{name}", tensor, torch)
-            flat.append((f"moe_routing_replay/{name}", tensor))
+        tensor = replay.expert_indices
+        _validate_tensor("moe_routing_replay/expert_indices", tensor, torch)
+        flat.append(("moe_routing_replay/expert_indices", tensor))
         replay_spec = MoeRoutingReplaySpec(
             num_layers=replay.num_layers,
             topk=replay.topk,
@@ -1008,9 +1004,6 @@ def _unflatten_packed_tensors(flat: dict[str, Any], ref: PackedBatchRef) -> Any:
     tensors["moe_routing_replay"] = (
         PackedMoeRoutingReplay(
             expert_indices=flat["moe_routing_replay/expert_indices"],
-            token_mask=flat["moe_routing_replay/token_mask"],
-            num_layers=replay.num_layers,
-            topk=replay.topk,
             num_experts=replay.num_experts,
             pack_stats=MoeRoutingPackStats(packed_tokens=replay.packed_tokens),
         )

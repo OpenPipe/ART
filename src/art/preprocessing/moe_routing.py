@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from openai.types.chat.chat_completion import Choice
@@ -13,9 +13,36 @@ ART_MOE_ROUTING_METADATA_KEY = "art_moe_routing"
 PROMPT_TOKEN_IDS_KEY = "prompt_token_ids"
 COMPLETION_TOKEN_IDS_KEY = "completion_token_ids"
 ROUTED_EXPERTS_KEY = "routed_experts"
+NUM_EXPERTS_KEY = "num_experts"
 
-MoeRouteArray = np.ndarray
-MISSING_EXPERT_ID = -1
+
+class MoeRouteArray(np.ndarray):
+    num_experts: int
+
+    def __new__(
+        cls,
+        array: np.ndarray,
+        *,
+        num_experts: int,
+        validate: bool = True,
+    ) -> "MoeRouteArray":
+        result = np.asarray(array).view(cls)
+        result.num_experts = int(num_experts)
+        if validate:
+            _validate_route_array(result, field_name=ROUTED_EXPERTS_KEY)
+        result.flags.writeable = False
+        return result
+
+    def __array_finalize__(self, source: np.ndarray | None) -> None:
+        self.num_experts = int(getattr(source, "num_experts", 0))
+
+
+def moe_route_dtype(num_experts: int) -> np.dtype[Any]:
+    if not 1 <= num_experts <= 65_536:
+        raise RuntimeError(
+            f"MoE routing requires num_experts in [1, 65536], got {num_experts}"
+        )
+    return np.dtype(np.uint8 if num_experts <= 256 else np.uint16)
 
 
 class MoeRoutingAlignmentStats(BaseModel):
@@ -35,6 +62,22 @@ class MoeRouteSegments(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     segments: tuple[MoeRouteArray, ...]
+
+    @model_validator(mode="after")
+    def _validate(self) -> "MoeRouteSegments":
+        if not self.segments:
+            raise RuntimeError("MoE route segments cannot be empty")
+        contract = {
+            (segment.num_experts, segment.dtype, *segment.shape[1:])
+            for segment in self.segments
+        }
+        if len(contract) != 1:
+            raise RuntimeError("MoE route segments must share one exact contract")
+        return self
+
+    @property
+    def num_experts(self) -> int:
+        return self.segments[0].num_experts
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -58,7 +101,10 @@ class MoeRouteSegments(BaseModel):
                 slices.append(
                     (
                         overlap_start,
-                        segment[overlap_start - offset : overlap_end - offset],
+                        cast(
+                            MoeRouteArray,
+                            segment[overlap_start - offset : overlap_end - offset],
+                        ),
                     )
                 )
             offset = segment_end
@@ -71,9 +117,6 @@ class PackedMoeRoutingReplay(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     expert_indices: Any
-    token_mask: Any
-    num_layers: int
-    topk: int
     num_experts: int
     pack_stats: MoeRoutingPackStats
 
@@ -82,27 +125,18 @@ class PackedMoeRoutingReplay(BaseModel):
         if self.expert_indices.ndim != 4:
             raise RuntimeError(
                 "expert_indices must have shape "
-                "[num_sequences, sequence_length, num_layers, topk], got "
+                "[num_layers, num_sequences, sequence_length, topk], got "
                 f"{tuple(self.expert_indices.shape)}"
             )
-        if self.token_mask.shape != self.expert_indices.shape[:2]:
+        if min(map(int, self.expert_indices.shape)) <= 0:
+            raise RuntimeError("expert_indices axes must be non-empty")
+        expected_dtype = str(moe_route_dtype(self.num_experts))
+        actual_dtype = str(self.expert_indices.dtype).removeprefix("torch.")
+        if actual_dtype != expected_dtype:
             raise RuntimeError(
-                "token_mask shape must match packed route tokens, got "
-                f"{tuple(self.token_mask.shape)} vs "
-                f"{tuple(self.expert_indices.shape[:2])}"
+                f"{self.num_experts} experts require {expected_dtype} replay ids, "
+                f"got {actual_dtype}"
             )
-        if self.num_layers != int(self.expert_indices.shape[2]):
-            raise RuntimeError(
-                f"num_layers={self.num_layers} does not match "
-                f"expert_indices.shape[2]={self.expert_indices.shape[2]}"
-            )
-        if self.topk != int(self.expert_indices.shape[3]):
-            raise RuntimeError(
-                f"topk={self.topk} does not match "
-                f"expert_indices.shape[3]={self.expert_indices.shape[3]}"
-            )
-        if self.num_experts <= 0:
-            raise RuntimeError(f"num_experts must be >0, got {self.num_experts}")
         if self.topk > self.num_experts:
             raise RuntimeError(
                 f"MoE routing topk cannot exceed num_experts: topk={self.topk}, "
@@ -110,19 +144,31 @@ class PackedMoeRoutingReplay(BaseModel):
             )
         return self
 
+    @property
+    def num_layers(self) -> int:
+        return int(self.expert_indices.shape[0])
+
+    @property
+    def topk(self) -> int:
+        return int(self.expert_indices.shape[3])
+
 
 def attach_moe_routing_metadata_to_choice(
     *,
     choice: Choice,
     response_payload: dict[str, Any],
     choice_index: int = 0,
-    routed_experts: MoeRouteArray | None = None,
+    routed_experts: np.ndarray | None = None,
+    num_experts: int | None = None,
 ) -> None:
     if routed_experts is None:
         return
+    num_experts = int(num_experts or getattr(routed_experts, "num_experts", 0))
+    routes = MoeRouteArray(routed_experts, num_experts=num_experts)
     metadata: dict[str, Any] = {
         PROMPT_TOKEN_IDS_KEY: response_payload.get(PROMPT_TOKEN_IDS_KEY),
-        ROUTED_EXPERTS_KEY: routed_experts,
+        ROUTED_EXPERTS_KEY: routes,
+        NUM_EXPERTS_KEY: num_experts,
     }
     raw_choices = response_payload.get("choices")
     if isinstance(raw_choices, list) and choice_index < len(raw_choices):
@@ -142,7 +188,6 @@ def attach_moe_routing_metadata_to_choice(
             )
     _normalize_token_ids(metadata[PROMPT_TOKEN_IDS_KEY])
     _normalize_token_ids(metadata.get(COMPLETION_TOKEN_IDS_KEY))
-    _validate_route_array(routed_experts, field_name=ROUTED_EXPERTS_KEY)
     extra = choice.model_extra
     if extra is None:
         raise RuntimeError("OpenAI Choice.model_extra is unavailable for route capture")
@@ -170,10 +215,11 @@ def align_choice_routes_to_tokenized_result(
             f"choices={len(choices)}, offsets={len(choice_offsets)}, "
             f"lengths={len(choice_token_lengths)}"
         )
-    aligned: MoeRouteArray | None = None
+    aligned: np.ndarray | None = None
     route_mask: np.ndarray | None = None
     route_segments: list[MoeRouteArray] = []
     route_shape: tuple[int, int] | None = None
+    num_experts: int | None = None
     covered_until = 0
     stats = MoeRoutingAlignmentStats()
     saw_routing = False
@@ -195,6 +241,10 @@ def align_choice_routes_to_tokenized_result(
             completion_token_count=len(completion_token_ids),
             stats=stats,
         )
+        if num_experts is None:
+            num_experts = prompt_routes.num_experts
+        elif num_experts != prompt_routes.num_experts:
+            raise RuntimeError("MoE route captures disagree on exact expert count")
         timing_start = _route_alignment_time_ns()
         if prompt_token_ids != token_ids[:offset]:
             raise RuntimeError(
@@ -264,27 +314,32 @@ def align_choice_routes_to_tokenized_result(
         raise RuntimeError("Some trainable choices had MoE routes while others did not")
     if not saw_routing:
         return None, stats
+    if num_experts is None:
+        raise RuntimeError("MoE routing metadata omitted exact expert count")
     if aligned is not None:
-        return aligned, stats
+        assert route_mask is not None
+        _fill_missing_routes(aligned, route_mask, num_experts=num_experts)
+        return MoeRouteArray(aligned, num_experts=num_experts), stats
     if covered_until == len(token_ids):
         if len(route_segments) == 1:
             return route_segments[0], stats
         return MoeRouteSegments(segments=tuple(route_segments)), stats
     if route_shape is None:
         raise RuntimeError("MoE routing metadata did not contain any routed tokens")
-    aligned, route_mask = _materialize_route_segments(
-        token_count=len(token_ids),
+    missing = deterministic_moe_routes(
+        np.arange(covered_until, len(token_ids), dtype=np.int64),
         route_shape=route_shape,
-        route_segments=route_segments,
+        num_experts=num_experts,
     )
-    stats.routed_tokens = int(route_mask.sum())
-    return aligned, stats
+    route_segments.append(missing)
+    stats.routed_tokens = covered_until
+    return MoeRouteSegments(segments=tuple(route_segments)), stats
 
 
 def _timed_append_or_overlay_routes(
     *,
     stats: MoeRoutingAlignmentStats,
-    aligned: MoeRouteArray | None,
+    aligned: np.ndarray | None,
     route_mask: np.ndarray | None,
     route_segments: list[MoeRouteArray],
     covered_until: int,
@@ -292,7 +347,7 @@ def _timed_append_or_overlay_routes(
     route_shape: tuple[int, int],
     start: int,
     routes: MoeRouteArray,
-) -> tuple[MoeRouteArray | None, np.ndarray | None, int]:
+) -> tuple[np.ndarray | None, np.ndarray | None, int]:
     timing_start = _route_alignment_time_ns()
     try:
         return _append_or_overlay_routes(
@@ -311,7 +366,7 @@ def _timed_append_or_overlay_routes(
 
 def _append_or_overlay_routes(
     *,
-    aligned: MoeRouteArray | None,
+    aligned: np.ndarray | None,
     route_mask: np.ndarray | None,
     route_segments: list[MoeRouteArray],
     covered_until: int,
@@ -319,7 +374,7 @@ def _append_or_overlay_routes(
     route_shape: tuple[int, int],
     start: int,
     routes: MoeRouteArray,
-) -> tuple[MoeRouteArray | None, np.ndarray | None, int]:
+) -> tuple[np.ndarray | None, np.ndarray | None, int]:
     if routes.shape[0] == 0:
         return aligned, route_mask, covered_until
     if aligned is None and start == covered_until:
@@ -341,13 +396,10 @@ def _materialize_route_segments(
     token_count: int,
     route_shape: tuple[int, int],
     route_segments: list[MoeRouteArray],
-) -> tuple[MoeRouteArray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     num_layers, topk = route_shape
-    aligned = np.full(
-        (token_count, num_layers, topk),
-        MISSING_EXPERT_ID,
-        dtype=np.int32,
-    )
+    dtype = route_segments[0].dtype if route_segments else np.dtype(np.uint8)
+    aligned = np.zeros((token_count, num_layers, topk), dtype=dtype)
     route_mask = np.zeros(token_count, dtype=np.bool_)
     offset = 0
     for routes in route_segments:
@@ -357,7 +409,7 @@ def _materialize_route_segments(
 
 
 def _overlay_routes(
-    aligned: MoeRouteArray,
+    aligned: np.ndarray,
     route_mask: np.ndarray,
     start: int,
     routes: MoeRouteArray,
@@ -366,6 +418,10 @@ def _overlay_routes(
         return
     end = start + routes.shape[0]
     existing = route_mask[start:end]
+    if bool(existing.any()) and not np.array_equal(
+        aligned[start:end][existing], routes[existing]
+    ):
+        raise RuntimeError("Overlapping routed experts disagree for the same token")
     fill = ~existing
     if bool(fill.any()):
         aligned[start:end][fill] = routes[fill]
@@ -387,6 +443,23 @@ def _validate_route_array(array: MoeRouteArray, *, field_name: str) -> None:
         )
     if array.shape[0] > 0 and (array.shape[1] <= 0 or array.shape[2] <= 0):
         raise RuntimeError(f"{field_name} must have non-empty layer and topk axes")
+    expected_dtype = moe_route_dtype(array.num_experts)
+    if array.dtype != expected_dtype:
+        raise RuntimeError(
+            f"{array.num_experts} experts require {expected_dtype} routes, "
+            f"got {array.dtype}"
+        )
+    if array.shape[-1] > array.num_experts:
+        raise RuntimeError("MoE routing top-k exceeds exact expert count")
+    flat = array.reshape(-1, array.shape[-1])
+    for start in range(0, len(flat), 1 << 20):
+        rows = np.sort(flat[start : start + (1 << 20)], axis=1)
+        if rows.size and int(rows.max()) >= array.num_experts:
+            raise RuntimeError("MoE route expert id is outside the exact model range")
+        if rows.shape[1] > 1 and bool(np.any(rows[:, 1:] == rows[:, :-1])):
+            raise RuntimeError(
+                "MoE route expert ids must be distinct per token and layer"
+            )
 
 
 def _common_route_shape(*arrays: MoeRouteArray) -> tuple[int, int]:
@@ -421,7 +494,8 @@ def _choice_routes(
     routes = metadata.get(ROUTED_EXPERTS_KEY)
     if not isinstance(routes, np.ndarray):
         raise RuntimeError("Missing binary routed experts")
-    _validate_route_array(routes, field_name=ROUTED_EXPERTS_KEY)
+    num_experts = int(metadata.get(NUM_EXPERTS_KEY, 0))
+    routes = MoeRouteArray(routes, num_experts=num_experts)
     routes.flags.writeable = False
     expected_lengths = {
         len(prompt_token_ids) + completion_token_count,
@@ -440,9 +514,44 @@ def _choice_routes(
     return prompt_routes, completion_routes
 
 
-def _readonly_route_view(routes: MoeRouteArray) -> MoeRouteArray:
-    routes.flags.writeable = False
-    return routes
+def _readonly_route_view(routes: np.ndarray) -> MoeRouteArray:
+    route_view = cast(MoeRouteArray, routes)
+    route_view.flags.writeable = False
+    return route_view
+
+
+def _fill_missing_routes(
+    routes: np.ndarray, mask: np.ndarray, *, num_experts: int
+) -> None:
+    missing = np.flatnonzero(~mask)
+    if missing.size:
+        routes[missing] = deterministic_moe_routes(
+            missing,
+            route_shape=(int(routes.shape[1]), int(routes.shape[2])),
+            num_experts=num_experts,
+        )
+        mask[missing] = True
+
+
+def deterministic_moe_routes(
+    positions: np.ndarray,
+    *,
+    route_shape: tuple[int, int],
+    num_experts: int,
+) -> MoeRouteArray:
+    num_layers, topk = route_shape
+    if num_layers <= 0 or not 1 <= topk <= num_experts:
+        raise RuntimeError(
+            "MoE route shape requires positive layers and top-k in expert range"
+        )
+    routes = np.empty(
+        (len(positions), num_layers, topk), dtype=moe_route_dtype(num_experts)
+    )
+    for layer in range(num_layers):
+        base = ((positions + 1) * 1_299_709 + (layer + 1) * 97_003) % num_experts
+        for slot in range(topk):
+            routes[:, layer, slot] = (base + slot) % num_experts
+    return MoeRouteArray(routes, num_experts=num_experts, validate=False)
 
 
 def _route_alignment_time_ns() -> int:

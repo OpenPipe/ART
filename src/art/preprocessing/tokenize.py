@@ -50,13 +50,20 @@ def _slice_moe_routes(
         if start <= 0:
             return routes
         if start >= routes.shape[0]:
-            return np.empty((0, routes.shape[1], routes.shape[2]), dtype=np.int32)
+            return MoeRouteArray(
+                np.empty(
+                    (0, routes.shape[1], routes.shape[2]),
+                    dtype=routes.segments[0].dtype,
+                ),
+                num_experts=routes.num_experts,
+                validate=False,
+            )
         return MoeRouteSegments(
             segments=tuple(
                 segment for _, segment in routes.iter_slices(start, routes.shape[0])
             )
         )
-    return routes[start:]
+    return cast(MoeRouteArray, routes[start:])
 
 
 class _TokenDecoder(Protocol):

@@ -8,12 +8,17 @@ from openai.types.chat.chat_completion import Choice
 import pytest
 import torch
 
+from art.distributed.data_plane import SharedMemoryPackedBatchStore
+from art.distributed.packing import TrajectoryPayload
 from art.megatron.prefix_tree import parse_prefix_tree_row
 from art.megatron.routing_replay import (
     build_moe_routing_replay_bundle_from_packed_tensors,
 )
 from art.preprocessing.moe_routing import (
     ART_MOE_ROUTING_METADATA_KEY,
+    NUM_EXPERTS_KEY,
+    ROUTED_EXPERTS_KEY,
+    MoeRouteArray,
     MoeRouteSegments,
     align_choice_routes_to_tokenized_result,
 )
@@ -28,6 +33,7 @@ class _FakeTokenizer:
 
 
 def _choice(metadata: dict[str, Any]) -> Choice:
+    metadata.setdefault("num_experts", 256)
     return Choice.model_validate(
         {
             "index": 0,
@@ -39,6 +45,7 @@ def _choice(metadata: dict[str, Any]) -> Choice:
 
 
 def _route(seed: int) -> list[list[int]]:
+    seed %= 240
     return [[seed, seed + 1], [seed + 2, seed + 3]]
 
 
@@ -93,6 +100,28 @@ def test_align_choice_routes_to_tokenized_result_rejects_token_mismatch() -> Non
         )
 
 
+def test_align_choice_routes_materializes_missing_terminal_route() -> None:
+    routes, _stats = align_choice_routes_to_tokenized_result(
+        token_ids=[10, 20],
+        choices=[
+            _choice(
+                {
+                    "prompt_token_ids": [10],
+                    "completion_token_ids": [20],
+                    "routed_experts": np.asarray([_route(0)], dtype=np.uint8),
+                }
+            )
+        ],
+        choice_offsets=[1],
+        choice_token_lengths=[1],
+    )
+
+    assert routes is not None
+    materialized = _routes_to_list(routes)
+    assert materialized[0] == _route(0)
+    assert all(len(set(layer)) == 2 for layer in materialized[1])
+
+
 def _tokenized(
     token_ids: list[int],
     routes: list[list[list[int]]],
@@ -104,6 +133,7 @@ def _tokenized(
     weight: float = 1.0,
     pixel_values: torch.Tensor | None = None,
     image_grid_thw: torch.Tensor | None = None,
+    num_experts: int = 256,
 ) -> TokenizedResult:
     trainable_start = prompt_length if trainable_start is None else trainable_start
     return TokenizedResult(
@@ -120,7 +150,13 @@ def _tokenized(
         choice_offsets=[trainable_start],
         extra_logprobs={},
         _tokenizer=_FakeTokenizer(),  # type: ignore[arg-type]
-        moe_routed_experts=np.asarray(routes, dtype=np.int32),
+        moe_routed_experts=MoeRouteArray(
+            np.asarray(
+                routes,
+                dtype=np.uint8 if num_experts <= 256 else np.uint16,
+            ),
+            num_experts=num_experts,
+        ),
         prompt_id=prompt_id,
         prompt_length=prompt_length,
         weight=weight,
@@ -137,7 +173,7 @@ def test_pack_carries_routes_through_prefix_tree_splicing() -> None:
     )
     second = _tokenized(
         [10, 11, 22, 23],
-        [_route(99), _route(10), _route(40), _route(50)],
+        [_route(0), _route(10), _route(40), _route(50)],
         prompt_id=123,
         prompt_length=1,
         trainable_start=2,
@@ -155,7 +191,7 @@ def test_pack_carries_routes_through_prefix_tree_splicing() -> None:
     assert packed["tokens"].tolist()[0][:7] == [10, 11, 20, 21, 11, 22, 23]
     routing_replay = packed["moe_routing_replay"]
     assert routing_replay is not None
-    assert routing_replay.expert_indices.tolist()[0][:7] == [
+    assert torch.movedim(routing_replay.expert_indices[:, 0], 0, 1).tolist()[:7] == [
         _route(0),
         _route(10),
         _route(20),
@@ -165,6 +201,30 @@ def test_pack_carries_routes_through_prefix_tree_splicing() -> None:
         _route(50),
     ]
     assert routing_replay.pack_stats.packed_tokens == 7
+
+
+def test_pack_rejects_mismatched_routes_for_shared_prefix() -> None:
+    first = _tokenized(
+        [10, 11, 20],
+        [_route(0), _route(10), _route(20)],
+        prompt_id=123,
+        prompt_length=2,
+    )
+    second = _tokenized(
+        [10, 11, 21],
+        [_route(90), _route(10), _route(30)],
+        prompt_id=123,
+        prompt_length=2,
+    )
+
+    with pytest.raises(RuntimeError, match="mismatched routed experts"):
+        packed_tensors_from_tokenized_results(
+            [first, second],
+            seq_len=8,
+            truncate_long_results=False,
+            include_moe_routing=True,
+            min_prefix_tree_shared_segment_length=0,
+        )
 
 
 def test_prefix_tree_pack_keeps_trainable_duplicates_in_leaf_metadata() -> None:
@@ -310,12 +370,19 @@ def test_prefix_tree_pack_best_fit_combines_independent_small_groups() -> None:
     assert int((packed["group_ids"] != -1).sum().item()) == 24
 
 
-def test_pack_infers_at_least_topk_experts_from_sparse_routes() -> None:
+@pytest.mark.parametrize(
+    ("num_experts", "dtype"),
+    [(256, torch.uint8), (257, torch.uint16)],
+)
+def test_pack_preserves_exact_expert_count_and_smallest_dtype(
+    num_experts: int, dtype: torch.dtype
+) -> None:
     result = _tokenized(
         [10, 20],
-        [[[0, 0, 0, 0]], [[0, 0, 0, 0]]],
+        [[[0, 1, 2, 3]], [[4, 5, 6, 7]]],
         prompt_id=456,
         prompt_length=1,
+        num_experts=num_experts,
     )
 
     packed = packed_tensors_from_tokenized_results(
@@ -329,10 +396,15 @@ def test_pack_infers_at_least_topk_experts_from_sparse_routes() -> None:
     routing_replay = packed["moe_routing_replay"]
     assert routing_replay is not None
     assert routing_replay.topk == 4
-    assert routing_replay.num_experts == 4
+    assert routing_replay.num_experts == num_experts
+    assert routing_replay.expert_indices.dtype == dtype
+    assert routing_replay.expert_indices.shape == (1, 1, 4, 4)
+    assert all(
+        len(set(row)) == 4 for row in routing_replay.expert_indices[0, 0].tolist()
+    )
 
 
-def test_build_replay_bundle_uses_packed_sequence_sample_calls() -> None:
+def test_build_replay_bundle_retains_layer_major_storage() -> None:
     result = _tokenized(
         [10, 11, 20],
         [_route(0), _route(10), _route(20)],
@@ -352,7 +424,88 @@ def test_build_replay_bundle_uses_packed_sequence_sample_calls() -> None:
         global_grad_accumulation_sequences=1,
     )
 
-    route = bundle.steps[0].routers["chunk_00.layer_0000.mlp.router"].calls[0]
-    assert route.sample_index == 0
-    assert route.expert_indices.tolist()[:3] == [[0, 1], [10, 11], [20, 21]]
-    assert len(set(route.expert_indices.tolist()[3])) == 2
+    replay = packed["moe_routing_replay"]
+    assert replay is not None
+    assert bundle.tensor_backed
+    assert bundle.steps == {}
+    assert bundle.expert_indices is replay.expert_indices
+    assert bundle.expert_indices[0, 0].tolist()[:3] == [
+        [0, 1],
+        [10, 11],
+        [20, 21],
+    ]
+    assert len(set(bundle.expert_indices[0, 0, 3].tolist())) == 2
+
+
+def test_trajectory_route_roundtrip_preserves_exact_contract() -> None:
+    routes = MoeRouteArray(
+        np.asarray([[[0, 256]], [[255, 1]]], dtype=np.uint16),
+        num_experts=257,
+    )
+    trajectory = Trajectory(
+        messages_and_choices=[
+            _choice(
+                {
+                    "prompt_token_ids": [10],
+                    "completion_token_ids": [20],
+                    ROUTED_EXPERTS_KEY: routes,
+                    NUM_EXPERTS_KEY: 257,
+                }
+            )
+        ]
+    )
+
+    restored = TrajectoryPayload.from_trajectory(trajectory).build()
+    choice = restored.messages_and_choices[0]
+    assert isinstance(choice, Choice)
+    metadata = (choice.model_extra or {})[ART_MOE_ROUTING_METADATA_KEY]
+    restored_routes = metadata[ROUTED_EXPERTS_KEY]
+    assert isinstance(restored_routes, MoeRouteArray)
+    assert restored_routes.num_experts == 257
+    assert restored_routes.dtype == np.dtype(np.uint16)
+    assert np.array_equal(restored_routes, routes)
+
+
+def test_shm_replay_is_one_layer_major_uint16_tensor() -> None:
+    packed = packed_tensors_from_tokenized_results(
+        [
+            _tokenized(
+                [10, 20],
+                [[[0, 256]], [[255, 1]]],
+                prompt_id=456,
+                prompt_length=1,
+                num_experts=257,
+            )
+        ],
+        seq_len=4,
+        pad_token_id=0,
+        truncate_long_results=False,
+        include_moe_routing=True,
+    )
+    store = SharedMemoryPackedBatchStore(
+        owner_actor_id="test-owner", capacity_bytes=1 << 20
+    )
+    try:
+        ref = store.create(packed, batch_id="route-batch")
+        replay_specs = [
+            spec for spec in ref.tensors if spec.name.startswith("moe_routing_replay/")
+        ]
+        assert [spec.name for spec in replay_specs] == [
+            "moe_routing_replay/expert_indices"
+        ]
+        assert replay_specs[0].dtype == "uint16"
+        assert ref.moe_routing_replay is not None
+        assert ref.moe_routing_replay.num_experts == 257
+        assert ref.moe_routing_replay.packed_tokens == 2
+
+        with store.map(ref) as mapped:
+            replay = mapped.tensors["moe_routing_replay"]
+            assert replay.expert_indices.shape == (1, 1, 4, 2)
+            assert replay.expert_indices.dtype == torch.uint16
+            bundle = build_moe_routing_replay_bundle_from_packed_tensors(
+                packed_tensors=mapped.tensors,
+                global_grad_accumulation_sequences=1,
+            )
+            assert bundle.expert_indices is replay.expert_indices
+    finally:
+        store.close()

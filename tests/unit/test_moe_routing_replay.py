@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+import art.megatron.routing_replay as routing_replay_module
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,
@@ -102,6 +103,33 @@ def _make_multi_call_bundle() -> MoeRoutingReplayBundle:
     )
 
 
+def _make_tensor_bundle(
+    *, num_layers: int = 1, topology: ParallelTopology | None = None
+) -> MoeRoutingReplayBundle:
+    rows = torch.tensor(
+        [
+            [[0, 2], [1, 0], [2, 1], [1, 2]],
+            [[2, 0], [0, 1], [1, 2], [2, 1]],
+        ],
+        dtype=torch.uint8,
+    )
+    expert_indices = torch.stack(
+        [torch.roll(rows, shifts=layer, dims=-1) for layer in range(num_layers)]
+    ).contiguous()
+    return MoeRoutingReplayBundle(
+        topology=topology
+        or ParallelTopology(tp=1, ep=1, etp=1, dp=1, sp=False, cp=1, pp=1, vpp=1),
+        num_steps=1,
+        max_topk=2,
+        router_keys=[
+            f"chunk_00.layer_{layer:04d}.mlp.router" for layer in range(num_layers)
+        ],
+        expert_indices=expert_indices,
+        num_experts=3,
+        global_grad_accumulation_sequences=2,
+    )
+
+
 class _FakeParallelState:
     def __init__(
         self,
@@ -175,6 +203,7 @@ class _FakeRouter(nn.Module):
                 "sequence_parallel": False,
                 "context_parallel_size": 1,
                 "moe_router_fusion": False,
+                "num_moe_experts": 3,
             },
         )()
 
@@ -345,6 +374,108 @@ def test_bundle_roundtrip_disk() -> None:
     assert loaded_route.expert_mask is not None
     assert route.expert_mask is not None
     assert torch.equal(loaded_route.expert_mask, route.expert_mask)
+
+
+def test_tensor_bundle_uint16_roundtrip_disk() -> None:
+    indices = torch.tensor(
+        [[[[0, 256], [255, 1]]]],
+        dtype=torch.uint16,
+    )
+    bundle = MoeRoutingReplayBundle(
+        topology=ParallelTopology(tp=1, ep=1, etp=1, dp=1, sp=False, cp=1, pp=1, vpp=1),
+        num_steps=1,
+        max_topk=2,
+        router_keys=["chunk_00.layer_0000.mlp.router"],
+        expert_indices=indices,
+        num_experts=257,
+        global_grad_accumulation_sequences=1,
+    )
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        bundle.to_dir(tmp_dir)
+        loaded = MoeRoutingReplayBundle.from_dir(tmp_dir)
+
+    assert loaded.tensor_backed
+    assert loaded.num_experts == 257
+    assert loaded.expert_indices is not None
+    assert loaded.expert_indices.dtype == torch.uint16
+    assert torch.equal(loaded.expert_indices, indices)
+
+
+def test_tensor_controller_preserves_uid_order_and_synthesizes_tp_padding() -> None:
+    bundle = _make_tensor_bundle()
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+    chunk = _FakeChunk()
+    router = _fake_chunk_router(chunk)
+    replay = cast(_FakeRouterReplay, router.router_replay)
+
+    controller.install_router_patches([chunk])
+    controller.set_step(step_index=0, sample_index=[0, 1])
+    controller.begin_micro(0, 0)
+    controller.set_local_input_token_uids(torch.tensor([3, 1, -1], dtype=torch.int64))
+    router.routing(torch.randn((3, 3), dtype=torch.float32))
+
+    assert bundle.expert_indices is not None
+    expected = bundle.expert_indices[0, 0, [3, 1]].to(torch.long)
+    target = replay.targets_seen[-1]
+    assert torch.equal(target[:2], expected)
+    assert target[2].min().item() >= 0
+    assert target[2].max().item() < 3
+    assert target[2].unique().numel() == 2
+
+    controller.begin_micro(1, 1)
+    controller.set_local_input_token_uids(torch.arange(4, dtype=torch.int64))
+    router.routing(torch.randn((4, 3), dtype=torch.float32))
+    controller.finalize_step()
+    controller.remove_router_patches()
+
+
+def test_tensor_controller_synthesizes_dp_dummy_routes() -> None:
+    bundle = _make_tensor_bundle()
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+    chunk = _FakeChunk()
+    router = _fake_chunk_router(chunk)
+    replay = cast(_FakeRouterReplay, router.router_replay)
+
+    controller.install_router_patches([chunk])
+    controller.set_step(step_index=0, sample_index=[None])
+    controller.begin_micro(None, 0)
+    controller.set_local_input_token_uids(torch.tensor([2, 0], dtype=torch.int64))
+    router.routing(torch.randn((2, 3), dtype=torch.float32))
+
+    target = replay.targets_seen[-1]
+    assert bool(((0 <= target) & (target < 3)).all())
+    assert all(row.unique().numel() == 2 for row in target)
+    controller.finalize_step()
+    controller.remove_router_patches()
+
+
+def test_tensor_controller_addresses_pp_global_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topology = ParallelTopology(tp=1, ep=1, etp=1, dp=1, sp=False, cp=1, pp=2, vpp=1)
+    bundle = _make_tensor_bundle(num_layers=2, topology=topology)
+    monkeypatch.setattr(
+        routing_replay_module,
+        "_global_layer_prefixes",
+        lambda _chunk: [("decoder.layers.0", 1)],
+    )
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+    chunk = _FakeChunk()
+    router = _fake_chunk_router(chunk)
+    replay = cast(_FakeRouterReplay, router.router_replay)
+
+    controller.install_router_patches([chunk])
+    controller.set_step(step_index=0, sample_index=[0])
+    controller.begin_micro(0, 0)
+    controller.set_local_input_token_uids(torch.arange(4, dtype=torch.int64))
+    router.routing(torch.randn((4, 3), dtype=torch.float32))
+
+    assert bundle.expert_indices is not None
+    assert torch.equal(
+        replay.targets_seen[-1], bundle.expert_indices[1, 0].to(torch.long)
+    )
+    controller.finalize_step()
+    controller.remove_router_patches()
 
 
 def test_controller_uses_native_router_replay_target_indices() -> None:

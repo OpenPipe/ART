@@ -5,8 +5,10 @@ import struct
 import numpy as np
 from openai.types.chat import ChatCompletion
 
-MAGIC = b"ARTRTE1\0"
-HEADER = struct.Struct("<8sQI")
+from art.preprocessing.moe_routing import MoeRouteArray
+
+MAGIC = b"ARTRTE2\0"
+HEADER = struct.Struct("<8sQII")
 ROUTE_HEADER = struct.Struct("<IB3xQQQ")
 DTYPES = {1: np.dtype(np.uint8), 2: np.dtype("<u2")}
 
@@ -17,10 +19,10 @@ def is_routed_experts_response(body: bytes) -> bool:
 
 def decode_routed_experts_response(
     body: bytes,
-) -> tuple[ChatCompletion, dict[int, np.ndarray]]:
+) -> tuple[ChatCompletion, dict[int, MoeRouteArray]]:
     if len(body) < HEADER.size:
         raise RuntimeError("Truncated ART routed-experts response header")
-    magic, json_size, route_count = HEADER.unpack_from(body)
+    magic, json_size, route_count, num_experts = HEADER.unpack_from(body)
     if magic != MAGIC:
         raise RuntimeError("Invalid ART routed-experts response magic")
     offset = HEADER.size
@@ -29,7 +31,7 @@ def decode_routed_experts_response(
         raise RuntimeError("Truncated ART routed-experts JSON response")
     response = ChatCompletion.model_validate_json(body[offset:json_end])
     offset = json_end
-    routes: dict[int, np.ndarray] = {}
+    routes: dict[int, MoeRouteArray] = {}
     for _ in range(route_count):
         if offset + ROUTE_HEADER.size > len(body):
             raise RuntimeError("Truncated ART routed-experts array header")
@@ -49,7 +51,9 @@ def decode_routed_experts_response(
         array = np.frombuffer(
             body, dtype=dtype, count=tokens * layers * topk, offset=offset
         )
-        routes[choice_index] = array.reshape((tokens, layers, topk))
+        routes[choice_index] = MoeRouteArray(
+            array.reshape((tokens, layers, topk)), num_experts=num_experts
+        )
         offset = end
     if offset != len(body):
         raise RuntimeError("Unexpected trailing bytes in ART routed-experts response")

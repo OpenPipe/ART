@@ -10,19 +10,30 @@ from typing import Any
 
 import numpy as np
 
-MAGIC = b"ARTRTE1\0"
-HEADER = struct.Struct("<8sQI")
+MAGIC = b"ARTRTE2\0"
+HEADER = struct.Struct("<8sQII")
 ROUTE_HEADER = struct.Struct("<IB3xQQQ")
 PIPELINE_ROUTES_ENV = "ART_VLLM_PIPELINE_ROUTES_PROTOCOL"
 PIPELINE_ROUTES_PROTOCOL = "1"
-_CAPTURE: ContextVar[dict[int, np.ndarray] | None] = ContextVar(
+_REGISTERED_NUM_EXPERTS: int | None = None
+
+
+class _CapturedRoutes(dict[int, np.ndarray]):
+    def __init__(self, *, num_experts: int) -> None:
+        super().__init__()
+        self.num_experts = num_experts
+
+
+_CAPTURE: ContextVar[_CapturedRoutes | None] = ContextVar(
     "art_binary_routed_experts", default=None
 )
 
 
 @contextmanager
-def capture_routed_experts() -> Iterator[dict[int, np.ndarray]]:
-    routes: dict[int, np.ndarray] = {}
+def capture_routed_experts() -> Iterator[_CapturedRoutes]:
+    if _REGISTERED_NUM_EXPERTS is None:
+        raise RuntimeError("vLLM did not register an exact MoE expert count")
+    routes = _CapturedRoutes(num_experts=_REGISTERED_NUM_EXPERTS)
     token = _CAPTURE.set(routes)
     try:
         yield routes
@@ -31,24 +42,31 @@ def capture_routed_experts() -> Iterator[dict[int, np.ndarray]]:
 
 
 def encode_routed_experts_response(
-    json_body: bytes, routes: dict[int, np.ndarray]
+    json_body: bytes,
+    routes: dict[int, np.ndarray],
+    *,
+    num_experts: int | None = None,
 ) -> bytes:
+    num_experts = int(num_experts or getattr(routes, "num_experts", 0))
+    dtype = _route_dtype(num_experts)
     chunks: list[bytes | memoryview] = [
-        HEADER.pack(MAGIC, len(json_body), len(routes)),
+        HEADER.pack(MAGIC, len(json_body), len(routes), num_experts),
         json_body,
     ]
     for choice_index, array in sorted(routes.items()):
         if array.ndim != 3:
             raise RuntimeError(f"Routed experts must have rank 3, got {array.shape}")
-        if array.dtype == np.dtype(np.uint8):
+        if dtype == np.dtype(np.uint8):
             dtype_code = 1
-        elif array.dtype == np.dtype(np.uint16):
+        else:
             dtype_code = 2
             array = array.astype("<u2", copy=False)
-        else:
+        if array.dtype != dtype:
             raise RuntimeError(
-                f"vLLM routed experts must use uint8 or uint16, got {array.dtype}"
+                f"vLLM routed experts for {num_experts} experts must use "
+                f"{dtype}, got {array.dtype}"
             )
+        _validate_route_ids(array, num_experts=num_experts)
         array = np.ascontiguousarray(array)
         chunks.extend(
             (
@@ -57,6 +75,57 @@ def encode_routed_experts_response(
             )
         )
     return b"".join(chunks)
+
+
+def _route_dtype(num_experts: int) -> np.dtype[Any]:
+    if not 1 <= num_experts <= 65_536:
+        raise RuntimeError(
+            f"ART routed experts require num_experts in [1, 65536], got {num_experts}"
+        )
+    return np.dtype(np.uint8 if num_experts <= 256 else np.uint16)
+
+
+def _validate_route_ids(array: np.ndarray, *, num_experts: int) -> None:
+    if array.shape[-1] > num_experts:
+        raise RuntimeError("Routed-expert top-k exceeds exact expert count")
+    flat = array.reshape(-1, array.shape[-1])
+    for start in range(0, len(flat), 1 << 20):
+        rows = np.sort(flat[start : start + (1 << 20)], axis=1)
+        if rows.size and int(rows.max()) >= num_experts:
+            raise RuntimeError("Routed expert id is outside the exact model range")
+        if rows.shape[1] > 1 and bool(np.any(rows[:, 1:] == rows[:, :-1])):
+            raise RuntimeError("Routed expert ids must be distinct per token and layer")
+
+
+def _register_model_num_experts(model_config: Any) -> None:
+    global _REGISTERED_NUM_EXPERTS
+    getter = getattr(model_config, "get_num_experts", None)
+    if callable(getter):
+        num_experts = int(getter())
+    else:
+        configs = [
+            model_config,
+            getattr(model_config, "hf_config", None),
+            getattr(getattr(model_config, "hf_config", None), "text_config", None),
+        ]
+        values = {
+            int(value)
+            for config in configs
+            if config is not None
+            for name in ("num_experts", "n_routed_experts", "num_local_experts")
+            if (value := getattr(config, name, None)) is not None and int(value) > 0
+        }
+        if not values:
+            raise RuntimeError("Unable to find the model's exact MoE expert count")
+        if len(values) != 1:
+            raise RuntimeError(f"Model configs disagree on MoE expert count: {values}")
+        num_experts = values.pop()
+    _route_dtype(num_experts)
+    if _REGISTERED_NUM_EXPERTS not in {None, num_experts}:
+        raise RuntimeError(
+            "One vLLM process cannot capture routes for different expert counts"
+        )
+    _REGISTERED_NUM_EXPERTS = num_experts
 
 
 def patch_binary_routed_experts_response() -> None:
@@ -184,6 +253,8 @@ def patch_pipeline_routed_experts_validation() -> None:
     @wraps(original)
     def post_init(self: Any) -> None:
         model = self.model_config
+        if model is not None and model.enable_return_routed_experts:
+            _register_model_num_experts(model)
         pipeline_capture = (
             os.environ.get(PIPELINE_ROUTES_ENV) == PIPELINE_ROUTES_PROTOCOL
             and model is not None

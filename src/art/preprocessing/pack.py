@@ -16,11 +16,12 @@ from ..megatron.prefix_tree_packing import (
 )
 from ..types import Verbosity
 from .moe_routing import (
-    MISSING_EXPERT_ID,
     MoeRouteArray,
     MoeRouteSegments,
     MoeRoutingPackStats,
     PackedMoeRoutingReplay,
+    deterministic_moe_routes,
+    moe_route_dtype,
 )
 from .tokenize import TokenizedResult
 
@@ -54,22 +55,6 @@ class DiskPackedTensors(TypedDict):
     sequence_length: int
     pixel_values: NotRequired[tuple[int, list[int]]]
     image_grid_thw: NotRequired[tuple[int, list[int]]]
-
-
-class _PackedPrefixTreeRow(NamedTuple):
-    token_ids: np.ndarray
-    group_ids: np.ndarray
-    parent_ids: np.ndarray
-    input_pos: np.ndarray
-    assistant_mask: np.ndarray
-    logprobs: np.ndarray
-    advantages: np.ndarray
-    weights: np.ndarray
-    pixel_values: torch.Tensor | None
-    image_grid_thw: torch.Tensor | None
-    route_tensor: np.ndarray | None = None
-    route_mask: np.ndarray | None = None
-    max_expert_id: int = 0
 
 
 class _PrefixTreePackItem(NamedTuple):
@@ -299,31 +284,26 @@ def prefix_tree_pack(
     weights_np = np.zeros((num_sequences, seq_len), dtype=np.float32)
     pixel_values: list[torch.Tensor | None] = []
     image_grid_thw: list[torch.Tensor | None] = []
-    route_shape = next(
-        (
-            shape
-            for row in rows
-            if (shape := _first_item_moe_route_shape(row)) is not None
-        ),
-        None,
-    )
+    route_contract = _moe_route_contract(rows) if include_moe_routing else None
     route_tensor_np: np.ndarray | None = None
-    route_mask_np: np.ndarray | None = None
-    max_expert_id = 0
     if include_moe_routing:
-        if route_shape is None:
+        if route_contract is None:
             raise RuntimeError("No MoE routes were packed")
-        num_layers, topk = route_shape
-        route_tensor_np = np.zeros(
-            (num_sequences, seq_len, num_layers, topk), dtype=np.int32
+        num_experts, num_layers, topk = route_contract
+        padding = deterministic_moe_routes(
+            np.arange(seq_len, dtype=np.int64),
+            route_shape=(num_layers, topk),
+            num_experts=num_experts,
         )
-        route_mask_np = np.zeros((num_sequences, seq_len), dtype=np.bool_)
+        route_tensor_np = np.broadcast_to(
+            np.moveaxis(padding, 1, 0)[:, None],
+            (num_layers, num_sequences, seq_len, topk),
+        ).copy()
 
     for index, (row, plan) in enumerate(zip(rows, row_plans, strict=True)):
         row_route_tensor = (
-            route_tensor_np[index] if route_tensor_np is not None else None
+            route_tensor_np[:, index] if route_tensor_np is not None else None
         )
-        row_route_mask = route_mask_np[index] if route_mask_np is not None else None
         _materialize_prefix_tree_row(
             row,
             plan=plan,
@@ -336,17 +316,11 @@ def prefix_tree_pack(
             advantages=advantages_np[index],
             weights=weights_np[index],
             route_tensor=row_route_tensor,
-            route_mask=row_route_mask,
-            route_shape=route_shape,
+            route_shape=(None if route_contract is None else route_contract[1:]),
             include_moe_routing=include_moe_routing,
         )
         pixel_values.append(_packed_row_tensor_list(row, "pixel_values"))
         image_grid_thw.append(_packed_row_tensor_list(row, "image_grid_thw"))
-    if include_moe_routing:
-        assert route_tensor_np is not None and route_mask_np is not None
-        if bool(route_mask_np.any()):
-            max_expert_id = int(route_tensor_np.max())
-
     assistant_mask_tensor = torch.from_numpy(assistant_mask_np)
     weights_tensor = torch.from_numpy(weights_np)
     weights_tensor = torch.where(
@@ -396,18 +370,12 @@ def prefix_tree_pack(
         },
     }
     if include_moe_routing:
-        assert route_tensor_np is not None and route_mask_np is not None
-        assert route_shape is not None
-        num_layers, topk = route_shape
-        if not bool(route_mask_np.any()):
-            raise RuntimeError("No MoE routes were packed")
-        moe_routing_pack_stats.packed_tokens = int(route_mask_np.sum())
+        assert route_tensor_np is not None and route_contract is not None
+        num_experts, _num_layers, _topk = route_contract
+        moe_routing_pack_stats.packed_tokens = sum(plan.length for plan in row_plans)
         packed_tensors["moe_routing_replay"] = PackedMoeRoutingReplay(
             expert_indices=torch.from_numpy(route_tensor_np),
-            token_mask=torch.from_numpy(route_mask_np),
-            num_layers=num_layers,
-            topk=topk,
-            num_experts=max(topk, max_expert_id + 1),
+            num_experts=num_experts,
             pack_stats=moe_routing_pack_stats,
         )
     return packed_tensors
@@ -715,7 +683,6 @@ def _materialize_prefix_tree_row(
     advantages: np.ndarray,
     weights: np.ndarray,
     route_tensor: np.ndarray | None,
-    route_mask: np.ndarray | None,
     route_shape: tuple[int, int] | None,
     include_moe_routing: bool,
 ) -> None:
@@ -744,105 +711,17 @@ def _materialize_prefix_tree_row(
                 src_end=src_end,
             )
         if include_moe_routing:
-            assert route_tensor is not None and route_mask is not None
+            assert route_tensor is not None
             assert route_shape is not None
             assert item.moe_routes is not None
             _copy_moe_route_slice(
                 route_tensor=route_tensor,
-                route_mask=route_mask,
                 dst_start=dst_start,
                 src_start=src_start,
                 src_end=src_end,
                 raw_routes=item.moe_routes,
                 route_shape=route_shape,
             )
-
-
-def _pack_prefix_tree_row(
-    row: list[_PrefixTreePackItem],
-    *,
-    seq_len: int,
-    pack_results: bool,
-    include_moe_routing: bool,
-    min_shared_segment_length: int = DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH,
-) -> _PackedPrefixTreeRow:
-    if not row:
-        empty_i64 = np.empty((0,), dtype=np.int64)
-        empty_f32 = np.empty((0,), dtype=np.float32)
-        return _PackedPrefixTreeRow(
-            token_ids=empty_i64,
-            group_ids=empty_i64,
-            parent_ids=empty_i64,
-            input_pos=empty_i64,
-            assistant_mask=np.empty((0,), dtype=np.bool_),
-            logprobs=empty_f32,
-            advantages=empty_f32,
-            weights=empty_f32,
-            pixel_values=None,
-            image_grid_thw=None,
-        )
-    plan = _prefix_tree_row_plan(
-        row,
-        seq_len=seq_len,
-        pack_results=pack_results,
-        min_shared_segment_length=min_shared_segment_length,
-    )
-    length = plan.length
-    token_ids = np.empty(length, dtype=np.int64)
-    group_ids = np.empty(length, dtype=np.int64)
-    parent_ids = np.empty(length, dtype=np.int64)
-    input_pos = np.zeros(length, dtype=np.int64)
-    assistant_mask = np.zeros(length, dtype=np.bool_)
-    logprobs = np.full(length, np.nan, dtype=np.float32)
-    advantages = np.zeros(length, dtype=np.float32)
-    weights = np.zeros(length, dtype=np.float32)
-    route_shape = _first_item_moe_route_shape(row) if include_moe_routing else None
-    route_tensor: np.ndarray | None = None
-    route_mask: np.ndarray | None = None
-    max_expert_id = 0
-    if route_shape is not None:
-        route_tensor = np.zeros(
-            (length, route_shape[0], route_shape[1]), dtype=np.int32
-        )
-        route_mask = np.zeros(length, dtype=np.bool_)
-    _materialize_prefix_tree_row(
-        row,
-        plan=plan,
-        token_ids=token_ids,
-        group_ids=group_ids,
-        parent_ids=parent_ids,
-        input_pos=input_pos,
-        assistant_mask=assistant_mask,
-        logprobs=logprobs,
-        advantages=advantages,
-        weights=weights,
-        route_tensor=route_tensor,
-        route_mask=route_mask,
-        route_shape=route_shape,
-        include_moe_routing=include_moe_routing,
-    )
-    max_expert_id = (
-        int(route_tensor.max())
-        if route_tensor is not None
-        and route_mask is not None
-        and bool(route_mask.any())
-        else 0
-    )
-    return _PackedPrefixTreeRow(
-        token_ids=token_ids[:length],
-        group_ids=group_ids[:length],
-        parent_ids=parent_ids[:length],
-        input_pos=input_pos,
-        assistant_mask=assistant_mask,
-        logprobs=logprobs,
-        advantages=advantages,
-        weights=weights,
-        pixel_values=_packed_row_tensor_list(row, "pixel_values"),
-        image_grid_thw=_packed_row_tensor_list(row, "image_grid_thw"),
-        route_tensor=route_tensor,
-        route_mask=route_mask,
-        max_expert_id=max_expert_id,
-    )
 
 
 def _validate_shared_prefix_tree_segment(
@@ -862,6 +741,66 @@ def _validate_shared_prefix_tree_segment(
             raise RuntimeError(
                 "Prefix-tree pack cannot share mismatched input positions"
             )
+        if (item.moe_routes is None) != (reference.moe_routes is None):
+            raise RuntimeError("Prefix-tree shared routes are incomplete")
+        if (
+            item.moe_routes is not None
+            and reference.moe_routes is not None
+            and not _moe_route_ranges_equal(
+                reference.moe_routes,
+                item.moe_routes,
+                start=src_start,
+                end=src_end,
+            )
+        ):
+            raise RuntimeError(
+                "Prefix-tree pack cannot share mismatched routed experts"
+            )
+
+
+def _moe_route_ranges_equal(
+    left: MoeRouteArray | MoeRouteSegments,
+    right: MoeRouteArray | MoeRouteSegments,
+    *,
+    start: int,
+    end: int,
+) -> bool:
+    if left.num_experts != right.num_experts:
+        return False
+    left_chunks = _moe_route_chunks(left, start=start, end=end)
+    right_chunks = _moe_route_chunks(right, start=start, end=end)
+    left_index = right_index = left_offset = right_offset = 0
+    compared = 0
+    while left_index < len(left_chunks) and right_index < len(right_chunks):
+        left_chunk = left_chunks[left_index]
+        right_chunk = right_chunks[right_index]
+        count = min(
+            len(left_chunk) - left_offset,
+            len(right_chunk) - right_offset,
+        )
+        if not np.array_equal(
+            left_chunk[left_offset : left_offset + count],
+            right_chunk[right_offset : right_offset + count],
+        ):
+            return False
+        compared += count
+        left_offset += count
+        right_offset += count
+        if left_offset == len(left_chunk):
+            left_index += 1
+            left_offset = 0
+        if right_offset == len(right_chunk):
+            right_index += 1
+            right_offset = 0
+    return compared == end - start
+
+
+def _moe_route_chunks(
+    routes: MoeRouteArray | MoeRouteSegments, *, start: int, end: int
+) -> tuple[MoeRouteArray, ...]:
+    if isinstance(routes, MoeRouteSegments):
+        return tuple(segment for _, segment in routes.iter_slices(start, end))
+    return (cast(MoeRouteArray, routes[start:end]),)
 
 
 def _packed_row_tensor_list(
@@ -882,39 +821,35 @@ def _packed_row_tensor_list(
     return torch.concat(tensors) if tensors else None
 
 
-def _first_item_moe_route_shape(
-    row: list[_PrefixTreePackItem],
-) -> tuple[int, int] | None:
-    for item in row:
-        if item.moe_routes is not None:
-            shape = _moe_route_shape(item.moe_routes)
-            if shape is not None:
-                return shape
-    return None
-
-
-def _moe_route_shape(raw: MoeRouteArray | MoeRouteSegments) -> tuple[int, int] | None:
-    if isinstance(raw, MoeRouteSegments):
-        return int(raw.shape[1]), int(raw.shape[2])
-    routes = _coerce_moe_routes(raw)
-    if routes.shape[0] == 0:
-        return None
-    return int(routes.shape[1]), int(routes.shape[2])
+def _moe_route_contract(
+    rows: list[list[_PrefixTreePackItem]],
+) -> tuple[int, int, int] | None:
+    contracts = {
+        (
+            routes.num_experts,
+            int(routes.shape[1]),
+            int(routes.shape[2]),
+        )
+        for row in rows
+        for item in row
+        if (routes := item.moe_routes) is not None and routes.shape[0] > 0
+    }
+    if len(contracts) > 1:
+        raise RuntimeError("Packed MoE routes must share one exact contract")
+    return next(iter(contracts), None)
 
 
 def _coerce_moe_routes(raw: MoeRouteArray | MoeRouteSegments) -> MoeRouteArray:
-    if not isinstance(raw, np.ndarray):
+    if not isinstance(raw, MoeRouteArray):
         raise RuntimeError(f"Expected MoE routes array, got {type(raw)}")
-    routes = np.asarray(raw, dtype=np.int32)
-    if routes.ndim != 3 or routes.shape[1] <= 0 or routes.shape[2] <= 0:
-        raise RuntimeError(f"Packed MoE routes must be rank 3, got {routes.shape}")
-    return routes
+    if raw.dtype != moe_route_dtype(raw.num_experts):
+        raise RuntimeError("Packed MoE routes use the wrong exact ID dtype")
+    return raw
 
 
 def _copy_moe_route_slice(
     *,
     route_tensor: np.ndarray,
-    route_mask: np.ndarray,
     dst_start: int,
     src_start: int,
     src_end: int,
@@ -933,12 +868,9 @@ def _copy_moe_route_slice(
             if tuple(segment.shape[1:]) != route_shape:
                 raise RuntimeError("Packed MoE routes must have one rectangular shape")
             segment_dst_start = dst_start + segment_start - src_start
-            _copy_valid_moe_route_chunk(
-                route_tensor=route_tensor,
-                route_mask=route_mask,
-                dst_start=segment_dst_start,
-                routes=segment,
-                assume_valid=True,
+            segment_dst_end = segment_dst_start + int(segment.shape[0])
+            route_tensor[:, segment_dst_start:segment_dst_end] = np.moveaxis(
+                segment, 1, 0
             )
             covered_until = segment_start + int(segment.shape[0])
         if covered_until != src_end:
@@ -949,91 +881,12 @@ def _copy_moe_route_slice(
     route_slice = routes[src_start:src_end]
     if tuple(route_slice.shape[1:]) != route_shape:
         raise RuntimeError("Packed MoE routes must have one rectangular shape")
-    _copy_valid_moe_route_chunk(
-        route_tensor=route_tensor,
-        route_mask=route_mask,
-        dst_start=dst_start,
-        routes=route_slice,
+    dst_end = dst_start + int(route_slice.shape[0])
+    route_tensor[:, dst_start:dst_end] = np.moveaxis(
+        route_slice,
+        1,
+        0,
     )
-
-
-def _copy_valid_moe_route_chunk(
-    *,
-    route_tensor: np.ndarray,
-    route_mask: np.ndarray,
-    dst_start: int,
-    routes: np.ndarray,
-    assume_valid: bool = False,
-) -> None:
-    if int(routes.shape[0]) == 0:
-        return
-    if assume_valid:
-        dst_end = dst_start + int(routes.shape[0])
-        route_tensor[dst_start:dst_end] = routes
-        route_mask[dst_start:dst_end] = True
-        return
-    valid = np.all(routes != MISSING_EXPERT_ID, axis=(1, 2))
-    if not bool(valid.any()):
-        return
-    if bool(valid.all()):
-        dst_end = dst_start + int(routes.shape[0])
-        route_tensor[dst_start:dst_end] = routes
-        route_mask[dst_start:dst_end] = True
-        return
-    valid_offsets = np.nonzero(valid)[0]
-    route_tensor[dst_start + valid_offsets] = routes[valid_offsets]
-    route_mask[dst_start + valid_offsets] = True
-
-
-def _copy_source_moe_route(
-    *,
-    route_tensor: np.ndarray,
-    route_mask: np.ndarray,
-    dst_index: int,
-    source_index: int,
-    raw_routes: MoeRouteArray | MoeRouteSegments,
-    route_shape: tuple[int, int],
-) -> int:
-    if isinstance(raw_routes, MoeRouteSegments):
-        for segment_start, segment in raw_routes.iter_slices(
-            source_index, source_index + 1
-        ):
-            if tuple(segment.shape[1:]) != route_shape:
-                raise RuntimeError("Packed MoE routes must have one rectangular shape")
-            route = segment[source_index - segment_start]
-            return _copy_valid_moe_route(
-                route_tensor=route_tensor,
-                route_mask=route_mask,
-                dst_index=dst_index,
-                route=route,
-            )
-        raise RuntimeError(f"Segmented MoE routes did not cover row {source_index}")
-
-    routes = _coerce_moe_routes(raw_routes)
-    route = routes[source_index]
-    if tuple(route.shape) != route_shape:
-        raise RuntimeError("Packed MoE routes must have one rectangular shape")
-    return _copy_valid_moe_route(
-        route_tensor=route_tensor,
-        route_mask=route_mask,
-        dst_index=dst_index,
-        route=route,
-    )
-
-
-def _copy_valid_moe_route(
-    *,
-    route_tensor: np.ndarray,
-    route_mask: np.ndarray,
-    dst_index: int,
-    route: np.ndarray,
-) -> int:
-    valid = bool(np.all(route != MISSING_EXPERT_ID))
-    if not valid:
-        return 0
-    route_tensor[dst_index] = route
-    route_mask[dst_index] = True
-    return int(route.max()) if route.size else 0
 
 
 def packed_tensors_from_dir(**kwargs: Unpack[DiskPackedTensors]) -> PackedTensors:

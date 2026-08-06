@@ -10,7 +10,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from art.pipeline_tuner.config import PackedGroupShape
 from art.preprocessing.moe_routing import (
     ART_MOE_ROUTING_METADATA_KEY,
+    NUM_EXPERTS_KEY,
     ROUTED_EXPERTS_KEY,
+    MoeRouteArray,
+    moe_route_dtype,
 )
 from art.trajectories import (
     MetadataValue,
@@ -45,6 +48,9 @@ class _ChoiceRoutingPayload(BaseModel):
             raise RuntimeError("routed experts must be a uint8 or uint16 array")
         if routes.ndim != 3:
             raise RuntimeError(f"routed experts must have rank 3, got {routes.shape}")
+        num_experts = int(metadata.get(NUM_EXPERTS_KEY, 0))
+        if routes.dtype != moe_route_dtype(num_experts):
+            raise RuntimeError("routed experts do not match exact expert count")
         dtype: Literal["uint8", "uint16"] = (
             "uint8" if routes.dtype == np.dtype(np.uint8) else "uint16"
         )
@@ -60,7 +66,11 @@ class _ChoiceRoutingPayload(BaseModel):
         )
 
     def build(self) -> dict[str, Any]:
-        routes = np.frombuffer(self.data, dtype=self.dtype).reshape(self.shape)
+        num_experts = int(self.metadata[NUM_EXPERTS_KEY])
+        routes = MoeRouteArray(
+            np.frombuffer(self.data, dtype=self.dtype).reshape(self.shape),
+            num_experts=num_experts,
+        )
         return {**self.metadata, ROUTED_EXPERTS_KEY: routes}
 
 
