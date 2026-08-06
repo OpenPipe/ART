@@ -621,6 +621,7 @@ def execute_megatron_rl_job(
         global_grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
             job.config.grad_accumulation_sequences
         )
+        replay_finalize_started = time.perf_counter()
         if (
             replay_bundle is None
             and packed_tensors.get("moe_routing_replay") is not None
@@ -634,6 +635,7 @@ def execute_megatron_rl_job(
             replay_bundle=replay_bundle,
             strict=_moe_replay_strict(job),
         )
+        replay_finalize_s = time.perf_counter() - replay_finalize_started
         adapter_dtypes = _prepare_rl_training_state(runtime, job)
 
         template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
@@ -768,6 +770,7 @@ def execute_megatron_rl_job(
                 num_gradient_steps=num_steps,
                 train_step_s=train_step_s,
             )
+            final_metrics["time/replay_finalize_s"] = replay_finalize_s
             if runtime.rank == 0:
                 progress_sink(step_index, num_steps, final_metrics)
 

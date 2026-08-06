@@ -1016,11 +1016,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             collect_started = time.monotonic()
             selection_s = 0.0
             preparation_s = 0.0
+            packed_queue_depth = 0
             preparation_metrics: dict[str, float] = {}
             packing_policy_step = current_step
             if self._packed_queue is None:
                 batch, discarded, saw_sentinel = await self._collect_batch(current_step)
             else:
+                packed_queue_depth = self._packed_queue.qsize()
                 prepared = await self._packed_queue.get()
                 if prepared is None:
                     break
@@ -1155,6 +1157,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                             "time/step_batch_selection_s": selection_s,
                             "time/step_batch_prepare_s": preparation_s,
                             "queue/packed_get_wait_s": trainer_idle_s,
+                            "queue/packed_queue_depth": float(packed_queue_depth),
+                            "queue/packed_queue_occupancy": packed_queue_depth
+                            / self._packed_queue.maxsize,
                             "queue/packing_policy_lag_steps": float(
                                 current_step - packing_policy_step
                             ),
@@ -1639,7 +1644,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 "queue/leased_groups": float(snapshot.leased_groups),
                 "queue/packing_groups": float(snapshot.packing_groups),
                 "queue/packed_groups": float(snapshot.packed_groups),
-                "queue/packed_occupancy": snapshot.packed_groups
+                "queue/data_plane_packed_group_occupancy": snapshot.packed_groups
                 / snapshot.max_ready_groups,
                 "queue/lease_lifetime_mean_s": snapshot.lease_lifetime_s
                 / max(snapshot.released_leases, 1),
