@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import struct
 import sys
+import tempfile
 from typing import Any
 
 import torch
@@ -110,7 +111,7 @@ def _save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
         dtype = _SAFETENSORS_DTYPES.get(tensor.dtype)
         if dtype is None:
             raise RuntimeError(f"Unsupported LoRA tensor dtype: {tensor.dtype}")
-        data = memoryview(tensor.view(torch.uint8).reshape(-1).numpy())
+        data = memoryview(tensor.reshape(-1).view(torch.uint8).numpy())
         header[name] = {
             "dtype": dtype,
             "shape": list(tensor.shape),
@@ -121,13 +122,20 @@ def _save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
 
     encoded = json.dumps(header, separators=(",", ":")).encode()
     encoded += b" " * (-len(encoded) % 8)
-    with path.open("wb", buffering=0) as output:
-        for data in (memoryview(struct.pack("<Q", len(encoded))), encoded, *buffers):
-            while data:
-                written = output.write(data)
-                if not written:
-                    raise OSError(f"Short write while saving {path}")
-                data = data[written:]
+    with tempfile.TemporaryDirectory(dir=path.parent) as temp_dir:
+        temporary_path = Path(temp_dir) / path.name
+        with temporary_path.open("wb", buffering=0) as output:
+            for data in (
+                memoryview(struct.pack("<Q", len(encoded))),
+                encoded,
+                *buffers,
+            ):
+                while data:
+                    written = output.write(data)
+                    if not written:
+                        raise OSError(f"Short write while saving {path}")
+                    data = data[written:]
+        temporary_path.replace(path)
 
 
 def save_vllm_lora_tensors(
