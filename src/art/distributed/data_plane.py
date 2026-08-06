@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-import gc
 from multiprocessing import resource_tracker, shared_memory
 import os
 import secrets
@@ -511,7 +510,6 @@ class MappedPackedBatch(BaseModel):
     def close(self) -> None:
         if not self._closed:
             self.tensors = None
-            gc.collect()
             self._shm.close()
             self._closed = True
 
