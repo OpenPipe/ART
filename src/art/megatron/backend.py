@@ -635,14 +635,15 @@ class MegatronBackend(LocalBackend):
         service: ModelService,
         current_step: int,
         next_step: int,
-    ) -> None:
+    ) -> dict[str, float]:
         if self._runtime is None:
-            await super()._advance_skipped_step(model, service, current_step, next_step)
-            return
+            return await super()._advance_skipped_step(
+                model, service, current_step, next_step
+            )
         from .distributed_service import DistributedMegatronService
 
         distributed = cast(DistributedMegatronService, service)
-        await distributed.advance_without_training(
+        return await distributed.advance_without_training(
             expected_step=current_step,
             learner_version=next_step,
         )

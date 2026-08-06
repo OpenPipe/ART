@@ -64,7 +64,7 @@ class MegatronTrainJobExecutor:
         learner_version: int,
         optimizer_state_path: str,
         adapter: "OptimizerAdapter | None",
-    ) -> None:
+    ) -> dict[str, float]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
         if learner_version != expected_learner_version + 1:
@@ -77,15 +77,17 @@ class MegatronTrainJobExecutor:
             or runtime.optimizer is None
         ):
             raise RuntimeError("resident trainer state does not match no-op transition")
+        metrics = {}
         if int(runtime.rank) == 0:
             if adapter is None:
                 raise RuntimeError("rank zero no-op transition requires an adapter")
-            self._publisher.submit_policy_alias(
+            metrics = self._publisher.submit_policy_alias(
                 optimizer_state_path=optimizer_state_path,
                 expected_step=expected_learner_version,
                 adapter=adapter,
             )
         runtime.resident_policy_step = learner_version
+        return metrics
 
     def close(self) -> None:
         if self._closed:
@@ -173,14 +175,19 @@ class _GenerationPublisher:
         optimizer_state_path: str,
         expected_step: int,
         adapter: "OptimizerAdapter",
-    ) -> None:
-        self._acquire_slot()
+    ) -> dict[str, float]:
+        wait_s, in_flight = self._acquire_slot()
         self._enqueue(
             self._persist_policy_alias,
             optimizer_state_path,
             expected_step,
             adapter=adapter,
         )
+        return {
+            "snapshot_pool_wait_s": wait_s,
+            "snapshot_pool_in_use": float(in_flight),
+            "snapshot_pool_pressure": in_flight / self.capacity,
+        }
 
     def _acquire_slot(self) -> tuple[float, int]:
         self.raise_if_failed()

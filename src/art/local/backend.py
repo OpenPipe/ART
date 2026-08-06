@@ -1456,11 +1456,11 @@ class LocalBackend:
         service: ModelService,
         current_step: int,
         next_step: int,
-    ) -> None:
+    ) -> dict[str, float]:
         model_dir = get_model_dir(model=model, art_path=self._path)
         current = get_step_checkpoint_dir(model_dir, current_step)
         if not os.path.exists(current):
-            return
+            return {}
         checkpoint = get_step_checkpoint_dir(model_dir, next_step)
         if os.path.exists(checkpoint):
             raise RuntimeError(f"Refusing to replace checkpoint {checkpoint}")
@@ -1499,6 +1499,7 @@ class LocalBackend:
                     "skipped-step publication and rollback failed", failures
                 ) from None
             raise
+        return {}
 
     async def _train_model(
         self,
@@ -1541,7 +1542,9 @@ class LocalBackend:
                 f"[BACKEND] _train_model SKIP: current_step={current_step} "
                 f"next_step={next_step} (all rewards equal)"
             )
-            await self._advance_skipped_step(model, service, current_step, next_step)
+            advance_metrics = await self._advance_skipped_step(
+                model, service, current_step, next_step
+            )
             logger.info(
                 f"[BACKEND] _train_model SKIP: advanced checkpoint "
                 f"{current_step} -> {next_step}"
@@ -1559,6 +1562,7 @@ class LocalBackend:
                 "data/step_nominal_schedule_capacity_tokens": 0.0,
                 "data/step_padding_ratio": 0.0,
                 TRAIN_GRADIENT_STEPS_KEY: 0.0,
+                **advance_metrics,
             }
             return
         async with self._training_batch_lifecycle(packed_batch):

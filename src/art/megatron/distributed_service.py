@@ -413,6 +413,7 @@ class DistributedMegatronService:
             dtype=_trainer_dtype(self.config),
             trainer_mesh=mesh,
             packed_sequence_length=runtime_config.packed_sequence_length,
+            snapshot_pool_capacity=runtime_config.snapshot_pool_capacity,
             compile_enabled=compile_enabled,
             compile_fingerprint=_digest({**identity, "compile": compile_enabled}),
             optimizer_layout_fingerprint=_digest(
@@ -1208,8 +1209,9 @@ class DistributedMegatronService:
         *,
         expected_step: int,
         learner_version: int,
-    ) -> None:
+    ) -> dict[str, float]:
         async with self._train_lock:
+            metrics = self.drain_publication_metrics()
             async with self._mutation_lock:
                 self._require_open()
                 self._raise_publication_failure()
@@ -1238,6 +1240,7 @@ class DistributedMegatronService:
                         self.output_dir, learner_version
                     ),
                 )
+            prepare_started = time.monotonic()
             published = await asyncio.to_thread(
                 _publish_adapter_alias,
                 self._published_adapters[expected_step],
@@ -1245,6 +1248,9 @@ class DistributedMegatronService:
                 f"{self.output_dir}/megatron_runtime/staging/"
                 f"{generation.generation_id}",
             )
+            snapshot_metrics = {
+                "snapshot_prepare_s": time.monotonic() - prepare_started
+            }
             self._published_adapters[learner_version] = published
             if trainer is None:
                 await asyncio.to_thread(
@@ -1260,11 +1266,13 @@ class DistributedMegatronService:
                     generation,
                 )
             else:
-                await trainer.advance_without_training(
-                    expected_learner_version=expected_step,
-                    learner_version=learner_version,
-                    optimizer_state_path=self._optimizer_state_path,
-                    adapter=published,
+                snapshot_metrics.update(
+                    await trainer.advance_without_training(
+                        expected_learner_version=expected_step,
+                        learner_version=learner_version,
+                        optimizer_state_path=self._optimizer_state_path,
+                        adapter=published,
+                    )
                 )
 
             async with self._mutation_lock:
@@ -1273,7 +1281,10 @@ class DistributedMegatronService:
                 self._trainer_resident_generation = (
                     generation if trainer is not None else None
                 )
+                self._publication_metrics[learner_version] = snapshot_metrics
                 self._schedule_publication(generation)
+            metrics.update(self.drain_publication_metrics())
+            return metrics
 
     async def _register_lora_for_step_locked(self, step: int, checkpoint: str) -> None:
         if self._base_url is None:

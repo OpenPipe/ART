@@ -391,7 +391,7 @@ class MonarchTrainerActor(Actor):
         learner_version: int,
         optimizer_state_path: str,
         adapter_json: str | None,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         if not self._valid:
             raise RuntimeError("trainer actor runtime is invalid")
         from art.megatron.optimizer_state import OptimizerAdapter
@@ -403,14 +403,18 @@ class MonarchTrainerActor(Actor):
         )
         try:
             with self._weight_offload.job():
-                self._executor.advance_without_training(
+                metrics = self._executor.advance_without_training(
                     training_session_id=training_session_id,
                     expected_learner_version=expected_learner_version,
                     learner_version=learner_version,
                     optimizer_state_path=optimizer_state_path,
                     adapter=adapter,
                 )
-            return {"rank": self._runtime.rank, "learner_version": learner_version}
+            return {
+                "rank": self._runtime.rank,
+                "learner_version": learner_version,
+                "metrics": metrics,
+            }
         except BaseException:
             self._valid = False
             raise
@@ -688,7 +692,7 @@ class MonarchTrainerRun:
         learner_version: int,
         optimizer_state_path: str,
         adapter: Any | None,
-    ) -> None:
+    ) -> dict[str, float]:
         async with self._lock:
             if self._closed or not self._valid:
                 raise RuntimeError("trainer runtime is invalid")
@@ -730,6 +734,7 @@ class MonarchTrainerRun:
                 )
                 raise
             self._learner_version = learner_version
+            return next(result["metrics"] for result in results if result["rank"] == 0)
 
     def _validate(
         self, job: TrainJobSpec, batch: PackedBatchLeaseSet
