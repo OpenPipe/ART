@@ -224,6 +224,19 @@ class DistributedMegatronService:
                 self._emitted_publication_metrics.pop(step, None)
         return metrics
 
+    async def finalize_publication_metrics(self, step: int) -> dict[str, float]:
+        async with self._mutation_lock:
+            self._require_open()
+            if step != self._latest_step:
+                raise ValueError(
+                    f"final publication step {step} != learner step {self._latest_step}"
+                )
+            publication = self._publication_tasks.get(step)
+        if publication is not None:
+            await asyncio.shield(publication)
+        self._raise_publication_failure()
+        return self.drain_publication_metrics()
+
     async def wait_for_serving(self, step: int) -> None:
         async with self._mutation_lock:
             self._require_open()

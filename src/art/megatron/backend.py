@@ -99,11 +99,18 @@ class MegatronBackend(LocalBackend):
             packed_sequence_length=get_megatron_runtime_config().packed_sequence_length,
             **kwargs,
         )
-        if self._runtime is None or not kwargs.get("save_checkpoint", True):
+        if self._runtime is None:
             return result
         from .distributed_service import DistributedMegatronService
 
         service = cast(DistributedMegatronService, await self._get_service(model))
+        final_step = kwargs.get("final_training_step")
+        if final_step is not None and result.step >= final_step:
+            result.metrics.update(
+                await service.finalize_publication_metrics(result.step)
+            )
+        if not kwargs.get("save_checkpoint", True):
+            return result
         result.checkpoint_path = get_step_checkpoint_dir(
             get_model_dir(model=model, art_path=self._path), result.step
         )
