@@ -495,8 +495,11 @@ def _choice_routes(
     if not isinstance(routes, np.ndarray):
         raise RuntimeError("Missing binary routed experts")
     num_experts = int(metadata.get(NUM_EXPERTS_KEY, 0))
-    routes = MoeRouteArray(routes, num_experts=num_experts)
-    routes.flags.writeable = False
+    if isinstance(routes, MoeRouteArray):
+        if routes.num_experts != num_experts:
+            raise RuntimeError("MoE route array disagrees with its exact expert count")
+    else:
+        routes = MoeRouteArray(routes, num_experts=num_experts)
     expected_lengths = {
         len(prompt_token_ids) + completion_token_count,
         len(prompt_token_ids) + max(completion_token_count - 1, 0),
@@ -547,10 +550,12 @@ def deterministic_moe_routes(
     routes = np.empty(
         (len(positions), num_layers, topk), dtype=moe_route_dtype(num_experts)
     )
-    for layer in range(num_layers):
-        base = ((positions + 1) * 1_299_709 + (layer + 1) * 97_003) % num_experts
-        for slot in range(topk):
-            routes[:, layer, slot] = (base + slot) % num_experts
+    base = (
+        (positions.astype(np.uint64, copy=False)[:, None] + 1) * 1_299_709
+        + np.arange(1, num_layers + 1, dtype=np.uint64)[None, :] * 97_003
+    ) % num_experts
+    for slot in range(topk):
+        routes[:, :, slot] = (base + slot) % num_experts
     return MoeRouteArray(routes, num_experts=num_experts, validate=False)
 
 
