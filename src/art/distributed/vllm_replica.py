@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..utils.lifecycle import ChildProcessSupervisor
 from ..vllm_runtime import ManagedVllmRuntime, VllmRuntimeLaunchConfig
+from .adapter_transport import AdapterReceiveResult, AdapterTransferTarget
 from .specs import ModelServiceMemberSpec, ModelServiceSpec
 
 
@@ -92,6 +93,16 @@ class ReplicaHostLauncher(Protocol):
     async def stop_member(
         self, replica_id: str, member_id: str, generation: int
     ) -> None: ...
+
+    async def prepare_adapter_receive(
+        self, generation_id: str, template_path: str
+    ) -> AdapterTransferTarget: ...
+
+    async def wait_adapter_receive(
+        self, generation_id: str, timeout_s: float
+    ) -> AdapterReceiveResult: ...
+
+    async def release_adapter_receive(self, generation_id: str) -> None: ...
 
 
 class _ManagedMember:
@@ -332,6 +343,54 @@ class ReplicaManager:
             update={"phase": "updating", "update_identity": update_identity}
         )
         return self._state
+
+    async def prepare_adapter_transfer(
+        self, generation_id: str, template_path: str
+    ) -> tuple[AdapterTransferTarget, ...]:
+        return tuple(
+            await asyncio.gather(
+                *(
+                    asyncio.wait_for(
+                        self._launchers[host_id].prepare_adapter_receive(
+                            generation_id, template_path
+                        ),
+                        self._rpc_timeout_s,
+                    )
+                    for host_id in dict.fromkeys(
+                        member.host_id for member in self._spec.members
+                    )
+                )
+            )
+        )
+
+    async def wait_adapter_transfer(
+        self, generation_id: str
+    ) -> tuple[AdapterReceiveResult, ...]:
+        return tuple(
+            await asyncio.gather(
+                *(
+                    asyncio.wait_for(
+                        self._launchers[host_id].wait_adapter_receive(
+                            generation_id, self._rpc_timeout_s
+                        ),
+                        self._rpc_timeout_s,
+                    )
+                    for host_id in dict.fromkeys(
+                        member.host_id for member in self._spec.members
+                    )
+                )
+            )
+        )
+
+    async def release_adapter_transfer(self, generation_id: str) -> None:
+        await asyncio.gather(
+            *(
+                self._launchers[host_id].release_adapter_receive(generation_id)
+                for host_id in dict.fromkeys(
+                    member.host_id for member in self._spec.members
+                )
+            )
+        )
 
     def verify_update(self, report: ReplicaUpdateReport) -> ReplicaState:
         expected = self._state

@@ -47,6 +47,7 @@ from .model_support import (
     model_uses_expert_parallel,
 )
 from .optimizer_state import (
+    CheckpointFile,
     OptimizerAdapter,
     adapter_generation_lease,
     commit_optimizer_policy_advance,
@@ -572,6 +573,17 @@ class DistributedMegatronService:
                     generation_id=generation_id,
                     adapter_path=final_path,
                 )
+                publication_targets = ()
+                if (
+                    self._managed_service_name is not None
+                    and self.rollout_weight_update_mode == "in_flight_lora"
+                ):
+                    publication_targets = await self.runtime.model_service(
+                        self._managed_service_name
+                    ).prepare_adapter_transfer(
+                        generation_id,
+                        get_step_checkpoint_dir(self.output_dir, 0),
+                    )
                 values = {
                     key: value
                     for key, value in experimental_config.items()
@@ -595,6 +607,7 @@ class DistributedMegatronService:
                         ),
                         optimizer_state_path=self._optimizer_state_path,
                     ),
+                    publication_targets=publication_targets,
                 )
 
             if reconcile is not None:
@@ -664,10 +677,18 @@ class DistributedMegatronService:
                 self._latest_step = next_step
                 self._learner_generation = output_generation
                 self._trainer_resident_generation = output_generation
-                self._schedule_publication(output_generation)
+                self._schedule_publication(
+                    output_generation,
+                    publication_targets=job.publication_targets,
+                )
             yield final_metrics
 
-    def _schedule_publication(self, generation: TrainerGeneration) -> None:
+    def _schedule_publication(
+        self,
+        generation: TrainerGeneration,
+        *,
+        publication_targets: tuple[Any, ...] = (),
+    ) -> None:
         step = generation.policy_step
         if step in self._publication_tasks:
             raise RuntimeError(f"generation publication already exists for step {step}")
@@ -682,11 +703,21 @@ class DistributedMegatronService:
         serving.add_done_callback(
             lambda done: _retire_completed(self._serving_futures, step, done)
         )
-        task = asyncio.create_task(
+        publication = (
             self._publish_generation(
-                generation, previous_serving=previous, serving=serving
+                generation,
+                publication_targets=publication_targets,
+                previous_serving=previous,
+                serving=serving,
+            )
+            if publication_targets
+            else self._publish_generation(
+                generation,
+                previous_serving=previous,
+                serving=serving,
             )
         )
+        task = asyncio.create_task(publication)
         self._publication_tasks[step] = task
         task.add_done_callback(_consume_task_result)
         task.add_done_callback(
@@ -697,30 +728,77 @@ class DistributedMegatronService:
         self,
         generation: TrainerGeneration,
         *,
+        publication_targets: tuple[Any, ...] = (),
         previous_serving: asyncio.Future[None],
         serving: asyncio.Future[None],
     ) -> None:
         metrics = self._publication_metrics.setdefault(generation.policy_step, {})
         try:
             materialization_started = time.monotonic()
-            adapter = await asyncio.to_thread(
-                _wait_for_adapter_generation,
-                self._optimizer_state_path,
-                generation,
+            manager = (
+                self.runtime.model_service(self._managed_service_name)
+                if publication_targets and self._managed_service_name is not None
+                else None
             )
-            metrics["adapter_materialization_s"] = (
-                time.monotonic() - materialization_started
-            )
+            if manager is None:
+                adapter = await asyncio.to_thread(
+                    _wait_for_adapter_generation,
+                    self._optimizer_state_path,
+                    generation,
+                )
+                checkpoint = generation.adapter_path
+                metrics["adapter_materialization_s"] = (
+                    time.monotonic() - materialization_started
+                )
+            else:
+                received = await manager.wait_adapter_transfer(generation.generation_id)
+                if len(received) != len(publication_targets):
+                    raise RuntimeError("Not every inference host received the adapter")
+                paths = {result.path for result in received}
+                sizes = {
+                    (result.tensor_bytes, result.config_bytes) for result in received
+                }
+                if len(paths) != 1 or len(sizes) != 1:
+                    raise RuntimeError(
+                        "Inference hosts materialized different adapters"
+                    )
+                tensor_bytes, config_bytes = sizes.pop()
+                checkpoint = paths.pop()
+                adapter = OptimizerAdapter(
+                    identity=str(Path(generation.adapter_path).absolute()),
+                    training_session_id=generation.training_session_id,
+                    step=generation.policy_step,
+                    generation_id=generation.generation_id,
+                    files=(
+                        CheckpointFile(
+                            name="adapter_config.json", size_bytes=config_bytes
+                        ),
+                        CheckpointFile(
+                            name="adapter_model.safetensors", size_bytes=tensor_bytes
+                        ),
+                    ),
+                )
+                metrics["adapter_transport_wait_s"] = (
+                    time.monotonic() - materialization_started
+                )
+                metrics["adapter_transport_bytes"] = float(tensor_bytes * len(received))
+                metrics["adapter_materialization_s"] = max(
+                    result.materialization_s for result in received
+                )
             await previous_serving
             self._raise_publication_failure()
             activation_started = time.monotonic()
             async with self._mutation_lock:
                 self._published_adapters[generation.policy_step] = adapter
             async with self._serving_lock:
-                await self._register_lora_for_step_locked(
-                    generation.policy_step,
-                    generation.adapter_path,
-                )
+                try:
+                    await self._register_lora_for_step_locked(
+                        generation.policy_step,
+                        checkpoint,
+                    )
+                finally:
+                    if manager is not None:
+                        await manager.release_adapter_transfer(generation.generation_id)
             metrics["serving_activation_s"] = time.monotonic() - activation_started
             if not serving.done():
                 serving.set_result(None)
@@ -731,6 +809,13 @@ class DistributedMegatronService:
                 self._optimizer_state_path,
                 generation,
             )
+            durable_adapter = await asyncio.to_thread(
+                _wait_for_adapter_generation,
+                self._optimizer_state_path,
+                generation,
+            )
+            if durable_adapter != adapter:
+                raise RuntimeError("Durable and serving adapter manifests differ")
             async with self._mutation_lock:
                 self._durable_step = max(self._durable_step, durable_step)
                 self._durable_optimizer_step = max(

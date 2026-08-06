@@ -7,6 +7,7 @@ from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
+from art.distributed.adapter_transport import AdapterTransferTarget
 from art.distributed.data_plane import PackedBatchRef
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
 from art.types import TrainConfig
@@ -138,6 +139,7 @@ class TrainJobSpec(_Spec):
     config: CurrentTrainConfig
     experimental_config: ExperimentalTrainConfig = ExperimentalTrainConfig()
     output: DurableTrainOutput
+    publication_targets: tuple[AdapterTransferTarget, ...] = ()
 
     @model_validator(mode="after")
     def _validate_versions(self) -> "TrainJobSpec":

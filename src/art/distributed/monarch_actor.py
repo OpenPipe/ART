@@ -17,6 +17,7 @@ from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
 
 from art.utils.lifecycle import complete_task
 
+from .adapter_transport import NixlAdapterReceiver
 from .artifact_preflight import (
     ArtifactProbeCommand,
     ArtifactProbeResult,
@@ -133,6 +134,7 @@ class RolloutHostService(Actor):
         self._packer = None
         self._vllm_output_root = vllm_output_root
         self._vllm_launcher = None
+        self._adapter_receiver: NixlAdapterReceiver | None = None
         self._nccl_cleanups: dict[str, asyncio.Task[None]] = {}
         self._nccl_rendezvous: dict[str, NcclRendezvous] = {}
         self._nccl_sessions: dict[str, tuple[float, asyncio.Task[None]]] = {}
@@ -396,6 +398,13 @@ class RolloutHostService(Actor):
             )
         return self._vllm_launcher
 
+    def _receiver(self) -> NixlAdapterReceiver:
+        if self._adapter_receiver is None:
+            self._adapter_receiver = NixlAdapterReceiver(
+                self.host_id, self._vllm_output_root
+            )
+        return self._adapter_receiver
+
     @resilient_endpoint
     async def start_vllm_member(self, request: HostMemberLaunchRequest):
         if self._admission_report is None:
@@ -412,6 +421,21 @@ class RolloutHostService(Actor):
     ) -> None:
         if self._vllm_launcher is not None:
             await self._vllm_launcher.stop_member(replica_id, member_id, generation)
+
+    @resilient_endpoint
+    async def prepare_adapter_receive(self, generation_id: str, template_path: str):
+        return await asyncio.to_thread(
+            self._receiver().prepare, generation_id, template_path
+        )
+
+    @resilient_endpoint
+    async def wait_adapter_receive(self, generation_id: str, timeout_s: float):
+        return await asyncio.to_thread(self._receiver().wait, generation_id, timeout_s)
+
+    @resilient_endpoint
+    async def release_adapter_receive(self, generation_id: str) -> None:
+        if self._adapter_receiver is not None:
+            await asyncio.to_thread(self._adapter_receiver.release, generation_id)
 
     @resilient_endpoint
     async def pack_batch(

@@ -109,6 +109,10 @@ class _GenerationPublisher:
         self._slots = BoundedSemaphore(capacity)
         self._lock = Lock()
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="art-publish")
+        self._transport_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="art-adapter-transport"
+        )
+        self._transport_sender: Any | None = None
         self._failures: list[BaseException] = []
         self._in_flight = 0
 
@@ -154,13 +158,14 @@ class _GenerationPublisher:
                 self._release_slot()
             raise
         self._enqueue(
-            self._persist_generation,
+            self._publish_snapshot,
             generation=job.output.generation,
             optimizer_state_path=job.output.optimizer_state_path,
             staging_adapter_path=job.output.staging_adapter_path,
             lora=lora,
             adapter=None,
             optimizer=optimizer,
+            publication_targets=getattr(job, "publication_targets", ()),
         )
         return {
             "snapshot_pool_wait_s": wait_s,
@@ -266,6 +271,63 @@ class _GenerationPublisher:
                 Path(optimizer_state_path), adapter.generation_id, 0, error
             )
             raise
+
+    def _publish_snapshot(
+        self,
+        *,
+        generation: TrainerGeneration,
+        optimizer_state_path: str,
+        staging_adapter_path: str | None,
+        lora: Any,
+        adapter: "OptimizerAdapter | None",
+        optimizer: Any,
+        publication_targets: tuple[Any, ...],
+    ) -> None:
+        transfer = None
+        if int(self.runtime.rank) == 0 and publication_targets:
+            if lora is None:
+                raise RuntimeError("rank zero has no LoRA snapshot to transfer")
+            transfer = self._transport_pool.submit(
+                self._transfer_lora_snapshot,
+                lora,
+                publication_targets,
+            )
+        failures: list[BaseException] = []
+        try:
+            self._persist_generation(
+                generation=generation,
+                optimizer_state_path=optimizer_state_path,
+                staging_adapter_path=staging_adapter_path,
+                lora=lora,
+                adapter=adapter,
+                optimizer=optimizer,
+            )
+        except BaseException as error:
+            failures.append(error)
+        if transfer is not None:
+            try:
+                transfer.result()
+            except BaseException as error:
+                failures.append(error)
+                _record_generation_failure(
+                    Path(optimizer_state_path),
+                    generation.generation_id,
+                    int(self.runtime.rank),
+                    error,
+                )
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup(
+                "adapter persistence and transport failed", failures
+            )
+
+    def _transfer_lora_snapshot(self, lora: Any, targets: tuple[Any, ...]) -> None:
+        from art.distributed.adapter_transport import NixlAdapterSender
+
+        if self._transport_sender is None:
+            self._transport_sender = NixlAdapterSender()
+        self._transport_sender.send(lora, targets)
 
     def _persist_generation(
         self,
@@ -411,6 +473,7 @@ class _GenerationPublisher:
 
     def close(self) -> None:
         self._pool.shutdown(wait=True)
+        self._transport_pool.shutdown(wait=True)
         self.raise_if_failed()
 
 

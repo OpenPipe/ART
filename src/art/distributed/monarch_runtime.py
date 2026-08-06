@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict
 
 from art.trajectories import TrajectoryGroup
 
+from .adapter_transport import AdapterReceiveResult, AdapterTransferTarget
 from .data_plane import PackedBatchRef, PackedBatchTransfer
 from .packing import PackingRequest, PackingResult
 from .rollout import (
@@ -170,6 +171,23 @@ class MonarchVllmHostLauncher:
         await call_remote(
             self.actor.stop_vllm_member, replica_id, member_id, generation
         )
+
+    async def prepare_adapter_receive(
+        self, generation_id: str, template_path: str
+    ) -> AdapterTransferTarget:
+        return await call_remote(
+            self.actor.prepare_adapter_receive, generation_id, template_path
+        )
+
+    async def wait_adapter_receive(
+        self, generation_id: str, timeout_s: float
+    ) -> AdapterReceiveResult:
+        return await call_remote(
+            self.actor.wait_adapter_receive, generation_id, timeout_s
+        )
+
+    async def release_adapter_receive(self, generation_id: str) -> None:
+        await call_remote(self.actor.release_adapter_receive, generation_id)
 
 
 class MonarchPackedBatchInbox:
