@@ -142,8 +142,8 @@ def _read_adapter_template(
         config = json.load(source)
     if not isinstance(config, dict):
         raise RuntimeError(f"Adapter config must be an object: {path}")
-    if config.get("art_lora_format") == "vllm":
-        config.pop("art_lora_format")
+    if config.get("art_lora_format") != "vllm":
+        raise RuntimeError(f"Adapter template is not in vLLM format: {path}")
     return specs, config
 
 
@@ -343,7 +343,8 @@ class NixlAdapterSender:
             for target in targets[1:]
         ):
             raise RuntimeError("Adapter transfer targets disagree")
-        if snapshot.adapter_config != first.adapter_config:
+        snapshot_config = {**snapshot.adapter_config, "art_lora_format": "vllm"}
+        if snapshot_config != first.adapter_config:
             raise RuntimeError("LoRA snapshot adapter config changed during training")
         blocks = _snapshot_blocks(snapshot.tensors, first.tensors)
         agent = self._require_agent()
