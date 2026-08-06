@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Mapping
 import secrets
+import time
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -35,7 +36,32 @@ class TrajectoryGroupDescriptor(_Contract):
     initial_policy_versions: tuple[int, ...]
     completion_tokens: tuple[float, ...]
     policy_token_counts: dict[int, int]
+    trajectory_initial_policy_versions: tuple[int | None, ...]
+    trajectory_final_policy_versions: tuple[int | None, ...]
+    trajectory_policy_token_counts: tuple[dict[int, int], ...]
+    trajectory_metrics: tuple[dict[str, float | int | bool], ...]
+    trajectory_metadata: tuple[dict[str, MetadataValue], ...]
+    group_metadata: dict[str, MetadataValue]
+    group_metrics: dict[str, float | int | bool]
+    exceptions: tuple[tuple[str, str], ...]
     byte_count: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_trajectory_summaries(self) -> "TrajectoryGroupDescriptor":
+        aligned = (
+            self.rewards,
+            self.completion_tokens,
+            self.trajectory_initial_policy_versions,
+            self.trajectory_final_policy_versions,
+            self.trajectory_policy_token_counts,
+            self.trajectory_metrics,
+            self.trajectory_metadata,
+        )
+        if any(len(values) != self.trajectory_count for values in aligned):
+            raise ValueError("trajectory descriptor summaries are not aligned")
+        if len(self.exceptions) != self.exception_count:
+            raise ValueError("trajectory descriptor exceptions are not aligned")
+        return self
 
 
 class TrajectoryGroupBundle(_Contract):
@@ -188,6 +214,32 @@ class TrajectoryQueueItem(_Contract):
     ref: TrajectoryGroupRef
     annotations: TrajectoryGroupAnnotations
 
+    async def receive(self, *, timeout_s: float) -> TrajectoryGroup:
+        transfer = self.ref.transfer
+        if transfer is None:
+            raise RuntimeError("remote trajectory has no data-plane transfer")
+        if transfer.stream.stream_id != self.ref.result_id:
+            raise RuntimeError("trajectory owner returned the wrong result ID")
+        if transfer.stream.byte_count != self.ref.descriptor.byte_count:
+            raise RuntimeError("trajectory owner returned the wrong byte count")
+        groups = await transfer.receive_groups(timeout_s=timeout_s)
+        if len(groups) != 1:
+            raise RuntimeError("trajectory owner returned the wrong group count")
+        return self.apply_annotations(groups[0])
+
+    def apply_annotations(self, group: TrajectoryGroup) -> TrajectoryGroup:
+        annotations = self.annotations
+        group.metadata.update(annotations.metadata)
+        group.metadata["_art_rollout_wall_s"] = annotations.rollout_wall_s
+        group.metadata["_art_actor_idle_s"] = annotations.actor_idle_s
+        group.metadata["_art_queue_wait_s"] = annotations.queue_wait_s
+        for trajectory in group.trajectories:
+            if trajectory.initial_policy_version is None:
+                trajectory.initial_policy_version = annotations.initial_policy_version
+            if trajectory.final_policy_version is None:
+                trajectory.final_policy_version = annotations.final_policy_version
+        return group
+
 
 class TrajectoryQueueResize(_Contract):
     queue_id: str = Field(min_length=1)
@@ -237,6 +289,9 @@ class TrajectoryQueueSnapshot(_Contract):
     ready_groups: int = Field(ge=0)
     packing_groups: int = Field(ge=0)
     packed_groups: int = Field(ge=0)
+    released_leases: int = Field(ge=0)
+    lease_lifetime_s: float = Field(ge=0)
+    max_lease_lifetime_s: float = Field(ge=0)
 
 
 class TrajectoryCapacityError(RuntimeError):
@@ -316,6 +371,27 @@ class TrajectoryRecordStore:
                 for value in (trajectory.metrics.get("completion_tokens"),)
             ),
             policy_token_counts=_policy_token_counts(group.trajectories),
+            trajectory_initial_policy_versions=tuple(
+                trajectory.initial_policy_version for trajectory in group.trajectories
+            ),
+            trajectory_final_policy_versions=tuple(
+                trajectory.final_policy_version for trajectory in group.trajectories
+            ),
+            trajectory_policy_token_counts=tuple(
+                _trajectory_policy_token_counts(trajectory)
+                for trajectory in group.trajectories
+            ),
+            trajectory_metrics=tuple(
+                trajectory.metrics for trajectory in group.trajectories
+            ),
+            trajectory_metadata=tuple(
+                trajectory.metadata for trajectory in group.trajectories
+            ),
+            group_metadata=group.metadata,
+            group_metrics=group.metrics,
+            exceptions=tuple(
+                (exception.type, exception.message) for exception in group.exceptions
+            ),
             byte_count=byte_count,
         )
         ref = TrajectoryGroupRef(
@@ -389,6 +465,7 @@ class _QueueEntry:
         self.claim_id: str | None = None
         self.claim_generation: int | None = None
         self.packing_generation_id: str | None = None
+        self.acquired_at: float | None = None
 
 
 class TrajectoryQueueStore:
@@ -413,6 +490,9 @@ class TrajectoryQueueStore:
         self._finished = False
         self.generation = 0
         self._claim_generation = 0
+        self._released_leases = 0
+        self._lease_lifetime_s = 0.0
+        self._max_lease_lifetime_s = 0.0
 
     def resize(self, *, maxsize: int, generation: int) -> None:
         if maxsize < 1 or generation < 1:
@@ -467,6 +547,7 @@ class TrajectoryQueueStore:
         entry.consumer_id = consumer_id
         entry.claim_id = secrets.token_hex(16)
         entry.claim_generation = self._claim_generation
+        entry.acquired_at = time.monotonic()
         return TrajectoryQueueTake(
             lease=TrajectoryQueueLease(
                 claim_id=entry.claim_id,
@@ -496,6 +577,11 @@ class TrajectoryQueueStore:
                 )
         else:
             raise TrajectoryLeaseError("trajectory claim was not acquired")
+        assert entry.acquired_at is not None
+        lifetime = time.monotonic() - entry.acquired_at
+        self._released_leases += 1
+        self._lease_lifetime_s += lifetime
+        self._max_lease_lifetime_s = max(self._max_lease_lifetime_s, lifetime)
         self._remove(operation.lease.item.ref.result_id)
 
     def finish(self) -> None:
@@ -531,6 +617,9 @@ class TrajectoryQueueStore:
             packed_groups=sum(
                 entry.phase == "packed" for entry in self._entries.values()
             ),
+            released_leases=self._released_leases,
+            lease_lifetime_s=self._lease_lifetime_s,
+            max_lease_lifetime_s=self._max_lease_lifetime_s,
         )
 
     def _leased_entry(self, lease: TrajectoryQueueLease) -> _QueueEntry:
@@ -570,24 +659,31 @@ def _resolve_grouping(item: TrajectoryQueueItem) -> TrajectoryQueueItem:
 def _policy_token_counts(trajectories: list[Trajectory]) -> dict[int, int]:
     counts: dict[int, int] = {}
     for trajectory in trajectories:
-        items = list(trajectory.messages_and_choices)
-        for history in trajectory.additional_histories:
-            items.extend(history.messages_and_choices)
-        for item in items:
-            extra = getattr(item, "model_extra", None)
-            if not isinstance(extra, Mapping):
+        for version, tokens in _trajectory_policy_token_counts(trajectory).items():
+            counts[version] = counts.get(version, 0) + tokens
+    return counts
+
+
+def _trajectory_policy_token_counts(trajectory: Trajectory) -> dict[int, int]:
+    counts: dict[int, int] = {}
+    items = list(trajectory.messages_and_choices)
+    for history in trajectory.additional_histories:
+        items.extend(history.messages_and_choices)
+    for item in items:
+        extra = getattr(item, "model_extra", None)
+        if not isinstance(extra, Mapping):
+            continue
+        spans = extra.get("policy_token_spans")
+        if not isinstance(spans, list):
+            continue
+        for span in spans:
+            if not isinstance(span, Mapping):
                 continue
-            spans = extra.get("policy_token_spans")
-            if not isinstance(spans, list):
+            try:
+                version = int(span["policy_version"])
+                tokens = int(span["end_token"]) - int(span["start_token"])
+            except (KeyError, TypeError, ValueError):
                 continue
-            for span in spans:
-                if not isinstance(span, Mapping):
-                    continue
-                try:
-                    version = int(span["policy_version"])
-                    tokens = int(span["end_token"]) - int(span["start_token"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if tokens > 0:
-                    counts[version] = counts.get(version, 0) + tokens
+            if tokens > 0:
+                counts[version] = counts.get(version, 0) + tokens
     return counts

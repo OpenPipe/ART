@@ -46,6 +46,7 @@ class Trajectory(pydantic.BaseModel):
     metadata: dict[str, MetadataValue] = {}
     logs: list[str] = []
     start_time: datetime = pydantic.Field(default_factory=datetime.now, exclude=True)
+    _policy_token_counts: dict[int, int] | None = pydantic.PrivateAttr(default=None)
 
     def log(self, message: str) -> None:
         self.logs.append(message)
@@ -135,6 +136,9 @@ class TrajectoryGroup(pydantic.BaseModel):
     logs: list[str] = []
     _collect_packing_shape: bool = pydantic.PrivateAttr(default=False)
     _packed_group_shape: Any = pydantic.PrivateAttr(default=None)
+    _distributed_lease: Any = pydantic.PrivateAttr(default=None)
+    _prepared_training_batch: Any = pydantic.PrivateAttr(default=None)
+    _prepared_log_path: str | None = pydantic.PrivateAttr(default=None)
 
     def __init__(
         self,

@@ -1,6 +1,10 @@
+import asyncio
 from pathlib import Path
 import secrets
-from typing import Any, AsyncIterator, Iterable, cast
+from typing import Any, AsyncIterator, Iterable, Literal, cast
+import uuid
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from mp_actors import move_to_child_process
 
@@ -19,6 +23,23 @@ from .optimizer_state import (
     prepare_megatron_resume_state,
 )
 from .runtime_config import get_megatron_runtime_config
+
+
+class _DistributedBatchPayload(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    packed: Any
+    selections: tuple[Any, ...]
+    generation_id: str = Field(min_length=1)
+
+
+class _PipelinePreparedBatch(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    batch: Any
+    groups: tuple[Any, ...]
+    include_moe_routing: bool
+    metrics: dict[str, float]
 
 
 class MegatronBackend(LocalBackend):
@@ -162,6 +183,19 @@ class MegatronBackend(LocalBackend):
         *,
         include_moe_routing: bool,
     ) -> _PackedTrainingBatch | None:
+        prepared = tuple(group._prepared_training_batch for group in trajectory_groups)
+        if any(value is not None for value in prepared):
+            first = prepared[0]
+            if (
+                not isinstance(first, _PipelinePreparedBatch)
+                or any(value is not first for value in prepared)
+                or first.groups != tuple(trajectory_groups)
+                or first.include_moe_routing != include_moe_routing
+            ):
+                raise RuntimeError("pipeline prepared batch does not match training")
+            for group in trajectory_groups:
+                group._prepared_training_batch = None
+            return cast(_PackedTrainingBatch, first.batch)
         if self._runtime is None:
             return await super()._prepare_training_batch(
                 model,
@@ -170,8 +204,25 @@ class MegatronBackend(LocalBackend):
                 include_moe_routing=include_moe_routing,
             )
         from ..distributed.packing import PackingRequest
-        from ..distributed.rollout import RolloutModelSpec
+        from ..distributed.rollout import (
+            DistributedTrajectorySelection,
+            RolloutModelSpec,
+        )
         from ..distributed.trajectory_store import TrajectoryGroupBundle
+
+        selections = tuple(group._distributed_lease for group in trajectory_groups)
+        selected = tuple(
+            selection
+            for selection in selections
+            if isinstance(selection, DistributedTrajectorySelection)
+        )
+        if selected and len(selected) != len(trajectory_groups):
+            raise RuntimeError("distributed batch mixes owned and controller groups")
+        queue = selected[0].queue if selected else None
+        if queue is not None and any(
+            selection.queue is not queue for selection in selected
+        ):
+            raise RuntimeError("distributed batch spans trajectory queues")
 
         versions = [
             version
@@ -183,42 +234,136 @@ class MegatronBackend(LocalBackend):
             )
             if version is not None
         ]
-        current_step = await self._get_step(model)
-        group_ids = tuple(
-            f"{group.metadata.get('scenario_id', 'group')}:{index}"
-            for index, group in enumerate(trajectory_groups)
+        current_step = min(versions) if versions else await self._get_step(model)
+        if selected:
+            group_ids = tuple(
+                selection.lease.item.ref.result_id for selection in selected
+            )
+            record_ids = tuple(
+                record.record_id
+                for selection in selected
+                for record in selection.lease.item.ref.records
+            )
+        else:
+            group_ids = tuple(
+                f"{group.metadata.get('scenario_id', 'group')}:{index}"
+                for index, group in enumerate(trajectory_groups)
+            )
+            record_ids = tuple(
+                f"{group_id}:{trajectory_index}"
+                for group_id, group in zip(group_ids, trajectory_groups, strict=True)
+                for trajectory_index, _ in enumerate(group.trajectories)
+            )
+        generation_id = uuid.uuid4().hex
+        trajectory_log_path = (
+            str(
+                Path(get_model_dir(model=model, art_path=self._path))
+                / "trajectories"
+                / ".staging"
+                / f"{generation_id}.parquet"
+            )
+            if selected
+            else None
         )
-        record_ids = tuple(
-            f"{group_id}:{trajectory_index}"
-            for group_id, group in zip(group_ids, trajectory_groups, strict=True)
-            for trajectory_index, _ in enumerate(group.trajectories)
-        )
-        packed = await self._runtime.pack(
-            PackingRequest(
-                model=RolloutModelSpec.from_model(model),
-                trajectory_groups=tuple(
+        request = PackingRequest(
+            model=RolloutModelSpec.from_model(model),
+            generation_id=generation_id,
+            trajectory_groups=(
+                ()
+                if selected
+                else tuple(
                     TrajectoryGroupBundle.from_group(group)
                     for group in trajectory_groups
-                ),
-                advantage_balance=dev_config.get("advantage_balance", 0.0),
-                allow_training_without_logprobs=dev_config.get(
-                    "allow_training_without_logprobs", False
-                ),
-                scale_rewards=dev_config.get("scale_rewards", True),
-                plot_tensors=dev_config.get("plot_tensors", False),
-                packed_sequence_length=dev_config["packed_sequence_length"],
-                logprob_calculation_chunk_size=dev_config.get(
-                    "logprob_calculation_chunk_size", 1024
-                ),
-                include_moe_routing=include_moe_routing,
-                group_ids=group_ids,
-                record_ids=record_ids,
-                min_source_version=min(versions, default=current_step),
-                max_source_version=max(versions, default=current_step),
-            )
+                )
+            ),
+            trajectory_sources=tuple(selection.lease.item for selection in selected),
+            trajectory_log_path=trajectory_log_path,
+            advantage_balance=dev_config.get("advantage_balance", 0.0),
+            allow_training_without_logprobs=dev_config.get(
+                "allow_training_without_logprobs", False
+            ),
+            scale_rewards=dev_config.get("scale_rewards", True),
+            plot_tensors=dev_config.get("plot_tensors", False),
+            packed_sequence_length=dev_config["packed_sequence_length"],
+            logprob_calculation_chunk_size=dev_config.get(
+                "logprob_calculation_chunk_size", 1024
+            ),
+            include_moe_routing=include_moe_routing,
+            collect_packing_shapes=any(
+                group._collect_packing_shape for group in trajectory_groups
+            ),
+            group_ids=group_ids,
+            record_ids=record_ids,
+            min_source_version=min(versions, default=current_step),
+            max_source_version=max(versions, default=current_step),
         )
+        try:
+            packed = await self._runtime.pack(request)
+        except BaseException as error:
+            cleanup = await asyncio.gather(
+                *(
+                    (queue.release_selections(selected, disposition="discarded"),)
+                    if queue is not None
+                    else ()
+                ),
+                *(
+                    (
+                        asyncio.to_thread(
+                            Path(trajectory_log_path).unlink, missing_ok=True
+                        ),
+                    )
+                    if trajectory_log_path is not None
+                    else ()
+                ),
+                return_exceptions=True,
+            )
+            for group in trajectory_groups:
+                group._distributed_lease = None
+            failures = [
+                result for result in cleanup if isinstance(result, BaseException)
+            ]
+            if failures:
+                raise BaseExceptionGroup(
+                    "packing and source cleanup failed", [error, *failures]
+                ) from None
+            raise
         if packed is None:
+            if queue is not None:
+                await queue.release_selections(selected, disposition="discarded")
+                for group in trajectory_groups:
+                    group._distributed_lease = None
             return None
+        if queue is not None:
+            try:
+                await queue.mark_packed(selected, generation_id)
+            except BaseException as error:
+                cleanup = await asyncio.gather(
+                    self._runtime.release_batch(packed),
+                    queue.release_selections(selected, disposition="discarded"),
+                    *(
+                        (
+                            asyncio.to_thread(
+                                Path(trajectory_log_path).unlink, missing_ok=True
+                            ),
+                        )
+                        if trajectory_log_path is not None
+                        else ()
+                    ),
+                    return_exceptions=True,
+                )
+                failures = [
+                    result for result in cleanup if isinstance(result, BaseException)
+                ]
+                for group in trajectory_groups:
+                    group._distributed_lease = None
+                if failures:
+                    raise BaseExceptionGroup(
+                        "packing claim and cleanup failed", [error, *failures]
+                    ) from None
+                raise
+            for group in trajectory_groups:
+                group._distributed_lease = None
+                group._prepared_log_path = packed.trajectory_log_path
         for group, shape in zip(
             trajectory_groups, packed.packed_group_shapes, strict=True
         ):
@@ -229,7 +374,15 @@ class MegatronBackend(LocalBackend):
         if stats is None:
             raise RuntimeError("distributed packed batch has no prefix-tree statistics")
         return _PackedTrainingBatch(
-            payload=packed,
+            payload=(
+                _DistributedBatchPayload(
+                    packed=packed,
+                    selections=selected,
+                    generation_id=generation_id,
+                )
+                if selected
+                else packed
+            ),
             num_sequences=ref.num_sequences,
             sequence_length=ref.sequence_length,
             trainable_assistant_tokens=packed.trainable_assistant_tokens,
@@ -239,6 +392,69 @@ class MegatronBackend(LocalBackend):
             physical_tokens=stats.physical_tokens,
             include_moe_routing=include_moe_routing,
         )
+
+    async def prepare_pipeline_batch(
+        self, model: TrainableModel, trajectory_groups: list[TrajectoryGroup]
+    ) -> dict[str, float] | None:
+        include_moe_routing = self._model_uses_expert_replay(model)
+        batch = await self._prepare_training_batch(
+            model,
+            trajectory_groups,
+            {
+                "packed_sequence_length": get_megatron_runtime_config().packed_sequence_length
+            },
+            include_moe_routing=include_moe_routing,
+        )
+        if batch is None:
+            return None
+        payload = batch.payload
+        distributed = (
+            payload.packed if isinstance(payload, _DistributedBatchPayload) else payload
+        )
+        metrics = {
+            "time/step_trajectory_fetch_s": distributed.trajectory_fetch_s,
+            "time/step_packing_core_s": distributed.packing_core_s,
+            "time/step_trajectory_log_wait_s": distributed.trajectory_log_wait_s,
+            "time/step_packed_batch_finalize_s": distributed.packed_batch_finalize_s,
+            "time/step_packing_rpc_s": distributed.packing_rpc_s,
+            "time/step_packed_batch_fanout_s": distributed.packed_batch_fanout_s,
+        }
+        prepared = _PipelinePreparedBatch(
+            batch=batch,
+            groups=tuple(trajectory_groups),
+            include_moe_routing=include_moe_routing,
+            metrics=metrics,
+        )
+        for group in trajectory_groups:
+            group._prepared_training_batch = prepared
+        return metrics
+
+    async def discard_pipeline_batch(
+        self, trajectory_groups: list[TrajectoryGroup]
+    ) -> None:
+        prepared = trajectory_groups[0]._prepared_training_batch
+        if not isinstance(prepared, _PipelinePreparedBatch) or any(
+            group._prepared_training_batch is not prepared
+            for group in trajectory_groups
+        ):
+            raise RuntimeError("pipeline batch is not prepared")
+        for group in trajectory_groups:
+            group._prepared_training_batch = None
+        paths = {
+            group._prepared_log_path
+            for group in trajectory_groups
+            if group._prepared_log_path is not None
+        }
+        results = await asyncio.gather(
+            self._release_distributed_batch(prepared.batch, disposition="discarded"),
+            *(asyncio.to_thread(Path(path).unlink) for path in paths),
+            return_exceptions=True,
+        )
+        for group in trajectory_groups:
+            group._prepared_log_path = None
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("prepared batch discard failed", failures)
 
     async def _stream_prepared_training(
         self,
@@ -265,7 +481,51 @@ class MegatronBackend(LocalBackend):
         from ..distributed.art_runtime import DistributedPackedBatch
         from .distributed_service import DistributedMegatronService
 
-        distributed_batch = cast(DistributedPackedBatch, batch.payload)
+        payload = batch.payload
+        distributed_batch = cast(
+            DistributedPackedBatch,
+            payload.packed
+            if isinstance(payload, _DistributedBatchPayload)
+            else payload,
+        )
+        if isinstance(payload, _DistributedBatchPayload):
+            ref = distributed_batch.leases.ref
+            expected_groups = tuple(
+                selection.lease.item.ref.result_id for selection in payload.selections
+            )
+            expected_records = tuple(
+                record.record_id
+                for selection in payload.selections
+                for record in selection.lease.item.ref.records
+            )
+            versions = []
+            for selection in payload.selections:
+                item = selection.lease.item
+                descriptor = item.ref.descriptor
+                versions.extend(
+                    version
+                    for initial, final in zip(
+                        descriptor.trajectory_initial_policy_versions,
+                        descriptor.trajectory_final_policy_versions,
+                        strict=True,
+                    )
+                    for version in (
+                        initial
+                        if initial is not None
+                        else item.annotations.initial_policy_version,
+                        final
+                        if final is not None
+                        else item.annotations.final_policy_version,
+                    )
+                )
+            if (
+                distributed_batch.packing_generation_id != payload.generation_id
+                or ref.group_ids != expected_groups
+                or ref.record_ids != expected_records
+                or ref.min_source_version != min(versions)
+                or ref.max_source_version != max(versions)
+            ):
+                raise RuntimeError("packed batch policy provenance does not match")
         distributed_service = cast(DistributedMegatronService, service)
         async for result in distributed_service.train_packed(
             distributed_batch, config, service_dev_config
@@ -275,9 +535,37 @@ class MegatronBackend(LocalBackend):
     async def _release_training_batch(self, batch: _PackedTrainingBatch) -> None:
         if self._runtime is None:
             return await super()._release_training_batch(batch)
+        await self._release_distributed_batch(batch, disposition="consumed")
+
+    async def _release_distributed_batch(
+        self,
+        batch: _PackedTrainingBatch,
+        *,
+        disposition: Literal["consumed", "discarded"],
+    ) -> None:
         from ..distributed.art_runtime import DistributedPackedBatch
 
-        await self._runtime.release_batch(cast(DistributedPackedBatch, batch.payload))
+        assert self._runtime is not None
+        payload = batch.payload
+        if not isinstance(payload, _DistributedBatchPayload):
+            await self._runtime.release_batch(cast(DistributedPackedBatch, payload))
+            return
+        distributed_batch = cast(DistributedPackedBatch, payload.packed)
+        queue = payload.selections[0].queue
+        results = await asyncio.gather(
+            self._runtime.release_batch(distributed_batch),
+            queue.release_selections(
+                payload.selections,
+                disposition=disposition,
+                generation_id=payload.generation_id,
+            ),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise BaseExceptionGroup(
+                "distributed training batch release failed", failures
+            )
 
     async def _advance_skipped_step(
         self,

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import secrets
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from openai.types.chat.chat_completion import Choice
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art.pipeline_tuner.config import PackedGroupShape
 from art.preprocessing.moe_routing import (
@@ -24,7 +25,11 @@ from art.trajectories import (
 
 from .data_plane import PackedBatchRef
 from .rollout import RolloutModelSpec
-from .trajectory_store import TrajectoryBatchTransfer, TrajectoryGroupBundle
+from .trajectory_store import (
+    TrajectoryBatchTransfer,
+    TrajectoryGroupBundle,
+    TrajectoryQueueItem,
+)
 
 if TYPE_CHECKING:
     from art.model import TrainableModel
@@ -218,8 +223,11 @@ class PackingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     model: RolloutModelSpec
-    trajectory_groups: tuple[TrajectoryGroupBundle, ...]
+    generation_id: str = Field(min_length=1)
+    trajectory_groups: tuple[TrajectoryGroupBundle, ...] = ()
     trajectory_transfer: TrajectoryBatchTransfer | None = None
+    trajectory_sources: tuple[TrajectoryQueueItem, ...] = ()
+    trajectory_log_path: str | None = None
     advantage_balance: float = 0.0
     allow_training_without_logprobs: bool = False
     scale_rewards: bool = True
@@ -227,10 +235,22 @@ class PackingRequest(BaseModel):
     packed_sequence_length: int = Field(ge=1)
     logprob_calculation_chunk_size: int = Field(default=1024, ge=1)
     include_moe_routing: bool = False
+    collect_packing_shapes: bool = False
     group_ids: tuple[str, ...] = ()
     record_ids: tuple[str, ...] = ()
     min_source_version: int = Field(default=0, ge=0)
     max_source_version: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_trajectory_input(self) -> "PackingRequest":
+        inputs = (
+            bool(self.trajectory_groups),
+            self.trajectory_transfer is not None,
+            bool(self.trajectory_sources),
+        )
+        if sum(inputs) != 1:
+            raise ValueError("packing requires exactly one trajectory input")
+        return self
 
     @classmethod
     def from_groups(
@@ -254,6 +274,7 @@ class PackingRequest(BaseModel):
 
         return cls(
             model=RolloutModelSpec.from_model(model),
+            generation_id=secrets.token_hex(16),
             trajectory_groups=tuple(
                 TrajectoryGroupBundle.from_group(group) for group in trajectory_groups
             ),
@@ -264,6 +285,9 @@ class PackingRequest(BaseModel):
             packed_sequence_length=packed_sequence_length,
             logprob_calculation_chunk_size=logprob_calculation_chunk_size,
             include_moe_routing=include_moe_routing,
+            collect_packing_shapes=any(
+                group._collect_packing_shape for group in trajectory_groups
+            ),
             group_ids=group_ids,
             record_ids=record_ids,
             min_source_version=min_source_version,
@@ -279,3 +303,9 @@ class PackingResult(BaseModel):
     trainable_assistant_tokens: int = Field(default=0, ge=0)
     loss_bearing_tokens: int = Field(default=0, ge=0)
     non_padding_tokens: int = Field(default=0, ge=0)
+    trajectory_log_path: str | None = None
+    trajectory_fetch_s: float = Field(default=0.0, ge=0)
+    packing_core_s: float = Field(default=0.0, ge=0)
+    trajectory_log_wait_s: float = Field(default=0.0, ge=0)
+    packed_batch_finalize_s: float = Field(default=0.0, ge=0)
+    generation_id: str = Field(min_length=1)

@@ -5,6 +5,7 @@ from collections import OrderedDict
 from functools import wraps
 import json
 import os
+from pathlib import Path
 import socket
 import time
 import traceback
@@ -423,7 +424,17 @@ class RolloutHostService(Actor):
                 path=f"/tmp/art-packing-{os.getpid()}",
                 enable_expert_replay=request.include_moe_routing,
             )
-        if request.trajectory_transfer is None:
+        fetch_started = time.monotonic()
+        if request.trajectory_sources:
+            groups = list(
+                await asyncio.gather(
+                    *(
+                        source.receive(timeout_s=transfer_timeout_s)
+                        for source in request.trajectory_sources
+                    )
+                )
+            )
+        elif request.trajectory_transfer is None:
             groups = [payload.build() for payload in request.trajectory_groups]
         else:
             if request.trajectory_groups:
@@ -435,6 +446,22 @@ class RolloutHostService(Actor):
                     timeout_s=transfer_timeout_s
                 )
             )
+        trajectory_fetch_s = time.monotonic() - fetch_started
+        if request.collect_packing_shapes:
+            for group in groups:
+                group._collect_packing_shape = True
+        log_future = None
+        if request.trajectory_log_path is not None:
+            from art.utils.trajectory_logging import write_trajectory_groups_parquet
+
+            path = Path(request.trajectory_log_path)
+
+            def write_log() -> None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                write_trajectory_groups_parquet(groups, str(path))
+
+            log_future = asyncio.get_running_loop().run_in_executor(None, write_log)
+        packing_started = time.monotonic()
         packed = self._packer._get_packed_tensors(
             request.model.build(),
             groups,
@@ -446,12 +473,27 @@ class RolloutHostService(Actor):
             logprob_calculation_chunk_size=request.logprob_calculation_chunk_size,
             include_moe_routing=request.include_moe_routing,
         )
+        packing_core_s = time.monotonic() - packing_started
+        log_wait_started = time.monotonic()
+        if log_future is not None:
+            await log_future
+        trajectory_log_wait_s = time.monotonic() - log_wait_started
         shapes = tuple(group._packed_group_shape for group in groups)
         if packed is None:
-            return PackingResult(ref=None, packed_group_shapes=shapes)
+            if request.trajectory_log_path is not None:
+                await asyncio.to_thread(Path(request.trajectory_log_path).unlink)
+            return PackingResult(
+                ref=None,
+                packed_group_shapes=shapes,
+                generation_id=request.generation_id,
+                trajectory_fetch_s=trajectory_fetch_s,
+                packing_core_s=packing_core_s,
+                trajectory_log_wait_s=trajectory_log_wait_s,
+            )
         trainable_assistant_tokens = int(packed["assistant_mask"].sum().item())
         loss_bearing_tokens = int(packed["assistant_mask"][:, 1:].sum().item())
         non_padding_tokens = int((packed["group_ids"] != -1).sum().item())
+        finalize_started = time.monotonic()
         ref = self.inbox.store.create(
             packed,
             batch_id=batch_id,
@@ -460,12 +502,19 @@ class RolloutHostService(Actor):
             min_source_version=request.min_source_version,
             max_source_version=request.max_source_version,
         )
+        packed_batch_finalize_s = time.monotonic() - finalize_started
         return PackingResult(
             ref=ref,
             packed_group_shapes=shapes,
+            generation_id=request.generation_id,
             trainable_assistant_tokens=trainable_assistant_tokens,
             loss_bearing_tokens=loss_bearing_tokens,
             non_padding_tokens=non_padding_tokens,
+            trajectory_log_path=request.trajectory_log_path,
+            trajectory_fetch_s=trajectory_fetch_s,
+            packing_core_s=packing_core_s,
+            trajectory_log_wait_s=trajectory_log_wait_s,
+            packed_batch_finalize_s=packed_batch_finalize_s,
         )
 
     @resilient_endpoint
@@ -542,7 +591,6 @@ class RolloutWorkerService(Actor):
         )
         self._data_plane_host = data_plane_host
         self._trajectory_publishers = {}
-        self._trajectory_cleanup_tasks: set[asyncio.Task[None]] = set()
 
     @resilient_endpoint
     async def run(self, invocation: RolloutInvocation):
@@ -576,7 +624,6 @@ class RolloutWorkerService(Actor):
                         (self._results.bundle(ref),),
                         stream_id=ref.result_id,
                         advertise_host=self._data_plane_host,
-                        on_sent=lambda: self._schedule_trajectory_release(ref),
                     )
                 except BaseException:
                     self._results.drop(ref)
@@ -584,11 +631,6 @@ class RolloutWorkerService(Actor):
                 self._trajectory_publishers[ref.result_id] = publisher
                 value = ref.model_copy(update={"transfer": transfer})
         return RolloutResult(value=value, metrics=await builder.drain_pending())
-
-    def _schedule_trajectory_release(self, ref: TrajectoryGroupRef) -> None:
-        task = asyncio.create_task(self._release_trajectory(ref))
-        self._trajectory_cleanup_tasks.add(task)
-        task.add_done_callback(self._trajectory_cleanup_tasks.discard)
 
     async def _release_trajectory(self, ref: TrajectoryGroupRef) -> None:
         self._results.drop(ref)
@@ -602,7 +644,6 @@ class RolloutWorkerService(Actor):
 
     @resilient_endpoint
     async def close(self) -> None:
-        await asyncio.gather(*tuple(self._trajectory_cleanup_tasks))
         await asyncio.gather(
             *(
                 publisher.close()

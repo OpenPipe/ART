@@ -9,20 +9,26 @@ import inspect
 import json
 from pathlib import Path
 import time
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art.model import TrainableModel
 from art.serving_capabilities import ServingCapabilities
-from art.trajectories import MetadataValue, TrajectoryGroup
+from art.trajectories import (
+    MetadataValue,
+    PydanticException,
+    Trajectory,
+    TrajectoryGroup,
+)
 
 from .trajectory_store import (
     TrajectoryCapacityError,
     TrajectoryEnqueueResult,
     TrajectoryGroupAnnotations,
     TrajectoryGroupRef,
+    TrajectoryLeaseError,
     TrajectoryQueueItem,
     TrajectoryQueueLease,
     TrajectoryQueuePacking,
@@ -446,7 +452,69 @@ class DistributedTrajectoryQueue:
             if closed or not wait:
                 break
             await asyncio.sleep(0.01)
-        return await self._materialize_many(leases), closed
+        return await self._resolve_many(leases), closed
+
+    async def discard_group(self, group: TrajectoryGroup) -> None:
+        selection = group._distributed_lease
+        if not isinstance(selection, DistributedTrajectorySelection):
+            return
+        await self.release_selection(selection, disposition="discarded")
+
+    async def mark_packed(
+        self,
+        selections: Sequence[DistributedTrajectorySelection],
+        generation_id: str,
+    ) -> None:
+        if any(selection.queue is not self for selection in selections):
+            raise TrajectoryLeaseError("trajectory selection belongs to another queue")
+        await self.endpoint.mark_packed(
+            TrajectoryQueuePacking(
+                queue_id=self.queue_id,
+                leases=tuple(selection.lease for selection in selections),
+                generation_id=generation_id,
+            )
+        )
+
+    async def release_selection(
+        self,
+        selection: DistributedTrajectorySelection,
+        *,
+        disposition: Literal["consumed", "discarded"],
+        generation_id: str | None = None,
+    ) -> None:
+        if selection.queue is not self:
+            raise TrajectoryLeaseError("trajectory selection belongs to another queue")
+        owner = self._owner(selection.lease.item.ref)
+        cleanup = await self._release(
+            selection.lease,
+            owner,
+            disposition=disposition,
+            generation_id=generation_id,
+        )
+        if cleanup:
+            raise BaseExceptionGroup("trajectory result release failed", cleanup)
+
+    async def release_selections(
+        self,
+        selections: Sequence[DistributedTrajectorySelection],
+        *,
+        disposition: Literal["consumed", "discarded"],
+        generation_id: str | None = None,
+    ) -> None:
+        results = await asyncio.gather(
+            *(
+                self.release_selection(
+                    selection,
+                    disposition=disposition,
+                    generation_id=generation_id,
+                )
+                for selection in selections
+            ),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("trajectory selection release failed", failures)
 
     async def finish(self) -> None:
         if self._started and not self._finished and not self._closed:
@@ -470,6 +538,9 @@ class DistributedTrajectoryQueue:
                 ready_groups=0,
                 packing_groups=0,
                 packed_groups=0,
+                released_leases=0,
+                lease_lifetime_s=0.0,
+                max_lease_lifetime_s=0.0,
             )
         while True:
             await self._flush_resizes()
@@ -543,28 +614,22 @@ class DistributedTrajectoryQueue:
                     "trajectory materialization and release failed", [error, *cleanup]
                 ) from None
             raise
-        cleanup = await self._release(
-            lease, owner, drop_owner=item.ref.transfer is None
-        )
+        cleanup = await self._release(lease, owner)
         if cleanup:
             raise BaseExceptionGroup("trajectory result release failed", cleanup)
-        annotations = item.annotations
-        group.metadata.update(annotations.metadata)
-        group.metadata["_art_rollout_wall_s"] = annotations.rollout_wall_s
-        group.metadata["_art_actor_idle_s"] = annotations.actor_idle_s
-        group.metadata["_art_queue_wait_s"] = annotations.queue_wait_s
-        for trajectory in group.trajectories:
-            if trajectory.initial_policy_version is None:
-                trajectory.initial_policy_version = annotations.initial_policy_version
-            if trajectory.final_policy_version is None:
-                trajectory.final_policy_version = annotations.final_policy_version
-        return group
+        return item.apply_annotations(group)
 
-    async def _materialize_many(
+    async def _resolve_many(
         self, leases: Sequence[TrajectoryQueueLease]
     ) -> list[TrajectoryGroup]:
         results = await asyncio.gather(
-            *(self._consume(lease) for lease in leases), return_exceptions=True
+            *(
+                self._consume(lease)
+                if lease.item.ref.transfer is None
+                else asyncio.sleep(0, result=self._summary_group(lease))
+                for lease in leases
+            ),
+            return_exceptions=True,
         )
         failures = [result for result in results if isinstance(result, BaseException)]
         if len(failures) == 1:
@@ -573,24 +638,70 @@ class DistributedTrajectoryQueue:
             raise BaseExceptionGroup("trajectory materialization failed", failures)
         return cast(list[TrajectoryGroup], results)
 
+    def _summary_group(self, lease: TrajectoryQueueLease) -> TrajectoryGroup:
+        item = lease.item
+        descriptor = item.ref.descriptor
+        trajectories = []
+        for reward, initial, final, counts, metrics, metadata in zip(
+            descriptor.rewards,
+            descriptor.trajectory_initial_policy_versions,
+            descriptor.trajectory_final_policy_versions,
+            descriptor.trajectory_policy_token_counts,
+            descriptor.trajectory_metrics,
+            descriptor.trajectory_metadata,
+            strict=True,
+        ):
+            trajectory = Trajectory(
+                reward=reward,
+                initial_policy_version=(
+                    initial
+                    if initial is not None
+                    else item.annotations.initial_policy_version
+                ),
+                final_policy_version=(
+                    final
+                    if final is not None
+                    else item.annotations.final_policy_version
+                ),
+                metrics=dict(metrics),
+                metadata=dict(metadata),
+            )
+            trajectory._policy_token_counts = dict(counts)
+            trajectories.append(trajectory)
+        group = TrajectoryGroup(
+            trajectories,
+            metadata={**descriptor.group_metadata, **item.annotations.metadata},
+            metrics=dict(descriptor.group_metrics),
+        )
+        group.exceptions = [
+            PydanticException(type=kind, message=message, traceback="")
+            for kind, message in descriptor.exceptions
+        ]
+        group.metadata["_art_rollout_wall_s"] = item.annotations.rollout_wall_s
+        group.metadata["_art_actor_idle_s"] = item.annotations.actor_idle_s
+        group.metadata["_art_queue_wait_s"] = item.annotations.queue_wait_s
+        group._distributed_lease = DistributedTrajectorySelection(self, lease)
+        return group
+
     async def _release(
         self,
         lease: TrajectoryQueueLease,
         owner: RolloutHostEndpoint,
         *,
-        drop_owner: bool = True,
+        disposition: Literal["consumed", "discarded"] = "discarded",
+        generation_id: str | None = None,
     ) -> list[BaseException]:
-        if drop_owner:
-            try:
-                await owner.drop(lease.item.ref)
-            except BaseException as error:
-                return [error]
+        try:
+            await owner.drop(lease.item.ref)
+        except BaseException as error:
+            return [error]
         try:
             await self.endpoint.release(
                 TrajectoryQueueRelease(
                     queue_id=self.queue_id,
                     lease=lease,
-                    disposition="discarded",
+                    generation_id=generation_id,
+                    disposition=disposition,
                 )
             )
         except BaseException as error:
@@ -604,6 +715,16 @@ class DistributedTrajectoryQueue:
             raise RuntimeError(
                 f"trajectory owner {ref.owner_actor_id!r} is unavailable"
             ) from None
+
+
+class DistributedTrajectorySelection:
+    __slots__ = ("lease", "queue")
+
+    def __init__(
+        self, queue: DistributedTrajectoryQueue, lease: TrajectoryQueueLease
+    ) -> None:
+        self.queue = queue
+        self.lease = lease
 
 
 def apportion_rollout_workers(

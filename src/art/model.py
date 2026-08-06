@@ -1260,9 +1260,22 @@ class Model(
 
         # 1. Write parquet
         file_name = f"{step:04d}.parquet"
-        write_trajectory_groups_parquet(
-            trajectory_groups, f"{trajectories_dir}/{file_name}"
-        )
+        trajectory_path = f"{trajectories_dir}/{file_name}"
+        prepared_paths = {
+            group._prepared_log_path
+            for group in trajectory_groups
+            if group._prepared_log_path is not None
+        }
+        if prepared_paths:
+            if len(prepared_paths) != 1 or any(
+                group._prepared_log_path is None for group in trajectory_groups
+            ):
+                raise RuntimeError("trajectory batch has inconsistent prepared logs")
+            os.replace(prepared_paths.pop(), trajectory_path)
+            for group in trajectory_groups:
+                group._prepared_log_path = None
+        else:
+            write_trajectory_groups_parquet(trajectory_groups, trajectory_path)
 
         # 2. Calculate aggregate metrics (excluding additive costs)
         reward_key = "reward"

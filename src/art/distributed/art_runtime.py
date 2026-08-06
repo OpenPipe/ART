@@ -4,6 +4,7 @@ import asyncio
 from collections import Counter
 from collections.abc import Awaitable, Callable
 import logging
+import time
 from typing import Any, Literal
 from urllib.parse import urlparse
 import uuid
@@ -86,6 +87,14 @@ class DistributedPackedBatch(BaseModel):
     trainable_assistant_tokens: int
     loss_bearing_tokens: int
     non_padding_tokens: int
+    trajectory_log_path: str | None = None
+    packing_rpc_s: float = 0.0
+    trajectory_fetch_s: float = 0.0
+    packing_core_s: float = 0.0
+    trajectory_log_wait_s: float = 0.0
+    packed_batch_finalize_s: float = 0.0
+    packed_batch_fanout_s: float = 0.0
+    packing_generation_id: str
 
 
 class ArtRuntime:
@@ -709,17 +718,21 @@ class ArtRuntime:
                     update={"trajectory_groups": (), "trajectory_transfer": transfer}
                 )
             try:
+                packing_rpc_started = time.monotonic()
                 result: PackingResult = await MonarchPackingEndpoint(source_actor).pack(
                     wire_request,
                     batch_id,
                     transfer_timeout_s=self.topology.cluster.rpc_timeout_s,
                 )
+                packing_rpc_s = time.monotonic() - packing_rpc_started
             finally:
                 if publisher is not None:
                     await publisher.close()
             if result.ref is None:
                 self._live_batches.pop(batch_id)
                 return None
+            if result.generation_id != request.generation_id:
+                raise RuntimeError("packing host returned the wrong generation ID")
             if result.ref.batch_id != batch_id:
                 raise RuntimeError("packing host returned the wrong batch ID")
             host_refs = {source_host: result.ref}
@@ -728,6 +741,7 @@ class ArtRuntime:
                 for host_id in trainer_hosts
                 if host_id != source_host
             }
+            fanout_started = time.monotonic()
             if destinations:
                 host_refs.update(
                     await fanout_packed_batch(
@@ -737,6 +751,7 @@ class ArtRuntime:
                         timeout_s=self.topology.cluster.rpc_timeout_s,
                     )
                 )
+            packed_batch_fanout_s = time.monotonic() - fanout_started
             leases = PackedBatchLeaseSet(ref=result.ref, host_refs=host_refs)
         except BaseException as error:
             await self._reclaim_after_failure(batch_id, error)
@@ -747,6 +762,14 @@ class ArtRuntime:
             trainable_assistant_tokens=result.trainable_assistant_tokens,
             loss_bearing_tokens=result.loss_bearing_tokens,
             non_padding_tokens=result.non_padding_tokens,
+            trajectory_log_path=result.trajectory_log_path,
+            packing_rpc_s=packing_rpc_s,
+            trajectory_fetch_s=result.trajectory_fetch_s,
+            packing_core_s=result.packing_core_s,
+            trajectory_log_wait_s=result.trajectory_log_wait_s,
+            packed_batch_finalize_s=result.packed_batch_finalize_s,
+            packed_batch_fanout_s=packed_batch_fanout_s,
+            packing_generation_id=result.generation_id,
         )
 
     async def release_batch(self, batch: DistributedPackedBatch) -> None:

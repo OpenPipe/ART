@@ -24,6 +24,7 @@ from typing import (
     cast,
 )
 
+from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import TypeIs
 
 T = TypeVar("T")
@@ -80,6 +81,19 @@ class _ResizableAsyncQueue(asyncio.Queue[T]):
         if grew:
             for _ in range(min(maxsize - self.qsize(), len(internals._putters))):
                 internals._wakeup_next(internals._putters)
+
+
+class _PreparedPipelineItem(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    batch: list[TrajectoryGroup]
+    discarded: int = Field(ge=0)
+    saw_sentinel: bool
+    packing_policy_step: int = Field(ge=0)
+    selection_s: float = Field(ge=0)
+    preparation_s: float = Field(ge=0)
+    preparation_metrics: dict[str, float]
+    handoff: asyncio.Event = Field(default_factory=asyncio.Event, exclude=True)
 
 
 def _is_eval_mapping(
@@ -304,6 +318,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._output_queue: (
             asyncio.Queue[TrajectoryGroup | None] | DistributedTrajectoryQueue | None
         ) = None
+        self._packed_queue: asyncio.Queue[_PreparedPipelineItem | None] | None = None
+        self._accept_prepared_batches = True
         self._eval_queue: asyncio.Queue[int] | None = None
         self._rollout_worker_controller = RolloutWorkerController(
             self, self.num_rollout_workers
@@ -386,6 +402,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             await self._output_queue.start()
         else:
             self._output_queue = _ResizableAsyncQueue(maxsize=queue_maxsize)
+        if isinstance(self._output_queue, DistributedTrajectoryQueue) and callable(
+            getattr(self.backend, "prepare_pipeline_batch", None)
+        ):
+            self._packed_queue = asyncio.Queue(maxsize=1)
         self._eval_queue = asyncio.Queue()
 
         loop = asyncio.get_running_loop()
@@ -427,6 +447,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             try:
                 async with asyncio.TaskGroup() as tg:
                     tg.create_task(self._rollout_stage(), name="rollout_stage")
+                    if self._packed_queue is not None:
+                        tg.create_task(self._packing_stage(), name="packing_stage")
                     tg.create_task(self._training_stage(), name="training_stage")
                     tg.create_task(self._eval_stage(), name="eval_stage")
                     tg.create_task(self._status_loop(), name="status_loop")
@@ -454,6 +476,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     except (ValueError, RuntimeError):
                         pass
             cleanup_failures: list[BaseException] = []
+            self._accept_prepared_batches = False
+            try:
+                await self._discard_pending_prepared_batches()
+            except BaseException as exc:
+                cleanup_failures.append(exc)
             if isinstance(self._output_queue, DistributedTrajectoryQueue):
                 try:
                     await self._output_queue.close()
@@ -911,6 +938,49 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             except asyncio.QueueFull:
                 await self._output_queue.put(None)
 
+    async def _packing_stage(self) -> None:
+        assert self._packed_queue is not None
+        prepare = getattr(self.backend, "prepare_pipeline_batch")
+        while True:
+            packing_policy_step = self.state.next_training_step
+            started = time.monotonic()
+            batch, discarded, saw_sentinel = await self._collect_batch(
+                packing_policy_step
+            )
+            selection_s = time.monotonic() - started
+            if not batch:
+                await self._packed_queue.put(None)
+                return
+            if self.autotune.mode != "off":
+                for group in batch:
+                    group._collect_packing_shape = True
+            started = time.monotonic()
+            preparation_metrics = await prepare(self.model, batch)
+            preparation_s = time.monotonic() - started
+            if preparation_metrics is None:
+                if saw_sentinel:
+                    await self._packed_queue.put(None)
+                    return
+                continue
+            item = _PreparedPipelineItem(
+                batch=batch,
+                discarded=discarded,
+                saw_sentinel=saw_sentinel,
+                packing_policy_step=packing_policy_step,
+                selection_s=selection_s,
+                preparation_s=preparation_s,
+                preparation_metrics=preparation_metrics,
+            )
+            if not self._accept_prepared_batches:
+                await getattr(self.backend, "discard_pipeline_batch")(batch)
+                return
+            await self._packed_queue.put(item)
+            await item.handoff.wait()
+            if not self._accept_prepared_batches:
+                return
+            if saw_sentinel:
+                return
+
     async def _training_stage(self) -> None:
         if self._output_queue is None:
             return
@@ -932,8 +1002,36 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 break
             step_start = time.monotonic()
             collect_started = time.monotonic()
-            batch, discarded, saw_sentinel = await self._collect_batch(current_step)
+            selection_s = 0.0
+            preparation_s = 0.0
+            preparation_metrics: dict[str, float] = {}
+            packing_policy_step = current_step
+            if self._packed_queue is None:
+                batch, discarded, saw_sentinel = await self._collect_batch(current_step)
+            else:
+                prepared = await self._packed_queue.get()
+                if prepared is None:
+                    break
+                batch = prepared.batch
+                discarded = prepared.discarded
+                saw_sentinel = prepared.saw_sentinel
+                selection_s = prepared.selection_s
+                preparation_s = prepared.preparation_s
+                preparation_metrics = prepared.preparation_metrics
+                packing_policy_step = prepared.packing_policy_step
             trainer_idle_s = time.monotonic() - collect_started
+            if self._packed_queue is not None and any(
+                self._is_group_stale(group, current_step) for group in batch
+            ):
+                discard = getattr(self.backend, "discard_pipeline_batch")
+                await discard(batch)
+                prepared.handoff.set()
+                discarded += len(batch)
+                self.state.discarded_stale_groups += discarded
+                self._status.note_stale(discarded)
+                if saw_sentinel:
+                    break
+                continue
             self.state.discarded_stale_groups += discarded
             if discarded:
                 self._status.note_stale(discarded)
@@ -952,6 +1050,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             async with self.state.policy_updated:
                 self.state.next_training_step = expected_step
                 self.state.policy_updated.notify_all()
+            if self._packed_queue is not None:
+                prepared.handoff.set()
 
             self._status.note_training_start(len(batch))
             train_call_start = time.monotonic()
@@ -993,6 +1093,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 for group in batch:
                     group._collect_packing_shape = False
                     group._packed_group_shape = None
+                    await self._discard_collected_group(group)
                 self._status.note_training_end()
                 raise
             finally:
@@ -1036,6 +1137,18 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "time/step_collect_batch_s": trainer_idle_s,
                     "time/step_trainer_idle_s": trainer_idle_s,
                 }
+                if self._packed_queue is not None:
+                    metrics.update(
+                        {
+                            "time/step_batch_selection_s": selection_s,
+                            "time/step_batch_prepare_s": preparation_s,
+                            "queue/packed_get_wait_s": trainer_idle_s,
+                            "queue/packing_policy_lag_steps": float(
+                                current_step - packing_policy_step
+                            ),
+                        }
+                    )
+                    metrics.update(preparation_metrics)
                 metrics.setdefault("time/step_backend_train_s", train_call_elapsed)
                 if actor_wall_s > 0:
                     metrics["time/step_rollout_s"] = actor_wall_s
@@ -1098,10 +1211,22 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if stop_after_batch:
                 break
 
+        self._accept_prepared_batches = False
+        await self._discard_pending_prepared_batches()
         self.state.done = True
         self._persist_state(current_step)
         async with self.state.policy_updated:
             self.state.policy_updated.notify_all()
+
+    async def _discard_pending_prepared_batches(self) -> None:
+        if self._packed_queue is None:
+            return
+        discard = getattr(self.backend, "discard_pipeline_batch")
+        while not self._packed_queue.empty():
+            pending = self._packed_queue.get_nowait()
+            if pending is not None:
+                await discard(pending.batch)
+                pending.handoff.set()
 
     async def _collect_batch(
         self, current_step: int
@@ -1137,17 +1262,29 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 items = [item]
             for item in items:
                 self._status.note_group_dequeued()
-                self._check_all_failed(item)
+                try:
+                    self._check_all_failed(item)
+                except BaseException:
+                    await self._discard_collected_group(item)
+                    raise
                 if self._is_group_stale(item, current_step):
                     discarded += 1
+                    await self._discard_collected_group(item)
                     continue
                 if self._group_zero_variance(item):
                     if self._record_zero_variance(item):
+                        await self._discard_collected_group(item)
                         return [], discarded, saw_sentinel
+                    await self._discard_collected_group(item)
                     continue
                 batch.append(item)
 
         return batch, discarded, saw_sentinel
+
+    async def _discard_collected_group(self, group: TrajectoryGroup) -> None:
+        if isinstance(self._output_queue, DistributedTrajectoryQueue):
+            await self._output_queue.discard_group(group)
+            group._distributed_lease = None
 
     def _check_all_failed(self, group: TrajectoryGroup) -> None:
         """Raise if all rollouts in a group failed with exceptions."""
@@ -1474,7 +1611,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     )
                     age = float(current_step - initial)
                 ages.append(float(age))
-            ready = float(len(snapshot.items))
+            ready = float(snapshot.ready_groups)
+            depth = float(len(snapshot.items))
             maxsize = float(snapshot.max_ready_groups)
             put_waiting = float(self._output_queue.put_waiters)
             capacity_metrics = {
@@ -1485,6 +1623,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 "queue/data_plane_byte_occupancy": snapshot.used_bytes
                 / snapshot.capacity_bytes,
                 "queue/leased_groups": float(snapshot.leased_groups),
+                "queue/packing_groups": float(snapshot.packing_groups),
+                "queue/packed_groups": float(snapshot.packed_groups),
+                "queue/packed_occupancy": snapshot.packed_groups
+                / snapshot.max_ready_groups,
+                "queue/lease_lifetime_mean_s": snapshot.lease_lifetime_s
+                / max(snapshot.released_leases, 1),
+                "queue/lease_lifetime_max_s": snapshot.max_lease_lifetime_s,
             }
         else:
             output_queue = cast(Any, self._output_queue)
@@ -1502,16 +1647,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 if age is not None:
                     ages.append(float(age))
             ready = float(len(queued))
+            depth = ready
             maxsize = float(self._output_queue.maxsize)
             put_waiting = 0.0
         stale = sum(1 for age in ages if age > limit)
         return {
             "queue/ready_groups_est": ready,
-            "queue/completed_backlog_groups": ready,
+            "queue/completed_backlog_groups": depth,
             "queue/put_waiting_groups": put_waiting,
-            "queue/groups_depth": ready,
+            "queue/groups_depth": depth,
             "queue/groups_depth_max": maxsize,
-            "queue/occupancy": ready / max(maxsize, 1.0),
+            "queue/occupancy": depth / max(maxsize, 1.0),
             "queue/predicted_policy_age_mean_steps": sum(ages) / len(ages)
             if ages
             else 0.0,
@@ -1684,6 +1830,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     def _trajectory_policy_span_age_stats(
         self, current_step: int, trajectory: art.Trajectory
     ) -> tuple[float, float, float] | None:
+        if trajectory._policy_token_counts is not None:
+            age_sum = sum(
+                (current_step - version) * count
+                for version, count in trajectory._policy_token_counts.items()
+            )
+            age_exp_sum = sum(
+                _policy_age_exp(current_step - version) * count
+                for version, count in trajectory._policy_token_counts.items()
+            )
+            weight = float(sum(trajectory._policy_token_counts.values()))
+            return (float(age_sum), weight, age_exp_sum) if weight > 0 else None
         age_sum = 0.0
         age_exp_sum = 0.0
         weight_sum = 0.0
