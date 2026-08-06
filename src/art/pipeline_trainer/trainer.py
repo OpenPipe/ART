@@ -956,6 +956,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 packing_policy_step
             )
             selection_s = time.monotonic() - started
+            if not self._accept_prepared_batches:
+                for group in batch:
+                    await self._discard_collected_group(group)
+                return
             if not batch:
                 await self._packed_queue.put(None)
                 return
@@ -1219,9 +1223,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if stop_after_batch:
                 break
 
-        self._accept_prepared_batches = False
-        await self._discard_pending_prepared_batches()
         self.state.done = True
+        self._accept_prepared_batches = False
+        if isinstance(self._output_queue, DistributedTrajectoryQueue):
+            await self._output_queue.finish()
+        await self._discard_pending_prepared_batches()
         self._persist_state(current_step)
         async with self.state.policy_updated:
             self.state.policy_updated.notify_all()
