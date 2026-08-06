@@ -23,6 +23,7 @@ from .artifact_preflight import (
     execute_artifact_probe,
 )
 from .data_plane import (
+    ByteStreamServerLoop,
     PackedBatchCapacityError,
     PackedBatchInbox,
     PackedBatchLeaseError,
@@ -590,6 +591,7 @@ class RolloutWorkerService(Actor):
             capacity_bytes=capacity_bytes,
         )
         self._data_plane_host = data_plane_host
+        self._byte_stream_loop = ByteStreamServerLoop()
         self._trajectory_publishers = {}
 
     @resilient_endpoint
@@ -624,6 +626,7 @@ class RolloutWorkerService(Actor):
                         (self._results.bundle(ref),),
                         stream_id=ref.result_id,
                         advertise_host=self._data_plane_host,
+                        server_loop=self._byte_stream_loop,
                     )
                 except BaseException:
                     self._results.drop(ref)
@@ -644,13 +647,16 @@ class RolloutWorkerService(Actor):
 
     @resilient_endpoint
     async def close(self) -> None:
-        await asyncio.gather(
-            *(
-                publisher.close()
-                for publisher in tuple(self._trajectory_publishers.values())
+        try:
+            await asyncio.gather(
+                *(
+                    publisher.close()
+                    for publisher in tuple(self._trajectory_publishers.values())
+                )
             )
-        )
-        self._trajectory_publishers.clear()
+        finally:
+            self._trajectory_publishers.clear()
+            await self._byte_stream_loop.close()
         for model in self._models.values():
             await model._reset_inference_runtime()
         self._models.clear()

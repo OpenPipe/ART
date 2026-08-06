@@ -6,8 +6,9 @@ from multiprocessing import resource_tracker, shared_memory
 import os
 import secrets
 import socket
+from threading import Thread
 import time
-from typing import Any, Protocol, cast
+from typing import Any, Coroutine, Protocol, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -26,6 +27,7 @@ _DTYPE_BYTES = {
     "float64": 8,
 }
 _STREAM_CHUNK_BYTES = 4 << 20
+T = TypeVar("T")
 
 
 class _Contract(BaseModel):
@@ -520,14 +522,46 @@ class MappedPackedBatch(BaseModel):
         self.close()
 
 
+class ByteStreamServerLoop:
+    """A process-local I/O loop that cannot be blocked by rollout code."""
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = Thread(target=self._run, name="art-byte-stream", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    async def submit(self, coroutine: Coroutine[Any, Any, T]) -> T:
+        return await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        )
+
+    async def close(self) -> None:
+        if self._thread.is_alive():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            await asyncio.to_thread(self._thread.join)
+            self._loop.close()
+
+
 class _AuthenticatedStreamPublisher:
-    def __init__(self, advertise_host: str) -> None:
+    def __init__(
+        self, advertise_host: str, server_loop: ByteStreamServerLoop | None = None
+    ) -> None:
         self.advertise_host = advertise_host
+        self._server_loop = server_loop
         self._token = secrets.token_bytes(32)
         self._server: Any = None
         self._handlers: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
+        if self._server_loop is not None:
+            return await self._server_loop.submit(self._start())
+        await self._start()
+
+    async def _start(self) -> None:
         family = socket.getaddrinfo(self.advertise_host, 0, type=socket.SOCK_STREAM)[0][
             0
         ]
@@ -542,6 +576,11 @@ class _AuthenticatedStreamPublisher:
         return int(self._server.sockets[0].getsockname()[1])
 
     async def close(self) -> None:
+        if self._server_loop is not None:
+            return await self._server_loop.submit(self._close())
+        await self._close()
+
+    async def _close(self) -> None:
         if self._server is None:
             return
         self._server.close()
@@ -600,8 +639,9 @@ class ByteStreamPublisher(_AuthenticatedStreamPublisher):
         advertise_host: str,
         chunks: tuple[bytes, ...],
         on_sent: Callable[[], None] | None,
+        server_loop: ByteStreamServerLoop | None,
     ) -> None:
-        super().__init__(advertise_host)
+        super().__init__(advertise_host, server_loop)
         self.stream_id = stream_id
         self.chunks = chunks
         self.on_sent = on_sent
@@ -617,8 +657,9 @@ class ByteStreamPublisher(_AuthenticatedStreamPublisher):
         *,
         advertise_host: str,
         on_sent: Callable[[], None] | None = None,
+        server_loop: ByteStreamServerLoop | None = None,
     ) -> "ByteStreamPublisher":
-        publisher = cls(stream_id, advertise_host, chunks, on_sent)
+        publisher = cls(stream_id, advertise_host, chunks, on_sent, server_loop)
         await publisher.start()
         return publisher
 

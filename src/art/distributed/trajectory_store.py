@@ -11,7 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art.trajectories import MetadataValue, Trajectory, TrajectoryGroup
 
-from .data_plane import ByteStreamPublisher, ByteStreamTransfer, receive_byte_stream
+from .data_plane import (
+    ByteStreamPublisher,
+    ByteStreamServerLoop,
+    ByteStreamTransfer,
+    receive_byte_stream,
+)
 
 if TYPE_CHECKING:
     from .packing import TrajectoryGroupPayload
@@ -176,6 +181,7 @@ async def publish_trajectory_bundles(
     stream_id: str,
     advertise_host: str,
     on_sent: Callable[[], None] | None = None,
+    server_loop: ByteStreamServerLoop | None = None,
 ) -> tuple[TrajectoryBatchTransfer, ByteStreamPublisher]:
     publisher = await ByteStreamPublisher.create(
         stream_id,
@@ -184,6 +190,7 @@ async def publish_trajectory_bundles(
         ),
         advertise_host=advertise_host,
         on_sent=on_sent,
+        server_loop=server_loop,
     )
     try:
         transfer = TrajectoryBatchTransfer(
