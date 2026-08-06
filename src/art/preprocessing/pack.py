@@ -743,64 +743,6 @@ def _validate_shared_prefix_tree_segment(
             )
         if (item.moe_routes is None) != (reference.moe_routes is None):
             raise RuntimeError("Prefix-tree shared routes are incomplete")
-        if (
-            item.moe_routes is not None
-            and reference.moe_routes is not None
-            and not _moe_route_ranges_equal(
-                reference.moe_routes,
-                item.moe_routes,
-                start=src_start,
-                end=src_end,
-            )
-        ):
-            raise RuntimeError(
-                "Prefix-tree pack cannot share mismatched routed experts"
-            )
-
-
-def _moe_route_ranges_equal(
-    left: MoeRouteArray | MoeRouteSegments,
-    right: MoeRouteArray | MoeRouteSegments,
-    *,
-    start: int,
-    end: int,
-) -> bool:
-    if left.num_experts != right.num_experts:
-        return False
-    left_chunks = _moe_route_chunks(left, start=start, end=end)
-    right_chunks = _moe_route_chunks(right, start=start, end=end)
-    left_index = right_index = left_offset = right_offset = 0
-    compared = 0
-    while left_index < len(left_chunks) and right_index < len(right_chunks):
-        left_chunk = left_chunks[left_index]
-        right_chunk = right_chunks[right_index]
-        count = min(
-            len(left_chunk) - left_offset,
-            len(right_chunk) - right_offset,
-        )
-        if not np.array_equal(
-            left_chunk[left_offset : left_offset + count],
-            right_chunk[right_offset : right_offset + count],
-        ):
-            return False
-        compared += count
-        left_offset += count
-        right_offset += count
-        if left_offset == len(left_chunk):
-            left_index += 1
-            left_offset = 0
-        if right_offset == len(right_chunk):
-            right_index += 1
-            right_offset = 0
-    return compared == end - start
-
-
-def _moe_route_chunks(
-    routes: MoeRouteArray | MoeRouteSegments, *, start: int, end: int
-) -> tuple[MoeRouteArray, ...]:
-    if isinstance(routes, MoeRouteSegments):
-        return tuple(segment for _, segment in routes.iter_slices(start, end))
-    return (cast(MoeRouteArray, routes[start:end]),)
 
 
 def _packed_row_tensor_list(

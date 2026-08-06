@@ -203,7 +203,7 @@ def test_pack_carries_routes_through_prefix_tree_splicing() -> None:
     assert routing_replay.pack_stats.packed_tokens == 7
 
 
-def test_pack_rejects_mismatched_routes_for_shared_prefix() -> None:
+def test_pack_uses_reference_routes_for_shared_prefix() -> None:
     first = _tokenized(
         [10, 11, 20],
         [_route(0), _route(10), _route(20)],
@@ -217,14 +217,24 @@ def test_pack_rejects_mismatched_routes_for_shared_prefix() -> None:
         prompt_length=2,
     )
 
-    with pytest.raises(RuntimeError, match="mismatched routed experts"):
-        packed_tensors_from_tokenized_results(
-            [first, second],
-            seq_len=8,
-            truncate_long_results=False,
-            include_moe_routing=True,
-            min_prefix_tree_shared_segment_length=0,
-        )
+    packed = packed_tensors_from_tokenized_results(
+        [first, second],
+        seq_len=8,
+        truncate_long_results=False,
+        include_moe_routing=True,
+        min_prefix_tree_shared_segment_length=0,
+    )
+
+    replay = packed["moe_routing_replay"]
+    assert replay is not None
+    routes = torch.movedim(replay.expert_indices[:, 0], 0, 1).tolist()
+    assert routes[:5] == [
+        _route(0),
+        _route(10),
+        _route(20),
+        _route(10),
+        _route(30),
+    ]
 
 
 def test_prefix_tree_pack_keeps_trainable_duplicates_in_leaf_metadata() -> None:
