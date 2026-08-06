@@ -865,6 +865,10 @@ def _policy_version_from_lora_request(lora_request: Any) -> int | None:
     for pattern, value in (
         (r"@(\d+)$", getattr(lora_request, "lora_name", "")),
         (
+            r"^step-(\d+)-[0-9a-f]{32}$",
+            getattr(lora_request, "lora_path", "").rstrip("/").split("/")[-1],
+        ),
+        (
             r"^(?:step[_-]?)?(\d+)$",
             getattr(lora_request, "lora_path", "").rstrip("/").split("/")[-1],
         ),
