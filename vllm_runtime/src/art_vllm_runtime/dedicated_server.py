@@ -24,9 +24,13 @@ from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
 ART_SERVING_PROTOCOL_VERSION = 3
 _runtime_state: dict[str, object] = {}
+_auth_tokens: list[str] = []
 
 
 class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
+    def __init__(self, app: Any) -> None:
+        super().__init__(app, tokens=_auth_tokens)
+
     def __call__(self, scope: Scope, receive: Receive, send: Send):
         path = scope.get("path", "").removeprefix(scope.get("root_path", ""))
         if (
@@ -186,12 +190,6 @@ def _patch_art_runtime_routes() -> None:
 
     def art_build_app(*build_args: object, **build_kwargs: object) -> FastAPI:
         app = original_build_app(*build_args, **build_kwargs)
-        from vllm import envs
-
-        args = app.state.args
-        tokens = [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]
-        if tokens:
-            app.add_middleware(_ArtAuthenticationMiddleware, tokens=tokens)
         router = APIRouter()
 
         def engine(request: Request):
@@ -601,6 +599,12 @@ def main(argv: list[str] | None = None) -> None:
     namespace = vllm_parser.parse_args(vllm_args)
     if api_key := os.environ.pop("VLLM_API_KEY", None):
         namespace.api_key = [api_key]
+    _auth_tokens[:] = namespace.api_key or []
+    if _auth_tokens:
+        namespace.middleware = [
+            *namespace.middleware,
+            "art_vllm_runtime.dedicated_server._ArtAuthenticationMiddleware",
+        ]
     validate_parsed_serve_args(namespace)
     if args.headless:
         from vllm.entrypoints.cli.serve import run_headless
