@@ -382,6 +382,12 @@ def _apply_art_training_runtime_prepare_defaults(
     provider: GPTModelProvider,
     handler: Any,
 ) -> None:
+    # Apex does not build its CUDA extensions in the CUDA 13 environment.
+    if (
+        torch.version.cuda is not None
+        and int(torch.version.cuda.partition(".")[0]) >= 13
+    ):
+        provider.gradient_accumulation_fusion = False
     provider.recompute_granularity = "full"
     provider.recompute_method = "uniform"
     provider.recompute_num_layers = 1
