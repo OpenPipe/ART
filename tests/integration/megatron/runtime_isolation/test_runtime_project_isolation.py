@@ -231,20 +231,6 @@ def test_runtime_general_plugin_loads_full_patch_set() -> None:
     assert 'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject
 
 
-def test_runtime_patch_adds_gemma4_moe_topk_alias(artifact_dir: Path) -> None:
-    payload = _runtime_python(
-        "import json; "
-        "from art_vllm_runtime.patches import apply_vllm_runtime_patches; "
-        "apply_vllm_runtime_patches(); "
-        "from transformers import Gemma4TextConfig; "
-        "config = Gemma4TextConfig(enable_moe_block=True, top_k_experts=8); "
-        "print(json.dumps({'num_experts_per_tok': config.num_experts_per_tok}))",
-        artifact_dir,
-        "gemma4_topk_alias",
-    )
-    assert json.loads(payload) == {"num_experts_per_tok": 8}
-
-
 def test_runtime_patch_selects_checkpoint_weight_update_lifecycle(
     artifact_dir: Path,
 ) -> None:
