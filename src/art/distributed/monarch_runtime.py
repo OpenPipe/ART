@@ -173,13 +173,18 @@ class MonarchVllmHostLauncher:
         )
 
     async def prepare_adapter_receive(
-        self, generation_id: str, template_path: str, tensor_dtype: str
+        self,
+        generation_id: str,
+        template_path: str,
+        tensor_dtype: str,
+        timeout_s: float,
     ) -> AdapterTransferTarget:
         return await call_remote(
             self.actor.prepare_adapter_receive,
             generation_id,
             template_path,
             tensor_dtype,
+            timeout_s,
         )
 
     async def wait_adapter_receive(

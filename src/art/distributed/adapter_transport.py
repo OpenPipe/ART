@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import struct
 import sys
-from threading import Lock
+from threading import Condition, Lock
 import time
 from typing import Any, Literal
 
@@ -35,6 +35,12 @@ class AdapterTransferTarget(_TransportRecord):
     remote_descriptors_b64: str = Field(min_length=1)
     tensors: tuple[AdapterTensorSpec, ...]
     adapter_config: dict[str, Any]
+    slot_id: int = Field(ge=0)
+    used_bytes: int = Field(gt=0)
+    capacity_bytes: int = Field(gt=0)
+    prepare_s: float = Field(ge=0)
+    pool_wait_s: float = Field(ge=0)
+    registration_s: float = Field(ge=0)
 
 
 class AdapterReceiveResult(_TransportRecord):
@@ -44,6 +50,20 @@ class AdapterReceiveResult(_TransportRecord):
     tensor_bytes: int = Field(gt=0)
     config_bytes: int = Field(gt=0)
     materialization_s: float = Field(ge=0)
+    slot_id: int = Field(default=0, ge=0)
+    used_bytes: int = Field(default=0, ge=0)
+    capacity_bytes: int = Field(default=0, ge=0)
+    prepare_s: float = Field(default=0, ge=0)
+    pool_wait_s: float = Field(default=0, ge=0)
+    registration_s: float = Field(default=0, ge=0)
+    sender_staging_s: float = Field(default=0, ge=0)
+    sender_registration_s: float = Field(default=0, ge=0)
+
+
+class AdapterTransferNotification(_TransportRecord):
+    generation_id: str = Field(min_length=1)
+    sender_staging_s: float = Field(ge=0)
+    sender_registration_s: float = Field(ge=0)
 
 
 class _PendingReceive:
@@ -51,14 +71,25 @@ class _PendingReceive:
         self,
         *,
         target: AdapterTransferTarget,
-        blocks: tuple[torch.Tensor, ...],
+        slot: "_RegisteredSlot",
         tensors: dict[str, torch.Tensor],
-        registration: Any,
     ) -> None:
         self.target = target
-        self.blocks = blocks
+        self.slot = slot
         self.tensors = tensors
+
+
+class _RegisteredSlot:
+    def __init__(
+        self,
+        slot_id: int,
+        block: torch.Tensor,
+        registration: Any,
+    ) -> None:
+        self.slot_id = slot_id
+        self.block = block
         self.registration = registration
+        self.generation_id: str | None = None
 
 
 _SAFETENSORS_DTYPES = {
@@ -176,6 +207,38 @@ def _allocate_blocks(
     return tuple(blocks), tensors
 
 
+def _tensor_views(
+    block: torch.Tensor, specs: tuple[AdapterTensorSpec, ...]
+) -> tuple[dict[str, torch.Tensor], int]:
+    offset = 0
+    tensors = {}
+    for spec in specs:
+        dtype = _SAFETENSORS_DTYPES.get(spec.dtype)
+        if dtype is None:
+            raise RuntimeError(f"Unsupported adapter transport dtype: {spec.dtype}")
+        item_size = torch.empty((), dtype=dtype).element_size()
+        offset = (offset + item_size - 1) // item_size * item_size
+        count = spec_numel(spec)
+        byte_count = count * item_size
+        tensors[spec.name] = (
+            block.narrow(0, offset, byte_count).view(dtype).view(spec.shape)
+        )
+        offset += byte_count
+    return tensors, offset
+
+
+def _spec_bytes(specs: tuple[AdapterTensorSpec, ...]) -> int:
+    offset = 0
+    for spec in specs:
+        dtype = _SAFETENSORS_DTYPES.get(spec.dtype)
+        if dtype is None:
+            raise RuntimeError(f"Unsupported adapter transport dtype: {spec.dtype}")
+        item_size = torch.empty((), dtype=dtype).element_size()
+        offset = (offset + item_size - 1) // item_size * item_size
+        offset += spec_numel(spec) * item_size
+    return offset
+
+
 def spec_numel(spec: AdapterTensorSpec) -> int:
     count = 1
     for dim in spec.shape:
@@ -183,13 +246,15 @@ def spec_numel(spec: AdapterTensorSpec) -> int:
     return count
 
 
-def _snapshot_blocks(
-    tensors: dict[str, torch.Tensor], specs: tuple[AdapterTensorSpec, ...]
-) -> tuple[torch.Tensor, ...]:
+def _copy_snapshot(
+    tensors: dict[str, torch.Tensor],
+    specs: tuple[AdapterTensorSpec, ...],
+    block: torch.Tensor,
+) -> int:
     expected = {spec.name for spec in specs}
     if set(tensors) != expected:
         raise RuntimeError("LoRA snapshot and transport target tensor names differ")
-    grouped: dict[str, list[tuple[AdapterTensorSpec, torch.Tensor]]] = {}
+    targets, used_bytes = _tensor_views(block, specs)
     for spec in specs:
         tensor = tensors[spec.name]
         expected_dtype = _SAFETENSORS_DTYPES.get(spec.dtype)
@@ -197,64 +262,94 @@ def _snapshot_blocks(
             raise RuntimeError(
                 f"LoRA snapshot tensor changed shape or dtype: {spec.name}"
             )
-        grouped.setdefault(spec.dtype, []).append((spec, tensor))
-
-    blocks = []
-    for _dtype, group in sorted(grouped.items()):
-        first = group[0][1]
-        storage = first.untyped_storage()
-        count = sum(tensor.numel() for _spec, tensor in group)
-        expected_address = first.data_ptr()
-        for _spec, tensor in group:
-            if tensor.untyped_storage().data_ptr() != storage.data_ptr():
-                raise RuntimeError("LoRA snapshot dtype group does not share storage")
-            if tensor.data_ptr() != expected_address:
-                raise RuntimeError("LoRA snapshot dtype group is not contiguous")
-            expected_address += tensor.numel() * tensor.element_size()
-        block = first.new_empty(0).set_(storage, first.storage_offset(), (count,), (1,))
-        blocks.append(block)
-    return tuple(blocks)
+        targets[spec.name].copy_(tensor)
+    return used_bytes
 
 
 class NixlAdapterReceiver:
     """Owns host memory registered for immutable LoRA generations."""
 
-    def __init__(self, host_id: str, output_root: str) -> None:
+    def __init__(
+        self, host_id: str, output_root: str, *, pool_capacity: int = 2
+    ) -> None:
+        if pool_capacity < 1:
+            raise ValueError("adapter receive pool capacity must be positive")
         self.host_id = host_id
         self.output_root = Path(output_root) / "adapter_transfers"
+        self.pool_capacity = pool_capacity
         self._agent: Any | None = None
         self._pending: dict[str, _PendingReceive] = {}
-        self._notifications: set[str] = set()
-        self._notification_lock = Lock()
+        self._slots: list[_RegisteredSlot] = []
+        self._templates: dict[
+            tuple[str, str], tuple[tuple[AdapterTensorSpec, ...], dict[str, Any]]
+        ] = {}
+        self._condition = Condition()
+        self._notifications: dict[str, AdapterTransferNotification] = {}
+        self._agent_lock = Lock()
+        self._closed = False
 
     def prepare(
-        self, generation_id: str, template_path: str, tensor_dtype: str
+        self,
+        generation_id: str,
+        template_path: str,
+        tensor_dtype: str,
+        timeout_s: float = 300.0,
     ) -> AdapterTransferTarget:
-        if generation_id in self._pending:
-            raise RuntimeError(f"Adapter receive already exists: {generation_id}")
-        specs, config = _read_adapter_template(template_path, tensor_dtype)
-        blocks, tensors = _allocate_blocks(specs)
-        agent = self._require_agent()
-        registration = agent.register_memory(blocks, backends=["UCX"])
-        descriptors = agent.get_xfer_descs(blocks)
-        path = str((self.output_root / generation_id).absolute())
-        target = AdapterTransferTarget(
-            host_id=self.host_id,
-            generation_id=generation_id,
-            path=path,
-            remote_agent=agent.name,
-            remote_metadata_b64=base64.b64encode(agent.get_agent_metadata()).decode(),
-            remote_descriptors_b64=base64.b64encode(
-                agent.get_serialized_descs(descriptors)
-            ).decode(),
-            tensors=specs,
-            adapter_config=config,
-        )
+        prepare_started = time.monotonic()
+        template_key = (str(Path(template_path).absolute()), tensor_dtype)
+        specs, config = self._templates.get(template_key, ((), {}))
+        if not specs:
+            specs, config = _read_adapter_template(template_path, tensor_dtype)
+            self._templates[template_key] = (specs, config)
+        used_bytes = _spec_bytes(specs)
+        wait_started = time.monotonic()
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("adapter receive pool is closed")
+            if generation_id in self._pending:
+                raise RuntimeError(f"Adapter receive already exists: {generation_id}")
+            slot, registration_s = self._acquire_slot(
+                used_bytes, deadline=wait_started + timeout_s
+            )
+            slot.generation_id = generation_id
+            pool_wait_s = time.monotonic() - wait_started - registration_s
+        try:
+            used_block = slot.block.narrow(0, 0, used_bytes)
+            tensors, actual_used_bytes = _tensor_views(slot.block, specs)
+            if actual_used_bytes != used_bytes:
+                raise RuntimeError("adapter byte layout changed during preparation")
+            with self._agent_lock:
+                agent = self._require_agent()
+                descriptors = agent.get_xfer_descs((used_block,))
+                remote_agent = agent.name
+                metadata = base64.b64encode(agent.get_agent_metadata()).decode()
+                serialized = base64.b64encode(
+                    agent.get_serialized_descs(descriptors)
+                ).decode()
+            path = str((self.output_root / generation_id).absolute())
+            target = AdapterTransferTarget(
+                host_id=self.host_id,
+                generation_id=generation_id,
+                path=path,
+                remote_agent=remote_agent,
+                remote_metadata_b64=metadata,
+                remote_descriptors_b64=serialized,
+                tensors=specs,
+                adapter_config=config,
+                slot_id=slot.slot_id,
+                used_bytes=used_bytes,
+                capacity_bytes=slot.block.numel(),
+                prepare_s=time.monotonic() - prepare_started,
+                pool_wait_s=max(0.0, pool_wait_s),
+                registration_s=registration_s,
+            )
+        except BaseException:
+            self._release_slot(slot, generation_id)
+            raise
         self._pending[generation_id] = _PendingReceive(
             target=target,
-            blocks=blocks,
+            slot=slot,
             tensors=tensors,
-            registration=registration,
         )
         return target
 
@@ -262,7 +357,8 @@ class NixlAdapterReceiver:
         pending = self._pending.get(generation_id)
         if pending is None:
             raise RuntimeError(f"Unknown adapter receive: {generation_id}")
-        if not self._take_notification(generation_id):
+        notification = self._take_notification(generation_id)
+        if notification is None:
             return None
         from art.megatron.weights.lora_publish import (
             LoraSnapshot,
@@ -300,6 +396,14 @@ class NixlAdapterReceiver:
             tensor_bytes=model_bytes,
             config_bytes=config_bytes,
             materialization_s=materialization_s,
+            slot_id=pending.target.slot_id,
+            used_bytes=pending.target.used_bytes,
+            capacity_bytes=pending.target.capacity_bytes,
+            prepare_s=pending.target.prepare_s,
+            pool_wait_s=pending.target.pool_wait_s,
+            registration_s=pending.target.registration_s,
+            sender_staging_s=notification.sender_staging_s,
+            sender_registration_s=notification.sender_registration_s,
         )
 
     def release(self, generation_id: str) -> None:
@@ -307,8 +411,8 @@ class NixlAdapterReceiver:
 
         if generation_id in self._pending:
             self._finish(generation_id)
-        with self._notification_lock:
-            self._notifications.discard(generation_id)
+        with self._agent_lock:
+            self._notifications.pop(generation_id, None)
         path = self.output_root / generation_id
         if path.exists():
             rmtree(path)
@@ -318,18 +422,77 @@ class NixlAdapterReceiver:
             self._agent = _new_agent(f"art-lora-receiver-{self.host_id}-{os.getpid()}")
         return self._agent
 
-    def _take_notification(self, generation_id: str) -> bool:
-        with self._notification_lock:
+    def _take_notification(
+        self, generation_id: str
+    ) -> AdapterTransferNotification | None:
+        with self._agent_lock:
             for messages in self._require_agent().get_new_notifs().values():
-                self._notifications.update(message.decode() for message in messages)
-            if generation_id not in self._notifications:
-                return False
-            self._notifications.remove(generation_id)
-            return True
+                for message in messages:
+                    notification = AdapterTransferNotification.model_validate_json(
+                        message
+                    )
+                    self._notifications[notification.generation_id] = notification
+            return self._notifications.pop(generation_id, None)
 
     def _finish(self, generation_id: str) -> None:
         pending = self._pending.pop(generation_id)
-        self._require_agent().deregister_memory(pending.registration, backends=["UCX"])
+        self._release_slot(pending.slot, generation_id)
+
+    def _release_slot(self, slot: _RegisteredSlot, generation_id: str) -> None:
+        with self._condition:
+            if slot.generation_id != generation_id:
+                raise RuntimeError("adapter receive slot ownership changed")
+            slot.generation_id = None
+            self._condition.notify()
+
+    def _acquire_slot(
+        self, used_bytes: int, *, deadline: float
+    ) -> tuple[_RegisteredSlot, float]:
+        while True:
+            free = [slot for slot in self._slots if slot.generation_id is None]
+            fitting = [slot for slot in free if slot.block.numel() >= used_bytes]
+            if fitting:
+                return min(fitting, key=lambda slot: slot.block.numel()), 0.0
+            if free or len(self._slots) < self.pool_capacity:
+                previous = min(free, key=lambda slot: slot.block.numel(), default=None)
+                slot_id = len(self._slots) if previous is None else previous.slot_id
+                capacity = max(
+                    used_bytes,
+                    2 * (0 if previous is None else previous.block.numel()),
+                )
+                started = time.monotonic()
+                block = torch.empty(capacity, dtype=torch.uint8)
+                with self._agent_lock:
+                    agent = self._require_agent()
+                    registration = agent.register_memory((block,), backends=["UCX"])
+                    if previous is not None:
+                        agent.deregister_memory(previous.registration, backends=["UCX"])
+                if previous is None:
+                    slot = _RegisteredSlot(slot_id, block, registration)
+                    self._slots.append(slot)
+                else:
+                    previous.block = block
+                    previous.registration = registration
+                    slot = previous
+                return slot, time.monotonic() - started
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                raise TimeoutError("adapter receive pool remained full")
+            self._condition.wait(remaining_s)
+            if self._closed:
+                raise RuntimeError("adapter receive pool closed while waiting")
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+        for generation_id in tuple(self._pending):
+            self._finish(generation_id)
+        if self._agent is not None:
+            with self._agent_lock:
+                for slot in self._slots:
+                    self._agent.deregister_memory(slot.registration, backends=["UCX"])
+        self._slots.clear()
 
 
 class NixlAdapterSender:
@@ -337,6 +500,9 @@ class NixlAdapterSender:
 
     def __init__(self) -> None:
         self._agent: Any | None = None
+        self._block: torch.Tensor | None = None
+        self._registration: Any | None = None
+        self._remote_agents: dict[tuple[str, str], str] = {}
 
     def send(self, snapshot: Any, targets: tuple[AdapterTransferTarget, ...]) -> None:
         if not targets:
@@ -352,43 +518,87 @@ class NixlAdapterSender:
         snapshot_config = {**snapshot.adapter_config, "art_lora_format": "vllm"}
         if snapshot_config != first.adapter_config:
             raise RuntimeError("LoRA snapshot adapter config changed during training")
-        blocks = _snapshot_blocks(snapshot.tensors, first.tensors)
+        used_bytes = first.used_bytes
         agent = self._require_agent()
-        registration = agent.register_memory(blocks, backends=["UCX"])
-        try:
-            local_descriptors = agent.get_xfer_descs(blocks)
-            for target in targets:
+        sender_registration_s = self._ensure_capacity(used_bytes)
+        assert self._block is not None
+        staging_started = time.monotonic()
+        if _copy_snapshot(snapshot.tensors, first.tensors, self._block) != used_bytes:
+            raise RuntimeError(
+                "LoRA snapshot byte layout differs from transport target"
+            )
+        notification = (
+            AdapterTransferNotification(
+                generation_id=first.generation_id,
+                sender_staging_s=time.monotonic() - staging_started,
+                sender_registration_s=sender_registration_s,
+            )
+            .model_dump_json()
+            .encode()
+        )
+        local_descriptors = agent.get_xfer_descs(
+            (self._block.narrow(0, 0, used_bytes),)
+        )
+        for target in targets:
+            key = (target.host_id, target.remote_metadata_b64)
+            remote_agent = self._remote_agents.get(key)
+            if remote_agent is None:
                 remote_agent = agent.add_remote_agent(
                     base64.b64decode(target.remote_metadata_b64)
                 )
                 if isinstance(remote_agent, bytes):
                     remote_agent = remote_agent.decode()
-                if remote_agent != target.remote_agent:
-                    raise RuntimeError("NIXL target returned the wrong agent identity")
-                handle = agent.initialize_xfer(
-                    "WRITE",
-                    local_descriptors,
-                    agent.deserialize_descs(
-                        base64.b64decode(target.remote_descriptors_b64)
-                    ),
-                    remote_agent,
-                    target.generation_id.encode(),
-                    backends=["UCX"],
-                )
-                try:
-                    state = agent.transfer(handle)
-                    while state == "PROC":
-                        time.sleep(0.001)
-                        state = agent.check_xfer_state(handle)
-                    if state != "DONE":
-                        raise RuntimeError(
-                            f"NIXL adapter transfer failed for {target.host_id}"
-                        )
-                finally:
-                    handle.release()
-                    agent.remove_remote_agent(remote_agent)
-        finally:
-            agent.deregister_memory(registration, backends=["UCX"])
+                self._remote_agents[key] = remote_agent
+            if remote_agent != target.remote_agent:
+                raise RuntimeError("NIXL target returned the wrong agent identity")
+            handle = agent.initialize_xfer(
+                "WRITE",
+                local_descriptors,
+                agent.deserialize_descs(
+                    base64.b64decode(target.remote_descriptors_b64)
+                ),
+                remote_agent,
+                notification,
+                backends=["UCX"],
+            )
+            try:
+                state = agent.transfer(handle)
+                while state == "PROC":
+                    time.sleep(0.001)
+                    state = agent.check_xfer_state(handle)
+                if state != "DONE":
+                    raise RuntimeError(
+                        f"NIXL adapter transfer failed for {target.host_id}"
+                    )
+            finally:
+                handle.release()
+
+    def _ensure_capacity(self, used_bytes: int) -> float:
+        if self._block is not None and self._block.numel() >= used_bytes:
+            return 0.0
+        capacity = max(
+            used_bytes,
+            2 * (0 if self._block is None else self._block.numel()),
+        )
+        block = torch.empty(capacity, dtype=torch.uint8)
+        agent = self._require_agent()
+        started = time.monotonic()
+        registration = agent.register_memory((block,), backends=["UCX"])
+        if self._registration is not None:
+            agent.deregister_memory(self._registration, backends=["UCX"])
+        self._block = block
+        self._registration = registration
+        return time.monotonic() - started
+
+    def close(self) -> None:
+        if self._agent is not None:
+            for remote_agent in self._remote_agents.values():
+                self._agent.remove_remote_agent(remote_agent)
+        self._remote_agents.clear()
+        if self._agent is not None and self._registration is not None:
+            self._agent.deregister_memory(self._registration, backends=["UCX"])
+        self._block = None
+        self._registration = None
 
     def _require_agent(self) -> Any:
         if self._agent is None:

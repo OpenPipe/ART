@@ -474,6 +474,9 @@ class _GenerationPublisher:
     def close(self) -> None:
         self._pool.shutdown(wait=True)
         self._transport_pool.shutdown(wait=True)
+        if self._transport_sender is not None:
+            self._transport_sender.close()
+            self._transport_sender = None
         self.raise_if_failed()
 
 

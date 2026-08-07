@@ -260,6 +260,9 @@ class ArtHostService(Actor):
         if self._vllm_launcher is not None:
             await self._vllm_launcher.close()
             self._vllm_launcher = None
+        if self._adapter_receiver is not None:
+            await asyncio.to_thread(self._adapter_receiver.close)
+            self._adapter_receiver = None
         self._packed_batches.store.close()
 
     async def _require_nccl_probe(self, probe_id: str) -> float:
@@ -424,10 +427,18 @@ class ArtHostService(Actor):
 
     @resilient_endpoint
     async def prepare_adapter_receive(
-        self, generation_id: str, template_path: str, tensor_dtype: str
+        self,
+        generation_id: str,
+        template_path: str,
+        tensor_dtype: str,
+        timeout_s: float,
     ):
         return await asyncio.to_thread(
-            self._receiver().prepare, generation_id, template_path, tensor_dtype
+            self._receiver().prepare,
+            generation_id,
+            template_path,
+            tensor_dtype,
+            timeout_s,
         )
 
     @resilient_endpoint

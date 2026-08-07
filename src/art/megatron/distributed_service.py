@@ -786,6 +786,27 @@ class DistributedMegatronService:
                 metrics["adapter_materialization_s"] = max(
                     result.materialization_s for result in received
                 )
+                metrics["adapter_transport_pool_wait_s"] = max(
+                    result.pool_wait_s for result in received
+                )
+                metrics["adapter_transport_prepare_s"] = max(
+                    result.prepare_s for result in received
+                )
+                metrics["adapter_transport_registration_s"] = max(
+                    result.registration_s for result in received
+                )
+                metrics["adapter_transport_sender_staging_s"] = max(
+                    result.sender_staging_s for result in received
+                )
+                metrics["adapter_transport_sender_registration_s"] = max(
+                    result.sender_registration_s for result in received
+                )
+                metrics["adapter_transport_capacity_bytes"] = float(
+                    sum(result.capacity_bytes for result in received)
+                )
+                metrics["adapter_transport_capacity_utilization"] = sum(
+                    result.used_bytes for result in received
+                ) / sum(result.capacity_bytes for result in received)
             await previous_serving
             self._raise_publication_failure()
             activation_started = time.monotonic()

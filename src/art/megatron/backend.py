@@ -77,6 +77,9 @@ class MegatronBackend(LocalBackend):
         )
         self._batch_release_tasks: set[asyncio.Task[None]] = set()
         self._batch_release_failures: list[BaseException] = []
+        self._adapter_prune_requests: dict[str, tuple[AnyTrainableModel, set[int]]] = {}
+        self._adapter_prune_task: asyncio.Task[None] | None = None
+        self._adapter_prune_failures: list[BaseException] = []
 
     def __enter__(self) -> "MegatronBackend":
         if self._runtime is not None:
@@ -529,6 +532,8 @@ class MegatronBackend(LocalBackend):
             return
         self._collect_batch_release_results()
         self._raise_batch_release_failures()
+        self._collect_adapter_prune_result()
+        self._raise_adapter_prune_failures()
         from ..distributed.art_runtime import DistributedPackedBatch
         from .distributed_service import DistributedMegatronService
 
@@ -621,6 +626,45 @@ class MegatronBackend(LocalBackend):
         failures, self._batch_release_failures = self._batch_release_failures, []
         raise BaseExceptionGroup("distributed training batch release failed", failures)
 
+    async def prune_model_adapters(
+        self,
+        model: AnyTrainableModel,
+        *,
+        retain_steps: set[int],
+    ) -> None:
+        if self._runtime is None:
+            return await super().prune_model_adapters(model, retain_steps=retain_steps)
+        service = await self._get_service(cast(TrainableModel, model))
+        if getattr(service, "rollout_weight_update_mode", None) == "in_flight_lora":
+            return
+        self._collect_adapter_prune_result()
+        self._raise_adapter_prune_failures()
+        self._adapter_prune_requests[model.name] = (model, set(retain_steps))
+        if self._adapter_prune_task is None:
+            self._adapter_prune_task = asyncio.create_task(self._prune_adapters())
+
+    async def _prune_adapters(self) -> None:
+        while self._adapter_prune_requests:
+            requests, self._adapter_prune_requests = self._adapter_prune_requests, {}
+            for model, retain_steps in requests.values():
+                await super().prune_model_adapters(model, retain_steps=retain_steps)
+
+    def _collect_adapter_prune_result(self) -> None:
+        task = self._adapter_prune_task
+        if task is None or not task.done():
+            return
+        self._adapter_prune_task = None
+        try:
+            task.result()
+        except BaseException as error:
+            self._adapter_prune_failures.append(error)
+
+    def _raise_adapter_prune_failures(self) -> None:
+        if not self._adapter_prune_failures:
+            return
+        failures, self._adapter_prune_failures = self._adapter_prune_failures, []
+        raise BaseExceptionGroup("Megatron adapter pruning failed", failures)
+
     async def close(self) -> None:
         failures: list[BaseException] = []
         if self._batch_release_tasks:
@@ -633,6 +677,15 @@ class MegatronBackend(LocalBackend):
             )
         failures.extend(self._batch_release_failures)
         self._batch_release_failures.clear()
+        if self._adapter_prune_task is not None:
+            result = await asyncio.gather(
+                self._adapter_prune_task, return_exceptions=True
+            )
+            if isinstance(result[0], BaseException):
+                failures.append(result[0])
+            self._adapter_prune_task = None
+        failures.extend(self._adapter_prune_failures)
+        self._adapter_prune_failures.clear()
         try:
             await super().close()
         except BaseException as error:

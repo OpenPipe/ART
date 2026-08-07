@@ -876,11 +876,14 @@ class LocalBackend:
         if service is None:
             return
         manager = self._adapter_leases.get(model.name)
-        if manager is not None:
-            retain_steps = set(retain_steps) | manager.active_steps()
         prune_loaded_adapters = getattr(service, "prune_loaded_adapters", None)
-        if prune_loaded_adapters is not None:
+        if prune_loaded_adapters is None:
+            return
+        if manager is None:
             await prune_loaded_adapters(retain_steps=retain_steps)
+            return
+        async with manager.prune_guard() as leased_steps:
+            await prune_loaded_adapters(retain_steps=set(retain_steps) | leased_steps)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
