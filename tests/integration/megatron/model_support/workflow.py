@@ -67,6 +67,7 @@ OPTIONAL_VALIDATION_STAGES = (
 )
 ALL_VALIDATION_STAGES = (*MANDATORY_VALIDATION_STAGES, *OPTIONAL_VALIDATION_STAGES)
 ARCHITECTURE_REPRESENTATIVE_MODELS = {
+    "llama3_dense": "meta-llama/Llama-3.2-1B-Instruct",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
     "qwen3_dense": "Qwen/Qwen3-32B",
     "qwen3_5_moe": "Qwen/Qwen3.5-35B-A3B",
