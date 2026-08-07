@@ -220,6 +220,17 @@ _DSV4_REDUCED_NATIVE_VLLM_EP4 = VllmWorkflowResources(
     hf_overrides=_DSV4_HF_OVERRIDES,
     extra_engine_args=_DSV4_NATIVE_LORA_VLLM_ENGINE_ARGS,
 )
+_GLM52_REDUCED_MEGATRON = MegatronWorkflowResources(
+    gpu_ids=[0],
+    topology=MegatronWorkflowTopology(),
+)
+_GLM52_REDUCED_VLLM = VllmWorkflowResources(
+    gpu_ids=[1],
+    tensor_parallel_size=1,
+    # FlashInfer's SM100 BF16 autotuner does not support the narrow reduced
+    # fixture dimensions. This gate validates serving, not kernel selection.
+    extra_engine_args={"moe_backend": "triton"},
+)
 
 # Explicitly for large models which do not fit in the default topology.
 HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
@@ -268,6 +279,13 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             streaming_weight_offload=True,
         ),
         yes_no_trainability_variant="megatron_dedicated",
+    ),
+    "glm52": HandlerWorkflowResources(
+        merged_vllm_serving=WorkflowStageResources(
+            required_world_size=2,
+            megatron=_GLM52_REDUCED_MEGATRON,
+            vllm=_GLM52_REDUCED_VLLM,
+        ),
     ),
 }
 

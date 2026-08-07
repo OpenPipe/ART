@@ -158,6 +158,18 @@ def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
     assert stage.vllm.engine_args()["kv_cache_dtype"] == "fp8"
 
 
+def test_glm52_reduced_merged_serving_uses_portable_moe_backend() -> None:
+    resources = handler_workflow_resources_for_base_model("zai-org/GLM-5.2")
+    assert resources is not None
+    assert resources.train_inf_mismatch is None
+    assert resources.merged_vllm_serving is not None
+    assert resources.merged_vllm_serving.megatron is not None
+    assert resources.merged_vllm_serving.megatron.gpu_ids == [0]
+    assert resources.merged_vllm_serving.vllm is not None
+    assert resources.merged_vllm_serving.vllm.gpu_ids == [1]
+    assert resources.merged_vllm_serving.vllm.engine_args()["moe_backend"] == "triton"
+
+
 def test_h200_equivalent_slots_tolerate_reported_gb300_vram() -> None:
     assert _h200_equivalent_slots_for_total_gib(80.0) == 0
     assert _h200_equivalent_slots_for_total_gib(139.0) == 1
