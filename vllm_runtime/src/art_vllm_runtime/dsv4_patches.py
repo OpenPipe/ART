@@ -1126,6 +1126,14 @@ def _dsv4_deep_gemm_fp8_o_proj_with_lora(
     return wo_b(z.flatten(1))
 
 
+def _dsv4_fp32_cos_sin_cache(rotary_emb: Any) -> Any:
+    cache = rotary_emb.cos_sin_cache
+    if cache.dtype != torch.float32:
+        cache = cache.float()
+        rotary_emb.cos_sin_cache = cache
+    return cache
+
+
 def _patch_dsv4_cuda_o_proj_lora(attn_cls: Any, o_proj_mod: Any) -> None:
     if getattr(attn_cls, "_art_wo_a_fast_path_lora_patched", False):
         return
@@ -1135,7 +1143,7 @@ def _patch_dsv4_cuda_o_proj_lora(attn_cls: Any, o_proj_mod: Any) -> None:
             o_proj_mod,
             o,
             positions,
-            self.rotary_emb.cos_sin_cache,
+            _dsv4_fp32_cos_sin_cache(self.rotary_emb),
             self.wo_a,
             self.wo_b,
             n_groups=self.n_local_groups,
@@ -1267,7 +1275,7 @@ def patch_dsv4_fast_path_lora() -> None:
                     dsv4_attn,
                     o,
                     positions,
-                    self.rotary_emb.cos_sin_cache,
+                    _dsv4_fp32_cos_sin_cache(self.rotary_emb),
                     n_groups=self.n_local_groups,
                     heads_per_group=self.n_local_heads // self.n_local_groups,
                     lora_dtype=self.wo_a.lora_a_stacked[0].dtype,
@@ -1280,7 +1288,7 @@ def patch_dsv4_fast_path_lora() -> None:
             o_fp8, o_scale = dsv4_attn.fused_inv_rope_fp8_quant(
                 o,
                 positions,
-                self.rotary_emb.cos_sin_cache,
+                _dsv4_fp32_cos_sin_cache(self.rotary_emb),
                 n_groups=self.n_local_groups,
                 heads_per_group=self.n_local_heads // self.n_local_groups,
                 nope_dim=self.nope_head_dim,

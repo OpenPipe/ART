@@ -50,6 +50,17 @@ def test_dsv4_lora_support_declares_vllm_024_manager_protocol(monkeypatch) -> No
     assert manager_patches == [FakeDeepseekV4ForCausalLM]
 
 
+def test_dsv4_fp8_o_proj_normalizes_rope_cache_once() -> None:
+    patches = _load_dsv4_patches_module()
+    rotary_emb = SimpleNamespace(cos_sin_cache=torch.ones(4, 8, dtype=torch.bfloat16))
+
+    cache = patches._dsv4_fp32_cos_sin_cache(rotary_emb)
+
+    assert cache.dtype == torch.float32
+    assert rotary_emb.cos_sin_cache is cache
+    assert patches._dsv4_fp32_cos_sin_cache(rotary_emb) is cache
+
+
 def test_dsv4_compressor_helper_uses_punica_metadata_without_full_batch_lora(
     monkeypatch,
 ) -> None:
