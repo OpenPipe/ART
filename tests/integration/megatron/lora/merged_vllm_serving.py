@@ -193,7 +193,7 @@ async def _run_merged_vllm_serving(
                     f"http://{host}:{resolved_port}/v1/completions",
                     json={
                         "model": served_model_name,
-                        "prompt": "Hello",
+                        "prompt": [100],
                         "max_tokens": 1,
                         "temperature": 0.0,
                     },

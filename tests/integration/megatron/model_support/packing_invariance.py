@@ -56,6 +56,7 @@ _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
     {
         "default_dense",
         "default_moe",
+        "llama3_dense",
         "qwen3_dense",
         "qwen3_moe",
         "qwen3_5_dense",

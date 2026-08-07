@@ -15,6 +15,7 @@ from art.megatron.lora import (
     SelfAttentionLinearProjLoRA,
     SelfAttentionLinearQKVLoRA,
     SharedExpertsLinearFC1LoRA,
+    SharedExpertsLinearFC2LoRA,
 )
 from art.megatron.weights.param_name_canonicalization import canonical_art_param_name
 
@@ -426,10 +427,10 @@ def add_split_mlp_adapter_weights(
         )
 
     linear_fc2 = getattr(mlp, "linear_fc2", None)
-    if isinstance(linear_fc2, SelfAttentionLinearProjLoRA):
+    if isinstance(linear_fc2, SharedExpertsLinearFC2LoRA):
         fc2_prefix = f"{base_prefix}.linear_fc2"
         _set_adapter_weights(
             adapter_weights_by_base,
             fc2_prefix,
-            _simple_adapter_weight(fc2_prefix, linear_fc2.lora),
+            _simple_adapter_weight(fc2_prefix, linear_fc2.row_parallel_lora.lora),
         )

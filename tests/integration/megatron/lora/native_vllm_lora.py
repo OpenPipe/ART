@@ -96,7 +96,7 @@ async def _completion_text(client, base_url: str, model_name: str) -> str:
         f"{base_url}/v1/completions",
         json={
             "model": model_name,
-            "prompt": "Hello",
+            "prompt": [100],
             "max_tokens": 1,
             "temperature": 0.0,
         },
