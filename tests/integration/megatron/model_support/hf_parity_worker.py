@@ -14,6 +14,8 @@ import torch
 import torch.nn.functional as F
 
 from art.megatron import train as megatron_train
+from art.megatron.context_parallel.block_mask import prepare_block_mask_context
+from art.megatron.prefix_tree_state import create_prefix_tree_state
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     RouterCallRoute,
@@ -23,6 +25,7 @@ from art.megatron.routing_replay import (
 from art.megatron.routing_replay import (
     ParallelTopology as ReplayParallelTopology,
 )
+from art.megatron.training import microbatches as megatron_microbatches
 from art.megatron.training.trace import prepare_replay_local_input_token_uids
 from art.megatron.weights.merged_weight_export import build_art_conversion_tasks
 from art.preprocessing.pack import packed_tensors_from_dir
@@ -630,6 +633,119 @@ def _focus_derivative_tensor_map(
     return focused
 
 
+def _dense_prefix_tree_attention_mask(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+    sliding_window: int | None = None,
+) -> torch.Tensor:
+    context = prepare_block_mask_context(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        input_pos=position_ids,
+    )
+    seq_len = int(group_ids.numel())
+    absolute = torch.arange(seq_len)
+    group_enter = torch.from_numpy(context.group_enter_np)
+    group_exit = torch.from_numpy(context.group_exit_np)
+    allowed = (absolute[:, None] >= absolute[None, :]) & (
+        (group_enter[None, :] <= group_enter[:, None])
+        & (group_enter[:, None] < group_exit[None, :])
+    )
+    if sliding_window is not None:
+        positions = position_ids.detach().cpu().reshape(-1)
+        delta = positions[:, None] - positions[None, :]
+        allowed &= (delta >= 0) & (delta < sliding_window)
+    mask = torch.full(
+        (seq_len, seq_len),
+        torch.finfo(dtype).min,
+        device=device,
+        dtype=dtype,
+    )
+    return mask.masked_fill(allowed.to(device), 0).unsqueeze(0).unsqueeze(0)
+
+
+def _hf_prefix_tree_forward_inputs(
+    model: Any,
+    micro: dict[str, torch.Tensor],
+    *,
+    actual_len: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor | dict[str, torch.Tensor], torch.Tensor]:
+    group_ids = micro["group_ids"].reshape(-1)[:actual_len]
+    parent_ids = micro["parent_ids"].reshape(-1)[:actual_len]
+    position_ids = micro["position_ids"].reshape(-1)[:actual_len]
+    full_mask = _dense_prefix_tree_attention_mask(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        position_ids=position_ids,
+        device=device,
+        dtype=dtype,
+    )
+    config = model.config
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = get_text_config() if callable(get_text_config) else config
+    layer_types = tuple(getattr(text_config, "layer_types", ()))
+    attention_mask: torch.Tensor | dict[str, torch.Tensor] = full_mask
+    if "sliding_attention" in layer_types:
+        attention_mask = {
+            "full_attention": full_mask,
+            "sliding_attention": _dense_prefix_tree_attention_mask(
+                group_ids=group_ids,
+                parent_ids=parent_ids,
+                position_ids=position_ids,
+                device=device,
+                dtype=dtype,
+                sliding_window=int(text_config.sliding_window),
+            ),
+        }
+    return attention_mask, position_ids.unsqueeze(0).to(device=device)
+
+
+def _prepare_hf_parity_megatron_micro(
+    micro: dict[str, torch.Tensor],
+    *,
+    device: torch.device,
+    provider: Any,
+    model_support_handler: Any,
+) -> megatron_train.PreparedSFTMicroInputs:
+    prepared = megatron_train._prepare_dense_sft_micro(
+        micro,
+        device=device,
+        provider=provider,
+        model_support_handler=model_support_handler,
+    )
+    seq_len = int(prepared.input_ids.shape[1])
+    position_ids = micro["position_ids"].reshape(-1)[:seq_len].unsqueeze(0)
+    attention_state = create_prefix_tree_state(
+        group_ids=micro["group_ids"].reshape(-1)[:seq_len].unsqueeze(0),
+        parent_ids=micro["parent_ids"].reshape(-1)[:seq_len].unsqueeze(0),
+        target_device=device,
+        input_pos=position_ids,
+        sliding_windows=megatron_microbatches._art_flex_sliding_windows(provider),
+        build_gdn_execution_spec=bool(
+            getattr(model_support_handler, "build_gdn_execution_spec", False)
+        ),
+        model_support_handler=model_support_handler,
+        attention_head_dim=getattr(provider, "kv_channels", None),
+        attention_value_head_dim=getattr(provider, "kv_channels", None),
+        gdn_planner_config=megatron_microbatches._gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
+        ),
+    )
+    return prepared.model_copy(
+        update={
+            "position_ids": position_ids.to(device=device),
+            "attention_state": attention_state,
+        }
+    )
+
+
 def _run_hf_sft_step(
     *,
     base_model: str,
@@ -678,10 +794,17 @@ def _run_hf_sft_step(
         actual_len = max(int(attention_mask.sum().item()), 1)
         input_ids = micro["input_ids"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
         labels = micro["labels"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
-        hf_attention_mask = torch.ones_like(input_ids, dtype=torch.long, device=device)
+        hf_attention_mask, position_ids = _hf_prefix_tree_forward_inputs(
+            model,
+            micro,
+            actual_len=actual_len,
+            device=device,
+            dtype=dtype,
+        )
         logits = model(
             input_ids=input_ids,
             attention_mask=hf_attention_mask,
+            position_ids=position_ids,
             use_cache=False,
         ).logits
         shifted_labels = megatron_train.shift_tensor(labels, -100)
@@ -1145,7 +1268,7 @@ def _run_megatron_sft_step(
                 sample_indices[micro_order],
                 micro_order,
             )
-        prepared_micro = megatron_train._prepare_dense_sft_micro(
+        prepared_micro = _prepare_hf_parity_megatron_micro(
             micro,
             device=device,
             provider=runtime.provider,
@@ -1252,6 +1375,14 @@ def _worker_run(request: HfParityRunRequest) -> None:
     trajectory_tensors = build_sft_trajectory_tensors_from_packed_tensors(
         packed_tensors
     )
+    for index, trajectory in enumerate(trajectory_tensors):
+        trajectory.update(
+            {
+                "group_ids": packed_tensors["group_ids"][index].detach().clone(),
+                "parent_ids": packed_tensors["parent_ids"][index].detach().clone(),
+                "position_ids": packed_tensors["input_pos"][index].detach().clone(),
+            }
+        )
     zero_template = megatron_train._zero_contribution_sft_inputs(trajectory_tensors[0])
     sample_indices = build_parity_sample_indices(
         num_sequences=len(trajectory_tensors),

@@ -32,6 +32,7 @@ from ..trajectories import (
 from ..trajectories._selection import ModelSelector, resolve_training_model
 from ..types import MessagesAndChoices
 from ..utils.chat_template import (
+    TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR,
     default_chat_template_kwargs_for_tokenizer,
     merge_chat_template_kwargs,
 )
@@ -337,8 +338,9 @@ def _normalize_tool_call_arguments_for_chat_template(
         r"{%\s*set\s+([A-Za-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*\.)+arguments\s*%}",
         chat_template,
     )
-    if "tool_call.arguments|items" not in chat_template and not any(
-        f"{alias}.items()" in chat_template for alias in aliases
+    if not getattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR, False) and (
+        "tool_call.arguments|items" not in chat_template
+        and not any(f"{alias}.items()" in chat_template for alias in aliases)
     ):
         return messages
 

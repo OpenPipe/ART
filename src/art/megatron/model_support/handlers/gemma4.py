@@ -795,6 +795,21 @@ class Gemma4DenseHandler(DefaultDenseHandler):
     key = "gemma4_dense"
     native_vllm_lora_status = "validated"
 
+    def configure_tokenizer(
+        self,
+        tokenizer: Any,
+        *,
+        internal_config: Any,
+    ) -> Any:
+        if not any(
+            internal_config.get(key) is not None
+            for key in ("chat_template", "chat_template_path")
+        ):
+            from art.utils.chat_template import TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR
+
+            setattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR, True)
+        return tokenizer
+
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return getattr(base_config, "text_config", base_config)
 

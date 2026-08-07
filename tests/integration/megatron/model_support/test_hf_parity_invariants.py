@@ -23,6 +23,7 @@ from .hf_parity_worker import (
     _drop_gemma4_reparameterized_norm_grads,
     _filter_language_only_tensor_map,
     _hf_moe_router_key,
+    _hf_prefix_tree_forward_inputs,
     _hf_router_num_experts,
     _is_language_hf_param_name,
     _mapping_supports_derivative_parity,
@@ -43,6 +44,38 @@ def test_build_parity_sample_indices_pads_with_none() -> None:
         num_sequences=2,
         global_grad_accumulation_sequences=4,
     ) == [0, 1, None, None]
+
+
+def test_hf_prefix_tree_inputs_block_siblings_and_repeat_positions() -> None:
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            layer_types=["full_attention", "sliding_attention"],
+            sliding_window=2,
+        )
+    )
+    micro = {
+        "group_ids": torch.tensor([0, 0, 1, 1, 2, 2]),
+        "parent_ids": torch.tensor([0, 0, 0, 0, 0, 0]),
+        "position_ids": torch.tensor([0, 1, 2, 3, 2, 3]),
+    }
+
+    attention_mask, position_ids = _hf_prefix_tree_forward_inputs(
+        model,
+        micro,
+        actual_len=6,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert isinstance(attention_mask, dict)
+    masks = cast(dict[str, torch.Tensor], attention_mask)
+    full_allowed = masks["full_attention"][0, 0] == 0
+    sliding_allowed = masks["sliding_attention"][0, 0] == 0
+    assert position_ids.tolist() == [[0, 1, 2, 3, 2, 3]]
+    assert full_allowed[4, 1]
+    assert not full_allowed[4, 2]
+    assert not sliding_allowed[4, 0]
+    assert sliding_allowed[4, 1]
 
 
 def test_hf_parity_uses_train_inf_mismatch_settings() -> None:

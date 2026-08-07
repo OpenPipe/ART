@@ -5,12 +5,14 @@ import pydantic
 import pytest
 from transformers.tokenization_utils_base import BatchEncoding
 
+from art.megatron.model_support.handlers.gemma4 import GEMMA4_DENSE_HANDLER
 from art.preprocessing.tokenize import (
     _normalize_tool_call_arguments_for_chat_template,
     tokenize_sft_batch,
 )
 from art.trajectories import Trajectory
 from art.types import MessagesAndChoices, TrainSFTConfig
+from art.utils.chat_template import TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR
 
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
@@ -200,6 +202,33 @@ def test_glm_chat_template_normalizes_aliased_tool_call_arguments() -> None:
 
     assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {"value": "yes"}
     assert messages[0]["tool_calls"][0]["function"]["arguments"] == ('{"value": "yes"}')
+
+
+def test_gemma4_normalizes_json_tool_arguments_for_mapping_template() -> None:
+    tokenizer = _FakeTokenizer()
+    tokenizer.chat_template = (
+        "{% set function = tool_call['function'] %}"
+        "{% if function['arguments'] is mapping %}{{ function['arguments'] }}{% endif %}"
+    )
+    GEMMA4_DENSE_HANDLER.configure_tokenizer(tokenizer, internal_config={})
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "answer",
+                        "arguments": '{"value": "yes"}',
+                    }
+                }
+            ],
+        }
+    ]
+
+    normalized = _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
+
+    assert getattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR) is True
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {"value": "yes"}
 
 
 def test_tokenize_sft_batch_masks_response_tokens_without_unsloth_import() -> None:
