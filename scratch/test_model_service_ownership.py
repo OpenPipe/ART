@@ -1,4 +1,5 @@
 import ast
+import asyncio
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -301,3 +302,18 @@ async def test_retention_protects_absent_learner_and_serving_steps(
     assert (checkpoints / "0002").is_dir()
     assert (checkpoints / "0003").is_dir()
     assert not (checkpoints / "0004").exists()
+
+
+@pytest.mark.asyncio
+async def test_in_flight_prune_does_not_enter_serving_critical_section(
+    tmp_path,
+) -> None:
+    service = _service(tmp_path, SimpleNamespace())
+    service.config["rollout_weight_update_mode"] = "in_flight_lora"
+    service._loaded_adapter_steps = {1, 2}
+    await service._serving_lock.acquire()
+    try:
+        await asyncio.wait_for(service.prune_loaded_adapters(retain_steps=set()), 0.1)
+    finally:
+        service._serving_lock.release()
+    assert service._loaded_adapter_steps == {1, 2}

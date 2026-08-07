@@ -75,6 +75,8 @@ class MegatronBackend(LocalBackend):
         self._managed_api_key = (
             secrets.token_urlsafe(32) if runtime is not None else None
         )
+        self._batch_release_tasks: set[asyncio.Task[None]] = set()
+        self._batch_release_failures: list[BaseException] = []
 
     def __enter__(self) -> "MegatronBackend":
         if self._runtime is not None:
@@ -525,6 +527,8 @@ class MegatronBackend(LocalBackend):
             ):
                 yield result
             return
+        self._collect_batch_release_results()
+        self._raise_batch_release_failures()
         from ..distributed.art_runtime import DistributedPackedBatch
         from .distributed_service import DistributedMegatronService
 
@@ -583,6 +587,60 @@ class MegatronBackend(LocalBackend):
         if self._runtime is None:
             return await super()._release_training_batch(batch)
         await self._release_distributed_batch(batch, disposition="consumed")
+
+    async def _finish_training_batch(
+        self, batch: _PackedTrainingBatch, *, failed: bool
+    ) -> None:
+        if self._runtime is None or failed:
+            return await super()._finish_training_batch(batch, failed=failed)
+        self._collect_batch_release_results()
+        self._raise_batch_release_failures()
+        while len(self._batch_release_tasks) >= 2:
+            await asyncio.wait(
+                self._batch_release_tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            self._collect_batch_release_results()
+            self._raise_batch_release_failures()
+        self._batch_release_tasks.add(
+            asyncio.create_task(self._release_training_batch(batch))
+        )
+
+    def _collect_batch_release_results(self) -> None:
+        for task in tuple(self._batch_release_tasks):
+            if not task.done():
+                continue
+            self._batch_release_tasks.remove(task)
+            try:
+                task.result()
+            except BaseException as error:
+                self._batch_release_failures.append(error)
+
+    def _raise_batch_release_failures(self) -> None:
+        if not self._batch_release_failures:
+            return
+        failures, self._batch_release_failures = self._batch_release_failures, []
+        raise BaseExceptionGroup("distributed training batch release failed", failures)
+
+    async def close(self) -> None:
+        failures: list[BaseException] = []
+        if self._batch_release_tasks:
+            results = await asyncio.gather(
+                *self._batch_release_tasks, return_exceptions=True
+            )
+            self._batch_release_tasks.clear()
+            failures.extend(
+                result for result in results if isinstance(result, BaseException)
+            )
+        failures.extend(self._batch_release_failures)
+        self._batch_release_failures.clear()
+        try:
+            await super().close()
+        except BaseException as error:
+            failures.append(error)
+        if failures:
+            raise BaseExceptionGroup(
+                "distributed Megatron backend close failed", failures
+            )
 
     async def _release_distributed_batch(
         self,

@@ -1669,7 +1669,9 @@ class LocalBackend:
         finally:
             try:
                 _, cancelled = await complete_task(
-                    asyncio.create_task(self._release_training_batch(batch))
+                    asyncio.create_task(
+                        self._finish_training_batch(batch, failed=primary is not None)
+                    )
                 )
                 if cancelled is not None:
                     raise cancelled
@@ -1681,6 +1683,11 @@ class LocalBackend:
                         "training-batch release also failed: "
                         f"{type(release_error).__name__}: {release_error}"
                     )
+
+    async def _finish_training_batch(
+        self, batch: _PackedTrainingBatch, *, failed: bool
+    ) -> None:
+        await self._release_training_batch(batch)
 
     async def _release_training_batch(self, batch: _PackedTrainingBatch) -> None:
         pass

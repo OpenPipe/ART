@@ -1428,7 +1428,8 @@ class DistributedMegatronService:
                     "LoRA publication and serving rollback failed", [error, *cleanup]
                 ) from None
             raise
-        self._loaded_adapter_steps.add(step)
+        if self.rollout_weight_update_mode != "in_flight_lora":
+            self._loaded_adapter_steps.add(step)
         self._current_lora_name = lora_name
         self._serving_step = step
 
@@ -1497,6 +1498,8 @@ class DistributedMegatronService:
                 self._exact_adapter_refcounts[step] = count - 1
 
     async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            return
         async with self._serving_lock:
             self._require_open()
             for step in sorted(
