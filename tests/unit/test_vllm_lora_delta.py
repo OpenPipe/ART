@@ -71,3 +71,33 @@ def test_additive_weight_loader_keeps_v2_for_vllm_parameter_like_param():
 
     assert calls == ["v2"]
     assert torch.equal(param, loaded)
+
+
+def test_delta_update_normalizes_missing_quantization_config_during_load():
+    lora_delta = _load_lora_delta_module()
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(2, 2))
+            self.config = SimpleNamespace(quantization_config=None)
+
+        def load_weights(self, weights):
+            assert self.config.quantization_config == {"quant_method": None}
+            for _name, weight in weights:
+                getattr(self.weight, "weight_loader")(self.weight, weight)
+
+    model = Model()
+    tensors = {
+        "base_model.model.weight.lora_A.weight": torch.eye(2),
+        "base_model.model.weight.lora_B.weight": torch.eye(2),
+    }
+    lora_delta.apply_lora_delta_update(
+        model=model,
+        lora_tensors=tensors,
+        adapter_config={"r": 2, "lora_alpha": 2},
+        previous_lora_tensors=None,
+    )
+
+    assert model.config.quantization_config is None
+    assert torch.equal(model.weight, torch.eye(2))

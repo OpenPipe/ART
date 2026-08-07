@@ -223,6 +223,19 @@ def _additive_weight_loaders(model: Any) -> Any:
                 delattr(param, "weight_loader")
 
 
+@contextmanager
+def _normalized_quantization_config(model: Any) -> Any:
+    config = getattr(model, "config", None)
+    if config is None or getattr(config, "quantization_config", None) is not None:
+        yield
+        return
+    config.quantization_config = {"quant_method": None}
+    try:
+        yield
+    finally:
+        config.quantization_config = None
+
+
 def apply_lora_delta_update(
     *,
     model: Any,
@@ -237,7 +250,11 @@ def apply_lora_delta_update(
             "LoRA update key set changed: "
             f"current={sorted(lora_tensors)} previous={sorted(previous_lora_tensors)}"
         )
-    with torch.no_grad(), _additive_weight_loaders(model):
+    with (
+        torch.no_grad(),
+        _additive_weight_loaders(model),
+        _normalized_quantization_config(model),
+    ):
         model.load_weights(
             _iter_lora_checkpoint_deltas(
                 lora_tensors,

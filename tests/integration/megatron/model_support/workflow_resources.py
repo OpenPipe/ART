@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-_H200_REFERENCE_VRAM_GIB = 140.0
+_H200_REFERENCE_VRAM_GIB = 130.0
 _H200_SLOT_TOLERANCE = 0.05
 
 
@@ -147,6 +147,11 @@ _DSV4_HF_OVERRIDES = {
     "compress_ratios": _DSV4_REPRESENTATIVE_COMPRESS_RATIOS,
     "layer_types": _DSV4_REPRESENTATIVE_LAYER_TYPES,
     "mlp_layer_types": _DSV4_REPRESENTATIVE_MLP_LAYER_TYPES,
+    "rope_parameters": {
+        "partial_rotary_factor": 0.125,
+        "rope_theta": 10000,
+        "rope_type": "default",
+    },
 }
 _DSV4_COMMON_VLLM_ENGINE_ARGS = {
     "compilation_config": {

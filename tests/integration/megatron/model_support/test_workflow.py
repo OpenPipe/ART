@@ -189,6 +189,7 @@ def test_glm52_reduced_workflow_uses_portable_serving_backends() -> None:
 def test_h200_equivalent_slots_tolerate_reported_gb300_vram() -> None:
     assert _h200_equivalent_slots_for_total_gib(80.0) == 0
     assert _h200_equivalent_slots_for_total_gib(139.0) == 1
+    assert _h200_equivalent_slots_for_total_gib(267.69) == 2
     assert _h200_equivalent_slots_for_total_gib(276.6) == 2
 
 
