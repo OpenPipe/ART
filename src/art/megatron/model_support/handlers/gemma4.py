@@ -2138,7 +2138,6 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
     from megatron.bridge.models.conversion.mapping_registry import (
         MegatronMappingRegistry,
     )
-    from megatron.bridge.models.conversion.param_mapping import AutoMapping
     from megatron.bridge.models.gemma.gemma4_bridge import _Gemma4QKVMapping
     from megatron.bridge.models.gemma_vl.gemma4_vl_bridge import Gemma4VLBridge
 
@@ -2197,7 +2196,7 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
 
     text_config = getattr(hf_config, "text_config", hf_config)
     is_moe = bool(getattr(text_config, "enable_moe_block", False))
-    language_mappings = [AutoMapping("output_layer.weight", "lm_head.weight")]
+    language_mappings = []
     for mapping in upstream_registry.mappings:
         if not mapping.megatron_param.startswith("language_model."):
             continue
