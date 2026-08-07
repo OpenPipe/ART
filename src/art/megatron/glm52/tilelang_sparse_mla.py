@@ -591,10 +591,15 @@ def forward(
             (q, q.new_zeros((*q.shape[:2], kernel_heads - heads, q.shape[3]))), dim=2
         )
     kv = torch.cat((kv, kv.new_zeros((kv.shape[0], 1, kv.shape[2]))), dim=1)
+    sm_major = torch.cuda.get_device_capability(q.device)[0]
+    threads = 128 if sm_major == 10 and kernel_heads == 32 else 256
     with _preserve_env():
-        output, lse = _forward(int(kernel_heads), int(indices.shape[-1]), float(scale))(
-            q, kv, indices
-        )
+        output, lse = _forward(
+            int(kernel_heads),
+            int(indices.shape[-1]),
+            float(scale),
+            threads=threads,
+        )(q, kv, indices)
     return output[:, :, :heads], lse[:, :, :heads]
 
 
