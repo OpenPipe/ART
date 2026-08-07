@@ -7,7 +7,7 @@ if TYPE_CHECKING:
     from .packing import PackingRequest
     from .rollout import (
         DistributedRolloutExecutor,
-        InProcessRolloutHost,
+        InProcessRolloutWorker,
         InstalledAsyncCallable,
         LocalRolloutExecutor,
         RolloutExecutor,
@@ -52,7 +52,7 @@ _EXPORTS = {
     "HostMemberState": ".vllm_replica",
     "HostServiceHealth": ".specs",
     "HostSpec": ".specs",
-    "InProcessRolloutHost": ".rollout",
+    "InProcessRolloutWorker": ".rollout",
     "InstalledAsyncCallable": ".rollout",
     "LocalRolloutExecutor": ".rollout",
     "ManagedVllmHostLauncher": ".vllm_replica",

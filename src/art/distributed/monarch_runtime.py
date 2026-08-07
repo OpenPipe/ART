@@ -11,9 +11,9 @@ from .adapter_transport import AdapterReceiveResult, AdapterTransferTarget
 from .data_plane import PackedBatchRef, PackedBatchTransfer
 from .packing import PackingRequest, PackingResult
 from .rollout import (
-    RolloutHostEndpoint,
     RolloutInvocation,
     RolloutResult,
+    RolloutWorkerEndpoint,
 )
 from .trajectory_store import (
     TrajectoryEnqueueResult,
@@ -72,7 +72,7 @@ async def call_remote(endpoint: Any, *args: Any) -> Any:
     return unwrap_remote_call(await endpoint.call_one(*args))
 
 
-class MonarchRolloutHostEndpoint(RolloutHostEndpoint):
+class MonarchRolloutWorkerEndpoint(RolloutWorkerEndpoint):
     def __init__(
         self, actor: Any, *, timeout_s: float, owns_actor: bool = False
     ) -> None:

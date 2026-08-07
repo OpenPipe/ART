@@ -234,7 +234,7 @@ class LocalRolloutExecutor:
         return await rollout_fn(model, scenario, config)
 
 
-class RolloutHostEndpoint(Protocol):
+class RolloutWorkerEndpoint(Protocol):
     async def run(self, invocation: RolloutInvocation) -> RolloutResult: ...
 
     async def materialize(self, ref: TrajectoryGroupRef) -> TrajectoryGroup: ...
@@ -332,7 +332,7 @@ class DistributedTrajectoryQueue:
         self,
         *,
         endpoint: TrajectoryQueueEndpoint,
-        owner_endpoints: dict[str, RolloutHostEndpoint],
+        owner_endpoints: dict[str, RolloutWorkerEndpoint],
         maxsize: int,
         capacity_records: int,
         capacity_bytes: int,
@@ -695,7 +695,7 @@ class DistributedTrajectoryQueue:
     async def _release(
         self,
         lease: TrajectoryQueueLease,
-        owner: RolloutHostEndpoint,
+        owner: RolloutWorkerEndpoint,
         *,
         disposition: Literal["consumed", "discarded"] = "discarded",
         generation_id: str | None = None,
@@ -715,7 +715,7 @@ class DistributedTrajectoryQueue:
         return []
 
     def _schedule_owner_cleanup(
-        self, owner: RolloutHostEndpoint, ref: TrajectoryGroupRef
+        self, owner: RolloutWorkerEndpoint, ref: TrajectoryGroupRef
     ) -> None:
         owner_id = ref.owner_actor_id
         self._owner_cleanup_refs.setdefault(owner_id, deque()).append(ref)
@@ -725,7 +725,7 @@ class DistributedTrajectoryQueue:
             )
 
     async def _drain_owner_cleanup(
-        self, owner_id: str, owner: RolloutHostEndpoint
+        self, owner_id: str, owner: RolloutWorkerEndpoint
     ) -> None:
         refs = self._owner_cleanup_refs[owner_id]
         while refs:
@@ -744,7 +744,7 @@ class DistributedTrajectoryQueue:
         if error is not None:
             raise error
 
-    def _owner(self, ref: TrajectoryGroupRef) -> RolloutHostEndpoint:
+    def _owner(self, ref: TrajectoryGroupRef) -> RolloutWorkerEndpoint:
         try:
             return self.owner_endpoints[ref.owner_actor_id]
         except KeyError:
@@ -794,7 +794,7 @@ class DistributedRolloutExecutor:
         self,
         *,
         callable: InstalledAsyncCallable,
-        hosts: Mapping[str, Sequence[RolloutHostEndpoint]],
+        hosts: Mapping[str, Sequence[RolloutWorkerEndpoint]],
         target_workers: int,
         queue_endpoint: TrajectoryQueueEndpoint | None = None,
         trajectory_capacity_records: int = 16_384,
@@ -805,12 +805,12 @@ class DistributedRolloutExecutor:
         self.callable = callable
         self.hosts = {host: tuple(endpoints) for host, endpoints in hosts.items()}
         self.max_workers = sum(len(endpoints) for endpoints in self.hosts.values())
-        self._worker_endpoints: tuple[RolloutHostEndpoint, ...] = ()
-        self._endpoint_by_worker: dict[int, RolloutHostEndpoint] = {}
+        self._worker_endpoints: tuple[RolloutWorkerEndpoint, ...] = ()
+        self._endpoint_by_worker: dict[int, RolloutWorkerEndpoint] = {}
         self._queue_endpoint = queue_endpoint
         self._trajectory_capacity_records = trajectory_capacity_records
         self._trajectory_capacity_bytes = trajectory_capacity_bytes
-        self._endpoint_by_owner: dict[str, RolloutHostEndpoint] = {}
+        self._endpoint_by_owner: dict[str, RolloutWorkerEndpoint] = {}
         self._result_queue: DistributedTrajectoryQueue | None = None
         self.set_target(target_workers)
 
@@ -821,10 +821,11 @@ class DistributedRolloutExecutor:
         if queue_endpoint is None:
             endpoints = next(iter(self.hosts.values()))
             if len(self.hosts) != 1 or not all(
-                isinstance(endpoint, InProcessRolloutHost) for endpoint in endpoints
+                isinstance(endpoint, InProcessRolloutWorker) for endpoint in endpoints
             ):
                 raise RuntimeError(
-                    "queue_endpoint is required unless one in-process host is used"
+                    "queue_endpoint is required unless one host uses only "
+                    "in-process rollout workers"
                 )
             queue_endpoint = _InProcessTrajectoryQueueEndpoint()
             self._queue_endpoint = queue_endpoint
@@ -943,8 +944,8 @@ class DistributedRolloutExecutor:
             raise BaseExceptionGroup("distributed rollout cleanup failed", failures)
 
 
-class InProcessRolloutHost:
-    """One coarse host service used by local collapse and tests."""
+class InProcessRolloutWorker:
+    """One in-process rollout execution slot used by local collapse and tests."""
 
     def __init__(
         self, *, capacity_records: int = 16_384, capacity_bytes: int = 4 << 30

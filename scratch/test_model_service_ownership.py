@@ -78,7 +78,7 @@ async def test_runtime_retains_model_service_until_stop_succeeds(monkeypatch) ->
         model_services=(spec,),
         cluster=SimpleNamespace(startup_timeout_s=1, rpc_timeout_s=1),
     )
-    runtime._host_actors = {"host0": object()}
+    runtime._host_services = {"host0": object()}
     runtime._model_services = {}
     runtime._started, runtime._closed = True, False
     runtime._preflight_launch = AsyncMock()

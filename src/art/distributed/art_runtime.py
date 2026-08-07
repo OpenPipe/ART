@@ -43,7 +43,7 @@ from .monarch_runtime import (
     MonarchPackedBatchInbox,
     MonarchPackedBatchSource,
     MonarchPackingEndpoint,
-    MonarchRolloutHostEndpoint,
+    MonarchRolloutWorkerEndpoint,
     MonarchTrajectoryQueueEndpoint,
     MonarchVllmHostLauncher,
     call_remote,
@@ -114,7 +114,7 @@ class ArtRuntime:
         self.owns_host_mesh = owns_host_mesh
         self.runtime_id = uuid.uuid4().hex
         self._host_procs: dict[str, Any] = {}
-        self._host_actors: dict[str, Any] = {}
+        self._host_services: dict[str, Any] = {}
         self._rollout_procs: dict[str, Any] = {}
         self._rollout_actors: dict[str, Any] = {}
         self._trainer_runs: set[Any] = set()
@@ -231,7 +231,7 @@ class ArtRuntime:
         return self
 
     async def _start_host_services(self) -> None:
-        from .monarch_actor import RolloutHostService
+        from .monarch_actor import ArtHostService
 
         async with asyncio.timeout(self.topology.cluster.startup_timeout_s):
             for index, host in enumerate(self.topology.cluster.hosts):
@@ -245,7 +245,7 @@ class ArtRuntime:
                 )
                 actor = proc.spawn(
                     monarch_identifier(f"art_service_{self.runtime_id}_{host.host_id}"),
-                    RolloutHostService,
+                    ArtHostService,
                     HostAdmissionRequest(
                         host_id=host.host_id,
                         node_rank=host.node_rank,
@@ -257,16 +257,16 @@ class ArtRuntime:
                     data_plane_host,
                 )
                 self._host_procs[host.host_id] = proc
-                self._host_actors[host.host_id] = actor
+                self._host_services[host.host_id] = actor
             await asyncio.gather(
-                *(actor.initialized for actor in self._host_actors.values())
+                *(actor.initialized for actor in self._host_services.values())
             )
             self._controller_fingerprint, reports = await asyncio.gather(
                 asyncio.to_thread(build_runtime_fingerprint, self._runtime_packages),
                 asyncio.gather(
                     *(
                         call_remote(actor.admission)
-                        for actor in self._host_actors.values()
+                        for actor in self._host_services.values()
                     )
                 ),
             )
@@ -296,7 +296,7 @@ class ArtRuntime:
     async def health(self) -> dict[str, HostServiceHealth]:
         async with asyncio.timeout(self.topology.cluster.rpc_timeout_s):
             values = await asyncio.gather(
-                *(call_remote(actor.health) for actor in self._host_actors.values())
+                *(call_remote(actor.health) for actor in self._host_services.values())
             )
         health = {value.host_id: value for value in values}
         if len(health) != len(values) or health.keys() != self._admitted_hosts.keys():
@@ -372,7 +372,7 @@ class ArtRuntime:
                     session_results = await asyncio.gather(
                         *(
                             call_remote(
-                                self._host_actors[
+                                self._host_services[
                                     placement.host_id
                                 ].start_nccl_preflight_session,
                                 session,
@@ -392,7 +392,7 @@ class ArtRuntime:
                             session_failures,
                         )
                     rendezvous = await call_remote(
-                        self._host_actors[leader.host_id].nccl_preflight_rendezvous,
+                        self._host_services[leader.host_id].nccl_preflight_rendezvous,
                         NcclRendezvousRequest(
                             probe_id=probe_id,
                             runtime_kind=runtime_kind,
@@ -419,7 +419,7 @@ class ArtRuntime:
                     results = await asyncio.gather(
                         *(
                             call_remote(
-                                self._host_actors[placement.host_id].nccl_preflight,
+                                self._host_services[placement.host_id].nccl_preflight,
                                 request,
                             )
                             for placement, request in zip(
@@ -501,7 +501,9 @@ class ArtRuntime:
                 results = await asyncio.gather(
                     *(
                         call_remote(
-                            self._host_actors[placement.host_id].cancel_nccl_preflight,
+                            self._host_services[
+                                placement.host_id
+                            ].cancel_nccl_preflight,
                             probe_id,
                         )
                         for placement in placements
@@ -531,13 +533,13 @@ class ArtRuntime:
         transport = self.topology.cluster.nixl_transport
         if transport is None:
             return
-        host_ids = tuple(self._host_actors)
+        host_ids = tuple(self._host_services)
         probe_timeout_s = min(5.0, self.topology.cluster.rpc_timeout_s)
         async with asyncio.timeout(self.topology.cluster.rpc_timeout_s):
             results = await asyncio.gather(
                 *(
                     call_remote(
-                        self._host_actors[host_id].nixl_metadata_store_health,
+                        self._host_services[host_id].nixl_metadata_store_health,
                         transport.metadata_store.url,
                         probe_timeout_s,
                     )
@@ -598,7 +600,9 @@ class ArtRuntime:
         async with asyncio.timeout(self.topology.cluster.rpc_timeout_s):
             results: list[ArtifactProbeResult] = await asyncio.gather(
                 *(
-                    call_remote(self._host_actors[host_id].artifact_root_probe, command)
+                    call_remote(
+                        self._host_services[host_id].artifact_root_probe, command
+                    )
                     for host_id in host_ids
                 )
             )
@@ -634,7 +638,7 @@ class ArtRuntime:
         self._start_rollout_workers()
         hosts = {
             host_id: tuple(
-                MonarchRolloutHostEndpoint(
+                MonarchRolloutWorkerEndpoint(
                     actor.slice(rollout=slot),
                     timeout_s=self.topology.cluster.rpc_timeout_s,
                 )
@@ -647,7 +651,7 @@ class ArtRuntime:
             hosts=hosts,
             target_workers=target_workers,
             queue_endpoint=MonarchTrajectoryQueueEndpoint(
-                self._host_actors[self.topology.cluster.controller_host_id]
+                self._host_services[self.topology.cluster.controller_host_id]
             ),
             trajectory_capacity_records=self.config.trajectory_capacity_records,
             trajectory_capacity_bytes=self.config.trajectory_capacity_bytes,
@@ -696,7 +700,7 @@ class ArtRuntime:
         trainer_hosts = tuple(dict.fromkeys(rank.host_id for rank in trainer.ranks))
         source_host = trainer_hosts[self._next_packing_host % len(trainer_hosts)]
         self._next_packing_host += 1
-        source_actor = self._host_actors[source_host]
+        source_service = self._host_services[source_host]
         batch_id = uuid.uuid4().hex
         self._live_batches[batch_id] = trainer_hosts
         try:
@@ -719,7 +723,9 @@ class ArtRuntime:
                 )
             try:
                 packing_rpc_started = time.monotonic()
-                result: PackingResult = await MonarchPackingEndpoint(source_actor).pack(
+                result: PackingResult = await MonarchPackingEndpoint(
+                    source_service
+                ).pack(
                     wire_request,
                     batch_id,
                     transfer_timeout_s=self.topology.cluster.rpc_timeout_s,
@@ -737,7 +743,7 @@ class ArtRuntime:
                 raise RuntimeError("packing host returned the wrong batch ID")
             host_refs = {source_host: result.ref}
             destinations = {
-                host_id: MonarchPackedBatchInbox(self._host_actors[host_id])
+                host_id: MonarchPackedBatchInbox(self._host_services[host_id])
                 for host_id in trainer_hosts
                 if host_id != source_host
             }
@@ -746,7 +752,7 @@ class ArtRuntime:
                 host_refs.update(
                     await fanout_packed_batch(
                         ref=result.ref,
-                        source_endpoint=MonarchPackedBatchSource(source_actor),
+                        source_endpoint=MonarchPackedBatchSource(source_service),
                         inboxes=destinations,
                         timeout_s=self.topology.cluster.rpc_timeout_s,
                     )
@@ -781,7 +787,7 @@ class ArtRuntime:
             return
 
         async def reclaim(host_id: str) -> None:
-            inbox = MonarchPackedBatchInbox(self._host_actors[host_id])
+            inbox = MonarchPackedBatchInbox(self._host_services[host_id])
             await inbox.reclaim(batch_id, fence=fence)
 
         results = await asyncio.gather(
@@ -915,7 +921,7 @@ class ArtRuntime:
             master_addr=spec.rendezvous.host,
         )
         launchers = {
-            member.host_id: MonarchVllmHostLauncher(self._host_actors[member.host_id])
+            member.host_id: MonarchVllmHostLauncher(self._host_services[member.host_id])
             for member in spec.members
         }
         manager = ReplicaManager(
@@ -1009,14 +1015,14 @@ class ArtRuntime:
         self._rollout_actors.clear()
         self._rollout_procs.clear()
         await collect(
-            "host actor shutdown",
-            *(call_remote(actor.close) for actor in self._host_actors.values()),
+            "host service shutdown",
+            *(call_remote(actor.close) for actor in self._host_services.values()),
         )
         await collect(
             "host process shutdown",
             *(proc.stop() for proc in self._host_procs.values()),
         )
-        self._host_actors.clear()
+        self._host_services.clear()
         self._host_procs.clear()
         self._live_batches.clear()
         if self.owns_host_mesh:

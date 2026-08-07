@@ -109,8 +109,8 @@ def resilient_endpoint(function: Any) -> Any:
     return endpoint(wrapped)
 
 
-class RolloutHostService(Actor):
-    """One packed-batch and managed-service owner per host."""
+class ArtHostService(Actor):
+    """One ART control and data-plane service per host."""
 
     def __init__(
         self,
@@ -123,7 +123,7 @@ class RolloutHostService(Actor):
         self.host_id = admission.host_id
         self._admission = admission
         self._admission_report: HostAdmissionReport | None = None
-        self.inbox = PackedBatchInbox(
+        self._packed_batches = PackedBatchInbox(
             host_id=self.host_id, capacity_bytes=packed_batch_capacity_bytes
         )
         self._batch_publishers: dict[str, PackedBatchPublisher] = {}
@@ -260,7 +260,7 @@ class RolloutHostService(Actor):
         if self._vllm_launcher is not None:
             await self._vllm_launcher.close()
             self._vllm_launcher = None
-        self.inbox.store.close()
+        self._packed_batches.store.close()
 
     async def _require_nccl_probe(self, probe_id: str) -> float:
         if probe_id in self._cancelled_nccl_probes:
@@ -521,7 +521,7 @@ class RolloutHostService(Actor):
         loss_bearing_tokens = int(packed["assistant_mask"][:, 1:].sum().item())
         non_padding_tokens = int((packed["group_ids"] != -1).sum().item())
         finalize_started = time.monotonic()
-        ref = self.inbox.store.create(
+        ref = self._packed_batches.store.create(
             packed,
             batch_id=batch_id,
             group_ids=request.group_ids,
@@ -565,7 +565,7 @@ class RolloutHostService(Actor):
 
     @resilient_endpoint
     async def note_batch_transmitted(self, byte_count: int) -> None:
-        self.inbox.store.note_transmitted(byte_count)
+        self._packed_batches.store.note_transmitted(byte_count)
 
     async def _drop_batch(self, batch_id: str) -> bool:
         publisher = self._batch_publishers.pop(batch_id, None)
@@ -578,11 +578,11 @@ class RolloutHostService(Actor):
     async def receive_batch(
         self, ref: PackedBatchRef, transfer: PackedBatchTransfer, timeout_s: float
     ) -> PackedBatchRef:
-        return await self.inbox.receive(ref, transfer, timeout_s=timeout_s)
+        return await self._packed_batches.receive(ref, transfer, timeout_s=timeout_s)
 
     @resilient_endpoint
     async def drop_batch_ref(self, ref: PackedBatchRef) -> None:
-        await self.inbox.drop(ref)
+        await self._packed_batches.drop(ref)
 
     @resilient_endpoint
     async def reclaim_batch(self, batch_id: str, fence: bool) -> bool:
@@ -592,14 +592,14 @@ class RolloutHostService(Actor):
             published = await self._drop_batch(batch_id)
         except BaseException as error:
             failure = error
-        reclaimed = self.inbox.store.reclaim(batch_id, fence=fence)
+        reclaimed = self._packed_batches.store.reclaim(batch_id, fence=fence)
         if failure is not None:
             raise failure
         return published or reclaimed
 
     @resilient_endpoint
     async def stats(self):
-        return self.inbox.store.stats()
+        return self._packed_batches.store.stats()
 
 
 class RolloutWorkerService(Actor):
