@@ -154,7 +154,7 @@ async def _run_native_vllm_lora(
         engine_args = cast(dev.EngineArgs, stage_resources.vllm.engine_args())
     else:
         trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
-        engine_args = dev.EngineArgs()
+        engine_args = dev.EngineArgs(enforce_eager=True)
     service_name = "model_support_native_lora_validation"
     case_artifacts = ensure_case_artifacts(case_config)
     output_root = Path(case_artifacts.case_dir) / "native_vllm_lora"

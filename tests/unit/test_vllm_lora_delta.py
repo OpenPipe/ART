@@ -27,20 +27,25 @@ def test_additive_weight_loader_uses_legacy_loader_for_plain_merged_column_param
     calls = []
 
     class Owner:
-        def weight_loader_v2(self, loader_param, loaded_weight, shard_id):
-            del shard_id
+        def weight_loader_v2(self, loader_param, loaded_weight, shard_id, **kwargs):
+            del shard_id, kwargs
             loader_param.load_merged_column_weight(loaded_weight=loaded_weight)
 
-        def weight_loader(self, loader_param, loaded_weight, shard_id):
-            calls.append((loader_param, shard_id))
+        def weight_loader(self, loader_param, loaded_weight, shard_id, **kwargs):
+            calls.append((loader_param, shard_id, kwargs))
             loader_param.data.copy_(loaded_weight)
 
     owner = Owner()
-    loader = lora_delta._additive_weight_loader(param, owner.weight_loader_v2)
-    result = loader(param, loaded, 0)
+    loader = lora_delta._additive_weight_loader(owner.weight_loader_v2)
+    result = loader(
+        param=param,
+        loaded_weight=loaded,
+        shard_id=0,
+        return_success=True,
+    )
 
     assert result is None
-    assert calls == [(param, 0)]
+    assert calls == [(param, 0, {"return_success": True})]
     assert torch.equal(param, loaded)
 
 
@@ -61,7 +66,7 @@ def test_additive_weight_loader_keeps_v2_for_vllm_parameter_like_param():
         ),
         weight_loader=lambda *_args, **_kwargs: calls.append("legacy"),
     )
-    loader = lora_delta._additive_weight_loader(param, owner.weight_loader_v2)
+    loader = lora_delta._additive_weight_loader(owner.weight_loader_v2)
     loader(param, loaded, 0)
 
     assert calls == ["v2"]

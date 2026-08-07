@@ -178,26 +178,26 @@ def _call_weight_loader(
     return loader(loader_param, loaded_weight, *args, **kwargs)
 
 
-def _additive_weight_loader(param: torch.Tensor, original_loader: Any) -> Any:
+def _additive_weight_loader(original_loader: Any) -> Any:
     def load_delta(
-        loader_param: torch.Tensor,
+        param: torch.Tensor,
         loaded_weight: torch.Tensor,
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        real_data = loader_param.data
+        real_data = param.data
         scratch = torch.zeros_like(real_data)
-        loader_param.data = scratch
+        param.data = scratch
         try:
             result = _call_weight_loader(
                 original_loader,
-                loader_param,
+                param,
                 loaded_weight,
                 *args,
                 **kwargs,
             )
         finally:
-            loader_param.data = real_data
+            param.data = real_data
         if result is not False:
             real_data.add_(scratch)
         return result
@@ -212,13 +212,13 @@ def _additive_weight_loaders(model: Any) -> Any:
         has_loader = hasattr(param, "weight_loader")
         original_loader = getattr(param, "weight_loader", _default_weight_loader)
         originals.append((param, has_loader, original_loader))
-        param.weight_loader = _additive_weight_loader(param, original_loader)  # type: ignore[attr-defined]
+        setattr(param, "weight_loader", _additive_weight_loader(original_loader))
     try:
         yield
     finally:
         for param, has_loader, original_loader in originals:
             if has_loader:
-                param.weight_loader = original_loader  # type: ignore[attr-defined]
+                setattr(param, "weight_loader", original_loader)
             else:
                 delattr(param, "weight_loader")
 

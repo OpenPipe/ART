@@ -413,7 +413,7 @@ def test_build_megatron_runtime_uses_training_provider_bundle(
     assert configured_bundles == [(provider_bundle, False)]
     assert kwargs["print_env"] is False
     assert kwargs["trainable_parameter_mode"] == "base_model"
-    configured_provider = SimpleNamespace()
+    configured_provider = SimpleNamespace(_art_model_support_handler=SimpleNamespace())
     kwargs["provider_configure"](configured_provider)
     optimizer_config = kwargs["optimizer_config"]
     assert configured_provider.num_layers == request.case_config.num_layers

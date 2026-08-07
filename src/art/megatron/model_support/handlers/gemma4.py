@@ -519,7 +519,24 @@ def _canonicalize_gemma4_loaded_lora_state(
     }
 
 
-class Gemma4MoeHandler(DefaultMoeHandler):
+class _Gemma4TokenizerMixin:
+    def configure_tokenizer(
+        self,
+        tokenizer: Any,
+        *,
+        internal_config: Any,
+    ) -> Any:
+        if not any(
+            internal_config.get(key) is not None
+            for key in ("chat_template", "chat_template_path")
+        ):
+            from art.utils.chat_template import TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR
+
+            setattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR, True)
+        return tokenizer
+
+
+class Gemma4MoeHandler(_Gemma4TokenizerMixin, DefaultMoeHandler):
     key = "gemma4_moe"
     is_moe = True
     native_vllm_lora_status = "validated"
@@ -791,24 +808,9 @@ class Gemma4MoeHandler(DefaultMoeHandler):
 GEMMA4_MOE_HANDLER = Gemma4MoeHandler()
 
 
-class Gemma4DenseHandler(DefaultDenseHandler):
+class Gemma4DenseHandler(_Gemma4TokenizerMixin, DefaultDenseHandler):
     key = "gemma4_dense"
     native_vllm_lora_status = "validated"
-
-    def configure_tokenizer(
-        self,
-        tokenizer: Any,
-        *,
-        internal_config: Any,
-    ) -> Any:
-        if not any(
-            internal_config.get(key) is not None
-            for key in ("chat_template", "chat_template_path")
-        ):
-            from art.utils.chat_template import TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR
-
-            setattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR, True)
-        return tokenizer
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return getattr(base_config, "text_config", base_config)

@@ -138,7 +138,7 @@ _DSV4_REPRESENTATIVE_LAYER_TYPES = [
     "compressed_sparse_attention",
     "heavily_compressed_attention",
 ]
-_DSV4_REPRESENTATIVE_MLP_LAYER_TYPES = ["hash_moe", "hash_moe", "hash_moe", "moe"]
+_DSV4_REPRESENTATIVE_MLP_LAYER_TYPES = ["moe"] * 4
 _DSV4_MEGATRON_ENV = {
     "ART_DSV4_VALIDATION_NUM_LAYERS": str(_DSV4_REPRESENTATIVE_NUM_LAYERS)
 }
@@ -161,11 +161,11 @@ _DSV4_COMMON_VLLM_ENGINE_ARGS = {
 }
 _DSV4_MERGED_VLLM_ENGINE_ARGS = {
     **_DSV4_COMMON_VLLM_ENGINE_ARGS,
-    "moe_backend": "triton_unfused",
+    "moe_backend": "triton",
 }
 _DSV4_LORA_VLLM_ENGINE_ARGS = {
     **_DSV4_COMMON_VLLM_ENGINE_ARGS,
-    "moe_backend": "triton_unfused",
+    "moe_backend": "triton",
 }
 _DSV4_REDUCED_VLLM_ENGINE_ARGS = {
     **_DSV4_MERGED_VLLM_ENGINE_ARGS,
@@ -232,6 +232,19 @@ _GLM52_REDUCED_VLLM = VllmWorkflowResources(
     extra_engine_args={
         "attention_backend": "FLASHMLA_SPARSE",
         "max_model_len": 1024,
+        "moe_backend": "triton",
+    },
+)
+_GPT_OSS_REDUCED_MEGATRON = MegatronWorkflowResources(
+    gpu_ids=[0],
+    topology=MegatronWorkflowTopology(),
+)
+_GPT_OSS_REDUCED_VLLM = VllmWorkflowResources(
+    gpu_ids=[1],
+    tensor_parallel_size=1,
+    extra_engine_args={
+        "enforce_eager": True,
+        "load_format": "dummy",
         "moe_backend": "triton",
     },
 )
@@ -310,6 +323,17 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             vllm=_GLM52_REDUCED_VLLM,
         ),
         yes_no_trainability_variant="megatron_dedicated",
+    ),
+    "gpt_oss_moe": HandlerWorkflowResources(
+        merged_vllm_serving=WorkflowStageResources(
+            required_world_size=2,
+            megatron=_GPT_OSS_REDUCED_MEGATRON,
+            vllm=_GPT_OSS_REDUCED_VLLM,
+        ),
+        native_vllm_lora=WorkflowStageResources(
+            required_world_size=2,
+            vllm=_GPT_OSS_REDUCED_VLLM,
+        ),
     ),
 }
 

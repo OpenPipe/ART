@@ -837,7 +837,7 @@ class GptOssMoeHandler(DefaultMoeHandler):
         rollout_weights_mode: RolloutWeightsMode,
     ) -> dict[str, object]:
         del rollout_weights_mode
-        return {"moe_backend": "triton_unfused"}
+        return {"moe_backend": "triton"}
 
     def vllm_server_args(self) -> dict[str, object]:
         return {"tool_call_parser": "openai"}

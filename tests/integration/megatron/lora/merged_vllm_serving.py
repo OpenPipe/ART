@@ -115,7 +115,7 @@ async def _run_merged_vllm_serving(
     )
     topology: Topology = ORACLE_TOPOLOGY
     megatron_env: dict[str, str] = {}
-    engine_args: dev.EngineArgs = dev.EngineArgs()
+    engine_args: dev.EngineArgs = dev.EngineArgs(enforce_eager=True)
     if stage_resources is not None:
         stage_resources = resolve_stage_resources_for_visible_gpus(
             "merged_vllm_serving",
