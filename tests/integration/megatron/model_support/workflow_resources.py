@@ -227,9 +227,13 @@ _GLM52_REDUCED_MEGATRON = MegatronWorkflowResources(
 _GLM52_REDUCED_VLLM = VllmWorkflowResources(
     gpu_ids=[1],
     tensor_parallel_size=1,
-    # FlashInfer's SM100 BF16 autotuner does not support the narrow reduced
-    # fixture dimensions. This gate validates serving, not kernel selection.
-    extra_engine_args={"moe_backend": "triton"},
+    # The reduced fixture is narrower than the production model. FlashMLA covers
+    # its sparse attention shape while Triton avoids absent SM100 E=4 MoE tuning.
+    extra_engine_args={
+        "attention_backend": "FLASHMLA_SPARSE",
+        "max_model_len": 1024,
+        "moe_backend": "triton",
+    },
 )
 
 # Explicitly for large models which do not fit in the default topology.
@@ -286,6 +290,17 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             megatron=_GLM52_REDUCED_MEGATRON,
             vllm=_GLM52_REDUCED_VLLM,
         ),
+        yes_no_trainability=WorkflowStageResources(
+            required_world_size=2,
+            megatron=_GLM52_REDUCED_MEGATRON,
+            vllm=_GLM52_REDUCED_VLLM,
+        ),
+        length_trainability=WorkflowStageResources(
+            required_world_size=2,
+            megatron=_GLM52_REDUCED_MEGATRON,
+            vllm=_GLM52_REDUCED_VLLM,
+        ),
+        yes_no_trainability_variant="megatron_dedicated",
     ),
 }
 

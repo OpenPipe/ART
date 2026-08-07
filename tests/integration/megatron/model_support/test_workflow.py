@@ -158,16 +158,26 @@ def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
     assert stage.vllm.engine_args()["kv_cache_dtype"] == "fp8"
 
 
-def test_glm52_reduced_merged_serving_uses_portable_moe_backend() -> None:
+def test_glm52_reduced_workflow_uses_portable_serving_backends() -> None:
     resources = handler_workflow_resources_for_base_model("zai-org/GLM-5.2")
     assert resources is not None
     assert resources.train_inf_mismatch is None
-    assert resources.merged_vllm_serving is not None
-    assert resources.merged_vllm_serving.megatron is not None
-    assert resources.merged_vllm_serving.megatron.gpu_ids == [0]
-    assert resources.merged_vllm_serving.vllm is not None
-    assert resources.merged_vllm_serving.vllm.gpu_ids == [1]
-    assert resources.merged_vllm_serving.vllm.engine_args()["moe_backend"] == "triton"
+    for stage in (
+        resources.merged_vllm_serving,
+        resources.yes_no_trainability,
+        resources.length_trainability,
+    ):
+        assert stage is not None
+        assert stage.required_world_size == 2
+        assert stage.megatron is not None
+        assert stage.megatron.gpu_ids == [0]
+        assert stage.vllm is not None
+        assert stage.vllm.gpu_ids == [1]
+        engine_args = stage.vllm.engine_args()
+        assert engine_args["attention_backend"] == "FLASHMLA_SPARSE"
+        assert engine_args["max_model_len"] == 1024
+        assert engine_args["moe_backend"] == "triton"
+    assert resources.yes_no_trainability_variant == "megatron_dedicated"
 
 
 def test_h200_equivalent_slots_tolerate_reported_gb300_vram() -> None:
