@@ -14,6 +14,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 import torch
 
+from art.utils.safetensors import save_safetensors
+
 
 class _TransportRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -360,24 +362,19 @@ class NixlAdapterReceiver:
         notification = self._take_notification(generation_id)
         if notification is None:
             return None
-        from art.megatron.weights.lora_publish import (
-            LoraSnapshot,
-            save_vllm_lora_snapshot,
-        )
-
         started = time.monotonic()
         path = Path(pending.target.path)
         if path.exists():
             self._finish(generation_id)
             raise RuntimeError(f"Adapter transfer path already exists: {path}")
         try:
-            save_vllm_lora_snapshot(
-                LoraSnapshot(
-                    tensors=pending.tensors,
-                    adapter_config=pending.target.adapter_config,
-                ),
-                str(path),
-            )
+            path.mkdir(parents=True)
+            save_safetensors(pending.tensors, path / "adapter_model.safetensors")
+            with (path / "adapter_config.json").open("w", encoding="utf-8") as output:
+                json.dump(
+                    pending.target.adapter_config, output, indent=2, sort_keys=True
+                )
+                output.write("\n")
             materialization_s = time.monotonic() - started
             model_bytes = (path / "adapter_model.safetensors").stat().st_size
             config_bytes = (path / "adapter_config.json").stat().st_size
