@@ -246,7 +246,7 @@ def test_sync_merged_weights_to_vllm_sender_controls_runtime_and_sends(
         ("http://runtime.test/pause", None, {"mode": "wait"}, 300.0),
         (
             "http://runtime.test/start_weight_update",
-            {"is_checkpoint_format": False},
+            None,
             None,
             300.0,
         ),
