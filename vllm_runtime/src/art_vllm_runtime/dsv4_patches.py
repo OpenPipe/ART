@@ -129,7 +129,14 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                 if is_pp_missing_parameter(name, self):
                     break
                 param = params_dict[name]
-                param.weight_loader(param, loaded_weight, shard_id)
+                try:
+                    param.weight_loader(param, loaded_weight, shard_id)
+                except AssertionError as error:
+                    raise RuntimeError(
+                        f"DSV4 fused weight load failed for {name}: "
+                        f"parameter={tuple(param.shape)} weight={tuple(loaded_weight.shape)} "
+                        f"shard={shard_id}"
+                    ) from error
                 loaded_params.add(name)
                 break
             else:
