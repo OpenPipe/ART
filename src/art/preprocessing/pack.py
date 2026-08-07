@@ -588,7 +588,26 @@ def _prefix_tree_pack_item(
         image_grid_thw=result.image_grid_thw,
         moe_routes=result.moe_routed_experts,
     )
+    _validate_prefix_tree_pack_item(item)
     return _truncate_prefix_tree_pack_item(item, seq_len)
+
+
+def _validate_prefix_tree_pack_item(item: _PrefixTreePackItem) -> None:
+    token_count = len(item.token_ids)
+    for name in ("input_pos", "assistant_mask", "logprobs"):
+        value = getattr(item, name)
+        if value.ndim != 1 or len(value) != token_count:
+            raise RuntimeError(
+                f"Prefix-tree packing {name} must have shape ({token_count},), got "
+                f"{value.shape}"
+            )
+    if item.shareable_length > token_count:
+        raise RuntimeError("Prefix-tree shareable length exceeds token count")
+    if item.moe_routes is not None and item.moe_routes.shape[0] != token_count:
+        raise RuntimeError(
+            "Prefix-tree MoE route token count does not match token IDs: "
+            f"{item.moe_routes.shape[0]} != {token_count}"
+        )
 
 
 def prefix_tree_shareable_length(

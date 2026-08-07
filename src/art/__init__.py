@@ -62,7 +62,6 @@ except ImportError:
 
 
 from . import dev
-from .auto_trajectory import auto_trajectory, capture_auto_trajectory
 from .backend import Backend
 from .batches import trajectory_group_batches
 from .dev import LoRAConfig
@@ -81,7 +80,41 @@ from .metrics import (
 from .model import Model, TrainableModel
 from .pipeline_tuner import PipelineAutotuneConfig, PipelineRuntimeConfig
 from .serverless import ServerlessBackend
-from .trajectories import Trajectory, TrajectoryGroup
+from .trajectories import (
+    AnthropicMessagesHistory,
+    AnthropicMessageSource,
+    ChatCompletionsExchange,
+    ChatCompletionsHistory,
+    ChatCompletionsMessageSource,
+    CompletionsExchange,
+    CompletionsSource,
+    CompletionsStringHistory,
+    CompletionsStringSourceSpan,
+    CompletionsTokenHistory,
+    CompletionsTokenSourceSpan,
+    History,
+    LegacyHistory,
+    MessagesExchange,
+    ResponsesExchange,
+    ResponsesHistory,
+    ResponsesItemSource,
+    TokenFlag,
+    TokenizedHistory,
+    TokenizedMultiHistoryTrajectory,
+    TokenizedTrajectory,
+    TokenizedTrajectoryGroup,
+    Tokenizer,
+    Trajectory,
+    TrajectoryExchanges,
+    TrajectoryGroup,
+    TrajectoryHistory,
+    auto_trajectory,  # ty: ignore[deprecated]
+    capture_auto_trajectory,  # ty: ignore[deprecated]
+    current_trajectory,
+    no_capture,
+    trajectory,
+    trajectory_group,
+)
 from .types import (
     LocalTrainResult,
     MegatronRuntimeConfig,
@@ -101,6 +134,8 @@ __all__ = [
     "dev",
     "auto_trajectory",
     "capture_auto_trajectory",
+    "current_trajectory",
+    "no_capture",
     "gather_trajectories",
     "gather_trajectory_groups",
     "trajectory_group_batches",
@@ -130,7 +165,34 @@ __all__ = [
     "TrainConfig",
     "TrainResult",
     "Trajectory",
+    "TrajectoryExchanges",
     "TrajectoryGroup",
+    "History",
+    "LegacyHistory",
+    "TrajectoryHistory",
+    "ChatCompletionsExchange",
+    "ChatCompletionsHistory",
+    "ChatCompletionsMessageSource",
+    "CompletionsExchange",
+    "CompletionsSource",
+    "CompletionsTokenHistory",
+    "CompletionsStringHistory",
+    "CompletionsTokenSourceSpan",
+    "CompletionsStringSourceSpan",
+    "ResponsesExchange",
+    "ResponsesHistory",
+    "ResponsesItemSource",
+    "MessagesExchange",
+    "AnthropicMessagesHistory",
+    "AnthropicMessageSource",
+    "TokenFlag",
+    "Tokenizer",
+    "TokenizedHistory",
+    "TokenizedMultiHistoryTrajectory",
+    "TokenizedTrajectory",
+    "TokenizedTrajectoryGroup",
+    "trajectory",
+    "trajectory_group",
     "capture_yielded_trajectory",
     "yield_trajectory",
 ]

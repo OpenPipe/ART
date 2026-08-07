@@ -141,7 +141,7 @@ class InternalModelConfig(TypedDict, total=False):
             when rollout_weights_mode is "lora".
             - "step_lora": load one adapter per policy step
             - "in_flight_lora": update one derived LoRA slot in place while
-              keeping versioned model-name aliases
+              recording token-level policy spans
         chat_template_kwargs: Extra keyword arguments passed to chat-template
             rendering for both rollout inference and local training tokenization.
         chat_template: Raw chat template text used by rollout inference and

@@ -21,8 +21,10 @@ class RolloutWorkerController:
     async def run(self) -> None:
         try:
             while not self.trainer.state.done:
-                self._reconcile()
                 await self._raise_finished_errors()
+                self._reconcile()
+                if self.trainer._scenario_source_exhausted and not self._tasks:
+                    break
                 await asyncio.sleep(0.25)
         finally:
             for task in self._tasks.values():
@@ -30,16 +32,15 @@ class RolloutWorkerController:
             await asyncio.gather(*self._tasks.values(), return_exceptions=True)
 
     def _reconcile(self) -> None:
-        for worker_id, task in list(self._tasks.items()):
-            if task.done():
-                self._tasks.pop(worker_id)
-                self._retiring.discard(worker_id)
-
         live = [wid for wid, task in self._tasks.items() if not task.done()]
         self._retiring = set(live[self.target_workers :])
 
         active = [wid for wid in live if wid not in self._retiring]
-        while len(active) < self.target_workers and not self.trainer.state.done:
+        while (
+            len(active) < self.target_workers
+            and not self.trainer.state.done
+            and not self.trainer._scenario_source_exhausted
+        ):
             worker_id = self._next_worker_id
             self._next_worker_id += 1
             task = asyncio.create_task(
@@ -48,11 +49,9 @@ class RolloutWorkerController:
             )
             self._tasks[worker_id] = task
             active.append(worker_id)
-        # Retiring workers keep their endpoint until their acquired scenario is
-        # delivered; worker_allowed() prevents them from acquiring another.
-        self.trainer._rollout_executor.set_workers(tuple(self._tasks))
 
     async def _raise_finished_errors(self) -> None:
+        errors: list[BaseException] = []
         for worker_id, task in list(self._tasks.items()):
             if not task.done():
                 continue
@@ -62,4 +61,8 @@ class RolloutWorkerController:
                 continue
             exc = task.exception()
             if exc is not None:
-                raise exc
+                errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("Rollout workers failed.", errors)

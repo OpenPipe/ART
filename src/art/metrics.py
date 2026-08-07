@@ -358,6 +358,30 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         kind="ratio",
         higher_is_better=False,
     ),
+    MetricDefinition(
+        key="queue/actual_stale_fraction",
+        title="Actual stale dequeue fraction",
+        description="stale groups divided by all groups dequeued for this train step",
+        kind="ratio",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="queue/put_wait_frac",
+        title="Completed queue wait fraction",
+        description=(
+            "worker queue-put wait divided by queue-put wait plus rollout time"
+        ),
+        kind="ratio",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="queue/put_wait_s",
+        title="Completed queue wait",
+        description="worker-seconds spent waiting to enqueue completed rollout groups",
+        kind="duration",
+        unit="seconds",
+        higher_is_better=False,
+    ),
 )
 
 PIPELINE_RL_DASHBOARD_DEFAULT_METRICS = tuple(

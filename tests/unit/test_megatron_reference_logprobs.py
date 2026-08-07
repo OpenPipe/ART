@@ -158,6 +158,9 @@ class _Handler:
         del attention_bias
         return {}
 
+    def build_pipeline_microbatch_activator(self, _model_chunks: Any) -> None:
+        return None
+
 
 def test_calculate_megatron_logprobs_replays_routes(monkeypatch) -> None:
     controller = _ReplayController()

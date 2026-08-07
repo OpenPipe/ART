@@ -8,6 +8,7 @@ from art.megatron.model_support.spec import (
 )
 
 _DEFAULT_DENSE_HANDLER_KEY = "default_dense"
+_LLAMA3_DENSE_HANDLER_KEY = "llama3_dense"
 _QWEN3_DENSE_HANDLER_KEY = "qwen3_dense"
 _QWEN3_MOE_HANDLER_KEY = "qwen3_moe"
 _QWEN3_5_DENSE_HANDLER_KEY = "qwen3_5_dense"
@@ -90,6 +91,30 @@ DEFAULT_DENSE_SPEC = ModelSupportSpec(
     handler_key=_DEFAULT_DENSE_HANDLER_KEY,
     default_target_modules=_DENSE_TARGET_MODULES,
     native_vllm_lora_status=_DISABLED_NATIVE_VLLM_LORA_STATUS,
+)
+
+LLAMA3_DENSE_SPEC = ModelSupportSpec(
+    key="llama3_dense",
+    handler_key=_LLAMA3_DENSE_HANDLER_KEY,
+    model_names=(
+        "meta-llama/Meta-Llama-3-8B",
+        "meta-llama/Meta-Llama-3-8B-Instruct",
+        "meta-llama/Meta-Llama-3-70B",
+        "meta-llama/Meta-Llama-3-70B-Instruct",
+        "meta-llama/Llama-3.1-8B",
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "meta-llama/Llama-3.1-70B",
+        "meta-llama/Llama-3.1-70B-Instruct",
+        "meta-llama/Llama-3.1-405B",
+        "meta-llama/Llama-3.1-405B-Instruct",
+        "meta-llama/Llama-3.2-1B",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "meta-llama/Llama-3.2-3B",
+        "meta-llama/Llama-3.2-3B-Instruct",
+        "meta-llama/Llama-3.3-70B-Instruct",
+    ),
+    default_target_modules=_DENSE_TARGET_MODULES,
+    native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
 )
 
 QWEN3_MOE_SPEC = ModelSupportSpec(
@@ -236,6 +261,7 @@ GPT_OSS_MOE_SPEC = ModelSupportSpec(
 )
 
 VALIDATED_MODEL_SUPPORT_SPECS = (
+    LLAMA3_DENSE_SPEC,
     QWEN3_MOE_SPEC,
     QWEN3_DENSE_SPEC,
     QWEN3_5_MOE_SPEC,
@@ -267,6 +293,10 @@ _HANDLER_IMPORTS: dict[str, tuple[str, str]] = {
     _DEFAULT_DENSE_HANDLER_KEY: (
         "art.megatron.model_support.handlers.default_dense",
         "DEFAULT_DENSE_HANDLER",
+    ),
+    _LLAMA3_DENSE_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.llama3",
+        "LLAMA3_DENSE_HANDLER",
     ),
     _QWEN3_DENSE_HANDLER_KEY: (
         "art.megatron.model_support.handlers.qwen3_dense",
@@ -331,6 +361,7 @@ _HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {}
 _REGISTERED_BRIDGE_KEYS: set[str] = set()
 
 QWEN3_DENSE_MODELS = frozenset(QWEN3_DENSE_SPEC.model_names)
+LLAMA3_DENSE_MODELS = frozenset(LLAMA3_DENSE_SPEC.model_names)
 QWEN3_MOE_MODELS = frozenset(QWEN3_MOE_SPEC.model_names)
 QWEN3_5_DENSE_MODELS = frozenset(QWEN3_5_DENSE_SPEC.model_names)
 QWEN3_5_MOE_MODELS = frozenset(QWEN3_5_MOE_SPEC.model_names)

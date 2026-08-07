@@ -29,6 +29,23 @@ jobs:
       - name: Build managed-runtime wheel
         run: python scripts/build_package.py --wheel
 
+      - name: Smoke test base wheel import
+        run: |
+          wheel_path="$(python - <<'PY'
+          from pathlib import Path
+
+          print(next(Path("dist").glob("openpipe_art-*.whl")).resolve())
+          PY
+          )"
+
+          project_dir="$(mktemp -d)"
+          cd "$project_dir"
+          uv init --name art-base-install-smoke --python 3.12 --bare
+          uv add "openpipe-art @ file://${wheel_path}"
+          uv run python -c "import importlib.util; assert importlib.util.find_spec('numpy') is None; assert importlib.util.find_spec('torch') is None; import art; from art.pipeline_trainer import PipelineTrainer; print(art.__name__, PipelineTrainer.__name__)"
+          uv add "weave==0.52.41"
+          uv run python -c "from weave.trace.settings import override_settings; import art"
+
       - name: Smoke test uv add + sync for backend extra
         run: |
           wheel_path="$(python - <<'PY'

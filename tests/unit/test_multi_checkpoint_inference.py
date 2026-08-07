@@ -69,6 +69,7 @@ class TestTrainableModelGetInferenceName:
     def test_trainable_model_get_inference_name_with_step(self):
         """TrainableModel should also support step parameter."""
         model = TrainableModel(
+            run_name="trainable-model",
             name="trainable-model",
             project="test-project",
             base_model="meta-llama/Llama-3.1-8B",
@@ -109,6 +110,7 @@ class TestLitellmCompletionParams:
     def test_litellm_completion_params_trainable_model_with_step(self):
         """Trainable model with step should have hosted_vllm/ prefix and @step suffix."""
         model = TrainableModel(
+            run_name="trainable-model",
             name="trainable-model",
             project="test-project",
             base_model="meta-llama/Llama-3.1-8B",
@@ -142,6 +144,7 @@ class TestServerlessBackendModelInferenceName:
             backend = ServerlessBackend(api_key="test-key")
 
         model = TrainableModel(
+            run_name="test-model",
             name="test-model",
             project="test-project",
             base_model="meta-llama/Llama-3.1-8B",
@@ -159,6 +162,7 @@ class TestServerlessBackendModelInferenceName:
             backend = ServerlessBackend(api_key="test-key")
 
         model = TrainableModel(
+            run_name="test-model",
             name="test-model",
             project="test-project",
             base_model="meta-llama/Llama-3.1-8B",
@@ -179,6 +183,7 @@ class TestServerlessBackendModelInferenceName:
             backend = ServerlessBackend(api_key="test-key")
 
         model = TrainableModel(
+            run_name="test-model",
             name="test-model",
             project="test-project",
             base_model="meta-llama/Llama-3.1-8B",

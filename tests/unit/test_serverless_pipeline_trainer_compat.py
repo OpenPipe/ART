@@ -35,6 +35,7 @@ def _make_backend() -> ServerlessBackend:
 async def test_serverless_train_accepts_pipeline_trainer_kwargs() -> None:
     backend = _make_backend()
     model = TrainableModel(
+        run_name="serverless-pipeline-compat",
         name="serverless-pipeline-compat",
         project="pipeline-tests",
         base_model="test-model",
@@ -67,6 +68,7 @@ async def test_serverless_train_accepts_pipeline_trainer_kwargs() -> None:
             loss_fn="ppo",
             normalize_advantages=False,
             save_checkpoint=False,
+            optimizer_save_interval=7,
             packed_sequence_length=4096,
             kl_penalty_coef=0.1,
             kl_ref_adapter_path="/tmp/ref-adapter",
@@ -110,6 +112,7 @@ async def test_serverless_train_accepts_pipeline_trainer_kwargs() -> None:
 async def test_serverless_train_rejects_unsupported_pipeline_kwargs() -> None:
     backend = _make_backend()
     model = TrainableModel(
+        run_name="serverless-pipeline-rejects",
         name="serverless-pipeline-rejects",
         project="pipeline-tests",
         base_model="test-model",
@@ -140,6 +143,7 @@ async def test_serverless_train_rejects_unsupported_pipeline_kwargs() -> None:
 async def test_serverless_train_model_forwards_experimental_config() -> None:
     backend = _make_backend()
     model = TrainableModel(
+        run_name="serverless-config-payload",
         name="serverless-config-payload",
         project="pipeline-tests",
         base_model="test-model",
@@ -206,9 +210,10 @@ async def test_serverless_train_model_forwards_experimental_config() -> None:
 
 
 @pytest.mark.asyncio
-async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
+async def test_serverless_train_sft_forwards_config() -> None:
     backend = _make_backend()
     model = TrainableModel(
+        run_name="serverless-sft-config-payload",
         name="serverless-sft-config-payload",
         project="pipeline-tests",
         base_model="test-model",
@@ -266,7 +271,11 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
                 async for _ in backend._train_sft(
                     model,
                     [trajectory],
-                    TrainSFTConfig(learning_rate=[1e-4], batch_size=2),
+                    TrainSFTConfig(
+                        learning_rate=[1e-4],
+                        batch_size=2,
+                        assistant_turns="last",
+                    ),
                     {
                         "metric_logging": {
                             "enabled": True,
@@ -280,39 +289,16 @@ async def test_serverless_train_sft_forwards_metric_logging_config() -> None:
     metric_logging = config["metric_logging"]
     assert config["learning_rate"] == [1e-4]
     assert config["batch_size"] == 2
+    assert config["assistant_turns"] == "last"
     assert metric_logging["enabled"] is True
     assert metric_logging["target_training_step"] == 1
-
-
-@pytest.mark.asyncio
-async def test_serverless_train_sft_rejects_last_assistant_mode() -> None:
-    backend = _make_backend()
-    model = TrainableModel(
-        name="serverless-sft-last-assistant",
-        project="pipeline-tests",
-        base_model="test-model",
-    )
-    trajectory = Trajectory(
-        messages_and_choices=[
-            {"role": "user", "content": "prompt"},
-            {"role": "assistant", "content": "answer"},
-        ],
-    )
-
-    with pytest.raises(NotImplementedError, match="currently requires LocalBackend"):
-        async for _ in backend._train_sft(
-            model,
-            [trajectory],
-            TrainSFTConfig(assistant_turns="last"),
-            {},
-        ):
-            pass
 
 
 @pytest.mark.asyncio
 async def test_serverless_train_forwards_kl_step_lag() -> None:
     backend = _make_backend()
     model = TrainableModel(
+        run_name="serverless-kl-step-lag",
         name="serverless-kl-step-lag",
         project="pipeline-tests",
         base_model="test-model",

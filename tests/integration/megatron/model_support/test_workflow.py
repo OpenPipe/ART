@@ -73,6 +73,7 @@ def test_build_validation_stage_names_has_fixed_order() -> None:
 
 def test_validated_architecture_representative_models_are_fixed() -> None:
     assert validated_architecture_representative_models() == [
+        "meta-llama/Llama-3.2-1B-Instruct",
         "Qwen/Qwen3-30B-A3B",
         "Qwen/Qwen3-32B",
         "Qwen/Qwen3.5-35B-A3B",
@@ -244,7 +245,11 @@ def test_build_all_architectures_validation_report_stops_on_failure(
         stop_on_failure=True,
     )
 
-    assert calls == ["Qwen/Qwen3-30B-A3B", "Qwen/Qwen3-32B"]
+    assert calls == [
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "Qwen/Qwen3-30B-A3B",
+        "Qwen/Qwen3-32B",
+    ]
     assert report.passed is False
     assert [item.base_model for item in report.reports] == calls
 

@@ -200,6 +200,7 @@ async def main() -> None:
 
     backend = MegatronBackend()
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project=project,
         base_model=base_model,

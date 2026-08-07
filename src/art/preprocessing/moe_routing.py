@@ -8,7 +8,7 @@ import numpy as np
 from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, model_validator
 
-ART_MOE_ROUTING_METADATA_KEY = "art_moe_routing"
+from ..openai import ART_MOE_ROUTING_METADATA_KEY
 
 PROMPT_TOKEN_IDS_KEY = "prompt_token_ids"
 COMPLETION_TOKEN_IDS_KEY = "completion_token_ids"

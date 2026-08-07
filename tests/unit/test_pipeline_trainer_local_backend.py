@@ -78,6 +78,7 @@ def _make_trainer(
 @pytest.mark.asyncio
 async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -> None:
     model = TrainableModel(
+        run_name="pipeline-default-backend-kwargs",
         name="pipeline-default-backend-kwargs",
         project="pipeline-tests",
         base_model="test-model",
@@ -112,7 +113,6 @@ async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -
         "save_checkpoint": False,
         "adam_params": adam_params,
         "optimizer_save_interval": 5,
-        "final_training_step": 1,
     }
 
 
@@ -121,6 +121,7 @@ async def test_pipeline_trainer_forwards_default_kl_step_zero_for_generic_backen
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-generic-backend-kl-kwargs",
         name="pipeline-generic-backend-kl-kwargs",
         project="pipeline-tests",
         base_model="test-model",
@@ -149,7 +150,6 @@ async def test_pipeline_trainer_forwards_default_kl_step_zero_for_generic_backen
         "save_checkpoint": False,
         "adam_params": None,
         "optimizer_save_interval": 5,
-        "final_training_step": 1,
         "kl_penalty_coef": 0.25,
         "kl_penalty_reference_step": 0,
         "kl_penalty_source": "sample",
@@ -161,6 +161,7 @@ async def test_pipeline_trainer_kl_step_lag_floors_at_zero(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-kl-step-lag-floor",
         name="pipeline-kl-step-lag-floor",
         project="pipeline-tests",
         base_model="test-model",
@@ -192,6 +193,7 @@ async def test_pipeline_trainer_kl_step_lag_computes_reference(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-kl-step-lag",
         name="pipeline-kl-step-lag",
         project="pipeline-tests",
         base_model="test-model",
@@ -220,6 +222,7 @@ async def test_pipeline_trainer_kl_step_lag_computes_reference(
 
 def test_pipeline_trainer_rejects_zero_kl_step_lag(tmp_path: Path) -> None:
     model = TrainableModel(
+        run_name="pipeline-kl-zero-step-lag",
         name="pipeline-kl-zero-step-lag",
         project="pipeline-tests",
         base_model="test-model",
@@ -240,6 +243,7 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-local-backend-kwargs",
         name="pipeline-local-backend-kwargs",
         project="pipeline-tests",
         base_model="test-model",
@@ -275,13 +279,13 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
         "save_checkpoint": False,
         "adam_params": None,
         "optimizer_save_interval": 5,
-        "final_training_step": 1,
     }
 
 
 @pytest.mark.asyncio
 async def test_local_backend_train_translates_loss_fn(tmp_path: Path) -> None:
     model = TrainableModel(
+        run_name="local-backend-train-translation",
         name="local-backend-train-translation",
         project="pipeline-tests",
         base_model="test-model",
@@ -322,6 +326,7 @@ async def test_local_backend_train_translates_loss_fn(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_local_backend_train_passes_kl_penalty_source(tmp_path: Path) -> None:
     model = TrainableModel(
+        run_name="local-backend-kl-source",
         name="local-backend-kl-source",
         project="pipeline-tests",
         base_model="test-model",
@@ -363,6 +368,7 @@ async def test_megatron_backend_defaults_kl_reference_to_step_zero(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="megatron-default-kl-reference",
         name="megatron-default-kl-reference",
         project="pipeline-tests",
         base_model="test-model",
@@ -407,6 +413,7 @@ async def test_local_backend_train_maps_normalize_advantages_to_scale_rewards(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="local-backend-normalize-advantages",
         name="local-backend-normalize-advantages",
         project="pipeline-tests",
         base_model="test-model",
@@ -443,6 +450,7 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-checkpoint-retention",
         name="pipeline-checkpoint-retention",
         project="pipeline-tests",
         base_model="test-model",
@@ -456,14 +464,14 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
         "\n".join(
             json.dumps(row)
             for row in [
-                {"step": 2, "reward/val": 1.0},
-                {"step": 2, "reward/val": 3.0},
+                {"step": 2, "val/reward": 1.0},
+                {"step": 2, "val/reward": 3.0},
                 {
                     "step": 2,
                     CHECKPOINT_CREATED_AT_METRIC: 123.0,
                     CHECKPOINT_EVAL_COMPLETED_METRIC: 1.0,
                 },
-                {"step": 3, "reward/val": 10.0},
+                {"step": 3, "val/reward": 10.0},
             ]
         )
         + "\n",
@@ -493,7 +501,7 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
     step_two = contexts[0].checkpoints[2]
     assert step_two.is_eval_step is True
     assert step_two.created_at == datetime.fromtimestamp(123.0, timezone.utc)
-    assert step_two.metrics["reward/val"] == 2.0
+    assert step_two.metrics["val/reward"] == 2.0
     backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
         model,
         [1, 3, 4, 5],
@@ -505,6 +513,7 @@ async def test_pipeline_trainer_checkpoint_retention_protects_default_kl_referen
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-checkpoint-retention-default-kl-ref",
         name="pipeline-checkpoint-retention-default-kl-ref",
         project="pipeline-tests",
         base_model="test-model",
@@ -543,6 +552,7 @@ async def test_pipeline_trainer_checkpoint_retention_protects_lagged_kl_referenc
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-checkpoint-retention-lagged-kl-ref",
         name="pipeline-checkpoint-retention-lagged-kl-ref",
         project="pipeline-tests",
         base_model="test-model",
@@ -582,6 +592,7 @@ async def test_pipeline_trainer_checkpoint_retention_lag_warmup_protects_window(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-checkpoint-retention-lag-floor-zero",
         name="pipeline-checkpoint-retention-lag-floor-zero",
         project="pipeline-tests",
         base_model="test-model",
@@ -618,6 +629,7 @@ async def test_pipeline_trainer_checkpoint_retention_honors_interval(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-checkpoint-retention-interval",
         name="pipeline-checkpoint-retention-interval",
         project="pipeline-tests",
         base_model="test-model",
@@ -647,6 +659,7 @@ async def test_pipeline_trainer_logs_checkpoint_retention_metadata(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-checkpoint-retention-metadata",
         name="pipeline-checkpoint-retention-metadata",
         project="pipeline-tests",
         base_model="test-model",
@@ -705,6 +718,7 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
 ) -> None:
     backend = LocalBackend(path=str(tmp_path))
     model = TrainableModel(
+        run_name="local-backend-packed-sequence-length",
         name="local-backend-packed-sequence-length",
         project="pipeline-tests",
         base_model="test-model",
@@ -739,7 +753,7 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
         patch(
             "art.local.backend.tokenize_trajectory_groups",
             return_value=iter([short_result, long_result]),
-        ),
+        ) as tokenize,
         pytest.warns(UserWarning, match="Dropping 1 tokenized results"),
     ):
         packed_tensors = backend._get_packed_tensors(
@@ -755,6 +769,10 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
 
     assert packed_tensors is not None
     assert packed_tensors["tokens"].shape == (1, 4)
+    selector = tokenize.call_args.kwargs["model"]
+    assert selector.value == f"{model.name}@0"
+    assert selector.automatic_family == (model.name, "@")
+    assert selector.allow_glob is False
 
 
 @pytest.mark.asyncio
@@ -762,6 +780,7 @@ async def test_local_backend_register_leaves_token_priced_generation_costs_disab
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="local-backend-cost-accounting",
         name="local-backend-cost-accounting",
         project="pipeline-tests",
         base_model="openai/gpt-oss-20b",
@@ -780,6 +799,7 @@ async def test_megatron_backend_register_disables_token_priced_generation_costs(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="megatron-backend-cost-accounting",
         name="megatron-backend-cost-accounting",
         project="pipeline-tests",
         base_model="openai/gpt-oss-20b",
@@ -810,6 +830,7 @@ async def test_tinker_backend_register_enables_tinker_token_priced_generation_co
         sys.modules.pop("art.tinker", None)
 
     model = TrainableModel(
+        run_name="tinker-backend-cost-accounting",
         name="tinker-backend-cost-accounting",
         project="pipeline-tests",
         base_model="openai/gpt-oss-20b",
@@ -832,6 +853,7 @@ async def test_megatron_backend_train_requires_runtime_config(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="megatron-backend-packed-sequence-length",
         name="megatron-backend-packed-sequence-length",
         project="pipeline-tests",
         base_model="test-model",
@@ -889,7 +911,7 @@ async def test_local_backend_async_context_manager_awaits_async_cleanup(
             calls.append("aclose")
 
     service = FakeService()
-    backend._services["test-service"] = cast(Any, service)
+    backend._services[("test-project", "test-service")] = cast(Any, service)
 
     with patch("art.local.backend.close_proxy") as close_proxy:
         async with backend:
@@ -939,6 +961,7 @@ def test_pipeline_trainer_rejects_unsupported_local_backend_settings(
     match: str,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-local-backend-invalid",
         name="pipeline-local-backend-invalid",
         project="pipeline-tests",
         base_model="test-model",
@@ -959,6 +982,7 @@ def test_pipeline_trainer_rejects_unsupported_local_backend_settings(
 
 def test_pipeline_trainer_rejects_shared_local_backend(tmp_path: Path) -> None:
     model = TrainableModel(
+        run_name="pipeline-local-backend-shared",
         name="pipeline-local-backend-shared",
         project="pipeline-tests",
         base_model="test-model",
@@ -975,6 +999,7 @@ def test_local_backend_inference_name_prefers_served_step_in_dedicated_mode(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="local-backend-served-step",
         name="local-backend-served-step",
         project="pipeline-tests",
         base_model="test-model",
@@ -987,7 +1012,9 @@ def test_local_backend_inference_name_prefers_served_step_in_dedicated_mode(
     backend = LocalBackend(path=str(tmp_path))
     output_dir = Path(get_model_dir(model=model, art_path=str(tmp_path)))
     (output_dir / "checkpoints" / "3").mkdir(parents=True)
-    backend._services[model.name] = cast(Any, SimpleNamespace(_latest_step=2))
+    backend._services[backend._model_storage_key(model)] = cast(
+        Any, SimpleNamespace(_latest_step=2)
+    )
 
     assert backend._model_inference_name(model) == f"{model.name}@2"
     assert backend._model_inference_name(model, step=3) == f"{model.name}@3"
@@ -998,6 +1025,7 @@ async def test_local_backend_adapter_lease_pins_inference_name_and_prune(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="local-backend-adapter-lease",
         name="local-backend-adapter-lease",
         project="pipeline-tests",
         base_model="test-model",
@@ -1012,7 +1040,7 @@ async def test_local_backend_adapter_lease_pins_inference_name_and_prune(
         _latest_step=5,
         prune_loaded_adapters=AsyncMock(),
     )
-    backend._services[model.name] = cast(Any, service)
+    backend._services[backend._model_storage_key(model)] = cast(Any, service)
 
     async with backend.adapter_lease(model, 3):
         assert backend._model_inference_name(model) == f"{model.name}@3"
@@ -1027,6 +1055,7 @@ async def test_local_backend_exact_adapter_lease_pins_immutable_name(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="local-backend-exact-adapter-lease",
         name="local-backend-exact-adapter-lease",
         project="pipeline-tests",
         base_model="test-model",
@@ -1034,6 +1063,7 @@ async def test_local_backend_exact_adapter_lease_pins_immutable_name(
         _internal_config=InternalModelConfig(
             trainer_gpu_ids=[0],
             inference_gpu_ids=[1],
+            rollout_weight_update_mode="in_flight_lora",
         ),
     )
     backend = LocalBackend(path=str(tmp_path))
@@ -1044,15 +1074,20 @@ async def test_local_backend_exact_adapter_lease_pins_immutable_name(
         release_exact_adapter=AsyncMock(),
         prune_loaded_adapters=AsyncMock(),
     )
-    backend._services[model.name] = cast(Any, service)
+    backend._services[backend._model_storage_key(model)] = cast(Any, service)
+
+    assert backend._model_inference_name(model) == f"{model.name}:active"
+    with pytest.raises(ValueError, match="cannot address an immutable policy step"):
+        backend._model_inference_name(model, step=3)
 
     async with backend.exact_adapter_lease(model, 3):
         assert backend._model_inference_name(model) == exact_name
         assert backend._model_inference_name(model, step=3) == exact_name
-        assert backend._model_inference_name(model, step=4) == f"{model.name}@4"
+        with pytest.raises(ValueError, match="cannot address an immutable policy step"):
+            backend._model_inference_name(model, step=4)
         await backend.prune_model_adapters(model, retain_steps={5})
 
-    assert backend._model_inference_name(model) == f"{model.name}@5"
+    assert backend._model_inference_name(model) == f"{model.name}:active"
     service.acquire_exact_adapter.assert_awaited_once_with(
         3,
         get_step_checkpoint_dir(get_model_dir(model=model, art_path=str(tmp_path)), 3),
@@ -1066,6 +1101,7 @@ async def test_local_backend_adapter_retention_lease_does_not_pin_inference(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="local-backend-adapter-retention-lease",
         name="local-backend-adapter-retention-lease",
         project="pipeline-tests",
         base_model="test-model",
@@ -1080,7 +1116,7 @@ async def test_local_backend_adapter_retention_lease_does_not_pin_inference(
         _latest_step=5,
         prune_loaded_adapters=AsyncMock(),
     )
-    backend._services[model.name] = cast(Any, service)
+    backend._services[backend._model_storage_key(model)] = cast(Any, service)
 
     async with backend.adapter_retention_lease(model, 3):
         assert backend._model_inference_name(model) == f"{model.name}@5"
@@ -1094,6 +1130,7 @@ async def test_pipeline_trainer_scheduled_eval_holds_retention_lease(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-scheduled-eval-lease",
         name="pipeline-scheduled-eval-lease",
         project="pipeline-tests",
         base_model="test-model",
@@ -1132,6 +1169,7 @@ async def test_pipeline_trainer_scheduled_eval_holds_retention_lease(
 
 def test_pipeline_trainer_rejects_merged_weight_eval(tmp_path: Path) -> None:
     model = TrainableModel(
+        run_name="pipeline-merged-eval",
         name="pipeline-merged-eval",
         project="pipeline-tests",
         base_model="test-model",

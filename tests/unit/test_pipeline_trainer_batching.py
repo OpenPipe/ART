@@ -58,6 +58,7 @@ def test_eval_rejects_tokens_from_another_policy() -> None:
 async def test_collect_batch_respects_max_batch_size(tmp_path: Path) -> None:
     trainer = PipelineTrainer(
         model=TrainableModel(
+            run_name="pipeline-max-batch-size-test",
             name="pipeline-max-batch-size-test",
             project="pipeline-tests",
             base_model="test-model",

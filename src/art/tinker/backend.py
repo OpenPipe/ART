@@ -56,7 +56,8 @@ class TinkerBackend(LocalBackend):
         from ..dev.model import TinkerArgs, TinkerTrainingClientArgs
         from .service import TinkerService
 
-        if model.name not in self._services:
+        storage_key = self._model_storage_key(model)
+        if storage_key not in self._services:
             config = get_model_config(
                 base_model=model.base_model,
                 output_dir=get_model_dir(model=model, art_path=self._path),
@@ -70,15 +71,18 @@ class TinkerBackend(LocalBackend):
                 TinkerTrainingClientArgs,
                 config["tinker_args"].get("training_client_args") or {},
             )
-            self._services[model.name] = TinkerService(
-                model_name=model.name,
-                base_model=model.base_model,
-                config=config,
-                output_dir=get_model_dir(model=model, art_path=self._path),
+            self._services[storage_key] = cast(
+                ModelService,
+                TinkerService(
+                    model_name=model.name,
+                    base_model=model.base_model,
+                    config=config,
+                    output_dir=get_model_dir(model=model, art_path=self._path),
+                ),
             )
             if not self._in_process:
-                self._services[model.name] = move_to_child_process(
-                    self._services[model.name],
+                self._services[storage_key] = move_to_child_process(
+                    self._services[storage_key],
                     process_name="tinker-service",
                 )
-        return self._services[model.name]
+        return self._services[storage_key]

@@ -105,7 +105,11 @@ jobs:
               [
                   str(runtime_python),
                   "-c",
-                  "import art_vllm_runtime, torch, vllm; print('runtime imports ok')",
+                  "import torch, vllm; "
+                  "from art_vllm_runtime.policy_spans import "
+                  "_patch_lora_update_coordinator; "
+                  "_patch_lora_update_coordinator(); "
+                  "print('runtime compatibility ok')",
               ],
               check=True,
           )

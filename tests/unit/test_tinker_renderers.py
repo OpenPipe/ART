@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from typing import cast
 
 from tinker import EncodedTextChunk, ModelInput
@@ -7,6 +8,10 @@ from tinker_cookbook.tokenizer_utils import Tokenizer
 
 from art.tinker.renderers import get_renderer_name
 from art.tinker_native.data import convert_openai_messages_to_renderer_format
+
+_TOOL_PARSER_CONTRACT = json.loads(
+    (Path(__file__).parents[1] / "support/qwen_tool_parser_contract.json").read_text()
+)
 
 
 class FakeTokenizer:
@@ -95,22 +100,9 @@ def test_qwen3_5_generation_prompt_matches_hf_suffixes() -> None:
 
 def test_qwen3_5_parse_response_handles_xml_tool_calls() -> None:
     tokenizer = FakeTokenizer()
-    renderer = _get_test_renderer("qwen3_5", tokenizer)
+    renderer = _get_test_renderer("qwen3_5_disable_thinking", tokenizer)
 
-    response = tokenizer.encode(
-        "  reasoning  </think>\n\nAnswer first.\n\n"
-        "<tool_call>\n"
-        "<function=lookup_weather>\n"
-        "<parameter=city>\n"
-        "San Francisco\n"
-        "</parameter>\n"
-        "<parameter=days>\n"
-        "3\n"
-        "</parameter>\n"
-        "</function>\n"
-        "</tool_call>"
-        "<|im_end|>"
-    )
+    response = tokenizer.encode(f"{_TOOL_PARSER_CONTRACT['model_output']}<|im_end|>")
 
     message, success = renderer.parse_response(response)
 
@@ -120,12 +112,14 @@ def test_qwen3_5_parse_response_handles_xml_tool_calls() -> None:
         {"type": "text", "text": "Answer first.\n\n"},
     ]
     assert "unparsed_tool_calls" not in message
-    assert len(message["tool_calls"]) == 1
-    assert message["tool_calls"][0].function.name == "lookup_weather"
-    assert json.loads(message["tool_calls"][0].function.arguments) == {
-        "city": "San Francisco",
-        "days": 3,
-    }
+    normalized_tool_calls = [
+        {
+            "name": tool_call.function.name,
+            "arguments": json.loads(tool_call.function.arguments),
+        }
+        for tool_call in message["tool_calls"]
+    ]
+    assert normalized_tool_calls == _TOOL_PARSER_CONTRACT["expected_tool_calls"]
 
 
 def test_qwen3_5_to_openai_message_uses_mapping_tool_arguments() -> None:

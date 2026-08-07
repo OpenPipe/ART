@@ -12,6 +12,7 @@ def load_random_checkpoint_slots(
     count: int,
     *,
     lora_rank: int = 8,
+    site_limit: int | None = None,
 ) -> tuple[str, ...]:
     assert count >= 0, "slots must be >= 0"
     if count == 0:
@@ -23,12 +24,24 @@ def load_random_checkpoint_slots(
         gathered, LoRAPublishPlanner(runtime.model).global_metadata({})
     )
     metadata = {meta.key: meta for values in gathered if values for meta in values}
+    selected = sorted(metadata.values(), key=lambda item: item.key)
+    if site_limit is not None:
+        pairs = []
+        for meta in selected:
+            if ".lora_A." not in meta.key or ".experts." in meta.key:
+                continue
+            b_key = meta.key.replace(".lora_A.", ".lora_B.")
+            if b_meta := metadata.get(b_key):
+                pairs.append((meta, b_meta))
+        selected = [meta for pair in pairs[:site_limit] for meta in pair]
+        if not selected:
+            raise RuntimeError("No replicated LoRA sites are available for the check")
     dtype = next(runtime.model[0].parameters()).dtype
     names = tuple(f"S{index}" for index in range(count))
     for index, name in enumerate(names):
         generator = torch.Generator(device=rank.device).manual_seed(index + 1)
         adapter: dict[str, torch.Tensor] = {}
-        for meta in sorted(metadata.values(), key=lambda item: item.key):
+        for meta in selected:
             shape = list(meta.shape)
             if meta.manifest["sharded"]:
                 axis = int(meta.manifest["export_shard_dim"])

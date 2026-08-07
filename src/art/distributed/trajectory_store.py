@@ -78,16 +78,16 @@ class TrajectoryGroupBundle(_Contract):
 
     @classmethod
     def from_payload(cls, payload: TrajectoryGroupPayload) -> "TrajectoryGroupBundle":
-        from msgspec.msgpack import encode
+        from msgspec import msgpack
 
         return cls(
-            header=encode(
+            header=msgpack.encode(
                 payload.model_copy(update={"trajectories": ()}).model_dump(
                     mode="python"
                 )
             ),
             records=tuple(
-                encode(record.model_dump(mode="python"))
+                msgpack.encode(record.model_dump(mode="python"))
                 for record in payload.trajectories
             ),
         )
@@ -99,12 +99,14 @@ class TrajectoryGroupBundle(_Contract):
         return cls.from_payload(TrajectoryGroupPayload.from_group(group))
 
     def payload(self) -> TrajectoryGroupPayload:
-        from msgspec.msgpack import decode
+        from msgspec import msgpack
 
         from .packing import TrajectoryGroupPayload
 
-        header = decode(self.header)
-        header["trajectories"] = tuple(decode(record) for record in self.records)
+        header = msgpack.decode(self.header)
+        header["trajectories"] = tuple(
+            msgpack.decode(record) for record in self.records
+        )
         return TrajectoryGroupPayload.model_validate(header)
 
     def build(self) -> TrajectoryGroup:
@@ -141,7 +143,7 @@ class TrajectoryBatchTransfer(_Contract):
         return await asyncio.to_thread(self._build_groups, payload)
 
     def _build_groups(self, payload: bytearray) -> tuple[TrajectoryGroup, ...]:
-        from msgspec.msgpack import decode
+        from msgspec import msgpack
 
         from .packing import TrajectoryGroupPayload
 
@@ -151,12 +153,12 @@ class TrajectoryBatchTransfer(_Contract):
         try:
             for layout in self.groups:
                 end = offset + layout.header_byte_count
-                header = decode(view[offset:end])
+                header = msgpack.decode(view[offset:end])
                 offset = end
                 records = []
                 for byte_count in layout.record_byte_counts:
                     end = offset + byte_count
-                    records.append(decode(view[offset:end]))
+                    records.append(msgpack.decode(view[offset:end]))
                     offset = end
                 header["trajectories"] = tuple(records)
                 groups.append(TrajectoryGroupPayload.model_validate(header).build())

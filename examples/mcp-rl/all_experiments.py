@@ -37,6 +37,7 @@ class McpPolicyConfig(BaseModel):
 
 models: dict[str, art.TrainableModel[McpPolicyConfig]] = {
     "mcp-7b-001": art.TrainableModel(
+        run_name="mcp-7b-001",
         name="mcp-7b-001",
         project="mcp-agent-training",
         base_model="Qwen/Qwen2.5-7B-Instruct",

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime
 import math
 from typing import Any
 
 import numpy as np
+from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
 import pytest
 import torch
@@ -24,7 +26,7 @@ from art.preprocessing.moe_routing import (
 )
 from art.preprocessing.pack import packed_tensors_from_tokenized_results
 from art.preprocessing.tokenize import TokenizedResult
-from art.trajectories import Trajectory
+from art.trajectories import ChatCompletionsExchange, Trajectory
 
 
 class _FakeTokenizer:
@@ -473,6 +475,41 @@ def test_trajectory_route_roundtrip_preserves_exact_contract() -> None:
     assert isinstance(restored_routes, MoeRouteArray)
     assert restored_routes.num_experts == 257
     assert restored_routes.dtype == np.dtype(np.uint16)
+    assert np.array_equal(restored_routes, routes)
+
+
+def test_exchange_route_roundtrip_preserves_exact_contract() -> None:
+    routes = MoeRouteArray(
+        np.asarray([[[0, 256]], [[255, 1]]], dtype=np.uint16),
+        num_experts=257,
+    )
+    response = ChatCompletion(
+        id="route-test",
+        choices=[_choice({ROUTED_EXPERTS_KEY: routes, NUM_EXPERTS_KEY: 257})],
+        created=0,
+        model="test-model",
+        object="chat.completion",
+    )
+    now = datetime.now()
+    trajectory = Trajectory(
+        exchanges={
+            "chat_completions": [
+                ChatCompletionsExchange(
+                    request={"model": "test-model", "messages": []},
+                    response=response,
+                    start_time=now,
+                    end_time=now,
+                )
+            ]
+        }
+    )
+
+    restored = TrajectoryPayload.from_trajectory(trajectory).build()
+    choice = restored.exchanges.chat_completions[0].response.choices[0]
+    restored_routes = (choice.model_extra or {})[ART_MOE_ROUTING_METADATA_KEY][
+        ROUTED_EXPERTS_KEY
+    ]
+    assert restored_routes.num_experts == 257
     assert np.array_equal(restored_routes, routes)
 
 

@@ -34,6 +34,7 @@ async def main(model_name: str, steps: int) -> None:
 
     # Initialize trainable model and backend
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project="math-vista",
         base_model="Qwen/Qwen2.5-VL-7B-Instruct",

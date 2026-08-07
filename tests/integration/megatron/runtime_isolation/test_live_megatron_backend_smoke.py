@@ -272,8 +272,10 @@ async def test_megatron_backend_shared_lora_runtime_sleep_wake_live_smoke(
         backend_root=backend_root,
         topology=SHARED_TOPOLOGY,
     ) as backend:
+        run_name = f"megatron-shared-live-{uuid.uuid4().hex[:8]}"
         model = art.TrainableModel(
-            name=f"megatron-shared-live-{uuid.uuid4().hex[:8]}",
+            name=run_name,
+            run_name=run_name,
             project="integration-tests",
             base_model=_base_model(),
             _internal_config=_shared_live_config(),
@@ -365,8 +367,10 @@ async def test_megatron_backend_dedicated_merged_live_smoke(
         backend_root=backend_root,
         topology=ORACLE_TOPOLOGY,
     ) as backend:
+        run_name = f"megatron-merged-live-{uuid.uuid4().hex[:8]}"
         model = art.TrainableModel(
-            name=f"megatron-merged-live-{uuid.uuid4().hex[:8]}",
+            name=run_name,
+            run_name=run_name,
             project="integration-tests",
             base_model=_base_model(),
             _internal_config=_dedicated_merged_config(),
@@ -438,8 +442,10 @@ async def test_megatron_backend_dedicated_multirank_merged_live_smoke(
         backend_root=backend_root,
         topology=SHARED_TOPOLOGY,
     ) as backend:
+        run_name = f"megatron-multirank-merged-live-{uuid.uuid4().hex[:8]}"
         model = art.TrainableModel(
-            name=f"megatron-multirank-merged-live-{uuid.uuid4().hex[:8]}",
+            name=run_name,
+            run_name=run_name,
             project="integration-tests",
             base_model=_base_model(),
             _internal_config=_dedicated_multirank_merged_config(),
@@ -516,8 +522,10 @@ async def test_megatron_backend_shared_lora_ten_step_live_smoke(
         backend_root=backend_root,
         topology=SHARED_TOPOLOGY,
     ) as backend:
+        run_name = f"megatron-shared-long-live-{uuid.uuid4().hex[:8]}"
         model = art.TrainableModel(
-            name=f"megatron-shared-long-live-{uuid.uuid4().hex[:8]}",
+            name=run_name,
+            run_name=run_name,
             project="integration-tests",
             base_model=_base_model(),
             _internal_config=_shared_live_config(),

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 import gc
+from importlib.util import find_spec
 import inspect
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 import torch
 
+from art.megatron.prefix_tree_packing import prefix_tree_pack
 from art.trainer_rank import (
     AdamParams,
     AdapterSelection,
@@ -18,8 +20,12 @@ from art.trainer_rank import (
     TopK,
     TrainerRank,
     TrainerRankMemoryError,
+    TrainerRankOptimizerLayout,
+    TrainerRankOptimizerState,
     TrainerRankSlotStateError,
     Unset,
+)
+from art.trainer_rank._impl import (
     _anchor_disconnected_outputs,
     _MemoryCheck,
     _MemoryProfile,
@@ -33,6 +39,29 @@ if TYPE_CHECKING:
 
 class _Model:
     vocab_size = 8
+
+
+def test_public_types_have_canonical_module_paths() -> None:
+    import art.trainer_rank
+
+    assert {
+        "AdapterSelection",
+        "TrainerRankOptimizerLayout",
+        "TrainerRankOptimizerState",
+        "Unset",
+    } <= set(art.trainer_rank.__all__)
+    for public_type in (
+        AdamParams,
+        ForwardInput,
+        ForwardOutput,
+        TopK,
+        TrainerRank,
+        TrainerRankMemoryError,
+        TrainerRankOptimizerLayout,
+        TrainerRankOptimizerState,
+        TrainerRankSlotStateError,
+    ):
+        assert public_type.__module__ == "art.trainer_rank"
 
 
 class _FakeLoRASite(torch.nn.Module):
@@ -84,8 +113,18 @@ def _runtime(
     return SimpleNamespace(
         model=[model or torch.nn.Linear(1, 1)],
         optimizer=optimizer,
-        provider=SimpleNamespace(hidden_size=4, num_layers=1),
-        model_support_handler=SimpleNamespace(build_gdn_execution_spec=True),
+        provider=SimpleNamespace(
+            hidden_size=4,
+            num_layers=1,
+            kv_channels=2,
+            art_flex_sliding_windows=(16,),
+        ),
+        model_support_handler=SimpleNamespace(
+            build_gdn_execution_spec=True,
+            canonicalize_loaded_lora_state=lambda state, _model: state,
+            zero_internal_padding_grads=lambda _model: None,
+            zero_internal_padding_params=lambda _model: None,
+        ),
     )  # type: ignore
 
 
@@ -200,6 +239,155 @@ def test_trainer_rank_accepts_shared_prefix_depth(depth: int) -> None:
     assert trainer.shared_prefix_max_depth == depth
 
 
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+def test_cp1_packed_forward_uses_model_attention_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.megatron.context_parallel.types import ParallelTopology
+
+    runtime = _runtime()
+    trainer = TrainerRank(runtime)
+    batch = prefix_tree_pack(
+        (torch.tensor([1, 2, 3]), torch.tensor([1, 2, 4])), max_depth=1
+    )
+    captured: dict[str, object] = {}
+    state = object()
+
+    def create_state(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return state
+
+    monkeypatch.setattr(trainer, "_topology", lambda: ParallelTopology())
+    monkeypatch.setattr(trainer, "_configure_hybridep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "art.megatron.prefix_tree_state.create_prefix_tree_state", create_state
+    )
+    monkeypatch.setattr(
+        "art.megatron.training.microbatches._gdn_planner_config_for_provider",
+        lambda provider, handler: "planner-config",
+    )
+
+    prepared = trainer._prepare_packed_forward(batch)
+
+    assert prepared.attention_state is state
+    assert captured["model_support_handler"] is runtime.model_support_handler
+    assert captured["sliding_windows"] == (16,)
+    assert captured["gdn_planner_config"] == "planner-config"
+    torch.testing.assert_close(
+        cast(torch.Tensor, captured["input_pos"]), batch.position_ids
+    )
+
+
+@pytest.mark.parametrize("dp", [1, 4])
+def test_hybridep_validates_topology_for_empty_forward(
+    monkeypatch: pytest.MonkeyPatch,
+    dp: int,
+) -> None:
+    runtime = _runtime()
+    runtime.provider.expert_model_parallel_size = 4
+    trainer = TrainerRank(runtime)
+    monkeypatch.setattr(trainer, "_topology", lambda: SimpleNamespace(dp=dp, cp=4))
+
+    if dp > 1:
+        with pytest.raises(NotImplementedError, match="DP=1"):
+            trainer.dp_rank_forward([])
+    else:
+        assert trainer.dp_rank_forward([]) == []
+
+
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+def test_hybridep_uses_maximum_cp_model_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.megatron.context_parallel.types import ParallelTopology
+
+    trainer = TrainerRank(_runtime())
+    batch = prefix_tree_pack((torch.arange(9),), max_depth=0)
+    short_batch = prefix_tree_pack((torch.arange(5),), max_depth=0)
+    topology = ParallelTopology(cp=4)
+    calls: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "megatron.core.parallel_state.get_expert_model_parallel_world_size",
+        lambda: 4,
+    )
+    monkeypatch.setattr(
+        "art.megatron.train._ensure_hybridep_capacity",
+        lambda runtime, **kwargs: calls.update(capacity=kwargs),
+    )
+    monkeypatch.setattr(
+        "art.megatron.context_parallel.runtime.context_parallel_rank_model_token_counts",
+        lambda **kwargs: (
+            8,
+            int(cast(torch.Tensor, kwargs["group_ids"]).numel()) + 4,
+            9,
+            11,
+        ),
+    )
+    monkeypatch.setattr(
+        "art.megatron.training.microbatches._context_parallel_config_for_provider",
+        lambda *_: "cp-config",
+    )
+    monkeypatch.setattr(
+        "art.megatron.training.microbatches._gdn_planner_config_for_provider",
+        lambda *_: "gdn-config",
+    )
+
+    buffer = SimpleNamespace(
+        configurer=SimpleNamespace(
+            buffer_config=SimpleNamespace(max_num_of_tokens_per_rank=1024)
+        )
+    )
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.fused_a2a._hybrid_ep_buffer", buffer
+    )
+
+    configured = trainer._configure_hybridep((batch, short_batch), topology=topology)
+
+    assert calls == {
+        "capacity": {
+            "packed_sequence_length": 9,
+            "context_parallel_size": 4,
+        },
+    }
+    assert configured == ((13, 11), 13)
+
+
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+def test_hybridep_rejects_buffer_growth_with_live_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.megatron.context_parallel.types import ParallelTopology
+
+    trainer = TrainerRank(_runtime())
+    trainer._hybridep_graph_tracking = True
+    output = trainer._track_slot_graph_outputs(
+        None,
+        [ForwardOutput(torch.ones(1, requires_grad=True), None, None, None)],
+    )[0]
+    assert output.target_logprobs is not None
+    buffer = SimpleNamespace(
+        configurer=SimpleNamespace(
+            buffer_config=SimpleNamespace(max_num_of_tokens_per_rank=4)
+        )
+    )
+    trainer._hybridep_buffer_id = id(buffer)
+    trainer._hybridep_rows_high_water = 4
+    monkeypatch.setattr(
+        "megatron.core.parallel_state.get_expert_model_parallel_world_size",
+        lambda: 4,
+    )
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.fused_a2a._hybrid_ep_buffer", buffer
+    )
+
+    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+        trainer._configure_hybridep(
+            (prefix_tree_pack((torch.arange(9),), max_depth=0),),
+            topology=ParallelTopology(),
+        )
+
+
 def test_trainer_rank_adapter_stack_errors() -> None:
     trainer = TrainerRank(_runtime())
 
@@ -266,6 +454,32 @@ def test_checkpoint_slot_adapter_config_is_validated_and_copied() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("base_model_name_or_path", 1),
+        ("r", "8"),
+        ("lora_alpha", "16"),
+        ("target_modules", 1),
+    ),
+)
+def test_checkpoint_slot_adapter_config_rejects_invalid_field_types(
+    field: str,
+    value: object,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    config: dict[str, object] = {
+        "base_model_name_or_path": "Qwen/Qwen3-8B",
+        "r": 8,
+        "lora_alpha": 16,
+        "target_modules": ["q_proj"],
+    }
+    config[field] = value
+
+    with pytest.raises(TypeError, match=field):
+        trainer._validate_checkpoint_slot_adapter_config("student", config, alpha=None)
+
+
 def test_checkpoint_slot_adapter_config_rejects_cross_rank_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -310,6 +524,57 @@ def test_load_checkpoint_slot_retains_config_and_uses_its_alpha(
     trainer.load_checkpoint_slot("student", {}, alpha=7)
     assert seen["alpha"] == 7
     assert "student" not in trainer._checkpoint_slot_adapter_configs
+
+
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+def test_slot_load_canonicalizes_only_local_incoming_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[dict[str, torch.Tensor], object]] = []
+    loaded_state: dict[str, torch.Tensor] = {}
+    runtime = _runtime()
+    runtime.model_support_handler.canonicalize_loaded_lora_state = lambda state, model: (
+        calls.append((state, model))
+        or {key: torch.zeros_like(value) for key, value in state.items()}
+    )
+    runtime.model_support_handler.zero_internal_padding_params = lambda _model: (
+        pytest.fail("slot load must not mutate unrelated slot parameters")
+    )
+    trainer = TrainerRank(runtime)
+    monkeypatch.setattr(
+        trainer, "_local_lora_adapter_templates", lambda: {"weight": torch.empty(1)}
+    )
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    def gather_expected(values: list[set[str] | None], local: set[str]) -> None:
+        values[:] = [local, {"remote_weight"}]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_expected)
+    monkeypatch.setattr(trainer, "_guard_slot_can_load", lambda *_: None)
+
+    def load_slot(
+        _model: object,
+        _ref: object,
+        adapter_model: dict[str, torch.Tensor],
+        **_kwargs: object,
+    ) -> int:
+        loaded_state.update(adapter_model)
+        return 1
+
+    monkeypatch.setattr(
+        "art.megatron.lora.load_lora_slot_into_model",
+        load_slot,
+    )
+
+    adapter = {"weight": torch.ones(1), "remote_weight": torch.ones(1)}
+    trainer._load_slot("checkpoint", "student", adapter, trainable=True, alpha=None)
+
+    assert calls == [({"weight": adapter["weight"]}, runtime.model)]
+    torch.testing.assert_close(loaded_state["weight"], torch.zeros(1))
+    assert "remote_weight" not in loaded_state
+    torch.testing.assert_close(adapter["weight"], torch.ones(1))
 
 
 def test_checkpoint_slot_publish_requires_retained_adapter_config() -> None:
@@ -409,6 +674,43 @@ def test_optim_step_implicitly_steps_only_slots_with_grads(
     torch.testing.assert_close(untouched, before_untouched)
 
 
+def test_dynamic_optimizer_zeroes_internal_padding_grads_before_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    param = torch.nn.Parameter(torch.tensor([1.0, 0.0]))
+    param.grad = torch.ones_like(param)
+    runtime = _runtime()
+
+    def zero_padding_grads(_model: object) -> None:
+        calls.append("grads")
+        assert param.grad is not None
+        param.grad[-1] = 0.0
+
+    runtime.model_support_handler.zero_internal_padding_grads = zero_padding_grads
+    runtime.model_support_handler.zero_internal_padding_params = lambda _model: (
+        pytest.fail("slot step must not mutate unrelated slot parameters")
+    )
+    trainer = TrainerRank(runtime)
+    trainer._checkpoint_slot_params_by_name["student"] = (param,)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+    )
+
+    trainer.optim_step(
+        params=AdamParams(
+            learning_rate=1e-2,
+            weight_decay=0.1,
+            grad_clip_norm=10.0,
+        )
+    )
+
+    assert calls == ["grads"]
+    assert param[-1].item() == 0.0
+
+
 def test_checkpoint_slot_optimizer_state_reproduces_exact_next_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -492,7 +794,7 @@ def test_checkpoint_slot_optimizer_state_rejects_incompatible_state(
     state = trainer.checkpoint_slot_optimizer_state("student")
     assert state is not None
     if corruption == "layout":
-        state["layout"] = {"different": True}
+        cast(dict[str, object], state)["layout"] = {"different": True}
     elif corruption == "missing_master":
         state["master_params"] = ()
     restored, _ = _trainer_with_checkpoint(

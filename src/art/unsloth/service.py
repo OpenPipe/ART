@@ -12,6 +12,7 @@ import torch
 from trl import GRPOTrainer
 
 from .. import dev, types
+from ..adapter_leases import in_flight_lora_name
 from ..dev.validate import is_dedicated_mode
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.inputs import TrainInputs
@@ -207,7 +208,7 @@ class UnslothService:
 
     @property
     def _in_flight_lora_slot(self) -> str:
-        return f"{self.model_name}:active"
+        return in_flight_lora_name(self.model_name)
 
     @property
     def _initial_served_model_name(self) -> str:
@@ -608,7 +609,7 @@ class UnslothService:
             response = await client.post(
                 f"{self._vllm_base_url}/art/in_flight_lora_update",
                 json={
-                    "model_name": f"{self.model_name}@{step}",
+                    "model_name": self._in_flight_lora_slot,
                     "lora_slot": self._in_flight_lora_slot,
                     "lora_path": checkpoint_path,
                     "policy_version": step,
@@ -671,22 +672,6 @@ class UnslothService:
                 return
             await self._unload_exact_adapter(step)
             del self._exact_adapter_refcounts[step]
-
-    async def resolve_global_grad_accumulation_sequences(
-        self, config: types.TrainConfig
-    ) -> int:
-        configured = int(
-            self.config.get("trainer_args", {}).get("gradient_accumulation_steps", 1)
-        )
-        if configured < 1:
-            raise ValueError("Unsloth gradient accumulation must be >= 1")
-        requested = config.grad_accumulation_sequences
-        if requested is not None and requested != configured:
-            raise ValueError(
-                f"UnslothService is configured for "
-                f"grad_accumulation_sequences={configured}, got {requested}"
-            )
-        return configured
 
     async def _unload_adapter_name(self, lora_name: str) -> bool:
         import httpx

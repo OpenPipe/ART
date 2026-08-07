@@ -382,7 +382,12 @@ async def deployment_smoke(hosts: Any) -> None:
             target_workers=host_count,
         )
         executor.set_workers(tuple(range(host_count)))
-        model = TrainableModel(name="bootstrap-smoke", project="art", base_model="none")
+        model = TrainableModel(
+            name="bootstrap-smoke",
+            run_name="bootstrap-smoke",
+            project="art",
+            base_model="none",
+        )
         results = await asyncio.gather(
             *(
                 executor.run(worker, _deployment_rollout, model, worker, None)

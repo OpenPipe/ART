@@ -591,9 +591,16 @@ def _patch_openai_response_policy_spans() -> None:
 
 
 def _patch_lora_alias_resolution() -> None:
-    from vllm.entrypoints.openai.engine.serving import OpenAIServing
+    try:
+        module = importlib.import_module("vllm.entrypoints.openai.engine.serving")
+        serving_base = module.OpenAIServing
+    except ModuleNotFoundError as exc:
+        if exc.name != "vllm.entrypoints.openai.engine.serving":
+            raise
+        module = importlib.import_module("vllm.entrypoints.generate.base.serving")
+        serving_base = module.GenerateBaseServing
 
-    original_init = OpenAIServing.__init__
+    original_init = serving_base.__init__
     if not getattr(original_init, "__art_lora_update_patched__", False):
 
         def __init__(self: Any, *args: Any, **kwargs: Any) -> None:
@@ -601,9 +608,9 @@ def _patch_lora_alias_resolution() -> None:
             lora_update_coordinator(self.models, self.engine_client)
 
         __init__.__art_lora_update_patched__ = True  # type: ignore[attr-defined]
-        OpenAIServing.__init__ = __init__  # type: ignore[method-assign]
+        serving_base.__init__ = __init__
 
-    original_check = OpenAIServing._check_model
+    original_check = serving_base._check_model
     if not getattr(original_check, "__art_policy_spans_patched__", False):
 
         async def _check_model(self: Any, request: Any) -> Any:
@@ -622,9 +629,9 @@ def _patch_lora_alias_resolution() -> None:
             return await original_check(self, request)
 
         _check_model.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
-        OpenAIServing._check_model = _check_model  # type: ignore[method-assign]
+        serving_base._check_model = _check_model
 
-    original_maybe = OpenAIServing._maybe_get_adapters
+    original_maybe = serving_base._maybe_get_adapters
     if getattr(original_maybe, "__art_policy_spans_patched__", False):
         return
 
@@ -644,7 +651,7 @@ def _patch_lora_alias_resolution() -> None:
         )
 
     _maybe_get_adapters.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
-    OpenAIServing._maybe_get_adapters = _maybe_get_adapters  # type: ignore[method-assign]
+    serving_base._maybe_get_adapters = _maybe_get_adapters
 
 
 def _patch_engine_request_admission() -> None:

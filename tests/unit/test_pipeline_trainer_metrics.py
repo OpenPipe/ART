@@ -36,6 +36,7 @@ async def test_training_records_stale_and_zero_variance_discards(
     tmp_path: Path,
 ) -> None:
     model = TrainableModel(
+        run_name="pipeline-discard-metrics-test",
         name="pipeline-discard-metrics-test",
         project="pipeline-discard-metrics-test",
         base_model="test-model",
@@ -54,8 +55,8 @@ async def test_training_records_stale_and_zero_variance_discards(
             num_rollout_workers=1,
             min_batch_size=1,
             max_batch_size=1,
-            max_steps_off_policy=0,
         ),
+        max_steps_off_policy=0,
         eval_fn=None,
         max_steps=1,
     )
@@ -72,8 +73,8 @@ async def test_training_records_stale_and_zero_variance_discards(
 
     history = Path(model._get_output_dir()) / "history.jsonl"
     rows = [json.loads(line) for line in history.read_text().splitlines()]
-    train_row = next(row for row in rows if "reward/train" in row)
-    zero_variance_row = next(row for row in rows if "task/discarded/reward" in row)
+    train_row = next(row for row in rows if "train/reward" in row)
+    zero_variance_row = next(row for row in rows if "discarded/reward" in row)
     assert "discarded/cum/stale_groups" in train_row
     assert "discarded/step/stale_groups" in train_row
-    assert "task/discarded/reward" in zero_variance_row
+    assert "discarded/reward" in zero_variance_row

@@ -12,7 +12,6 @@ class PipelineRuntimeConfig(pydantic.BaseModel):
     num_rollout_workers: int = pydantic.Field(default=16, ge=1)
     min_batch_size: int = pydantic.Field(default=4, ge=1)
     max_batch_size: int | None = pydantic.Field(default=None, ge=1)
-    max_steps_off_policy: int | None = pydantic.Field(default=4, ge=0)
     queue_maxsize: int | None = pydantic.Field(default=None, ge=1)
     score_reference_groups_per_step: float | None = pydantic.Field(default=8.0, gt=0.0)
     score_reference_rollouts_per_group: float | None = pydantic.Field(
@@ -39,6 +38,7 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     worker_step: int = pydantic.Field(default=4, ge=1)
     worker_move_fraction: float = pydantic.Field(default=0.10, gt=0.0, le=1.0)
     max_worker_move: int = pydantic.Field(default=16, ge=4)
+    max_rollout_workers: int = pydantic.Field(default=1024, ge=1)
     initial_model_calls_per_inference_gpu: int = pydantic.Field(default=8, ge=1)
     initial_min_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
     initial_max_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
@@ -55,14 +55,20 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     trainer_load_over_score: float = pydantic.Field(default=0.04, ge=0.0)
     vllm_pressure_over_ratio: float = pydantic.Field(default=0.80, ge=0.0)
     vllm_pressure_under_ratio: float = pydantic.Field(default=0.50, ge=0.0)
-    queue_put_severe_frac: float = pydantic.Field(default=0.50, ge=0.0, le=1.0)
+    queue_put_severe_frac: float = pydantic.Field(default=1.0 / 3.0, ge=0.0, le=1.0)
     stale_high_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
+    stale_clear_frac: float = pydantic.Field(default=0.10, ge=0.0, le=1.0)
     unused_and_dummy_high_frac: float = pydantic.Field(default=0.25, ge=0.0, le=1.0)
     trainer_min_batch_lower_score: float = pydantic.Field(default=0.15, ge=0.0)
+    trainer_min_batch_raise_score: float = pydantic.Field(default=0.10, ge=0.0)
+    min_batch_collect_improvement_ratio: float = pydantic.Field(
+        default=0.85, gt=0.0, le=1.0
+    )
+    min_batch_trial_windows: int = pydantic.Field(default=2, ge=1)
     recommendation_min_windows: int = pydantic.Field(default=5, ge=1)
     recommendation_consecutive_holds: int = pydantic.Field(default=2, ge=1)
     freshness_min_batch_floor_fraction: float = pydantic.Field(
-        default=0.50, gt=0.0, le=1.0
+        default=0.85, gt=0.0, le=1.0
     )
     target_group_change_windows: int = pydantic.Field(default=1, ge=1)
     target_group_increase_fraction: float = pydantic.Field(default=0.25, gt=0.0, le=1.0)
@@ -77,6 +83,16 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     vllm_metric_timeout_window_frac: float = pydantic.Field(
         default=0.35, ge=0.0, le=1.0
     )
+
+    @pydantic.model_validator(mode="after")
+    def validate_stale_hysteresis(self) -> "PipelineAutotuneConfig":
+        if self.stale_clear_frac > self.stale_high_frac:
+            raise ValueError("stale_clear_frac must be <= stale_high_frac")
+        if self.trainer_min_batch_raise_score > self.trainer_min_batch_lower_score:
+            raise ValueError(
+                "trainer_min_batch_raise_score must be <= trainer_min_batch_lower_score"
+            )
+        return self
 
 
 class PipelineTuneSettings(pydantic.BaseModel):
@@ -123,10 +139,12 @@ class TunerWindowStats(pydantic.BaseModel):
     end_step: int
     window_start_s: float = 0.0
     window_end_s: float = 0.0
+    collect_batch_s: float = 0.0
     trainer_underfeed_score: float = 0.0
     vllm_pressure: float = 0.0
     queue_put_wait_frac: float = 0.0
     predicted_stale_frac: float = 0.0
+    actual_stale_frac: float = 0.0
     unused_and_dummy_ratio_mean: float = 0.0
 
 

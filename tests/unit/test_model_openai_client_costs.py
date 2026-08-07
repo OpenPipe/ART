@@ -58,6 +58,7 @@ def _build_model() -> TrainableModel:
     assert pricing is not None
 
     model = TrainableModel(
+        run_name="test-run",
         name="test-run",
         project="test-project",
         base_model="openai/gpt-oss-20b",
@@ -192,6 +193,7 @@ class TestModelOpenAIClientCosts:
 
     def test_trainable_model_uses_configured_chat_template_kwargs(self) -> None:
         model = TrainableModel(
+            run_name="test-run",
             name="test-run",
             project="test-project",
             base_model="test-model",

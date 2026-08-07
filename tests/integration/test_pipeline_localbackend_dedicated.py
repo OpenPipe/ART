@@ -110,6 +110,7 @@ async def test_pipeline_trainer_local_backend_dedicated_smoke() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         async with LocalBackend(path=tmpdir) as backend:
             model = art.TrainableModel(
+                run_name=model_name,
                 name=model_name,
                 project="integration-tests",
                 base_model=get_base_model(),

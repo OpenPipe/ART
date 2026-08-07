@@ -49,6 +49,7 @@ from .lora_config import (
     MEGATRON_LORA_TARGET_MODULES_ENV,
     default_lora_rank_for_handler,
 )
+from .migrations import optimizer_state_path
 from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
 from .model_support.registry import (
     UnsupportedModelArchitectureError,
@@ -456,19 +457,17 @@ class MegatronService:
     def _sleep_mode_enabled(self) -> bool:
         return bool(self.config.get("engine_args", {}).get("enable_sleep_mode", True))
 
-    def _get_optimizer_state_path(self, job_type: Literal["rl", "sft"]) -> str:
-        optimizer_state_path = os.path.join(
-            self.output_dir, f"optimizer_states_{job_type}"
-        )
-        os.makedirs(optimizer_state_path, exist_ok=True)
-        return optimizer_state_path
+    def _get_optimizer_state_path(self) -> str:
+        path = optimizer_state_path(self.output_dir)
+        os.makedirs(path, exist_ok=True)
+        return path
 
     def _resolve_resume_step(self) -> MegatronResumeStep:
         if self._resume_step is not None:
             return self._resume_step
         info = prepare_megatron_resume_state(
             output_dir=self.output_dir,
-            optimizer_state_path=self._get_optimizer_state_path("rl"),
+            optimizer_state_path=self._get_optimizer_state_path(),
         )
         self._resume_step = info
         self._status(format_megatron_resume_message(info))
@@ -1171,7 +1170,7 @@ class MegatronService:
                             training_session_id=self._training_session_id,
                             lora_path=staging_lora_path,
                             allow_unvalidated_arch=self._allow_unvalidated_arch,
-                            optimizer_state_path=self._get_optimizer_state_path("rl"),
+                            optimizer_state_path=self._get_optimizer_state_path(),
                             disk_packed_tensors=disk_packed_tensors,
                             config=config,
                             experimental_config=cast(dict[str, Any], _config),
@@ -1195,7 +1194,7 @@ class MegatronService:
                         training_session_id=self._training_session_id,
                         lora_path=staging_lora_path,
                         allow_unvalidated_arch=self._allow_unvalidated_arch,
-                        optimizer_state_path=self._get_optimizer_state_path("rl"),
+                        optimizer_state_path=self._get_optimizer_state_path(),
                         disk_packed_tensors=disk_packed_tensors,
                         config=config,
                         experimental_config=cast(dict[str, Any], _config),
@@ -1242,7 +1241,7 @@ class MegatronService:
                 training_session_id=self._training_session_id,
                 lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
-                optimizer_state_path=self._get_optimizer_state_path("rl"),
+                optimizer_state_path=self._get_optimizer_state_path(),
                 disk_packed_tensors=disk_packed_tensors,
                 config=config,
                 experimental_config=cast(dict[str, Any], _config),
@@ -1279,7 +1278,7 @@ class MegatronService:
         except BaseException as exc:
             try:
                 durable_step = read_committed_optimizer_adapter_step(
-                    self._get_optimizer_state_path("rl")
+                    self._get_optimizer_state_path()
                 )
                 if durable_step is not None:
                     self._latest_step = max(self._latest_step, durable_step)
@@ -1319,7 +1318,7 @@ class MegatronService:
             job = MegatronSFTTrainingJob(
                 lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
-                optimizer_state_path=self._get_optimizer_state_path("sft"),
+                optimizer_state_path=self._get_optimizer_state_path(),
                 sft_data_dir=serialized_batches.sft_data_dir,
                 num_batches=serialized_batches.num_batches,
                 learning_rates=serialized_batches.learning_rates,

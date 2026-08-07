@@ -91,6 +91,7 @@ class TrajectoryPayload(BaseModel):
     additional_history_choice_routing_metadata: tuple[
         dict[int, _ChoiceRoutingPayload], ...
     ] = ()
+    exchange_choice_routing_metadata: tuple[dict[int, _ChoiceRoutingPayload], ...] = ()
 
     @classmethod
     def from_trajectory(cls, trajectory: Trajectory) -> "TrajectoryPayload":
@@ -98,6 +99,10 @@ class TrajectoryPayload(BaseModel):
         history_routing = tuple(
             _choice_routing_metadata(history.messages_and_choices)
             for history in trajectory.additional_histories
+        )
+        exchange_routing = tuple(
+            _choice_routing_metadata(exchange.response.choices)
+            for exchange in trajectory.exchanges.chat_completions
         )
         exclude: dict[str, Any] = {
             "messages_and_choices": _routing_exclude(choice_routing),
@@ -125,17 +130,20 @@ class TrajectoryPayload(BaseModel):
             ),
             choice_routing_metadata=choice_routing,
             additional_history_choice_routing_metadata=history_routing,
+            exchange_choice_routing_metadata=exchange_routing,
         )
 
     def build(self) -> Trajectory:
         payload = dict(self.payload)
-        messages = list(payload["messages_and_choices"])
+        messages = list(payload.get("messages_and_choices", []))
         for index in self.choice_positions:
             messages[index] = _build_choice(
                 messages[index], self.choice_routing_metadata.get(index)
             )
         payload["messages_and_choices"] = messages
-        histories = [dict(history) for history in payload["additional_histories"]]
+        histories = [
+            dict(history) for history in payload.get("additional_histories", [])
+        ]
         for history, positions, routing in zip(
             histories,
             self.additional_history_choice_positions,
@@ -147,6 +155,23 @@ class TrajectoryPayload(BaseModel):
                 messages[index] = _build_choice(messages[index], routing.get(index))
             history["messages_and_choices"] = messages
         payload["additional_histories"] = histories
+        exchanges = dict(payload.get("exchanges", {}))
+        chat_exchanges = [
+            dict(exchange) for exchange in exchanges.get("chat_completions", [])
+        ]
+        for exchange, routing in zip(
+            chat_exchanges,
+            self.exchange_choice_routing_metadata,
+            strict=True,
+        ):
+            response = dict(exchange["response"])
+            choices = list(response["choices"])
+            for index, metadata in routing.items():
+                choices[index] = _build_choice(choices[index], metadata)
+            response["choices"] = choices
+            exchange["response"] = response
+        exchanges["chat_completions"] = chat_exchanges
+        payload["exchanges"] = exchanges
         return Trajectory.model_validate(payload)
 
 

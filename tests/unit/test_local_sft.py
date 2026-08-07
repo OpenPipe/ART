@@ -60,6 +60,7 @@ async def test_local_sft_does_not_start_service_without_trainable_tokens(
 ) -> None:
     backend = LocalBackend(path=str(tmp_path))
     model = TrainableModel(
+        run_name="empty-sft",
         name="empty-sft",
         project="tests",
         base_model="test-model",
@@ -105,6 +106,7 @@ async def test_local_sft_skipped_batch_does_not_consume_learning_rate(
 ) -> None:
     backend = LocalBackend(path=str(tmp_path))
     model = TrainableModel(
+        run_name="filtered-sft",
         name="filtered-sft",
         project="tests",
         base_model="test-model",

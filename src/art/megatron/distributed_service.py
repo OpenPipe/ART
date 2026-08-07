@@ -40,6 +40,7 @@ from art.vllm_runtime import (
 
 from .identity_lora import create_identity_lora
 from .lora_config import LORA_ALPHA, default_lora_rank_for_handler
+from .migrations import optimizer_state_path
 from .model_support import (
     get_model_support_handler,
     get_model_support_handler_for_spec,
@@ -296,7 +297,7 @@ class DistributedMegatronService:
 
     @property
     def _optimizer_state_path(self) -> str:
-        path = f"{self.output_dir}/optimizer_states_rl"
+        path = optimizer_state_path(self.output_dir)
         os.makedirs(path, exist_ok=True)
         return path
 

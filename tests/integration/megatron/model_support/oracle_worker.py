@@ -524,6 +524,24 @@ def _configure_cuda_precision(case_config: OracleCaseConfig) -> None:
     torch.set_float32_matmul_precision("highest")
 
 
+def _sparse_flex_test_call(attention_call: Callable[..., Any]) -> Callable[..., Any]:
+    from torch.nn.attention.flex_attention import AuxRequest
+
+    def sparse_call(q, k, v, *, block_mask, scale, enable_gqa):
+        out, aux = attention_call(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            return_aux=AuxRequest(lse=True),
+        )
+        return out, aux.lse
+
+    return sparse_call
+
+
 @contextmanager
 def _apply_requested_flex_backend_patch(flex_backend: str | None):
     if flex_backend is None:
@@ -558,7 +576,9 @@ def _apply_requested_flex_backend_patch(flex_backend: str | None):
         compiled_flex_attention._forced_flex_attention_dense
     )
     compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
-        compiled_flex_attention._forced_flex_attention_sparse
+        compiled_flex_attention._sparse_flex_attention_with_options(
+            patched_kernel_options
+        )
     )
     try:
         yield
@@ -613,7 +633,7 @@ def _apply_test_flex_inner_fp32_patch(flex_backend: str | None):
         _fp32_inner_call
     )
     compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
-        _fp32_inner_call
+        _sparse_flex_test_call(_fp32_inner_call)
     )
     try:
         yield
@@ -697,7 +717,7 @@ def _apply_test_attention_full_fp32_patch(flex_backend: str | None):
         _fp32_inner_call
     )
     compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
-        _fp32_inner_call
+        _sparse_flex_test_call(_fp32_inner_call)
     )
     setattr(ColumnParallelLinear, "_forward_impl", _column_forward_impl_fp32)
     setattr(RowParallelLinear, "_forward_impl", _row_forward_impl_fp32)

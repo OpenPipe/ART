@@ -16,7 +16,7 @@ from torch.distributed import destroy_process_group, init_process_group  # noqa:
 import torch.multiprocessing as mp  # noqa: E402
 
 from art.megatron.lora import LoRA, LoRASlotRef, use_lora_slot  # noqa: E402
-from art.trainer_rank import (  # noqa: E402
+from art.trainer_rank._impl import (  # noqa: E402
     AdamParams,
     TrainerRank,
     _distributed_grad_norm,

@@ -634,6 +634,7 @@ class TestTrackApiCostIntegration:
         self, tmp_path: Path
     ) -> None:
         model = TrainableModel(
+            run_name="pipeline-context-test",
             name="pipeline-context-test",
             project="pipeline-context-test",
             base_model="test-model",
@@ -685,6 +686,7 @@ class TestTrackApiCostIntegration:
         self, tmp_path: Path
     ) -> None:
         model = TrainableModel(
+            run_name="pipeline-eval-context-test",
             name="pipeline-eval-context-test",
             project="pipeline-eval-context-test",
             base_model="test-model",

@@ -41,7 +41,9 @@ from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
 from ..trajectories import Trajectory, TrajectoryGroup
+from ..trajectories._selection import automatic_training_model_selector
 from ..types import TrainResult, TrainSFTConfig
+from ..utils.lifecycle import process_shutdown_timeout
 from ..utils.output_dirs import get_model_dir
 from ..utils.trajectory_migration import auto_migrate_on_register
 from .data import (
@@ -52,12 +54,13 @@ from .data import (
 
 STATE_KEY_RUN_IDS = "tinker_run_ids"
 STATE_KEY_LATEST_STEP = "latest_step"
+_SERVER_CLOSE_TIMEOUT_SECONDS = process_shutdown_timeout(1)
 T = TypeVar("T")
 
 _UPSTREAM_TRAIN_METRIC_KEYS = {
-    "reward": "reward/train",
-    "reward_std_dev": "reward/train_std_dev",
-    "exception_rate": "task/train/exception_rate",
+    "reward": "train/reward",
+    "reward_std_dev": "train/reward_std_dev",
+    "exception_rate": "train/exception_rate",
     "policy_loss": "loss/train",
     "loss": "loss/train",
     "entropy": "loss/entropy",
@@ -80,7 +83,7 @@ def _canonicalize_upstream_metric_key(metric: str) -> str:
     if metric == "tokens_per_second":
         return ""
     if metric.startswith("group_metric_"):
-        return f"group_{metric[len('group_metric_') :]}"
+        return f"train/group/{metric[len('group_metric_') :]}"
     return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
 
 
@@ -169,6 +172,8 @@ class ModelState:
     tinker_run_ids: list[str]
     model_name: str
     server_task: asyncio.Task[None] | None = None
+    server: uvicorn.Server | None = None
+    server_shutdown_requested: bool = False
     server_host: str | None = None
     server_port: int | None = None
     server_api_key: str | None = None
@@ -199,7 +204,11 @@ class TinkerNativeBackend:
 
         self._path = path or ".art"
         os.makedirs(self._path, exist_ok=True)
-        self._model_state: dict[str, ModelState] = {}
+        self._model_state: dict[tuple[str, str], ModelState] = {}
+
+    @staticmethod
+    def _model_key(model: Model) -> tuple[str, str]:
+        return model.project, model._storage_name()
 
     def _env_enabled(self, env_name: str) -> bool:
         value = os.getenv(env_name)
@@ -251,11 +260,24 @@ class TinkerNativeBackend:
         tasks: list[asyncio.Task[None]] = []
         for state in self._model_state.values():
             if state.server_task is not None:
-                state.server_task.cancel()
+                state.server_shutdown_requested = True
+                if state.server is not None:
+                    state.server.should_exit = True
                 tasks.append(state.server_task)
-                state.server_task = None
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=_SERVER_CLOSE_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                for state in self._model_state.values():
+                    state.server_task = None
+                    state.server = None
 
     async def register(self, model: Model) -> None:
         model.base_path = self._path
@@ -275,14 +297,14 @@ class TinkerNativeBackend:
         if pricing is not None:
             trainable_model.set_cost_calculator(build_cost_calculator(pricing))
         state = await self._build_model_state(trainable_model)
-        self._model_state[model.name] = state
+        self._model_state[self._model_key(model)] = state
 
     async def _prepare_backend_for_training(
         self,
         model: TrainableModel,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
-        state = self._model_state[model.name]
+        state = self._model_state[self._model_key(model)]
 
         raw_config: dict[str, Any] = cast(dict[str, Any], config) if config else {}
         server_args = cast(dict[str, Any], raw_config.get("server_args", {}))
@@ -299,7 +321,9 @@ class TinkerNativeBackend:
             state.server_task = asyncio.create_task(
                 self._run_openai_server(state, host=host, port=port)
             )
-            state.server_task.add_done_callback(self._crash_on_server_exit)
+            state.server_task.add_done_callback(
+                lambda task, state=state: self._crash_on_server_exit(state, task)
+            )
 
         base_url = f"http://{host}:{port}/v1"
         await self._wait_for_server_ready(base_url, api_key, model)
@@ -325,7 +349,7 @@ class TinkerNativeBackend:
             "TinkerNativeBackend only supports kl_penalty_source='sample'."
         )
 
-        state = self._model_state[model.name]
+        state = self._model_state[self._model_key(model)]
         groups_list = list(trajectory_groups)
         summary = summarize_trajectory_groups(groups_list)
 
@@ -334,6 +358,8 @@ class TinkerNativeBackend:
             state.renderer,
             state.tokenizer,
             normalize_advantages,
+            base_model=model.base_model,
+            model=automatic_training_model_selector(self._model_inference_name(model)),
         )
 
         metrics: dict[str, float] = {
@@ -347,14 +373,17 @@ class TinkerNativeBackend:
         if not datums:
             return TrainResult(step=state.current_step, metrics=metrics)
 
-        train_tokens = 0
-        for datum in datums:
-            train_tokens += len(datum.model_input.to_ints())
-        metrics["data/step_trainable_assistant_tokens"] = float(train_tokens)
+        flattened_tokens = sum(len(datum.model_input.to_ints()) for datum in datums)
+        assistant_tokens = sum(
+            float(datum.loss_fn_inputs["mask"].to_torch().sum().item())
+            for datum in datums
+        )
+        metrics["data/step_trainable_assistant_tokens"] = assistant_tokens
+        metrics["data/step_flattened_train_tokens"] = float(flattened_tokens)
         pricing = get_model_pricing(model.base_model)
         if pricing is not None:
             metrics["costs/train/tinker_train"] = compute_train_cost(
-                train_tokens, pricing
+                flattened_tokens, pricing
             )
         trainer_started = time.monotonic()
         sampled_kl_policy_ref: float | None = None
@@ -395,16 +424,15 @@ class TinkerNativeBackend:
                 model_input=datum.model_input, loss_fn_inputs=loss_fn_inputs
             )
 
-        forward_output = await self._tinker_train_call(
-            "forward_backward",
-            state.training_client.forward_backward(
-                [remove_mask(datum) for datum in datums],
-                loss_fn=loss_fn,
-                loss_fn_config=loss_fn_config,
-            ),
+        forward_future = state.training_client.forward_backward(
+            [remove_mask(datum) for datum in datums],
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
         )
-        optim_output = await self._tinker_train_call(
-            "optim_step", state.training_client.optim_step(adam_params)
+        optim_future = state.training_client.optim_step(adam_params)
+        forward_output, optim_output = await asyncio.gather(
+            self._tinker_train_call("forward_backward", forward_future),
+            self._tinker_train_call("optim_step", optim_future),
         )
 
         if forward_output.metrics:
@@ -473,8 +501,9 @@ class TinkerNativeBackend:
         yield {}
 
     async def _get_step(self, model: TrainableModel) -> int:
-        if model.name in self._model_state:
-            return self._model_state[model.name].current_step
+        model_key = self._model_key(model)
+        if model_key in self._model_state:
+            return self._model_state[model_key].current_step
         state = model.read_state() or {}
         return int(state.get(STATE_KEY_LATEST_STEP, 0))
 
@@ -490,11 +519,20 @@ class TinkerNativeBackend:
         if "@" in base_name:
             base_name = base_name.split("@", 1)[0]
         if step is None:
-            step = pinned_inference_step(model.name)
+            step = pinned_inference_step(model._storage_name())
         if step is None:
-            state = self._model_state.get(model.name)
+            state = self._model_state.get(self._model_key(model))
             step = state.current_step if state is not None else 0
         return f"{base_name}@{step}"
+
+    @asynccontextmanager
+    async def adapter_lease(
+        self,
+        model: TrainableModel,
+        step: int,
+    ) -> AsyncIterator[None]:
+        async with pin_inference_step(model._storage_name(), step):
+            yield
 
     @asynccontextmanager
     async def exact_adapter_lease(
@@ -502,7 +540,7 @@ class TinkerNativeBackend:
         model: TrainableModel,
         step: int,
     ) -> AsyncIterator[None]:
-        async with pin_inference_step(model.name, step):
+        async with self.adapter_lease(model, step):
             yield
 
     async def _run_openai_server(
@@ -605,6 +643,8 @@ class TinkerNativeBackend:
                                 )
                             ]
                         ),
+                        prompt_token_ids=prompt_tokens,
+                        token_ids=list(sequence.tokens),
                     )
                 )
 
@@ -626,9 +666,17 @@ class TinkerNativeBackend:
 
         server_config = uvicorn.Config(app, host=host, port=port, log_level="error")
         server = uvicorn.Server(server_config)
-        await server.serve()
+        state.server = server
+        if state.server_shutdown_requested:
+            server.should_exit = True
+        try:
+            await server.serve()
+        finally:
+            state.server = None
 
-    def _crash_on_server_exit(self, task: asyncio.Task[None]) -> None:
+    def _crash_on_server_exit(
+        self, state: ModelState, task: asyncio.Task[None]
+    ) -> None:
         try:
             task.result()
         except asyncio.CancelledError:
@@ -636,6 +684,8 @@ class TinkerNativeBackend:
         except Exception as exc:
             print(f"OpenAI server crashed: {exc}")
         else:
+            if state.server_shutdown_requested:
+                return
             print("OpenAI server exited unexpectedly.")
         os._exit(1)
 
@@ -763,7 +813,7 @@ class TinkerNativeBackend:
             else {}
         )
         if "rank" not in training_client_args:
-            training_client_args["rank"] = 8
+            training_client_args["rank"] = (model.lora_config or {}).get("rank", 1)
         if "train_unembed" not in training_client_args:
             training_client_args["train_unembed"] = False
 
@@ -1015,9 +1065,10 @@ class TinkerNativeBackend:
 
         trainable_model = cast(TrainableModel, model)
 
-        if trainable_model.name not in self._model_state:
+        model_key = self._model_key(trainable_model)
+        if model_key not in self._model_state:
             raise RuntimeError(
-                f"Model '{trainable_model.name}' is not registered. "
+                f"Run '{trainable_model.run_name}' is not registered. "
                 "Call register() before forking."
             )
 
@@ -1047,7 +1098,7 @@ class TinkerNativeBackend:
             )
 
         # List source model's checkpoints
-        dest_state = self._model_state[trainable_model.name]
+        dest_state = self._model_state[model_key]
         training_paths, sampler_paths = await self._list_checkpoints(
             dest_state.rest_client, source_run_ids
         )
@@ -1116,6 +1167,6 @@ class TinkerNativeBackend:
 
         if verbose:
             print(
-                f"Fork complete. Model '{trainable_model.name}' is now at "
+                f"Fork complete. Run '{trainable_model.run_name}' is now at "
                 f"step {target_step}."
             )

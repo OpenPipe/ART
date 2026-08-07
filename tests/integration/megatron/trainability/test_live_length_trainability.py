@@ -776,8 +776,10 @@ async def run_length_trainability_async(
         backend_root=backend_root,
         extra_env=backend_env,
     ) as backend:
+        run_name = f"length-{uuid.uuid4().hex[:8]}"
         model = art.TrainableModel(
-            name=f"length-{uuid.uuid4().hex[:8]}",
+            name=run_name,
+            run_name=run_name,
             project="integration-tests",
             base_model=base_model,
             _internal_config=internal_config,
@@ -842,8 +844,8 @@ async def run_length_trainability_async(
                 num_rollout_workers=rollout_workers,
                 min_batch_size=1,
                 max_batch_size=1,
-                max_steps_off_policy=max_steps_off_policy,
             ),
+            max_steps_off_policy=max_steps_off_policy,
             learning_rate=_get_env_float(
                 "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
                 _default_learning_rate(base_model),

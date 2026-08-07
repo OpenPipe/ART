@@ -9,7 +9,11 @@ import os
 from typing import Any
 import uuid
 
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers
+from starlette.types import Receive, Scope, Send
+from vllm.entrypoints.serve.utils.server_utils import AuthenticationMiddleware
 
 from art_vllm_runtime.binary_routes import (
     PIPELINE_ROUTES_ENV,
@@ -20,6 +24,20 @@ from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
 ART_SERVING_PROTOCOL_VERSION = 3
 _runtime_state: dict[str, object] = {}
+
+
+class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
+    def __call__(self, scope: Scope, receive: Receive, send: Send):
+        path = scope.get("path", "").removeprefix(scope.get("root_path", ""))
+        if (
+            scope.get("type") in {"http", "websocket"}
+            and scope.get("method") != "OPTIONS"
+            and path.startswith("/art/")
+            and not self.verify_token(Headers(scope=scope))
+        ):
+            response = JSONResponse(content={"error": "Unauthorized"}, status_code=401)
+            return response(scope, receive, send)
+        return self.app(scope, receive, send)
 
 
 class _SetServedModelNameRequest(BaseModel):
@@ -168,6 +186,12 @@ def _patch_art_runtime_routes() -> None:
 
     def art_build_app(*build_args: object, **build_kwargs: object) -> FastAPI:
         app = original_build_app(*build_args, **build_kwargs)
+        from vllm import envs
+
+        args = app.state.args
+        tokens = [key for key in (args.api_key or [envs.VLLM_API_KEY]) if key]
+        if tokens:
+            app.add_middleware(_ArtAuthenticationMiddleware, tokens=tokens)
         router = APIRouter()
 
         def engine(request: Request):
@@ -257,6 +281,8 @@ def _patch_art_runtime_routes() -> None:
                 )
             with capture_routed_experts() as routes:
                 response = await create_chat_completion(request, raw_request)
+            if response is None:
+                return Response(status_code=499)
             if response.status_code >= HTTPStatus.BAD_REQUEST.value:
                 return response
             if not routes:

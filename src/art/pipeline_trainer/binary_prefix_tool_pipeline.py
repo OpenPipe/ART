@@ -148,7 +148,7 @@ def extract_guess(choice: Any) -> tuple[str | None, str]:
 
 
 def get_model_output_dir(model: art.TrainableModel) -> Path:
-    return Path(model.base_path) / model.project / "models" / model.name
+    return Path(model.base_path) / model.project / "models" / model.run_name
 
 
 def print_history_summary(model: art.TrainableModel, tail: int = 5) -> None:
@@ -159,12 +159,12 @@ def print_history_summary(model: art.TrainableModel, tail: int = 5) -> None:
 
     rows = pl.read_ndjson(str(history_path)).to_dicts()
 
-    train_rows = [row for row in rows if "reward/train" in row]
+    train_rows = [row for row in rows if "train/reward" in row]
     print("\nRecent training metrics:")
     for row in train_rows[-tail:]:
         step = row["step"]
-        reward = row["reward/train"]
-        std_dev = row["reward/train_std_dev"]
+        reward = row["train/reward"]
+        std_dev = row["train/reward_std_dev"]
         discarded = row["train/discarded_stale_groups"]
         off_policy = row["train/steps_off_policy"]
         print(
@@ -219,6 +219,7 @@ async def main() -> None:
 
     backend = TinkerNativeBackend(path=art_path)
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project=project,
         base_model=base_model,
@@ -335,8 +336,8 @@ async def main() -> None:
             num_rollout_workers=num_rollout_workers,
             min_batch_size=min_batch_size,
             max_batch_size=max_batch_size,
-            max_steps_off_policy=max_steps_off_policy,
         ),
+        max_steps_off_policy=max_steps_off_policy,
         learning_rate=float(os.environ.get("LEARNING_RATE", "1e-4")),
         log_interval_seconds=log_interval_seconds,
         eval_every_n_steps=eval_every_n_steps,

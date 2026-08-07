@@ -14,6 +14,8 @@ from openai.types.chat.chat_completion_message_tool_call import Function
 
 from .preprocessing.policy_spans import POLICY_TOKEN_SPANS_KEY
 
+ART_MOE_ROUTING_METADATA_KEY = "art_moe_routing"
+
 
 async def consume_chat_completion_stream(
     stream: AsyncStream[ChatCompletionChunk],
@@ -161,14 +163,14 @@ def update_chat_completion(
                         tool_call.function.arguments += (
                             tool_call_delta.function.arguments
                         )
-        if getattr(chunk_choice.delta, "reasoning", None):
-            if not hasattr(choice.message, "reasoning"):
-                setattr(choice.message, "reasoning", "")
+        for field in ("reasoning", "reasoning_content"):
+            value = getattr(chunk_choice.delta, field, None)
+            if not value:
+                continue
             setattr(
                 choice.message,
-                "reasoning",
-                getattr(choice.message, "reasoning")
-                + getattr(chunk_choice.delta, "reasoning"),
+                field,
+                (getattr(choice.message, field, None) or "") + value,
             )
     chat_completion.service_tier = chunk.service_tier
     chat_completion.system_fingerprint = chunk.system_fingerprint

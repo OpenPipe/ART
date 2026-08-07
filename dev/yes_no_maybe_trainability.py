@@ -282,6 +282,7 @@ async def main() -> None:
     os.makedirs(art_path, exist_ok=True)
     backend = make_backend(backend_name, art_path, in_process=in_process)
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project=project,
         base_model=base_model,

@@ -5,7 +5,7 @@ from typing import Any, cast
 import torch
 from torch._dynamo import config as dynamo_config
 import torch.distributed as dist
-from torch.nn.attention.flex_attention import AuxOutput, AuxRequest, BlockMask
+from torch.nn.attention.flex_attention import BlockMask
 import triton
 import triton.language as tl
 
@@ -16,6 +16,7 @@ from art.megatron.flex_attn.compiled import (
     get_sparse_compiled_flex_attention,
     normalize_flex_lse,
     normalize_sparse_block_size,
+    prepare_sparse_flex_attention,
     select_sparse_execution_family,
     sparse_compiled_flex_attention,
 )
@@ -23,6 +24,7 @@ from art.megatron.flex_attn.compiled import (
 from .block_mask import build_block_mask_from_context, prepare_block_mask_context
 from .comm import A2AVCommunicator
 from .range_ops import (
+    prepare_range_head_major_kernels,
     range_gather_head_major,
     range_reduce_sum_,
     range_reduce_sum_head_major_,
@@ -689,21 +691,21 @@ class FlexAttentionKernel:
                 triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
             )
         )
-        out, aux = cast(
-            tuple[torch.Tensor, AuxOutput],
-            compiled_flex_attention(
-                q,
-                k,
-                v,
-                block_mask=block_mask,
-                scale=scale,
-                enable_gqa=enable_gqa,
-                return_aux=AuxRequest(lse=True),
-            ),
+        prepare_sparse_flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            enable_gqa=enable_gqa,
         )
-        lse = aux.lse
-        if lse is None:
-            raise RuntimeError("Compiled flex attention did not return lse.")
+        out, lse = compiled_flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
         lse = normalize_flex_lse(lse, backend=backend)
         return out, lse
 
@@ -1022,9 +1024,9 @@ def _run_stage_attention(
         head_major=input_head_major,
     )
     if input_head_major:
-        q_flex = q_stage.unsqueeze(0)
-        k_flex = k_stage.unsqueeze(0)
-        v_flex = v_stage.unsqueeze(0)
+        q_flex = q_stage.unsqueeze(0).contiguous()
+        k_flex = k_stage.unsqueeze(0).contiguous()
+        v_flex = v_stage.unsqueeze(0).contiguous()
     else:
         q_flex = q_stage.permute(1, 0, 2).unsqueeze(0).contiguous()
         k_flex = k_stage.permute(1, 0, 2).unsqueeze(0).contiguous()
@@ -1888,11 +1890,14 @@ def _flatten_qkv(
     value: torch.Tensor,
     state: ArtContextParallelState,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return (
+    flattened = (
         flatten_valid_sequence_head_major(query, state.rank_plan.local_valid_lengths),
         flatten_valid_sequence_head_major(key, state.rank_plan.local_valid_lengths),
         flatten_valid_sequence_head_major(value, state.rank_plan.local_valid_lengths),
     )
+    for tensor in flattened:
+        prepare_range_head_major_kernels(tensor)
+    return flattened
 
 
 def _run_context_parallel_forward(

@@ -34,7 +34,7 @@ class TestMetricRoutingBaseline:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["reward/mean"] == 0.9
+        assert entry["train/reward/mean"] == 0.9
         assert entry["train/custom"] == 1.0
         assert entry["train/checkpoint/foo"] == 1.5
         assert entry["train/rewardish/value"] == 2.0
@@ -66,7 +66,9 @@ class TestMetricRoutingBaseline:
         assert define_calls == [
             (("training_step",), {}),
             (("sft/gradient_step",), {}),
-            (("reward/*",), {"step_metric": "training_step"}),
+            (("train/*",), {"step_metric": "training_step"}),
+            (("val/*",), {"step_metric": "training_step"}),
+            (("test/*",), {"step_metric": "training_step"}),
             (("loss/*",), {"step_metric": "training_step"}),
             (("objective/*",), {"step_metric": "training_step"}),
             (("sample_efficiency/*",), {"step_metric": "training_step"}),
@@ -77,7 +79,6 @@ class TestMetricRoutingBaseline:
             (("data/*",), {"step_metric": "training_step"}),
             (("discarded/*",), {"step_metric": "training_step"}),
             (("pipeline_settings/*",), {"step_metric": "training_step"}),
-            (("task/*",), {"step_metric": "training_step"}),
             (("vllm/*",), {"step_metric": "training_step"}),
             (("sft/*",), {"step_metric": "sft/gradient_step"}),
         ]

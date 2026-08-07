@@ -18,7 +18,7 @@ def get_models_dir(project_name: str, art_path: str | None = None) -> str:
 def get_model_dir(model: Model, art_path: str | None = None) -> str:
     if art_path is None:
         art_path = get_default_art_path()
-    return f"{art_path}/{model.project}/models/{model.name}"
+    return f"{art_path}/{model.project}/models/{model._storage_name()}"
 
 
 def get_output_dir_from_model_properties(

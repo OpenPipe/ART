@@ -45,6 +45,7 @@ async def main():
 
     backend = LocalBackend()
     model = art.TrainableModel(
+        run_name="007",
         name="007",
         project="yes-no-maybe-s",
         base_model="Qwen/Qwen3-0.6B",

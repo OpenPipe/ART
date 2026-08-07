@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
 import time
 from typing import Any
 import warnings
@@ -104,12 +105,13 @@ class PipelineAutotunerAttachment:
             self.tuner = PipelineAutotuner(
                 config=self.config,
                 settings=settings,
-                model_name=trainer.model.name,
+                model_name=trainer.model.run_name,
                 backend_name=type(trainer.backend).__name__,
                 packed_sequence_length=packed_sequence_length,
                 target_packed_sequences=target_packed_sequences,
                 inference_gpu_count=inference_gpu_count,
                 policy_age_limit_steps=policy_age_limit_steps,
+                starting_step=trainer.state.next_training_step,
                 rollout_worker_capacity=rollout_worker_capacity,
             )
             await self._wait_for_initial_serving_metrics()
@@ -298,6 +300,13 @@ class PipelineAutotunerAttachment:
             return None
         assert self.store is not None
         profile = self.store.load(self.config.profile)
+        if profile.settings.num_rollout_workers > self.config.max_rollout_workers:
+            raise ValueError(
+                "Autotuner profile requests "
+                f"num_rollout_workers={profile.settings.num_rollout_workers}, which "
+                "exceeds the active max_rollout_workers="
+                f"{self.config.max_rollout_workers}."
+            )
         if (
             rollout_worker_capacity is not None
             and profile.settings.num_rollout_workers > rollout_worker_capacity
@@ -358,6 +367,13 @@ class PipelineAutotunerAttachment:
         )
         return settings.model_copy(
             update={
+                "min_batch_size": max(
+                    settings.min_batch_size,
+                    math.ceil(
+                        settings.target_groups_per_step
+                        * self.config.freshness_min_batch_floor_fraction
+                    ),
+                ),
                 "num_rollout_workers": workers,
                 "queue_maxsize": recommended_queue_size(
                     target_groups_per_step=settings.target_groups_per_step,

@@ -14,14 +14,14 @@ cuda12 = [
     "torch==2.11.0 ; sys_platform == 'linux'",
     "torchaudio==2.11.0 ; sys_platform == 'linux'",
     "torchvision==0.26.0 ; sys_platform == 'linux'",
-    "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.23.0/vllm-0.23.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux'",
+    "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux'",
 ]
 cuda13 = [
     "nvidia-nccl-cu13==2.28.9 ; sys_platform == 'linux'",
     "torch==2.11.0 ; sys_platform == 'linux'",
     "torchaudio==2.11.0 ; sys_platform == 'linux'",
     "torchvision==0.26.0 ; sys_platform == 'linux'",
-    "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.23.0/vllm-0.23.0-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux'",
+    "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux'",
 ]
 
 [project.scripts]
@@ -50,9 +50,10 @@ allow-direct-references = true
 required-version = ">=0.6.15"
 conflicts = [[{ extra = "cuda12" }, { extra = "cuda13" }]]
 override-dependencies = [
-    "flashinfer-python==0.6.12",
+    "flashinfer-python==0.6.13",
     "numpy<2",
     "transformers==5.12.1",
+    "xgrammar==0.2.3",
 ]
 
 [tool.uv.sources]

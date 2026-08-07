@@ -1,27 +1,29 @@
-"""
-Parquet-based trajectory logging.
+"""Versioned Parquet persistence for trajectory groups."""
 
-This module provides efficient Parquet serialization for trajectory data,
-offering ~25x compression compared to JSONL and fast columnar queries.
-
-For legacy JSONL support and migration utilities, see trajectory_migration.py.
-"""
-
+from collections.abc import Mapping
 import json
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from openai.types.chat.chat_completion import Choice
-from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
+import pydantic
 
-from art.trajectories import Trajectory, TrajectoryGroup
+from art.openai import ART_MOE_ROUTING_METADATA_KEY
+from art.trajectories import LegacyHistory, Trajectory, TrajectoryGroup
+
+if TYPE_CHECKING:
+    import pyarrow as pa
+
+_FORMAT_VERSION = 2
+_JSON_VALUE = pydantic.TypeAdapter(Any)
 
 
-def _flatten_message(msg: dict) -> dict:
-    """Convert a message or Choice to flat parquet format."""
-    if "finish_reason" in msg:
-        # Choice format - extract inner message, mark as trainable
-        inner = msg.get("message", {})
+def _flatten_message(message: Mapping[str, object]) -> dict[str, object]:
+    """Convert a legacy message or Choice to the query-friendly v1 shape."""
+    if "finish_reason" in message:
+        inner = message.get("message", {})
+        if not isinstance(inner, Mapping):
+            inner = {}
         tool_calls = inner.get("tool_calls")
         return {
             "role": inner.get("role"),
@@ -30,98 +32,169 @@ def _flatten_message(msg: dict) -> dict:
             "tool_call_id": None,
             "trainable": True,
         }
-    else:
-        # Regular message
-        tool_calls = msg.get("tool_calls")
-        return {
-            "role": msg.get("role"),
-            "content": msg.get("content"),
-            "tool_calls": json.dumps(tool_calls) if tool_calls else None,
-            "tool_call_id": msg.get("tool_call_id"),
-            "trainable": False,
-        }
-
-
-def _unflatten_message(msg_dict: dict) -> dict:
-    """Convert flat parquet format back to message dict."""
-    result = {
-        "role": msg_dict["role"],
-        "content": msg_dict["content"],
+    tool_calls = message.get("tool_calls")
+    return {
+        "role": message.get("role"),
+        "content": message.get("content"),
+        "tool_calls": json.dumps(tool_calls) if tool_calls else None,
+        "tool_call_id": message.get("tool_call_id"),
+        "trainable": False,
     }
-    if msg_dict.get("tool_calls"):
-        result["tool_calls"] = json.loads(msg_dict["tool_calls"])
-    if msg_dict.get("tool_call_id"):
-        result["tool_call_id"] = msg_dict["tool_call_id"]
+
+
+def _unflatten_message(message: Mapping[str, object]) -> dict[str, object]:
+    """Convert the query-friendly v1 shape back to a legacy message."""
+    result = {"role": message["role"], "content": message["content"]}
+    if tool_calls := message.get("tool_calls"):
+        result["tool_calls"] = json.loads(str(tool_calls))
+    if tool_call_id := message.get("tool_call_id"):
+        result["tool_call_id"] = tool_call_id
     return result
 
 
-def write_trajectory_groups_parquet(
-    trajectory_groups: list[TrajectoryGroup],
-    path: str | Path,
-) -> None:
-    """
-    Write trajectory groups to a Parquet file with ZSTD compression.
+def _compact_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
-    Args:
-        trajectory_groups: List of TrajectoryGroup objects to serialize.
-        path: Output path for the Parquet file.
-    """
-    import pyarrow as pa
-    import pyarrow.parquet as pq
 
-    rows = []
-    for group_index, group in enumerate(trajectory_groups):
-        group_metadata = json.dumps(group.metadata) if group.metadata else None
-        group_metrics = json.dumps(group.metrics) if group.metrics else None
-        group_logs = group.logs if group.logs else None
-        for trajectory in group.trajectories:
-            if not isinstance(trajectory, Trajectory):
-                continue
-
-            # Flatten messages
-            messages = []
-            for message_or_choice in trajectory.messages_and_choices:
-                if isinstance(message_or_choice, dict):
-                    message = message_or_choice
-                elif isinstance(message_or_choice, Choice):
-                    message = message_or_choice.to_dict()
-                else:
-                    from litellm.types.utils import Choices
-
-                    if not isinstance(message_or_choice, Choices):
-                        raise TypeError(
-                            "trajectory messages must be dict, OpenAI Choice, or "
-                            "LiteLLM Choices objects"
-                        )
-                    message = {
-                        "finish_reason": message_or_choice.finish_reason,
-                        "index": message_or_choice.index,
-                        "message": message_or_choice.message.to_dict()
-                        if hasattr(message_or_choice.message, "to_dict")
-                        else message_or_choice.message,
-                    }
-                messages.append(_flatten_message(message))  # type: ignore
-
-            rows.append(
-                {
-                    "group_index": group_index,
-                    "group_metadata": group_metadata,
-                    "group_metrics": group_metrics,
-                    "group_logs": group_logs,
-                    "reward": trajectory.reward,
-                    "metrics": json.dumps(trajectory.metrics)
-                    if trajectory.metrics
-                    else None,
-                    "metadata": json.dumps(trajectory.metadata)
-                    if trajectory.metadata
-                    else None,
-                    "tools": json.dumps(trajectory.tools) if trajectory.tools else None,
-                    "logs": trajectory.logs if trajectory.logs else None,
-                    "messages": messages,
-                }
+def _choice_data(item: object) -> dict[str, Any] | None:
+    if isinstance(item, Choice):
+        raw = item.model_dump(
+            mode="json", exclude={ART_MOE_ROUTING_METADATA_KEY}, warnings="error"
+        )
+    elif (
+        isinstance(item, Mapping)
+        and {
+            "finish_reason",
+            "index",
+            "message",
+        }
+        <= item.keys()
+    ):
+        raw = dict(item)
+        try:
+            return Choice.model_validate(raw).model_dump(
+                mode="json", exclude={ART_MOE_ROUTING_METADATA_KEY}, warnings="error"
             )
+        except pydantic.ValidationError:
+            return None
+    else:
+        from litellm.types.utils import Choices
 
-    # Define schema
+        if not isinstance(item, Choices):
+            return None
+        raw = item.model_dump(mode="json", warnings="error")
+    return Choice.model_validate(raw).model_dump(
+        mode="json", exclude={ART_MOE_ROUTING_METADATA_KEY}, warnings="error"
+    )
+
+
+def _history_data(history: LegacyHistory) -> dict[str, Any]:
+    data = history.model_dump(
+        mode="json", exclude={"messages_and_choices"}, warnings="error"
+    )
+    if history.messages_and_choices:
+        data["messages_and_choices"] = [
+            choice
+            if (choice := _choice_data(item)) is not None
+            else _JSON_VALUE.dump_python(item, mode="json", warnings="error")
+            for item in history.messages_and_choices
+        ]
+    return data
+
+
+def _trajectory_data(trajectory: Trajectory) -> dict[str, Any]:
+    data = trajectory.model_dump(
+        mode="json",
+        exclude={"messages_and_choices", "additional_histories"},
+        exclude_computed_fields=True,
+        warnings="error",
+    )
+    if trajectory.messages_and_choices:
+        data["messages_and_choices"] = [
+            choice
+            if (choice := _choice_data(item)) is not None
+            else _JSON_VALUE.dump_python(item, mode="json", warnings="error")
+            for item in trajectory.messages_and_choices
+        ]
+    if trajectory.additional_histories:
+        data["additional_histories"] = [
+            _history_data(history) for history in trajectory.additional_histories
+        ]
+    return data
+
+
+def _restore_history(data: object) -> LegacyHistory:
+    if not isinstance(data, dict):
+        raise ValueError("Parquet additional history must be a JSON object")
+    restored = dict(data)
+    messages = restored.get("messages_and_choices", [])
+    if not isinstance(messages, list):
+        raise ValueError("Parquet history messages must be a list")
+    restored["messages_and_choices"] = [
+        Choice.model_validate(choice)
+        if (choice := _choice_data(item)) is not None
+        else item
+        for item in messages
+    ]
+    return LegacyHistory.model_validate(restored)
+
+
+def _restore_trajectory(payload: object) -> Trajectory:
+    data = _json_object(payload, field="trajectory_json")
+    messages = data.get("messages_and_choices", [])
+    if not isinstance(messages, list):
+        raise ValueError("Parquet trajectory messages must be a list")
+    data["messages_and_choices"] = [
+        Choice.model_validate(choice)
+        if (choice := _choice_data(item)) is not None
+        else item
+        for item in messages
+    ]
+    histories = data.get("additional_histories", [])
+    if not isinstance(histories, list):
+        raise ValueError("Parquet additional_histories must be a list")
+    data["additional_histories"] = [_restore_history(item) for item in histories]
+    return Trajectory.model_validate(data)
+
+
+def _legacy_messages(trajectory: Trajectory) -> list[dict[str, object]] | None:
+    if trajectory.exchanges:
+        return None
+    messages = []
+    for item in trajectory.messages_and_choices:
+        if isinstance(item, Choice):
+            message = item.to_dict()
+        elif isinstance(item, Mapping):
+            message = item
+        else:
+            from litellm.types.utils import Choices
+
+            if not isinstance(item, Choices):
+                return None
+            message = {
+                "finish_reason": item.finish_reason,
+                "index": item.index,
+                "message": (
+                    item.message.to_dict()
+                    if hasattr(item.message, "to_dict")
+                    else item.message
+                ),
+            }
+        try:
+            flattened = _flatten_message(message)
+        except (TypeError, ValueError):
+            return None
+        if flattened["content"] is not None and not isinstance(
+            flattened["content"], str
+        ):
+            return None
+        messages.append(flattened)
+    return messages
+
+
+def _schema() -> "pa.Schema":
+    import pyarrow as pa
+
     message_type = pa.struct(
         [
             ("role", pa.string()),
@@ -131,10 +204,15 @@ def write_trajectory_groups_parquet(
             ("trainable", pa.bool_()),
         ]
     )
-
-    schema = pa.schema(
+    return pa.schema(
         [
+            ("format_version", pa.int16()),
             ("group_index", pa.int64()),
+            ("trajectory_index", pa.int64()),
+            ("group_json", pa.large_string()),
+            ("trajectory_json", pa.large_string()),
+            # Stable materialized columns remain convenient for analytics. The JSON
+            # payloads above are authoritative and preserve the complete models.
             ("group_metadata", pa.string()),
             ("group_metrics", pa.string()),
             ("group_logs", pa.list_(pa.string())),
@@ -144,114 +222,293 @@ def write_trajectory_groups_parquet(
             ("tools", pa.string()),
             ("logs", pa.list_(pa.string())),
             ("messages", pa.list_(message_type)),
-        ]
+        ],
+        metadata={b"art.trajectory_parquet.version": str(_FORMAT_VERSION).encode()},
     )
 
-    if not rows:
-        table = pa.table({name: [] for name in schema.names}, schema=schema)
-        pq.write_table(table, path, compression="zstd")
-        return
 
-    table = pa.Table.from_pylist(rows, schema=schema)
+def write_trajectory_groups_parquet(
+    trajectory_groups: list[TrajectoryGroup],
+    path: str | Path,
+) -> None:
+    """Persist complete trajectory groups with Zstd-compressed Parquet."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows: list[dict[str, object]] = []
+    for group_index, group in enumerate(trajectory_groups):
+        group_data = group.model_dump(
+            mode="json", exclude={"trajectories"}, warnings="error"
+        )
+        common: dict[str, object] = {
+            "format_version": _FORMAT_VERSION,
+            "group_index": group_index,
+            "group_json": _compact_json(group_data),
+            "group_metadata": (
+                _compact_json(group_data["metadata"])
+                if group_data.get("metadata")
+                else None
+            ),
+            "group_metrics": (
+                _compact_json(group_data["metrics"])
+                if group_data.get("metrics")
+                else None
+            ),
+            "group_logs": group_data.get("logs") or None,
+        }
+        if not group.trajectories:
+            rows.append(
+                {
+                    **common,
+                    "trajectory_index": None,
+                    "trajectory_json": None,
+                    "reward": None,
+                    "metrics": None,
+                    "metadata": None,
+                    "tools": None,
+                    "logs": None,
+                    "messages": None,
+                }
+            )
+            continue
+
+        for trajectory_index, trajectory in enumerate(group.trajectories):
+            trajectory_data = _trajectory_data(trajectory)
+            rows.append(
+                {
+                    **common,
+                    "trajectory_index": trajectory_index,
+                    "trajectory_json": _compact_json(trajectory_data),
+                    "reward": trajectory.reward,
+                    "metrics": (
+                        _compact_json(trajectory_data["metrics"])
+                        if trajectory_data.get("metrics")
+                        else None
+                    ),
+                    "metadata": (
+                        _compact_json(trajectory_data["metadata"])
+                        if trajectory_data.get("metadata")
+                        else None
+                    ),
+                    "tools": (
+                        _compact_json(trajectory_data["tools"])
+                        if trajectory_data.get("tools")
+                        else None
+                    ),
+                    "logs": trajectory_data.get("logs") or None,
+                    "messages": _legacy_messages(trajectory),
+                }
+            )
+
+    schema = _schema()
+    table = (
+        pa.Table.from_pylist(rows, schema=schema)
+        if rows
+        else pa.table({name: [] for name in schema.names}, schema=schema)
+    )
     pq.write_table(table, path, compression="zstd")
 
 
-def read_trajectory_groups_parquet(path: str | Path) -> list[TrajectoryGroup]:
-    """
-    Read trajectory groups from a Parquet file.
+def _json_object(payload: object, *, field: str) -> dict[str, Any]:
+    if not isinstance(payload, (str, bytes, bytearray)):
+        raise ValueError(f"Parquet {field} must be JSON text")
+    try:
+        value = json.loads(payload)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"Parquet {field} contains invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"Parquet {field} must contain a JSON object")
+    return value
 
-    Args:
-        path: Path to the Parquet file.
 
-    Returns:
-        List of TrajectoryGroup objects.
-    """
-    import duckdb
+def _read_v2(rows: list[dict[str, object]]) -> list[TrajectoryGroup]:
+    grouped: dict[int, list[dict[str, object]]] = {}
+    for row in rows:
+        version = row.get("format_version")
+        if version != _FORMAT_VERSION:
+            raise ValueError(f"Unsupported trajectory Parquet version: {version!r}")
+        group_index = row.get("group_index")
+        if not isinstance(group_index, int) or isinstance(group_index, bool):
+            raise ValueError("Parquet group_index must be an integer")
+        grouped.setdefault(group_index, []).append(row)
 
-    con = duckdb.connect(":memory:")
-    rows = con.execute(f"SELECT * FROM '{path}' ORDER BY group_index").fetchall()
-    columns = [desc[0] for desc in con.description]
+    result: list[TrajectoryGroup] = []
+    if sorted(grouped) != list(range(len(grouped))):
+        raise ValueError("Parquet group indexes are duplicate or non-contiguous")
+    for group_index in sorted(grouped):
+        group_rows = grouped[group_index]
+        group_payloads = {row.get("group_json") for row in group_rows}
+        if len(group_payloads) != 1:
+            raise ValueError(f"Parquet group {group_index} has conflicting metadata")
+        group_data = _json_object(group_payloads.pop(), field="group_json")
+        if "trajectories" in group_data:
+            raise ValueError("Parquet group_json must not contain trajectories")
 
-    groups_dict: dict[int, list[Trajectory]] = {}
-    group_metadata_by_index: dict[int, dict[str, Any]] = {}
-    group_metrics_by_index: dict[int, dict[str, Any]] = {}
-    group_logs_by_index: dict[int, list[str]] = {}
+        indexed: list[tuple[int, Trajectory]] = []
+        sentinel_count = 0
+        for row in group_rows:
+            trajectory_index = row.get("trajectory_index")
+            trajectory_json = row.get("trajectory_json")
+            if trajectory_index is None:
+                if trajectory_json is not None:
+                    raise ValueError("Parquet group sentinel contains a trajectory")
+                sentinel_count += 1
+                continue
+            if not isinstance(trajectory_index, int) or isinstance(
+                trajectory_index, bool
+            ):
+                raise ValueError("Parquet trajectory_index must be an integer")
+            if not isinstance(trajectory_json, (str, bytes, bytearray)):
+                raise ValueError("Parquet trajectory_json must be JSON text")
+            indexed.append((trajectory_index, _restore_trajectory(trajectory_json)))
 
-    def _load_json_payload(payload: object | None) -> dict[str, Any]:
-        if payload is None:
-            return {}
-        if isinstance(payload, dict):
-            return cast(dict[str, Any], payload)
-        if isinstance(payload, (str, bytes, bytearray)):
-            if not payload:
-                return {}
-            try:
-                return json.loads(payload)
-            except (json.JSONDecodeError, TypeError):
-                return {}
+        indexed.sort(key=lambda item: item[0])
+        if [index for index, _ in indexed] != list(range(len(indexed))):
+            raise ValueError(
+                f"Parquet group {group_index} has duplicate or missing trajectories"
+            )
+        if indexed and sentinel_count:
+            raise ValueError(f"Parquet group {group_index} mixes data and a sentinel")
+        if not indexed and sentinel_count != 1:
+            raise ValueError(f"Parquet group {group_index} has no valid group sentinel")
+        result.append(
+            TrajectoryGroup.model_validate(
+                {**group_data, "trajectories": [item for _, item in indexed]}
+            )
+        )
+    return result
+
+
+def _load_legacy_object(payload: object | None) -> dict[str, Any]:
+    if payload is None:
         return {}
+    if isinstance(payload, dict):
+        return cast(dict[str, Any], payload)
+    if isinstance(payload, (str, bytes, bytearray)) and payload:
+        try:
+            value = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
+
+
+def _read_v1(rows: list[dict[str, object]]) -> list[TrajectoryGroup]:
+    groups: dict[int, list[Trajectory]] = {}
+    group_metadata: dict[int, dict[str, Any]] = {}
+    group_metrics: dict[int, dict[str, Any]] = {}
+    group_logs: dict[int, list[str]] = {}
 
     for row in rows:
-        row_dict = dict(zip(columns, row))
-
-        if row_dict.get("reward") is None and row_dict.get("messages") is None:
+        if row.get("reward") is None and row.get("messages") is None:
             continue
-
-        group_index = row_dict.get("group_index", 0)
-        if group_index not in group_metadata_by_index:
-            group_metadata_by_index[group_index] = _load_json_payload(
-                row_dict.get("group_metadata")
-            )
-        if group_index not in group_metrics_by_index:
-            group_metrics_by_index[group_index] = _load_json_payload(
-                row_dict.get("group_metrics")
-            )
-        if group_index not in group_logs_by_index:
-            raw_group_logs = row_dict.get("group_logs")
-            if isinstance(raw_group_logs, (list, tuple)):
-                group_logs_by_index[group_index] = [
-                    str(item) for item in raw_group_logs
-                ]
-            elif raw_group_logs is None:
-                group_logs_by_index[group_index] = []
-            else:
-                group_logs_by_index[group_index] = [str(raw_group_logs)]
-
-        # Convert messages
-        messages_and_choices = []
-        for msg in row_dict.get("messages") or []:
-            # Handle tuple format from DuckDB
-            if not isinstance(msg, dict):
-                msg = {
-                    "role": msg[0],
-                    "content": msg[1],
-                    "tool_calls": msg[2],
-                    "tool_call_id": msg[3],
-                    "trainable": msg[4],
-                }
-            messages_and_choices.append(_unflatten_message(msg))
-
-        trajectory = Trajectory(
-            messages_and_choices=messages_and_choices,
-            reward=row_dict["reward"],
-            metrics=json.loads(row_dict["metrics"]) if row_dict.get("metrics") else {},
-            metadata=json.loads(row_dict["metadata"])
-            if row_dict.get("metadata")
-            else {},
-            logs=row_dict.get("logs") or [],
+        raw_group_index = row.get("group_index", 0)
+        if not isinstance(raw_group_index, int) or isinstance(raw_group_index, bool):
+            raise ValueError("Legacy Parquet group_index must be an integer")
+        group_index = raw_group_index
+        group_metadata.setdefault(
+            group_index, _load_legacy_object(row.get("group_metadata"))
+        )
+        group_metrics.setdefault(
+            group_index, _load_legacy_object(row.get("group_metrics"))
+        )
+        raw_logs = row.get("group_logs")
+        group_logs.setdefault(
+            group_index,
+            [str(item) for item in raw_logs]
+            if isinstance(raw_logs, (list, tuple))
+            else ([] if raw_logs is None else [str(raw_logs)]),
         )
 
-        if group_index not in groups_dict:
-            groups_dict[group_index] = []
-        groups_dict[group_index].append(trajectory)
+        raw_messages = row.get("messages")
+        if raw_messages is None:
+            raw_messages = []
+        if not isinstance(raw_messages, (list, tuple)):
+            raise ValueError("Legacy Parquet messages must be a list")
+        messages = []
+        for raw_message in raw_messages:
+            if isinstance(raw_message, Mapping):
+                message = {str(key): value for key, value in raw_message.items()}
+            else:
+                if not isinstance(raw_message, (list, tuple)):
+                    raise ValueError("Legacy Parquet message must be a struct")
+                message = {
+                    "role": raw_message[0],
+                    "content": raw_message[1],
+                    "tool_calls": raw_message[2],
+                    "tool_call_id": raw_message[3],
+                    "trainable": raw_message[4],
+                }
+            messages.append(_unflatten_message(message))
+        reward = row.get("reward")
+        if not isinstance(reward, (int, float)) or isinstance(reward, bool):
+            raise ValueError("Legacy Parquet reward must be numeric")
+        raw_trajectory_logs = row.get("logs")
+        if raw_trajectory_logs is None:
+            trajectory_logs = []
+        elif isinstance(raw_trajectory_logs, (list, tuple)):
+            trajectory_logs = [str(item) for item in raw_trajectory_logs]
+        else:
+            raise ValueError("Legacy Parquet logs must be a list")
+        groups.setdefault(group_index, []).append(
+            Trajectory(
+                messages_and_choices=messages,
+                reward=float(reward),
+                metrics=_load_legacy_object(row.get("metrics")),
+                metadata=_load_legacy_object(row.get("metadata")),
+                logs=trajectory_logs,
+            )
+        )
 
     return [
         TrajectoryGroup(
-            trajectories=groups_dict[idx],
+            trajectories=groups[index],
             exceptions=[],
-            metadata=group_metadata_by_index.get(idx, {}),
-            metrics=group_metrics_by_index.get(idx, {}),
-            logs=group_logs_by_index.get(idx, []),
+            metadata=group_metadata.get(index, {}),
+            metrics=group_metrics.get(index, {}),
+            logs=group_logs.get(index, []),
         )
-        for idx in sorted(groups_dict.keys())
+        for index in sorted(groups)
     ]
+
+
+def read_trajectory_groups_parquet(path: str | Path) -> list[TrajectoryGroup]:
+    """Read exact v2 trajectory groups or legacy v1 files."""
+    import duckdb
+    import pyarrow.parquet as pq
+
+    schema = pq.read_schema(path)
+    metadata = schema.metadata or {}
+    raw_version = metadata.get(b"art.trajectory_parquet.version")
+    try:
+        file_version = int(raw_version) if raw_version is not None else None
+    except ValueError as exc:
+        raise ValueError("Invalid trajectory Parquet version metadata") from exc
+    if file_version not in {None, _FORMAT_VERSION}:
+        raise ValueError(f"Unsupported trajectory Parquet version: {file_version}")
+    has_version_column = "format_version" in schema.names
+    has_canonical_columns = bool(
+        {"group_json", "trajectory_json"}.intersection(schema.names)
+    )
+    if file_version == _FORMAT_VERSION and not has_version_column:
+        raise ValueError("Versioned trajectory Parquet is missing format_version")
+    if has_canonical_columns and not has_version_column:
+        raise ValueError("Canonical trajectory Parquet is missing its version marker")
+    if (
+        has_version_column
+        and file_version is None
+        and not pq.read_metadata(path).num_rows
+    ):
+        raise ValueError(
+            "Empty versioned trajectory Parquet is missing version metadata"
+        )
+
+    with duckdb.connect(":memory:") as connection:
+        result = connection.execute("SELECT * FROM read_parquet(?)", [str(path)])
+        rows = [
+            dict(zip((column[0] for column in result.description), row))
+            for row in result.fetchall()
+        ]
+    if not rows:
+        return []
+    return _read_v2(rows) if has_version_column else _read_v1(rows)
