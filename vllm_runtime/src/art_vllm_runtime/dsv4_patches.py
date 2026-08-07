@@ -4,6 +4,8 @@ import functools
 import importlib
 from typing import Any
 
+import torch
+
 
 def apply_dsv4_vllm_runtime_patches() -> None:
     patch_layerwise_reload_shadow_attrs()
