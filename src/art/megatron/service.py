@@ -322,7 +322,7 @@ class MegatronService:
         staging_dir = self._staging_lora_dir(step)
         if os.path.exists(staging_dir):
             shutil.rmtree(staging_dir)
-        shutil.copytree(source_path, staging_dir)
+        self._ensure_lora_adapter_config(staging_dir, source_path=source_path)
         return staging_dir
 
     def _clear_wake_lock(self) -> None:
@@ -1167,6 +1167,7 @@ class MegatronService:
                         MegatronMergedTrainingJob(
                             step=next_step,
                             source_policy_step=self._latest_step,
+                            source_adapter_path=lora_path,
                             training_session_id=self._training_session_id,
                             lora_path=staging_lora_path,
                             allow_unvalidated_arch=self._allow_unvalidated_arch,
@@ -1191,6 +1192,7 @@ class MegatronService:
                     job = MegatronTrainingJob(
                         step=next_step,
                         source_policy_step=self._latest_step,
+                        source_adapter_path=lora_path,
                         training_session_id=self._training_session_id,
                         lora_path=staging_lora_path,
                         allow_unvalidated_arch=self._allow_unvalidated_arch,
@@ -1238,6 +1240,7 @@ class MegatronService:
             job = MegatronTrainingJob(
                 step=next_step,
                 source_policy_step=self._latest_step,
+                source_adapter_path=lora_path,
                 training_session_id=self._training_session_id,
                 lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
@@ -1316,6 +1319,8 @@ class MegatronService:
                 config.batch_size if isinstance(config.batch_size, int) else None
             )
             job = MegatronSFTTrainingJob(
+                source_policy_step=self._latest_step,
+                source_adapter_path=lora_path,
                 lora_path=staging_lora_path,
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
                 optimizer_state_path=self._get_optimizer_state_path(),

@@ -33,6 +33,7 @@ class MergedWeightTransferSpec(BaseModel):
 class _MegatronTrainingJobBase(BaseModel):
     step: int = Field(default=0, ge=0)
     source_policy_step: int = Field(ge=0)
+    source_adapter_path: str
     training_session_id: str
     lora_path: str
     allow_unvalidated_arch: bool = False
@@ -64,6 +65,8 @@ class MegatronSyncJob(BaseModel):
 
 class MegatronSFTTrainingJob(BaseModel):
     kind: Literal["sft"] = "sft"
+    source_policy_step: int = Field(ge=0)
+    source_adapter_path: str
     lora_path: str
     allow_unvalidated_arch: bool = False
     optimizer_state_path: str

@@ -857,16 +857,11 @@ def run_megatron_sft_job(
 
     try:
         configure_moe_routing_replay(runtime)
-        adapter_step = int(Path(job.lora_path).name)
-        if adapter_step <= 0:
-            raise RuntimeError(
-                f"Invalid managed SFT adapter staging path: {job.lora_path}"
-            )
         adapter_dtypes = _load_lora_and_optimizer(
             runtime,
-            lora_path=job.lora_path,
+            lora_path=job.source_adapter_path,
             optimizer_state_path=job.optimizer_state_path,
-            adapter_step=adapter_step - 1,
+            adapter_step=job.source_policy_step,
         )
 
         assert runtime.optimizer is not None
@@ -992,11 +987,11 @@ def run_megatron_sft_job(
             adapter_dtypes=adapter_dtypes,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
-            step=adapter_step,
+            step=job.source_policy_step + 1,
             optimizer_save_interval=1,
-            final_training_step=adapter_step,
+            final_training_step=job.source_policy_step + 1,
             adapter_ready=lambda: _write_job_event(
-                job.log_path, LORA_READY_EVENT, step=adapter_step
+                job.log_path, LORA_READY_EVENT, step=job.source_policy_step + 1
             ),
         )
     finally:
@@ -1130,7 +1125,7 @@ def _prepare_rl_training_state(
 
     _load_adapter_into_model(
         runtime.model,
-        job.source_adapter_path if isinstance(job, TrainJobSpec) else job.lora_path,
+        job.source_adapter_path,
         runtime.rank,
         handler=runtime.model_support_handler,
         optimizer=runtime.optimizer,
@@ -1142,9 +1137,7 @@ def _prepare_rl_training_state(
     _load_optimizer(
         runtime,
         optimizer_state_path=job.optimizer_state_path,
-        adapter_path=(
-            job.source_adapter_path if isinstance(job, TrainJobSpec) else job.lora_path
-        ),
+        adapter_path=job.source_adapter_path,
         adapter_step=job.source_policy_step,
         allow_missing=(
             job.source_policy_step == 0
@@ -1156,9 +1149,7 @@ def _prepare_rl_training_state(
     # Serialize the live LoRA dtype instead of perpetuating a source checkpoint's
     # PEFT-upcast FP32 dtype.
     runtime.adapter_export_dtypes = {}
-    runtime.adapter_export_config = load_adapter_config(
-        job.source_adapter_path if isinstance(job, TrainJobSpec) else job.lora_path
-    )
+    runtime.adapter_export_config = load_adapter_config(job.source_adapter_path)
     runtime.resident_training_session_id = job.training_session_id
     runtime.resident_policy_step = job.source_policy_step
     runtime.optimizer_state_loaded = True
@@ -2055,9 +2046,7 @@ def _prepare_kl_reference_logprobs(
             "provide kl_ref_adapter_path."
         )
 
-    current_adapter_path = (
-        job.source_adapter_path if isinstance(job, TrainJobSpec) else job.lora_path
-    )
+    current_adapter_path = job.source_adapter_path
     adapter_swapped = os.path.abspath(ref_adapter_path) != os.path.abspath(
         current_adapter_path
     )
