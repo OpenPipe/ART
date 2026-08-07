@@ -34,4 +34,8 @@ def test_run_packing_invariance_qwen35() -> None:
         scenario.repeated_position_key_count > 0 for scenario in report.scenarios
     )
     assert all(scenario.completion_pair_count > 0 for scenario in report.scenarios)
-    assert all(scenario.logits_mean_abs_pct <= 0.5 for scenario in report.scenarios)
+    assert report.precision == "fp32"
+    assert all(
+        scenario.logits_mean_abs_pct <= scenario.logits_mean_abs_pct_limit
+        for scenario in report.scenarios
+    )

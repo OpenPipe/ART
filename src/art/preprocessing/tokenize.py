@@ -7,6 +7,7 @@ from itertools import takewhile
 import json
 import math
 import random
+import re
 from typing import TYPE_CHECKING, Any, Generator, Literal, Protocol, cast
 
 import numpy as np
@@ -332,7 +333,13 @@ def _normalize_tool_call_arguments_for_chat_template(
 ) -> list[dict[str, Any]]:
     chat_template = tokenizer.chat_template
     assert isinstance(chat_template, str)
-    if "tool_call.arguments|items" not in chat_template:
+    aliases = re.findall(
+        r"{%\s*set\s+([A-Za-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*\.)+arguments\s*%}",
+        chat_template,
+    )
+    if "tool_call.arguments|items" not in chat_template and not any(
+        f"{alias}.items()" in chat_template for alias in aliases
+    ):
         return messages
 
     normalized_messages: list[dict[str, Any]] = []

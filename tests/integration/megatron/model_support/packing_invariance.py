@@ -47,9 +47,7 @@ from .prefix_tree_workloads import build_complex_prefix_tree_packed_tensors
 
 allow_fp32_grouped_gemm_fallback_for_model_support_tests()
 
-# Qwen3.5's single packed forward versus many shorter references has measured
-# up to 0.24% shape-dependent numerical drift. Use the standard 0.5% fp32 gate.
-_LOGITS_MEAN_ABS_PCT_LIMIT = 0.5
+_LOGITS_MEAN_ABS_PCT_LIMITS = {"fp32": 0.5, "bf16": 3.0}
 _DEBUG_ENV = "ART_PACKING_INVARIANCE_DEBUG"
 PACKING_INVARIANCE_REPORT_FILENAME = "report.json"
 PACKING_INVARIANCE_ARTIFACT_SUITE_NAME = "Megatron packing-invariance artifacts"
@@ -165,6 +163,7 @@ class PackingInvarianceScenario(BaseModel):
     completion_pair_count: int
     logits_equivalent: bool
     logits_mean_abs_pct: float
+    logits_mean_abs_pct_limit: float
     logits_max_abs_diff: float
     matched: bool
 
@@ -174,6 +173,7 @@ class PackingInvarianceReport(BaseModel):
     base_model: str
     output_dir: str
     num_layers: int
+    precision: str
     scenarios: list[PackingInvarianceScenario] = Field(default_factory=list)
 
 
@@ -413,6 +413,7 @@ def _logits_equivalence_check(
     position_ids: torch.Tensor,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
+    mean_abs_pct_limit: float,
 ) -> tuple[int, bool, float, float]:
     _debug_log(
         "logits_check start "
@@ -522,12 +523,13 @@ def _logits_equivalence_check(
         mean_abs = logits_abs_sum / max(logits_numel, 1)
         typical_abs = logits_ref_abs_sum / max(logits_numel, 1)
         logits_mean_abs_pct = (mean_abs / (typical_abs + 1e-12)) * 100.0
-        logits_equivalent = logits_mean_abs_pct <= _LOGITS_MEAN_ABS_PCT_LIMIT
+        logits_equivalent = logits_mean_abs_pct <= mean_abs_pct_limit
         _debug_log(
             "logits_check done "
             f"pairs={completion_pair_count} "
             f"equivalent={logits_equivalent} "
             f"mean_abs_pct={logits_mean_abs_pct:.6f} "
+            f"limit={mean_abs_pct_limit:.6f} "
             f"max_abs_diff={logits_max_abs_diff:.6f}"
         )
         return (
@@ -652,13 +654,6 @@ def _run_packing_invariance_worker(
             False,
         ),
     ]
-    report = PackingInvarianceReport(
-        git=git,
-        base_model=base_model,
-        output_dir=str(output_dir),
-        num_layers=num_layers,
-    )
-
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for packing invariance validation")
 
@@ -668,6 +663,14 @@ def _run_packing_invariance_worker(
     )
     handler = get_model_support_handler_for_spec(spec)
     precision = handler.correctness_precision()
+    mean_abs_pct_limit = _LOGITS_MEAN_ABS_PCT_LIMITS[precision]
+    report = PackingInvarianceReport(
+        git=git,
+        base_model=base_model,
+        output_dir=str(output_dir),
+        num_layers=num_layers,
+        precision=precision,
+    )
     case_config = OracleCaseConfig(
         base_model=base_model,
         precision=precision,
@@ -781,6 +784,7 @@ def _run_packing_invariance_worker(
                     position_ids=position_ids,
                     group_ids=group_ids,
                     parent_ids=parent_ids,
+                    mean_abs_pct_limit=mean_abs_pct_limit,
                 ),
                 device=input_ids.device,
             )
@@ -817,6 +821,7 @@ def _run_packing_invariance_worker(
                     completion_pair_count=completion_pair_count,
                     logits_equivalent=logits_equivalent,
                     logits_mean_abs_pct=logits_mean_abs_pct,
+                    logits_mean_abs_pct_limit=mean_abs_pct_limit,
                     logits_max_abs_diff=logits_max_abs_diff,
                     matched=matched,
                 )

@@ -5,7 +5,10 @@ import pydantic
 import pytest
 from transformers.tokenization_utils_base import BatchEncoding
 
-from art.preprocessing.tokenize import tokenize_sft_batch
+from art.preprocessing.tokenize import (
+    _normalize_tool_call_arguments_for_chat_template,
+    tokenize_sft_batch,
+)
 from art.trajectories import Trajectory
 from art.types import MessagesAndChoices, TrainSFTConfig
 
@@ -166,6 +169,37 @@ class _NonPrefixStableTokenizer(_LastAssistantTokenizer):
         ):
             return f"<changed>{rendered}"
         return rendered
+
+
+def test_glm_chat_template_normalizes_aliased_tool_call_arguments() -> None:
+    tokenizer = _FakeTokenizer()
+    tokenizer.chat_template = (
+        "{% for tc in message.tool_calls %}"
+        "{% set _args = tc.function.arguments %}"
+        "{% for name, value in _args.items() %}{{ name }}{{ value }}{% endfor %}"
+        "{% endfor %}"
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "answer",
+                        "arguments": '{"value": "yes"}',
+                    }
+                }
+            ],
+        }
+    ]
+
+    normalized = _normalize_tool_call_arguments_for_chat_template(
+        tokenizer,
+        messages,
+    )
+
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {"value": "yes"}
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == ('{"value": "yes"}')
 
 
 def test_tokenize_sft_batch_masks_response_tokens_without_unsloth_import() -> None:
