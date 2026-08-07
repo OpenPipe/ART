@@ -1631,7 +1631,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     age = float(current_step - initial)
                 ages.append(float(age))
             ready = float(snapshot.ready_groups)
-            depth = float(len(snapshot.items))
+            depth = ready
             maxsize = float(snapshot.max_ready_groups)
             put_waiting = float(self._output_queue.put_waiters)
             capacity_metrics = {

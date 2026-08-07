@@ -477,7 +477,7 @@ class _QueueEntry:
 
 
 class TrajectoryQueueStore:
-    """Bounded FIFO and consumer-lease owner for trajectory-group references."""
+    """Bounded ready FIFO and consumer-lease owner for trajectory references."""
 
     def __init__(
         self,
@@ -532,7 +532,7 @@ class TrajectoryQueueStore:
                 return TrajectoryEnqueueResult(status="accepted")
             raise TrajectoryLeaseError("trajectory result lease changed while queued")
         if (
-            len(self._entries) >= self.max_ready_groups
+            len(self._ready) >= self.max_ready_groups
             or self._used_records + records > self.capacity_records
             or self._used_bytes + byte_count > self.capacity_bytes
         ):
