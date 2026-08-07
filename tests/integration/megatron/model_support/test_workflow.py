@@ -122,6 +122,7 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert engine_args["load_format"] == "dummy"
         hf_overrides = cast(dict[str, object], engine_args["hf_overrides"])
         assert hf_overrides["num_hidden_layers"] == 4
+        assert hf_overrides["num_hash_layers"] == 0
     assert resources.merged_vllm_serving is not None
     assert resources.merged_vllm_serving.vllm is not None
     assert resources.merged_vllm_serving.vllm.engine_args()["kv_cache_dtype"] == "fp8"
@@ -205,6 +206,14 @@ def test_qwen_moe_reduced_serving_uses_plain_expert_storage(handler_key: str) ->
         assert engine_args["enforce_eager"] is True
         assert engine_args["max_model_len"] == 1024
         assert engine_args["moe_backend"] == "triton"
+
+
+def test_gpt_oss_reduced_serving_has_bounded_context() -> None:
+    resources = HANDLER_WORKFLOW_RESOURCES["gpt_oss_moe"]
+    for stage in (resources.merged_vllm_serving, resources.native_vllm_lora):
+        assert stage is not None
+        assert stage.vllm is not None
+        assert stage.vllm.engine_args()["max_model_len"] == 1024
 
 
 def test_inspect_architecture_for_workflow_uses_minimal_topology(monkeypatch) -> None:

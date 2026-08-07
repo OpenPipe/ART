@@ -144,6 +144,7 @@ _DSV4_MEGATRON_ENV = {
 }
 _DSV4_HF_OVERRIDES = {
     "num_hidden_layers": _DSV4_REPRESENTATIVE_NUM_LAYERS,
+    "num_hash_layers": 0,
     "compress_ratios": _DSV4_REPRESENTATIVE_COMPRESS_RATIOS,
     "layer_types": _DSV4_REPRESENTATIVE_LAYER_TYPES,
     "mlp_layer_types": _DSV4_REPRESENTATIVE_MLP_LAYER_TYPES,
@@ -250,6 +251,7 @@ _GPT_OSS_REDUCED_VLLM = VllmWorkflowResources(
     extra_engine_args={
         "enforce_eager": True,
         "load_format": "dummy",
+        "max_model_len": 1024,
         "moe_backend": "triton",
     },
 )
