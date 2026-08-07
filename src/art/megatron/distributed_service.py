@@ -17,6 +17,7 @@ import uuid
 import httpx
 
 from art import dev, types
+from art.adapter_leases import in_flight_lora_name
 from art.dev.get_model_config import default_target_modules
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
 from art.distributed.specs import ModelServiceSpec, NixlTransportSpec, TrainerMeshSpec
@@ -279,6 +280,11 @@ class DistributedMegatronService:
     @property
     def rollout_weight_update_mode(self) -> str:
         return self.config.get("rollout_weight_update_mode", "step_lora")
+
+    def _serving_lora_name(self, step: int) -> str:
+        if self.rollout_weight_update_mode == "in_flight_lora":
+            return in_flight_lora_name(self.model_name)
+        return f"{self.model_name}@{step}"
 
     @property
     def _allow_unvalidated_arch(self) -> bool:
@@ -976,7 +982,7 @@ class DistributedMegatronService:
                 "distributed Megatron currently requires LoRA rollout serving"
             )
         template = ReplicaLaunchTemplate(
-            served_model_name=f"{self.model_name}@{step}",
+            served_model_name=self._serving_lora_name(step),
             lora_path=lora_path,
             engine_args=self._engine_args(config),
             server_args=self._server_args(config),
@@ -1096,10 +1102,10 @@ class DistributedMegatronService:
             )
         checkpoint = serving_adapter.identity
         generation_id = serving_adapter.generation_id
-        current_lora_name = self._current_lora_name or (
-            f"{self.model_name}@{serving_step}"
+        current_lora_name = self._current_lora_name or self._serving_lora_name(
+            serving_step
         )
-        bootstrap_name = f"{self.model_name}@{serving_step}"
+        bootstrap_name = self._serving_lora_name(serving_step)
         base_url = service.leader_endpoint.url
         exact_steps = tuple(sorted(self._loaded_exact_adapter_steps))
         try:
@@ -1260,7 +1266,7 @@ class DistributedMegatronService:
         name = (
             f"{self.model_name}:eval@{step}"
             if exact and self.rollout_weight_update_mode == "in_flight_lora"
-            else f"{self.model_name}@{step}"
+            else self._serving_lora_name(step)
         )
         path = map_checkpoint_path_for_vllm(self.config, checkpoint)
         in_flight = (
@@ -1273,8 +1279,8 @@ class DistributedMegatronService:
         )
         payload = (
             {
-                "model_name": f"{self.model_name}@{step}",
-                "lora_slot": f"{self.model_name}:active",
+                "model_name": name,
+                "lora_slot": name,
                 "lora_path": path,
                 "policy_version": step,
             }

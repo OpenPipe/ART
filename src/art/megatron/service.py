@@ -16,6 +16,7 @@ from peft.tuners.lora.config import LoraConfig
 import torch
 
 from .. import dev, types
+from ..adapter_leases import in_flight_lora_name
 from ..dev.get_model_config import default_target_modules
 from ..dev.validate import is_dedicated_mode
 from ..preprocessing.pack import DiskPackedTensors
@@ -192,7 +193,7 @@ class MegatronService:
 
     @property
     def _in_flight_lora_slot(self) -> str:
-        return f"{self.model_name}:active"
+        return in_flight_lora_name(self.model_name)
 
     @property
     def _initial_served_model_name(self) -> str:
@@ -696,7 +697,7 @@ class MegatronService:
             response = await client.post(
                 f"{self._vllm_base_url}/art/in_flight_lora_update",
                 json={
-                    "model_name": f"{self.model_name}@{step}",
+                    "model_name": self._in_flight_lora_slot,
                     "lora_slot": self._in_flight_lora_slot,
                     "lora_path": checkpoint_path,
                     "policy_version": step,
