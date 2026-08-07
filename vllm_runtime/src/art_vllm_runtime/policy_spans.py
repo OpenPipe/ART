@@ -21,6 +21,7 @@ import torch
 
 POLICY_TOKEN_SPANS_FIELD = "policy_token_spans"
 ART_POLICY_TOKEN_SPANS_FIELD = "art_policy_token_spans"
+_PARENT_POLICY_TOKEN_SPANS_FIELD = "_art_policy_token_spans_by_choice"
 
 _CURRENT_ENGINE_POLICY_SPANS: dict[str, list[dict[str, Any]]] = {}
 _WORKER_LORA_POLICY_BY_ID: dict[int, dict[str, Any]] = {}
@@ -527,15 +528,27 @@ def _patch_output_processor_policy_span_accumulation() -> None:
         **kwargs: Any,
     ):
         _append_current_policy_spans(self, len(new_token_ids))
+        spans = getattr(self, ART_POLICY_TOKEN_SPANS_FIELD, None)
+        parent_req = getattr(self, "parent_req", None)
+        if spans and parent_req is not None:
+            spans_by_choice = getattr(
+                parent_req, _PARENT_POLICY_TOKEN_SPANS_FIELD, None
+            )
+            if spans_by_choice is None:
+                spans_by_choice = {}
+                setattr(parent_req, _PARENT_POLICY_TOKEN_SPANS_FIELD, spans_by_choice)
+            spans_by_choice[int(getattr(self, "request_index", 0))] = [
+                dict(span) for span in spans
+            ]
+
         request_output = original_make(self, new_token_ids, *args, **kwargs)
         if request_output is not None and hasattr(request_output, "outputs"):
-            spans = getattr(self, ART_POLICY_TOKEN_SPANS_FIELD, None)
-            if spans:
-                _record_request_output_spans(
-                    request_output,
-                    request_index=getattr(self, "request_index", 0),
-                    spans=spans,
-                )
+            spans_by_choice = (
+                getattr(parent_req, _PARENT_POLICY_TOKEN_SPANS_FIELD, {})
+                if parent_req is not None
+                else {int(getattr(self, "request_index", 0)): spans}
+            )
+            _record_request_output_spans(request_output, spans_by_choice)
         return request_output
 
     make_request_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
@@ -1000,12 +1013,11 @@ def _can_merge_spans(left: dict[str, Any], right: dict[str, Any]) -> bool:
 
 def _record_request_output_spans(
     request_output: Any,
-    *,
-    request_index: int,
-    spans: list[dict[str, Any]],
+    spans_by_choice: Mapping[int, list[dict[str, Any]] | None],
 ) -> None:
     for output in request_output.outputs:
-        if getattr(output, "index", request_index) != request_index:
+        spans = spans_by_choice.get(int(output.index))
+        if not spans:
             continue
         copied = [dict(span) for span in spans]
         setattr(output, ART_POLICY_TOKEN_SPANS_FIELD, copied)

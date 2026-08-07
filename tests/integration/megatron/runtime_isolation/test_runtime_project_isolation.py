@@ -138,6 +138,94 @@ asyncio.run(main())
     }
 
 
+def test_runtime_policy_spans_survive_parallel_sample_aggregation(
+    artifact_dir: Path,
+) -> None:
+    payload = _runtime_python(
+        """
+import json
+from types import SimpleNamespace
+
+from art_vllm_runtime.patches import _patch_openai_namespace_tool_import
+
+_patch_openai_namespace_tool_import()
+from vllm.v1.engine.output_processor import RequestState
+
+
+def aggregate_final_outputs(self, new_token_ids, *args, **kwargs):
+    if not self.finished:
+        return None
+    self.parent_req.outputs[self.request_index] = SimpleNamespace(
+        index=self.request_index
+    )
+    self.parent_req.finished += 1
+    if self.parent_req.finished < len(self.parent_req.outputs):
+        return None
+    return SimpleNamespace(outputs=self.parent_req.outputs)
+
+
+RequestState.make_request_output = aggregate_final_outputs
+import art_vllm_runtime.policy_spans as policy_spans
+
+policy_spans._patch_output_processor_policy_span_accumulation()
+parent = SimpleNamespace(outputs=[None] * 4, finished=0)
+none_count = 0
+final_output = None
+for choice_index in range(4):
+    detokenizer = SimpleNamespace(num_output_tokens=lambda: 0)
+    state = SimpleNamespace(
+        request_id=f"child-{choice_index}",
+        request_index=choice_index,
+        parent_req=parent,
+        detokenizer=detokenizer,
+        finished=False,
+    )
+    for token_index in range(5):
+        detokenizer.num_output_tokens = lambda count=token_index + 1: count
+        state.finished = token_index == 4
+        policy_spans._CURRENT_ENGINE_POLICY_SPANS = {
+            state.request_id: [{
+                "start_token": 0,
+                "end_token": 1,
+                "policy_version": 7,
+                "lora_slot": "model:active",
+                "update_seq": 3,
+            }]
+        }
+        output = RequestState.make_request_output(state, [100 + token_index])
+        if output is None:
+            none_count += 1
+        else:
+            final_output = output
+
+print(json.dumps({
+    "none_count": none_count,
+    "spans": [
+        getattr(output, policy_spans.ART_POLICY_TOKEN_SPANS_FIELD, None)
+        for output in final_output.outputs
+    ],
+}, sort_keys=True))
+""",
+        artifact_dir,
+        "parallel_sample_policy_spans",
+    )
+    assert json.loads(payload) == {
+        "none_count": 19,
+        "spans": [
+            [
+                {
+                    "end_token": 5,
+                    "lora_slot": "model:active",
+                    "policy_version": 7,
+                    "start_token": 0,
+                    "update_seq": 3,
+                }
+            ]
+        ]
+        * 4,
+    }
+
+
 def test_runtime_general_plugin_loads_full_patch_set() -> None:
     pyproject = (ROOT / "vllm_runtime" / "pyproject.toml").read_text()
     assert 'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject
