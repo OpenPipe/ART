@@ -515,7 +515,6 @@ def sync_merged_weights_to_vllm(
                     client.post,
                     f"{spec.vllm_base_url}/start_weight_update",
                     phase="start merged weight update",
-                    json={"is_checkpoint_format": False},
                     headers=_runtime_headers(spec),
                     timeout=300.0,
                 )

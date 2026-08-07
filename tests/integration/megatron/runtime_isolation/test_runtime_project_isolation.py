@@ -157,44 +157,66 @@ def test_runtime_patch_adds_gemma4_moe_topk_alias(artifact_dir: Path) -> None:
     assert json.loads(payload) == {"num_experts_per_tok": 8}
 
 
-def test_runtime_patch_skips_gemma4_layerwise_weight_update_reload(
+def test_runtime_patch_selects_checkpoint_weight_update_lifecycle(
     artifact_dir: Path,
 ) -> None:
     payload = _runtime_python(
-        "import json; "
-        "from art_vllm_runtime.patches import apply_vllm_runtime_patches; "
-        "apply_vllm_runtime_patches(); "
-        "from vllm.v1.worker.gpu_worker import Worker; "
-        "HfConfig = type('HfConfig', (), {"
-        "'architectures': ['Gemma4ForConditionalGeneration']"
-        "}); "
-        "ModelConfig = type('ModelConfig', (), {'hf_config': HfConfig()}); "
-        "DummyWorker = type('DummyWorker', (), {"
-        "'model_config': ModelConfig(), "
-        "'_weight_update_active': False, "
-        "'_is_checkpoint_format': True, "
-        "'checks': 0, "
-        "'_check_weight_transfer_engine': "
-        "lambda self: setattr(self, 'checks', self.checks + 1)"
-        "}); "
-        "dummy = DummyWorker(); "
-        "Worker.start_weight_update(dummy, is_checkpoint_format=True); "
-        "active_after_start = dummy._weight_update_active; "
-        "Worker.finish_weight_update(dummy); "
-        "print(json.dumps({"
-        "'active_after_start': active_after_start, "
-        "'active_after_finish': dummy._weight_update_active, "
-        "'is_checkpoint_format': dummy._is_checkpoint_format, "
-        "'checks': dummy.checks"
-        "}))",
+        """
+import json
+from types import SimpleNamespace
+
+from art_vllm_runtime.patches import apply_vllm_runtime_patches
+
+apply_vllm_runtime_patches()
+from vllm.v1.worker.gpu_worker import Worker
+
+
+class Engine:
+    def __init__(self):
+        self.starts = self.updates = self.finishes = 0
+
+    def start_weight_update(self):
+        self.starts += 1
+
+    def update_weights(self, update_info):
+        self.updates += 1
+
+    def finish_weight_update(self):
+        self.finishes += 1
+
+
+def exercise(architecture):
+    engine = Engine()
+    worker = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        ),
+        weight_transfer_engine=engine,
+        _weight_update_active=False,
+        _check_weight_transfer_engine=lambda: None,
+    )
+    Worker.start_weight_update(worker)
+    Worker.update_weights(worker, {"names": []})
+    Worker.finish_weight_update(worker)
+    return {
+        "starts": engine.starts,
+        "updates": engine.updates,
+        "finishes": engine.finishes,
+        "active": worker._weight_update_active,
+    }
+
+
+print(json.dumps({
+    "dense": exercise("Qwen3ForCausalLM"),
+    "gemma4": exercise("Gemma4ForConditionalGeneration"),
+}, sort_keys=True))
+""",
         artifact_dir,
-        "gemma4_weight_update_reload",
+        "checkpoint_weight_update_lifecycle",
     )
     assert json.loads(payload) == {
-        "active_after_start": True,
-        "active_after_finish": False,
-        "is_checkpoint_format": True,
-        "checks": 2,
+        "dense": {"active": False, "finishes": 1, "starts": 1, "updates": 1},
+        "gemma4": {"active": False, "finishes": 0, "starts": 0, "updates": 1},
     }
 
 

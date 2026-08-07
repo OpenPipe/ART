@@ -487,7 +487,6 @@ class UnslothService:
                 weights = self._merged_checkpoint_weights_for_vllm()
                 response = await client.post(
                     f"{self._vllm_base_url}/start_weight_update",
-                    json={"is_checkpoint_format": True},
                     **self._runtime_request_kwargs(),
                     timeout=300.0,
                 )
