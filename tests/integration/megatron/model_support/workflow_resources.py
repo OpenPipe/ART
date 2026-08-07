@@ -253,6 +253,19 @@ _GPT_OSS_REDUCED_VLLM = VllmWorkflowResources(
         "moe_backend": "triton",
     },
 )
+_QWEN_MOE_REDUCED_MEGATRON = MegatronWorkflowResources(
+    gpu_ids=[0],
+    topology=MegatronWorkflowTopology(),
+)
+_QWEN_MOE_REDUCED_VLLM = VllmWorkflowResources(
+    gpu_ids=[1],
+    tensor_parallel_size=1,
+    extra_engine_args={
+        "enforce_eager": True,
+        "max_model_len": 1024,
+        "moe_backend": "triton",
+    },
+)
 
 # Explicitly for large models which do not fit in the default topology.
 HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
@@ -340,6 +353,20 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             vllm=_GPT_OSS_REDUCED_VLLM,
         ),
     ),
+    **{
+        handler_key: HandlerWorkflowResources(
+            merged_vllm_serving=WorkflowStageResources(
+                required_world_size=2,
+                megatron=_QWEN_MOE_REDUCED_MEGATRON,
+                vllm=_QWEN_MOE_REDUCED_VLLM,
+            ),
+            native_vllm_lora=WorkflowStageResources(
+                required_world_size=2,
+                vllm=_QWEN_MOE_REDUCED_VLLM,
+            ),
+        )
+        for handler_key in ("qwen3_moe", "qwen3_5_moe")
+    },
 }
 
 

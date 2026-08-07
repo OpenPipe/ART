@@ -33,6 +33,7 @@ from .workflow import (
     validated_architecture_representative_models,
 )
 from .workflow_resources import (
+    HANDLER_WORKFLOW_RESOURCES,
     _h200_equivalent_slots_for_total_gib,
     handler_workflow_resources_for_base_model,
     resolve_stage_resources_for_visible_gpus,
@@ -191,6 +192,19 @@ def test_h200_equivalent_slots_tolerate_reported_gb300_vram() -> None:
     assert _h200_equivalent_slots_for_total_gib(139.0) == 1
     assert _h200_equivalent_slots_for_total_gib(267.69) == 2
     assert _h200_equivalent_slots_for_total_gib(276.6) == 2
+
+
+@pytest.mark.parametrize("handler_key", ["qwen3_moe", "qwen3_5_moe"])
+def test_qwen_moe_reduced_serving_uses_plain_expert_storage(handler_key: str) -> None:
+    resources = HANDLER_WORKFLOW_RESOURCES[handler_key]
+    for stage in (resources.merged_vllm_serving, resources.native_vllm_lora):
+        assert stage is not None
+        assert stage.vllm is not None
+        assert stage.vllm.gpu_ids == [1]
+        engine_args = stage.vllm.engine_args()
+        assert engine_args["enforce_eager"] is True
+        assert engine_args["max_model_len"] == 1024
+        assert engine_args["moe_backend"] == "triton"
 
 
 def test_inspect_architecture_for_workflow_uses_minimal_topology(monkeypatch) -> None:
