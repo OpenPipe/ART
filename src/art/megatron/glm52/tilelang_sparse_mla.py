@@ -423,6 +423,9 @@ def _backward(
                         mbar=grad_q_barrier,
                         clear_accum=block == 0,
                     )
+                    # The next prefetch reuses kv_shared, so wait until TCGEN
+                    # has finished reading the current block from it.
+                    T.mbarrier_wait_parity(grad_q_barrier, block % 2)
                     if block + 1 < blocks:
                         prefetch_kv(
                             KV,
@@ -451,7 +454,6 @@ def _backward(
                             _ROPE,
                             _LATENT,
                         )
-                    T.mbarrier_wait_parity(grad_q_barrier, block % 2)
                 else:
                     T.copy(grad_probabilities, grad_scores_shared)
                     T.gemm(
