@@ -285,9 +285,18 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
         yes_no_trainability_variant="megatron_dedicated",
     ),
     "glm52": HandlerWorkflowResources(
+        train_inf_mismatch=WorkflowStageResources(
+            required_world_size=2,
+            megatron=_GLM52_REDUCED_MEGATRON,
+            vllm=_GLM52_REDUCED_VLLM,
+        ),
         merged_vllm_serving=WorkflowStageResources(
             required_world_size=2,
             megatron=_GLM52_REDUCED_MEGATRON,
+            vllm=_GLM52_REDUCED_VLLM,
+        ),
+        native_vllm_lora=WorkflowStageResources(
+            required_world_size=2,
             vllm=_GLM52_REDUCED_VLLM,
         ),
         yes_no_trainability=WorkflowStageResources(

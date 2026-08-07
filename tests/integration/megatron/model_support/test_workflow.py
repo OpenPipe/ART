@@ -161,16 +161,22 @@ def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
 def test_glm52_reduced_workflow_uses_portable_serving_backends() -> None:
     resources = handler_workflow_resources_for_base_model("zai-org/GLM-5.2")
     assert resources is not None
-    assert resources.train_inf_mismatch is None
-    for stage in (
+    joint_stages = (
+        resources.train_inf_mismatch,
         resources.merged_vllm_serving,
         resources.yes_no_trainability,
         resources.length_trainability,
-    ):
+    )
+    for stage in joint_stages:
         assert stage is not None
         assert stage.required_world_size == 2
         assert stage.megatron is not None
         assert stage.megatron.gpu_ids == [0]
+    assert resources.native_vllm_lora is not None
+    assert resources.native_vllm_lora.required_world_size == 2
+    assert resources.native_vllm_lora.megatron is None
+    for stage in (*joint_stages, resources.native_vllm_lora):
+        assert stage is not None
         assert stage.vllm is not None
         assert stage.vllm.gpu_ids == [1]
         engine_args = stage.vllm.engine_args()
