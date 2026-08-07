@@ -123,7 +123,7 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         hf_overrides = cast(dict[str, object], engine_args["hf_overrides"])
         assert hf_overrides["num_hidden_layers"] == 4
         assert hf_overrides["num_hash_layers"] == 0
-        assert hf_overrides["quantization_config"] is None
+        assert hf_overrides["expert_dtype"] == "fp8"
         assert engine_args["max_model_len"] == 1024
     assert resources.merged_vllm_serving is not None
     assert resources.merged_vllm_serving.vllm is not None

@@ -145,9 +145,9 @@ _DSV4_MEGATRON_ENV = {
 _DSV4_HF_OVERRIDES = {
     "num_hidden_layers": _DSV4_REPRESENTATIVE_NUM_LAYERS,
     "num_hash_layers": 0,
-    # Reduced serving loads BF16 trainer weights into a dummy model; retaining
-    # the public FP8 metadata selects an incompatible quantized MoE layout.
-    "quantization_config": None,
+    # Keep DSV4's required FP8 linear path, but avoid the public checkpoint's
+    # MXFP4 experts, which cannot represent the reduced BF16 trainer fixture.
+    "expert_dtype": "fp8",
     "compress_ratios": _DSV4_REPRESENTATIVE_COMPRESS_RATIOS,
     "layer_types": _DSV4_REPRESENTATIVE_LAYER_TYPES,
     "mlp_layer_types": _DSV4_REPRESENTATIVE_MLP_LAYER_TYPES,
