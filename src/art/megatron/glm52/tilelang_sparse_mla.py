@@ -647,5 +647,5 @@ def backward(
         )(q, kv_grouped, grad_output, indices_grouped, lse, delta, grad_kv)
     return (
         grad_q[:, :, :heads],
-        grad_kv.sum(dim=1)[:, :-1].to(kv.dtype).squeeze(2),
+        grad_kv.sum(dim=1)[:, :-1].squeeze(2),
     )

@@ -53,6 +53,19 @@ def sparse_mla_backward(
     )
 
 
+def reduce_tensor_parallel_dkv(
+    grad_kv: torch.Tensor,
+    *,
+    tp_group: Any | None,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if tp_group is not None:
+        torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
+            grad_kv, group=tp_group
+        )
+    return grad_kv.to(dtype)
+
+
 class _SparseMla(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -61,10 +74,12 @@ class _SparseMla(torch.autograd.Function):
         kv: torch.Tensor,
         indices: torch.Tensor,
         scale: float,
+        tp_group: Any | None,
     ) -> torch.Tensor:
         out, lse = sparse_mla_forward(q, kv, indices, scale=scale)
         ctx.save_for_backward(q, kv, indices, out, lse)
         ctx.scale = float(scale)
+        ctx.tp_group = tp_group
         return out
 
     @staticmethod
@@ -79,7 +94,10 @@ class _SparseMla(torch.autograd.Function):
             grad_outputs[0],
             scale=ctx.scale,
         )
-        return grad_q, grad_kv, None, None
+        grad_kv = reduce_tensor_parallel_dkv(
+            grad_kv, tp_group=ctx.tp_group, dtype=kv.dtype
+        )
+        return grad_q, grad_kv, None, None, None
 
 
 def sparse_mla(
@@ -88,10 +106,15 @@ def sparse_mla(
     indices: torch.Tensor,
     *,
     scale: float,
+    tp_group: Any | None = None,
 ) -> torch.Tensor:
-    """Run GLM-5.2 list-sparse absorbed MLA with BF16 forward/backward."""
+    """Run GLM-5.2 list-sparse absorbed MLA."""
     return _SparseMla.apply(
-        q.contiguous(), kv.contiguous(), indices.contiguous(), float(scale)
+        q.contiguous(),
+        kv.contiguous(),
+        indices.contiguous(),
+        float(scale),
+        tp_group,
     )
 
 

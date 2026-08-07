@@ -13,7 +13,11 @@ from art.megatron.glm52.cp_stage import (
     stage_kv_rows,
 )
 from art.megatron.glm52.indexer import Glm52RoutedTopk
-from art.megatron.glm52.sparse_mla import sparse_mla_backward, sparse_mla_forward
+from art.megatron.glm52.sparse_mla import (
+    reduce_tensor_parallel_dkv,
+    sparse_mla_backward,
+    sparse_mla_forward,
+)
 from art.megatron.glm52.state import Glm52PrefixTreeState
 
 _LATENT_DIM = 512
@@ -70,6 +74,7 @@ def _backward(
     global_lse: torch.Tensor,
     state: Glm52PrefixTreeState,
     scale: float,
+    tp_group: Any | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     cp_state = cast(ArtContextParallelState, state.context_parallel_state)
     valid = int(sum(cp_state.rank_plan.local_valid_lengths))
@@ -84,6 +89,9 @@ def _backward(
         global_lse.unsqueeze(0),
         grad_output[:, :valid].contiguous(),
         scale=scale,
+    )
+    combined_dkv = reduce_tensor_parallel_dkv(
+        combined_dkv, tp_group=tp_group, dtype=kv.dtype
     )
     stage_starts = [0]
     for size in stage_sizes:
@@ -118,11 +126,13 @@ class _ContextParallelSparseMla(torch.autograd.Function):
         indices: torch.Tensor,
         state: Glm52PrefixTreeState,
         scale: float,
+        tp_group: Any | None,
     ) -> torch.Tensor:
         output, global_out, global_lse = _forward(q, kv, indices, state, scale)
         ctx.save_for_backward(q, kv, indices, global_out, global_lse)
         ctx.state = state
         ctx.scale = float(scale)
+        ctx.tp_group = tp_group
         return output
 
     @staticmethod
@@ -138,8 +148,9 @@ class _ContextParallelSparseMla(torch.autograd.Function):
             global_lse,
             ctx.state,
             ctx.scale,
+            ctx.tp_group,
         )
-        return dq, dkv, None, None, None
+        return dq, dkv, None, None, None, None
 
 
 def context_parallel_sparse_mla(
@@ -149,6 +160,7 @@ def context_parallel_sparse_mla(
     state: Glm52PrefixTreeState,
     *,
     scale: float,
+    tp_group: Any | None = None,
 ) -> torch.Tensor:
     """Run sparse MLA once over the union of ART-planned KV stages."""
     if q.ndim != 4 or kv.ndim != 3 or q.shape[:2] != kv.shape[:2]:
@@ -161,4 +173,5 @@ def context_parallel_sparse_mla(
         topk.indices.contiguous(),
         state,
         float(scale),
+        tp_group,
     )

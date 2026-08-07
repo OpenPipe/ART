@@ -390,9 +390,6 @@ class Glm52SelfAttention(Attention):
         q_absorbed = torch.einsum("sbhd,hdm->sbhm", q_nope, key_weight)
         q_absorbed = torch.cat((q_absorbed, q_rope), dim=-1)
         kv_absorbed = torch.cat((kv_compressed, k_rope), dim=-1)
-        kv_absorbed = copy_to_tensor_model_parallel_region(
-            kv_absorbed, group=self.tp_group
-        )
         core = self.core_attention
         if not isinstance(core, Glm52SparseCore):
             raise TypeError(f"Expected Glm52SparseCore, got {type(core).__name__}.")
@@ -406,6 +403,7 @@ class Glm52SelfAttention(Attention):
                 topk,
                 state,
                 scale=self.softmax_scale,
+                tp_group=self.tp_group if get_pg_size(self.tp_group) > 1 else None,
             )
             if isinstance(topk, Glm52RoutedTopk)
             else sparse_mla(
@@ -413,6 +411,7 @@ class Glm52SelfAttention(Attention):
                 kv_absorbed,
                 topk,
                 scale=self.softmax_scale,
+                tp_group=self.tp_group if get_pg_size(self.tp_group) > 1 else None,
             )
         )
         value_out = torch.einsum("bshm,hdm->bshd", latent_out, value_weight)
