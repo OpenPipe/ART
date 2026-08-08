@@ -49,6 +49,20 @@ def _restore_linear_shard_dim(param: Any, loaded_weight: Any) -> None:
             param.output_dim = dim
 
 
+def _reshape_dsv4_bmm_weight(
+    name: str,
+    param: Any,
+    loaded_weight: Any,
+    tp_rank: int,
+    tp_size: int,
+) -> Any:
+    if not name.endswith(".attn.wo_a.weight"):
+        return loaded_weight
+    local_rows = param.shape[0] * param.shape[1]
+    assert loaded_weight.shape == (local_rows * tp_size, param.shape[2])
+    return loaded_weight.narrow(0, tp_rank * local_rows, local_rows).view(param.shape)
+
+
 def _attach_block_fp8_scale(
     param: Any,
     name: str,
@@ -233,6 +247,9 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                 if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
+                loaded_weight = _reshape_dsv4_bmm_weight(
+                    name, param, loaded_weight, tp_rank, tp_size
+                )
                 _attach_block_fp8_scale(param, name, params_dict, block_size)
                 _restore_linear_shard_dim(param, loaded_weight)
                 weight_loader = getattr(

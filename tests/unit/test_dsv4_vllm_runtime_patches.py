@@ -80,6 +80,19 @@ def test_dsv4_layerwise_reload_restores_direct_linear_shard_metadata() -> None:
     assert getattr(param, "output_dim") == 1
 
 
+def test_dsv4_bmm_weight_selects_tp_rows_before_grouping() -> None:
+    patches = _load_dsv4_patches_module()
+    param = torch.nn.Parameter(torch.empty(2, 3, 4), requires_grad=False)
+    loaded = torch.arange(48).view(12, 4)
+
+    reshaped = patches._reshape_dsv4_bmm_weight(
+        "layers.0.attn.wo_a.weight", param, loaded, tp_rank=1, tp_size=2
+    )
+
+    assert reshaped.shape == param.shape
+    assert torch.equal(reshaped.flatten(0, 1), loaded[6:])
+
+
 def test_dsv4_fp8_weight_is_linked_to_its_block_scale() -> None:
     patches = _load_dsv4_patches_module()
     param = torch.nn.Parameter(
