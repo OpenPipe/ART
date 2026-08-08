@@ -191,14 +191,23 @@ def _requantize_block_fp8_delta(
 ) -> None:
     scale = getattr(param, _BLOCK_FP8_SCALE_ATTR)
     block_m, block_k = getattr(param, _BLOCK_FP8_SIZE_ATTR)
-    scale_data = scale.data
+    _requantize_block_fp8_tensors(param.data, scale.data, delta, block_m, block_k)
+
+
+def _requantize_block_fp8_tensors(
+    weight: torch.Tensor,
+    scale_data: torch.Tensor,
+    delta: torch.Tensor,
+    block_m: int,
+    block_k: int,
+) -> None:
     scale_float = (
         _e8m0_to_float(scale_data)
         if scale_data.dtype in (torch.float8_e8m0fnu, torch.uint8)
         else scale_data.float()
     )
     expanded = scale_float.repeat_interleave(block_m, -2).repeat_interleave(block_k, -1)
-    merged = param.data.float().mul_(expanded).add_(delta)
+    merged = weight.float().mul_(expanded).add_(delta)
     leading = merged.shape[:-2]
     blocks = merged.view(
         *leading,
@@ -216,13 +225,46 @@ def _requantize_block_fp8_delta(
     )
     new_scale.masked_fill_(block_amax == 0, 1.0)
     expanded = new_scale.repeat_interleave(block_m, -2).repeat_interleave(block_k, -1)
-    param.data.copy_((merged / expanded).clamp_(-448, 448))
+    weight.copy_((merged / expanded).clamp_(-448, 448))
     if scale_data.dtype == torch.float8_e8m0fnu:
         scale_data.copy_(new_scale.to(scale_data.dtype))
     elif scale_data.dtype == torch.uint8:
         scale_data.copy_(new_scale.to(torch.float8_e8m0fnu).view(torch.uint8))
     else:
         scale_data.copy_(new_scale)
+
+
+def _load_block_fp8_expert_delta(
+    param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    original_loader: Any,
+    kwargs: dict[str, Any],
+) -> bool | None:
+    owner = getattr(original_loader, "__self__", None)
+    map_expert = getattr(owner, "_map_global_expert_id_to_local_expert_id", None)
+    if map_expert is None or "expert_id" not in kwargs:
+        return None
+    local_expert = map_expert(kwargs["expert_id"])
+    if local_expert == -1:
+        return False
+    block_m, block_k = getattr(param, _BLOCK_FP8_SIZE_ATTR)
+    weight = param.data[local_expert]
+    scale = getattr(param, _BLOCK_FP8_SCALE_ATTR).data[local_expert]
+    shard_id = kwargs["shard_id"]
+    if shard_id in ("w1", "w3"):
+        rows = loaded_weight.shape[-2]
+        offset = 0 if shard_id == "w1" else weight.shape[-2] - rows
+        weight = weight.narrow(-2, offset, rows)
+        scale = scale.narrow(-2, offset // block_m, rows // block_m)
+    assert weight.shape == loaded_weight.shape
+    _requantize_block_fp8_tensors(
+        weight,
+        scale,
+        loaded_weight.float(),
+        block_m,
+        block_k,
+    )
+    return True
 
 
 def _additive_weight_loader(
@@ -237,6 +279,12 @@ def _additive_weight_loader(
     ) -> Any:
         real_data = param.data
         is_block_fp8 = hasattr(param, _BLOCK_FP8_SCALE_ATTR)
+        if is_block_fp8:
+            expert_result = _load_block_fp8_expert_delta(
+                param, loaded_weight, original_loader, kwargs
+            )
+            if expert_result is not None:
+                return expert_result
         scratch = block_fp8_deltas.get(param)
         if scratch is None:
             scratch = torch.zeros_like(

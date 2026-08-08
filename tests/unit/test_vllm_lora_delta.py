@@ -141,3 +141,41 @@ def test_block_fp8_delta_supports_expert_leading_dimension() -> None:
     merged = param.float() * expanded
     assert torch.allclose(merged[0], torch.ones(4, 4))
     assert torch.allclose(merged[1], torch.full((4, 4), 2.0))
+
+
+def test_block_fp8_expert_loader_updates_only_local_shard() -> None:
+    lora_delta = _load_lora_delta_module()
+    param = torch.nn.Parameter(
+        torch.ones(2, 4, 4).to(torch.float8_e4m3fn), requires_grad=False
+    )
+    scale = torch.nn.Parameter(torch.ones(2, 2, 2), requires_grad=False)
+    setattr(param, lora_delta._BLOCK_FP8_SCALE_ATTR, scale)
+    setattr(param, lora_delta._BLOCK_FP8_SIZE_ATTR, (2, 2))
+
+    class Owner:
+        @staticmethod
+        def _map_global_expert_id_to_local_expert_id(expert_id):
+            return {4: 1}.get(expert_id, -1)
+
+        def weight_loader(self, *_args, **_kwargs):
+            raise AssertionError("packed expert loader must not allocate full scratch")
+
+    loader = lora_delta._additive_weight_loader(Owner().weight_loader, {})
+    assert loader(
+        param,
+        torch.ones(2, 4),
+        shard_id="w3",
+        expert_id=4,
+    )
+    assert not loader(
+        param,
+        torch.ones(2, 4),
+        shard_id="w3",
+        expert_id=5,
+    )
+
+    expanded = scale.repeat_interleave(2, -2).repeat_interleave(2, -1)
+    merged = param.float() * expanded
+    assert torch.allclose(merged[0], torch.ones(4, 4))
+    assert torch.allclose(merged[1, :2], torch.ones(2, 4))
+    assert torch.allclose(merged[1, 2:], torch.full((2, 4), 2.0))
