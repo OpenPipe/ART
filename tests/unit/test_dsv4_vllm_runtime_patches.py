@@ -93,6 +93,15 @@ def test_dsv4_bmm_weight_selects_tp_rows_before_grouping() -> None:
     assert torch.equal(reshaped.flatten(0, 1), loaded[6:])
 
 
+def test_dsv4_expert_delta_names_use_checkpoint_projection_names() -> None:
+    patches = _load_dsv4_patches_module()
+
+    assert (
+        patches._dsv4_expert_checkpoint_name("layers.0.ffn.experts.3.down_proj.weight")
+        == "layers.0.ffn.experts.3.w2.weight"
+    )
+
+
 def test_dsv4_fp8_weight_is_linked_to_its_block_scale() -> None:
     patches = _load_dsv4_patches_module()
     param = torch.nn.Parameter(

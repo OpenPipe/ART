@@ -63,6 +63,16 @@ def _reshape_dsv4_bmm_weight(
     return loaded_weight.narrow(0, tp_rank * local_rows, local_rows).view(param.shape)
 
 
+def _dsv4_expert_checkpoint_name(name: str) -> str:
+    if ".experts." not in name:
+        return name
+    return (
+        name.replace(".gate_proj.", ".w1.")
+        .replace(".down_proj.", ".w2.")
+        .replace(".up_proj.", ".w3.")
+    )
+
+
 def _attach_block_fp8_scale(
     param: Any,
     name: str,
@@ -199,16 +209,19 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                 break
             else:
                 if ".experts." in name:
+                    name = _dsv4_expert_checkpoint_name(name)
                     if (
                         "weight_scale" in name
                         and loaded_weight.dtype == dsv4_model.torch.float8_e8m0fnu
                     ):
                         loaded_weight = loaded_weight.view(dsv4_model.torch.uint8)
+                    candidate_name = None
                     for mapping in expert_mapping:
                         param_name, weight_name, expert_id, expert_shard_id = mapping
                         if weight_name not in name:
                             continue
                         name_mapped = name.replace(weight_name, param_name)
+                        candidate_name = name_mapped
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
                         param = params_dict[name_mapped]
@@ -224,9 +237,10 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                             return_success=True,
                         )
                         if success:
-                            name = name_mapped
                             break
-                    loaded_params.add(name_mapped)
+                    if candidate_name is None:
+                        raise RuntimeError(f"No DSV4 expert mapping for {name}")
+                    loaded_params.add(candidate_name)
                     continue
                 if "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
