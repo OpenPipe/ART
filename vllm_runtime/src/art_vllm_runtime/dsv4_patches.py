@@ -36,6 +36,19 @@ def _restore_merged_column_output_dim(param: Any) -> None:
         param.output_dim = 0
 
 
+def _restore_linear_shard_dim(param: Any, loaded_weight: Any) -> None:
+    mismatched = [
+        dim
+        for dim, (local, loaded) in enumerate(zip(param.shape, loaded_weight.shape))
+        if local != loaded
+    ]
+    if len(mismatched) == 1:
+        dim = mismatched[0]
+        if loaded_weight.shape[dim] % param.shape[dim] == 0:
+            param.input_dim = dim
+            param.output_dim = dim
+
+
 def _attach_block_fp8_scale(
     param: Any,
     name: str,
@@ -221,10 +234,18 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                     continue
                 param = params_dict[name]
                 _attach_block_fp8_scale(param, name, params_dict, block_size)
+                _restore_linear_shard_dim(param, loaded_weight)
                 weight_loader = getattr(
                     param, "weight_loader", dsv4_model.default_weight_loader
                 )
-                weight_loader(param, loaded_weight)
+                try:
+                    weight_loader(param, loaded_weight)
+                except AssertionError as error:
+                    raise RuntimeError(
+                        f"DSV4 weight load failed for {name}: "
+                        f"parameter={tuple(param.shape)} "
+                        f"weight={tuple(loaded_weight.shape)}"
+                    ) from error
                 loaded_params.add(name)
 
         return loaded_params

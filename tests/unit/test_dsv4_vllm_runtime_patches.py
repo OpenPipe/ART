@@ -70,6 +70,16 @@ def test_dsv4_layerwise_reload_restores_merged_column_metadata() -> None:
     assert getattr(param, "output_dim") == 0
 
 
+def test_dsv4_layerwise_reload_restores_direct_linear_shard_metadata() -> None:
+    patches = _load_dsv4_patches_module()
+    param = torch.nn.Parameter(torch.empty(3, 4), requires_grad=False)
+
+    patches._restore_linear_shard_dim(param, torch.empty(3, 8))
+
+    assert getattr(param, "input_dim") == 1
+    assert getattr(param, "output_dim") == 1
+
+
 def test_dsv4_fp8_weight_is_linked_to_its_block_scale() -> None:
     patches = _load_dsv4_patches_module()
     param = torch.nn.Parameter(
