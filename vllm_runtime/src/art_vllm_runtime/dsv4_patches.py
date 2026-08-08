@@ -64,6 +64,8 @@ def _reshape_dsv4_bmm_weight(
 
 
 def _dsv4_expert_checkpoint_name(name: str) -> str:
+    if ".shared_experts." in name:
+        return name.replace(".gate_proj.", ".w1.").replace(".up_proj.", ".w3.")
     if ".experts." not in name:
         return name
     return (
@@ -185,6 +187,7 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
         expert_mapping = self.get_expert_mapping()
 
         for name, loaded_weight in weights:
+            name = _dsv4_expert_checkpoint_name(name)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if ".experts." in name:
                     continue
@@ -209,7 +212,6 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                 break
             else:
                 if ".experts." in name:
-                    name = _dsv4_expert_checkpoint_name(name)
                     if (
                         "weight_scale" in name
                         and loaded_weight.dtype == dsv4_model.torch.float8_e8m0fnu

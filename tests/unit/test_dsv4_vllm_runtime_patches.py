@@ -100,6 +100,18 @@ def test_dsv4_expert_delta_names_use_checkpoint_projection_names() -> None:
         patches._dsv4_expert_checkpoint_name("layers.0.ffn.experts.3.down_proj.weight")
         == "layers.0.ffn.experts.3.w2.weight"
     )
+    assert (
+        patches._dsv4_expert_checkpoint_name(
+            "layers.0.ffn.shared_experts.gate_proj.weight"
+        )
+        == "layers.0.ffn.shared_experts.w1.weight"
+    )
+    assert (
+        patches._dsv4_expert_checkpoint_name(
+            "layers.0.ffn.shared_experts.down_proj.weight"
+        )
+        == "layers.0.ffn.shared_experts.down_proj.weight"
+    )
 
 
 def test_dsv4_fp8_weight_is_linked_to_its_block_scale() -> None:
