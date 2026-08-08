@@ -185,6 +185,46 @@ def _e8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
     return bits.view(torch.float32)
 
 
+def _block_scale_to_float(
+    scale: torch.Tensor,
+    block_m: int,
+    k_blocks: int,
+) -> torch.Tensor:
+    if scale.dtype != torch.int32:
+        return (
+            _e8m0_to_float(scale)
+            if scale.dtype in (torch.float8_e8m0fnu, torch.uint8)
+            else scale.float()
+        )
+    shifts = torch.arange(4, device=scale.device, dtype=torch.int32) * 8
+    exponent = ((scale.unsqueeze(-1) >> shifts) & 0xFF).flatten(-2)[..., :k_blocks]
+    return _e8m0_to_float(exponent[..., ::block_m, :].to(torch.uint8))
+
+
+def _copy_block_scale(
+    destination: torch.Tensor,
+    scale: torch.Tensor,
+    block_m: int,
+) -> None:
+    if destination.dtype == torch.int32:
+        exponent = (scale.view(torch.int32) >> 23).to(torch.uint8)
+        exponent = exponent.repeat_interleave(block_m, -2)
+        padding = -exponent.shape[-1] % 4
+        if padding:
+            exponent = torch.cat(
+                [exponent, exponent.new_zeros(*exponent.shape[:-1], padding)], dim=-1
+            )
+        shifts = torch.arange(4, device=scale.device, dtype=torch.int32) * 8
+        packed = (exponent.unflatten(-1, (-1, 4)).to(torch.int32) << shifts).sum(-1)
+        destination.copy_(packed)
+    elif destination.dtype == torch.float8_e8m0fnu:
+        destination.copy_(scale.to(destination.dtype))
+    elif destination.dtype == torch.uint8:
+        destination.copy_(scale.to(torch.float8_e8m0fnu).view(torch.uint8))
+    else:
+        destination.copy_(scale)
+
+
 def _requantize_block_fp8_delta(
     param: torch.Tensor,
     delta: torch.Tensor,
@@ -204,10 +244,8 @@ def _requantize_block_fp8_tensors(
     if weight.ndim == 3 and scale_data.ndim == 2:
         weight = weight.flatten(0, 1)
         delta = delta.flatten(0, 1)
-    scale_float = (
-        _e8m0_to_float(scale_data)
-        if scale_data.dtype in (torch.float8_e8m0fnu, torch.uint8)
-        else scale_data.float()
+    scale_float = _block_scale_to_float(
+        scale_data, block_m, weight.shape[-1] // block_k
     )
     expanded = scale_float.repeat_interleave(block_m, -2).repeat_interleave(block_k, -1)
     merged = weight.float().mul_(expanded).add_(delta)
@@ -229,12 +267,7 @@ def _requantize_block_fp8_tensors(
     new_scale.masked_fill_(block_amax == 0, 1.0)
     expanded = new_scale.repeat_interleave(block_m, -2).repeat_interleave(block_k, -1)
     weight.copy_((merged / expanded).clamp_(-448, 448))
-    if scale_data.dtype == torch.float8_e8m0fnu:
-        scale_data.copy_(new_scale.to(scale_data.dtype))
-    elif scale_data.dtype == torch.uint8:
-        scale_data.copy_(new_scale.to(torch.float8_e8m0fnu).view(torch.uint8))
-    else:
-        scale_data.copy_(new_scale)
+    _copy_block_scale(scale_data, new_scale, block_m)
 
 
 def _load_block_fp8_expert_delta(

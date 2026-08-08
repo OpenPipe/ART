@@ -159,6 +159,25 @@ def test_block_fp8_delta_supports_grouped_matrix_layout() -> None:
     assert torch.allclose(merged, torch.full((4, 4), 2.0))
 
 
+def test_block_fp8_delta_supports_deep_gemm_packed_scale_layout() -> None:
+    lora_delta = _load_lora_delta_module()
+    param = torch.nn.Parameter(
+        torch.ones(2, 4, 4).to(torch.float8_e4m3fn), requires_grad=False
+    )
+    scale = torch.nn.Parameter(
+        torch.zeros(2, 4, 1, dtype=torch.int32), requires_grad=False
+    )
+    lora_delta._copy_block_scale(scale, torch.ones(2, 2, 2), block_m=2)
+    setattr(param, lora_delta._BLOCK_FP8_SCALE_ATTR, scale)
+    setattr(param, lora_delta._BLOCK_FP8_SIZE_ATTR, (2, 2))
+
+    lora_delta._requantize_block_fp8_delta(param, torch.ones_like(param).float())
+
+    logical_scale = lora_delta._block_scale_to_float(scale, block_m=2, k_blocks=2)
+    expanded = logical_scale.repeat_interleave(2, -2).repeat_interleave(2, -1)
+    assert torch.allclose(param.float() * expanded, torch.full((2, 4, 4), 2.0))
+
+
 def test_block_fp8_expert_loader_updates_only_local_shard() -> None:
     lora_delta = _load_lora_delta_module()
     param = torch.nn.Parameter(
