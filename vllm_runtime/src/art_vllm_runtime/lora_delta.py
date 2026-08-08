@@ -201,6 +201,9 @@ def _requantize_block_fp8_tensors(
     block_m: int,
     block_k: int,
 ) -> None:
+    if weight.ndim == 3 and scale_data.ndim == 2:
+        weight = weight.flatten(0, 1)
+        delta = delta.flatten(0, 1)
     scale_float = (
         _e8m0_to_float(scale_data)
         if scale_data.dtype in (torch.float8_e8m0fnu, torch.uint8)
