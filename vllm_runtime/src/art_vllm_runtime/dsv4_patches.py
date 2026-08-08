@@ -31,6 +31,11 @@ def _drop_reload_shadow_attrs(layer: Any, names: Any) -> None:
             delattr(layer, name)
 
 
+def _restore_merged_column_output_dim(param: Any) -> None:
+    if not hasattr(param, "output_dim"):
+        param.output_dim = 0
+
+
 def patch_layerwise_reload_shadow_attrs() -> None:
     """Allow vLLM layerwise reload to restore processed DSV4 MegaMoE params.
 
@@ -129,6 +134,7 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                 if is_pp_missing_parameter(name, self):
                     break
                 param = params_dict[name]
+                _restore_merged_column_output_dim(param)
                 try:
                     param.weight_loader(param, loaded_weight, shard_id)
                 except AssertionError as error:

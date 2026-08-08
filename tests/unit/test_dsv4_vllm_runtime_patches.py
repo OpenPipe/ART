@@ -61,6 +61,15 @@ def test_dsv4_fp8_o_proj_normalizes_rope_cache_once() -> None:
     assert patches._dsv4_fp32_cos_sin_cache(rotary_emb) is cache
 
 
+def test_dsv4_layerwise_reload_restores_merged_column_metadata() -> None:
+    patches = _load_dsv4_patches_module()
+    param = torch.nn.Parameter(torch.empty(3, 4), requires_grad=False)
+
+    patches._restore_merged_column_output_dim(param)
+
+    assert getattr(param, "output_dim") == 0
+
+
 def test_dsv4_compressor_helper_uses_punica_metadata_without_full_batch_lora(
     monkeypatch,
 ) -> None:
