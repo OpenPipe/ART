@@ -70,6 +70,24 @@ def test_dsv4_layerwise_reload_restores_merged_column_metadata() -> None:
     assert getattr(param, "output_dim") == 0
 
 
+def test_dsv4_fp8_weight_is_linked_to_its_block_scale() -> None:
+    patches = _load_dsv4_patches_module()
+    param = torch.nn.Parameter(
+        torch.empty(4, 4, dtype=torch.float8_e4m3fn), requires_grad=False
+    )
+    scale = torch.nn.Parameter(torch.ones(2, 2), requires_grad=False)
+
+    patches._attach_block_fp8_scale(
+        param,
+        "layers.0.attn.q_proj.weight",
+        {"layers.0.attn.q_proj.weight_scale_inv": scale},
+        (2, 2),
+    )
+
+    assert getattr(param, "_art_block_fp8_scale") is scale
+    assert getattr(param, "_art_block_fp8_size") == (2, 2)
+
+
 def test_dsv4_compressor_helper_uses_punica_metadata_without_full_batch_lora(
     monkeypatch,
 ) -> None:

@@ -14,6 +14,8 @@ _PEFT_PREFIX = "base_model.model."
 _UNSUPPORTED_MERGED_DELTA_TARGETS_KEY = (
     "art_merged_lora_delta_unsupported_target_modules"
 )
+_BLOCK_FP8_SCALE_ATTR = "_art_block_fp8_scale"
+_BLOCK_FP8_SIZE_ATTR = "_art_block_fp8_size"
 
 
 def _lora_scaling(adapter_config: dict[str, Any]) -> float:
@@ -178,7 +180,55 @@ def _call_weight_loader(
     return loader(loader_param, loaded_weight, *args, **kwargs)
 
 
-def _additive_weight_loader(original_loader: Any) -> Any:
+def _e8m0_to_float(scale: torch.Tensor) -> torch.Tensor:
+    bits = scale.view(torch.uint8).to(torch.int32) << 23
+    return bits.view(torch.float32)
+
+
+def _requantize_block_fp8_delta(
+    param: torch.Tensor,
+    delta: torch.Tensor,
+) -> None:
+    scale = getattr(param, _BLOCK_FP8_SCALE_ATTR)
+    block_m, block_k = getattr(param, _BLOCK_FP8_SIZE_ATTR)
+    scale_data = scale.data
+    scale_float = (
+        _e8m0_to_float(scale_data)
+        if scale_data.dtype in (torch.float8_e8m0fnu, torch.uint8)
+        else scale_data.float()
+    )
+    expanded = scale_float.repeat_interleave(block_m, -2).repeat_interleave(block_k, -1)
+    merged = param.data.float().mul_(expanded).add_(delta)
+    leading = merged.shape[:-2]
+    blocks = merged.view(
+        *leading,
+        merged.shape[-2] // block_m,
+        block_m,
+        merged.shape[-1] // block_k,
+        block_k,
+    )
+    block_amax = blocks.abs().amax(dim=(-3, -1))
+    new_scale = torch.pow(
+        2.0,
+        torch.ceil(
+            torch.log2((block_amax / 448.0).clamp_min(torch.finfo(torch.float32).tiny))
+        ),
+    )
+    new_scale.masked_fill_(block_amax == 0, 1.0)
+    expanded = new_scale.repeat_interleave(block_m, -2).repeat_interleave(block_k, -1)
+    param.data.copy_((merged / expanded).clamp_(-448, 448))
+    if scale_data.dtype == torch.float8_e8m0fnu:
+        scale_data.copy_(new_scale.to(scale_data.dtype))
+    elif scale_data.dtype == torch.uint8:
+        scale_data.copy_(new_scale.to(torch.float8_e8m0fnu).view(torch.uint8))
+    else:
+        scale_data.copy_(new_scale)
+
+
+def _additive_weight_loader(
+    original_loader: Any,
+    block_fp8_deltas: dict[torch.Tensor, torch.Tensor],
+) -> Any:
     def load_delta(
         param: torch.Tensor,
         loaded_weight: torch.Tensor,
@@ -186,7 +236,13 @@ def _additive_weight_loader(original_loader: Any) -> Any:
         **kwargs: Any,
     ) -> Any:
         real_data = param.data
-        scratch = torch.zeros_like(real_data)
+        is_block_fp8 = hasattr(param, _BLOCK_FP8_SCALE_ATTR)
+        scratch = block_fp8_deltas.get(param)
+        if scratch is None:
+            scratch = torch.zeros_like(
+                real_data,
+                dtype=torch.float32 if is_block_fp8 else None,
+            )
         param.data = scratch
         try:
             result = _call_weight_loader(
@@ -199,7 +255,10 @@ def _additive_weight_loader(original_loader: Any) -> Any:
         finally:
             param.data = real_data
         if result is not False:
-            real_data.add_(scratch)
+            if is_block_fp8:
+                block_fp8_deltas[param] = scratch
+            else:
+                real_data.add_(scratch)
         return result
 
     return load_delta
@@ -208,13 +267,23 @@ def _additive_weight_loader(original_loader: Any) -> Any:
 @contextmanager
 def _additive_weight_loaders(model: Any) -> Any:
     originals: list[tuple[torch.Tensor, bool, Any]] = []
+    block_fp8_deltas: dict[torch.Tensor, torch.Tensor] = {}
     for param in model.parameters():
         has_loader = hasattr(param, "weight_loader")
         original_loader = getattr(param, "weight_loader", _default_weight_loader)
         originals.append((param, has_loader, original_loader))
-        setattr(param, "weight_loader", _additive_weight_loader(original_loader))
+        setattr(
+            param,
+            "weight_loader",
+            _additive_weight_loader(original_loader, block_fp8_deltas),
+        )
     try:
         yield
+    except BaseException:
+        raise
+    else:
+        for param, delta in block_fp8_deltas.items():
+            _requantize_block_fp8_delta(param, delta)
     finally:
         for param, has_loader, original_loader in originals:
             if has_loader:

@@ -36,7 +36,7 @@ def test_additive_weight_loader_uses_legacy_loader_for_plain_merged_column_param
             loader_param.data.copy_(loaded_weight)
 
     owner = Owner()
-    loader = lora_delta._additive_weight_loader(owner.weight_loader_v2)
+    loader = lora_delta._additive_weight_loader(owner.weight_loader_v2, {})
     result = loader(
         param=param,
         loaded_weight=loaded,
@@ -66,7 +66,7 @@ def test_additive_weight_loader_keeps_v2_for_vllm_parameter_like_param():
         ),
         weight_loader=lambda *_args, **_kwargs: calls.append("legacy"),
     )
-    loader = lora_delta._additive_weight_loader(owner.weight_loader_v2)
+    loader = lora_delta._additive_weight_loader(owner.weight_loader_v2, {})
     loader(param, loaded, 0)
 
     assert calls == ["v2"]
@@ -101,3 +101,43 @@ def test_delta_update_normalizes_missing_quantization_config_during_load():
 
     assert model.config.quantization_config is None
     assert torch.equal(model.weight, torch.eye(2))
+
+
+def test_block_fp8_delta_requantizes_weight_and_e8m0_scale() -> None:
+    lora_delta = _load_lora_delta_module()
+    weight = torch.full((4, 4), 0.5).to(torch.float8_e4m3fn)
+    param = torch.nn.Parameter(weight, requires_grad=False)
+    scale = torch.nn.Parameter(
+        torch.full((2, 2), 0.25).to(torch.float8_e8m0fnu),
+        requires_grad=False,
+    )
+    setattr(param, lora_delta._BLOCK_FP8_SCALE_ATTR, scale)
+    setattr(param, lora_delta._BLOCK_FP8_SIZE_ATTR, (2, 2))
+    delta = torch.zeros(4, 4)
+    delta[:2, :2] = 0.5
+
+    lora_delta._requantize_block_fp8_delta(param, delta)
+
+    expanded = scale.float().repeat_interleave(2, 0).repeat_interleave(2, 1)
+    merged = param.float() * expanded
+    assert torch.allclose(merged[:2, :2], torch.full((2, 2), 0.625))
+    assert torch.allclose(merged[2:, 2:], torch.full((2, 2), 0.125))
+
+
+def test_block_fp8_delta_supports_expert_leading_dimension() -> None:
+    lora_delta = _load_lora_delta_module()
+    param = torch.nn.Parameter(
+        torch.ones(2, 4, 4).to(torch.float8_e4m3fn), requires_grad=False
+    )
+    scale = torch.nn.Parameter(torch.ones(2, 2, 2), requires_grad=False)
+    setattr(param, lora_delta._BLOCK_FP8_SCALE_ATTR, scale)
+    setattr(param, lora_delta._BLOCK_FP8_SIZE_ATTR, (2, 2))
+    delta = torch.zeros(2, 4, 4)
+    delta[1] = 1.0
+
+    lora_delta._requantize_block_fp8_delta(param, delta)
+
+    expanded = scale.repeat_interleave(2, -2).repeat_interleave(2, -1)
+    merged = param.float() * expanded
+    assert torch.allclose(merged[0], torch.ones(4, 4))
+    assert torch.allclose(merged[1], torch.full((4, 4), 2.0))

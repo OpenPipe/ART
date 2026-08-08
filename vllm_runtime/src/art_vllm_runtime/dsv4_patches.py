@@ -36,6 +36,28 @@ def _restore_merged_column_output_dim(param: Any) -> None:
         param.output_dim = 0
 
 
+def _attach_block_fp8_scale(
+    param: Any,
+    name: str,
+    params: dict[str, Any],
+    block_size: Any,
+) -> None:
+    if param.dtype != torch.float8_e4m3fn or not block_size:
+        return
+    if name.endswith(".w13_weight"):
+        scale_name = name.removesuffix("weight") + "weight_scale_inv"
+    elif name.endswith(".w2_weight"):
+        scale_name = name.removesuffix("weight") + "weight_scale_inv"
+    elif name.endswith(".weight"):
+        scale_name = name.removesuffix("weight") + "weight_scale_inv"
+    else:
+        return
+    scale = params.get(scale_name)
+    if scale is not None:
+        param._art_block_fp8_scale = scale
+        param._art_block_fp8_size = tuple(block_size)
+
+
 def patch_layerwise_reload_shadow_attrs() -> None:
     """Allow vLLM layerwise reload to restore processed DSV4 MegaMoE params.
 
@@ -113,6 +135,8 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
             ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
         ]
         params_dict = dict(self.named_parameters())
+        quantization_config = self.config.quantization_config or {}
+        block_size = quantization_config.get("weight_block_size")
         loaded_params: set[str] = set()
 
         tp_size = dsv4_model.get_tensor_model_parallel_world_size()
@@ -134,6 +158,7 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                 if is_pp_missing_parameter(name, self):
                     break
                 param = params_dict[name]
+                _attach_block_fp8_scale(param, name, params_dict, block_size)
                 _restore_merged_column_output_dim(param)
                 try:
                     param.weight_loader(param, loaded_weight, shard_id)
@@ -160,6 +185,9 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
                         param = params_dict[name_mapped]
+                        _attach_block_fp8_scale(
+                            param, name_mapped, params_dict, block_size
+                        )
                         success = param.weight_loader(
                             param,
                             loaded_weight,
@@ -192,6 +220,7 @@ def patch_dsv4_attn_sink_layerwise_reload() -> None:
                 if is_pp_missing_parameter(name, self):
                     continue
                 param = params_dict[name]
+                _attach_block_fp8_scale(param, name, params_dict, block_size)
                 weight_loader = getattr(
                     param, "weight_loader", dsv4_model.default_weight_loader
                 )
