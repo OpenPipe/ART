@@ -59,6 +59,7 @@ from .packing import PackingRequest, PackingResult
 from .rollout import DistributedRolloutExecutor, InstalledAsyncCallable
 from .specs import (
     ArtRuntimeConfig,
+    GpuId,
     GpuPlacement,
     HostServiceHealth,
     ModelServiceSpec,
@@ -123,7 +124,9 @@ class ArtRuntime:
         self._closeables: set[Any] = set()
         self._next_packing_host = 0
         self._nccl_preflight_lock = asyncio.Lock()
-        self._nccl_preflights: set[tuple[str, tuple[tuple[str, int], ...], str]] = set()
+        self._nccl_preflights: set[tuple[str, tuple[tuple[str, GpuId], ...], str]] = (
+            set()
+        )
         self._runtime_packages = runtime_package_names(
             trainer=topology.trainer is not None
         )
@@ -170,7 +173,10 @@ class ArtRuntime:
         requested_address = require_local_worker_address(
             tuple(host.worker_address for host in topology.cluster.hosts)
         )
-        worker = _start_worker(requested_address)
+        worker = _start_worker(
+            requested_address,
+            startup_timeout_s=topology.cluster.startup_timeout_s,
+        )
         address = worker.address
         if address != requested_address:
             host = topology.cluster.hosts[0].model_copy(
@@ -888,10 +894,8 @@ class ArtRuntime:
         return run
 
     async def stop_trainer(self, run: Any) -> None:
-        try:
-            await run.close()
-        finally:
-            self._trainer_runs.discard(run)
+        await run.close()
+        self._trainer_runs.discard(run)
 
     def register_closeable(self, closeable: Any) -> None:
         self._require_open()
@@ -948,6 +952,11 @@ class ArtRuntime:
         return state
 
     async def close(self) -> None:
+        if self._close_task is not None and self._close_task.done():
+            try:
+                self._close_task.result()
+            except BaseException:
+                self._close_task = None
         if self._close_task is None:
             self._closed = True
             self._close_task = asyncio.create_task(self._close())
@@ -956,9 +965,9 @@ class ArtRuntime:
     async def _close(self) -> None:
         failures: list[BaseException] = []
 
-        async def collect(name: str, *awaitables: Any) -> None:
+        async def collect(name: str, *awaitables: Any) -> bool:
             if not awaitables:
-                return
+                return True
             tasks = {asyncio.ensure_future(awaitable) for awaitable in awaitables}
             try:
                 done, pending = await asyncio.wait(
@@ -967,10 +976,12 @@ class ArtRuntime:
             except BaseException:
                 for task in tasks:
                     task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
                 raise
             for task in pending:
                 task.cancel()
-                task.add_done_callback(_consume_task_result)
+            await asyncio.gather(*pending, return_exceptions=True)
+            group_failed = bool(pending)
             if pending:
                 failures.append(
                     TimeoutError(
@@ -982,17 +993,21 @@ class ArtRuntime:
                     task.result()
                 except BaseException as error:
                     failures.append(error)
+                    group_failed = True
+            return not group_failed
 
-        await collect(
+        if await collect(
             "dependent shutdown", *(value.aclose() for value in self._closeables)
-        )
-        self._closeables.clear()
+        ):
+            self._closeables.clear()
         await collect(
             "model-service shutdown",
             *(self.stop_model_service(name) for name in tuple(self._model_services)),
         )
-        await collect("trainer shutdown", *(run.close() for run in self._trainer_runs))
-        self._trainer_runs.clear()
+        if await collect(
+            "trainer shutdown", *(run.close() for run in self._trainer_runs)
+        ):
+            self._trainer_runs.clear()
         await collect(
             "packed batch reclamation",
             *(
@@ -1000,39 +1015,41 @@ class ArtRuntime:
                 for batch_id in tuple(self._live_batches)
             ),
         )
-        await collect(
+        if await collect(
             "rollout actor shutdown",
             *(
                 call_remote(actor.slice(rollout=slot).close)
                 for host_id, actor in self._rollout_actors.items()
                 for slot in range(self._host(host_id).cpu_slots)
             ),
-        )
-        await collect(
+        ):
+            self._rollout_actors.clear()
+        if await collect(
             "rollout process shutdown",
             *(proc.stop() for proc in self._rollout_procs.values()),
-        )
-        self._rollout_actors.clear()
-        self._rollout_procs.clear()
-        await collect(
+        ):
+            self._rollout_procs.clear()
+        if await collect(
             "host service shutdown",
             *(call_remote(actor.close) for actor in self._host_services.values()),
-        )
-        await collect(
+        ):
+            self._host_services.clear()
+        if await collect(
             "host process shutdown",
             *(proc.stop() for proc in self._host_procs.values()),
-        )
-        self._host_services.clear()
-        self._host_procs.clear()
-        self._live_batches.clear()
-        if self.owns_host_mesh:
-            await collect("host mesh shutdown", self.host_mesh.shutdown())
-        worker, self._local_worker = self._local_worker, None
-        if worker is not None:
+        ):
+            self._host_procs.clear()
+        if self.owns_host_mesh and await collect(
+            "host mesh shutdown", self.host_mesh.shutdown()
+        ):
+            self.owns_host_mesh = False
+        if self._local_worker is not None:
             try:
-                await asyncio.to_thread(_stop_worker, worker)
+                await asyncio.to_thread(_stop_worker, self._local_worker)
             except BaseException as error:
                 failures.append(error)
+            else:
+                self._local_worker = None
         if failures:
             raise BaseExceptionGroup("ART runtime teardown failed", failures)
 

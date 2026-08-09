@@ -7,20 +7,17 @@ from art.megatron.runtime.bridge_runtime import install_art_bridge_runtime_patch
 install_art_bridge_runtime_patches()
 # isort: on
 
-"""Megatron training runtime and public worker API.
+"""Megatron training runtime and typed executor API.
 
 Public cross-repo API consumed by serverless-training:
 - build_training_runtime
-- run_megatron_worker_loop
+- execute_megatron_rl_job
+- execute_megatron_sft_job
 """
 
-from contextlib import ExitStack
-import json
 import math
 import os
-from pathlib import Path
 import random
-import shutil
 from threading import Event
 import time
 from typing import Any, Callable, Literal, cast
@@ -56,13 +53,7 @@ from art.megatron.model_support.lora_disk import (
 )
 from art.megatron.optimizer_state import (
     ALLOW_UNPAIRED_MEGATRON_RESUME_ENV,
-    OptimizerAdapter,
-    await_adapter_publication_group,
     load_optimizer_state,
-    optimizer_group_decision,
-    optimizer_model_lease,
-    read_committed_optimizer_step,
-    save_optimizer_state_under_model_lease,
 )
 from art.megatron.provider import (
     ProviderBundle,
@@ -74,24 +65,14 @@ from art.megatron.routing_replay import (
     MoeRoutingReplayController,
     build_moe_routing_replay_bundle_from_packed_tensors,
 )
-from art.megatron.runtime.jobs import (
-    DEFAULT_JOBS_DIR,
-    DEFAULT_VLLM_WAKE_LOCK_PATH,
-    LORA_READY_EVENT,
-    MegatronJob,
-    MegatronMergedTrainingJob,
-    MegatronSFTTrainingJob,
-    MegatronSyncJob,
-    MegatronTrainingJob,
-    MergedWeightTransferInitInfo,
-    MergedWeightTransferSpec,
-    load_megatron_job,
-)
-from art.megatron.runtime.specs import TrainJobSpec
+from art.megatron.runtime.data_plane import SFTBatchData
+from art.megatron.runtime.specs import SFTJobSpec, TrainJobSpec
+from art.megatron.runtime.weight_transfer import MergedWeightTransferInitInfo
 from art.megatron.selective_lm_head import (
     TokenLossOutput,
     forward_token_losses,
 )
+from art.megatron.tensor_snapshot import SnapshotReadBarrier
 from art.megatron.training.compile import (
     configure_training_compile,
 )
@@ -142,21 +123,12 @@ from art.megatron.training.pipeline_schedule import (
     chunk_pre_process,
     validate_pipeline_topology,
 )
-from art.megatron.training.sft_batches import load_sft_batch_from_disk
 from art.megatron.training.trace import (
     attach_trace_token_uids,
     context_parallel_trace_token_uids_enabled,
 )
-from art.megatron.training.weight_offload import WeightOffloadManager
-from art.megatron.weights.lora_publish import save_vllm_lora_from_model
-from art.megatron.weights.merged_weight_export import (
-    sync_merged_weights_to_vllm,
-)
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
-from art.preprocessing.pack import (
-    PackedTensors,
-    packed_tensors_from_dir,
-)
+from art.preprocessing.pack import PackedTensors
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 _optimizer_stats_printed = False
@@ -165,10 +137,8 @@ __all__ = [
     "DEFAULT_MODEL_IDENTIFIER",
     "TrainingRuntime",
     "build_training_runtime",
-    "run_megatron_worker_loop",
-    "run_megatron_rl_job",
-    "run_megatron_sft_job",
-    "finalize_megatron_job",
+    "execute_megatron_rl_job",
+    "execute_megatron_sft_job",
 ]
 
 
@@ -187,6 +157,9 @@ class TrainingRuntime(BaseModel):
     adapter_export_dtypes: dict[str, torch.dtype] | None = None
     adapter_export_config: dict[str, Any] | None = None
     snapshot_pool_capacity: int = Field(default=2, ge=1, le=4)
+    optimizer_snapshot_barrier: SnapshotReadBarrier = Field(
+        default_factory=SnapshotReadBarrier
+    )
     transformer_layers_compiled: bool = False
     rank: int
     world_size: int
@@ -385,9 +358,30 @@ def _enable_native_moe_routing_replay(provider: Any) -> None:
     provider.moe_enable_routing_replay = True
 
 
+def _is_bridge_hf_load_hook(hook: Any) -> bool:
+    function = hook
+    seen: set[int] = set()
+    while id(function) not in seen:
+        seen.add(id(function))
+        if getattr(function, "__name__", "") in {
+            "load_weights_hf_to_megatron",
+            "_optimized_load_weights_hf_to_megatron",
+        } or getattr(function, "__qualname__", "").endswith(
+            ".load_weights_hf_to_megatron"
+        ):
+            return True
+        function = getattr(function, "func", None) or getattr(
+            function, "__wrapped__", None
+        )
+        if function is None:
+            return False
+    return False
+
+
 def build_training_runtime(
     *,
     model_identifier: str | None = None,
+    model_initialization: Literal["pretrained", "random"] = "pretrained",
     provider_torch_dtype: torch.dtype = torch.bfloat16,
     provider_bundle_configure: Callable[[ProviderBundle], None] | None = None,
     provider_configure: Callable[[Any], None] | None = None,
@@ -421,6 +415,16 @@ def build_training_runtime(
         ),
         model_support_key=model_support_key,
     )
+    if model_initialization == "random":
+        hooks = list(getattr(provider_bundle.provider, "_pre_wrap_hooks", ()))
+        checkpoint_hooks = [hook for hook in hooks if _is_bridge_hf_load_hook(hook)]
+        if not hooks or len(checkpoint_hooks) != len(hooks):
+            raise RuntimeError(
+                "random model initialization requires only Bridge checkpoint loaders; "
+                f"found {len(checkpoint_hooks)} loaders among {len(hooks)} hooks"
+            )
+        provider_bundle.provider._pre_wrap_hooks = []
+        provider_bundle.provider.perform_initialization = True
     if provider_bundle_configure is not None:
         provider_bundle_configure(provider_bundle)
     provider = provider_bundle.provider
@@ -446,7 +450,7 @@ def build_training_runtime(
                 average_in_collective=False,
             ),
             data_parallel_random_init=False,
-            init_model_with_meta_device=True,
+            init_model_with_meta_device=model_initialization == "pretrained",
         ),
     )
 
@@ -506,93 +510,9 @@ def build_training_runtime(
     return runtime
 
 
-def _poll_next_megatron_job_path(
-    runtime: TrainingRuntime,
-    jobs_dir: str,
-) -> str | None:
-    selected_job: list[str | None] = [None]
-    if runtime.rank == 0:
-        os.makedirs(jobs_dir, exist_ok=True)
-        job_names = sorted(
-            job_name for job_name in os.listdir(jobs_dir) if job_name.endswith(".json")
-        )
-        if job_names:
-            selected_job[0] = os.path.join(jobs_dir, job_names[0])
-    torch.distributed.broadcast_object_list(selected_job, src=0)  # type: ignore[possibly-missing-attribute]
-    return selected_job[0]
-
-
-def run_megatron_worker_loop(
-    runtime: TrainingRuntime,
-    *,
-    supports_sft: bool,
-    wait_until_ready: Callable[[], None] | None = None,
-    before_job: Callable[[], None] | None = None,
-    after_job: Callable[[], None] | None = None,
-) -> None:
-    jobs_dir = os.environ.get("ART_MEGATRON_JOBS_DIR", DEFAULT_JOBS_DIR)
-    while True:
-        job_path = _poll_next_megatron_job_path(runtime, jobs_dir)
-        if job_path is None:
-            time.sleep(0.05)
-            continue
-
-        if wait_until_ready is not None:
-            wait_until_ready()
-        if before_job is not None:
-            before_job()
-
-        job = _load_megatron_job(job_path, supports_sft=supports_sft)
-        print0(runtime.rank, "Loaded job from", job_path)
-        print0(runtime.rank, "Job:", job)
-
-        job_completed = False
-        try:
-            _run_megatron_job(runtime, job)
-            job_completed = True
-        finally:
-            if job_completed and after_job is not None:
-                after_job()
-
-        finalize_megatron_job(
-            runtime,
-            job_path=job_path,
-            log_path=job.log_path,
-            cleanup_path=_job_cleanup_path(job),
-        )
-
-
-def run_megatron_rl_job(
-    runtime: TrainingRuntime,
-    job: MegatronTrainingJob | MegatronMergedTrainingJob,
-) -> None:
-    """Compatibility adapter for the legacy file-backed local service."""
-    packed_tensors = packed_tensors_from_dir(**job.disk_packed_tensors)
-    replay_bundle = (
-        MoeRoutingReplayBundle.from_dir(job.moe_routing_replay_path)
-        if job.moe_routing_replay_path is not None
-        else None
-    )
-
-    def progress(step_index: int, num_steps: int, metrics: dict[str, float]) -> None:
-        del step_index, num_steps
-        _write_job_metrics(job.log_path, metrics)
-
-    execute_megatron_rl_job(
-        runtime,
-        job,
-        packed_tensors,
-        progress_sink=progress,
-        adapter_ready_sink=lambda: _write_job_event(
-            job.log_path, LORA_READY_EVENT, step=job.step
-        ),
-        replay_bundle=replay_bundle,
-    )
-
-
 def execute_megatron_rl_job(
     runtime: TrainingRuntime,
-    job: MegatronTrainingJob | MegatronMergedTrainingJob | TrainJobSpec,
+    job: TrainJobSpec,
     packed_tensors: PackedTensors,
     *,
     progress_sink: Callable[[int, int, dict[str, float]], None],
@@ -757,6 +677,9 @@ def execute_megatron_rl_job(
                 next_step_first_micro=next_step_first_micro,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
                 hybridep_token_counts=hybridep_token_counts,
+                before_optimizer_step=(
+                    runtime.optimizer_snapshot_barrier.wait_before_mutation
+                ),
             )
             train_step_s = time.perf_counter() - train_step_started
             print0(
@@ -779,45 +702,24 @@ def execute_megatron_rl_job(
 
             raise TrainingCancelledError("train job was cancelled")
 
-        if isinstance(job, TrainJobSpec):
-            if snapshot_sink is None or adapter_ready_sink is None:
-                raise RuntimeError("Distributed training requires a snapshot publisher")
-            if runtime.adapter_export_config is None:
-                raise RuntimeError("Trainer has no resident adapter export config")
-            final_metrics.update(
-                snapshot_sink(
-                    job,
-                    adapter_dtypes,
-                    runtime.adapter_export_config,
-                    _should_snapshot_optimizer(
-                        runtime,
-                        step=job.step,
-                        optimizer_save_interval=job.config.optimizer_save_interval,
-                        final_training_step=job.config.final_training_step,
-                    ),
-                )
-            )
-            adapter_ready_sink()
-        else:
-            published_adapter = _save_lora_and_optimizer(
-                runtime,
-                adapter_dtypes=adapter_dtypes,
-                lora_path=job.lora_path,
-                optimizer_state_path=job.optimizer_state_path,
-                step=job.step,
-                optimizer_save_interval=job.config.optimizer_save_interval,
-                final_training_step=job.config.final_training_step,
-                adapter_ready=adapter_ready_sink,
-            )
-            if isinstance(job, MegatronMergedTrainingJob):
-                _sync_merged_weights_to_vllm(
+        if snapshot_sink is None or adapter_ready_sink is None:
+            raise RuntimeError("Typed training requires a snapshot publisher")
+        if runtime.adapter_export_config is None:
+            raise RuntimeError("Trainer has no resident adapter export config")
+        final_metrics.update(
+            snapshot_sink(
+                job,
+                adapter_dtypes,
+                runtime.adapter_export_config,
+                _should_snapshot_optimizer(
                     runtime,
-                    job.merged_weight_transfer,
-                    lora_path=published_adapter.identity,
-                    pause_generation=True,
-                )
-            if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
-                torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
+                    step=job.step,
+                    optimizer_save_interval=job.config.optimizer_save_interval,
+                    final_training_step=job.config.final_training_step,
+                ),
+            )
+        )
+        adapter_ready_sink()
         runtime.resident_training_session_id = job.training_session_id
         runtime.resident_policy_step = job.step
         runtime.optimizer_state_loaded = True
@@ -849,68 +751,59 @@ def execute_megatron_rl_job(
             del cp_lookahead_state
 
 
-def run_megatron_sft_job(
+def execute_megatron_sft_job(
     runtime: TrainingRuntime,
-    job: MegatronSFTTrainingJob,
-) -> None:
+    job: SFTJobSpec,
+    batches: tuple[SFTBatchData, ...],
+    *,
+    progress_sink: Callable[[int, int, dict[str, float]], None],
+    adapter_ready_sink: Callable[[], None],
+    snapshot_sink: Callable[
+        [SFTJobSpec, dict[str, Any], dict[str, Any], bool], dict[str, float]
+    ]
+    | None = None,
+    cancelled: Event | None = None,
+) -> dict[str, float]:
+    """Execute SFT from in-memory batches; callers own transport and events."""
+    if len(batches) != job.num_batches:
+        raise ValueError("SFT job batch count does not match its payload")
     adapter_dtypes = None
-
+    succeeded = False
+    final_metrics: dict[str, float] = {}
     try:
         configure_moe_routing_replay(runtime)
-        adapter_dtypes = _load_lora_and_optimizer(
-            runtime,
-            lora_path=job.source_adapter_path,
-            optimizer_state_path=job.optimizer_state_path,
-            adapter_step=job.source_policy_step,
+        adapter_dtypes = _prepare_rl_training_state(runtime, job)
+        grad_accumulation_sequences = int(job.config.batch_size)
+        grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
+            grad_accumulation_sequences
         )
-
         assert runtime.optimizer is not None
         runtime.optimizer.config.clip_grad = job.max_grad_norm
         for param_group in runtime.optimizer.param_groups:
             param_group["weight_decay"] = job.weight_decay
+        topology = _infer_parallel_topology(runtime.model)
 
-        grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
-            job.grad_accumulation_sequences
-        )
-        checkpoint_interval = job.internal_checkpoint_interval
+        for batch_index, batch in enumerate(batches):
+            if cancelled is not None and cancelled.is_set():
+                from art.megatron.runtime.trainer_run import TrainingCancelledError
 
-        for batch_idx in range(job.num_batches):
-            batch_start_time = time.perf_counter()
-            batch_dir = os.path.join(job.sft_data_dir, f"batch_{batch_idx:06d}")
-            batch_metadata, trajectory_tensors = load_sft_batch_from_disk(batch_dir)
-            num_trajectories = int(batch_metadata["num_trajectories"])
-            if not trajectory_tensors:
-                raise RuntimeError(f"SFT batch {batch_idx} is empty")
-            if num_trajectories != len(trajectory_tensors):
-                raise RuntimeError(
-                    "SFT batch metadata does not match trajectory count: "
-                    f"{num_trajectories} != {len(trajectory_tensors)}"
-                )
-
-            global_tokens = max(
-                int(batch_metadata.get("num_tokens", 0)),
-                1,
-            )
-            if "num_tokens" not in batch_metadata:
-                global_tokens = max(
-                    sum(
-                        int(inputs["attention_mask"].sum().item())
-                        for inputs in trajectory_tensors
-                    ),
-                    1,
-                )
-            global_trainable_tokens = max(
-                int(batch_metadata["num_trainable_tokens"]),
-                1,
-            )
+                raise TrainingCancelledError("SFT job was cancelled")
+            started = time.perf_counter()
+            trajectory_tensors = list(batch.trajectory_tensors)
             template = _clone_sft_tensors(trajectory_tensors[0])
             zero_template = _zero_contribution_sft_inputs(template)
-            topology = _infer_parallel_topology(runtime.model)
+            # Scheduling uses run-global sample IDs while each payload only owns one
+            # batch. Prefix aliases place this window in global index space without
+            # copying tensors, then selected IDs are rebased for local lookup.
+            sample_offset = batch_index * grad_accumulation_sequences
+            scheduled_tensors = [
+                trajectory_tensors[0]
+            ] * sample_offset + trajectory_tensors
             hybridep_token_counts = (
                 build_sft_hybridep_token_counts(
-                    trajectory_tensors=trajectory_tensors,
-                    step_index=0,
-                    global_grad_accumulation_sequences=grad_accumulation_sequences,
+                    trajectory_tensors=scheduled_tensors,
+                    step_index=batch_index,
+                    global_grad_accumulation_sequences=(grad_accumulation_sequences),
                     topology=topology,
                     provider=runtime.provider,
                     model_support_handler=runtime.model_support_handler,
@@ -926,141 +819,75 @@ def run_megatron_sft_job(
                 context_parallel_size=topology.cp,
                 required_capacity=max(hybridep_token_counts or (), default=0),
             )
-            micro_indices = build_micro_sample_indices(
-                step_index=0,
-                num_sequences=num_trajectories,
+            scheduled_indices = build_micro_sample_indices(
+                step_index=batch_index,
+                num_sequences=len(scheduled_tensors),
                 global_grad_accumulation_sequences=grad_accumulation_sequences,
             )
-            micro_inputs = select_sft_micro_inputs(
-                trajectory_tensors,
-                micro_indices,
-                zero_template,
-            )
+            micro_indices = [
+                None if index is None else index - sample_offset
+                for index in scheduled_indices
+            ]
             step_result = run_megatron_sft_step(
                 model_chunks=runtime.model,
                 provider=runtime.provider,
                 model_support_handler=runtime.model_support_handler,
                 optimizer=runtime.optimizer,
-                learning_rate=job.learning_rates[batch_idx],
-                inputs=micro_inputs,
-                step_index=batch_idx,
+                learning_rate=batch.learning_rate,
+                inputs=select_sft_micro_inputs(
+                    trajectory_tensors, micro_indices, zero_template
+                ),
+                step_index=batch_index,
                 sample_index=micro_indices,
-                moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                moe_routing_replay_controller=(runtime.moe_routing_replay_controller),
                 hybridep_token_counts=hybridep_token_counts,
+                before_optimizer_step=(
+                    runtime.optimizer_snapshot_barrier.wait_before_mutation
+                ),
             )
-            batch_time = time.perf_counter() - batch_start_time
-            tokens_per_second = global_tokens / batch_time if batch_time > 0 else 0.0
-            completed_batches = batch_idx + 1
-
-            if (
-                checkpoint_interval is not None
-                and completed_batches < job.num_batches
-                and completed_batches % checkpoint_interval == 0
-            ):
-                # Intermediate SFT files remain staging-only and must never advance
-                # the durable optimizer pointer without a canonical adapter.
-                _save_staged_lora(
-                    runtime,
-                    adapter_dtypes=adapter_dtypes,
-                    lora_path=job.lora_path,
-                )
-
+            elapsed = time.perf_counter() - started
+            final_metrics = {
+                "loss/train": float(step_result.reduced_loss.item()),
+                "loss/learning_rate": batch.learning_rate,
+                "loss/grad_norm": float(step_result.grad_norm),
+                "throughput/train_executed_tok_equiv_per_s": (
+                    batch.num_tokens / elapsed if elapsed else 0.0
+                ),
+                **step_result.pipeline_metrics,
+            }
             if runtime.rank == 0:
-                with open(job.log_path, "a+", encoding="utf-8") as log_file:
-                    log_msg = json.dumps(
-                        {
-                            "loss": step_result.reduced_loss.item(),
-                            "learning_rate": job.learning_rates[batch_idx],
-                            "grad_norm": float(step_result.grad_norm),
-                            "num_trajectories": float(num_trajectories),
-                            "num_tokens": float(global_tokens),
-                            "num_trainable_tokens": float(global_trainable_tokens),
-                            "tokens_per_second": tokens_per_second,
-                            **step_result.pipeline_metrics,
-                        }
-                    )
-                    print("Logging SFT", log_msg)
-                    log_file.write(log_msg + "\n")
+                progress_sink(batch_index, len(batches), final_metrics)
+            del step_result, template, zero_template
 
-        _save_lora_and_optimizer(
-            runtime,
-            adapter_dtypes=adapter_dtypes,
-            lora_path=job.lora_path,
-            optimizer_state_path=job.optimizer_state_path,
-            step=job.source_policy_step + 1,
-            optimizer_save_interval=1,
-            final_training_step=job.source_policy_step + 1,
-            adapter_ready=lambda: _write_job_event(
-                job.log_path, LORA_READY_EVENT, step=job.source_policy_step + 1
-            ),
+        if snapshot_sink is None or runtime.adapter_export_config is None:
+            raise RuntimeError("typed SFT requires an immutable snapshot publisher")
+        final_metrics.update(
+            snapshot_sink(job, adapter_dtypes, runtime.adapter_export_config, True)
         )
+        adapter_ready_sink()
+        runtime.resident_training_session_id = job.training_session_id
+        runtime.resident_policy_step = job.learner_version
+        runtime.optimizer_state_loaded = True
+        succeeded = True
+        return final_metrics
     finally:
+        if not succeeded:
+            runtime.resident_training_session_id = None
+            runtime.resident_policy_step = None
+            runtime.optimizer_state_loaded = False
         if adapter_dtypes is not None:
             del adapter_dtypes
 
 
-def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
-    with open(job_path, "rb") as handle:
-        job = load_megatron_job(handle.read())
-    if isinstance(job, MegatronSFTTrainingJob) and not supports_sft:
-        raise NotImplementedError("SFT jobs are not supported in this worker loop")
-    return job
+def _experimental_train_config(job: TrainJobSpec) -> dev.TrainConfig:
+    return cast(
+        dev.TrainConfig,
+        job.experimental_config.model_dump(exclude_none=True),
+    )
 
 
-def _run_megatron_job(runtime: TrainingRuntime, job: MegatronJob) -> None:
-    if isinstance(job, MegatronSyncJob):
-        adapter_model = _load_adapter_into_model(
-            runtime.model,
-            job.lora_path,
-            runtime.rank,
-            handler=runtime.model_support_handler,
-        )
-        del adapter_model
-        _sync_merged_weights_to_vllm(
-            runtime,
-            job.merged_weight_transfer,
-            lora_path=job.lora_path,
-            pause_generation=False,
-        )
-        return
-    if isinstance(job, MegatronSFTTrainingJob):
-        run_megatron_sft_job(runtime, job)
-        return
-    run_megatron_rl_job(runtime, job)
-    if isinstance(job, MegatronMergedTrainingJob):
-        _sync_merged_weights_to_vllm(
-            runtime,
-            job.merged_weight_transfer,
-            lora_path=job.lora_path,
-            pause_generation=True,
-        )
-
-
-def _job_cleanup_path(job: MegatronJob) -> str | None:
-    if isinstance(job, MegatronSyncJob):
-        return None
-    if isinstance(job, MegatronSFTTrainingJob):
-        return job.sft_data_dir
-    return job.disk_packed_tensors["dir"]
-
-
-def _experimental_train_config(
-    job: MegatronTrainingJob | MegatronMergedTrainingJob | TrainJobSpec,
-) -> dev.TrainConfig:
-    if isinstance(job, TrainJobSpec):
-        return cast(
-            dev.TrainConfig,
-            job.experimental_config.model_dump(exclude_none=True),
-        )
-    return cast(dev.TrainConfig, job.experimental_config)
-
-
-def _moe_replay_strict(
-    job: MegatronTrainingJob | MegatronMergedTrainingJob | TrainJobSpec,
-) -> bool:
-    if isinstance(job, TrainJobSpec):
-        return job.experimental_config.moe_routing_replay_strict
-    return job.moe_routing_replay_strict
+def _moe_replay_strict(job: TrainJobSpec) -> bool:
+    return job.experimental_config.moe_routing_replay_strict
 
 
 def _load_lora_and_optimizer(
@@ -1070,6 +897,7 @@ def _load_lora_and_optimizer(
     optimizer_state_path: str,
     adapter_step: int,
 ) -> dict[str, torch.dtype]:
+    runtime.optimizer_snapshot_barrier.synchronize()
     persistent_optimizer = runtime.optimizer if runtime.optimizer_persistent else None
     _load_adapter_into_model(
         runtime.model,
@@ -1098,7 +926,7 @@ def _load_lora_and_optimizer(
 
 def _prepare_rl_training_state(
     runtime: TrainingRuntime,
-    job: MegatronTrainingJob | MegatronMergedTrainingJob | TrainJobSpec,
+    job: TrainJobSpec | SFTJobSpec,
 ) -> dict[str, torch.dtype]:
     state_is_resident = (
         runtime.optimizer_persistent
@@ -1115,6 +943,7 @@ def _prepare_rl_training_state(
             raise RuntimeError("Resident Megatron state has no LoRA export metadata")
         return runtime.adapter_export_dtypes
 
+    runtime.optimizer_snapshot_barrier.synchronize()
     replacing_resident_state = runtime.resident_training_session_id is not None
     runtime.resident_training_session_id = None
     runtime.resident_policy_step = None
@@ -1203,78 +1032,6 @@ def _load_adapter_into_model(
     return adapter_model
 
 
-def _save_lora_and_optimizer(
-    runtime: TrainingRuntime,
-    *,
-    adapter_dtypes: dict[str, torch.dtype],
-    lora_path: str,
-    optimizer_state_path: str,
-    step: int,
-    optimizer_save_interval: int,
-    final_training_step: int | None = None,
-    adapter_ready: Callable[[], None] | None = None,
-    controller_owns_model_lease: bool = False,
-) -> OptimizerAdapter:
-    assert runtime.optimizer is not None
-    with ExitStack() as leases:
-        if not controller_owns_model_lease:
-            optimizer_group_decision(
-                runtime,
-                lambda: leases.enter_context(
-                    optimizer_model_lease(optimizer_state_path)
-                ),
-                operation="optimizer model lease acquisition",
-            )
-        _save_staged_lora(
-            runtime,
-            adapter_dtypes=adapter_dtypes,
-            lora_path=lora_path,
-        )
-
-        if adapter_ready is None:
-            raise RuntimeError("Optimizer durability requires an adapter publisher")
-        adapter = await_adapter_publication_group(
-            runtime,
-            lora_path,
-            step=step,
-            ready=adapter_ready,
-        )
-        if _should_save_optimizer_group(
-            runtime,
-            step=step,
-            optimizer_state_path=optimizer_state_path,
-            optimizer_save_interval=optimizer_save_interval,
-            final_training_step=final_training_step,
-        ):
-            save_optimizer_state_under_model_lease(
-                runtime,
-                optimizer_state_path=optimizer_state_path,
-                step=step,
-                adapter=adapter,
-            )
-
-        return adapter
-
-
-def _save_staged_lora(
-    runtime: TrainingRuntime,
-    *,
-    adapter_dtypes: dict[str, torch.dtype],
-    lora_path: str,
-) -> None:
-    save_vllm_lora_from_model(
-        model=runtime.model,
-        adapter_dtypes=adapter_dtypes,
-        handler=runtime.model_support_handler,
-        adapter_config=load_adapter_config(lora_path),
-        output_dir=lora_path,
-        rank=runtime.rank,
-        world_size=runtime.world_size,
-    )
-    if torch.distributed.is_initialized():  # ty:ignore[possibly-missing-attribute]
-        torch.distributed.barrier()  # ty:ignore[possibly-missing-attribute]
-
-
 def _validate_train_step_result_finite(
     runtime: TrainingRuntime,
     step_result: TrainStepResult,
@@ -1296,22 +1053,6 @@ def _validate_train_step_result_finite(
     )
 
 
-def _should_save_optimizer(
-    runtime: TrainingRuntime,
-    *,
-    step: int,
-    optimizer_state_path: str,
-    optimizer_save_interval: int,
-    final_training_step: int | None,
-) -> bool:
-    committed_step = read_committed_optimizer_step(optimizer_state_path)
-    if not runtime.optimizer_persistent or optimizer_save_interval == 1:
-        return True
-    if final_training_step is not None and step >= final_training_step:
-        return True
-    return step <= 1 or step % optimizer_save_interval == 0 or committed_step is None
-
-
 def _should_snapshot_optimizer(
     runtime: TrainingRuntime,
     *,
@@ -1326,35 +1067,6 @@ def _should_snapshot_optimizer(
         or step % optimizer_save_interval == 0
         or (final_training_step is not None and step >= final_training_step)
     )
-
-
-def _should_save_optimizer_group(
-    runtime: TrainingRuntime,
-    *,
-    step: int,
-    optimizer_state_path: str,
-    optimizer_save_interval: int,
-    final_training_step: int | None,
-) -> bool:
-    return bool(
-        optimizer_group_decision(
-            runtime,
-            lambda: _should_save_optimizer(
-                runtime,
-                step=step,
-                optimizer_state_path=optimizer_state_path,
-                optimizer_save_interval=optimizer_save_interval,
-                final_training_step=final_training_step,
-            ),
-            operation="optimizer save selection",
-        )
-    )
-
-
-def _write_job_event(log_path: str, event: str, **payload: int | float | str) -> None:
-    with open(log_path, "a+", encoding="utf-8") as log_file:
-        log_file.write(json.dumps({"event": event, **payload}) + "\n")
-        log_file.flush()
 
 
 def _rl_step_metrics(
@@ -1396,32 +1108,6 @@ def _rl_step_metrics(
     return metrics
 
 
-def _write_job_metrics(log_path: str, metrics: dict[str, float]) -> None:
-    with open(log_path, "a+", encoding="utf-8") as log_file:
-        log_msg = json.dumps(metrics)
-        print("Logging", log_msg)
-        log_file.write(log_msg + "\n")
-
-
-def finalize_megatron_job(
-    runtime: TrainingRuntime,
-    *,
-    job_path: str | None,
-    log_path: str,
-    cleanup_path: str | None,
-) -> None:
-    torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
-    if runtime.rank != 0:
-        return
-
-    if job_path is not None and os.path.exists(job_path):
-        os.remove(job_path)
-    if cleanup_path is not None and os.path.exists(cleanup_path):
-        shutil.rmtree(cleanup_path)
-    with open(log_path, "a+", encoding="utf-8") as log_file:
-        log_file.write("all done\n")
-
-
 def _placeholder_attention_mask(device: torch.device) -> torch.Tensor:
     return torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device)
 
@@ -1461,11 +1147,14 @@ def _optimizer_step(
     *,
     model_support_handler: Any | None = None,
     model_chunks: ModelChunks | None = None,
+    before_step: Callable[[], None] | None = None,
 ) -> tuple[bool, float, int | None]:
     for param_group in optimizer.param_groups:
         param_group["lr"] = learning_rate
     if model_support_handler is not None and model_chunks is not None:
         model_support_handler.zero_internal_padding_grads(model_chunks)
+    if before_step is not None:
+        before_step()
     update_successful, grad_norm, num_zeros_in_grad = cast(
         tuple[bool, float, int | None], optimizer.step()
     )
@@ -2028,7 +1717,7 @@ def _reference_sample_step_indices(
 def _prepare_kl_reference_logprobs(
     *,
     runtime: TrainingRuntime,
-    job: MegatronTrainingJob | MegatronMergedTrainingJob | TrainJobSpec,
+    job: TrainJobSpec,
     packed_tensors: PackedTensors,
     num_sequences: int,
     num_steps: int,
@@ -2082,6 +1771,7 @@ def _prepare_kl_reference_logprobs(
                 runtime.model_support_handler.zero_internal_padding_params(
                     runtime.model
                 )
+            runtime.optimizer_snapshot_barrier.synchronize()
             runtime.optimizer.reload_model_params()
 
 
@@ -2110,6 +1800,7 @@ def run_megatron_sft_step(
     sample_index: int | list[int | None],
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     hybridep_token_counts: list[int] | None = None,
+    before_optimizer_step: Callable[[], None] | None = None,
 ) -> TrainStepResult:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
@@ -2231,6 +1922,7 @@ def run_megatron_sft_step(
         learning_rate,
         model_support_handler=model_support_handler,
         model_chunks=model_chunks,
+        before_step=before_optimizer_step,
     )
     num_tokens = _local_trainable_sft_token_count_tensor(prepared_micros, device=device)
     reduced_loss = _reduce_loss_sum(
@@ -2269,6 +1961,7 @@ def run_training_step(
     next_step_first_micro: PackedTensors | None = None,
     next_step_first_ref_logprobs: torch.Tensor | None = None,
     hybridep_token_counts: list[int] | None = None,
+    before_optimizer_step: Callable[[], None] | None = None,
 ) -> TrainStepResult:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
@@ -2460,6 +2153,7 @@ def run_training_step(
         learning_rate,
         model_support_handler=model_support_handler,
         model_chunks=model_chunks,
+        before_step=before_optimizer_step,
     )
     reduced_loss = _reduce_loss_sum(
         raw_loss_sum,
@@ -2485,35 +2179,6 @@ def run_training_step(
     )
 
 
-def _sync_merged_weights_to_vllm(
-    runtime: TrainingRuntime,
-    spec: MergedWeightTransferSpec,
-    *,
-    lora_path: str,
-    pause_generation: bool,
-) -> None:
-    adapter_model = load_lora_tensors_for_megatron(
-        lora_path,
-        handler=runtime.model_support_handler,
-    )
-    (
-        runtime.merged_weight_transfer_group,
-        runtime.merged_weight_transfer_init_info,
-    ) = sync_merged_weights_to_vllm(
-        bridge=runtime.bridge,
-        model=runtime.model,
-        model_support_handler=runtime.model_support_handler,
-        adapter_model=adapter_model,
-        adapter_config=load_adapter_config(lora_path),
-        rank=runtime.rank,
-        world_size=runtime.world_size,
-        merged_weight_transfer_group=runtime.merged_weight_transfer_group,
-        merged_weight_transfer_init_info=runtime.merged_weight_transfer_init_info,
-        spec=spec,
-        pause_generation=pause_generation,
-    )
-
-
 def _close_merged_weight_transfer_group(
     runtime: TrainingRuntime, *, abort: bool = False
 ) -> None:
@@ -2527,61 +2192,3 @@ def _close_merged_weight_transfer_group(
         shutdown = getattr(weight_transfer_group, "close", None)
     if shutdown is not None:
         shutdown()
-
-
-def _run_service_loop(runtime: TrainingRuntime) -> None:
-    weight_offload = WeightOffloadManager.from_env(
-        model=runtime.model,
-        rank=runtime.rank,
-        compile_enabled=runtime.transformer_layers_compiled,
-    )
-    runtime.optimizer_persistent = not weight_offload.offload_between_jobs
-    weight_offload.install()
-    wake_lock_path = os.environ.get(
-        "ART_MEGATRON_WAKE_LOCK_PATH", DEFAULT_VLLM_WAKE_LOCK_PATH
-    )
-
-    def wait_until_ready() -> None:
-        while os.path.exists(wake_lock_path):
-            time.sleep(0.2)
-
-    def before_job() -> None:
-        weight_offload.before_job()
-
-    def after_job() -> None:
-        if not runtime.optimizer_persistent:
-            runtime.optimizer = None
-            runtime.resident_training_session_id = None
-            runtime.resident_policy_step = None
-            runtime.optimizer_state_loaded = False
-            runtime.adapter_export_dtypes = None
-        weight_offload.after_job()
-
-    worker_error = False
-    try:
-        after_job()
-        run_megatron_worker_loop(
-            runtime,
-            supports_sft=True,
-            wait_until_ready=wait_until_ready,
-            before_job=before_job,
-            after_job=after_job,
-        )
-    except BaseException:
-        worker_error = True
-        raise
-    finally:
-        _close_merged_weight_transfer_group(runtime, abort=worker_error)
-
-
-def main() -> None:
-    runtime = build_training_runtime(
-        model_identifier=os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
-        model_support_key=os.environ.get("ART_MEGATRON_MODEL_SUPPORT_KEY"),
-        build_optimizer=False,
-    )
-    _run_service_loop(runtime)
-
-
-if __name__ == "__main__":
-    main()

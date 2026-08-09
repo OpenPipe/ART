@@ -447,37 +447,6 @@ def _patch_gpt_oss_mapping_registry(target: Any) -> None:
     bridge_type.mapping_registry = mapping_registry
 
 
-def _patch_gpt_oss_weight_loader(target: Any) -> None:
-    bridge_type = type(target)
-    original = getattr(bridge_type, "maybe_modify_loaded_hf_weight", None)
-    if original is None or getattr(original, "_art_gpt_oss_bias_encoding", False):
-        return
-    original_loader = cast(Any, original)
-
-    def maybe_modify_loaded_hf_weight(
-        self: Any,
-        hf_param: str | dict[str, str],
-        hf_state_dict: Any,
-    ) -> Any:
-        def load_one(name: str) -> torch.Tensor:
-            loaded = original_loader(self, name, hf_state_dict)
-            if name.endswith(".mlp.experts.down_proj") and name not in hf_state_dict:
-                # This Bridge version documents MXFP4 down projection output as
-                # [E, hidden, ffn], but its dequantizer emits the checkpoint's
-                # [E, ffn, hidden] layout. GPT-OSS-20B is square, so shape-based
-                # alignment cannot detect the orientation. Normalize before the
-                # optimized loader caches the materialized logical tensor.
-                loaded = loaded.transpose(-1, -2).contiguous()
-            return loaded
-
-        if isinstance(hf_param, dict):
-            return {key: load_one(name) for key, name in hf_param.items()}
-        return load_one(hf_param)
-
-    setattr(maybe_modify_loaded_hf_weight, "_art_gpt_oss_bias_encoding", True)
-    bridge_type.maybe_modify_loaded_hf_weight = maybe_modify_loaded_hf_weight
-
-
 def _gpt_oss_padded_mapping_registry(
     upstream_registry: Any,
     *,
@@ -668,6 +637,7 @@ def _gpt_oss_padded_mapping_registry(
             )
 
             global_expert_number = extract_expert_number_from_param(self.megatron_param)
+            # Index through ExpertTensorSlice so global EP metadata is preserved.
             expert_weight = hf_weights["weight"][global_expert_number]
             expert_bias = hf_weights["bias"][global_expert_number]
             normalized_param = self._normalize_expert_param_name(self.megatron_param)
@@ -799,7 +769,6 @@ class GptOssMoeHandler(DefaultMoeHandler):
         setattr(bridge, "_art_hf_weight_source", _hf_weight_source)
         model_bridge = getattr(bridge, "_model_bridge", None)
         if model_bridge is not None and model_bridge is not bridge:
-            _patch_gpt_oss_weight_loader(model_bridge)
             _patch_gpt_oss_mapping_registry(model_bridge)
             if type(model_bridge) is object:
                 return
@@ -836,8 +805,11 @@ class GptOssMoeHandler(DefaultMoeHandler):
         *,
         rollout_weights_mode: RolloutWeightsMode,
     ) -> dict[str, object]:
-        del rollout_weights_mode
-        return {"moe_backend": "triton"}
+        return {
+            "moe_backend": (
+                "triton_unfused" if rollout_weights_mode == "lora" else "triton"
+            )
+        }
 
     def vllm_server_args(self) -> dict[str, object]:
         return {"tool_call_parser": "openai"}

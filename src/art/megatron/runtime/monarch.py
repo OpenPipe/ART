@@ -16,17 +16,29 @@ from monarch.spmd import SPMDActor
 from pydantic import BaseModel, ConfigDict
 
 from art.distributed.data_plane import PackedBatchLeaseSet
+from art.distributed.monarch_bootstrap import activate_cuda_device
+from art.distributed.specs import GpuId
 from art.utils.cache_dirs import configure_model_cache_env
 from art.utils.lifecycle import cleanup_after_failure
 
-from .data_plane import InMemoryPackedBatch
+from .data_plane import InMemoryPackedBatch, SFTBatchData
+from .publication import (
+    TRAINER_PUBLICATION_EVENT_ADAPTER,
+    TrainerPublicationEvent,
+    TrainerPublicationFailed,
+    TrainerPublicationSucceeded,
+    TrainerRankPublication,
+)
 from .specs import (
     TRAIN_EVENT_ADAPTER,
     AdapterReady,
     HybridEpRuntimeSpec,
+    SFTJobSpec,
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
+    TrainerGeneration,
+    TrainerJobSpec,
     TrainerRuntimeSpec,
     TrainEvent,
     TrainFailed,
@@ -34,16 +46,18 @@ from .specs import (
     TrainJobSpec,
     TrainProgress,
 )
+from .weight_transfer import MergedWeightTransferSpec
 
 
 class _ActorEventSink:
-    def __init__(self, port: Port[dict[str, Any]] | None) -> None:
+    def __init__(self, port: Port[dict[str, Any]], *, coordinator: bool) -> None:
         self._port = port
+        self._coordinator = coordinator
 
     def progress(
         self, *, step_index: int, num_steps: int, metrics: dict[str, float]
     ) -> None:
-        if self._port is not None:
+        if self._coordinator:
             self._port.send(
                 {
                     "kind": "progress",
@@ -54,7 +68,7 @@ class _ActorEventSink:
             )
 
     def adapter_ready(self, *, learner_version: int, adapter_path: str) -> None:
-        if self._port is not None:
+        if self._coordinator:
             self._port.send(
                 {
                     "kind": "adapter_ready",
@@ -62,6 +76,9 @@ class _ActorEventSink:
                     "adapter_path": adapter_path,
                 }
             )
+
+    def publication(self, event: TrainerPublicationEvent) -> None:
+        self._port.send(event.model_dump(mode="json"))
 
 
 _SUPERVISION_LOCK = Lock()
@@ -109,6 +126,7 @@ def _build_training_runtime(spec: TrainerRuntimeSpec, *, rank: int) -> Any:
 
     return build_training_runtime(
         model_identifier=spec.model_identifier,
+        model_initialization=spec.model_initialization,
         provider_torch_dtype={
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
@@ -125,7 +143,7 @@ class _TrainerRankReady(BaseModel):
 
     rank: int
     host_id: str
-    gpu_id: int
+    gpu_id: GpuId
     hostname: str
     process_id: int
 
@@ -219,6 +237,39 @@ class MonarchTrainerSupervision:
                 _PREVIOUS_FAULT_HOOK = None
 
 
+class _TrainerSPMDActor(SPMDActor):
+    """Own the rendezvous store until the warm trainer mesh is stopped."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._store: Any = None
+
+    @endpoint
+    def start_store(self, _request: None) -> tuple[str, int]:
+        if self._store is not None:
+            raise RuntimeError("trainer rendezvous store is already running")
+        from torch.distributed import TCPStore
+
+        hostname = socket.gethostname()
+        self._store = TCPStore(
+            hostname,
+            0,
+            self.world_size,
+            True,
+            wait_for_workers=False,
+        )
+        return hostname, int(self._store.port)
+
+    @endpoint
+    def setup_agent_store_env(self, master_addr: str, master_port: int) -> None:
+        self._setup_env(master_addr, master_port)
+        os.environ["TORCHELASTIC_USE_AGENT_STORE"] = "True"
+
+    def __cleanup__(self, exc: Exception | None) -> None:
+        del exc
+        self._store = None
+
+
 class MonarchTrainerActor(Actor):
     """One warm Megatron rank, spawned once on every trainer ProcMesh process."""
 
@@ -254,7 +305,9 @@ class MonarchTrainerActor(Actor):
                 "ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD": str(
                     int(runtime_spec.streaming_weight_offload)
                 ),
-                "ART_MEGATRON_OFFLOAD_BETWEEN_JOBS": "0",
+                "ART_MEGATRON_OFFLOAD_BETWEEN_JOBS": str(
+                    int(runtime_spec.offload_between_jobs)
+                ),
             }
         )
         if runtime_spec.random_state is not None:
@@ -274,13 +327,17 @@ class MonarchTrainerActor(Actor):
                 f"{world_size} != {len(runtime_spec.trainer_mesh.ranks)}"
             )
 
-        import torch
-
         rank = int(os.environ["RANK"])
         placement = runtime_spec.trainer_mesh.ranks[rank]
         self._host_id = placement.host_id
-        os.environ["LOCAL_RANK"] = str(placement.gpu_id)
-        torch.cuda.set_device(placement.gpu_id)
+        self._gpu_id = placement.gpu_id
+        local_rank = activate_cuda_device(placement.gpu_id)
+        os.environ["LOCAL_RANK"] = str(local_rank)
+
+        import torch
+
+        torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
+        torch.cuda.set_device(local_rank)
         if topology.ep > 1:
             from art.megatron.hybrid_ep_setup import validate_hybrid_ep
 
@@ -314,7 +371,7 @@ class MonarchTrainerActor(Actor):
             model=self._runtime.model,
             rank=self._runtime.rank,
             compile_enabled=self._runtime.transformer_layers_compiled,
-            offload_between_jobs=False,
+            offload_between_jobs=runtime_spec.offload_between_jobs,
             streaming_config=streaming_weight_offload_config_from_env(),
         )
         self._weight_offload.install()
@@ -325,7 +382,7 @@ class MonarchTrainerActor(Actor):
         return _TrainerRankReady(
             rank=self._runtime.rank,
             host_id=self._host_id,
-            gpu_id=int(os.environ["LOCAL_RANK"]),
+            gpu_id=self._gpu_id,
             hostname=socket.gethostname(),
             process_id=os.getpid(),
         ).model_dump(mode="json")
@@ -349,7 +406,7 @@ class MonarchTrainerActor(Actor):
                 metrics = self._executor.execute(
                     job,
                     batch,
-                    _ActorEventSink(event_port if coordinator else None),
+                    _ActorEventSink(event_port, coordinator=coordinator),
                     Event(),
                 )
             if coordinator:
@@ -374,6 +431,63 @@ class MonarchTrainerActor(Actor):
         finally:
             if batch is not None:
                 batch.close()
+
+    @endpoint
+    def execute_sft(
+        self,
+        job_json: str,
+        batches: tuple[SFTBatchData, ...],
+        event_port: Port[dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = SFTJobSpec.model_validate_json(job_json)
+            coordinator = self._runtime.rank == 0
+            with self._weight_offload.job():
+                metrics = self._executor.execute_sft(
+                    job,
+                    batches,
+                    _ActorEventSink(event_port, coordinator=coordinator),
+                    Event(),
+                )
+            if coordinator:
+                event_port.send({"kind": "actor_completed", "metrics": metrics})
+            return {
+                "rank": self._runtime.rank,
+                "learner_version": job.learner_version,
+                "metrics": metrics if coordinator else {},
+            }
+        except BaseException as error:
+            self._valid = False
+            event_port.send(
+                {
+                    "kind": "rank_failed",
+                    "rank": self._runtime.rank,
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+            raise
+
+    @endpoint
+    def sync_merged(self, generation_json: str, transfer_json: str) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        generation = TrainerGeneration.model_validate_json(generation_json)
+        transfer = MergedWeightTransferSpec.model_validate_json(transfer_json)
+        try:
+            with self._weight_offload.job():
+                metrics = self._executor.sync_merged_source(generation, transfer)
+            return {
+                "rank": self._runtime.rank,
+                "learner_version": generation.policy_step,
+                "metrics": metrics,
+            }
+        except BaseException:
+            self._valid = False
+            raise
 
     @endpoint
     def close(self) -> None:
@@ -431,14 +545,13 @@ async def spawn_monarch_trainer_actors(
     supervision: MonarchTrainerSupervision,
 ) -> tuple[Any, tuple[_TrainerRankReady, ...]]:
     """Configure torch-elastic first, then initialize exactly one actor per rank."""
-    spmd: Any = proc_mesh.spawn(f"art_torch_elastic_{supervision.token}", SPMDActor)
+    spmd: Any = proc_mesh.spawn(
+        f"art_torch_elastic_{supervision.token}", _TrainerSPMDActor
+    )
     supervision.own_mesh(await spmd._name)
     first_rank = dict.fromkeys(proc_mesh._labels, 0)
-    master_addr, master_port = await spmd.slice(**first_rank).get_host_port.call_one(
-        None
-    )
-    await spmd.setup_env.call(master_addr, master_port)
-    await _remote_teardown(spmd.stop())
+    master_addr, master_port = await spmd.slice(**first_rank).start_store.call_one(None)
+    await spmd.setup_agent_store_env.call(master_addr, master_port)
     actors: Any = proc_mesh.spawn(
         f"art_megatron_trainer_{supervision.token}",
         MonarchTrainerActor,
@@ -464,6 +577,33 @@ async def spawn_monarch_trainer_actors(
             "trainer startup did not return the configured rank placement"
         )
     return actors, ready
+
+
+class _PublicationState:
+    __slots__ = (
+        "active_waiters",
+        "drain_done",
+        "future",
+        "generation_id",
+        "late_waitable",
+        "outcome_observed",
+        "records",
+        "train_done",
+    )
+
+    def __init__(
+        self,
+        generation_id: str,
+        future: asyncio.Future[tuple[TrainerRankPublication, ...]],
+    ) -> None:
+        self.generation_id = generation_id
+        self.future = future
+        self.records: dict[int, TrainerRankPublication] = {}
+        self.train_done = False
+        self.drain_done = True
+        self.active_waiters = 0
+        self.late_waitable = True
+        self.outcome_observed = False
 
 
 class MonarchTrainerRun:
@@ -492,6 +632,8 @@ class MonarchTrainerRun:
         self._active_job_id: str | None = None
         self._active_collective: asyncio.Future[Any] | None = None
         self._active_receive: asyncio.Future[Any] | None = None
+        self._publications: dict[str, _PublicationState] = {}
+        self._publication_drains: set[asyncio.Task[None]] = set()
         self._stop_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._closed = False
@@ -507,6 +649,33 @@ class MonarchTrainerRun:
 
     async def train(
         self, job: TrainJobSpec, batch: PackedBatchLeaseSet
+    ) -> AsyncIterator[TrainEvent]:
+        async for event in self._train(
+            job,
+            lambda port: self._actors.execute.call(
+                job.model_dump_json(), batch.model_dump_json(), port
+            ),
+            lambda: self._validate_rl(job, batch),
+        ):
+            yield event
+
+    async def train_sft(
+        self, job: SFTJobSpec, batches: tuple[SFTBatchData, ...]
+    ) -> AsyncIterator[TrainEvent]:
+        async for event in self._train(
+            job,
+            lambda port: self._actors.execute_sft.call(
+                job.model_dump_json(), batches, port
+            ),
+            lambda: self._validate_sft(job, batches),
+        ):
+            yield event
+
+    async def _train(
+        self,
+        job: TrainerJobSpec,
+        start: Callable[[Port[dict[str, Any]]], Awaitable[Any]],
+        validate: Callable[[], BaseException | None],
     ) -> AsyncIterator[TrainEvent]:
         cached = self._jobs.get(job.job_id)
         if cached is not None and cached[0] == job.fingerprint:
@@ -548,24 +717,30 @@ class MonarchTrainerRun:
                     expected_learner_version=job.expected_learner_version,
                 )
             )
-            error = self._validate(job, batch)
+            error = validate()
             if error is not None:
                 yield emit(self._failed(job, len(events), error, not self._valid))
-                self._jobs[job.job_id] = (job.fingerprint, tuple(events))
                 return
 
-            send_port, receiver = Channel[dict[str, Any]].open()
-            collective = asyncio.ensure_future(
-                self._actors.execute.call(
-                    job.model_dump_json(), batch.model_dump_json(), send_port
+            publication = asyncio.get_running_loop().create_future()
+            publication.add_done_callback(_consume_future)
+            generation_id = job.output_generation_id
+            if generation_id in self._publications:
+                raise RuntimeError(
+                    f"publication generation already exists: {generation_id}"
                 )
-            )
-            receive = asyncio.ensure_future(receiver.recv())
-            supervision = asyncio.create_task(self._supervision.wait())
-            self._active_job_id = job.job_id
-            self._active_collective = collective
-            self._active_receive = receive
+            self._expire_prior_publications()
+            publication_state = _PublicationState(generation_id, publication)
+            self._publications[generation_id] = publication_state
+            supervision: asyncio.Task[str] | None = None
             try:
+                send_port, receiver = Channel[dict[str, Any]].open()
+                collective = asyncio.ensure_future(start(send_port))
+                receive = asyncio.ensure_future(receiver.recv())
+                supervision = asyncio.create_task(self._supervision.wait())
+                self._active_job_id = job.job_id
+                self._active_collective = collective
+                self._active_receive = receive
                 while True:
                     waiters = {receive, supervision}
                     if not collective.done():
@@ -594,6 +769,14 @@ class MonarchTrainerRun:
                         if receive not in done:
                             continue
                     payload = receive.result()
+                    if payload["kind"] in {
+                        "publication_succeeded",
+                        "publication_failed",
+                    }:
+                        self._record_publication(payload)
+                        receive = asyncio.ensure_future(receiver.recv())
+                        self._active_receive = receive
+                        continue
                     if payload["kind"] == "rank_failed":
                         raise RuntimeError(
                             f"trainer rank {payload['rank']} failed: "
@@ -636,6 +819,14 @@ class MonarchTrainerRun:
                             learner_version=job.learner_version,
                             metrics=payload["metrics"],
                         )
+                        if not publication.done():
+                            publication_state.drain_done = False
+                            drain = asyncio.create_task(
+                                self._drain_publication(receiver, publication_state)
+                            )
+                            self._publication_drains.add(drain)
+                            drain.add_done_callback(self._publication_drains.discard)
+                            drain.add_done_callback(_consume_future)
                         yield completed
                         self._learner_version = job.learner_version
                         emit(completed)
@@ -649,6 +840,9 @@ class MonarchTrainerRun:
                     receive = asyncio.ensure_future(receiver.recv())
                     self._active_receive = receive
             except BaseException as exc:
+                if not publication.done():
+                    publication.set_exception(exc)
+                    publication_state.records.clear()
                 closed_by_caller = self._closed
                 self._valid = False
                 self._closed = True
@@ -680,10 +874,152 @@ class MonarchTrainerRun:
                 events.append(failure)
                 yield failure
             finally:
-                supervision.cancel()
-                supervision.add_done_callback(_consume_future)
+                if supervision is not None:
+                    supervision.cancel()
+                    supervision.add_done_callback(_consume_future)
                 self._clear_active(job.job_id)
-                self._jobs[job.job_id] = (job.fingerprint, tuple(events))
+                # Older jobs cannot be retried after the sequential learner advances.
+                self._jobs = {job.job_id: (job.fingerprint, tuple(events))}
+                publication_state.train_done = True
+                self._retire_publication(publication_state)
+
+    def wait_for_publication(
+        self, generation_id: str
+    ) -> Awaitable[tuple[TrainerRankPublication, ...]]:
+        state = self._publications.get(generation_id)
+        if state is None:
+            raise RuntimeError(f"trainer has no publication {generation_id}")
+        if not state.late_waitable:
+            raise RuntimeError(
+                f"trainer publication {generation_id} is no longer waitable"
+            )
+        # Reserve before returning control; the next train may expire late waiters
+        # without yielding to the task which awaits this publication.
+        state.active_waiters += 1
+        return self._await_publication(state)
+
+    async def _await_publication(
+        self, state: "_PublicationState"
+    ) -> tuple[TrainerRankPublication, ...]:
+        observed = False
+        try:
+            result = await asyncio.shield(state.future)
+            observed = True
+            return result
+        except asyncio.CancelledError:
+            observed = state.future.cancelled()
+            raise
+        except BaseException:
+            observed = True
+            raise
+        finally:
+            state.active_waiters -= 1
+            state.outcome_observed |= observed
+            self._retire_publication(state)
+
+    def _record_publication(self, payload: dict[str, Any]) -> None:
+        event = TRAINER_PUBLICATION_EVENT_ADAPTER.validate_python(payload)
+        generation_id = (
+            event.record.generation.generation_id
+            if isinstance(event, TrainerPublicationSucceeded)
+            else event.generation_id
+        )
+        state = self._publications.get(generation_id)
+        if state is None:
+            raise RuntimeError(
+                f"trainer rank reported unknown publication {generation_id}"
+            )
+        future = state.future
+        if future.done():
+            if not future.cancelled() and future.exception() is not None:
+                return
+            raise RuntimeError(
+                f"trainer publication {generation_id} is already terminal"
+            )
+        if isinstance(event, TrainerPublicationFailed):
+            future.set_exception(
+                RuntimeError(
+                    f"trainer rank {event.rank} publication failed "
+                    f"({event.error_type}): {event.message}"
+                )
+            )
+            state.records.clear()
+            self._retire_publication(state)
+            return
+        record = event.record
+        world_size = len(self.runtime_spec.trainer_mesh.ranks)
+        if record.rank >= world_size:
+            raise RuntimeError(f"publication reported invalid rank {record.rank}")
+        records = state.records
+        if record.rank in records:
+            raise RuntimeError(
+                f"trainer rank {record.rank} published {generation_id} twice"
+            )
+        records[record.rank] = record
+        if len(records) == world_size:
+            future.set_result(tuple(records[rank] for rank in range(world_size)))
+            records.clear()
+            self._retire_publication(state)
+
+    async def _drain_publication(
+        self, receiver: Any, state: "_PublicationState"
+    ) -> None:
+        publication = state.future
+        supervision = asyncio.create_task(self._supervision.wait())
+        receive: asyncio.Future[Any] | None = None
+        try:
+            while not publication.done():
+                receive = asyncio.ensure_future(receiver.recv())
+                done, _ = await asyncio.wait(
+                    {receive, supervision},
+                    timeout=self.run_spec.shutdown_timeout_s,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    raise TimeoutError(
+                        f"trainer ranks produced no publication event for "
+                        f"{self.run_spec.shutdown_timeout_s:g}s"
+                    )
+                if supervision in done:
+                    raise RuntimeError("trainer mesh failed: " + supervision.result())
+                payload = receive.result()
+                if payload["kind"] == "rank_failed":
+                    raise RuntimeError(
+                        f"trainer rank {payload['rank']} failed after training: "
+                        f"{payload['error_type']}: {payload['message']}"
+                    )
+                self._record_publication(payload)
+        except BaseException as exc:
+            if not publication.done():
+                publication.set_exception(exc)
+                state.records.clear()
+            raise
+        finally:
+            supervision.cancel()
+            supervision.add_done_callback(_consume_future)
+            if receive is not None and not receive.done():
+                receive.cancel()
+                receive.add_done_callback(_consume_future)
+            state.drain_done = True
+            self._retire_publication(state)
+
+    def _expire_prior_publications(self) -> None:
+        for state in tuple(self._publications.values()):
+            state.late_waitable = False
+            self._retire_publication(state)
+
+    def _retire_publication(self, state: "_PublicationState") -> None:
+        # A waiter can observe a terminal event before the train/drain producer exits.
+        if not (
+            state.future.done()
+            and (state.outcome_observed or not state.late_waitable)
+            and state.active_waiters == 0
+            and state.train_done
+            and state.drain_done
+        ):
+            return
+        if self._publications.get(state.generation_id) is state:
+            self._publications.pop(state.generation_id)
 
     async def advance_without_training(
         self,
@@ -736,9 +1072,44 @@ class MonarchTrainerRun:
             self._learner_version = learner_version
             return next(result["metrics"] for result in results if result["rank"] == 0)
 
-    def _validate(
-        self, job: TrainJobSpec, batch: PackedBatchLeaseSet
-    ) -> BaseException | None:
+    async def sync_merged(
+        self,
+        generation: TrainerGeneration,
+        transfer: MergedWeightTransferSpec,
+    ) -> dict[str, float]:
+        async with self._lock:
+            if self._closed or not self._valid:
+                raise RuntimeError("trainer runtime is invalid")
+            if self._active_job_id is not None:
+                raise RuntimeError("trainer has an active job")
+            if generation.policy_step != self._learner_version:
+                raise ValueError("merged source does not match the resident learner")
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.sync_merged.call(
+                        generation.model_dump_json(), transfer.model_dump_json()
+                    ),
+                    timeout=self.run_spec.event_timeout_s,
+                )
+                results = list(values.values())
+                if {result["rank"] for result in results} != set(
+                    range(len(self.runtime_spec.trainer_mesh.ranks))
+                ) or {result["learner_version"] for result in results} != {
+                    generation.policy_step
+                }:
+                    raise RuntimeError("trainer ranks rejected merged publication")
+            except BaseException as exc:
+                self._valid = False
+                self._closed = True
+                await cleanup_after_failure(
+                    exc,
+                    self._force_stop,
+                    message="merged publication and trainer cleanup failed",
+                )
+                raise
+            return next(result["metrics"] for result in results if result["rank"] == 0)
+
+    def _validate_common(self, job: TrainerJobSpec) -> BaseException | None:
         if self._closed:
             return RuntimeError("trainer run is closed")
         if not self._valid:
@@ -760,6 +1131,13 @@ class MonarchTrainerRun:
                 "expected learner version mismatch: "
                 f"job={job.expected_learner_version}, runtime={self._learner_version}"
             )
+        return None
+
+    def _validate_rl(
+        self, job: TrainJobSpec, batch: PackedBatchLeaseSet
+    ) -> BaseException | None:
+        if error := self._validate_common(job):
+            return error
         if batch.ref != job.batch:
             return ValueError("job batch ref does not match supplied packed batch")
         if job.batch.sequence_length != self.runtime_spec.packed_sequence_length:
@@ -768,9 +1146,18 @@ class MonarchTrainerRun:
             )
         return None
 
+    def _validate_sft(
+        self, job: SFTJobSpec, batches: tuple[SFTBatchData, ...]
+    ) -> BaseException | None:
+        if error := self._validate_common(job):
+            return error
+        if len(batches) != job.num_batches:
+            return ValueError("SFT job batch count does not match its payload")
+        return None
+
     @staticmethod
     def _failed(
-        job: TrainJobSpec,
+        job: TrainerJobSpec,
         sequence: int,
         exc: BaseException,
         invalidated: bool,
@@ -785,15 +1172,18 @@ class MonarchTrainerRun:
         )
 
     async def close(self) -> None:
-        if self._close_task is not None:
-            await asyncio.shield(self._close_task)
-            return
-        graceful = self._valid and self._active_job_id is None
-        self._closed = True
-        self._valid = False
-        self._cancel_active()
-        self._close_task = asyncio.create_task(self._close(graceful))
-        self._close_task.add_done_callback(_consume_future)
+        if self._close_task is not None and self._close_task.done():
+            try:
+                self._close_task.result()
+            except BaseException:
+                self._close_task = None
+        if self._close_task is None:
+            graceful = self._valid and self._active_job_id is None
+            self._closed = True
+            self._valid = False
+            self._cancel_active()
+            self._close_task = asyncio.create_task(self._close(graceful))
+            self._close_task.add_done_callback(_consume_future)
         await asyncio.shield(self._close_task)
 
     async def _close(self, graceful: bool) -> None:
@@ -801,9 +1191,17 @@ class MonarchTrainerRun:
         deadline = loop.time() + self.run_spec.shutdown_timeout_s
         primary: BaseException | None = None
         if graceful:
+            publications = tuple(self._publications.values())
             try:
                 async with asyncio.timeout(self.run_spec.shutdown_timeout_s / 2):
-                    await _remote_teardown(self._actors.close.call())
+                    await asyncio.gather(
+                        _remote_teardown(self._actors.close.call()),
+                        *(
+                            self._await_publication(publication)
+                            for publication in publications
+                        ),
+                        *tuple(self._publication_drains),
+                    )
             except BaseException as exc:
                 primary = exc
         try:
@@ -819,14 +1217,19 @@ class MonarchTrainerRun:
             raise primary
 
     async def _force_stop(self, timeout_s: float | None = None) -> None:
+        if self._stop_task is not None and self._stop_task.done():
+            try:
+                self._stop_task.result()
+            except BaseException:
+                self._stop_task = None
         if self._stop_task is None:
             self._stop_task = asyncio.create_task(
                 _remote_teardown(self._proc_mesh.stop())
             )
 
             def stopped(task: asyncio.Task[None]) -> None:
-                self._supervision.close()
-                _consume_future(task)
+                if not task.cancelled() and task.exception() is None:
+                    self._supervision.close()
 
             self._stop_task.add_done_callback(stopped)
         await asyncio.wait_for(

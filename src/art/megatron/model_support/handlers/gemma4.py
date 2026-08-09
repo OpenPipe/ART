@@ -67,14 +67,6 @@ _GEMMA4_MOE_COMPILE_WORKAROUND_FLAGS = (
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
 )
-_GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES = {
-    # google/gemma-4-31B-it: Triton flex attention raises "No valid triton
-    # configs" for global attention head_dim=512 with backend-only options.
-    ("dense", 60, 5376, 32, 256, 512, 4),
-    # google/gemma-4-26B-A4B-it hits the same Triton resource limit on global
-    # attention head_dim=512 with backend-only options.
-    ("moe", 30, 2816, 16, 256, 512, 2),
-}
 _ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
     r"(?P<module>gate_up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
@@ -1503,35 +1495,12 @@ def _gemma4_attention_pattern(provider: Any) -> tuple[int, int]:
 def _gemma4_flex_attention_compile_crash_config(
     provider: Any,
 ) -> FlexAttentionCompileCrashConfig:
-    signature = _gemma4_compile_crash_signature(provider)
     global_head_dim = int(getattr(provider, "global_head_dim", 0) or 0)
-    if signature in _GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES or (
-        signature is None and global_head_dim >= 512
-    ):
+    if global_head_dim >= 512:
         return FlexAttentionCompileCrashConfig(
             triton_num_stages_2_head_dims=(global_head_dim,)
         )
     return FlexAttentionCompileCrashConfig()
-
-
-def _gemma4_compile_crash_signature(provider: Any) -> tuple[Any, ...] | None:
-    required_attrs = (
-        "num_layers",
-        "hidden_size",
-        "num_attention_heads",
-        "kv_channels",
-    )
-    if any(not hasattr(provider, attr) for attr in required_attrs):
-        return None
-    return (
-        "moe" if int(getattr(provider, "num_moe_experts", 0) or 0) > 0 else "dense",
-        int(provider.num_layers),
-        int(provider.hidden_size),
-        int(provider.num_attention_heads),
-        int(provider.kv_channels),
-        int(getattr(provider, "global_head_dim", 0) or 0),
-        int(getattr(provider, "num_global_key_value_heads", 0) or 0),
-    )
 
 
 def _is_gemma4_global_layer(layer_number: int, provider: Any) -> bool:

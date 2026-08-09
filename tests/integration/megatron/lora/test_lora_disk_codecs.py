@@ -1605,6 +1605,7 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
 @pytest.mark.parametrize(
     ("handler", "base_model"),
     (
+        (QWEN3_MOE_HANDLER, "Qwen/Qwen3-30B-A3B-Instruct-2507"),
         (QWEN3_5_MOE_HANDLER, "Qwen/Qwen3.5-35B-A3B"),
         (DSV4_HANDLER, "deepseek-ai/DeepSeek-V4-Flash"),
     ),
@@ -1625,41 +1626,33 @@ def test_direct_3d_packed_expert_publish_matches_handler_vllm_exactly(
     intermediate = 4
     group_prefix = "base_model.model.model.layers.0.mlp.experts"
     full: dict[str, torch.Tensor] = {}
-    gate_up_lora = LoRA(
-        adapter_model_prefix=f"{group_prefix}.{{expert}}.gate_up_proj",
-        in_features=hidden,
-        out_features=2 * intermediate,
-        rank=rank,
-        alpha=rank,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        num_local_experts=2,
-    )
-    down_lora = LoRA(
-        adapter_model_prefix=f"{group_prefix}.{{expert}}.down_proj",
-        in_features=intermediate,
-        out_features=hidden,
-        rank=rank,
-        alpha=rank,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        num_local_experts=2,
-    )
+    projection_loras = {
+        projection: LoRA(
+            adapter_model_prefix=f"{group_prefix}.{{expert}}.{projection}",
+            in_features=hidden if projection != "down_proj" else intermediate,
+            out_features=(
+                hidden
+                if projection == "down_proj"
+                else 2 * intermediate
+                if projection == "gate_up_proj"
+                else intermediate
+            ),
+            rank=rank,
+            alpha=rank,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            num_local_experts=2,
+        )
+        for projection in (
+            ("gate_proj", "up_proj", "down_proj")
+            if handler is QWEN3_MOE_HANDLER
+            else ("gate_up_proj", "down_proj")
+        )
+    }
     offset = 0
     for expert in range(2):
         expert_prefix = f"{group_prefix}.{expert}"
         tensors = {
-            "gate_up_proj.lora_A.weight": torch.arange(
-                rank * hidden,
-                dtype=torch.float32,
-            ).reshape(rank, hidden)
-            + offset,
-            "gate_up_proj.lora_B.weight": torch.arange(
-                2 * intermediate * rank,
-                dtype=torch.float32,
-            ).reshape(2 * intermediate, rank)
-            + offset
-            + 100,
             "down_proj.lora_A.weight": torch.arange(
                 rank * intermediate,
                 dtype=torch.float32,
@@ -1673,20 +1666,36 @@ def test_direct_3d_packed_expert_publish_matches_handler_vllm_exactly(
             + offset
             + 300,
         }
+        for projection_index, projection in enumerate(
+            ("gate_proj", "up_proj")
+            if handler is QWEN3_MOE_HANDLER
+            else ("gate_up_proj",)
+        ):
+            output = intermediate if handler is QWEN3_MOE_HANDLER else 2 * intermediate
+            tensors[f"{projection}.lora_A.weight"] = (
+                torch.arange(rank * hidden, dtype=torch.float32).reshape(rank, hidden)
+                + offset
+                + projection_index * 10
+            )
+            tensors[f"{projection}.lora_B.weight"] = (
+                torch.arange(output * rank, dtype=torch.float32).reshape(output, rank)
+                + offset
+                + 100
+                + projection_index * 10
+            )
         for suffix, tensor in tensors.items():
             full[f"{expert_prefix}.{suffix}"] = tensor
-        gate_up_lora.A_T.data[expert].copy_(tensors["gate_up_proj.lora_A.weight"].T)
-        gate_up_lora.B_T.data[expert].copy_(tensors["gate_up_proj.lora_B.weight"].T)
-        down_lora.A_T.data[expert].copy_(tensors["down_proj.lora_A.weight"].T)
-        down_lora.B_T.data[expert].copy_(tensors["down_proj.lora_B.weight"].T)
+        for projection, lora in projection_loras.items():
+            lora.A_T.data[expert].copy_(tensors[f"{projection}.lora_A.weight"].T)
+            lora.B_T.data[expert].copy_(tensors[f"{projection}.lora_B.weight"].T)
         offset += 1000
 
     slot_ref = LoRASlotRef("checkpoint", "student") if dynamic_slot else None
     if slot_ref is not None:
-        assert gate_up_lora.load_lora_slot(
-            slot_ref, full, alpha=rank, requires_grad=True
+        assert all(
+            lora.load_lora_slot(slot_ref, full, alpha=rank, requires_grad=True)
+            for lora in projection_loras.values()
         )
-        assert down_lora.load_lora_slot(slot_ref, full, alpha=rank, requires_grad=True)
 
     adapter_config = _config(base_model, rank=rank, alpha=rank)
     old_dir = tmp_path / "old"
@@ -1697,7 +1706,7 @@ def test_direct_3d_packed_expert_publish_matches_handler_vllm_exactly(
     )
     save_vllm_lora_tensors(old_dir, old_tensors, old_config)
     save_vllm_lora_from_model(
-        model=cast(Any, [torch.nn.Sequential(gate_up_lora, down_lora)]),
+        model=cast(Any, [torch.nn.Sequential(*projection_loras.values())]),
         adapter_dtypes={key: tensor.dtype for key, tensor in full.items()},
         handler=handler,
         adapter_config=dict(adapter_config),

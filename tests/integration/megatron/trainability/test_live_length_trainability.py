@@ -32,6 +32,7 @@ from .yes_no_trainability import (
     _get_env_int_list,
     _init_megatron_runtime_config,
     _list_model_ids,
+    _temporary_env,
     _topology_with_env_overrides,
     _trainability_stage_resources,
 )
@@ -226,6 +227,7 @@ def _word_count(text: str) -> int:
 def _target_tokens(base_model: str | None = None) -> int:
     model_key = _model_support_key(base_model)
     default = {
+        "gemma4_dense": GEMMA4_TARGET_TOKENS,
         "gemma4_moe": GEMMA4_TARGET_TOKENS,
         "gpt_oss_moe": GPT_OSS_TARGET_TOKENS,
     }.get(model_key, 10)
@@ -442,7 +444,9 @@ def _messages(
     return messages
 
 
-def _extra_body(chat_template_kwargs: dict[str, Any]) -> dict[str, object]:
+def _extra_body(
+    chat_template_kwargs: dict[str, Any], *, seed: int | None = None
+) -> dict[str, object]:
     body: dict[str, object] = (
         {"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else {}
     )
@@ -459,6 +463,8 @@ def _extra_body(chat_template_kwargs: dict[str, Any]) -> dict[str, object]:
         )
     ) is not None:
         body["frequency_penalty"] = float(frequency_penalty)
+    if seed is not None:
+        body["seed"] = seed
     return body
 
 
@@ -558,6 +564,7 @@ async def _length_group(
         )
         for completion_index in range(n)
     ]
+    seed = os.environ.get("ART_MODEL_SUPPORT_LENGTH_ROLLOUT_SEED")
     trajectories: list[art.Trajectory] = []
     completions = await asyncio.gather(
         *(
@@ -567,7 +574,14 @@ async def _length_group(
                 max_tokens=max_tokens,
                 n=1,
                 temperature=temperature,
-                extra_body=_extra_body(chat_template_kwargs),
+                extra_body=_extra_body(
+                    chat_template_kwargs,
+                    seed=(
+                        None
+                        if seed is None
+                        else int(seed) + scenario.scenario_index * n + completion_index
+                    ),
+                ),
                 logprobs=True,
                 top_logprobs=0,
                 timeout=_get_env_float(
@@ -575,7 +589,7 @@ async def _length_group(
                     900.0,
                 ),
             )
-            for max_tokens in max_tokens_by_completion
+            for completion_index, max_tokens in enumerate(max_tokens_by_completion)
         )
     )
     for max_tokens, completion in zip(
@@ -712,27 +726,39 @@ async def run_length_trainability_async(
         resource_stage_name="length_trainability",
     )
     _use_default_moe_dedicated_placement(variant, base_model=base_model)
-    max_steps = _length_max_steps()
-    max_steps_off_policy = _get_env_int(
-        "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS_OFF_POLICY",
-        0,
+    stage_resources = _trainability_stage_resources(
+        base_model,
+        stage_name="length_trainability",
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    rollouts_per_prompt = _get_env_int(
-        "ART_MODEL_SUPPORT_LENGTH_ROLLOUTS_PER_PROMPT",
-        4,
-    )
-    normalize_advantages = _get_env_bool(
-        "ART_MODEL_SUPPORT_LENGTH_NORMALIZE_ADVANTAGES",
-        True,
-    )
-    rollout_workers = _get_env_int(
-        "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_WORKERS",
-        max(1, max_steps_off_policy + 1),
-    )
-    thresholds = _length_trainability_thresholds(base_model)
-    scenario_limit = _scenario_limit()
-    zero_variance_discard_multiplier = _zero_variance_discard_multiplier(max_steps)
+    backend_env = stage_resources.megatron_env if stage_resources is not None else {}
+    with _temporary_env(backend_env):
+        max_steps = _length_max_steps()
+        max_steps_off_policy = _get_env_int(
+            "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS_OFF_POLICY",
+            0,
+        )
+        rollouts_per_prompt = _get_env_int(
+            "ART_MODEL_SUPPORT_LENGTH_ROLLOUTS_PER_PROMPT",
+            4,
+        )
+        normalize_advantages = _get_env_bool(
+            "ART_MODEL_SUPPORT_LENGTH_NORMALIZE_ADVANTAGES",
+            True,
+        )
+        rollout_workers = _get_env_int(
+            "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_WORKERS",
+            max(1, max_steps_off_policy + 1),
+        )
+        thresholds = _length_trainability_thresholds(base_model)
+        scenario_limit = _scenario_limit()
+        zero_variance_discard_multiplier = _zero_variance_discard_multiplier(max_steps)
+        current_step_demand = _get_env_bool(
+            "ART_MODEL_SUPPORT_LENGTH_CURRENT_STEP_DEMAND",
+            False,
+        )
     success_hit = False
+    pending_trainable_step: int | None = None
     samples: list[LengthSampleReport] = []
     backend_root = artifact_dir / "megatron_dedicated_workspace"
     summary_log_path = artifact_dir / "length_trainability.log"
@@ -756,20 +782,15 @@ async def run_length_trainability_async(
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     chat_template_kwargs = _length_chat_template_kwargs(base_model, tokenizer)
     rollout_weights_mode = internal_config["rollout_weights_mode"]
-    stage_resources = _trainability_stage_resources(
-        base_model,
-        stage_name="length_trainability",
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    _init_megatron_runtime_config(
-        variant,
-        streaming_weight_offload=(
-            stage_resources.streaming_weight_offload
-            if stage_resources is not None
-            else False
-        ),
-    )
-    backend_env = stage_resources.megatron_env if stage_resources is not None else {}
+    with _temporary_env(backend_env):
+        _init_megatron_runtime_config(
+            variant,
+            streaming_weight_offload=(
+                stage_resources.streaming_weight_offload
+                if stage_resources is not None
+                else False
+            ),
+        )
 
     async with _backend_context(
         variant,
@@ -787,11 +808,28 @@ async def run_length_trainability_async(
         )
         await model.register(backend)
 
+        trainer: PipelineTrainer | None = None
+
         async def scenarios() -> AsyncIterator[dict[str, object]]:
+            nonlocal pending_trainable_step
             index = 0
             while not success_hit and (
                 scenario_limit is None or index < scenario_limit
             ):
+                required_step = pending_trainable_step
+                if current_step_demand and required_step is not None:
+                    assert trainer is not None
+                    active_trainer = trainer
+                    async with active_trainer.state.policy_updated:
+                        await active_trainer.state.policy_updated.wait_for(
+                            lambda: (
+                                active_trainer.state.done
+                                or active_trainer.state.policy_version > required_step
+                            )
+                        )
+                    pending_trainable_step = None
+                    if active_trainer.state.done:
+                        return
                 yield _scenario(
                     index,
                     target_step=0,
@@ -804,7 +842,7 @@ async def run_length_trainability_async(
             scenario: dict[str, object],
             _config: None,
         ) -> art.TrajectoryGroup:
-            nonlocal success_hit
+            nonlocal pending_trainable_step, success_hit
             model_name = rollout_model.get_inference_name()
             target_step = _step_from_model_name(model_name)
             if target_step is None:
@@ -825,6 +863,14 @@ async def run_length_trainability_async(
                 samples=samples,
                 summary_log_path=summary_log_path,
             )
+            rewards = [trajectory.reward for trajectory in group.trajectories]
+            if current_step_demand:
+                pending_trainable_step = (
+                    target_step
+                    if len(rewards) > 1
+                    and any(abs(reward - rewards[0]) > 1e-12 for reward in rewards[1:])
+                    else None
+                )
             if _success_abs_error_passed(
                 _mean_abs_error_by_step(
                     [sample for sample in samples if sample.split == "train"]
@@ -864,7 +910,8 @@ async def run_length_trainability_async(
         await trainer.train(handle_signals=False)
 
         latest_step = await model.get_step()
-        model_ids_after = await _list_model_ids(model)
+        async with backend.exact_adapter_lease(model, latest_step):
+            model_ids_after = await _list_model_ids(model)
 
     train_samples = [sample for sample in samples if sample.split == "train"]
     train_rewards_by_step = {

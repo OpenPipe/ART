@@ -1,6 +1,9 @@
+import json
 import os
+from pathlib import Path
+import subprocess
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -8,15 +11,21 @@ from art.megatron.model_support.spec import (
     ArchitectureReport,
     LayerFamilyInstance,
 )
+from tests.integration.megatron.train_inf_mismatch import (
+    workflow_stage as mismatch_workflow_stage,
+)
 
 from .validation_spec import ValidationReport, ValidationStageResult
 from .workflow import (
+    _RUNTIME_ARTIFACT_DIR_NAMES,
     INCLUDE_FLASH_SENSITIVITY_ENV,
     KEEP_TOPOLOGY_ARTIFACTS_ENV,
     MANDATORY_VALIDATION_STAGES,
     NATIVE_VLLM_LORA_STAGE,
     SKIP_SENSITIVITY_ENV,
+    WORKFLOW_STAGE_DIR_ENV,
     _inspect_architecture_for_workflow,
+    _prune_runtime_artifacts,
     assess_minimal_layer_coverage,
     build_all_architectures_validation_report,
     build_validation_report,
@@ -32,17 +41,43 @@ from .workflow import (
     run_yes_no_trainability_stage,
     validated_architecture_representative_models,
 )
+from .workflow_fixtures import (
+    FIXTURE_PATH_ENV,
+    WorkflowFixture,
+    _validate_tokenizer_compatible_fixture,
+)
 from .workflow_resources import (
     HANDLER_WORKFLOW_RESOURCES,
+    ThroughputThresholds,
+    ThroughputWorkflowConfig,
     _h200_equivalent_slots_for_total_gib,
     handler_workflow_resources_for_base_model,
+    resolve_stage_resources_for_current_host,
     resolve_stage_resources_for_visible_gpus,
+)
+from .workflow_throughput import (
+    PolicyActivationEvent,
+    ThroughputFixture,
+    _collect_matched_packing_shapes,
+    _collect_measurements,
+    _packed_input_fingerprint,
+    _phase_evidence,
+    _reduced_config,
+    acceptance_failures,
 )
 
 
 @pytest.fixture(autouse=True)
-def _stub_pinned_git_state(monkeypatch) -> None:
+def _stub_workflow_environment(monkeypatch, tmp_path) -> None:
     monkeypatch.delenv(INCLUDE_FLASH_SENSITIVITY_ENV, raising=False)
+    fixture_path = tmp_path / "correctness_fixture"
+    tokenizer_compatible_path = tmp_path / "tokenizer_compatible_fixture"
+    stage_path = tmp_path / "stage"
+    fixture_path.mkdir()
+    tokenizer_compatible_path.mkdir()
+    stage_path.mkdir()
+    monkeypatch.setenv(FIXTURE_PATH_ENV, str(fixture_path))
+    monkeypatch.setenv(WORKFLOW_STAGE_DIR_ENV, str(stage_path))
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow.pinned_git_state",
         lambda suite_name: SimpleNamespace(
@@ -54,6 +89,418 @@ def _stub_pinned_git_state(monkeypatch) -> None:
             }
         ),
     )
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow.ensure_workflow_fixture",
+        lambda base_model, allow_unvalidated_arch=False, required_stages=frozenset(): (
+            WorkflowFixture(
+                canonical_model=base_model,
+                model_key="qwen3_5_moe",
+                source_revision="test",
+                path=str(fixture_path),
+                hf_home=str(tmp_path / "hf_home"),
+                manifest={"version": 15},
+                tokenizer_compatible_path=str(tokenizer_compatible_path),
+                tokenizer_compatible_hf_home=str(tmp_path / "tokenizer_hf_home"),
+                tokenizer_compatible_manifest={"version": 1},
+                canonical_path=str(fixture_path),
+                canonical_hf_home=str(tmp_path / "hf_home"),
+            )
+        ),
+    )
+
+
+def _fixture(tmp_path: Path, model_key: str) -> WorkflowFixture:
+    return WorkflowFixture(
+        canonical_model=model_key,
+        model_key=model_key,
+        source_revision="pinned",
+        path=str(tmp_path / "compact"),
+        hf_home=str(tmp_path / "compact_cache"),
+        manifest={"version": 15},
+        tokenizer_compatible_path=str(tmp_path / "tokenizer"),
+        tokenizer_compatible_hf_home=str(tmp_path / "tokenizer_cache"),
+        canonical_path=str(tmp_path / "canonical"),
+        canonical_hf_home=str(tmp_path / "canonical_cache"),
+    )
+
+
+def test_fixture_stage_contracts(tmp_path: Path) -> None:
+    # fmt: off
+    cases = {
+        ("gemma4_dense", "canonical"): ("hf_parity", "packing_invariance", "length_trainability"),
+        ("gemma4_dense", "compact"): ("lora_coverage",),
+        ("gemma4_dense", "tokenizer"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "yes_no_trainability"),
+        ("llama3_dense", "compact"): ("hf_parity",),
+        ("llama3_dense", "tokenizer"): ("train_inf_mismatch",),
+        ("llama3_dense", "canonical"): ("length_trainability", "yes_no_trainability"),
+        ("gpt_oss_moe", "canonical"): ("train_inf_mismatch",),
+        ("gpt_oss_moe", "tokenizer"): ("merged_vllm_serving", "native_vllm_lora"),
+        ("glm52", "compact"): ("length_trainability", "yes_no_trainability"),
+        ("dsv4", "canonical"): ("length_trainability", "yes_no_trainability"),
+    }
+    # fmt: on
+    for (model_key, selected), stages in cases.items():
+        for stage in stages:
+            environment = _fixture(tmp_path, model_key).environment(stage)
+            assert environment[FIXTURE_PATH_ENV] == str(tmp_path / selected)
+            assert environment["ART_ORACLE_BASE_MODEL"] == str(tmp_path / selected)
+
+
+def test_fixture_stage_contracts_require_available_assets(tmp_path: Path) -> None:
+    for stage, missing, contract in (
+        ("hf_parity", "canonical_path", "canonical weights"),
+        ("train_inf_mismatch", "tokenizer_compatible_path", "canonical vocabulary"),
+    ):
+        fixture = _fixture(tmp_path, "gemma4_dense").model_copy(update={missing: None})
+        with pytest.raises(RuntimeError, match=f"requires {contract}"):
+            fixture.environment(stage)
+
+
+def test_reduced_trainability_preserves_validated_token_contract(
+    tmp_path: Path,
+) -> None:
+    for model_key, stage, expected in (
+        ("glm52", "length_trainability", "154820,38069"),
+        ("glm52", "yes_no_trainability", "9829,902,36569"),
+        ("gemma4_dense", "yes_no_trainability", "4443,951,7463"),
+        ("gemma4_moe", "yes_no_trainability", "4443,951,7463"),
+    ):
+        key = f"ART_MODEL_SUPPORT_{stage.removesuffix('_trainability').upper()}_ALLOWED_TOKEN_IDS"
+        assert _fixture(tmp_path, model_key).environment(stage)[key] == expected
+
+
+@pytest.mark.parametrize(
+    ("vocab_size", "registered_max", "encoded_max", "error"),
+    [
+        (8_192, 9_000, 3, "registered tokenizer ID 9000"),
+        (128_256, 128_255, 128_009, None),
+    ],
+)
+def test_tokenizer_compatible_fixture_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    vocab_size: int,
+    registered_max: int,
+    encoded_max: int,
+    error: str | None,
+) -> None:
+    class Tokenizer:
+        chat_template = "template"
+
+        def get_vocab(self):
+            return {"ordinary": 1, "highest": registered_max}
+
+        def __call__(self, *_args, **_kwargs):
+            return {"input_ids": [1, encoded_max]}
+
+        apply_chat_template = __call__
+
+    monkeypatch.setattr(
+        "transformers.AutoTokenizer.from_pretrained",
+        lambda *_args, **_kwargs: Tokenizer(),
+    )
+    manifest: dict[str, object] = {"config_vocab_size": vocab_size}
+    if error:
+        with pytest.raises(RuntimeError, match=error):
+            _validate_tokenizer_compatible_fixture(Path("/tmp/provider"), manifest)
+    else:
+        _validate_tokenizer_compatible_fixture(Path("/tmp/provider"), manifest)
+        assert manifest["representative_max_token_id"] == encoded_max
+        assert manifest["tokenizer_max_id"] == registered_max
+
+
+def test_throughput_runtime_keeps_canonical_handler_separate_from_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.megatron.runtime import local as local_runtime
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(
+        local_runtime,
+        "get_megatron_runtime_config",
+        lambda: SimpleNamespace(
+            topology={"tp": 1, "ep": 1, "etp": 1, "cp": 1, "pp": 1}
+        ),
+    )
+    topology = local_runtime.compile_local_runtime_topology(
+        cast(
+            Any,
+            {
+                "trainer_gpu_ids": [0],
+                "init_args": {"model_name": "/tmp/production-width-provider"},
+            },
+        ),
+        model_name="validation",
+        base_model="meta-llama/Llama-3.2-1B-Instruct",
+        artifact_root="/tmp/art",
+        visible_gpu_count=1,
+    )
+
+    assert topology.model_services[0].base_model == "/tmp/production-width-provider"
+
+
+def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        {
+            "step": step,
+            "data/step_num_groups_trainable": 8,
+            "data/step_packed_sequences": 1,
+            "data/step_nonpadding_logical_tokens": 1_000,
+            "train/prefix_tree/logical_tokens": 4_000,
+            "data/step_loss_bearing_tokens": 500,
+            "data/step_trainable_assistant_tokens": 500,
+            "data/step_executed_token_equivalents": 1_000,
+            "data/step_dummy_executed_token_equivalents": 0,
+            "data/step_nominal_schedule_capacity_tokens": 131_072,
+            "data/step_dummy_schedule_capacity_tokens": 0,
+            "data/step_unused_packed_capacity_tokens": 130_072,
+            "data/step_num_gradient_steps": 1,
+            "pipeline/global_real_microbatches": 1,
+            "pipeline/global_dummy_microbatches": 0,
+            "time/step_train_s": 1.5,
+            "time/step_wall_s": 2.0,
+            "queue/packed_get_wait_s": 0.1,
+            "offpolicy/token_weighted_policy_age_steps": 1.0,
+            "offpolicy/token_weighted_policy_age_p95_steps": 2.0,
+            "sample_efficiency/freshness_discount": 0.8,
+            "discarded/step/stale_groups": 0,
+            "discarded/step/zero_variance_groups": 0,
+        }
+        for step in range(16, 20)
+    ]
+    history_path = tmp_path / "history.jsonl"
+    history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    profile = SimpleNamespace(
+        config=SimpleNamespace(mode="online", window_steps=2),
+        decisions=[
+            SimpleNamespace(
+                action="hold",
+                previous={"workers": 16},
+                updated={"workers": 16},
+                stats=SimpleNamespace(
+                    start_step=16,
+                    end_step=17,
+                    window_start_s=0.0,
+                    window_end_s=4.0,
+                    vllm_pressure=0.6,
+                    trainer_underfeed_score=0.05,
+                    actual_stale_frac=0.0,
+                ),
+            ),
+            SimpleNamespace(
+                action="hold",
+                previous={"workers": 16},
+                updated={"workers": 16},
+                stats=SimpleNamespace(
+                    start_step=18,
+                    end_step=19,
+                    window_start_s=4.0,
+                    window_end_s=8.0,
+                    vllm_pressure=0.6,
+                    trainer_underfeed_score=0.05,
+                    actual_stale_frac=0.0,
+                ),
+            ),
+        ],
+        policy_age_limit_steps=4,
+    )
+    events = [
+        PolicyActivationEvent(15, -2.25, -2.0),
+        PolicyActivationEvent(16, 0.5, 0.75),
+        PolicyActivationEvent(17, 2.5, 2.75),
+        PolicyActivationEvent(18, 4.5, 4.75),
+        PolicyActivationEvent(19, 6.5, 7.75),
+    ]
+    config = ThroughputWorkflowConfig(num_layers=2, completion_tokens=128, max_steps=19)
+    fixture = ThroughputFixture(
+        model_key="llama3_dense",
+        path="/tmp/llama-throughput",
+        num_layers=2,
+        width_fingerprint={"hidden_size": 2048},
+        manifest={"initialization": "deterministic_random_v1"},
+    )
+
+    def phase(kind: str, packed: str, steps: tuple[int, ...]):
+        return _phase_evidence(
+            phase=cast(Any, kind),
+            runtime_fingerprint="runtime-a",
+            trajectory_input_fingerprint="trajectory-a",
+            packed_input_fingerprint=packed,
+            samples=[(rows[-1], step) for step in steps],
+        )
+
+    e2e_phase, isolated_phase = (
+        phase("e2e", "input-a", (20,)),
+        phase("isolated", "input-a", (21, 22)),
+    )
+
+    def collect(isolated):
+        return _collect_measurements(
+            fixture=fixture,
+            config=config,
+            hardware="b300",
+            model_output_dir=tmp_path,
+            profile=profile,
+            events=events,
+            isolated=isolated,
+            e2e=e2e_phase,
+            calibration_fingerprint="a" * 64,
+        )
+
+    measurements = collect(isolated_phase)
+
+    expected = {
+        "original_trajectory_tokens": 16_000,
+        "nonpadding_logical_tokens": 4_000,
+        "loss_bearing_tokens": 2_000,
+        "accepted_train_tokens": 2_000,
+        "isolated_train_tok_s": 2_000 / 3.0,
+        "matched_e2e_core_train_tok_s": 2_000 / 3.0,
+        "e2e_core_train_tok_s": 4_000 / 6.0,
+        "e2e_train_tok_s": 500.0,
+        "accepted_train_tok_s": 250.0,
+        "mean_train_gap_s": 0.5,
+        "post_warmup_policy_activation_count": 4,
+        "mean_policy_activation_lag_s": 0.5,
+        "max_policy_activation_lag_s": 1.25,
+        "mean_policy_activation_interval_s": 2.4375,
+        "max_policy_activation_interval_s": 3.0,
+    }
+    assert {key: measurements[key] for key in expected} == pytest.approx(expected)
+    thresholds = ThroughputThresholds(
+        calibration_basis="measured",
+        calibration_fingerprint="a" * 64,
+        min_isolated_train_tok_s=1.0,
+        min_e2e_train_tok_s=1.0,
+        min_accepted_train_tok_s=1.0,
+        min_e2e_to_isolated_ratio=0.5,
+        min_matched_core_to_isolated_ratio=0.95,
+        max_policy_activation_lag_s=2.0,
+        max_policy_activation_interval_s=2.5,
+    )
+    assert acceptance_failures(measurements, config, thresholds) == [
+        "policy_activation_cadence_s"
+    ]
+    estimated = ThroughputThresholds(
+        calibration_basis="estimated",
+        min_isolated_train_tok_s=1.0,
+        min_e2e_train_tok_s=1.0,
+        min_accepted_train_tok_s=1.0,
+        min_e2e_to_isolated_ratio=0.5,
+        min_matched_core_to_isolated_ratio=0.95,
+        max_policy_activation_lag_s=2.0,
+        max_policy_activation_interval_s=2.5,
+    )
+    assert acceptance_failures(measurements, config, estimated) == [
+        "policy_activation_cadence_s",
+        "calibration_basis",
+    ]
+    fractional = [dict(row) for row in rows]
+    fractional[0]["data/step_nonpadding_logical_tokens"] = 999.5
+    history_path.write_text("".join(json.dumps(row) + "\n" for row in fractional))
+    with pytest.raises(RuntimeError, match="must be a nonnegative integer"):
+        collect(isolated_phase)
+    history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(RuntimeError, match="same packed input"):
+        collect(phase("isolated", "input-b", (21, 22)))
+
+
+def test_dsv4_throughput_reduction_preserves_hash_moe_prefix() -> None:
+    source = {
+        "num_hidden_layers": 10,
+        "hidden_size": 2048,
+        "mlp_layer_types": ["hash_moe"] * 3 + ["moe"] * 7,
+    }
+
+    reduced, _ = _reduced_config(source, model_key="dsv4", num_layers=8)
+
+    assert "num_hash_layers" not in reduced
+    assert reduced["mlp_layer_types"] == ["hash_moe"] * 3 + ["moe"] * 5
+
+
+def test_matched_batch_always_collects_packing_shapes() -> None:
+    groups = [SimpleNamespace(_collect_packing_shape=False) for _ in range(3)]
+
+    _collect_matched_packing_shapes(groups)
+
+    assert all(group._collect_packing_shape for group in groups)
+
+
+def test_throughput_packed_input_fingerprint_hashes_data_plane_bytes() -> None:
+    from array import array
+    from multiprocessing import shared_memory
+
+    from art.pipeline_tuner.config import PackedGroupShape, PackingLeafShape
+
+    shm = shared_memory.SharedMemory(create=True, size=4)
+    try:
+        buffer = shm.buf
+        assert buffer is not None
+        buffer[:] = b"abcd"
+        tensor = SimpleNamespace(offset=0, byte_count=4)
+        ref = SimpleNamespace(
+            shared_memory_name=shm.name,
+            owner_process_id=os.getpid(),
+            tensors=(tensor,),
+            model_dump=lambda **kwargs: {
+                "tensors": [{"name": "tokens", "shape": [4], "dtype": "int8"}]
+            },
+        )
+        packed = SimpleNamespace(
+            leases=SimpleNamespace(ref=ref),
+            packed_group_shapes=(
+                PackedGroupShape(
+                    leaves=(
+                        PackingLeafShape(
+                            token_ids=array("I", [1, 2, 3]), shareable_length=2
+                        ),
+                    )
+                ),
+            ),
+        )
+        batch = SimpleNamespace(
+            payload=SimpleNamespace(packed=packed),
+            model_dump=lambda **kwargs: {"sequence_length": 4},
+        )
+        prepared = SimpleNamespace(
+            batch=batch,
+            packing_config=SimpleNamespace(
+                model_dump=lambda **kwargs: {"packed_sequence_length": 4}
+            ),
+        )
+        groups = [SimpleNamespace(_prepared_training_batch=prepared)]
+
+        before = _packed_input_fingerprint(groups)
+        buffer[0] = ord("z")
+        changed_bytes = _packed_input_fingerprint(groups)
+        buffer[0] = ord("a")
+        packed.packed_group_shapes = (
+            PackedGroupShape(
+                leaves=(
+                    PackingLeafShape(
+                        token_ids=array("I", [1, 2, 4]), shareable_length=2
+                    ),
+                )
+            ),
+        )
+        changed_shape = _packed_input_fingerprint(groups)
+
+        assert before != changed_bytes
+        assert before != changed_shape
+    finally:
+        del buffer
+        shm.close()
+        shm.unlink()
+
+
+def _without_stage_duration(stage: ValidationStageResult) -> dict[str, object]:
+    metrics = dict(stage.metrics)
+    assert float(metrics.pop("workflow_stage_duration_s")) >= 0.0
+    metrics.pop("fixture_provisioning_s", None)
+    metrics.pop("workflow_pruned_runtime_artifact_dirs", None)
+    metrics.pop("workflow_pruned_runtime_artifact_bytes", None)
+    return metrics
 
 
 def test_build_validation_stage_names_has_fixed_order() -> None:
@@ -197,6 +644,159 @@ def test_h200_equivalent_slots_tolerate_reported_gb300_vram() -> None:
     assert _h200_equivalent_slots_for_total_gib(276.6) == 2
 
 
+@pytest.mark.parametrize("handler_key", sorted(HANDLER_WORKFLOW_RESOURCES))
+def test_throughput_requires_four_distinct_physical_gpus(
+    handler_key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stage = HANDLER_WORKFLOW_RESOURCES[handler_key].e2e_throughput
+    assert stage is not None
+    megatron, vllm = stage.megatron, stage.vllm
+    assert megatron is not None and vllm is not None
+    assert (stage.required_world_size, stage.required_physical_gpus) == (4, 4)
+    assert (megatron.gpu_ids, vllm.gpu_ids) == ([0, 1], [2, 3])
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow_resources."
+        "_visible_h200_equivalent_gpus",
+        lambda *, visible_gpu_count: visible_gpu_count * 2,
+    )
+
+    with pytest.raises(RuntimeError, match="Need 4 physical GPUs"):
+        resolve_stage_resources_for_visible_gpus(
+            "e2e_throughput",
+            stage,
+            visible_gpu_count=2,
+        )
+
+    assert (
+        resolve_stage_resources_for_visible_gpus(
+            "e2e_throughput", stage, visible_gpu_count=4
+        )
+        == stage
+    )
+
+
+def test_backend_resources_stay_logical_until_topology_compilation(monkeypatch) -> None:
+    from art.megatron.runtime import local as local_runtime
+
+    stage = HANDLER_WORKFLOW_RESOURCES["llama3_dense"].e2e_throughput
+    assert stage is not None
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow_resources."
+        "_current_visible_gpu_count",
+        lambda: 4,
+    )
+
+    resolved = resolve_stage_resources_for_current_host("e2e_throughput", stage)
+
+    megatron = resolved.megatron
+    vllm = resolved.vllm
+    assert megatron is not None
+    assert vllm is not None
+    assert megatron.gpu_ids == [0, 1]
+    assert vllm.gpu_ids == [2, 3]
+    monkeypatch.setattr(
+        local_runtime,
+        "get_megatron_runtime_config",
+        lambda: SimpleNamespace(topology=megatron.topology.to_megatron_config()),
+    )
+    topology = local_runtime.compile_local_runtime_topology(
+        cast(
+            Any,
+            {
+                "trainer_gpu_ids": megatron.gpu_ids,
+                "inference_gpu_ids": vllm.gpu_ids,
+                "engine_args": vllm.engine_args(),
+            },
+        ),
+        model_name="throughput",
+        base_model="/tmp/provider",
+        artifact_root="/tmp/art",
+        visible_gpu_count=4,
+    )
+
+    assert topology.trainer is not None
+    assert [rank.gpu_id for rank in topology.trainer.ranks] == [4, 5]
+    assert topology.model_services[0].members[0].gpu_ids == (6, 7)
+    assert topology.cluster.hosts[0].gpu_ids == (4, 5, 6, 7)
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "passed", "attempts", "retryable"),
+    [
+        (
+            (
+                (
+                    2,
+                    {
+                        "outcome": "error",
+                        "comparison_completed": False,
+                        "exception_type": "ConnectionRefusedError",
+                    },
+                ),
+                (0, {"outcome": "passed", "comparison_completed": True}),
+            ),
+            True,
+            2,
+            True,
+        ),
+        (((1, {"outcome": "failed", "comparison_completed": True}),), False, 1, False),
+        (
+            (
+                (
+                    2,
+                    {
+                        "outcome": "error",
+                        "comparison_completed": False,
+                        "exception_type": "ValueError",
+                    },
+                ),
+            ),
+            False,
+            1,
+            False,
+        ),
+        (
+            ((0, {"outcome": "skipped", "comparison_completed": False}),),
+            False,
+            1,
+            False,
+        ),
+        (((3, None),), False, 1, False),
+    ],
+)
+def test_mismatch_workflow_retries_only_executed_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outcomes: tuple[tuple[int, dict[str, object] | None], ...],
+    passed: bool,
+    attempts: int,
+    retryable: bool,
+) -> None:
+    results = iter(outcomes)
+
+    def run_attempt(command, **_kwargs):
+        returncode, payload = next(results)
+        if payload is not None:
+            Path(command[-1]).write_text(json.dumps(payload), encoding="utf-8")
+        return subprocess.CompletedProcess(command, returncode, stdout="", stderr="")
+
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_ATTEMPTS", "3")
+    monkeypatch.setattr(
+        mismatch_workflow_stage, "create_artifact_dir", lambda _nodeid: tmp_path
+    )
+    monkeypatch.setattr(mismatch_workflow_stage, "_run_attempt", run_attempt)
+    report = mismatch_workflow_stage.run_train_inf_mismatch(
+        base_model="Qwen/Qwen3.5-35B-A3B"
+    )
+    assert (report.passed, report.attempt_count, report.attempts[0].retryable) == (
+        passed,
+        attempts,
+        retryable,
+    )
+    assert report.duration_s >= report.attempts[0].duration_s
+
+
 @pytest.mark.parametrize("handler_key", ["qwen3_moe", "qwen3_5_moe"])
 def test_qwen_moe_reduced_serving_uses_plain_expert_storage(handler_key: str) -> None:
     resources = HANDLER_WORKFLOW_RESOURCES[handler_key]
@@ -240,7 +840,7 @@ def test_inspect_architecture_for_workflow_uses_minimal_topology(monkeypatch) ->
         )
 
     monkeypatch.setattr(
-        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        "art.megatron.model_support.discovery.inspect_architecture",
         _inspect_architecture,
     )
 
@@ -277,14 +877,16 @@ def test_build_all_architectures_validation_report_stops_on_failure(
         del stop_on_failure
         del allow_unvalidated_arch
         calls.append(base_model)
+        passed = base_model != "Qwen/Qwen3-32B"
         return ValidationReport(
             git={},
             base_model=base_model,
             model_key="qwen3_dense",
+            passed=passed,
             stages=[
                 ValidationStageResult(
                     name="train_inf_mismatch",
-                    passed=base_model != "Qwen/Qwen3-32B",
+                    passed=passed,
                 )
             ],
         )
@@ -312,7 +914,7 @@ def test_build_validation_report_populates_architecture_stage(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        "art.megatron.model_support.discovery.inspect_architecture",
         lambda base_model: ArchitectureReport(
             base_model=base_model,
             model_key="qwen3_5_moe",
@@ -394,6 +996,12 @@ def test_build_validation_report_populates_architecture_stage(
                 },
                 artifact_dir="/tmp/length-trainability",
             ),
+            "e2e_throughput": ValidationStageResult(
+                name="e2e_throughput",
+                passed=True,
+                metrics={"accepted_train_tok_s": 1234.0},
+                artifact_dir="/tmp/e2e-throughput",
+            ),
             "native_vllm_lora": ValidationStageResult(
                 name="native_vllm_lora",
                 passed=True,
@@ -420,12 +1028,12 @@ def test_build_validation_report_populates_architecture_stage(
         stage for stage in report.stages if stage.name == "dependency_resolution"
     )
     assert dependency_stage.passed is True
-    assert dependency_stage.metrics == {"transformers": "5.2.0"}
+    assert _without_stage_duration(dependency_stage) == {"transformers": "5.2.0"}
     architecture_stage = next(
         stage for stage in report.stages if stage.name == "architecture_discovery"
     )
     assert architecture_stage.passed is True
-    assert architecture_stage.metrics == {
+    assert _without_stage_duration(architecture_stage) == {
         "recommended_min_layers": 1,
         "layer_families": [
             {
@@ -442,24 +1050,32 @@ def test_build_validation_report_populates_architecture_stage(
         stage for stage in report.stages if stage.name == "hf_parity"
     )
     assert hf_parity_stage.passed is True
-    assert hf_parity_stage.metrics == {"signal": "pass", "requested_num_layers": 1}
+    assert _without_stage_duration(hf_parity_stage) == {
+        "signal": "pass",
+        "requested_num_layers": 1,
+    }
     assert hf_parity_stage.artifact_dir == "/tmp/hf_parity"
     lora_coverage_stage = next(
         stage for stage in report.stages if stage.name == "lora_coverage"
     )
     assert lora_coverage_stage.passed is True
-    assert lora_coverage_stage.metrics == {"wrapped_adapter_prefix_count": 12}
+    assert _without_stage_duration(lora_coverage_stage) == {
+        "wrapped_adapter_prefix_count": 12
+    }
     mismatch_stage = next(
         stage for stage in report.stages if stage.name == "train_inf_mismatch"
     )
     assert mismatch_stage.passed is True
-    assert mismatch_stage.metrics == {"passed_count": 1, "failed_count": 0}
+    assert _without_stage_duration(mismatch_stage) == {
+        "passed_count": 1,
+        "failed_count": 0,
+    }
     assert mismatch_stage.artifact_dir == "/tmp/train-inf-mismatch"
     correctness_stage = next(
         stage for stage in report.stages if stage.name == "correctness_sensitivity"
     )
     assert correctness_stage.passed is True
-    assert correctness_stage.metrics == {
+    assert _without_stage_duration(correctness_stage) == {
         "correctness_variant_count": 4,
         "sensitivity_variant_count": 9,
     }
@@ -468,13 +1084,15 @@ def test_build_validation_report_populates_architecture_stage(
         stage for stage in report.stages if stage.name == "merged_vllm_serving"
     )
     assert merged_stage.passed is True
-    assert merged_stage.metrics == {"served_model_name": "validation@0"}
+    assert _without_stage_duration(merged_stage) == {
+        "served_model_name": "validation@0"
+    }
     assert merged_stage.artifact_dir == "/tmp/merged-serving"
     chat_template_stage = next(
         stage for stage in report.stages if stage.name == "chat_template_rollout"
     )
     assert chat_template_stage.passed is True
-    assert chat_template_stage.metrics == {
+    assert _without_stage_duration(chat_template_stage) == {
         "passed": True,
         "scenario_count": 6,
         "failed_scenarios": [],
@@ -484,7 +1102,7 @@ def test_build_validation_report_populates_architecture_stage(
         stage for stage in report.stages if stage.name == "packing_invariance"
     )
     assert packing_invariance_stage.passed is True
-    assert packing_invariance_stage.metrics == {
+    assert _without_stage_duration(packing_invariance_stage) == {
         "num_layers": 4,
         "scenarios": [
             {
@@ -499,17 +1117,30 @@ def test_build_validation_report_populates_architecture_stage(
         stage for stage in report.stages if stage.name == "length_trainability"
     )
     assert trainability_stage.passed is True
-    assert trainability_stage.metrics == {
+    assert _without_stage_duration(trainability_stage) == {
         "latest_step": 4,
         "best_train_abs_error": 1.0,
     }
     assert trainability_stage.artifact_dir == "/tmp/length-trainability"
+    throughput_stage = next(
+        stage for stage in report.stages if stage.name == "e2e_throughput"
+    )
+    assert throughput_stage.passed is True
+    throughput_metrics = _without_stage_duration(throughput_stage)
+    assert throughput_metrics["accepted_train_tok_s"] == 1234.0
+    assert throughput_stage.artifact_dir == "/tmp/e2e-throughput"
+    fixture_durations = [
+        cast(float, stage.metrics["fixture_provisioning_s"])
+        for stage in report.stages
+        if "fixture_provisioning_s" in stage.metrics
+    ]
+    assert len(fixture_durations) == 1 and fixture_durations[0] >= 0.0
     assert all(stage.name != "yes_no_trainability" for stage in report.stages)
     native_vllm_lora_stage = next(
         stage for stage in report.stages if stage.name == "native_vllm_lora"
     )
     assert native_vllm_lora_stage.passed is True
-    assert native_vllm_lora_stage.metrics == {
+    assert _without_stage_duration(native_vllm_lora_stage) == {
         "rollout_weights_mode": "lora",
         "step0_name": "validation@0",
         "step1_name": "validation@1",
@@ -521,7 +1152,7 @@ def test_build_validation_report_populates_architecture_stage(
     assert native_vllm_lora_stage.artifact_dir == "/tmp/native-vllm-lora"
 
 
-def test_build_validation_report_preserves_traces_when_sensitivity_runs(
+def test_build_validation_report_success_cleanup_does_not_implicitly_keep_traces(
     monkeypatch,
 ) -> None:
     seen_keep_env: list[str | None] = []
@@ -529,7 +1160,7 @@ def test_build_validation_report_preserves_traces_when_sensitivity_runs(
     monkeypatch.delenv(KEEP_TOPOLOGY_ARTIFACTS_ENV, raising=False)
 
     monkeypatch.setattr(
-        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        "art.megatron.model_support.discovery.inspect_architecture",
         lambda base_model: ArchitectureReport(
             base_model=base_model,
             model_key="qwen3_5_moe",
@@ -561,14 +1192,46 @@ def test_build_validation_report_preserves_traces_when_sensitivity_runs(
         include_sensitivity=True,
     )
 
-    assert seen_keep_env == ["1"]
+    assert seen_keep_env == [None]
     assert os.environ.get(KEEP_TOPOLOGY_ARTIFACTS_ENV) is None
+
+
+def test_runtime_artifact_cleanup_preserves_evidence(tmp_path: Path) -> None:
+    stage_dir = tmp_path / "e2e_throughput"
+    model_dir = stage_dir / "art" / "models" / "run"
+    report = stage_dir / "throughput_measurements.json"
+    matched_input = stage_dir / "matched_packed_input.msgpack"
+    report.parent.mkdir(parents=True)
+    report.write_text("{}")
+    matched_input.write_bytes(b"input")
+    removed_bytes = 0
+    for name in (
+        "checkpoints",
+        "megatron_runtime",
+        "optimizer_states",
+        "trajectories",
+    ):
+        path = model_dir / name
+        path.mkdir(parents=True)
+        payload = path / "payload"
+        payload.write_bytes(name.encode())
+        removed_bytes += payload.stat().st_size
+
+    metrics = _prune_runtime_artifacts(stage_dir)
+
+    assert metrics == {
+        "workflow_pruned_runtime_artifact_dirs": 4,
+        "workflow_pruned_runtime_artifact_bytes": removed_bytes,
+    }
+    assert report.read_text() == "{}"
+    assert matched_input.read_bytes() == b"input"
+    assert not any((model_dir / name).exists() for name in _RUNTIME_ARTIFACT_DIR_NAMES)
 
 
 def test_build_validation_report_only_stage_skips_other_stages(monkeypatch) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
-        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        "art.megatron.model_support.discovery.inspect_architecture",
         lambda base_model: ArchitectureReport(
             base_model=base_model,
             model_key="qwen3_5_moe",
@@ -599,7 +1262,7 @@ def test_build_validation_report_only_stage_skips_other_stages(monkeypatch) -> N
 
     skipped = next(stage for stage in report.stages if stage.name == "hf_parity")
     assert calls == ["length_trainability"]
-    assert skipped.metrics == {
+    assert _without_stage_duration(skipped) == {
         "skipped": True,
         "reason": "--only-stage=length_trainability",
     }
@@ -607,7 +1270,7 @@ def test_build_validation_report_only_stage_skips_other_stages(monkeypatch) -> N
 
 def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None:
     monkeypatch.setattr(
-        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        "art.megatron.model_support.discovery.inspect_architecture",
         lambda base_model: ArchitectureReport(
             base_model=base_model,
             model_key="qwen3_5_moe",
@@ -644,13 +1307,15 @@ def test_build_validation_report_captures_hf_parity_failure(monkeypatch) -> None
         stage for stage in report.stages if stage.name == "hf_parity"
     )
     assert hf_parity_stage.passed is False
-    assert hf_parity_stage.metrics == {"error": "AssertionError: parity failed"}
+    assert _without_stage_duration(hf_parity_stage) == {
+        "error": "AssertionError: parity failed"
+    }
     assert hf_parity_stage.artifact_dir is None
 
 
 def test_build_validation_report_captures_lora_coverage_failure(monkeypatch) -> None:
     monkeypatch.setattr(
-        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        "art.megatron.model_support.discovery.inspect_architecture",
         lambda base_model: ArchitectureReport(
             base_model=base_model,
             model_key="qwen3_5_moe",
@@ -686,7 +1351,7 @@ def test_build_validation_report_captures_lora_coverage_failure(monkeypatch) -> 
         stage for stage in report.stages if stage.name == "lora_coverage"
     )
     assert lora_coverage_stage.passed is False
-    assert lora_coverage_stage.metrics == {
+    assert _without_stage_duration(lora_coverage_stage) == {
         "error": "RuntimeError: missing wrapped targets"
     }
 
@@ -697,7 +1362,7 @@ def test_build_validation_report_writes_incremental_output_and_stops(
 ) -> None:
     calls: list[str] = []
     monkeypatch.setattr(
-        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        "art.megatron.model_support.discovery.inspect_architecture",
         lambda base_model: ArchitectureReport(
             base_model=base_model,
             model_key="qwen3_5_moe",
@@ -748,7 +1413,7 @@ def test_build_validation_report_writes_incremental_output_and_stops(
         stage for stage in saved.stages if stage.name == "train_inf_mismatch"
     )
     assert failed_stage.passed is False
-    assert skipped_stage.metrics == {
+    assert _without_stage_duration(skipped_stage) == {
         "skipped": True,
         "reason": "stopped after lora_coverage failed",
     }
@@ -758,7 +1423,7 @@ def test_assess_minimal_layer_coverage_reports_missing_families(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "tests.integration.megatron.model_support.workflow.inspect_architecture",
+        "art.megatron.model_support.discovery.inspect_architecture",
         lambda base_model: ArchitectureReport(
             base_model=base_model,
             model_key="qwen3_5_moe",
@@ -819,12 +1484,14 @@ def test_run_chat_template_rollout_stage(monkeypatch) -> None:
 def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> None:
     case_configs: list[SimpleNamespace] = []
     oracle_module = SimpleNamespace(
+        ORACLE_OBJECTIVE_ENV="ART_ORACLE_OBJECTIVE",
+        SUPPORTED_ORACLE_OBJECTIVES=("sft",),
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
         selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
-            SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
-            SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
-            SimpleNamespace(world_size=lambda: 2, slug=lambda: "dp2"),
-            SimpleNamespace(world_size=lambda: 4, slug=lambda: "tp2_dp2"),
+            SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1", pp=1, vpp=1),
+            SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2", pp=1, vpp=1),
+            SimpleNamespace(world_size=lambda: 2, slug=lambda: "dp2", pp=1, vpp=1),
+            SimpleNamespace(world_size=lambda: 4, slug=lambda: "tp2_dp2", pp=1, vpp=1),
         ],
         oracle_topology=lambda *, is_moe: SimpleNamespace(world_size=lambda: 1),
         selected_oracle_objectives=lambda: ["sft"],
@@ -885,7 +1552,7 @@ def test_run_correctness_sensitivity_stage_runs_dense_models(monkeypatch) -> Non
     assert result.metrics["is_moe"] is False
     assert result.metrics["available_gpu_count"] == 4
     assert result.metrics["max_world_size"] == 4
-    assert result.metrics["required_gpu_count"] == 1
+    assert result.metrics["required_gpu_count"] == 4
     assert result.metrics["correctness_variant_count"] == 1
     assert result.metrics["correctness_excluded_topologies"] == []
     assert result.metrics["sensitivity_mutations"] == ["skip_finalize"]
@@ -899,7 +1566,7 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow._import_integration_module",
         lambda name: SimpleNamespace(
-            run_yes_no_trainability=lambda *, base_model, allow_unvalidated_arch=False: (
+            run_yes_no_trainability=lambda *, base_model, artifact_root, allow_unvalidated_arch=False: (
                 SimpleNamespace(
                     latest_step=2,
                     initial_eval_reward=0.4,
@@ -936,6 +1603,13 @@ def test_run_yes_no_trainability_stage(monkeypatch) -> None:
 
 
 def test_run_length_trainability_stage(monkeypatch) -> None:
+    workspace = (
+        Path(os.environ[WORKFLOW_STAGE_DIR_ENV])
+        / "artifacts"
+        / "megatron_dedicated_workspace"
+    )
+    workspace.mkdir(parents=True)
+    (workspace / "optimizer.pt").write_bytes(b"large")
     report = SimpleNamespace(
         summary_log_path="/tmp/length-trainability/length_trainability.log",
         model_dump=lambda mode="json": {
@@ -966,6 +1640,36 @@ def test_run_length_trainability_stage(monkeypatch) -> None:
     assert result.name == "length_trainability"
     assert result.passed is True
     assert result.artifact_dir == "/tmp/length-trainability"
+    assert not workspace.exists()
+
+
+def test_run_length_trainability_stage_cleans_workspace_on_failure(monkeypatch) -> None:
+    workspace = (
+        Path(os.environ[WORKFLOW_STAGE_DIR_ENV])
+        / "artifacts"
+        / "megatron_dedicated_workspace"
+    )
+    workspace.mkdir(parents=True)
+
+    def fail(**kwargs) -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "tests.integration.megatron.model_support.workflow._import_integration_module",
+        lambda name: SimpleNamespace(run_length_trainability=fail),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_length_trainability_stage(
+            base_model="google/gemma-4-31B-it",
+            architecture=ArchitectureReport(
+                base_model="google/gemma-4-31B-it",
+                model_key="gemma4_dense",
+                handler_key="gemma4_dense",
+            ),
+        )
+
+    assert not workspace.exists()
 
 
 def test_run_train_inf_mismatch_stage(monkeypatch) -> None:
@@ -1064,11 +1768,13 @@ def test_run_native_vllm_lora_stage(monkeypatch) -> None:
 
 
 def test_run_packing_invariance_stage(monkeypatch) -> None:
+    calls: list[bool] = []
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow._import_integration_module",
         lambda name: SimpleNamespace(
-            run_packing_invariance=lambda *, base_model, num_layers, allow_unvalidated_arch=False: (
-                SimpleNamespace(
+            run_packing_invariance=lambda *, base_model, num_layers, allow_unvalidated_arch=False, in_process=False: (
+                calls.append(in_process)
+                or SimpleNamespace(
                     output_dir="/tmp/packing-invariance",
                     model_dump=lambda mode="json": {
                         "base_model": base_model,
@@ -1103,6 +1809,7 @@ def test_run_packing_invariance_stage(monkeypatch) -> None:
 
     assert result.passed is True
     assert result.artifact_dir == "/tmp/packing-invariance"
+    assert calls == [True]
 
 
 def test_assess_minimal_layer_coverage_passes_when_prefix_covers_all_families(
@@ -1185,13 +1892,15 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
         model_key="qwen3_5_moe",
         handler_key="qwen3_5_moe",
         layer_families=[LayerFamilyInstance(key="grouped_moe_mlp", layer_index=0)],
-        recommended_min_layers=4,
+        recommended_min_layers=1,
     )
     oracle_module = SimpleNamespace(
+        ORACLE_OBJECTIVE_ENV="ART_ORACLE_OBJECTIVE",
+        SUPPORTED_ORACLE_OBJECTIVES=("sft",),
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
         selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
-            SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
-            SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
+            SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1", pp=1, vpp=1),
+            SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2", pp=2, vpp=2),
         ],
         oracle_topology=lambda *, is_moe: SimpleNamespace(world_size=lambda: 1),
         selected_oracle_objectives=lambda: ["sft"],
@@ -1244,7 +1953,7 @@ def test_run_correctness_sensitivity_stage_summarizes_reports(monkeypatch) -> No
         "attn_skip_flash_lse_normalize"
     ]
     assert stage.metrics["available_gpu_count"] == 2
-    assert stage.metrics["required_gpu_count"] == 1
+    assert stage.metrics["required_gpu_count"] == 2
     assert stage.metrics["correctness_variant_count"] == 1
     assert stage.metrics["sensitivity_skipped"] is False
     assert stage.metrics["sensitivity_skip_reason"] is None
@@ -1264,11 +1973,13 @@ def test_run_correctness_sensitivity_stage_uses_dsv4_real_path_config(
     )
     captured: dict[str, object] = {}
     oracle_module = SimpleNamespace(
+        ORACLE_OBJECTIVE_ENV="ART_ORACLE_OBJECTIVE",
+        SUPPORTED_ORACLE_OBJECTIVES=("rl",),
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
         MetricThresholdRule=lambda **kwargs: SimpleNamespace(**kwargs),
         selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
-            SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
-            SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
+            SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1", pp=1, vpp=1),
+            SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2", pp=1, vpp=1),
         ],
         oracle_topology=lambda *, is_moe: SimpleNamespace(world_size=lambda: 1),
         selected_oracle_objectives=lambda: ["rl"],
@@ -1327,10 +2038,12 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
         recommended_min_layers=4,
     )
     oracle_module = SimpleNamespace(
+        ORACLE_OBJECTIVE_ENV="ART_ORACLE_OBJECTIVE",
+        SUPPORTED_ORACLE_OBJECTIVES=("sft",),
         OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
         selected_suite_topologies=lambda *, is_moe, cp_supported=True: [
-            SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1"),
-            SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2"),
+            SimpleNamespace(world_size=lambda: 1, slug=lambda: "tp1", pp=1, vpp=1),
+            SimpleNamespace(world_size=lambda: 2, slug=lambda: "tp2", pp=1, vpp=1),
         ],
         oracle_topology=lambda *, is_moe: SimpleNamespace(world_size=lambda: 1),
         selected_oracle_objectives=lambda: ["sft"],
@@ -1370,7 +2083,7 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
 
     assert stage.name == "correctness_sensitivity"
     assert stage.passed is True
-    assert stage.metrics["required_gpu_count"] == 1
+    assert stage.metrics["required_gpu_count"] == 2
     assert stage.metrics["correctness_variant_count"] == 1
     assert stage.metrics["sensitivity_mutations"] == []
     assert stage.metrics["default_excluded_sensitivity_mutations"] == []

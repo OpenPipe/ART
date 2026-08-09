@@ -87,8 +87,29 @@ def run_worker_subprocess(
     repo_root: Path,
 ) -> None:
     """Runs one distributed worker subprocess and stores combined logs."""
-    request_path = topology_dir / "run_request.json"
-    _write_json(request_path, request.model_dump(mode="json"))
+    run_worker_subprocesses([request], [topology_dir], repo_root=repo_root)
+
+
+def run_worker_subprocesses(
+    requests: list[WorkerRunRequest],
+    topology_dirs: list[Path],
+    *,
+    repo_root: Path,
+) -> None:
+    """Runs compatible requests in one distributed rank-process lifetime."""
+    if not requests or len(requests) != len(topology_dirs):
+        raise ValueError(
+            "Worker requests and topology directories must be non-empty and aligned"
+        )
+    topology = requests[0].topology
+    if any(request.topology != topology for request in requests[1:]):
+        raise ValueError("One worker process lifetime requires one parallel topology")
+
+    request_paths: list[Path] = []
+    for request, topology_dir in zip(requests, topology_dirs, strict=True):
+        request_path = topology_dir / "run_request.json"
+        _write_json(request_path, request.model_dump(mode="json"))
+        request_paths.append(request_path)
     worker_module = "integration.megatron.model_support.oracle_worker"
     worker_cwd = repo_root / "tests"
 
@@ -98,35 +119,39 @@ def run_worker_subprocess(
         "torch.distributed.run",
         "--standalone",
         "--nproc_per_node",
-        str(request.topology.world_size()),
+        str(topology.world_size()),
         "-m",
         worker_module,
         "--worker-run",
-        "--run-request",
-        str(request_path),
     ]
+    for request_path in request_paths:
+        command.extend(("--run-request", str(request_path)))
     combined_lines: list[str] = []
-    worker_log_path = topology_dir / "worker.log"
     live_log_raw = os.environ.get("ART_ORACLE_LIVE_TRAINING_LOG")
     live_log_path = None if not live_log_raw else Path(live_log_raw)
     run: subprocess.Popen[str] | None = None
-    worker_log_path.parent.mkdir(parents=True, exist_ok=True)
-    with worker_log_path.open("w", encoding="utf-8") as worker_log:
+    for topology_dir in topology_dirs:
+        topology_dir.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as logs:
+        worker_logs = [
+            logs.enter_context(
+                (topology_dir / "worker.log").open("w", encoding="utf-8")
+            )
+            for topology_dir in topology_dirs
+        ]
         live_log = None
         try:
             if live_log_path is not None:
                 live_log_path.parent.mkdir(parents=True, exist_ok=True)
                 live_log = live_log_path.open("a", encoding="utf-8")
-                live_log.write(
-                    f"\n=== {request.objective} {request.topology.slug()} ===\n"
-                )
+                live_log.write(f"\n=== {requests[0].objective} {topology.slug()} ===\n")
                 live_log.flush()
             env = {
                 **os.environ,
                 "ART_MEGATRON_ATTACH_TOKEN_UIDS": "1",
                 "PYTHONUNBUFFERED": "1",
             }
-            if request.case_config.precision == "fp32":
+            if requests[0].case_config.precision == "fp32":
                 env["NVIDIA_TF32_OVERRIDE"] = "0"
             run = subprocess.Popen(
                 command,
@@ -139,10 +164,18 @@ def run_worker_subprocess(
                 start_new_session=True,
             )
             assert run.stdout is not None
+            active_log_index = 0
+            request_markers = {
+                f"=== {request.objective} {topology.slug()} ===": index
+                for index, request in enumerate(requests)
+            }
             for line in run.stdout:
                 combined_lines.append(line)
-                worker_log.write(line)
-                worker_log.flush()
+                marker_index = request_markers.get(line.strip())
+                if marker_index is not None:
+                    active_log_index = marker_index
+                worker_logs[active_log_index].write(line)
+                worker_logs[active_log_index].flush()
                 if live_log is not None:
                     live_log.write(line)
                     live_log.flush()
@@ -156,7 +189,7 @@ def run_worker_subprocess(
     if run.returncode != 0:
         tail = "\n".join(combined_output.splitlines()[-80:])
         raise RuntimeError(
-            f"Topology run failed for {request.topology.slug()} with exit code "
+            f"Topology run failed for {topology.slug()} with exit code "
             f"{run.returncode}.\n{tail}"
         )
 
@@ -1349,16 +1382,96 @@ def _mutation_hook(
             )
 
 
-def _worker_run(request: WorkerRunRequest) -> None:
-    """Executes one full distributed training trace generation worker run."""
-    os.environ.setdefault(_ATTACH_TOKEN_UIDS_ENV, "1")
-    from safetensors.torch import load_file, save_file  # ty: ignore[unresolved-import]
-    import torch
+class _WorkerSession:
+    """Owns reusable distributed model state for one parallel topology."""
 
-    from art import dev, types
+    def __init__(
+        self,
+        *,
+        request: WorkerRunRequest,
+        runtime: Any,
+        weight_offload: Any,
+        flex_patch_stack: ExitStack,
+    ) -> None:
+        self.request = request
+        self.runtime = runtime
+        self.weight_offload = weight_offload
+        self.flex_patch_stack = flex_patch_stack
+        self.rng_state: tuple[Any, Any, torch.Tensor, list[torch.Tensor]] | None = None
+
+    def begin_request(self) -> None:
+        self.weight_offload.before_job()
+        if self.rng_state is None:
+            self.rng_state = (
+                random.getstate(),
+                np.random.get_state(),
+                torch.get_rng_state(),
+                torch.cuda.get_rng_state_all(),
+            )
+            return
+        python_state, numpy_state, torch_state, cuda_states = self.rng_state
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
+        torch.cuda.set_rng_state_all(cuda_states)
+
+    def end_request(self) -> None:
+        self.weight_offload.after_job()
+
+    def close(self) -> None:
+        torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
+        self.flex_patch_stack.close()
+        torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]
+
+
+def _validate_session_request(
+    session_request: WorkerRunRequest,
+    request: WorkerRunRequest,
+) -> None:
+    """Rejects request differences that require rebuilding distributed state."""
+    per_run_fields = {
+        "objective",
+        "topology_dir",
+        "mutation",
+        "moe_routing_replay_path",
+        "moe_routing_replay_strict",
+        "capture_moe_routing_bundle_path",
+    }
+    if session_request.model_dump(exclude=per_run_fields) != request.model_dump(
+        exclude=per_run_fields
+    ):
+        raise ValueError("Worker requests require different distributed runtimes")
+    if bool(session_request.moe_routing_replay_path) != bool(
+        request.moe_routing_replay_path
+    ):
+        raise ValueError("Worker requests cannot mix captured and replayed MoE routing")
+
+
+def _clear_optimizer_state(optimizer: Any) -> None:
+    chained = getattr(optimizer, "chained_optimizers", None)
+    if chained is not None:
+        for child in chained:
+            _clear_optimizer_state(child)
+        return
+    inner = getattr(optimizer, "optimizer", None)
+    state = getattr(inner, "state", None)
+    if state is None:
+        raise TypeError(f"{type(optimizer).__name__} has no mutable optimizer state")
+    state.clear()
+
+
+def _reset_optimizer_state(optimizer: Any) -> None:
+    from art.megatron import train as megatron_train
+
+    _clear_optimizer_state(optimizer)
+    megatron_train._eager_initialize_optimizer_state(optimizer)
+
+
+def _start_worker_session(request: WorkerRunRequest) -> _WorkerSession:
+    """Builds distributed model state once for compatible oracle requests."""
+    os.environ.setdefault(_ATTACH_TOKEN_UIDS_ENV, "1")
     from art.megatron import train as megatron_train
     from art.megatron.training.weight_offload import WeightOffloadManager
-    from art.preprocessing.pack import packed_tensors_from_dir
 
     if request.case_config.precision == "fp32":
         allow_fp32_grouped_gemm_fallback_for_model_support_tests()
@@ -1426,7 +1539,42 @@ def _worker_run(request: WorkerRunRequest) -> None:
     )
     weight_offload.install()
     weight_offload.after_job()
-    weight_offload.before_job()
+    return _WorkerSession(
+        request=request,
+        runtime=runtime,
+        weight_offload=weight_offload,
+        flex_patch_stack=flex_patch_stack,
+    )
+
+
+def _worker_run(
+    request: WorkerRunRequest,
+    session: _WorkerSession | None = None,
+) -> _WorkerSession:
+    """Executes one trace while retaining compatible distributed model state."""
+    from safetensors.torch import load_file, save_file  # ty: ignore[unresolved-import]
+
+    from art import dev, types
+    from art.megatron import train as megatron_train
+    from art.preprocessing.pack import packed_tensors_from_dir
+
+    reused_runtime = session is not None
+    if session is None:
+        session = _start_worker_session(request)
+    else:
+        _validate_session_request(session.request, request)
+    runtime = session.runtime
+    model_chunks = runtime.model
+    optimizer = runtime.optimizer
+    session.begin_request()
+    # Reloading LoRA masters does not clear moments from a prior paired objective.
+    _reset_optimizer_state(optimizer)
+    if reused_runtime:
+        megatron_train.configure_moe_routing_replay(
+            runtime,
+            replay_bundle_path=request.moe_routing_replay_path,
+            strict=request.moe_routing_replay_strict,
+        )
 
     topology_dir = Path(request.topology_dir)
     traces_dir = topology_dir / "traces"
@@ -1461,6 +1609,8 @@ def _worker_run(request: WorkerRunRequest) -> None:
         optimizer,
         model_support_handler=runtime.model_support_handler,
     )
+    optimizer.zero_grad()
+    megatron_train._zero_grad_buffers(model_chunks)
     _debug("collecting loaded lora state")
     loaded_state = _collect_lora_state(model_chunks)
     if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
@@ -1733,18 +1883,31 @@ def _worker_run(request: WorkerRunRequest) -> None:
             steps=step_traces,
         )
         _write_json(topology_dir / "manifest.json", manifest.model_dump(mode="json"))
-    weight_offload.after_job()
-    torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
-    flex_patch_stack.close()
-    torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]
+    session.end_request()
+    return session
 
 
-def run_worker_cli(run_request_path: Path) -> None:
-    """Loads a worker request and dispatches worker execution."""
-    request = WorkerRunRequest.model_validate(_read_json(run_request_path))
+def run_worker_cli(run_request_paths: list[Path]) -> None:
+    """Loads compatible worker requests and dispatches them in one process lifetime."""
+    requests = [
+        WorkerRunRequest.model_validate(_read_json(run_request_path))
+        for run_request_path in run_request_paths
+    ]
+    session: _WorkerSession | None = None
     try:
-        _worker_run(request)
+        for index, request in enumerate(requests):
+            if index > 0:
+                torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
+                if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
+                    print(
+                        f"=== {request.objective} {request.topology.slug()} ===",
+                        flush=True,
+                    )
+                torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
+            session = _worker_run(request, session)
     finally:
+        if session is not None:
+            session.close()
         if _oracle_debug_enabled():
             faulthandler.cancel_dump_traceback_later()
 
@@ -1753,7 +1916,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parses worker CLI arguments."""
     parser = argparse.ArgumentParser(description="Megatron oracle harness worker")
     parser.add_argument("--worker-run", action="store_true")
-    parser.add_argument("--run-request", type=Path)
+    parser.add_argument("--run-request", type=Path, action="append")
     return parser.parse_args(argv)
 
 
@@ -1762,7 +1925,7 @@ def _main(argv: list[str]) -> int:
     args = _parse_args(argv)
     if not args.worker_run:
         raise SystemExit("This module is intended for test imports or --worker-run")
-    if args.run_request is None:
+    if not args.run_request:
         raise SystemExit("--run-request is required with --worker-run")
     run_worker_cli(args.run_request)
     return 0

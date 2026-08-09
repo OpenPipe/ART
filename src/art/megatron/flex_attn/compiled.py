@@ -60,6 +60,10 @@ _TRITON_NUM_STAGES_2_FLEX_KERNEL_OPTIONS = cast(
     FlexKernelOptions,
     {"BACKEND": "TRITON", "num_stages": 2},
 )
+_BLACKWELL_WIDE_HEAD_FLEX_KERNEL_OPTIONS = cast(
+    FlexKernelOptions,
+    {"BACKEND": "TRITON", "num_stages": 2, "BLOCK_M": 32},
+)
 _FORCED_FLEX_KERNEL_OPTIONS = cast(
     FlexKernelOptions,
     {"BACKEND": _FORCED_FLEX_BACKEND},
@@ -254,13 +258,41 @@ def _needs_triton_num_stages_2(
     )
 
 
+def _needs_blackwell_wide_head_tile(
+    *,
+    backend: FlexBackend,
+    head_dim: int,
+    head_dim_v: int,
+    triton_num_stages_2_head_dims: tuple[int, ...],
+    device: torch.device | None,
+) -> bool:
+    if device is None or device.type != "cuda":
+        return False
+    major, _minor = torch.cuda.get_device_capability(device)
+    return major in {10, 11} and _needs_triton_num_stages_2(
+        backend=backend,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
+    )
+
+
 def get_dense_compiled_flex_attention(
     *,
     backend: FlexBackend,
     head_dim: int,
     head_dim_v: int,
     triton_num_stages_2_head_dims: tuple[int, ...] = (),
+    device: torch.device | None = None,
 ) -> Any:
+    if _needs_blackwell_wide_head_tile(
+        backend=backend,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
+        device=device,
+    ):
+        return blackwell_wide_head_dense_compiled_flex_attention
     if _needs_triton_num_stages_2(
         backend=backend,
         head_dim=head_dim,
@@ -282,8 +314,17 @@ def get_sparse_compiled_flex_attention(
     head_dim: int,
     head_dim_v: int,
     triton_num_stages_2_head_dims: tuple[int, ...] = (),
+    device: torch.device | None = None,
 ) -> Any:
     del family_key
+    if _needs_blackwell_wide_head_tile(
+        backend=backend,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        triton_num_stages_2_head_dims=triton_num_stages_2_head_dims,
+        device=device,
+    ):
+        return blackwell_wide_head_sparse_compiled_flex_attention
     if _needs_triton_num_stages_2(
         backend=backend,
         head_dim=head_dim,
@@ -310,6 +351,9 @@ triton_dense_compiled_flex_attention = torch.compile(
 triton_num_stages_2_dense_compiled_flex_attention = torch.compile(
     _flex_attention_with_options(_TRITON_NUM_STAGES_2_FLEX_KERNEL_OPTIONS),
 )
+blackwell_wide_head_dense_compiled_flex_attention = torch.compile(
+    _flex_attention_with_options(_BLACKWELL_WIDE_HEAD_FLEX_KERNEL_OPTIONS),
+)
 
 sparse_compiled_flex_attention = torch.compile(
     _sparse_flex_attention_with_options(_FORCED_FLEX_KERNEL_OPTIONS),
@@ -322,4 +366,7 @@ triton_sparse_compiled_flex_attention = torch.compile(
 )
 triton_num_stages_2_sparse_compiled_flex_attention = torch.compile(
     _sparse_flex_attention_with_options(_TRITON_NUM_STAGES_2_FLEX_KERNEL_OPTIONS),
+)
+blackwell_wide_head_sparse_compiled_flex_attention = torch.compile(
+    _sparse_flex_attention_with_options(_BLACKWELL_WIDE_HEAD_FLEX_KERNEL_OPTIONS),
 )

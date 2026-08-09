@@ -326,6 +326,20 @@ def _configured_lora_target_modules(provider: Any, spec: Any) -> list[str]:
     return [str(target_module) for target_module in target_modules]
 
 
+def _compile_disabled_collective(function: _F) -> _F:
+    return cast(
+        _F,
+        torch.compiler.disable(
+            getattr(function, "_torchdynamo_orig_callable", function)
+        ),
+    )
+
+
+_gather_lora_sequence_parallel_region = _compile_disabled_collective(
+    gather_from_sequence_parallel_region
+)
+
+
 def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
     if _linear_disables_tensor_parallel_comm(linear):
         return x
@@ -333,7 +347,8 @@ def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
         bool(getattr(linear, "sequence_parallel", False))
         and int(getattr(linear, "tp_size", 1)) > 1
     ):
-        return gather_from_sequence_parallel_region(x)
+        # Torch 2.11 compiled autograd drops the gather's input-gradient edge.
+        return _gather_lora_sequence_parallel_region(x)
     return x
 
 
@@ -1285,6 +1300,18 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
         return base_output + lora_output, bias_output
 
 
+def _install_replicated_qkv_all_gather_compile_boundary() -> None:
+    from megatron.core.transformer import attention
+
+    # Torch 2.11 compiled autograd drops LoRA parameter edges through this gather.
+    gather = attention.all_gather_last_dim_from_tensor_parallel_region
+    if getattr(gather, "_art_replicated_qkv_compile_boundary", False):
+        return
+    gather = _compile_disabled_collective(gather)
+    setattr(gather, "_art_replicated_qkv_compile_boundary", True)
+    attention.all_gather_last_dim_from_tensor_parallel_region = gather
+
+
 class SelfAttentionLinearQKVLoRA(torch.nn.Module):
     def __init__(
         self,
@@ -1312,32 +1339,47 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         total_out_features_per_rank = int(weight.shape[0])
         kv_out_features = self.provider.kv_channels * self.provider.num_query_groups
         tp_world_size = ps.get_tensor_model_parallel_world_size()
-        assert kv_out_features % tp_world_size == 0, (
-            "kv_out_features must be divisible by tensor parallel size"
-        )
         q_out_features = self.provider.kv_channels * self.provider.num_attention_heads
-        assert q_out_features % tp_world_size == 0, (
-            "q_out_features must be divisible by tensor parallel size"
-        )
-        q_out_features_per_rank = q_out_features // tp_world_size
-        kv_out_features_per_rank = kv_out_features // tp_world_size
         self.attention_output_gate = bool(
             getattr(self.provider, "attention_output_gate", False)
         )
-        q_and_gate_out_features_per_rank = total_out_features_per_rank - (
-            2 * kv_out_features_per_rank
-        )
-        expected_q_out_features_per_rank = q_out_features_per_rank * (
-            2 if self.attention_output_gate else 1
-        )
-        assert q_and_gate_out_features_per_rank == expected_q_out_features_per_rank, (
-            "Unexpected per-rank QKV packing for this attention layout"
-        )
+        gate_multiplier = 2 if self.attention_output_gate else 1
+        self.replicated_qkv = self.provider.num_query_groups < tp_world_size
+        if self.replicated_qkv:
+            # Megatron forms global packed QKV, then gives each TP rank one slice.
+            _install_replicated_qkv_all_gather_compile_boundary()
+            q_and_gate_out_features_per_rank = q_out_features * gate_multiplier
+            kv_out_features_per_rank = kv_out_features
+            packed_width = q_and_gate_out_features_per_rank + 2 * kv_out_features
+            if packed_width != total_out_features_per_rank * tp_world_size:
+                raise ValueError(
+                    "Unexpected replicated-KV QKV packing: "
+                    f"global width {packed_width}, local width "
+                    f"{total_out_features_per_rank}, TP {tp_world_size}"
+                )
+            self.num_query_groups_per_partition = self.provider.num_query_groups
+        else:
+            assert kv_out_features % tp_world_size == 0, (
+                "kv_out_features must be divisible by tensor parallel size"
+            )
+            assert q_out_features % tp_world_size == 0, (
+                "q_out_features must be divisible by tensor parallel size"
+            )
+            q_out_features_per_rank = q_out_features // tp_world_size
+            kv_out_features_per_rank = kv_out_features // tp_world_size
+            q_and_gate_out_features_per_rank = total_out_features_per_rank - (
+                2 * kv_out_features_per_rank
+            )
+            expected_q_out_features_per_rank = q_out_features_per_rank * gate_multiplier
+            assert (
+                q_and_gate_out_features_per_rank == expected_q_out_features_per_rank
+            ), "Unexpected per-rank QKV packing for this attention layout"
+            self.num_query_groups_per_partition = (
+                self.provider.num_query_groups // tp_world_size
+            )
+        self.tp_rank = ps.get_tensor_model_parallel_rank()
         self.q_and_gate_out_features_per_rank = q_and_gate_out_features_per_rank
         self.kv_out_features_per_rank = kv_out_features_per_rank
-        self.num_query_groups_per_partition = (
-            self.provider.num_query_groups // tp_world_size
-        )
         self.num_attention_heads_per_group = (
             self.provider.num_attention_heads // self.provider.num_query_groups
         )
@@ -1349,6 +1391,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
                 rank=rank,
                 alpha=alpha,
                 out_features=q_and_gate_out_features_per_rank,
+                replicated=self.replicated_qkv,
             )
             if _targets_include(target_modules, "q_proj")
             else None
@@ -1360,6 +1403,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
                 rank=rank,
                 alpha=alpha,
                 out_features=kv_out_features_per_rank,
+                replicated=self.replicated_qkv,
             )
             if _targets_include(target_modules, "k_proj")
             else None
@@ -1371,6 +1415,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
                 rank=rank,
                 alpha=alpha,
                 out_features=kv_out_features_per_rank,
+                replicated=self.replicated_qkv,
             )
             if _targets_include(target_modules, "v_proj")
             else None
@@ -1384,8 +1429,23 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         out_features: int,
+        replicated: bool,
     ) -> LoRA:
         assert isinstance(linear_qkv.weight, torch.Tensor)
+        if replicated:
+            parallel_spec = LoRAParallelSpec(grad_sync_op=GRAD_SYNC_OP_SUM)
+            return LoRA(
+                adapter_model_prefix=adapter_model_prefix,
+                in_features=linear_qkv.in_features,
+                out_features=out_features,
+                rank=rank,
+                alpha=alpha,
+                dtype=linear_qkv.weight.dtype,
+                device=linear_qkv.weight.device,
+                a_parallel_spec=parallel_spec,
+                b_parallel_spec=parallel_spec,
+                allreduce=True,
+            )
         a_parallel_spec = LoRAParallelSpec(
             shard_domain="tp",
             sharded=False,
@@ -1451,29 +1511,32 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
             self.kv_out_features_per_rank,
         )
         query_and_gate_5d = query_and_gate.reshape(
-            query_and_gate.shape[0],
-            query_and_gate.shape[1],
+            *query_and_gate.shape[:-1],
             self.num_query_groups_per_partition,
             self.num_attention_heads_per_group
             * (2 if self.attention_output_gate else 1),
             self.hidden_size_per_attention_head,
         )
         key_5d = key.reshape(
-            key.shape[0],
-            key.shape[1],
+            *key.shape[:-1],
             self.num_query_groups_per_partition,
             1,
             self.hidden_size_per_attention_head,
         )
         value_5d = value.reshape(
-            value.shape[0],
-            value.shape[1],
+            *value.shape[:-1],
             self.num_query_groups_per_partition,
             1,
             self.hidden_size_per_attention_head,
         )
-        qkv_5d = torch.cat([query_and_gate_5d, key_5d, value_5d], dim=3)
-        adapter_output = qkv_5d.reshape(qkv_5d.shape[0], qkv_5d.shape[1], -1)
+        adapter_output = torch.cat(
+            [query_and_gate_5d, key_5d, value_5d], dim=-2
+        ).flatten(-3)
+        if self.replicated_qkv:
+            local_width = linear_output.shape[-1]
+            adapter_output = adapter_output.narrow(
+                -1, self.tp_rank * local_width, local_width
+            )
 
         return linear_output + adapter_output, bias
 

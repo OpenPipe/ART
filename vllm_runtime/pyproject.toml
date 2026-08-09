@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Tiny ART-owned vLLM runtime package"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "openai==2.53.0",
     "pydantic>=2.12.5",
     "transformers==5.12.1",
 ]
@@ -21,6 +22,7 @@ cuda13 = [
     "torch==2.11.0 ; sys_platform == 'linux'",
     "torchaudio==2.11.0 ; sys_platform == 'linux'",
     "torchvision==0.26.0 ; sys_platform == 'linux'",
+    "triton-kernels @ git+https://github.com/triton-lang/triton.git@7c56a5e40f7fd928dfd5c72902d5def0097db73a#subdirectory=python/triton_kernels ; sys_platform == 'linux'",
     "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux'",
 ]
 
@@ -51,7 +53,6 @@ required-version = ">=0.6.15"
 conflicts = [[{ extra = "cuda12" }, { extra = "cuda13" }]]
 override-dependencies = [
     "flashinfer-python==0.6.13",
-    "numpy<2",
     "transformers==5.12.1",
     "xgrammar==0.2.3",
 ]

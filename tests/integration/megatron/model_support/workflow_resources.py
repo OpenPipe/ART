@@ -2,10 +2,73 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _H200_REFERENCE_VRAM_GIB = 130.0
 _H200_SLOT_TOLERANCE = 0.05
+THROUGHPUT_PACKED_SEQUENCE_LENGTH = 131_072
+THROUGHPUT_RANDOM_INITIALIZATION_VERSION = "deterministic_random_v1"
+THROUGHPUT_RANDOM_SEED = 3407
+
+
+class ThroughputThresholds(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    calibration_basis: Literal["measured", "estimated"]
+    calibration_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    min_isolated_train_tok_s: float = Field(gt=0.0, allow_inf_nan=False)
+    min_e2e_train_tok_s: float = Field(gt=0.0, allow_inf_nan=False)
+    min_accepted_train_tok_s: float = Field(gt=0.0, allow_inf_nan=False)
+    min_e2e_to_isolated_ratio: float = Field(gt=0.0, le=1.0, allow_inf_nan=False)
+    min_matched_core_to_isolated_ratio: float = Field(
+        gt=0.0, le=1.0, allow_inf_nan=False
+    )
+    max_policy_activation_lag_s: float = Field(gt=0.0, le=2.0, allow_inf_nan=False)
+    max_policy_activation_interval_s: float = Field(gt=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_calibration_identity(self) -> "ThroughputThresholds":
+        measured = self.calibration_basis == "measured"
+        if measured != (self.calibration_fingerprint is not None):
+            raise ValueError(
+                "measured calibration requires a fingerprint and estimated "
+                "calibration must not claim one"
+            )
+        return self
+
+
+class ThroughputWorkflowConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    num_layers: int = Field(ge=2)
+    prompt_tokens: int = Field(default=3839, ge=1)
+    completion_tokens: int = Field(default=64, ge=1)
+    rollouts_per_group: int = Field(default=4, ge=2)
+    groups_per_step: int = Field(default=32, ge=2)
+    initial_model_calls_per_inference_gpu: int = Field(default=32, ge=1)
+    max_num_seqs: int = Field(default=64, ge=1)
+    max_num_batched_tokens: int = Field(default=65_536, ge=1)
+    enable_prefix_caching: bool = False
+    max_steps: int = Field(default=31, ge=11)
+    max_steps_off_policy: int = Field(default=4, ge=0)
+    packed_sequence_length: Literal[131072] = THROUGHPUT_PACKED_SEQUENCE_LENGTH
+    min_vllm_pressure: float = Field(default=0.5, ge=0.0, allow_inf_nan=False)
+    max_trainer_underfeed: float = Field(default=0.08, ge=0.0, allow_inf_nan=False)
+    max_mean_train_gap_s: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    random_initialization_version: Literal["deterministic_random_v1"] = (
+        THROUGHPUT_RANDOM_INITIALIZATION_VERSION
+    )
+    random_seed: int = Field(default=THROUGHPUT_RANDOM_SEED, ge=0, le=2**31 - 1)
+    thresholds: dict[Literal["h200", "b300"], ThroughputThresholds] = Field(
+        default_factory=dict
+    )
+
+    @model_validator(mode="after")
+    def require_measured_b300_calibration(self) -> "ThroughputWorkflowConfig":
+        b300 = self.thresholds.get("b300")
+        if b300 is not None and b300.calibration_basis != "measured":
+            raise ValueError("B300 throughput thresholds must be measured")
+        return self
 
 
 class MegatronWorkflowTopology(BaseModel):
@@ -74,6 +137,7 @@ class WorkflowStageResources(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     required_world_size: int
+    required_physical_gpus: int | None = None
     required_h200_equivalent_gpus: int | None = None
     allow_gpu_overlap: bool = False
     requires_external_vllm: bool = False
@@ -83,6 +147,7 @@ class WorkflowStageResources(BaseModel):
     high_vram_vllm: VllmWorkflowResources | None = None
     streaming_weight_offload: bool = False
     megatron_env: dict[str, str] = Field(default_factory=dict)
+    throughput: ThroughputWorkflowConfig | None = None
 
 
 class HandlerWorkflowResources(BaseModel):
@@ -93,6 +158,7 @@ class HandlerWorkflowResources(BaseModel):
     native_vllm_lora: WorkflowStageResources | None = None
     yes_no_trainability: WorkflowStageResources | None = None
     length_trainability: WorkflowStageResources | None = None
+    e2e_throughput: WorkflowStageResources | None = None
     yes_no_trainability_variant: (
         Literal[
             "megatron_shared",
@@ -256,7 +322,6 @@ _GPT_OSS_REDUCED_VLLM = VllmWorkflowResources(
         "enforce_eager": True,
         "load_format": "dummy",
         "max_model_len": 1024,
-        "moe_backend": "triton",
     },
 )
 _QWEN_MOE_REDUCED_MEGATRON = MegatronWorkflowResources(
@@ -349,6 +414,18 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
         yes_no_trainability_variant="megatron_dedicated",
     ),
     "gpt_oss_moe": HandlerWorkflowResources(
+        train_inf_mismatch=WorkflowStageResources(
+            required_world_size=3,
+            required_physical_gpus=3,
+            megatron=MegatronWorkflowResources(
+                gpu_ids=[0, 1],
+                topology=MegatronWorkflowTopology(cp=2, ep=2),
+            ),
+            vllm=VllmWorkflowResources(
+                gpu_ids=[2],
+                tensor_parallel_size=1,
+            ),
+        ),
         merged_vllm_serving=WorkflowStageResources(
             required_world_size=2,
             megatron=_GPT_OSS_REDUCED_MEGATRON,
@@ -374,6 +451,119 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
         for handler_key in ("qwen3_moe", "qwen3_5_moe")
     },
 }
+
+_THROUGHPUT_CONFIGS = {
+    "llama3_dense": ThroughputWorkflowConfig(
+        num_layers=16,
+        prompt_tokens=3922,
+        completion_tokens=384,
+        groups_per_step=24,
+        initial_model_calls_per_inference_gpu=26,
+    ),
+    "qwen3_dense": ThroughputWorkflowConfig(num_layers=8),
+    "qwen3_moe": ThroughputWorkflowConfig(
+        num_layers=16,
+        prompt_tokens=3884,
+        completion_tokens=48,
+    ),
+    "qwen3_5_dense": ThroughputWorkflowConfig(
+        num_layers=8,
+        prompt_tokens=3839,
+        completion_tokens=8,
+        enable_prefix_caching=True,
+    ),
+    "qwen3_5_moe": ThroughputWorkflowConfig(
+        num_layers=16,
+        completion_tokens=8,
+        groups_per_step=33,
+        max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
+        max_steps=35,
+        enable_prefix_caching=True,
+    ),
+    "gemma4_dense": ThroughputWorkflowConfig(num_layers=12),
+    "gemma4_moe": ThroughputWorkflowConfig(
+        num_layers=12,
+        prompt_tokens=3640,
+        completion_tokens=80,
+    ),
+    "dsv4": ThroughputWorkflowConfig(
+        num_layers=8,
+        prompt_tokens=12_800,
+        completion_tokens=768,
+        groups_per_step=8,
+        initial_model_calls_per_inference_gpu=32,
+        max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
+    ),
+    "glm52": ThroughputWorkflowConfig(
+        num_layers=12,
+        prompt_tokens=3836,
+    ),
+    "gpt_oss_moe": ThroughputWorkflowConfig(
+        num_layers=4,
+        initial_model_calls_per_inference_gpu=24,
+        max_num_seqs=48,
+    ),
+}
+_DENSE_HANDLER_KEYS = {
+    "llama3_dense",
+    "qwen3_dense",
+    "qwen3_5_dense",
+    "gemma4_dense",
+}
+
+
+def _throughput_stage_resources(model_key: str) -> WorkflowStageResources:
+    config = _THROUGHPUT_CONFIGS[model_key]
+    is_moe = model_key not in _DENSE_HANDLER_KEYS
+    vllm_engine_args: dict[str, object] = {
+        "disable_custom_all_reduce": True,
+        "load_format": "dummy",
+        "gpu_memory_utilization": 0.82,
+        "max_model_len": 16_384,
+        "max_num_batched_tokens": config.max_num_batched_tokens,
+        "max_num_seqs": config.max_num_seqs,
+        "lora_dtype": "bfloat16",
+    }
+    if model_key in {"qwen3_moe", "qwen3_5_moe"}:
+        vllm_engine_args["compilation_config"] = {
+            "pass_config": {"fuse_allreduce_rms": False}
+        }
+    if config.enable_prefix_caching:
+        vllm_engine_args["enable_prefix_caching"] = True
+    if model_key == "dsv4":
+        vllm_engine_args.update(
+            compilation_config={
+                "cudagraph_mode": "NONE",
+                "pass_config": {"fuse_allreduce_rms": False},
+            },
+            enforce_eager=True,
+            kv_cache_dtype="fp8",
+        )
+    return WorkflowStageResources(
+        required_world_size=4,
+        required_physical_gpus=4,
+        megatron=MegatronWorkflowResources(
+            gpu_ids=[0, 1],
+            topology=MegatronWorkflowTopology(
+                cp=1 if model_key == "dsv4" else 2,
+                ep=2 if is_moe else 1,
+            ),
+        ),
+        vllm=VllmWorkflowResources(
+            gpu_ids=[2, 3],
+            tensor_parallel_size=2,
+            enable_expert_parallel=is_moe,
+            extra_engine_args=vllm_engine_args,
+        ),
+        throughput=config,
+    )
+
+
+for _model_key in _THROUGHPUT_CONFIGS:
+    _resources = HANDLER_WORKFLOW_RESOURCES.get(_model_key, HandlerWorkflowResources())
+    HANDLER_WORKFLOW_RESOURCES[_model_key] = _resources.model_copy(
+        update={"e2e_throughput": _throughput_stage_resources(_model_key)}
+    )
 
 
 def handler_workflow_resources_for_base_model(
@@ -439,6 +629,13 @@ def resolve_stage_resources_for_visible_gpus(
     *,
     visible_gpu_count: int,
 ) -> WorkflowStageResources:
+    required_physical = stage_resources.required_physical_gpus
+    if required_physical is not None and visible_gpu_count < required_physical:
+        raise RuntimeError(
+            f"Need {required_physical} physical GPUs for {stage_name}, found "
+            f"{visible_gpu_count}; H200-equivalent capacity cannot coalesce "
+            "distinct workflow roles."
+        )
     if visible_gpu_count >= stage_resources.required_world_size:
         return stage_resources
     required_equivalent = stage_resources.required_h200_equivalent_gpus
@@ -498,20 +695,22 @@ def resolve_stage_resources_for_visible_gpus(
     return stage_resources.model_copy(update={"megatron": megatron, "vllm": vllm})
 
 
+def _current_visible_gpu_count() -> int:
+    try:
+        import torch
+    except ImportError:
+        return 0
+    return int(torch.cuda.device_count())
+
+
 def resolve_stage_resources_for_current_host(
     stage_name: str,
     stage_resources: WorkflowStageResources,
 ) -> WorkflowStageResources:
-    try:
-        import torch
-    except ImportError:
-        visible_gpu_count = 0
-    else:
-        visible_gpu_count = int(torch.cuda.device_count())
     return resolve_stage_resources_for_visible_gpus(
         stage_name,
         stage_resources,
-        visible_gpu_count=visible_gpu_count,
+        visible_gpu_count=_current_visible_gpu_count(),
     )
 
 

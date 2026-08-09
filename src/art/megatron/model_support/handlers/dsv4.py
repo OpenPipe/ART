@@ -522,6 +522,28 @@ class Dsv4Handler(DefaultMoeHandler):
         config._experts_implementation = "eager"
         self._apply_oracle_shape_overrides(config)
 
+    def prepare_hf_reference_model(self, model: Any) -> Any:
+        from art.megatron.dsv4.hf_oracle import prepare_hf_reference_model
+
+        return prepare_hf_reference_model(model)
+
+    def prepare_hf_reference_forward(
+        self,
+        model: Any,
+        *,
+        position_ids: torch.Tensor,
+        group_ids: torch.Tensor,
+        parent_ids: torch.Tensor,
+    ) -> None:
+        from art.megatron.dsv4.hf_oracle import set_hf_reference_prefix_tree
+
+        set_hf_reference_prefix_tree(
+            model,
+            position_ids=position_ids,
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+        )
+
     def hf_reference_from_pretrained_kwargs(
         self, *, config: Any, dtype: torch.dtype
     ) -> dict[str, Any]:

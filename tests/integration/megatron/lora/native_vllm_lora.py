@@ -3,18 +3,18 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-import shutil
 import socket
 import tempfile
 from typing import cast
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 import torch
 
 import art
 from art import dev
-from art.megatron.service import MegatronService
-from art.utils.output_dirs import get_step_checkpoint_dir
+from art.megatron.backend import MegatronBackend
+from art.megatron.distributed_service import DistributedMegatronService
 
 from ..model_support.oracle_harness import (
     ORACLE_TOPOLOGY,
@@ -106,12 +106,6 @@ async def _completion_text(client, base_url: str, model_name: str) -> str:
     return str(response.json().get("choices", [{}])[0].get("text", ""))
 
 
-def _copy_adapter_checkpoint(source_dir: str, dest_dir: str) -> None:
-    os.makedirs(dest_dir, exist_ok=True)
-    for filename in ("adapter_model.safetensors", "adapter_config.json"):
-        shutil.copy(Path(source_dir) / filename, Path(dest_dir) / filename)
-
-
 def _init_runtime_config(case_config: OracleCaseConfig) -> None:
     art.init_megatron_runtime_config(
         topology=art.MegatronTopologyConfig(
@@ -159,45 +153,61 @@ async def _run_native_vllm_lora(
     case_artifacts = ensure_case_artifacts(case_config)
     output_root = Path(case_artifacts.case_dir) / "native_vllm_lora"
     output_root.mkdir(parents=True, exist_ok=True)
-    output_dir = tempfile.mkdtemp(prefix="run_", dir=output_root)
+    backend_root = tempfile.mkdtemp(prefix="run_", dir=output_root)
     internal_config = dev.InternalModelConfig(
-        trainer_gpu_ids=trainer_gpu_ids,
-        inference_gpu_ids=inference_gpu_ids,
         rollout_weights_mode="lora",
         allow_unvalidated_arch=case_config.allow_unvalidated_arch,
         engine_args=engine_args,
     )
+    if set(trainer_gpu_ids).isdisjoint(inference_gpu_ids):
+        internal_config["trainer_gpu_ids"] = trainer_gpu_ids
+        internal_config["inference_gpu_ids"] = inference_gpu_ids
+    else:
+        trainer_gpu_ids = list(inference_gpu_ids)
     if stage_resources is None:
         dev.validate_dedicated_config(internal_config)
     with provider_topology_env(ORACLE_TOPOLOGY):
         _init_runtime_config(case_config)
-        service = MegatronService(
-            model_name=service_name,
+        backend = MegatronBackend(path=backend_root)
+        model = art.TrainableModel(
+            name=service_name,
+            run_name=service_name,
+            project="model-support-validation",
             base_model=case_config.base_model,
-            config=internal_config,
-            output_dir=output_dir,
+            _internal_config=internal_config,
+            report_metrics=[],
         )
         port = _find_free_port()
         try:
-            host, resolved_port = await service.start_openai_server(
-                {"server_args": {"port": port}}
+            await model.register(backend, {"server_args": {"port": port}})
+            service = cast(
+                DistributedMegatronService, await backend._get_service(model)
             )
+            endpoint = urlparse(service._base_url or "")
+            host, resolved_port = (
+                endpoint.hostname or "127.0.0.1",
+                int(endpoint.port or port),
+            )
+            output_dir = service.output_dir
             import httpx
 
             base_url = f"http://{host}:{resolved_port}"
             step0_name = f"{service_name}@0"
             step1_name = f"{service_name}@1"
-            async with httpx.AsyncClient() as client:
+            api_key = service._api_key()
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+            async with httpx.AsyncClient(headers=headers) as client:
                 model_ids_before = await _model_ids(client, base_url)
                 step0_completion_text = await _completion_text(
                     client,
                     base_url,
                     step0_name,
                 )
-                step0_dir = get_step_checkpoint_dir(output_dir, 0)
-                step1_dir = get_step_checkpoint_dir(output_dir, 1)
-                _copy_adapter_checkpoint(step0_dir, step1_dir)
-                await service.register_lora_for_step(1, step1_dir)
+                await service.advance_without_training(
+                    expected_step=0,
+                    learner_version=1,
+                )
+                await service.wait_for_serving(1)
                 model_ids_after = await _model_ids(client, base_url)
                 step1_completion_text = await _completion_text(
                     client,
@@ -222,7 +232,7 @@ async def _run_native_vllm_lora(
                 step1_completion_text=step1_completion_text,
             )
         finally:
-            service.close()
+            await backend.close()
 
 
 def run_native_vllm_lora(

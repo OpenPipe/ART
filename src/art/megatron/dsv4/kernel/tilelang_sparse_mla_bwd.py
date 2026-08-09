@@ -23,52 +23,107 @@ T = _T
 def preprocess(
     H,
     D,
-    block_ND=32,
-    num_stages=5,
+    topk,
+    sm_scale=None,
+    block_size=64,
+    num_stages=0,
+    threads=128,
+    indices_dtype=T.int32,
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
+    assert topk % block_size == 0
     assert dtype == T.bfloat16
     assert accum_dtype == T.float32
     B = T.dynamic("batch")
     S = T.dynamic("seq_len")
-    shape = [B, S, H, D]
+    S_kv = T.dynamic("seq_len_kv")
+    if sm_scale is None:
+        sm_scale = D ** (-0.5)
+
+    q_shape = [B, S, H, D]
+    kv_shape = [B, S_kv, D]
+    indices_shape = [B, S, topk]
+    padded_H = max(tilelang.math.next_power_of_2(H), 16)
+    block_H = min(64, padded_H)
+    assert padded_H % block_H == 0
+    NH = padded_H // block_H
+    BS = block_size
+    NS = tilelang.cdiv(topk, block_size)
 
     @T.prim_func
     def preprocess_kernel(
-        O: T.Tensor(shape, dtype),  # type: ignore
-        dO: T.Tensor(shape, dtype),  # type: ignore
+        Q: T.Tensor(q_shape, dtype),  # type: ignore
+        KV: T.Tensor(kv_shape, dtype),  # type: ignore
+        dO: T.Tensor(q_shape, dtype),  # type: ignore
+        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        Lse: T.Tensor([B, S, H], accum_dtype),  # type: ignore
         Delta: T.Tensor([B, S, H], accum_dtype),  # type: ignore
     ):
-        with T.Kernel(H, T.ceildiv(S, block_ND), B) as (bx, by, bz):
-            o = T.alloc_fragment([block_ND, block_ND], accum_dtype)
-            do = T.alloc_fragment([block_ND, block_ND], accum_dtype)
-            delta = T.alloc_fragment([block_ND], accum_dtype)
-            acc = T.alloc_fragment([block_ND, block_ND], accum_dtype)
-            T.clear(acc)
-            for k in T.Pipelined(T.ceildiv(D, block_ND), num_stages=num_stages):
-                T.copy(
-                    O[
-                        bz,
-                        by * block_ND : (by + 1) * block_ND,
-                        bx,
-                        k * block_ND : (k + 1) * block_ND,
-                    ],
-                    o,
+        with T.Kernel(S, B, NH, threads=threads) as (s_i, by, bz):
+            Q_shared = T.alloc_shared([block_H, D], dtype)
+            KV_shared = T.alloc_shared([BS, D], dtype)
+            dO_shared = T.alloc_shared([block_H, D], dtype)
+            P_shared_cast = T.alloc_shared([block_H, BS], dtype)
+            dP_shared_cast = T.alloc_shared([block_H, BS], dtype)
+            mask = T.alloc_fragment([BS], "bool")
+            safe_indices = T.alloc_fragment([BS], indices_dtype)
+            acc_p = T.alloc_fragment([block_H, BS], accum_dtype)
+            acc_dp = T.alloc_fragment([block_H, BS], accum_dtype)
+            delta = T.alloc_fragment([block_H], accum_dtype)
+            delta_i = T.alloc_fragment([block_H], accum_dtype)
+
+            T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, :], Q_shared)
+            T.copy(dO[by, s_i, bz * block_H : (bz + 1) * block_H, :], dO_shared)
+            T.clear(delta)
+
+            for i_i in T.Pipelined(NS, num_stages=num_stages):
+                for bi_i in T.Parallel(BS):
+                    mask[bi_i] = Indices[by, s_i, i_i * BS + bi_i] != -1
+                    safe_indices[bi_i] = T.if_then_else(
+                        mask[bi_i], Indices[by, s_i, i_i * BS + bi_i], 0
+                    )
+                for bi_i, d_i in T.Parallel(BS, D):
+                    KV_shared[bi_i, d_i] = KV[by, safe_indices[bi_i], d_i]
+
+                T.gemm(
+                    Q_shared,
+                    KV_shared,
+                    acc_p,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                    clear_accum=True,
                 )
-                T.copy(
-                    dO[
-                        bz,
-                        by * block_ND : (by + 1) * block_ND,
-                        bx,
-                        k * block_ND : (k + 1) * block_ND,
-                    ],
-                    do,
+                T.copy(acc_p, P_shared_cast)
+                for h_i, bi_i in T.Parallel(block_H, BS):
+                    acc_p[h_i, bi_i] = P_shared_cast[h_i, bi_i] * sm_scale
+                T.copy(acc_p, P_shared_cast)
+                for h_i, bi_i in T.Parallel(block_H, BS):
+                    acc_p[h_i, bi_i] = T.if_then_else(
+                        mask[bi_i],
+                        T.exp2(
+                            P_shared_cast[h_i, bi_i] * 1.44269504
+                            - Lse[by, s_i, bz * block_H + h_i]
+                        ),
+                        0,
+                    )
+
+                T.gemm(
+                    dO_shared,
+                    KV_shared,
+                    acc_dp,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullCol,
+                    clear_accum=True,
                 )
-                for i, j in T.Parallel(block_ND, block_ND):
-                    acc[i, j] += o[i, j] * do[i, j]
-            T.reduce_sum(acc, delta, 1)
-            T.copy(delta, Delta[bz, by * block_ND : (by + 1) * block_ND, bx])
+                T.copy(acc_dp, dP_shared_cast)
+                for h_i, bi_i in T.Parallel(block_H, BS):
+                    acc_dp[h_i, bi_i] = acc_p[h_i, bi_i] * dP_shared_cast[h_i, bi_i]
+                T.reduce_sum(acc_dp, delta_i, dim=1)
+                for h_i in T.Parallel(block_H):
+                    delta[h_i] += delta_i[h_i]
+
+            T.copy(delta, Delta[by, s_i, bz * block_H : (bz + 1) * block_H])
 
     return preprocess_kernel
 
@@ -132,7 +187,6 @@ def bwd(
 
     if sm_scale is None:
         sm_scale = D ** (-0.5)
-    sm_scale_mul_reciprocal_log2 = sm_scale * 1.44269504  # log2(e)
 
     q_shape = [B, S, H, D]
     kv_shape = [B, S_kv, D]
@@ -206,21 +260,25 @@ def bwd(
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullCol,
                 )
+                T.copy(acc_p, P_shared_cast)
+                for h_i, bi_i in T.Parallel(block_H, BS):
+                    acc_p[h_i, bi_i] = P_shared_cast[h_i, bi_i] * sm_scale
+                T.copy(acc_p, P_shared_cast)
                 for h_i, bi_i in T.Parallel(block_H, BS):
                     acc_p[h_i, bi_i] = T.if_then_else(
-                        mask[bi_i], acc_p[h_i, bi_i], -T.infinity(acc_p.dtype)
+                        mask[bi_i], P_shared_cast[h_i, bi_i], -T.infinity(acc_p.dtype)
                     )
 
                 # P = exp2(scores * sm_scale_log2e - LSE)
                 for h_i, bi_i in T.Parallel(block_H, BS):
                     acc_p[h_i, bi_i] = T.exp2(
-                        acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2
-                        - Lse[by, s_i, bz * block_H + h_i]
+                        acc_p[h_i, bi_i] * 1.44269504 - Lse[by, s_i, bz * block_H + h_i]
                     )
 
                 T.copy(acc_p, P_shared_cast)
 
-                # dP = P * (dO @ KV^T - Delta)
+                # BF16 matmul in the canonical path rounds dO @ KV before the
+                # FP32 softmax derivative.
                 T.gemm(
                     dO_shared,
                     KV_shared,
@@ -230,13 +288,16 @@ def bwd(
                     clear_accum=True,
                 )
 
+                T.copy(acc_dp, dP_shared_cast)
+
                 for h_i, bi_i in T.Parallel(block_H, BS):
-                    acc_dp[h_i, bi_i] = (
-                        acc_p[h_i, bi_i]
-                        * (acc_dp[h_i, bi_i] - Delta[by, s_i, bz * block_H + h_i])
-                        * sm_scale
+                    acc_dp[h_i, bi_i] = acc_p[h_i, bi_i] * (
+                        dP_shared_cast[h_i, bi_i] - Delta[by, s_i, bz * block_H + h_i]
                     )
 
+                T.copy(acc_dp, dP_shared_cast)
+                for h_i, bi_i in T.Parallel(block_H, BS):
+                    acc_dp[h_i, bi_i] = dP_shared_cast[h_i, bi_i] * sm_scale
                 T.copy(acc_dp, dP_shared_cast)
 
                 # dQ += dP @ KV
@@ -314,14 +375,13 @@ def _tilelang_input_dtype(torch_dtype):
     raise TypeError(f"DSV4 sparse MLA TileLang launch requires bf16, got {torch_dtype}")
 
 
-def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=None):
+def sparse_mqa_bwd_interface(q, kv, attn_sink, do, topk_idxs, lse, sm_scale=None):
     """Backward interface for V4 sparse MQA attention.
 
     Args:
         q:         [B, S, H, D] bf16
         kv:        [B, S_kv, D] bf16
         attn_sink: [H] fp32
-        o:         [B, S, H, D] bf16 (forward output)
         do:        [B, S, H, D] bf16 (grad of output)
         topk_idxs: [B, S, topk] int32
         lse:       [B, S, H] fp32 (log-sum-exp from forward)
@@ -338,7 +398,7 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     _, S_kv, _ = kv.shape
     topk = topk_idxs.shape[-1]
     dtype = _tilelang_input_dtype(q.dtype)
-    assert kv.dtype == q.dtype and o.dtype == q.dtype and do.dtype == q.dtype
+    assert kv.dtype == q.dtype and do.dtype == q.dtype
 
     # Pad topk to next multiple of block_size (kernel requires divisibility)
     block_size = 64
@@ -356,9 +416,9 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
     with preserve_tilelang_env():
         # Keep sequence lengths dynamic so changing packed workloads reuse the
         # same generated kernels.  Model/tile dimensions remain static.
-        preprocess_kernel = preprocess(H, D, dtype=dtype)
+        preprocess_kernel = preprocess(H, D, topk, sm_scale, dtype=dtype)
         postprocess_kernel = postprocess(D, dtype=dtype)
-        delta = preprocess_kernel(o, do)
+        delta = preprocess_kernel(q, kv, do, topk_idxs, lse)
     dkv = torch.zeros_like(kv, dtype=torch.float32)
     d_attn_sink = torch.zeros_like(attn_sink)
     if topk <= block_size:
@@ -372,7 +432,15 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
                 dtype=dtype,
             )
             dq = bwd_kernel(
-                q, kv, do, attn_sink, topk_idxs, lse, delta, dkv, d_attn_sink
+                q,
+                kv,
+                do,
+                attn_sink,
+                topk_idxs,
+                lse,
+                delta,
+                dkv,
+                d_attn_sink,
             )
     else:
         dq_accum = torch.zeros_like(q, dtype=torch.float32)
@@ -389,7 +457,15 @@ def sparse_mqa_bwd_interface(q, kv, attn_sink, o, do, topk_idxs, lse, sm_scale=N
             for start in range(0, topk, block_size):
                 chunk = topk_idxs[:, :, start : start + block_size].contiguous()
                 dq_i = bwd_kernel(
-                    q, kv, do, attn_sink, chunk, lse, delta, dkv, d_attn_sink
+                    q,
+                    kv,
+                    do,
+                    attn_sink,
+                    chunk,
+                    lse,
+                    delta,
+                    dkv,
+                    d_attn_sink,
                 )
                 dq_accum.add_(dq_i.float())
         dq = dq_accum.to(q.dtype)

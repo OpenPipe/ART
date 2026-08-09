@@ -116,4 +116,8 @@ def get_model_config(
         result["inference_gpu_ids"] = config["inference_gpu_ids"]
     if "vllm_runtime" in config:
         result["vllm_runtime"] = config["vllm_runtime"]
+    if "megatron_model_initialization" in config:
+        result["megatron_model_initialization"] = config[
+            "megatron_model_initialization"
+        ]
     return result

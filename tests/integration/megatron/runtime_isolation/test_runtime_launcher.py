@@ -40,6 +40,7 @@ def test_build_runtime_server_cmd_uses_runtime_project(
             lora_path="/tmp/lora",
             served_model_name="test@0",
             rollout_weights_mode="merged",
+            initial_policy_version=7,
             engine_args={"weight_transfer_config": {"backend": "nccl"}},
             server_args={"tool_call_parser": "hermes"},
         )
@@ -50,6 +51,7 @@ def test_build_runtime_server_cmd_uses_runtime_project(
         '--engine-args-json={"weight_transfer_config": {"backend": "nccl"}}' in command
     )
     assert '--server-args-json={"tool_call_parser": "hermes"}' in command
+    assert "--initial-policy-version=7" in command
 
 
 def test_build_runtime_server_cmd_honors_runtime_bin_override(monkeypatch) -> None:
@@ -399,3 +401,24 @@ async def test_wait_for_vllm_runtime_polls_http_health(monkeypatch) -> None:
         "url": "http://127.0.0.1:8123/health",
         "timeout": 5.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_wait_for_vllm_runtime_fails_when_engine_core_dies(
+    tmp_path: Path,
+) -> None:
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    log_path = tmp_path / "vllm.log"
+    log_path.write_text("APIServer is alive\nEngineCore failed to start\n")
+
+    with pytest.raises(RuntimeError, match="EngineCore failed to start"):
+        await runtime.wait_for_vllm_runtime(
+            process=cast(Any, FakeProcess()),
+            host="127.0.0.1",
+            port=8123,
+            timeout=300.0,
+            log_path=str(log_path),
+        )

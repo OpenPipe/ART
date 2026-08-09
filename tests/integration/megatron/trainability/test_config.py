@@ -120,6 +120,7 @@ def test_optional_sampling_controls(monkeypatch) -> None:
         "min_tokens": 2,
         "frequency_penalty": 0.5,
     }
+    assert _length_extra_body({}, seed=1234)["seed"] == 1234
 
 
 def test_integer_list_rejects_empty_values(monkeypatch) -> None:
@@ -218,7 +219,7 @@ def test_yes_no_default_variant_env_override(monkeypatch) -> None:
     assert _default_variant_name("Qwen/Qwen3-32B") == "megatron_shared"
 
 
-def test_yes_no_trainability_passes_initially_saturated_stable_report() -> None:
+def test_yes_no_trainability_rejects_initially_saturated_stable_report() -> None:
     report = YesNoTrainabilityReport(
         variant="megatron_shared",
         backend_name="megatron",
@@ -249,7 +250,72 @@ def test_yes_no_trainability_passes_initially_saturated_stable_report() -> None:
         ],
     )
 
+    assert yes_no_trainability_passed(report) is False
+
+
+def test_yes_no_trainability_requires_gradient_correlation_and_learning() -> None:
+    report = YesNoTrainabilityReport(
+        variant="megatron_dedicated",
+        backend_name="megatron",
+        placement_mode="dedicated",
+        base_model="deepseek-ai/DeepSeek-V4-Flash",
+        output_dir="/tmp/report",
+        trainer_gpu_ids=[0, 1],
+        inference_gpu_ids=[2, 3],
+        rollout_weights_mode="lora",
+        reward_threshold=0.9,
+        max_steps=4,
+        prompt_count=8,
+        eval_prompt_count=8,
+        rollouts_per_prompt=4,
+        latest_step=1,
+        initial_eval_reward=0.5,
+        final_eval_reward=1.0,
+        saturated_step=1,
+        step0_name="model@0",
+        latest_name="model@1",
+        steps=[
+            TrainabilityStepReport(
+                step=1,
+                eval_reward=1.0,
+                train_reward=0.75,
+                train_metrics={
+                    "loss/grad_norm": 1.0,
+                    "loss/probs_corr": 0.9,
+                },
+            )
+        ],
+    )
+
     assert yes_no_trainability_passed(report) is True
+    assert (
+        yes_no_trainability_passed(
+            report.model_copy(
+                update={
+                    "steps": [
+                        report.steps[0].model_copy(
+                            update={"train_metrics": {"loss/probs_corr": 0.9}}
+                        )
+                    ]
+                }
+            )
+        )
+        is False
+    )
+    assert (
+        yes_no_trainability_passed(
+            report.model_copy(
+                update={
+                    "steps": [
+                        report.steps[0].model_copy(
+                            update={"train_metrics": {"loss/grad_norm": 1.0}}
+                        )
+                    ]
+                }
+            )
+        )
+        is False
+    )
 
 
 def test_yes_no_prompts_form_prefix_tree_by_default(monkeypatch) -> None:
@@ -267,6 +333,7 @@ def test_qwen3_5_length_trainability_uses_stable_learning_rate() -> None:
 
 
 def test_gpt_oss_length_target_accounts_for_harmony_tokens(monkeypatch) -> None:
+    assert _target_tokens("google/gemma-4-31B-it") == 22
     assert _target_tokens("openai/gpt-oss-20b") == 20
     assert _target_tokens("Qwen/Qwen3.5-35B-A3B") == 10
     monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", "24")
@@ -420,7 +487,6 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
         lambda device_ids: 0.5,
     )
     monkeypatch.setenv("ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL", "http://127.0.0.1:8000")
-
     default_variant = _default_variant_name(
         "deepseek-ai/DeepSeek-V4-Flash",
     )
@@ -445,7 +511,7 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
     assert config["engine_args"]["tensor_parallel_size"] == 2
     assert config["engine_args"]["enable_expert_parallel"] is True
     assert config["engine_args"]["kv_cache_dtype"] == "fp8"
-    assert config["engine_args"].get("moe_backend") == "triton_unfused"
+    assert config["engine_args"].get("moe_backend") == "triton"
     assert "megatron_topology" not in config
     assert config["vllm_runtime"] == {
         "mode": "external",

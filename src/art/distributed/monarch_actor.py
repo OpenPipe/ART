@@ -9,7 +9,7 @@ from pathlib import Path
 import socket
 import time
 import traceback
-from typing import Any
+from typing import Any, Literal
 from urllib.request import urlopen
 
 # This module is imported only by explicit distributed runtime construction.
@@ -17,7 +17,7 @@ from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
 
 from art.utils.lifecycle import complete_task
 
-from .adapter_transport import NixlAdapterReceiver
+from .adapter_transport import AdapterSnapshotReceiver
 from .artifact_preflight import (
     ArtifactProbeCommand,
     ArtifactProbeResult,
@@ -134,7 +134,7 @@ class ArtHostService(Actor):
         self._packer = None
         self._vllm_output_root = vllm_output_root
         self._vllm_launcher = None
-        self._adapter_receiver: NixlAdapterReceiver | None = None
+        self._adapter_receiver: AdapterSnapshotReceiver | None = None
         self._nccl_cleanups: dict[str, asyncio.Task[None]] = {}
         self._nccl_rendezvous: dict[str, NcclRendezvous] = {}
         self._nccl_sessions: dict[str, tuple[float, asyncio.Task[None]]] = {}
@@ -358,9 +358,9 @@ class ArtHostService(Actor):
 
     @resilient_endpoint
     async def take_trajectory(
-        self, queue_id: str, consumer_id: str
+        self, queue_id: str, consumer_id: str, count: int
     ) -> TrajectoryQueueTake:
-        return self._trajectory_queue(queue_id).take(consumer_id)
+        return self._trajectory_queue(queue_id).take(consumer_id, count)
 
     @resilient_endpoint
     async def mark_trajectories_packed(self, operation: TrajectoryQueuePacking) -> None:
@@ -401,9 +401,9 @@ class ArtHostService(Actor):
             )
         return self._vllm_launcher
 
-    def _receiver(self) -> NixlAdapterReceiver:
+    def _receiver(self) -> AdapterSnapshotReceiver:
         if self._adapter_receiver is None:
-            self._adapter_receiver = NixlAdapterReceiver(
+            self._adapter_receiver = AdapterSnapshotReceiver(
                 self.host_id, self._vllm_output_root
             )
         return self._adapter_receiver
@@ -432,6 +432,7 @@ class ArtHostService(Actor):
         template_path: str,
         tensor_dtype: str,
         timeout_s: float,
+        transport: Literal["local", "nixl"],
     ):
         return await asyncio.to_thread(
             self._receiver().prepare,
@@ -439,6 +440,7 @@ class ArtHostService(Actor):
             template_path,
             tensor_dtype,
             timeout_s,
+            transport,
         )
 
     @resilient_endpoint
@@ -458,7 +460,6 @@ class ArtHostService(Actor):
             from art.megatron.backend import MegatronBackend
 
             self._packer = MegatronBackend(
-                in_process=True,
                 path=f"/tmp/art-packing-{os.getpid()}",
                 enable_expert_replay=request.include_moe_routing,
             )
@@ -500,17 +501,38 @@ class ArtHostService(Actor):
 
             log_future = asyncio.get_running_loop().run_in_executor(None, write_log)
         packing_started = time.monotonic()
-        packed = self._packer._get_packed_tensors(
-            request.model.build(),
-            groups,
-            advantage_balance=request.advantage_balance,
-            allow_training_without_logprobs=request.allow_training_without_logprobs,
-            scale_rewards=request.scale_rewards,
-            plot_tensors=request.plot_tensors,
-            packed_sequence_length=request.packed_sequence_length,
-            logprob_calculation_chunk_size=request.logprob_calculation_chunk_size,
-            include_moe_routing=request.include_moe_routing,
-        )
+        try:
+            packed = self._packer._get_packed_tensors(
+                request.model.build(),
+                groups,
+                advantage_balance=request.advantage_balance,
+                allow_training_without_logprobs=(
+                    request.allow_training_without_logprobs
+                ),
+                scale_rewards=request.scale_rewards,
+                plot_tensors=request.plot_tensors,
+                packed_sequence_length=request.packed_sequence_length,
+                logprob_calculation_chunk_size=request.logprob_calculation_chunk_size,
+                include_moe_routing=request.include_moe_routing,
+            )
+        except BaseException as error:
+            if log_future is not None:
+
+                async def finish_log() -> None:
+                    await log_future
+
+                try:
+                    _, cancelled = await complete_task(
+                        asyncio.create_task(finish_log())
+                    )
+                    if cancelled is not None:
+                        error.add_note("trajectory logging observed cancellation")
+                except BaseException as log_error:
+                    error.add_note(
+                        "trajectory logging also failed: "
+                        f"{type(log_error).__name__}: {log_error}"
+                    )
+            raise
         packing_core_s = time.monotonic() - packing_started
         log_wait_started = time.monotonic()
         if log_future is not None:

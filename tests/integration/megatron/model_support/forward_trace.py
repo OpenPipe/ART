@@ -515,6 +515,8 @@ class ForwardTraceCapture:
         a_world_size = _shard_world_size_for_domain(a_domain)
         if bool(getattr(a_param, "lora_tp_sharded", False)) and a_world_size > 1:
             return {"op": "sum"}
+        if a_world_size > 1 and a_domain == b_domain:
+            return {"op": "replicated"}
         return None
 
     def _infer_primary_output_merge_hint(
@@ -1660,6 +1662,13 @@ class ForwardTraceCapture:
             raise RuntimeError("Cannot merge empty rank value list")
         if all(isinstance(value, torch.Tensor) for value in values_by_rank):
             tensors = cast(list[torch.Tensor], values_by_rank)
+            if preferred_reduce == "replicated":
+                if not all(
+                    tensors[0].shape == tensor.shape and torch.equal(tensors[0], tensor)
+                    for tensor in tensors[1:]
+                ):
+                    raise RuntimeError("Replicated trace outputs diverged across ranks")
+                return tensors[0]
             if preferred_reduce == "sum" and all(
                 tensors[0].shape == tensor.shape for tensor in tensors[1:]
             ):
@@ -1820,8 +1829,8 @@ class ForwardTraceCapture:
                 preferred_cat_dim = None
                 preferred_reduce = None
                 if isinstance(primary_hint, dict):
-                    if primary_hint.get("op") == "sum":
-                        preferred_reduce = "sum"
+                    if primary_hint.get("op") in {"sum", "replicated"}:
+                        preferred_reduce = str(primary_hint["op"])
                     elif primary_hint.get("op") == "concat" and isinstance(
                         primary_hint.get("dim"), int
                     ):
@@ -1870,8 +1879,8 @@ class ForwardTraceCapture:
                         dim = selected_hint.get("dim")
                         if isinstance(dim, int):
                             preferred_cat_dim = dim
-                    elif op == "sum":
-                        preferred_reduce = "sum"
+                    elif op in {"sum", "replicated"}:
+                        preferred_reduce = op
                 if (
                     preferred_reduce is None
                     and preferred_cat_dim == 0
@@ -1961,7 +1970,7 @@ class ForwardTraceCapture:
                 preferred_cat_dim=preferred_cat_dim,
                 preferred_reduce=preferred_reduce,
             )
-        if preferred_cat_dim != -1 and preferred_reduce != "sum":
+        if preferred_cat_dim != -1 and preferred_reduce not in {"sum", "replicated"}:
             return cls._merge_rank_values(
                 values_by_rank,
                 preferred_cat_dim=preferred_cat_dim,

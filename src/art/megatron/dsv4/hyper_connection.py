@@ -32,6 +32,11 @@ class HCHeadParams(MegatronModule):
         )
         for param in (self.hc_head_fn, self.hc_head_base, self.hc_head_scale):
             setattr(param, "_keep_fp32", True)
+        if config.perform_initialization:
+            assert config.init_method is not None
+            config.init_method(self.hc_head_fn)
+            torch.nn.init.zeros_(self.hc_head_base)
+            torch.nn.init.ones_(self.hc_head_scale)
 
     def forward(self):
         raise NotImplementedError

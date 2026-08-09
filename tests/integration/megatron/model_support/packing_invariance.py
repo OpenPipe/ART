@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import os
 from pathlib import Path
 import subprocess
@@ -575,6 +575,17 @@ def _run_packing_invariance_subprocess(
         )
 
 
+def _run_packing_invariance_in_process(
+    request: PackingInvarianceRunRequest,
+    output_dir: Path,
+) -> None:
+    request_path = output_dir / "run_request.json"
+    _write_json(request_path, request.model_dump(mode="json"))
+    with (output_dir / "worker.log").open("w", encoding="utf-8") as worker_log:
+        with redirect_stdout(worker_log), redirect_stderr(worker_log):
+            run_worker_cli(request_path)
+
+
 def _run_packing_invariance_worker(
     *,
     git: GitRepoState,
@@ -848,6 +859,7 @@ def run_packing_invariance(
     base_model: str,
     num_layers: int | None = None,
     allow_unvalidated_arch: bool = False,
+    in_process: bool = False,
 ) -> PackingInvarianceReport:
     _debug_log(f"run start base_model={base_model} requested_num_layers={num_layers}")
     spec = get_model_support_spec(
@@ -881,7 +893,12 @@ def run_packing_invariance(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     with provider_topology_env(ORACLE_TOPOLOGY):
-        _run_packing_invariance_subprocess(request, output_dir)
+        runner = (
+            _run_packing_invariance_in_process
+            if in_process
+            else _run_packing_invariance_subprocess
+        )
+        runner(request, output_dir)
     return PackingInvarianceReport.model_validate(_read_json(report_path))
 
 

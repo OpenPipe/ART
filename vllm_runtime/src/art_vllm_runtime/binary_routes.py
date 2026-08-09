@@ -129,7 +129,7 @@ def _model_padding_layers(model_config: Any) -> tuple[int, ...]:
     if layer_types is not None:
         if len(layer_types) != num_layers:
             raise RuntimeError("mlp_layer_types does not match num_hidden_layers")
-        if not set(layer_types).issubset({"dense", "sparse"}):
+        if not set(layer_types).issubset({"dense", "sparse", "moe", "hash_moe"}):
             raise RuntimeError(f"Unsupported MoE layer types: {set(layer_types)}")
         return tuple(i for i, kind in enumerate(layer_types) if kind == "dense")
     first_dense = int(getattr(config, "first_k_dense_replace", 0))
@@ -138,8 +138,33 @@ def _model_padding_layers(model_config: Any) -> tuple[int, ...]:
     return tuple(range(first_dense))
 
 
+def _normalize_route_topk(model_config: Any) -> None:
+    hf_config = getattr(model_config, "hf_config", None)
+    text_config = getattr(model_config, "hf_text_config", None) or getattr(
+        hf_config, "text_config", hf_config
+    )
+    configs = (model_config, hf_config, text_config)
+    values = {
+        int(value)
+        for config in configs
+        if config is not None
+        for name in (
+            "num_experts_per_tok",
+            "experts_per_token",
+            "top_k_experts",
+        )
+        if (value := getattr(config, name, None)) is not None and int(value) > 0
+    }
+    if len(values) != 1:
+        raise RuntimeError(f"Model configs disagree on MoE route top-k: {values}")
+    if text_config is None:
+        raise RuntimeError("Unable to find the model's text config for route capture")
+    text_config.num_experts_per_tok = values.pop()
+
+
 def _register_model_route_layout(model_config: Any) -> None:
     global _REGISTERED_NUM_EXPERTS, _REGISTERED_PADDING_LAYERS
+    _normalize_route_topk(model_config)
     getter = getattr(model_config, "get_num_experts", None)
     if callable(getter):
         num_experts = int(getter())

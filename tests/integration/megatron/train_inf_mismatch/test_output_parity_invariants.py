@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pytest
 
@@ -31,6 +32,14 @@ from .real_path import (
 )
 
 
+def _write_workflow_worker_result(
+    command: list[str],
+    result: workflow_stage.TrainInfMismatchWorkerResult,
+) -> None:
+    result_path = Path(command[command.index("--workflow-attempt-result") + 1])
+    result_path.write_text(result.model_dump_json(), encoding="utf-8")
+
+
 def test_logical_map_flattens_prefix_tree_branches() -> None:
     packed = {
         "tokens": torch.tensor([[10, 11, 12, 13, 14, 12, 15, 16]]),
@@ -57,6 +66,21 @@ def test_logical_map_flattens_prefix_tree_branches() -> None:
         3,
         4,
     ]
+
+
+def test_logical_map_handles_unscored_prompt_suffix_inside_leaf() -> None:
+    packed = {
+        "tokens": torch.tensor([[10, 11, 12, 13, 14, 15]]),
+        "group_ids": torch.tensor([[0, 0, 1, 1, 1, 1]]),
+        "parent_ids": torch.tensor([[0, 0, 0, 0, 0, 0]]),
+        "assistant_mask": torch.tensor([[False, False, False, False, True, True]]),
+    }
+
+    logical_map = build_logical_token_map(packed)
+
+    assert logical_map.prompts[0].token_ids == [10, 11, 12, 13, 14, 15]
+    assert logical_map.prompts[0].scored_token_start_index == 4
+    assert [token.vllm_prompt_token_index for token in logical_map.tokens] == [4, 5]
 
 
 def test_logical_map_flattens_nested_prefix_tree_leaves() -> None:
@@ -367,16 +391,23 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     import subprocess
 
     captured_env = {}
-    real_run = workflow_stage.subprocess.run
+    captured_command = []
+    real_run = subprocess.run
 
     def fake_run(*args, **kwargs):
         if "env" not in kwargs:
             return real_run(*args, **kwargs)
+        command = args[0]
+        captured_command.extend(command)
         captured_env.update(kwargs["env"])
+        _write_workflow_worker_result(
+            command,
+            workflow_stage.TrainInfMismatchWorkerResult(outcome="passed"),
+        )
         return subprocess.CompletedProcess(
             args=args,
             returncode=0,
-            stdout="1 passed\n",
+            stdout="",
             stderr="",
         )
 
@@ -393,6 +424,7 @@ def test_workflow_stage_enables_live_train_inf_mismatch(
     assert captured_env["ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH"] == "1"
     assert captured_env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] == "16"
     assert captured_env["ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION"] == "0.50"
+    assert "pytest" not in captured_command
 
 
 def test_workflow_stage_does_not_accept_a_skipped_live_test(
@@ -401,21 +433,100 @@ def test_workflow_stage_does_not_accept_a_skipped_live_test(
 ) -> None:
     import subprocess
 
+    real_run = subprocess.run
     monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_ATTEMPTS", "1")
     monkeypatch.setattr(workflow_stage, "create_artifact_dir", lambda _nodeid: tmp_path)
-    monkeypatch.setattr(
-        workflow_stage.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
+
+    def fake_run(*args, **kwargs):
+        if "env" not in kwargs:
+            return real_run(*args, **kwargs)
+        _write_workflow_worker_result(
+            args[0],
+            workflow_stage.TrainInfMismatchWorkerResult(outcome="skipped"),
+        )
+        return subprocess.CompletedProcess(
             args=args,
             returncode=0,
-            stdout="1 skipped\n",
+            stdout="",
             stderr="",
-        ),
-    )
+        )
+
+    monkeypatch.setattr(workflow_stage.subprocess, "run", fake_run)
 
     report = workflow_stage.run_train_inf_mismatch(base_model="Qwen/Qwen3.5-35B-A3B")
 
     assert report.passed is False
     assert report.passed_count == 0
     assert report.skipped_count == 1
+
+
+def test_workflow_stage_retries_only_classified_transient_startup_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import subprocess
+
+    calls = 0
+    real_run = subprocess.run
+
+    def fake_run(*args, **kwargs):
+        nonlocal calls
+        if "env" not in kwargs:
+            return real_run(*args, **kwargs)
+        calls += 1
+        _write_workflow_worker_result(
+            args[0],
+            workflow_stage.TrainInfMismatchWorkerResult(
+                outcome="failed",
+                comparison_completed=True,
+                exception_type="builtins.AssertionError",
+                exception_message="TimeoutError in completed numerical evidence",
+            ),
+        )
+        return subprocess.CompletedProcess(
+            args=args, returncode=1, stdout="", stderr=""
+        )
+
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_ATTEMPTS", "3")
+    monkeypatch.setattr(workflow_stage, "create_artifact_dir", lambda _nodeid: tmp_path)
+    monkeypatch.setattr(workflow_stage.subprocess, "run", fake_run)
+
+    report = workflow_stage.run_train_inf_mismatch(base_model="openai/gpt-oss-20b")
+
+    assert calls == report.attempt_count == 1
+    assert report.failed_count == 1
+    assert report.attempts[0].retryable is False
+    assert workflow_stage._retryable_attempt_failure(
+        returncode=2,
+        result=workflow_stage.TrainInfMismatchWorkerResult(
+            outcome="error",
+            exception_type="builtins.TimeoutError",
+        ),
+        output="",
+    )
+
+    calls = 0
+
+    def transient_then_pass(*args, **kwargs):
+        nonlocal calls
+        if "env" not in kwargs:
+            return real_run(*args, **kwargs)
+        calls += 1
+        worker_result = workflow_stage.TrainInfMismatchWorkerResult(
+            outcome="error" if calls == 1 else "passed",
+            exception_type="builtins.TimeoutError" if calls == 1 else None,
+        )
+        _write_workflow_worker_result(args[0], worker_result)
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=2 if calls == 1 else 0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(workflow_stage.subprocess, "run", transient_then_pass)
+    report = workflow_stage.run_train_inf_mismatch(base_model="openai/gpt-oss-20b")
+
+    assert report.passed is True
+    assert calls == report.attempt_count == 2
+    assert [attempt.retryable for attempt in report.attempts] == [True, False]

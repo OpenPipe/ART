@@ -8,6 +8,7 @@ from torch import nn
 
 from art import types
 from art.megatron import train as megatron_train
+from art.megatron.runtime.specs import ExperimentalTrainConfig, TrainJobSpec
 from art.megatron.training import microbatches as megatron_microbatches
 from art.preprocessing.pack import PackedTensors
 
@@ -87,14 +88,14 @@ def test_prepare_kl_reference_logprobs_requires_reference_path() -> None:
     runtime = SimpleNamespace(rank=0)
     job = SimpleNamespace(
         config=types.TrainConfig(kl_penalty_coef=0.25),
-        experimental_config={},
-        lora_path="/tmp/current",
+        experimental_config=ExperimentalTrainConfig(),
+        source_adapter_path="/tmp/current",
     )
 
     try:
         megatron_train._prepare_kl_reference_logprobs(
             runtime=cast(megatron_train.TrainingRuntime, runtime),
-            job=cast(megatron_train.MegatronTrainingJob, job),
+            job=cast(TrainJobSpec, job),
             packed_tensors=_packed_inputs(),
             num_sequences=1,
             num_steps=1,

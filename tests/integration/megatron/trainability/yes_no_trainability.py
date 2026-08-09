@@ -1006,15 +1006,16 @@ async def run_yes_no_trainability_async(
     ) as backend:
         await model.register(backend)
         output_dir = Path(model.base_path) / model.project / "models" / model.run_name
-        await _warmup_model(model, base_model=base_model, prompt=prompts[0])
         step0_name = model.get_inference_name(step=0)
         model_ids_before = await _list_model_ids(model)
-        initial_eval_groups = await _evaluate_groups(
-            model,
-            base_model=base_model,
-            prompts=eval_prompts,
-            step=0,
-        )
+        async with backend.exact_adapter_lease(model, 0):
+            await _warmup_model(model, base_model=base_model, prompt=prompts[0])
+            initial_eval_groups = await _evaluate_groups(
+                model,
+                base_model=base_model,
+                prompts=eval_prompts,
+                step=0,
+            )
         initial_eval_reward = _mean_group_reward(initial_eval_groups)
         await model.log(initial_eval_groups, step=0, split="val")
         report = YesNoTrainabilityReport(
@@ -1063,12 +1064,13 @@ async def run_yes_no_trainability_async(
                 step=result.step,
                 split="train",
             )
-            eval_groups = await _evaluate_groups(
-                model,
-                base_model=base_model,
-                prompts=eval_prompts,
-                step=result.step,
-            )
+            async with backend.exact_adapter_lease(model, int(result.step)):
+                eval_groups = await _evaluate_groups(
+                    model,
+                    base_model=base_model,
+                    prompts=eval_prompts,
+                    step=result.step,
+                )
             eval_reward = _mean_group_reward(eval_groups)
             await model.log(eval_groups, step=result.step, split="val")
             report.latest_step = int(result.step)
@@ -1096,7 +1098,10 @@ async def run_yes_no_trainability_async(
                 break
 
         report.model_ids_after = await _list_model_ids(model)
-        report.latest_snapshot = await _chat_snapshot(model, step=report.latest_step)
+        async with backend.exact_adapter_lease(model, report.latest_step):
+            report.latest_snapshot = await _chat_snapshot(
+                model, step=report.latest_step
+            )
 
     output_dir = Path(report.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1110,6 +1115,7 @@ async def run_yes_no_trainability_async(
 def run_yes_no_trainability(
     base_model: str,
     *,
+    artifact_root: Path | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> YesNoTrainabilityReport:
     return asyncio.run(
@@ -1119,12 +1125,29 @@ def run_yes_no_trainability(
                 base_model,
                 allow_unvalidated_arch=allow_unvalidated_arch,
             ),
+            artifact_root=artifact_root,
             allow_unvalidated_arch=allow_unvalidated_arch,
         )
     )
 
 
 def yes_no_trainability_passed(report: YesNoTrainabilityReport) -> bool:
+    has_nonzero_gradient = any(
+        max(
+            step.train_metrics.get("grad_norm", 0.0),
+            step.train_metrics.get("loss/grad_norm", 0.0),
+        )
+        > 0.0
+        for step in report.steps
+    )
+    has_positive_probs_corr = any(
+        max(
+            step.train_metrics.get("probs_corr", 0.0),
+            step.train_metrics.get("loss/probs_corr", 0.0),
+        )
+        > 0.0
+        for step in report.steps
+    )
     learned_from_below_threshold = (
         report.saturated_step is not None
         and report.saturated_step > 0
@@ -1133,22 +1156,11 @@ def yes_no_trainability_passed(report: YesNoTrainabilityReport) -> bool:
         and report.final_eval_reward >= report.reward_threshold
         and report.final_eval_reward > report.initial_eval_reward
     )
-    already_saturated_and_stable = (
-        report.initial_eval_reward >= report.reward_threshold
-        and report.latest_step > 0
-        and report.final_eval_reward is not None
-        and report.final_eval_reward >= report.reward_threshold
-        and bool(report.steps)
-        and any(
-            max(
-                step.train_metrics.get("grad_norm", 0.0),
-                step.train_metrics.get("loss/grad_norm", 0.0),
-            )
-            > 0.0
-            for step in report.steps
-        )
+    return (
+        learned_from_below_threshold
+        and has_nonzero_gradient
+        and has_positive_probs_corr
     )
-    return learned_from_below_threshold or already_saturated_and_stable
 
 
 def run_megatron_dedicated_yes_no_trainability(

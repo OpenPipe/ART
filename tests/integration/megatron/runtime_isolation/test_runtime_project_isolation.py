@@ -89,6 +89,7 @@ import json
 from types import SimpleNamespace
 from art_vllm_runtime.policy_spans import (
     LoraUpdateCoordinator,
+    PolicyLoRARequest,
     _apply_lora_alias_policy_cache_salt,
     publish_lora_slot_policy,
     register_lora_alias,
@@ -96,18 +97,26 @@ from art_vllm_runtime.policy_spans import (
 
 async def main():
     slot = "model:active"
-    old = SimpleNamespace(lora_name=slot, lora_path="old")
-    new = SimpleNamespace(lora_name=slot, lora_path="new")
+    old = PolicyLoRARequest(
+        lora_name=slot, lora_int_id=1, lora_path="old",
+        policy_version=4, update_seq=1,
+    )
+    new = PolicyLoRARequest(
+        lora_name=slot, lora_int_id=1, lora_path="new",
+        policy_version=5, update_seq=2,
+    )
     models = SimpleNamespace(lora_requests={slot: new})
     register_lora_alias(models, public_model_name="model@4", lora_slot=slot)
-    publish_lora_slot_policy(models, lora_slot=slot, policy_version=5)
+    publish_lora_slot_policy(
+        models, lora_slot=slot, policy_version=5, update_seq=2
+    )
     request = SimpleNamespace(model="model@4", cache_salt=None)
     _apply_lora_alias_policy_cache_salt(models, request, new)
 
     coordinator = LoraUpdateCoordinator()
-    await coordinator.begin_update(slot)
-    await coordinator.commit_update(slot, 4, old)
-    await coordinator.begin_update(slot)
+    assert await coordinator.begin_update(slot) == 1
+    await coordinator.commit_update(slot, old)
+    assert await coordinator.begin_update(slot) == 2
 
     async def admit():
         async with coordinator.admission(slot) as state:
@@ -116,12 +125,12 @@ async def main():
     admission = asyncio.create_task(admit())
     await asyncio.sleep(0)
     blocked = not admission.done()
-    await coordinator.commit_update(slot, 5, new)
-    version, admitted_lora = await admission
+    await coordinator.commit_update(slot, new)
+    admitted_lora = await admission
     print(json.dumps({
         "blocked": blocked,
         "cache_salt": request.cache_salt,
-        "policy_version": version,
+        "policy_version": admitted_lora.policy_version,
         "lora_path": admitted_lora.lora_path,
     }, sort_keys=True))
 
@@ -130,11 +139,503 @@ asyncio.run(main())
         artifact_dir,
         "lora_update_admission",
     )
-    assert json.loads(payload) == {
+    result = json.loads(payload)
+    cache_salt = result.pop("cache_salt")
+    assert result == {
         "blocked": True,
-        "cache_salt": "art_policy_cache_salt=model:active:5",
         "lora_path": "new",
         "policy_version": 5,
+    }
+    assert cache_salt.startswith("art_policy_cache_salt=v1:")
+    assert len(cache_salt) == len("art_policy_cache_salt=v1:") + 64
+
+
+def test_runtime_cancelled_update_releases_admission(
+    artifact_dir: Path,
+) -> None:
+    payload = _runtime_python(
+        """
+import asyncio
+import json
+from art_vllm_runtime.policy_spans import LoraUpdateCoordinator, PolicyLoRARequest
+
+async def main():
+    coordinator = LoraUpdateCoordinator()
+    slot = "model:active"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_admission():
+        async with coordinator.admission(slot):
+            entered.set()
+            await release.wait()
+
+    holder = asyncio.create_task(hold_admission())
+    await entered.wait()
+    update = asyncio.create_task(coordinator.begin_update(slot))
+    await asyncio.sleep(0)
+    update.cancel()
+    try:
+        await update
+    except asyncio.CancelledError:
+        pass
+    release.set()
+    await holder
+    async with asyncio.timeout(1):
+        async with coordinator.admission(slot):
+            admitted = True
+    failed_seq = await coordinator.begin_update(slot)
+    await coordinator.fail_update(slot, failed_seq)
+    cancelled_retry = await coordinator.begin_update(slot)
+    await coordinator.cancel_update(slot, cancelled_retry)
+
+    async def admit_after_failure():
+        async with coordinator.admission(slot):
+            return True
+
+    quarantined_admission = asyncio.create_task(admit_after_failure())
+    await asyncio.sleep(0)
+    quarantine_preserved = not quarantined_admission.done()
+    recovery_seq = await coordinator.begin_update(slot)
+    await coordinator.commit_update(slot, PolicyLoRARequest(
+        lora_name=slot, lora_int_id=1, lora_path="recovered",
+        policy_version=2, update_seq=recovery_seq,
+    ))
+    recovered = await quarantined_admission
+    print(json.dumps({
+        "admitted": admitted,
+        "quarantine_preserved": quarantine_preserved,
+        "recovered": recovered,
+    }))
+
+asyncio.run(main())
+""",
+        artifact_dir,
+        "cancelled_lora_update",
+    )
+    assert json.loads(payload) == {
+        "admitted": True,
+        "quarantine_preserved": True,
+        "recovered": True,
+    }
+
+
+def test_runtime_policy_history_rekeys_real_vllm_requests(
+    artifact_dir: Path,
+) -> None:
+    payload = _runtime_python(
+        """
+import hashlib
+import json
+from types import SimpleNamespace
+
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.request import Request
+from art_vllm_runtime.policy_spans import (
+    PolicyLoRARequest,
+    _policy_history_from_cache_salt,
+    _request_has_executed,
+    _set_policy_cache_salt,
+    _transition_scheduler_policy_history,
+)
+
+def hash_value(value):
+    return hashlib.sha256(repr(value).encode()).digest()
+
+init_none_hash(hash_value)
+block_hasher = get_request_block_hasher(4, hash_value)
+old = PolicyLoRARequest(
+    lora_name="model:active", lora_int_id=1, lora_path="old",
+    policy_version=4, update_seq=1,
+)
+new = PolicyLoRARequest(
+    lora_name="model:active", lora_int_id=1, lora_path="new",
+    policy_version=4, update_seq=2,
+)
+
+def make_request(request_id):
+    request = Request(
+        request_id, list(range(8)), SamplingParams(max_tokens=4), None,
+        lora_request=old, block_hasher=block_hasher,
+    )
+    _set_policy_cache_salt(
+        request, lora_slot=old.lora_name,
+        policy_version=old.policy_version, update_seq=old.update_seq,
+    )
+    request.block_hashes.clear()
+    request.update_block_hashes()
+    return request
+
+continued = make_request("continued")
+waiting = make_request("waiting")
+old_hashes = list(continued.block_hashes)
+continued.num_computed_tokens = 4
+scheduler = SimpleNamespace(requests={
+    continued.request_id: continued,
+    waiting.request_id: waiting,
+})
+transition = _transition_scheduler_policy_history(
+    scheduler,
+    lora_request=new,
+    previous_policy=None,
+    started_request_ids={continued.request_id},
+)
+continued_history = continued.cache_salt
+fresh = make_request("fresh")
+_set_policy_cache_salt(
+    fresh, lora_slot=new.lora_name,
+    policy_version=new.policy_version, update_seq=new.update_seq,
+)
+fresh.block_hashes.clear()
+fresh.update_block_hashes()
+continued.num_computed_tokens = 0
+third = PolicyLoRARequest(
+    lora_name="model:active", lora_int_id=1, lora_path="third",
+    policy_version=4, update_seq=3,
+)
+old_history = _policy_history_from_cache_salt(make_request("old").cache_salt)
+expected_third = make_request("expected-third")
+_set_policy_cache_salt(
+    expected_third, lora_slot=third.lora_name,
+    policy_version=third.policy_version, update_seq=third.update_seq,
+    previous_digest=old_history,
+)
+not_executed_after_reset = not _request_has_executed(continued)
+_transition_scheduler_policy_history(
+    SimpleNamespace(requests={continued.request_id: continued}),
+    lora_request=third,
+    previous_policy=None,
+    started_request_ids=set(),
+)
+print(json.dumps({
+    "transition": transition,
+    "continued_differs": continued_history != waiting.cache_salt,
+    "waiting_matches_fresh": waiting.cache_salt == fresh.cache_salt,
+    "same_version_reload_differs": (
+        _policy_history_from_cache_salt(waiting.cache_salt)
+        != _policy_history_from_cache_salt(make_request("old").cache_salt)
+    ),
+    "block_hashes_changed": old_hashes != continued.block_hashes,
+    "not_executed_after_reset": not_executed_after_reset,
+    "skipped_policy_replaced": continued.cache_salt == expected_third.cache_salt,
+}))
+""",
+        artifact_dir,
+        "policy_history_real_request",
+    )
+    assert json.loads(payload) == {
+        "block_hashes_changed": True,
+        "continued_differs": True,
+        "not_executed_after_reset": True,
+        "same_version_reload_differs": True,
+        "skipped_policy_replaced": True,
+        "transition": {"continued_requests": 1, "updated_requests": 2},
+        "waiting_matches_fresh": True,
+    }
+
+
+def test_runtime_policy_update_verifies_declared_identity_and_quarantines(
+    artifact_dir: Path,
+) -> None:
+    payload = _runtime_python(
+        """
+import json
+from types import SimpleNamespace
+from vllm.lora.request import LoRARequest
+from art_vllm_runtime.policy_spans import (
+    PolicyLoRARequest,
+    _apply_policy_lora_update,
+    _policy_metadata_for_lora_request,
+    _record_worker_lora_policy,
+)
+
+declared = PolicyLoRARequest(
+    lora_name="model:active", lora_int_id=1,
+    lora_path="/mapped/step-999-deadbeef", policy_version=7, update_seq=3,
+)
+declared_state = _record_worker_lora_policy(declared)
+bootstrap_state = _record_worker_lora_policy(LoRARequest(
+    lora_name="model:active", lora_int_id=2,
+    lora_path="/mapped/step-999-deadbeef",
+))
+try:
+    _policy_metadata_for_lora_request(LoRARequest(
+        lora_name="model:active", lora_int_id=2,
+        lora_path="/mapped/step-999-deadbeef",
+    ))
+except RuntimeError as error:
+    undeclared_failure = str(error)
+
+class FailingCore:
+    def __init__(self):
+        self.scheduler = SimpleNamespace(requests={})
+        self.pause_calls = []
+
+    def is_scheduler_paused(self):
+        return True
+
+    def collective_rpc(self, *_args, **_kwargs):
+        raise RuntimeError("rank 1 failed")
+
+    def pause_scheduler(self, mode, clear_cache):
+        self.pause_calls.append((mode, clear_cache))
+
+core = FailingCore()
+try:
+    _apply_policy_lora_update(core, {
+        "lora_name": declared.lora_name,
+        "lora_int_id": declared.lora_int_id,
+        "lora_path": declared.lora_path,
+        "base_model_name": None,
+        "tensorizer_config_dict": None,
+        "is_3d_lora_weight": False,
+        "policy_version": declared.policy_version,
+        "update_seq": declared.update_seq,
+    })
+except RuntimeError as error:
+    failure = str(error)
+
+print(json.dumps({
+    "declared_version": declared_state["policy_version"],
+    "bootstrap_path_not_inferred": bootstrap_state["policy_version"],
+    "failure": failure,
+    "pause_calls": core.pause_calls,
+    "undeclared_failure": undeclared_failure,
+}))
+""",
+        artifact_dir,
+        "declared_policy_and_quarantine",
+    )
+    assert json.loads(payload) == {
+        "bootstrap_path_not_inferred": 0,
+        "declared_version": 7,
+        "failure": "rank 1 failed",
+        "pause_calls": [["abort", True]],
+        "undeclared_failure": (
+            "Mutable LoRA slot 'model:active' has no declared policy identity"
+        ),
+    }
+
+
+def test_runtime_policy_update_pins_workers_and_normalizes_scheduler_requests(
+    artifact_dir: Path,
+) -> None:
+    payload = _runtime_python(
+        """
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+
+from art_vllm_runtime.policy_spans import (
+    _apply_policy_lora_update,
+    _patch_policy_lora_update_rpc,
+)
+from vllm.lora.model_manager import AdapterLRUCache, LRUCacheLoRAModelManager
+from vllm.lora.request import LoRARequest
+from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+from vllm.v1.worker.worker_base import WorkerBase
+
+class TestAdapterManager(LRUCacheLoRAModelManager):
+    def __init__(self):
+        self.lora_config = SimpleNamespace(max_cpu_loras=2, max_loras=2)
+        self._registered_adapters = AdapterLRUCache(2, self.deactivate_adapter)
+        self._active_adapters = AdapterLRUCache(2, self._deactivate_adapter)
+        self.lora_index_to_id = [None, None]
+        self.modules = {}
+
+    def _create_merged_loras_inplace(self, _lora):
+        pass
+
+class TestWorkerManager(LRUCacheWorkerLoRAManager):
+    def __init__(self):
+        self._adapter_manager = TestAdapterManager()
+        self.loaded_paths = []
+
+    def _load_adapter(self, request):
+        path = Path(request.lora_path)
+        if not path.is_dir():
+            raise FileNotFoundError(path)
+        self.loaded_paths.append(path.name)
+        return SimpleNamespace(id=request.lora_int_id)
+
+class Core:
+    def __init__(self, worker):
+        self.worker = worker
+        self.acks = []
+        initial = LoRARequest("model:active", 99, "/initial")
+        request = SimpleNamespace(
+            request_id="waiting", lora_request=initial, cache_salt=None,
+            block_hashes=[], num_computed_tokens=0, output_token_ids=[],
+            num_preemptions=0, update_block_hashes=lambda: None,
+        )
+        self.scheduler = SimpleNamespace(requests={request.request_id: request})
+
+    def is_scheduler_paused(self):
+        return True
+
+    def collective_rpc(self, method, args):
+        assert method == "art_load_lora_policy"
+        ack = WorkerBase.art_load_lora_policy(self.worker, args[0])
+        self.acks.append(ack)
+        return [ack]
+
+    def _reset_caches(self, **_kwargs):
+        pass
+
+    def pause_scheduler(self, *_args):
+        raise AssertionError("successful update must not quarantine the engine")
+
+def policy_payload(path, policy_version, update_seq):
+    return {
+        "lora_name": "model:active",
+        "lora_int_id": 99,
+        "lora_path": str(path),
+        "base_model_name": None,
+        "tensorizer_config_dict": None,
+        "is_3d_lora_weight": False,
+        "policy_version": policy_version,
+        "update_seq": update_seq,
+    }
+
+def pinned(manager):
+    cache = manager._adapter_manager
+    return (
+        99 in manager.list_adapters()
+        and 99 in cache._registered_adapters.pinned_items
+        and 99 in cache._active_adapters.pinned_items
+    )
+
+_patch_policy_lora_update_rpc()
+manager = TestWorkerManager()
+worker = SimpleNamespace(
+    add_lora=manager.add_adapter,
+    pin_lora=manager.pin_adapter,
+    list_loras=manager.list_adapters,
+)
+core = Core(worker)
+request = core.scheduler.requests["waiting"]
+with TemporaryDirectory() as temp_dir:
+    root = Path(temp_dir)
+    first_path = root / "active_1"
+    first_path.mkdir()
+    first = policy_payload(first_path, 1, 1)
+    first_transition = _apply_policy_lora_update(core, first)
+    first_result = core.acks[-1]
+    initially_pinned = pinned(manager)
+    first_path.rmdir()
+    manager.add_adapter(request.lora_request)
+    no_scheduler_reload = manager.loaded_paths == ["active_1"]
+
+    for adapter_id, name in ((1, "exact"), (2, "eval")):
+        path = root / name
+        path.mkdir()
+        manager.add_adapter(LoRARequest(name, adapter_id, str(path)))
+    retained_under_pressure = pinned(manager)
+
+    update_path = root / "active_2"
+    update_path.mkdir()
+    update = policy_payload(update_path, 2, 2)
+    update_transition = _apply_policy_lora_update(core, update)
+    update_result = core.acks[-1]
+    repinned = pinned(manager)
+    update_path.rmdir()
+    manager.add_adapter(request.lora_request)
+
+    pressure_path = root / "eval_after_update"
+    pressure_path.mkdir()
+    manager.add_adapter(LoRARequest("eval_after_update", 3, str(pressure_path)))
+    retained_after_update = pinned(manager)
+
+expected_paths = ["active_1", "exact", "eval", "active_2", "eval_after_update"]
+assert first_result["loaded"] and update_result["loaded"]
+assert first_transition == update_transition == {
+    "continued_requests": 0, "updated_requests": 1,
+}
+assert manager.loaded_paths == expected_paths
+assert not request.lora_request.load_inplace and no_scheduler_reload
+assert initially_pinned and retained_under_pressure and repinned
+assert retained_after_update
+assert update_result["previous"]["update_seq"] == 1
+assert update_result["current"]["update_seq"] == 2
+print(json.dumps({
+    "loaded_paths": manager.loaded_paths,
+    "load_inplace": request.lora_request.load_inplace,
+    "no_scheduler_reload": no_scheduler_reload,
+    "pinned_through_update_and_pressure": True,
+    "update_sequence": [
+        update_result["previous"]["update_seq"],
+        update_result["current"]["update_seq"],
+    ],
+}))
+""",
+        artifact_dir,
+        "pinned_policy_lifetime",
+    )
+    assert json.loads(payload) == {
+        "loaded_paths": ["active_1", "exact", "eval", "active_2", "eval_after_update"],
+        "load_inplace": False,
+        "no_scheduler_reload": True,
+        "pinned_through_update_and_pressure": True,
+        "update_sequence": [1, 2],
+    }
+
+
+def test_runtime_declares_launch_policy_before_admission(artifact_dir: Path) -> None:
+    payload = _runtime_python(
+        """
+import asyncio
+import json
+from types import SimpleNamespace
+from vllm.lora.request import LoRARequest
+from art_vllm_runtime.policy_spans import (
+    PolicyLoRARequest,
+    declare_initial_lora_policy,
+    lora_update_coordinator,
+)
+
+class Core:
+    async def call_utility_async(self, method, payload):
+        assert method == "art_declare_loaded_lora_policy"
+        self.payload = payload
+        return {"workers": 2}
+
+async def main():
+    slot = "model:active"
+    models = SimpleNamespace(lora_requests={slot: LoRARequest(
+        lora_name=slot, lora_int_id=3, lora_path="/initial"
+    )})
+    core = Core()
+    engine = SimpleNamespace(engine_core=core)
+    await declare_initial_lora_policy(
+        models, engine, lora_slot=slot, policy_version=7
+    )
+    declared = models.lora_requests[slot]
+    coordinator = lora_update_coordinator(models, engine)
+    async with coordinator.admission(slot) as admitted:
+        admitted_identity = [admitted.policy_version, admitted.update_seq]
+    next_sequence = await coordinator.begin_update(slot)
+    await coordinator.cancel_update(slot, next_sequence)
+    return {
+        "declared_type": type(declared).__name__,
+        "declared_identity": [declared.policy_version, declared.update_seq],
+        "worker_identity": [core.payload["policy_version"], core.payload["update_seq"]],
+        "admitted_identity": admitted_identity,
+        "next_sequence": next_sequence,
+    }
+
+print(json.dumps(asyncio.run(main())))
+""",
+        artifact_dir,
+        "launch_policy_declaration",
+    )
+    assert json.loads(payload) == {
+        "admitted_identity": [7, 1],
+        "declared_identity": [7, 1],
+        "declared_type": "PolicyLoRARequest",
+        "next_sequence": 2,
+        "worker_identity": [7, 1],
     }
 
 
@@ -316,39 +817,3 @@ def test_runtime_cli_serializes_lora_target_modules_as_single_nargs_vector(
         "lora_target_modules",
     )
     assert json.loads(payload) == ["--lora-target-modules", "a", "b"]
-
-
-def test_runtime_project_restores_nccl_unique_id_from_raw_bytes(
-    artifact_dir: Path,
-) -> None:
-    payload = json.loads(
-        _runtime_python(
-            "import ctypes, json; "
-            "from art_vllm_runtime.patches import _restore_nccl_unique_id_payload; "
-            "from vllm.distributed.device_communicators.pynccl_wrapper import ncclUniqueId; "
-            "payload = bytes(range(128)); "
-            "restored = _restore_nccl_unique_id_payload(payload, ncclUniqueId()); "
-            "print(json.dumps({"
-            "'type': type(restored).__name__, "
-            "'matches': ctypes.string_at(ctypes.byref(restored), ctypes.sizeof(restored)).hex() == payload.hex()"
-            "}))",
-            artifact_dir,
-            "restore",
-        )
-    )
-    assert payload == {"type": "ncclUniqueId", "matches": True}
-
-
-def test_runtime_project_nccl_wrapper_accepts_raw_bytes(artifact_dir: Path) -> None:
-    payload = json.loads(
-        _runtime_python(
-            "import json; "
-            "from art_vllm_runtime.patches import _normalize_nccl_comm_init_rank_unique_id; "
-            "FakeLibrary = type('FakeLibrary', (), {'unique_id_from_bytes': lambda self, data: {'restored': len(data)}}); "
-            "restored = _normalize_nccl_comm_init_rank_unique_id(FakeLibrary(), bytes(range(128))); "
-            "print(json.dumps(restored))",
-            artifact_dir,
-            "nccl_wrapper",
-        )
-    )
-    assert payload == {"restored": 128}

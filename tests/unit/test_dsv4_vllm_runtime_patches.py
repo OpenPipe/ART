@@ -25,7 +25,7 @@ def _load_dsv4_patches_module():
     return module
 
 
-def test_dsv4_lora_support_declares_vllm_024_manager_protocol(monkeypatch) -> None:
+def test_dsv4_lora_support_declares_vllm_025_manager_protocol(monkeypatch) -> None:
     patches = _load_dsv4_patches_module()
 
     class FakeDeepseekV4ForCausalLM:
@@ -33,9 +33,13 @@ def test_dsv4_lora_support_declares_vllm_024_manager_protocol(monkeypatch) -> No
 
     manager_patches: list[type] = []
     monkeypatch.setattr(
-        patches,
-        "_import_dsv4_model_module",
-        lambda: SimpleNamespace(DeepseekV4ForCausalLM=FakeDeepseekV4ForCausalLM),
+        patches.importlib,
+        "import_module",
+        lambda name: (
+            SimpleNamespace(DeepseekV4ForCausalLM=FakeDeepseekV4ForCausalLM)
+            if name == "vllm.models.deepseek_v4.nvidia.model"
+            else None
+        ),
     )
     monkeypatch.setattr(
         patches,

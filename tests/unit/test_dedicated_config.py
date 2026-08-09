@@ -85,18 +85,16 @@ def test_overlapping_gpu_ids():
         )
 
 
-def test_trainer_not_starting_at_zero():
-    with pytest.raises(ValueError, match="must start at GPU 0"):
-        validate_dedicated_config(
-            InternalModelConfig(trainer_gpu_ids=[1], inference_gpu_ids=[0])
-        )
+def test_trainer_can_use_nonzero_gpu():
+    validate_dedicated_config(
+        InternalModelConfig(trainer_gpu_ids=[2], inference_gpu_ids=[3])
+    )
 
 
-def test_trainer_not_contiguous():
-    with pytest.raises(ValueError, match="must be contiguous starting from 0"):
-        validate_dedicated_config(
-            InternalModelConfig(trainer_gpu_ids=[0, 2], inference_gpu_ids=[1])
-        )
+def test_trainer_can_use_noncontiguous_gpus():
+    validate_dedicated_config(
+        InternalModelConfig(trainer_gpu_ids=[0, 2], inference_gpu_ids=[1])
+    )
 
 
 def test_dedicated_rejects_fast_inference():

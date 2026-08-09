@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-import json
-import os
 from pathlib import Path
 from threading import BoundedSemaphore, Event, Lock
 import time
 from typing import TYPE_CHECKING, Any
 
-from .data_plane import InMemoryPackedBatch, validate_packed_batch
-from .specs import TrainerGeneration, TrainJobSpec
+from ..tensor_snapshot import PinnedCpuSnapshotStager
+from .data_plane import InMemoryPackedBatch, SFTBatchData, validate_packed_batch
+from .publication import (
+    TrainerPublicationFailed,
+    TrainerPublicationSucceeded,
+    TrainerRankPublication,
+)
+from .specs import SFTJobSpec, TrainerGeneration, TrainerJobSpec, TrainJobSpec
 from .trainer_run import EventSink
 
 if TYPE_CHECKING:
@@ -22,7 +26,9 @@ class MegatronTrainJobExecutor:
     def __init__(self, runtime: Any) -> None:
         self.runtime = runtime
         self._publisher = _GenerationPublisher(
-            runtime, capacity=int(runtime.snapshot_pool_capacity)
+            runtime,
+            stager=PinnedCpuSnapshotStager(),
+            capacity=int(runtime.snapshot_pool_capacity),
         )
         self._closed = False
 
@@ -39,7 +45,7 @@ class MegatronTrainJobExecutor:
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_rl_job
 
-        return execute_megatron_rl_job(
+        metrics = execute_megatron_rl_job(
             self.runtime,
             job,
             batch.tensors,
@@ -52,8 +58,102 @@ class MegatronTrainJobExecutor:
                 learner_version=job.learner_version,
                 adapter_path=job.output_adapter_path,
             ),
-            snapshot_sink=self._publisher.submit,
+            snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
             cancelled=cancelled,
+        )
+        if job.merged_weight_transfer is not None:
+            started = time.perf_counter()
+            self._sync_merged(job.merged_weight_transfer)
+            metrics["time/merged_weight_publish_s"] = time.perf_counter() - started
+        return metrics
+
+    def execute_sft(
+        self,
+        job: SFTJobSpec,
+        batches: tuple[SFTBatchData, ...],
+        sink: EventSink,
+        cancelled: Event,
+    ) -> dict[str, float]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        self._publisher.raise_if_failed()
+        from art.megatron.train import execute_megatron_sft_job
+
+        metrics = execute_megatron_sft_job(
+            self.runtime,
+            job,
+            batches,
+            progress_sink=lambda step_index, num_steps, metrics: sink.progress(
+                step_index=step_index,
+                num_steps=num_steps,
+                metrics=metrics,
+            ),
+            adapter_ready_sink=lambda: sink.adapter_ready(
+                learner_version=job.learner_version,
+                adapter_path=job.output_adapter_path,
+            ),
+            snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
+            cancelled=cancelled,
+        )
+        if job.merged_weight_transfer is not None:
+            started = time.perf_counter()
+            self._sync_merged(job.merged_weight_transfer)
+            metrics["time/merged_weight_publish_s"] = time.perf_counter() - started
+        return metrics
+
+    def sync_merged_source(
+        self,
+        generation: TrainerGeneration,
+        transfer: Any,
+    ) -> dict[str, float]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        runtime = self.runtime
+        if (
+            runtime.resident_training_session_id != generation.training_session_id
+            or runtime.resident_policy_step != generation.policy_step
+        ):
+            from art.megatron.model_support.lora_disk import load_adapter_config
+            from art.megatron.train import _load_adapter_into_model
+
+            _load_adapter_into_model(
+                runtime.model,
+                generation.adapter_path,
+                runtime.rank,
+                handler=runtime.model_support_handler,
+            )
+            runtime.adapter_export_config = load_adapter_config(generation.adapter_path)
+            runtime.adapter_export_dtypes = {}
+            runtime.resident_training_session_id = None
+            runtime.resident_policy_step = None
+            runtime.optimizer_state_loaded = False
+        started = time.perf_counter()
+        self._sync_merged(transfer)
+        return {"time/merged_weight_publish_s": time.perf_counter() - started}
+
+    def _sync_merged(self, transfer: Any) -> None:
+        from art.megatron.weights.merged_weight_export import (
+            sync_merged_weights_to_vllm,
+        )
+
+        runtime = self.runtime
+        if runtime.adapter_export_config is None:
+            raise RuntimeError("merged publication has no adapter export config")
+        (
+            runtime.merged_weight_transfer_group,
+            runtime.merged_weight_transfer_init_info,
+        ) = sync_merged_weights_to_vllm(
+            bridge=runtime.bridge,
+            model=runtime.model,
+            model_support_handler=runtime.model_support_handler,
+            adapter_model={},
+            adapter_config=runtime.adapter_export_config,
+            rank=runtime.rank,
+            world_size=runtime.world_size,
+            merged_weight_transfer_group=runtime.merged_weight_transfer_group,
+            merged_weight_transfer_init_info=(runtime.merged_weight_transfer_init_info),
+            spec=transfer,
+            pause_generation=True,
         )
 
     def advance_without_training(
@@ -77,34 +177,59 @@ class MegatronTrainJobExecutor:
             or runtime.optimizer is None
         ):
             raise RuntimeError("resident trainer state does not match no-op transition")
-        metrics = {}
-        if int(runtime.rank) == 0:
-            if adapter is None:
-                raise RuntimeError("rank zero no-op transition requires an adapter")
-            metrics = self._publisher.submit_policy_alias(
-                optimizer_state_path=optimizer_state_path,
-                expected_step=expected_learner_version,
-                adapter=adapter,
-            )
+        del optimizer_state_path, adapter
         runtime.resident_policy_step = learner_version
-        return metrics
+        return {}
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self._publisher.close()
+        failures: list[BaseException] = []
+        try:
+            self._publisher.close()
+            self.runtime.optimizer_snapshot_barrier.synchronize()
+        except BaseException as error:
+            failures.append(error)
         controller = getattr(self.runtime, "moe_routing_replay_controller", None)
         if controller is not None:
-            controller.remove_router_patches()
-            self.runtime.moe_routing_replay_controller = None
+            try:
+                controller.remove_router_patches()
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                self.runtime.moe_routing_replay_controller = None
+        from art.megatron.train import _close_merged_weight_transfer_group
+
+        try:
+            _close_merged_weight_transfer_group(self.runtime)
+        except BaseException as error:
+            failures.append(error)
+        try:
+            import torch
+
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+        except BaseException as error:
+            failures.append(error)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Megatron executor close failed", failures)
 
 
 class _GenerationPublisher:
-    def __init__(self, runtime: Any, *, capacity: int) -> None:
+    def __init__(
+        self,
+        runtime: Any,
+        *,
+        stager: PinnedCpuSnapshotStager,
+        capacity: int,
+    ) -> None:
         if capacity < 1:
             raise ValueError("snapshot pool capacity must be positive")
         self.runtime = runtime
+        self.stager = stager
         self.capacity = capacity
         self._slots = BoundedSemaphore(capacity)
         self._lock = Lock()
@@ -118,41 +243,51 @@ class _GenerationPublisher:
 
     def submit(
         self,
-        job: TrainJobSpec,
+        job: TrainerJobSpec,
         adapter_dtypes: dict[str, Any],
         adapter_config: dict[str, Any],
         save_optimizer: bool,
+        *,
+        sink: EventSink,
     ) -> dict[str, float]:
-        from art.megatron.optimizer_state import snapshot_optimizer_state
-        from art.megatron.weights.lora_publish import snapshot_vllm_lora_from_model
+        from art.megatron.optimizer_state import stage_optimizer_state_snapshot
+        from art.megatron.weights.lora_publish import (
+            stage_vllm_lora_snapshot_from_model,
+        )
 
         wait_s, in_flight = self._acquire_slot()
         prepare_started = time.perf_counter()
         try:
-            lora = snapshot_vllm_lora_from_model(
+            lora = stage_vllm_lora_snapshot_from_model(
                 model=self.runtime.model,
                 adapter_dtypes=adapter_dtypes,
                 handler=self.runtime.model_support_handler,
                 adapter_config=adapter_config,
                 rank=self.runtime.rank,
                 world_size=self.runtime.world_size,
+                stager=self.stager,
             )
             optimizer = (
-                snapshot_optimizer_state(
+                stage_optimizer_state_snapshot(
                     self.runtime,
                     generation_id=job.output_generation_id,
                     step=job.learner_version,
+                    stager=self.stager,
                 )
                 if save_optimizer
                 else None
             )
+            if optimizer is not None:
+                self.runtime.optimizer_snapshot_barrier.register(optimizer)
         except BaseException as error:
             try:
-                _record_generation_failure(
-                    Path(job.output.optimizer_state_path),
-                    job.output_generation_id,
-                    int(self.runtime.rank),
-                    error,
+                sink.publication(
+                    TrainerPublicationFailed(
+                        generation_id=job.output_generation_id,
+                        rank=int(self.runtime.rank),
+                        error_type=type(error).__name__,
+                        message=str(error) or type(error).__name__,
+                    )
                 )
             finally:
                 self._release_slot()
@@ -166,32 +301,14 @@ class _GenerationPublisher:
             adapter=None,
             optimizer=optimizer,
             publication_targets=getattr(job, "publication_targets", ()),
+            sink=sink,
+            completion_generation=job.output.generation,
         )
         return {
             "snapshot_pool_wait_s": wait_s,
             "snapshot_pool_in_use": float(in_flight),
             "snapshot_pool_pressure": in_flight / self.capacity,
-            "snapshot_prepare_s": time.perf_counter() - prepare_started,
-        }
-
-    def submit_policy_alias(
-        self,
-        *,
-        optimizer_state_path: str,
-        expected_step: int,
-        adapter: "OptimizerAdapter",
-    ) -> dict[str, float]:
-        wait_s, in_flight = self._acquire_slot()
-        self._enqueue(
-            self._persist_policy_alias,
-            optimizer_state_path,
-            expected_step,
-            adapter=adapter,
-        )
-        return {
-            "snapshot_pool_wait_s": wait_s,
-            "snapshot_pool_in_use": float(in_flight),
-            "snapshot_pool_pressure": in_flight / self.capacity,
+            "snapshot_launch_s": time.perf_counter() - prepare_started,
         }
 
     def _acquire_slot(self) -> tuple[float, int]:
@@ -203,74 +320,25 @@ class _GenerationPublisher:
             self._in_flight += 1
             return wait_s, self._in_flight
 
-    def _enqueue(self, function: Any, /, *args: Any, **kwargs: Any) -> None:
+    def _enqueue(
+        self,
+        function: Any,
+        /,
+        *args: Any,
+        sink: EventSink,
+        completion_generation: TrainerGeneration,
+        **kwargs: Any,
+    ) -> None:
         try:
             future = self._pool.submit(function, *args, **kwargs)
         except BaseException:
             self._release_slot()
             raise
-        future.add_done_callback(self._completed)
-
-    def _persist_policy_alias(
-        self,
-        optimizer_state_path: str,
-        expected_step: int,
-        *,
-        adapter: "OptimizerAdapter",
-    ) -> None:
-        from art.megatron.optimizer_state import (
-            commit_optimizer_policy_advance,
-            read_adapter_publication,
-            resolve_committed_optimizer_policy,
-            trainer_publication_path,
+        future.add_done_callback(
+            lambda done: self._completed(
+                done, sink=sink, generation=completion_generation
+            )
         )
-        from art.utils.output_dirs import get_step_checkpoint_dir
-
-        coordination = trainer_publication_path(
-            optimizer_state_path, adapter.generation_id
-        )
-        try:
-            initial = get_step_checkpoint_dir(str(Path(optimizer_state_path).parent), 0)
-            policy = resolve_committed_optimizer_policy(
-                optimizer_state_path, initial_adapter_path=initial
-            )
-            if read_adapter_publication(adapter.identity, step=adapter.step) != adapter:
-                raise RuntimeError("no-op adapter generation is not immutable")
-            if policy.policy_adapter.step > expected_step:
-                raise RuntimeError("no-op policy metadata is stale")
-            if policy.policy_adapter.step == expected_step:
-                commit_optimizer_policy_advance(
-                    optimizer_state_path,
-                    initial_adapter_path=initial,
-                    expected_step=expected_step,
-                    adapter=adapter,
-                )
-                policy = resolve_committed_optimizer_policy(
-                    optimizer_state_path, initial_adapter_path=initial
-                )
-            generation = TrainerGeneration(
-                training_session_id=adapter.training_session_id,
-                policy_step=adapter.step,
-                generation_id=adapter.generation_id,
-                adapter_path=adapter.identity,
-            )
-            _write_json_atomic(
-                coordination / "complete.json",
-                {
-                    "generation": generation.model_dump(mode="json"),
-                    "resume_step": policy.policy_adapter.step,
-                    "optimizer_step": (
-                        0
-                        if policy.optimizer_anchor is None
-                        else policy.optimizer_anchor.step
-                    ),
-                },
-            )
-        except BaseException as error:
-            _record_generation_failure(
-                Path(optimizer_state_path), adapter.generation_id, 0, error
-            )
-            raise
 
     def _publish_snapshot(
         self,
@@ -282,7 +350,8 @@ class _GenerationPublisher:
         adapter: "OptimizerAdapter | None",
         optimizer: Any,
         publication_targets: tuple[Any, ...],
-    ) -> None:
+    ) -> TrainerRankPublication:
+        lora = None if lora is None else lora.resolve()
         transfer = None
         if int(self.runtime.rank) == 0 and publication_targets:
             if lora is None:
@@ -292,9 +361,11 @@ class _GenerationPublisher:
                 lora,
                 publication_targets,
             )
+        optimizer = None if optimizer is None else optimizer.resolve()
         failures: list[BaseException] = []
+        record: TrainerRankPublication | None = None
         try:
-            self._persist_generation(
+            record = self._persist_generation(
                 generation=generation,
                 optimizer_state_path=optimizer_state_path,
                 staging_adapter_path=staging_adapter_path,
@@ -309,24 +380,21 @@ class _GenerationPublisher:
                 transfer.result()
             except BaseException as error:
                 failures.append(error)
-                _record_generation_failure(
-                    Path(optimizer_state_path),
-                    generation.generation_id,
-                    int(self.runtime.rank),
-                    error,
-                )
         if len(failures) == 1:
             raise failures[0]
         if failures:
             raise BaseExceptionGroup(
                 "adapter persistence and transport failed", failures
             )
+        if record is None:
+            raise RuntimeError("trainer rank produced no publication record")
+        return record
 
     def _transfer_lora_snapshot(self, lora: Any, targets: tuple[Any, ...]) -> None:
-        from art.distributed.adapter_transport import NixlAdapterSender
+        from art.distributed.adapter_transport import AdapterSnapshotSender
 
         if self._transport_sender is None:
-            self._transport_sender = NixlAdapterSender()
+            self._transport_sender = AdapterSnapshotSender()
         self._transport_sender.send(lora, targets)
 
     def _persist_generation(
@@ -338,122 +406,68 @@ class _GenerationPublisher:
         lora: Any,
         adapter: "OptimizerAdapter | None",
         optimizer: Any,
-    ) -> None:
+    ) -> TrainerRankPublication:
         from art.megatron.optimizer_state import (
-            OptimizerAdapter,
-            OptimizerShard,
-            build_optimizer_manifest,
-            commit_optimizer_generation,
             publish_adapter_checkpoint,
-            read_committed_optimizer_pointer,
-            trainer_publication_path,
             write_optimizer_snapshot_shard,
         )
         from art.megatron.weights.lora_publish import save_vllm_lora_snapshot
 
         rank = int(self.runtime.rank)
-        world_size = int(self.runtime.world_size)
-        root = Path(optimizer_state_path)
-        coordination = trainer_publication_path(
-            optimizer_state_path, generation.generation_id
+        if rank == 0:
+            if lora is not None:
+                if staging_adapter_path is None or adapter is not None:
+                    raise RuntimeError("new adapter publication is inconsistent")
+                staging = Path(staging_adapter_path)
+                if staging.exists():
+                    raise RuntimeError(f"Adapter staging generation exists: {staging}")
+                save_vllm_lora_snapshot(lora, str(staging))
+                adapter = publish_adapter_checkpoint(
+                    staging,
+                    step=generation.policy_step,
+                    training_session_id=generation.training_session_id,
+                    generation_id=generation.generation_id,
+                )
+            if adapter is None:
+                raise RuntimeError("rank zero has no immutable adapter")
+        shard = (
+            write_optimizer_snapshot_shard(
+                optimizer,
+                optimizer_state_path=optimizer_state_path,
+            )
+            if optimizer is not None
+            else None
         )
-        coordination.mkdir(parents=True, exist_ok=True)
+        return TrainerRankPublication(
+            generation=generation,
+            rank=rank,
+            adapter=adapter,
+            shard=shard,
+            runtime_sha256=None if optimizer is None else optimizer.runtime_sha256,
+            topology=None if optimizer is None else optimizer.topology,
+            saves_optimizer=optimizer is not None,
+        )
+
+    def _completed(
+        self,
+        future: Future[TrainerRankPublication],
+        *,
+        sink: EventSink,
+        generation: TrainerGeneration,
+    ) -> None:
         try:
-            if rank == 0:
-                if lora is not None:
-                    if staging_adapter_path is None or adapter is not None:
-                        raise RuntimeError("new adapter publication is inconsistent")
-                    staging = Path(staging_adapter_path)
-                    if staging.exists():
-                        raise RuntimeError(
-                            f"Adapter staging generation exists: {staging}"
-                        )
-                    save_vllm_lora_snapshot(lora, str(staging))
-                    adapter = publish_adapter_checkpoint(
-                        staging,
-                        step=generation.policy_step,
-                        training_session_id=generation.training_session_id,
-                        generation_id=generation.generation_id,
-                    )
-                if adapter is None:
-                    raise RuntimeError("rank zero has no immutable adapter")
-                if adapter.identity != str(Path(generation.adapter_path).absolute()):
-                    raise RuntimeError(
-                        "Published adapter path differs from TrainJobSpec"
-                    )
-                _write_json_atomic(coordination / "adapter.json", adapter.model_dump())
-
-            result: dict[str, Any] = {"rank": rank}
-            if optimizer is not None:
-                shard = write_optimizer_snapshot_shard(
-                    optimizer,
-                    optimizer_state_path=optimizer_state_path,
-                )
-                result.update(
-                    shard=shard.model_dump(mode="json"),
-                    runtime_sha256=optimizer.runtime_sha256,
-                    topology=optimizer.topology.model_dump(mode="json"),
-                )
-            _write_json_atomic(coordination / f"rank-{rank:08d}.json", result)
-
-            if rank == 0:
-                records = _wait_rank_records(coordination, world_size)
-                adapter = OptimizerAdapter.model_validate(
-                    json.loads((coordination / "adapter.json").read_text("utf-8"))
-                )
-                if optimizer is not None:
-                    runtime_ids = {record["runtime_sha256"] for record in records}
-                    topologies = {
-                        json.dumps(record["topology"], sort_keys=True)
-                        for record in records
-                    }
-                    if len(runtime_ids) != 1 or len(topologies) != 1:
-                        raise RuntimeError(
-                            "Trainer ranks produced incompatible optimizer snapshots"
-                        )
-                    manifest = build_optimizer_manifest(
-                        generation=generation.generation_id,
-                        step=generation.policy_step,
-                        adapter=adapter,
-                        runtime_sha256=runtime_ids.pop(),
-                        world_size=world_size,
-                        shards=[
-                            OptimizerShard.model_validate(record["shard"])
-                            for record in records
-                        ],
-                        topology=optimizer.topology,
-                    )
-                    expected = read_committed_optimizer_pointer(optimizer_state_path)
-                    commit_optimizer_generation(
-                        optimizer_state_path,
-                        manifest,
-                        expected_pointer=expected,
-                    )
-                committed = read_committed_optimizer_pointer(optimizer_state_path)
-                optimizer_step = 0 if committed is None else committed.step
-                _write_json_atomic(
-                    coordination / "complete.json",
-                    {
-                        "generation": generation.model_dump(mode="json"),
-                        "resume_step": (
-                            generation.policy_step
-                            if optimizer is not None
-                            else optimizer_step
-                        ),
-                        "optimizer_step": optimizer_step,
-                    },
-                )
-            else:
-                _wait_for_path(
-                    coordination / "complete.json", coordination / "failed.json"
-                )
+            event = TrainerPublicationSucceeded(record=future.result())
         except BaseException as error:
-            _record_generation_failure(root, generation.generation_id, rank, error)
-            raise
-
-    def _completed(self, future: Future[None]) -> None:
+            with self._lock:
+                self._failures.append(error)
+            event = TrainerPublicationFailed(
+                generation_id=generation.generation_id,
+                rank=int(self.runtime.rank),
+                error_type=type(error).__name__,
+                message=str(error) or type(error).__name__,
+            )
         try:
-            future.result()
+            sink.publication(event)
         except BaseException as error:
             with self._lock:
                 self._failures.append(error)
@@ -478,61 +492,3 @@ class _GenerationPublisher:
             self._transport_sender.close()
             self._transport_sender = None
         self.raise_if_failed()
-
-
-def _write_json_atomic(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with temporary.open("w", encoding="utf-8") as output:
-        json.dump(value, output, sort_keys=True)
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(temporary, path)
-    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
-
-
-def _record_generation_failure(
-    optimizer_root: Path,
-    generation_id: str,
-    rank: int,
-    error: BaseException,
-) -> None:
-    from art.megatron.optimizer_state import trainer_publication_path
-
-    coordination = trainer_publication_path(str(optimizer_root), generation_id)
-    payload = {"error_type": type(error).__name__, "message": str(error)}
-    _write_json_atomic(coordination / f"rank-{rank:08d}.error.json", payload)
-    if rank == 0:
-        _write_json_atomic(coordination / "failed.json", payload)
-
-
-def _wait_for_path(path: Path, failed: Path, *, timeout_s: float = 300.0) -> None:
-    deadline = time.monotonic() + timeout_s
-    while not path.is_file():
-        if failed.is_file():
-            raise RuntimeError(
-                f"Peer generation publication failed: {failed.read_text('utf-8')}"
-            )
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"Timed out waiting for generation publication: {path}")
-        time.sleep(0.05)
-
-
-def _wait_rank_records(path: Path, world_size: int) -> list[dict[str, Any]]:
-    deadline = time.monotonic() + 300.0
-    while True:
-        errors = tuple(path.glob("rank-*.error.json"))
-        if errors:
-            raise RuntimeError(
-                f"Trainer rank publication failed: {errors[0].read_text('utf-8')}"
-            )
-        ready = [path / f"rank-{rank:08d}.json" for rank in range(world_size)]
-        if all(record.is_file() for record in ready):
-            return [json.loads(record.read_text("utf-8")) for record in ready]
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Timed out waiting for trainer rank publication records")
-        time.sleep(0.05)

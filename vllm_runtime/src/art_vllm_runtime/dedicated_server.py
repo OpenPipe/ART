@@ -56,7 +56,7 @@ class _ResetPrefixCacheRequest(BaseModel):
 class _InFlightLoraUpdateRequest(BaseModel):
     model_name: str = Field(min_length=1)
     lora_path: str = Field(min_length=1)
-    policy_version: int
+    policy_version: int = Field(ge=0)
     lora_slot: str | None = Field(default=None, min_length=1)
     base_model_name: str | None = None
     is_3d_lora_weight: bool = False
@@ -147,6 +147,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--replica-generation", type=int, default=0)
     parser.add_argument("--process-uuid")
     parser.add_argument("--update-identity")
+    parser.add_argument("--initial-policy-version", type=int)
     parser.add_argument("--lora-path", help="Optional initial checkpoint path")
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument(
@@ -187,6 +188,7 @@ def _patch_art_runtime_routes() -> None:
         return
 
     original_build_app = api_server.build_app
+    original_init_app_state = api_server.init_app_state
 
     def art_build_app(*build_args: object, **build_kwargs: object) -> FastAPI:
         app = original_build_app(*build_args, **build_kwargs)
@@ -317,7 +319,9 @@ def _patch_art_runtime_routes() -> None:
             from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
 
             from art_vllm_runtime.policy_spans import (
+                PolicyLoRARequest,
                 lora_update_coordinator,
+                policy_lora_request_payload,
                 publish_lora_slot_policy,
                 register_lora_alias,
             )
@@ -329,59 +333,99 @@ def _patch_art_runtime_routes() -> None:
             models = raw_request.app.state.openai_serving_models
             engine_client = engine(raw_request)
             coordinator = lora_update_coordinator(models, engine_client)
-            await coordinator.begin_update(lora_slot)
+            update_seq = await coordinator.begin_update(lora_slot)
+            mutation_started = False
             try:
-                # vLLM completes this collective only after every engine worker loads.
-                load_result = await models.load_lora_adapter(
-                    LoadLoRAAdapterRequest(
+                async with models.lora_resolver_lock[lora_slot]:
+                    load_request = LoadLoRAAdapterRequest(
                         lora_name=lora_slot,
                         lora_path=lora_path,
                         load_inplace=lora_slot in models.lora_requests,
                         is_3d_lora_weight=body.is_3d_lora_weight,
-                    ),
-                    base_model_name=body.base_model_name,
-                )
-                if isinstance(load_result, ErrorResponse):
-                    await coordinator.fail_update(lora_slot)
-                    return JSONResponse(
-                        content=load_result.model_dump(mode="python"),
-                        status_code=load_result.error.code,
                     )
-                register_lora_alias(
-                    models,
-                    public_model_name=public_model_name,
-                    lora_slot=lora_slot,
-                )
-                waiting_cache_salt = await engine_client.engine_core.call_utility_async(
-                    "art_update_waiting_lora_cache_salt",
-                    lora_slot,
-                    policy_version,
-                )
-                publish_lora_slot_policy(
-                    models,
-                    lora_slot=lora_slot,
-                    policy_version=policy_version,
-                )
-                await coordinator.commit_update(
-                    lora_slot,
-                    policy_version,
-                    models.lora_requests[lora_slot],
-                )
+                    load_error = await models._check_load_lora_adapter_request(
+                        load_request
+                    )
+                    if isinstance(load_error, ErrorResponse):
+                        await coordinator.cancel_update(lora_slot, update_seq)
+                        return JSONResponse(
+                            content=load_error.model_dump(mode="python"),
+                            status_code=load_error.error.code,
+                        )
+                    lora_int_id = (
+                        models.lora_requests[lora_slot].lora_int_id
+                        if lora_slot in models.lora_requests
+                        else models.lora_id_counter.inc(1)
+                    )
+                    lora_request = PolicyLoRARequest(
+                        lora_name=lora_slot,
+                        lora_int_id=lora_int_id,
+                        lora_path=lora_path,
+                        base_model_name=(
+                            body.base_model_name
+                            if body.base_model_name is not None
+                            and models.is_base_model(body.base_model_name)
+                            else None
+                        ),
+                        load_inplace=True,
+                        is_3d_lora_weight=body.is_3d_lora_weight,
+                        policy_version=policy_version,
+                        update_seq=update_seq,
+                    )
+                    mutation_started = True
+                    await engine_client.engine_core.call_utility_async(
+                        "pause_scheduler", "keep", False
+                    )
+                    cache_transition = (
+                        await engine_client.engine_core.call_utility_async(
+                            "art_apply_lora_policy_update",
+                            policy_lora_request_payload(lora_request),
+                        )
+                    )
+                    serving_request = PolicyLoRARequest(
+                        **{
+                            **policy_lora_request_payload(lora_request),
+                            "load_inplace": False,
+                        }
+                    )
+                    models.lora_requests[lora_slot] = serving_request
+                    register_lora_alias(
+                        models,
+                        public_model_name=public_model_name,
+                        lora_slot=lora_slot,
+                    )
+                    publish_lora_slot_policy(
+                        models,
+                        lora_slot=lora_slot,
+                        policy_version=policy_version,
+                        update_seq=update_seq,
+                    )
+                    await engine_client.engine_core.call_utility_async(
+                        "resume_scheduler"
+                    )
+                    await coordinator.commit_update(lora_slot, serving_request)
+                    mutation_started = False
                 _runtime_state.update(
                     loaded_adapter=public_model_name,
                     policy_version=policy_version,
-                    update_identity=f"lora:{lora_slot}:{policy_version}",
-                )
-                from art_vllm_runtime.metrics import record_policy_cache_waiting_update
-
-                record_policy_cache_waiting_update(
-                    updated=int(waiting_cache_salt["updated_waiting_requests"]),
-                    skipped_started=int(
-                        waiting_cache_salt["skipped_started_waiting_requests"]
-                    ),
+                    update_identity=(f"lora:{lora_slot}:{policy_version}:{update_seq}"),
                 )
             except BaseException:
-                await coordinator.fail_update(lora_slot)
+                if mutation_started:
+                    try:
+                        await asyncio.shield(
+                            engine_client.engine_core.call_utility_async(
+                                "pause_scheduler", "abort", True
+                            )
+                        )
+                    finally:
+                        await asyncio.shield(
+                            coordinator.fail_update(lora_slot, update_seq)
+                        )
+                else:
+                    await asyncio.shield(
+                        coordinator.cancel_update(lora_slot, update_seq)
+                    )
                 raise
             return JSONResponse(
                 content={
@@ -389,14 +433,32 @@ def _patch_art_runtime_routes() -> None:
                     "model_name": public_model_name,
                     "lora_slot": lora_slot,
                     "policy_version": policy_version,
-                    "waiting_cache_salt": waiting_cache_salt,
+                    "update_seq": update_seq,
+                    "cache_transition": cache_transition,
                 }
             )
 
         app.include_router(router)
         return app
 
+    async def art_init_app_state(
+        engine_client: Any, state: Any, *args: Any, **kwargs: Any
+    ) -> None:
+        await original_init_app_state(engine_client, state, *args, **kwargs)
+        policy_version = _runtime_state.get("initial_policy_version")
+        if policy_version is None:
+            return
+        from art_vllm_runtime.policy_spans import declare_initial_lora_policy
+
+        await declare_initial_lora_policy(
+            state.openai_serving_models,
+            engine_client,
+            lora_slot=str(_runtime_state["loaded_adapter"]),
+            policy_version=int(policy_version),
+        )
+
     setattr(api_server, "build_app", art_build_app)
+    setattr(api_server, "init_app_state", art_init_app_state)
     setattr(api_server, "_art_runtime_routes_patched", True)
 
 
@@ -535,13 +597,16 @@ def main(argv: list[str] | None = None) -> None:
         nnodes=args.nnodes,
         headless=args.headless,
         loaded_adapter=args.served_model_name if args.lora_path else None,
-        policy_version=(
+        policy_version=args.initial_policy_version
+        if args.initial_policy_version is not None
+        else (
             int(args.served_model_name.rsplit("@", 1)[1])
             if "@" in args.served_model_name
             and args.served_model_name.rsplit("@", 1)[1].isdigit()
             else None
         ),
         update_identity=args.update_identity,
+        initial_policy_version=args.initial_policy_version,
         pp_layer_partition=pp_layer_partition,
     )
 

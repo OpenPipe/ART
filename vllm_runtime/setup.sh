@@ -24,6 +24,49 @@ if [ -x "${HOME}/.local/bin/uv" ]; then
 fi
 echo "[art-vllm-runtime-setup] CUDA_HOME=${cuda_home}, profile=${runtime_extra}"
 "${uv_bin}" sync --extra "${runtime_extra}" --frozen --no-dev
+
+cutlass_cu13_intact() {
+    ".venv/bin/python" - <<'PY'
+import base64
+import hashlib
+from importlib.metadata import PackageNotFoundError, distribution
+
+try:
+    files = distribution("nvidia-cutlass-dsl-libs-cu13").files
+except PackageNotFoundError:
+    raise SystemExit(1)
+if not files:
+    raise SystemExit(1)
+for path in files:
+    expected = path.hash
+    if expected is None or expected.mode != "sha256" or not expected.value:
+        continue
+    try:
+        actual = base64.urlsafe_b64encode(
+            hashlib.sha256(path.locate().read_bytes()).digest()
+        ).decode().rstrip("=")
+    except OSError:
+        raise SystemExit(1)
+    if actual != expected.value:
+        raise SystemExit(1)
+PY
+}
+
+if [ "${cuda_major}" = 13 ] && ! cutlass_cu13_intact; then
+    echo "[art-vllm-runtime-setup] Repairing CUTLASS DSL install-order race"
+    site_packages="$(".venv/bin/python" -c \
+        'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+    # Overlay the wheel because its files share directories with libs-base;
+    # uninstalling either wheel first can delete files owned by the other.
+    "${uv_bin}" pip install --python .venv/bin/python --target "${site_packages}" \
+        --reinstall --no-deps \
+        nvidia-cutlass-dsl-libs-cu13==4.5.2
+    cutlass_cu13_intact || {
+        echo "[art-vllm-runtime-setup] CUTLASS DSL integrity check failed" >&2
+        exit 1
+    }
+fi
+
 ".venv/bin/python" - <<'PY'
 import torch
 import vllm

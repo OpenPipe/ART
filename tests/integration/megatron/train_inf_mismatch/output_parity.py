@@ -531,11 +531,14 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
             leaf_paths
         ):
             leaf_start, leaf_end = leaf_segment
+            first_scored_i = None
             last_scored_i = None
             for packed_i in range(leaf_start + 1, leaf_end):
                 if scored_token(sample_id, packed_i):
+                    if first_scored_i is None:
+                        first_scored_i = packed_i
                     last_scored_i = packed_i
-            if last_scored_i is None:
+            if first_scored_i is None or last_scored_i is None:
                 continue
             effective_leaf_end = last_scored_i + 1
             prompt_len = sum(end - start for start, end in ancestor_segments)
@@ -557,7 +560,8 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
                         family_id=family_id,
                         completion_id=completion_id,
                         packed_prompt_length=prompt_len,
-                        scored_token_start_index=prompt_len + 1,
+                        scored_token_start_index=prompt_len
+                        + (first_scored_i - leaf_start),
                         token_ids=flat,
                     )
                 )

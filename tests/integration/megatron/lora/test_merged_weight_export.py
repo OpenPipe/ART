@@ -4,7 +4,7 @@ from typing import Any, cast
 import httpx
 import torch
 
-from art.megatron.runtime.jobs import (
+from art.megatron.runtime.weight_transfer import (
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
 )

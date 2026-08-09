@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art.utils.lifecycle import complete_task
 
+from .specs import GpuId
+
 
 class _NcclRuntimeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -47,7 +49,7 @@ class NcclProbeRequest(_NcclRuntimeRequest):
     rank: int = Field(ge=0)
     world_size: int = Field(ge=2)
     master_port: int = Field(ge=1, le=65535)
-    gpu_id: int = Field(ge=0)
+    gpu_id: GpuId
     net_name: str = Field(min_length=1)
 
     @model_validator(mode="after")

@@ -486,6 +486,8 @@ class DeepSeekV4Compressor(nn.Module):
 
         self._keep_fp32_parameters = ("ape",)
         setattr(self.ape, "_keep_fp32", True)
+        if config.perform_initialization:
+            nn.init.zeros_(self.ape)
 
         base = cfg.dsv4_compress_rope_theta
         assert rope_head_dim == 64

@@ -29,6 +29,7 @@ ReplicaPhase = Literal[
 class ReplicaLaunchTemplate(_Message):
     served_model_name: str = Field(min_length=1)
     lora_path: str | None = None
+    initial_policy_version: int | None = Field(default=None, ge=0)
     engine_args: dict[str, object] = Field(default_factory=dict)
     server_args: dict[str, object] = Field(default_factory=dict)
 
@@ -39,6 +40,7 @@ class HostMemberLaunchRequest(_Message):
     generation: int = Field(ge=0)
     generation_digest: str = Field(min_length=1)
     process_uuid: str = Field(min_length=1)
+    startup_timeout_s: float = Field(gt=0)
     launch_config: VllmRuntimeLaunchConfig
 
 
@@ -100,6 +102,7 @@ class ReplicaHostLauncher(Protocol):
         template_path: str,
         tensor_dtype: str,
         timeout_s: float,
+        transport: Literal["local", "nixl"],
     ) -> AdapterTransferTarget: ...
 
     async def wait_adapter_receive(
@@ -141,7 +144,8 @@ class ManagedVllmHostLauncher:
             raise RuntimeError(f"vLLM member already exists: {key}")
         managed = _ManagedMember(request)
         self._members[key] = managed
-        output_dir = self._output_root / request.replica_id / str(request.generation)
+        output_dir = self._output_root / request.process_uuid / request.replica_id
+        output_dir /= str(request.generation)
         output_dir /= request.member.member_id
         try:
             await managed.runtime.start(
@@ -149,7 +153,7 @@ class ManagedVllmHostLauncher:
                 output_dir=str(output_dir),
                 child_processes=managed.supervisor,
                 install_parent_cleanup=self._install_parent_cleanup,
-                timeout=self._startup_timeout_s,
+                timeout=self._startup_timeout_s or request.startup_timeout_s,
             )
         except BaseException:
             await self.stop_member(*key)
@@ -234,7 +238,7 @@ class ReplicaManager:
             raise ValueError("ART-managed replicas require vLLM multiprocessing")
         for key in ("revision", "tokenizer_revision"):
             configured = template.engine_args.get(key)
-            if configured not in (None, spec.model_revision):
+            if configured is not None and configured != spec.model_revision:
                 raise ValueError(f"{key} conflicts with the replica model revision")
         self._spec = spec
         self._launchers = launchers
@@ -325,11 +329,21 @@ class ReplicaManager:
         self._state = self._state.model_copy(update={"phase": "stopped", "members": ()})
         return self._state
 
-    async def restart(self, *, served_model_name: str, lora_path: str) -> ReplicaState:
+    async def restart(
+        self,
+        *,
+        served_model_name: str,
+        lora_path: str | None,
+        initial_policy_version: int | None,
+    ) -> ReplicaState:
         async with self._lock:
             await self._stop_locked()
             self._template = self._template.model_copy(
-                update={"served_model_name": served_model_name, "lora_path": lora_path}
+                update={
+                    "served_model_name": served_model_name,
+                    "lora_path": lora_path,
+                    "initial_policy_version": initial_policy_version,
+                }
             )
             generation = self._state.generation + 1
             self._state = ReplicaState(
@@ -349,7 +363,12 @@ class ReplicaManager:
         return self._state
 
     async def prepare_adapter_transfer(
-        self, generation_id: str, template_path: str, tensor_dtype: str
+        self,
+        generation_id: str,
+        template_path: str,
+        tensor_dtype: str,
+        *,
+        transport: Literal["local", "nixl"] = "nixl",
     ) -> tuple[AdapterTransferTarget, ...]:
         return tuple(
             await asyncio.gather(
@@ -360,6 +379,7 @@ class ReplicaManager:
                             template_path,
                             tensor_dtype,
                             max(1.0, self._rpc_timeout_s - 1.0),
+                            transport,
                         ),
                         self._rpc_timeout_s,
                     )
@@ -392,7 +412,10 @@ class ReplicaManager:
     async def release_adapter_transfer(self, generation_id: str) -> None:
         await asyncio.gather(
             *(
-                self._launchers[host_id].release_adapter_receive(generation_id)
+                asyncio.wait_for(
+                    self._launchers[host_id].release_adapter_receive(generation_id),
+                    self._rpc_timeout_s,
+                )
                 for host_id in dict.fromkeys(
                     member.host_id for member in self._spec.members
                 )
@@ -561,14 +584,18 @@ class ReplicaManager:
         parallel = self._spec.parallel
         engine_args = {
             **self._template.engine_args,
-            "revision": self._spec.model_revision,
-            "tokenizer_revision": self._spec.model_revision,
             "tensor_parallel_size": parallel.tp,
             "pipeline_parallel_size": parallel.pp,
             "data_parallel_size": parallel.dp,
             "enable_expert_parallel": parallel.enable_expert_parallel,
         }
+        if self._spec.model_revision is not None:
+            engine_args.update(
+                revision=self._spec.model_revision,
+                tokenizer_revision=self._spec.model_revision,
+            )
         process_uuid = uuid.uuid4().hex
+        physical_ids = all(isinstance(gpu_id, int) for gpu_id in member.gpu_ids)
         launch = VllmRuntimeLaunchConfig(
             base_model=self._spec.base_model,
             port=self._spec.leader_endpoint.port,
@@ -577,7 +604,14 @@ class ReplicaManager:
                 if member.node_rank == 0
                 else "127.0.0.1"
             ),
-            local_gpu_ids=member.gpu_ids,
+            cuda_visible_devices=(
+                None if physical_ids else ",".join(map(str, member.gpu_ids))
+            ),
+            local_gpu_ids=(
+                tuple(gpu_id for gpu_id in member.gpu_ids if isinstance(gpu_id, int))
+                if physical_ids
+                else None
+            ),
             lora_path=self._template.lora_path,
             served_model_name=self._template.served_model_name,
             rollout_weights_mode=self._spec.update_mode,
@@ -595,6 +629,7 @@ class ReplicaManager:
             replica_generation=self._state.generation,
             process_uuid=process_uuid,
             update_identity=self._state.update_identity,
+            initial_policy_version=self._template.initial_policy_version,
         )
         return HostMemberLaunchRequest(
             replica_id=self._spec.name,
@@ -602,6 +637,7 @@ class ReplicaManager:
             generation=self._state.generation,
             generation_digest=self._state.generation_digest,
             process_uuid=process_uuid,
+            startup_timeout_s=self._startup_timeout_s,
             launch_config=launch,
         )
 

@@ -54,14 +54,52 @@ _WORKER_ADDRESS_LOCK = threading.Lock()
 _USED_WORKER_ADDRESSES: set[str] = set()
 _BROKEN_OUTPUT_FLAGS = select.POLLERR | select.POLLHUP | select.POLLNVAL
 _WORKER_CODE = """\
+import ctypes
+import os
+import signal
+import sys
+
+if len(sys.argv) >= 4 and sys.argv[2] == "--parent-pid":
+    expected_parent_pid = int(sys.argv[3])
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0):
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    if os.getppid() != expected_parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+from monarch.actor import run_worker_loop_forever
+run_worker_loop_forever(address=sys.argv[1], ca="trust_all_connections")
+"""
+_LEGACY_OWNED_WORKER_CODE = """\
 import sys
 from monarch.actor import run_worker_loop_forever
 run_worker_loop_forever(address=sys.argv[1], ca="trust_all_connections")
 """
+_WORKER_LOCK_ROOT = Path("/tmp")
+_OWNED_WORKER_SCHEMA = "art.monarch.owned-worker.v1"
 
 
 class _BootstrapContract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _OwnedWorkerMetadata(_BootstrapContract):
+    schema_name: str = _OWNED_WORKER_SCHEMA
+    address: str
+    controller_pid: int = Field(gt=0)
+    controller_start_time: int = Field(gt=0)
+    worker_pid: int = Field(gt=0)
+    worker_start_time: int = Field(gt=0)
+    python_executable: str = Field(min_length=1)
+    worker_code_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    ownership_token: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+    @model_validator(mode="after")
+    def _validate_schema(self) -> "_OwnedWorkerMetadata":
+        if self.schema_name != _OWNED_WORKER_SCHEMA:
+            raise ValueError("unsupported owned-worker metadata schema")
+        return self
 
 
 class _WorkerSession(_BootstrapContract):
@@ -284,6 +322,10 @@ def _prepare_child_environment(
     if os.path.isfile(os.path.join(sys.prefix, "pyvenv.cfg")):
         environ.setdefault("ART_VIRTUAL_ENV", sys.prefix)
     if worker:
+        environ.pop("CUDA_VISIBLE_DEVICES", None)
+        allocator_config = "expandable_segments:True"
+        environ["PYTORCH_ALLOC_CONF"] = allocator_config
+        environ["PYTORCH_CUDA_ALLOC_CONF"] = allocator_config
         nvidia_libs = (
             str(path)
             for root in roots
@@ -331,9 +373,19 @@ def activate_trainer_child_virtualenv() -> None:
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(name, threads)
     activate_child_virtualenv()
-    import torch
 
-    torch.set_num_threads(int(threads))
+
+def activate_cuda_device(gpu_id: int | str) -> int:
+    """Bind a clean trainer process to one physical ordinal or CUDA UUID."""
+
+    if isinstance(gpu_id, str):
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+        return 0
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        raise RuntimeError(
+            "physical GPU placement requires an unmasked Monarch worker process"
+        )
+    return gpu_id
 
 
 def activate_cpu_child_virtualenv() -> None:
@@ -659,11 +711,220 @@ def _resolve_ephemeral_worker_address(address: str) -> str:
     raise RuntimeError("could not allocate a fresh local worker address") from error
 
 
-def _start_worker(address: str) -> _WorkerSession:
+def _worker_lock_path(address: str) -> Path:
+    digest = hashlib.sha256(address.encode()).hexdigest()[:16]
+    return _WORKER_LOCK_ROOT / f"art-monarch-worker-{digest}.lock"
+
+
+def _process_identity(pid: int) -> tuple[int, int, int, str] | None:
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text()
+    except OSError:
+        return None
+    fields = stat.rsplit(")", 1)[1].split()
+    return int(fields[19]), int(fields[1]), int(fields[3]), fields[0]
+
+
+def _process_command(pid: int) -> tuple[str, ...] | None:
+    try:
+        command = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return None
+    return tuple(os.fsdecode(value) for value in command.rstrip(b"\0").split(b"\0"))
+
+
+def _write_owned_worker_metadata(
+    lease: Any,
+    address: str,
+    process: subprocess.Popen[bytes],
+    ownership_token: str,
+) -> None:
+    controller = _process_identity(os.getpid())
+    worker = _process_identity(process.pid)
+    if controller is None or worker is None:
+        raise RuntimeError("owned Monarch worker process identity disappeared")
+    metadata = _OwnedWorkerMetadata(
+        address=address,
+        controller_pid=os.getpid(),
+        controller_start_time=controller[0],
+        worker_pid=process.pid,
+        worker_start_time=worker[0],
+        python_executable=os.path.realpath(sys.executable),
+        worker_code_sha256=hashlib.sha256(_WORKER_CODE.encode()).hexdigest(),
+        ownership_token=ownership_token,
+    )
+    lease.seek(0)
+    lease.truncate()
+    lease.write(metadata.model_dump_json().encode())
+    lease.flush()
+    os.fsync(lease.fileno())
+
+
+def _metadata_owned_orphan(
+    metadata: _OwnedWorkerMetadata, lock_path: Path
+) -> tuple[int, int] | None:
+    if _worker_lock_path(
+        metadata.address
+    ) != lock_path or metadata.python_executable != os.path.realpath(sys.executable):
+        return None
+    worker = _process_identity(metadata.worker_pid)
+    if worker is None or worker[0] != metadata.worker_start_time or worker[3] == "Z":
+        return None
+    controller = _process_identity(metadata.controller_pid)
+    if controller is not None and controller[0] == metadata.controller_start_time:
+        return None
+    command = _process_command(metadata.worker_pid)
+    if command is None or len(command) != 8:
+        return None
+    expected_tail = (
+        metadata.address,
+        "--parent-pid",
+        str(metadata.controller_pid),
+        "--ownership-token",
+        metadata.ownership_token,
+    )
+    if os.path.realpath(command[0]) != metadata.python_executable:
+        return None
+    if (
+        command[1] != "-c"
+        or hashlib.sha256(command[2].encode()).hexdigest()
+        != metadata.worker_code_sha256
+        or command[3:] != expected_tail
+        or worker[2] != metadata.worker_pid
+    ):
+        return None
+    return metadata.worker_pid, metadata.worker_start_time
+
+
+def _legacy_owned_orphans() -> dict[Path, tuple[int, int]]:
+    matches: dict[Path, tuple[int, int]] = {}
+    for process_dir in Path("/proc").iterdir():
+        if not process_dir.name.isdigit():
+            continue
+        pid = int(process_dir.name)
+        identity = _process_identity(pid)
+        command = _process_command(pid)
+        if identity is None or command is None or len(command) != 4:
+            continue
+        start_time, parent_pid, session_id, state = identity
+        if parent_pid != 1 or session_id != pid or state == "Z":
+            continue
+        if os.path.realpath(command[0]) != os.path.realpath(sys.executable):
+            continue
+        if command[1:3] != ("-c", _LEGACY_OWNED_WORKER_CODE):
+            continue
+        address = command[3]
+        parsed = urlsplit(address)
+        try:
+            loopback = (
+                parsed.hostname is not None
+                and ipaddress.ip_address(parsed.hostname).is_loopback
+            )
+        except ValueError:
+            loopback = False
+        if not loopback or parsed.port in (None, 0):
+            continue
+        lock_path = _worker_lock_path(address)
+        if lock_path in matches:
+            raise RuntimeError(f"multiple legacy workers match owned lease {lock_path}")
+        matches[lock_path] = (pid, start_time)
+    return matches
+
+
+def _terminate_owned_orphan(pid: int, start_time: int) -> None:
+    try:
+        pidfd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        identity = _process_identity(pid)
+        if identity is None or identity[0] != start_time or identity[3] == "Z":
+            return
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        exited = select.poll()
+        exited.register(pidfd, select.POLLIN)
+        if not exited.poll(5000):
+            raise RuntimeError(f"owned Monarch worker {pid} did not exit")
+    finally:
+        os.close(pidfd)
+
+
+def _reconcile_orphaned_workers() -> None:
+    legacy_owned: dict[Path, tuple[int, int]] | None = None
+    for lock_path in sorted(_WORKER_LOCK_ROOT.glob("art-monarch-worker-*.lock")):
+        try:
+            lease = open(lock_path, "r+b")
+        except FileNotFoundError:
+            continue
+        try:
+            try:
+                fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            payload = lease.read().strip()
+            owned: tuple[int, int] | None
+            if payload:
+                try:
+                    metadata = _OwnedWorkerMetadata.model_validate_json(payload)
+                except ValueError:
+                    continue
+                if _worker_lock_path(
+                    metadata.address
+                ) != lock_path or metadata.python_executable != os.path.realpath(
+                    sys.executable
+                ):
+                    continue
+                identity = _process_identity(metadata.worker_pid)
+                if (
+                    identity is None
+                    or identity[0] != metadata.worker_start_time
+                    or identity[3] == "Z"
+                ):
+                    lock_path.unlink(missing_ok=True)
+                    continue
+                owned = _metadata_owned_orphan(metadata, lock_path)
+            else:
+                if legacy_owned is None:
+                    legacy_owned = _legacy_owned_orphans()
+                owned = legacy_owned.get(lock_path)
+            if owned is None:
+                continue
+            _terminate_owned_orphan(*owned)
+            lock_path.unlink(missing_ok=True)
+        finally:
+            lease.close()
+
+
+def _wait_for_worker_listener(
+    process: subprocess.Popen[bytes], address: str, timeout_s: float
+) -> None:
+    port = urlsplit(address).port
+    assert port is not None
+    deadline = time.monotonic() + timeout_s
+    while True:
+        if (exitcode := process.poll()) is not None:
+            raise RuntimeError(
+                f"Monarch worker exited {exitcode} before listening on {address}"
+            )
+        try:
+            if _owns_tcp_listener(process.pid, port):
+                return
+        except FileNotFoundError:
+            pass
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"Monarch worker did not listen on {address} in time")
+        time.sleep(0.05)
+
+
+def _start_worker(
+    address: str, *, startup_timeout_s: float = DEFAULT_STARTUP_TIMEOUT_S
+) -> _WorkerSession:
     with _WORKER_ADDRESS_LOCK:
+        _reconcile_orphaned_workers()
         address = _resolve_ephemeral_worker_address(address)
-        digest = hashlib.sha256(address.encode()).hexdigest()[:16]
-        lease = open(f"/tmp/art-monarch-worker-{digest}.lock", "a+b")
+        lease = open(_worker_lock_path(address), "a+b")
+        process: subprocess.Popen[bytes] | None = None
+        ownership_token = uuid.uuid4().hex
         try:
             fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             if address in _USED_WORKER_ADDRESSES:
@@ -675,11 +936,22 @@ def _start_worker(address: str) -> _WorkerSession:
             environment = os.environ.copy()
             _prepare_child_environment(worker=True, environ=environment)
             process = subprocess.Popen(
-                [sys.executable, "-c", _WORKER_CODE, address],
+                [
+                    sys.executable,
+                    "-c",
+                    _WORKER_CODE,
+                    address,
+                    "--parent-pid",
+                    str(os.getpid()),
+                    "--ownership-token",
+                    ownership_token,
+                ],
                 env=environment,
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            _wait_for_worker_listener(process, address, startup_timeout_s)
+            _write_owned_worker_metadata(lease, address, process, ownership_token)
             _USED_WORKER_ADDRESSES.add(address)
             return _WorkerSession(
                 address=address,
@@ -688,6 +960,8 @@ def _start_worker(address: str) -> _WorkerSession:
                 lease=lease,
             )
         except BaseException:
+            if process is not None:
+                _stop_worker_process(process)
             lease.close()
             raise
 
@@ -710,6 +984,8 @@ def _stop_worker_sessions(workers: Sequence[_WorkerSession]) -> None:
 
 def _stop_worker(worker: _WorkerSession) -> None:
     _stop_worker_sessions((worker,))
+    with _WORKER_ADDRESS_LOCK:
+        _reconcile_orphaned_workers()
 
 
 def run_local(
@@ -721,7 +997,7 @@ def run_local(
     """Own one clean loopback worker and controller for one local program."""
 
     address = require_local_worker_address((_tcp_address("127.0.0.1", port),))
-    worker = _start_worker(address)
+    worker = _start_worker(address, startup_timeout_s=startup_timeout_s)
     try:
         asyncio.run(
             run_explicit_controller(
@@ -840,7 +1116,9 @@ def run_skypilot(
     """Translate SkyPilot topology and own one worker process per task rank."""
 
     spec = SkyPilotBootstrap.from_environ(port=port)
-    worker = _start_worker(spec.worker_addresses[spec.node_rank])
+    worker = _start_worker(
+        spec.worker_addresses[spec.node_rank], startup_timeout_s=startup_timeout_s
+    )
     if spec.node_rank != 0:
         try:
             _wait_for_sky_controller(spec, worker, startup_timeout_s)

@@ -1,4 +1,7 @@
+from collections import deque
+from itertools import islice
 import json
+import os
 from pathlib import Path
 import struct
 import sys
@@ -31,6 +34,19 @@ _DTYPES = {
 }
 
 
+def _writev_all(fd: int, buffers: list[memoryview]) -> None:
+    pending = deque(buffer for buffer in buffers if buffer.nbytes)
+    iov_max = os.sysconf("SC_IOV_MAX")
+    while pending:
+        written = os.writev(fd, tuple(islice(pending, iov_max)))
+        if written <= 0:
+            raise OSError("Short vectored write")
+        while pending and written >= pending[0].nbytes:
+            written -= pending.popleft().nbytes
+        if written:
+            pending[0] = pending[0][written:]
+
+
 def save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
     """Stream CPU tensor buffers without copying them into GIL-held bytes."""
     if sys.byteorder != "little":
@@ -58,14 +74,12 @@ def save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
     with tempfile.TemporaryDirectory(dir=path.parent) as temp_dir:
         temporary_path = Path(temp_dir) / path.name
         with temporary_path.open("wb", buffering=0) as output:
-            for data in (
-                memoryview(struct.pack("<Q", len(encoded))),
-                encoded,
-                *buffers,
-            ):
-                while data:
-                    written = output.write(data)
-                    if not written:
-                        raise OSError(f"Short write while saving {path}")
-                    data = data[written:]
+            _writev_all(
+                output.fileno(),
+                [
+                    memoryview(struct.pack("<Q", len(encoded))),
+                    memoryview(encoded),
+                    *buffers,
+                ],
+            )
         temporary_path.replace(path)

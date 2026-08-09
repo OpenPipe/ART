@@ -6,13 +6,15 @@ import os
 from pathlib import Path
 import socket
 from typing import Any, Iterator, cast
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field
 import torch
 
 import art
 from art import dev
-from art.megatron.service import MegatronService
+from art.megatron.backend import MegatronBackend
+from art.megatron.distributed_service import DistributedMegatronService
 
 from ..model_support.oracle_harness import (
     ORACLE_TOPOLOGY,
@@ -115,7 +117,12 @@ async def _run_merged_vllm_serving(
     )
     topology: Topology = ORACLE_TOPOLOGY
     megatron_env: dict[str, str] = {}
-    engine_args: dev.EngineArgs = dev.EngineArgs(enforce_eager=True)
+    engine_args: dev.EngineArgs = dev.EngineArgs(
+        enforce_eager=True,
+        max_model_len=128,
+        max_num_seqs=4,
+        limit_mm_per_prompt={"image": 0, "video": 0, "audio": 0},
+    )
     if stage_resources is not None:
         stage_resources = resolve_stage_resources_for_visible_gpus(
             "merged_vllm_serving",
@@ -148,10 +155,12 @@ async def _run_merged_vllm_serving(
         engine_args = cast(dev.EngineArgs, stage_resources.vllm.engine_args())
     else:
         trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
-    service_name = "model_support_merged_validation"
+        if case_config.is_moe:
+            engine_args["moe_backend"] = "triton"
     case_artifacts = ensure_case_artifacts(case_config)
-    output_dir = str(Path(case_artifacts.case_dir) / "merged_vllm_serving")
-    os.makedirs(output_dir, exist_ok=True)
+    service_name = f"model_support_merged_validation_{case_artifacts.case_id[-12:]}"
+    backend_root = str(Path(case_artifacts.case_dir) / "merged_vllm_serving")
+    os.makedirs(backend_root, exist_ok=True)
     internal_config = dev.InternalModelConfig(
         trainer_gpu_ids=trainer_gpu_ids,
         inference_gpu_ids=inference_gpu_ids,
@@ -163,20 +172,32 @@ async def _run_merged_vllm_serving(
         dev.validate_dedicated_config(internal_config)
     with _temporary_env(megatron_env), provider_topology_env(topology):
         _init_runtime_config(case_config, topology)
-        service = MegatronService(
-            model_name=service_name,
+        backend = MegatronBackend(path=backend_root)
+        model = art.TrainableModel(
+            name=service_name,
+            run_name=service_name,
+            project="model-support-validation",
             base_model=case_config.base_model,
-            config=internal_config,
-            output_dir=output_dir,
+            _internal_config=internal_config,
+            report_metrics=[],
         )
         port = _find_free_port()
         try:
-            host, resolved_port = await service.start_openai_server(
-                {"server_args": {"port": port}}
+            await model.register(backend, {"server_args": {"port": port}})
+            service = cast(
+                DistributedMegatronService, await backend._get_service(model)
             )
+            endpoint = urlparse(service._base_url or "")
+            host, resolved_port = (
+                endpoint.hostname or "127.0.0.1",
+                int(endpoint.port or port),
+            )
+            output_dir = service.output_dir
             import httpx
 
-            async with httpx.AsyncClient() as client:
+            api_key = service._api_key()
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+            async with httpx.AsyncClient(headers=headers) as client:
                 models_response = await client.get(
                     f"http://{host}:{resolved_port}/v1/models",
                     timeout=60.0,
@@ -216,7 +237,7 @@ async def _run_merged_vllm_serving(
                 completion_text=completion_text,
             )
         finally:
-            service.close()
+            await backend.close()
 
 
 def run_merged_vllm_serving(

@@ -1,8 +1,12 @@
-from typing import Any
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Literal
 
 import pytest
 import torch
 
+from ..artifacts import GitRepoState
+from . import oracle_harness
 from .forward_trace import ForwardTraceCapture, _extract_router_topk
 from .oracle_harness import (
     CP_ATTENTION_SENSITIVITY_MUTATIONS,
@@ -23,6 +27,7 @@ from .oracle_harness import (
     PackedTensorConfig,
     Topology,
     VariantRunner,
+    VariantSpec,
     _default_phase_pass_fns,
     _resolve_test_flex_backend,
     _suite_variants,
@@ -30,7 +35,7 @@ from .oracle_harness import (
     selected_sensitivity_mutations_for_objective,
     sensitivity_topology_for_mutation,
 )
-from .oracle_worker import _matches_grad_sync_skip_mutation
+from .oracle_worker import _matches_grad_sync_skip_mutation, _reset_optimizer_state
 from .prefix_tree_workloads import build_complex_prefix_tree_packed_tensors
 
 
@@ -98,6 +103,361 @@ def _expert_trace_call(
             "expert_dp_world_size": 1,
         },
     }
+
+
+def _artifact_tree(path: Path) -> None:
+    (path / "traces").mkdir(parents=True)
+    (path / "manifest.json").write_text("{}", encoding="utf-8")
+    (path / "worker.log").write_text("diagnostic", encoding="utf-8")
+    (path / "traces" / "forward.pt").write_bytes(b"trace")
+
+
+def test_paired_oracle_request_resets_optimizer_state() -> None:
+    class Inner:
+        def __init__(self) -> None:
+            self.state = {"stale": object()}
+
+    class Leaf:
+        def __init__(self) -> None:
+            self.optimizer = Inner()
+            self.config = object()
+
+        @staticmethod
+        def init_state_fn(inner: Inner, config: object) -> None:
+            assert config is not None
+            inner.state["fresh"] = 0
+
+    leaves = [Leaf(), Leaf()]
+    optimizer = SimpleNamespace(chained_optimizers=leaves)
+
+    _reset_optimizer_state(optimizer)
+
+    assert [leaf.optimizer.state for leaf in leaves] == [
+        {"fresh": 0},
+        {"fresh": 0},
+    ]
+
+
+def _lifecycle_runner(tmp_path: Path) -> VariantRunner:
+    runner = object.__new__(VariantRunner)
+    runner.objective = "rl"
+    runner.paired_objective = None
+    runner.case_config = case_config("Qwen/Qwen3-32B")
+    runner.case_dir = tmp_path
+    runner.oracle_dir = tmp_path / "oracle"
+    return runner
+
+
+def _lifecycle_variant(
+    expected_signal: Literal["pass", "fail"] = "pass",
+) -> VariantSpec:
+    return VariantSpec(
+        name="candidate",
+        objective="rl",
+        topology=Topology(tp=1, ep=1),
+        output_slug="candidate",
+        reference_slug="oracle",
+        expected_signal=expected_signal,
+    )
+
+
+def test_reference_cleanup_prunes_paired_dense_oracle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS", raising=False)
+    runner = object.__new__(VariantRunner)
+    runner.objective = "rl"
+    runner.paired_objective = "sft"
+    runner.case_config = case_config("Qwen/Qwen3-32B")
+    runner.case_dir = tmp_path
+    runner.oracle_dir = tmp_path / "rl__tp1_ep1_etp1_dp1_edp1_cp1_pp1_vpp1_sp0"
+    paired_dir = tmp_path / "sft__tp1_ep1_etp1_dp1_edp1_cp1_pp1_vpp1_sp0"
+    for path in (runner.oracle_dir, paired_dir):
+        (path / "traces").mkdir(parents=True)
+        (path / "manifest.json").write_text("{}", encoding="utf-8")
+        (path / "traces" / "forward.pt").write_bytes(b"trace")
+
+    runner._prune_reference_artifacts()
+
+    for path in (runner.oracle_dir, paired_dir):
+        assert (path / "manifest.json").exists()
+        assert not (path / "traces").exists()
+
+
+def test_moe_capture_prunes_only_after_persisted_metadata_validates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS", raising=False)
+    runner = _lifecycle_runner(tmp_path)
+    runner.git = GitRepoState(path="/repo", commit="commit", dirty=False)
+    runner.case_id = "case"
+    runner.oracle_topology = Topology(tp=1, ep=1)
+    runner.oracle_routing_bundle_dir = tmp_path / "routing"
+    capture_dir = tmp_path / "capture"
+    _artifact_tree(capture_dir)
+    expected_topology = oracle_harness.ReplayParallelTopology.model_validate(
+        runner.oracle_topology.model_dump(
+            include={"tp", "ep", "etp", "dp", "sp", "cp", "pp", "vpp"}
+        )
+    )
+    manifest = SimpleNamespace(
+        git=SimpleNamespace(commit="commit"),
+        case_id="case",
+        objective="rl",
+        topology=runner.oracle_topology.slug(),
+        num_steps=1,
+        steps=[object()],
+    )
+    monkeypatch.setattr(oracle_harness, "_load_manifest", lambda _: manifest)
+    monkeypatch.setattr(
+        oracle_harness.MoeRoutingReplayBundle,
+        "from_dir",
+        staticmethod(
+            lambda _: SimpleNamespace(topology=expected_topology, num_steps=1)
+        ),
+    )
+
+    runner._prune_valid_moe_capture(capture_dir)
+
+    assert not (capture_dir / "traces").exists()
+    assert (capture_dir / "manifest.json").exists()
+    assert (capture_dir / "worker.log").exists()
+
+
+def test_moe_capture_retains_tensors_on_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _lifecycle_runner(tmp_path)
+    runner.git = GitRepoState(path="/repo", commit="commit", dirty=False)
+    runner.case_id = "case"
+    runner.oracle_topology = Topology(tp=1, ep=1)
+    runner.oracle_routing_bundle_dir = tmp_path / "routing"
+    capture_dir = tmp_path / "capture"
+    _artifact_tree(capture_dir)
+    monkeypatch.setattr(
+        oracle_harness,
+        "_load_manifest",
+        lambda _: SimpleNamespace(
+            git=SimpleNamespace(commit="wrong"),
+            case_id="case",
+            objective="rl",
+            topology=runner.oracle_topology.slug(),
+            num_steps=1,
+            steps=[object()],
+        ),
+    )
+    monkeypatch.setattr(
+        oracle_harness.MoeRoutingReplayBundle,
+        "from_dir",
+        staticmethod(lambda _: SimpleNamespace(topology=None, num_steps=1)),
+    )
+
+    with pytest.raises(RuntimeError, match="capture metadata"):
+        runner._prune_valid_moe_capture(capture_dir)
+
+    assert (capture_dir / "traces" / "forward.pt").exists()
+
+
+def test_expected_sensitivity_signal_prunes_only_candidate_tensors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS", raising=False)
+    runner = _lifecycle_runner(tmp_path)
+    candidate_dir = tmp_path / "candidate"
+    _artifact_tree(candidate_dir)
+    report = SimpleNamespace(
+        signal="fail", expected_signal="fail", topology="candidate"
+    )
+    monkeypatch.setattr(runner, "run_variant", lambda _: report)
+
+    runner.run_suite(
+        [_lifecycle_variant("fail")],
+        prune_reference_artifacts=False,
+        prune_case_artifacts=False,
+    )
+
+    assert not (candidate_dir / "traces").exists()
+    assert (candidate_dir / "manifest.json").exists()
+    assert (candidate_dir / "worker.log").exists()
+
+
+def test_paired_suite_retains_unconsumed_objective_tensors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS", raising=False)
+    runner = _lifecycle_runner(tmp_path)
+    runner.paired_objective = "sft"
+    variant = _lifecycle_variant().model_copy(update={"output_slug": "rl__candidate"})
+    candidate_dir = tmp_path / "rl__candidate"
+    paired_dir = tmp_path / "sft__candidate"
+    for path in (candidate_dir, paired_dir):
+        _artifact_tree(path)
+    report = SimpleNamespace(
+        signal="pass", expected_signal="pass", topology="candidate"
+    )
+    monkeypatch.setattr(runner, "run_variant", lambda _: report)
+
+    runner.run_suite(
+        [variant],
+        prune_reference_artifacts=False,
+        prune_case_artifacts=False,
+        prune_paired_artifacts=False,
+    )
+
+    assert not (candidate_dir / "traces").exists()
+    assert (paired_dir / "traces" / "forward.pt").exists()
+
+
+def test_keep_topology_artifacts_override_retains_successful_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS", "1")
+    runner = _lifecycle_runner(tmp_path)
+    candidate_dir = tmp_path / "candidate"
+    _artifact_tree(candidate_dir)
+    report = SimpleNamespace(
+        signal="pass", expected_signal="pass", topology="candidate"
+    )
+    monkeypatch.setattr(runner, "run_variant", lambda _: report)
+
+    runner.run_suite(
+        [_lifecycle_variant()],
+        prune_reference_artifacts=False,
+        prune_case_artifacts=False,
+    )
+
+    assert (candidate_dir / "traces" / "forward.pt").exists()
+
+
+def test_unexpected_signal_prunes_candidate_reference_and_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS", raising=False)
+    runner = _lifecycle_runner(tmp_path)
+    for path in (tmp_path / "candidate", runner.oracle_dir):
+        _artifact_tree(path)
+    (tmp_path / "packed_tensors").mkdir()
+    (tmp_path / "packed_tensors" / "tokens.pt").write_bytes(b"tokens")
+    (tmp_path / "packed_tensors.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "shared_init").mkdir()
+    report = SimpleNamespace(
+        signal="pass", expected_signal="fail", topology="candidate"
+    )
+    monkeypatch.setattr(runner, "run_variant", lambda _: report)
+
+    with pytest.raises(AssertionError, match="expected_signal=fail"):
+        runner.run_suite([_lifecycle_variant("fail")])
+
+    assert not (tmp_path / "candidate" / "traces").exists()
+    assert not (runner.oracle_dir / "traces").exists()
+    assert not (tmp_path / "packed_tensors").exists()
+    assert not (tmp_path / "shared_init").exists()
+    assert (tmp_path / "candidate" / "manifest.json").exists()
+    assert (tmp_path / "candidate" / "worker.log").exists()
+
+
+@pytest.mark.parametrize("failure_point", ["worker", "comparison"])
+def test_worker_and_comparison_failures_retain_candidate(
+    failure_point: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _lifecycle_runner(tmp_path)
+    candidate_dir = tmp_path / "candidate"
+    _artifact_tree(candidate_dir)
+
+    def fail(_: object) -> None:
+        raise RuntimeError(failure_point)
+
+    if failure_point == "worker":
+        monkeypatch.setattr(runner, "ensure_variant_artifacts", fail)
+    else:
+        monkeypatch.setattr(runner, "ensure_variant_artifacts", lambda _: candidate_dir)
+        monkeypatch.setattr(runner, "compare_variant", fail)
+
+    with pytest.raises(RuntimeError, match=failure_point):
+        runner.run_variant(_lifecycle_variant())
+
+    assert (candidate_dir / "traces" / "forward.pt").exists()
+
+
+def test_cleanup_failure_surfaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _lifecycle_runner(tmp_path)
+    _artifact_tree(tmp_path / "candidate")
+    report = SimpleNamespace(
+        signal="pass", expected_signal="pass", topology="candidate"
+    )
+    monkeypatch.setattr(runner, "run_variant", lambda _: report)
+
+    def fail_cleanup(_: Path) -> None:
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(oracle_harness.shutil, "rmtree", fail_cleanup)
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        runner.run_suite(
+            [_lifecycle_variant()],
+            prune_reference_artifacts=False,
+            prune_case_artifacts=False,
+        )
+
+
+def test_top_level_suite_prunes_deferred_artifacts_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_run_suite(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("variant")
+
+    runner = SimpleNamespace(run_suite=fail_run_suite)
+    pruned: list[list[object]] = []
+    monkeypatch.setattr(oracle_harness, "selected_oracle_objectives", lambda: ["rl"])
+    monkeypatch.setattr(oracle_harness, "VariantRunner", lambda **_kwargs: runner)
+    monkeypatch.setattr(oracle_harness, "_suite_variants", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        oracle_harness,
+        "_prune_completed_runners",
+        lambda runners, **_kwargs: pruned.append(runners),
+    )
+
+    with pytest.raises(RuntimeError, match="variant"):
+        oracle_harness.run_suite(case_config=case_config())
+
+    assert pruned == [[runner]]
+
+
+def test_paired_dense_suite_prunes_deferred_artifacts_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_run_suite(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("variant")
+
+    runner = SimpleNamespace(run_suite=fail_run_suite)
+    pruned: list[list[object]] = []
+    monkeypatch.setattr(oracle_harness, "VariantRunner", lambda **_kwargs: runner)
+    monkeypatch.setattr(
+        oracle_harness,
+        "_prune_completed_runners",
+        lambda runners, **_kwargs: pruned.append(runners),
+    )
+
+    with pytest.raises(RuntimeError, match="variant"):
+        oracle_harness._run_paired_dense_suite(
+            objectives=["rl", "sft"],
+            case_config=oracle_harness.OracleCaseConfig(
+                base_model="google/gemma-4-31B-it",
+                model_support_key="gemma4_dense",
+            ),
+            max_world_size=2,
+            oracle_flex_backend=None,
+            variant_flex_backend=None,
+            cp_supported=True,
+            phase_pass_fns=None,
+            use_fp32_lora_reference=True,
+            prune_reference_artifacts=True,
+            prune_case_artifacts=True,
+        )
+
+    assert pruned == [[runner]]
 
 
 def test_fc1_grad_sync_sensitivity_matches_split_and_fused_lora_names() -> None:
@@ -687,6 +1047,43 @@ def test_forward_trace_sums_expert_tp_row_shards_inside_ep_groups() -> None:
     assert torch.equal(
         call["primary_output"],
         torch.tensor([[11.0, 22.0], [33.0, 44.0]]),
+    )
+
+
+def test_forward_trace_deduplicates_replicated_tp_outputs_with_cp_rows() -> None:
+    module_name = "chunk0.module.decoder.layers.0.self_attention.linear_qkv.q_proj_lora"
+    rank_traces = []
+    for cp_rank, values in enumerate(
+        (torch.tensor([[1.0, 2.0]]), torch.tensor([[3.0, 4.0]]))
+    ):
+        for tp_rank in range(2):
+            rank_traces.append(
+                {
+                    module_name: [
+                        {
+                            "micro_call_index": 0,
+                            "micro_order": 0,
+                            "micro_sample_index": 0,
+                            "module_type": "LoRA",
+                            "primary_output": values,
+                            "merge_hints": {"primary_output": {"op": "replicated"}},
+                            "rank_meta": {
+                                "global_rank": cp_rank * 2 + tp_rank,
+                                "tp_rank": tp_rank,
+                                "tp_world_size": 2,
+                                "cp_rank": cp_rank,
+                                "cp_world_size": 2,
+                            },
+                        }
+                    ]
+                }
+            )
+
+    merged = ForwardTraceCapture._merge_rank_traces(rank_traces)
+
+    assert torch.equal(
+        merged[module_name][0]["primary_output"],
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
     )
 
 

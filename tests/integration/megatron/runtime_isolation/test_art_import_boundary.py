@@ -104,8 +104,7 @@ def test_service_modules_import_without_vllm(artifact_dir: Path) -> None:
             (
                 "import importlib, json; "
                 "modules = ["
-                "'art.unsloth.service', "
-                "'art.megatron.service', "
+                "'art.megatron.distributed_service', "
                 "'art.megatron.weights.merged_weight_export'"
                 "]; "
                 "loaded = [importlib.import_module(name).__name__ for name in modules]; "
@@ -116,7 +115,32 @@ def test_service_modules_import_without_vllm(artifact_dir: Path) -> None:
     )
     payload = _load_json_from_stdout(result.stdout)
     assert payload["loaded"] == [
-        "art.unsloth.service",
-        "art.megatron.service",
+        "art.megatron.distributed_service",
         "art.megatron.weights.merged_weight_export",
     ]
+
+
+def test_runtime_env_preserves_build_arch_without_initializing_cuda(
+    artifact_dir: Path,
+) -> None:
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "TORCH_CUDA_ARCH_LIST": "10.3"}
+    result = _run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, os, torch; "
+                "from art.megatron.runtime.runtime_env import "
+                "configure_megatron_runtime_env; "
+                "configure_megatron_runtime_env(); "
+                "print(json.dumps({'arch': os.environ['TORCH_CUDA_ARCH_LIST'], "
+                "'cuda_initialized': torch.cuda.is_initialized()}))"
+            ),
+        ],
+        artifact_dir=artifact_dir,
+        env=env,
+    )
+    assert _load_json_from_stdout(result.stdout) == {
+        "arch": "10.3",
+        "cuda_initialized": False,
+    }

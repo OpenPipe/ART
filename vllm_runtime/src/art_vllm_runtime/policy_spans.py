@@ -10,6 +10,7 @@ import asyncio
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import hashlib
 import importlib
 import re
 import sys
@@ -18,6 +19,7 @@ from typing import Any, AsyncIterator
 import msgspec
 import numpy as np
 import torch
+from vllm.lora.request import LoRARequest
 
 POLICY_TOKEN_SPANS_FIELD = "policy_token_spans"
 ART_POLICY_TOKEN_SPANS_FIELD = "art_policy_token_spans"
@@ -25,11 +27,13 @@ _PARENT_POLICY_TOKEN_SPANS_FIELD = "_art_policy_token_spans_by_choice"
 
 _CURRENT_ENGINE_POLICY_SPANS: dict[str, list[dict[str, Any]]] = {}
 _WORKER_LORA_POLICY_BY_ID: dict[int, dict[str, Any]] = {}
-_WORKER_LORA_UPDATE_SEQ = 0
 _POLICY_CACHE_SALT_PREFIX = "art_policy_cache_salt="
 _POLICY_CACHE_SALT_MARKER = f"|{_POLICY_CACHE_SALT_PREFIX}"
+_POLICY_CACHE_SALT_VERSION = "v1:"
 _LORA_UPDATE_COORDINATOR_FIELD = "_art_lora_update_coordinator"
 _EXECUTING_POLICY_CONTEXT_FIELD = "_art_executing_policy_context"
+_POLICY_EXECUTION_MARKER_FIELD = "_art_policy_execution_marker"
+_POLICY_HISTORY_BASE_FIELD = "_art_policy_history_before_current"
 
 _MODEL_RUNNER_OUTPUT_MODULES = (
     "vllm.v1.outputs",
@@ -46,6 +50,18 @@ _GPU_MODEL_RUNNER_MODULES = (
 )
 
 
+class PolicyLoRARequest(LoRARequest, omit_defaults=True, array_like=True):  # type: ignore[call-arg]
+    """LoRA request carrying ART's exact executing-policy identity."""
+
+    policy_version: int = 0
+    update_seq: int = 0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.policy_version < 0 or self.update_seq < 0:
+            raise ValueError("policy_version and update_seq must be non-negative")
+
+
 def patch_policy_token_spans() -> None:
     _patch_model_runner_output_type()
     _patch_engine_core_output_type()
@@ -56,7 +72,7 @@ def patch_policy_token_spans() -> None:
     _patch_lora_alias_resolution()
     _patch_engine_request_admission()
     _patch_load_inplace_storage()
-    _patch_engine_waiting_cache_salt_utility()
+    _patch_policy_lora_update_rpc()
 
 
 class _SlotAdmissionState:
@@ -65,8 +81,10 @@ class _SlotAdmissionState:
         "active_admissions",
         "blocked",
         "lora_request",
+        "next_update_seq",
+        "pending_update_seq",
+        "poisoned",
         "update_active",
-        "policy_version",
     )
 
     def __init__(self) -> None:
@@ -74,8 +92,10 @@ class _SlotAdmissionState:
         self.active_admissions = 0
         self.blocked = False
         self.lora_request: Any | None = None
+        self.next_update_seq = 1
+        self.pending_update_seq: int | None = None
+        self.poisoned = False
         self.update_active = False
-        self.policy_version: int | None = None
 
 
 class LoraUpdateCoordinator:
@@ -88,52 +108,100 @@ class LoraUpdateCoordinator:
         return self._states.setdefault(lora_slot, _SlotAdmissionState())
 
     @asynccontextmanager
-    async def admission(
-        self, lora_slot: str
-    ) -> AsyncIterator[tuple[int | None, Any | None]]:
+    async def admission(self, lora_slot: str) -> AsyncIterator[Any | None]:
         state = self._state(lora_slot)
         async with state.condition:
             await state.condition.wait_for(lambda: not state.blocked)
             state.active_admissions += 1
         try:
-            yield state.policy_version, state.lora_request
+            yield state.lora_request
         finally:
             async with state.condition:
                 state.active_admissions -= 1
                 state.condition.notify_all()
 
-    async def begin_update(self, lora_slot: str) -> None:
+    async def declare_initial(
+        self, lora_slot: str, lora_request: PolicyLoRARequest
+    ) -> None:
+        state = self._state(lora_slot)
+        async with state.condition:
+            if (
+                state.active_admissions
+                or state.update_active
+                or state.lora_request is not None
+            ):
+                raise RuntimeError(f"LoRA slot {lora_slot!r} is already active")
+            if lora_request.update_seq <= 0:
+                raise ValueError(
+                    "initial mutable LoRA policy requires a positive sequence"
+                )
+            if lora_request.lora_name != lora_slot:
+                raise ValueError("initial LoRA policy does not match its slot")
+            state.lora_request = lora_request
+            state.next_update_seq = lora_request.update_seq + 1
+
+    async def begin_update(self, lora_slot: str) -> int:
         state = self._state(lora_slot)
         async with state.condition:
             await state.condition.wait_for(lambda: not state.update_active)
             state.update_active = True
             state.blocked = True
-            await state.condition.wait_for(lambda: state.active_admissions == 0)
+            update_seq = state.next_update_seq
+            state.next_update_seq += 1
+            state.pending_update_seq = update_seq
+            try:
+                await state.condition.wait_for(lambda: state.active_admissions == 0)
+            except BaseException:
+                state.update_active = False
+                state.blocked = state.poisoned
+                state.pending_update_seq = None
+                state.condition.notify_all()
+                raise
+            return update_seq
 
     async def commit_update(
         self,
         lora_slot: str,
-        policy_version: int,
-        lora_request: Any,
+        lora_request: PolicyLoRARequest,
     ) -> None:
         state = self._state(lora_slot)
         async with state.condition:
-            if not state.update_active:
-                raise RuntimeError(f"No active LoRA update for slot {lora_slot!r}")
-            state.policy_version = int(policy_version)
+            self._require_pending(state, lora_slot, lora_request.update_seq)
             state.lora_request = lora_request
             state.update_active = False
             state.blocked = False
+            state.poisoned = False
+            state.pending_update_seq = None
             state.condition.notify_all()
 
-    async def fail_update(self, lora_slot: str) -> None:
+    async def cancel_update(self, lora_slot: str, update_seq: int) -> None:
         state = self._state(lora_slot)
         async with state.condition:
+            self._require_pending(state, lora_slot, update_seq)
             state.update_active = False
-            # The workers may already hold new weights. Keep admission blocked
-            # until a retry completes publication and scheduler rehashing.
-            state.blocked = True
+            state.blocked = state.poisoned
+            state.pending_update_seq = None
             state.condition.notify_all()
+
+    async def fail_update(self, lora_slot: str, update_seq: int) -> None:
+        state = self._state(lora_slot)
+        async with state.condition:
+            self._require_pending(state, lora_slot, update_seq)
+            state.update_active = False
+            # A worker may already hold new weights. This slot stays poisoned.
+            state.blocked = True
+            state.poisoned = True
+            state.pending_update_seq = None
+            state.condition.notify_all()
+
+    @staticmethod
+    def _require_pending(
+        state: _SlotAdmissionState, lora_slot: str, update_seq: int
+    ) -> None:
+        if not state.update_active or state.pending_update_seq != update_seq:
+            raise RuntimeError(
+                f"LoRA slot {lora_slot!r} has no update {update_seq} in progress"
+            )
 
 
 def lora_update_coordinator(models: Any, engine_client: Any) -> LoraUpdateCoordinator:
@@ -145,6 +213,43 @@ def lora_update_coordinator(models: Any, engine_client: Any) -> LoraUpdateCoordi
     setattr(models, _LORA_UPDATE_COORDINATOR_FIELD, coordinator)
     setattr(engine_client, _LORA_UPDATE_COORDINATOR_FIELD, coordinator)
     return coordinator
+
+
+async def declare_initial_lora_policy(
+    models: Any,
+    engine_client: Any,
+    *,
+    lora_slot: str,
+    policy_version: int,
+) -> None:
+    loaded = models.lora_requests.get(lora_slot)
+    if loaded is None:
+        raise RuntimeError(f"Initial LoRA slot {lora_slot!r} is not loaded")
+    request = PolicyLoRARequest(
+        lora_name=loaded.lora_name,
+        lora_int_id=loaded.lora_int_id,
+        lora_path=loaded.lora_path,
+        base_model_name=loaded.base_model_name,
+        tensorizer_config_dict=loaded.tensorizer_config_dict,
+        is_3d_lora_weight=loaded.is_3d_lora_weight,
+        policy_version=policy_version,
+        update_seq=1,
+    )
+    report = await engine_client.engine_core.call_utility_async(
+        "art_declare_loaded_lora_policy", policy_lora_request_payload(request)
+    )
+    if int(report.get("workers", 0)) <= 0:
+        raise RuntimeError("Initial LoRA policy declaration reached no workers")
+    models.lora_requests[lora_slot] = request
+    publish_lora_slot_policy(
+        models,
+        lora_slot=lora_slot,
+        policy_version=policy_version,
+        update_seq=request.update_seq,
+    )
+    await lora_update_coordinator(models, engine_client).declare_initial(
+        lora_slot, request
+    )
 
 
 def _patch_model_runner_output_type() -> None:
@@ -199,12 +304,13 @@ def publish_lora_slot_policy(
     *,
     lora_slot: str,
     policy_version: int,
+    update_seq: int,
 ) -> None:
-    versions = getattr(models, "_art_lora_slot_policy_versions", None)
-    if versions is None:
-        versions = {}
-        setattr(models, "_art_lora_slot_policy_versions", versions)
-    versions[lora_slot] = int(policy_version)
+    identities = getattr(models, "_art_lora_slot_policy_identities", None)
+    if identities is None:
+        identities = {}
+        setattr(models, "_art_lora_slot_policy_identities", identities)
+    identities[lora_slot] = (int(policy_version), int(update_seq))
 
 
 def _resolve_lora_alias(models: Any, model_name: str | None) -> Any | None:
@@ -216,11 +322,12 @@ def _resolve_lora_alias(models: Any, model_name: str | None) -> Any | None:
     return models.lora_requests.get(slot)
 
 
-def _slot_policy_version(models: Any, lora_slot: str) -> int | None:
-    version = getattr(models, "_art_lora_slot_policy_versions", {}).get(lora_slot)
-    if version is None:
+def _slot_policy_identity(models: Any, lora_slot: str) -> tuple[int, int] | None:
+    identity = getattr(models, "_art_lora_slot_policy_identities", {}).get(lora_slot)
+    if identity is None:
         return None
-    return int(version)
+    policy_version, update_seq = identity
+    return int(policy_version), int(update_seq)
 
 
 def _strip_policy_cache_salt(cache_salt: str | None) -> str | None:
@@ -234,13 +341,48 @@ def _strip_policy_cache_salt(cache_salt: str | None) -> str | None:
     return cache_salt
 
 
-def _policy_cache_salt(
+def _policy_history_from_cache_salt(cache_salt: str | None) -> str | None:
+    if not cache_salt:
+        return None
+    if cache_salt.startswith(_POLICY_CACHE_SALT_PREFIX):
+        value = cache_salt.removeprefix(_POLICY_CACHE_SALT_PREFIX)
+    else:
+        _base, marker, value = cache_salt.partition(_POLICY_CACHE_SALT_MARKER)
+        if not marker:
+            return None
+    if not value.startswith(_POLICY_CACHE_SALT_VERSION):
+        raise RuntimeError("Unsupported ART policy cache-salt format")
+    digest = value.removeprefix(_POLICY_CACHE_SALT_VERSION)
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise RuntimeError("Malformed ART policy cache-salt digest")
+    return digest
+
+
+def _extend_policy_history(
+    previous_digest: str | None,
     *,
     lora_slot: str,
     policy_version: int,
+    update_seq: int,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"art-policy-history-v1\0")
+    if previous_digest is not None:
+        digest.update(bytes.fromhex(previous_digest))
+    digest.update(lora_slot.encode())
+    digest.update(b"\0")
+    digest.update(str(policy_version).encode())
+    digest.update(b"\0")
+    digest.update(str(update_seq).encode())
+    return digest.hexdigest()
+
+
+def _policy_cache_salt(
+    *,
+    history_digest: str,
     user_cache_salt: str | None,
 ) -> str:
-    policy_salt = f"{lora_slot}:{policy_version}"
+    policy_salt = f"{_POLICY_CACHE_SALT_VERSION}{history_digest}"
     if user_cache_salt:
         return f"{user_cache_salt}{_POLICY_CACHE_SALT_MARKER}{policy_salt}"
     return f"{_POLICY_CACHE_SALT_PREFIX}{policy_salt}"
@@ -251,13 +393,28 @@ def _set_policy_cache_salt(
     *,
     lora_slot: str,
     policy_version: int,
+    update_seq: int,
+    previous_digest: str | None = None,
 ) -> None:
-    user_cache_salt = _strip_policy_cache_salt(getattr(request, "cache_salt", None))
-    request.cache_salt = _policy_cache_salt(
-        lora_slot=lora_slot,
-        policy_version=policy_version,
+    current_salt = (
+        request.get("cache_salt")
+        if isinstance(request, dict)
+        else getattr(request, "cache_salt", None)
+    )
+    user_cache_salt = _strip_policy_cache_salt(current_salt)
+    cache_salt = _policy_cache_salt(
+        history_digest=_extend_policy_history(
+            previous_digest,
+            lora_slot=lora_slot,
+            policy_version=policy_version,
+            update_seq=update_seq,
+        ),
         user_cache_salt=user_cache_salt,
     )
+    if isinstance(request, dict):
+        request["cache_salt"] = cache_salt
+    else:
+        request.cache_salt = cache_salt
 
 
 def _apply_lora_alias_policy_cache_salt(
@@ -266,13 +423,15 @@ def _apply_lora_alias_policy_cache_salt(
     lora_request: Any,
 ) -> None:
     lora_slot = str(lora_request.lora_name)
-    policy_version = _slot_policy_version(models, lora_slot)
-    if policy_version is None:
+    identity = _slot_policy_identity(models, lora_slot)
+    if identity is None:
         return
+    policy_version, update_seq = identity
     _set_policy_cache_salt(
         request,
         lora_slot=lora_slot,
         policy_version=policy_version,
+        update_seq=update_seq,
     )
 
 
@@ -695,23 +854,26 @@ def _patch_engine_request_admission() -> None:
                 **kwargs,
             )
         lora_slot = str(lora_request.lora_name)
-        async with coordinator.admission(lora_slot) as (
-            policy_version,
-            current_lora_request,
-        ):
+        async with coordinator.admission(lora_slot) as current_lora_request:
             if current_lora_request is not None:
                 lora_request = current_lora_request
-            if policy_version is not None:
+            elif lora_slot.endswith(":active"):
+                raise RuntimeError(
+                    f"Mutable LoRA slot {lora_slot!r} has no declared policy identity"
+                )
+            if isinstance(lora_request, PolicyLoRARequest):
                 _set_policy_cache_salt(
                     params,
                     lora_slot=lora_slot,
-                    policy_version=policy_version,
+                    policy_version=lora_request.policy_version,
+                    update_seq=lora_request.update_seq,
                 )
-                if hasattr(prompt, "cache_salt"):
+                if isinstance(prompt, dict) or hasattr(prompt, "cache_salt"):
                     _set_policy_cache_salt(
                         prompt,
                         lora_slot=lora_slot,
-                        policy_version=policy_version,
+                        policy_version=lora_request.policy_version,
+                        update_seq=lora_request.update_seq,
                     )
             return await original(
                 self,
@@ -729,7 +891,6 @@ def _patch_engine_request_admission() -> None:
 
 def _patch_load_inplace_storage() -> None:
     from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-    from vllm.lora.request import LoRARequest
 
     original = OpenAIServingModels.load_lora_adapter
     if getattr(original, "__art_policy_spans_patched__", False):
@@ -740,76 +901,296 @@ def _patch_load_inplace_storage() -> None:
         request: Any,
         base_model_name: str | None = None,
     ) -> Any:
+        if request.load_inplace and request.lora_name in self.lora_requests:
+            raise RuntimeError(
+                "Existing LoRA slots must be updated through /art/in_flight_lora_update"
+            )
         result = await original(self, request, base_model_name=base_model_name)
         lora_request = self.lora_requests.get(request.lora_name)
         if lora_request is not None and lora_request.load_inplace:
-            normalized = LoRARequest(
-                lora_name=lora_request.lora_name,
-                lora_int_id=lora_request.lora_int_id,
-                lora_path=lora_request.lora_path,
-                base_model_name=lora_request.base_model_name,
-                tensorizer_config_dict=lora_request.tensorizer_config_dict,
-                load_inplace=False,
-                is_3d_lora_weight=lora_request.is_3d_lora_weight,
+            self.lora_requests[request.lora_name] = _normalized_lora_request(
+                lora_request
             )
-            self.lora_requests[request.lora_name] = normalized
         return result
 
     load_lora_adapter.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
     OpenAIServingModels.load_lora_adapter = load_lora_adapter  # type: ignore[method-assign]
 
 
-def _patch_engine_waiting_cache_salt_utility() -> None:
+def _patch_policy_lora_update_rpc() -> None:
     from vllm.v1.engine.core import EngineCore
+    from vllm.v1.worker.worker_base import WorkerBase
 
-    if hasattr(EngineCore, "art_update_waiting_lora_cache_salt"):
-        return
+    if not hasattr(WorkerBase, "art_load_lora_policy"):
 
-    def art_update_waiting_lora_cache_salt(
-        self: Any,
-        lora_slot: str,
-        policy_version: int,
-    ) -> dict[str, int]:
-        return _update_waiting_lora_cache_salt(
-            self.scheduler,
-            lora_slot=str(lora_slot),
-            policy_version=int(policy_version),
+        def art_load_lora_policy(self: Any, payload: dict[str, Any]) -> dict[str, Any]:
+            lora_request = _policy_lora_request_from_payload(payload)
+            previous = _WORKER_LORA_POLICY_BY_ID.get(lora_request.lora_int_id)
+            loaded = self.add_lora(lora_request)
+            if not self.pin_lora(lora_request.lora_int_id):
+                raise RuntimeError("Loaded policy LoRA could not be pinned")
+            current = _record_worker_lora_policy(lora_request)
+            return {
+                "loaded": bool(loaded),
+                "previous": None if previous is None else dict(previous),
+                "current": dict(current),
+            }
+
+        WorkerBase.art_load_lora_policy = art_load_lora_policy  # type: ignore[attr-defined]
+
+    if not hasattr(WorkerBase, "art_declare_loaded_lora_policy"):
+
+        def art_declare_loaded_lora_policy(
+            self: Any, payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            lora_request = _policy_lora_request_from_payload(
+                payload, load_inplace=False
+            )
+            previous = _WORKER_LORA_POLICY_BY_ID.get(lora_request.lora_int_id)
+            if lora_request.lora_int_id not in self.list_loras() or previous is None:
+                raise RuntimeError(
+                    f"LoRA {lora_request.lora_int_id} is not loaded on this worker"
+                )
+            for field in ("lora_slot", "lora_path"):
+                expected = getattr(
+                    lora_request,
+                    "lora_name" if field == "lora_slot" else "lora_path",
+                )
+                if previous[field] != expected:
+                    raise RuntimeError(
+                        f"Loaded LoRA {field} is {previous[field]!r}, expected {expected!r}"
+                    )
+            if not self.pin_lora(lora_request.lora_int_id):
+                raise RuntimeError("Initial policy LoRA could not be pinned")
+            current = _record_worker_lora_policy(lora_request)
+            return {
+                "loaded": True,
+                "previous": dict(previous),
+                "current": dict(current),
+            }
+
+        WorkerBase.art_declare_loaded_lora_policy = art_declare_loaded_lora_policy  # type: ignore[attr-defined]
+
+    if not hasattr(EngineCore, "art_apply_lora_policy_update"):
+
+        def art_apply_lora_policy_update(
+            self: Any, payload: dict[str, Any]
+        ) -> dict[str, int]:
+            return _apply_policy_lora_update(self, payload)
+
+        EngineCore.art_apply_lora_policy_update = art_apply_lora_policy_update  # type: ignore[attr-defined]
+
+    if not hasattr(EngineCore, "art_declare_loaded_lora_policy"):
+
+        def art_declare_loaded_lora_policy(
+            self: Any, payload: dict[str, Any]
+        ) -> dict[str, int]:
+            request = _policy_lora_request_from_payload(payload, load_inplace=False)
+            acknowledgements = self.collective_rpc(
+                "art_declare_loaded_lora_policy", args=(payload,)
+            )
+            _validate_worker_lora_update(request, acknowledgements)
+            return {"workers": len(acknowledgements)}
+
+        EngineCore.art_declare_loaded_lora_policy = art_declare_loaded_lora_policy  # type: ignore[attr-defined]
+
+
+def _apply_policy_lora_update(
+    engine_core: Any, payload: dict[str, Any]
+) -> dict[str, int]:
+    if not engine_core.is_scheduler_paused():
+        raise RuntimeError("Policy LoRA updates require a paused scheduler")
+    lora_request = _policy_lora_request_from_payload(payload)
+    try:
+        acknowledgements = engine_core.collective_rpc(
+            "art_load_lora_policy", args=(payload,)
         )
+        previous = _validate_worker_lora_update(lora_request, acknowledgements)
+        started = {
+            request.request_id
+            for request in engine_core.scheduler.requests.values()
+            if _request_uses_lora_slot(request, lora_request.lora_name)
+            and _request_has_executed(request)
+        }
+        engine_core._reset_caches(
+            reset_running_requests=True,
+            reset_connector=True,
+        )
+        return _transition_scheduler_policy_history(
+            engine_core.scheduler,
+            lora_request=_policy_lora_request_from_payload(payload, load_inplace=False),
+            previous_policy=previous,
+            started_request_ids=started,
+        )
+    except BaseException:
+        # Never let a core that may have partially changed workers schedule again.
+        engine_core.pause_scheduler("abort", True)
+        raise
 
-    EngineCore.art_update_waiting_lora_cache_salt = art_update_waiting_lora_cache_salt  # type: ignore[attr-defined]
 
-
-def _update_waiting_lora_cache_salt(
+def _transition_scheduler_policy_history(
     scheduler: Any,
     *,
-    lora_slot: str,
-    policy_version: int,
+    lora_request: PolicyLoRARequest,
+    previous_policy: Mapping[str, Any] | None,
+    started_request_ids: set[str],
 ) -> dict[str, int]:
     updated = 0
-    skipped_started = 0
-    for queue_name in ("waiting", "skipped_waiting"):
-        queue = getattr(scheduler, queue_name, None)
-        if queue is None:
+    continued = 0
+    for request in scheduler.requests.values():
+        if not _request_uses_lora_slot(request, lora_request.lora_name):
             continue
-        for request in list(queue):
-            lora_request = getattr(request, "lora_request", None)
-            if lora_request is None or str(lora_request.lora_name) != lora_slot:
-                continue
-            if int(getattr(request, "num_computed_tokens", 0) or 0) != 0:
-                skipped_started += 1
-                continue
-            _set_policy_cache_salt(
-                request,
-                lora_slot=lora_slot,
-                policy_version=policy_version,
-            )
-            request.block_hashes.clear()
-            request.update_block_hashes()
-            updated += 1
+        previous_digest = getattr(request, _POLICY_HISTORY_BASE_FIELD, None)
+        if request.request_id in started_request_ids:
+            continued += 1
+            previous_digest = _policy_history_from_cache_salt(request.cache_salt)
+            if previous_digest is None:
+                if previous_policy is None:
+                    raise RuntimeError(
+                        f"Started request {request.request_id!r} has no policy identity"
+                    )
+                if int(previous_policy["update_seq"]) != 0:
+                    raise RuntimeError(
+                        f"Started request {request.request_id!r} lost policy history"
+                    )
+                previous_digest = _extend_policy_history(
+                    None,
+                    lora_slot=str(previous_policy["lora_slot"]),
+                    policy_version=int(previous_policy["policy_version"]),
+                    update_seq=0,
+                )
+        request.lora_request = lora_request
+        setattr(request, _POLICY_HISTORY_BASE_FIELD, previous_digest)
+        _set_policy_cache_salt(
+            request,
+            lora_slot=lora_request.lora_name,
+            policy_version=lora_request.policy_version,
+            update_seq=lora_request.update_seq,
+            previous_digest=previous_digest,
+        )
+        request.block_hashes.clear()
+        request.update_block_hashes()
+        setattr(
+            request,
+            _POLICY_EXECUTION_MARKER_FIELD,
+            (
+                int(getattr(request, "num_preemptions", 0) or 0),
+                len(getattr(request, "output_token_ids", ())),
+            ),
+        )
+        updated += 1
     return {
-        "updated_waiting_requests": updated,
-        "skipped_started_waiting_requests": skipped_started,
+        "updated_requests": updated,
+        "continued_requests": continued,
     }
+
+
+def _policy_lora_request_from_payload(
+    payload: Mapping[str, Any], *, load_inplace: bool = True
+) -> PolicyLoRARequest:
+    return PolicyLoRARequest(
+        lora_name=str(payload["lora_name"]),
+        lora_int_id=int(payload["lora_int_id"]),
+        lora_path=str(payload["lora_path"]),
+        base_model_name=payload.get("base_model_name"),
+        tensorizer_config_dict=payload.get("tensorizer_config_dict"),
+        load_inplace=load_inplace,
+        is_3d_lora_weight=bool(payload.get("is_3d_lora_weight", False)),
+        policy_version=int(payload["policy_version"]),
+        update_seq=int(payload["update_seq"]),
+    )
+
+
+def policy_lora_request_payload(lora_request: PolicyLoRARequest) -> dict[str, Any]:
+    return {
+        "lora_name": lora_request.lora_name,
+        "lora_int_id": lora_request.lora_int_id,
+        "lora_path": lora_request.lora_path,
+        "base_model_name": lora_request.base_model_name,
+        "tensorizer_config_dict": lora_request.tensorizer_config_dict,
+        "is_3d_lora_weight": lora_request.is_3d_lora_weight,
+        "policy_version": lora_request.policy_version,
+        "update_seq": lora_request.update_seq,
+    }
+
+
+def _normalized_lora_request(lora_request: Any) -> LoRARequest:
+    request_type = (
+        PolicyLoRARequest
+        if isinstance(lora_request, PolicyLoRARequest)
+        else LoRARequest
+    )
+    policy_fields = (
+        {
+            "policy_version": lora_request.policy_version,
+            "update_seq": lora_request.update_seq,
+        }
+        if request_type is PolicyLoRARequest
+        else {}
+    )
+    return request_type(
+        lora_name=lora_request.lora_name,
+        lora_int_id=lora_request.lora_int_id,
+        lora_path=lora_request.lora_path,
+        base_model_name=lora_request.base_model_name,
+        tensorizer_config_dict=lora_request.tensorizer_config_dict,
+        load_inplace=False,
+        is_3d_lora_weight=lora_request.is_3d_lora_weight,
+        **policy_fields,
+    )
+
+
+def _validate_worker_lora_update(
+    lora_request: PolicyLoRARequest,
+    acknowledgements: list[Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    if not acknowledgements:
+        raise RuntimeError("Policy LoRA update returned no worker acknowledgements")
+    expected = {
+        "policy_version": lora_request.policy_version,
+        "lora_slot": lora_request.lora_name,
+        "lora_path": lora_request.lora_path,
+        "update_seq": lora_request.update_seq,
+    }
+    previous: Mapping[str, Any] | None = None
+    previous_set = False
+    for rank, acknowledgement in enumerate(acknowledgements):
+        if not acknowledgement.get("loaded"):
+            raise RuntimeError(f"Worker rank {rank} did not load the policy LoRA")
+        current = acknowledgement.get("current")
+        if current != expected:
+            raise RuntimeError(
+                f"Worker rank {rank} acknowledged {current!r}, expected {expected!r}"
+            )
+        rank_previous = acknowledgement.get("previous")
+        if previous_set and rank_previous != previous:
+            raise RuntimeError("Policy LoRA workers started from different policies")
+        previous = rank_previous
+        previous_set = True
+    return previous
+
+
+def _request_uses_lora_slot(request: Any, lora_slot: str) -> bool:
+    lora_request = getattr(request, "lora_request", None)
+    return lora_request is not None and str(lora_request.lora_name) == lora_slot
+
+
+def _request_has_executed(request: Any) -> bool:
+    preemptions = int(getattr(request, "num_preemptions", 0) or 0)
+    output_tokens = len(getattr(request, "output_token_ids", ()))
+    marker = getattr(request, _POLICY_EXECUTION_MARKER_FIELD, None)
+    if marker is not None:
+        baseline_preemptions, baseline_output_tokens = marker
+        return bool(
+            int(getattr(request, "num_computed_tokens", 0) or 0)
+            or preemptions > baseline_preemptions
+            or output_tokens > baseline_output_tokens
+        )
+    return bool(
+        int(getattr(request, "num_computed_tokens", 0) or 0)
+        or output_tokens
+        or preemptions
+    )
 
 
 def _policy_context_from_runner(runner: Any) -> dict[str, dict[str, Any]]:
@@ -846,18 +1227,26 @@ def _policy_metadata_for_lora_request(lora_request: Any | None) -> dict[str, Any
     state = _WORKER_LORA_POLICY_BY_ID.get(lora_request.lora_int_id)
     if state is None:
         state = _record_worker_lora_policy(lora_request)
+    if state["lora_slot"].endswith(":active") and state["update_seq"] == 0:
+        raise RuntimeError(
+            f"Mutable LoRA slot {state['lora_slot']!r} has no declared policy identity"
+        )
     return state
 
 
 def _record_worker_lora_policy(lora_request: Any) -> dict[str, Any]:
-    global _WORKER_LORA_UPDATE_SEQ
-    _WORKER_LORA_UPDATE_SEQ += 1
-    policy_version = _policy_version_from_lora_request(lora_request)
+    policy_version = getattr(lora_request, "policy_version", None)
+    update_seq = getattr(lora_request, "update_seq", None)
+    if policy_version is None:
+        policy_version = _immutable_policy_version_from_lora_name(
+            str(lora_request.lora_name)
+        )
+        update_seq = int(policy_version or 0)
     state = {
         "policy_version": int(policy_version or 0),
         "lora_slot": str(lora_request.lora_name),
         "lora_path": str(lora_request.lora_path),
-        "update_seq": _WORKER_LORA_UPDATE_SEQ,
+        "update_seq": int(update_seq or 0),
     }
     _WORKER_LORA_POLICY_BY_ID[int(lora_request.lora_int_id)] = state
     return state
@@ -881,22 +1270,9 @@ def get_worker_lora_states(lora_ids: set[int]) -> tuple[dict[str, Any], ...]:
     return tuple(states)
 
 
-def _policy_version_from_lora_request(lora_request: Any) -> int | None:
-    for pattern, value in (
-        (r"@(\d+)$", getattr(lora_request, "lora_name", "")),
-        (
-            r"^step-(\d+)-[0-9a-f]{32}$",
-            getattr(lora_request, "lora_path", "").rstrip("/").split("/")[-1],
-        ),
-        (
-            r"^(?:step[_-]?)?(\d+)$",
-            getattr(lora_request, "lora_path", "").rstrip("/").split("/")[-1],
-        ),
-    ):
-        match = re.search(pattern, value)
-        if match:
-            return int(match.group(1))
-    return None
+def _immutable_policy_version_from_lora_name(lora_name: str) -> int | None:
+    match = re.search(r"@(\d+)$", lora_name)
+    return int(match.group(1)) if match else None
 
 
 def _attach_policy_spans_to_model_output(

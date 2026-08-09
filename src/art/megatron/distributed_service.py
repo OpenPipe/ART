@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, nullcontext
 import hashlib
 from itertools import groupby
@@ -10,8 +10,9 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import socket
 import time
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypedDict, cast
 import uuid
 
 import httpx
@@ -34,6 +35,7 @@ from art.utils.lifecycle import complete_task, complete_to_thread
 from art.utils.output_dirs import get_step_checkpoint_dir
 from art.vllm_runtime import (
     get_external_vllm_runtime_config,
+    get_vllm_runtime_nccl_so_path,
     map_checkpoint_path_for_vllm,
     normalize_vllm_server_url,
     wait_for_vllm_http_runtime,
@@ -61,27 +63,69 @@ from .optimizer_state import (
     read_adapter_publication,
     read_committed_optimizer_pointer,
     resolve_committed_optimizer_policy,
-    trainer_publication_path,
+)
+from .runtime.data_plane import SFTBatchData
+from .runtime.publication import (
+    DurableTrainerPublication,
+    TrainerRankPublication,
+    commit_trainer_publication,
 )
 from .runtime.specs import (
     AdapterReady,
+    CurrentSFTConfig,
     CurrentTrainConfig,
     DurableTrainOutput,
     ExperimentalTrainConfig,
     HybridEpRuntimeSpec,
+    SFTJobSpec,
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
     TrainerGeneration,
+    TrainerJobSpec,
     TrainerRuntimeSpec,
     TrainFailed,
     TrainingRunSpec,
     TrainJobSpec,
     TrainProgress,
 )
+from .runtime.weight_transfer import (
+    MergedWeightTransferInitInfo,
+    MergedWeightTransferSpec,
+)
 from .runtime_config import get_megatron_runtime_config
 
 logger = logging.getLogger(__name__)
+_POLICY_TIMING_HISTORY = 64
+
+
+class _TrainerJobFields(TypedDict):
+    job_id: str
+    run_id: str
+    training_session_id: str
+    expected_learner_version: int
+    learner_version: int
+    source: TrainerGeneration
+    output: DurableTrainOutput
+    publication_targets: tuple[Any, ...]
+    merged_weight_transfer: MergedWeightTransferSpec | None
+
+
+async def _post_vllm(
+    url: str,
+    *,
+    api_key: str | None,
+    timeout_s: float = 30.0,
+    **kwargs: Any,
+) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        return await client.post(url, headers=_headers(api_key), **kwargs)
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("", 0))
+        return int(listener.getsockname()[1])
 
 
 def _consume_task_result(task: asyncio.Future[Any]) -> None:
@@ -134,7 +178,7 @@ class DistributedMegatronService:
     """One model's durable checkpoints and run-scoped distributed runtimes."""
 
     propagate_close_errors = True
-    close_timeout_s = 60.0
+    close_timeout_s = 120.0
 
     def __init__(
         self,
@@ -161,30 +205,42 @@ class DistributedMegatronService:
         self._learner_generation: TrainerGeneration | None = None
         self._trainer_resident_generation: TrainerGeneration | None = None
         self._trainer: Any = None
+        # Nested acquisitions must follow train -> serving -> mutation.
         self._train_lock = asyncio.Lock()
         self._mutation_lock = asyncio.Lock()
         self._serving_lock = asyncio.Lock()
+        self._durability_lock = asyncio.Lock()
         self._managed_service_name: str | None = None
         self._base_url: str | None = None
         self._serving_capabilities: ServingCapabilities | None = None
         self._api_key_value: str | None = None
         self._current_lora_name: str | None = None
+        self._vllm_sleeping = False
+        self._merged_transfer_init: MergedWeightTransferInitInfo | None = None
         self._published_adapters: dict[int, OptimizerAdapter] = {}
         self._loaded_adapter_steps: set[int] = set()
         self._loaded_exact_adapter_steps: set[int] = set()
         self._exact_adapter_refcounts: dict[int, int] = {}
         self._recovery_tasks: set[asyncio.Task[None]] = set()
         self._publication_tasks: dict[int, asyncio.Task[None]] = {}
+        self._durability_tasks: set[asyncio.Task[Any]] = set()
+        self._prepared_adapter_transfers: dict[str, Any] = {}
         self._serving_futures: dict[int, asyncio.Future[None]] = {}
         self._publication_failure: BaseException | None = None
         self._publication_metrics: dict[int, dict[str, float]] = {}
         self._emitted_publication_metrics: dict[int, set[str]] = {}
+        self._trainer_completion_times: dict[int, float] = {}
+        self._serving_activation_times: dict[int, float] = {}
         self._close_task: asyncio.Task[None] | None = None
         self._closed = False
 
     @property
-    def rollout_weights_mode(self) -> str:
+    def rollout_weights_mode(self) -> Literal["lora", "merged"]:
         return self.config.get("rollout_weights_mode", "lora")
+
+    @property
+    def openai_server_port(self) -> int:
+        return self._model_service_spec().leader_endpoint.port
 
     @property
     def active_learner_step(self) -> int:
@@ -257,6 +313,30 @@ class DistributedMegatronService:
         await asyncio.shield(serving)
         self._raise_publication_failure()
 
+    def policy_activation_timing(self, step: int) -> tuple[float, float]:
+        try:
+            return (
+                self._trainer_completion_times[step],
+                self._serving_activation_times[step],
+            )
+        except KeyError as error:
+            raise RuntimeError(
+                f"policy {step} lacks an authoritative trainer/serving timestamp"
+            ) from error
+
+    @staticmethod
+    def _record_policy_timestamp(history: dict[int, float], step: int) -> None:
+        history[step] = time.monotonic()
+        while len(history) > _POLICY_TIMING_HISTORY:
+            history.pop(next(iter(history)))
+
+    def _record_serving_activation(self, step: int) -> None:
+        if (
+            step in self._trainer_completion_times
+            and step not in self._serving_activation_times
+        ):
+            self._record_policy_timestamp(self._serving_activation_times, step)
+
     def checkpoint_materialization(self, step: int) -> asyncio.Task[None]:
         self._require_open()
         self._raise_publication_failure()
@@ -267,11 +347,11 @@ class DistributedMegatronService:
             )
 
         async def wait() -> None:
-            await asyncio.to_thread(
-                _wait_for_adapter_generation,
-                self._optimizer_state_path,
-                generation,
-            )
+            publication = self._publication_tasks.get(step)
+            if publication is not None:
+                await asyncio.shield(publication)
+            if step not in self._published_adapters:
+                raise RuntimeError(f"learner generation {step} is not materialized")
 
         task = asyncio.create_task(wait())
         task.add_done_callback(_consume_task_result)
@@ -280,6 +360,13 @@ class DistributedMegatronService:
     @property
     def rollout_weight_update_mode(self) -> str:
         return self.config.get("rollout_weight_update_mode", "step_lora")
+
+    @property
+    def _temporal_gpu_sharing(self) -> bool:
+        return (
+            get_external_vllm_runtime_config(self.config) is None
+            and self._model_service_spec().temporal_gpu_sharing
+        )
 
     def _serving_lora_name(self, step: int) -> str:
         if self.rollout_weight_update_mode == "in_flight_lora":
@@ -420,11 +507,15 @@ class DistributedMegatronService:
             "revision": revision,
             "handler": handler.key,
             "mesh": mesh.model_dump(mode="json"),
+            "model_initialization": self.config.get(
+                "megatron_model_initialization", "pretrained"
+            ),
         }
         return TrainerRuntimeSpec(
             art_revision=identity["art"],
             model_identifier=self._model_identifier,
             model_revision=revision,
+            model_initialization=identity["model_initialization"],
             cache_root=self.runtime.topology.cluster.cache_root,
             model_support_key=support_spec.key,
             handler_name=handler.key,
@@ -447,6 +538,7 @@ class DistributedMegatronService:
                 allow_unvalidated_arch=self._allow_unvalidated_arch,
             ),
             streaming_weight_offload=runtime_config.streaming_weight_offload,
+            offload_between_jobs=self._temporal_gpu_sharing,
             random_state=self._random_state(),
             hybrid_ep=hybrid_ep,
         )
@@ -507,6 +599,12 @@ class DistributedMegatronService:
         if self._base_url is None:
             self._serving_step = step
             return
+        if self.rollout_weights_mode == "merged":
+            await self._sync_merged_serving_source_locked(
+                step=step,
+                base_url=self._base_url,
+                api_key=self._api_key(),
+            )
         previous_name = self._current_lora_name
         await self._register_lora_for_step_locked(step, checkpoint)
         invalid_exact = {
@@ -538,8 +636,8 @@ class DistributedMegatronService:
     async def _trainer_transaction(
         self,
         trainer: Any,
-        job: TrainJobSpec,
-        leases: Any,
+        job: TrainerJobSpec,
+        start: Callable[[], AsyncIterator[Any]],
     ) -> AsyncIterator[AsyncIterator[Any]]:
         cold = self._trainer_resident_generation != job.source
         source = self._published_adapters.get(job.source.policy_step) if cold else None
@@ -551,11 +649,315 @@ class DistributedMegatronService:
         ):
             raise RuntimeError("cold trainer source generation is not registered")
         with adapter_generation_lease(source) if source is not None else nullcontext():
-            events = trainer.train(job, leases)
+            events: AsyncIterator[Any] | None = None
             try:
+                events = start()
                 yield events
-            finally:
-                await events.aclose()
+                close = getattr(events, "aclose", None)
+                if close is not None:
+                    await close()
+            except BaseException as error:
+                await self._cleanup_failed_trainer_transaction(trainer, events, error)
+                raise
+
+    async def _cleanup_failed_trainer_transaction(
+        self,
+        trainer: Any,
+        events: AsyncIterator[Any] | None,
+        primary: BaseException,
+    ) -> None:
+        async def cleanup() -> None:
+            failures: list[BaseException] = []
+            try:
+                await self._release_prepared_adapter_transfers()
+            except BaseException as error:
+                failures.append(error)
+            close = None if events is None else getattr(events, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except BaseException as error:
+                    failures.append(error)
+            try:
+                await self._invalidate_trainer_and_restore_serving(trainer)
+            except BaseException as error:
+                failures.append(error)
+            if failures:
+                raise BaseExceptionGroup("failed trainer job cleanup failed", failures)
+
+        try:
+            _, interrupted = await complete_task(asyncio.create_task(cleanup()))
+        except BaseException as cleanup_error:
+            raise BaseExceptionGroup(
+                "trainer job and cancellation-safe cleanup failed",
+                [primary, cleanup_error],
+            ) from None
+        if interrupted is not None:
+            primary.add_note("trainer cleanup completed after another cancellation")
+
+    async def _release_prepared_adapter_transfers(self) -> None:
+        prepared = tuple(self._prepared_adapter_transfers.items())
+        results = await asyncio.gather(
+            *(
+                manager.release_adapter_transfer(generation_id)
+                for generation_id, manager in prepared
+            ),
+            return_exceptions=True,
+        )
+        failures = []
+        for (generation_id, manager), result in zip(prepared, results, strict=True):
+            if isinstance(result, BaseException):
+                failures.append(result)
+            elif self._prepared_adapter_transfers.get(generation_id) is manager:
+                self._prepared_adapter_transfers.pop(generation_id)
+        if failures:
+            raise BaseExceptionGroup(
+                "prepared adapter transfer cleanup failed", failures
+            )
+
+    async def _release_adapter_transfer(
+        self,
+        manager: Any,
+        generation_id: str,
+        primary: BaseException | None = None,
+    ) -> asyncio.CancelledError | None:
+        try:
+            _, interrupted = await complete_task(
+                asyncio.create_task(manager.release_adapter_transfer(generation_id))
+            )
+        except BaseException as cleanup_error:
+            if primary is not None:
+                raise BaseExceptionGroup(
+                    "adapter transfer and cleanup failed", [primary, cleanup_error]
+                ) from None
+            raise
+        return interrupted
+
+    @asynccontextmanager
+    async def _trainer_failure_boundary(self) -> AsyncIterator[None]:
+        try:
+            yield
+        except BaseException as error:
+            await self._cleanup_failed_trainer_transaction(self._trainer, None, error)
+            raise
+
+    async def _invalidate_trainer_and_restore_serving(self, trainer: Any) -> None:
+        failures: list[BaseException] = []
+        async with self._mutation_lock:
+            owned = trainer is not None and self._trainer is trainer
+            if owned:
+                self._trainer = None
+                self._trainer_resident_generation = None
+        if owned:
+            try:
+                await self.runtime.stop_trainer(trainer)
+            except BaseException as error:
+                failures.append(error)
+        if self._temporal_gpu_sharing and self._vllm_sleeping:
+            async with self._serving_lock:
+                if self._vllm_sleeping:
+                    try:
+                        await self._wake_for_serving_locked()
+                    except BaseException as error:
+                        failures.append(error)
+                        service_name = self._managed_service_name
+                        if service_name is not None:
+                            try:
+                                await self.runtime.stop_model_service(service_name)
+                            except BaseException as stop_error:
+                                failures.append(stop_error)
+                        self._clear_serving_state()
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("failed trainer invalidation failed", failures)
+
+    async def _trainer_metrics(
+        self,
+        job: TrainerJobSpec,
+        events: AsyncIterator[Any],
+    ) -> AsyncIterator[tuple[bool, dict[str, float]]]:
+        snapshot_prepared = False
+        completed = False
+        final_metrics: dict[str, float] | None = None
+        async for event in events:
+            if event.job_id != job.job_id or event.run_id != job.run_id:
+                raise RuntimeError("trainer returned an event for a different job")
+            if isinstance(event, TrainAccepted):
+                continue
+            if isinstance(event, TrainProgress):
+                if event.step_index + 1 == event.num_steps:
+                    final_metrics = dict(event.metrics)
+                    self._record_policy_timestamp(
+                        self._trainer_completion_times, job.learner_version
+                    )
+                else:
+                    yield False, dict(event.metrics)
+                continue
+            if isinstance(event, AdapterReady):
+                if snapshot_prepared:
+                    raise RuntimeError("trainer returned duplicate snapshot events")
+                if (
+                    event.learner_version != job.learner_version
+                    or event.adapter_path != job.output_adapter_path
+                ):
+                    raise RuntimeError("trainer prepared the wrong generation")
+                snapshot_prepared = True
+                continue
+            if isinstance(event, TrainCompleted):
+                if completed or not snapshot_prepared:
+                    raise RuntimeError("trainer completed without one snapshot")
+                if event.learner_version != job.learner_version:
+                    raise RuntimeError("trainer completed the wrong learner")
+                snapshot_metrics = {
+                    name: value
+                    for name, value in event.metrics.items()
+                    if name.startswith("snapshot_")
+                }
+                self._publication_metrics[job.learner_version] = snapshot_metrics
+                self._emitted_publication_metrics[job.learner_version] = set(
+                    snapshot_metrics
+                )
+                final_metrics = dict(event.metrics)
+                completed = True
+                continue
+            if isinstance(event, TrainFailed):
+                raise RuntimeError(
+                    f"distributed Megatron job failed ({event.error_type}): "
+                    f"{event.message}"
+                )
+            if isinstance(event, TrainCancelled):
+                raise asyncio.CancelledError(event.reason)
+        if not snapshot_prepared or not completed or final_metrics is None:
+            raise RuntimeError("trainer ended without preparing a generation")
+        yield True, final_metrics
+
+    async def _prepare_serving_publication(
+        self,
+        trainer: Any,
+        generation_id: str,
+        learner_version: int,
+    ) -> tuple[tuple[Any, ...], MergedWeightTransferSpec | None]:
+        if self._managed_service_name is None:
+            return (), None
+        if self.rollout_weights_mode == "merged":
+            return (), await self._merged_weight_transfer_spec(
+                self._serving_lora_name(learner_version)
+            )
+        manager = self.runtime.model_service(self._managed_service_name)
+        try:
+            targets = await manager.prepare_adapter_transfer(
+                generation_id,
+                get_step_checkpoint_dir(self.output_dir, 0),
+                trainer.runtime_spec.dtype,
+                transport=(
+                    "local" if len(self.runtime.topology.cluster.hosts) == 1 else "nixl"
+                ),
+            )
+            if not targets:
+                raise RuntimeError("model service returned no adapter transfer targets")
+        except BaseException as error:
+            interrupted = await self._release_adapter_transfer(
+                manager, generation_id, error
+            )
+            if interrupted is not None:
+                error.add_note("adapter transfer cleanup observed cancellation")
+            raise
+        self._prepared_adapter_transfers[generation_id] = manager
+        return targets, None
+
+    async def _run_train_job(
+        self,
+        build_job: Callable[[_TrainerJobFields], TrainerJobSpec],
+        start_job: Callable[[Any, TrainerJobSpec], AsyncIterator[Any]],
+        *,
+        lineage_error: str,
+        wait_for_serving: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        async with self._train_lock:
+            async with self._trainer_failure_boundary():
+                if self._temporal_gpu_sharing and self._base_url is not None:
+                    previous = self._serving_futures.get(self._latest_step)
+                    if previous is not None:
+                        await asyncio.shield(previous)
+                    async with self._serving_lock:
+                        await self._sleep_for_training_locked()
+                async with self._mutation_lock:
+                    self._require_open()
+                    self._raise_publication_failure()
+                    trainer, reconcile = await self._ensure_trainer_locked()
+                    source = self._learner_generation
+                    if source is None:
+                        raise RuntimeError("trainer has no source generation")
+                    next_step = self._latest_step + 1
+                    generation_id = new_optimizer_generation(next_step)
+                    output_generation = TrainerGeneration(
+                        training_session_id=self._training_session_id,
+                        policy_step=next_step,
+                        generation_id=generation_id,
+                        adapter_path=get_step_checkpoint_dir(
+                            self.output_dir, next_step
+                        ),
+                    )
+                    (
+                        publication_targets,
+                        merged_transfer,
+                    ) = await self._prepare_serving_publication(
+                        trainer, generation_id, next_step
+                    )
+                    output = DurableTrainOutput(
+                        generation=output_generation,
+                        staging_adapter_path=(
+                            f"{self.output_dir}/megatron_runtime/staging/"
+                            f"{generation_id}"
+                        ),
+                        optimizer_state_path=self._optimizer_state_path,
+                    )
+                    job = build_job(
+                        _TrainerJobFields(
+                            job_id=uuid.uuid4().hex,
+                            run_id=trainer.run_spec.run_id,
+                            training_session_id=self._training_session_id,
+                            expected_learner_version=self._latest_step,
+                            learner_version=next_step,
+                            source=source,
+                            output=output,
+                            publication_targets=publication_targets,
+                            merged_weight_transfer=merged_transfer,
+                        )
+                    )
+
+                if reconcile is not None:
+                    reconcile_step, checkpoint = reconcile
+                    async with self._serving_lock:
+                        await self._reconcile_serving_locked(reconcile_step, checkpoint)
+
+            final_metrics: dict[str, float] | None = None
+            async with self._trainer_transaction(
+                trainer, job, lambda: start_job(trainer, job)
+            ) as events:
+                async for final, metrics in self._trainer_metrics(job, events):
+                    if final:
+                        final_metrics = metrics
+                    else:
+                        yield metrics
+            assert final_metrics is not None
+
+            async with self._trainer_failure_boundary():
+                async with self._mutation_lock:
+                    if self._latest_step != job.expected_learner_version:
+                        raise RuntimeError(lineage_error)
+                    self._latest_step = next_step
+                    self._learner_generation = output_generation
+                    self._trainer_resident_generation = output_generation
+                    self._schedule_publication(
+                        output_generation,
+                        trainer=trainer,
+                        publication_targets=job.publication_targets,
+                    )
+            if wait_for_serving:
+                await self.wait_for_serving(next_step)
+            yield final_metrics
 
     async def train_packed(
         self,
@@ -563,143 +965,51 @@ class DistributedMegatronService:
         config: types.TrainConfig,
         experimental_config: dev.TrainConfig,
     ) -> AsyncIterator[dict[str, float]]:
-        async with self._train_lock:
-            async with self._mutation_lock:
-                self._require_open()
-                self._raise_publication_failure()
-                trainer, reconcile = await self._ensure_trainer_locked()
-                source = self._learner_generation
-                if source is None:
-                    raise RuntimeError("trainer has no source generation")
-                next_step = self._latest_step + 1
-                generation_id = new_optimizer_generation(next_step)
-                final_path = get_step_checkpoint_dir(self.output_dir, next_step)
-                output_generation = TrainerGeneration(
-                    training_session_id=self._training_session_id,
-                    policy_step=next_step,
-                    generation_id=generation_id,
-                    adapter_path=final_path,
-                )
-                publication_targets = ()
-                if (
-                    self._managed_service_name is not None
-                    and self.rollout_weight_update_mode == "in_flight_lora"
-                ):
-                    publication_targets = await self.runtime.model_service(
-                        self._managed_service_name
-                    ).prepare_adapter_transfer(
-                        generation_id,
-                        get_step_checkpoint_dir(self.output_dir, 0),
-                        trainer.runtime_spec.dtype,
-                    )
-                values = {
-                    key: value
-                    for key, value in experimental_config.items()
-                    if key in ExperimentalTrainConfig.model_fields and value is not None
-                }
-                job = TrainJobSpec(
-                    job_id=uuid.uuid4().hex,
-                    run_id=trainer.run_spec.run_id,
-                    training_session_id=self._training_session_id,
-                    expected_learner_version=self._latest_step,
-                    learner_version=next_step,
-                    source=source,
-                    batch=batch.leases.ref,
-                    config=CurrentTrainConfig.model_validate(config.model_dump()),
-                    experimental_config=ExperimentalTrainConfig.model_validate(values),
-                    output=DurableTrainOutput(
-                        generation=output_generation,
-                        staging_adapter_path=(
-                            f"{self.output_dir}/megatron_runtime/staging/"
-                            f"{generation_id}"
-                        ),
-                        optimizer_state_path=self._optimizer_state_path,
-                    ),
-                    publication_targets=publication_targets,
-                )
+        def build_job(fields: _TrainerJobFields) -> TrainerJobSpec:
+            values = {
+                key: value
+                for key, value in experimental_config.items()
+                if key in ExperimentalTrainConfig.model_fields and value is not None
+            }
+            return TrainJobSpec(
+                **fields,
+                batch=batch.leases.ref,
+                config=CurrentTrainConfig.model_validate(config.model_dump()),
+                experimental_config=ExperimentalTrainConfig.model_validate(values),
+            )
 
-            if reconcile is not None:
-                reconcile_step, checkpoint = reconcile
-                async with self._serving_lock:
-                    await self._reconcile_serving_locked(reconcile_step, checkpoint)
-
-            snapshot_prepared = False
-            completed = False
-            final_metrics: dict[str, float] | None = None
-            async with self._trainer_transaction(trainer, job, batch.leases) as events:
-                async for event in events:
-                    if event.job_id != job.job_id or event.run_id != job.run_id:
-                        raise RuntimeError(
-                            "trainer returned an event for a different job"
-                        )
-                    if isinstance(event, TrainAccepted):
-                        continue
-                    if isinstance(event, TrainProgress):
-                        if event.step_index + 1 == event.num_steps:
-                            final_metrics = dict(event.metrics)
-                        else:
-                            yield event.metrics
-                        continue
-                    if isinstance(event, AdapterReady):
-                        if snapshot_prepared:
-                            raise RuntimeError(
-                                "trainer returned duplicate snapshot events"
-                            )
-                        if (
-                            event.learner_version != next_step
-                            or event.adapter_path != final_path
-                        ):
-                            raise RuntimeError("trainer prepared the wrong generation")
-                        snapshot_prepared = True
-                        continue
-                    if isinstance(event, TrainCompleted):
-                        if completed or not snapshot_prepared:
-                            raise RuntimeError("trainer completed without one snapshot")
-                        if event.learner_version != next_step:
-                            raise RuntimeError("trainer completed the wrong learner")
-                        snapshot_metrics = {
-                            name: value
-                            for name, value in event.metrics.items()
-                            if name.startswith("snapshot_")
-                        }
-                        self._publication_metrics[next_step] = snapshot_metrics
-                        self._emitted_publication_metrics[next_step] = set(
-                            snapshot_metrics
-                        )
-                        final_metrics = dict(event.metrics)
-                        completed = True
-                        continue
-                    if isinstance(event, TrainFailed):
-                        raise RuntimeError(
-                            f"distributed Megatron job failed ({event.error_type}): "
-                            f"{event.message}"
-                        )
-                    if isinstance(event, TrainCancelled):
-                        raise asyncio.CancelledError(event.reason)
-            if not snapshot_prepared or not completed or final_metrics is None:
-                raise RuntimeError("trainer ended without preparing a generation")
-
-            async with self._mutation_lock:
-                if self._latest_step != job.expected_learner_version:
-                    raise RuntimeError("learner lineage changed during training")
-                self._latest_step = next_step
-                self._learner_generation = output_generation
-                self._trainer_resident_generation = output_generation
-                self._schedule_publication(
-                    output_generation,
-                    publication_targets=job.publication_targets,
-                )
-            yield final_metrics
+        async for metrics in self._run_train_job(
+            build_job,
+            lambda trainer, job: trainer.train(job, batch.leases),
+            lineage_error="learner lineage changed during training",
+        ):
+            yield metrics
 
     def _schedule_publication(
         self,
         generation: TrainerGeneration,
         *,
+        trainer: Any = None,
+        durable: DurableTrainerPublication | None = None,
         publication_targets: tuple[Any, ...] = (),
     ) -> None:
+        if (trainer is None) == (durable is None):
+            raise ValueError(
+                "publication requires exactly one trainer stream or durable result"
+            )
         step = generation.policy_step
         if step in self._publication_tasks:
             raise RuntimeError(f"generation publication already exists for step {step}")
+        transfer_manager = self._prepared_adapter_transfers.get(
+            generation.generation_id
+        )
+        if publication_targets and transfer_manager is None:
+            raise RuntimeError("adapter transfer publication is not prepared")
+        publication_waiter = (
+            trainer.wait_for_publication(generation.generation_id)
+            if trainer is not None
+            else None
+        )
         loop = asyncio.get_running_loop()
         previous = self._serving_futures.get(step - 1)
         if previous is None:
@@ -711,49 +1021,121 @@ class DistributedMegatronService:
         serving.add_done_callback(
             lambda done: _retire_completed(self._serving_futures, step, done)
         )
+        previous_publication = self._publication_tasks.get(step - 1)
         publication = (
             self._publish_generation(
                 generation,
+                durable=durable,
+                publication_waiter=publication_waiter,
+                previous_publication=previous_publication,
                 publication_targets=publication_targets,
+                transfer_manager=transfer_manager,
                 previous_serving=previous,
                 serving=serving,
             )
             if publication_targets
             else self._publish_generation(
                 generation,
+                durable=durable,
+                publication_waiter=publication_waiter,
+                previous_publication=previous_publication,
                 previous_serving=previous,
                 serving=serving,
             )
         )
         task = asyncio.create_task(publication)
         self._publication_tasks[step] = task
+        self._prepared_adapter_transfers.pop(generation.generation_id, None)
         task.add_done_callback(_consume_task_result)
         task.add_done_callback(
             lambda done: _retire_completed(self._publication_tasks, step, done)
         )
 
+    async def _resolve_durable_publication(
+        self,
+        generation: TrainerGeneration,
+        *,
+        durable: DurableTrainerPublication | None,
+        publication_waiter: Awaitable[tuple[TrainerRankPublication, ...]] | None,
+        previous_publication: asyncio.Task[None] | None,
+    ) -> tuple[DurableTrainerPublication, float]:
+        started = time.monotonic()
+        records = (
+            asyncio.ensure_future(publication_waiter)
+            if publication_waiter is not None
+            else None
+        )
+        if records is not None:
+            records.add_done_callback(_consume_task_result)
+        try:
+            if previous_publication is not None:
+                await asyncio.shield(previous_publication)
+            if records is not None:
+                rank_publications = await asyncio.shield(records)
+                async with self._durability_lock:
+                    durable = await asyncio.to_thread(
+                        commit_trainer_publication,
+                        self._optimizer_state_path,
+                        generation,
+                        rank_publications,
+                    )
+        finally:
+            if records is not None and not records.done():
+                records.cancel()
+        return cast(DurableTrainerPublication, durable), time.monotonic() - started
+
     async def _publish_generation(
         self,
         generation: TrainerGeneration,
         *,
+        durable: DurableTrainerPublication | None,
+        publication_waiter: Awaitable[tuple[TrainerRankPublication, ...]] | None,
+        previous_publication: asyncio.Task[None] | None,
         publication_targets: tuple[Any, ...] = (),
+        transfer_manager: Any = None,
         previous_serving: asyncio.Future[None],
         serving: asyncio.Future[None],
     ) -> None:
         metrics = self._publication_metrics.setdefault(generation.policy_step, {})
+        manager = transfer_manager
+        transfer_released = manager is None
+        durable_task = asyncio.create_task(
+            self._resolve_durable_publication(
+                generation,
+                durable=durable,
+                publication_waiter=publication_waiter,
+                previous_publication=previous_publication,
+            )
+        )
+        self._durability_tasks.add(durable_task)
+        durable_task.add_done_callback(_consume_task_result)
+        durable_task.add_done_callback(self._durability_tasks.discard)
         try:
             materialization_started = time.monotonic()
-            manager = (
-                self.runtime.model_service(self._managed_service_name)
-                if publication_targets and self._managed_service_name is not None
-                else None
-            )
-            if manager is None:
-                adapter = await asyncio.to_thread(
-                    _wait_for_adapter_generation,
-                    self._optimizer_state_path,
-                    generation,
+            if self.rollout_weights_mode == "merged":
+                await previous_serving
+                self._raise_publication_failure()
+                activation_started = time.monotonic()
+                async with self._serving_lock:
+                    await self._register_lora_for_step_locked(
+                        generation.policy_step,
+                        generation.adapter_path,
+                        generation_id=generation.generation_id,
+                    )
+                metrics["serving_activation_s"] = time.monotonic() - activation_started
+                if not serving.done():
+                    serving.set_result(None)
+                durable_result, _ = await asyncio.shield(durable_task)
+                adapter = durable_result.adapter
+                checkpoint = generation.adapter_path
+                metrics["adapter_materialization_s"] = (
+                    time.monotonic() - materialization_started
                 )
+                async with self._mutation_lock:
+                    self._published_adapters[generation.policy_step] = adapter
+            elif manager is None:
+                durable_result, _ = await asyncio.shield(durable_task)
+                adapter = durable_result.adapter
                 checkpoint = generation.adapter_path
                 metrics["adapter_materialization_s"] = (
                     time.monotonic() - materialization_started
@@ -814,58 +1196,65 @@ class DistributedMegatronService:
                 metrics["adapter_transport_capacity_utilization"] = sum(
                     result.used_bytes for result in received
                 ) / sum(result.capacity_bytes for result in received)
-            await previous_serving
-            self._raise_publication_failure()
-            activation_started = time.monotonic()
-            async with self._mutation_lock:
-                self._published_adapters[generation.policy_step] = adapter
-            async with self._serving_lock:
-                try:
+            if self.rollout_weights_mode != "merged":
+                await previous_serving
+                self._raise_publication_failure()
+                activation_started = time.monotonic()
+                async with self._mutation_lock:
+                    self._published_adapters[generation.policy_step] = adapter
+                async with self._serving_lock:
                     await self._register_lora_for_step_locked(
                         generation.policy_step,
                         checkpoint,
                     )
-                finally:
-                    if manager is not None:
-                        await manager.release_adapter_transfer(generation.generation_id)
-            metrics["serving_activation_s"] = time.monotonic() - activation_started
-            if not serving.done():
-                serving.set_result(None)
+                metrics["serving_activation_s"] = time.monotonic() - activation_started
+                if manager is None and not serving.done():
+                    serving.set_result(None)
+            if manager is not None:
+                interrupted = await self._release_adapter_transfer(
+                    manager, generation.generation_id
+                )
+                transfer_released = True
+                if interrupted is not None:
+                    raise interrupted
+                if not serving.done():
+                    serving.set_result(None)
 
-            durable_started = time.monotonic()
-            durable_step, optimizer_step = await asyncio.to_thread(
-                _wait_for_durable_generation,
-                self._optimizer_state_path,
-                generation,
-            )
-            durable_adapter = await asyncio.to_thread(
-                _wait_for_adapter_generation,
-                self._optimizer_state_path,
-                generation,
-            )
-            if durable_adapter != adapter:
+            durable_result, durable_s = await asyncio.shield(durable_task)
+            if durable_result.adapter != adapter:
                 raise RuntimeError("Durable and serving adapter manifests differ")
             async with self._mutation_lock:
-                self._durable_step = max(self._durable_step, durable_step)
+                self._durable_step = max(self._durable_step, durable_result.resume_step)
                 self._durable_optimizer_step = max(
-                    self._durable_optimizer_step, optimizer_step
+                    self._durable_optimizer_step, durable_result.optimizer_step
                 )
-                metrics["durable_checkpoint_s"] = time.monotonic() - durable_started
+                metrics["durable_checkpoint_s"] = durable_s
                 metrics["durable_checkpoint_lag_steps"] = float(
                     self._latest_step - self._durable_optimizer_step
                 )
             logger.info(
                 "Published trainer generation session=%s step=%d generation=%s "
-                "prepare=%.3fs activate=%.3fs durable=%.3fs durable_lag=%d",
+                "launch=%.3fs activate=%.3fs durable=%.3fs durable_lag=%d",
                 generation.training_session_id,
                 generation.policy_step,
                 generation.generation_id,
-                metrics.get("snapshot_prepare_s", 0.0),
+                metrics["snapshot_launch_s"],
                 metrics["serving_activation_s"],
                 metrics["durable_checkpoint_s"],
                 self._latest_step - self._durable_optimizer_step,
             )
         except BaseException as error:
+            if manager is not None and not transfer_released:
+                try:
+                    interrupted = await self._release_adapter_transfer(
+                        manager, generation.generation_id, error
+                    )
+                except BaseException as cleanup_error:
+                    error = cleanup_error
+                else:
+                    transfer_released = True
+                    if interrupted is not None:
+                        error.add_note("adapter transfer cleanup observed cancellation")
             if not serving.done():
                 serving.set_exception(error)
             self._publication_failure = error
@@ -885,7 +1274,7 @@ class DistributedMegatronService:
                     "generation publication and serving teardown failed",
                     [error, *cleanup],
                 ) from None
-            raise
+            raise error
 
     def _raise_publication_failure(self) -> None:
         if self._publication_failure is not None:
@@ -937,6 +1326,10 @@ class DistributedMegatronService:
         api_key = self._api_key(config)
         external = get_external_vllm_runtime_config(self.config)
         if external is not None:
+            if self.rollout_weights_mode != "lora":
+                raise RuntimeError(
+                    "External vLLM runtime requires LoRA rollout weights"
+                )
             base_url = normalize_vllm_server_url(external.server_url)
             headers = _headers(external.api_key)
             await wait_for_vllm_http_runtime(
@@ -966,24 +1359,23 @@ class DistributedMegatronService:
             )
             return _host_port(base_url)
 
-        services = tuple(
-            service
-            for service in self.runtime.topology.model_services
-            if service.name == self.model_name
-        )
-        if len(services) != 1:
-            raise ValueError(
-                f"runtime topology must define one model service named "
-                f"{self.model_name!r}"
+        service = self._model_service_spec()
+        server_args = dict((config or {}).get("server_args", {}))
+        if "port" in server_args:
+            from .runtime.local import with_local_serving_port
+
+            self.runtime.topology = with_local_serving_port(
+                self.runtime.topology,
+                model_name=self.model_name,
+                port=cast(int, server_args["port"]),
             )
-        service = services[0]
-        if self.rollout_weights_mode != "lora":
-            raise RuntimeError(
-                "distributed Megatron currently requires LoRA rollout serving"
-            )
+            service = self._model_service_spec()
         template = ReplicaLaunchTemplate(
             served_model_name=self._serving_lora_name(step),
             lora_path=lora_path,
+            initial_policy_version=(
+                step if self.rollout_weights_mode == "lora" else None
+            ),
             engine_args=self._engine_args(config),
             server_args=self._server_args(config),
         )
@@ -997,6 +1389,10 @@ class DistributedMegatronService:
                 headers=_headers(api_key),
                 allow_openai_compatible=False,
             )
+            if self.rollout_weights_mode == "merged":
+                await self._sync_merged_serving_source_locked(
+                    step=step, base_url=base_url, api_key=api_key
+                )
             generation_id = self._generation_id_for_step(step)
             update_identity = uuid.uuid4().hex
             manager = self.runtime.model_service(service.name)
@@ -1044,7 +1440,51 @@ class DistributedMegatronService:
         self._api_key_value = api_key
         self._current_lora_name = current_lora_name
         self._serving_step = serving_step
-        self._loaded_adapter_steps.add(serving_step)
+        if self.rollout_weights_mode == "lora":
+            self._loaded_adapter_steps.add(serving_step)
+
+    async def _sync_merged_serving_source_locked(
+        self,
+        *,
+        step: int,
+        base_url: str,
+        api_key: str | None,
+    ) -> None:
+        if step == 0:
+            return
+        temporal_sharing = self._temporal_gpu_sharing
+        if temporal_sharing:
+            await self._sleep_vllm_at(base_url, api_key)
+            self._vllm_sleeping = True
+        try:
+            async with self._mutation_lock:
+                trainer, _ = await self._ensure_trainer_locked()
+                generation = self._learner_generation
+                if generation is None or generation.policy_step != step:
+                    raise RuntimeError(
+                        "merged serving source is not the active learner"
+                    )
+            transfer = await self._merged_weight_transfer_spec(
+                self._serving_lora_name(step),
+                base_url=base_url,
+                api_key=api_key,
+            )
+            metrics = await trainer.sync_merged(generation, transfer)
+            self._publication_metrics.setdefault(step, {}).update(metrics)
+        except BaseException as error:
+            if temporal_sharing:
+                try:
+                    await self._wake_vllm_at(base_url, api_key)
+                except BaseException as wake_error:
+                    raise BaseExceptionGroup(
+                        "merged sync and vLLM wake failed", [error, wake_error]
+                    ) from None
+                finally:
+                    self._vllm_sleeping = False
+            raise
+        if temporal_sharing:
+            await self._wake_vllm_at(base_url, api_key)
+            self._vllm_sleeping = False
 
     def _clear_serving_state(self) -> None:
         self._managed_service_name = None
@@ -1058,6 +1498,8 @@ class DistributedMegatronService:
         self._loaded_adapter_steps.clear()
         self._loaded_exact_adapter_steps.clear()
         self._exact_adapter_refcounts.clear()
+        self._vllm_sleeping = False
+        self._merged_transfer_init = None
 
     async def _replica_failed(self, failure: ReplicaFailure) -> None:
         if self._closed or failure.replica_id != self._managed_service_name:
@@ -1068,28 +1510,29 @@ class DistributedMegatronService:
         task.add_done_callback(_consume_task_result)
 
     async def _recover_failed_replica(self, failure: ReplicaFailure) -> None:
-        async with self._serving_lock:
-            try:
-                if self._closed or failure.replica_id != self._managed_service_name:
-                    return
-                manager = self.runtime.model_service(failure.replica_id)
-                state = manager.state
-                if (
-                    state.generation != failure.generation
-                    or state.generation_digest != failure.generation_digest
-                    or state.phase != "quarantined"
-                ):
-                    return
-                await self._recover_replica_locked(failure)
-            except asyncio.CancelledError:
-                raise
-            except BaseException:
-                self._unpublish_serving_state()
-                logger.exception(
-                    "vLLM replica %s generation %d recovery failed",
-                    failure.replica_id,
-                    failure.generation,
-                )
+        async with self._train_lock:
+            async with self._serving_lock:
+                try:
+                    if self._closed or failure.replica_id != self._managed_service_name:
+                        return
+                    manager = self.runtime.model_service(failure.replica_id)
+                    state = manager.state
+                    if (
+                        state.generation != failure.generation
+                        or state.generation_digest != failure.generation_digest
+                        or state.phase != "quarantined"
+                    ):
+                        return
+                    await self._recover_replica_locked(failure)
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    self._unpublish_serving_state()
+                    logger.exception(
+                        "vLLM replica %s generation %d recovery failed",
+                        failure.replica_id,
+                        failure.generation,
+                    )
 
     async def _recover_replica_locked(self, failure: ReplicaFailure) -> None:
         service = self._model_service_spec()
@@ -1110,8 +1553,13 @@ class DistributedMegatronService:
         exact_steps = tuple(sorted(self._loaded_exact_adapter_steps))
         try:
             state = await manager.restart(
-                served_model_name=bootstrap_name, lora_path=checkpoint
+                served_model_name=bootstrap_name,
+                lora_path=checkpoint,
+                initial_policy_version=(
+                    serving_step if self.rollout_weights_mode == "lora" else None
+                ),
             )
+            self._vllm_sleeping = False
             capability = await discover_serving_capabilities(
                 base_url=base_url,
                 headers=_headers(self._api_key()),
@@ -1119,11 +1567,20 @@ class DistributedMegatronService:
             )
             if capability != self._serving_capabilities:
                 raise RuntimeError("restarted vLLM replica capabilities changed")
+            if self.rollout_weights_mode == "merged":
+                self._merged_transfer_init = None
+                await self._sync_merged_serving_source_locked(
+                    step=serving_step,
+                    base_url=base_url,
+                    api_key=self._api_key(),
+                )
             update_identity = uuid.uuid4().hex
             manager.prepare_update(update_identity=update_identity)
             lora_name = bootstrap_name
-            lora_path = checkpoint
-            if current_lora_name != bootstrap_name:
+            if (
+                self.rollout_weights_mode == "lora"
+                and current_lora_name != bootstrap_name
+            ):
                 lora_name, lora_path = await self._load_adapter_at(
                     checkpoint,
                     serving_step,
@@ -1141,24 +1598,32 @@ class DistributedMegatronService:
             )
             if manager.verify_update(report).phase != "ready":
                 raise RuntimeError("restarted vLLM replica rejected current policy")
-            if current_lora_name != bootstrap_name:
+            if (
+                self.rollout_weights_mode == "lora"
+                and current_lora_name != bootstrap_name
+            ):
                 await self._unload_adapter_at(bootstrap_name, base_url)
-            for step in exact_steps:
-                if step == serving_step and self.rollout_weight_update_mode != (
-                    "in_flight_lora"
-                ):
-                    continue
-                exact_name, exact_path = await self._load_adapter_at(
-                    get_step_checkpoint_dir(self.output_dir, step),
-                    step,
-                    exact=True,
-                    base_url=base_url,
-                    api_key=self._api_key(),
-                    active_step=serving_step,
-                )
+            if self.rollout_weights_mode == "lora":
+                for step in exact_steps:
+                    if step == serving_step and self.rollout_weight_update_mode != (
+                        "in_flight_lora"
+                    ):
+                        continue
+                    await self._load_adapter_at(
+                        get_step_checkpoint_dir(self.output_dir, step),
+                        step,
+                        exact=True,
+                        base_url=base_url,
+                        api_key=self._api_key(),
+                        active_step=serving_step,
+                    )
             self._current_lora_name = lora_name
-            self._loaded_adapter_steps = {serving_step}
-            self._loaded_exact_adapter_steps = set(exact_steps)
+            self._loaded_adapter_steps = (
+                {serving_step} if self.rollout_weights_mode == "lora" else set()
+            )
+            self._loaded_exact_adapter_steps = (
+                set(exact_steps) if self.rollout_weights_mode == "lora" else set()
+            )
         except BaseException as error:
             manager.quarantine(f"replica recovery failed: {error}")
             try:
@@ -1209,11 +1674,18 @@ class DistributedMegatronService:
         )
         values = dict(self.config.get("engine_args", {}))
         values.update(dict((server or {}).get("engine_args", {})))
-        for key, value in handler.vllm_engine_args(rollout_weights_mode="lora").items():
+        for key, value in handler.vllm_engine_args(
+            rollout_weights_mode=self.rollout_weights_mode
+        ).items():
             values.setdefault(key, value)
-        values["enable_sleep_mode"] = False
-        values.pop("enable_lora", None)
-        values.setdefault("max_loras", 2)
+        values["enable_sleep_mode"] = self._temporal_gpu_sharing
+        if self.rollout_weights_mode == "merged":
+            values["weight_transfer_config"] = {"backend": "nccl"}
+            values.pop("enable_lora", None)
+            values.pop("max_loras", None)
+        else:
+            values["enable_lora"] = True
+            values.setdefault("max_loras", 2)
         values.setdefault("generation_config", "vllm")
         for key in ("model", "served_model_name"):
             values.pop(key, None)
@@ -1237,7 +1709,82 @@ class DistributedMegatronService:
 
     def _api_key(self, server: dev.OpenAIServerConfig | None = None) -> str | None:
         value = dict((server or {}).get("server_args", {})).get("api_key")
-        return cast(str | None, value) if value is not None else self._api_key_value
+        external = get_external_vllm_runtime_config(self.config)
+        if external is not None:
+            if value is not None and value != external.api_key:
+                raise ValueError(
+                    "OpenAI server api_key conflicts with external vLLM credentials"
+                )
+            return external.api_key
+        if value is not None:
+            return cast(str, value)
+        return self._api_key_value
+
+    async def _sleep_for_training_locked(self) -> None:
+        if not self._temporal_gpu_sharing or self._base_url is None:
+            return
+        if self._vllm_sleeping:
+            return
+        self._vllm_sleeping = True
+        await self._sleep_vllm_at(self._base_url, self._api_key())
+
+    async def _wake_for_serving_locked(self) -> None:
+        if not self._vllm_sleeping or self._base_url is None:
+            return
+        await self._wake_vllm_at(self._base_url, self._api_key())
+        self._vllm_sleeping = False
+
+    @staticmethod
+    async def _sleep_vllm_at(base_url: str, api_key: str | None) -> None:
+        response = await _post_vllm(
+            f"{base_url}/sleep",
+            api_key=api_key,
+            params={"level": 1, "mode": "wait"},
+            timeout_s=300.0,
+        )
+        response.raise_for_status()
+
+    @staticmethod
+    async def _wake_vllm_at(base_url: str, api_key: str | None) -> None:
+        response = await _post_vllm(
+            f"{base_url}/wake_up", api_key=api_key, timeout_s=300.0
+        )
+        response.raise_for_status()
+
+    async def _merged_weight_transfer_spec(
+        self,
+        served_model_name: str,
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> MergedWeightTransferSpec:
+        target_url = base_url or self._base_url
+        if target_url is None:
+            raise RuntimeError("merged serving has not started")
+        target_api_key = api_key if base_url is not None else self._api_key()
+        service = self._model_service_spec()
+        if len(service.members) != 1:
+            raise NotImplementedError("merged updates currently require one vLLM host")
+        if self._merged_transfer_init is None:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    f"{target_url}/get_world_size",
+                    headers=_headers(target_api_key),
+                )
+            response.raise_for_status()
+            self._merged_transfer_init = MergedWeightTransferInitInfo(
+                master_address="127.0.0.1",
+                master_port=_free_port(),
+                rank_offset=1,
+                world_size=int(response.json()["world_size"]) + 1,
+            )
+        return MergedWeightTransferSpec(
+            init_info=self._merged_transfer_init,
+            vllm_base_url=target_url,
+            served_model_name=served_model_name,
+            api_key=target_api_key,
+            nccl_so_path=str(get_vllm_runtime_nccl_so_path()),
+        )
 
     async def _load_adapter(
         self, checkpoint: str, step: int, *, exact: bool = False
@@ -1350,15 +1897,17 @@ class DistributedMegatronService:
                     raise ValueError("a no-op policy transition must advance one step")
                 trainer = self._trainer if self._trainer_is_current() else None
                 previous = self._publication_tasks.get(expected_step)
-            if trainer is not None:
-                await self.wait_for_serving(expected_step)
-            elif previous is not None:
-                await previous
-
-            async with self._mutation_lock:
                 source = self._learner_generation
                 if source is None or source.policy_step != expected_step:
                     raise RuntimeError("no-op transition has no immutable source")
+            if previous is not None:
+                await asyncio.shield(previous)
+            source_adapter = self._published_adapters.get(expected_step)
+            if source_adapter is None:
+                raise RuntimeError("no-op source generation is not durably published")
+
+            async with self._mutation_lock:
+                self._published_adapters[expected_step] = source_adapter
                 generation = TrainerGeneration(
                     training_session_id=self._training_session_id,
                     policy_step=learner_version,
@@ -1367,57 +1916,84 @@ class DistributedMegatronService:
                         self.output_dir, learner_version
                     ),
                 )
-            prepare_started = time.monotonic()
-            published = await asyncio.to_thread(
-                _publish_adapter_alias,
-                self._published_adapters[expected_step],
-                generation,
-                f"{self.output_dir}/megatron_runtime/staging/"
-                f"{generation.generation_id}",
-            )
-            snapshot_metrics = {
-                "snapshot_prepare_s": time.monotonic() - prepare_started
-            }
-            self._published_adapters[learner_version] = published
-            if trainer is None:
-                await asyncio.to_thread(
-                    commit_optimizer_policy_advance,
-                    self._optimizer_state_path,
-                    initial_adapter_path=get_step_checkpoint_dir(self.output_dir, 0),
-                    expected_step=expected_step,
-                    adapter=published,
-                )
-                await asyncio.to_thread(
-                    _write_generation_complete,
-                    self._optimizer_state_path,
-                    generation,
-                )
-            else:
-                snapshot_metrics.update(
-                    await trainer.advance_without_training(
-                        expected_learner_version=expected_step,
-                        learner_version=learner_version,
-                        optimizer_state_path=self._optimizer_state_path,
-                        adapter=published,
+            snapshot_metrics: dict[str, float] = {}
+            if trainer is not None:
+                try:
+                    snapshot_metrics.update(
+                        await trainer.advance_without_training(
+                            expected_learner_version=expected_step,
+                            learner_version=learner_version,
+                            optimizer_state_path=self._optimizer_state_path,
+                            adapter=None,
+                        )
                     )
-                )
+                except BaseException as error:
+                    await self._cleanup_failed_trainer_transaction(trainer, None, error)
+                    raise
 
-            async with self._mutation_lock:
-                self._latest_step = learner_version
-                self._learner_generation = generation
-                self._trainer_resident_generation = (
-                    generation if trainer is not None else None
+            async def commit() -> None:
+                prepare_started = time.monotonic()
+                published = await asyncio.to_thread(
+                    _commit_adapter_alias,
+                    self._optimizer_state_path,
+                    self.output_dir,
+                    expected_step,
+                    source_adapter,
+                    generation,
+                    f"{self.output_dir}/megatron_runtime/staging/"
+                    f"{generation.generation_id}",
                 )
-                self._publication_metrics[learner_version] = snapshot_metrics
-                self._schedule_publication(generation)
+                snapshot_metrics["snapshot_launch_s"] = (
+                    time.monotonic() - prepare_started
+                )
+                async with self._mutation_lock:
+                    if self._latest_step != expected_step:
+                        raise RuntimeError(
+                            "learner lineage changed during no-op commit"
+                        )
+                    self._published_adapters[learner_version] = published
+                    self._latest_step = learner_version
+                    self._learner_generation = generation
+                    self._trainer_resident_generation = (
+                        generation if trainer is not None else None
+                    )
+                    self._publication_metrics[learner_version] = snapshot_metrics
+                    pointer = read_committed_optimizer_pointer(
+                        self._optimizer_state_path
+                    )
+                    self._schedule_publication(
+                        generation,
+                        durable=DurableTrainerPublication(
+                            adapter=published,
+                            resume_step=learner_version,
+                            optimizer_step=0 if pointer is None else pointer.step,
+                        ),
+                    )
+
+            try:
+                _, cancelled = await complete_task(asyncio.create_task(commit()))
+            except BaseException as error:
+                if trainer is not None:
+                    await self._cleanup_failed_trainer_transaction(trainer, None, error)
+                raise
             metrics.update(self.drain_publication_metrics())
+            if cancelled is not None:
+                raise cancelled
             return metrics
 
-    async def _register_lora_for_step_locked(self, step: int, checkpoint: str) -> None:
+    async def _register_lora_for_step_locked(
+        self,
+        step: int,
+        checkpoint: str,
+        *,
+        generation_id: str | None = None,
+    ) -> None:
         if self._base_url is None:
             self._serving_step = step
+            self._record_serving_activation(step)
             return
-        generation_id = self._generation_id_for_step(step)
+        await self._wake_for_serving_locked()
+        generation_id = generation_id or self._generation_id_for_step(step)
         update_identity = uuid.uuid4().hex
         manager = (
             self.runtime.model_service(self._managed_service_name)
@@ -1430,7 +2006,16 @@ class DistributedMegatronService:
                 if manager is not None
                 else None
             )
-            lora_name, _lora_path = await self._load_adapter(checkpoint, step)
+            lora_name = self._serving_lora_name(step)
+            if self.rollout_weights_mode == "lora":
+                lora_name, _lora_path = await self._load_adapter(checkpoint, step)
+            else:
+                response = await _post_vllm(
+                    f"{self._base_url}/art/set_served_model_name",
+                    api_key=self._api_key(),
+                    json={"name": lora_name},
+                )
+                response.raise_for_status()
             if manager is not None and state is not None:
                 report = ReplicaUpdateReport(
                     replica_id=manager.spec.name,
@@ -1441,7 +2026,7 @@ class DistributedMegatronService:
                     update_identity=update_identity,
                 )
                 if manager.verify_update(report).phase != "ready":
-                    raise RuntimeError("model service rejected its LoRA update")
+                    raise RuntimeError("model service rejected its policy update")
         except BaseException as error:
             if manager is not None:
                 manager.quarantine("partial or failed LoRA update")
@@ -1453,13 +2038,17 @@ class DistributedMegatronService:
                 self._clear_serving_state()
             if cleanup:
                 raise BaseExceptionGroup(
-                    "LoRA publication and serving rollback failed", [error, *cleanup]
+                    "policy publication and serving rollback failed", [error, *cleanup]
                 ) from None
             raise
-        if self.rollout_weight_update_mode != "in_flight_lora":
+        if (
+            self.rollout_weights_mode == "lora"
+            and self.rollout_weight_update_mode != "in_flight_lora"
+        ):
             self._loaded_adapter_steps.add(step)
         self._current_lora_name = lora_name
         self._serving_step = step
+        self._record_serving_activation(step)
 
     def _generation_id_for_step(self, step: int) -> str:
         published = self._published_adapters.get(step)
@@ -1469,8 +2058,20 @@ class DistributedMegatronService:
 
     async def acquire_exact_adapter(self, step: int, checkpoint: str) -> str:
         self._require_open()
+        if self.rollout_weights_mode != "lora":
+            raise RuntimeError("Exact checkpoint eval requires LoRA rollout serving")
         async with self._mutation_lock:
             published = step in self._published_adapters
+            generation = self._learner_generation
+            materialization = (
+                self.checkpoint_materialization(step)
+                if self.rollout_weight_update_mode == "in_flight_lora"
+                and generation is not None
+                and generation.policy_step == step
+                else None
+            )
+        if materialization is not None:
+            await asyncio.shield(materialization)
         if not published:
             adapter = await asyncio.to_thread(
                 read_adapter_publication,
@@ -1518,18 +2119,29 @@ class DistributedMegatronService:
             self._require_open()
             count = self._exact_adapter_refcounts.get(step, 0)
             if count <= 1:
-                self._exact_adapter_refcounts.pop(step, None)
                 if self.rollout_weight_update_mode == "in_flight_lora":
                     await self._unload_adapter(f"{self.model_name}:eval@{step}")
+                self._exact_adapter_refcounts.pop(step, None)
                 self._loaded_exact_adapter_steps.discard(step)
             else:
                 self._exact_adapter_refcounts[step] = count - 1
 
     async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
-        if self.rollout_weight_update_mode == "in_flight_lora":
+        if self.rollout_weights_mode != "lora":
             return
         async with self._serving_lock:
             self._require_open()
+            for step in sorted(self._loaded_exact_adapter_steps - retain_steps):
+                if self._exact_adapter_refcounts.get(step, 0) == 0:
+                    name = (
+                        f"{self.model_name}:eval@{step}"
+                        if self.rollout_weight_update_mode == "in_flight_lora"
+                        else f"{self.model_name}@{step}"
+                    )
+                    await self._unload_adapter(name)
+                    self._loaded_exact_adapter_steps.discard(step)
+            if self.rollout_weight_update_mode == "in_flight_lora":
+                return
             for step in sorted(
                 self._loaded_adapter_steps - retain_steps - {self._serving_step}
             ):
@@ -1538,11 +2150,15 @@ class DistributedMegatronService:
 
     @asynccontextmanager
     async def checkpoint_retention_lease(self) -> AsyncIterator[frozenset[int]]:
-        async with self._mutation_lock:
+        # Disk pruning keeps mutation, not serving, held after ordered acquisition.
+        async with self._serving_lock:
+            await self._mutation_lock.acquire()
+        try:
             self._require_open()
-            async with self._serving_lock:
-                protected = frozenset((self._latest_step, self._serving_step))
+            protected = frozenset((self._latest_step, self._serving_step))
             yield protected
+        finally:
+            self._mutation_lock.release()
 
     async def _unload_adapter(self, name: str) -> None:
         if self._base_url is None:
@@ -1565,9 +2181,47 @@ class DistributedMegatronService:
         return self._serving_capabilities
 
     async def vllm_engine_is_sleeping(self) -> bool:
-        return False
+        return self._vllm_sleeping
+
+    async def train_sft(
+        self, batches: list[Any], config: Any, verbose: bool = False
+    ) -> AsyncIterator[dict[str, float]]:
+        del verbose
+        payload = tuple(
+            SFTBatchData(
+                trajectory_tensors=tuple(batch.trajectory_tensors),
+                learning_rate=float(batch.learning_rate),
+                num_trajectories=int(batch.num_trajectories),
+                num_tokens=int(batch.num_tokens),
+                num_trainable_tokens=int(batch.num_trainable_tokens),
+            )
+            for batch in batches
+        )
+        if not payload:
+            return
+
+        def build_job(fields: _TrainerJobFields) -> TrainerJobSpec:
+            return SFTJobSpec(
+                **fields,
+                batch_id=uuid.uuid4().hex,
+                num_batches=len(payload),
+                config=CurrentSFTConfig.model_validate(config.model_dump()),
+            )
+
+        async for metrics in self._run_train_job(
+            build_job,
+            lambda trainer, job: trainer.train_sft(job, payload),
+            lineage_error="learner lineage changed during SFT",
+            wait_for_serving=True,
+        ):
+            yield metrics
 
     async def aclose(self) -> None:
+        if self._close_task is not None and self._close_task.done():
+            try:
+                self._close_task.result()
+            except BaseException:
+                self._close_task = None
         if self._close_task is None:
             self._closed = True
             self._close_task = asyncio.create_task(self._close())
@@ -1578,16 +2232,7 @@ class DistributedMegatronService:
         async with self._train_lock:
             failures: list[BaseException] = []
             publications = tuple(self._publication_tasks.values())
-            if publications:
-                results = await asyncio.gather(*publications, return_exceptions=True)
-                publication_failures = [
-                    result for result in results if isinstance(result, BaseException)
-                ]
-                failures.extend(publication_failures)
-            else:
-                publication_failures = []
-            if self._publication_failure is not None and not publication_failures:
-                failures.append(self._publication_failure)
+            durability_tasks = tuple(self._durability_tasks)
             recovery_tasks = tuple(self._recovery_tasks)
             for task in recovery_tasks:
                 task.cancel()
@@ -1596,28 +2241,83 @@ class DistributedMegatronService:
             self._recovery_tasks.clear()
             async with self._mutation_lock:
                 trainer = self._trainer
-                self._trainer = None
+            shutdown = [*publications, *durability_tasks]
+            trainer_task = None
+            if trainer is not None:
+                trainer_task = asyncio.create_task(self.runtime.stop_trainer(trainer))
+                shutdown.append(trainer_task)
+            results = await asyncio.gather(*shutdown, return_exceptions=True)
+            if trainer_task is not None and not isinstance(results[-1], BaseException):
+                async with self._mutation_lock:
+                    if self._trainer is trainer:
+                        self._trainer = None
+            publication_failures = [
+                result
+                for result in results[: len(publications)]
+                if isinstance(result, BaseException)
+            ]
+            failures.extend(
+                result for result in results if isinstance(result, BaseException)
+            )
+            if self._publication_failure is not None and not publication_failures:
+                failures.append(self._publication_failure)
+            async with self._mutation_lock:
                 self._publication_tasks.clear()
+                self._durability_tasks.clear()
                 self._serving_futures.clear()
                 self._publication_metrics.clear()
                 self._emitted_publication_metrics.clear()
-            if trainer is not None:
-                result = await asyncio.gather(
-                    self.runtime.stop_trainer(trainer), return_exceptions=True
-                )
-                failures.extend(
-                    value for value in result if isinstance(value, BaseException)
-                )
+                self._trainer_completion_times.clear()
+                self._serving_activation_times.clear()
+            try:
+                await self._release_prepared_adapter_transfers()
+            except BaseException as error:
+                failures.append(error)
             async with self._serving_lock:
                 if self._managed_service_name is not None:
                     result = await asyncio.gather(
                         self.runtime.stop_model_service(self._managed_service_name),
                         return_exceptions=True,
                     )
-                    failures.extend(
+                    serving_failures = [
                         value for value in result if isinstance(value, BaseException)
+                    ]
+                    failures.extend(serving_failures)
+                    if not serving_failures:
+                        self._clear_serving_state()
+                elif (
+                    get_external_vllm_runtime_config(self.config) is not None
+                    and self._base_url is not None
+                ):
+                    names = {
+                        *(
+                            self._serving_lora_name(step)
+                            for step in self._loaded_adapter_steps
+                        ),
+                        *(
+                            f"{self.model_name}:eval@{step}"
+                            if self.rollout_weight_update_mode == "in_flight_lora"
+                            else f"{self.model_name}@{step}"
+                            for step in self._loaded_exact_adapter_steps
+                        ),
+                    }
+                    if self._current_lora_name is not None:
+                        names.add(self._current_lora_name)
+                    results = await asyncio.gather(
+                        *(
+                            self._unload_adapter_at(name, self._base_url)
+                            for name in sorted(names)
+                        ),
+                        return_exceptions=True,
                     )
-                self._clear_serving_state()
+                    serving_failures = [
+                        value for value in results if isinstance(value, BaseException)
+                    ]
+                    failures.extend(serving_failures)
+                    if not serving_failures:
+                        self._clear_serving_state()
+                else:
+                    self._clear_serving_state()
             _, cancelled = await complete_to_thread(
                 lambda: _remove_staging_root(self.output_dir)
             )
@@ -1662,124 +2362,59 @@ def _publish_adapter_alias(
             raise
 
 
-def _write_generation_complete(
+def _commit_adapter_alias(
     optimizer_state_path: str,
+    output_dir: str,
+    expected_step: int,
+    source: OptimizerAdapter,
     generation: TrainerGeneration,
-) -> None:
-    pointer = read_committed_optimizer_pointer(optimizer_state_path)
-    path = (
-        trainer_publication_path(optimizer_state_path, generation.generation_id)
-        / "complete.json"
-    )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as output:
-            json.dump(
-                {
-                    "generation": generation.model_dump(mode="json"),
-                    "resume_step": generation.policy_step,
-                    "optimizer_step": 0 if pointer is None else pointer.step,
-                },
-                output,
-                sort_keys=True,
-            )
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _wait_for_adapter_generation(
-    optimizer_state_path: str,
-    generation: TrainerGeneration,
-    *,
-    timeout_s: float = 300.0,
+    staging_path: str,
 ) -> OptimizerAdapter:
-    deadline = time.monotonic() + timeout_s
-    failed = (
-        trainer_publication_path(optimizer_state_path, generation.generation_id)
-        / "failed.json"
-    )
-    while True:
-        adapter = read_adapter_publication(
-            generation.adapter_path,
-            step=generation.policy_step,
-            verify_files=True,
-        )
-        if adapter is not None:
-            if (
-                adapter.training_session_id,
-                adapter.step,
-                adapter.generation_id,
-                adapter.identity,
-            ) != (
-                generation.training_session_id,
-                generation.policy_step,
-                generation.generation_id,
-                str(Path(generation.adapter_path).absolute()),
-            ):
-                raise RuntimeError(
-                    "adapter publication has the wrong generation identity"
-                )
-            return adapter
-        if error := _publication_marker_failure(failed):
-            raise error
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"Timed out waiting for adapter generation {generation.generation_id}"
-            )
-        time.sleep(0.05)
-
-
-def _wait_for_durable_generation(
-    optimizer_state_path: str,
-    generation: TrainerGeneration,
-    *,
-    timeout_s: float = 300.0,
-) -> tuple[int, int]:
-    deadline = time.monotonic() + timeout_s
-    complete = (
-        trainer_publication_path(optimizer_state_path, generation.generation_id)
-        / "complete.json"
-    )
-    failed = complete.with_name("failed.json")
-    while True:
-        if complete.is_file():
-            payload = json.loads(complete.read_text("utf-8"))
-            committed = TrainerGeneration.model_validate(payload["generation"])
-            if committed != generation:
-                raise RuntimeError("durability marker identifies another generation")
-            return int(payload["resume_step"]), int(payload["optimizer_step"])
-        if error := _publication_marker_failure(failed):
-            raise error
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"Timed out waiting for durable generation {generation.generation_id}"
-            )
-        time.sleep(0.05)
-
-
-def _publication_marker_failure(path: Path) -> RuntimeError | None:
-    if not path.is_file():
-        return None
     try:
-        payload = json.loads(path.read_text("utf-8"))
-        error_type = payload["error_type"]
-        message = payload["message"]
-        if not isinstance(error_type, str) or not isinstance(message, str):
-            raise TypeError
-    except (KeyError, TypeError, json.JSONDecodeError) as error:
-        raise RuntimeError(
-            f"Invalid trainer publication failure marker: {path}"
-        ) from error
-    return RuntimeError(f"trainer publisher failed ({error_type}): {message}")
+        published = _publish_adapter_alias(source, generation, staging_path)
+        commit_optimizer_policy_advance(
+            optimizer_state_path,
+            initial_adapter_path=get_step_checkpoint_dir(output_dir, 0),
+            expected_step=expected_step,
+            adapter=published,
+        )
+        return published
+    except BaseException as error:
+        try:
+            policy = resolve_committed_optimizer_policy(
+                optimizer_state_path,
+                initial_adapter_path=get_step_checkpoint_dir(output_dir, 0),
+            )
+        except BaseException as state_error:
+            raise BaseExceptionGroup(
+                "no-op policy commit state is ambiguous", [error, state_error]
+            ) from None
+        if policy.policy_adapter.generation_id == generation.generation_id:
+            return policy.policy_adapter
+        failures: list[BaseException] = []
+        latest = Path(output_dir) / "megatron_runtime/latest-adapter.json"
+        try:
+            if latest.is_file():
+                adapter = OptimizerAdapter.model_validate_json(
+                    latest.read_text("utf-8")
+                )
+                if adapter.generation_id == generation.generation_id:
+                    latest.unlink()
+        except BaseException as cleanup_error:
+            failures.append(cleanup_error)
+        for path in (
+            staging_path,
+            generation.adapter_path,
+        ):
+            try:
+                _remove_staging_checkpoint(path)
+            except BaseException as cleanup_error:
+                failures.append(cleanup_error)
+        if failures:
+            raise BaseExceptionGroup(
+                "no-op policy commit and rollback failed", [error, *failures]
+            ) from None
+        raise
 
 
 def _trainer_dtype(

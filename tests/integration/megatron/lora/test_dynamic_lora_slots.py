@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import contextmanager
 import os
 from pathlib import Path
@@ -388,7 +389,11 @@ def _assert_reload_replaces_slot_optimizer(
 
 def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
     trainer = TrainerRank.__new__(TrainerRank)
-    trainer.runtime = SimpleNamespace(model=[lora], optimizer=None)
+    trainer.runtime = SimpleNamespace(
+        model=[lora],
+        optimizer=None,
+        model_support_handler=_IdentityModelSupportHandler(),
+    )
     trainer.device = device
     trainer._slot_stack = []
     trainer._default_slot_ref = None
@@ -398,6 +403,21 @@ def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
         "B": tuple(lora.lora_slot_params(LoRASlotRef("checkpoint", "B"))),
     }
     return trainer
+
+
+class _IdentityModelSupportHandler:
+    def zero_internal_padding_grads(
+        self, model_chunks: Sequence[torch.nn.Module]
+    ) -> None:
+        del model_chunks
+
+    def canonicalize_loaded_lora_state(
+        self,
+        state: dict[str, torch.Tensor],
+        model_chunks: Sequence[torch.nn.Module],
+    ) -> dict[str, torch.Tensor]:
+        del model_chunks
+        return state
 
 
 @contextmanager

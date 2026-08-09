@@ -16,7 +16,7 @@ from art.megatron.runtime.bridge_runtime import (
     _logical_hf_param,
     _remap_hf_expert_name,
 )
-from art.megatron.runtime.jobs import (
+from art.megatron.runtime.weight_transfer import (
     MergedWeightTransferInitInfo,
     MergedWeightTransferSpec,
 )

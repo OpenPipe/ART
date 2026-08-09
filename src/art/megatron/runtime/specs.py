@@ -10,7 +10,9 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 from art.distributed.adapter_transport import AdapterTransferTarget
 from art.distributed.data_plane import PackedBatchRef
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
-from art.types import TrainConfig
+from art.types import TrainConfig, TrainSFTConfig
+
+from .weight_transfer import MergedWeightTransferSpec
 
 
 class _Spec(BaseModel):
@@ -31,6 +33,7 @@ class TrainerRuntimeSpec(_Spec):
     art_revision: str = Field(min_length=1)
     model_identifier: str = Field(min_length=1)
     model_revision: str = Field(min_length=1)
+    model_initialization: Literal["pretrained", "random"] = "pretrained"
     cache_root: str | None = Field(default=None, min_length=1)
     model_support_key: str = Field(min_length=1)
     handler_name: str = Field(min_length=1)
@@ -46,6 +49,7 @@ class TrainerRuntimeSpec(_Spec):
     allow_unvalidated_arch: bool = False
     enable_moe_routing_replay: bool = False
     streaming_weight_offload: bool = False
+    offload_between_jobs: bool = False
     random_state: int | None = None
     hybrid_ep: HybridEpRuntimeSpec | None = None
     snapshot_pool_capacity: int = Field(default=2, ge=1, le=4)
@@ -78,6 +82,10 @@ class TrainingRunSpec(_Spec):
 
 
 class CurrentTrainConfig(TrainConfig):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class CurrentSFTConfig(TrainSFTConfig):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
@@ -128,28 +136,22 @@ class DurableTrainOutput(_Spec):
     optimizer_state_path: str = Field(min_length=1)
 
 
-class TrainJobSpec(_Spec):
+class _TrainerJobSpec(_Spec):
     job_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     training_session_id: str = Field(min_length=1)
     expected_learner_version: int = Field(ge=0)
     learner_version: int = Field(ge=1)
     source: TrainerGeneration
-    batch: PackedBatchRef
-    config: CurrentTrainConfig
-    experimental_config: ExperimentalTrainConfig = ExperimentalTrainConfig()
     output: DurableTrainOutput
     publication_targets: tuple[AdapterTransferTarget, ...] = ()
+    merged_weight_transfer: MergedWeightTransferSpec | None = None
 
     @model_validator(mode="after")
-    def _validate_versions(self) -> "TrainJobSpec":
+    def _validate_versions(self) -> "_TrainerJobSpec":
         if self.learner_version != self.expected_learner_version + 1:
             raise ValueError(
                 "learner_version must immediately follow expected_learner_version"
-            )
-        if self.batch.max_source_version > self.expected_learner_version:
-            raise ValueError(
-                "batch source policy version cannot be newer than the learner"
             )
         if (
             self.source.training_session_id != self.training_session_id
@@ -197,6 +199,43 @@ class TrainJobSpec(_Spec):
     @property
     def optimizer_state_path(self) -> str:
         return self.output.optimizer_state_path
+
+
+class TrainJobSpec(_TrainerJobSpec):
+    kind: Literal["rl"] = "rl"
+    batch: PackedBatchRef
+    config: CurrentTrainConfig
+    experimental_config: ExperimentalTrainConfig = ExperimentalTrainConfig()
+
+    @model_validator(mode="after")
+    def _validate_batch_version(self) -> "TrainJobSpec":
+        if self.batch.max_source_version > self.expected_learner_version:
+            raise ValueError(
+                "batch source policy version cannot be newer than the learner"
+            )
+        return self
+
+
+class SFTJobSpec(_TrainerJobSpec):
+    kind: Literal["sft"] = "sft"
+    batch_id: str = Field(min_length=1)
+    num_batches: int = Field(ge=1)
+    config: CurrentSFTConfig
+    weight_decay: float = Field(default=0.0, ge=0)
+    max_grad_norm: float = Field(default=1.0, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_batch_size(self) -> "SFTJobSpec":
+        if not isinstance(self.config.batch_size, int):
+            raise ValueError("typed SFT jobs require a resolved integer batch size")
+        return self
+
+
+TrainerJobSpec: TypeAlias = Annotated[
+    TrainJobSpec | SFTJobSpec,
+    Field(discriminator="kind"),
+]
+TRAIN_JOB_ADAPTER = TypeAdapter(TrainerJobSpec)
 
 
 class _TrainEvent(_Spec):

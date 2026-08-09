@@ -47,6 +47,46 @@ _VLLM_SCRAPE_GROUP_TOLERANCE_S = 0.05
 _TRAINER_CAPACITY_EPSILON = 1e-9
 
 
+def _vllm_sample_max_age_s(metric_interval_s: float) -> float:
+    # Preserve one delayed poll without allowing an unbounded zero-order hold.
+    return 2.0 * metric_interval_s
+
+
+def _vllm_sample_intervals(
+    sample_times: Sequence[float],
+    *,
+    window_start_s: float,
+    window_end_s: float,
+    metric_interval_s: float,
+) -> list[tuple[float, float]]:
+    times = sorted(set(sample_times))
+    max_age_s = _vllm_sample_max_age_s(metric_interval_s)
+    intervals: list[tuple[float, float]] = []
+    for index, t_s in enumerate(times):
+        next_t_s = times[index + 1] if index + 1 < len(times) else math.inf
+        start_s = max(t_s, window_start_s)
+        end_s = min(next_t_s, t_s + max_age_s, window_end_s)
+        if end_s > start_s:
+            intervals.append((t_s, end_s - start_s))
+    return intervals
+
+
+def _packing_group_candidates(
+    *, current: int, available: int, radius: int, min_change_fraction: float
+) -> list[int]:
+    step = max(1, math.ceil(current * min_change_fraction / 2.0))
+    lower = max(1, min(available, current - radius))
+    upper = min(available, current + radius)
+    candidates = {lower, min(current, available), upper}
+    for offset in range(step, radius, step):
+        candidates.update(
+            groups
+            for groups in (current - offset, current + offset)
+            if lower <= groups <= upper
+        )
+    return sorted(candidates)
+
+
 class PackingProjection(pydantic.BaseModel):
     groups: int
     spill_probability: float
@@ -160,7 +200,18 @@ class PipelineAutotuner:
         if len(steps) < self.config.window_steps:
             return None
         window_steps = steps[-self.config.window_steps :]
-        t0 = min(by_step[step]["objective/score"].t_s for step in window_steps)
+        preceding_objective_times = [
+            rec.t_s
+            for rec in self.metrics
+            if rec.name == "objective/score"
+            and rec.step is not None
+            and int(rec.step) < window_steps[0]
+        ]
+        t0 = (
+            max(preceding_objective_times)
+            if preceding_objective_times
+            else min(by_step[step]["objective/score"].t_s for step in window_steps)
+        )
         t1 = max(rec.t_s for step in window_steps for rec in by_step[step].values())
 
         def step_values(name: str) -> list[float]:
@@ -200,7 +251,10 @@ class PipelineAutotuner:
         vllm_metrics = [
             rec
             for rec in self.metrics
-            if rec.step is None and t0 <= rec.t_s <= max(t1, t0 + 1e-6)
+            if rec.step is None
+            and t0 - _vllm_sample_max_age_s(self.config.vllm_metric_interval_s)
+            <= rec.t_s
+            <= max(t1, t0 + 1e-6)
         ]
         window_step_set = set(window_steps)
         packed_group_counts: dict[int, int] = defaultdict(int)
@@ -243,7 +297,11 @@ class PipelineAutotuner:
                 unused_and_dummy_ratio=unused_and_dummy_ratio_mean,
             ),
             vllm_pressure=_vllm_pressure(
-                vllm_metrics, window_start_s=t0, window_end_s=t1
+                vllm_metrics,
+                window_start_s=t0,
+                window_end_s=t1,
+                metric_interval_s=self.config.vllm_metric_interval_s,
+                min_coverage=1.0 - self.config.vllm_metric_timeout_window_frac,
             ),
             queue_put_wait_frac=queue_put_wait_s
             / max(queue_put_wait_s + rollout_s, 1e-9),
@@ -407,7 +465,7 @@ class PipelineAutotuner:
             reason = "running rollout reserve exceeded the policy-age budget"
         elif action == "hold" and updated != previous:
             action = "resize_batch_queue"
-            reason = "recomputed target batch size and freshness-bounded queue"
+            reason = "recomputed target batch size and one-batch queue capacity"
         return TunerDecision(
             step=stats.end_step,
             state=state,
@@ -656,9 +714,6 @@ class PipelineAutotuner:
         )
         queue = recommended_queue_size(
             target_groups_per_step=target,
-            limit_steps_off_policy=self.policy_age_limit_steps,
-            num_rollout_workers=workers,
-            running_reserve_fraction=self.config.queue_running_reserve_fraction,
         )
         return settings.model_copy(
             update={
@@ -747,62 +802,87 @@ class PipelineAutotuner:
             ]
         )
         current = max(1, settings.target_groups_per_step)
-        increase = max(
+        radius = max(
             1,
             min(
                 self.config.target_group_max_increase,
                 math.ceil(current * self.config.target_group_increase_fraction),
             ),
         )
-        lo = max(1, current // 2)
-        hi = min(len(reservoir), current + increase)
-        history_risks = self._packing_history_risks(range(lo, hi + 1))
+        candidates = _packing_group_candidates(
+            current=current,
+            available=len(reservoir),
+            radius=radius,
+            min_change_fraction=self.config.target_group_min_relative_change,
+        )
+        history_risks = self._packing_history_risks(candidates)
         projections: dict[int, PackingProjection] = {}
 
         def project(groups: int) -> PackingProjection:
             existing = projections.get(groups)
             if existing is not None:
                 return existing
+            history_risk = history_risks[groups]
+            if history_risk > self.config.target_spill_probability:
+                projection = PackingProjection(
+                    groups=groups, spill_probability=history_risk
+                )
+                projections[groups] = projection
+                return projection
             rng = random.Random((stats.end_step << 32) ^ groups)
             spills = 0.0
+            trials = 0.0
             for _ in range(self.config.packing_trials):
                 selected = rng.sample(range(len(reservoir)), groups)
                 after = pool.estimate(selected, seq_len=self.packed_sequence_length)
-                spills += float(after.packed_sequences > self.target_packed_sequences)
-            trials = float(self.config.packing_trials)
+                trials += 1.0
+                if after.packed_sequences > self.target_packed_sequences:
+                    spills += 1.0
+                    best_case_risk = self._packing_probability_upper(
+                        events=spills, trials=float(self.config.packing_trials)
+                    )
+                    if best_case_risk > self.config.target_spill_probability:
+                        break
+                if (
+                    self._packing_probability_upper(events=spills, trials=trials)
+                    <= self.config.target_spill_probability
+                ):
+                    break
             counterfactual_risk = self._packing_probability_upper(
                 events=spills,
                 trials=trials,
             )
             projection = PackingProjection(
                 groups=groups,
-                spill_probability=max(counterfactual_risk, history_risks[groups]),
+                spill_probability=max(counterfactual_risk, history_risk),
             )
             projections[groups] = projection
             return projection
 
-        best = lo - 1
-        left, right = lo, hi
-        while left <= right:
-            groups = (left + right) // 2
-            if (
-                project(groups).spill_probability
-                <= self.config.target_spill_probability
-            ):
-                best = groups
-                left = groups + 1
-            else:
-                right = groups - 1
-        for groups in range(max(lo, best - 2), min(hi, best + 2) + 1):
-            project(groups)
+        upper_index = len(candidates) - 1
+        if (
+            project(candidates[upper_index]).spill_probability
+            > self.config.target_spill_probability
+        ):
+            left, right = 0, upper_index - 1
+            while left <= right:
+                index = (left + right) // 2
+                if (
+                    project(candidates[index]).spill_probability
+                    <= self.config.target_spill_probability
+                ):
+                    left = index + 1
+                else:
+                    right = index - 1
         monotone_risk = 0.0
         for groups in sorted(projections):
             projection = projections[groups]
-            monotone_risk = max(monotone_risk, projection.spill_probability)
             if projection.spill_probability < monotone_risk:
                 projections[groups] = projection.model_copy(
                     update={"spill_probability": monotone_risk}
                 )
+            else:
+                monotone_risk = projection.spill_probability
         return [projections[groups] for groups in sorted(projections)]
 
     def _packing_reservoir(
@@ -841,9 +921,13 @@ class PipelineAutotuner:
                 break
         return selected
 
-    def _packing_history_risks(self, groups_range: range) -> dict[int, float]:
-        risks: dict[int, float] = {}
-        for groups in groups_range:
+    def _packing_history_risks(self, groups_range: Sequence[int]) -> dict[int, float]:
+        exact_risks: dict[int, float] = {}
+        for groups in {
+            outcome.groups
+            for outcome in self._packing_outcomes
+            if outcome.groups <= max(groups_range)
+        }:
             outcomes = [
                 outcome
                 for outcome in self._packing_outcomes
@@ -860,16 +944,21 @@ class PipelineAutotuner:
             # Zero-spill samples are useful diagnostics but should not block exploration:
             # a beta upper bound with sparse clean samples would make target batches
             # sticky. Actual spills are the hard signal we carry across the horizon.
-            risks[groups] = (
+            exact_risks[groups] = (
                 self._packing_probability_upper(events=spills, trials=trials)
                 if spills > 0.0
                 else 0.0
             )
+        risks: dict[int, float] = {}
         inherited_spill_probability = 0.0
-        for groups in sorted(risks):
-            inherited_spill_probability = max(
-                inherited_spill_probability, risks[groups]
-            )
+        history_groups = iter(sorted(exact_risks.items()))
+        next_history = next(history_groups, None)
+        for groups in sorted(groups_range):
+            while next_history is not None and next_history[0] <= groups:
+                inherited_spill_probability = max(
+                    inherited_spill_probability, next_history[1]
+                )
+                next_history = next(history_groups, None)
             risks[groups] = inherited_spill_probability
         return risks
 
@@ -902,7 +991,8 @@ class PipelineAutotuner:
             decisions=self.decisions,
             notes=[
                 "The first warmup_ignore_steps are excluded from throughput decisions.",
-                "The queued batch and running-rollout reserve are bounded by the policy-age budget.",
+                "queue_maxsize bounds ready, packing, and packed groups to one target "
+                "batch; active rollouts add at most one worker wave.",
                 *self._profile_recommendations(),
             ],
         )
@@ -957,9 +1047,6 @@ def build_initial_settings(
     )
     queue = recommended_queue_size(
         target_groups_per_step=max_batch,
-        limit_steps_off_policy=policy_age_limit_steps,
-        num_rollout_workers=workers,
-        running_reserve_fraction=config.queue_running_reserve_fraction,
     )
     return PipelineTuneSettings(
         num_rollout_workers=workers,
@@ -990,22 +1077,17 @@ def freshness_worker_limit(
 def recommended_queue_size(
     *,
     target_groups_per_step: int,
-    limit_steps_off_policy: float,
-    num_rollout_workers: int,
-    running_reserve_fraction: float,
 ) -> int:
-    target = max(1, int(target_groups_per_step))
-    limit = max(1.0, float(limit_steps_off_policy))
-    max_completed = max(1, int(math.floor(target * limit)))
-    running_reserve = int(
-        math.ceil(max(0, num_rollout_workers) * running_reserve_fraction)
-    )
-    lower = target
-    return max(lower, min(max_completed, max_completed - running_reserve))
+    return max(1, int(target_groups_per_step))
 
 
 def _vllm_pressure(
-    metrics: list[PipelineMetric], *, window_start_s: float, window_end_s: float
+    metrics: list[PipelineMetric],
+    *,
+    window_start_s: float,
+    window_end_s: float,
+    metric_interval_s: float,
+    min_coverage: float,
 ) -> float:
     wanted = {"vllm/num_requests_running", "vllm/num_requests_waiting_capacity"}
     rows: list[tuple[float, str, float]] = []
@@ -1020,23 +1102,29 @@ def _vllm_pressure(
         raise RuntimeError(
             "Pipeline autotuning requires complete vLLM running/capacity samples."
         )
+    window_s = window_end_s - window_start_s
+    if window_s <= 0.0:
+        raise RuntimeError(
+            "Pipeline autotuning requires a positive vLLM sample window."
+        )
+    intervals = _vllm_sample_intervals(
+        times,
+        window_start_s=window_start_s,
+        window_end_s=window_end_s,
+        metric_interval_s=metric_interval_s,
+    )
+    total_s = sum(duration_s for _, duration_s in intervals)
+    coverage = total_s / window_s
+    if coverage + 1e-9 < min_coverage:
+        raise RuntimeError(
+            "Pipeline autotuning cannot rely on vLLM pressure: successful telemetry "
+            f"covered {coverage:.1%} of the decision window; requires at least "
+            f"{min_coverage:.1%}."
+        )
     capacity_wait_request_s = 0.0
     running_request_s = 0.0
-    total_s = 0.0
-    for idx, t_s in enumerate(times):
+    for t_s, duration_s in intervals:
         values = by_time[t_s]
-        if not {
-            "vllm/num_requests_running",
-            "vllm/num_requests_waiting_capacity",
-        }.issubset(values):
-            continue
-        next_t_s = times[idx + 1] if idx + 1 < len(times) else window_end_s
-        start_s = max(t_s, window_start_s)
-        end_s = min(next_t_s, window_end_s)
-        if end_s <= start_s:
-            continue
-        duration_s = end_s - start_s
-        total_s += duration_s
         capacity_wait_request_s += (
             max(0.0, values["vllm/num_requests_waiting_capacity"]) * duration_s
         )

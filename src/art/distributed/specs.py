@@ -2,11 +2,21 @@ from __future__ import annotations
 
 from collections import Counter
 from ipaddress import ip_address
-from typing import Literal
+from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..types import MegatronTopologyConfig
+
+CUDA_DEVICE_UUID_PATTERN = (
+    r"^(?:GPU-[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}"
+    r"|MIG-(?:[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}"
+    r"|GPU-[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}/[0-9]+/[0-9]+))$"
+)
+GpuId: TypeAlias = (
+    Annotated[int, Field(ge=0)]
+    | Annotated[str, Field(pattern=CUDA_DEVICE_UUID_PATTERN)]
+)
 
 
 class _Spec(BaseModel):
@@ -18,13 +28,15 @@ class HostSpec(_Spec):
     node_rank: int = Field(ge=0)
     worker_address: str = Field(min_length=1)
     cpu_slots: int = Field(ge=1)
-    gpu_ids: tuple[int, ...] = ()
+    gpu_ids: tuple[GpuId, ...] = ()
 
     @model_validator(mode="after")
     def _validate_gpu_ids(self) -> "HostSpec":
-        if any(gpu_id < 0 for gpu_id in self.gpu_ids):
-            raise ValueError("gpu_ids must be non-negative")
-        if len(set(self.gpu_ids)) != len(self.gpu_ids):
+        identities = tuple(
+            gpu_id.casefold() if isinstance(gpu_id, str) else gpu_id
+            for gpu_id in self.gpu_ids
+        )
+        if len(set(identities)) != len(identities):
             raise ValueError("gpu_ids must be unique within a host")
         return self
 
@@ -127,7 +139,7 @@ class ClusterSpec(_Spec):
 
 class GpuPlacement(_Spec):
     host_id: str = Field(min_length=1)
-    gpu_id: int = Field(ge=0)
+    gpu_id: GpuId
 
 
 class TrainerMeshSpec(_Spec):
@@ -165,15 +177,17 @@ class ModelServiceMemberSpec(_Spec):
     member_id: str = Field(min_length=1)
     host_id: str = Field(min_length=1)
     node_rank: int = Field(ge=0)
-    gpu_ids: tuple[int, ...]
+    gpu_ids: tuple[GpuId, ...]
 
     @model_validator(mode="after")
     def _validate_gpu_ids(self) -> "ModelServiceMemberSpec":
         if not self.gpu_ids:
             raise ValueError("model-service members require at least one GPU")
-        if any(gpu_id < 0 for gpu_id in self.gpu_ids):
-            raise ValueError("gpu_ids must be non-negative")
-        if len(set(self.gpu_ids)) != len(self.gpu_ids):
+        identities = tuple(
+            gpu_id.casefold() if isinstance(gpu_id, str) else gpu_id
+            for gpu_id in self.gpu_ids
+        )
+        if len(set(identities)) != len(identities):
             raise ValueError("member gpu_ids must be unique")
         return self
 
@@ -185,10 +199,11 @@ class ModelServiceSpec(_Spec):
     leader_endpoint: EndpointSpec
     rendezvous: EndpointSpec
     base_model: str = Field(min_length=1)
-    model_revision: str = Field(min_length=1)
+    model_revision: str | None = Field(default=None, min_length=1)
     runtime_fingerprint: str = Field(min_length=1)
     parallel: VllmParallelSpec
     update_mode: Literal["lora", "merged"]
+    temporal_gpu_sharing: bool = False
 
     @model_validator(mode="after")
     def _validate_members(self) -> "ModelServiceSpec":
@@ -256,7 +271,7 @@ class RuntimeTopology(_Spec):
                 f"rollout_host_ids references unknown hosts: {unknown_rollout_hosts}"
             )
 
-        placements: list[tuple[str, int, str]] = []
+        placements: list[tuple[str, GpuId, str]] = []
         if self.trainer is not None:
             trainer_hosts = tuple(rank.host_id for rank in self.trainer.ranks)
             unknown_trainer_hosts = sorted(set(trainer_hosts) - hosts.keys())
@@ -327,23 +342,32 @@ class RuntimeTopology(_Spec):
                 raise ValueError(f"{owner} references unknown host {host_id!r}")
             if gpu_id not in host.gpu_ids:
                 raise ValueError(f"{owner} requests unavailable GPU {host_id}:{gpu_id}")
-        duplicate_gpus = [
-            placement
+        temporal_services = {
+            service.name
+            for service in self.model_services
+            if service.temporal_gpu_sharing
+        }
+        overlapping = {
+            placement: tuple(
+                owner
+                for host_id, gpu_id, owner in placements
+                if (host_id, gpu_id) == placement
+            )
             for placement, count in Counter(
                 (host_id, gpu_id) for host_id, gpu_id, _ in placements
             ).items()
             if count > 1
-        ]
-        if duplicate_gpus:
-            owners = [
-                owner
-                for duplicate in duplicate_gpus
-                for host_id, gpu_id, owner in placements
-                if (host_id, gpu_id) == duplicate
-            ]
-            raise ValueError(
-                f"GPU placements overlap at {duplicate_gpus}; owners={owners}"
-            )
+        }
+        invalid_overlap = {
+            placement: owners
+            for placement, owners in overlapping.items()
+            if len(owners) != 2
+            or "trainer" not in owners
+            or next(owner for owner in owners if owner != "trainer")
+            not in temporal_services
+        }
+        if invalid_overlap:
+            raise ValueError(f"GPU placements overlap: {invalid_overlap}")
         seen: dict[tuple[str, int], str] = {}
         for host_id, port, kind in endpoints:
             key = (host_id, port)

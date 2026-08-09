@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib
 import json
 import os
 from pathlib import Path
+import socket
 import struct
 import sys
 from threading import Condition, Lock
@@ -28,7 +30,7 @@ class AdapterTensorSpec(_TransportRecord):
 
 
 class AdapterTransferTarget(_TransportRecord):
-    transport: Literal["nixl"] = "nixl"
+    transport: Literal["local", "nixl"] = "nixl"
     host_id: str = Field(min_length=1)
     generation_id: str = Field(min_length=1)
     path: str = Field(min_length=1)
@@ -79,6 +81,17 @@ class _PendingReceive:
         self.target = target
         self.slot = slot
         self.tensors = tensors
+
+
+class _PendingLocalReceive:
+    def __init__(
+        self,
+        *,
+        target: AdapterTransferTarget,
+        listener: socket.socket,
+    ) -> None:
+        self.target = target
+        self.listener = listener
 
 
 class _RegisteredSlot:
@@ -268,8 +281,8 @@ def _copy_snapshot(
     return used_bytes
 
 
-class NixlAdapterReceiver:
-    """Owns host memory registered for immutable LoRA generations."""
+class AdapterSnapshotReceiver:
+    """Owns receive buffers for immutable LoRA generations."""
 
     def __init__(
         self, host_id: str, output_root: str, *, pool_capacity: int = 2
@@ -281,12 +294,14 @@ class NixlAdapterReceiver:
         self.pool_capacity = pool_capacity
         self._agent: Any | None = None
         self._pending: dict[str, _PendingReceive] = {}
+        self._local_pending: dict[str, _PendingLocalReceive] = {}
         self._slots: list[_RegisteredSlot] = []
         self._templates: dict[
             tuple[str, str], tuple[tuple[AdapterTensorSpec, ...], dict[str, Any]]
         ] = {}
         self._condition = Condition()
         self._notifications: dict[str, AdapterTransferNotification] = {}
+        self._materialized: set[str] = set()
         self._agent_lock = Lock()
         self._closed = False
 
@@ -296,7 +311,12 @@ class NixlAdapterReceiver:
         template_path: str,
         tensor_dtype: str,
         timeout_s: float = 300.0,
+        transport: Literal["local", "nixl"] = "nixl",
     ) -> AdapterTransferTarget:
+        if transport == "local":
+            return self._prepare_local(
+                generation_id, template_path, tensor_dtype, timeout_s
+            )
         prepare_started = time.monotonic()
         template_key = (str(Path(template_path).absolute()), tensor_dtype)
         specs, config = self._templates.get(template_key, ((), {}))
@@ -355,7 +375,79 @@ class NixlAdapterReceiver:
         )
         return target
 
+    def _prepare_local(
+        self,
+        generation_id: str,
+        template_path: str,
+        tensor_dtype: str,
+        timeout_s: float,
+    ) -> AdapterTransferTarget:
+        prepare_started = time.monotonic()
+        template_key = (str(Path(template_path).absolute()), tensor_dtype)
+        specs, config = self._templates.get(template_key, ((), {}))
+        if not specs:
+            specs, config = _read_adapter_template(template_path, tensor_dtype)
+            self._templates[template_key] = (specs, config)
+        wait_started = time.monotonic()
+        with self._condition:
+            while len(self._local_pending) >= self.pool_capacity:
+                remaining_s = wait_started + timeout_s - time.monotonic()
+                if remaining_s <= 0:
+                    raise TimeoutError("local adapter receive pool remained full")
+                self._condition.wait(remaining_s)
+            if self._closed:
+                raise RuntimeError("adapter receive pool is closed")
+            if generation_id in self._local_pending or generation_id in self._pending:
+                raise RuntimeError(f"Adapter receive already exists: {generation_id}")
+            socket_path = (
+                "/tmp/art-lora-"
+                + hashlib.sha256(
+                    f"{self.host_id}:{generation_id}:{os.getpid()}".encode()
+                ).hexdigest()[:24]
+                + ".sock"
+            )
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                listener.bind(socket_path)
+                listener.listen(1)
+                listener.setblocking(False)
+                used_bytes = _spec_bytes(specs)
+                local_root = Path(
+                    os.environ.get(
+                        "ART_LOCAL_ADAPTER_TRANSFER_ROOT",
+                        "/dev/shm/art_adapter_transfers",
+                    )
+                )
+                target = AdapterTransferTarget(
+                    transport="local",
+                    host_id=self.host_id,
+                    generation_id=generation_id,
+                    path=str((local_root / self.host_id / generation_id).absolute()),
+                    remote_agent=socket_path,
+                    remote_metadata_b64="-",
+                    remote_descriptors_b64="-",
+                    tensors=specs,
+                    adapter_config=config,
+                    slot_id=0,
+                    used_bytes=used_bytes,
+                    capacity_bytes=used_bytes,
+                    prepare_s=time.monotonic() - prepare_started,
+                    pool_wait_s=time.monotonic() - wait_started,
+                    registration_s=0.0,
+                )
+            except BaseException:
+                listener.close()
+                Path(socket_path).unlink(missing_ok=True)
+                raise
+            self._local_pending[generation_id] = _PendingLocalReceive(
+                target=target,
+                listener=listener,
+            )
+        return target
+
     def poll(self, generation_id: str) -> AdapterReceiveResult | None:
+        if generation_id in self._local_pending:
+            return self._poll_local(generation_id)
         pending = self._pending.get(generation_id)
         if pending is None:
             raise RuntimeError(f"Unknown adapter receive: {generation_id}")
@@ -386,6 +478,7 @@ class NixlAdapterReceiver:
             raise
         finally:
             self._finish(generation_id)
+        self._materialized.add(generation_id)
         return AdapterReceiveResult(
             host_id=self.host_id,
             generation_id=generation_id,
@@ -403,16 +496,76 @@ class NixlAdapterReceiver:
             sender_registration_s=notification.sender_registration_s,
         )
 
+    def _poll_local(self, generation_id: str) -> AdapterReceiveResult | None:
+        pending = self._local_pending[generation_id]
+        try:
+            connection, _ = pending.listener.accept()
+        except BlockingIOError:
+            return None
+        try:
+            connection.settimeout(60.0)
+            payload = bytearray()
+            while chunk := connection.recv(64 * 1024):
+                payload.extend(chunk)
+            notification = AdapterTransferNotification.model_validate_json(payload)
+            if notification.generation_id != generation_id:
+                raise RuntimeError("local adapter notification has wrong generation")
+            path = Path(pending.target.path)
+            model_path = path / "adapter_model.safetensors"
+            config_path = path / "adapter_config.json"
+            if not model_path.is_file() or not config_path.is_file():
+                raise RuntimeError("local adapter transfer is incomplete")
+            self._materialized.add(generation_id)
+            return AdapterReceiveResult(
+                host_id=self.host_id,
+                generation_id=generation_id,
+                path=str(path),
+                tensor_bytes=model_path.stat().st_size,
+                config_bytes=config_path.stat().st_size,
+                materialization_s=notification.sender_staging_s,
+                slot_id=pending.target.slot_id,
+                used_bytes=pending.target.used_bytes,
+                capacity_bytes=pending.target.capacity_bytes,
+                prepare_s=pending.target.prepare_s,
+                pool_wait_s=pending.target.pool_wait_s,
+                registration_s=0.0,
+                sender_staging_s=notification.sender_staging_s,
+                sender_registration_s=0.0,
+            )
+        finally:
+            connection.close()
+            self._finish_local(generation_id)
+
     def release(self, generation_id: str) -> None:
         from shutil import rmtree
 
         if generation_id in self._pending:
             self._finish(generation_id)
+        if generation_id in self._local_pending:
+            self._finish_local(generation_id)
         with self._agent_lock:
             self._notifications.pop(generation_id, None)
-        path = self.output_root / generation_id
-        if path.exists():
-            rmtree(path)
+        self._materialized.discard(generation_id)
+        for root in (
+            self.output_root,
+            Path(
+                os.environ.get(
+                    "ART_LOCAL_ADAPTER_TRANSFER_ROOT",
+                    "/dev/shm/art_adapter_transfers",
+                )
+            )
+            / self.host_id,
+        ):
+            path = root / generation_id
+            if path.exists():
+                rmtree(path)
+
+    def _finish_local(self, generation_id: str) -> None:
+        pending = self._local_pending.pop(generation_id)
+        pending.listener.close()
+        Path(pending.target.remote_agent).unlink(missing_ok=True)
+        with self._condition:
+            self._condition.notify()
 
     def _require_agent(self) -> Any:
         if self._agent is None:
@@ -483,8 +636,12 @@ class NixlAdapterReceiver:
         with self._condition:
             self._closed = True
             self._condition.notify_all()
-        for generation_id in tuple(self._pending):
-            self._finish(generation_id)
+        for generation_id in (
+            *self._pending,
+            *self._local_pending,
+            *self._materialized,
+        ):
+            self.release(generation_id)
         if self._agent is not None:
             with self._agent_lock:
                 for slot in self._slots:
@@ -601,3 +758,62 @@ class NixlAdapterSender:
         if self._agent is None:
             self._agent = _new_agent(f"art-lora-sender-{os.getpid()}")
         return self._agent
+
+
+class AdapterSnapshotSender:
+    """Dispatches immutable snapshots over the transport selected by each target."""
+
+    def __init__(self) -> None:
+        self._nixl: NixlAdapterSender | None = None
+
+    def send(self, snapshot: Any, targets: tuple[AdapterTransferTarget, ...]) -> None:
+        transports = {target.transport for target in targets}
+        if not targets:
+            return
+        if len(transports) != 1:
+            raise RuntimeError("adapter transfer targets mix transports")
+        if transports == {"nixl"}:
+            if self._nixl is None:
+                self._nixl = NixlAdapterSender()
+            self._nixl.send(snapshot, targets)
+            return
+        self._send_local(snapshot, targets)
+
+    @staticmethod
+    def _send_local(snapshot: Any, targets: tuple[AdapterTransferTarget, ...]) -> None:
+        from art.megatron.weights.lora_publish import save_vllm_lora_snapshot
+
+        first = targets[0]
+        snapshot_config = {**snapshot.adapter_config, "art_lora_format": "vllm"}
+        if any(
+            target.generation_id != first.generation_id
+            or target.tensors != first.tensors
+            or target.adapter_config != snapshot_config
+            for target in targets
+        ):
+            raise RuntimeError("local adapter transfer target changed")
+        expected = {spec.name for spec in first.tensors}
+        if set(snapshot.tensors) != expected:
+            raise RuntimeError("LoRA snapshot tensor names changed")
+        for spec in first.tensors:
+            tensor = snapshot.tensors[spec.name]
+            expected_dtype = _SAFETENSORS_DTYPES.get(spec.dtype)
+            if tuple(tensor.shape) != spec.shape or tensor.dtype != expected_dtype:
+                raise RuntimeError(f"LoRA snapshot shape or dtype changed: {spec.name}")
+        for target in targets:
+            started = time.monotonic()
+            save_vllm_lora_snapshot(snapshot, target.path)
+            notification = AdapterTransferNotification(
+                generation_id=target.generation_id,
+                sender_staging_s=time.monotonic() - started,
+                sender_registration_s=0.0,
+            ).model_dump_json()
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(60.0)
+                client.connect(target.remote_agent)
+                client.sendall(notification.encode())
+
+    def close(self) -> None:
+        if self._nixl is not None:
+            self._nixl.close()
+            self._nixl = None

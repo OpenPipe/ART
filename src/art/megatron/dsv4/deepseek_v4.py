@@ -355,6 +355,8 @@ class DeepSeekV4Attention(MegatronModule):
         self._keep_fp32_buffers = ("attn_sink",)
         self.attn_sink = nn.Parameter(attn_sink)
         setattr(self.attn_sink, "_keep_fp32", True)
+        if config.perform_initialization:
+            nn.init.zeros_(self.attn_sink)
 
         self.wq_a = TELinear(
             self.dim,

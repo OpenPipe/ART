@@ -9,12 +9,14 @@ import re
 import sys
 import time
 from typing import Any, cast
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
 
 from art.megatron import train as megatron_train
 from art.megatron.context_parallel.block_mask import prepare_block_mask_context
+from art.megatron.prefix_tree import parse_prefix_tree_row
 from art.megatron.prefix_tree_state import create_prefix_tree_state
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
@@ -78,6 +80,14 @@ _HF_MOE_ROUTER_NAME_PATTERN = re.compile(
 )
 _REPLAY_ROUTER_LAYER_PATTERN = re.compile(
     r"^chunk_\d+\.layer_(?P<layer>\d+)\.mlp\.router$"
+)
+_DISTRIBUTED_PROCESS_ENV = (
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
 )
 _GATE_WEIGHT_PATTERN = re.compile(
     r"^model(?:\.language_model)?\.layers\.(?P<layer>\d+)\.mlp\.gate\.weight$"
@@ -159,11 +169,17 @@ class _HfMoeRoutingCapture:
         self._routes: dict[str, dict[int, RouterCallRoute]] = {}
         self._active_sample_index: int | None = None
         self._active_micro_slot = 0
+        self._active_token_uids: torch.Tensor | None = None
+        self._active_token_span: int | None = None
+        self._assembled_routes: dict[str, dict[int, RouterCallRoute]] = {}
+        self._assembled_filled: dict[str, dict[int, torch.Tensor]] = {}
         for module_name, module in model.named_modules():
             router_key = _hf_moe_router_key(module_name)
             if router_key is None:
                 continue
             self._routes[router_key] = {}
+            self._assembled_routes[router_key] = {}
+            self._assembled_filled[router_key] = {}
             self._handles.append(
                 module.register_forward_hook(self._make_hook(router_key, module))
             )
@@ -172,9 +188,18 @@ class _HfMoeRoutingCapture:
     def enabled(self) -> bool:
         return bool(self._handles)
 
-    def set_active_micro(self, sample_index: int | None, micro_slot: int) -> None:
+    def set_active_micro(
+        self,
+        sample_index: int | None,
+        micro_slot: int,
+        *,
+        token_uids: torch.Tensor | None = None,
+        token_span: int | None = None,
+    ) -> None:
         self._active_sample_index = sample_index
         self._active_micro_slot = micro_slot
+        self._active_token_uids = token_uids
+        self._active_token_span = token_span
 
     def close(self) -> None:
         for handle in self._handles:
@@ -192,9 +217,16 @@ class _HfMoeRoutingCapture:
         max_topk = 0
         num_global_tokens: int | None = None
         for router_key in sorted(self._routes):
-            calls = self._routes[router_key]
+            assembled = self._assembled_routes[router_key]
+            calls = assembled if assembled else self._routes[router_key]
             if not calls:
                 raise RuntimeError(f"HF parity captured no routes for '{router_key}'")
+            for micro_slot, filled in self._assembled_filled[router_key].items():
+                if not bool(filled.all()):
+                    raise RuntimeError(
+                        f"HF parity did not assemble all route rows for {router_key} "
+                        f"micro {micro_slot}: {int(filled.sum())}/{int(filled.numel())}"
+                    )
             routers[router_key] = StepRouterRoutes(calls=calls)
             for route in calls.values():
                 max_topk = max(max_topk, route.max_topk)
@@ -243,12 +275,12 @@ class _HfMoeRoutingCapture:
                     f"Expected tensor router outputs for '{router_key}', "
                     f"got scores={type(router_scores)} indices={type(router_indices)}"
                 )
+            indices = router_indices.detach().cpu().to(torch.int32)
+            scores = router_scores.detach().cpu().to(torch.float32)
             route = RouterCallRoute(
-                expert_indices=router_indices.detach().cpu().to(torch.int32),
-                expert_probs=router_scores.detach().cpu().to(torch.float32),
-                expert_mask=torch.ones_like(
-                    router_indices.detach().cpu(), dtype=torch.bool
-                ),
+                expert_indices=indices,
+                expert_probs=scores,
+                expert_mask=torch.ones_like(indices, dtype=torch.bool),
                 num_experts=_hf_router_num_experts(module, router_scores),
                 sample_index=self._active_sample_index,
                 micro_slot=(
@@ -257,9 +289,63 @@ class _HfMoeRoutingCapture:
                     else self._active_micro_slot
                 ),
             )
+            if self._active_token_uids is not None:
+                self._assemble_route(router_key, route)
+                return
             self._routes[router_key][len(self._routes[router_key])] = route
 
         return _hook
+
+    def _assemble_route(self, router_key: str, route: RouterCallRoute) -> None:
+        token_uids = cast(torch.Tensor, self._active_token_uids).cpu().long()
+        token_span = self._active_token_span
+        if token_span is None or int(token_uids.numel()) != route.num_global_tokens:
+            raise RuntimeError("HF parity route path metadata does not match routes")
+        micro_slot = self._active_micro_slot
+        assembled = self._assembled_routes[router_key].get(micro_slot)
+        filled = self._assembled_filled[router_key].get(micro_slot)
+        if assembled is None:
+            assembled = route.model_copy(
+                update={
+                    "expert_indices": torch.full(
+                        (token_span, route.max_topk), -1, dtype=torch.int32
+                    ),
+                    "expert_probs": torch.zeros(
+                        (token_span, route.max_topk), dtype=torch.float32
+                    ),
+                    "expert_mask": torch.zeros(
+                        (token_span, route.max_topk), dtype=torch.bool
+                    ),
+                }
+            )
+            filled = torch.zeros(token_span, dtype=torch.bool)
+            self._assembled_routes[router_key][micro_slot] = assembled
+            self._assembled_filled[router_key][micro_slot] = filled
+        assert filled is not None
+        repeated = filled.index_select(0, token_uids)
+        if bool(repeated.any()):
+            path_rows = torch.where(repeated)[0]
+            existing_rows = token_uids.index_select(0, path_rows)
+            if not torch.equal(
+                assembled.expert_indices.index_select(0, existing_rows),
+                route.expert_indices.index_select(0, path_rows),
+            ):
+                raise RuntimeError("HF parity repeated path changed expert ids")
+            assert assembled.expert_probs is not None
+            assert route.expert_probs is not None
+            if not torch.allclose(
+                assembled.expert_probs.index_select(0, existing_rows),
+                route.expert_probs.index_select(0, path_rows),
+            ):
+                raise RuntimeError("HF parity repeated path changed expert scores")
+        assembled.expert_indices.index_copy_(0, token_uids, route.expert_indices)
+        assert assembled.expert_probs is not None
+        assert route.expert_probs is not None
+        assembled.expert_probs.index_copy_(0, token_uids, route.expert_probs)
+        assert assembled.expert_mask is not None
+        assert route.expert_mask is not None
+        assembled.expert_mask.index_copy_(0, token_uids, route.expert_mask)
+        filled.index_fill_(0, token_uids, True)
 
 
 def _debug(message: str) -> None:
@@ -746,6 +832,41 @@ def _prepare_hf_parity_megatron_micro(
     )
 
 
+def _hf_requires_recurrent_prefix_paths(
+    base_model: str, *, allow_unvalidated_arch: bool
+) -> bool:
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(
+        base_model, allow_unvalidated_arch=allow_unvalidated_arch
+    )
+    return bool(getattr(handler, "build_gdn_execution_spec", False))
+
+
+def _prepare_hf_reference_forward(
+    model: Any,
+    micro: dict[str, torch.Tensor],
+    *,
+    base_model: str,
+    actual_len: int,
+    allow_unvalidated_arch: bool,
+) -> None:
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(
+        base_model, allow_unvalidated_arch=allow_unvalidated_arch
+    )
+    prepare_forward = getattr(handler, "prepare_hf_reference_forward", None)
+    if prepare_forward is None:
+        return
+    prepare_forward(
+        model,
+        position_ids=micro["position_ids"].reshape(-1)[:actual_len],
+        group_ids=micro["group_ids"].reshape(-1)[:actual_len],
+        parent_ids=micro["parent_ids"].reshape(-1)[:actual_len],
+    )
+
+
 def _run_hf_sft_step(
     *,
     base_model: str,
@@ -773,6 +894,9 @@ def _run_hf_sft_step(
     )
     if dtype == torch.float32:
         _install_hf_qwen35_gdn_fp32_reference(model, base_model=base_model)
+    recurrent_prefix_paths = _hf_requires_recurrent_prefix_paths(
+        base_model, allow_unvalidated_arch=allow_unvalidated_arch
+    )
     route_capture = _HfMoeRoutingCapture(model)
     _debug("running HF forward/backward")
     model.zero_grad(set_to_none=True)
@@ -789,9 +913,32 @@ def _run_hf_sft_step(
     for micro_slot, (micro, sample_index) in enumerate(
         zip(micro_inputs, sample_indices, strict=True)
     ):
-        route_capture.set_active_micro(sample_index, micro_slot)
         attention_mask = micro["attention_mask"].reshape(-1)
         actual_len = max(int(attention_mask.sum().item()), 1)
+        if recurrent_prefix_paths:
+            micro_losses = _run_hf_recurrent_prefix_tree_micro(
+                model=model,
+                route_capture=route_capture,
+                micro=micro,
+                sample_index=sample_index,
+                micro_slot=micro_slot,
+                actual_len=actual_len,
+                total_token_count=total_token_count,
+                device=device,
+                dtype=dtype,
+            )
+            trainable_losses.append(micro_losses.detach().cpu())
+            loss_sum = loss_sum + micro_losses.detach().sum()
+            token_count += int(micro_losses.numel())
+            continue
+        route_capture.set_active_micro(sample_index, micro_slot)
+        _prepare_hf_reference_forward(
+            model,
+            micro,
+            base_model=base_model,
+            actual_len=actual_len,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
         input_ids = micro["input_ids"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
         labels = micro["labels"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
         hf_attention_mask, position_ids = _hf_prefix_tree_forward_inputs(
@@ -848,6 +995,112 @@ def _run_hf_sft_step(
         routing_replay_bundle,
         hf_reference_state_dict,
     )
+
+
+def _run_hf_recurrent_prefix_tree_micro(
+    *,
+    model: Any,
+    route_capture: _HfMoeRoutingCapture,
+    micro: dict[str, torch.Tensor],
+    sample_index: int | None,
+    micro_slot: int,
+    actual_len: int,
+    total_token_count: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    input_ids = micro["input_ids"].reshape(-1)[:actual_len]
+    labels = micro["labels"].reshape(-1)[:actual_len]
+    position_ids = micro["position_ids"].reshape(-1)[:actual_len]
+    shifted_labels = megatron_train.shift_tensor(labels.unsqueeze(0), -100)[0]
+    expected_mask = shifted_labels != -100
+    claimed_mask = torch.zeros(actual_len, dtype=torch.bool)
+    claimed_targets = torch.full((actual_len,), -100, dtype=labels.dtype)
+    packed_losses = torch.empty(actual_len, dtype=torch.float32)
+    for path_indices in _hf_prefix_tree_paths(micro, actual_len=actual_len):
+        route_capture.set_active_micro(
+            sample_index,
+            micro_slot,
+            token_uids=path_indices,
+            token_span=actual_len,
+        )
+        path_input_ids = input_ids.index_select(0, path_indices).unsqueeze(0).to(device)
+        path_labels = labels.index_select(0, path_indices).unsqueeze(0).to(device)
+        path_positions = (
+            position_ids.index_select(0, path_indices).unsqueeze(0).to(device)
+        )
+        logits = model(
+            input_ids=path_input_ids,
+            attention_mask=torch.ones_like(path_input_ids, dtype=dtype),
+            position_ids=path_positions,
+            use_cache=False,
+        ).logits
+        path_shifted_labels = megatron_train.shift_tensor(path_labels, -100)[0]
+        per_token_loss = F.cross_entropy(
+            logits.float().reshape(-1, logits.shape[-1]),
+            path_shifted_labels,
+            reduction="none",
+            ignore_index=-100,
+        )
+        path_mask = path_shifted_labels != -100
+        path_uids = path_indices[path_mask.cpu()]
+        path_targets = path_shifted_labels[path_mask].detach().cpu()
+        repeated = claimed_mask.index_select(0, path_uids)
+        if bool(repeated.any()) and not torch.equal(
+            claimed_targets.index_select(0, path_uids[repeated]),
+            path_targets[repeated],
+        ):
+            raise RuntimeError("HF prefix paths assign different targets to one token")
+        unclaimed = ~repeated
+        selected_uids = path_uids[unclaimed]
+        selected_losses = per_token_loss[path_mask][unclaimed.to(device)]
+        packed_losses.index_copy_(0, selected_uids, selected_losses.detach().cpu())
+        claimed_targets.index_copy_(0, selected_uids, path_targets[unclaimed])
+        claimed_mask.index_fill_(0, selected_uids, True)
+        if selected_losses.numel():
+            (selected_losses.sum() / total_token_count).backward()
+    if not torch.equal(claimed_mask, expected_mask.cpu()):
+        missing = torch.where(expected_mask.cpu() & ~claimed_mask)[0].tolist()
+        extra = torch.where(claimed_mask & ~expected_mask.cpu())[0].tolist()
+        raise RuntimeError(
+            "HF prefix paths do not preserve packed loss positions: "
+            f"missing={missing} extra={extra}"
+        )
+    return packed_losses[expected_mask.cpu()]
+
+
+def _hf_prefix_tree_paths(
+    micro: dict[str, torch.Tensor], *, actual_len: int
+) -> tuple[torch.Tensor, ...]:
+    row = parse_prefix_tree_row(
+        group_ids=micro["group_ids"].reshape(-1)[:actual_len],
+        parent_ids=micro["parent_ids"].reshape(-1)[:actual_len],
+    )
+    if row.valid_tokens != actual_len:
+        raise RuntimeError(
+            f"HF prefix tree covers {row.valid_tokens}/{actual_len} valid tokens"
+        )
+    by_group = {segment.group_id: segment for segment in row.segments}
+    parent_groups = {
+        segment.parent_id
+        for segment in row.segments
+        if segment.parent_id != segment.group_id
+    }
+    paths: list[torch.Tensor] = []
+    for leaf in row.segments:
+        if leaf.group_id in parent_groups:
+            continue
+        path_segments = [by_group[group_id] for group_id in leaf.ancestors]
+        path_segments.append(leaf)
+        paths.append(
+            torch.cat(
+                [
+                    torch.arange(segment.start, segment.end, dtype=torch.long)
+                    for segment in path_segments
+                ]
+            )
+        )
+    return tuple(paths)
 
 
 def _install_hf_qwen35_gdn_fp32_reference(model: Any, *, base_model: str) -> None:
@@ -966,7 +1219,18 @@ def _build_hf_parity_conversion_tasks(
     hf_keys: set[str],
 ) -> list[Any]:
     tasks = []
-    for task in build_art_conversion_tasks(bridge=bridge, model=model):
+    registry_type = type(bridge._model_bridge.mapping_registry())
+    lookup = registry_type.megatron_to_hf_lookup
+
+    def permissive_lookup(registry: Any, name: str) -> Any:
+        mapping = lookup(registry, name)
+        if mapping is not None:
+            mapping.allow_hf_name_mismatch = True
+        return mapping
+
+    with patch.object(registry_type, "megatron_to_hf_lookup", permissive_lookup):
+        conversion_tasks = build_art_conversion_tasks(bridge=bridge, model=model)
+    for task in conversion_tasks:
         mapping_names = _hf_param_names_for_mapping(task.mapping)
         if not mapping_names:
             tasks.append(task)
@@ -1361,7 +1625,28 @@ def _drop_gemma4_reparameterized_norm_grads(
     }
 
 
+def _validate_distributed_process_env() -> None:
+    missing = [name for name in _DISTRIBUTED_PROCESS_ENV if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError(
+            f"HF parity worker requires explicit distributed environment: {missing}"
+        )
+    master_port = int(os.environ["MASTER_PORT"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    if not 0 < master_port < 65536:
+        raise RuntimeError(f"Invalid MASTER_PORT={master_port}")
+    if not 0 <= rank < world_size or not 0 <= local_rank < local_world_size:
+        raise RuntimeError(
+            "Invalid HF parity rank environment: "
+            f"rank={rank}/{world_size} local_rank={local_rank}/{local_world_size}"
+        )
+
+
 def _worker_run(request: HfParityRunRequest) -> None:
+    _validate_distributed_process_env()
     if not torch.cuda.is_available():
         raise RuntimeError("HF parity requires at least one CUDA device")
     torch.cuda.set_device(0)

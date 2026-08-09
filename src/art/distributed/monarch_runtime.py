@@ -132,8 +132,12 @@ class MonarchTrajectoryQueueEndpoint:
     async def resize(self, operation: TrajectoryQueueResize) -> None:
         await call_remote(self.actor.resize_trajectory_queue, operation)
 
-    async def take(self, queue_id: str, consumer_id: str) -> TrajectoryQueueTake:
-        return await call_remote(self.actor.take_trajectory, queue_id, consumer_id)
+    async def take(
+        self, queue_id: str, consumer_id: str, count: int
+    ) -> TrajectoryQueueTake:
+        return await call_remote(
+            self.actor.take_trajectory, queue_id, consumer_id, count
+        )
 
     async def mark_packed(self, operation: TrajectoryQueuePacking) -> None:
         await call_remote(self.actor.mark_trajectories_packed, operation)
@@ -178,6 +182,7 @@ class MonarchVllmHostLauncher:
         template_path: str,
         tensor_dtype: str,
         timeout_s: float,
+        transport: Literal["local", "nixl"],
     ) -> AdapterTransferTarget:
         return await call_remote(
             self.actor.prepare_adapter_receive,
@@ -185,6 +190,7 @@ class MonarchVllmHostLauncher:
             template_path,
             tensor_dtype,
             timeout_s,
+            transport,
         )
 
     async def wait_adapter_receive(

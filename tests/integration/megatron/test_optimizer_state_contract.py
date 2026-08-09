@@ -4,8 +4,9 @@ from typing import cast
 
 import pytest
 
+from art.megatron.distributed_service import DistributedMegatronService
 from art.megatron.migrations import apply_megatron_migrations, optimizer_state_path
-from art.megatron.service import MegatronService
+from art.megatron.tensor_snapshot import SnapshotReadBarrier
 
 
 def test_split_optimizer_root_moves_to_unified_path(tmp_path: Path) -> None:
@@ -44,11 +45,13 @@ def test_loose_optimizer_shards_are_not_silently_upgraded(tmp_path: Path) -> Non
 
 
 def test_service_uses_one_optimizer_root_for_all_objectives(tmp_path: Path) -> None:
-    service = cast(MegatronService, SimpleNamespace(output_dir=str(tmp_path)))
-
-    assert MegatronService._get_optimizer_state_path(service) == optimizer_state_path(
-        str(tmp_path)
+    service = cast(
+        DistributedMegatronService, SimpleNamespace(output_dir=str(tmp_path))
     )
+
+    assert DistributedMegatronService._optimizer_state_path.__get__(
+        service, DistributedMegatronService
+    ) == optimizer_state_path(str(tmp_path))
 
 
 def test_resident_optimizer_is_reused_across_objectives_in_one_run(
@@ -66,6 +69,7 @@ def test_resident_optimizer_is_reused_across_objectives_in_one_run(
             model=object(),
             rank=0,
             model_support_handler=object(),
+            optimizer_snapshot_barrier=SnapshotReadBarrier(),
         ),
     )
     monkeypatch.setattr(train, "_load_adapter_into_model", lambda *_args, **_kwargs: {})

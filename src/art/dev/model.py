@@ -173,6 +173,7 @@ class InternalModelConfig(TypedDict, total=False):
     chat_template_tool_schema_format: Literal["default", "vllm_openai"]
     vllm_runtime: VllmRuntimeArgs
     allow_unvalidated_arch: bool
+    megatron_model_initialization: Literal["pretrained", "random"]
 
 
 class BackendModelConfig(InternalModelConfig, total=False):

@@ -269,7 +269,7 @@ def prefix_tree_pack(
     )
     if not planned_rows:
         raise RuntimeError("No tokenized results were packable")
-    random.shuffle(planned_rows)
+    random.Random(len(planned_rows)).shuffle(planned_rows)
     rows = [row for row, _ in planned_rows]
     row_plans = [plan for _, plan in planned_rows]
 

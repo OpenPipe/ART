@@ -18,6 +18,11 @@ from art.megatron.lora import (
 )
 from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
 from art.megatron.model_support.spec import ExpertPackedLoraGroup, ExpertPackedLoraSlot
+from art.megatron.tensor_snapshot import (
+    PendingCpuSnapshot,
+    PinnedCpuSnapshotBuilder,
+    PinnedCpuSnapshotStager,
+)
 from art.megatron.training.model_chunks import ModelChunks
 
 
@@ -37,34 +42,6 @@ class PackedExpertShardMeta(NamedTuple):
         for dim in self.shape:
             total *= dim
         return total
-
-
-class _PinnedCpuStager:
-    def __init__(self) -> None:
-        self._events: list[torch.cuda.Event] = []
-        self._stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-
-    def stage(self, tensor: torch.Tensor) -> torch.Tensor:
-        source = tensor.detach()
-        if self._stream is None or not source.is_cuda:
-            return source.to(device="cpu", copy=True)
-
-        source = source.contiguous()
-        target = torch.empty_like(source, device="cpu", pin_memory=True)
-        source_stream = torch.cuda.current_stream(source.device)
-        self._stream.wait_stream(source_stream)
-        with torch.cuda.stream(self._stream):
-            target.copy_(source, non_blocking=True)
-            source.record_stream(self._stream)
-            event = torch.cuda.Event()
-            event.record(self._stream)
-        self._events.append(event)
-        return target
-
-    def finish(self) -> None:
-        for event in self._events:
-            event.synchronize()
-        self._events.clear()
 
 
 class LoraSnapshot(BaseModel):
@@ -635,15 +612,56 @@ def merge_packed_expert_adapter_entries(
 
 def _stage_published_tensors(
     tensors: dict[str, torch.Tensor],
-    stager: _PinnedCpuStager,
+    stager: PinnedCpuSnapshotBuilder,
 ) -> dict[str, torch.Tensor]:
-    grouped: dict[tuple[str, int | None, str], list[tuple[str, torch.Tensor]]] = {}
+    aliases: dict[
+        tuple[str, int | None, torch.dtype, int], list[tuple[str, torch.Tensor]]
+    ] = {}
+    regular: list[tuple[str, torch.Tensor]] = []
     for key, tensor in tensors.items():
+        if not tensor.numel() or not tensor.is_contiguous():
+            regular.append((key, tensor))
+            continue
+        storage = tensor.untyped_storage()
+        aliases.setdefault(
+            (
+                tensor.device.type,
+                tensor.device.index,
+                tensor.dtype,
+                storage.data_ptr(),
+            ),
+            [],
+        ).append((key, tensor))
+
+    staged: dict[str, torch.Tensor] = {}
+    for group in aliases.values():
+        storage = group[0][1].untyped_storage()
+        if len(group) == 1 or storage.nbytes() > sum(
+            tensor.nbytes for _key, tensor in group
+        ):
+            regular.extend(group)
+            continue
+        representative = group[0][1]
+        flat = representative.new_empty(0).set_(
+            storage,
+            0,
+            (storage.nbytes() // representative.element_size(),),
+            (1,),
+        )
+        staged_flat = stager.stage(flat)
+        for key, tensor in group:
+            staged[key] = staged_flat.as_strided(
+                tensor.shape,
+                tensor.stride(),
+                tensor.storage_offset(),
+            )
+
+    grouped: dict[tuple[str, int | None, str], list[tuple[str, torch.Tensor]]] = {}
+    for key, tensor in regular:
         dtype_name = _dtype_name(tensor.dtype)
         group_key = (tensor.device.type, tensor.device.index, dtype_name)
         grouped.setdefault(group_key, []).append((key, tensor))
 
-    staged: dict[str, torch.Tensor] = {}
     for _group_key, group in sorted(grouped.items()):
         flat = torch.cat(
             [tensor.detach().contiguous().view(-1) for _key, tensor in sorted(group)]
@@ -681,9 +699,9 @@ def _save_rank0_vllm_lora(
         handler=handler,
         adapter_config=adapter_config,
     )
-    stager = _PinnedCpuStager()
-    published_tensors = _stage_published_tensors(vllm_tensors, stager)
-    stager.finish()
+    builder = PinnedCpuSnapshotStager().begin()
+    published_tensors = _stage_published_tensors(vllm_tensors, builder)
+    builder.finish(published_tensors).resolve()
     save_vllm_lora_tensors(output_dir, published_tensors, published_config)
 
 
@@ -698,6 +716,27 @@ def _rank0_vllm_lora_tensors(
     handler: Any,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    merged_tensors = _rank0_merged_lora_tensors(
+        metadata=metadata,
+        tensors_by_owner_key=tensors_by_owner_key,
+        packed_expert_metadata=packed_expert_metadata,
+        packed_expert_tensors_by_owner_key=packed_expert_tensors_by_owner_key,
+    )
+    return handler.to_vllm_lora_tensors(
+        merged_tensors,
+        adapter_config=dict(adapter_config),
+    )
+
+
+def _rank0_merged_lora_tensors(
+    *,
+    metadata: list[LoraShardMeta],
+    tensors_by_owner_key: dict[tuple[int, str], torch.Tensor],
+    packed_expert_metadata: list[PackedExpertShardMeta] | None = None,
+    packed_expert_tensors_by_owner_key: (
+        dict[tuple[int, str], torch.Tensor] | None
+    ) = None,
+) -> dict[str, torch.Tensor]:
     merged_tensors = merge_sharded_adapter_entries(
         _entries_by_key(metadata, tensors_by_owner_key)
     )
@@ -712,10 +751,7 @@ def _rank0_vllm_lora_tensors(
             if key in merged_tensors:
                 raise RuntimeError(f"Duplicate LoRA tensor after packed publish: {key}")
             merged_tensors[key] = tensor
-    return handler.to_vllm_lora_tensors(
-        merged_tensors,
-        adapter_config=dict(adapter_config),
-    )
+    return merged_tensors
 
 
 def build_vllm_lora_tensors_from_model(
@@ -728,6 +764,31 @@ def build_vllm_lora_tensors_from_model(
     world_size: int,
     slot_ref: LoRASlotRef | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]] | None:
+    merged_tensors = _build_merged_lora_tensors_from_model(
+        model=model,
+        adapter_dtypes=adapter_dtypes,
+        handler=handler,
+        rank=rank,
+        world_size=world_size,
+        slot_ref=slot_ref,
+    )
+    if merged_tensors is None:
+        return None
+    return handler.to_vllm_lora_tensors(
+        merged_tensors,
+        adapter_config=dict(adapter_config),
+    )
+
+
+def _build_merged_lora_tensors_from_model(
+    *,
+    model: ModelChunks,
+    adapter_dtypes: dict[str, torch.dtype],
+    handler: Any,
+    rank: int,
+    world_size: int,
+    slot_ref: LoRASlotRef | None = None,
+) -> dict[str, torch.Tensor] | None:
     actual_rank, device = _rank_and_device()
     if _distributed_ready():
         actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
@@ -776,13 +837,11 @@ def build_vllm_lora_tensors_from_model(
     if rank != 0:
         return None
 
-    return _rank0_vllm_lora_tensors(
+    return _rank0_merged_lora_tensors(
         metadata=all_metadata,
         tensors_by_owner_key=exchanged_tensors,
         packed_expert_metadata=all_packed_metadata,
         packed_expert_tensors_by_owner_key=exchanged_packed_tensors,
-        handler=handler,
-        adapter_config=adapter_config,
     )
 
 
@@ -821,7 +880,7 @@ def snapshot_vllm_lora_from_model(
     world_size: int,
     slot_ref: LoRASlotRef | None = None,
 ) -> LoraSnapshot | None:
-    result = build_vllm_lora_tensors_from_model(
+    pending = stage_vllm_lora_snapshot_from_model(
         model=model,
         adapter_dtypes=adapter_dtypes,
         handler=handler,
@@ -829,16 +888,50 @@ def snapshot_vllm_lora_from_model(
         rank=rank,
         world_size=world_size,
         slot_ref=slot_ref,
+        stager=PinnedCpuSnapshotStager(),
     )
-    if result is None:
+    return None if pending is None else pending.resolve()
+
+
+def stage_vllm_lora_snapshot_from_model(
+    *,
+    model: ModelChunks,
+    adapter_dtypes: dict[str, torch.dtype],
+    handler: Any,
+    adapter_config: dict[str, Any],
+    rank: int,
+    world_size: int,
+    stager: PinnedCpuSnapshotStager,
+    slot_ref: LoRASlotRef | None = None,
+) -> PendingCpuSnapshot[LoraSnapshot] | None:
+    merged_tensors = _build_merged_lora_tensors_from_model(
+        model=model,
+        adapter_dtypes=adapter_dtypes,
+        handler=handler,
+        rank=rank,
+        world_size=world_size,
+        slot_ref=slot_ref,
+    )
+    if merged_tensors is None:
         return None
-    vllm_tensors, published_config = result
-    stager = _PinnedCpuStager()
-    published_tensors = _stage_published_tensors(vllm_tensors, stager)
-    stager.finish()
-    return LoraSnapshot(
-        tensors=published_tensors,
-        adapter_config=published_config,
+    builder = stager.begin()
+    if handler.vllm_lora_conversion_is_view_only():
+        merged_tensors = _stage_published_tensors(merged_tensors, builder)
+        vllm_tensors, published_config = handler.to_vllm_lora_tensors(
+            merged_tensors,
+            adapter_config=dict(adapter_config),
+        )
+    else:
+        vllm_tensors, published_config = handler.to_vllm_lora_tensors(
+            merged_tensors,
+            adapter_config=dict(adapter_config),
+        )
+        vllm_tensors = _stage_published_tensors(vllm_tensors, builder)
+    return builder.finish(
+        LoraSnapshot(
+            tensors=vllm_tensors,
+            adapter_config=published_config,
+        )
     )
 
 

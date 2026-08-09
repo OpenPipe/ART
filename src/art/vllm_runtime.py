@@ -88,6 +88,7 @@ class VllmRuntimeLaunchConfig(BaseModel):
     replica_generation: int = Field(default=0, ge=0)
     process_uuid: str | None = None
     update_identity: str | None = None
+    initial_policy_version: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _validate_native_member(self) -> "VllmRuntimeLaunchConfig":
@@ -279,6 +280,16 @@ def _vllm_runtime_subprocess_env(
     """
     env = os.environ.copy()
     configure_model_cache_env(env)
+    for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        options = [
+            option
+            for option in env.get(key, "").split(",")
+            if option and option != "expandable_segments:True"
+        ]
+        if options:
+            env[key] = ",".join(options)
+        else:
+            env.pop(key, None)
     service_prefixes = {
         key.removesuffix("_SERVICE_HOST")
         for key in env
@@ -413,6 +424,7 @@ class ManagedVllmRuntime:
                     host=self.host,
                     port=self.port,
                     timeout=runtime_timeout,
+                    log_path=self.log_path,
                 )
             except TimeoutError as exc:
                 log_path = self.log_path
@@ -426,7 +438,8 @@ class ManagedVllmRuntime:
                 log_path = self.log_path
                 self._cleanup_after_start_error(cleanup_on_error)
                 raise RuntimeError(
-                    f"vLLM subprocess exited with code {returncode}. "
+                    f"vLLM subprocess failed during startup "
+                    f"(returncode={returncode}): {exc}. "
                     f"Check logs at {log_path}"
                 ) from exc
 
@@ -948,6 +961,8 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
         )
     if config.update_identity is not None:
         command.append(f"--update-identity={config.update_identity}")
+    if config.initial_policy_version is not None:
+        command.append(f"--initial-policy-version={config.initial_policy_version}")
     return command
 
 
@@ -957,15 +972,35 @@ async def wait_for_vllm_runtime(
     host: str,
     port: int,
     timeout: float,
+    log_path: str | None = None,
 ) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     url = f"http://{host}:{port}/health"
+    log_offset = 0
+    log_tail = ""
+    fatal_markers = (
+        "EngineCore failed to start",
+        "Engine core initialization failed",
+    )
     async with httpx.AsyncClient() as client:
         while True:
             if process.poll() is not None:
                 raise RuntimeError(
                     f"vLLM runtime exited with code {process.returncode}"
                 )
+            if log_path is not None:
+                try:
+                    with open(log_path, "rb") as log:
+                        log.seek(log_offset)
+                        payload = log.read()
+                        log_offset = log.tell()
+                except FileNotFoundError:
+                    payload = b""
+                log_tail = (log_tail + payload.decode(errors="replace"))[-8192:]
+                if marker := next(
+                    (marker for marker in fatal_markers if marker in log_tail), None
+                ):
+                    raise RuntimeError(f"vLLM reported fatal startup failure: {marker}")
             try:
                 response = await client.get(url, timeout=5.0)
                 if response.status_code == 200:

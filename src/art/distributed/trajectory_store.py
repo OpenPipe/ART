@@ -5,10 +5,11 @@ from collections import deque
 from collections.abc import Callable, Mapping
 import secrets
 import time
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from art.preprocessing.policy_spans import PolicyTokenSpan
 from art.trajectories import MetadataValue, Trajectory, TrajectoryGroup
 
 from .data_plane import (
@@ -258,12 +259,12 @@ class TrajectoryQueueResize(_Contract):
 
 
 class TrajectoryEnqueueResult(_Contract):
-    status: Literal["accepted", "full", "oversize", "closed"]
+    status: Literal["accepted", "full", "oversize", "minimum_unreachable", "closed"]
     reason: str | None = None
 
 
 class TrajectoryQueueTake(_Contract):
-    lease: TrajectoryQueueLease | None = None
+    leases: tuple[TrajectoryQueueLease, ...] = ()
     closed: bool = False
 
 
@@ -282,7 +283,7 @@ class TrajectoryQueuePacking(_Contract):
 
 class TrajectoryQueueRelease(_Contract):
     queue_id: str = Field(min_length=1)
-    lease: TrajectoryQueueLease
+    leases: tuple[TrajectoryQueueLease, ...] = Field(min_length=1)
     generation_id: str | None = None
     disposition: Literal["consumed", "discarded"]
 
@@ -479,7 +480,7 @@ class _QueueEntry:
 
 
 class TrajectoryQueueStore:
-    """Bounded ready FIFO and consumer-lease owner for trajectory references."""
+    """Bounded FIFO and consumer-lease owner for trajectory-group references."""
 
     def __init__(
         self,
@@ -498,6 +499,8 @@ class TrajectoryQueueStore:
         self._used_records = 0
         self._used_bytes = 0
         self._finished = False
+        self._pending_minimum: tuple[str, int] | None = None
+        self._minimum_error: str | None = None
         self.generation = 0
         self._claim_generation = 0
         self._released_leases = 0
@@ -522,9 +525,12 @@ class TrajectoryQueueStore:
         records = len(ref.records)
         byte_count = ref.descriptor.byte_count
         if records > self.capacity_records or byte_count > self.capacity_bytes:
+            reason = f"result requires {records} records/{byte_count} bytes"
+            if self._pending_minimum is not None:
+                return self._fail_pending_minimum(item, reason)
             return TrajectoryEnqueueResult(
                 status="oversize",
-                reason=f"result requires {records} records/{byte_count} bytes",
+                reason=reason,
             )
         if self._finished:
             return TrajectoryEnqueueResult(status="closed")
@@ -533,11 +539,25 @@ class TrajectoryQueueStore:
             if existing.item.ref == ref:
                 return TrajectoryEnqueueResult(status="accepted")
             raise TrajectoryLeaseError("trajectory result lease changed while queued")
-        if (
-            len(self._ready) >= self.max_ready_groups
-            or self._used_records + records > self.capacity_records
-            or self._used_bytes + byte_count > self.capacity_bytes
-        ):
+        if self._minimum_error is not None:
+            return TrajectoryEnqueueResult(
+                status="minimum_unreachable", reason=self._minimum_error
+            )
+        blockers = []
+        if len(self._entries) >= self.max_ready_groups:
+            blockers.append("group capacity")
+        if self._used_records + records > self.capacity_records:
+            blockers.append("record capacity")
+        if self._used_bytes + byte_count > self.capacity_bytes:
+            blockers.append("byte capacity")
+        if blockers:
+            pending = self._pending_minimum
+            if (
+                pending is not None
+                and len(self._ready) < pending[1]
+                and self._minimum_cannot_make_progress(pending[0])
+            ):
+                return self._fail_pending_minimum(item, ", ".join(blockers))
             return TrajectoryEnqueueResult(status="full")
         self._entries[ref.result_id] = _QueueEntry(item)
         self._ready.append(ref.result_id)
@@ -545,26 +565,66 @@ class TrajectoryQueueStore:
         self._used_bytes += byte_count
         return TrajectoryEnqueueResult(status="accepted")
 
-    def take(self, consumer_id: str) -> TrajectoryQueueTake:
+    def take(self, consumer_id: str, count: int) -> TrajectoryQueueTake:
+        """Acquire a positive minimum, take up to a negative limit, or cancel at zero."""
         if not consumer_id:
             raise ValueError("consumer_id must not be empty")
-        if not self._ready:
-            return TrajectoryQueueTake(closed=self._finished)
-        result_id = self._ready.popleft()
-        entry = self._entries[result_id]
-        self._claim_generation += 1
-        entry.phase = "packing"
-        entry.consumer_id = consumer_id
-        entry.claim_id = secrets.token_hex(16)
-        entry.claim_generation = self._claim_generation
-        entry.acquired_at = time.monotonic()
-        return TrajectoryQueueTake(
-            lease=TrajectoryQueueLease(
-                claim_id=entry.claim_id,
-                consumer_id=consumer_id,
-                generation=self._claim_generation,
-                item=entry.item,
+        if count == 0:
+            pending = self._pending_minimum
+            if pending is not None and pending[0] != consumer_id:
+                raise TrajectoryLeaseError(
+                    "trajectory minimum acquisition belongs to another consumer"
+                )
+            self._pending_minimum = None
+            return TrajectoryQueueTake(closed=self._finished and not self._ready)
+        if self._minimum_error is not None:
+            raise TrajectoryCapacityError(self._minimum_error)
+
+        best_effort = count < 0
+        limit = abs(count)
+        request = (consumer_id, limit)
+        if self._pending_minimum not in (None, request):
+            raise TrajectoryLeaseError(
+                "trajectory queue already has a pending minimum acquisition"
             )
+        if best_effort:
+            if self._pending_minimum is not None:
+                raise TrajectoryLeaseError(
+                    "best-effort take cannot replace a pending minimum acquisition"
+                )
+            take_count = min(limit, len(self._ready))
+        elif not self._finished and limit > self.max_ready_groups:
+            raise TrajectoryCapacityError(
+                f"minimum acquisition requires {limit} trajectory groups; shared "
+                f"queue capacity is {self.max_ready_groups} groups"
+            )
+        elif not self._finished and len(self._ready) < limit:
+            self._pending_minimum = request
+            return TrajectoryQueueTake()
+        else:
+            self._pending_minimum = None
+            take_count = min(limit, len(self._ready))
+
+        leases: list[TrajectoryQueueLease] = []
+        while len(leases) < take_count:
+            result_id = self._ready.popleft()
+            entry = self._entries[result_id]
+            self._claim_generation += 1
+            entry.phase = "packing"
+            entry.consumer_id = consumer_id
+            entry.claim_id = secrets.token_hex(16)
+            entry.claim_generation = self._claim_generation
+            entry.acquired_at = time.monotonic()
+            leases.append(
+                TrajectoryQueueLease(
+                    claim_id=entry.claim_id,
+                    consumer_id=consumer_id,
+                    generation=self._claim_generation,
+                    item=entry.item,
+                )
+            )
+        return TrajectoryQueueTake(
+            leases=tuple(leases), closed=self._finished and not self._ready
         )
 
     def mark_packed(self, operation: TrajectoryQueuePacking) -> None:
@@ -576,23 +636,28 @@ class TrajectoryQueueStore:
             entry.packing_generation_id = operation.generation_id
 
     def release(self, operation: TrajectoryQueueRelease) -> None:
-        entry = self._leased_entry(operation.lease)
-        if entry.phase == "packing":
-            if operation.disposition != "discarded" or operation.generation_id:
-                raise TrajectoryLeaseError("unpacked trajectory can only be discarded")
-        elif entry.phase == "packed":
-            if operation.generation_id != entry.packing_generation_id:
-                raise TrajectoryLeaseError(
-                    "trajectory packing generation does not match"
-                )
-        else:
-            raise TrajectoryLeaseError("trajectory claim was not acquired")
-        assert entry.acquired_at is not None
-        lifetime = time.monotonic() - entry.acquired_at
-        self._released_leases += 1
-        self._lease_lifetime_s += lifetime
-        self._max_lease_lifetime_s = max(self._max_lease_lifetime_s, lifetime)
-        self._remove(operation.lease.item.ref.result_id)
+        entries = [self._leased_entry(lease) for lease in operation.leases]
+        for entry in entries:
+            if entry.phase == "packing":
+                if operation.disposition != "discarded" or operation.generation_id:
+                    raise TrajectoryLeaseError(
+                        "unpacked trajectory can only be discarded"
+                    )
+            elif entry.phase == "packed":
+                if operation.generation_id != entry.packing_generation_id:
+                    raise TrajectoryLeaseError(
+                        "trajectory packing generation does not match"
+                    )
+            else:
+                raise TrajectoryLeaseError("trajectory claim was not acquired")
+        now = time.monotonic()
+        for lease, entry in zip(operation.leases, entries, strict=True):
+            assert entry.acquired_at is not None
+            lifetime = now - entry.acquired_at
+            self._released_leases += 1
+            self._lease_lifetime_s += lifetime
+            self._max_lease_lifetime_s = max(self._max_lease_lifetime_s, lifetime)
+            self._remove(lease.item.ref.result_id)
 
     def finish(self) -> None:
         self._finished = True
@@ -604,6 +669,8 @@ class TrajectoryQueueStore:
         self._used_records = 0
         self._used_bytes = 0
         self._finished = True
+        self._pending_minimum = None
+        self._minimum_error = None
         return refs
 
     def snapshot(self) -> TrajectoryQueueSnapshot:
@@ -649,6 +716,32 @@ class TrajectoryQueueStore:
         self._used_records -= len(entry.item.ref.records)
         self._used_bytes -= entry.item.ref.descriptor.byte_count
 
+    def _fail_pending_minimum(
+        self, item: TrajectoryQueueItem, blocker: str
+    ) -> TrajectoryEnqueueResult:
+        assert self._pending_minimum is not None
+        count = self._pending_minimum[1]
+        ref = item.ref
+        packing = sum(entry.phase == "packing" for entry in self._entries.values())
+        self._minimum_error = (
+            f"minimum acquisition of {count} trajectory groups is unreachable: "
+            f"{len(self._ready)} ready/{packing} packing groups use "
+            f"{self._used_records}/{self.capacity_records} records and "
+            f"{self._used_bytes}/{self.capacity_bytes} bytes; result "
+            f"{ref.result_id!r} requires {len(ref.records)} records/"
+            f"{ref.descriptor.byte_count} bytes ({blocker})"
+        )
+        return TrajectoryEnqueueResult(
+            status="minimum_unreachable", reason=self._minimum_error
+        )
+
+    def _minimum_cannot_make_progress(self, consumer_id: str) -> bool:
+        return all(
+            entry.phase == "ready"
+            or (entry.phase == "packing" and entry.consumer_id == consumer_id)
+            for entry in self._entries.values()
+        )
+
 
 def _grouping_key(group: TrajectoryGroup, fallback: str) -> str:
     value = group.metadata.get("grouping_tag", group.metadata.get("scenario_id"))
@@ -676,7 +769,12 @@ def _policy_token_counts(trajectories: list[Trajectory]) -> dict[int, int]:
 
 def _trajectory_policy_token_counts(trajectory: Trajectory) -> dict[int, int]:
     counts: dict[int, int] = {}
-    items = list(trajectory.messages_and_choices)
+    items: list[Any] = [
+        choice
+        for exchange in trajectory.exchanges.chat_completions
+        for choice in exchange.response.choices
+    ]
+    items.extend(trajectory.messages_and_choices)
     for history in trajectory.additional_histories:
         items.extend(history.messages_and_choices)
     for item in items:
@@ -684,16 +782,20 @@ def _trajectory_policy_token_counts(trajectory: Trajectory) -> dict[int, int]:
         if not isinstance(extra, Mapping):
             continue
         spans = extra.get("policy_token_spans")
-        if not isinstance(spans, list):
+        if spans is None:
             continue
+        if not isinstance(spans, list):
+            raise RuntimeError("policy_token_spans must be a list")
+        cursor = 0
         for span in spans:
-            if not isinstance(span, Mapping):
-                continue
-            try:
-                version = int(span["policy_version"])
-                tokens = int(span["end_token"]) - int(span["start_token"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if tokens > 0:
-                counts[version] = counts.get(version, 0) + tokens
+            parsed = PolicyTokenSpan.model_validate(span)
+            if parsed.start_token != cursor:
+                raise RuntimeError(
+                    "policy_token_spans must be a contiguous completion partition"
+                )
+            tokens = parsed.end_token - parsed.start_token
+            counts[parsed.policy_version] = (
+                counts.get(parsed.policy_version, 0) + tokens
+            )
+            cursor = parsed.end_token
     return counts

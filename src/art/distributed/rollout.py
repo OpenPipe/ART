@@ -215,6 +215,35 @@ class RolloutExecutor(Protocol):
 class LocalRolloutExecutor:
     max_workers: int | None = None
 
+    def __init__(
+        self,
+        *,
+        trajectory_capacity_records: int = 16_384,
+        trajectory_capacity_bytes: int = 4 << 30,
+    ) -> None:
+        self._owner = InProcessRolloutWorker(
+            capacity_records=trajectory_capacity_records,
+            capacity_bytes=trajectory_capacity_bytes,
+        )
+        self._owner_endpoints: dict[str, RolloutWorkerEndpoint] = {
+            self._owner.owner_actor_id: self._owner
+        }
+        self._trajectory_capacity_records = trajectory_capacity_records
+        self._trajectory_capacity_bytes = trajectory_capacity_bytes
+        self._result_queue: DistributedTrajectoryQueue | None = None
+
+    def create_result_queue(self, maxsize: int) -> DistributedTrajectoryQueue:
+        if self._result_queue is not None:
+            raise RuntimeError("local rollout result queue already exists")
+        self._result_queue = DistributedTrajectoryQueue(
+            endpoint=_InProcessTrajectoryQueueEndpoint(),
+            owner_endpoints=self._owner_endpoints,
+            maxsize=maxsize,
+            capacity_records=self._trajectory_capacity_records,
+            capacity_bytes=self._trajectory_capacity_bytes,
+        )
+        return self._result_queue
+
     def set_target(self, target_workers: int) -> None:
         if target_workers < 1:
             raise ValueError("target_workers must be >= 1")
@@ -231,7 +260,10 @@ class LocalRolloutExecutor:
         config: Any,
     ) -> Any:
         del worker_id
-        return await rollout_fn(model, scenario, config)
+        result = await rollout_fn(model, scenario, config)
+        if self._result_queue is not None and isinstance(result, TrajectoryGroup):
+            return self._owner.store(result)
+        return result
 
 
 class RolloutWorkerEndpoint(Protocol):
@@ -259,7 +291,9 @@ class TrajectoryQueueEndpoint(Protocol):
 
     async def resize(self, operation: TrajectoryQueueResize) -> None: ...
 
-    async def take(self, queue_id: str, consumer_id: str) -> TrajectoryQueueTake: ...
+    async def take(
+        self, queue_id: str, consumer_id: str, count: int
+    ) -> TrajectoryQueueTake: ...
 
     async def mark_packed(self, operation: TrajectoryQueuePacking) -> None: ...
 
@@ -301,8 +335,10 @@ class _InProcessTrajectoryQueueEndpoint:
             maxsize=operation.maxsize, generation=operation.generation
         )
 
-    async def take(self, queue_id: str, consumer_id: str) -> TrajectoryQueueTake:
-        return self._queue(queue_id).take(consumer_id)
+    async def take(
+        self, queue_id: str, consumer_id: str, count: int
+    ) -> TrajectoryQueueTake:
+        return self._queue(queue_id).take(consumer_id, count)
 
     async def mark_packed(self, operation: TrajectoryQueuePacking) -> None:
         self._queue(operation.queue_id).mark_packed(operation)
@@ -353,6 +389,9 @@ class DistributedTrajectoryQueue:
         self._cleanup_refs: tuple[TrajectoryGroupRef, ...] = ()
         self._resize_generation = 0
         self._resize_tasks: set[asyncio.Task[None]] = set()
+        self._space_waiters: set[asyncio.Future[None]] = set()
+        self._item_waiters: set[asyncio.Future[None]] = set()
+        self._take_lock = asyncio.Lock()
         self._owner_cleanup_refs: dict[str, deque[TrajectoryGroupRef]] = {}
         self._owner_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
         self._owner_cleanup_failure: BaseException | None = None
@@ -396,6 +435,8 @@ class DistributedTrajectoryQueue:
         try:
             while not self._closed:
                 wait_s = time.monotonic() - started
+                space_available = asyncio.get_running_loop().create_future()
+                self._space_waiters.add(space_available)
                 request = asyncio.create_task(
                     self.endpoint.enqueue(
                         self.queue_id,
@@ -413,19 +454,31 @@ class DistributedTrajectoryQueue:
                     )
                 )
                 try:
-                    result = await asyncio.shield(request)
-                except asyncio.CancelledError:
-                    result = await request
-                    transferred = result.status == "accepted"
-                    raise
-                if result.status == "accepted":
-                    transferred = True
-                    return True, time.monotonic() - started
-                if result.status == "oversize":
-                    raise TrajectoryCapacityError(result.reason or "oversize result")
-                if result.status == "closed":
-                    return False, time.monotonic() - started
-                await asyncio.sleep(0.05)
+                    try:
+                        result = await asyncio.shield(request)
+                    except asyncio.CancelledError:
+                        result = await request
+                        transferred = result.status == "accepted"
+                        if transferred:
+                            self._notify_items()
+                        raise
+                    if result.status == "accepted":
+                        transferred = True
+                        self._notify_items()
+                        return True, time.monotonic() - started
+                    if result.status in ("oversize", "minimum_unreachable"):
+                        self._notify_items()
+                        raise TrajectoryCapacityError(
+                            result.reason or "oversize result"
+                        )
+                    if result.status == "closed":
+                        self._notify_items()
+                        return False, time.monotonic() - started
+                    await space_available
+                finally:
+                    self._space_waiters.discard(space_available)
+                    if not space_available.done():
+                        space_available.cancel()
             return False, time.monotonic() - started
         finally:
             self.put_waiters -= 1
@@ -446,18 +499,32 @@ class DistributedTrajectoryQueue:
         if count < 1:
             raise ValueError("trajectory queue get count must be positive")
         self._raise_owner_cleanup_failure()
-        leases: list[TrajectoryQueueLease] = []
-        closed = self._closed
-        while not closed and len(leases) < count:
-            take = await self.endpoint.take(self.queue_id, self.consumer_id)
-            if take.lease is not None:
-                leases.append(take.lease)
-                continue
-            closed = take.closed
-            if closed or not wait:
-                break
-            await asyncio.sleep(0.01)
-        return await self._resolve_many(leases), closed
+        async with self._take_lock:
+            closed = self._closed
+            while not closed:
+                item_available = asyncio.get_running_loop().create_future()
+                self._item_waiters.add(item_available)
+                try:
+                    # Negative counts retain best-effort bulk reads above the minimum.
+                    take = await self._take_trajectories(count if wait else -count)
+                    if take.leases:
+                        return await self._resolve_many(take.leases), take.closed
+                    closed = take.closed
+                    if closed or not wait:
+                        break
+                    self._notify_space()
+                    try:
+                        await item_available
+                    except asyncio.CancelledError:
+                        if not self._closed:
+                            await self.endpoint.take(self.queue_id, self.consumer_id, 0)
+                        raise
+                    closed = self._closed
+                finally:
+                    self._item_waiters.discard(item_available)
+                    if not item_available.done():
+                        item_available.cancel()
+            return [], closed
 
     async def discard_group(self, group: TrajectoryGroup) -> None:
         selection = group._distributed_lease
@@ -487,18 +554,11 @@ class DistributedTrajectoryQueue:
         disposition: Literal["consumed", "discarded"],
         generation_id: str | None = None,
     ) -> None:
-        if selection.queue is not self:
-            raise TrajectoryLeaseError("trajectory selection belongs to another queue")
-        owner = self._owner(selection.lease.item.ref)
-        cleanup = await self._release(
-            selection.lease,
-            owner,
+        await self.release_selections(
+            (selection,),
             disposition=disposition,
             generation_id=generation_id,
         )
-        if cleanup:
-            raise BaseExceptionGroup("trajectory result release failed", cleanup)
-        self._raise_owner_cleanup_failure()
 
     async def release_selections(
         self,
@@ -507,25 +567,24 @@ class DistributedTrajectoryQueue:
         disposition: Literal["consumed", "discarded"],
         generation_id: str | None = None,
     ) -> None:
-        results = await asyncio.gather(
-            *(
-                self.release_selection(
-                    selection,
-                    disposition=disposition,
-                    generation_id=generation_id,
-                )
-                for selection in selections
-            ),
-            return_exceptions=True,
+        if any(selection.queue is not self for selection in selections):
+            raise TrajectoryLeaseError("trajectory selection belongs to another queue")
+        cleanup = await self._release_many(
+            tuple(selection.lease for selection in selections),
+            tuple(self._owner(selection.lease.item.ref) for selection in selections),
+            disposition=disposition,
+            generation_id=generation_id,
         )
-        failures = [result for result in results if isinstance(result, BaseException)]
-        if failures:
-            raise BaseExceptionGroup("trajectory selection release failed", failures)
+        if cleanup:
+            raise BaseExceptionGroup("trajectory selection release failed", cleanup)
+        self._raise_owner_cleanup_failure()
 
     async def finish(self) -> None:
         if self._started and not self._finished and not self._closed:
             await self.endpoint.finish(self.queue_id)
             self._finished = True
+            self._notify_space()
+            self._notify_items()
 
     async def discard(self, ref: TrajectoryGroupRef) -> None:
         await self._owner(ref).drop(ref)
@@ -562,6 +621,8 @@ class DistributedTrajectoryQueue:
             failures.append(error)
         if not self._closed:
             self._closed = True
+            self._notify_space()
+            self._notify_items()
             if self._started:
                 try:
                     self._cleanup_refs += await self.endpoint.close(self.queue_id)
@@ -587,15 +648,18 @@ class DistributedTrajectoryQueue:
 
     def _schedule_resize(self) -> None:
         self._resize_generation += 1
-        task = asyncio.create_task(
-            self.endpoint.resize(
-                TrajectoryQueueResize(
-                    queue_id=self.queue_id,
-                    maxsize=self.maxsize,
-                    generation=self._resize_generation,
-                )
-            )
+        operation = TrajectoryQueueResize(
+            queue_id=self.queue_id,
+            maxsize=self.maxsize,
+            generation=self._resize_generation,
         )
+
+        async def resize() -> None:
+            await self.endpoint.resize(operation)
+            self._notify_space()
+            self._notify_items()
+
+        task = asyncio.create_task(resize())
         self._resize_tasks.add(task)
 
     async def _flush_resizes(self) -> None:
@@ -631,21 +695,39 @@ class DistributedTrajectoryQueue:
     async def _resolve_many(
         self, leases: Sequence[TrajectoryQueueLease]
     ) -> list[TrajectoryGroup]:
-        results = await asyncio.gather(
-            *(
-                self._consume(lease)
-                if lease.item.ref.transfer is None
-                else asyncio.sleep(0, result=self._summary_group(lease))
-                for lease in leases
-            ),
-            return_exceptions=True,
+        return [self._summary_group(lease) for lease in leases]
+
+    async def _take_trajectories(self, count: int) -> TrajectoryQueueTake:
+        request = asyncio.create_task(
+            self.endpoint.take(self.queue_id, self.consumer_id, count)
         )
-        failures = [result for result in results if isinstance(result, BaseException)]
-        if len(failures) == 1:
-            raise failures[0]
-        if failures:
-            raise BaseExceptionGroup("trajectory materialization failed", failures)
-        return cast(list[TrajectoryGroup], results)
+        try:
+            return await asyncio.shield(request)
+        except asyncio.CancelledError as cancelled:
+            take = await request
+            if take.leases:
+                cleanup = await self._release_many(
+                    take.leases,
+                    tuple(self._owner(lease.item.ref) for lease in take.leases),
+                    disposition="discarded",
+                    generation_id=None,
+                )
+                if cleanup:
+                    raise BaseExceptionGroup(
+                        "trajectory acquisition cancellation cleanup failed",
+                        [cancelled, *cleanup],
+                    ) from None
+            elif count > 0 and not take.closed and not self._closed:
+                await self.endpoint.take(self.queue_id, self.consumer_id, 0)
+            raise
+
+    async def materialize_selection(
+        self, selection: DistributedTrajectorySelection
+    ) -> TrajectoryGroup:
+        if selection.queue is not self:
+            raise TrajectoryLeaseError("trajectory selection belongs to another queue")
+        item = selection.lease.item
+        return item.apply_annotations(await self._owner(item.ref).materialize(item.ref))
 
     def _summary_group(self, lease: TrajectoryQueueLease) -> TrajectoryGroup:
         item = lease.item
@@ -700,19 +782,48 @@ class DistributedTrajectoryQueue:
         disposition: Literal["consumed", "discarded"] = "discarded",
         generation_id: str | None = None,
     ) -> list[BaseException]:
+        return await self._release_many(
+            (lease,),
+            (owner,),
+            disposition=disposition,
+            generation_id=generation_id,
+        )
+
+    async def _release_many(
+        self,
+        leases: tuple[TrajectoryQueueLease, ...],
+        owners: tuple[RolloutWorkerEndpoint, ...],
+        *,
+        disposition: Literal["consumed", "discarded"],
+        generation_id: str | None,
+    ) -> list[BaseException]:
+        if not leases:
+            return []
         try:
             await self.endpoint.release(
                 TrajectoryQueueRelease(
                     queue_id=self.queue_id,
-                    lease=lease,
+                    leases=leases,
                     generation_id=generation_id,
                     disposition=disposition,
                 )
             )
         except BaseException as error:
             return [error]
-        self._schedule_owner_cleanup(owner, lease.item.ref)
+        self._notify_space()
+        for lease, owner in zip(leases, owners, strict=True):
+            self._schedule_owner_cleanup(owner, lease.item.ref)
         return []
+
+    def _notify_space(self) -> None:
+        for waiter in tuple(self._space_waiters):
+            if not waiter.done():
+                waiter.set_result(None)
+
+    def _notify_items(self) -> None:
+        for waiter in tuple(self._item_waiters):
+            if not waiter.done():
+                waiter.set_result(None)
 
     def _schedule_owner_cleanup(
         self, owner: RolloutWorkerEndpoint, ref: TrajectoryGroupRef
@@ -955,6 +1066,13 @@ class InProcessRolloutWorker:
             capacity_records=capacity_records,
             capacity_bytes=capacity_bytes,
         )
+
+    @property
+    def owner_actor_id(self) -> str:
+        return self._results.owner_actor_id
+
+    def store(self, group: TrajectoryGroup) -> TrajectoryGroupRef:
+        return self._results.put(group)
 
     async def run(self, invocation: RolloutInvocation) -> RolloutResult:
         from art.metrics import MetricsBuilder

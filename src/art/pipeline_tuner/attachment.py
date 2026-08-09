@@ -13,6 +13,7 @@ from art.errors import ArtVllmMetricsTimeoutError
 
 from .autotune import (
     PipelineAutotuner,
+    _vllm_sample_intervals,
     build_initial_settings,
     freshness_worker_limit,
     recommended_queue_size,
@@ -234,17 +235,30 @@ class PipelineAutotunerAttachment:
             for poll in self._poll_health
             if stats.window_start_s <= poll.t_s <= end_s
         ]
-        if not polls:
+        if polls:
+            timeout_frac = sum(poll.timed_out for poll in polls) / len(polls)
+            if timeout_frac > self.config.vllm_metric_timeout_window_frac:
+                raise RuntimeError(
+                    "Pipeline autotuning cannot rely on ART vLLM metrics: "
+                    f"{timeout_frac:.1%} of metric polls timed out during decision "
+                    f"window steps {stats.start_step}-{stats.end_step}."
+                )
+        intervals = _vllm_sample_intervals(
+            [poll.t_s for poll in self._poll_health if not poll.timed_out],
+            window_start_s=stats.window_start_s,
+            window_end_s=end_s,
+            metric_interval_s=self.config.vllm_metric_interval_s,
+        )
+        coverage = sum(duration_s for _, duration_s in intervals) / (
+            end_s - stats.window_start_s
+        )
+        min_coverage = 1.0 - self.config.vllm_metric_timeout_window_frac
+        if coverage + 1e-9 < min_coverage:
             raise RuntimeError(
-                "Pipeline autotuning did not collect any ART vLLM metrics polls "
-                f"during decision window steps {stats.start_step}-{stats.end_step}."
-            )
-        timeout_frac = sum(poll.timed_out for poll in polls) / len(polls)
-        if timeout_frac > self.config.vllm_metric_timeout_window_frac:
-            raise RuntimeError(
-                "Pipeline autotuning cannot rely on ART vLLM metrics: "
-                f"{timeout_frac:.1%} of metric polls timed out during decision "
-                f"window steps {stats.start_step}-{stats.end_step}."
+                "Pipeline autotuning cannot rely on ART vLLM metrics: successful "
+                f"telemetry covered {coverage:.1%} of decision window steps "
+                f"{stats.start_step}-{stats.end_step}; requires at least "
+                f"{min_coverage:.1%}."
             )
 
     def _raise_sampler_error(self) -> None:
@@ -345,8 +359,8 @@ class PipelineAutotunerAttachment:
             warnings.warn(
                 "Autotuner profile was produced with policy_age_limit_steps="
                 f"{profile.policy_age_limit_steps}, but active config uses "
-                f"{policy_age_limit_steps}. Recomputing queue size for the "
-                "active limit.",
+                f"{policy_age_limit_steps}. Recomputing the active worker target for "
+                "the active limit.",
                 stacklevel=2,
             )
         return profile
@@ -377,9 +391,6 @@ class PipelineAutotunerAttachment:
                 "num_rollout_workers": workers,
                 "queue_maxsize": recommended_queue_size(
                     target_groups_per_step=settings.target_groups_per_step,
-                    limit_steps_off_policy=policy_age_limit_steps,
-                    num_rollout_workers=workers,
-                    running_reserve_fraction=self.config.queue_running_reserve_fraction,
                 ),
             }
         )

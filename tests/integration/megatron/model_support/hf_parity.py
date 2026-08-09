@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 from typing import Any
@@ -38,6 +39,24 @@ HF_PARITY_PACKED_TENSORS = PackedTensorConfig(
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 HF_PARITY_ARTIFACT_SUITE_NAME = "Megatron HF parity artifacts"
+
+
+def _find_free_rendezvous_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        return int(listener.getsockname()[1])
+
+
+def _hf_parity_worker_env() -> dict[str, str]:
+    return {
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": str(_find_free_rendezvous_port()),
+        "RANK": "0",
+        "WORLD_SIZE": "1",
+        "LOCAL_RANK": "0",
+        "LOCAL_WORLD_SIZE": "1",
+        "PYTHONUNBUFFERED": "1",
+    }
 
 
 class HfParityMetricRow(BaseModel):
@@ -317,11 +336,10 @@ def run_hf_parity_subprocess(request: HfParityRunRequest, output_dir: Path) -> N
         "--run-request",
         str(request_path),
     ]
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     run = subprocess.run(
         command,
         cwd=str(worker_cwd),
-        env=env,
+        env={**os.environ, **_hf_parity_worker_env()},
         capture_output=True,
         text=True,
         check=False,
@@ -335,9 +353,24 @@ def run_hf_parity_subprocess(request: HfParityRunRequest, output_dir: Path) -> N
         )
 
 
+def _run_hf_parity_in_process(
+    request: HfParityRunRequest,
+    output_dir: Path,
+) -> None:
+    from .hf_parity_worker import run_worker_cli
+    from .workflow import _redirect_output, _temporary_env
+
+    request_path = output_dir / "run_request.json"
+    _write_json(request_path, request.model_dump(mode="json"))
+    with _temporary_env(**_hf_parity_worker_env()):
+        with _redirect_output(output_dir / "worker.log"):
+            run_worker_cli(request_path)
+
+
 def run_hf_parity(
     *,
     case_config: OracleCaseConfig,
+    in_process: bool = False,
 ) -> HfParityReport:
     case_config = hf_parity_case_config(case_config)
     if case_config.precision not in {"bf16", "fp32"}:
@@ -373,7 +406,8 @@ def run_hf_parity(
         coverage=coverage,
     )
     with provider_topology_env(ORACLE_TOPOLOGY):
-        run_hf_parity_subprocess(request, output_dir)
+        runner = _run_hf_parity_in_process if in_process else run_hf_parity_subprocess
+        runner(request, output_dir)
     report = HfParityReport.model_validate(_read_json(report_path))
     assert_hf_parity_pass(report, report_path=report_path)
     _prune_case_artifacts(Path(case_artifacts.case_dir))

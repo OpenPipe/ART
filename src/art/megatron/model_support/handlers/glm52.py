@@ -274,6 +274,12 @@ class Glm52Handler(DefaultMoeHandler):
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         pattern = tuple(provider.glm52_indexer_types)
+        full = [index for index, value in enumerate(pattern) if value == "full"]
+        complete_shared_groups = [
+            end - 1
+            for start, end in zip(full, full[1:], strict=False)
+            if end - start > 1
+        ]
         shared = next(
             (index for index, value in enumerate(pattern) if value == "shared"),
             None,
@@ -290,6 +296,15 @@ class Glm52Handler(DefaultMoeHandler):
             families.append(
                 LayerFamilyInstance(
                     key="glm52_shared_index_attention", layer_index=shared
+                )
+            )
+        if len(complete_shared_groups) >= 2:
+            # Exercise shared-index reuse twice and retain four legal PP/VPP
+            # split points after the full-layer prelude.
+            families.append(
+                LayerFamilyInstance(
+                    key="glm52_repeated_index_share_groups",
+                    layer_index=complete_shared_groups[1],
                 )
             )
         if sparse_mlp is not None:

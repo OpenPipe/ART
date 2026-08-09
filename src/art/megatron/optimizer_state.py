@@ -19,6 +19,11 @@ import torch
 
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
+from .tensor_snapshot import (
+    PendingCpuSnapshot,
+    PinnedCpuSnapshotBuilder,
+    PinnedCpuSnapshotStager,
+)
 
 ALLOW_UNPAIRED_MEGATRON_RESUME_ENV = "ART_ALLOW_UNPAIRED_MEGATRON_RESUME"
 OPTIMIZER_GENERATIONS_DIR = "generations"
@@ -32,7 +37,6 @@ OPTIMIZER_TRASH_PREFIX = ".trash-"
 OPTIMIZER_ORPHAN_GRACE_S = 3600.0
 ADAPTER_PUBLICATION_ACK = ".optimizer-published.json"
 ADAPTER_LATEST_POINTER = "latest-adapter.json"
-ADAPTER_PUBLICATION_TIMEOUT_ENV = "ART_ADAPTER_PUBLICATION_TIMEOUT_S"
 _ADAPTER_FILES = ("adapter_config.json", "adapter_model.safetensors")
 _GENERATION_PATTERN = r"step-\d{8,}-[0-9a-f]{32}"
 _GENERATION_RE = re.compile(f"^{_GENERATION_PATTERN}$")
@@ -203,11 +207,6 @@ def new_optimizer_generation(step: int) -> str:
     if step < 0:
         raise ValueError(f"Optimizer step must be non-negative, got {step}")
     return f"step-{step:08d}-{uuid4().hex}"
-
-
-def trainer_publication_path(optimizer_state_path: str, generation: str) -> Path:
-    _validate_generation_name(generation)
-    return Path(optimizer_state_path).parent / ".trainer_publications" / generation
 
 
 def _validate_generation_name(generation: str) -> None:
@@ -1220,9 +1219,44 @@ def _runtime_json_default(value: Any) -> Any:
     return _type_identity(value)
 
 
+def _canonical_runtime_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        keys = tuple(value)
+        try:
+            supported = all(
+                key is None or isinstance(key, (str, int, float, bool)) for key in keys
+            )
+            if supported:
+                sorted(keys)
+        except TypeError:
+            supported = False
+        if supported:
+            return {key: _canonical_runtime_json(item) for key, item in value.items()}
+        return [
+            "__art_typed_mapping__",
+            [
+                [_type_identity(key), repr(key), _canonical_runtime_json(item)]
+                for key, item in sorted(
+                    value.items(),
+                    key=lambda pair: (_type_identity(pair[0]), repr(pair[0])),
+                )
+            ],
+        ]
+    if isinstance(value, (list, tuple)):
+        return [_canonical_runtime_json(item) for item in value]
+    if isinstance(value, set):
+        return sorted(
+            (_canonical_runtime_json(item) for item in value),
+            key=repr,
+        )
+    if isinstance(value, BaseModel):
+        return _canonical_runtime_json(value.model_dump(mode="json"))
+    return value
+
+
 def _json_sha256(value: Any) -> str:
     encoded = json.dumps(
-        value,
+        _canonical_runtime_json(value),
         default=_runtime_json_default,
         sort_keys=True,
         separators=(",", ":"),
@@ -1409,21 +1443,21 @@ def _validated_runtime_layouts(
     return runtime_digests.pop(), tuple(record["layout_sha256"] for record in records)
 
 
-def _snapshot_optimizer_value(value: Any) -> Any:
+def _stage_optimizer_value(value: Any, stager: PinnedCpuSnapshotBuilder) -> Any:
     if isinstance(value, torch.Tensor):
-        return value.detach().to(device="cpu", copy=True)
+        return stager.stage(value)
     if isinstance(value, dict):
         return {
-            _snapshot_optimizer_value(key): _snapshot_optimizer_value(item)
+            _stage_optimizer_value(key, stager): _stage_optimizer_value(item, stager)
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_snapshot_optimizer_value(item) for item in value]
+        return [_stage_optimizer_value(item, stager) for item in value]
     if isinstance(value, tuple):
         return (
-            type(value)(*map(_snapshot_optimizer_value, value))
+            type(value)(*(_stage_optimizer_value(item, stager) for item in value))
             if hasattr(value, "_fields")
-            else tuple(_snapshot_optimizer_value(item) for item in value)
+            else tuple(_stage_optimizer_value(item, stager) for item in value)
         )
     return copy.deepcopy(value)
 
@@ -1434,19 +1468,37 @@ def snapshot_optimizer_state(
     generation_id: str,
     step: int,
 ) -> OptimizerStateSnapshot:
+    return stage_optimizer_state_snapshot(
+        runtime,
+        generation_id=generation_id,
+        step=step,
+        stager=PinnedCpuSnapshotStager(),
+    ).resolve()
+
+
+def stage_optimizer_state_snapshot(
+    runtime: Any,
+    *,
+    generation_id: str,
+    step: int,
+    stager: PinnedCpuSnapshotStager,
+) -> PendingCpuSnapshot[OptimizerStateSnapshot]:
     if runtime.optimizer is None:
         raise RuntimeError("Cannot snapshot an uninitialized optimizer")
     records = _all_gather_objects(runtime, _runtime_layout_record(runtime))
     runtime_sha256, layouts = _validated_runtime_layouts(runtime, records)
-    return OptimizerStateSnapshot(
-        generation_id=generation_id,
-        step=step,
-        rank=runtime.rank,
-        world_size=runtime.world_size,
-        runtime_sha256=runtime_sha256,
-        layout_sha256=layouts[runtime.rank],
-        topology=current_optimizer_topology(runtime.world_size),
-        state_dict=_snapshot_optimizer_value(runtime.optimizer.state_dict()),
+    builder = stager.begin()
+    return builder.finish(
+        OptimizerStateSnapshot(
+            generation_id=generation_id,
+            step=step,
+            rank=runtime.rank,
+            world_size=runtime.world_size,
+            runtime_sha256=runtime_sha256,
+            layout_sha256=layouts[runtime.rank],
+            topology=current_optimizer_topology(runtime.world_size),
+            state_dict=_stage_optimizer_value(runtime.optimizer.state_dict(), builder),
+        )
     )
 
 
@@ -1489,42 +1541,6 @@ def _loaded_adapter(adapter_path: str, step: int) -> OptimizerAdapter:
     if path != canonical:
         raise RuntimeError("Optimizer state must load an immutable canonical adapter")
     return adapter
-
-
-def await_adapter_publication_group(
-    runtime: Any,
-    staging_path: str,
-    *,
-    step: int,
-    ready: Callable[[], None],
-) -> OptimizerAdapter:
-    def wait_for_acknowledgment() -> dict[str, Any]:
-        ready()
-        deadline = time.monotonic() + float(
-            os.environ.get(ADAPTER_PUBLICATION_TIMEOUT_ENV, "300")
-        )
-        while (
-            adapter := read_adapter_publication(
-                staging_path,
-                step=step,
-                verify_files=False,
-            )
-        ) is None:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    "Timed out waiting for canonical adapter publication "
-                    f"acknowledgment for step {step}"
-                )
-            time.sleep(0.05)
-        return adapter.model_dump(mode="json")
-
-    return OptimizerAdapter.model_validate(
-        optimizer_group_decision(
-            runtime,
-            wait_for_acknowledgment,
-            operation="canonical adapter publication acknowledgment",
-        )
-    )
 
 
 def _write_optimizer_shard(

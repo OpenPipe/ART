@@ -136,17 +136,6 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
             "match len(inference_gpu_ids)"
         )
 
-    if trainer_gpu_ids[0] != 0:
-        raise ValueError(
-            "trainer_gpu_ids must start at GPU 0 (training runs in-process)"
-        )
-
-    expected = list(range(len(trainer_gpu_ids)))
-    if trainer_gpu_ids != expected:
-        raise ValueError(
-            "trainer_gpu_ids must be contiguous starting from 0 (e.g., [0], [0,1])"
-        )
-
     if config.get("engine_args", {}).get("enable_sleep_mode"):
         raise ValueError(
             "enable_sleep_mode is incompatible with dedicated mode "

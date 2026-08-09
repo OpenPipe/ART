@@ -12,7 +12,7 @@ import pytest
 import art
 from art import dev
 from art.megatron.backend import MegatronBackend
-from art.megatron.service import MegatronService
+from art.megatron.distributed_service import DistributedMegatronService
 
 from ..model_support.oracle_harness import ORACLE_TOPOLOGY, Topology
 from ..model_support.oracle_worker import provider_topology_env
@@ -169,15 +169,15 @@ async def _chat_snapshot(model: art.TrainableModel, *, step: int) -> dict[str, o
     }
 
 
-async def _runtime_is_sleeping(service: MegatronService) -> bool:
+async def _runtime_is_sleeping(service: DistributedMegatronService) -> bool:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(f"{service._vllm_base_url}/is_sleeping")
+        response = await client.get(f"{service._base_url}/is_sleeping")
         response.raise_for_status()
         return bool(response.json()["is_sleeping"])
 
 
 async def _wait_until_runtime_sleeping(
-    service: MegatronService,
+    service: DistributedMegatronService,
     *,
     timeout_s: float = 300.0,
     poll_s: float = 0.5,
@@ -282,7 +282,7 @@ async def test_megatron_backend_shared_lora_runtime_sleep_wake_live_smoke(
             report_metrics=[],
         )
         await model.register(backend)
-        service = cast(MegatronService, await backend._get_service(model))
+        service = cast(DistributedMegatronService, await backend._get_service(model))
         prompts = _train_group_prompts()
         await _warmup_model(model, base_model=model.base_model, prompt=prompts[0])
         step0_name = model.get_inference_name(step=0)
@@ -377,7 +377,7 @@ async def test_megatron_backend_dedicated_merged_live_smoke(
             report_metrics=[],
         )
         await model.register(backend)
-        service = cast(MegatronService, await backend._get_service(model))
+        service = cast(DistributedMegatronService, await backend._get_service(model))
         prompts = _train_group_prompts()
         await _warmup_model(model, base_model=model.base_model, prompt=prompts[0])
         step0_name = model.get_inference_name(step=0)
@@ -452,7 +452,7 @@ async def test_megatron_backend_dedicated_multirank_merged_live_smoke(
             report_metrics=[],
         )
         await model.register(backend)
-        service = cast(MegatronService, await backend._get_service(model))
+        service = cast(DistributedMegatronService, await backend._get_service(model))
         prompts = _train_group_prompts()
         await _warmup_model(model, base_model=model.base_model, prompt=prompts[0])
         step0_name = model.get_inference_name(step=0)
@@ -532,7 +532,7 @@ async def test_megatron_backend_shared_lora_ten_step_live_smoke(
             report_metrics=[],
         )
         await model.register(backend)
-        service = cast(MegatronService, await backend._get_service(model))
+        service = cast(DistributedMegatronService, await backend._get_service(model))
         prompts = _train_group_prompts()
         await _warmup_model(model, base_model=model.base_model, prompt=prompts[0])
         step0_name = model.get_inference_name(step=0)

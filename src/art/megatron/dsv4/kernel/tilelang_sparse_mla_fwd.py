@@ -43,9 +43,7 @@ def sparse_mqa_fwd(
         f"topk ({topk}) must be divisible by block_I ({block_I})"
     )
     if sm_scale is None:
-        sm_scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
-    else:
-        sm_scale = sm_scale * 1.44269504  # log2(e)
+        sm_scale = (1.0 / dim) ** 0.5
 
     batch = T.dynamic("batch")
     seq_len = T.dynamic("seq_len")
@@ -101,14 +99,16 @@ def sparse_mqa_fwd(
             m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
 
             T.fill(acc_o, 0)
-            T.fill(sumexp, 0)
-            T.fill(m_i, -(2**30))
 
             b_i = by
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
 
             H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64
             H1 = H0 + H_per_block
+
+            for h_i in T.Parallel(H_per_block):
+                sumexp[h_i] = 1
+                m_i[h_i] = AttnSink[H0 + h_i]
 
             T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
 
@@ -135,42 +135,40 @@ def sparse_mqa_fwd(
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullRow,
                 )
+                T.copy(acc_s, S_shared)
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = S_shared[h_i, bi_i] * sm_scale
+                T.copy(acc_s, S_shared)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
-                        mask[bi_i], acc_s[h_i, bi_i], -T.infinity(acc_s.dtype)
+                        mask[bi_i], S_shared[h_i, bi_i], -T.infinity(acc_s.dtype)
                     )
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
                 for h_i in T.Parallel(H_per_block):
                     m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
                 for h_i in T.Parallel(H_per_block):
-                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * 1.44269504)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
                     acc_s[h_i, bi_i] = T.exp2(
-                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                        (acc_s[h_i, bi_i] - m_i[h_i]) * 1.44269504
                     )
                 T.reduce_sum(acc_s, sumexp_i, dim=1)
                 for h_i in T.Parallel(H_per_block):
-                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                    sumexp_i[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                    alpha[h_i] = sumexp[h_i] * alpha[h_i] / sumexp_i[h_i]
+                    sumexp[h_i] = sumexp_i[h_i]
                 for h_i, d_i in T.Parallel(H_per_block, D):
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
 
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] /= sumexp[h_i]
                 T.copy(acc_s, S_shared)
                 T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
-            # attn_sink: add exp(attn_sink[h] - max_scaled) to softmax denominator
-            # attn_sink is a pre-scaled logit (same space as scores*sm_scale), so only convert to log2 base
-            for h_i in T.Parallel(H_per_block):
-                sumexp[h_i] += T.exp2(
-                    AttnSink[H0 + h_i] * 1.44269504 - m_i[h_i] * sm_scale
-                )
-
-            # Rescale output
-            for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] /= sumexp[h_i]
             # LSE = log2(sumexp) + m_i * sm_scale (in log2 space)
             for h_i in T.Parallel(H_per_block):
-                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * 1.44269504
 
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
             T.copy(sumexp, Lse[b_i, s_i, H0:H1])

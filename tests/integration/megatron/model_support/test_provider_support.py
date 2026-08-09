@@ -179,6 +179,11 @@ def test_dsv4_provider_disables_shared_expert_overlap(
         lambda *args, **kwargs: fake_bridge,
     )
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(
+        provider_module.torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(major=9, name="NVIDIA H200"),
+    )
 
     resolved = provider_module.get_provider("deepseek-ai/DeepSeek-V4-Flash")
 

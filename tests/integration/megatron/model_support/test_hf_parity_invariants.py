@@ -30,6 +30,7 @@ from .hf_parity_worker import (
     _maybe_modify_converted_hf_grad,
     _normalize_hf_grads_for_bridge,
     _normalize_hf_tensor_map_for_bridge,
+    _validate_distributed_process_env,
 )
 from .oracle_harness import DiskPackedTensorsSpec, OracleCaseConfig
 from .validation_spec import MinimalLayerCoverageReport
@@ -183,6 +184,7 @@ def test_run_hf_parity_always_reruns_existing_report(
         "assess_minimal_layer_coverage",
         lambda **_: coverage,
     )
+    monkeypatch.setattr(hf_parity_module, "pinned_git_state", lambda _: _git_state())
     monkeypatch.setattr(
         hf_parity_module,
         "ensure_case_artifacts",
@@ -255,7 +257,11 @@ def test_run_hf_parity_subprocess_does_not_override_recompute(
         captured.update(kwargs)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(hf_parity_module.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        hf_parity_module,
+        "subprocess",
+        SimpleNamespace(run=_fake_run),
+    )
 
     hf_parity_module.run_hf_parity_subprocess(request, tmp_path)
 
@@ -264,6 +270,77 @@ def test_run_hf_parity_subprocess_does_not_override_recompute(
     assert "ART_MEGATRON_RECOMPUTE_METHOD" not in env
     assert "ART_MEGATRON_RECOMPUTE_NUM_LAYERS" not in env
     assert "ART_MEGATRON_RECOMPUTE_MODULES" not in env
+
+
+def test_run_hf_parity_subprocess_assigns_unique_rendezvous(
+    monkeypatch, tmp_path
+) -> None:
+    request = HfParityRunRequest(
+        git=_git_state(),
+        case_id="case-id",
+        case_config=OracleCaseConfig(base_model="Qwen/Qwen3.5-35B-A3B"),
+        packed_tensors=DiskPackedTensorsSpec(
+            dir=str(tmp_path / "packed"),
+            num_sequences=4,
+            sequence_length=8,
+        ),
+        output_dir=str(tmp_path),
+        coverage=MinimalLayerCoverageReport(
+            base_model="Qwen/Qwen3.5-35B-A3B",
+            model_key="qwen3_5_moe",
+            requested_num_layers=4,
+            recommended_min_layers=4,
+            covered=True,
+        ),
+    )
+    ports = iter((24101, 24102))
+    environments: list[dict[str, str]] = []
+    monkeypatch.setattr(
+        hf_parity_module,
+        "_find_free_rendezvous_port",
+        lambda: next(ports),
+    )
+
+    def _fake_run(*args, **kwargs):
+        del args
+        environments.append(kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        hf_parity_module,
+        "subprocess",
+        SimpleNamespace(run=_fake_run),
+    )
+
+    hf_parity_module.run_hf_parity_subprocess(request, tmp_path)
+    hf_parity_module.run_hf_parity_subprocess(request, tmp_path)
+
+    assert [env["MASTER_PORT"] for env in environments] == ["24101", "24102"]
+    for env in environments:
+        assert env["MASTER_ADDR"] == "127.0.0.1"
+        assert env["RANK"] == "0"
+        assert env["WORLD_SIZE"] == "1"
+        assert env["LOCAL_RANK"] == "0"
+        assert env["LOCAL_WORLD_SIZE"] == "1"
+
+
+def test_hf_parity_worker_requires_explicit_distributed_env(monkeypatch) -> None:
+    distributed_env = {
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": "24101",
+        "RANK": "0",
+        "WORLD_SIZE": "1",
+        "LOCAL_RANK": "0",
+        "LOCAL_WORLD_SIZE": "1",
+    }
+    for name in distributed_env:
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(RuntimeError, match="explicit distributed environment"):
+        _validate_distributed_process_env()
+
+    for name, value in distributed_env.items():
+        monkeypatch.setenv(name, value)
+    _validate_distributed_process_env()
 
 
 def test_normalize_hf_tensor_map_for_bridge_adds_language_model_prefix() -> None:

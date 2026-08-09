@@ -5,7 +5,17 @@ from art.megatron.model_support.handlers.gemma4 import (
 
 
 def test_gemma4_wide_global_attention_uses_lower_triton_stage_count() -> None:
-    provider = type("Provider", (), {"global_head_dim": 512})()
+    provider = type(
+        "Provider",
+        (),
+        {
+            "global_head_dim": 512,
+            "hidden_size": 5376,
+            "kv_channels": 256,
+            "num_attention_heads": 32,
+            "num_layers": 12,
+        },
+    )()
 
     assert GEMMA4_DENSE_HANDLER.flex_attention_compile_crash_config(
         provider

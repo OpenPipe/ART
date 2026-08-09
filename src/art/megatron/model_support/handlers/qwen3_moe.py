@@ -11,7 +11,11 @@ from art.megatron.model_support.handlers.qwen3_common import (
     install_qwen3_text_preprocess_patch,
     qwen3_forward_kwargs,
 )
-from art.megatron.model_support.spec import CompileWorkaroundConfig
+from art.megatron.model_support.spec import (
+    CompileWorkaroundConfig,
+    ExpertPackedLoraGroup,
+    ExpertPackedLoraSlot,
+)
 
 _QWEN3_MOE_COMPILE_WORKAROUND_FLAGS = (
     "moe_postprocess",
@@ -24,6 +28,23 @@ class Qwen3MoeHandler(DefaultMoeHandler):
     key = "qwen3_moe"
     native_vllm_lora_status = "validated"
 
+    def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]:
+        return (
+            ExpertPackedLoraGroup(
+                art_group_suffix=".mlp.experts",
+                slots=tuple(
+                    ExpertPackedLoraSlot(
+                        source_projection=projection,
+                        source_lora=lora,
+                        output_suffix=f"{projection}.{lora}.weight",
+                        pack_layout="expert_rows",
+                    )
+                    for projection in ("gate_proj", "up_proj", "down_proj")
+                    for lora in ("lora_A", "lora_B")
+                ),
+            ),
+        )
+
     def to_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],
@@ -34,6 +55,9 @@ class Qwen3MoeHandler(DefaultMoeHandler):
 
     def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
         return _qwen3_moe_config(adapter_config)
+
+    def vllm_lora_conversion_is_view_only(self) -> bool:
+        return True
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         install_qwen3_text_preprocess_patch(model_chunks)
@@ -65,6 +89,11 @@ _QWEN3_EXPERT_MOE_KEY_RE = re.compile(
     r"^.*\.mlp\.experts\.\d+\."
     r"(?:gate_proj|up_proj|down_proj)\.lora_[AB]\.weight$"
 )
+_QWEN3_PACKED_MOE_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp\.experts)\."
+    r"(?P<projection>gate_proj|up_proj|down_proj)\."
+    r"(?P<lora>lora_[AB])\.weight$"
+)
 
 
 def _qwen3_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
@@ -87,6 +116,52 @@ def _packed_lora_b_by_expert(
 
 def _clone(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.clone().contiguous()
+
+
+def _expand_packed_moe_lora(
+    prefix: str,
+    slots: dict[tuple[str, str], torch.Tensor],
+    *,
+    rank: int,
+) -> dict[str, torch.Tensor]:
+    expected = {
+        (projection, lora)
+        for projection in ("gate_proj", "up_proj", "down_proj")
+        for lora in ("lora_A", "lora_B")
+    }
+    if set(slots) != expected:
+        raise RuntimeError(f"Incomplete packed Qwen3 MoE LoRA block for {prefix}")
+    num_experts: int | None = None
+    shaped: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        a = slots[(projection, "lora_A")]
+        b = slots[(projection, "lora_B")]
+        if a.ndim != 2 or b.ndim != 2 or a.shape[0] % rank or b.shape[1] != rank:
+            raise RuntimeError(
+                f"Invalid packed Qwen3 MoE LoRA shapes for {prefix}.{projection}: "
+                f"A={tuple(a.shape)} B={tuple(b.shape)} rank={rank}"
+            )
+        projection_experts = a.shape[0] // rank
+        if projection_experts <= 0 or b.shape[0] % projection_experts:
+            raise RuntimeError(
+                f"Packed Qwen3 MoE LoRA expert shape does not divide for "
+                f"{prefix}.{projection}"
+            )
+        if num_experts is not None and projection_experts != num_experts:
+            raise RuntimeError(f"Packed Qwen3 MoE expert counts differ for {prefix}")
+        num_experts = projection_experts
+        shaped[projection] = (
+            a.reshape(projection_experts, rank, a.shape[1]),
+            b.reshape(projection_experts, b.shape[0] // projection_experts, rank),
+        )
+
+    assert num_experts is not None
+    return {
+        f"{prefix}.{expert}.{projection}.lora_{lora}.weight": tensor[expert]
+        for projection, pair in shaped.items()
+        for lora, tensor in zip(("A", "B"), pair, strict=True)
+        for expert in range(num_experts)
+    }
 
 
 def _expand_fused_moe_lora(
@@ -196,8 +271,15 @@ def _to_vllm_lora_tensors(
     *,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    packed: dict[str, dict[tuple[str, str], torch.Tensor]] = {}
     grouped: dict[str, dict[str, torch.Tensor]] = {}
     for key, tensor in tensors.items():
+        packed_match = _QWEN3_PACKED_MOE_KEY_RE.match(key)
+        if packed_match is not None:
+            packed.setdefault(packed_match.group("prefix"), {})[
+                (packed_match.group("projection"), packed_match.group("lora"))
+            ] = tensor
+            continue
         match = _QWEN3_FUSED_MOE_KEY_RE.match(key)
         if match is None:
             continue
@@ -205,6 +287,30 @@ def _to_vllm_lora_tensors(
             f"{'base_layer.' if match.group('base_layer') else ''}{match.group('lora')}"
         )
         grouped.setdefault(match.group("prefix"), {})[slot] = tensor
+
+    if packed and grouped:
+        raise RuntimeError("Qwen3 LoRA contains both packed and fused expert blocks")
+
+    if packed:
+        rank = int(adapter_config["r"])
+        transformed = {
+            key: tensor
+            for prefix, slots in packed.items()
+            for key, tensor in _expand_packed_moe_lora(prefix, slots, rank=rank).items()
+        }
+        used_keys = {
+            f"{prefix}.{projection}.{lora}.weight"
+            for prefix in packed
+            for projection in ("gate_proj", "up_proj", "down_proj")
+            for lora in ("lora_A", "lora_B")
+        }
+        for key, tensor in tensors.items():
+            if key in used_keys:
+                continue
+            if key in transformed:
+                raise RuntimeError(f"Duplicate expanded Qwen3 MoE LoRA key: {key}")
+            transformed[key] = tensor
+        return transformed, _qwen3_moe_config(adapter_config)
 
     if not grouped:
         if any(_QWEN3_EXPERT_MOE_KEY_RE.match(key) for key in tensors):

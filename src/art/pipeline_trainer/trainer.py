@@ -25,6 +25,7 @@ from typing import (
 )
 import warnings
 
+from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import TypeIs
 
@@ -32,7 +33,11 @@ T = TypeVar("T")
 
 import art
 from art import TrajectoryGroup
-from art.distributed.rollout import DistributedTrajectoryQueue, RolloutExecutor
+from art.distributed.rollout import (
+    DistributedTrajectoryQueue,
+    LocalRolloutExecutor,
+    RolloutExecutor,
+)
 from art.distributed.trajectory_store import TrajectoryGroupRef
 from art.errors import LocalServingUnavailableError
 from art.pipeline_tuner import (
@@ -45,6 +50,7 @@ from art.pipeline_tuner import (
     PipelineTuneSettings,
     RolloutWorkerController,
 )
+from art.preprocessing.policy_spans import PolicyTokenSpan
 
 from .checkpoint_retention import (
     CHECKPOINT_CREATED_AT_METRIC,
@@ -272,8 +278,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.backend = backend
         self.rollout_fn = rollout_fn
         if rollout_executor is None:
-            from art.distributed.rollout import LocalRolloutExecutor
-
             rollout_executor = LocalRolloutExecutor()
         self._rollout_executor = rollout_executor
         self.rollout_worker_capacity = rollout_executor.max_workers
@@ -434,13 +438,23 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         result_queue_factory = getattr(
             self._rollout_executor, "create_result_queue", None
         )
-        if callable(result_queue_factory):
+        local_data_plane = isinstance(self._rollout_executor, LocalRolloutExecutor)
+        supports_preparation = callable(
+            getattr(self.backend, "prepare_pipeline_batch", None)
+        )
+        packing_support = getattr(self.backend, "supports_async_pipeline_packing", None)
+        if supports_preparation and callable(packing_support):
+            supports_preparation = bool(packing_support(self.model))
+        if callable(result_queue_factory) and (
+            supports_preparation or not local_data_plane
+        ):
             self._output_queue = result_queue_factory(queue_maxsize)
             await self._output_queue.start()
         else:
             self._output_queue = _ResizableAsyncQueue(maxsize=queue_maxsize)
-        if isinstance(self._output_queue, DistributedTrajectoryQueue) and callable(
-            getattr(self.backend, "prepare_pipeline_batch", None)
+        if (
+            isinstance(self._output_queue, DistributedTrajectoryQueue)
+            and supports_preparation
         ):
             self._packed_queue = asyncio.Queue(maxsize=1)
         self._eval_queue = asyncio.Queue()
@@ -605,7 +619,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return
         finalize = getattr(self.backend, "finalize_training_session", None)
         if finalize is not None:
-            await finalize(self.model)
+            metrics = await finalize(self.model)
+            if isinstance(metrics, Mapping):
+                await self._emit_pipeline_metrics(
+                    metrics, step=self.state.next_training_step
+                )
 
     def apply_pipeline_settings(self, settings: PipelineTuneSettings) -> None:
         if (
@@ -1039,7 +1057,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 for group in batch:
                     group._collect_packing_shape = True
             started = time.monotonic()
-            preparation_metrics = await prepare(self.model, batch)
+            preparation_metrics = await prepare(
+                self.model,
+                batch,
+                normalize_advantages=self.normalize_advantages,
+            )
             preparation_s = time.monotonic() - started
             if preparation_metrics is None:
                 if saw_sentinel:
@@ -1079,6 +1101,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             self.request_stop()
             return
         stop_after_batch = False
+        pending_stale_groups = 0
+        pending_zero_variance_groups = 0
+        pending_dequeued_groups = 0
 
         while True:
             if stop_at_step is not None and current_step >= stop_at_step:
@@ -1121,6 +1146,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 discarded += len(batch)
                 self.state.discarded_stale_groups += discarded
                 self._status.note_stale(discarded)
+                pending_stale_groups += discarded
+                pending_zero_variance_groups += zero_variance_discarded
+                pending_dequeued_groups += dequeued_groups
                 if saw_sentinel:
                     break
                 continue
@@ -1129,8 +1157,19 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self._status.note_stale(discarded)
             if not batch:
                 break
+            step_stale_groups = pending_stale_groups + discarded
+            step_zero_variance_groups = (
+                pending_zero_variance_groups + zero_variance_discarded
+            )
+            step_dequeued_groups = pending_dequeued_groups + dequeued_groups
+            pending_stale_groups = 0
+            pending_zero_variance_groups = 0
+            pending_dequeued_groups = 0
 
             training_policy_step = current_step
+            policy_age_metrics = self._batch_policy_age_metrics(
+                training_policy_step, batch
+            )
             expected_step = current_step + 1
             should_eval_step = self._should_eval_step(expected_step)
             should_checkpoint = self.save_checkpoint and should_eval_step
@@ -1219,9 +1258,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 metrics = {
                     "discarded/cum/stale_groups": stale_groups,
                     "discarded/cum/zero_variance_groups": zero_variance_groups,
-                    "discarded/step/stale_groups": float(discarded),
+                    "discarded/step/stale_groups": float(step_stale_groups),
                     "discarded/step/zero_variance_groups": float(
-                        zero_variance_discarded
+                        step_zero_variance_groups
                     ),
                     "discarded/rate/stale_groups": stale_groups
                     / max(generated_groups_cum, 1.0),
@@ -1235,7 +1274,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "queue/put_wait_s": queue_wait_s,
                     "queue/put_wait_frac": queue_wait_s
                     / max(queue_wait_s + actor_wall_s, 1e-9),
-                    "queue/actual_stale_fraction": discarded / max(dequeued_groups, 1),
+                    "queue/actual_stale_fraction": step_stale_groups
+                    / max(step_dequeued_groups, 1),
                 }
                 if self._packed_queue is not None:
                     metrics.update(
@@ -1276,6 +1316,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         batch,
                         step_seconds=step_seconds,
                         result_metrics=metrics,
+                        age_metrics=policy_age_metrics,
                     )
                 )
                 metrics.update(await self._queue_freshness_metrics(current_step))
@@ -1519,20 +1560,45 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     ) -> None:
         for trajectory in trajectories:
             for item in cls._trajectory_messages_and_choices(trajectory):
-                extra = getattr(item, "model_extra", None)
-                if not isinstance(extra, Mapping) or "policy_token_spans" not in extra:
+                is_completion = isinstance(item, Choice) or (
+                    isinstance(item, Mapping) and item.get("role") == "assistant"
+                )
+                if not is_completion:
                     continue
-                spans = extra["policy_token_spans"]
-                if not isinstance(spans, list):
-                    raise RuntimeError("Eval policy_token_spans must be a list")
+                spans = cls._validated_policy_spans(item, required=True)
+                assert spans is not None
                 for span in spans:
-                    if not isinstance(span, Mapping) or "policy_version" not in span:
-                        raise RuntimeError("Eval policy token span is malformed")
-                    policy_version = int(span["policy_version"])
-                    if policy_version != step:
+                    if span.policy_version != step:
                         raise RuntimeError(
-                            f"Eval at step {step} returned policy-{policy_version} tokens"
+                            f"Eval at step {step} returned "
+                            f"policy-{span.policy_version} tokens"
                         )
+
+    @staticmethod
+    def _validated_policy_spans(
+        item: Any, *, required: bool
+    ) -> list[PolicyTokenSpan] | None:
+        extra = (
+            item if isinstance(item, Mapping) else getattr(item, "model_extra", None)
+        )
+        raw = extra.get("policy_token_spans") if isinstance(extra, Mapping) else None
+        if raw is None:
+            if required:
+                raise RuntimeError(
+                    "Exact policy provenance is missing policy_token_spans"
+                )
+            return None
+        if not isinstance(raw, list) or not raw:
+            raise RuntimeError("policy_token_spans must be a non-empty list")
+        spans = [PolicyTokenSpan.model_validate(span) for span in raw]
+        cursor = 0
+        for span in spans:
+            if span.start_token != cursor:
+                raise RuntimeError(
+                    "policy_token_spans must be a contiguous completion partition"
+                )
+            cursor = span.end_token
+        return spans
 
     def _apply_policy_versions(
         self,
@@ -1718,7 +1784,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     age = float(current_step - initial)
                 ages.append(float(age))
             ready = float(snapshot.ready_groups)
-            depth = ready
+            depth = float(len(snapshot.items))
             maxsize = float(snapshot.max_ready_groups)
             put_waiting = float(self._output_queue.put_waiters)
             capacity_metrics = {
@@ -1822,6 +1888,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         *,
         step_seconds: float,
         result_metrics: dict[str, float],
+        age_metrics: dict[str, float] | None = None,
     ) -> dict[str, float]:
         metrics: dict[str, float] = {}
         accepted_groups = float(len(batch))
@@ -1833,7 +1900,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         )
         metrics["sample_efficiency/batch_factor"] = batch_factor
 
-        age_metrics = self._batch_policy_age_metrics(current_step, batch)
+        age_metrics = (
+            self._batch_policy_age_metrics(current_step, batch)
+            if age_metrics is None
+            else dict(age_metrics)
+        )
         age_exp_moment = age_metrics.pop("_policy_age_exp_tau8", None)
         metrics.update(age_metrics)
         mean_age = age_metrics.get("offpolicy/token_weighted_policy_age_steps")
@@ -1925,12 +1996,25 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self, current_step: int, trajectory: art.Trajectory
     ) -> tuple[float, float, float] | None:
         span_stats = self._trajectory_policy_span_age_stats(current_step, trajectory)
+        if self._requires_exact_policy_spans():
+            if span_stats is None:
+                raise RuntimeError(
+                    "In-flight LoRA trajectory is missing exact policy token spans"
+                )
+            completion_tokens = self._trajectory_completion_weight(trajectory)
+            if span_stats[1] != completion_tokens:
+                raise RuntimeError(
+                    "In-flight LoRA policy spans do not cover every completion token: "
+                    f"covered={span_stats[1]:g}, completion_tokens="
+                    f"{completion_tokens:g}"
+                )
+            return span_stats
         if span_stats is not None:
             return span_stats
         if trajectory.initial_policy_version is None:
             return None
         weight = self._trajectory_completion_weight(trajectory)
-        age = float(current_step - trajectory.initial_policy_version)
+        age = self._policy_age(current_step, trajectory.initial_policy_version)
         return age * weight, weight, _policy_age_exp(age) * weight
 
     def _trajectory_policy_span_age_stats(
@@ -1938,11 +2022,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     ) -> tuple[float, float, float] | None:
         if trajectory._policy_token_counts is not None:
             age_sum = sum(
-                (current_step - version) * count
+                self._policy_age(current_step, version) * count
                 for version, count in trajectory._policy_token_counts.items()
             )
             age_exp_sum = sum(
-                _policy_age_exp(current_step - version) * count
+                _policy_age_exp(self._policy_age(current_step, version)) * count
                 for version, count in trajectory._policy_token_counts.items()
             )
             weight = float(sum(trajectory._policy_token_counts.values()))
@@ -1951,29 +2035,32 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         age_exp_sum = 0.0
         weight_sum = 0.0
         for item in self._trajectory_messages_and_choices(trajectory):
-            extra = getattr(item, "model_extra", None)
-            if not isinstance(extra, Mapping):
-                continue
-            spans = extra.get("policy_token_spans")
-            if not isinstance(spans, list):
+            spans = self._validated_policy_spans(item, required=False)
+            if spans is None:
                 continue
             for span in spans:
-                if not isinstance(span, Mapping):
-                    continue
-                try:
-                    policy_version = int(span["policy_version"])
-                    weight = int(span["end_token"]) - int(span["start_token"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if weight <= 0:
-                    continue
-                age = float(current_step - policy_version)
+                weight = span.end_token - span.start_token
+                age = self._policy_age(current_step, span.policy_version)
                 age_sum += age * weight
                 age_exp_sum += _policy_age_exp(age) * weight
                 weight_sum += float(weight)
         if weight_sum <= 0:
             return None
         return age_sum, weight_sum, age_exp_sum
+
+    def _requires_exact_policy_spans(self) -> bool:
+        return (self.model._internal_config or {}).get(
+            "rollout_weight_update_mode"
+        ) == "in_flight_lora"
+
+    @staticmethod
+    def _policy_age(current_step: int, policy_version: int) -> float:
+        if policy_version > current_step:
+            raise RuntimeError(
+                "Trajectory tokens came from a future policy: "
+                f"policy={policy_version}, trainer={current_step}"
+            )
+        return float(current_step - policy_version)
 
     @staticmethod
     def _trajectory_messages_and_choices(trajectory: art.Trajectory) -> Iterable[Any]:

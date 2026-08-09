@@ -188,6 +188,9 @@ class DefaultDenseHandler:
     def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
         return adapter_config
 
+    def vllm_lora_conversion_is_view_only(self) -> bool:
+        return False
+
     def from_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],

@@ -71,7 +71,7 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
         default=0.85, gt=0.0, le=1.0
     )
     target_group_change_windows: int = pydantic.Field(default=1, ge=1)
-    target_group_increase_fraction: float = pydantic.Field(default=0.25, gt=0.0, le=1.0)
+    target_group_increase_fraction: float = pydantic.Field(default=0.20, gt=0.0, le=1.0)
     target_group_max_increase: int = pydantic.Field(default=64, ge=1)
     target_group_min_relative_change: float = pydantic.Field(
         default=0.10, ge=0.0, le=1.0

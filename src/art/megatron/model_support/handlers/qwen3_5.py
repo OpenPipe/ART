@@ -28,9 +28,6 @@ from art.megatron.model_support.spec import (
 _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
-    # Torch 2.11.0 compiles Megatron's weighted SwiGLU custom autograd
-    # function with zero cotangents when its forward casts internally.
-    "weighted_bias_swiglu_no_inner_forward_cast",
 )
 _QWEN35_MOE_UNCONDITIONAL_COMPILE_WORKAROUND_FLAGS: tuple[str, ...] = ()
 _ART_LAYER_PREFIX = "base_model.model.model.layers."
@@ -1179,6 +1176,11 @@ def _select_qwen35_expert_weight(
 _QWEN35_TEXT_ONLY_BRIDGE_REGISTERED = False
 
 
+def _propagate_qwen35_text_dtype(hf_pretrained: Any) -> None:
+    config = hf_pretrained.config
+    config.text_config.dtype = config.dtype
+
+
 def ensure_qwen35_text_only_bridge_registered() -> None:
     global _QWEN35_TEXT_ONLY_BRIDGE_REGISTERED
     if _QWEN35_TEXT_ONLY_BRIDGE_REGISTERED:
@@ -1204,6 +1206,10 @@ def ensure_qwen35_text_only_bridge_registered() -> None:
         model_type="qwen3_5",
     )
     class _ArtQwen35DenseTextOnlyBridge(Qwen35VLBridge):
+        def provider_bridge(self, hf_pretrained: Any) -> Any:
+            _propagate_qwen35_text_dtype(hf_pretrained)
+            return super().provider_bridge(hf_pretrained)
+
         def mapping_registry(self) -> Any:
             return _qwen35_text_only_mapping_registry(Qwen35VLBridge)
 
@@ -1214,6 +1220,10 @@ def ensure_qwen35_text_only_bridge_registered() -> None:
         model_type="qwen3_5_moe",
     )
     class _ArtQwen35TextOnlyBridge(Qwen35VLMoEBridge):
+        def provider_bridge(self, hf_pretrained: Any) -> Any:
+            _propagate_qwen35_text_dtype(hf_pretrained)
+            return super().provider_bridge(hf_pretrained)
+
         def mapping_registry(self) -> Any:
             return _qwen35_text_only_mapping_registry(Qwen35VLMoEBridge)
 

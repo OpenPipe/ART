@@ -68,6 +68,7 @@ class FlexAttentionWrapper(torch.nn.Module):
             head_dim=int(q.shape[-1]),
             head_dim_v=int(v.shape[-1]),
             triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
+            device=q.device,
         )(
             q,
             k,

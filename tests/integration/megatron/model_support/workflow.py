@@ -2,16 +2,19 @@ import argparse
 from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import importlib
 import importlib.metadata
+import math
 import os
 from pathlib import Path
+import shutil
+import signal
 import subprocess
 import sys
-import tempfile
+import time
 from typing import Any
+import uuid
 
 from pydantic import BaseModel, Field
 
-from art.megatron.model_support.discovery import inspect_architecture
 from art.megatron.model_support.registry import (
     VALIDATED_MODEL_SUPPORT_SPECS,
     get_model_support_handler_for_spec,
@@ -28,14 +31,13 @@ from .validation_spec import (
     ValidationReport,
     ValidationStageResult,
 )
+from .workflow_fixtures import WorkflowFixture, ensure_workflow_fixture
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 TESTS_DIR = REPO_ROOT / "tests"
-LOCAL_LOG_DIR = REPO_ROOT / ".local"
-CORRECTNESS_LOG_PATH = LOCAL_LOG_DIR / "correctness.log"
-SENSITIVITY_LOG_PATH = LOCAL_LOG_DIR / "sensitivity.log"
-LIVE_TRAINING_LOG_PATH = LOCAL_LOG_DIR / "live_training.log"
 ORACLE_LIVE_TRAINING_LOG_ENV = "ART_ORACLE_LIVE_TRAINING_LOG"
+WORKFLOW_RUN_DIR_ENV = "ART_MODEL_SUPPORT_WORKFLOW_RUN_DIR"
+WORKFLOW_STAGE_DIR_ENV = "ART_MODEL_SUPPORT_WORKFLOW_STAGE_DIR"
 SKIP_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_SKIP_SENSITIVITY"
 INCLUDE_FLASH_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_INCLUDE_FLASH_SENSITIVITY"
 KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
@@ -58,6 +60,7 @@ MANDATORY_VALIDATION_STAGES = (
     "chat_template_rollout",
     "packing_invariance",
     "length_trainability",
+    "e2e_throughput",
 )
 NATIVE_VLLM_LORA_STAGE = "native_vllm_lora"
 YES_NO_TRAINABILITY_STAGE = "yes_no_trainability"
@@ -88,14 +91,28 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
         "chat_template_rollout",
         "packing_invariance",
         "length_trainability",
+        "e2e_throughput",
         YES_NO_TRAINABILITY_STAGE,
         NATIVE_VLLM_LORA_STAGE,
     }
 )
+_RUNTIME_CLEANUP_STAGES = frozenset(
+    {"length_trainability", "e2e_throughput", YES_NO_TRAINABILITY_STAGE}
+)
+_RUNTIME_ARTIFACT_DIR_NAMES = frozenset(
+    {
+        "checkpoints",
+        "megatron_runtime",
+        "optimizer_states",
+        "trajectories",
+    }
+)
+_WORKFLOW_STAGE_TIMEOUT_S = 30 * 60
 
 
 class AllArchitecturesValidationReport(BaseModel):
     passed: bool = False
+    complete: bool = False
     reports: list[ValidationReport] = Field(default_factory=list)
 
 
@@ -134,7 +151,6 @@ def initialize_validation_report(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    handler = get_model_support_handler_for_spec(spec)
     return ValidationReport(
         git=pinned_git_state(WORKFLOW_ARTIFACT_SUITE_NAME).model_dump(mode="json"),
         base_model=base_model,
@@ -145,7 +161,7 @@ def initialize_validation_report(
             for stage_name in build_validation_stage_names(
                 include_native_vllm_lora=include_native_vllm_lora,
                 include_yes_no_trainability=include_yes_no_trainability,
-                native_vllm_lora_status=handler.native_vllm_lora_status,
+                native_vllm_lora_status=spec.native_vllm_lora_status,
             )
         ],
     )
@@ -179,6 +195,8 @@ def _inspect_architecture_for_workflow(
     *,
     allow_unvalidated_arch: bool,
 ) -> ArchitectureReport:
+    from art.megatron.model_support.discovery import inspect_architecture
+
     # Discovery only inspects layer families, so use a minimal topology instead
     # of inheriting visible GPU count and tripping model-specific TP limits.
     with _temporary_env(
@@ -216,6 +234,62 @@ def _temporary_env(**updates: str):
             os.environ[key] = value
 
 
+def _new_workflow_run_dir(*, output_json: str | Path | None, model_key: str) -> Path:
+    run_id = f"{time.strftime('%Y%m%dT%H%M%SZ')}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    if output_json is None:
+        root = REPO_ROOT / ".local" / "model_support_workflow_runs" / model_key
+    else:
+        output_path = Path(output_json).resolve()
+        root = output_path.parent / f"{output_path.stem}.artifacts"
+    path = root / run_id
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def _workflow_stage_dir() -> Path:
+    raw = os.environ.get(WORKFLOW_STAGE_DIR_ENV)
+    if raw is None:
+        raise RuntimeError(f"missing {WORKFLOW_STAGE_DIR_ENV}")
+    path = Path(raw)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _stage_artifact_dir() -> Path:
+    path = _workflow_stage_dir() / "artifacts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _cleanup_stage_workspace(path: Path) -> None:
+    if os.environ.get(KEEP_TOPOLOGY_ARTIFACTS_ENV) != "1" and path.exists():
+        shutil.rmtree(path)
+
+
+def _oracle_case_config(
+    oracle_harness: Any,
+    *,
+    base_model: str,
+    model_support_key: str,
+    is_moe: bool,
+    precision: str,
+    num_layers: int,
+    target_modules: list[str],
+    allow_unvalidated_arch: bool,
+) -> Any:
+    oracle_harness.ARTIFACT_ROOT = _stage_artifact_dir()
+    return oracle_harness.OracleCaseConfig(
+        base_model=base_model,
+        model_support_key=model_support_key,
+        is_moe=is_moe,
+        precision=precision,
+        num_layers=num_layers,
+        num_steps=1,
+        lora={"target_modules": target_modules},
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+
+
 def _write_validation_report(
     report: ValidationReport,
     output_json: str | Path | None,
@@ -225,6 +299,32 @@ def _write_validation_report(
     path = Path(output_json)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+
+
+def _record_stage_duration(stage: ValidationStageResult, *, started: float) -> None:
+    stage.metrics["workflow_stage_duration_s"] = time.monotonic() - started
+
+
+def _prune_runtime_artifacts(stage_dir: Path) -> dict[str, int]:
+    paths = sorted(
+        (
+            path
+            for path in stage_dir.rglob("*")
+            if path.is_dir() and path.name in _RUNTIME_ARTIFACT_DIR_NAMES
+        ),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    removed_bytes = 0
+    for path in paths:
+        removed_bytes += sum(
+            child.stat().st_size for child in path.rglob("*") if child.is_file()
+        )
+        shutil.rmtree(path)
+    return {
+        "workflow_pruned_runtime_artifact_dirs": len(paths),
+        "workflow_pruned_runtime_artifact_bytes": removed_bytes,
+    }
 
 
 def _write_all_architectures_report(
@@ -273,16 +373,32 @@ def _mark_remaining_stages_skipped(
     report: ValidationReport,
     *,
     after_stage_name: str,
+    reason: str | None = None,
 ) -> None:
     past_failure = False
     for stage in report.stages:
         if past_failure:
+            stage.passed = False
+            stage.skipped = True
             stage.metrics = {
                 "skipped": True,
-                "reason": f"stopped after {after_stage_name} failed",
+                "reason": reason or f"stopped after {after_stage_name} failed",
+                "workflow_stage_duration_s": 0.0,
             }
             continue
         past_failure = stage.name == after_stage_name
+
+
+def _finalize_validation_report(
+    report: ValidationReport,
+    *,
+    partial: bool,
+) -> None:
+    executed = [stage for stage in report.stages if not stage.skipped]
+    report.passed = bool(executed) and all(stage.passed for stage in executed)
+    report.complete = (
+        not partial and len(executed) == len(report.stages) and report.passed
+    )
 
 
 def _only_stage_run_set(only_stage: str | None) -> set[str] | None:
@@ -304,68 +420,123 @@ def _run_stage_in_subprocess(
     architecture: ArchitectureReport,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
-    with tempfile.TemporaryDirectory(prefix=f"model_support_{stage_name}_") as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        architecture_json = tmp_path / "architecture.json"
-        output_json = tmp_path / "stage_result.json"
-        log_path = tmp_path / "stage.log"
-        architecture_json.write_text(
-            architecture.model_dump_json(indent=2),
-            encoding="utf-8",
+    run_dir = Path(os.environ[WORKFLOW_RUN_DIR_ENV])
+    stage_dir = run_dir / stage_name
+    stage_dir.mkdir(parents=True, exist_ok=False)
+    architecture_json = stage_dir / "architecture.json"
+    output_json = stage_dir / "stage_result.json"
+    log_path = stage_dir / "worker.log"
+    architecture_json.write_text(
+        architecture.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    cmd = [
+        sys.executable,
+        "-m",
+        "integration.megatron.model_support.workflow_stage_worker",
+        "--stage",
+        stage_name,
+        "--base-model",
+        base_model,
+        "--architecture-json",
+        str(architecture_json),
+        "--output-json",
+        str(output_json),
+    ]
+    if allow_unvalidated_arch:
+        cmd.append("--allow-unsupported-arch")
+    env = os.environ.copy()
+    env["WANDB_MODE"] = "disabled"
+    env[WORKFLOW_STAGE_DIR_ENV] = str(stage_dir)
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        str(TESTS_DIR)
+        if not existing_pythonpath
+        else f"{TESTS_DIR}{os.pathsep}{existing_pythonpath}"
+    )
+    started = time.monotonic()
+    with log_path.open("w", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(REPO_ROOT),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
         )
-        cmd = [
-            sys.executable,
-            "-m",
-            "integration.megatron.model_support.workflow_stage_worker",
-            "--stage",
-            stage_name,
-            "--base-model",
-            base_model,
-            "--architecture-json",
-            str(architecture_json),
-            "--output-json",
-            str(output_json),
-        ]
-        if allow_unvalidated_arch:
-            cmd.append("--allow-unsupported-arch")
-        env = os.environ.copy()
-        existing_pythonpath = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = (
-            str(TESTS_DIR)
-            if not existing_pythonpath
-            else f"{TESTS_DIR}{os.pathsep}{existing_pythonpath}"
+        try:
+            returncode = _wait_stage_process(process)
+        except subprocess.TimeoutExpired:
+            returncode = None
+    duration_s = time.monotonic() - started
+    common_metrics = {
+        "workflow_stage_artifact_dir": str(stage_dir),
+        "workflow_stage_duration_s": duration_s,
+    }
+    if returncode is None:
+        return ValidationStageResult(
+            name=stage_name,
+            passed=False,
+            metrics={
+                **common_metrics,
+                "error": (
+                    f"stage exceeded {_WORKFLOW_STAGE_TIMEOUT_S:g}s; log={log_path}"
+                ),
+            },
         )
-        with log_path.open("w", encoding="utf-8") as log_file:
-            completed = subprocess.run(
-                cmd,
-                cwd=str(REPO_ROOT),
-                env=env,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                text=True,
-                check=False,
-            )
-        if completed.returncode != 0:
-            tail = _subprocess_log_tail(log_path)
-            error = (
-                f"subprocess exited with code {completed.returncode}"
-                if not tail
-                else tail
-            )
-            return ValidationStageResult(
-                name=stage_name,
-                passed=False,
-                metrics={"error": error},
-            )
-        if not output_json.exists():
-            return ValidationStageResult(
-                name=stage_name,
-                passed=False,
-                metrics={"error": "stage worker did not write output_json"},
-            )
-        return ValidationStageResult.model_validate_json(
-            output_json.read_text(encoding="utf-8")
+    if returncode != 0:
+        tail = _subprocess_log_tail(log_path)
+        return ValidationStageResult(
+            name=stage_name,
+            passed=False,
+            metrics={
+                **common_metrics,
+                "error": tail or f"subprocess exited with code {returncode}",
+            },
         )
+    if not output_json.exists():
+        return ValidationStageResult(
+            name=stage_name,
+            passed=False,
+            metrics={
+                **common_metrics,
+                "error": "stage worker did not write output_json",
+            },
+        )
+    result = ValidationStageResult.model_validate_json(output_json.read_text())
+    result.metrics.update(common_metrics)
+    output_json.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    return result
+
+
+def _raise_signal_exit(signum: int, _frame: Any) -> None:
+    raise SystemExit(128 + signum)
+
+
+def _wait_stage_process(process: subprocess.Popen[Any]) -> int:
+    previous_sigterm = signal.signal(signal.SIGTERM, _raise_signal_exit)
+    try:
+        return process.wait(timeout=_WORKFLOW_STAGE_TIMEOUT_S)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        else:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 def run_hf_parity_stage(
@@ -385,20 +556,22 @@ def run_hf_parity_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
-    case_config = oracle_harness.OracleCaseConfig(
+    case_config = _oracle_case_config(
+        oracle_harness,
         base_model=base_model,
+        model_support_key=spec.key,
         is_moe=handler.is_moe,
         precision=handler.correctness_precision(),
         num_layers=max(1, architecture.recommended_min_layers),
-        num_steps=1,
-        lora={"target_modules": list(spec.default_target_modules)},
+        target_modules=list(spec.default_target_modules),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     case_config = hf_parity.hf_parity_case_config(case_config)
-    report = hf_parity.run_hf_parity(case_config=case_config)
-    case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
+    report = hf_parity.run_hf_parity(case_config=case_config, in_process=True)
     artifact_dir = str(
-        Path(case_artifacts.case_dir) / hf_parity.HF_PARITY_OUTPUT_DIRNAME
+        Path(oracle_harness.ARTIFACT_ROOT)
+        / report.case_id
+        / hf_parity.HF_PARITY_OUTPUT_DIRNAME
     )
     return ValidationStageResult(
         name="hf_parity",
@@ -432,13 +605,14 @@ def run_lora_coverage_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
-    case_config = oracle_harness.OracleCaseConfig(
+    case_config = _oracle_case_config(
+        oracle_harness,
         base_model=base_model,
+        model_support_key=spec.key,
         is_moe=handler.is_moe,
         precision=handler.correctness_precision(),
         num_layers=max(1, architecture.recommended_min_layers),
-        num_steps=1,
-        lora={"target_modules": list(spec.default_target_modules)},
+        target_modules=list(spec.default_target_modules),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     report = lora_coverage.run_lora_coverage(case_config)
@@ -478,6 +652,10 @@ def run_correctness_sensitivity_stage(
     architecture: ArchitectureReport,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
+    stage_dir = _workflow_stage_dir()
+    correctness_log = stage_dir / "correctness.log"
+    sensitivity_log = stage_dir / "sensitivity.log"
+    live_training_log = stage_dir / "live_training.log"
     oracle_harness = _import_integration_module(
         "integration.megatron.model_support.oracle_harness"
     )
@@ -490,43 +668,48 @@ def run_correctness_sensitivity_stage(
     correctness_precision = handler.correctness_precision()
     correctness_use_fp32_lora_reference = handler.correctness_use_fp32_lora_reference()
     correctness_phase_pass_fns = handler.correctness_phase_pass_fns(oracle_harness)
-    case_config = oracle_harness.OracleCaseConfig(
-        base_model=base_model,
-        is_moe=handler.is_moe,
-        precision=correctness_precision,
-        num_layers=max(1, architecture.recommended_min_layers),
-        num_steps=1,
-        lora={"target_modules": list(spec.default_target_modules)},
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
     suite_topologies = list(
         oracle_harness.selected_suite_topologies(
             is_moe=handler.is_moe,
             cp_supported=cp_supported,
         )
     )
-    objectives = list(oracle_harness.selected_oracle_objectives())
+    objectives = list(oracle_harness.SUPPORTED_ORACLE_OBJECTIVES)
     skip_sensitivity = _truthy_env(SKIP_SENSITIVITY_ENV)
     available_gpu_count = oracle_harness.available_gpu_count()
     max_world_size = available_gpu_count
     oracle_world_size = oracle_harness.oracle_topology(
         is_moe=handler.is_moe
     ).world_size()
-    if available_gpu_count < oracle_world_size:
+    required_gpu_count = max(
+        oracle_world_size,
+        *(topology.world_size() for topology in suite_topologies),
+    )
+    if available_gpu_count < required_gpu_count:
         raise RuntimeError(
             "Need "
-            f"{oracle_world_size} GPUs for oracle topology, found {available_gpu_count}"
+            f"{required_gpu_count} GPUs for the complete correctness topology set, "
+            f"found {available_gpu_count}"
         )
-    selected_suite_topologies = [
-        topology
-        for topology in suite_topologies
-        if topology.world_size() <= max_world_size
-    ]
-    excluded_suite_topologies = [
-        topology
-        for topology in suite_topologies
-        if topology.world_size() > max_world_size
-    ]
+    selected_suite_topologies = suite_topologies
+    excluded_suite_topologies: list[Any] = []
+    pipeline_layer_multiple = math.lcm(
+        *(topology.pp * topology.vpp for topology in selected_suite_topologies)
+    )
+    minimum_layers = max(1, architecture.recommended_min_layers)
+    num_layers = (
+        (minimum_layers + pipeline_layer_multiple - 1) // pipeline_layer_multiple
+    ) * pipeline_layer_multiple
+    case_config = _oracle_case_config(
+        oracle_harness,
+        base_model=base_model,
+        model_support_key=spec.key,
+        is_moe=handler.is_moe,
+        precision=correctness_precision,
+        num_layers=num_layers,
+        target_modules=list(spec.default_target_modules),
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
     mutations: list[str] = []
     inapplicable_sensitivity_mutations: list[str] = []
     default_excluded_sensitivity_mutations: list[str] = []
@@ -576,51 +759,53 @@ def run_correctness_sensitivity_stage(
                 *default_excluded_sensitivity_mutations,
             }
         ]
-    LIVE_TRAINING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LIVE_TRAINING_LOG_PATH.write_text("", encoding="utf-8")
-    with _temporary_env(**{ORACLE_LIVE_TRAINING_LOG_ENV: str(LIVE_TRAINING_LOG_PATH)}):
-        with _redirect_output(CORRECTNESS_LOG_PATH):
-            suite_reports = oracle_harness.run_suite(
-                case_config=case_config,
-                max_world_size=max_world_size,
-                cp_supported=cp_supported,
-                phase_pass_fns=correctness_phase_pass_fns,
-                use_fp32_lora_reference=correctness_use_fp32_lora_reference,
-                prune_reference_artifacts=skip_sensitivity or not mutations,
-                prune_case_artifacts=skip_sensitivity or not mutations,
-            )
-        sensitivity_reports = []
-        if skip_sensitivity:
-            SENSITIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SENSITIVITY_LOG_PATH.write_text(
-                (
-                    "Sensitivity suite skipped. "
-                    f"Set {SKIP_SENSITIVITY_ENV}=0 to re-enable workflow sensitivity.\n"
-                ),
-                encoding="utf-8",
-            )
-        elif not mutations:
-            SENSITIVITY_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SENSITIVITY_LOG_PATH.write_text(
-                (
-                    "Sensitivity suite skipped. "
-                    f"No sensitivity mutations fit max_world_size={max_world_size}.\n"
-                ),
-                encoding="utf-8",
-            )
-        else:
-            with _redirect_output(SENSITIVITY_LOG_PATH):
-                sensitivity_reports = oracle_harness.run_sensitivity_suite(
+    live_training_log.write_text("", encoding="utf-8")
+    with _temporary_env(**{oracle_harness.ORACLE_OBJECTIVE_ENV: "all"}):
+        with _temporary_env(**{ORACLE_LIVE_TRAINING_LOG_ENV: str(live_training_log)}):
+            with _redirect_output(correctness_log):
+                suite_reports = oracle_harness.run_suite(
                     case_config=case_config,
-                    mutations=mutations,
                     max_world_size=max_world_size,
+                    cp_supported=cp_supported,
+                    phase_pass_fns=correctness_phase_pass_fns,
+                    use_fp32_lora_reference=correctness_use_fp32_lora_reference,
+                    prune_reference_artifacts=skip_sensitivity or not mutations,
+                    prune_case_artifacts=skip_sensitivity or not mutations,
                 )
+            sensitivity_reports = []
+            if skip_sensitivity:
+                sensitivity_log.write_text(
+                    (
+                        "Sensitivity suite skipped. "
+                        f"Set {SKIP_SENSITIVITY_ENV}=0 to re-enable workflow sensitivity.\n"
+                    ),
+                    encoding="utf-8",
+                )
+            elif not mutations:
+                sensitivity_log.write_text(
+                    (
+                        "Sensitivity suite skipped. "
+                        f"No sensitivity mutations fit max_world_size={max_world_size}.\n"
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                with _redirect_output(sensitivity_log):
+                    sensitivity_reports = oracle_harness.run_sensitivity_suite(
+                        case_config=case_config,
+                        mutations=mutations,
+                        max_world_size=max_world_size,
+                    )
     case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
     return ValidationStageResult(
         name="correctness_sensitivity",
         passed=True,
         metrics={
+            "correctness_log_path": str(correctness_log),
+            "sensitivity_log_path": str(sensitivity_log),
+            "live_training_log_path": str(live_training_log),
             "requested_num_layers": case_config.num_layers,
+            "pipeline_layer_multiple": pipeline_layer_multiple,
             "precision": correctness_precision,
             "use_fp32_lora_reference": correctness_use_fp32_lora_reference,
             "is_moe": handler.is_moe,
@@ -635,7 +820,7 @@ def run_correctness_sensitivity_stage(
             ),
             "available_gpu_count": available_gpu_count,
             "max_world_size": max_world_size,
-            "required_gpu_count": oracle_world_size,
+            "required_gpu_count": required_gpu_count,
             "topology_artifacts_retained": oracle_harness.keep_topology_artifacts(),
             "correctness_variant_count": len(suite_reports),
             "correctness_excluded_topology_count": len(excluded_suite_topologies),
@@ -691,13 +876,14 @@ def run_merged_vllm_serving_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
-    case_config = oracle_harness.OracleCaseConfig(
+    case_config = _oracle_case_config(
+        oracle_harness,
         base_model=base_model,
+        model_support_key=spec.key,
         is_moe=handler.is_moe,
         precision=handler.correctness_precision(),
         num_layers=max(1, architecture.recommended_min_layers),
-        num_steps=1,
-        lora={"target_modules": list(spec.default_target_modules)},
+        target_modules=list(spec.default_target_modules),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     report = merged_vllm_serving.run_merged_vllm_serving(case_config)
@@ -748,6 +934,7 @@ def run_chat_template_rollout_stage(
     chat_template_rollout = _import_integration_module(
         "integration.megatron.model_support.chat_template_rollout"
     )
+    chat_template_rollout._artifact_dir = lambda _base_model: _stage_artifact_dir()
     report = chat_template_rollout.run_chat_template_rollout(base_model=base_model)
     return ValidationStageResult(
         name="chat_template_rollout",
@@ -769,6 +956,7 @@ def run_yes_no_trainability_stage(
     )
     report = yes_no_trainability.run_yes_no_trainability(
         base_model=base_model,
+        artifact_root=_stage_artifact_dir(),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     passed = yes_no_trainability.yes_no_trainability_passed(report)
@@ -790,10 +978,18 @@ def run_length_trainability_stage(
     length_trainability = _import_integration_module(
         "integration.megatron.trainability.test_live_length_trainability"
     )
-    report = length_trainability.run_length_trainability(
-        base_model=base_model,
-        allow_unvalidated_arch=allow_unvalidated_arch,
+    length_trainability.LATEST_SUMMARY_LOG_PATH = (
+        _workflow_stage_dir() / "length_trainability.log"
     )
+    artifact_dir = _stage_artifact_dir()
+    length_trainability._artifact_dir = lambda _base_model: artifact_dir
+    try:
+        report = length_trainability.run_length_trainability(
+            base_model=base_model,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
+    finally:
+        _cleanup_stage_workspace(artifact_dir / "megatron_dedicated_workspace")
     return ValidationStageResult(
         name="length_trainability",
         passed=length_trainability.length_trainability_passed(report),
@@ -819,13 +1015,14 @@ def run_native_vllm_lora_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
-    case_config = oracle_harness.OracleCaseConfig(
+    case_config = _oracle_case_config(
+        oracle_harness,
         base_model=base_model,
+        model_support_key=spec.key,
         is_moe=handler.is_moe,
         precision=handler.correctness_precision(),
         num_layers=max(1, architecture.recommended_min_layers),
-        num_steps=1,
-        lora={"target_modules": list(spec.default_target_modules)},
+        target_modules=list(spec.default_target_modules),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     report = native_vllm_lora.run_native_vllm_lora(case_config)
@@ -855,10 +1052,12 @@ def run_packing_invariance_stage(
     packing_invariance = _import_integration_module(
         "integration.megatron.model_support.packing_invariance"
     )
+    packing_invariance._artifact_dir = lambda _base_model: _stage_artifact_dir()
     report = packing_invariance.run_packing_invariance(
         base_model=base_model,
         num_layers=max(1, architecture.recommended_min_layers),
         allow_unvalidated_arch=allow_unvalidated_arch,
+        in_process=True,
     )
     metrics = report.model_dump(mode="json")
     passed = bool(metrics["scenarios"]) and all(
@@ -870,6 +1069,21 @@ def run_packing_invariance_stage(
         passed=passed,
         metrics=metrics,
         artifact_dir=report.output_dir,
+    )
+
+
+def run_e2e_throughput_stage(
+    *,
+    base_model: str,
+    architecture: ArchitectureReport,
+    allow_unvalidated_arch: bool = False,
+) -> ValidationStageResult:
+    from .workflow_throughput import run_e2e_throughput
+
+    return run_e2e_throughput(
+        base_model=base_model,
+        architecture=architecture,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
 
 
@@ -898,6 +1112,18 @@ def build_validation_report(
         ),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    skip_stages = skip_stages or set()
+    selected_subprocess_stages = {
+        stage.name
+        for stage in report.stages
+        if stage.name in SUBPROCESS_VALIDATION_STAGES
+        and stage.name not in skip_stages
+        and (only_stage_run_set is None or stage.name in only_stage_run_set)
+    }
+    run_dir = _new_workflow_run_dir(
+        output_json=output_json,
+        model_key=report.model_key,
+    )
     stage_runners = {
         "hf_parity": run_hf_parity_stage,
         "lora_coverage": run_lora_coverage_stage,
@@ -907,35 +1133,48 @@ def build_validation_report(
         "chat_template_rollout": run_chat_template_rollout_stage,
         "packing_invariance": run_packing_invariance_stage,
         "length_trainability": run_length_trainability_stage,
+        "e2e_throughput": run_e2e_throughput_stage,
         YES_NO_TRAINABILITY_STAGE: run_yes_no_trainability_stage,
         NATIVE_VLLM_LORA_STAGE: run_native_vllm_lora_stage,
     }
-    env = {}
+    env = {WORKFLOW_RUN_DIR_ENV: str(run_dir)}
     if include_sensitivity is not None:
         env[SKIP_SENSITIVITY_ENV] = "0" if include_sensitivity else "1"
-    if include_sensitivity:
-        env[KEEP_TOPOLOGY_ARTIFACTS_ENV] = "1"
-    skip_stages = skip_stages or set()
     architecture: ArchitectureReport | None = None
-    context = _temporary_env(**env) if env else nullcontext()
-    with context:
+    fixture: WorkflowFixture | None = None
+    fixture_error: Exception | None = None
+    fixture_attempted = False
+    with _temporary_env(**env):
         for stage in report.stages:
+            stage_started = time.monotonic()
             if only_stage_run_set is not None and stage.name not in only_stage_run_set:
-                stage.passed = True
+                stage.passed = False
+                stage.skipped = True
                 stage.metrics = {
                     "skipped": True,
                     "reason": f"--only-stage={only_stage}",
                 }
+                _record_stage_duration(stage, started=stage_started)
                 _write_validation_report(report, output_json)
                 continue
             if stage.name in skip_stages:
-                stage.passed = True
+                stage.passed = False
+                stage.skipped = True
                 stage.metrics = {"skipped": True, "reason": "--skip-stage"}
+                _record_stage_duration(stage, started=stage_started)
                 _write_validation_report(report, output_json)
+                if stage.name == "architecture_discovery":
+                    _mark_remaining_stages_skipped(
+                        report,
+                        after_stage_name=stage.name,
+                        reason="architecture_discovery was skipped",
+                    )
+                    break
                 continue
             if stage.name == "dependency_resolution":
                 stage.passed = True
                 stage.metrics = dict(report.dependency_versions)
+                _record_stage_duration(stage, started=stage_started)
                 _write_validation_report(report, output_json)
                 continue
             if stage.name == "architecture_discovery":
@@ -956,9 +1195,21 @@ def build_validation_report(
                 except Exception as exc:
                     stage.passed = False
                     stage.metrics = _stage_error_metrics(exc)
+                _record_stage_duration(stage, started=stage_started)
                 _write_validation_report(report, output_json)
+                if architecture is None:
+                    _mark_remaining_stages_skipped(
+                        report,
+                        after_stage_name=stage.name,
+                        reason="architecture_discovery failed",
+                    )
+                    break
                 if stop_on_failure and not stage.passed:
                     _mark_remaining_stages_skipped(report, after_stage_name=stage.name)
+                    _finalize_validation_report(
+                        report,
+                        partial=only_stage is not None or bool(skip_stages),
+                    )
                     _write_validation_report(report, output_json)
                     break
                 continue
@@ -968,12 +1219,38 @@ def build_validation_report(
                 )
             stage_runner = stage_runners[stage.name]
             if stage.name in SUBPROCESS_VALIDATION_STAGES:
-                stage_result = _run_stage_in_subprocess(
-                    stage_name=stage.name,
-                    base_model=base_model,
-                    architecture=architecture,
-                    allow_unvalidated_arch=allow_unvalidated_arch,
-                )
+                fixture_provisioning_s: float | None = None
+                if not fixture_attempted:
+                    fixture_started = time.monotonic()
+                    fixture_attempted = True
+                    try:
+                        fixture = ensure_workflow_fixture(
+                            base_model,
+                            allow_unvalidated_arch=allow_unvalidated_arch,
+                            required_stages=selected_subprocess_stages,
+                        )
+                    except Exception as exc:
+                        fixture_error = exc
+                    fixture_provisioning_s = time.monotonic() - fixture_started
+                if fixture_error is not None:
+                    stage_result = ValidationStageResult(
+                        name=stage.name,
+                        passed=False,
+                        metrics=_stage_error_metrics(fixture_error),
+                    )
+                else:
+                    assert fixture is not None
+                    with _temporary_env(**fixture.environment(stage.name)):
+                        stage_result = _run_stage_in_subprocess(
+                            stage_name=stage.name,
+                            base_model=base_model,
+                            architecture=architecture,
+                            allow_unvalidated_arch=allow_unvalidated_arch,
+                        )
+                if fixture_provisioning_s is not None:
+                    stage_result.metrics["fixture_provisioning_s"] = (
+                        fixture_provisioning_s
+                    )
             else:
                 try:
                     stage_result = stage_runner(
@@ -990,11 +1267,29 @@ def build_validation_report(
             stage.passed = stage_result.passed
             stage.metrics = dict(stage_result.metrics)
             stage.artifact_dir = stage_result.artifact_dir
+            if stage.name in _RUNTIME_CLEANUP_STAGES:
+                try:
+                    stage.metrics.update(_prune_runtime_artifacts(run_dir / stage.name))
+                except Exception as exc:
+                    stage.passed = False
+                    stage.metrics["runtime_artifact_cleanup_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            _record_stage_duration(stage, started=stage_started)
             _write_validation_report(report, output_json)
             if stop_on_failure and not stage.passed:
                 _mark_remaining_stages_skipped(report, after_stage_name=stage.name)
+                _finalize_validation_report(
+                    report,
+                    partial=only_stage is not None or bool(skip_stages),
+                )
                 _write_validation_report(report, output_json)
                 break
+    _finalize_validation_report(
+        report,
+        partial=only_stage is not None or bool(skip_stages),
+    )
+    _write_validation_report(report, output_json)
     return report
 
 
@@ -1009,8 +1304,9 @@ def build_all_architectures_validation_report(
     allow_unvalidated_arch: bool = False,
 ) -> AllArchitecturesValidationReport:
     aggregate = AllArchitecturesValidationReport()
+    representatives = validated_architecture_representative_models()
     _write_all_architectures_report(aggregate, output_json)
-    for base_model in validated_architecture_representative_models():
+    for base_model in representatives:
         model_key = get_model_support_spec(
             base_model,
             allow_unvalidated_arch=allow_unvalidated_arch,
@@ -1031,11 +1327,13 @@ def build_all_architectures_validation_report(
         )
         aggregate.reports.append(report)
         aggregate.passed = all(
-            all(stage.passed for stage in model_report.stages)
-            for model_report in aggregate.reports
+            model_report.passed for model_report in aggregate.reports
+        )
+        aggregate.complete = len(aggregate.reports) == len(representatives) and all(
+            model_report.complete for model_report in aggregate.reports
         )
         _write_all_architectures_report(aggregate, output_json)
-        if stop_on_failure and not all(stage.passed for stage in report.stages):
+        if stop_on_failure and not report.passed:
             break
     return aggregate
 
@@ -1061,7 +1359,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _print_stage_result(stage: ValidationStageResult, *, indent: str = "") -> None:
-    status = "PASS" if stage.passed else "FAIL"
+    status = "SKIP" if stage.skipped else "PASS" if stage.passed else "FAIL"
     print(f"{indent}{stage.name}: {status}", flush=True)
     child_indent = f"{indent}  "
     if stage.artifact_dir:
@@ -1070,7 +1368,7 @@ def _print_stage_result(stage: ValidationStageResult, *, indent: str = "") -> No
     if isinstance(summary, list):
         for line in summary:
             print(f"{child_indent}{line}", flush=True)
-    if not stage.passed:
+    if not stage.passed and not stage.skipped:
         print(f"{child_indent}metrics={stage.metrics}", flush=True)
 
 
@@ -1105,7 +1403,7 @@ def main(argv: list[str] | None = None) -> int:
     for stage in report.stages:
         _print_stage_result(stage)
     print(f"report_json={args.output_json}", flush=True)
-    return 0 if all(stage.passed for stage in report.stages) else 1
+    return 0 if report.passed else 1
 
 
 def assess_minimal_layer_coverage(

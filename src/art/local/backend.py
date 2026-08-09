@@ -654,6 +654,12 @@ class LocalBackend:
         await self.close()
 
     async def close(self) -> None:
+        task = asyncio.create_task(self._close_local_backend())
+        _, cancelled = await complete_task(task)
+        if cancelled is not None:
+            raise cancelled
+
+    async def _close_local_backend(self) -> None:
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """

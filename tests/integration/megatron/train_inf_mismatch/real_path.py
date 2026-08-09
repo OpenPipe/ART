@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Mapping
 from contextlib import asynccontextmanager, contextmanager
 import hashlib
 import inspect
@@ -390,6 +391,77 @@ def _build_prompts(config: RealPathConfig, tokenizer: Any) -> list[str]:
     return prompts
 
 
+def _real_path_max_model_len(
+    config: RealPathConfig,
+    *,
+    tokenizer: Any,
+    prompts: list[str],
+    chat_template_kwargs: dict[str, Any],
+) -> int:
+    def prompt_tokens(prompt: str) -> int:
+        encoded = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True,
+            add_generation_prompt=True,
+            **chat_template_kwargs,
+        )
+        token_ids = encoded["input_ids"] if isinstance(encoded, Mapping) else encoded
+        shape: Any = getattr(token_ids, "shape", ())
+        if len(shape) > 1:
+            return int(shape[-1])
+        if len(token_ids) == 1 and isinstance(token_ids[0], list):
+            return len(token_ids[0])
+        return len(token_ids)
+
+    return max(
+        config.output_parity.packed.sequence_length,
+        max(prompt_tokens(prompt) + config.max_completion_tokens for prompt in prompts),
+    )
+
+
+def _prepare_real_path_prompts(
+    config: RealPathConfig,
+) -> tuple[list[str], dict[str, Any] | None, int]:
+    from transformers import AutoTokenizer
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+    from art.megatron.model_support.tokenizer import (
+        configure_tokenizer_for_model_support,
+    )
+
+    loaded_tokenizer = AutoTokenizer.from_pretrained(config.output_parity.base_model)
+    assert isinstance(loaded_tokenizer, PreTrainedTokenizerBase)
+    tokenizer = configure_tokenizer_for_model_support(
+        loaded_tokenizer,
+        base_model=config.output_parity.base_model,
+        internal_config={
+            "allow_unvalidated_arch": config.output_parity.allow_unvalidated_arch
+        },
+    )
+    chat_template_kwargs: dict[str, Any] = {}
+    if isinstance(tokenizer.chat_template, str):
+        if "enable_thinking" in tokenizer.chat_template:
+            chat_template_kwargs["enable_thinking"] = False
+        if "preserve_thinking" in tokenizer.chat_template:
+            chat_template_kwargs["preserve_thinking"] = True
+    prompts = _build_prompts(config, tokenizer)
+    max_model_len = _real_path_max_model_len(
+        config,
+        tokenizer=tokenizer,
+        prompts=prompts,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    return (
+        prompts,
+        (
+            {"chat_template_kwargs": chat_template_kwargs}
+            if chat_template_kwargs
+            else None
+        ),
+        max_model_len,
+    )
+
+
 async def _rollout(
     *,
     model: Any,
@@ -430,36 +502,13 @@ async def _collect_real_trajectory_groups(
     *,
     model: Any,
     config: RealPathConfig,
+    prompts: list[str],
+    extra_body: dict[str, Any] | None,
 ) -> list[Any]:
-    from transformers import AutoTokenizer
-    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-
     import art
-    from art.megatron.model_support.tokenizer import (
-        configure_tokenizer_for_model_support,
-    )
 
     if config.rollouts_per_prompt < 2:
         raise ValueError("real-path mismatch requires at least two rollouts per prompt")
-    loaded_tokenizer = AutoTokenizer.from_pretrained(config.output_parity.base_model)
-    assert isinstance(loaded_tokenizer, PreTrainedTokenizerBase)
-    tokenizer = configure_tokenizer_for_model_support(
-        loaded_tokenizer,
-        base_model=config.output_parity.base_model,
-        internal_config={
-            "allow_unvalidated_arch": config.output_parity.allow_unvalidated_arch
-        },
-    )
-    chat_template_kwargs: dict[str, Any] = {}
-    if isinstance(tokenizer.chat_template, str):
-        if "enable_thinking" in tokenizer.chat_template:
-            chat_template_kwargs["enable_thinking"] = False
-        if "preserve_thinking" in tokenizer.chat_template:
-            chat_template_kwargs["preserve_thinking"] = True
-    extra_body = (
-        {"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else None
-    )
-    prompts = _build_prompts(config, tokenizer)
     groups = [
         art.TrajectoryGroup(
             [
@@ -496,6 +545,21 @@ def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _cuda_visible_devices_for_slots(gpu_ids: list[int]) -> str:
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    devices = (
+        [value.strip() for value in visible.split(",") if value.strip()]
+        if visible is not None
+        else None
+    )
+    if devices is None:
+        return ",".join(map(str, gpu_ids))
+    invalid = [gpu_id for gpu_id in gpu_ids if gpu_id < 0 or gpu_id >= len(devices)]
+    if invalid:
+        raise ValueError(f"GPU slots {invalid} exceed CUDA_VISIBLE_DEVICES={visible!r}")
+    return ",".join(devices[gpu_id] for gpu_id in gpu_ids)
 
 
 def _choice_score_index(
@@ -558,7 +622,7 @@ async def _direct_vllm_runtime(
         base_model=config.base_model,
         port=port,
         host="127.0.0.1",
-        cuda_visible_devices=",".join(str(value) for value in config.inference_gpu_ids),
+        cuda_visible_devices=_cuda_visible_devices_for_slots(config.inference_gpu_ids),
         lora_path=lora_path,
         served_model_name=served_model_name,
         rollout_weights_mode=cast(Any, rollout_weights_mode),
@@ -699,6 +763,9 @@ async def _score_base_real_generation_path(
     config: RealPathConfig,
     artifact_dir: Path,
     is_moe: bool,
+    prompts: list[str],
+    extra_body: dict[str, Any] | None,
+    max_model_len: int,
 ) -> RealPathBaseDiagnosticBundle:
     import art
     from art.megatron.backend import MegatronBackend
@@ -716,7 +783,7 @@ async def _score_base_real_generation_path(
     engine_args = {
         "tensor_parallel_size": len(parity_config.inference_gpu_ids),
         "enable_expert_parallel": is_moe and len(parity_config.inference_gpu_ids) > 1,
-        "max_model_len": parity_config.packed.sequence_length + 8,
+        "max_model_len": max_model_len,
         "max_logprobs": TOP_K,
         **parity_config.engine_args,
     }
@@ -772,6 +839,8 @@ async def _score_base_real_generation_path(
         trajectory_groups = await _collect_real_trajectory_groups(
             model=model,
             config=config,
+            prompts=prompts,
+            extra_body=extra_body,
         )
 
     packing_backend = MegatronBackend(
@@ -927,30 +996,138 @@ def _build_real_path_moe_routing_replay_bundle(
     )
 
 
+def _pack_expert_lora_tensors(
+    tensors: dict[str, Any],
+    groups: tuple[Any, ...],
+) -> dict[str, Any]:
+    import torch
+
+    packed = dict(tensors)
+    for group in groups:
+        for slot in group.slots:
+            suffix = f".{slot.source_projection}.{slot.source_lora}.weight"
+            matches: dict[str, dict[int, tuple[str, torch.Tensor]]] = {}
+            for key, tensor in tensors.items():
+                if not key.endswith(suffix):
+                    continue
+                prefix, separator, expert = key[: -len(suffix)].rpartition(".")
+                if not separator or not prefix.endswith(group.art_group_suffix):
+                    continue
+                try:
+                    expert_index = int(expert)
+                except ValueError:
+                    continue
+                matches.setdefault(prefix, {})[expert_index] = (key, tensor)
+
+            for prefix, experts in matches.items():
+                if sorted(experts) != list(range(len(experts))):
+                    raise RuntimeError(
+                        f"Non-contiguous expert LoRA tensors for {prefix}: "
+                        f"{sorted(experts)}"
+                    )
+                joined = torch.stack([experts[index][1] for index in sorted(experts)])
+                for key, _tensor in experts.values():
+                    packed.pop(key)
+                if slot.pack_layout == "expert_rows":
+                    value = joined.flatten(0, 1)
+                elif slot.pack_layout == "rank_major_expert_cols":
+                    value = joined.permute(1, 2, 0).reshape(
+                        joined.shape[1], joined.shape[2] * joined.shape[0]
+                    )
+                elif slot.pack_layout == "interleaved_gate_up_rank_major_expert_cols":
+                    gate, up = joined.split(joined.shape[1] // 2, dim=1)
+                    interleaved = torch.stack((gate, up), dim=2).flatten(1, 2)
+                    value = interleaved.permute(1, 2, 0).reshape(
+                        interleaved.shape[1],
+                        interleaved.shape[2] * interleaved.shape[0],
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Unsupported expert LoRA layout: {slot.pack_layout}"
+                    )
+                output_key = f"{prefix}.{slot.output_suffix}"
+                if output_key in packed:
+                    raise RuntimeError(
+                        f"Duplicate packed expert LoRA tensor: {output_key}"
+                    )
+                packed[output_key] = value.contiguous()
+    return packed
+
+
 def _make_nonzero_adapter(
     *,
     config: TrainInfOutputParityConfig,
     artifact_dir: Path,
 ) -> str:
-    request = RealPathMegatronWorkerRequest(
-        config=config,
-        artifact_dir=str(artifact_dir),
-        disk_packed_tensors=cast(
-            DiskPackedTensors,
-            {
-                "dir": str(artifact_dir / "unused"),
-                "num_sequences": 1,
-                "sequence_length": 1,
-            },
-        ),
-        logical_map_path=str(artifact_dir / "unused_logical_map.json"),
-        weight_state="lora",
-        adapter_path=None,
-        moe_routing_replay_path=None,
-        global_grad_accumulation_sequences=1,
-        forward_trace_dir=None,
+    import torch
+
+    from art.megatron.identity_lora import create_identity_lora
+    from art.megatron.model_support import get_model_support_handler
+    from art.megatron.model_support.lora_disk import (
+        load_adapter_config,
+        load_vllm_lora_tensors,
+        save_vllm_lora_tensors,
     )
-    return _run_real_path_megatron_worker(request, adapter_only=True).adapter_path or ""
+
+    from .output_parity import _adapter_config
+
+    handler = get_model_support_handler(
+        config.base_model,
+        allow_unvalidated_arch=config.allow_unvalidated_arch,
+    )
+    adapter_path = artifact_dir / "real_path_active_lora"
+    with torch.random.fork_rng(devices=[]):
+        create_identity_lora(
+            config.base_model,
+            str(adapter_path),
+            target_modules=_lora_target_modules(config),
+            random_state=config.seed,
+            allow_unvalidated_arch=config.allow_unvalidated_arch,
+            handler=handler,
+        )
+    published_config = load_adapter_config(adapter_path)
+    templates = handler.from_vllm_lora_tensors(
+        load_vllm_lora_tensors(adapter_path),
+        adapter_config=published_config,
+    )
+    if not templates:
+        raise RuntimeError("Identity LoRA metadata produced no adapter tensors")
+    adapter_config = _adapter_config(config)
+    initialized = _build_deterministic_nonzero_lora(
+        {
+            key: torch.empty_like(value, device="cpu", dtype=torch.bfloat16)
+            for key, value in templates.items()
+        },
+        seed=config.seed,
+    )
+    normalized, normalized_config = handler.to_vllm_lora_tensors(
+        initialized,
+        adapter_config=dict(adapter_config),
+    )
+    initialized = handler.from_vllm_lora_tensors(
+        normalized,
+        adapter_config=normalized_config,
+    )
+    tensors, published_config = handler.to_vllm_lora_tensors(
+        _pack_expert_lora_tensors(
+            initialized,
+            tuple(handler.expert_packed_lora_groups()),
+        ),
+        adapter_config=adapter_config,
+    )
+    invalid = [
+        key
+        for key, value in tensors.items()
+        if value.dtype != torch.bfloat16 or not torch.count_nonzero(value).item()
+    ]
+    if invalid:
+        raise RuntimeError(f"Invalid materialized LoRA tensors: {invalid[:5]}")
+    save_vllm_lora_tensors(
+        adapter_path,
+        {key: value.cpu().contiguous() for key, value in tensors.items()},
+        published_config,
+    )
+    return str(adapter_path)
 
 
 def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
@@ -1006,7 +1183,10 @@ def _default_adapter_cache_dir() -> Path:
 def _adapter_cache_dir(config: RealPathConfig) -> Path:
     if config.adapter_cache_dir:
         return Path(config.adapter_cache_dir)
-    return _default_adapter_cache_dir()
+    model_namespace = hashlib.sha256(
+        config.output_parity.base_model.encode()
+    ).hexdigest()[:16]
+    return _default_adapter_cache_dir() / model_namespace
 
 
 def _adapter_cache_manifest_path(adapter_path: Path) -> Path:
@@ -1369,8 +1549,8 @@ def _run_real_path_megatron_worker(
     request_path = artifact_dir / request_name
     _write_json(request_path, request.model_dump(mode="json"))
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(
-        str(value) for value in request.config.trainer_gpu_ids
+    env["CUDA_VISIBLE_DEVICES"] = _cuda_visible_devices_for_slots(
+        request.config.trainer_gpu_ids
     )
     env.update(request.config.megatron_env)
     env["PYTHONUNBUFFERED"] = "1"
@@ -1443,6 +1623,7 @@ async def run_real_path_train_inf_mismatch(
 
     parity_config = config.output_parity
     _apply_sliding_window_prompt_defaults(config)
+    prompts, extra_body, max_model_len = _prepare_real_path_prompts(config)
     rollout_mode = _real_path_rollout_mode(parity_config)
     is_moe = model_support_is_moe(
         parity_config.base_model,
@@ -1469,7 +1650,7 @@ async def run_real_path_train_inf_mismatch(
                 "tensor_parallel_size": len(parity_config.inference_gpu_ids),
                 "enable_expert_parallel": is_moe
                 and len(parity_config.inference_gpu_ids) > 1,
-                "max_model_len": parity_config.packed.sequence_length + 8,
+                "max_model_len": max_model_len,
                 "max_logprobs": TOP_K,
                 **parity_config.engine_args,
             },
@@ -1506,6 +1687,8 @@ async def run_real_path_train_inf_mismatch(
         trajectory_groups = await _collect_real_trajectory_groups(
             model=model,
             config=config,
+            prompts=prompts,
+            extra_body=extra_body,
         )
         packed_tensors = backend._get_packed_tensors(
             model,
@@ -1578,6 +1761,9 @@ async def run_real_path_train_inf_mismatch(
                 config=config,
                 artifact_dir=artifact_dir,
                 is_moe=is_moe,
+                prompts=prompts,
+                extra_body=extra_body,
+                max_model_len=max_model_len,
             )
             megatron_base = base_diagnostic.megatron_scores
             vllm_base = base_diagnostic.vllm_scores

@@ -1,6 +1,6 @@
 from art.distributed.data_plane import PackedBatchLeaseSet, PackedBatchRef
 
-from .data_plane import InMemoryPackedBatch, PackedBatch
+from .data_plane import InMemoryPackedBatch
 from .specs import (
     AdapterReady,
     CurrentTrainConfig,
@@ -16,7 +16,6 @@ from .specs import (
     TrainJobSpec,
     TrainProgress,
 )
-from .trainer_run import LocalTrainerRun, TrainerRun
 
 __all__ = [
     "AdapterReady",
@@ -24,8 +23,6 @@ __all__ = [
     "DurableTrainOutput",
     "ExperimentalTrainConfig",
     "InMemoryPackedBatch",
-    "LocalTrainerRun",
-    "PackedBatch",
     "PackedBatchRef",
     "PackedBatchLeaseSet",
     "TrainAccepted",
@@ -35,7 +32,6 @@ __all__ = [
     "TrainFailed",
     "TrainJobSpec",
     "TrainProgress",
-    "TrainerRun",
     "TrainerRuntimeSpec",
     "TrainingRunSpec",
 ]
