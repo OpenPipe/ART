@@ -234,9 +234,6 @@ class _GenerationPublisher:
         self._slots = BoundedSemaphore(capacity)
         self._lock = Lock()
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="art-publish")
-        self._transport_pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="art-adapter-transport"
-        )
         self._transport_sender: Any | None = None
         self._failures: list[BaseException] = []
         self._in_flight = 0
@@ -352,19 +349,17 @@ class _GenerationPublisher:
         publication_targets: tuple[Any, ...],
     ) -> TrainerRankPublication:
         lora = None if lora is None else lora.resolve()
-        transfer = None
+        failures: list[BaseException] = []
         if int(self.runtime.rank) == 0 and publication_targets:
             if lora is None:
                 raise RuntimeError("rank zero has no LoRA snapshot to transfer")
-            transfer = self._transport_pool.submit(
-                self._transfer_lora_snapshot,
-                lora,
-                publication_targets,
-            )
-        optimizer = None if optimizer is None else optimizer.resolve()
-        failures: list[BaseException] = []
+            try:
+                self._transfer_lora_snapshot(lora, publication_targets)
+            except BaseException as error:
+                failures.append(error)
         record: TrainerRankPublication | None = None
         try:
+            optimizer = None if optimizer is None else optimizer.resolve()
             record = self._persist_generation(
                 generation=generation,
                 optimizer_state_path=optimizer_state_path,
@@ -375,11 +370,6 @@ class _GenerationPublisher:
             )
         except BaseException as error:
             failures.append(error)
-        if transfer is not None:
-            try:
-                transfer.result()
-            except BaseException as error:
-                failures.append(error)
         if len(failures) == 1:
             raise failures[0]
         if failures:
@@ -487,7 +477,6 @@ class _GenerationPublisher:
 
     def close(self) -> None:
         self._pool.shutdown(wait=True)
-        self._transport_pool.shutdown(wait=True)
         if self._transport_sender is not None:
             self._transport_sender.close()
             self._transport_sender = None
