@@ -108,15 +108,15 @@ def test_local_start_reconciles_legacy_owned_orphan(
     monkeypatch.setattr(bootstrap, "_WORKER_LOCK_ROOT", tmp_path)
     address = bootstrap._resolve_ephemeral_worker_address("tcp://127.0.0.1:0")
     bootstrap._worker_lock_path(address).touch()
-    program = """
+    program = f"""
 import os
 import subprocess
 import sys
 
-from art.distributed.monarch_bootstrap import _LEGACY_OWNED_WORKER_CODE
+worker_code = {bootstrap._LEGACY_OWNED_WORKER_CODE!r}
 
 worker = subprocess.Popen(
-    [sys.executable, "-c", _LEGACY_OWNED_WORKER_CODE, sys.argv[1]],
+    [sys.executable, "-c", worker_code, sys.argv[1]],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
