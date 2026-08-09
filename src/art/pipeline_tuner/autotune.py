@@ -75,9 +75,15 @@ def _packing_group_candidates(
     *, current: int, available: int, radius: int, min_change_fraction: float
 ) -> list[int]:
     step = max(1, math.ceil(current * min_change_fraction / 2.0))
+    min_change = max(1, math.ceil(current * min_change_fraction))
     lower = max(1, min(available, current - radius))
     upper = min(available, current + radius)
     candidates = {lower, min(current, available), upper}
+    candidates.update(
+        groups
+        for groups in (current - min_change, current + min_change)
+        if lower <= groups <= upper
+    )
     for offset in range(step, radius, step):
         candidates.update(
             groups
