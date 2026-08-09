@@ -470,7 +470,7 @@ _THROUGHPUT_CONFIGS = {
         completion_tokens=144,
         rollouts_per_group=8,
         groups_per_step=25,
-        initial_model_calls_per_inference_gpu=18,
+        initial_model_calls_per_inference_gpu=9,
         max_steps=35,
     ),
     "qwen3_moe": ThroughputWorkflowConfig(
@@ -534,7 +534,7 @@ _THROUGHPUT_CONFIGS = {
     ),
     "gpt_oss_moe": ThroughputWorkflowConfig(
         num_layers=4,
-        initial_model_calls_per_inference_gpu=24,
+        initial_model_calls_per_inference_gpu=20,
         max_num_seqs=48,
         max_steps=35,
     ),
