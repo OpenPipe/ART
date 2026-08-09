@@ -11,6 +11,7 @@ pytest.importorskip("megatron.bridge")
 from megatron.core.transformer.enums import AttnBackend
 
 from art.megatron.context_parallel.core_attention import ArtContextParallelCoreAttention
+from art.megatron.dsv4.bridge import _install_dsv4_source_aliases
 from art.megatron.flex_attn.attention import FlexDotProductAttention
 from art.megatron.lora import default_lora_rank_for_handler
 from art.megatron.model_support.registry import (
@@ -161,6 +162,10 @@ def test_dsv4_prefers_validated_native_lora_rollout() -> None:
 
     assert spec.native_vllm_lora_status == "validated"
     assert model_requires_merged_rollout("deepseek-ai/DeepSeek-V4-Flash") is False
+
+
+def test_dsv4_config_only_bridge_does_not_require_checkpoint_state() -> None:
+    _install_dsv4_source_aliases(SimpleNamespace(config=SimpleNamespace()))
 
 
 def test_dsv4_provider_disables_shared_expert_overlap(

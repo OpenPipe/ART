@@ -513,7 +513,9 @@ class _Dsv4AliasStateSource:
 
 
 def _install_dsv4_source_aliases(hf_pretrained: Any) -> None:
-    state = hf_pretrained.state
+    state = getattr(hf_pretrained, "state", None)
+    if state is None:
+        return
     source = getattr(state, "source", None)
     if source is None or isinstance(source, _Dsv4AliasStateSource):
         return
