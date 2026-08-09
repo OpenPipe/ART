@@ -459,6 +459,8 @@ def _prepare_real_path_prompts(
         prompts=prompts,
         chat_template_kwargs=chat_template_kwargs,
     )
+    max_model_len = _round_up(max_model_len, 128)
+    config.output_parity.packed.sequence_length = max_model_len
     return (
         prompts,
         (
