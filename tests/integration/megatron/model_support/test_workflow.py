@@ -332,7 +332,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
 
     e2e_phase, isolated_phase = (
         phase("e2e", "input-a", (20,)),
-        phase("isolated", "input-a", (21, 22)),
+        phase("isolated", "input-a", (22, 23)),
     )
 
     def collect(isolated):
@@ -403,7 +403,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         collect(isolated_phase)
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     with pytest.raises(RuntimeError, match="same packed input"):
-        collect(phase("isolated", "input-b", (21, 22)))
+        collect(phase("isolated", "input-b", (22, 23)))
 
 
 def test_dsv4_throughput_reduction_preserves_hash_moe_prefix() -> None:
