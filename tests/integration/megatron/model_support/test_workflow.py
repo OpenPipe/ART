@@ -396,6 +396,10 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "policy_activation_cadence_s",
         "calibration_basis",
     ]
+    measurements["matched_e2e_core_train_tok_s"] *= 1.1
+    assert "matched_core_to_isolated_ratio_max" in acceptance_failures(
+        measurements, config, thresholds
+    )
     fractional = [dict(row) for row in rows]
     fractional[0]["data/step_nonpadding_logical_tokens"] = 999.5
     history_path.write_text("".join(json.dumps(row) + "\n" for row in fractional))

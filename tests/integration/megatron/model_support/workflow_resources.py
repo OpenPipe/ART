@@ -23,6 +23,9 @@ class ThroughputThresholds(BaseModel):
     min_matched_core_to_isolated_ratio: float = Field(
         gt=0.0, le=1.0, allow_inf_nan=False
     )
+    max_matched_core_to_isolated_ratio: float = Field(
+        default=1.05, gt=1.0, allow_inf_nan=False
+    )
     max_policy_activation_lag_s: float = Field(gt=0.0, le=2.0, allow_inf_nan=False)
     max_policy_activation_interval_s: float = Field(gt=0.0, allow_inf_nan=False)
 

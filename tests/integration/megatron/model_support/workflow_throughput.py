@@ -1188,6 +1188,11 @@ def acceptance_failures(
         "matched_core_to_isolated_ratio": measurements["matched_e2e_core_train_tok_s"]
         / measurements["isolated_train_tok_s"]
         >= thresholds.min_matched_core_to_isolated_ratio,
+        "matched_core_to_isolated_ratio_max": measurements[
+            "matched_e2e_core_train_tok_s"
+        ]
+        / measurements["isolated_train_tok_s"]
+        <= thresholds.max_matched_core_to_isolated_ratio,
         "policy_activation_lag_s": measurements["max_policy_activation_lag_s"]
         <= thresholds.max_policy_activation_lag_s,
         "policy_activation_cadence_s": measurements["max_policy_activation_interval_s"]
