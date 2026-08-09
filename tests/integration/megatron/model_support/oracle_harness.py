@@ -1377,8 +1377,6 @@ class VariantRunner:
         )
 
     def _routing_bundle_dir(self, objective: OracleObjective) -> Path:
-        if objective == self.objective:
-            return self.oracle_routing_bundle_dir
         return self.case_dir / f"{objective}__{ORACLE_MOE_ROUTING_BUNDLE_DIRNAME}"
 
     def _objective_artifact_paths(
