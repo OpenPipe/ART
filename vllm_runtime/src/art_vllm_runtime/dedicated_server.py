@@ -3,16 +3,11 @@
 import argparse
 import asyncio
 from functools import lru_cache
-import hashlib
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
 import json
 import os
-import secrets
 import socket
-import threading
-from typing import Any, cast
+from typing import Any
 import uuid
 
 from fastapi.responses import JSONResponse
@@ -26,6 +21,7 @@ from art_vllm_runtime.binary_routes import (
     PIPELINE_ROUTES_PROTOCOL,
     _register_model_route_layout,
 )
+from art_vllm_runtime.fast_metrics import FastMetricsSidecar
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
 ART_SERVING_PROTOCOL_VERSION = 4
@@ -55,81 +51,6 @@ def _art_metrics_snapshot() -> dict[str, Any]:
         generation=_runtime_state["generation"],
     )
     return snapshot
-
-
-class _FastMetricsHTTPServer(ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-    def __init__(self, host: str, tokens: list[str], port: int = 0) -> None:
-        self._token_hashes = tuple(
-            hashlib.sha256(token.encode("utf-8")).digest() for token in tokens
-        )
-        super().__init__((host, port), _FastMetricsRequestHandler)
-
-    def get_request(self) -> tuple[socket.socket, Any]:
-        request, address = super().get_request()
-        request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        return request, address
-
-    def authorized(self, value: str | None) -> bool:
-        if not self._token_hashes:
-            return True
-        scheme, _, token = (value or "").partition(" ")
-        candidate = hashlib.sha256(token.encode("utf-8")).digest()
-        token_match = False
-        for expected in self._token_hashes:
-            token_match |= secrets.compare_digest(candidate, expected)
-        return scheme.lower() == "bearer" and token_match
-
-
-class _FastMetricsRequestHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def do_GET(self) -> None:
-        server = cast(_FastMetricsHTTPServer, self.server)
-        if self.path.partition("?")[0] != "/art/metrics":
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not Found"})
-        elif not server.authorized(self.headers.get("Authorization")):
-            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized"})
-        else:
-            self._send_json(HTTPStatus.OK, _art_metrics_snapshot())
-
-    def _send_json(self, status: HTTPStatus, content: object) -> None:
-        body = json.dumps(content, allow_nan=False, separators=(",", ":")).encode()
-        self.send_response(status.value)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args: object) -> None:
-        return None
-
-
-def _start_fast_metrics_server(
-    host: str, tokens: list[str], port: int = 0
-) -> tuple[_FastMetricsHTTPServer, threading.Thread]:
-    server = _FastMetricsHTTPServer(host, tokens, port)
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="art_vllm_fast_metrics",
-        daemon=True,
-    )
-    try:
-        thread.start()
-    except BaseException:
-        server.server_close()
-        raise
-    return server, thread
-
-
-def _stop_fast_metrics_server(
-    server: _FastMetricsHTTPServer, thread: threading.Thread
-) -> None:
-    server.shutdown()
-    server.server_close()
-    thread.join()
 
 
 def _fast_metrics_url(request: Any) -> str:
@@ -809,15 +730,22 @@ def main(argv: list[str] | None = None) -> None:
         namespace.api_server_count = 0
         run_headless(namespace)
     else:
-        metrics_server, metrics_thread = _start_fast_metrics_server(
-            args.host, _auth_tokens
+        from art_vllm_runtime.metrics import set_fast_metrics_writer
+
+        metrics_sidecar = FastMetricsSidecar.start(
+            args.host,
+            _auth_tokens,
+            process_uuid=process_uuid,
+            generation=args.replica_generation,
         )
-        _fast_metrics_port = metrics_server.server_port
+        _fast_metrics_port = metrics_sidecar.port
         try:
+            set_fast_metrics_writer(metrics_sidecar.writer)
             asyncio.run(api_server.run_server(namespace))
         finally:
             _fast_metrics_port = None
-            _stop_fast_metrics_server(metrics_server, metrics_thread)
+            set_fast_metrics_writer(None)
+            metrics_sidecar.close()
 
 
 if __name__ == "__main__":

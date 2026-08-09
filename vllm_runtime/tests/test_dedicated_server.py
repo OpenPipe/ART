@@ -1,10 +1,10 @@
-import asyncio
 from http.client import HTTPConnection
 import json
-import threading
+import os
 from types import SimpleNamespace
 
 from art_vllm_runtime import dedicated_server
+from art_vllm_runtime.fast_metrics import FAST_METRIC_NAMES, FastMetricsSidecar
 import pytest
 from starlette.datastructures import URL
 
@@ -14,7 +14,11 @@ _PAYLOAD: dict[str, object] = {
     "last_update_unix_s": 1.0,
     "record_count": 1,
     "engine_count": 1,
-    "metrics": {"num_requests_running": 2.0, "prompt_tokens_total": 3.0},
+    "metrics": {
+        **dict.fromkeys(FAST_METRIC_NAMES, 0.0),
+        "num_requests_running": 2.0,
+        "prompt_tokens_total": 3.0,
+    },
     "process_uuid": "runtime-process",
     "generation": 4,
 }
@@ -29,18 +33,27 @@ def _get(
     return response.status, response.version, json.loads(response.read())
 
 
-def test_fast_metrics_listener_auth_keepalive_and_scalar_payload(monkeypatch) -> None:
-    handler_threads: list[int] = []
-
-    def snapshot() -> dict[str, object]:
-        handler_threads.append(threading.get_ident())
-        return _PAYLOAD
-
-    monkeypatch.setattr(dedicated_server, "_art_metrics_snapshot", snapshot)
-    server, thread = dedicated_server._start_fast_metrics_server(
-        "127.0.0.1", ["first", "second"]
+def _start_sidecar(*, tokens: list[str], port: int = 0) -> FastMetricsSidecar:
+    sidecar = FastMetricsSidecar.start(
+        "127.0.0.1",
+        tokens,
+        process_uuid="runtime-process",
+        generation=4,
+        port=port,
     )
-    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=1.0)
+    sidecar.writer.publish(
+        last_update_unix_s=1.0,
+        record_count=1,
+        engine_count=1,
+        metrics=_PAYLOAD["metrics"],  # type: ignore[arg-type]
+    )
+    return sidecar
+
+
+def test_fast_metrics_listener_auth_keepalive_and_scalar_payload() -> None:
+    sidecar = _start_sidecar(tokens=["first", "second"])
+    assert sidecar.process.pid != os.getpid()
+    connection = HTTPConnection("127.0.0.1", sidecar.port, timeout=1.0)
     try:
         assert _get(connection)[0] == 401
         reused_socket = connection.sock
@@ -53,61 +66,61 @@ def test_fast_metrics_listener_auth_keepalive_and_scalar_payload(monkeypatch) ->
         metrics = payload["metrics"]
         assert isinstance(metrics, dict)
         assert all(type(value) in {int, float} for value in metrics.values())
-        assert len(set(handler_threads)) == 1
-        assert handler_threads[0] != threading.get_ident()
     finally:
         connection.close()
-        dedicated_server._stop_fast_metrics_server(server, thread)
-    assert not thread.is_alive()
+        sidecar.close()
+    assert sidecar.process.poll() == 0
 
 
-def test_fast_metrics_listener_responds_while_main_event_loop_is_blocked(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(dedicated_server, "_art_metrics_snapshot", lambda: _PAYLOAD)
-    blocked = threading.Event()
-    release = threading.Event()
-
-    async def block_main_loop() -> None:
-        blocked.set()
-        release.wait(5.0)
-
-    main_loop = threading.Thread(
-        target=lambda: asyncio.run(block_main_loop()), name="blocked_main_api_loop"
-    )
-    server, server_thread = dedicated_server._start_fast_metrics_server("127.0.0.1", [])
-    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=1.0)
+def test_fast_metrics_listener_reads_updated_shared_snapshot() -> None:
+    sidecar = _start_sidecar(tokens=[])
+    connection = HTTPConnection("127.0.0.1", sidecar.port, timeout=1.0)
     try:
-        main_loop.start()
-        assert blocked.wait(1.0)
-        for _ in range(10):
-            assert _get(connection)[0] == 200
-        assert main_loop.is_alive()
+        metrics = dict(_PAYLOAD["metrics"])  # type: ignore[arg-type]
+        metrics["num_requests_running"] = 7.0
+        sidecar.writer.publish(
+            last_update_unix_s=2.0,
+            record_count=2,
+            engine_count=1,
+            metrics=metrics,
+        )
+        _, _, payload = _get(connection)
+        assert payload["record_count"] == 2
+        assert payload["last_update_unix_s"] == 2.0
+        assert payload["metrics"]["num_requests_running"] == 7.0  # type: ignore[index]
     finally:
-        release.set()
-        main_loop.join(1.0)
         connection.close()
-        dedicated_server._stop_fast_metrics_server(server, server_thread)
-    assert not main_loop.is_alive()
+        sidecar.close()
 
 
-def test_fast_metrics_listener_stops_and_restarts_on_same_port(monkeypatch) -> None:
-    monkeypatch.setattr(dedicated_server, "_art_metrics_snapshot", lambda: _PAYLOAD)
-    server, thread = dedicated_server._start_fast_metrics_server("127.0.0.1", [])
-    port = server.server_port
-    dedicated_server._stop_fast_metrics_server(server, thread)
-    assert not thread.is_alive()
-
-    restarted, restarted_thread = dedicated_server._start_fast_metrics_server(
-        "127.0.0.1", [], port
+def test_fast_metrics_listener_reports_unpublished_snapshot() -> None:
+    sidecar = FastMetricsSidecar.start(
+        "127.0.0.1", [], process_uuid="runtime-process", generation=4
     )
+    connection = HTTPConnection("127.0.0.1", sidecar.port, timeout=1.0)
+    try:
+        status, _, payload = _get(connection)
+        assert status == 503
+        assert payload == {"error": "Metrics unavailable"}
+    finally:
+        connection.close()
+        sidecar.close()
+
+
+def test_fast_metrics_listener_stops_and_restarts_on_same_port() -> None:
+    sidecar = _start_sidecar(tokens=[])
+    port = sidecar.port
+    sidecar.close()
+    assert sidecar.process.poll() == 0
+
+    restarted = _start_sidecar(tokens=[], port=port)
     connection = HTTPConnection("127.0.0.1", port, timeout=1.0)
     try:
         assert _get(connection)[0] == 200
     finally:
         connection.close()
-        dedicated_server._stop_fast_metrics_server(restarted, restarted_thread)
-    assert not restarted_thread.is_alive()
+        restarted.close()
+    assert restarted.process.poll() == 0
 
 
 def test_fast_metrics_url_uses_controller_routable_host(monkeypatch) -> None:
