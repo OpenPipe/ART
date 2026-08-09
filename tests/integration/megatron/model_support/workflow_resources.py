@@ -454,11 +454,11 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
 
 _THROUGHPUT_CONFIGS = {
     "llama3_dense": ThroughputWorkflowConfig(
-        num_layers=8,
+        num_layers=16,
         prompt_tokens=3922,
-        completion_tokens=504,
-        groups_per_step=22,
-        initial_model_calls_per_inference_gpu=22,
+        completion_tokens=384,
+        groups_per_step=24,
+        initial_model_calls_per_inference_gpu=26,
     ),
     "qwen3_dense": ThroughputWorkflowConfig(
         num_layers=8,
@@ -483,6 +483,7 @@ _THROUGHPUT_CONFIGS = {
         num_layers=24,
         completion_tokens=8,
         groups_per_step=33,
+        initial_model_calls_per_inference_gpu=16,
         max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
         max_steps=35,
         enable_prefix_caching=True,
@@ -502,18 +503,17 @@ _THROUGHPUT_CONFIGS = {
     "dsv4": ThroughputWorkflowConfig(
         num_layers=8,
         prompt_tokens=12_800,
-        completion_tokens=1152,
-        groups_per_step=7,
-        initial_model_calls_per_inference_gpu=16,
+        completion_tokens=768,
+        groups_per_step=8,
+        initial_model_calls_per_inference_gpu=20,
         max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
-        max_steps=11,
     ),
     "glm52": ThroughputWorkflowConfig(
         num_layers=12,
         prompt_tokens=3836,
         completion_tokens=640,
         groups_per_step=20,
-        initial_model_calls_per_inference_gpu=18,
+        initial_model_calls_per_inference_gpu=19,
     ),
     "gpt_oss_moe": ThroughputWorkflowConfig(
         num_layers=4,
