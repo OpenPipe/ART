@@ -463,6 +463,19 @@ class PipelineAutotuner:
             )
             action = "decrease_workers"
             reason = "predicted or actual stale backlog exceeds the freshness target"
+        elif (
+            state == "inference_over_train_over"
+            and stats.queue_put_wait_frac >= self.config.queue_put_severe_frac
+        ):
+            updated = updated.model_copy(
+                update={
+                    "num_rollout_workers": self._move_workers(
+                        updated.num_rollout_workers, -1
+                    )
+                }
+            )
+            action = "decrease_workers"
+            reason = "vLLM pressure plus queue backpressure indicates excess workers"
         elif stats.queue_put_wait_frac >= self.config.queue_put_severe_frac:
             reason = "completed-group queue backpressure is active"
         elif state in {
