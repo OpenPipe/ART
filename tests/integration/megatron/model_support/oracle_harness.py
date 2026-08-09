@@ -1376,6 +1376,55 @@ class VariantRunner:
             f"{self.paired_objective}__{topology_dir.name.removeprefix(prefix)}"
         )
 
+    def _routing_bundle_dir(self, objective: OracleObjective) -> Path:
+        if objective == self.objective:
+            return self.oracle_routing_bundle_dir
+        return self.case_dir / f"{objective}__{ORACLE_MOE_ROUTING_BUNDLE_DIRNAME}"
+
+    def _objective_artifact_paths(
+        self,
+    ) -> list[tuple[OracleObjective, Path, Path, Path]]:
+        oracle_dirs = [(self.objective, self.oracle_dir)]
+        if self.paired_objective is not None:
+            oracle_dirs.append(
+                (self.paired_objective, self._paired_topology_dir(self.oracle_dir))
+            )
+        return [
+            (
+                objective,
+                oracle_dir,
+                self._routing_bundle_dir(objective),
+                self.case_dir / f"{oracle_dir.name}__oracle_capture",
+            )
+            for objective, oracle_dir in oracle_dirs
+        ]
+
+    def _paired_worker_request(
+        self,
+        request: WorkerRunRequest,
+        paired_dir: Path,
+    ) -> WorkerRunRequest:
+        objective = self.paired_objective
+        if objective is None:
+            raise ValueError("Cannot build a paired request without a paired objective")
+        updates: dict[str, Any] = {
+            "objective": objective,
+            "topology_dir": str(paired_dir),
+        }
+        if request.moe_routing_replay_path is not None:
+            updates["moe_routing_replay_path"] = str(
+                _replay_bundle_for_topology(
+                    self._routing_bundle_dir(objective),
+                    topology=request.topology,
+                    output_dir=paired_dir / "moe_routing_replay",
+                )
+            )
+        if request.capture_moe_routing_bundle_path is not None:
+            updates["capture_moe_routing_bundle_path"] = str(
+                self._routing_bundle_dir(objective)
+            )
+        return request.model_copy(update=updates)
+
     def _run_topology(
         self,
         *,
@@ -1409,12 +1458,7 @@ class VariantRunner:
             else:
                 paired_dir = self._paired_topology_dir(topology_dir)
                 _replace_topology_dir(paired_dir)
-                paired_request = request.model_copy(
-                    update={
-                        "objective": self.paired_objective,
-                        "topology_dir": str(paired_dir),
-                    }
-                )
+                paired_request = self._paired_worker_request(request, paired_dir)
                 run_worker_subprocesses(
                     [request, paired_request],
                     [topology_dir, paired_dir],
@@ -1422,10 +1466,18 @@ class VariantRunner:
                 )
         return topology_dir
 
-    def _prune_valid_moe_capture(self, capture_dir: Path) -> None:
+    def _prune_valid_moe_capture(
+        self,
+        capture_dir: Path,
+        *,
+        objective: OracleObjective | None = None,
+        bundle_dir: Path | None = None,
+    ) -> None:
         """Prunes capture tensors only after persisted metadata reloads cleanly."""
+        objective = objective or self.objective
+        bundle_dir = bundle_dir or self.oracle_routing_bundle_dir
         manifest = _load_manifest(capture_dir)
-        bundle = MoeRoutingReplayBundle.from_dir(self.oracle_routing_bundle_dir)
+        bundle = MoeRoutingReplayBundle.from_dir(bundle_dir)
         expected_topology = ReplayParallelTopology.model_validate(
             self.oracle_topology.model_dump(
                 include={"tp", "ep", "etp", "dp", "sp", "cp", "pp", "vpp"},
@@ -1435,7 +1487,7 @@ class VariantRunner:
         if (
             manifest.git.commit != self.git.commit
             or manifest.case_id != self.case_id
-            or manifest.objective != self.objective
+            or manifest.objective != objective
             or manifest.topology != self.oracle_topology.slug()
             or manifest.num_steps != self.case_config.num_steps
             or len(manifest.steps) != manifest.num_steps
@@ -1452,31 +1504,26 @@ class VariantRunner:
             return self.oracle_dir
         if regenerate and self.shared_init_path.exists():
             self.shared_init_path.unlink()
-        bundle_manifest = self.oracle_routing_bundle_dir / "manifest.json"
-        oracle_manifest = self.oracle_dir / "manifest.json"
-        paired_oracle_dir = (
-            self._paired_topology_dir(self.oracle_dir)
-            if self.paired_objective is not None
-            else None
-        )
-        capture_manifest = (
-            self.case_dir / f"{self.oracle_slug}__oracle_capture" / "manifest.json"
-        )
-        bundle_format_current = False
-        if bundle_manifest.exists():
+        objective_artifacts = self._objective_artifact_paths()
+        bundle_format_current = True
+        for _, _, bundle_dir, _ in objective_artifacts:
+            bundle_manifest = bundle_dir / "manifest.json"
             try:
-                bundle_format_current = (
-                    _read_json(bundle_manifest).get("format_version")
+                bundle_format_current &= (
+                    bundle_manifest.exists()
+                    and _read_json(bundle_manifest).get("format_version")
                     == ROUTER_KEY_FORMAT_VERSION
                 )
             except Exception:
                 bundle_format_current = False
         need_capture = (
             regenerate
-            or not bundle_manifest.exists()
             or not bundle_format_current
             or not self.shared_init_path.exists()
-            or not _manifest_matches_current_commit(capture_manifest)
+            or any(
+                not _manifest_matches_current_commit(capture_dir / "manifest.json")
+                for _, _, _, capture_dir in objective_artifacts
+            )
         )
         run_oracle_topology = partial(
             self._run_topology,
@@ -1488,40 +1535,32 @@ class VariantRunner:
             regenerate=True,
         )
         if self.case_config.is_moe and need_capture:
-            capture_dir = run_oracle_topology(
+            run_oracle_topology(
                 output_slug=f"{self.oracle_slug}__oracle_capture",
                 replay_bundle_dir=None,
                 capture_bundle_dir=self.oracle_routing_bundle_dir,
             )
-            self._prune_valid_moe_capture(capture_dir)
+            for objective, _, bundle_dir, capture_dir in objective_artifacts:
+                self._prune_valid_moe_capture(
+                    capture_dir,
+                    objective=objective,
+                    bundle_dir=bundle_dir,
+                )
         if (
             regenerate
-            or not oracle_manifest.exists()
+            or (self.case_config.is_moe and need_capture)
             or not self.shared_init_path.exists()
-            or not _manifest_matches_current_commit(oracle_manifest)
             or any(
-                not (
-                    self.oracle_dir
-                    / "traces"
-                    / f"forward_trace_step_{step_index:03d}.pt"
-                ).exists()
-                for step_index in range(self.case_config.num_steps)
-            )
-            or (
-                paired_oracle_dir is not None
-                and (
-                    not _manifest_matches_current_commit(
-                        paired_oracle_dir / "manifest.json"
-                    )
-                    or any(
-                        not (
-                            paired_oracle_dir
-                            / "traces"
-                            / f"forward_trace_step_{step_index:03d}.pt"
-                        ).exists()
-                        for step_index in range(self.case_config.num_steps)
-                    )
+                not _manifest_matches_current_commit(oracle_dir / "manifest.json")
+                or any(
+                    not (
+                        oracle_dir
+                        / "traces"
+                        / f"forward_trace_step_{step_index:03d}.pt"
+                    ).exists()
+                    for step_index in range(self.case_config.num_steps)
                 )
+                for _, oracle_dir, _, _ in objective_artifacts
             )
         ):
             run_oracle_topology(
@@ -2009,14 +2048,11 @@ class VariantRunner:
 
     def _prune_reference_artifacts(self) -> None:
         """Drops oracle-only tensors after all comparisons that need them are complete."""
-        _prune_topology_artifacts(self.oracle_dir)
-        if self.paired_objective is not None:
-            _prune_topology_artifacts(self._paired_topology_dir(self.oracle_dir))
-        if self.case_config.is_moe:
-            _prune_topology_artifacts(self.oracle_routing_bundle_dir)
-            _prune_topology_artifacts(
-                self.case_dir / f"{self.oracle_slug}__oracle_capture"
-            )
+        for _, oracle_dir, bundle_dir, capture_dir in self._objective_artifact_paths():
+            _prune_topology_artifacts(oracle_dir)
+            if self.case_config.is_moe:
+                _prune_topology_artifacts(bundle_dir)
+                _prune_topology_artifacts(capture_dir)
 
     def print_report(self, report: VariantReport) -> None:
         """Prints a row-level table excluding expert-specific rows."""
@@ -2197,7 +2233,7 @@ def _prune_completed_runners(
             _prune_case_artifacts(case_dir)
 
 
-def _run_paired_dense_suite(
+def _run_paired_objective_suite(
     *,
     objectives: list[OracleObjective],
     case_config: OracleCaseConfig,
@@ -2210,7 +2246,7 @@ def _run_paired_dense_suite(
     prune_reference_artifacts: bool,
     prune_case_artifacts: bool,
 ) -> list[VariantReport]:
-    """Runs dense RL/SFT pairs without rebuilding one topology twice."""
+    """Runs RL/SFT pairs without rebuilding one topology twice."""
     rl_objective, sft_objective = objectives
 
     def runner(
@@ -2229,7 +2265,7 @@ def _run_paired_dense_suite(
     def variants(objective: OracleObjective) -> list[VariantSpec]:
         return _suite_variants(
             objective,
-            is_moe=False,
+            is_moe=case_config.is_moe,
             cp_supported=cp_supported,
             max_world_size=max_world_size,
             variant_flex_backend=variant_flex_backend,
@@ -2265,6 +2301,9 @@ def _run_paired_dense_suite(
         )
 
 
+_run_paired_dense_suite = _run_paired_objective_suite
+
+
 def run_suite(
     *,
     case_config: OracleCaseConfig,
@@ -2279,8 +2318,8 @@ def run_suite(
 ) -> list[VariantReport]:
     """Runs non-oracle topologies against the canonical replay-backed oracle."""
     objectives = selected_oracle_objectives()
-    if not case_config.is_moe and objectives == list(SUPPORTED_ORACLE_OBJECTIVES):
-        return _run_paired_dense_suite(
+    if objectives == list(SUPPORTED_ORACLE_OBJECTIVES):
+        return _run_paired_objective_suite(
             objectives=objectives,
             case_config=case_config,
             max_world_size=max_world_size,
