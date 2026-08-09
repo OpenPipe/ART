@@ -533,7 +533,7 @@ _THROUGHPUT_CONFIGS = {
     ),
     "gpt_oss_moe": ThroughputWorkflowConfig(
         num_layers=4,
-        initial_model_calls_per_inference_gpu=24,
+        initial_model_calls_per_inference_gpu=21,
         max_num_seqs=48,
         max_steps=35,
     ),
