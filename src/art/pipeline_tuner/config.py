@@ -35,7 +35,7 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     window_steps: int = pydantic.Field(default=4, ge=1)
     warmup_ignore_steps: int = pydantic.Field(default=3, ge=0)
     target_spill_probability: float = pydantic.Field(default=0.03, ge=0.0, le=1.0)
-    worker_step: int = pydantic.Field(default=4, ge=1)
+    worker_step: int = pydantic.Field(default=2, ge=1)
     worker_move_fraction: float = pydantic.Field(default=0.10, gt=0.0, le=1.0)
     max_worker_move: int = pydantic.Field(default=16, ge=4)
     max_rollout_workers: int = pydantic.Field(default=1024, ge=1)

@@ -74,6 +74,7 @@ def _vllm_sample_intervals(
 def _packing_group_candidates(
     *, current: int, available: int, radius: int, min_change_fraction: float
 ) -> list[int]:
+    # Half-hysteresis spacing brackets each actionable target change.
     step = max(1, math.ceil(current * min_change_fraction / 2.0))
     min_change = max(1, math.ceil(current * min_change_fraction))
     lower = max(1, min(available, current - radius))
@@ -859,6 +860,7 @@ class PipelineAutotuner:
             ]
         )
         current = max(1, settings.target_groups_per_step)
+        # Search only target changes that the controller can apply in one window.
         radius = max(
             1,
             min(
