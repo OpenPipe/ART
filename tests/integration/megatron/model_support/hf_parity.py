@@ -5,7 +5,7 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
@@ -205,6 +205,7 @@ def build_tensor_map_metric_rows(
     reference: dict[str, Any],
     candidate: dict[str, Any],
     phase_pass_fns: dict[str, PhasePassFn] | None = None,
+    group_by: Callable[[str], str] | None = None,
 ) -> list[HfParityMetricRow]:
     reference_keys = set(reference.keys())
     candidate_keys = set(candidate.keys())
@@ -221,6 +222,12 @@ def build_tensor_map_metric_rows(
             )
         ]
     rows: list[HfParityMetricRow] = []
+    accumulators: dict[str, DiffAccumulator] = {}
+    diagnostic_pass_fns = dict(phase_pass_fns or _hf_parity_phase_pass_fns())
+    diagnostic_phase = f"{phase}_diagnostic"
+    diagnostic_pass_fns[diagnostic_phase] = MetricThresholdRule(
+        minimums={"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
+    )
     for key in sorted(reference_keys):
         if tuple(reference[key].shape) != tuple(candidate[key].shape):
             rows.append(
@@ -233,6 +240,19 @@ def build_tensor_map_metric_rows(
                 )
             )
             continue
+        if group_by is not None:
+            summary = summarize_tensor_pair(reference[key], candidate[key])
+            rows.append(
+                _build_metric_row(
+                    phase=diagnostic_phase,
+                    param=key,
+                    summary=summary,
+                    phase_pass_fns=diagnostic_pass_fns,
+                )
+            )
+            accumulator = accumulators.setdefault(group_by(key), DiffAccumulator())
+            accumulator.update(reference[key], candidate[key])
+            continue
         rows.append(
             _build_metric_row(
                 phase=phase,
@@ -241,6 +261,15 @@ def build_tensor_map_metric_rows(
                 phase_pass_fns=phase_pass_fns,
             )
         )
+    rows.extend(
+        _build_metric_row(
+            phase=phase,
+            param=group,
+            summary=accumulator.as_summary(),
+            phase_pass_fns=phase_pass_fns,
+        )
+        for group, accumulator in sorted(accumulators.items())
+    )
     return rows
 
 

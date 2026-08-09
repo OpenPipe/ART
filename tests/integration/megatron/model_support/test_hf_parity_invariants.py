@@ -4,6 +4,8 @@ from typing import Any, cast
 import pytest
 import torch
 
+from art.megatron.model_support.handlers.dsv4 import DSV4_HANDLER
+
 from ..artifacts import GitRepoState
 from . import hf_parity as hf_parity_module
 from . import hf_parity_worker as hf_parity_worker_module
@@ -384,6 +386,61 @@ def test_build_tensor_map_metric_rows_enforces_nonzero_per_tensor() -> None:
 
     assert by_param["all_zero"].pass_signal is False
     assert by_param["active"].pass_signal is True
+
+
+def test_grouped_tensor_map_rows_keep_individual_nonzero_gates() -> None:
+    rows = build_tensor_map_metric_rows(
+        phase="grads",
+        reference={"large": torch.ones(1000), "small": torch.ones(1)},
+        candidate={"large": torch.full((1000,), 1.01), "small": torch.full((1,), 2.0)},
+        group_by=lambda _: "joint_update",
+    )
+    by_param = {row.param: row for row in rows}
+
+    assert by_param["joint_update"].phase == "grads"
+    assert by_param["joint_update"].mean_abs_pct < 3.0
+    assert by_param["joint_update"].pass_signal is True
+    assert by_param["small"].phase == "grads_diagnostic"
+    assert by_param["small"].mean_abs_pct == 100.0
+    assert by_param["small"].pass_signal is True
+
+    zero_rows = build_tensor_map_metric_rows(
+        phase="grads",
+        reference={"active": torch.ones(2), "zero": torch.zeros(1)},
+        candidate={"active": torch.ones(2), "zero": torch.zeros(1)},
+        group_by=lambda _: "joint_update",
+    )
+    assert {row.param: row for row in zero_rows}["zero"].pass_signal is False
+
+
+@pytest.mark.parametrize(
+    ("param", "group"),
+    (
+        ("model.embed_tokens.weight", "embedding"),
+        ("lm_head.weight", "final_envelope"),
+        ("model.hc_head.hc_scale", "final_envelope"),
+        ("model.norm.weight", "final_envelope"),
+        ("model.layers.2.attn_hc.base", "model.layers.2.attention"),
+        (
+            "model.layers.2.self_attn.compressor.kv_proj.weight",
+            "model.layers.2.attention",
+        ),
+        ("model.layers.2.ffn_hc.fn", "model.layers.2.ffn"),
+        ("model.layers.2.mlp.experts.0.up_proj.weight", "model.layers.2.ffn"),
+        ("model.layers.2.input_layernorm.weight", "model.layers.2.input_norm"),
+        (
+            "model.layers.2.post_attention_layernorm.weight",
+            "model.layers.2.post_attention_norm",
+        ),
+    ),
+)
+def test_dsv4_hf_parity_gradient_groups(param: str, group: str) -> None:
+    assert DSV4_HANDLER.hf_parity_gradient_group(param) == group
+
+
+def test_dsv4_hf_parity_gradient_groups_reject_unknown_parameter() -> None:
+    with pytest.raises(ValueError, match="Unmapped DSV4 HF-parity gradient"):
+        DSV4_HANDLER.hf_parity_gradient_group("model.layers.0.unknown.weight")
 
 
 def test_language_hf_param_filter_keeps_text_and_drops_visual() -> None:

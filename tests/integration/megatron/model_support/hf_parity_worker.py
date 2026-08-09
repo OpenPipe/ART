@@ -1767,11 +1767,18 @@ def _worker_run(request: HfParityRunRequest) -> None:
         )
         outputs_summary = summarize_tensor_pair(hf_outputs, megatron_outputs)
         loss_summary = summarize_tensor_pair(hf_loss, megatron_loss)
+        from art.megatron.model_support.registry import get_model_support_handler
+
+        handler = get_model_support_handler(
+            request.case_config.base_model,
+            allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
+        )
         grads_rows = build_tensor_map_metric_rows(
             phase="grads",
             reference=normalized_hf_grads,
             candidate=megatron_grads,
             phase_pass_fns=_hf_parity_phase_pass_fns_for_case(request.case_config),
+            group_by=getattr(handler, "hf_parity_gradient_group", None),
         )
         report = build_hf_parity_report(
             request=request,

@@ -572,6 +572,30 @@ class Dsv4Handler(DefaultMoeHandler):
     ) -> None:
         _add_dsv4_hf_reference_source_aliases(state, config)
 
+    def hf_parity_gradient_group(self, param: str) -> str:
+        if param == "model.embed_tokens.weight":
+            return "embedding"
+        if (
+            param == "lm_head.weight"
+            or param == "model.norm.weight"
+            or param.startswith("model.hc_head.")
+        ):
+            return "final_envelope"
+        match = re.fullmatch(r"model\.layers\.(\d+)\.(.+)", param)
+        if match is None:
+            raise ValueError(f"Unmapped DSV4 HF-parity gradient: {param}")
+        layer, module = match.groups()
+        prefix = f"model.layers.{layer}"
+        if module.startswith(("attn_hc.", "self_attn.")):
+            return f"{prefix}.attention"
+        if module.startswith(("ffn_hc.", "mlp.")):
+            return f"{prefix}.ffn"
+        if module == "input_layernorm.weight":
+            return f"{prefix}.input_norm"
+        if module == "post_attention_layernorm.weight":
+            return f"{prefix}.post_attention_norm"
+        raise ValueError(f"Unmapped DSV4 HF-parity gradient: {param}")
+
     def configure_oracle_provider(self, provider: Any, *, case_config: Any) -> None:
         """Mirrors HF oracle reductions while keeping DSV4 hard kernel invariants."""
         hooks = list(getattr(provider, "_pre_wrap_hooks", []))

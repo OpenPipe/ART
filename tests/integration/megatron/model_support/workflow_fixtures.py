@@ -178,7 +178,7 @@ _PLAIN_TEXT: dict[str, tuple[int, int, dict[str, Any]]] = {
         4,
         256,
         {
-            **_DENSE_TEXT, "moe_intermediate_size": 128,
+            **_DENSE_TEXT, "moe_intermediate_size": 256,
             "num_experts": 4, "num_local_experts": 4,
             "num_experts_per_tok": 2, "quantization_config": None,
         },
@@ -267,7 +267,7 @@ _MULTIMODAL_SHAPES = {
         _GEMMA_TEXT,
         _GEMMA_VISION,
         {
-            "moe_intermediate_size": 128, "num_experts": 4,
+            "moe_intermediate_size": 256, "num_experts": 4,
             "num_local_experts": 4, "top_k_experts": 2, "num_experts_per_tok": 2,
         },
         {"image_token_id": 2, "pad_token_id": 0, "bos_token_id": 2, "eos_token_id": 1},
