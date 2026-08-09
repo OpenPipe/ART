@@ -42,7 +42,7 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     initial_model_calls_per_inference_gpu: int = pydantic.Field(default=8, ge=1)
     initial_min_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
     initial_max_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
-    packing_trials: int = pydantic.Field(default=64, ge=16)
+    packing_trials: int = pydantic.Field(default=48, ge=16)
     packing_reservoir_multiplier: int = pydantic.Field(default=2, ge=2)
     packing_reservoir_min_groups: int = pydantic.Field(default=32, ge=16)
     packing_history_steps: int = pydantic.Field(default=64, ge=1)
