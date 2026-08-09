@@ -383,7 +383,9 @@ async def _capture_training_bundles(groups: Any) -> tuple[Any, ...]:
     materialized = await asyncio.gather(
         *(selection.queue.materialize_selection(selection) for selection in selections)
     )
-    return tuple(TrajectoryGroupBundle.from_group(group) for group in materialized)
+    return await asyncio.to_thread(
+        lambda: tuple(TrajectoryGroupBundle.from_group(group) for group in materialized)
+    )
 
 
 def _collect_matched_packing_shapes(groups: Any) -> None:
@@ -1276,11 +1278,13 @@ async def _run_e2e_throughput_async(
     events: list[PolicyActivationEvent] = []
     e2e_phase: TrainerPhaseEvidence | None = None
     isolated_phase: TrainerPhaseEvidence | None = None
+    captured_training_input: (
+        tuple[tuple[Any, ...], str, Mapping[str, Any], int] | None
+    ) = None
     bundles_path = stage_dir / "matched_packed_input.msgpack"
     autotune = PipelineAutotuneConfig(
         mode="online",
         output_name="throughput",
-        max_rollout_workers=64,
         initial_model_calls_per_inference_gpu=(
             config.initial_model_calls_per_inference_gpu
         ),
@@ -1426,24 +1430,18 @@ async def _run_e2e_throughput_async(
             train_call_count = 0
 
             async def tracked_train(*args: Any, **kwargs: Any) -> Any:
-                nonlocal e2e_phase, train_call_count
+                nonlocal captured_training_input, train_call_count
                 train_call_count += 1
                 if len(args) < 2:
                     raise RuntimeError(
                         "PipelineTrainer did not pass trajectory groups positionally"
                     )
                 groups = args[1]
-                captured: tuple[bytes, str, str] | None = None
+                captured: tuple[tuple[Any, ...], str] | None = None
                 if train_call_count == capture_train_call:
                     _collect_matched_packing_shapes(groups)
-                    bundle_payload = await asyncio.to_thread(
-                        _bundle_bytes, await _capture_training_bundles(groups)
-                    )
                     captured = (
-                        bundle_payload,
-                        await asyncio.to_thread(
-                            lambda: hashlib.sha256(bundle_payload).hexdigest()
-                        ),
+                        await _capture_training_bundles(groups),
                         _packed_input_fingerprint(groups),
                     )
                 result = await original_train(*args, **kwargs)
@@ -1456,16 +1454,10 @@ async def _run_e2e_throughput_async(
                     _activation_event(service, step)
                 )
                 if captured is not None:
-                    bundle_payload, trajectory_fingerprint, packed_fingerprint = (
-                        captured
-                    )
-                    await asyncio.to_thread(bundles_path.write_bytes, bundle_payload)
-                    e2e_phase = _phase_evidence(
-                        phase="e2e",
-                        runtime_fingerprint=service._runtime_spec().fingerprint,
-                        trajectory_input_fingerprint=trajectory_fingerprint,
-                        packed_input_fingerprint=packed_fingerprint,
-                        samples=[(result.metrics, step)],
+                    captured_training_input = (
+                        *captured,
+                        result.metrics,
+                        step,
                     )
                 return result
 
@@ -1484,10 +1476,20 @@ async def _run_e2e_throughput_async(
             finally:
                 setattr(backend, "train", original_train)
                 await _cancel_activation_tasks(activation_tasks)
-            if e2e_phase is None or not bundles_path.is_file():
+            if captured_training_input is None:
                 raise RuntimeError(
                     "online pipeline never captured a matched train batch"
                 )
+            bundles, packed_fingerprint, metrics, step = captured_training_input
+            bundle_payload = await asyncio.to_thread(_bundle_bytes, bundles)
+            await asyncio.to_thread(bundles_path.write_bytes, bundle_payload)
+            e2e_phase = _phase_evidence(
+                phase="e2e",
+                runtime_fingerprint=service._runtime_spec().fingerprint,
+                trajectory_input_fingerprint=hashlib.sha256(bundle_payload).hexdigest(),
+                packed_input_fingerprint=packed_fingerprint,
+                samples=[(metrics, step)],
+            )
             isolated_phase = await _run_isolated_backend_phase(
                 backend=backend,
                 model=model,
