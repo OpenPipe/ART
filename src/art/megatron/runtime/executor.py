@@ -6,7 +6,7 @@ from threading import BoundedSemaphore, Event, Lock
 import time
 from typing import TYPE_CHECKING, Any
 
-from art.utils.safetensors import PreparedSafetensors, prepare_safetensors
+from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
 from ..tensor_snapshot import PinnedCpuSnapshotStager
 from .data_plane import InMemoryPackedBatch, SFTBatchData, validate_packed_batch
@@ -242,6 +242,7 @@ class _GenerationPublisher:
             max_workers=1, thread_name_prefix="art-publish-durable"
         )
         self._transport_sender: Any | None = None
+        self._lora_layout: SafetensorsLayout | None = None
         self._failures: list[BaseException] = []
         self._in_flight = 0
 
@@ -353,10 +354,14 @@ class _GenerationPublisher:
         publication_targets: tuple[Any, ...],
     ) -> Future[TrainerRankPublication]:
         lora = None if lora is None else lora.resolve()
-        prepared_tensors = None if lora is None else prepare_safetensors(lora.tensors)
+        prepared_tensors = None
+        if lora is not None:
+            if self._lora_layout is None:
+                self._lora_layout = SafetensorsLayout(lora.tensors)
+            prepared_tensors = self._lora_layout.bind(lora.tensors)
         failures: list[BaseException] = []
         if int(self.runtime.rank) == 0 and publication_targets:
-            if lora is None:
+            if lora is None or prepared_tensors is None:
                 raise RuntimeError("rank zero has no LoRA snapshot to transfer")
             try:
                 self._transfer_lora_snapshot(
@@ -419,7 +424,7 @@ class _GenerationPublisher:
         lora: Any,
         targets: tuple[Any, ...],
         *,
-        prepared_tensors: PreparedSafetensors | None,
+        prepared_tensors: PreparedSafetensors,
     ) -> None:
         from art.distributed.adapter_transport import AdapterSnapshotSender
 

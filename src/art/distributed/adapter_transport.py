@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import socket
-import struct
 import sys
 from threading import Condition, Lock
 import time
@@ -16,17 +15,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 import torch
 
-from art.utils.safetensors import PreparedSafetensors, save_safetensors
+from art.utils.safetensors import PreparedSafetensors, save_prepared_safetensors
 
 
 class _TransportRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-
-
-class AdapterTensorSpec(_TransportRecord):
-    name: str = Field(min_length=1)
-    shape: tuple[int, ...]
-    dtype: str = Field(min_length=1)
 
 
 class AdapterTransferTarget(_TransportRecord):
@@ -36,11 +29,9 @@ class AdapterTransferTarget(_TransportRecord):
     path: str = Field(min_length=1)
     remote_agent: str = Field(min_length=1)
     remote_metadata_b64: str = Field(min_length=1)
-    remote_descriptors_b64: str = Field(min_length=1)
-    tensors: tuple[AdapterTensorSpec, ...]
-    adapter_config: dict[str, Any]
+    remote_address: int = Field(ge=0)
+    remote_device_id: int = Field(ge=0)
     slot_id: int = Field(ge=0)
-    used_bytes: int = Field(gt=0)
     capacity_bytes: int = Field(gt=0)
     prepare_s: float = Field(ge=0)
     pool_wait_s: float = Field(ge=0)
@@ -66,6 +57,8 @@ class AdapterReceiveResult(_TransportRecord):
 
 class AdapterTransferNotification(_TransportRecord):
     generation_id: str = Field(min_length=1)
+    used_bytes: int = Field(gt=0)
+    adapter_config: dict[str, Any]
     sender_staging_s: float = Field(ge=0)
     sender_registration_s: float = Field(ge=0)
 
@@ -76,11 +69,9 @@ class _PendingReceive:
         *,
         target: AdapterTransferTarget,
         slot: "_RegisteredSlot",
-        tensors: dict[str, torch.Tensor],
     ) -> None:
         self.target = target
         self.slot = slot
-        self.tensors = tensors
 
 
 class _PendingLocalReceive:
@@ -105,22 +96,6 @@ class _RegisteredSlot:
         self.block = block
         self.registration = registration
         self.generation_id: str | None = None
-
-
-_SAFETENSORS_DTYPES = {
-    "BOOL": torch.bool,
-    "U8": torch.uint8,
-    "I8": torch.int8,
-    "I16": torch.int16,
-    "I32": torch.int32,
-    "I64": torch.int64,
-    "F16": torch.float16,
-    "BF16": torch.bfloat16,
-    "F32": torch.float32,
-    "F64": torch.float64,
-    "C64": torch.complex64,
-}
-_TRAINING_DTYPES = {"bfloat16": "BF16", "float16": "F16", "float32": "F32"}
 
 
 def _load_nixl() -> tuple[Any, Any, Any]:
@@ -162,123 +137,28 @@ def _new_agent(name: str) -> Any:
     )
 
 
-def _read_adapter_template(
-    path: str, tensor_dtype: str
-) -> tuple[tuple[AdapterTensorSpec, ...], dict[str, Any]]:
+def _adapter_template_bytes(path: str) -> int:
     root = Path(path)
-    with (root / "adapter_model.safetensors").open("rb") as source:
-        raw_length = source.read(8)
-        if len(raw_length) != 8:
-            raise RuntimeError(f"Invalid safetensors header in {path}")
-        header_length = struct.unpack("<Q", raw_length)[0]
-        if header_length > 64 * 1024 * 1024:
-            raise RuntimeError(f"Unreasonable safetensors header in {path}")
-        header = json.loads(source.read(header_length))
-    try:
-        dtype = _TRAINING_DTYPES[tensor_dtype]
-    except KeyError:
-        raise RuntimeError(
-            f"Unsupported adapter transport dtype: {tensor_dtype}"
-        ) from None
-    specs = tuple(
-        AdapterTensorSpec(
-            name=name,
-            shape=tuple(int(dim) for dim in value["shape"]),
-            dtype=dtype,
-        )
-        for name, value in sorted(header.items())
-        if name != "__metadata__"
-    )
-    if not specs:
-        raise RuntimeError(f"Adapter template has no tensors: {path}")
+    model_path = root / "adapter_model.safetensors"
+    model_bytes = model_path.stat().st_size
+    if model_bytes <= 8:
+        raise RuntimeError(f"Adapter template is empty: {path}")
     with (root / "adapter_config.json").open("r", encoding="utf-8") as source:
         config = json.load(source)
     if not isinstance(config, dict):
         raise RuntimeError(f"Adapter config must be an object: {path}")
     if config.get("art_lora_format") != "vllm":
         raise RuntimeError(f"Adapter template is not in vLLM format: {path}")
-    return specs, config
+    return model_bytes
 
 
-def _allocate_blocks(
-    specs: tuple[AdapterTensorSpec, ...],
-) -> tuple[tuple[torch.Tensor, ...], dict[str, torch.Tensor]]:
-    grouped: dict[str, list[AdapterTensorSpec]] = {}
-    for spec in specs:
-        grouped.setdefault(spec.dtype, []).append(spec)
-    blocks: list[torch.Tensor] = []
-    tensors: dict[str, torch.Tensor] = {}
-    for dtype_name, group in sorted(grouped.items()):
-        dtype = _SAFETENSORS_DTYPES.get(dtype_name)
-        if dtype is None:
-            raise RuntimeError(f"Unsupported adapter transport dtype: {dtype_name}")
-        counts = [spec_numel(spec) for spec in group]
-        block = torch.empty(sum(counts), dtype=dtype)
-        blocks.append(block)
-        offset = 0
-        for spec, count in zip(group, counts, strict=True):
-            tensors[spec.name] = block.narrow(0, offset, count).view(spec.shape)
-            offset += count
-    return tuple(blocks), tensors
-
-
-def _tensor_views(
-    block: torch.Tensor, specs: tuple[AdapterTensorSpec, ...]
-) -> tuple[dict[str, torch.Tensor], int]:
+def _copy_payload(payload: PreparedSafetensors, block: torch.Tensor) -> None:
     offset = 0
-    tensors = {}
-    for spec in specs:
-        dtype = _SAFETENSORS_DTYPES.get(spec.dtype)
-        if dtype is None:
-            raise RuntimeError(f"Unsupported adapter transport dtype: {spec.dtype}")
-        item_size = torch.empty((), dtype=dtype).element_size()
-        offset = (offset + item_size - 1) // item_size * item_size
-        count = spec_numel(spec)
-        byte_count = count * item_size
-        tensors[spec.name] = (
-            block.narrow(0, offset, byte_count).view(dtype).view(spec.shape)
-        )
-        offset += byte_count
-    return tensors, offset
-
-
-def _spec_bytes(specs: tuple[AdapterTensorSpec, ...]) -> int:
-    offset = 0
-    for spec in specs:
-        dtype = _SAFETENSORS_DTYPES.get(spec.dtype)
-        if dtype is None:
-            raise RuntimeError(f"Unsupported adapter transport dtype: {spec.dtype}")
-        item_size = torch.empty((), dtype=dtype).element_size()
-        offset = (offset + item_size - 1) // item_size * item_size
-        offset += spec_numel(spec) * item_size
-    return offset
-
-
-def spec_numel(spec: AdapterTensorSpec) -> int:
-    count = 1
-    for dim in spec.shape:
-        count *= dim
-    return count
-
-
-def _copy_snapshot(
-    tensors: dict[str, torch.Tensor],
-    specs: tuple[AdapterTensorSpec, ...],
-    block: torch.Tensor,
-) -> int:
-    expected = {spec.name for spec in specs}
-    if set(tensors) != expected:
-        raise RuntimeError("LoRA snapshot and transport target tensor names differ")
-    targets, used_bytes = _tensor_views(block, specs)
-    for spec in specs:
-        tensor = tensors[spec.name]
-        expected_dtype = _SAFETENSORS_DTYPES.get(spec.dtype)
-        if tuple(tensor.shape) != spec.shape or tensor.dtype != expected_dtype:
-            raise RuntimeError(
-                f"LoRA snapshot tensor changed shape or dtype: {spec.name}"
-            )
-        targets[spec.name].copy_(tensor)
-    return used_bytes
+    for chunk in payload.chunks:
+        block.narrow(0, offset, chunk.numel()).copy_(chunk)
+        offset += chunk.numel()
+    if offset != payload.nbytes:
+        raise RuntimeError("Adapter payload copy was incomplete")
 
 
 class AdapterSnapshotReceiver:
@@ -296,9 +176,6 @@ class AdapterSnapshotReceiver:
         self._pending: dict[str, _PendingReceive] = {}
         self._local_pending: dict[str, _PendingLocalReceive] = {}
         self._slots: list[_RegisteredSlot] = []
-        self._templates: dict[
-            tuple[str, str], tuple[tuple[AdapterTensorSpec, ...], dict[str, Any]]
-        ] = {}
         self._condition = Condition()
         self._notifications: dict[str, AdapterTransferNotification] = {}
         self._materialized: set[str] = set()
@@ -309,21 +186,13 @@ class AdapterSnapshotReceiver:
         self,
         generation_id: str,
         template_path: str,
-        tensor_dtype: str,
         timeout_s: float = 300.0,
         transport: Literal["local", "nixl"] = "nixl",
     ) -> AdapterTransferTarget:
         if transport == "local":
-            return self._prepare_local(
-                generation_id, template_path, tensor_dtype, timeout_s
-            )
+            return self._prepare_local(generation_id, template_path, timeout_s)
         prepare_started = time.monotonic()
-        template_key = (str(Path(template_path).absolute()), tensor_dtype)
-        specs, config = self._templates.get(template_key, ((), {}))
-        if not specs:
-            specs, config = _read_adapter_template(template_path, tensor_dtype)
-            self._templates[template_key] = (specs, config)
-        used_bytes = _spec_bytes(specs)
+        required_bytes = _adapter_template_bytes(template_path)
         wait_started = time.monotonic()
         with self._condition:
             if self._closed:
@@ -331,23 +200,15 @@ class AdapterSnapshotReceiver:
             if generation_id in self._pending:
                 raise RuntimeError(f"Adapter receive already exists: {generation_id}")
             slot, registration_s = self._acquire_slot(
-                used_bytes, deadline=wait_started + timeout_s
+                required_bytes, deadline=wait_started + timeout_s
             )
             slot.generation_id = generation_id
             pool_wait_s = time.monotonic() - wait_started - registration_s
         try:
-            used_block = slot.block.narrow(0, 0, used_bytes)
-            tensors, actual_used_bytes = _tensor_views(slot.block, specs)
-            if actual_used_bytes != used_bytes:
-                raise RuntimeError("adapter byte layout changed during preparation")
             with self._agent_lock:
                 agent = self._require_agent()
-                descriptors = agent.get_xfer_descs((used_block,))
                 remote_agent = agent.name
                 metadata = base64.b64encode(agent.get_agent_metadata()).decode()
-                serialized = base64.b64encode(
-                    agent.get_serialized_descs(descriptors)
-                ).decode()
             path = str((self.output_root / generation_id).absolute())
             target = AdapterTransferTarget(
                 host_id=self.host_id,
@@ -355,11 +216,9 @@ class AdapterSnapshotReceiver:
                 path=path,
                 remote_agent=remote_agent,
                 remote_metadata_b64=metadata,
-                remote_descriptors_b64=serialized,
-                tensors=specs,
-                adapter_config=config,
+                remote_address=slot.block.data_ptr(),
+                remote_device_id=0,
                 slot_id=slot.slot_id,
-                used_bytes=used_bytes,
                 capacity_bytes=slot.block.numel(),
                 prepare_s=time.monotonic() - prepare_started,
                 pool_wait_s=max(0.0, pool_wait_s),
@@ -371,7 +230,6 @@ class AdapterSnapshotReceiver:
         self._pending[generation_id] = _PendingReceive(
             target=target,
             slot=slot,
-            tensors=tensors,
         )
         return target
 
@@ -379,15 +237,10 @@ class AdapterSnapshotReceiver:
         self,
         generation_id: str,
         template_path: str,
-        tensor_dtype: str,
         timeout_s: float,
     ) -> AdapterTransferTarget:
         prepare_started = time.monotonic()
-        template_key = (str(Path(template_path).absolute()), tensor_dtype)
-        specs, config = self._templates.get(template_key, ((), {}))
-        if not specs:
-            specs, config = _read_adapter_template(template_path, tensor_dtype)
-            self._templates[template_key] = (specs, config)
+        required_bytes = _adapter_template_bytes(template_path)
         wait_started = time.monotonic()
         with self._condition:
             while len(self._local_pending) >= self.pool_capacity:
@@ -411,7 +264,6 @@ class AdapterSnapshotReceiver:
                 listener.bind(socket_path)
                 listener.listen(1)
                 listener.setblocking(False)
-                used_bytes = _spec_bytes(specs)
                 local_root = Path(
                     os.environ.get(
                         "ART_LOCAL_ADAPTER_TRANSFER_ROOT",
@@ -425,12 +277,10 @@ class AdapterSnapshotReceiver:
                     path=str((local_root / self.host_id / generation_id).absolute()),
                     remote_agent=socket_path,
                     remote_metadata_b64="-",
-                    remote_descriptors_b64="-",
-                    tensors=specs,
-                    adapter_config=config,
+                    remote_address=0,
+                    remote_device_id=0,
                     slot_id=0,
-                    used_bytes=used_bytes,
-                    capacity_bytes=used_bytes,
+                    capacity_bytes=required_bytes,
                     prepare_s=time.monotonic() - prepare_started,
                     pool_wait_s=time.monotonic() - wait_started,
                     registration_s=0.0,
@@ -454,6 +304,9 @@ class AdapterSnapshotReceiver:
         notification = self._take_notification(generation_id)
         if notification is None:
             return None
+        if notification.used_bytes > pending.slot.block.numel():
+            self._finish(generation_id)
+            raise RuntimeError("Adapter payload exceeds its prepared receive capacity")
         started = time.monotonic()
         path = Path(pending.target.path)
         if path.exists():
@@ -461,11 +314,14 @@ class AdapterSnapshotReceiver:
             raise RuntimeError(f"Adapter transfer path already exists: {path}")
         try:
             path.mkdir(parents=True)
-            save_safetensors(pending.tensors, path / "adapter_model.safetensors")
+            save_prepared_safetensors(
+                PreparedSafetensors(
+                    (pending.slot.block.narrow(0, 0, notification.used_bytes),)
+                ),
+                path / "adapter_model.safetensors",
+            )
             with (path / "adapter_config.json").open("w", encoding="utf-8") as output:
-                json.dump(
-                    pending.target.adapter_config, output, indent=2, sort_keys=True
-                )
+                json.dump(notification.adapter_config, output, indent=2, sort_keys=True)
                 output.write("\n")
             materialization_s = time.monotonic() - started
             model_bytes = (path / "adapter_model.safetensors").stat().st_size
@@ -487,7 +343,7 @@ class AdapterSnapshotReceiver:
             config_bytes=config_bytes,
             materialization_s=materialization_s,
             slot_id=pending.target.slot_id,
-            used_bytes=pending.target.used_bytes,
+            used_bytes=notification.used_bytes,
             capacity_bytes=pending.target.capacity_bytes,
             prepare_s=pending.target.prepare_s,
             pool_wait_s=pending.target.pool_wait_s,
@@ -524,7 +380,7 @@ class AdapterSnapshotReceiver:
                 config_bytes=config_path.stat().st_size,
                 materialization_s=notification.sender_staging_s,
                 slot_id=pending.target.slot_id,
-                used_bytes=pending.target.used_bytes,
+                used_bytes=notification.used_bytes,
                 capacity_bytes=pending.target.capacity_bytes,
                 prepare_s=pending.target.prepare_s,
                 pool_wait_s=pending.target.pool_wait_s,
@@ -606,10 +462,7 @@ class AdapterSnapshotReceiver:
             if free or len(self._slots) < self.pool_capacity:
                 previous = min(free, key=lambda slot: slot.block.numel(), default=None)
                 slot_id = len(self._slots) if previous is None else previous.slot_id
-                capacity = max(
-                    used_bytes,
-                    2 * (0 if previous is None else previous.block.numel()),
-                )
+                capacity = used_bytes
                 started = time.monotonic()
                 block = torch.empty(capacity, dtype=torch.uint8)
                 with self._agent_lock:
@@ -658,42 +511,40 @@ class NixlAdapterSender:
         self._registration: Any | None = None
         self._remote_agents: dict[tuple[str, str], str] = {}
 
-    def send(self, snapshot: Any, targets: tuple[AdapterTransferTarget, ...]) -> None:
+    def send(
+        self,
+        payload: PreparedSafetensors,
+        adapter_config: dict[str, Any],
+        targets: tuple[AdapterTransferTarget, ...],
+    ) -> None:
         if not targets:
             return
         first = targets[0]
-        if any(
-            target.generation_id != first.generation_id
-            or target.tensors != first.tensors
-            or target.adapter_config != first.adapter_config
-            for target in targets[1:]
-        ):
+        if any(target.generation_id != first.generation_id for target in targets[1:]):
             raise RuntimeError("Adapter transfer targets disagree")
-        snapshot_config = {**snapshot.adapter_config, "art_lora_format": "vllm"}
-        if snapshot_config != first.adapter_config:
-            raise RuntimeError("LoRA snapshot adapter config changed during training")
-        used_bytes = first.used_bytes
+        used_bytes = payload.nbytes
+        if any(used_bytes > target.capacity_bytes for target in targets):
+            raise RuntimeError("Adapter payload exceeds prepared receive capacity")
         agent = self._require_agent()
         sender_registration_s = self._ensure_capacity(used_bytes)
         assert self._block is not None
         staging_started = time.monotonic()
-        if _copy_snapshot(snapshot.tensors, first.tensors, self._block) != used_bytes:
-            raise RuntimeError(
-                "LoRA snapshot byte layout differs from transport target"
-            )
+        _copy_payload(payload, self._block)
         notification = (
             AdapterTransferNotification(
                 generation_id=first.generation_id,
+                used_bytes=used_bytes,
+                adapter_config=adapter_config,
                 sender_staging_s=time.monotonic() - staging_started,
                 sender_registration_s=sender_registration_s,
             )
             .model_dump_json()
             .encode()
         )
-        local_descriptors = agent.get_xfer_descs(
-            (self._block.narrow(0, 0, used_bytes),)
-        )
         for target in targets:
+            local_descriptors = agent.get_xfer_descs(
+                (self._block.narrow(0, 0, used_bytes),)
+            )
             key = (target.host_id, target.remote_metadata_b64)
             remote_agent = self._remote_agents.get(key)
             if remote_agent is None:
@@ -708,8 +559,15 @@ class NixlAdapterSender:
             handle = agent.initialize_xfer(
                 "WRITE",
                 local_descriptors,
-                agent.deserialize_descs(
-                    base64.b64decode(target.remote_descriptors_b64)
+                agent.get_xfer_descs(
+                    [
+                        (
+                            target.remote_address,
+                            used_bytes,
+                            target.remote_device_id,
+                        )
+                    ],
+                    mem_type="DRAM",
                 ),
                 remote_agent,
                 notification,
@@ -771,7 +629,7 @@ class AdapterSnapshotSender:
         snapshot: Any,
         targets: tuple[AdapterTransferTarget, ...],
         *,
-        prepared_tensors: PreparedSafetensors | None = None,
+        prepared_tensors: PreparedSafetensors,
     ) -> None:
         transports = {target.transport for target in targets}
         if not targets:
@@ -781,7 +639,11 @@ class AdapterSnapshotSender:
         if transports == {"nixl"}:
             if self._nixl is None:
                 self._nixl = NixlAdapterSender()
-            self._nixl.send(snapshot, targets)
+            self._nixl.send(
+                prepared_tensors,
+                {**snapshot.adapter_config, "art_lora_format": "vllm"},
+                targets,
+            )
             return
         self._send_local(snapshot, targets, prepared_tensors=prepared_tensors)
 
@@ -790,27 +652,14 @@ class AdapterSnapshotSender:
         snapshot: Any,
         targets: tuple[AdapterTransferTarget, ...],
         *,
-        prepared_tensors: PreparedSafetensors | None,
+        prepared_tensors: PreparedSafetensors,
     ) -> None:
         from art.megatron.weights.lora_publish import save_vllm_lora_snapshot
 
         first = targets[0]
         snapshot_config = {**snapshot.adapter_config, "art_lora_format": "vllm"}
-        if any(
-            target.generation_id != first.generation_id
-            or target.tensors != first.tensors
-            or target.adapter_config != snapshot_config
-            for target in targets
-        ):
+        if any(target.generation_id != first.generation_id for target in targets):
             raise RuntimeError("local adapter transfer target changed")
-        expected = {spec.name for spec in first.tensors}
-        if set(snapshot.tensors) != expected:
-            raise RuntimeError("LoRA snapshot tensor names changed")
-        for spec in first.tensors:
-            tensor = snapshot.tensors[spec.name]
-            expected_dtype = _SAFETENSORS_DTYPES.get(spec.dtype)
-            if tuple(tensor.shape) != spec.shape or tensor.dtype != expected_dtype:
-                raise RuntimeError(f"LoRA snapshot shape or dtype changed: {spec.name}")
         for target in targets:
             started = time.monotonic()
             save_vllm_lora_snapshot(
@@ -820,6 +669,8 @@ class AdapterSnapshotSender:
             )
             notification = AdapterTransferNotification(
                 generation_id=target.generation_id,
+                used_bytes=prepared_tensors.nbytes,
+                adapter_config=snapshot_config,
                 sender_staging_s=time.monotonic() - started,
                 sender_registration_s=0.0,
             ).model_dump_json()

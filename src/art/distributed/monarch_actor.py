@@ -430,7 +430,6 @@ class ArtHostService(Actor):
         self,
         generation_id: str,
         template_path: str,
-        tensor_dtype: str,
         timeout_s: float,
         transport: Literal["local", "nixl"],
     ):
@@ -438,7 +437,6 @@ class ArtHostService(Actor):
             self._receiver().prepare,
             generation_id,
             template_path,
-            tensor_dtype,
             timeout_s,
             transport,
         )

@@ -899,7 +899,6 @@ class DistributedMegatronService:
             targets = await manager.prepare_adapter_transfer(
                 generation_id,
                 get_step_checkpoint_dir(self.output_dir, 0),
-                trainer.runtime_spec.dtype,
                 transport=(
                     "local" if len(self.runtime.topology.cluster.hosts) == 1 else "nixl"
                 ),

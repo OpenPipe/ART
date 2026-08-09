@@ -100,7 +100,6 @@ class ReplicaHostLauncher(Protocol):
         self,
         generation_id: str,
         template_path: str,
-        tensor_dtype: str,
         timeout_s: float,
         transport: Literal["local", "nixl"],
     ) -> AdapterTransferTarget: ...
@@ -366,7 +365,6 @@ class ReplicaManager:
         self,
         generation_id: str,
         template_path: str,
-        tensor_dtype: str,
         *,
         transport: Literal["local", "nixl"] = "nixl",
     ) -> tuple[AdapterTransferTarget, ...]:
@@ -377,7 +375,6 @@ class ReplicaManager:
                         self._launchers[host_id].prepare_adapter_receive(
                             generation_id,
                             template_path,
-                            tensor_dtype,
                             max(1.0, self._rpc_timeout_s - 1.0),
                             transport,
                         ),

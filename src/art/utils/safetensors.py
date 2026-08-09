@@ -6,7 +6,7 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import torch
 
@@ -35,8 +35,149 @@ _DTYPES = {
 
 
 class PreparedSafetensors(NamedTuple):
-    header: bytes
-    buffers: tuple[memoryview, ...]
+    chunks: tuple[torch.Tensor, ...]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(chunk.numel() for chunk in self.chunks)
+
+
+class _TensorLayout(NamedTuple):
+    name: str
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+    storage: int
+    offset: int
+    nbytes: int
+
+
+class _StorageLayout(NamedTuple):
+    nbytes: int
+    chunks: tuple[tuple[int, int], ...]
+
+
+class SafetensorsLayout:
+    """Reusable file layout for immutable CPU snapshots with stable shapes."""
+
+    def __init__(self, tensors: dict[str, torch.Tensor]) -> None:
+        storage_indices: dict[tuple[int, int], int] = {}
+        storages: list[list[tuple[int, int]]] = []
+        storage_bytes: list[int] = []
+        entries: list[_TensorLayout] = []
+        for name, tensor in sorted(tensors.items()):
+            _validate_tensor(name, tensor)
+            storage = tensor.untyped_storage()
+            key = storage.data_ptr(), storage.nbytes()
+            storage_index = storage_indices.get(key)
+            if storage_index is None:
+                storage_index = len(storages)
+                storage_indices[key] = storage_index
+                storages.append([])
+                storage_bytes.append(storage.nbytes())
+            offset = tensor.data_ptr() - storage.data_ptr()
+            entries.append(
+                _TensorLayout(
+                    name,
+                    tensor.dtype,
+                    tuple(tensor.shape),
+                    storage_index,
+                    offset,
+                    tensor.nbytes,
+                )
+            )
+            storages[storage_index].append((offset, tensor.nbytes))
+
+        layouts: list[_StorageLayout] = []
+        for size, intervals in zip(storage_bytes, storages, strict=True):
+            ordered = sorted(intervals)
+            cursor = 0
+            coalesced = True
+            for offset, length in ordered:
+                if offset != cursor:
+                    coalesced = False
+                    break
+                cursor += length
+            layouts.append(
+                _StorageLayout(
+                    size,
+                    ((0, size),) if coalesced and cursor == size else tuple(intervals),
+                )
+            )
+
+        data_offsets: dict[str, tuple[int, int]] = {}
+        output_offset = 0
+        for storage_index, layout in enumerate(layouts):
+            storage_entries = [
+                entry for entry in entries if entry.storage == storage_index
+            ]
+            if len(layout.chunks) == 1 and layout.chunks[0] == (0, layout.nbytes):
+                for entry in storage_entries:
+                    data_offsets[entry.name] = (
+                        output_offset + entry.offset,
+                        output_offset + entry.offset + entry.nbytes,
+                    )
+                output_offset += layout.nbytes
+                continue
+            for entry in storage_entries:
+                data_offsets[entry.name] = (
+                    output_offset,
+                    output_offset + entry.nbytes,
+                )
+                output_offset += entry.nbytes
+
+        header = {
+            entry.name: {
+                "dtype": _DTYPES[entry.dtype],
+                "shape": list(entry.shape),
+                "data_offsets": list(data_offsets[entry.name]),
+            }
+            for entry in entries
+        }
+        encoded = json.dumps(header, separators=(",", ":")).encode()
+        encoded += b" " * (-len(encoded) % 8)
+        self._entries = tuple(entries)
+        self._storages = tuple(layouts)
+        self._prefix = torch.frombuffer(
+            bytearray(struct.pack("<Q", len(encoded)) + encoded), dtype=torch.uint8
+        )
+
+    def bind(self, tensors: dict[str, torch.Tensor]) -> PreparedSafetensors:
+        bound: list[torch.Tensor | None] = [None] * len(self._storages)
+        for entry in self._entries:
+            tensor = tensors.get(entry.name)
+            if tensor is None:
+                raise RuntimeError(f"Safetensors tensor disappeared: {entry.name}")
+            _validate_tensor(entry.name, tensor)
+            storage = tensor.untyped_storage()
+            if (
+                tensor.dtype != entry.dtype
+                or tuple(tensor.shape) != entry.shape
+                or storage.nbytes() != self._storages[entry.storage].nbytes
+                or tensor.data_ptr() - storage.data_ptr() != entry.offset
+            ):
+                raise RuntimeError(f"Safetensors tensor layout changed: {entry.name}")
+            owner = bound[entry.storage]
+            if owner is None:
+                bound[entry.storage] = torch.empty(0, dtype=torch.uint8).set_(
+                    storage, 0, (storage.nbytes(),), (1,)
+                )
+            elif owner.untyped_storage().data_ptr() != storage.data_ptr():
+                raise RuntimeError("Safetensors storage aliasing changed")
+        if len(tensors) != len(self._entries):
+            raise RuntimeError("Safetensors tensor set changed")
+        owners = tuple(owner for owner in bound if owner is not None)
+        if len(owners) != len(bound):
+            raise RuntimeError("Safetensors storage disappeared")
+        return PreparedSafetensors(
+            (
+                self._prefix,
+                *(
+                    owner.narrow(0, offset, length)
+                    for owner, layout in zip(owners, self._storages, strict=True)
+                    for offset, length in layout.chunks
+                ),
+            )
+        )
 
 
 def _writev_all(fd: int, buffers: list[memoryview]) -> None:
@@ -52,31 +193,17 @@ def _writev_all(fd: int, buffers: list[memoryview]) -> None:
             pending[0] = pending[0][written:]
 
 
-def prepare_safetensors(tensors: dict[str, torch.Tensor]) -> PreparedSafetensors:
-    """Prepare immutable CPU buffers once for one or more file writes."""
+def _validate_tensor(name: str, tensor: torch.Tensor) -> None:
     if sys.byteorder != "little":
         raise RuntimeError("ART's zero-copy safetensors writer requires little endian")
-    header: dict[str, Any] = {}
-    buffers: list[memoryview] = []
-    offset = 0
-    for name, tensor in sorted(tensors.items()):
-        if tensor.device.type != "cpu" or not tensor.is_contiguous():
-            raise RuntimeError(f"Tensor {name!r} must be contiguous CPU storage")
-        dtype = _DTYPES.get(tensor.dtype)
-        if dtype is None:
-            raise RuntimeError(f"Unsupported safetensors dtype: {tensor.dtype}")
-        data = memoryview(tensor.reshape(-1).view(torch.uint8).numpy())
-        header[name] = {
-            "dtype": dtype,
-            "shape": list(tensor.shape),
-            "data_offsets": [offset, offset + data.nbytes],
-        }
-        offset += data.nbytes
-        buffers.append(data)
+    if tensor.device.type != "cpu" or not tensor.is_contiguous():
+        raise RuntimeError(f"Tensor {name!r} must be contiguous CPU storage")
+    if tensor.dtype not in _DTYPES:
+        raise RuntimeError(f"Unsupported safetensors dtype: {tensor.dtype}")
 
-    encoded = json.dumps(header, separators=(",", ":")).encode()
-    encoded += b" " * (-len(encoded) % 8)
-    return PreparedSafetensors(encoded, tuple(buffers))
+
+def prepare_safetensors(tensors: dict[str, torch.Tensor]) -> PreparedSafetensors:
+    return SafetensorsLayout(tensors).bind(tensors)
 
 
 def save_prepared_safetensors(prepared: PreparedSafetensors, path: Path) -> None:
@@ -86,11 +213,7 @@ def save_prepared_safetensors(prepared: PreparedSafetensors, path: Path) -> None
         with temporary_path.open("wb", buffering=0) as output:
             _writev_all(
                 output.fileno(),
-                [
-                    memoryview(struct.pack("<Q", len(prepared.header))),
-                    memoryview(prepared.header),
-                    *prepared.buffers,
-                ],
+                [memoryview(chunk.numpy()) for chunk in prepared.chunks],
             )
         temporary_path.replace(path)
 

@@ -180,7 +180,6 @@ class MonarchVllmHostLauncher:
         self,
         generation_id: str,
         template_path: str,
-        tensor_dtype: str,
         timeout_s: float,
         transport: Literal["local", "nixl"],
     ) -> AdapterTransferTarget:
@@ -188,7 +187,6 @@ class MonarchVllmHostLauncher:
             self.actor.prepare_adapter_receive,
             generation_id,
             template_path,
-            tensor_dtype,
             timeout_s,
             transport,
         )
