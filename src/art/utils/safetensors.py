@@ -6,7 +6,7 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -34,6 +34,11 @@ _DTYPES = {
 }
 
 
+class PreparedSafetensors(NamedTuple):
+    header: bytes
+    buffers: tuple[memoryview, ...]
+
+
 def _writev_all(fd: int, buffers: list[memoryview]) -> None:
     pending = deque(buffer for buffer in buffers if buffer.nbytes)
     iov_max = os.sysconf("SC_IOV_MAX")
@@ -47,8 +52,8 @@ def _writev_all(fd: int, buffers: list[memoryview]) -> None:
             pending[0] = pending[0][written:]
 
 
-def save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
-    """Stream CPU tensor buffers without copying them into GIL-held bytes."""
+def prepare_safetensors(tensors: dict[str, torch.Tensor]) -> PreparedSafetensors:
+    """Prepare immutable CPU buffers once for one or more file writes."""
     if sys.byteorder != "little":
         raise RuntimeError("ART's zero-copy safetensors writer requires little endian")
     header: dict[str, Any] = {}
@@ -71,15 +76,25 @@ def save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
 
     encoded = json.dumps(header, separators=(",", ":")).encode()
     encoded += b" " * (-len(encoded) % 8)
+    return PreparedSafetensors(encoded, tuple(buffers))
+
+
+def save_prepared_safetensors(prepared: PreparedSafetensors, path: Path) -> None:
+    """Stream a prepared safetensors payload without rebuilding tensor metadata."""
     with tempfile.TemporaryDirectory(dir=path.parent) as temp_dir:
         temporary_path = Path(temp_dir) / path.name
         with temporary_path.open("wb", buffering=0) as output:
             _writev_all(
                 output.fileno(),
                 [
-                    memoryview(struct.pack("<Q", len(encoded))),
-                    memoryview(encoded),
-                    *buffers,
+                    memoryview(struct.pack("<Q", len(prepared.header))),
+                    memoryview(prepared.header),
+                    *prepared.buffers,
                 ],
             )
         temporary_path.replace(path)
+
+
+def save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
+    """Stream CPU tensor buffers without copying them into GIL-held bytes."""
+    save_prepared_safetensors(prepare_safetensors(tensors), path)

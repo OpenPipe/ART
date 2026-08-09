@@ -6,6 +6,8 @@ from threading import BoundedSemaphore, Event, Lock
 import time
 from typing import TYPE_CHECKING, Any
 
+from art.utils.safetensors import PreparedSafetensors, prepare_safetensors
+
 from ..tensor_snapshot import PinnedCpuSnapshotStager
 from .data_plane import InMemoryPackedBatch, SFTBatchData, validate_packed_batch
 from .publication import (
@@ -233,7 +235,12 @@ class _GenerationPublisher:
         self.capacity = capacity
         self._slots = BoundedSemaphore(capacity)
         self._lock = Lock()
-        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="art-publish")
+        self._transport_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="art-publish-transport"
+        )
+        self._durability_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="art-publish-durable"
+        )
         self._transport_sender: Any | None = None
         self._failures: list[BaseException] = []
         self._in_flight = 0
@@ -289,8 +296,7 @@ class _GenerationPublisher:
             finally:
                 self._release_slot()
             raise
-        self._enqueue(
-            self._publish_snapshot,
+        self._enqueue_transport(
             generation=job.output.generation,
             optimizer_state_path=job.output.optimizer_state_path,
             staging_adapter_path=job.output.staging_adapter_path,
@@ -299,7 +305,6 @@ class _GenerationPublisher:
             optimizer=optimizer,
             publication_targets=getattr(job, "publication_targets", ()),
             sink=sink,
-            completion_generation=job.output.generation,
         )
         return {
             "snapshot_pool_wait_s": wait_s,
@@ -317,27 +322,26 @@ class _GenerationPublisher:
             self._in_flight += 1
             return wait_s, self._in_flight
 
-    def _enqueue(
+    def _enqueue_transport(
         self,
-        function: Any,
-        /,
-        *args: Any,
+        *,
         sink: EventSink,
-        completion_generation: TrainerGeneration,
         **kwargs: Any,
     ) -> None:
         try:
-            future = self._pool.submit(function, *args, **kwargs)
+            future = self._transport_pool.submit(self._transport_snapshot, **kwargs)
         except BaseException:
             self._release_slot()
             raise
         future.add_done_callback(
-            lambda done: self._completed(
-                done, sink=sink, generation=completion_generation
+            lambda done: self._transport_completed(
+                done,
+                sink=sink,
+                generation=kwargs["generation"],
             )
         )
 
-    def _publish_snapshot(
+    def _transport_snapshot(
         self,
         *,
         generation: TrainerGeneration,
@@ -347,16 +351,45 @@ class _GenerationPublisher:
         adapter: "OptimizerAdapter | None",
         optimizer: Any,
         publication_targets: tuple[Any, ...],
-    ) -> TrainerRankPublication:
+    ) -> Future[TrainerRankPublication]:
         lora = None if lora is None else lora.resolve()
+        prepared_tensors = None if lora is None else prepare_safetensors(lora.tensors)
         failures: list[BaseException] = []
         if int(self.runtime.rank) == 0 and publication_targets:
             if lora is None:
                 raise RuntimeError("rank zero has no LoRA snapshot to transfer")
             try:
-                self._transfer_lora_snapshot(lora, publication_targets)
+                self._transfer_lora_snapshot(
+                    lora,
+                    publication_targets,
+                    prepared_tensors=prepared_tensors,
+                )
             except BaseException as error:
                 failures.append(error)
+        return self._durability_pool.submit(
+            self._persist_snapshot,
+            generation=generation,
+            optimizer_state_path=optimizer_state_path,
+            staging_adapter_path=staging_adapter_path,
+            lora=lora,
+            adapter=adapter,
+            optimizer=optimizer,
+            prepared_tensors=prepared_tensors,
+            failures=failures,
+        )
+
+    def _persist_snapshot(
+        self,
+        *,
+        generation: TrainerGeneration,
+        optimizer_state_path: str,
+        staging_adapter_path: str | None,
+        lora: Any,
+        adapter: "OptimizerAdapter | None",
+        optimizer: Any,
+        prepared_tensors: PreparedSafetensors | None,
+        failures: list[BaseException],
+    ) -> TrainerRankPublication:
         record: TrainerRankPublication | None = None
         try:
             optimizer = None if optimizer is None else optimizer.resolve()
@@ -367,6 +400,7 @@ class _GenerationPublisher:
                 lora=lora,
                 adapter=adapter,
                 optimizer=optimizer,
+                prepared_tensors=prepared_tensors,
             )
         except BaseException as error:
             failures.append(error)
@@ -380,12 +414,22 @@ class _GenerationPublisher:
             raise RuntimeError("trainer rank produced no publication record")
         return record
 
-    def _transfer_lora_snapshot(self, lora: Any, targets: tuple[Any, ...]) -> None:
+    def _transfer_lora_snapshot(
+        self,
+        lora: Any,
+        targets: tuple[Any, ...],
+        *,
+        prepared_tensors: PreparedSafetensors | None,
+    ) -> None:
         from art.distributed.adapter_transport import AdapterSnapshotSender
 
         if self._transport_sender is None:
             self._transport_sender = AdapterSnapshotSender()
-        self._transport_sender.send(lora, targets)
+        self._transport_sender.send(
+            lora,
+            targets,
+            prepared_tensors=prepared_tensors,
+        )
 
     def _persist_generation(
         self,
@@ -396,6 +440,7 @@ class _GenerationPublisher:
         lora: Any,
         adapter: "OptimizerAdapter | None",
         optimizer: Any,
+        prepared_tensors: PreparedSafetensors | None,
     ) -> TrainerRankPublication:
         from art.megatron.optimizer_state import (
             publish_adapter_checkpoint,
@@ -411,7 +456,11 @@ class _GenerationPublisher:
                 staging = Path(staging_adapter_path)
                 if staging.exists():
                     raise RuntimeError(f"Adapter staging generation exists: {staging}")
-                save_vllm_lora_snapshot(lora, str(staging))
+                save_vllm_lora_snapshot(
+                    lora,
+                    str(staging),
+                    prepared_tensors=prepared_tensors,
+                )
                 adapter = publish_adapter_checkpoint(
                     staging,
                     step=generation.policy_step,
@@ -438,6 +487,22 @@ class _GenerationPublisher:
             saves_optimizer=optimizer is not None,
         )
 
+    def _transport_completed(
+        self,
+        future: Future[Future[TrainerRankPublication]],
+        *,
+        sink: EventSink,
+        generation: TrainerGeneration,
+    ) -> None:
+        try:
+            persistence = future.result()
+        except BaseException as error:
+            self._failed(error, sink=sink, generation=generation)
+            return
+        persistence.add_done_callback(
+            lambda done: self._completed(done, sink=sink, generation=generation)
+        )
+
     def _completed(
         self,
         future: Future[TrainerRankPublication],
@@ -448,19 +513,36 @@ class _GenerationPublisher:
         try:
             event = TrainerPublicationSucceeded(record=future.result())
         except BaseException as error:
-            with self._lock:
-                self._failures.append(error)
-            event = TrainerPublicationFailed(
-                generation_id=generation.generation_id,
-                rank=int(self.runtime.rank),
-                error_type=type(error).__name__,
-                message=str(error) or type(error).__name__,
-            )
+            self._failed(error, sink=sink, generation=generation)
+            return
         try:
             sink.publication(event)
         except BaseException as error:
             with self._lock:
                 self._failures.append(error)
+        finally:
+            self._release_slot()
+
+    def _failed(
+        self,
+        error: BaseException,
+        *,
+        sink: EventSink,
+        generation: TrainerGeneration,
+    ) -> None:
+        with self._lock:
+            self._failures.append(error)
+        event = TrainerPublicationFailed(
+            generation_id=generation.generation_id,
+            rank=int(self.runtime.rank),
+            error_type=type(error).__name__,
+            message=str(error) or type(error).__name__,
+        )
+        try:
+            sink.publication(event)
+        except BaseException as sink_error:
+            with self._lock:
+                self._failures.append(sink_error)
         finally:
             self._release_slot()
 
@@ -476,8 +558,13 @@ class _GenerationPublisher:
             raise BaseExceptionGroup("trainer generation publication failed", failures)
 
     def close(self) -> None:
-        self._pool.shutdown(wait=True)
+        self._transport_pool.shutdown(wait=True)
+        self._durability_pool.shutdown(wait=True)
         if self._transport_sender is not None:
             self._transport_sender.close()
             self._transport_sender = None
+        with self._lock:
+            in_flight = self._in_flight
+        if in_flight:
+            raise RuntimeError(f"publication close retained {in_flight} snapshots")
         self.raise_if_failed()

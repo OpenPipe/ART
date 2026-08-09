@@ -6,7 +6,11 @@ from typing import Any
 import torch
 
 from art.megatron.model_support.spec import ModelSupportHandler
-from art.utils.safetensors import save_safetensors
+from art.utils.safetensors import (
+    PreparedSafetensors,
+    prepare_safetensors,
+    save_prepared_safetensors,
+)
 
 ART_LORA_FORMAT_CONFIG_KEY = "art_lora_format"
 ART_LORA_FORMAT_VLLM = "vllm"
@@ -77,10 +81,15 @@ def save_vllm_lora_tensors(
     lora_path: str | Path,
     tensors: dict[str, torch.Tensor],
     adapter_config: dict[str, Any],
+    *,
+    prepared_tensors: PreparedSafetensors | None = None,
 ) -> None:
     base_dir = Path(lora_path)
     base_dir.mkdir(parents=True, exist_ok=True)
-    save_safetensors(tensors, base_dir / "adapter_model.safetensors")
+    save_prepared_safetensors(
+        prepared_tensors or prepare_safetensors(tensors),
+        base_dir / "adapter_model.safetensors",
+    )
     save_adapter_config(
         base_dir,
         {**adapter_config, ART_LORA_FORMAT_CONFIG_KEY: ART_LORA_FORMAT_VLLM},

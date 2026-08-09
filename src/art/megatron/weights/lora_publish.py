@@ -24,6 +24,7 @@ from art.megatron.tensor_snapshot import (
     PinnedCpuSnapshotStager,
 )
 from art.megatron.training.model_chunks import ModelChunks
+from art.utils.safetensors import PreparedSafetensors
 
 
 class PackedExpertShardMeta(NamedTuple):
@@ -935,9 +936,15 @@ def stage_vllm_lora_snapshot_from_model(
     )
 
 
-def save_vllm_lora_snapshot(snapshot: LoraSnapshot, output_dir: str) -> None:
+def save_vllm_lora_snapshot(
+    snapshot: LoraSnapshot,
+    output_dir: str,
+    *,
+    prepared_tensors: PreparedSafetensors | None = None,
+) -> None:
     save_vllm_lora_tensors(
         output_dir,
         snapshot.tensors,
         snapshot.adapter_config,
+        prepared_tensors=prepared_tensors,
     )

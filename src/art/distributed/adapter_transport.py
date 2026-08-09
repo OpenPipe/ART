@@ -16,7 +16,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 import torch
 
-from art.utils.safetensors import save_safetensors
+from art.utils.safetensors import PreparedSafetensors, save_safetensors
 
 
 class _TransportRecord(BaseModel):
@@ -766,7 +766,13 @@ class AdapterSnapshotSender:
     def __init__(self) -> None:
         self._nixl: NixlAdapterSender | None = None
 
-    def send(self, snapshot: Any, targets: tuple[AdapterTransferTarget, ...]) -> None:
+    def send(
+        self,
+        snapshot: Any,
+        targets: tuple[AdapterTransferTarget, ...],
+        *,
+        prepared_tensors: PreparedSafetensors | None = None,
+    ) -> None:
         transports = {target.transport for target in targets}
         if not targets:
             return
@@ -777,10 +783,15 @@ class AdapterSnapshotSender:
                 self._nixl = NixlAdapterSender()
             self._nixl.send(snapshot, targets)
             return
-        self._send_local(snapshot, targets)
+        self._send_local(snapshot, targets, prepared_tensors=prepared_tensors)
 
     @staticmethod
-    def _send_local(snapshot: Any, targets: tuple[AdapterTransferTarget, ...]) -> None:
+    def _send_local(
+        snapshot: Any,
+        targets: tuple[AdapterTransferTarget, ...],
+        *,
+        prepared_tensors: PreparedSafetensors | None,
+    ) -> None:
         from art.megatron.weights.lora_publish import save_vllm_lora_snapshot
 
         first = targets[0]
@@ -802,7 +813,11 @@ class AdapterSnapshotSender:
                 raise RuntimeError(f"LoRA snapshot shape or dtype changed: {spec.name}")
         for target in targets:
             started = time.monotonic()
-            save_vllm_lora_snapshot(snapshot, target.path)
+            save_vllm_lora_snapshot(
+                snapshot,
+                target.path,
+                prepared_tensors=prepared_tensors,
+            )
             notification = AdapterTransferNotification(
                 generation_id=target.generation_id,
                 sender_staging_s=time.monotonic() - started,
