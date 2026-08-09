@@ -1325,6 +1325,7 @@ def _mutation_hook(
             *,
             model_support_handler: Any | None = None,
             model_chunks: Any | None = None,
+            before_step: Callable[[], None] | None = None,
         ):
             if pre_optimizer_step_hook is not None:
                 pre_optimizer_step_hook()
@@ -1333,6 +1334,7 @@ def _mutation_hook(
                 learning_rate,
                 model_support_handler=model_support_handler,
                 model_chunks=model_chunks,
+                before_step=before_step,
             )
 
         megatron_train_module._optimizer_step = _patched_optimizer_step

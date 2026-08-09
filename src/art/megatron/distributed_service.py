@@ -225,6 +225,7 @@ class DistributedMegatronService:
         self._publication_tasks: dict[int, asyncio.Task[None]] = {}
         self._durability_tasks: set[asyncio.Task[Any]] = set()
         self._prepared_adapter_transfers: dict[str, Any] = {}
+        self._loaded_adapter_transfers: dict[int, tuple[Any, str]] = {}
         self._next_publication_preparation: (
             tuple[
                 Any,
@@ -633,6 +634,7 @@ class DistributedMegatronService:
             step for step in self._loaded_adapter_steps if step > self._serving_step
         ):
             await self._unload_adapter(f"{self.model_name}@{step}")
+            await self._release_loaded_adapter_transfer(step)
             self._loaded_adapter_steps.discard(step)
         if previous_name == f"{self.model_name}:active" and previous_name != (
             self._current_lora_name
@@ -759,6 +761,29 @@ class DistributedMegatronService:
             raise
         return interrupted
 
+    async def _release_loaded_adapter_transfer(self, step: int) -> None:
+        transfer = self._loaded_adapter_transfers.get(step)
+        if transfer is None:
+            return
+        manager, generation_id = transfer
+        interrupted = await self._release_adapter_transfer(manager, generation_id)
+        if self._loaded_adapter_transfers.get(step) == transfer:
+            self._loaded_adapter_transfers.pop(step)
+        if interrupted is not None:
+            raise interrupted
+
+    async def _release_loaded_adapter_transfers(self) -> None:
+        results = await asyncio.gather(
+            *(
+                self._release_loaded_adapter_transfer(step)
+                for step in tuple(self._loaded_adapter_transfers)
+            ),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("loaded adapter transfer cleanup failed", failures)
+
     @asynccontextmanager
     async def _trainer_failure_boundary(self) -> AsyncIterator[None]:
         try:
@@ -788,10 +813,9 @@ class DistributedMegatronService:
                         failures.append(error)
                         service_name = self._managed_service_name
                         if service_name is not None:
-                            try:
-                                await self.runtime.stop_model_service(service_name)
-                            except BaseException as stop_error:
-                                failures.append(stop_error)
+                            failures.extend(
+                                await self._rollback_server_start_safely(service_name)
+                            )
                         self._clear_serving_state()
         if len(failures) == 1:
             raise failures[0]
@@ -1198,7 +1222,7 @@ class DistributedMegatronService:
     ) -> None:
         metrics = self._publication_metrics.setdefault(generation.policy_step, {})
         manager = transfer_manager
-        transfer_released = manager is None
+        transfer_owned = manager is not None
         durable_task = asyncio.create_task(
             self._resolve_durable_publication(
                 generation,
@@ -1307,16 +1331,26 @@ class DistributedMegatronService:
                         generation.policy_step,
                         checkpoint,
                     )
+                    if (
+                        manager is not None
+                        and self.rollout_weight_update_mode != "in_flight_lora"
+                    ):
+                        self._loaded_adapter_transfers[generation.policy_step] = (
+                            manager,
+                            generation.generation_id,
+                        )
+                        transfer_owned = False
                 metrics["serving_activation_s"] = time.monotonic() - activation_started
                 if manager is None and not serving.done():
                     serving.set_result(None)
-            if manager is not None:
+            if manager is not None and transfer_owned:
                 interrupted = await self._release_adapter_transfer(
                     manager, generation.generation_id
                 )
-                transfer_released = True
+                transfer_owned = False
                 if interrupted is not None:
                     raise interrupted
+            if manager is not None:
                 if not serving.done():
                     serving.set_result(None)
 
@@ -1344,7 +1378,7 @@ class DistributedMegatronService:
                 self._latest_step - self._durable_optimizer_step,
             )
         except BaseException as error:
-            if manager is not None and not transfer_released:
+            if manager is not None and transfer_owned:
                 try:
                     interrupted = await self._release_adapter_transfer(
                         manager, generation.generation_id, error
@@ -1352,7 +1386,7 @@ class DistributedMegatronService:
                 except BaseException as cleanup_error:
                     error = cleanup_error
                 else:
-                    transfer_released = True
+                    transfer_owned = False
                     if interrupted is not None:
                         error.add_note("adapter transfer cleanup observed cancellation")
             if not serving.done():
@@ -1724,6 +1758,7 @@ class DistributedMegatronService:
             self._loaded_exact_adapter_steps = (
                 set(exact_steps) if self.rollout_weights_mode == "lora" else set()
             )
+            await self._release_loaded_adapter_transfers()
         except BaseException as error:
             manager.quarantine(f"replica recovery failed: {error}")
             try:
@@ -1731,6 +1766,13 @@ class DistributedMegatronService:
             except BaseException as cleanup_error:
                 raise BaseExceptionGroup(
                     "replica recovery and teardown failed", [error, cleanup_error]
+                ) from None
+            try:
+                await self._release_loaded_adapter_transfers()
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "replica recovery and transfer cleanup failed",
+                    [error, cleanup_error],
                 ) from None
             raise
 
@@ -1753,6 +1795,10 @@ class DistributedMegatronService:
             return []
         try:
             await self.runtime.stop_model_service(service_name)
+        except BaseException as error:
+            return [error]
+        try:
+            await self._release_loaded_adapter_transfers()
         except BaseException as error:
             return [error]
         return []
@@ -2246,6 +2292,7 @@ class DistributedMegatronService:
                 self._loaded_adapter_steps - retain_steps - {self._serving_step}
             ):
                 await self._unload_adapter(f"{self.model_name}@{step}")
+                await self._release_loaded_adapter_transfer(step)
                 self._loaded_adapter_steps.discard(step)
 
     @asynccontextmanager
@@ -2378,6 +2425,7 @@ class DistributedMegatronService:
             except BaseException as error:
                 failures.append(error)
             async with self._serving_lock:
+                serving_stopped = False
                 if self._managed_service_name is not None:
                     result = await asyncio.gather(
                         self.runtime.stop_model_service(self._managed_service_name),
@@ -2388,6 +2436,7 @@ class DistributedMegatronService:
                     ]
                     failures.extend(serving_failures)
                     if not serving_failures:
+                        serving_stopped = True
                         self._clear_serving_state()
                 elif (
                     get_external_vllm_runtime_config(self.config) is not None
@@ -2419,9 +2468,16 @@ class DistributedMegatronService:
                     ]
                     failures.extend(serving_failures)
                     if not serving_failures:
+                        serving_stopped = True
                         self._clear_serving_state()
                 else:
+                    serving_stopped = True
                     self._clear_serving_state()
+                if serving_stopped:
+                    try:
+                        await self._release_loaded_adapter_transfers()
+                    except BaseException as error:
+                        failures.append(error)
             _, cancelled = await complete_to_thread(
                 lambda: _remove_staging_root(self.output_dir)
             )
