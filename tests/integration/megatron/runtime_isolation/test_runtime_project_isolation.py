@@ -647,9 +647,6 @@ def test_runtime_policy_spans_survive_parallel_sample_aggregation(
 import json
 from types import SimpleNamespace
 
-from art_vllm_runtime.patches import _patch_openai_namespace_tool_import
-
-_patch_openai_namespace_tool_import()
 from vllm.v1.engine.output_processor import RequestState
 
 
