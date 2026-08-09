@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 from functools import lru_cache
+from http import HTTPStatus
 from ipaddress import ip_address
 import json
 import os

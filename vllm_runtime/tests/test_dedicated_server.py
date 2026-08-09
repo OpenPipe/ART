@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 from art_vllm_runtime import dedicated_server
 from art_vllm_runtime.fast_metrics import FAST_METRIC_NAMES, FastMetricsSidecar
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 import pytest
 from starlette.datastructures import URL
 
@@ -136,3 +138,21 @@ def test_fast_metrics_url_uses_controller_routable_host(monkeypatch) -> None:
         request = SimpleNamespace(url=URL(f"http://{host}:8000/art/capabilities"))
         with pytest.raises(RuntimeError, match="unroutable host"):
             dedicated_server._fast_metrics_url(request)
+
+
+def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> None:
+    from vllm.entrypoints.openai import api_server
+
+    monkeypatch.setattr(api_server, "build_app", lambda *args, **kwargs: FastAPI())
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    dedicated_server._patch_art_runtime_routes()
+    app = api_server.build_app()
+
+    class Engine:
+        async def sleep(self, *, level: int, mode: str) -> None:
+            raise ValueError(f"invalid {level=} {mode=}")
+
+    app.state.engine_client = Engine()
+    response = TestClient(app).post("/sleep?level=1&mode=wait")
+    assert response.status_code == 400
+    assert response.json() == {"error": "invalid level=1 mode='wait'"}
