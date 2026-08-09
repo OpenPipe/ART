@@ -51,7 +51,7 @@ _TOKENIZER_COMPATIBLE_STAGES = frozenset(
         "native_vllm_lora",
     }
 )
-_TOKENIZER_FIXTURE_VERSION = 2
+_TOKENIZER_FIXTURE_VERSION = 3
 _REVISIONS = {
     "meta-llama/Llama-3.2-1B-Instruct": "9213176726f574b556790deb65791e0c5aa438b6",
     "Qwen/Qwen3-32B": "9216db5781bf21249d130ec9da846c4624c16137",
@@ -538,6 +538,13 @@ def _build(
                 model = auto.from_config(config, trust_remote_code=True).to(
                     torch.bfloat16
                 )
+            if tokenizer_compatible and model_key.startswith("gemma4_"):
+                layers = model.model.language_model.layers
+                residual_scale = (2 * len(layers)) ** -0.5
+                with torch.no_grad():
+                    for layer in layers:
+                        layer.post_attention_layernorm.weight.fill_(residual_scale)
+                        layer.post_feedforward_layernorm.weight.fill_(residual_scale)
             parameters = sum(parameter.numel() for parameter in model.parameters())
             model.save_pretrained(
                 staging, safe_serialization=True, max_shard_size="2GB"
