@@ -6,7 +6,6 @@ from functools import lru_cache
 from http import HTTPStatus
 import json
 import os
-import socket
 from typing import Any
 import uuid
 
@@ -26,18 +25,6 @@ from art_vllm_runtime.patches import apply_vllm_runtime_patches
 ART_SERVING_PROTOCOL_VERSION = 3
 _runtime_state: dict[str, object] = {}
 _auth_tokens: list[str] = []
-
-
-def _patch_prebound_listener_tcp_nodelay(api_server: Any) -> None:
-    create_server_socket = api_server.create_server_socket
-
-    def create_tcp_server_socket(*args: Any, **kwargs: Any) -> socket.socket:
-        listener = create_server_socket(*args, **kwargs)
-        # vLLM pre-binds before Uvicorn; accepted sockets inherit this option.
-        listener.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        return listener
-
-    api_server.create_server_socket = create_tcp_server_socket
 
 
 class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
@@ -637,7 +624,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-    _patch_prebound_listener_tcp_nodelay(api_server)
     _patch_art_runtime_routes()
     _patch_engine_config(
         AsyncEngineArgs,

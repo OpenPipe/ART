@@ -31,8 +31,8 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
     "H200": 3.0,
 }
 
+import httpx
 import numpy as np
-from openai import APIError, APITimeoutError
 import polars as pl
 from pydantic import BaseModel, ConfigDict
 import torch
@@ -336,6 +336,7 @@ class LocalBackend:
         self._vllm_metric_snapshots: dict[
             tuple[str, str, str, int], tuple[float, dict[str, float]]
         ] = {}
+        self._vllm_metrics_client: httpx.AsyncClient | None = None
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
@@ -425,17 +426,28 @@ class LocalBackend:
         metrics_root = base_url.rstrip("/")
         if metrics_root.endswith("/v1"):
             metrics_root = metrics_root[: -len("/v1")]
-        try:
-            payload = await model.openai_client().get(
-                "../art/metrics",
-                cast_to=dict[str, Any],
-                options={"timeout": 1.0, "max_retries": 0},
+        client = self._vllm_metrics_client
+        if client is None:
+            client = self._vllm_metrics_client = httpx.AsyncClient(
+                timeout=1.0,
+                limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
             )
-        except APITimeoutError:
+        try:
+            response = await client.get(
+                f"{metrics_root}/art/metrics",
+                headers=(
+                    {"Authorization": f"Bearer {model.inference_api_key}"}
+                    if model.inference_api_key
+                    else None
+                ),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.TimeoutException:
             raise ArtVllmMetricsTimeoutError(
                 f"Timed out collecting ART vLLM metrics from {metrics_root}."
             )
-        except (APIError, ValueError) as exc:
+        except (httpx.HTTPError, ValueError) as exc:
             raise RuntimeError(
                 "ART vLLM metrics require the dedicated ART runtime endpoint at "
                 f"{metrics_root}/art/metrics."
@@ -691,6 +703,9 @@ class LocalBackend:
                         logger.exception("Failed to close local backend service proxy.")
         self._services.clear()
         self._adapter_leases.clear()
+        client, self._vllm_metrics_client = self._vllm_metrics_client, None
+        if client is not None:
+            await client.aclose()
         await self._drain_provenance_update_tasks()
         gc.collect()
         if torch.cuda.is_available():
@@ -715,6 +730,14 @@ class LocalBackend:
                     logger.exception("Failed to close local backend service proxy.")
         self._services.clear()
         self._adapter_leases.clear()
+        client, self._vllm_metrics_client = self._vllm_metrics_client, None
+        if client is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(client.aclose())
+            else:
+                loop.create_task(client.aclose())
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
