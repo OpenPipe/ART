@@ -970,13 +970,27 @@ class DistributedMegatronService:
                     if source is None:
                         raise RuntimeError("trainer has no source generation")
                     next_step = self._latest_step + 1
-                    preparation_started = time.perf_counter()
-                    (
-                        output_generation,
-                        publication_targets,
-                        merged_transfer,
-                    ) = await self._take_publication_preparation(trainer, next_step)
-                    preparation_wait_s = time.perf_counter() - preparation_started
+
+                preparation_started = time.perf_counter()
+                (
+                    output_generation,
+                    publication_targets,
+                    merged_transfer,
+                ) = await self._take_publication_preparation(trainer, next_step)
+                preparation_wait_s = time.perf_counter() - preparation_started
+
+                async with self._mutation_lock:
+                    self._require_open()
+                    self._raise_publication_failure()
+                    if self._trainer is not trainer or not self._trainer_is_current():
+                        raise RuntimeError(
+                            "trainer changed while preparing serving publication"
+                        )
+                    if (
+                        self._learner_generation != source
+                        or self._latest_step != next_step - 1
+                    ):
+                        raise RuntimeError(lineage_error)
                     output = DurableTrainOutput(
                         generation=output_generation,
                         staging_adapter_path=(
