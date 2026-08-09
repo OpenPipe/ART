@@ -203,7 +203,30 @@ def _validate_tensor(name: str, tensor: torch.Tensor) -> None:
 
 
 def prepare_safetensors(tensors: dict[str, torch.Tensor]) -> PreparedSafetensors:
-    return SafetensorsLayout(tensors).bind(tensors)
+    entries: list[tuple[str, torch.Tensor]] = []
+    data_offsets: dict[str, tuple[int, int]] = {}
+    offset = 0
+    for name, tensor in sorted(tensors.items()):
+        _validate_tensor(name, tensor)
+        entries.append((name, tensor))
+        data_offsets[name] = offset, offset + tensor.nbytes
+        offset += tensor.nbytes
+    header = {
+        name: {
+            "dtype": _DTYPES[tensor.dtype],
+            "shape": list(tensor.shape),
+            "data_offsets": list(data_offsets[name]),
+        }
+        for name, tensor in entries
+    }
+    encoded = json.dumps(header, separators=(",", ":")).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    prefix = torch.frombuffer(
+        bytearray(struct.pack("<Q", len(encoded)) + encoded), dtype=torch.uint8
+    )
+    return PreparedSafetensors(
+        (prefix, *(tensor.reshape(-1).view(torch.uint8) for _name, tensor in entries))
+    )
 
 
 def save_prepared_safetensors(prepared: PreparedSafetensors, path: Path) -> None:
