@@ -225,6 +225,14 @@ class DistributedMegatronService:
         self._publication_tasks: dict[int, asyncio.Task[None]] = {}
         self._durability_tasks: set[asyncio.Task[Any]] = set()
         self._prepared_adapter_transfers: dict[str, Any] = {}
+        self._next_publication_preparation: (
+            tuple[
+                Any,
+                TrainerGeneration,
+                asyncio.Task[tuple[tuple[Any, ...], MergedWeightTransferSpec | None]],
+            ]
+            | None
+        ) = None
         self._serving_futures: dict[int, asyncio.Future[None]] = {}
         self._publication_failure: BaseException | None = None
         self._publication_metrics: dict[int, dict[str, float]] = {}
@@ -669,6 +677,10 @@ class DistributedMegatronService:
         async def cleanup() -> None:
             failures: list[BaseException] = []
             try:
+                await self._discard_next_publication_preparation()
+            except BaseException as error:
+                failures.append(error)
+            try:
                 await self._release_prepared_adapter_transfers()
             except BaseException as error:
                 failures.append(error)
@@ -714,6 +726,20 @@ class DistributedMegatronService:
             raise BaseExceptionGroup(
                 "prepared adapter transfer cleanup failed", failures
             )
+
+    async def _discard_next_publication_preparation(self) -> None:
+        prepared, self._next_publication_preparation = (
+            self._next_publication_preparation,
+            None,
+        )
+        if prepared is None:
+            return
+        _, generation, task = prepared
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        manager = self._prepared_adapter_transfers.pop(generation.generation_id, None)
+        if manager is not None:
+            await manager.release_adapter_transfer(generation.generation_id)
 
     async def _release_adapter_transfer(
         self,
@@ -866,6 +892,52 @@ class DistributedMegatronService:
         self._prepared_adapter_transfers[generation_id] = manager
         return targets, None
 
+    def _training_generation(self, step: int) -> TrainerGeneration:
+        return TrainerGeneration(
+            training_session_id=self._training_session_id,
+            policy_step=step,
+            generation_id=new_optimizer_generation(step),
+            adapter_path=get_step_checkpoint_dir(self.output_dir, step),
+        )
+
+    async def _take_publication_preparation(
+        self, trainer: Any, step: int
+    ) -> tuple[
+        TrainerGeneration,
+        tuple[Any, ...],
+        MergedWeightTransferSpec | None,
+    ]:
+        prepared, self._next_publication_preparation = (
+            self._next_publication_preparation,
+            None,
+        )
+        if prepared is not None:
+            prepared_trainer, generation, task = prepared
+            if prepared_trainer is trainer and generation.policy_step == step:
+                targets, merged = await task
+                return generation, targets, merged
+            self._next_publication_preparation = prepared
+            await self._discard_next_publication_preparation()
+        generation = self._training_generation(step)
+        targets, merged = await self._prepare_serving_publication(
+            trainer, generation.generation_id, step
+        )
+        return generation, targets, merged
+
+    def _prefetch_publication_preparation(self, trainer: Any, step: int) -> None:
+        if self._managed_service_name is None:
+            return
+        if self._next_publication_preparation is not None:
+            raise RuntimeError("next publication preparation already exists")
+        generation = self._training_generation(step)
+        task = asyncio.create_task(
+            self._prepare_serving_publication(
+                trainer, generation.generation_id, generation.policy_step
+            )
+        )
+        task.add_done_callback(_consume_task_result)
+        self._next_publication_preparation = trainer, generation, task
+
     async def _run_train_job(
         self,
         build_job: Callable[[_TrainerJobFields], TrainerJobSpec],
@@ -893,26 +965,18 @@ class DistributedMegatronService:
                     if source is None:
                         raise RuntimeError("trainer has no source generation")
                     next_step = self._latest_step + 1
-                    generation_id = new_optimizer_generation(next_step)
-                    output_generation = TrainerGeneration(
-                        training_session_id=self._training_session_id,
-                        policy_step=next_step,
-                        generation_id=generation_id,
-                        adapter_path=get_step_checkpoint_dir(
-                            self.output_dir, next_step
-                        ),
-                    )
+                    preparation_started = time.perf_counter()
                     (
+                        output_generation,
                         publication_targets,
                         merged_transfer,
-                    ) = await self._prepare_serving_publication(
-                        trainer, generation_id, next_step
-                    )
+                    ) = await self._take_publication_preparation(trainer, next_step)
+                    preparation_wait_s = time.perf_counter() - preparation_started
                     output = DurableTrainOutput(
                         generation=output_generation,
                         staging_adapter_path=(
                             f"{self.output_dir}/megatron_runtime/staging/"
-                            f"{generation_id}"
+                            f"{output_generation.generation_id}"
                         ),
                         optimizer_state_path=self._optimizer_state_path,
                     )
@@ -934,6 +998,7 @@ class DistributedMegatronService:
                     reconcile_step, checkpoint = reconcile
                     async with self._serving_lock:
                         await self._reconcile_serving_locked(reconcile_step, checkpoint)
+                self._prefetch_publication_preparation(trainer, next_step + 1)
             setup_s = time.perf_counter() - setup_started
 
             final_metrics: dict[str, float] | None = None
@@ -967,6 +1032,9 @@ class DistributedMegatronService:
                 {
                     "time/step_service_lock_wait_s": lock_wait_s,
                     "time/step_service_job_setup_s": setup_s,
+                    "time/step_service_publication_prepare_wait_s": (
+                        preparation_wait_s
+                    ),
                     "time/step_service_generation_commit_s": commit_s,
                 }
             )
@@ -2282,6 +2350,10 @@ class DistributedMegatronService:
                 self._emitted_publication_metrics.clear()
                 self._trainer_completion_times.clear()
                 self._serving_activation_times.clear()
+            try:
+                await self._discard_next_publication_preparation()
+            except BaseException as error:
+                failures.append(error)
             try:
                 await self._release_prepared_adapter_transfers()
             except BaseException as error:
