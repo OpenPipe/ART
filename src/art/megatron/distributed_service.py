@@ -930,11 +930,16 @@ class DistributedMegatronService:
         if self._next_publication_preparation is not None:
             raise RuntimeError("next publication preparation already exists")
         generation = self._training_generation(step)
-        task = asyncio.create_task(
-            self._prepare_serving_publication(
+        previous_publication = self._publication_tasks.get(step - 2)
+
+        async def prepare() -> tuple[tuple[Any, ...], MergedWeightTransferSpec | None]:
+            if previous_publication is not None:
+                await asyncio.shield(previous_publication)
+            return await self._prepare_serving_publication(
                 trainer, generation.generation_id, generation.policy_step
             )
-        )
+
+        task = asyncio.create_task(prepare())
         task.add_done_callback(_consume_task_result)
         self._next_publication_preparation = trainer, generation, task
 
