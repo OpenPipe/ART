@@ -63,6 +63,7 @@ from .workflow_throughput import (
     _packed_input_fingerprint,
     _phase_evidence,
     _reduced_config,
+    _throughput_config_for_hardware,
     acceptance_failures,
 )
 
@@ -646,6 +647,14 @@ def test_h200_equivalent_slots_tolerate_reported_gb300_vram() -> None:
     assert _h200_equivalent_slots_for_total_gib(139.0) == 1
     assert _h200_equivalent_slots_for_total_gib(267.69) == 2
     assert _h200_equivalent_slots_for_total_gib(276.6) == 2
+
+
+def test_h200_throughput_depth_only_reduces_memory_bound_handlers() -> None:
+    config = ThroughputWorkflowConfig(num_layers=12)
+    assert _throughput_config_for_hardware("glm52", config, "h200").num_layers == 6
+    assert _throughput_config_for_hardware("dsv4", config, "h200").num_layers == 4
+    assert _throughput_config_for_hardware("glm52", config, "b300") is config
+    assert _throughput_config_for_hardware("llama3_dense", config, "h200") is config
 
 
 @pytest.mark.parametrize("handler_key", sorted(HANDLER_WORKFLOW_RESOURCES))

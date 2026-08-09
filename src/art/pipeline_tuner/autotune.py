@@ -43,6 +43,10 @@ def _ceil_to_multiple(value: float, multiple: int, *, minimum: int = 1) -> int:
     return max(minimum, int(math.ceil(value / multiple)) * multiple)
 
 
+def _round_to_multiple(value: float, multiple: int, *, minimum: int = 1) -> int:
+    return max(minimum, int(math.floor(value / multiple + 0.5)) * multiple)
+
+
 _VLLM_SCRAPE_GROUP_TOLERANCE_S = 0.05
 _TRAINER_CAPACITY_EPSILON = 1e-9
 
@@ -156,6 +160,8 @@ class PipelineAutotuner:
         self._last_decision_step = self._warmup_end_step
         self._target_candidate: int | None = None
         self._target_candidate_count = 0
+        self._worker_load_candidate_direction: int | None = None
+        self._worker_load_candidate_count = 0
         self._stale_backlog_active = False
         self._min_batch_trial_baseline_collect_s: float | None = None
         self._min_batch_trial_batch_size: int | None = None
@@ -436,11 +442,14 @@ class PipelineAutotuner:
         )
         if target_changed:
             self._clear_min_batch_trial()
+            self._clear_worker_load_candidate()
         stale_backlog_active = self._update_stale_backlog_state(stats)
         action = "hold"
+        pending_worker_action = "hold"
         reason = "inside hysteresis band or already balanced"
 
         if stale_backlog_active and updated.min_batch_size < updated.max_batch_size:
+            self._clear_worker_load_candidate()
             updated = updated.model_copy(
                 update={
                     "min_batch_size": min(
@@ -455,6 +464,7 @@ class PipelineAutotuner:
             action = "raise_min_batch_size"
             reason = "stale backlog requires dense batches before reducing workers"
         elif stale_backlog_active:
+            self._clear_worker_load_candidate()
             updated = updated.model_copy(
                 update={
                     "num_rollout_workers": self._move_workers(
@@ -464,45 +474,65 @@ class PipelineAutotuner:
             )
             action = "decrease_workers"
             reason = "predicted or actual stale backlog exceeds the freshness target"
+        elif target_changed:
+            reason = "batch geometry changed; worker load evidence was reset"
         elif (
             state == "inference_over_train_over"
             and stats.queue_put_wait_frac >= self.config.queue_put_severe_frac
         ):
-            updated = updated.model_copy(
-                update={
-                    "num_rollout_workers": self._move_workers(
-                        updated.num_rollout_workers, -1
-                    )
-                }
-            )
-            action = "decrease_workers"
-            reason = "vLLM pressure plus queue backpressure indicates excess workers"
+            pending_worker_action = "decrease_workers"
+            if self._worker_load_change_ready(-1):
+                updated = updated.model_copy(
+                    update={
+                        "num_rollout_workers": self._move_workers(
+                            updated.num_rollout_workers, -1
+                        )
+                    }
+                )
+                action = pending_worker_action
+                reason = (
+                    "sustained vLLM pressure plus queue backpressure indicates "
+                    "excess workers"
+                )
+            else:
+                reason = self._pending_worker_load_reason("decrease")
         elif stats.queue_put_wait_frac >= self.config.queue_put_severe_frac:
+            self._clear_worker_load_candidate()
             reason = "completed-group queue backpressure is active"
         elif state in {
             "inference_under_train_under",
             "inference_balanced_train_under",
         }:
-            updated = updated.model_copy(
-                update={
-                    "num_rollout_workers": self._move_workers(
-                        updated.num_rollout_workers, +1
-                    )
-                }
-            )
-            action = "increase_workers"
-            reason = "vLLM pressure is low and trainer is underfed"
+            pending_worker_action = "increase_workers"
+            if self._worker_load_change_ready(+1):
+                updated = updated.model_copy(
+                    update={
+                        "num_rollout_workers": self._move_workers(
+                            updated.num_rollout_workers, +1
+                        )
+                    }
+                )
+                action = pending_worker_action
+                reason = "sustained vLLM pressure is low and trainer is underfed"
+            else:
+                reason = self._pending_worker_load_reason("increase")
         elif state == "inference_over_train_over":
+            self._clear_worker_load_candidate()
             reason = "both sides are loaded; no throughput-safe online change"
+        else:
+            self._clear_worker_load_candidate()
 
         if not target_changed and not stale_backlog_active:
             min_update = self._min_batch_adjustment(
                 updated,
                 stats,
-                action,
+                pending_worker_action
+                if pending_worker_action == "increase_workers"
+                else action,
                 inference_over=inference_over,
             )
             if min_update is not None:
+                self._clear_worker_load_candidate()
                 updated, action, reason = min_update
 
         updated = self._settings_with_recomputed_queue(
@@ -519,6 +549,7 @@ class PipelineAutotuner:
             and previous.num_rollout_workers > worker_limit
             and updated.num_rollout_workers <= worker_limit
         ):
+            self._clear_worker_load_candidate()
             action = "decrease_workers"
             reason = "running rollout reserve exceeded the policy-age budget"
         elif action == "hold" and updated != previous:
@@ -533,6 +564,28 @@ class PipelineAutotuner:
             updated=updated,
             stats=stats,
         )
+
+    def _worker_load_change_ready(self, direction: int) -> bool:
+        if self._worker_load_candidate_direction == direction:
+            self._worker_load_candidate_count += 1
+        else:
+            self._worker_load_candidate_direction = direction
+            self._worker_load_candidate_count = 1
+        if self._worker_load_candidate_count < self.config.worker_load_change_windows:
+            return False
+        self._clear_worker_load_candidate()
+        return True
+
+    def _pending_worker_load_reason(self, direction: str) -> str:
+        return (
+            f"worker {direction} awaits sustained evidence "
+            f"({self._worker_load_candidate_count}/"
+            f"{self.config.worker_load_change_windows})"
+        )
+
+    def _clear_worker_load_candidate(self) -> None:
+        self._worker_load_candidate_direction = None
+        self._worker_load_candidate_count = 0
 
     def _update_stale_backlog_state(self, stats: TunerWindowStats) -> bool:
         stale_fractions = (stats.predicted_stale_frac, stats.actual_stale_frac)
@@ -724,7 +777,7 @@ class PipelineAutotuner:
     def _move_workers(self, current: int, direction: int) -> int:
         raw = max(
             self.config.worker_step,
-            _ceil_to_multiple(
+            _round_to_multiple(
                 current * self.config.worker_move_fraction, self.config.worker_step
             ),
         )

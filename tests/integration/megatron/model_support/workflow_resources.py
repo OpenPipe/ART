@@ -496,7 +496,7 @@ _THROUGHPUT_CONFIGS = {
         prompt_tokens=7600,
         completion_tokens=16,
         groups_per_step=17,
-        initial_model_calls_per_inference_gpu=10,
+        initial_model_calls_per_inference_gpu=11,
         max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
         max_steps=35,
         enable_prefix_caching=True,
@@ -506,7 +506,7 @@ _THROUGHPUT_CONFIGS = {
         completion_tokens=75,
         rollouts_per_group=7,
         groups_per_step=30,
-        initial_model_calls_per_inference_gpu=10,
+        initial_model_calls_per_inference_gpu=11,
         max_steps=35,
     ),
     "gemma4_moe": ThroughputWorkflowConfig(

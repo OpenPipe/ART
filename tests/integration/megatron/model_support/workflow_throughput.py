@@ -71,6 +71,7 @@ _VLLM_RUNTIME_PACKAGES = (
     "flashinfer-python",
     "nvidia-nccl-cu13",
 )
+_H200_THROUGHPUT_NUM_LAYERS = {"dsv4": 4, "glm52": 6}
 
 
 class ThroughputFixture(NamedTuple):
@@ -618,6 +619,17 @@ def _hardware(gpu_identities: list[dict[str, Any]]) -> Literal["h200", "b300"]:
     if "H200" in name:
         return "h200"
     raise RuntimeError(f"throughput thresholds are unavailable for {name}")
+
+
+def _throughput_config_for_hardware(
+    model_key: str,
+    config: ThroughputWorkflowConfig,
+    hardware: Literal["h200", "b300"],
+) -> ThroughputWorkflowConfig:
+    num_layers = _H200_THROUGHPUT_NUM_LAYERS.get(model_key)
+    if hardware != "h200" or num_layers is None:
+        return config
+    return config.model_copy(update={"num_layers": num_layers})
 
 
 def _stable_gpu_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
@@ -1218,6 +1230,8 @@ async def _run_e2e_throughput_async(
     stage: Any,
     config: ThroughputWorkflowConfig,
     fixture: ThroughputFixture,
+    gpu_identities: list[dict[str, Any]],
+    hardware: Literal["h200", "b300"],
 ) -> ValidationStageResult:
     from transformers import AutoTokenizer
 
@@ -1232,11 +1246,6 @@ async def _run_e2e_throughput_async(
         raise RuntimeError(
             "E2E throughput requires separate Megatron and vLLM resources"
         )
-    gpu_identities = _gpu_identities(
-        trainer_gpu_ids=stage.megatron.gpu_ids,
-        inference_gpu_ids=stage.vllm.gpu_ids,
-    )
-    hardware = _hardware(gpu_identities)
     stage_dir = Path(os.environ[_STAGE_DIR_ENV])
     stage_dir.mkdir(parents=True, exist_ok=True)
     topology = stage.megatron.topology
@@ -1577,6 +1586,16 @@ def run_e2e_throughput(
     config = stage.throughput
     if config is None:
         raise RuntimeError("E2E throughput resources lack throughput configuration")
+    if stage.megatron is None or stage.vllm is None:
+        raise RuntimeError(
+            "E2E throughput requires separate Megatron and vLLM resources"
+        )
+    gpu_identities = _gpu_identities(
+        trainer_gpu_ids=stage.megatron.gpu_ids,
+        inference_gpu_ids=stage.vllm.gpu_ids,
+    )
+    hardware = _hardware(gpu_identities)
+    config = _throughput_config_for_hardware(spec.key, config, hardware)
     correctness_path = os.environ.get(FIXTURE_PATH_ENV)
     if correctness_path is None:
         raise RuntimeError(f"missing {FIXTURE_PATH_ENV}")
@@ -1597,5 +1616,7 @@ def run_e2e_throughput(
             stage=stage,
             config=config,
             fixture=fixture,
+            gpu_identities=gpu_identities,
+            hardware=hardware,
         )
     )
