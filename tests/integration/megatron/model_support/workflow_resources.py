@@ -456,11 +456,15 @@ _THROUGHPUT_CONFIGS = {
     "llama3_dense": ThroughputWorkflowConfig(
         num_layers=16,
         prompt_tokens=3922,
-        completion_tokens=704,
-        groups_per_step=19,
+        completion_tokens=504,
+        groups_per_step=22,
         initial_model_calls_per_inference_gpu=26,
     ),
-    "qwen3_dense": ThroughputWorkflowConfig(num_layers=8),
+    "qwen3_dense": ThroughputWorkflowConfig(
+        num_layers=8,
+        completion_tokens=80,
+        groups_per_step=31,
+    ),
     "qwen3_moe": ThroughputWorkflowConfig(
         num_layers=16,
         prompt_tokens=3884,
@@ -485,7 +489,7 @@ _THROUGHPUT_CONFIGS = {
     "gemma4_moe": ThroughputWorkflowConfig(
         num_layers=12,
         prompt_tokens=3640,
-        completion_tokens=160,
+        completion_tokens=176,
         groups_per_step=30,
     ),
     "dsv4": ThroughputWorkflowConfig(
@@ -493,14 +497,14 @@ _THROUGHPUT_CONFIGS = {
         prompt_tokens=12_800,
         completion_tokens=768,
         groups_per_step=8,
-        initial_model_calls_per_inference_gpu=32,
+        initial_model_calls_per_inference_gpu=24,
         max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
     ),
     "glm52": ThroughputWorkflowConfig(
         num_layers=12,
         prompt_tokens=3836,
-        completion_tokens=192,
-        groups_per_step=28,
+        completion_tokens=280,
+        groups_per_step=26,
     ),
     "gpt_oss_moe": ThroughputWorkflowConfig(
         num_layers=4,

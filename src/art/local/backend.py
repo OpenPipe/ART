@@ -31,8 +31,8 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
     "H200": 3.0,
 }
 
-import httpx
 import numpy as np
+from openai import APIError, APITimeoutError
 import polars as pl
 from pydantic import BaseModel, ConfigDict
 import torch
@@ -425,24 +425,17 @@ class LocalBackend:
         metrics_root = base_url.rstrip("/")
         if metrics_root.endswith("/v1"):
             metrics_root = metrics_root[: -len("/v1")]
-        headers = (
-            {"Authorization": f"Bearer {model.inference_api_key}"}
-            if model.inference_api_key
-            else None
-        )
         try:
-            async with httpx.AsyncClient(timeout=1.0) as client:
-                response = await client.get(
-                    f"{metrics_root}/art/metrics",
-                    headers=headers,
-                )
-                response.raise_for_status()
-                payload = response.json()
-        except httpx.TimeoutException:
+            payload = await model.openai_client().get(
+                "../art/metrics",
+                cast_to=dict[str, Any],
+                options={"timeout": 1.0, "max_retries": 0},
+            )
+        except APITimeoutError:
             raise ArtVllmMetricsTimeoutError(
                 f"Timed out collecting ART vLLM metrics from {metrics_root}."
             )
-        except (httpx.HTTPError, ValueError) as exc:
+        except (APIError, ValueError) as exc:
             raise RuntimeError(
                 "ART vLLM metrics require the dedicated ART runtime endpoint at "
                 f"{metrics_root}/art/metrics."

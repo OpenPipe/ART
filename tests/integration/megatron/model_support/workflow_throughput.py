@@ -1286,7 +1286,7 @@ async def _run_e2e_throughput_async(
         ),
         initial_min_groups_per_packed_sequence=config.groups_per_step,
         initial_max_groups_per_packed_sequence=config.groups_per_step,
-        vllm_metric_interval_s=0.5,
+        vllm_metric_interval_s=0.25,
     )
     measured_steps = config.max_steps - autotune.warmup_ignore_steps
     if (
