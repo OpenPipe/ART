@@ -45,7 +45,9 @@ _POLICY_AGE_P95 = "offpolicy/token_weighted_policy_age_p95_steps"
 _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
-_MEASUREMENT_CONTRACT_VERSION = 3
+_MEASUREMENT_CONTRACT_VERSION = 4
+_ISOLATED_WARMUP_STEPS = 1
+_ISOLATED_MEASURED_STEPS = 2
 _REPO_ROOT = Path(__file__).parents[4]
 _MAIN_RUNTIME_PACKAGES = (
     "openpipe-art",
@@ -693,6 +695,8 @@ def _calibration_contract(
             "score_reference_groups_per_step": config.groups_per_step,
             "score_reference_rollouts_per_group": config.rollouts_per_group,
             "max_steps_off_policy": config.max_steps_off_policy,
+            "isolated_warmup_steps": _ISOLATED_WARMUP_STEPS,
+            "isolated_measured_steps": _ISOLATED_MEASURED_STEPS,
         },
         "packed_sequence_length": config.packed_sequence_length,
         "prompt_tokens": actual_prompt_tokens,
@@ -898,7 +902,7 @@ async def _run_isolated_backend_phase(
     source_bundles = _load_bundles(bundles_path)
     packed_input_fingerprint: str | None = None
     samples: list[tuple[Mapping[str, Any], int]] = []
-    for _ in range(2):
+    for sample_index in range(_ISOLATED_WARMUP_STEPS + _ISOLATED_MEASURED_STEPS):
         groups = [bundle.build() for bundle in source_bundles]
         rebuilt = tuple(TrajectoryGroupBundle.from_group(group) for group in groups)
         if (
@@ -926,7 +930,8 @@ async def _run_isolated_backend_phase(
             adam_params=None,
             optimizer_save_interval=5,
         )
-        samples.append((result.metrics, int(result.step)))
+        if sample_index >= _ISOLATED_WARMUP_STEPS:
+            samples.append((result.metrics, int(result.step)))
         await service.wait_for_serving(int(result.step))
     assert packed_input_fingerprint is not None
     return _phase_evidence(
@@ -1127,11 +1132,15 @@ def _collect_measurements(
         f"matched E2E input was not captured at reserved step {capture_step}",
     )
     expected_isolated_steps = tuple(
-        range(capture_step + 1, capture_step + 1 + isolated.sample_count)
+        range(
+            capture_step + 1 + _ISOLATED_WARMUP_STEPS,
+            capture_step + 1 + _ISOLATED_WARMUP_STEPS + isolated.sample_count,
+        )
     )
     _require(
         isolated.policy_steps == expected_isolated_steps,
-        f"isolated steps do not immediately follow capture: {isolated.policy_steps}",
+        "isolated measured steps do not follow the configured warmup: "
+        f"{isolated.policy_steps}",
     )
     return measurements
 
@@ -1277,7 +1286,7 @@ async def _run_e2e_throughput_async(
         ),
         initial_min_groups_per_packed_sequence=config.groups_per_step,
         initial_max_groups_per_packed_sequence=config.groups_per_step,
-        vllm_metric_interval_s=0.25,
+        vllm_metric_interval_s=0.5,
     )
     measured_steps = config.max_steps - autotune.warmup_ignore_steps
     if (
@@ -1427,12 +1436,14 @@ async def _run_e2e_throughput_async(
                 captured: tuple[bytes, str, str] | None = None
                 if train_call_count == capture_train_call:
                     _collect_matched_packing_shapes(groups)
-                    bundle_payload = _bundle_bytes(
-                        await _capture_training_bundles(groups)
+                    bundle_payload = await asyncio.to_thread(
+                        _bundle_bytes, await _capture_training_bundles(groups)
                     )
                     captured = (
                         bundle_payload,
-                        hashlib.sha256(bundle_payload).hexdigest(),
+                        await asyncio.to_thread(
+                            lambda: hashlib.sha256(bundle_payload).hexdigest()
+                        ),
                         _packed_input_fingerprint(groups),
                     )
                 result = await original_train(*args, **kwargs)
@@ -1448,7 +1459,7 @@ async def _run_e2e_throughput_async(
                     bundle_payload, trajectory_fingerprint, packed_fingerprint = (
                         captured
                     )
-                    bundles_path.write_bytes(bundle_payload)
+                    await asyncio.to_thread(bundles_path.write_bytes, bundle_payload)
                     e2e_phase = _phase_evidence(
                         phase="e2e",
                         runtime_fingerprint=service._runtime_spec().fingerprint,
