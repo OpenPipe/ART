@@ -92,7 +92,7 @@ from ..preprocessing.tokenize import (
     tokenize_sft_batch,
     tokenize_trajectory_groups,
 )
-from ..serving_capabilities import ServingCapabilities
+from ..serving_capabilities import FastMetricsSnapshot, ServingCapabilities
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..trajectories._selection import automatic_training_model_selector
 from ..types import (
@@ -463,19 +463,12 @@ class LocalBackend:
         if capabilities is None:
             raise RuntimeError("vLLM serving capabilities have not been discovered")
         capabilities.require("fast_metrics", operation="ART vLLM metrics collection")
-        base_url = model.inference_base_url
-        if not base_url or not base_url.startswith(("http://", "https://")):
-            raise RuntimeError(
-                "ART vLLM metrics require model.inference_base_url to point to the "
-                "dedicated ART vLLM runtime."
-            )
-
-        metrics_root = base_url.rstrip("/")
-        if metrics_root.endswith("/v1"):
-            metrics_root = metrics_root[: -len("/v1")]
+        endpoint = capabilities.fast_metrics
+        assert endpoint is not None
+        metrics_url = str(endpoint.url)
         try:
             response = await client.get(
-                f"{metrics_root}/art/metrics",
+                metrics_url,
                 headers=(
                     {"Authorization": f"Bearer {model.inference_api_key}"}
                     if model.inference_api_key
@@ -483,47 +476,31 @@ class LocalBackend:
                 ),
             )
             response.raise_for_status()
-            payload = response.json()
+            payload = FastMetricsSnapshot.model_validate(response.json())
         except httpx.TimeoutException:
             raise ArtVllmMetricsTimeoutError(
-                f"Timed out collecting ART vLLM metrics from {metrics_root}."
+                f"Timed out collecting ART vLLM metrics from {metrics_url}."
             )
         except (httpx.HTTPError, ValueError) as exc:
             raise RuntimeError(
-                "ART vLLM metrics require the dedicated ART runtime endpoint at "
-                f"{metrics_root}/art/metrics."
+                f"ART vLLM metrics endpoint returned an invalid response from "
+                f"{metrics_url}."
             ) from exc
 
-        raw_metrics = payload.get("metrics") if isinstance(payload, dict) else None
-        process_uuid = (
-            payload.get("process_uuid") if isinstance(payload, dict) else None
-        )
-        generation = payload.get("generation") if isinstance(payload, dict) else None
-        if (
-            not isinstance(raw_metrics, dict)
-            or not isinstance(process_uuid, str)
-            or not process_uuid
-            or isinstance(generation, bool)
-            or not isinstance(generation, int)
-            or generation < 0
-        ):
-            raise RuntimeError(
-                "ART vLLM metrics endpoint returned an invalid direct-runtime payload."
-            )
+        raw_metrics = payload.metrics
+        process_uuid = payload.process_uuid
+        generation = payload.generation
 
         def required_metric(name: str) -> float:
-            raw_value = raw_metrics.get(name)
-            if not isinstance(raw_value, (int, float)):
+            try:
+                return raw_metrics[name]
+            except KeyError:
                 raise RuntimeError(
                     f"ART vLLM metrics endpoint did not provide numeric {name!r}."
-                )
-            return float(raw_value)
+                ) from None
 
         def optional_metric(name: str) -> float | None:
-            raw_value = raw_metrics.get(name)
-            if not isinstance(raw_value, (int, float)):
-                return None
-            return float(raw_value)
+            return raw_metrics.get(name)
 
         counter_names = (
             "prompt_tokens_total",

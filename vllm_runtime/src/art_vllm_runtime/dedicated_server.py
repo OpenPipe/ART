@@ -3,11 +3,16 @@
 import argparse
 import asyncio
 from functools import lru_cache
+import hashlib
 from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
 import json
 import os
+import secrets
 import socket
-from typing import Any
+import threading
+from typing import Any, cast
 import uuid
 
 from fastapi.responses import JSONResponse
@@ -23,9 +28,10 @@ from art_vllm_runtime.binary_routes import (
 )
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
-ART_SERVING_PROTOCOL_VERSION = 3
+ART_SERVING_PROTOCOL_VERSION = 4
 _runtime_state: dict[str, object] = {}
 _auth_tokens: list[str] = []
+_fast_metrics_port: int | None = None
 
 
 def _patch_prebound_listener_tcp_nodelay(api_server: Any) -> None:
@@ -38,6 +44,123 @@ def _patch_prebound_listener_tcp_nodelay(api_server: Any) -> None:
         return listener
 
     api_server.create_server_socket = create_tcp_server_socket
+
+
+def _art_metrics_snapshot() -> dict[str, Any]:
+    from art_vllm_runtime.metrics import get_art_metrics_snapshot
+
+    snapshot = get_art_metrics_snapshot()
+    snapshot.update(
+        process_uuid=_runtime_state["process_uuid"],
+        generation=_runtime_state["generation"],
+    )
+    return snapshot
+
+
+class _FastMetricsHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, host: str, tokens: list[str], port: int = 0) -> None:
+        self._token_hashes = tuple(
+            hashlib.sha256(token.encode("utf-8")).digest() for token in tokens
+        )
+        super().__init__((host, port), _FastMetricsRequestHandler)
+
+    def get_request(self) -> tuple[socket.socket, Any]:
+        request, address = super().get_request()
+        request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return request, address
+
+    def authorized(self, value: str | None) -> bool:
+        if not self._token_hashes:
+            return True
+        scheme, _, token = (value or "").partition(" ")
+        candidate = hashlib.sha256(token.encode("utf-8")).digest()
+        token_match = False
+        for expected in self._token_hashes:
+            token_match |= secrets.compare_digest(candidate, expected)
+        return scheme.lower() == "bearer" and token_match
+
+
+class _FastMetricsRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:
+        server = cast(_FastMetricsHTTPServer, self.server)
+        if self.path.partition("?")[0] != "/art/metrics":
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not Found"})
+        elif not server.authorized(self.headers.get("Authorization")):
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Unauthorized"})
+        else:
+            self._send_json(HTTPStatus.OK, _art_metrics_snapshot())
+
+    def _send_json(self, status: HTTPStatus, content: object) -> None:
+        body = json.dumps(content, allow_nan=False, separators=(",", ":")).encode()
+        self.send_response(status.value)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return None
+
+
+def _start_fast_metrics_server(
+    host: str, tokens: list[str], port: int = 0
+) -> tuple[_FastMetricsHTTPServer, threading.Thread]:
+    server = _FastMetricsHTTPServer(host, tokens, port)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="art_vllm_fast_metrics",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except BaseException:
+        server.server_close()
+        raise
+    return server, thread
+
+
+def _stop_fast_metrics_server(
+    server: _FastMetricsHTTPServer, thread: threading.Thread
+) -> None:
+    server.shutdown()
+    server.server_close()
+    thread.join()
+
+
+def _fast_metrics_url(request: Any) -> str:
+    if _fast_metrics_port is None:
+        raise RuntimeError("ART fast metrics listener is not running")
+    host = request.url.hostname
+    if host is None:
+        raise RuntimeError("ART capabilities request has no host")
+    try:
+        address = ip_address(host.strip("[]"))
+        unspecified = address.is_unspecified
+        loopback = address.is_loopback
+    except ValueError:
+        unspecified = False
+        loopback = host.casefold() == "localhost"
+    nnodes = _runtime_state.get("nnodes", 1)
+    if isinstance(nnodes, bool) or not isinstance(nnodes, int):
+        raise RuntimeError("ART runtime state has invalid nnodes")
+    if unspecified or (nnodes > 1 and loopback):
+        raise RuntimeError(
+            f"ART fast metrics cannot advertise unroutable host {host!r}"
+        )
+    return str(
+        request.url.replace(
+            scheme="http",
+            port=_fast_metrics_port,
+            path="/art/metrics",
+            query="",
+            fragment="",
+        )
+    )
 
 
 class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
@@ -257,23 +380,16 @@ def _patch_art_runtime_routes() -> None:
 
         @router.get("/art/metrics")
         async def art_metrics() -> JSONResponse:
-            from art_vllm_runtime.metrics import get_art_metrics_snapshot
-
-            snapshot = get_art_metrics_snapshot()
-            snapshot.update(
-                process_uuid=_runtime_state["process_uuid"],
-                generation=_runtime_state["generation"],
-            )
-            return JSONResponse(content=snapshot)
+            return JSONResponse(content=_art_metrics_snapshot())
 
         @router.get("/art/capabilities")
-        async def art_capabilities() -> JSONResponse:
+        async def art_capabilities(raw_request: Request) -> JSONResponse:
             return JSONResponse(
                 content={
                     "runtime": "art_vllm",
                     "protocol_version": ART_SERVING_PROTOCOL_VERSION,
                     "binary_routed_experts": True,
-                    "fast_metrics": True,
+                    "fast_metrics": {"url": _fast_metrics_url(raw_request)},
                     "inplace_lora_load": True,
                     "in_flight_lora_updates": True,
                     "policy_token_spans": True,
@@ -560,6 +676,8 @@ def _validate_pipeline_route_config(config: Any) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    global _fast_metrics_port
+
     args = parse_args(argv)
     if args.rollout_weights_mode == "merged" and not args.lora_path:
         raise SystemExit("--lora-path is required for merged rollout weights")
@@ -691,7 +809,15 @@ def main(argv: list[str] | None = None) -> None:
         namespace.api_server_count = 0
         run_headless(namespace)
     else:
-        asyncio.run(api_server.run_server(namespace))
+        metrics_server, metrics_thread = _start_fast_metrics_server(
+            args.host, _auth_tokens
+        )
+        _fast_metrics_port = metrics_server.server_port
+        try:
+            asyncio.run(api_server.run_server(namespace))
+        finally:
+            _fast_metrics_port = None
+            _stop_fast_metrics_server(metrics_server, metrics_thread)
 
 
 if __name__ == "__main__":
