@@ -146,6 +146,14 @@ class TunerWindowStats(pydantic.BaseModel):
     predicted_stale_frac: float = 0.0
     actual_stale_frac: float = 0.0
     unused_and_dummy_ratio_mean: float = 0.0
+    vllm_poll_samples: int = 0
+    vllm_poll_successes: int = 0
+    vllm_poll_timeouts: int = 0
+    vllm_poll_errors: int = 0
+    vllm_poll_skipped: int = 0
+    vllm_poll_coverage: float = 0.0
+    vllm_poll_schedule_lag_p99_s: float = 0.0
+    vllm_poll_request_latency_p99_s: float = 0.0
 
 
 class TunerDecision(pydantic.BaseModel):

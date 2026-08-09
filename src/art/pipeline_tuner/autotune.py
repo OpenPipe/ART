@@ -146,6 +146,7 @@ class PipelineAutotuner:
         self.policy_age_limit_steps = policy_age_limit_steps
         self.rollout_worker_capacity = rollout_worker_capacity
         self.metrics: list[PipelineMetric] = []
+        self.vllm_pressure_samples: list[tuple[float, float, float]] = []
         self.packed_groups: list[PackedGroupObservation] = []
         self._packing_outcomes: list[PackingOutcome] = []
         self._packing_outcome_steps: set[int] = set()
@@ -165,6 +166,11 @@ class PipelineAutotuner:
         if rec.name != "objective/score" or rec.step is None:
             return None
         return self.maybe_decide(int(rec.step))
+
+    def on_vllm_pressure_sample(
+        self, *, t_s: float, running: float, waiting_capacity: float
+    ) -> None:
+        self.vllm_pressure_samples.append((t_s, running, waiting_capacity))
 
     def on_packed_group(self, rec: PackedGroupObservation) -> None:
         if self.packed_groups and rec.step > self.packed_groups[-1].step:
@@ -190,7 +196,22 @@ class PipelineAutotuner:
         self._emit_stable_recommendations(decision)
         if decision.previous != decision.updated:
             self.settings = decision.updated
+        self._prune_metrics(stats)
         return decision
+
+    def _prune_metrics(self, stats: TunerWindowStats) -> None:
+        raw_cutoff = stats.window_end_s - _vllm_sample_max_age_s(
+            self.config.vllm_metric_interval_s
+        )
+        self.metrics = [
+            rec
+            for rec in self.metrics
+            if (rec.step is None and rec.t_s >= raw_cutoff)
+            or (rec.step is not None and int(rec.step) >= stats.end_step)
+        ]
+        self.vllm_pressure_samples = [
+            sample for sample in self.vllm_pressure_samples if sample[0] >= raw_cutoff
+        ]
 
     def window_stats(self) -> TunerWindowStats | None:
         by_step: dict[int, dict[str, PipelineMetric]] = defaultdict(dict)
@@ -262,6 +283,13 @@ class PipelineAutotuner:
             <= rec.t_s
             <= max(t1, t0 + 1e-6)
         ]
+        vllm_pressure_samples = [
+            sample
+            for sample in self.vllm_pressure_samples
+            if t0 - _vllm_sample_max_age_s(self.config.vllm_metric_interval_s)
+            <= sample[0]
+            <= max(t1, t0 + 1e-6)
+        ]
         window_step_set = set(window_steps)
         packed_group_counts: dict[int, int] = defaultdict(int)
         for obs in self.packed_groups:
@@ -302,12 +330,22 @@ class PipelineAutotuner:
                 idle_frac=trainer_idle_frac,
                 unused_and_dummy_ratio=unused_and_dummy_ratio_mean,
             ),
-            vllm_pressure=_vllm_pressure(
-                vllm_metrics,
-                window_start_s=t0,
-                window_end_s=t1,
-                metric_interval_s=self.config.vllm_metric_interval_s,
-                min_coverage=1.0 - self.config.vllm_metric_timeout_window_frac,
+            vllm_pressure=(
+                _vllm_pressure_from_samples(
+                    vllm_pressure_samples,
+                    window_start_s=t0,
+                    window_end_s=t1,
+                    metric_interval_s=self.config.vllm_metric_interval_s,
+                    min_coverage=1.0 - self.config.vllm_metric_timeout_window_frac,
+                )
+                if vllm_pressure_samples
+                else _vllm_pressure(
+                    vllm_metrics,
+                    window_start_s=t0,
+                    window_end_s=t1,
+                    metric_interval_s=self.config.vllm_metric_interval_s,
+                    min_coverage=1.0 - self.config.vllm_metric_timeout_window_frac,
+                )
             ),
             queue_put_wait_frac=queue_put_wait_s
             / max(queue_put_wait_s + rollout_s, 1e-9),
@@ -1103,11 +1141,44 @@ def _vllm_pressure(
     if not rows:
         raise RuntimeError("Pipeline autotuning requires vLLM runtime metric samples.")
     by_time = _group_vllm_metric_rows(rows)
-    times = sorted(t_s for t_s, values in by_time.items() if wanted <= values.keys())
-    if not times:
+    samples = [
+        (
+            t_s,
+            values["vllm/num_requests_running"],
+            values["vllm/num_requests_waiting_capacity"],
+        )
+        for t_s, values in by_time.items()
+        if wanted <= values.keys()
+    ]
+    if not samples:
         raise RuntimeError(
             "Pipeline autotuning requires complete vLLM running/capacity samples."
         )
+    return _vllm_pressure_from_samples(
+        samples,
+        window_start_s=window_start_s,
+        window_end_s=window_end_s,
+        metric_interval_s=metric_interval_s,
+        min_coverage=min_coverage,
+    )
+
+
+def _vllm_pressure_from_samples(
+    samples: Sequence[tuple[float, float, float]],
+    *,
+    window_start_s: float,
+    window_end_s: float,
+    metric_interval_s: float,
+    min_coverage: float,
+) -> float:
+    by_time = {
+        t_s: (running, waiting_capacity)
+        for t_s, running, waiting_capacity in samples
+        if math.isfinite(running) and math.isfinite(waiting_capacity)
+    }
+    times = sorted(by_time)
+    if not times:
+        raise RuntimeError("Pipeline autotuning requires vLLM pressure samples.")
     window_s = window_end_s - window_start_s
     if window_s <= 0.0:
         raise RuntimeError(
@@ -1130,11 +1201,9 @@ def _vllm_pressure(
     capacity_wait_request_s = 0.0
     running_request_s = 0.0
     for t_s, duration_s in intervals:
-        values = by_time[t_s]
-        capacity_wait_request_s += (
-            max(0.0, values["vllm/num_requests_waiting_capacity"]) * duration_s
-        )
-        running_request_s += max(0.0, values["vllm/num_requests_running"]) * duration_s
+        running, waiting_capacity = by_time[t_s]
+        capacity_wait_request_s += max(0.0, waiting_capacity) * duration_s
+        running_request_s += max(0.0, running) * duration_s
     if total_s <= 0.0:
         raise RuntimeError("Pipeline autotuning requires nonzero vLLM sample duration.")
     if running_request_s > 0.0:

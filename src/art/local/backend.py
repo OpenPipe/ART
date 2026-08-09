@@ -131,6 +131,29 @@ class _PackedTrainingBatch(BaseModel):
     include_moe_routing: bool
 
 
+class _TrainStepVllmMetricsCollector:
+    def __init__(self, backend: "LocalBackend", model: Model) -> None:
+        self._backend = backend
+        self._model = model
+        self._client = httpx.AsyncClient(
+            timeout=1.0,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+        )
+        self._snapshots: dict[
+            tuple[str, str, str, int], tuple[float, dict[str, float]]
+        ] = {}
+
+    async def collect(self) -> dict[str, float]:
+        return await self._backend._collect_train_step_vllm_metrics(
+            self._model,
+            client=self._client,
+            snapshots=self._snapshots,
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+
 def _prometheus_values(text: str, name: str) -> list[float]:
     values: list[float] = []
     for line in text.splitlines():
@@ -411,7 +434,31 @@ class LocalBackend:
             return None
         return per_gpu_cost * gpu_count
 
+    def create_train_step_vllm_metrics_collector(
+        self, model: Model
+    ) -> _TrainStepVllmMetricsCollector:
+        return _TrainStepVllmMetricsCollector(self, model)
+
     async def collect_train_step_vllm_metrics(self, model: Model) -> dict[str, float]:
+        client = self._vllm_metrics_client
+        if client is None:
+            client = self._vllm_metrics_client = httpx.AsyncClient(
+                timeout=1.0,
+                limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
+            )
+        return await self._collect_train_step_vllm_metrics(
+            model,
+            client=client,
+            snapshots=self._vllm_metric_snapshots,
+        )
+
+    async def _collect_train_step_vllm_metrics(
+        self,
+        model: Model,
+        *,
+        client: httpx.AsyncClient,
+        snapshots: dict[tuple[str, str, str, int], tuple[float, dict[str, float]]],
+    ) -> dict[str, float]:
         capabilities = model._serving_capabilities
         if capabilities is None:
             raise RuntimeError("vLLM serving capabilities have not been discovered")
@@ -426,12 +473,6 @@ class LocalBackend:
         metrics_root = base_url.rstrip("/")
         if metrics_root.endswith("/v1"):
             metrics_root = metrics_root[: -len("/v1")]
-        client = self._vllm_metrics_client
-        if client is None:
-            client = self._vllm_metrics_client = httpx.AsyncClient(
-                timeout=1.0,
-                limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
-            )
         try:
             response = await client.get(
                 f"{metrics_root}/art/metrics",
@@ -521,11 +562,11 @@ class LocalBackend:
         now = time.monotonic()
         model_key = self._model_storage_key(model)
         key = (*model_key, process_uuid, generation)
-        previous = self._vllm_metric_snapshots.get(key)
-        self._vllm_metric_snapshots[key] = (now, current)
-        for stale in tuple(self._vllm_metric_snapshots):
+        previous = snapshots.get(key)
+        snapshots[key] = (now, current)
+        for stale in tuple(snapshots):
             if stale[:2] == model_key and stale != key:
-                del self._vllm_metric_snapshots[stale]
+                del snapshots[stale]
         delta_queries = 0.0
         if previous is not None:
             previous_time, previous_snapshot = previous
