@@ -66,7 +66,8 @@ def create_identity_lora(
     ) -> torch.nn.Module:
         device = kwargs.get("device") or (args[0] if args else None)
         if device == meta or str(device) == "meta":
-            return module
+            dtype = kwargs.get("dtype")
+            return module if dtype is None else orig_to(module, dtype=dtype)
         return orig_to(module, *args, **kwargs)
 
     with warnings.catch_warnings():

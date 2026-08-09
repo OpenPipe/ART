@@ -1096,8 +1096,16 @@ def _make_nonzero_adapter(
             handler=handler,
         )
     published_config = load_adapter_config(adapter_path)
+    published_tensors = load_vllm_lora_tensors(adapter_path)
+    invalid_dtypes = {
+        key: str(value.dtype)
+        for key, value in published_tensors.items()
+        if value.dtype != torch.bfloat16
+    }
+    if invalid_dtypes:
+        raise RuntimeError(f"Identity LoRA tensors must be BF16: {invalid_dtypes}")
     templates = handler.from_vllm_lora_tensors(
-        load_vllm_lora_tensors(adapter_path),
+        published_tensors,
         adapter_config=published_config,
     )
     if not templates:
