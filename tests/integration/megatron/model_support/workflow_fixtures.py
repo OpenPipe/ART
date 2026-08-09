@@ -16,7 +16,8 @@ from pydantic import BaseModel, ConfigDict
 FIXTURE_PATH_ENV = "ART_MODEL_SUPPORT_FIXTURE_PATH"
 FIXTURE_CACHE_ENV = "ART_MODEL_SUPPORT_FIXTURE_CACHE"
 FIXTURE_ROOT_ENV = "ART_MODEL_SUPPORT_FIXTURE_ROOT"
-FIXTURE_VERSION = 16
+FIXTURE_VERSION = 17
+_CANONICAL_CACHE_VERSION = 16
 _ROOT = Path("/tmp/art-models/main-merge-oracle")
 _CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
 _TOKENIZER_FIXTURE_ROOT = Path("/tmp/art-model-support-workflow/tokenizer-compatible")
@@ -696,7 +697,7 @@ def _canonical_snapshot(
 ) -> tuple[Path, Path]:
     from huggingface_hub import snapshot_download
 
-    hf_home = _CANONICAL_CACHE_ROOT / f"v{FIXTURE_VERSION}" / model_key
+    hf_home = _CANONICAL_CACHE_ROOT / f"v{_CANONICAL_CACHE_VERSION}" / model_key
     snapshot = snapshot_download(
         repo_id=canonical_model,
         revision=revision,
