@@ -262,6 +262,8 @@ class _GenerationPublisher:
 
         wait_s, in_flight = self._acquire_slot()
         prepare_started = time.perf_counter()
+        optimizer_handoff: Future[Any] = Future()
+        transport: Future[Future[TrainerRankPublication]] | None = None
         try:
             lora = stage_vllm_lora_snapshot_from_model(
                 model=self.runtime.model,
@@ -272,6 +274,17 @@ class _GenerationPublisher:
                 world_size=self.runtime.world_size,
                 stager=self.stager,
             )
+            lora_launch_s = time.perf_counter() - prepare_started
+            transport = self._enqueue_transport(
+                generation=job.output.generation,
+                optimizer_state_path=job.output.optimizer_state_path,
+                staging_adapter_path=job.output.staging_adapter_path,
+                lora=lora,
+                adapter=None,
+                optimizer=optimizer_handoff,
+                publication_targets=getattr(job, "publication_targets", ()),
+            )
+            optimizer_started = time.perf_counter()
             optimizer = (
                 stage_optimizer_state_snapshot(
                     self.runtime,
@@ -284,33 +297,32 @@ class _GenerationPublisher:
             )
             if optimizer is not None:
                 self.runtime.optimizer_snapshot_barrier.register(optimizer)
+            optimizer_handoff.set_result(optimizer)
         except BaseException as error:
-            try:
-                sink.publication(
-                    TrainerPublicationFailed(
-                        generation_id=job.output_generation_id,
-                        rank=int(self.runtime.rank),
-                        error_type=type(error).__name__,
-                        message=str(error) or type(error).__name__,
-                    )
-                )
-            finally:
-                self._release_slot()
+            publication_error = error
+            if transport is not None:
+                optimizer_handoff.set_exception(error)
+                publication_error = self._drain_transport(transport, error)
+            self._report_failure(
+                publication_error,
+                sink=sink,
+                generation=job.output.generation,
+                remember=False,
+            )
             raise
-        self._enqueue_transport(
-            generation=job.output.generation,
-            optimizer_state_path=job.output.optimizer_state_path,
-            staging_adapter_path=job.output.staging_adapter_path,
-            lora=lora,
-            adapter=None,
-            optimizer=optimizer,
-            publication_targets=getattr(job, "publication_targets", ()),
-            sink=sink,
+        transport.add_done_callback(
+            lambda done: self._transport_completed(
+                done,
+                sink=sink,
+                generation=job.output.generation,
+            )
         )
         return {
             "snapshot_pool_wait_s": wait_s,
             "snapshot_pool_in_use": float(in_flight),
             "snapshot_pool_pressure": in_flight / self.capacity,
+            "snapshot_lora_launch_s": lora_launch_s,
+            "snapshot_optimizer_launch_s": time.perf_counter() - optimizer_started,
             "snapshot_launch_s": time.perf_counter() - prepare_started,
         }
 
@@ -325,22 +337,20 @@ class _GenerationPublisher:
 
     def _enqueue_transport(
         self,
-        *,
-        sink: EventSink,
         **kwargs: Any,
-    ) -> None:
+    ) -> Future[Future[TrainerRankPublication]]:
+        return self._transport_pool.submit(self._transport_snapshot, **kwargs)
+
+    @staticmethod
+    def _drain_transport(
+        transport: Future[Future[TrainerRankPublication]],
+        fallback: BaseException,
+    ) -> BaseException:
         try:
-            future = self._transport_pool.submit(self._transport_snapshot, **kwargs)
-        except BaseException:
-            self._release_slot()
-            raise
-        future.add_done_callback(
-            lambda done: self._transport_completed(
-                done,
-                sink=sink,
-                generation=kwargs["generation"],
-            )
-        )
+            transport.result().result()
+        except BaseException as error:
+            return error
+        return fallback
 
     def _transport_snapshot(
         self,
@@ -350,7 +360,7 @@ class _GenerationPublisher:
         staging_adapter_path: str | None,
         lora: Any,
         adapter: "OptimizerAdapter | None",
-        optimizer: Any,
+        optimizer: Future[Any],
         publication_targets: tuple[Any, ...],
     ) -> Future[TrainerRankPublication]:
         lora = None if lora is None else lora.resolve()
@@ -391,20 +401,23 @@ class _GenerationPublisher:
         staging_adapter_path: str | None,
         lora: Any,
         adapter: "OptimizerAdapter | None",
-        optimizer: Any,
+        optimizer: Future[Any],
         prepared_tensors: PreparedSafetensors | None,
         failures: list[BaseException],
     ) -> TrainerRankPublication:
         record: TrainerRankPublication | None = None
         try:
-            optimizer = None if optimizer is None else optimizer.resolve()
+            pending_optimizer = optimizer.result()
+            resolved_optimizer = (
+                None if pending_optimizer is None else pending_optimizer.resolve()
+            )
             record = self._persist_generation(
                 generation=generation,
                 optimizer_state_path=optimizer_state_path,
                 staging_adapter_path=staging_adapter_path,
                 lora=lora,
                 adapter=adapter,
-                optimizer=optimizer,
+                optimizer=resolved_optimizer,
                 prepared_tensors=prepared_tensors,
             )
         except BaseException as error:
@@ -535,8 +548,19 @@ class _GenerationPublisher:
         sink: EventSink,
         generation: TrainerGeneration,
     ) -> None:
-        with self._lock:
-            self._failures.append(error)
+        self._report_failure(error, sink=sink, generation=generation, remember=True)
+
+    def _report_failure(
+        self,
+        error: BaseException,
+        *,
+        sink: EventSink,
+        generation: TrainerGeneration,
+        remember: bool,
+    ) -> None:
+        if remember:
+            with self._lock:
+                self._failures.append(error)
         event = TrainerPublicationFailed(
             generation_id=generation.generation_id,
             rank=int(self.runtime.rank),

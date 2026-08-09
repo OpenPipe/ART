@@ -462,7 +462,7 @@ _THROUGHPUT_CONFIGS = {
         completion_tokens=256,
         rollouts_per_group=6,
         groups_per_step=24,
-        initial_model_calls_per_inference_gpu=26,
+        initial_model_calls_per_inference_gpu=20,
         max_steps=35,
     ),
     "qwen3_dense": ThroughputWorkflowConfig(
@@ -470,7 +470,7 @@ _THROUGHPUT_CONFIGS = {
         completion_tokens=144,
         rollouts_per_group=8,
         groups_per_step=25,
-        initial_model_calls_per_inference_gpu=9,
+        initial_model_calls_per_inference_gpu=10,
         max_steps=35,
     ),
     "qwen3_moe": ThroughputWorkflowConfig(
@@ -478,8 +478,8 @@ _THROUGHPUT_CONFIGS = {
         prompt_tokens=3884,
         completion_tokens=48,
         rollouts_per_group=5,
-        groups_per_step=31,
-        initial_model_calls_per_inference_gpu=22,
+        groups_per_step=27,
+        initial_model_calls_per_inference_gpu=20,
         max_steps=35,
     ),
     "qwen3_5_dense": ThroughputWorkflowConfig(
@@ -523,7 +523,6 @@ _THROUGHPUT_CONFIGS = {
         completion_tokens=768,
         groups_per_step=8,
         initial_model_calls_per_inference_gpu=20,
-        max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
     ),
     "glm52": ThroughputWorkflowConfig(
         num_layers=12,
@@ -534,7 +533,7 @@ _THROUGHPUT_CONFIGS = {
     ),
     "gpt_oss_moe": ThroughputWorkflowConfig(
         num_layers=4,
-        initial_model_calls_per_inference_gpu=20,
+        initial_model_calls_per_inference_gpu=24,
         max_num_seqs=48,
         max_steps=35,
     ),
