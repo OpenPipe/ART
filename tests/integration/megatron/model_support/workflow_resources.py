@@ -496,7 +496,7 @@ _THROUGHPUT_CONFIGS = {
         prompt_tokens=7600,
         completion_tokens=16,
         groups_per_step=17,
-        initial_model_calls_per_inference_gpu=11,
+        initial_model_calls_per_inference_gpu=12,
         max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
         max_steps=35,
         enable_prefix_caching=True,
@@ -538,6 +538,102 @@ _THROUGHPUT_CONFIGS = {
         max_steps=35,
     ),
 }
+
+# Floors are isolated tok/s, E2E tok/s, accepted tok/s, E2E/isolated, and
+# maximum policy-activation interval. B300 values are measured; H200 values are
+# estimates from the prior H200 workflow and remain intentionally fingerprint-free.
+_B300_THROUGHPUT_FLOORS = {
+    "llama3_dense": (
+        "06c41c11098959e33fbc5fc590b94e06018d845b8ed5924ad436d0d321200f53",
+        (49_500, 47_300, 12_900, 0.90, 4.5),
+    ),
+    "qwen3_dense": (
+        "aead56dc369f7e2b2a58a3aa50aa8275def7b595c60f81a1fc7de18c98e851df",
+        (40_200, 37_600, 8_600, 0.88, 4.5),
+    ),
+    "qwen3_moe": (
+        "c4344681bf8909951060e048d5c1175c86d10349f78a876f40e0b473a2e6781c",
+        (49_900, 43_700, 2_050, 0.82, 4.5),
+    ),
+    "qwen3_5_dense": (
+        "c78ad73ed5696802ec256be61a9a57bdd52d1911b853deb66e933cbe74e2a7e7",
+        (64_800, 60_000, 3_750, 0.87, 3.5),
+    ),
+    "qwen3_5_moe": (
+        "d1fcc2704b7fa43b50b3fe9cd76973ecdcc21c7d2630b6fa70cf89f699937925",
+        (32_600, 30_800, 257, 0.89, 5.5),
+    ),
+    "gemma4_dense": (
+        "7b170fd0d3732b0e6b39efa140e3db4677e9cdcac4dcd67d7c2332ea6b3e6fa4",
+        (23_100, 22_700, 2_390, 0.93, 7.0),
+    ),
+    "gemma4_moe": (
+        "f61a86b7ec35298ca2bee88a7de8772b94da56d693fb4cc9e11195d767cca4f7",
+        (40_300, 38_500, 4_740, 0.90, 5.0),
+    ),
+    "dsv4": (
+        "02d4b89a1c83fda941a18b0e08eea4c1a045f56308876ecd3d50799a0a9a5046",
+        (7_050, 7_020, 1_350, 0.94, 43.0),
+    ),
+    "glm52": (
+        "f541f548b8d550c27f1380d127054fc571f2a824b1f34dd4263e9128b4297769",
+        (14_880, 14_330, 5_730, 0.91, 12.0),
+    ),
+    "gpt_oss_moe": (
+        "e104341db54f90cb37f259c27be57731a30c7fb3705d110057e9041e6c7bbc38",
+        (81_700, 76_400, 4_850, 0.88, 2.5),
+    ),
+}
+_H200_THROUGHPUT_FLOORS = {
+    "llama3_dense": (27_500, 25_900, 6_600, 0.89, 7.0),
+    "qwen3_dense": (24_100, 23_100, 5_000, 0.91, 7.0),
+    "qwen3_moe": (26_400, 20_900, 930, 0.74, 10.0),
+    "qwen3_5_dense": (26_500, 25_600, 1_500, 0.91, 5.5),
+    "qwen3_5_moe": (13_600, 12_900, 100, 0.90, 12.0),
+    "gemma4_dense": (10_600, 10_400, 1_000, 0.93, 13.0),
+    "gemma4_moe": (17_900, 17_300, 2_000, 0.91, 9.5),
+    "dsv4": (3_500, 3_400, 620, 0.94, 80.0),
+    "glm52": (9_400, 9_000, 3_400, 0.91, 19.5),
+    "gpt_oss_moe": (39_900, 37_100, 2_200, 0.88, 4.5),
+}
+
+
+def _throughput_threshold(
+    calibration_basis: Literal["measured", "estimated"],
+    floor: tuple[float, float, float, float, float],
+    *,
+    calibration_fingerprint: str | None = None,
+) -> ThroughputThresholds:
+    isolated, e2e, accepted, ratio, cadence = floor
+    return ThroughputThresholds(
+        calibration_basis=calibration_basis,
+        calibration_fingerprint=calibration_fingerprint,
+        min_isolated_train_tok_s=isolated,
+        min_e2e_train_tok_s=e2e,
+        min_accepted_train_tok_s=accepted,
+        min_e2e_to_isolated_ratio=ratio,
+        min_matched_core_to_isolated_ratio=0.95,
+        max_policy_activation_lag_s=2.0,
+        max_policy_activation_interval_s=cadence,
+    )
+
+
+for _model_key, (_fingerprint, _b300_floor) in _B300_THROUGHPUT_FLOORS.items():
+    _THROUGHPUT_CONFIGS[_model_key] = _THROUGHPUT_CONFIGS[_model_key].model_copy(
+        update={
+            "thresholds": {
+                "b300": _throughput_threshold(
+                    "measured",
+                    _b300_floor,
+                    calibration_fingerprint=_fingerprint,
+                ),
+                "h200": _throughput_threshold(
+                    "estimated", _H200_THROUGHPUT_FLOORS[_model_key]
+                ),
+            }
+        }
+    )
+
 _DENSE_HANDLER_KEYS = {
     "llama3_dense",
     "qwen3_dense",
