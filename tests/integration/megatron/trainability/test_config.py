@@ -34,6 +34,8 @@ from .yes_no_trainability import (
     _default_variant_name,
     _evaluate_groups,
     _get_env_int_list,
+    _rescore_groups,
+    _select_answer_target,
     _TrainabilityVariant,
     _variant_init_args,
     _variant_max_steps,
@@ -41,6 +43,7 @@ from .yes_no_trainability import (
     _variant_rollouts_per_prompt,
     _variant_train_kwargs,
     build_prompts,
+    reward_for_answer,
     yes_no_trainability_passed,
 )
 from .yes_no_trainability import (
@@ -129,8 +132,56 @@ def test_integer_list_rejects_empty_values(monkeypatch) -> None:
         _get_env_int_list("INVALID_INTEGER_LIST")
 
 
+def test_answer_target_is_least_common_with_stable_tie_order() -> None:
+    assert _select_answer_target(["maybe", "Maybe.", "invalid"]) == "yes"
+    assert _select_answer_target(["yes", "YES", "no", "invalid"]) == "maybe"
+    assert _select_answer_target(["yes", "no", "maybe"]) == "yes"
+
+
+def test_reward_for_answer_preserves_default_and_supports_target() -> None:
+    answers = ["yes", "No.", "MAYBE!", "invalid"]
+
+    assert [reward_for_answer(answer) for answer in answers] == [0.5, 0.75, 1.0, 0.0]
+    assert [reward_for_answer(answer, target="no") for answer in answers] == [
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+    ]
+
+
+def test_initial_groups_can_be_rescored_for_selected_target() -> None:
+    group = art.TrajectoryGroup(
+        [
+            art.Trajectory(
+                messages_and_choices=[
+                    Choice(
+                        finish_reason="stop",
+                        index=index,
+                        message=ChatCompletionMessage(
+                            role="assistant",
+                            content=answer,
+                        ),
+                    )
+                ],
+                reward=-1.0,
+            )
+            for index, answer in enumerate(["yes", "no", "maybe", "invalid"])
+        ]
+    )
+
+    _rescore_groups([group], target="no")
+
+    assert [trajectory.reward for trajectory in group.trajectories] == [
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+    ]
+
+
 @pytest.mark.asyncio
-async def test_eval_prompts_are_submitted_concurrently() -> None:
+async def test_eval_prompts_are_submitted_concurrently_with_target_reward() -> None:
     completions = _ConcurrentCompletions(expected=3)
 
     groups = await _evaluate_groups(
@@ -138,12 +189,13 @@ async def test_eval_prompts_are_submitted_concurrently() -> None:
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         prompts=["a", "b", "c"],
         step=1,
+        target="yes",
     )
 
     assert len(groups) == 3
     assert completions.started == 3
     assert completions.max_active == 3
-    assert [group.trajectories[0].reward for group in groups] == [1.0, 1.0, 1.0]
+    assert [group.trajectories[0].reward for group in groups] == [0.0, 0.0, 0.0]
 
 
 def test_megatron_variants_keep_short_packed_sequence_default(monkeypatch) -> None:
@@ -225,6 +277,7 @@ def test_yes_no_trainability_rejects_initially_saturated_stable_report() -> None
         backend_name="megatron",
         placement_mode="shared",
         base_model="google/gemma-4-31B-it",
+        target_answer="maybe",
         output_dir="/tmp/report",
         trainer_gpu_ids=[0, 1],
         inference_gpu_ids=[0, 1],
@@ -259,6 +312,7 @@ def test_yes_no_trainability_requires_gradient_correlation_and_learning() -> Non
         backend_name="megatron",
         placement_mode="dedicated",
         base_model="deepseek-ai/DeepSeek-V4-Flash",
+        target_answer="yes",
         output_dir="/tmp/report",
         trainer_gpu_ids=[0, 1],
         inference_gpu_ids=[2, 3],

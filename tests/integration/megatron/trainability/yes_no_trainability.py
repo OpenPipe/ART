@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 import gc
 import os
 from pathlib import Path
 import re
 import time
-from typing import Any, AsyncIterator, Iterator, Literal, TypedDict, cast
+from typing import Any, AsyncIterator, Iterable, Iterator, Literal, TypedDict, cast
 import uuid
 
+from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, Field
 import torch
 
@@ -48,6 +50,8 @@ _VARIANT_NAME = Literal[
     "unsloth_dedicated",
 ]
 _RESOURCE_STAGE_NAME = Literal["yes_no_trainability", "length_trainability"]
+_Answer = Literal["yes", "no", "maybe"]
+_ANSWER_TARGETS: tuple[_Answer, ...] = ("yes", "no", "maybe")
 
 
 class _TrainKwargs(TypedDict, total=False):
@@ -66,6 +70,7 @@ class YesNoTrainabilityReport(BaseModel):
     backend_name: Literal["megatron", "local"]
     placement_mode: Literal["shared", "dedicated"]
     base_model: str
+    target_answer: _Answer
     output_dir: str
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
@@ -288,9 +293,12 @@ def _safe_gpu_memory_utilization(device_ids: list[int]) -> float:
     )
 
 
-def reward_for_answer(text: str) -> float:
+def reward_for_answer(text: str, *, target: _Answer | None = None) -> float:
+    answer = first_word_for_answer(text).lower()
+    if target is not None:
+        return float(answer == target)
     return {"yes": 0.5, "no": 0.75, "maybe": 1.0}.get(
-        first_word_for_answer(text).lower(),
+        answer,
         0.0,
     )
 
@@ -308,6 +316,28 @@ def first_word_for_answer(text: str | None) -> str:
     if not first_word:
         return ""
     return first_word[0].strip(".,!?:;\"'()[]{}")
+
+
+def _select_answer_target(texts: Iterable[str | None]) -> _Answer:
+    counts = Counter(
+        answer
+        for text in texts
+        if (answer := first_word_for_answer(text).lower()) in _ANSWER_TARGETS
+    )
+    return min(_ANSWER_TARGETS, key=lambda answer: counts[answer])
+
+
+def _trajectory_answer_text(trajectory: art.Trajectory) -> str:
+    choice = cast(Choice, trajectory.messages_and_choices[-1])
+    return choice.message.content or ""
+
+
+def _rescore_groups(groups: list[art.TrajectoryGroup], *, target: _Answer) -> None:
+    for group in groups:
+        for trajectory in group.trajectories:
+            trajectory.reward = reward_for_answer(
+                _trajectory_answer_text(trajectory), target=target
+            )
 
 
 def _get_env_int(name: str, default: int) -> int:
@@ -792,6 +822,7 @@ async def _evaluate_groups(
     base_model: str,
     prompts: list[str],
     step: int,
+    target: _Answer | None = None,
 ) -> list[art.TrajectoryGroup]:
     client = model.openai_client()
 
@@ -813,7 +844,9 @@ async def _evaluate_groups(
             [
                 art.Trajectory(
                     messages_and_choices=[*messages, choice],
-                    reward=reward_for_answer(choice.message.content or ""),
+                    reward=reward_for_answer(
+                        choice.message.content or "", target=target
+                    ),
                 )
             ]
         )
@@ -836,6 +869,7 @@ async def _evaluate_model(
     base_model: str,
     prompts: list[str],
     step: int,
+    target: _Answer | None = None,
 ) -> float:
     return _mean_group_reward(
         await _evaluate_groups(
@@ -843,6 +877,7 @@ async def _evaluate_model(
             base_model=base_model,
             prompts=prompts,
             step=step,
+            target=target,
         )
     )
 
@@ -853,6 +888,7 @@ async def _build_training_groups(
     base_model: str,
     prompts: list[str],
     rollouts_per_prompt: int,
+    target: _Answer | None = None,
 ) -> list[art.TrajectoryGroup]:
     client = model.openai_client()
 
@@ -877,7 +913,9 @@ async def _build_training_groups(
             [
                 art.Trajectory(
                     messages_and_choices=[*messages, choice],
-                    reward=reward_for_answer(choice.message.content or ""),
+                    reward=reward_for_answer(
+                        choice.message.content or "", target=target
+                    ),
                 )
                 for choice in completion.choices
             ]
@@ -898,6 +936,7 @@ async def _build_trainable_groups(
     base_model: str,
     prompts: list[str],
     rollouts_per_prompt: int,
+    target: _Answer | None = None,
 ) -> list[art.TrajectoryGroup]:
     max_attempts = _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_ROLLOUT_ATTEMPTS", 4)
     for _ in range(max_attempts):
@@ -906,6 +945,7 @@ async def _build_trainable_groups(
             base_model=base_model,
             prompts=prompts,
             rollouts_per_prompt=rollouts_per_prompt,
+            target=target,
         )
         trainable_groups = [
             group for group in groups if _group_has_reward_variance(group)
@@ -1016,6 +1056,12 @@ async def run_yes_no_trainability_async(
                 prompts=eval_prompts,
                 step=0,
             )
+        target_answer = _select_answer_target(
+            _trajectory_answer_text(trajectory)
+            for group in initial_eval_groups
+            for trajectory in group.trajectories
+        )
+        _rescore_groups(initial_eval_groups, target=target_answer)
         initial_eval_reward = _mean_group_reward(initial_eval_groups)
         await model.log(initial_eval_groups, step=0, split="val")
         report = YesNoTrainabilityReport(
@@ -1023,6 +1069,7 @@ async def run_yes_no_trainability_async(
             backend_name=variant.backend_name,
             placement_mode=variant.placement_mode,
             base_model=base_model,
+            target_answer=target_answer,
             output_dir=str(output_dir),
             trainer_gpu_ids=variant.trainer_gpu_ids,
             inference_gpu_ids=variant.inference_gpu_ids,
@@ -1047,6 +1094,7 @@ async def run_yes_no_trainability_async(
                 base_model=base_model,
                 prompts=prompts,
                 rollouts_per_prompt=rollouts_per_prompt,
+                target=target_answer,
             )
             result = await backend.train(
                 model,
@@ -1070,6 +1118,7 @@ async def run_yes_no_trainability_async(
                     base_model=base_model,
                     prompts=eval_prompts,
                     step=result.step,
+                    target=target_answer,
                 )
             eval_reward = _mean_group_reward(eval_groups)
             await model.log(eval_groups, step=result.step, split="val")
