@@ -454,11 +454,11 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
 
 _THROUGHPUT_CONFIGS = {
     "llama3_dense": ThroughputWorkflowConfig(
-        num_layers=16,
+        num_layers=8,
         prompt_tokens=3922,
         completion_tokens=504,
         groups_per_step=22,
-        initial_model_calls_per_inference_gpu=40,
+        initial_model_calls_per_inference_gpu=22,
     ),
     "qwen3_dense": ThroughputWorkflowConfig(
         num_layers=8,
@@ -471,7 +471,7 @@ _THROUGHPUT_CONFIGS = {
         prompt_tokens=3884,
         completion_tokens=64,
         groups_per_step=31,
-        initial_model_calls_per_inference_gpu=40,
+        initial_model_calls_per_inference_gpu=36,
     ),
     "qwen3_5_dense": ThroughputWorkflowConfig(
         num_layers=8,
@@ -487,7 +487,11 @@ _THROUGHPUT_CONFIGS = {
         max_steps=35,
         enable_prefix_caching=True,
     ),
-    "gemma4_dense": ThroughputWorkflowConfig(num_layers=12),
+    "gemma4_dense": ThroughputWorkflowConfig(
+        num_layers=12,
+        completion_tokens=80,
+        groups_per_step=31,
+    ),
     "gemma4_moe": ThroughputWorkflowConfig(
         num_layers=12,
         prompt_tokens=3640,
@@ -500,15 +504,15 @@ _THROUGHPUT_CONFIGS = {
         prompt_tokens=12_800,
         completion_tokens=768,
         groups_per_step=8,
-        initial_model_calls_per_inference_gpu=24,
+        initial_model_calls_per_inference_gpu=16,
         max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
     ),
     "glm52": ThroughputWorkflowConfig(
         num_layers=12,
         prompt_tokens=3836,
-        completion_tokens=280,
-        groups_per_step=26,
-        initial_model_calls_per_inference_gpu=48,
+        completion_tokens=640,
+        groups_per_step=20,
+        initial_model_calls_per_inference_gpu=18,
     ),
     "gpt_oss_moe": ThroughputWorkflowConfig(
         num_layers=4,
