@@ -224,7 +224,7 @@ class ReplicaManager:
         template: ReplicaLaunchTemplate,
         *,
         on_failure: Callable[[ReplicaFailure], Awaitable[None]] | None = None,
-        startup_timeout_s: float = 300.0,
+        startup_timeout_s: float = 600.0,
         rpc_timeout_s: float = 60.0,
         monitor_interval_s: float = 0.25,
     ) -> None:
@@ -281,7 +281,7 @@ class ReplicaManager:
             for request in requests
         ]
         try:
-            async with asyncio.timeout(self._startup_timeout_s):
+            async with asyncio.timeout(self._startup_timeout_s + self._rpc_timeout_s):
                 members = await asyncio.gather(*tasks)
             if any(member.phase != "ready" for member in members):
                 raise RuntimeError(f"vLLM gang was not ready: {members!r}")

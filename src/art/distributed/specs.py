@@ -116,7 +116,7 @@ class ClusterSpec(_Spec):
     cache_root: str | None = Field(default=None, min_length=1)
     nccl_transport: NcclTransportSpec | None = None
     nixl_transport: NixlTransportSpec | None = None
-    startup_timeout_s: float = Field(default=300.0, gt=0)
+    startup_timeout_s: float = Field(default=600.0, gt=0)
     rpc_timeout_s: float = Field(default=60.0, gt=0)
 
     @model_validator(mode="after")
