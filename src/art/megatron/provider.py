@@ -12,6 +12,7 @@ from megatron.bridge.training.flex_dispatcher_backend import (
 from megatron.core.transformer.enums import AttnBackend
 from pydantic import BaseModel, ConfigDict
 import torch
+from transformers import AutoConfig
 
 from art.megatron.expert_parallel import (
     activate_expert_parallel_layout,
@@ -632,6 +633,7 @@ def _build_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype,
+    load_weights: bool = True,
     allow_unvalidated_arch: bool = False,
     model_support_key: str | None = None,
 ) -> ProviderBundle:
@@ -645,12 +647,25 @@ def _build_provider_bundle(
     )
     ensure_model_support_bridge_registered_for_spec(spec)
     handler = get_model_support_handler_for_spec(spec)
-    bridge = AutoBridge.from_hf_pretrained(
-        model,
-        dtype=torch_dtype,
-        trust_remote_code=True,
+    if load_weights:
+        bridge = AutoBridge.from_hf_pretrained(
+            model,
+            dtype=torch_dtype,
+            trust_remote_code=True,
+        )
+    else:
+        bridge = AutoBridge.from_hf_config(
+            AutoConfig.from_pretrained(
+                model,
+                dtype=torch_dtype,
+                trust_remote_code=True,
+            )
+        )
+    provider = (
+        bridge.to_megatron_provider()
+        if load_weights
+        else bridge.to_megatron_provider(load_weights=False)
     )
-    provider = bridge.to_megatron_provider()
     handler.patch_bridge(bridge)
     return ProviderBundle(
         provider=provider,
@@ -664,6 +679,7 @@ def prepare_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
+    load_weights: bool = True,
     allow_unvalidated_arch: bool = False,
     model_support_key: str | None = None,
 ) -> ProviderBundle:
@@ -671,6 +687,7 @@ def prepare_provider_bundle(
     bundle = _build_provider_bundle(
         model,
         torch_dtype=torch_dtype,
+        load_weights=load_weights,
         allow_unvalidated_arch=allow_unvalidated_arch,
         model_support_key=model_support_key,
     )
@@ -808,6 +825,7 @@ def get_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
+    load_weights: bool = True,
     allow_unvalidated_arch: bool = False,
     model_support_key: str | None = None,
 ) -> ProviderBundle:
@@ -815,6 +833,7 @@ def get_provider_bundle(
         prepare_provider_bundle(
             model,
             torch_dtype=torch_dtype,
+            load_weights=load_weights,
             allow_unvalidated_arch=allow_unvalidated_arch,
             model_support_key=model_support_key,
         )
@@ -825,12 +844,14 @@ def get_provider(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
+    load_weights: bool = True,
     allow_unvalidated_arch: bool = False,
     model_support_key: str | None = None,
 ) -> GPTModelProvider:
     return get_provider_bundle(
         model,
         torch_dtype=torch_dtype,
+        load_weights=load_weights,
         allow_unvalidated_arch=allow_unvalidated_arch,
         model_support_key=model_support_key,
     ).provider

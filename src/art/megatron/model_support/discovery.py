@@ -47,6 +47,7 @@ def inspect_architecture(
     provider_bundle = get_provider_bundle(
         base_model,
         torch_dtype=torch_dtype,
+        load_weights=False,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     discovered = provider_bundle.handler.collect_layer_families(

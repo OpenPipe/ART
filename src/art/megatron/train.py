@@ -407,6 +407,7 @@ def build_training_runtime(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
         torch_dtype=provider_torch_dtype,
+        load_weights=model_initialization == "pretrained",
         allow_unvalidated_arch=(
             os.environ.get("ART_MEGATRON_ALLOW_UNVALIDATED_ARCH", "").strip().lower()
             in {"1", "true", "yes", "on"}
@@ -418,7 +419,7 @@ def build_training_runtime(
     if model_initialization == "random":
         hooks = list(getattr(provider_bundle.provider, "_pre_wrap_hooks", ()))
         checkpoint_hooks = [hook for hook in hooks if _is_bridge_hf_load_hook(hook)]
-        if not hooks or len(checkpoint_hooks) != len(hooks):
+        if len(checkpoint_hooks) != len(hooks):
             raise RuntimeError(
                 "random model initialization requires only Bridge checkpoint loaders; "
                 f"found {len(checkpoint_hooks)} loaders among {len(hooks)} hooks"
