@@ -398,12 +398,12 @@ def _real_path_max_model_len(
     prompts: list[str],
     chat_template_kwargs: dict[str, Any],
 ) -> int:
-    def prompt_tokens(prompt: str) -> int:
+    def rendered_tokens(messages: list[dict[str, str]], **kwargs: Any) -> int:
         encoded = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
+            messages,
             tokenize=True,
-            add_generation_prompt=True,
             **chat_template_kwargs,
+            **kwargs,
         )
         token_ids = encoded["input_ids"] if isinstance(encoded, Mapping) else encoded
         shape: Any = getattr(token_ids, "shape", ())
@@ -413,9 +413,17 @@ def _real_path_max_model_len(
             return len(token_ids[0])
         return len(token_ids)
 
+    def completed_tokens(prompt: str) -> int:
+        messages = [{"role": "user", "content": prompt}]
+        prompt_tokens = rendered_tokens(messages, add_generation_prompt=True)
+        closed_tokens = rendered_tokens(
+            [*messages, {"role": "assistant", "content": ""}],
+            add_generation_prompt=False,
+        )
+        return max(prompt_tokens, closed_tokens) + config.max_completion_tokens
+
     return max(
-        config.output_parity.packed.sequence_length,
-        max(prompt_tokens(prompt) + config.max_completion_tokens for prompt in prompts),
+        config.output_parity.packed.sequence_length, *map(completed_tokens, prompts)
     )
 
 
@@ -1131,6 +1139,8 @@ def _make_nonzero_adapter(
 
 
 def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
+    from transformers import AutoConfig
+
     from art.megatron.model_support import (
         get_model_support_handler,
         vllm_lora_config_for_model,
@@ -1158,9 +1168,13 @@ def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
         allow_unvalidated_arch=config.allow_unvalidated_arch,
     )
     handler_module = Path(inspect.getfile(type(handler)))
+    model_config = handler.identity_lora_model_config(
+        AutoConfig.from_pretrained(config.base_model, trust_remote_code=True)
+    ).to_json_string(use_diff=False)
     payload = {
-        "schema": 3,
+        "schema": 4,
         "base_model": config.base_model,
+        "model_config_sha256": hashlib.sha256(model_config.encode()).hexdigest(),
         "seed": config.seed,
         "allow_unvalidated_arch": config.allow_unvalidated_arch,
         "lora_target_modules": _lora_target_modules(config),
