@@ -518,7 +518,7 @@ class _ArtP2PCommunicator(P2PCommunicator):
             tensor_shape = torch.Size(
                 (*tensor_shape[:-1], multiplier, tensor_shape[-1])
             )
-        return super()._communicate(tensor_shape=cast(Any, tensor_shape), **kwargs)
+        return super()._communicate(tensor_shape=tensor_shape, **kwargs)
 
 
 class MCoreScheduleAdapter(Generic[_T]):
