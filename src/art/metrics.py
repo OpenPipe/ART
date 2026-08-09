@@ -569,14 +569,35 @@ class MetricsBuilder:
             }
             result.update(self._compute_rollups(cost_metrics))
 
+            cum_state = self._shared_state.cum_state
+            unused_and_dummy_ratio = "data/step_unused_and_dummy_ratio"
             for key, value in list(result.items()):
                 section = key.split("/", 1)[0]
-                if section not in _HIERARCHICAL_SECTIONS:
+                if (
+                    section not in _HIERARCHICAL_SECTIONS
+                    or key == unused_and_dummy_ratio
+                ):
                     continue
                 cum_key = to_cumulative_metric_key(key)
-                next_value = self._shared_state.cum_state.get(cum_key, 0.0) + value
-                self._shared_state.cum_state[cum_key] = next_value
+                next_value = cum_state.get(cum_key, 0.0) + value
+                cum_state[cum_key] = next_value
                 result[cum_key] = next_value
+
+            if unused_and_dummy_ratio in result:
+                cum_key = to_cumulative_metric_key(unused_and_dummy_ratio)
+                nominal = cum_state.get(
+                    "data/cum/nominal_schedule_capacity_tokens", 0.0
+                )
+                unused_and_dummy = sum(
+                    cum_state.get(key, 0.0)
+                    for key in (
+                        "data/cum/unused_packed_capacity_tokens",
+                        "data/cum/dummy_schedule_capacity_tokens",
+                    )
+                )
+                ratio = unused_and_dummy / nominal if nominal else 0.0
+                cum_state[cum_key] = ratio
+                result[cum_key] = ratio
 
             if pending_scenario_ids:
                 self._shared_state.unique_scenario_ids.update(pending_scenario_ids)
