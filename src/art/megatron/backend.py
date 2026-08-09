@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import secrets
 import sys
+import time
 from typing import Any, AsyncIterator, Iterable, Literal, cast
 import uuid
 
@@ -807,6 +808,7 @@ class MegatronBackend(LocalBackend):
             DistributedPackedBatch,
             payload.packed,
         )
+        source_release_s = 0.0
         if payload.selections:
             ref = distributed_batch.leases.ref
             expected_groups = tuple(
@@ -845,12 +847,18 @@ class MegatronBackend(LocalBackend):
                 or ref.max_source_version != max(versions)
             ):
                 raise RuntimeError("packed batch policy provenance does not match")
+            release_started = time.perf_counter()
             await self._release_trajectory_sources(batch, payload)
+            source_release_s = time.perf_counter() - release_started
         distributed_service = cast(DistributedMegatronService, service)
         async for result in distributed_service.train_packed(
             distributed_batch, config, service_dev_config
         ):
-            yield {**result, **distributed_service.drain_publication_metrics()}
+            yield {
+                **result,
+                "time/step_source_lease_release_s": source_release_s,
+                **distributed_service.drain_publication_metrics(),
+            }
 
     async def _release_training_batch(self, batch: _PackedTrainingBatch) -> None:
         await self._release_distributed_batch(batch, disposition="consumed")

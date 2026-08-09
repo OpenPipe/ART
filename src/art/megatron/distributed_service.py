@@ -874,7 +874,10 @@ class DistributedMegatronService:
         lineage_error: str,
         wait_for_serving: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        lock_started = time.perf_counter()
         async with self._train_lock:
+            lock_wait_s = time.perf_counter() - lock_started
+            setup_started = time.perf_counter()
             async with self._trainer_failure_boundary():
                 if self._temporal_gpu_sharing and self._base_url is not None:
                     previous = self._serving_futures.get(self._latest_step)
@@ -931,6 +934,7 @@ class DistributedMegatronService:
                     reconcile_step, checkpoint = reconcile
                     async with self._serving_lock:
                         await self._reconcile_serving_locked(reconcile_step, checkpoint)
+            setup_s = time.perf_counter() - setup_started
 
             final_metrics: dict[str, float] | None = None
             async with self._trainer_transaction(
@@ -943,6 +947,7 @@ class DistributedMegatronService:
                         yield metrics
             assert final_metrics is not None
 
+            commit_started = time.perf_counter()
             async with self._trainer_failure_boundary():
                 async with self._mutation_lock:
                     if self._latest_step != job.expected_learner_version:
@@ -955,8 +960,16 @@ class DistributedMegatronService:
                         trainer=trainer,
                         publication_targets=job.publication_targets,
                     )
+            commit_s = time.perf_counter() - commit_started
             if wait_for_serving:
                 await self.wait_for_serving(next_step)
+            final_metrics.update(
+                {
+                    "time/step_service_lock_wait_s": lock_wait_s,
+                    "time/step_service_job_setup_s": setup_s,
+                    "time/step_service_generation_commit_s": commit_s,
+                }
+            )
             yield final_metrics
 
     async def train_packed(

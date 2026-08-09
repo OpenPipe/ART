@@ -7,6 +7,7 @@ import json
 import os
 import socket
 from threading import Event, Lock
+import time
 import traceback
 from typing import Any, Callable
 
@@ -735,6 +736,8 @@ class MonarchTrainerRun:
             supervision: asyncio.Task[str] | None = None
             try:
                 send_port, receiver = Channel[dict[str, Any]].open()
+                dispatch_started = time.perf_counter()
+                final_progress_received: float | None = None
                 collective = asyncio.ensure_future(start(send_port))
                 receive = asyncio.ensure_future(receiver.recv())
                 supervision = asyncio.create_task(self._supervision.wait())
@@ -784,6 +787,8 @@ class MonarchTrainerRun:
                             f"{payload['traceback']}"
                         )
                     if payload["kind"] == "progress":
+                        if payload["step_index"] + 1 == payload["num_steps"]:
+                            final_progress_received = time.perf_counter()
                         event = TrainProgress(
                             job_id=job.job_id,
                             run_id=job.run_id,
@@ -801,7 +806,9 @@ class MonarchTrainerRun:
                             adapter_path=payload["adapter_path"],
                         )
                     elif payload["kind"] == "actor_completed":
+                        actor_completed_received = time.perf_counter()
                         values = await collective
+                        collective_completed = time.perf_counter()
                         results = list(values.values())
                         versions = {result["learner_version"] for result in results}
                         ranks = {result["rank"] for result in results}
@@ -812,12 +819,28 @@ class MonarchTrainerRun:
                             raise RuntimeError(
                                 "trainer ranks did not agree on job completion"
                             )
+                        metrics = dict(payload["metrics"])
+                        if final_progress_received is not None:
+                            metrics.update(
+                                {
+                                    "time/step_monarch_dispatch_to_progress_s": (
+                                        final_progress_received - dispatch_started
+                                    ),
+                                    "time/step_monarch_progress_to_completed_s": (
+                                        actor_completed_received
+                                        - final_progress_received
+                                    ),
+                                }
+                            )
+                        metrics["time/step_monarch_collective_tail_s"] = (
+                            collective_completed - actor_completed_received
+                        )
                         completed = TrainCompleted(
                             job_id=job.job_id,
                             run_id=job.run_id,
                             sequence=len(events),
                             learner_version=job.learner_version,
-                            metrics=payload["metrics"],
+                            metrics=metrics,
                         )
                         if not publication.done():
                             publication_state.drain_done = False
