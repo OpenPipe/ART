@@ -93,7 +93,10 @@ class WorkflowFixture(BaseModel):
                 self.model_key.startswith("gemma4_")
                 and stage_name in _GEMMA_CANONICAL_WEIGHT_STAGES
             )
-            or (self.model_key == "gpt_oss_moe" and stage_name == "train_inf_mismatch")
+            or (
+                self.model_key in {"dsv4", "gpt_oss_moe"}
+                and stage_name == "train_inf_mismatch"
+            )
         )
         use_tokenizer_compatible = stage_name in _TOKENIZER_COMPATIBLE_STAGES or (
             self.model_key.startswith("gemma4_") and reduced_trainability is not None

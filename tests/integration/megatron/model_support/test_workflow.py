@@ -137,7 +137,7 @@ def test_fixture_stage_contracts(tmp_path: Path) -> None:
         ("gpt_oss_moe", "canonical"): ("train_inf_mismatch",),
         ("gpt_oss_moe", "tokenizer"): ("merged_vllm_serving", "native_vllm_lora"),
         ("glm52", "compact"): ("length_trainability", "yes_no_trainability"),
-        ("dsv4", "canonical"): ("length_trainability", "yes_no_trainability"),
+        ("dsv4", "canonical"): ("train_inf_mismatch", "length_trainability", "yes_no_trainability"),
     }
     # fmt: on
     for (model_key, selected), stages in cases.items():
