@@ -109,6 +109,41 @@ def resilient_endpoint(function: Any) -> Any:
     return endpoint(wrapped)
 
 
+class AdapterTransferHostService(Actor):
+    """Adapter data-plane receiver isolated from serialized host control RPCs."""
+
+    def __init__(self, host_id: str, output_root: str) -> None:
+        self._receiver = AdapterSnapshotReceiver(host_id, output_root)
+
+    @resilient_endpoint
+    async def prepare(
+        self,
+        generation_id: str,
+        template_path: str,
+        timeout_s: float,
+        transport: Literal["local", "nixl"],
+    ):
+        return await asyncio.to_thread(
+            self._receiver.prepare,
+            generation_id,
+            template_path,
+            timeout_s,
+            transport,
+        )
+
+    @resilient_endpoint
+    async def poll(self, generation_id: str):
+        return await asyncio.to_thread(self._receiver.poll, generation_id)
+
+    @resilient_endpoint
+    async def release(self, generation_id: str) -> None:
+        await asyncio.to_thread(self._receiver.release, generation_id)
+
+    @resilient_endpoint
+    async def close(self) -> None:
+        await asyncio.to_thread(self._receiver.close)
+
+
 class ArtHostService(Actor):
     """One ART control and data-plane service per host."""
 
@@ -135,7 +170,6 @@ class ArtHostService(Actor):
         self._packing_lock = asyncio.Lock()
         self._vllm_output_root = vllm_output_root
         self._vllm_launcher = None
-        self._adapter_receiver: AdapterSnapshotReceiver | None = None
         self._nccl_cleanups: dict[str, asyncio.Task[None]] = {}
         self._nccl_rendezvous: dict[str, NcclRendezvous] = {}
         self._nccl_sessions: dict[str, tuple[float, asyncio.Task[None]]] = {}
@@ -262,9 +296,6 @@ class ArtHostService(Actor):
         if self._vllm_launcher is not None:
             await self._vllm_launcher.close()
             self._vllm_launcher = None
-        if self._adapter_receiver is not None:
-            await asyncio.to_thread(self._adapter_receiver.close)
-            self._adapter_receiver = None
         self._packed_batches.store.close()
 
     async def _require_nccl_probe(self, probe_id: str) -> float:
@@ -403,13 +434,6 @@ class ArtHostService(Actor):
             )
         return self._vllm_launcher
 
-    def _receiver(self) -> AdapterSnapshotReceiver:
-        if self._adapter_receiver is None:
-            self._adapter_receiver = AdapterSnapshotReceiver(
-                self.host_id, self._vllm_output_root
-            )
-        return self._adapter_receiver
-
     @resilient_endpoint
     async def start_vllm_member(self, request: HostMemberLaunchRequest):
         if self._admission_report is None:
@@ -426,31 +450,6 @@ class ArtHostService(Actor):
     ) -> None:
         if self._vllm_launcher is not None:
             await self._vllm_launcher.stop_member(replica_id, member_id, generation)
-
-    @resilient_endpoint
-    async def prepare_adapter_receive(
-        self,
-        generation_id: str,
-        template_path: str,
-        timeout_s: float,
-        transport: Literal["local", "nixl"],
-    ):
-        return await asyncio.to_thread(
-            self._receiver().prepare,
-            generation_id,
-            template_path,
-            timeout_s,
-            transport,
-        )
-
-    @resilient_endpoint
-    async def poll_adapter_receive(self, generation_id: str):
-        return await asyncio.to_thread(self._receiver().poll, generation_id)
-
-    @resilient_endpoint
-    async def release_adapter_receive(self, generation_id: str) -> None:
-        if self._adapter_receiver is not None:
-            await asyncio.to_thread(self._adapter_receiver.release, generation_id)
 
     @resilient_endpoint
     async def pack_batch(

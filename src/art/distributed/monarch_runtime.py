@@ -156,8 +156,9 @@ class MonarchTrajectoryQueueEndpoint:
 
 
 class MonarchVllmHostLauncher:
-    def __init__(self, actor: Any) -> None:
+    def __init__(self, actor: Any, adapter_actor: Any) -> None:
         self.actor = actor
+        self.adapter_actor = adapter_actor
 
     async def start_member(self, request: HostMemberLaunchRequest) -> HostMemberState:
         return await call_remote(self.actor.start_vllm_member, request)
@@ -184,7 +185,7 @@ class MonarchVllmHostLauncher:
         transport: Literal["local", "nixl"],
     ) -> AdapterTransferTarget:
         return await call_remote(
-            self.actor.prepare_adapter_receive,
+            self.adapter_actor.prepare,
             generation_id,
             template_path,
             timeout_s,
@@ -196,7 +197,7 @@ class MonarchVllmHostLauncher:
     ) -> AdapterReceiveResult:
         deadline = asyncio.get_running_loop().time() + timeout_s
         while True:
-            result = await call_remote(self.actor.poll_adapter_receive, generation_id)
+            result = await call_remote(self.adapter_actor.poll, generation_id)
             if result is not None:
                 return result
             remaining_s = deadline - asyncio.get_running_loop().time()
@@ -205,7 +206,7 @@ class MonarchVllmHostLauncher:
             await asyncio.sleep(min(0.01, remaining_s))
 
     async def release_adapter_receive(self, generation_id: str) -> None:
-        await call_remote(self.actor.release_adapter_receive, generation_id)
+        await call_remote(self.adapter_actor.release, generation_id)
 
 
 class MonarchPackedBatchInbox:

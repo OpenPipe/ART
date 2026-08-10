@@ -116,6 +116,7 @@ class ArtRuntime:
         self.runtime_id = uuid.uuid4().hex
         self._host_procs: dict[str, Any] = {}
         self._host_services: dict[str, Any] = {}
+        self._adapter_services: dict[str, Any] = {}
         self._rollout_procs: dict[str, Any] = {}
         self._rollout_actors: dict[str, Any] = {}
         self._trainer_runs: set[Any] = set()
@@ -237,7 +238,7 @@ class ArtRuntime:
         return self
 
     async def _start_host_services(self) -> None:
-        from .monarch_actor import ArtHostService
+        from .monarch_actor import AdapterTransferHostService, ArtHostService
 
         async with asyncio.timeout(self.topology.cluster.startup_timeout_s):
             for index, host in enumerate(self.topology.cluster.hosts):
@@ -262,10 +263,18 @@ class ArtRuntime:
                     self.config.vllm_output_root,
                     data_plane_host,
                 )
+                adapter_actor = proc.spawn(
+                    monarch_identifier(f"art_adapter_{self.runtime_id}_{host.host_id}"),
+                    AdapterTransferHostService,
+                    host.host_id,
+                    self.config.vllm_output_root,
+                )
                 self._host_procs[host.host_id] = proc
                 self._host_services[host.host_id] = actor
+                self._adapter_services[host.host_id] = adapter_actor
             await asyncio.gather(
-                *(actor.initialized for actor in self._host_services.values())
+                *(actor.initialized for actor in self._host_services.values()),
+                *(actor.initialized for actor in self._adapter_services.values()),
             )
             self._controller_fingerprint, reports = await asyncio.gather(
                 asyncio.to_thread(build_runtime_fingerprint, self._runtime_packages),
@@ -925,7 +934,10 @@ class ArtRuntime:
             master_addr=spec.rendezvous.host,
         )
         launchers = {
-            member.host_id: MonarchVllmHostLauncher(self._host_services[member.host_id])
+            member.host_id: MonarchVllmHostLauncher(
+                self._host_services[member.host_id],
+                self._adapter_services[member.host_id],
+            )
             for member in spec.members
         }
         manager = ReplicaManager(
@@ -1029,6 +1041,11 @@ class ArtRuntime:
             *(proc.stop() for proc in self._rollout_procs.values()),
         ):
             self._rollout_procs.clear()
+        if await collect(
+            "adapter transfer service shutdown",
+            *(call_remote(actor.close) for actor in self._adapter_services.values()),
+        ):
+            self._adapter_services.clear()
         if await collect(
             "host service shutdown",
             *(call_remote(actor.close) for actor in self._host_services.values()),
