@@ -275,6 +275,9 @@ class _GenerationPublisher:
                 stager=self.stager,
             )
             lora_launch_s = time.perf_counter() - prepare_started
+            lora_resolve_started = time.perf_counter()
+            lora = None if lora is None else lora.resolve()
+            lora_resolve_s = time.perf_counter() - lora_resolve_started
             transport = self._enqueue_transport(
                 generation=job.output.generation,
                 optimizer_state_path=job.output.optimizer_state_path,
@@ -322,6 +325,7 @@ class _GenerationPublisher:
             "snapshot_pool_in_use": float(in_flight),
             "snapshot_pool_pressure": in_flight / self.capacity,
             "snapshot_lora_launch_s": lora_launch_s,
+            "snapshot_lora_resolve_s": lora_resolve_s,
             "snapshot_optimizer_launch_s": time.perf_counter() - optimizer_started,
             "snapshot_launch_s": time.perf_counter() - prepare_started,
         }
@@ -363,7 +367,6 @@ class _GenerationPublisher:
         optimizer: Future[Any],
         publication_targets: tuple[Any, ...],
     ) -> Future[TrainerRankPublication]:
-        lora = None if lora is None else lora.resolve()
         prepared_tensors = None
         if lora is not None:
             if self._lora_layout is None:
