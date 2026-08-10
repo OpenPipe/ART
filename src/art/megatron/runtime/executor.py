@@ -301,6 +301,10 @@ class _GenerationPublisher:
             if optimizer is not None:
                 self.runtime.optimizer_snapshot_barrier.register(optimizer)
             optimizer_handoff.set_result(optimizer)
+            optimizer_launch_s = time.perf_counter() - optimizer_started
+            handoff_started = time.perf_counter()
+            persistence = transport.result()
+            transport_handoff_wait_s = time.perf_counter() - handoff_started
         except BaseException as error:
             publication_error = error
             if transport is not None:
@@ -313,8 +317,8 @@ class _GenerationPublisher:
                 remember=False,
             )
             raise
-        transport.add_done_callback(
-            lambda done: self._transport_completed(
+        persistence.add_done_callback(
+            lambda done: self._completed(
                 done,
                 sink=sink,
                 generation=job.output.generation,
@@ -326,7 +330,8 @@ class _GenerationPublisher:
             "snapshot_pool_pressure": in_flight / self.capacity,
             "snapshot_lora_launch_s": lora_launch_s,
             "snapshot_lora_resolve_s": lora_resolve_s,
-            "snapshot_optimizer_launch_s": time.perf_counter() - optimizer_started,
+            "snapshot_optimizer_launch_s": optimizer_launch_s,
+            "snapshot_transport_handoff_wait_s": transport_handoff_wait_s,
             "snapshot_launch_s": time.perf_counter() - prepare_started,
         }
 
@@ -506,22 +511,6 @@ class _GenerationPublisher:
             runtime_sha256=None if optimizer is None else optimizer.runtime_sha256,
             topology=None if optimizer is None else optimizer.topology,
             saves_optimizer=optimizer is not None,
-        )
-
-    def _transport_completed(
-        self,
-        future: Future[Future[TrainerRankPublication]],
-        *,
-        sink: EventSink,
-        generation: TrainerGeneration,
-    ) -> None:
-        try:
-            persistence = future.result()
-        except BaseException as error:
-            self._failed(error, sink=sink, generation=generation)
-            return
-        persistence.add_done_callback(
-            lambda done: self._completed(done, sink=sink, generation=generation)
         )
 
     def _completed(
