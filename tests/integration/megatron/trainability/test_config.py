@@ -122,7 +122,11 @@ def test_optional_sampling_controls(monkeypatch) -> None:
     monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_MIN_TOKENS", "2")
     monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_FREQUENCY_PENALTY", "0.5")
 
-    assert _yes_no_extra_body()["allowed_token_ids"] == [9829, 902, 36569]
+    assert _yes_no_extra_body("Qwen/Qwen3.5-35B-A3B")["allowed_token_ids"] == [
+        9829,
+        902,
+        36569,
+    ]
     assert _length_extra_body({}) == {
         "allowed_token_ids": [154820, 38069],
         "min_tokens": 2,

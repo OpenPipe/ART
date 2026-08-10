@@ -51,6 +51,10 @@ _VARIANT_NAME = Literal[
 _RESOURCE_STAGE_NAME = Literal["yes_no_trainability", "length_trainability"]
 _Answer = Literal["yes", "no", "maybe"]
 _ANSWER_TARGETS: tuple[_Answer, ...] = ("yes", "no", "maybe")
+_GPT_OSS_MAX_TOKENS = 512
+_GPT_OSS_SYSTEM_PROMPT = (
+    "Use minimal reasoning. Give only one final word: yes, no, or maybe."
+)
 
 
 class _TrainKwargs(TypedDict, total=False):
@@ -385,13 +389,22 @@ def _get_env_bool(name: str, default: bool) -> bool:
     raise ValueError(f"Invalid boolean value for {name}: {raw!r}")
 
 
-def _max_tokens() -> int:
-    return _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_TOKENS", 5)
+def _is_gpt_oss_model(base_model: str) -> bool:
+    return get_model_support_spec(base_model).key == "gpt_oss_moe"
+
+
+def _max_tokens(base_model: str) -> int:
+    return _get_env_int(
+        "ART_MODEL_SUPPORT_YES_NO_MAX_TOKENS",
+        _GPT_OSS_MAX_TOKENS if _is_gpt_oss_model(base_model) else 5,
+    )
 
 
 def _render_chat_messages(base_model: str, prompt: str) -> art.Messages:
-    del base_model
-    return [{"role": "user", "content": prompt}]
+    messages: art.Messages = [{"role": "user", "content": prompt}]
+    if _is_gpt_oss_model(base_model):
+        messages.insert(0, {"role": "system", "content": _GPT_OSS_SYSTEM_PROMPT})
+    return messages
 
 
 def _enable_thinking() -> bool:
@@ -400,10 +413,11 @@ def _enable_thinking() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _extra_body() -> dict[str, object]:
-    body: dict[str, object] = {
-        "chat_template_kwargs": {"enable_thinking": _enable_thinking()}
-    }
+def _extra_body(base_model: str) -> dict[str, object]:
+    chat_template_kwargs: dict[str, object] = {"enable_thinking": _enable_thinking()}
+    if _is_gpt_oss_model(base_model):
+        chat_template_kwargs["reasoning_effort"] = "low"
+    body: dict[str, object] = {"chat_template_kwargs": chat_template_kwargs}
     allowed_token_ids = _get_env_int_list("ART_MODEL_SUPPORT_YES_NO_ALLOWED_TOKEN_IDS")
     if allowed_token_ids is not None:
         body["allowed_token_ids"] = allowed_token_ids
@@ -846,8 +860,8 @@ async def _evaluate_groups(
         completion = await client.chat.completions.create(
             messages=messages,
             model=model.get_inference_name(step=step),
-            max_tokens=_max_tokens(),
-            extra_body=_extra_body(),
+            max_tokens=_max_tokens(base_model),
+            extra_body=_extra_body(base_model),
             temperature=_get_env_float(
                 "ART_MODEL_SUPPORT_YES_NO_EVAL_TEMPERATURE",
                 0.0,
@@ -912,9 +926,9 @@ async def _build_training_groups(
         completion = await client.chat.completions.create(
             messages=messages,
             model=model.get_inference_name(),
-            max_tokens=_max_tokens(),
+            max_tokens=_max_tokens(base_model),
             n=rollouts_per_prompt,
-            extra_body=_extra_body(),
+            extra_body=_extra_body(base_model),
             temperature=_get_env_float(
                 "ART_MODEL_SUPPORT_YES_NO_ROLLOUT_TEMPERATURE",
                 1.2,
@@ -1009,7 +1023,7 @@ async def _warmup_model(
         messages=_render_chat_messages(base_model, prompt),
         model=model.get_inference_name(step=0),
         max_tokens=1,
-        extra_body=_extra_body(),
+        extra_body=_extra_body(base_model),
         temperature=0.0,
         timeout=_request_timeout("ART_MODEL_SUPPORT_YES_NO_WARMUP_TIMEOUT", 900.0),
     )
