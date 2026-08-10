@@ -322,6 +322,7 @@ async def test_failed_vllm_start_rollback_remains_runtime_owned(
     runtime._closed = False
     runtime._model_services = {}
     runtime._host_services = {"host": object()}
+    runtime._adapter_services = {"host": object()}
     runtime._preflight_launch = AsyncMock()
     spec = SimpleNamespace(
         name="model",
