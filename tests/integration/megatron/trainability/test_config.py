@@ -40,6 +40,8 @@ from .yes_no_trainability import (
     _engine_args_for_yes_no_trainability,
     _evaluate_groups,
     _get_env_int_list,
+    _max_tokens,
+    _render_chat_messages,
     _rescore_groups,
     _select_answer_target,
     _TrainabilityVariant,
@@ -136,6 +138,37 @@ def test_optional_sampling_controls(monkeypatch) -> None:
     assert _length_extra_body({}, seed=1234)["seed"] == 1234
 
 
+def test_yes_no_requests_use_model_specific_reasoning_budget(monkeypatch) -> None:
+    monkeypatch.delenv("ART_MODEL_SUPPORT_YES_NO_ENABLE_THINKING", raising=False)
+    monkeypatch.delenv("ART_MODEL_SUPPORT_YES_NO_MAX_TOKENS", raising=False)
+    prompt = "Choose one answer."
+    qwen = "Qwen/Qwen3.5-35B-A3B"
+    gpt_oss = "openai/gpt-oss-20b"
+
+    assert _render_chat_messages(qwen, prompt) == [{"role": "user", "content": prompt}]
+    assert _max_tokens(qwen) == 5
+    assert _yes_no_extra_body(qwen) == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+    assert _render_chat_messages(gpt_oss, prompt) == [
+        {
+            "role": "system",
+            "content": "Use minimal reasoning. Give only one final word: yes, no, or maybe.",
+        },
+        {"role": "user", "content": prompt},
+    ]
+    assert _max_tokens(gpt_oss) == 256
+    assert _yes_no_extra_body(gpt_oss) == {
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+            "reasoning_effort": "low",
+        }
+    }
+    assert _render_chat_messages("probe/non-gpt", prompt) == [
+        {"role": "user", "content": prompt}
+    ]
+
+
 def test_yes_no_engine_args_use_model_context_budget() -> None:
     assert (
         _engine_args_for_yes_no_trainability(
@@ -148,6 +181,12 @@ def test_yes_no_engine_args_use_model_context_budget() -> None:
             base_model="openai/gpt-oss-20b", inference_gpu_ids=[0]
         )["max_model_len"]
         == 512
+    )
+    assert (
+        _engine_args_for_yes_no_trainability(
+            base_model="probe/non-gpt", inference_gpu_ids=[0]
+        )["max_model_len"]
+        == 128
     )
 
 
@@ -245,7 +284,10 @@ def test_megatron_variants_keep_short_packed_sequence_default(monkeypatch) -> No
         _default_variant_name("Qwen/Qwen3-30B-A3B-Instruct-2507") == "megatron_shared"
     )
     assert _variant_rollouts_per_prompt(variant) == 4
-    assert _variant_max_steps(variant) == 4
+    assert (
+        _variant_max_steps(variant, base_model="Qwen/Qwen3-30B-A3B-Instruct-2507") == 4
+    )
+    assert _variant_max_steps(variant, base_model="openai/gpt-oss-20b") == 8
 
 
 def test_unsloth_variant_uses_chunk_aligned_training_length(monkeypatch) -> None:
@@ -265,7 +307,9 @@ def test_unsloth_variant_uses_chunk_aligned_training_length(monkeypatch) -> None
         variant, base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"
     )["init_args"] == {"max_seq_length": 1024}
     assert _variant_rollouts_per_prompt(variant) == 8
-    assert _variant_max_steps(variant) == 12
+    assert (
+        _variant_max_steps(variant, base_model="Qwen/Qwen3-30B-A3B-Instruct-2507") == 12
+    )
 
 
 def test_qwen3_5_defaults_to_shared_lora_rollout() -> None:

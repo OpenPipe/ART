@@ -51,6 +51,7 @@ _VARIANT_NAME = Literal[
 _RESOURCE_STAGE_NAME = Literal["yes_no_trainability", "length_trainability"]
 _Answer = Literal["yes", "no", "maybe"]
 _ANSWER_TARGETS: tuple[_Answer, ...] = ("yes", "no", "maybe")
+_GPT_OSS_MAX_STEPS = 8
 _GPT_OSS_MAX_TOKENS = 256
 _GPT_OSS_MAX_MODEL_LEN = 512
 _GPT_OSS_SYSTEM_PROMPT = (
@@ -391,7 +392,10 @@ def _get_env_bool(name: str, default: bool) -> bool:
 
 
 def _is_gpt_oss_model(base_model: str) -> bool:
-    return get_model_support_spec(base_model).key == "gpt_oss_moe"
+    return (
+        get_model_support_spec(base_model, allow_unvalidated_arch=True).key
+        == "gpt_oss_moe"
+    )
 
 
 def _max_tokens(base_model: str) -> int:
@@ -663,8 +667,14 @@ def _init_megatron_runtime_config(
     )
 
 
-def _variant_max_steps(variant: _TrainabilityVariant) -> int:
-    default = 12 if variant.backend_name == "local" else 4
+def _variant_max_steps(variant: _TrainabilityVariant, *, base_model: str) -> int:
+    default = (
+        12
+        if variant.backend_name == "local"
+        else _GPT_OSS_MAX_STEPS
+        if _is_gpt_oss_model(base_model)
+        else 4
+    )
     return _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_STEPS", default)
 
 
@@ -1052,7 +1062,7 @@ async def run_yes_no_trainability_async(
     backend_root = artifact_root or _artifact_dir(base_model, variant.name)
     backend_root.mkdir(parents=True, exist_ok=True)
     reward_threshold = _get_env_float("ART_MODEL_SUPPORT_YES_NO_REWARD_THRESHOLD", 0.9)
-    max_steps = _variant_max_steps(variant)
+    max_steps = _variant_max_steps(variant, base_model=base_model)
     rollouts_per_prompt = _variant_rollouts_per_prompt(variant)
     eval_prompt_count = _get_env_int("ART_MODEL_SUPPORT_YES_NO_EVAL_PROMPTS", 8)
     prompts = build_prompts()
