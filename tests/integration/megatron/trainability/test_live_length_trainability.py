@@ -44,6 +44,7 @@ DEFAULT_LENGTH_LEARNING_RATE = 1e-4
 QWEN3_5_MOE_LENGTH_MAX_STEPS = 30
 QWEN3_5_MOE_LENGTH_ROLLOUTS_PER_PROMPT = 32
 QWEN3_5_MOE_LENGTH_ROLLOUT_SEED = 20261833
+QWEN3_5_MOE_LENGTH_ROLLOUT_TEMPERATURE = 0.8
 LIVE_ENV = "ART_RUN_LIVE_LENGTH_TRAINABILITY"
 TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
@@ -507,7 +508,16 @@ def _length_rollouts_per_prompt(base_model: str) -> int:
 def _length_current_step_demand(base_model: str) -> bool:
     return _get_env_bool(
         "ART_MODEL_SUPPORT_LENGTH_CURRENT_STEP_DEMAND",
-        _model_support_key(base_model) == "qwen3_5_moe",
+        _model_support_key(base_model) in {"gpt_oss_moe", "qwen3_5_moe"},
+    )
+
+
+def _length_rollout_temperature(base_model: str) -> float:
+    return _get_env_float(
+        "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_TEMPERATURE",
+        QWEN3_5_MOE_LENGTH_ROLLOUT_TEMPERATURE
+        if _model_support_key(base_model) == "qwen3_5_moe"
+        else 1.1,
     )
 
 
@@ -875,10 +885,7 @@ async def run_length_trainability_async(
                 split="train",
                 step=target_step,
                 n=rollouts_per_prompt,
-                temperature=_get_env_float(
-                    "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_TEMPERATURE",
-                    1.1,
-                ),
+                temperature=_length_rollout_temperature(base_model),
                 chat_template_kwargs=chat_template_kwargs,
                 samples=samples,
                 summary_log_path=summary_log_path,
