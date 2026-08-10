@@ -136,10 +136,28 @@ def test_integer_list_rejects_empty_values(monkeypatch) -> None:
         _get_env_int_list("INVALID_INTEGER_LIST")
 
 
-def test_answer_target_is_least_common_with_stable_tie_order() -> None:
-    assert _select_answer_target(["maybe", "Maybe.", "invalid"]) == "yes"
-    assert _select_answer_target(["yes", "YES", "no", "invalid"]) == "maybe"
-    assert _select_answer_target(["yes", "no", "maybe"]) == "yes"
+def _answer_group(answers: list[str]) -> art.TrajectoryGroup:
+    return art.TrajectoryGroup(
+        [
+            art.Trajectory(
+                messages_and_choices=[
+                    Choice(
+                        finish_reason="stop",
+                        index=index,
+                        message=ChatCompletionMessage(role="assistant", content=answer),
+                    )
+                ],
+                reward=-1.0,
+            )
+            for index, answer in enumerate(answers)
+        ]
+    )
+
+
+def test_answer_target_requires_support_and_prefers_least_common() -> None:
+    assert _select_answer_target([_answer_group(["maybe", "maybe", "yes"])]) == "yes"
+    assert _select_answer_target([_answer_group(["yes", "no"])]) == "yes"
+    assert _select_answer_target([_answer_group(["maybe", "maybe"])]) is None
 
 
 def test_reward_for_answer_preserves_default_and_supports_target() -> None:
@@ -155,24 +173,7 @@ def test_reward_for_answer_preserves_default_and_supports_target() -> None:
 
 
 def test_initial_groups_can_be_rescored_for_selected_target() -> None:
-    group = art.TrajectoryGroup(
-        [
-            art.Trajectory(
-                messages_and_choices=[
-                    Choice(
-                        finish_reason="stop",
-                        index=index,
-                        message=ChatCompletionMessage(
-                            role="assistant",
-                            content=answer,
-                        ),
-                    )
-                ],
-                reward=-1.0,
-            )
-            for index, answer in enumerate(["yes", "no", "maybe", "invalid"])
-        ]
-    )
+    group = _answer_group(["yes", "no", "maybe", "invalid"])
 
     _rescore_groups([group], target="no")
 

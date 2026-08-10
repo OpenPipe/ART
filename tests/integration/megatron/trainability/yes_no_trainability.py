@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 import gc
 import os
 from pathlib import Path
 import re
 import time
-from typing import Any, AsyncIterator, Iterable, Iterator, Literal, TypedDict, cast
+from typing import Any, AsyncIterator, Iterator, Literal, TypedDict, cast
 import uuid
 
 from openai.types.chat.chat_completion import Choice
@@ -318,13 +317,29 @@ def first_word_for_answer(text: str | None) -> str:
     return first_word[0].strip(".,!?:;\"'()[]{}")
 
 
-def _select_answer_target(texts: Iterable[str | None]) -> _Answer:
-    counts = Counter(
-        answer
-        for text in texts
-        if (answer := first_word_for_answer(text).lower()) in _ANSWER_TARGETS
+def _select_answer_target(groups: list[art.TrajectoryGroup]) -> _Answer | None:
+    counts = {
+        target: [
+            sum(
+                first_word_for_answer(_trajectory_answer_text(trajectory)).lower()
+                == target
+                for trajectory in group.trajectories
+            )
+            for group in groups
+        ]
+        for target in _ANSWER_TARGETS
+    }
+    candidates = [
+        target
+        for target, group_counts in counts.items()
+        if any(
+            0 < count < len(group.trajectories)
+            for count, group in zip(group_counts, groups, strict=True)
+        )
+    ]
+    return (
+        min(candidates, key=lambda target: sum(counts[target])) if candidates else None
     )
-    return min(_ANSWER_TARGETS, key=lambda answer: counts[answer])
 
 
 def _trajectory_answer_text(trajectory: art.Trajectory) -> str:
@@ -957,6 +972,32 @@ async def _build_trainable_groups(
     )
 
 
+async def _build_initial_trainable_groups(
+    model: art.TrainableModel,
+    *,
+    base_model: str,
+    prompts: list[str],
+    rollouts_per_prompt: int,
+) -> tuple[_Answer, list[art.TrajectoryGroup]]:
+    max_attempts = _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_ROLLOUT_ATTEMPTS", 4)
+    for _ in range(max_attempts):
+        groups = await _build_training_groups(
+            model,
+            base_model=base_model,
+            prompts=prompts,
+            rollouts_per_prompt=rollouts_per_prompt,
+        )
+        target = _select_answer_target(groups)
+        if target is not None:
+            _rescore_groups(groups, target=target)
+            return target, [
+                group for group in groups if _group_has_reward_variance(group)
+            ]
+    raise RuntimeError(
+        "No answer with within-group support was produced for yes/no trainability"
+    )
+
+
 async def _warmup_model(
     model: art.TrainableModel,
     *,
@@ -1056,10 +1097,11 @@ async def run_yes_no_trainability_async(
                 prompts=eval_prompts,
                 step=0,
             )
-        target_answer = _select_answer_target(
-            _trajectory_answer_text(trajectory)
-            for group in initial_eval_groups
-            for trajectory in group.trajectories
+        target_answer, initial_train_groups = await _build_initial_trainable_groups(
+            model,
+            base_model=base_model,
+            prompts=prompts,
+            rollouts_per_prompt=rollouts_per_prompt,
         )
         _rescore_groups(initial_eval_groups, target=target_answer)
         initial_eval_reward = _mean_group_reward(initial_eval_groups)
@@ -1088,13 +1130,17 @@ async def run_yes_no_trainability_async(
             model_ids_before=model_ids_before,
         )
 
-        for _ in range(max_steps):
-            train_groups = await _build_trainable_groups(
-                model,
-                base_model=base_model,
-                prompts=prompts,
-                rollouts_per_prompt=rollouts_per_prompt,
-                target=target_answer,
+        for step_index in range(max_steps):
+            train_groups = (
+                initial_train_groups
+                if step_index == 0
+                else await _build_trainable_groups(
+                    model,
+                    base_model=base_model,
+                    prompts=prompts,
+                    rollouts_per_prompt=rollouts_per_prompt,
+                    target=target_answer,
+                )
             )
             result = await backend.train(
                 model,
