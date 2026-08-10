@@ -22,4 +22,5 @@ jobs:
     with:
       service_name: ${{ inputs.service_name || 'art-agent' }}
       port: ${{ inputs.port || '8519' }}
+      image_name: art
     secrets: inherit
