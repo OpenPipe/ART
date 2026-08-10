@@ -59,7 +59,11 @@ def _arch_list() -> str:
 
 def _source_hash() -> str:
     digest = sha256()
-    for path in sorted(path for path in SOURCE.rglob("*") if path.is_file()):
+    for path in sorted(
+        path
+        for path in SOURCE.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    ):
         digest.update(str(path.relative_to(SOURCE)).encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
