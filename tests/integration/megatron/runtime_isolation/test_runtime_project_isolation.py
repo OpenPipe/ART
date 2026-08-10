@@ -276,7 +276,7 @@ asyncio.run(main())
         artifact_dir,
         "parallel_lora_admission",
     )
-    assert json.loads(payload) == {
+    assert json.loads(payload.splitlines()[-1]) == {
         "aborted": ["0_parent", "1_parent"],
         "blocked": [True, True],
         "calls": [["0_parent", 1], ["1_parent", 1]],
