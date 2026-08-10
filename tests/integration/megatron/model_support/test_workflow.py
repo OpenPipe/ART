@@ -578,19 +578,34 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert hf_overrides["expert_dtype"] == "fp8"
         assert engine_args["max_model_len"] == 1024
     assert resources.merged_vllm_serving is not None
+    assert resources.merged_vllm_serving.required_world_size == 8
+    assert resources.merged_vllm_serving.megatron is not None
     assert resources.merged_vllm_serving.vllm is not None
+    assert resources.merged_vllm_serving.megatron.gpu_ids == [0, 1, 2, 3]
+    assert resources.merged_vllm_serving.megatron.topology.tp == 2
+    assert resources.merged_vllm_serving.megatron.topology.ep == 4
+    assert resources.merged_vllm_serving.megatron.topology.dp == 2
+    assert resources.merged_vllm_serving.vllm.gpu_ids == [4, 5, 6, 7]
+    assert not (
+        set(resources.merged_vllm_serving.megatron.gpu_ids)
+        & set(resources.merged_vllm_serving.vllm.gpu_ids)
+    )
     assert resources.merged_vllm_serving.vllm.engine_args()["kv_cache_dtype"] == "fp8"
     assert resources.native_vllm_lora is not None
     assert resources.native_vllm_lora.vllm is not None
     assert resources.native_vllm_lora.vllm.engine_args().get("max_loras", 2) == 2
 
 
-def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
+@pytest.mark.parametrize("stage_name", ["train_inf_mismatch", "merged_vllm_serving"])
+def test_dsv4_resources_remap_to_four_high_vram_gpus(
+    monkeypatch, stage_name: str
+) -> None:
     resources = handler_workflow_resources_for_base_model(
         "deepseek-ai/DeepSeek-V4-Flash"
     )
     assert resources is not None
-    assert resources.train_inf_mismatch is not None
+    stage_resources = getattr(resources, stage_name)
+    assert stage_resources is not None
     monkeypatch.setattr(
         "tests.integration.megatron.model_support.workflow_resources."
         "_visible_h200_equivalent_gpus",
@@ -598,8 +613,8 @@ def test_dsv4_resources_remap_to_four_high_vram_gpus(monkeypatch) -> None:
     )
 
     stage = resolve_stage_resources_for_visible_gpus(
-        "train_inf_mismatch",
-        resources.train_inf_mismatch,
+        stage_name,
+        stage_resources,
         visible_gpu_count=4,
     )
 

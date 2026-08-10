@@ -262,6 +262,10 @@ _DSV4_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3, 4, 5, 6, 7],
     topology=_DSV4_TP2_EP8,
 )
+_DSV4_REDUCED_MEGATRON = MegatronWorkflowResources(
+    gpu_ids=[0, 1, 2, 3],
+    topology=_DSV4_TP2_EP4,
+)
 _DSV4_HIGH_VRAM_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1],
     topology=_DSV4_TP2_EP2,
@@ -357,7 +361,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
         merged_vllm_serving=WorkflowStageResources(
             required_world_size=8,
             required_h200_equivalent_gpus=8,
-            megatron=_DSV4_MEGATRON,
+            megatron=_DSV4_REDUCED_MEGATRON,
             vllm=_DSV4_REDUCED_VLLM_EP4,
             high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
             high_vram_vllm=_DSV4_REDUCED_VLLM_EP2,
