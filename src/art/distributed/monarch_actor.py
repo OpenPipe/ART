@@ -15,7 +15,7 @@ from urllib.request import urlopen
 # This module is imported only by explicit distributed runtime construction.
 from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
 
-from art.utils.lifecycle import complete_task
+from art.utils.lifecycle import complete_task, complete_to_thread
 
 from .adapter_transport import AdapterSnapshotReceiver
 from .artifact_preflight import (
@@ -132,6 +132,7 @@ class ArtHostService(Actor):
         )
         self._trajectory_queues: dict[str, TrajectoryQueueStore] = {}
         self._packer = None
+        self._packing_lock = asyncio.Lock()
         self._vllm_output_root = vllm_output_root
         self._vllm_launcher = None
         self._adapter_receiver: AdapterSnapshotReceiver | None = None
@@ -254,9 +255,10 @@ class ArtHostService(Actor):
         self._trajectory_queues.clear()
         for batch_id in tuple(self._batch_publishers):
             await self._drop_batch(batch_id)
-        if self._packer is not None:
-            await self._packer.close()
-            self._packer = None
+        async with self._packing_lock:
+            if self._packer is not None:
+                await self._packer.close()
+                self._packer = None
         if self._vllm_launcher is not None:
             await self._vllm_launcher.close()
             self._vllm_launcher = None
@@ -454,13 +456,6 @@ class ArtHostService(Actor):
     async def pack_batch(
         self, request: PackingRequest, batch_id: str, transfer_timeout_s: float
     ) -> PackingResult:
-        if self._packer is None:
-            from art.megatron.backend import MegatronBackend
-
-            self._packer = MegatronBackend(
-                path=f"/tmp/art-packing-{os.getpid()}",
-                enable_expert_replay=request.include_moe_routing,
-            )
         fetch_started = time.monotonic()
         if request.trajectory_sources:
             groups = list(
@@ -500,19 +495,35 @@ class ArtHostService(Actor):
             log_future = asyncio.get_running_loop().run_in_executor(None, write_log)
         packing_started = time.monotonic()
         try:
-            packed = self._packer._get_packed_tensors(
-                request.model.build(),
-                groups,
-                advantage_balance=request.advantage_balance,
-                allow_training_without_logprobs=(
-                    request.allow_training_without_logprobs
-                ),
-                scale_rewards=request.scale_rewards,
-                plot_tensors=request.plot_tensors,
-                packed_sequence_length=request.packed_sequence_length,
-                logprob_calculation_chunk_size=request.logprob_calculation_chunk_size,
-                include_moe_routing=request.include_moe_routing,
-            )
+            async with self._packing_lock:
+                if self._packer is None:
+                    from art.megatron.backend import MegatronBackend
+
+                    self._packer = MegatronBackend(
+                        path=f"/tmp/art-packing-{os.getpid()}",
+                        enable_expert_replay=request.include_moe_routing,
+                    )
+                packer = self._packer
+                assert packer is not None
+                packed, cancelled = await complete_to_thread(
+                    lambda: packer._get_packed_tensors(
+                        request.model.build(),
+                        groups,
+                        advantage_balance=request.advantage_balance,
+                        allow_training_without_logprobs=(
+                            request.allow_training_without_logprobs
+                        ),
+                        scale_rewards=request.scale_rewards,
+                        plot_tensors=request.plot_tensors,
+                        packed_sequence_length=request.packed_sequence_length,
+                        logprob_calculation_chunk_size=(
+                            request.logprob_calculation_chunk_size
+                        ),
+                        include_moe_routing=request.include_moe_routing,
+                    )
+                )
+                if cancelled is not None:
+                    raise cancelled
         except BaseException as error:
             if log_future is not None:
 
