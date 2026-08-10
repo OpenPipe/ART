@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict
 FIXTURE_PATH_ENV = "ART_MODEL_SUPPORT_FIXTURE_PATH"
 FIXTURE_CACHE_ENV = "ART_MODEL_SUPPORT_FIXTURE_CACHE"
 FIXTURE_ROOT_ENV = "ART_MODEL_SUPPORT_FIXTURE_ROOT"
-FIXTURE_VERSION = 17
+FIXTURE_VERSION = 18
 _CANONICAL_CACHE_VERSION = 16
 _ROOT = Path("/tmp/art-models/main-merge-oracle")
 _CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
@@ -539,7 +539,7 @@ def _build(
                 model = auto.from_config(config, trust_remote_code=True).to(
                     torch.bfloat16
                 )
-            if tokenizer_compatible and model_key.startswith("gemma4_"):
+            if model_key.startswith("gemma4_"):
                 layers = model.model.language_model.layers
                 residual_scale = (2 * len(layers)) ** -0.5
                 with torch.no_grad():
