@@ -106,7 +106,9 @@ def _shared_live_config() -> dev.InternalModelConfig:
         {
             "rollout_weights_mode": "lora",
             "engine_args": {
-                **_engine_args_for_yes_no_trainability(inference_gpu_ids=[0, 1]),
+                **_engine_args_for_yes_no_trainability(
+                    base_model=_base_model(), inference_gpu_ids=[0, 1]
+                ),
                 "tensor_parallel_size": 2,
                 "enable_expert_parallel": True,
                 "enable_sleep_mode": True,
@@ -123,7 +125,7 @@ def _dedicated_merged_config() -> dev.InternalModelConfig:
         "rollout_weights_mode": "merged",
         "engine_args": {
             **_engine_args_for_yes_no_trainability(
-                inference_gpu_ids=_inference_gpu_ids()
+                base_model=_base_model(), inference_gpu_ids=_inference_gpu_ids()
             ),
         },
         "init_args": {"max_seq_length": _max_seq_length()},
@@ -137,7 +139,8 @@ def _dedicated_multirank_merged_config() -> dev.InternalModelConfig:
         "rollout_weights_mode": "merged",
         "engine_args": {
             **_engine_args_for_yes_no_trainability(
-                inference_gpu_ids=_multirank_inference_gpu_ids()
+                base_model=_base_model(),
+                inference_gpu_ids=_multirank_inference_gpu_ids(),
             ),
         },
         "init_args": {"max_seq_length": _max_seq_length()},

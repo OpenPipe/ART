@@ -37,6 +37,7 @@ from .yes_no_trainability import (
     _build_internal_config,
     _build_variant,
     _default_variant_name,
+    _engine_args_for_yes_no_trainability,
     _evaluate_groups,
     _get_env_int_list,
     _rescore_groups,
@@ -133,6 +134,21 @@ def test_optional_sampling_controls(monkeypatch) -> None:
         "frequency_penalty": 0.5,
     }
     assert _length_extra_body({}, seed=1234)["seed"] == 1234
+
+
+def test_yes_no_engine_args_use_model_context_budget() -> None:
+    assert (
+        _engine_args_for_yes_no_trainability(
+            base_model="Qwen/Qwen3.5-35B-A3B", inference_gpu_ids=[0]
+        )["max_model_len"]
+        == 128
+    )
+    assert (
+        _engine_args_for_yes_no_trainability(
+            base_model="openai/gpt-oss-20b", inference_gpu_ids=[0]
+        )["max_model_len"]
+        == 512
+    )
 
 
 def test_integer_list_rejects_empty_values(monkeypatch) -> None:

@@ -431,7 +431,7 @@ def _request_timeout(name: str, default: float) -> float:
 
 def _engine_args_for_yes_no_trainability(
     *,
-    base_model: str = "",
+    base_model: str,
     inference_gpu_ids: list[int],
     tensor_parallel_size: int = 1,
     enable_expert_parallel: bool = False,
