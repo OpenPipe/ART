@@ -116,6 +116,7 @@ class ArtRuntime:
         self.runtime_id = uuid.uuid4().hex
         self._host_procs: dict[str, Any] = {}
         self._host_services: dict[str, Any] = {}
+        self._adapter_procs: dict[str, Any] = {}
         self._adapter_services: dict[str, Any] = {}
         self._rollout_procs: dict[str, Any] = {}
         self._rollout_actors: dict[str, Any] = {}
@@ -243,13 +244,15 @@ class ArtRuntime:
         async with asyncio.timeout(self.topology.cluster.startup_timeout_s):
             for index, host in enumerate(self.topology.cluster.hosts):
                 data_plane_host = urlparse(host.worker_address).hostname
-                proc = self.host_mesh.slice(hosts=index).spawn_procs(
+                host_mesh = self.host_mesh.slice(hosts=index)
+                proc = host_mesh.spawn_procs(
                     per_host={"service": 1},
                     bootstrap=activate_cpu_child_virtualenv,
                     name=monarch_identifier(
                         f"art_host_{self.runtime_id}_{host.host_id}"
                     ),
                 )
+                self._host_procs[host.host_id] = proc
                 actor = proc.spawn(
                     monarch_identifier(f"art_service_{self.runtime_id}_{host.host_id}"),
                     ArtHostService,
@@ -263,14 +266,21 @@ class ArtRuntime:
                     self.config.vllm_output_root,
                     data_plane_host,
                 )
-                adapter_actor = proc.spawn(
+                self._host_services[host.host_id] = actor
+                adapter_proc = host_mesh.spawn_procs(
+                    per_host={"adapter": 1},
+                    bootstrap=activate_cpu_child_virtualenv,
+                    name=monarch_identifier(
+                        f"art_adapter_host_{self.runtime_id}_{host.host_id}"
+                    ),
+                )
+                self._adapter_procs[host.host_id] = adapter_proc
+                adapter_actor = adapter_proc.spawn(
                     monarch_identifier(f"art_adapter_{self.runtime_id}_{host.host_id}"),
                     AdapterTransferHostService,
                     host.host_id,
                     self.config.vllm_output_root,
                 )
-                self._host_procs[host.host_id] = proc
-                self._host_services[host.host_id] = actor
                 self._adapter_services[host.host_id] = adapter_actor
             await asyncio.gather(
                 *(actor.initialized for actor in self._host_services.values()),
@@ -1046,6 +1056,11 @@ class ArtRuntime:
             *(call_remote(actor.close) for actor in self._adapter_services.values()),
         ):
             self._adapter_services.clear()
+        if await collect(
+            "adapter transfer process shutdown",
+            *(proc.stop() for proc in self._adapter_procs.values()),
+        ):
+            self._adapter_procs.clear()
         if await collect(
             "host service shutdown",
             *(call_remote(actor.close) for actor in self._host_services.values()),

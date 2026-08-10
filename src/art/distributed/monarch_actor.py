@@ -110,7 +110,7 @@ def resilient_endpoint(function: Any) -> Any:
 
 
 class AdapterTransferHostService(Actor):
-    """Adapter data-plane receiver isolated from serialized host control RPCs."""
+    """Adapter receiver isolated from packing in its own host process."""
 
     def __init__(self, host_id: str, output_root: str) -> None:
         self._receiver = AdapterSnapshotReceiver(host_id, output_root)
