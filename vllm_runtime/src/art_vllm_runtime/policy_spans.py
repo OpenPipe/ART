@@ -829,30 +829,24 @@ def _patch_lora_alias_resolution() -> None:
 def _patch_engine_request_admission() -> None:
     from vllm.v1.engine.async_llm import AsyncLLM
 
-    original = AsyncLLM.add_request
+    # Long-prompt input processing is policy-independent; only serialize the
+    # final request identity and engine enqueue with in-place weight updates.
+    original = AsyncLLM._add_request
     if getattr(original, "__art_lora_update_patched__", False):
         return
 
-    async def add_request(
+    async def _add_request(
         self: Any,
-        request_id: str,
-        prompt: Any,
-        params: Any,
-        arrival_time: float | None = None,
-        lora_request: Any | None = None,
-        **kwargs: Any,
+        request: Any,
+        prompt: str | None,
+        parent_req: Any,
+        index: int,
+        queue: Any,
     ) -> Any:
+        lora_request = request.lora_request
         coordinator = getattr(self, _LORA_UPDATE_COORDINATOR_FIELD, None)
         if coordinator is None or lora_request is None:
-            return await original(
-                self,
-                request_id,
-                prompt,
-                params,
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                **kwargs,
-            )
+            return await original(self, request, prompt, parent_req, index, queue)
         lora_slot = str(lora_request.lora_name)
         async with coordinator.admission(lora_slot) as current_lora_request:
             if current_lora_request is not None:
@@ -862,31 +856,17 @@ def _patch_engine_request_admission() -> None:
                     f"Mutable LoRA slot {lora_slot!r} has no declared policy identity"
                 )
             if isinstance(lora_request, PolicyLoRARequest):
+                request.lora_request = lora_request
                 _set_policy_cache_salt(
-                    params,
+                    request,
                     lora_slot=lora_slot,
                     policy_version=lora_request.policy_version,
                     update_seq=lora_request.update_seq,
                 )
-                if isinstance(prompt, dict) or hasattr(prompt, "cache_salt"):
-                    _set_policy_cache_salt(
-                        prompt,
-                        lora_slot=lora_slot,
-                        policy_version=lora_request.policy_version,
-                        update_seq=lora_request.update_seq,
-                    )
-            return await original(
-                self,
-                request_id,
-                prompt,
-                params,
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                **kwargs,
-            )
+            return await original(self, request, prompt, parent_req, index, queue)
 
-    add_request.__art_lora_update_patched__ = True  # type: ignore[attr-defined]
-    AsyncLLM.add_request = add_request  # type: ignore[method-assign]
+    _add_request.__art_lora_update_patched__ = True  # type: ignore[attr-defined]
+    AsyncLLM._add_request = _add_request  # type: ignore[method-assign]
 
 
 def _patch_load_inplace_storage() -> None:
