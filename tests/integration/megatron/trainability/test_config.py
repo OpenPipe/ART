@@ -14,6 +14,9 @@ from .test_live_length_trainability import (
     LengthSampleReport,
     LengthTrainabilityReport,
     _default_learning_rate,
+    _length_current_step_demand,
+    _length_max_steps,
+    _length_rollouts_per_prompt,
     _length_trainability_thresholds,
     _prompt_for_index,
     _target_tokens,
@@ -381,9 +384,15 @@ def test_yes_no_prompts_form_prefix_tree_by_default(monkeypatch) -> None:
     assert _yes_no_prompt_tree_shape(prompts) == (3, 6)
 
 
-def test_qwen3_5_length_trainability_uses_stable_learning_rate() -> None:
-    assert _default_learning_rate("Qwen/Qwen3.5-35B-A3B") == 7e-5
+def test_qwen3_5_length_trainability_uses_stable_moe_defaults() -> None:
+    assert _default_learning_rate("Qwen/Qwen3.5-35B-A3B") == 1e-4
+    assert _length_rollouts_per_prompt("Qwen/Qwen3.5-35B-A3B") == 32
+    assert _length_max_steps("Qwen/Qwen3.5-35B-A3B") == 30
+    assert _length_current_step_demand("Qwen/Qwen3.5-35B-A3B") is True
     assert _default_learning_rate("Qwen/Qwen3-30B-A3B-Instruct-2507") == 1e-4
+    assert _length_rollouts_per_prompt("Qwen/Qwen3-30B-A3B-Instruct-2507") == 4
+    assert _length_max_steps("Qwen/Qwen3-30B-A3B-Instruct-2507") == 20
+    assert _length_current_step_demand("Qwen/Qwen3-30B-A3B-Instruct-2507") is False
 
 
 def test_gpt_oss_length_target_accounts_for_harmony_tokens(monkeypatch) -> None:

@@ -41,7 +41,8 @@ torch = pytest.importorskip("torch")
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
 DEFAULT_LENGTH_LEARNING_RATE = 1e-4
-LARGE_MOE_LENGTH_LEARNING_RATE = 7e-5
+QWEN3_5_MOE_LENGTH_MAX_STEPS = 30
+QWEN3_5_MOE_LENGTH_ROLLOUTS_PER_PROMPT = 32
 LIVE_ENV = "ART_RUN_LIVE_LENGTH_TRAINABILITY"
 TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
@@ -237,8 +238,6 @@ def _target_tokens(base_model: str | None = None) -> int:
 def _default_learning_rate(base_model: str) -> float:
     if _model_support_key(base_model) == "gemma4_moe":
         return GEMMA4_LENGTH_LEARNING_RATE
-    if base_model == DEFAULT_BASE_MODEL:
-        return LARGE_MOE_LENGTH_LEARNING_RATE
     return DEFAULT_LENGTH_LEARNING_RATE
 
 
@@ -486,10 +485,28 @@ def _scenario_limit() -> int | None:
     return _get_env_int("ART_MODEL_SUPPORT_LENGTH_SCENARIOS", 0)
 
 
-def _length_max_steps() -> int:
+def _length_max_steps(base_model: str) -> int:
     return _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS",
-        DEFAULT_LENGTH_MAX_STEPS,
+        QWEN3_5_MOE_LENGTH_MAX_STEPS
+        if _model_support_key(base_model) == "qwen3_5_moe"
+        else DEFAULT_LENGTH_MAX_STEPS,
+    )
+
+
+def _length_rollouts_per_prompt(base_model: str) -> int:
+    return _get_env_int(
+        "ART_MODEL_SUPPORT_LENGTH_ROLLOUTS_PER_PROMPT",
+        QWEN3_5_MOE_LENGTH_ROLLOUTS_PER_PROMPT
+        if _model_support_key(base_model) == "qwen3_5_moe"
+        else 4,
+    )
+
+
+def _length_current_step_demand(base_model: str) -> bool:
+    return _get_env_bool(
+        "ART_MODEL_SUPPORT_LENGTH_CURRENT_STEP_DEMAND",
+        _model_support_key(base_model) == "qwen3_5_moe",
     )
 
 
@@ -733,15 +750,12 @@ async def run_length_trainability_async(
     )
     backend_env = stage_resources.megatron_env if stage_resources is not None else {}
     with _temporary_env(backend_env):
-        max_steps = _length_max_steps()
+        max_steps = _length_max_steps(base_model)
         max_steps_off_policy = _get_env_int(
             "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS_OFF_POLICY",
             0,
         )
-        rollouts_per_prompt = _get_env_int(
-            "ART_MODEL_SUPPORT_LENGTH_ROLLOUTS_PER_PROMPT",
-            4,
-        )
+        rollouts_per_prompt = _length_rollouts_per_prompt(base_model)
         normalize_advantages = _get_env_bool(
             "ART_MODEL_SUPPORT_LENGTH_NORMALIZE_ADVANTAGES",
             True,
@@ -753,10 +767,7 @@ async def run_length_trainability_async(
         thresholds = _length_trainability_thresholds(base_model)
         scenario_limit = _scenario_limit()
         zero_variance_discard_multiplier = _zero_variance_discard_multiplier(max_steps)
-        current_step_demand = _get_env_bool(
-            "ART_MODEL_SUPPORT_LENGTH_CURRENT_STEP_DEMAND",
-            False,
-        )
+        current_step_demand = _length_current_step_demand(base_model)
     success_hit = False
     pending_trainable_step: int | None = None
     samples: list[LengthSampleReport] = []
