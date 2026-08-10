@@ -52,6 +52,7 @@ _TOKENIZER_COMPATIBLE_STAGES = frozenset(
         "native_vllm_lora",
     }
 )
+_TRAIN_INF_CANONICAL_WEIGHT_MODELS = frozenset({"dsv4", "gpt_oss_moe"})
 _TOKENIZER_FIXTURE_VERSION = 3
 _REVISIONS = {
     "meta-llama/Llama-3.2-1B-Instruct": "9213176726f574b556790deb65791e0c5aa438b6",
@@ -94,7 +95,7 @@ class WorkflowFixture(BaseModel):
                 and stage_name in _GEMMA_CANONICAL_WEIGHT_STAGES
             )
             or (
-                self.model_key in {"dsv4", "gpt_oss_moe"}
+                self.model_key in _TRAIN_INF_CANONICAL_WEIGHT_MODELS
                 and stage_name == "train_inf_mismatch"
             )
         )
@@ -829,7 +830,10 @@ def ensure_workflow_fixture(
             model_key.startswith("gemma4_")
             and bool(required_stages & _GEMMA_CANONICAL_WEIGHT_STAGES)
         )
-        or (model_key == "gpt_oss_moe" and "train_inf_mismatch" in required_stages)
+        or (
+            model_key in _TRAIN_INF_CANONICAL_WEIGHT_MODELS
+            and "train_inf_mismatch" in required_stages
+        )
     )
     if canonical_required:
         canonical_path, canonical_hf_home = _canonical_snapshot(
