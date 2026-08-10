@@ -831,6 +831,39 @@ def _shared_embedding_broadcast_model(
     return megatron_model
 
 
+def _validate_local_pretrained_tasks(
+    bridge: MegatronModelBridge,
+    megatron_model: list[Any],
+    tasks: Iterable[Any],
+) -> None:
+    covered = {
+        id(task.param_weight)
+        for task in tasks
+        if task is not None
+        and task.megatron_module is not None
+        and task.param_weight is not None
+    }
+    config = getattr(unwrap_model(megatron_model)[0], "config", None)
+    tied_output = bool(
+        config is not None and bridge._share_embeddings_and_output_weights(config)
+    )
+    missing = [
+        name
+        for model in megatron_model
+        for name, param in model.named_parameters()
+        if not bridge._is_adapter_param_name(name)
+        and not (tied_output and "output_layer" in name)
+        and id(param) not in covered
+    ]
+    if missing:
+        preview = ", ".join(missing[:8])
+        remainder = f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""
+        raise RuntimeError(
+            "Megatron Bridge did not create pretrained load tasks for "
+            f"{len(missing)} required local parameter(s): {preview}{remainder}"
+        )
+
+
 def _optimized_load_weights_hf_to_megatron(
     self: MegatronModelBridge,
     hf_pretrained: Any,
@@ -844,9 +877,9 @@ def _optimized_load_weights_hf_to_megatron(
             stack.enter_context(megatron_model[0].hide_teacher_model())
         if hasattr(megatron_model[0], "hide_loss_modules"):
             stack.enter_context(megatron_model[0].hide_loss_modules())
-        tasks = _prepare_nonuniform_expert_tasks(
-            self.build_conversion_tasks(hf_pretrained, megatron_model)
-        )
+        tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
+        _validate_local_pretrained_tasks(self, megatron_model, tasks)
+        tasks = _prepare_nonuniform_expert_tasks(tasks)
     hf_state_dict = hf_pretrained.state
     raw_cache = load_unique_hf_keys_once(
         tasks,
