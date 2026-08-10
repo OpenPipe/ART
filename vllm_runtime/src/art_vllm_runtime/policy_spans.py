@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import wraps
 import hashlib
 import importlib
 import re
@@ -34,6 +36,22 @@ _LORA_UPDATE_COORDINATOR_FIELD = "_art_lora_update_coordinator"
 _EXECUTING_POLICY_CONTEXT_FIELD = "_art_executing_policy_context"
 _POLICY_EXECUTION_MARKER_FIELD = "_art_policy_execution_marker"
 _POLICY_HISTORY_BASE_FIELD = "_art_policy_history_before_current"
+
+
+class _RequestAdmissionLease:
+    __slots__ = ("closed", "context", "lora_request", "lora_slot", "request_id")
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.context: Any | None = None
+        self.lora_request: Any | None = None
+        self.lora_slot: str | None = None
+        self.request_id: str | None = None
+
+
+_REQUEST_ADMISSION_LEASE: ContextVar[_RequestAdmissionLease | None] = ContextVar(
+    "art_request_admission_lease", default=None
+)
 
 _MODEL_RUNNER_OUTPUT_MODULES = (
     "vllm.v1.outputs",
@@ -830,10 +848,29 @@ def _patch_engine_request_admission() -> None:
     from vllm.v1.engine.async_llm import AsyncLLM
 
     # Long-prompt input processing is policy-independent; only serialize the
-    # final request identity and engine enqueue with in-place weight updates.
-    original = AsyncLLM._add_request
-    if getattr(original, "__art_lora_update_patched__", False):
+    # complete final fanout and engine enqueue with in-place weight updates.
+    original_add_request = AsyncLLM.add_request
+    original_enqueue = AsyncLLM._add_request
+    if getattr(original_add_request, "__art_lora_update_patched__", False):
         return
+
+    @wraps(original_add_request)
+    async def add_request(self: Any, *args: Any, **kwargs: Any) -> Any:
+        lease = _RequestAdmissionLease()
+        token = _REQUEST_ADMISSION_LEASE.set(lease)
+        try:
+            return await original_add_request(self, *args, **kwargs)
+        except BaseException:
+            if lease.request_id is not None:
+                await asyncio.shield(self.abort(lease.request_id, internal=True))
+            raise
+        finally:
+            lease.closed = True
+            try:
+                if lease.context is not None:
+                    await asyncio.shield(lease.context.__aexit__(None, None, None))
+            finally:
+                _REQUEST_ADMISSION_LEASE.reset(token)
 
     async def _add_request(
         self: Any,
@@ -843,30 +880,60 @@ def _patch_engine_request_admission() -> None:
         index: int,
         queue: Any,
     ) -> Any:
+        lease = _REQUEST_ADMISSION_LEASE.get()
+        if lease is not None and not lease.closed:
+            request_id = parent_req.request_id if parent_req else request.request_id
+            if lease.request_id not in (None, request_id):
+                raise RuntimeError("One admission lease received multiple requests")
+            lease.request_id = request_id
         lora_request = request.lora_request
         coordinator = getattr(self, _LORA_UPDATE_COORDINATOR_FIELD, None)
         if coordinator is None or lora_request is None:
-            return await original(self, request, prompt, parent_req, index, queue)
+            return await original_enqueue(
+                self, request, prompt, parent_req, index, queue
+            )
         lora_slot = str(lora_request.lora_name)
-        async with coordinator.admission(lora_slot) as current_lora_request:
-            if current_lora_request is not None:
-                lora_request = current_lora_request
-            elif lora_slot.endswith(":active"):
-                raise RuntimeError(
-                    f"Mutable LoRA slot {lora_slot!r} has no declared policy identity"
+        if lease is None or lease.closed:
+            async with coordinator.admission(lora_slot) as current_lora_request:
+                _bind_admitted_lora(request, lora_slot, current_lora_request)
+                return await original_enqueue(
+                    self, request, prompt, parent_req, index, queue
                 )
-            if isinstance(lora_request, PolicyLoRARequest):
-                request.lora_request = lora_request
-                _set_policy_cache_salt(
-                    request,
-                    lora_slot=lora_slot,
-                    policy_version=lora_request.policy_version,
-                    update_seq=lora_request.update_seq,
-                )
-            return await original(self, request, prompt, parent_req, index, queue)
+        if lease.lora_slot is None:
+            context = coordinator.admission(lora_slot)
+            lease.lora_request = await context.__aenter__()
+            lease.context = context
+            lease.lora_slot = lora_slot
+        elif lease.lora_slot != lora_slot:
+            raise RuntimeError("One request fanout resolved to multiple LoRA slots")
+        _bind_admitted_lora(request, lora_slot, lease.lora_request)
+        return await original_enqueue(self, request, prompt, parent_req, index, queue)
 
+    add_request.__art_lora_update_patched__ = True  # type: ignore[attr-defined]
     _add_request.__art_lora_update_patched__ = True  # type: ignore[attr-defined]
+    AsyncLLM.add_request = add_request  # type: ignore[method-assign]
     AsyncLLM._add_request = _add_request  # type: ignore[method-assign]
+
+
+def _bind_admitted_lora(
+    request: Any,
+    lora_slot: str,
+    lora_request: Any | None,
+) -> None:
+    if lora_request is None:
+        if lora_slot.endswith(":active"):
+            raise RuntimeError(
+                f"Mutable LoRA slot {lora_slot!r} has no declared policy identity"
+            )
+        lora_request = request.lora_request
+    if isinstance(lora_request, PolicyLoRARequest):
+        request.lora_request = lora_request
+        _set_policy_cache_salt(
+            request,
+            lora_slot=lora_slot,
+            policy_version=lora_request.policy_version,
+            update_seq=lora_request.update_seq,
+        )
 
 
 def _patch_load_inplace_storage() -> None:

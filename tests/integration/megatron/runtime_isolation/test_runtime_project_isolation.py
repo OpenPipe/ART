@@ -150,6 +150,141 @@ asyncio.run(main())
     assert len(cache_salt) == len("art_policy_cache_salt=v1:") + 64
 
 
+def test_runtime_parallel_admission_is_atomic_and_cancellation_safe(
+    artifact_dir: Path,
+) -> None:
+    payload = _runtime_python(
+        """
+import asyncio
+from collections import defaultdict
+import json
+from types import SimpleNamespace
+
+from art_vllm_runtime.policy_spans import (
+    LoraUpdateCoordinator, PolicyLoRARequest, _patch_engine_request_admission,
+)
+from vllm.sampling_params import SamplingParams
+from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.output_processor import OutputProcessor
+
+class Output:
+    abort_requests = OutputProcessor.abort_requests
+
+    def __init__(self):
+        self.request_states = {}
+        self.parent_requests = {}
+        self.external_req_ids = defaultdict(list)
+        self.lora_states = SimpleNamespace(request_finished=lambda *_args: None)
+
+    def add_request(self, request, _prompt, parent, _index, _queue):
+        self.request_states[request.request_id] = SimpleNamespace(
+            external_req_id=request.external_req_id,
+            lora_name=request.lora_request.lora_name,
+            parent_req=parent,
+            queue=None,
+        )
+        self.external_req_ids[request.external_req_id].append(request.request_id)
+        if parent is not None:
+            self.parent_requests[parent.request_id] = parent
+
+class Core:
+    def __init__(self):
+        self.resources = SimpleNamespace(engine_dead=False)
+        self.calls = []
+        self.aborted = []
+        self.first = asyncio.Event()
+        self.release_first = asyncio.Event()
+        self.second = asyncio.Event()
+        self.release_second = asyncio.Event()
+
+    async def add_request_async(self, request):
+        self.calls.append((request.request_id, request.lora_request.policy_version))
+        if len(self.calls) == 1:
+            self.first.set()
+            await self.release_first.wait()
+        else:
+            self.second.set()
+            await self.release_second.wait()
+
+    async def abort_requests_async(self, request_ids):
+        self.aborted.extend(request_ids)
+
+async def main():
+    _patch_engine_request_admission()
+    slot = "model:active"
+    old = PolicyLoRARequest(
+        lora_name=slot, lora_int_id=1, lora_path="old",
+        policy_version=1, update_seq=1,
+    )
+    new = PolicyLoRARequest(
+        lora_name=slot, lora_int_id=1, lora_path="new",
+        policy_version=2, update_seq=2,
+    )
+    coordinator = LoraUpdateCoordinator()
+    assert await coordinator.begin_update(slot) == 1
+    await coordinator.commit_update(slot, old)
+    engine = object.__new__(AsyncLLM)
+    engine.engine_core = Core()
+    engine.output_handler = None
+    engine.vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(kv_sharing_fast_prefill=False)
+    )
+    engine.input_processor = SimpleNamespace(assign_request_id=lambda _request: None)
+    engine._run_output_handler = lambda: None
+    engine.output_processor = Output()
+    engine.log_requests = False
+    engine._art_lora_update_coordinator = coordinator
+    params = SamplingParams(n=2, max_tokens=1)
+    request = EngineCoreRequest(
+        request_id="parent", external_req_id="external", prompt_token_ids=[1],
+        mm_features=None, sampling_params=params, pooling_params=None,
+        arrival_time=0.0, lora_request=old, cache_salt=None,
+        data_parallel_rank=None,
+    )
+    admission = asyncio.create_task(
+        engine.add_request("parent", request, params, prompt_text="x")
+    )
+    await engine.engine_core.first.wait()
+    update = asyncio.create_task(coordinator.begin_update(slot))
+    await asyncio.sleep(0)
+    blocked_after_first = not update.done()
+    engine.engine_core.release_first.set()
+    await engine.engine_core.second.wait()
+    blocked_after_second = not update.done()
+    admission.cancel()
+    try:
+        await admission
+    except asyncio.CancelledError:
+        pass
+    update_seq = await asyncio.wait_for(update, timeout=1)
+    await coordinator.commit_update(slot, new)
+    print(json.dumps({
+        "calls": engine.engine_core.calls,
+        "blocked": [blocked_after_first, blocked_after_second],
+        "update_seq": update_seq,
+        "aborted": sorted(engine.engine_core.aborted),
+        "state_sizes": [
+            len(engine.output_processor.request_states),
+            len(engine.output_processor.external_req_ids),
+            len(engine.output_processor.parent_requests),
+        ],
+    }, sort_keys=True))
+
+asyncio.run(main())
+""",
+        artifact_dir,
+        "parallel_lora_admission",
+    )
+    assert json.loads(payload) == {
+        "aborted": ["0_parent", "1_parent"],
+        "blocked": [True, True],
+        "calls": [["0_parent", 1], ["1_parent", 1]],
+        "state_sizes": [0, 0, 0],
+        "update_seq": 2,
+    }
+
+
 def test_runtime_cancelled_update_releases_admission(
     artifact_dir: Path,
 ) -> None:
