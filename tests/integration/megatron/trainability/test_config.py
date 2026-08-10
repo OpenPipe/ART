@@ -395,6 +395,16 @@ def test_qwen3_5_length_trainability_uses_stable_moe_defaults() -> None:
     assert _length_current_step_demand("Qwen/Qwen3-30B-A3B-Instruct-2507") is False
 
 
+def test_length_trainability_environment_overrides_model_defaults(monkeypatch) -> None:
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_MAX_STEPS", "9")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_ROLLOUTS_PER_PROMPT", "6")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_CURRENT_STEP_DEMAND", "0")
+
+    assert _length_max_steps("Qwen/Qwen3.5-35B-A3B") == 9
+    assert _length_rollouts_per_prompt("Qwen/Qwen3.5-35B-A3B") == 6
+    assert _length_current_step_demand("Qwen/Qwen3.5-35B-A3B") is False
+
+
 def test_gpt_oss_length_target_accounts_for_harmony_tokens(monkeypatch) -> None:
     assert _target_tokens("google/gemma-4-31B-it") == 22
     assert _target_tokens("openai/gpt-oss-20b") == 20
