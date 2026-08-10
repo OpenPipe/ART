@@ -41,7 +41,7 @@ torch = pytest.importorskip("torch")
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
 DEFAULT_LENGTH_LEARNING_RATE = 1e-4
-QWEN3_5_MOE_LENGTH_MAX_STEPS = 30
+LENGTH_MAX_STEPS_BY_MODEL = {"llama3_dense": 30, "qwen3_5_moe": 30}
 QWEN3_5_MOE_LENGTH_ROLLOUTS_PER_PROMPT = 32
 QWEN3_5_MOE_LENGTH_ROLLOUT_SEED = 20261833
 QWEN3_5_MOE_LENGTH_ROLLOUT_TEMPERATURE = 0.8
@@ -490,9 +490,9 @@ def _scenario_limit() -> int | None:
 def _length_max_steps(base_model: str) -> int:
     return _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS",
-        QWEN3_5_MOE_LENGTH_MAX_STEPS
-        if _model_support_key(base_model) == "qwen3_5_moe"
-        else DEFAULT_LENGTH_MAX_STEPS,
+        LENGTH_MAX_STEPS_BY_MODEL.get(
+            _model_support_key(base_model), DEFAULT_LENGTH_MAX_STEPS
+        ),
     )
 
 
