@@ -39,14 +39,22 @@ _POLICY_HISTORY_BASE_FIELD = "_art_policy_history_before_current"
 
 
 class _RequestAdmissionLease:
-    __slots__ = ("closed", "context", "lora_request", "lora_slot", "request_id")
+    __slots__ = (
+        "closed",
+        "lora_request",
+        "lora_slot",
+        "owner",
+        "request_id",
+        "ticket",
+    )
 
     def __init__(self) -> None:
         self.closed = False
-        self.context: Any | None = None
         self.lora_request: Any | None = None
         self.lora_slot: str | None = None
+        self.owner = asyncio.current_task()
         self.request_id: str | None = None
+        self.ticket: _SlotAdmissionTicket | None = None
 
 
 _REQUEST_ADMISSION_LEASE: ContextVar[_RequestAdmissionLease | None] = ContextVar(
@@ -116,6 +124,38 @@ class _SlotAdmissionState:
         self.update_active = False
 
 
+class _SlotAdmissionTicket:
+    __slots__ = ("lora_request", "released", "state")
+
+    def __init__(self, state: _SlotAdmissionState) -> None:
+        self.lora_request = state.lora_request
+        self.released = False
+        self.state = state
+
+    async def release(self) -> None:
+        async with self.state.condition:
+            if self.released:
+                return
+            self.state.active_admissions -= 1
+            self.released = True
+            self.state.condition.notify_all()
+
+
+async def _complete_task(task: asyncio.Task[Any]) -> asyncio.CancelledError | None:
+    interrupted: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if task.cancelled():
+                break
+            interrupted = interrupted or error
+        except BaseException:
+            break
+    task.result()
+    return interrupted
+
+
 class LoraUpdateCoordinator:
     """Linearizes request admission with mutable LoRA slot updates."""
 
@@ -125,18 +165,22 @@ class LoraUpdateCoordinator:
     def _state(self, lora_slot: str) -> _SlotAdmissionState:
         return self._states.setdefault(lora_slot, _SlotAdmissionState())
 
-    @asynccontextmanager
-    async def admission(self, lora_slot: str) -> AsyncIterator[Any | None]:
+    async def acquire(self, lora_slot: str) -> _SlotAdmissionTicket:
         state = self._state(lora_slot)
         async with state.condition:
             await state.condition.wait_for(lambda: not state.blocked)
             state.active_admissions += 1
+            return _SlotAdmissionTicket(state)
+
+    @asynccontextmanager
+    async def admission(self, lora_slot: str) -> AsyncIterator[Any | None]:
+        ticket = await self.acquire(lora_slot)
         try:
-            yield state.lora_request
+            yield ticket.lora_request
         finally:
-            async with state.condition:
-                state.active_admissions -= 1
-                state.condition.notify_all()
+            interrupted = await _complete_task(asyncio.create_task(ticket.release()))
+            if interrupted is not None:
+                raise interrupted
 
     async def declare_initial(
         self, lora_slot: str, lora_request: PolicyLoRARequest
@@ -859,18 +903,16 @@ def _patch_engine_request_admission() -> None:
         lease = _RequestAdmissionLease()
         token = _REQUEST_ADMISSION_LEASE.set(lease)
         try:
-            return await original_add_request(self, *args, **kwargs)
-        except BaseException:
-            if lease.request_id is not None:
-                await asyncio.shield(self.abort(lease.request_id, internal=True))
+            result = await original_add_request(self, *args, **kwargs)
+            if lease.ticket is not None:
+                await lease.ticket.release()
+            return result
+        except BaseException as error:
+            await _cleanup_failed_admission(self, lease.request_id, lease.ticket, error)
             raise
         finally:
             lease.closed = True
-            try:
-                if lease.context is not None:
-                    await asyncio.shield(lease.context.__aexit__(None, None, None))
-            finally:
-                _REQUEST_ADMISSION_LEASE.reset(token)
+            _REQUEST_ADMISSION_LEASE.reset(token)
 
     async def _add_request(
         self: Any,
@@ -881,38 +923,71 @@ def _patch_engine_request_admission() -> None:
         queue: Any,
     ) -> Any:
         lease = _REQUEST_ADMISSION_LEASE.get()
-        if lease is not None and not lease.closed:
-            request_id = parent_req.request_id if parent_req else request.request_id
+        if lease is not None and (
+            lease.closed or lease.owner is not asyncio.current_task()
+        ):
+            lease = None
+        request_id = parent_req.request_id if parent_req else request.request_id
+        if lease is not None:
             if lease.request_id not in (None, request_id):
                 raise RuntimeError("One admission lease received multiple requests")
-            lease.request_id = request_id
         lora_request = request.lora_request
         coordinator = getattr(self, _LORA_UPDATE_COORDINATOR_FIELD, None)
         if coordinator is None or lora_request is None:
+            if lease is not None:
+                lease.request_id = request_id
             return await original_enqueue(
                 self, request, prompt, parent_req, index, queue
             )
         lora_slot = str(lora_request.lora_name)
-        if lease is None or lease.closed:
-            async with coordinator.admission(lora_slot) as current_lora_request:
-                _bind_admitted_lora(request, lora_slot, current_lora_request)
-                return await original_enqueue(
+        if lease is None:
+            ticket = await coordinator.acquire(lora_slot)
+            try:
+                _bind_admitted_lora(request, lora_slot, ticket.lora_request)
+                result = await original_enqueue(
                     self, request, prompt, parent_req, index, queue
                 )
+                await ticket.release()
+                return result
+            except BaseException as error:
+                await _cleanup_failed_admission(self, request_id, ticket, error)
+                raise
         if lease.lora_slot is None:
-            context = coordinator.admission(lora_slot)
-            lease.lora_request = await context.__aenter__()
-            lease.context = context
+            lease.ticket = await coordinator.acquire(lora_slot)
+            lease.lora_request = lease.ticket.lora_request
             lease.lora_slot = lora_slot
         elif lease.lora_slot != lora_slot:
             raise RuntimeError("One request fanout resolved to multiple LoRA slots")
         _bind_admitted_lora(request, lora_slot, lease.lora_request)
+        lease.request_id = request_id
         return await original_enqueue(self, request, prompt, parent_req, index, queue)
 
     add_request.__art_lora_update_patched__ = True  # type: ignore[attr-defined]
     _add_request.__art_lora_update_patched__ = True  # type: ignore[attr-defined]
     AsyncLLM.add_request = add_request  # type: ignore[method-assign]
     AsyncLLM._add_request = _add_request  # type: ignore[method-assign]
+
+
+async def _cleanup_failed_admission(
+    engine: Any,
+    request_id: str | None,
+    ticket: _SlotAdmissionTicket | None,
+    primary: BaseException,
+) -> None:
+    async def cleanup() -> None:
+        try:
+            if request_id is not None:
+                await engine.abort(request_id, internal=True)
+        finally:
+            if ticket is not None:
+                await ticket.release()
+
+    try:
+        await _complete_task(asyncio.create_task(cleanup()))
+    except BaseException as error:
+        raise BaseExceptionGroup(
+            "request admission and cleanup both failed", [primary, error]
+        ) from None
 
 
 def _bind_admitted_lora(

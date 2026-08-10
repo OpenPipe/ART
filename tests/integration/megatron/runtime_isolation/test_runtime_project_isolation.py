@@ -235,6 +235,17 @@ async def main():
     engine.output_processor = Output()
     engine.log_requests = False
     engine._art_lora_update_coordinator = coordinator
+    abort_started = asyncio.Event()
+    release_abort = asyncio.Event()
+    abort_finished = asyncio.Event()
+
+    async def abort(request_id, internal=False):
+        abort_started.set()
+        await release_abort.wait()
+        await AsyncLLM.abort(engine, request_id, internal=internal)
+        abort_finished.set()
+
+    engine.abort = abort
     params = SamplingParams(n=2, max_tokens=1)
     request = EngineCoreRequest(
         request_id="parent", external_req_id="external", prompt_token_ids=[1],
@@ -253,6 +264,28 @@ async def main():
     await engine.engine_core.second.wait()
     blocked_after_second = not update.done()
     admission.cancel()
+    await abort_started.wait()
+    state = coordinator._states[slot]
+    await state.condition.acquire()
+    admission.cancel()
+    await asyncio.sleep(0)
+    blocked_during_abort = not admission.done() and not update.done()
+    maps_during_abort = [
+        len(engine.output_processor.request_states),
+        len(engine.output_processor.external_req_ids),
+        len(engine.output_processor.parent_requests),
+    ]
+    release_abort.set()
+    await abort_finished.wait()
+    admission.cancel()
+    await asyncio.sleep(0)
+    blocked_during_release = not admission.done() and not update.done()
+    maps_after_abort = [
+        len(engine.output_processor.request_states),
+        len(engine.output_processor.external_req_ids),
+        len(engine.output_processor.parent_requests),
+    ]
+    state.condition.release()
     try:
         await admission
     except asyncio.CancelledError:
@@ -262,6 +295,9 @@ async def main():
     print(json.dumps({
         "calls": engine.engine_core.calls,
         "blocked": [blocked_after_first, blocked_after_second],
+        "blocked_cleanup": [blocked_during_abort, blocked_during_release],
+        "maps_during_abort": maps_during_abort,
+        "maps_after_abort": maps_after_abort,
         "update_seq": update_seq,
         "aborted": sorted(engine.engine_core.aborted),
         "state_sizes": [
@@ -279,7 +315,10 @@ asyncio.run(main())
     assert json.loads(payload.splitlines()[-1]) == {
         "aborted": ["0_parent", "1_parent"],
         "blocked": [True, True],
+        "blocked_cleanup": [True, True],
         "calls": [["0_parent", 1], ["1_parent", 1]],
+        "maps_after_abort": [0, 0, 0],
+        "maps_during_abort": [2, 1, 1],
         "state_sizes": [0, 0, 0],
         "update_seq": 2,
     }
