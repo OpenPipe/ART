@@ -895,13 +895,13 @@ class DistributedMegatronService:
                 self._serving_lora_name(learner_version)
             )
         manager = self.runtime.model_service(self._managed_service_name)
+        trainer_host = trainer.runtime_spec.trainer_mesh.ranks[0].host_id
+        inference_hosts = {member.host_id for member in manager.spec.members}
         try:
             targets = await manager.prepare_adapter_transfer(
                 generation_id,
                 get_step_checkpoint_dir(self.output_dir, 0),
-                transport=(
-                    "local" if len(self.runtime.topology.cluster.hosts) == 1 else "nixl"
-                ),
+                transport="local" if inference_hosts == {trainer_host} else "nixl",
             )
             if not targets:
                 raise RuntimeError("model service returned no adapter transfer targets")
