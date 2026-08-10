@@ -786,7 +786,7 @@ async def run_length_trainability_async(
     )
     internal_config["engine_args"]["max_num_seqs"] = _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_NUM_SEQS",
-        4,
+        max(4, rollouts_per_prompt),
     )
     from transformers import AutoTokenizer
 
