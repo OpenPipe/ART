@@ -16,6 +16,7 @@ from .test_live_length_trainability import (
     _default_learning_rate,
     _length_current_step_demand,
     _length_max_steps,
+    _length_rollout_seed,
     _length_rollouts_per_prompt,
     _length_trainability_thresholds,
     _prompt_for_index,
@@ -388,20 +389,25 @@ def test_qwen3_5_length_trainability_uses_stable_moe_defaults() -> None:
     assert _default_learning_rate("Qwen/Qwen3.5-35B-A3B") == 1e-4
     assert _length_rollouts_per_prompt("Qwen/Qwen3.5-35B-A3B") == 32
     assert _length_max_steps("Qwen/Qwen3.5-35B-A3B") == 30
+    assert _length_rollout_seed("Qwen/Qwen3.5-35B-A3B") == 20261833
     assert _length_current_step_demand("Qwen/Qwen3.5-35B-A3B") is True
     assert _default_learning_rate("Qwen/Qwen3-30B-A3B-Instruct-2507") == 1e-4
     assert _length_rollouts_per_prompt("Qwen/Qwen3-30B-A3B-Instruct-2507") == 4
     assert _length_max_steps("Qwen/Qwen3-30B-A3B-Instruct-2507") == 20
+    assert _length_rollout_seed("Qwen/Qwen3-30B-A3B-Instruct-2507") is None
     assert _length_current_step_demand("Qwen/Qwen3-30B-A3B-Instruct-2507") is False
 
 
 def test_length_trainability_environment_overrides_model_defaults(monkeypatch) -> None:
     monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_MAX_STEPS", "9")
     monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_ROLLOUTS_PER_PROMPT", "6")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_ROLLOUT_SEED", "17")
     monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_CURRENT_STEP_DEMAND", "0")
 
     assert _length_max_steps("Qwen/Qwen3.5-35B-A3B") == 9
     assert _length_rollouts_per_prompt("Qwen/Qwen3.5-35B-A3B") == 6
+    assert _length_rollout_seed("Qwen/Qwen3.5-35B-A3B") == 17
+    assert _length_rollout_seed("Qwen/Qwen3-30B-A3B-Instruct-2507") == 17
     assert _length_current_step_demand("Qwen/Qwen3.5-35B-A3B") is False
 
 

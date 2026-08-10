@@ -43,6 +43,7 @@ DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
 DEFAULT_LENGTH_LEARNING_RATE = 1e-4
 QWEN3_5_MOE_LENGTH_MAX_STEPS = 30
 QWEN3_5_MOE_LENGTH_ROLLOUTS_PER_PROMPT = 32
+QWEN3_5_MOE_LENGTH_ROLLOUT_SEED = 20261833
 LIVE_ENV = "ART_RUN_LIVE_LENGTH_TRAINABILITY"
 TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
@@ -510,6 +511,14 @@ def _length_current_step_demand(base_model: str) -> bool:
     )
 
 
+def _length_rollout_seed(base_model: str) -> int | None:
+    if (seed := os.environ.get("ART_MODEL_SUPPORT_LENGTH_ROLLOUT_SEED")) is not None:
+        return int(seed)
+    if _model_support_key(base_model) == "qwen3_5_moe":
+        return QWEN3_5_MOE_LENGTH_ROLLOUT_SEED
+    return None
+
+
 def _zero_variance_discard_multiplier(max_steps: int) -> int:
     return _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_ZERO_VARIANCE_DISCARD_MULTIPLIER",
@@ -581,7 +590,7 @@ async def _length_group(
         )
         for completion_index in range(n)
     ]
-    seed = os.environ.get("ART_MODEL_SUPPORT_LENGTH_ROLLOUT_SEED")
+    seed = _length_rollout_seed(base_model)
     trajectories: list[art.Trajectory] = []
     completions = await asyncio.gather(
         *(
@@ -596,7 +605,7 @@ async def _length_group(
                     seed=(
                         None
                         if seed is None
-                        else int(seed) + scenario.scenario_index * n + completion_index
+                        else seed + scenario.scenario_index * n + completion_index
                     ),
                 ),
                 logprobs=True,
