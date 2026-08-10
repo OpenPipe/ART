@@ -51,7 +51,8 @@ _VARIANT_NAME = Literal[
 _RESOURCE_STAGE_NAME = Literal["yes_no_trainability", "length_trainability"]
 _Answer = Literal["yes", "no", "maybe"]
 _ANSWER_TARGETS: tuple[_Answer, ...] = ("yes", "no", "maybe")
-_GPT_OSS_MAX_TOKENS = 512
+_GPT_OSS_MAX_TOKENS = 256
+_GPT_OSS_MAX_MODEL_LEN = 512
 _GPT_OSS_SYSTEM_PROMPT = (
     "Use minimal reasoning. Give only one final word: yes, no, or maybe."
 )
@@ -430,6 +431,7 @@ def _request_timeout(name: str, default: float) -> float:
 
 def _engine_args_for_yes_no_trainability(
     *,
+    base_model: str = "",
     inference_gpu_ids: list[int],
     tensor_parallel_size: int = 1,
     enable_expert_parallel: bool = False,
@@ -437,7 +439,10 @@ def _engine_args_for_yes_no_trainability(
 ) -> dev.EngineArgs:
     engine_args: dict[str, object] = {
         "gpu_memory_utilization": _safe_gpu_memory_utilization(inference_gpu_ids),
-        "max_model_len": _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_MODEL_LEN", 128),
+        "max_model_len": _get_env_int(
+            "ART_MODEL_SUPPORT_YES_NO_MAX_MODEL_LEN",
+            _GPT_OSS_MAX_MODEL_LEN if _is_gpt_oss_model(base_model) else 128,
+        ),
         "max_num_seqs": _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_NUM_SEQS", 4),
         "enforce_eager": True,
         "tensor_parallel_size": tensor_parallel_size,
@@ -744,6 +749,7 @@ def _build_internal_config(
     else:
         vllm_resources = None
     engine_args = _engine_args_for_yes_no_trainability(
+        base_model=base_model,
         inference_gpu_ids=inference_gpu_ids,
         tensor_parallel_size=(
             vllm_resources.tensor_parallel_size
