@@ -409,6 +409,7 @@ def _build_deterministic_shared_init(
     initial_state: dict[str, Any],
     *,
     seed: int,
+    dtype: torch.dtype | None = None,
 ) -> dict[str, Any]:
     """Builds deterministic nonzero LoRA init values for both A and B tensors."""
     initialized: dict[str, Any] = {}
@@ -424,7 +425,11 @@ def _build_deterministic_shared_init(
             generator=generator,
             dtype=torch.float32,
         )
-        initialized[key] = (0.01 * random_values).to(dtype=value.dtype).contiguous()
+        initialized[key] = (
+            (0.01 * random_values)
+            .to(dtype=dtype if dtype is not None else value.dtype)
+            .contiguous()
+        )
     return initialized
 
 
@@ -1593,6 +1598,7 @@ def _worker_run(
             deterministic_init = _build_deterministic_shared_init(
                 _require_not_none(initial_state, "initial_state"),
                 seed=request.case_config.seed,
+                dtype=torch.float32 if request.use_fp32_lora_reference else None,
             )
             _debug("saving deterministic initial lora state")
             save_file(
