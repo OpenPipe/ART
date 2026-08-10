@@ -221,8 +221,9 @@ def _restore_linear_shard_dim(param: Any, loaded_weight: Any) -> None:
     if len(mismatched) == 1:
         dim = mismatched[0]
         if loaded_weight.shape[dim] % param.shape[dim] == 0:
-            param.input_dim = dim
-            param.output_dim = dim
+            for attr in ("input_dim", "output_dim"):
+                if not hasattr(param, attr):
+                    setattr(param, attr, dim)
 
 
 def _reshape_dsv4_bmm_weight(
@@ -233,6 +234,8 @@ def _reshape_dsv4_bmm_weight(
     tp_size: int,
 ) -> Any:
     if not name.endswith(".attn.wo_a.weight"):
+        return loaded_weight
+    if param.ndim == 2:
         return loaded_weight
     local_rows = param.shape[0] * param.shape[1]
     assert loaded_weight.shape == (local_rows * tp_size, param.shape[2])

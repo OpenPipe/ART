@@ -84,6 +84,40 @@ def test_dsv4_layerwise_reload_restores_direct_linear_shard_metadata() -> None:
     assert getattr(param, "output_dim") == 1
 
 
+def test_dsv4_layerwise_reload_preserves_vllm_shard_metadata() -> None:
+    patches = _load_dsv4_patches_module()
+
+    class ReadOnlyShardParameter:
+        shape = (3, 4)
+
+        @property
+        def input_dim(self) -> int:
+            return 1
+
+        @property
+        def output_dim(self) -> int:
+            return 0
+
+    param = ReadOnlyShardParameter()
+
+    patches._restore_linear_shard_dim(param, torch.empty(3, 8))
+
+    assert param.input_dim == 1
+    assert param.output_dim == 0
+
+
+def test_dsv4_bmm_weight_passes_through_current_2d_parameter() -> None:
+    patches = _load_dsv4_patches_module()
+    param = torch.nn.Parameter(torch.empty(6, 4), requires_grad=False)
+    loaded = torch.empty(12, 4)
+
+    reshaped = patches._reshape_dsv4_bmm_weight(
+        "layers.0.attn.wo_a.weight", param, loaded, tp_rank=1, tp_size=2
+    )
+
+    assert reshaped is loaded
+
+
 def test_dsv4_bmm_weight_selects_tp_rows_before_grouping() -> None:
     patches = _load_dsv4_patches_module()
     param = torch.nn.Parameter(torch.empty(2, 3, 4), requires_grad=False)
