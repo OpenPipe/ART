@@ -1353,7 +1353,7 @@ async def _run_e2e_throughput_async(
     e2e_phase: TrainerPhaseEvidence | None = None
     isolated_phase: TrainerPhaseEvidence | None = None
     captured_training_input: (
-        tuple[tuple[Any, ...], str, Mapping[str, Any], int, dict[str, int]] | None
+        tuple[tuple[Any, ...], str, dict[str, int], Mapping[str, Any], int] | None
     ) = None
     bundles_path = stage_dir / "matched_packed_input.msgpack"
     autotune = PipelineAutotuneConfig(
@@ -1512,12 +1512,13 @@ async def _run_e2e_throughput_async(
                         "PipelineTrainer did not pass trajectory groups positionally"
                     )
                 groups = args[1]
-                captured: tuple[tuple[Any, ...], str] | None = None
+                captured: tuple[tuple[Any, ...], str, dict[str, int]] | None = None
                 if train_call_count == capture_train_call:
                     _collect_matched_packing_shapes(groups)
                     captured = (
                         await _capture_training_bundles(groups),
                         _packed_input_fingerprint(groups),
+                        _current_pipeline_settings(trainer),
                     )
                 result = await original_train(*args, **kwargs)
                 step = int(result.step)
@@ -1533,7 +1534,6 @@ async def _run_e2e_throughput_async(
                         *captured,
                         result.metrics,
                         step,
-                        _current_pipeline_settings(trainer),
                     )
                 return result
 
@@ -1557,7 +1557,7 @@ async def _run_e2e_throughput_async(
                 raise RuntimeError(
                     "online pipeline never captured a matched train batch"
                 )
-            bundles, packed_fingerprint, metrics, step, capture_settings = (
+            bundles, packed_fingerprint, capture_settings, metrics, step = (
                 captured_training_input
             )
             bundle_payload = await asyncio.to_thread(_bundle_bytes, bundles)

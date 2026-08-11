@@ -62,6 +62,7 @@ from .workflow_throughput import (
     ThroughputFixture,
     _collect_matched_packing_shapes,
     _collect_measurements,
+    _current_pipeline_settings,
     _environment_provenance,
     _hold_pipeline_settings_after_step,
     _packed_input_fingerprint,
@@ -468,20 +469,38 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
 
 
 def test_throughput_capture_holds_terminal_future_settings() -> None:
-    applied = []
+    measured = PipelineTuneSettings(
+        num_rollout_workers=16,
+        min_batch_size=8,
+        max_batch_size=32,
+        queue_maxsize=48,
+        target_groups_per_step=24,
+    )
+    future = measured.model_copy(update={"num_rollout_workers": 14})
     trainer = SimpleNamespace(
         state=SimpleNamespace(next_training_step=18),
-        apply_pipeline_settings=applied.append,
+        **measured.model_dump(mode="python"),
     )
+
+    def apply(settings: PipelineTuneSettings) -> None:
+        for name, value in settings.model_dump(mode="python").items():
+            setattr(trainer, name, value)
+
+    trainer.apply_pipeline_settings = apply
     original = trainer.apply_pipeline_settings
 
     with _hold_pipeline_settings_after_step(trainer, 19):
-        trainer.apply_pipeline_settings("measured")
+        trainer.apply_pipeline_settings(measured)
         trainer.state.next_training_step = 19
-        trainer.apply_pipeline_settings("future")
+        trainer.apply_pipeline_settings(future)
+        trainer.state.next_training_step = 20
+        trainer.apply_pipeline_settings(future)
+        trainer.state.next_training_step = 21
+        trainer.apply_pipeline_settings(future)
+        assert _current_pipeline_settings(trainer) == measured.model_dump(mode="json")
 
-    trainer.apply_pipeline_settings("restored")
-    assert applied == ["measured", "restored"]
+    trainer.apply_pipeline_settings(future)
+    assert _current_pipeline_settings(trainer) == future.model_dump(mode="json")
     assert trainer.apply_pipeline_settings == original
 
 
