@@ -5,8 +5,12 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
-from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion import Choice, ChoiceLogprobs
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
+from openai.types.chat.chat_completion_token_logprob import (
+    ChatCompletionTokenLogprob,
+    TopLogprob,
+)
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -36,6 +40,7 @@ from .real_path import (
     _delete_adapter_safetensors_on_pass,
     _real_path_rollout_mode,
     _real_path_rollout_weights_mode,
+    _topk_from_chat_logprob,
 )
 
 
@@ -224,7 +229,7 @@ def test_real_path_default_generates_16_tokens_per_rollout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_real_path_rollouts_use_stable_unique_request_seeds() -> None:
+async def test_real_path_rollouts_use_stable_unique_seeds_and_choices() -> None:
     calls = []
     active_requests = 0
     max_active_requests = 0
@@ -241,6 +246,18 @@ async def test_real_path_rollouts_use_stable_unique_request_seeds() -> None:
                 Choice(
                     finish_reason="stop",
                     index=0,
+                    logprobs=ChoiceLogprobs(
+                        content=[
+                            ChatCompletionTokenLogprob(
+                                token="token_id:101",
+                                logprob=-1.0,
+                                top_logprobs=[
+                                    TopLogprob(token="token_id:101", logprob=-1.0)
+                                ],
+                            )
+                            for _ in range(kwargs["max_tokens"])
+                        ]
+                    ),
                     message=ChatCompletionMessage(role="assistant", content="maybe"),
                 )
             ]
@@ -262,23 +279,36 @@ async def test_real_path_rollouts_use_stable_unique_request_seeds() -> None:
         model=model,
         config=config,
         prompts=["first", "second"],
-        forced_token_ids=[101, 102, 103],
+        rollout_continuations=["alpha", "beta", "gamma"],
         extra_body={"return_tokens_as_token_ids": True},
     )
 
     assert len(groups) == 2
     assert max_active_requests == 1
     assert sorted(call["seed"] for call in calls) == list(range(41, 47))
-    assert [call["extra_body"]["allowed_token_ids"] for call in calls] == [
-        [101],
-        [102],
-        [103],
+    assert [call["extra_body"]["structured_outputs"]["choice"] for call in calls] == [
+        ["alpha"],
+        ["beta"],
+        ["gamma"],
     ] * 2
-    assert all(call["extra_body"]["ignore_eos"] is True for call in calls)
-    assert all(call["extra_body"]["min_tokens"] == 16 for call in calls)
     assert all(
         call["extra_body"]["return_tokens_as_token_ids"] is True for call in calls
     )
+
+
+def test_real_path_topk_sorts_vllm_sampled_token_prefix() -> None:
+    entry = SimpleNamespace(
+        top_logprobs=[SimpleNamespace(token="token_id:999", logprob=-100.0)]
+        + [
+            SimpleNamespace(token=f"token_id:{token_id}", logprob=-float(token_id))
+            for token_id in range(TOP_K)
+        ]
+    )
+
+    topk = _topk_from_chat_logprob(entry)
+
+    assert topk.token_ids == list(range(TOP_K))
+    assert topk.logprobs == [-float(token_id) for token_id in range(TOP_K)]
 
 
 def test_real_path_rollout_mode_follows_config() -> None:
