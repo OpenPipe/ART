@@ -105,8 +105,6 @@ from .trajectories import (
     TrajectoryExchanges,
     TrajectoryGroup,
     TrajectoryHistory,
-    auto_trajectory,  # ty: ignore[deprecated]
-    capture_auto_trajectory,  # ty: ignore[deprecated]
     current_trajectory,
     no_capture,
     trajectory,
@@ -129,8 +127,6 @@ from .yield_trajectory import capture_yielded_trajectory, yield_trajectory
 
 __all__ = [
     "dev",
-    "auto_trajectory",
-    "capture_auto_trajectory",
     "current_trajectory",
     "no_capture",
     "gather_trajectories",

@@ -934,28 +934,6 @@ async def trajectory_group(
     )
 
 
-@overload
-@deprecated("Use current_trajectory() instead.")
-def auto_trajectory(*, require: Literal[True]) -> Trajectory: ...
-
-
-@overload
-@deprecated("Use current_trajectory() instead.")
-def auto_trajectory(*, require: Literal[False] = False) -> Trajectory | None: ...
-
-
-@deprecated("Use current_trajectory() instead.")
-def auto_trajectory(*, require: bool = False) -> Trajectory | None:
-    return current_trajectory(require=require)
-
-
-@deprecated("Use trajectory() instead.")
-async def capture_auto_trajectory(
-    coroutine: Coroutine[Any, Any, object],
-) -> Trajectory:
-    return await trajectory(coroutine)
-
-
 def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
     from ._compat import messages_from_legacy_history
 
@@ -1000,7 +978,5 @@ __all__ = [
     "no_capture",
     "trajectory",
     "trajectory_group",
-    "auto_trajectory",
-    "capture_auto_trajectory",
     "get_messages",
 ]
