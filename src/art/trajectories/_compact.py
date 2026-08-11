@@ -1,33 +1,77 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 import json
 import re
-from typing import TypeVar, cast
+from typing import TypeGuard, TypeVar, cast
 
 import pydantic
 
 from . import (
+    CompactDumpable,
     CompactTrajectoryKind,
     CompactTrajectoryPayload,
+    TokenizedHistory,
+    TokenizedMultiHistoryTrajectory,
+    TokenizedTrajectory,
+    TokenizedTrajectoryGroup,
     Trajectory,
     TrajectoryGroup,
 )
-from ._serialization import _StringPool
+from ._serialization import _intern_strings as _intern_string_graph
+from ._serialization import _rebind_history_sources, _StringPool
 
 _FORMAT = "art.trajectories"
 _VERSION = 1
 _FIELDS = {"format", "version", "kind", "strings", "data"}
 _REFERENCE = re.compile(r"\$(?:0|[1-9][0-9]*)\Z")
-_TRAJECTORIES = pydantic.TypeAdapter(list[Trajectory])
-_TRAJECTORY_GROUPS = pydantic.TypeAdapter(list[TrajectoryGroup])
+_SOURCE_MARKERS = {
+    "request_index",
+    "choice_index",
+    "output_index",
+    "output_indices",
+    "generation_index",
+    "prompt_index",
+}
 _TrajectoryT = TypeVar("_TrajectoryT", bound=Trajectory)
 _TrajectoryGroupT = TypeVar("_TrajectoryGroupT", bound=TrajectoryGroup)
+_TokenizedHistoryT = TypeVar("_TokenizedHistoryT", bound=TokenizedHistory)
+_TokenizedTrajectoryT = TypeVar("_TokenizedTrajectoryT", bound=TokenizedTrajectory)
+_TokenizedMultiT = TypeVar("_TokenizedMultiT", bound=TokenizedMultiHistoryTrajectory)
+_TokenizedGroupT = TypeVar("_TokenizedGroupT", bound=TokenizedTrajectoryGroup)
+
+
+def dump(
+    value: CompactDumpable | Iterable[CompactDumpable],
+) -> CompactTrajectoryPayload:
+    """Serialize one supported value or a homogeneous iterable."""
+
+    if _is_dumpable(value):
+        kind = _kind(value)
+        _intern(value)
+        return _encode(kind, _dump_value(value, kind))
+    values = list(cast(Iterable[CompactDumpable], value))
+    if not values:
+        return _encode("list", [])
+    if any(not _is_dumpable(item) for item in values):
+        raise TypeError("compact_dump() received an unsupported value")
+    kinds = [_kind(item) for item in values]
+    if len(set(kinds)) != 1:
+        raise TypeError("compact_dump() requires a homogeneous iterable")
+    pool: _StringPool = {}
+    for item in values:
+        _intern(item, pool)
+    return _encode(
+        "list",
+        [
+            {"kind": kind, "data": _dump_value(item, kind)}
+            for item, kind in zip(values, kinds, strict=True)
+        ],
+    )
 
 
 def dump_trajectory(trajectory: Trajectory) -> CompactTrajectoryPayload:
-    trajectory._intern_strings()
-    return _encode("trajectory", _dump_model(trajectory))
+    return dump(trajectory)
 
 
 def validate_trajectory(
@@ -39,8 +83,7 @@ def validate_trajectory(
 
 
 def dump_trajectory_group(group: TrajectoryGroup) -> CompactTrajectoryPayload:
-    group._intern_strings()
-    return _encode("trajectory_group", _dump_model(group))
+    return dump(group)
 
 
 def validate_trajectory_group(
@@ -51,51 +94,438 @@ def validate_trajectory_group(
     return value
 
 
-def dump_trajectories(
-    trajectories: Iterable[Trajectory],
+def dump_tokenized_history(value: TokenizedHistory) -> CompactTrajectoryPayload:
+    return dump(value)
+
+
+def validate_tokenized_history(
+    payload: Mapping[str, object], cls: type[_TokenizedHistoryT]
+) -> _TokenizedHistoryT:
+    return _finish(_validate_history(_decode(payload, "tokenized_history"), cls))
+
+
+def dump_tokenized_trajectory(
+    value: TokenizedTrajectory,
 ) -> CompactTrajectoryPayload:
-    values = list(trajectories)
-    pool: _StringPool = {}
-    for trajectory in values:
-        trajectory._intern_strings(pool)
-    return _encode("trajectories", [_dump_model(value) for value in values])
+    return dump(value)
 
 
-def validate_trajectories(
-    payload: Mapping[str, object],
-) -> list[Trajectory]:
-    values = _TRAJECTORIES.validate_python(_decode(payload, "trajectories"))
-    pool: _StringPool = {}
-    for value in values:
-        value._intern_strings(pool)
-    return values
+def validate_tokenized_trajectory(
+    payload: Mapping[str, object], cls: type[_TokenizedTrajectoryT]
+) -> _TokenizedTrajectoryT:
+    return _finish(_validate_trajectory(_decode(payload, "tokenized_trajectory"), cls))
 
 
-def dump_trajectory_groups(
-    groups: Iterable[TrajectoryGroup],
+def dump_tokenized_multi_history_trajectory(
+    value: TokenizedMultiHistoryTrajectory,
 ) -> CompactTrajectoryPayload:
-    values = list(groups)
-    pool: _StringPool = {}
-    for group in values:
-        group._intern_strings(pool)
-    return _encode("trajectory_groups", [_dump_model(value) for value in values])
+    return dump(value)
+
+
+def validate_tokenized_multi_history_trajectory(
+    payload: Mapping[str, object], cls: type[_TokenizedMultiT]
+) -> _TokenizedMultiT:
+    return _finish(
+        _validate_multi(_decode(payload, "tokenized_multi_history_trajectory"), cls)
+    )
+
+
+def dump_tokenized_trajectory_group(
+    value: TokenizedTrajectoryGroup,
+) -> CompactTrajectoryPayload:
+    return dump(value)
+
+
+def validate_tokenized_trajectory_group(
+    payload: Mapping[str, object], cls: type[_TokenizedGroupT]
+) -> _TokenizedGroupT:
+    return _finish(_validate_group(_decode(payload, "tokenized_trajectory_group"), cls))
+
+
+def validate_trajectories(payload: Mapping[str, object]) -> list[Trajectory]:
+    return _validate_list(payload, "trajectory", Trajectory.model_validate)
 
 
 def validate_trajectory_groups(
     payload: Mapping[str, object],
 ) -> list[TrajectoryGroup]:
-    values = _TRAJECTORY_GROUPS.validate_python(_decode(payload, "trajectory_groups"))
+    return _validate_list(payload, "trajectory_group", TrajectoryGroup.model_validate)
+
+
+def validate_tokenized_histories(
+    payload: Mapping[str, object],
+) -> list[TokenizedHistory]:
+    return _validate_list(payload, "tokenized_history", _validate_history_base)
+
+
+def validate_tokenized_trajectories(
+    payload: Mapping[str, object],
+) -> list[TokenizedTrajectory]:
+    return _validate_list(payload, "tokenized_trajectory", _validate_trajectory_base)
+
+
+def validate_tokenized_multi_history_trajectories(
+    payload: Mapping[str, object],
+) -> list[TokenizedMultiHistoryTrajectory]:
+    return _validate_list(
+        payload, "tokenized_multi_history_trajectory", _validate_multi_base
+    )
+
+
+def validate_tokenized_trajectory_groups(
+    payload: Mapping[str, object],
+) -> list[
+    TokenizedTrajectoryGroup[TokenizedTrajectory]
+    | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
+]:
+    return _validate_list(payload, "tokenized_trajectory_group", _validate_group_base)
+
+
+def _validate_list[ValueT](
+    payload: Mapping[str, object],
+    expected_item_kind: CompactTrajectoryKind,
+    validator: Callable[[object], ValueT],
+) -> list[ValueT]:
+    data = _decode(payload, "list")
+    if not isinstance(data, list):
+        raise ValueError("Compact list payload data must be a list")
+    values: list[ValueT] = []
+    for item in data:
+        record = _mapping(item, "Compact list item")
+        if set(record) != {"kind", "data"} or record["kind"] != expected_item_kind:
+            raise ValueError(
+                f"Expected compact list items of kind {expected_item_kind!r}"
+            )
+        values.append(validator(record["data"]))
     pool: _StringPool = {}
     for value in values:
-        value._intern_strings(pool)
+        _finish(value, pool)
     return values
 
 
-def _dump_model(model: pydantic.BaseModel) -> pydantic.JsonValue:
+def _validate_history_base(value: object) -> TokenizedHistory:
+    return _validate_history(value, TokenizedHistory)
+
+
+def _validate_trajectory_base(value: object) -> TokenizedTrajectory:
+    return _validate_trajectory(value, TokenizedTrajectory)
+
+
+def _validate_multi_base(value: object) -> TokenizedMultiHistoryTrajectory:
+    return _validate_multi(value, TokenizedMultiHistoryTrajectory)
+
+
+def _validate_group_base(
+    value: object,
+) -> (
+    TokenizedTrajectoryGroup[TokenizedTrajectory]
+    | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
+):
+    return _validate_group(value, TokenizedTrajectoryGroup)
+
+
+def _is_dumpable(value: object) -> TypeGuard[CompactDumpable]:
+    return isinstance(
+        value,
+        (
+            Trajectory,
+            TrajectoryGroup,
+            TokenizedHistory,
+            TokenizedMultiHistoryTrajectory,
+            TokenizedTrajectoryGroup,
+        ),
+    )
+
+
+def _kind(value: CompactDumpable) -> CompactTrajectoryKind:
+    if isinstance(value, TokenizedTrajectory):
+        return "tokenized_trajectory"
+    if isinstance(value, TokenizedHistory):
+        return "tokenized_history"
+    if isinstance(value, TokenizedMultiHistoryTrajectory):
+        return "tokenized_multi_history_trajectory"
+    if isinstance(value, TokenizedTrajectoryGroup):
+        return "tokenized_trajectory_group"
+    if isinstance(value, TrajectoryGroup):
+        return "trajectory_group"
+    if isinstance(value, Trajectory):
+        return "trajectory"
+    raise TypeError(f"Unsupported compact value: {type(value).__name__}")
+
+
+def _dump_value(
+    value: CompactDumpable, kind: CompactTrajectoryKind
+) -> pydantic.JsonValue:
+    if kind in {"trajectory", "trajectory_group"}:
+        if not isinstance(value, pydantic.BaseModel):
+            raise AssertionError("Plain compact values must be Pydantic models")
+        return _dump_model(value)
+    data = _dump_model(cast(pydantic.BaseModel, value))
+    if isinstance(value, TokenizedHistory) and not isinstance(
+        value, TokenizedTrajectory
+    ):
+        registry = _ExchangeDataRegistry()
+        _replace_source_exchanges(data["history"], registry, encode=True)
+        return {"value": data, "exchanges": registry.exchanges}
+    if isinstance(value, TokenizedTrajectory):
+        _compact_trajectory_data(data)
+        return data
+    if isinstance(value, TokenizedMultiHistoryTrajectory):
+        _compact_multi_data(data)
+        return data
+    if isinstance(value, TokenizedTrajectoryGroup):
+        _compact_group_data(data)
+        return data
+    raise AssertionError("Compact kind and value disagree")
+
+
+class _ExchangeDataRegistry:
+    def __init__(
+        self,
+        exchanges: Iterable[dict[str, pydantic.JsonValue]] = (),
+        *,
+        fixed: bool = False,
+    ):
+        self.exchanges = list(exchanges)
+        self.fixed = fixed
+        self._indices = {
+            _json_key(exchange): index for index, exchange in enumerate(self.exchanges)
+        }
+
+    @classmethod
+    def from_trajectory_data(cls, value: object) -> _ExchangeDataRegistry:
+        data = _mapping(value, "Compact source trajectory")
+        exchanges = _mapping(data.get("exchanges"), "Compact trajectory exchanges")
+        values: list[dict[str, pydantic.JsonValue]] = []
+        for protocol in ("chat_completions", "completions", "responses", "messages"):
+            for exchange in _list(exchanges.get(protocol, []), "Trajectory exchanges"):
+                values.append(
+                    cast(
+                        dict[str, pydantic.JsonValue],
+                        dict(_mapping(exchange, "Exchange")),
+                    )
+                )
+        return cls(values, fixed=True)
+
+    def reference(self, value: object) -> int:
+        exchange = cast(
+            dict[str, pydantic.JsonValue],
+            dict(_mapping(value, "History source exchange")),
+        )
+        key = _json_key(exchange)
+        if (index := self._indices.get(key)) is not None:
+            return index
+        if self.fixed:
+            raise ValueError("History source exchange is not present in its trajectory")
+        index = len(self.exchanges)
+        self.exchanges.append(exchange)
+        self._indices[key] = index
+        return index
+
+    def resolve(self, value: object) -> dict[str, pydantic.JsonValue]:
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not 0 <= value < len(self.exchanges)
+        ):
+            raise ValueError("History source exchange reference is invalid")
+        return self.exchanges[value]
+
+
+def _compact_trajectory_data(data: dict[str, pydantic.JsonValue]) -> None:
+    registry = _ExchangeDataRegistry.from_trajectory_data(data.get("trajectory"))
+    _replace_source_exchanges(data.get("history"), registry, encode=True)
+
+
+def _compact_multi_data(data: dict[str, pydantic.JsonValue]) -> None:
+    registry = _ExchangeDataRegistry.from_trajectory_data(data.get("trajectory"))
+    for history in _list(data.get("histories"), "Tokenized histories"):
+        _replace_source_exchanges(
+            _mapping(history, "Tokenized history").get("history"),
+            registry,
+            encode=True,
+        )
+
+
+def _compact_group_data(data: dict[str, pydantic.JsonValue]) -> None:
+    group = _mapping(data.get("trajectory_group"), "Compact source group")
+    source_trajectories = _list(group.get("trajectories"), "Source trajectories")
+    tokenized = _list(data.get("trajectories"), "Tokenized trajectories")
+    if len(source_trajectories) != len(tokenized):
+        raise ValueError("Tokenized group differs in length from its source group")
+    for index, (item, source) in enumerate(
+        zip(tokenized, source_trajectories, strict=True)
+    ):
+        child = cast(
+            dict[str, pydantic.JsonValue],
+            dict(_mapping(item, "Tokenized trajectory")),
+        )
+        if child.pop("trajectory", None) != source:
+            raise ValueError("Tokenized trajectory does not match its source group")
+        registry = _ExchangeDataRegistry.from_trajectory_data(source)
+        if "history" in child:
+            _replace_source_exchanges(child["history"], registry, encode=True)
+        else:
+            for history in _list(child.get("histories"), "Tokenized histories"):
+                _replace_source_exchanges(
+                    _mapping(history, "Tokenized history").get("history"),
+                    registry,
+                    encode=True,
+                )
+        cast(list[pydantic.JsonValue], tokenized)[index] = child
+
+
+def _validate_history[ValueT: TokenizedHistory](
+    value: object, cls: type[ValueT]
+) -> ValueT:
+    wrapper = _mapping(value, "Compact tokenized history")
+    if set(wrapper) != {"value", "exchanges"}:
+        raise ValueError("Compact tokenized history has invalid fields")
+    data = dict(_mapping(wrapper["value"], "Tokenized history data"))
+    registry = _ExchangeDataRegistry(
+        (
+            cast(dict[str, pydantic.JsonValue], dict(_mapping(item, "Exchange")))
+            for item in _list(wrapper["exchanges"], "History source exchanges")
+        ),
+        fixed=True,
+    )
+    _replace_source_exchanges(data.get("history"), registry, encode=False)
+    return cls.model_validate(data)
+
+
+def _validate_trajectory[ValueT: TokenizedTrajectory](
+    value: object, cls: type[ValueT]
+) -> ValueT:
+    data = dict(_mapping(value, "Compact tokenized trajectory"))
+    registry = _ExchangeDataRegistry.from_trajectory_data(data.get("trajectory"))
+    _replace_source_exchanges(data.get("history"), registry, encode=False)
+    return cls.model_validate(data)
+
+
+def _validate_multi[ValueT: TokenizedMultiHistoryTrajectory](
+    value: object, cls: type[ValueT]
+) -> ValueT:
+    data = dict(_mapping(value, "Compact multi-history trajectory"))
+    registry = _ExchangeDataRegistry.from_trajectory_data(data.get("trajectory"))
+    for history in _list(data.get("histories"), "Tokenized histories"):
+        _replace_source_exchanges(
+            _mapping(history, "Tokenized history").get("history"),
+            registry,
+            encode=False,
+        )
+    return cls.model_validate(data)
+
+
+def _validate_group[ValueT: TokenizedTrajectoryGroup](
+    value: object, cls: type[ValueT]
+) -> ValueT:
+    data = dict(_mapping(value, "Compact tokenized group"))
+    group = _mapping(data.get("trajectory_group"), "Compact source group")
+    source_trajectories = _list(group.get("trajectories"), "Source trajectories")
+    tokenized = _list(data.get("trajectories"), "Tokenized trajectories")
+    if len(source_trajectories) != len(tokenized):
+        raise ValueError("Tokenized group differs in length from its source group")
+    multi: bool | None = None
+    for index, (item, source) in enumerate(
+        zip(tokenized, source_trajectories, strict=True)
+    ):
+        child = cast(
+            dict[str, pydantic.JsonValue],
+            dict(_mapping(item, "Tokenized trajectory")),
+        )
+        child["trajectory"] = cast(pydantic.JsonValue, source)
+        registry = _ExchangeDataRegistry.from_trajectory_data(source)
+        child_is_multi = "histories" in child
+        if multi is not None and child_is_multi != multi:
+            raise ValueError("Compact tokenized group mixes trajectory types")
+        multi = child_is_multi
+        if child_is_multi:
+            for history in _list(child["histories"], "Tokenized histories"):
+                _replace_source_exchanges(
+                    _mapping(history, "Tokenized history").get("history"),
+                    registry,
+                    encode=False,
+                )
+        else:
+            _replace_source_exchanges(child.get("history"), registry, encode=False)
+        cast(list[pydantic.JsonValue], tokenized)[index] = child
+    model: type[TokenizedTrajectoryGroup]
+    if cls is TokenizedTrajectoryGroup:
+        model = cast(
+            type[TokenizedTrajectoryGroup],
+            (
+                TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
+                if multi
+                else TokenizedTrajectoryGroup[TokenizedTrajectory]
+            ),
+        )
+    else:
+        model = cls
+    return cast(ValueT, model.model_validate(data))
+
+
+def _replace_source_exchanges(
+    value: object, registry: _ExchangeDataRegistry, *, encode: bool
+) -> None:
+    if isinstance(value, list):
+        for item in value:
+            _replace_source_exchanges(item, registry, encode=encode)
+        return
+    if not isinstance(value, dict):
+        return
+    mutable = cast(dict[str, object], value)
+    if "exchange" in mutable and _SOURCE_MARKERS.intersection(mutable):
+        source = mutable["exchange"]
+        mutable["exchange"] = (
+            registry.reference(source) if encode else registry.resolve(source)
+        )
+        return
+    for key, item in mutable.items():
+        if key in {"system_source", "instructions_source"} and item is not None:
+            mutable[key] = (
+                registry.reference(item) if encode else registry.resolve(item)
+            )
+        else:
+            _replace_source_exchanges(item, registry, encode=encode)
+
+
+def _finish[ValueT](value: ValueT, pool: _StringPool | None = None) -> ValueT:
+    if isinstance(value, TokenizedHistory):
+        _rebind_history_sources(value.history)
+    _intern(value, pool)
+    return value
+
+
+def _dump_model(model: pydantic.BaseModel) -> dict[str, pydantic.JsonValue]:
     return cast(
-        pydantic.JsonValue,
+        dict[str, pydantic.JsonValue],
         model.model_dump(mode="json", warnings="error"),
     )
+
+
+def _mapping(value: object, label: str) -> Mapping[str, object]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{label} must be a string-keyed dictionary")
+    return cast(Mapping[str, object], value)
+
+
+def _list(value: object, label: str) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list")
+    return cast(list[object], value)
+
+
+def _json_key(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _intern(value: object, pool: _StringPool | None = None) -> None:
+    if isinstance(value, Trajectory):
+        value._intern_strings(pool)
+    elif isinstance(value, TrajectoryGroup):
+        value._intern_strings(pool)
+    else:
+        _intern_string_graph(value, pool)
 
 
 def _encode(

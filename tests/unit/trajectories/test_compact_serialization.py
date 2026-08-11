@@ -404,11 +404,11 @@ def test_compact_collection_dump_materializes_once_and_shares_strings() -> None:
             consumed += 1
             yield art.Trajectory(metadata={"value": _fresh(repeated)})
 
-    payload = art.trajectories_compact_dump(values())
+    payload = art.trajectories.compact_dump(values())
 
     assert consumed == 2
     assert list(payload["strings"].values()) == [repeated]
-    restored = art.trajectories_compact_validate(payload)
+    restored = art.trajectories.trajectories_compact_validate(payload)
     assert len(restored) == 2
     assert restored[0].metadata["value"] is restored[1].metadata["value"]
 
@@ -416,8 +416,8 @@ def test_compact_collection_dump_materializes_once_and_shares_strings() -> None:
         art.TrajectoryGroup([art.Trajectory(metadata={"value": _fresh(repeated)})]),
         art.TrajectoryGroup([art.Trajectory(metadata={"value": _fresh(repeated)})]),
     ]
-    group_payload = art.trajectory_groups_compact_dump(groups)
-    restored_groups = art.trajectory_groups_compact_validate(group_payload)
+    group_payload = art.trajectories.compact_dump(groups)
+    restored_groups = art.trajectories.trajectory_groups_compact_validate(group_payload)
     assert (
         restored_groups[0].trajectories[0].metadata["value"]
         is restored_groups[1].trajectories[0].metadata["value"]
@@ -435,22 +435,27 @@ def test_compact_all_four_kinds_and_empty_collections() -> None:
         group.model_dump()
     )
     assert (
-        art.trajectories_compact_validate(art.trajectories_compact_dump([trajectory]))[
-            0
-        ].model_dump()
+        art.trajectories.trajectories_compact_validate(
+            art.trajectories.compact_dump([trajectory])
+        )[0].model_dump()
         == trajectory.model_dump()
     )
     assert (
-        art.trajectory_groups_compact_validate(
-            art.trajectory_groups_compact_dump([group])
+        art.trajectories.trajectory_groups_compact_validate(
+            art.trajectories.compact_dump([group])
         )[0].model_dump()
         == group.model_dump()
     )
-    assert art.trajectories_compact_validate(art.trajectories_compact_dump([])) == []
-    assert (
-        art.trajectory_groups_compact_validate(art.trajectory_groups_compact_dump([]))
-        == []
-    )
+    empty = art.trajectories.compact_dump([])
+    assert art.trajectories.trajectories_compact_validate(empty) == []
+    assert art.trajectories.trajectory_groups_compact_validate(empty) == []
+
+    with pytest.raises(TypeError, match="homogeneous"):
+        art.trajectories.compact_dump([trajectory, group])
+    with pytest.raises(ValueError, match="Expected compact list items"):
+        art.trajectories.trajectory_groups_compact_validate(
+            art.trajectories.compact_dump([trajectory])
+        )
 
 
 def test_compact_profitability_and_determinism_include_complete_envelope() -> None:
@@ -524,7 +529,7 @@ def _protocol_trajectory() -> art.Trajectory:
         ),
         (
             "responses",
-            {"model": model, "input": model},
+            {"model": model, "input": model, "instructions": model},
             {
                 "id": "resp_1",
                 "created_at": 1.0,
@@ -538,7 +543,11 @@ def _protocol_trajectory() -> art.Trajectory:
         ),
         (
             "messages",
-            {"model": model, "messages": [{"role": "user", "content": model}]},
+            {
+                "model": model,
+                "system": model,
+                "messages": [{"role": "user", "content": model}],
+            },
             {
                 "id": "msg_1",
                 "type": "message",
@@ -579,6 +588,63 @@ def test_compact_round_trip_all_protocols_and_legacy_histories() -> None:
     )
     restored_legacy = art.Trajectory.compact_validate(legacy.compact_dump())
     assert restored_legacy.model_dump() == legacy.model_dump()
+
+
+def test_tokenized_compact_round_trip_all_protocol_source_shapes() -> None:
+    combined = _protocol_trajectory()
+    for protocol in ("chat_completions", "completions", "responses", "messages"):
+        source = art.Trajectory()
+        source_exchanges = getattr(source.exchanges, protocol)
+        source_exchanges.extend(getattr(combined.exchanges, protocol))
+        history = source.histories()[0]
+        assert isinstance(history, art.History)
+        assert history.model is not None
+        tokenized = art.TokenizedTrajectory(
+            history=history,
+            trajectory=source,
+            model=history.model,
+            token_ids=[1, 2],
+            logprobs=[float("nan"), -0.1],
+            flags=[art.TokenFlag.EXACT, art.TokenFlag.EXACT | art.TokenFlag.SAMPLED],
+            reward=1.0,
+            metrics={},
+            metadata={},
+        )
+
+        ordinary = art.TokenizedTrajectory.model_validate_json(
+            tokenized.model_dump_json(warnings="error")
+        )
+        assert ordinary.model_dump_json() == tokenized.model_dump_json()
+
+        restored = art.TokenizedTrajectory.compact_validate(tokenized.compact_dump())
+
+        assert restored.model_dump() == tokenized.model_dump()
+        canonical = getattr(restored.trajectory.exchanges, protocol)[0]
+        if isinstance(restored.history, art.ChatCompletionsHistory):
+            history_source = next(
+                item for item in restored.history.message_sources if item is not None
+            )
+            assert history_source.exchange is canonical
+        elif isinstance(restored.history, art.AnthropicMessagesHistory):
+            assert restored.history.system_source is canonical
+        elif isinstance(restored.history, art.ResponsesHistory):
+            assert restored.history.instructions_source is canonical
+        elif isinstance(
+            restored.history,
+            (art.CompletionsTokenHistory, art.CompletionsStringHistory),
+        ):
+            history_source = next(
+                span.source
+                for span in restored.history.prompt_sources
+                if span.source is not None
+            )
+            assert history_source.exchange is canonical
+        else:
+            raise AssertionError("Unexpected protocol history")
+        if protocol == "chat_completions":
+            assert _json_size(tokenized.compact_dump()) < len(
+                tokenized.model_dump_json().encode()
+            )
 
 
 def test_interning_reduces_pickle_and_compact_json_sizes() -> None:

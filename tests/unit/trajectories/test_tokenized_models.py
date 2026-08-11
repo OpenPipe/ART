@@ -1,10 +1,12 @@
 import math
+import pickle
 
 import art
 
 
 def _history() -> art.TokenizedHistory:
     return art.TokenizedHistory(
+        history=art.LegacyHistory(messages_and_choices=[]),
         model="policy",
         token_ids=[1, 2],
         logprobs=[math.nan, -0.25],
@@ -31,8 +33,10 @@ def test_tokenized_history_nan_json_round_trip() -> None:
 
 
 def test_tokenized_trajectory_nan_json_round_trip() -> None:
+    trajectory = art.Trajectory()
     value = art.TokenizedTrajectory(
         **_history().model_dump(),
+        trajectory=trajectory,
         reward=1.0,
         metrics={"count": 1},
         metadata={"source": "test"},
@@ -45,13 +49,16 @@ def test_tokenized_trajectory_nan_json_round_trip() -> None:
 
 
 def test_nested_tokenized_models_nan_json_round_trip() -> None:
+    source = art.Trajectory()
     trajectory = art.TokenizedMultiHistoryTrajectory(
+        trajectory=source,
         histories=[_history()],
         reward=1.0,
         metrics={},
         metadata={},
     )
     group = art.TokenizedTrajectoryGroup[art.TokenizedMultiHistoryTrajectory](
+        trajectory_group=art.TrajectoryGroup([source]),
         trajectories=[trajectory],
         metrics={},
         metadata={},
@@ -133,6 +140,14 @@ def test_public_group_tokenization_nan_json_round_trip() -> None:
             )
         ]
     ).tokenize()
+    single_value = single.trajectories[0]
+    assert isinstance(single_value.history, art.ChatCompletionsHistory)
+    assert single.trajectory_group.trajectories[0] is single_value.trajectory
+    assert single_value.history.message_sources[0] is not None
+    assert (
+        single_value.history.message_sources[0].exchange
+        is single_value.trajectory.exchanges.chat_completions[0]
+    )
     single_json = single.model_dump_json()
     assert '"NaN"' in single_json
     art.TokenizedTrajectoryGroup[art.TokenizedTrajectory].model_validate_json(
@@ -145,3 +160,128 @@ def test_public_group_tokenization_nan_json_round_trip() -> None:
     art.TokenizedTrajectoryGroup[
         art.TokenizedMultiHistoryTrajectory
     ].model_validate_json(multi_json)
+
+
+def test_tokenized_compact_round_trips_retain_source_references() -> None:
+    from datetime import datetime
+
+    from openai.types.chat import ChatCompletion
+
+    from art.trajectories import ChatCompletionsExchange, TrajectoryExchanges
+
+    exchange = ChatCompletionsExchange(
+        request={
+            "model": "policy",
+            "messages": [{"role": "user", "content": "question"}],
+        },
+        response=ChatCompletion.model_validate(
+            {
+                "id": "chat",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "policy",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "answer"},
+                        "prompt_token_ids": [1],
+                        "token_ids": [2],
+                    }
+                ],
+            }
+        ),
+        start_time=datetime(2026, 1, 1),
+        end_time=datetime(2026, 1, 1),
+    )
+    source_group = art.TrajectoryGroup(
+        [art.Trajectory(exchanges=TrajectoryExchanges(chat_completions=[exchange]))]
+    )
+    tokenized_group = source_group.tokenize()
+    tokenized = tokenized_group.trajectories[0]
+    history = tokenized.history
+    assert isinstance(history, art.ChatCompletionsHistory)
+
+    restored_history = art.TokenizedHistory.compact_validate(
+        history.tokenize().compact_dump()
+    )
+    assert isinstance(restored_history.history, art.ChatCompletionsHistory)
+    first_source = restored_history.history.message_sources[0]
+    last_source = restored_history.history.message_sources[-1]
+    assert first_source is not None and last_source is not None
+    assert first_source.exchange is last_source.exchange
+
+    restored = art.TokenizedTrajectory.compact_validate(tokenized.compact_dump())
+    assert isinstance(restored.history, art.ChatCompletionsHistory)
+    restored_source = restored.history.message_sources[0]
+    assert restored_source is not None
+    assert restored_source.exchange is restored.trajectory.exchanges.chat_completions[0]
+
+    pickled = pickle.loads(pickle.dumps(tokenized))
+    assert isinstance(pickled.history, art.ChatCompletionsHistory)
+    pickled_source = pickled.history.message_sources[0]
+    assert pickled_source is not None
+    assert pickled_source.exchange is pickled.trajectory.exchanges.chat_completions[0]
+
+    tokenized_multi = art.TokenizedMultiHistoryTrajectory(
+        trajectory=tokenized.trajectory,
+        histories=[
+            art.TokenizedHistory(
+                history=tokenized.history,
+                model=tokenized.model,
+                token_ids=tokenized.token_ids,
+                logprobs=tokenized.logprobs,
+                flags=tokenized.flags,
+            )
+        ],
+        reward=tokenized.reward,
+        metrics=tokenized.metrics,
+        metadata=tokenized.metadata,
+    )
+    restored_multi = art.TokenizedMultiHistoryTrajectory.compact_validate(
+        tokenized_multi.compact_dump()
+    )
+    assert isinstance(restored_multi.histories[0].history, art.ChatCompletionsHistory)
+    restored_multi_source = restored_multi.histories[0].history.message_sources[0]
+    assert restored_multi_source is not None
+    assert (
+        restored_multi_source.exchange
+        is restored_multi.trajectory.exchanges.chat_completions[0]
+    )
+
+    restored_group = art.TokenizedTrajectoryGroup[
+        art.TokenizedTrajectory
+    ].compact_validate(tokenized_group.compact_dump())
+    restored_child = restored_group.trajectories[0]
+    assert isinstance(restored_child.history, art.ChatCompletionsHistory)
+    assert restored_child.trajectory is restored_group.trajectory_group.trajectories[0]
+    restored_group_source = restored_child.history.message_sources[0]
+    assert restored_group_source is not None
+    assert (
+        restored_group_source.exchange
+        is restored_group.trajectory_group.trajectories[0].exchanges.chat_completions[0]
+    )
+
+    payload = art.trajectories.compact_dump([tokenized])
+    restored_list = art.trajectories.tokenized_trajectories_compact_validate(payload)
+    assert restored_list[0].model_dump() == tokenized.model_dump()
+    history_payload = art.trajectories.compact_dump([history.tokenize()])
+    assert (
+        len(art.trajectories.tokenized_histories_compact_validate(history_payload)) == 1
+    )
+    multi_payload = art.trajectories.compact_dump([tokenized_multi])
+    assert (
+        len(
+            art.trajectories.tokenized_multi_history_trajectories_compact_validate(
+                multi_payload
+            )
+        )
+        == 1
+    )
+    group_payload = art.trajectories.compact_dump([tokenized_group])
+    assert (
+        len(
+            art.trajectories.tokenized_trajectory_groups_compact_validate(group_payload)
+        )
+        == 1
+    )

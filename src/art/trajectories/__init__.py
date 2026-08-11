@@ -63,9 +63,12 @@ from typing_extensions import TypedDict, deprecated
 from ..types import Messages, MessagesAndChoices, Tools
 from ._serialization import (
     _CompactModel,
+    _rebind_history_sources,
     _StringPool,
     serialize_chat_completion,
+    serialize_history,
     serialize_messages_and_choices,
+    validate_history,
 )
 from ._serialization import (
     _intern_strings as _intern_string_graph,
@@ -77,8 +80,11 @@ MetadataValue = Any
 type CompactTrajectoryKind = Literal[
     "trajectory",
     "trajectory_group",
-    "trajectories",
-    "trajectory_groups",
+    "tokenized_history",
+    "tokenized_trajectory",
+    "tokenized_multi_history_trajectory",
+    "tokenized_trajectory_group",
+    "list",
 ]
 
 
@@ -926,29 +932,103 @@ class TrajectoryGroup(_CompactModel):
 class TokenizedHistory(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
 
+    history: TrajectoryHistory
     model: str
     token_ids: list[int]
     logprobs: list[float]
     flags: list[TokenFlag]
 
+    @pydantic.field_serializer("history")
+    def serialize_source_history(
+        self, value: TrajectoryHistory
+    ) -> dict[str, pydantic.JsonValue]:
+        return serialize_history(value)
+
+    @pydantic.field_validator("history", mode="before")
+    @classmethod
+    def validate_source_history(cls, value: object) -> object:
+        return validate_history(value)
+
     @pydantic.model_validator(mode="after")
     def validate_tokenwise_lengths(self) -> TokenizedHistory:
         if not (len(self.token_ids) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tokenized history fields differ in length")
+        _intern_string_graph(self)
         return self
+
+    def compact_dump(self) -> CompactTrajectoryPayload:
+        """Return a compact representation retaining the source history."""
+
+        from ._compact import dump_tokenized_history
+
+        return dump_tokenized_history(self)
+
+    @classmethod
+    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
+        """Validate a compact tokenized-history payload."""
+
+        from ._compact import validate_tokenized_history
+
+        return validate_tokenized_history(payload, cls)
 
 
 class TokenizedTrajectory(TokenizedHistory):
+    trajectory: Trajectory
     reward: float
     metrics: dict[str, float | int | bool]
     metadata: dict[str, MetadataValue]
 
+    @pydantic.model_validator(mode="after")
+    def _bind_source_trajectory(self) -> TokenizedTrajectory:
+        _rebind_history_sources(self.history, self.trajectory)
+        return self
+
+    def compact_dump(self) -> CompactTrajectoryPayload:
+        """Return a compact representation retaining the source trajectory."""
+
+        from ._compact import dump_tokenized_trajectory
+
+        return dump_tokenized_trajectory(self)
+
+    @classmethod
+    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
+        """Validate a compact tokenized-trajectory payload."""
+
+        from ._compact import validate_tokenized_trajectory
+
+        return validate_tokenized_trajectory(payload, cls)
+
 
 class TokenizedMultiHistoryTrajectory(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
+
+    trajectory: Trajectory
     histories: list[TokenizedHistory]
     reward: float
     metrics: dict[str, float | int | bool]
     metadata: dict[str, MetadataValue]
+
+    @pydantic.model_validator(mode="after")
+    def _intern_source_graph(self) -> TokenizedMultiHistoryTrajectory:
+        for history in self.histories:
+            _rebind_history_sources(history.history, self.trajectory)
+        _intern_string_graph(self)
+        return self
+
+    def compact_dump(self) -> CompactTrajectoryPayload:
+        """Return a compact representation retaining the source trajectory."""
+
+        from ._compact import dump_tokenized_multi_history_trajectory
+
+        return dump_tokenized_multi_history_trajectory(self)
+
+    @classmethod
+    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
+        """Validate a compact multi-history trajectory payload."""
+
+        from ._compact import validate_tokenized_multi_history_trajectory
+
+        return validate_tokenized_multi_history_trajectory(payload, cls)
 
 
 TokenizedTrajectoryT = TypeVar(
@@ -957,19 +1037,66 @@ TokenizedTrajectoryT = TypeVar(
 
 
 class TokenizedTrajectoryGroup(pydantic.BaseModel, Generic[TokenizedTrajectoryT]):
+    model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
+
+    trajectory_group: TrajectoryGroup
     trajectories: list[TokenizedTrajectoryT]
     metrics: dict[str, float | int | bool]
     metadata: dict[str, MetadataValue]
 
+    @pydantic.model_validator(mode="after")
+    def _intern_source_graph(self) -> TokenizedTrajectoryGroup[TokenizedTrajectoryT]:
+        if len(self.trajectories) != len(self.trajectory_group.trajectories):
+            raise ValueError("Tokenized group differs in length from its source group")
+        for tokenized, trajectory in zip(
+            self.trajectories, self.trajectory_group.trajectories, strict=True
+        ):
+            if tokenized.trajectory.model_dump() != trajectory.model_dump():
+                raise ValueError("Tokenized trajectory does not match its source group")
+            tokenized.trajectory = trajectory
+            if isinstance(tokenized, TokenizedTrajectory):
+                _rebind_history_sources(tokenized.history, trajectory)
+            else:
+                for history in tokenized.histories:
+                    _rebind_history_sources(history.history, trajectory)
+        _intern_string_graph(self)
+        return self
 
-def trajectories_compact_dump(
-    trajectories: Iterable[Trajectory],
+    def compact_dump(self) -> CompactTrajectoryPayload:
+        """Return a compact representation retaining the source group."""
+
+        from ._compact import dump_tokenized_trajectory_group
+
+        return dump_tokenized_trajectory_group(self)
+
+    @classmethod
+    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
+        """Validate a compact tokenized-group payload."""
+
+        from ._compact import validate_tokenized_trajectory_group
+
+        return validate_tokenized_trajectory_group(payload, cls)
+
+
+type CompactDumpable = (
+    Trajectory
+    | TrajectoryGroup
+    | TokenizedHistory
+    | TokenizedTrajectory
+    | TokenizedMultiHistoryTrajectory
+    | TokenizedTrajectoryGroup[TokenizedTrajectory]
+    | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
+)
+
+
+def compact_dump(
+    value: CompactDumpable | Iterable[CompactDumpable],
 ) -> CompactTrajectoryPayload:
-    """Compact trajectories with one shared string table."""
+    """Compact one supported value or a homogeneous iterable of values."""
 
-    from ._compact import dump_trajectories
+    from ._compact import dump
 
-    return dump_trajectories(trajectories)
+    return dump(value)
 
 
 def trajectories_compact_validate(
@@ -982,16 +1109,6 @@ def trajectories_compact_validate(
     return validate_trajectories(payload)
 
 
-def trajectory_groups_compact_dump(
-    groups: Iterable[TrajectoryGroup],
-) -> CompactTrajectoryPayload:
-    """Compact trajectory groups with one shared string table."""
-
-    from ._compact import dump_trajectory_groups
-
-    return dump_trajectory_groups(groups)
-
-
 def trajectory_groups_compact_validate(
     payload: Mapping[str, object],
 ) -> list[TrajectoryGroup]:
@@ -1000,6 +1117,49 @@ def trajectory_groups_compact_validate(
     from ._compact import validate_trajectory_groups
 
     return validate_trajectory_groups(payload)
+
+
+def tokenized_histories_compact_validate(
+    payload: Mapping[str, object],
+) -> list[TokenizedHistory]:
+    """Validate tokenized histories from a shared compact payload."""
+
+    from ._compact import validate_tokenized_histories
+
+    return validate_tokenized_histories(payload)
+
+
+def tokenized_trajectories_compact_validate(
+    payload: Mapping[str, object],
+) -> list[TokenizedTrajectory]:
+    """Validate tokenized trajectories from a shared compact payload."""
+
+    from ._compact import validate_tokenized_trajectories
+
+    return validate_tokenized_trajectories(payload)
+
+
+def tokenized_multi_history_trajectories_compact_validate(
+    payload: Mapping[str, object],
+) -> list[TokenizedMultiHistoryTrajectory]:
+    """Validate multi-history trajectories from a shared compact payload."""
+
+    from ._compact import validate_tokenized_multi_history_trajectories
+
+    return validate_tokenized_multi_history_trajectories(payload)
+
+
+def tokenized_trajectory_groups_compact_validate(
+    payload: Mapping[str, object],
+) -> list[
+    TokenizedTrajectoryGroup[TokenizedTrajectory]
+    | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
+]:
+    """Validate tokenized groups from a shared compact payload."""
+
+    from ._compact import validate_tokenized_trajectory_groups
+
+    return validate_tokenized_trajectory_groups(payload)
 
 
 @overload
@@ -1083,12 +1243,16 @@ __all__ = [
     "Tokenizer",
     "TokenFlag",
     "MetadataValue",
+    "CompactDumpable",
     "CompactTrajectoryKind",
     "CompactTrajectoryPayload",
-    "trajectories_compact_dump",
+    "compact_dump",
     "trajectories_compact_validate",
-    "trajectory_groups_compact_dump",
     "trajectory_groups_compact_validate",
+    "tokenized_histories_compact_validate",
+    "tokenized_trajectories_compact_validate",
+    "tokenized_multi_history_trajectories_compact_validate",
+    "tokenized_trajectory_groups_compact_validate",
     "current_trajectory",
     "no_capture",
     "trajectory",

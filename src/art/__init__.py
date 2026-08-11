@@ -109,12 +109,8 @@ from .trajectories import (
     TrajectoryHistory,
     current_trajectory,
     no_capture,
-    trajectories_compact_dump,
-    trajectories_compact_validate,
     trajectory,
     trajectory_group,
-    trajectory_groups_compact_dump,
-    trajectory_groups_compact_validate,
 )
 from .types import (
     LocalTrainResult,
@@ -194,10 +190,6 @@ __all__ = [
     "TokenizedTrajectoryGroup",
     "trajectory",
     "trajectory_group",
-    "trajectories_compact_dump",
-    "trajectories_compact_validate",
-    "trajectory_groups_compact_dump",
-    "trajectory_groups_compact_validate",
     "capture_yielded_trajectory",
     "yield_trajectory",
 ]
