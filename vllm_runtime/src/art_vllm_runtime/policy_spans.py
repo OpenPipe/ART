@@ -733,26 +733,42 @@ def _patch_scheduler_policy_span_transport() -> None:
     from vllm.v1.core.sched.scheduler import Scheduler
 
     original_update = Scheduler.update_from_output
-    if getattr(original_update, "__art_policy_spans_patched__", False):
+    if not getattr(original_update, "__art_policy_spans_patched__", False):
+
+        def update_from_output(
+            self: Any, scheduler_output: Any, model_runner_output: Any
+        ):
+            outputs_by_client = original_update(
+                self, scheduler_output, model_runner_output
+            )
+            spans_by_req = getattr(
+                model_runner_output, ART_POLICY_TOKEN_SPANS_FIELD, None
+            )
+            if not spans_by_req:
+                return outputs_by_client
+            for client_outputs in outputs_by_client.values():
+                for output in client_outputs.outputs:
+                    spans = spans_by_req.get(output.request_id)
+                    if not spans:
+                        continue
+                    output.art_policy_token_spans = _trim_step_spans(
+                        spans, len(output.new_token_ids)
+                    )
+            return outputs_by_client
+
+        update_from_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
+        Scheduler.update_from_output = update_from_output  # type: ignore[method-assign]
+
+    original_preempt = Scheduler._preempt_request
+    if getattr(original_preempt, "__art_policy_spans_patched__", False):
         return
 
-    def update_from_output(self: Any, scheduler_output: Any, model_runner_output: Any):
-        outputs_by_client = original_update(self, scheduler_output, model_runner_output)
-        spans_by_req = getattr(model_runner_output, ART_POLICY_TOKEN_SPANS_FIELD, None)
-        if not spans_by_req:
-            return outputs_by_client
-        for client_outputs in outputs_by_client.values():
-            for output in client_outputs.outputs:
-                spans = spans_by_req.get(output.request_id)
-                if not spans:
-                    continue
-                output.art_policy_token_spans = _trim_step_spans(
-                    spans, len(output.new_token_ids)
-                )
-        return outputs_by_client
+    def _preempt_request(self: Any, request: Any, timestamp: float) -> None:
+        original_preempt(self, request, timestamp)
+        _rebase_preempted_request_policy_history(request)
 
-    update_from_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
-    Scheduler.update_from_output = update_from_output  # type: ignore[method-assign]
+    _preempt_request.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
+    Scheduler._preempt_request = _preempt_request  # type: ignore[method-assign]
 
 
 def _patch_output_processor_policy_span_accumulation() -> None:
@@ -1164,17 +1180,18 @@ def _apply_policy_lora_update(
     if not engine_core.is_scheduler_paused():
         raise RuntimeError("Policy LoRA updates require a paused scheduler")
     lora_request = _policy_lora_request_from_payload(payload)
+    started = {
+        request.request_id
+        for request in engine_core.scheduler.requests.values()
+        if _request_uses_lora_slot(request, lora_request.lora_name)
+        and _request_has_executed(request)
+    }
+    _validate_continued_policy_update(engine_core.scheduler, started)
     try:
         acknowledgements = engine_core.collective_rpc(
             "art_load_lora_policy", args=(payload,)
         )
         previous = _validate_worker_lora_update(lora_request, acknowledgements)
-        started = {
-            request.request_id
-            for request in engine_core.scheduler.requests.values()
-            if _request_uses_lora_slot(request, lora_request.lora_name)
-            and _request_has_executed(request)
-        }
         return _transition_scheduler_policy_history(
             engine_core.scheduler,
             lora_request=_policy_lora_request_from_payload(payload, load_inplace=False),
@@ -1194,6 +1211,7 @@ def _transition_scheduler_policy_history(
     previous_policy: Mapping[str, Any] | None,
     started_request_ids: set[str],
 ) -> dict[str, int]:
+    _validate_continued_policy_update(scheduler, started_request_ids)
     updated = 0
     continued = 0
     for request in scheduler.requests.values():
@@ -1272,6 +1290,54 @@ def _transition_scheduler_policy_history(
         "updated_requests": updated,
         "continued_requests": continued,
     }
+
+
+def _validate_continued_policy_update(
+    scheduler: Any, started_request_ids: set[str]
+) -> None:
+    if not started_request_ids:
+        return
+    if getattr(scheduler, "connector", None) is not None:
+        raise RuntimeError(
+            "Mutable policy updates cannot continue requests with a KV connector"
+        )
+    for request_id in started_request_ids:
+        request = scheduler.requests[request_id]
+        if getattr(request, "mm_features", None):
+            raise RuntimeError(
+                "Mutable policy updates cannot continue multimodal requests"
+            )
+
+
+def _rebase_preempted_request_policy_history(request: Any) -> None:
+    if not getattr(request, _POLICY_CACHE_TRANSITIONS_FIELD, ()):
+        return
+    lora_request = request.lora_request
+    policy_version = getattr(lora_request, "policy_version", None)
+    update_seq = getattr(lora_request, "update_seq", None)
+    if policy_version is None or update_seq is None:
+        raise RuntimeError(
+            f"Preempted request {request.request_id!r} lost its policy identity"
+        )
+    setattr(request, _POLICY_HISTORY_BASE_FIELD, None)
+    _set_policy_cache_salt(
+        request,
+        lora_slot=str(lora_request.lora_name),
+        policy_version=int(policy_version),
+        update_seq=int(update_seq),
+    )
+    setattr(request, _POLICY_CACHE_TRANSITIONS_FIELD, ())
+    request.block_hashes.clear()
+    request.update_block_hashes()
+    setattr(
+        request,
+        _POLICY_EXECUTION_MARKER_FIELD,
+        (
+            int(getattr(request, "num_computed_tokens", 0) or 0),
+            int(getattr(request, "num_preemptions", 0) or 0),
+            len(getattr(request, "output_token_ids", ())),
+        ),
+    )
 
 
 def _scheduler_hash_block_size(scheduler: Any) -> int:

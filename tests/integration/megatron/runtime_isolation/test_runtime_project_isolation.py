@@ -404,6 +404,7 @@ import json
 from types import SimpleNamespace
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.request import Request
 from art_vllm_runtime.policy_spans import (
@@ -474,6 +475,36 @@ third = PolicyLoRARequest(
     lora_name="model:active", lora_int_id=1, lora_path="third",
     policy_version=4, update_seq=3,
 )
+intra = make_request("intra")
+intra_pool = BlockPool(4, enable_caching=True, hash_block_size=4)
+intra_blocks = intra_pool.get_new_blocks(1)
+intra_pool.cache_full_blocks(intra, intra_blocks, 0, 1, 4, 0)
+intra_old_hashes = list(intra.block_hashes)
+intra.num_computed_tokens = 6
+_transition_scheduler_policy_history(
+    SimpleNamespace(
+        requests={intra.request_id: intra},
+        kv_cache_manager=SimpleNamespace(block_pool=intra_pool),
+    ),
+    lora_request=new,
+    previous_policy=None,
+    started_request_ids={intra.request_id},
+)
+multiple = make_request("multiple")
+multiple.num_computed_tokens = 4
+multiple_scheduler = SimpleNamespace(
+    requests={multiple.request_id: multiple},
+    kv_cache_manager=SimpleNamespace(block_pool=SimpleNamespace(hash_block_size=4)),
+)
+_transition_scheduler_policy_history(
+    multiple_scheduler, lora_request=new, previous_policy=None,
+    started_request_ids={multiple.request_id},
+)
+multiple.num_computed_tokens = 8
+_transition_scheduler_policy_history(
+    multiple_scheduler, lora_request=third, previous_policy=None,
+    started_request_ids={multiple.request_id},
+)
 old_history = _policy_history_from_cache_salt(make_request("old").cache_salt)
 expected_third = make_request("expected-third")
 _set_policy_cache_salt(
@@ -507,6 +538,15 @@ print(json.dumps({
     "not_executed_after_update": not_executed_after_update,
     "same_boundary_replaced": len(continued._art_policy_cache_transitions) == 1,
     "skipped_policy_replaced": continued.cache_salt == expected_third.cache_salt,
+    "intra_block_boundary": intra._art_policy_cache_transitions[0][0],
+    "intra_block_prefix_preserved": (
+        intra.block_hashes[0] == intra_old_hashes[0]
+        and intra_pool.get_cached_block(intra.block_hashes[0], [0]) == intra_blocks
+    ),
+    "intra_block_suffix_rekeyed": intra.block_hashes[1] != intra_old_hashes[1],
+    "multiple_boundaries": [
+        item[0] for item in multiple._art_policy_cache_transitions
+    ],
 }))
 """,
         artifact_dir,
@@ -517,6 +557,10 @@ print(json.dumps({
         "computed_hash_preserved": True,
         "continued_differs": True,
         "future_hash_rekeyed": True,
+        "intra_block_boundary": 6,
+        "intra_block_prefix_preserved": True,
+        "intra_block_suffix_rekeyed": True,
+        "multiple_boundaries": [4, 8],
         "not_executed_after_update": True,
         "same_boundary_replaced": True,
         "same_version_reload_differs": True,
@@ -524,6 +568,260 @@ print(json.dumps({
         "transition": {"continued_requests": 1, "updated_requests": 2},
         "transition_boundary": 4,
         "waiting_matches_fresh": True,
+    }
+
+
+def test_runtime_policy_preemption_rebases_and_republishes_real_block_pool(
+    artifact_dir: Path,
+) -> None:
+    payload = _runtime_python(
+        """
+import hashlib
+import json
+from types import SimpleNamespace
+
+from art_vllm_runtime.policy_spans import (
+    PolicyLoRARequest,
+    _patch_policy_cache_hashing,
+    _patch_scheduler_policy_span_transport,
+    _request_has_executed,
+    _set_policy_cache_salt,
+    _transition_scheduler_policy_history,
+)
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.request import Request, RequestStatus
+
+def hash_value(value):
+    return hashlib.sha256(repr(value).encode()).digest()
+
+def make_request(request_id, lora_request):
+    request = Request(
+        request_id, list(range(12)), SamplingParams(max_tokens=4), None,
+        lora_request=lora_request, block_hasher=block_hasher,
+    )
+    request.cache_salt = "tenant"
+    _set_policy_cache_salt(
+        request, lora_slot=lora_request.lora_name,
+        policy_version=lora_request.policy_version,
+        update_seq=lora_request.update_seq,
+    )
+    request.block_hashes.clear()
+    request.update_block_hashes()
+    return request
+
+_patch_policy_cache_hashing()
+_patch_scheduler_policy_span_transport()
+init_none_hash(hash_value)
+block_hasher = get_request_block_hasher(4, hash_value)
+first = PolicyLoRARequest(
+    lora_name="model:active", lora_int_id=1, lora_path="first",
+    policy_version=1, update_seq=1,
+)
+second = PolicyLoRARequest(
+    lora_name="model:active", lora_int_id=1, lora_path="second",
+    policy_version=2, update_seq=2,
+)
+latest = PolicyLoRARequest(
+    lora_name="model:active", lora_int_id=1, lora_path="latest",
+    policy_version=3, update_seq=3,
+)
+request = make_request("replay", first)
+pool = BlockPool(10, enable_caching=True, hash_block_size=4)
+transition_scheduler = SimpleNamespace(
+    requests={request.request_id: request},
+    kv_cache_manager=SimpleNamespace(block_pool=pool),
+)
+request.num_computed_tokens = 4
+_transition_scheduler_policy_history(
+    transition_scheduler, lora_request=second, previous_policy=None,
+    started_request_ids={request.request_id},
+)
+request.num_computed_tokens = 8
+_transition_scheduler_policy_history(
+    transition_scheduler, lora_request=latest, previous_policy=None,
+    started_request_ids={request.request_id},
+)
+mixed_hashes = list(request.block_hashes)
+mixed_blocks = pool.get_new_blocks(3)
+pool.cache_full_blocks(request, mixed_blocks, 0, 3, 4, 0)
+
+waiting = []
+scheduler = object.__new__(Scheduler)
+scheduler._free_request_blocks = lambda _request: pool.free_blocks(
+    reversed(mixed_blocks)
+)
+scheduler.encoder_cache_manager = SimpleNamespace(free=lambda _request: None)
+scheduler._inflight_prefills = {request}
+scheduler.waiting = SimpleNamespace(prepend_request=waiting.append)
+scheduler.reset_preempted_req_ids = set()
+scheduler.log_stats = False
+request.status = RequestStatus.RUNNING
+Scheduler._preempt_request(scheduler, request, 0.0)
+
+fresh = make_request("fresh", latest)
+current_hashes = list(request.block_hashes)
+full_replay = all(pool.get_cached_block(item, [0]) is None for item in current_hashes)
+old_entries_preserved = all(
+    pool.get_cached_block(item, [0]) == [block]
+    for item, block in zip(mixed_hashes, mixed_blocks)
+)
+not_executed_after_rebase = not _request_has_executed(request)
+replay_blocks = pool.get_new_blocks(3)
+request.num_computed_tokens = request.num_tokens
+pool.cache_full_blocks(request, replay_blocks, 0, 3, 4, 0)
+published_current = all(
+    pool.get_cached_block(item, [0]) == [block]
+    for item, block in zip(current_hashes, replay_blocks)
+)
+print(json.dumps({
+    "cache_salt_matches_fresh": request.cache_salt == fresh.cache_salt,
+    "current_hashes_match_fresh": current_hashes == fresh.block_hashes,
+    "full_replay": full_replay,
+    "lora_identity_preserved": request.lora_request is latest,
+    "mixed_hashes_cleared": request._art_policy_cache_transitions == (),
+    "not_executed_after_rebase": not_executed_after_rebase,
+    "old_entries_preserved": old_entries_preserved,
+    "preempted": (
+        request.num_preemptions == 1
+        and waiting == [request]
+        and request.request_id in scheduler.reset_preempted_req_ids
+    ),
+    "published_current": published_current,
+    "user_cache_salt_preserved": request.cache_salt.startswith("tenant|"),
+}))
+""",
+        artifact_dir,
+        "policy_preemption_rebase",
+    )
+    assert json.loads(payload) == {
+        "cache_salt_matches_fresh": True,
+        "current_hashes_match_fresh": True,
+        "full_replay": True,
+        "lora_identity_preserved": True,
+        "mixed_hashes_cleared": True,
+        "not_executed_after_rebase": True,
+        "old_entries_preserved": True,
+        "preempted": True,
+        "published_current": True,
+        "user_cache_salt_preserved": True,
+    }
+
+
+def test_runtime_policy_update_rejects_unsupported_rehash_paths(
+    artifact_dir: Path,
+) -> None:
+    payload = _runtime_python(
+        """
+import hashlib
+import json
+from types import SimpleNamespace
+
+from art_vllm_runtime.policy_spans import (
+    PolicyLoRARequest,
+    _apply_policy_lora_update,
+    _set_policy_cache_salt,
+)
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.request import Request
+
+def hash_value(value):
+    return hashlib.sha256(repr(value).encode()).digest()
+
+init_none_hash(hash_value)
+block_hasher = get_request_block_hasher(4, hash_value)
+old = PolicyLoRARequest(
+    lora_name="model:active", lora_int_id=1, lora_path="old",
+    policy_version=1, update_seq=1,
+)
+payload = {
+    "lora_name": old.lora_name, "lora_int_id": old.lora_int_id,
+    "lora_path": "new", "base_model_name": None,
+    "tensorizer_config_dict": None, "is_3d_lora_weight": False,
+    "policy_version": 2, "update_seq": 2,
+}
+
+def make_request(request_id):
+    request = Request(
+        request_id, list(range(8)), SamplingParams(max_tokens=4), None,
+        lora_request=old, block_hasher=block_hasher,
+    )
+    _set_policy_cache_salt(
+        request, lora_slot=old.lora_name,
+        policy_version=old.policy_version, update_seq=old.update_seq,
+    )
+    request.block_hashes.clear()
+    request.update_block_hashes()
+    request.num_computed_tokens = 4
+    return request
+
+class Core:
+    def __init__(self, request, connector):
+        self.scheduler = SimpleNamespace(
+            requests={request.request_id: request}, connector=connector,
+        )
+        self.collective_calls = 0
+        self.pause_calls = []
+
+    def is_scheduler_paused(self):
+        return True
+
+    def collective_rpc(self, *_args, **_kwargs):
+        self.collective_calls += 1
+        raise AssertionError("unsafe update reached workers")
+
+    def pause_scheduler(self, *args):
+        self.pause_calls.append(args)
+
+connector_request = make_request("connector")
+connector_core = Core(connector_request, object())
+try:
+    _apply_policy_lora_update(connector_core, payload)
+except RuntimeError as error:
+    connector_error = str(error)
+
+multimodal_request = make_request("multimodal")
+multimodal_request.mm_features = [object()]
+multimodal_hashes = list(multimodal_request.block_hashes)
+multimodal_salt = multimodal_request.cache_salt
+multimodal_core = Core(multimodal_request, None)
+try:
+    _apply_policy_lora_update(multimodal_core, payload)
+except RuntimeError as error:
+    multimodal_error = str(error)
+
+print(json.dumps({
+    "connector_error": connector_error,
+    "connector_preflight": (
+        connector_core.collective_calls == 0 and not connector_core.pause_calls
+    ),
+    "multimodal_error": multimodal_error,
+    "multimodal_preflight": (
+        multimodal_core.collective_calls == 0 and not multimodal_core.pause_calls
+    ),
+    "multimodal_unchanged": (
+        multimodal_request.lora_request is old
+        and multimodal_request.cache_salt == multimodal_salt
+        and multimodal_request.block_hashes == multimodal_hashes
+    ),
+}))
+""",
+        artifact_dir,
+        "unsupported_policy_rehash",
+    )
+    assert json.loads(payload) == {
+        "connector_error": (
+            "Mutable policy updates cannot continue requests with a KV connector"
+        ),
+        "connector_preflight": True,
+        "multimodal_error": (
+            "Mutable policy updates cannot continue multimodal requests"
+        ),
+        "multimodal_preflight": True,
+        "multimodal_unchanged": True,
     }
 
 
