@@ -264,7 +264,7 @@ _DSV4_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3, 4, 5, 6, 7],
     topology=_DSV4_TP2_EP8,
 )
-_DSV4_REDUCED_MEGATRON = MegatronWorkflowResources(
+_DSV4_FOUR_GPU_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     topology=_DSV4_TP2_EP4,
 )
@@ -356,14 +356,14 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             requires_external_vllm=True,
             megatron=_DSV4_MEGATRON,
             vllm=_DSV4_FULL_VLLM_EP4,
-            high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
+            high_vram_megatron=_DSV4_FOUR_GPU_MEGATRON,
             high_vram_vllm=_DSV4_FULL_VLLM_EP2,
             streaming_weight_offload=True,
         ),
         merged_vllm_serving=WorkflowStageResources(
             required_world_size=8,
             required_h200_equivalent_gpus=8,
-            megatron=_DSV4_REDUCED_MEGATRON,
+            megatron=_DSV4_FOUR_GPU_MEGATRON,
             vllm=_DSV4_REDUCED_VLLM_EP4,
             high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
             high_vram_vllm=_DSV4_REDUCED_VLLM_EP2,
@@ -379,7 +379,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             requires_external_vllm=True,
             megatron=_DSV4_MEGATRON,
             vllm=_DSV4_FULL_VLLM_EP4,
-            high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
+            high_vram_megatron=_DSV4_FOUR_GPU_MEGATRON,
             high_vram_vllm=_DSV4_FULL_VLLM_EP2,
             streaming_weight_offload=True,
         ),
@@ -389,7 +389,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             requires_external_vllm=True,
             megatron=_DSV4_MEGATRON,
             vllm=_DSV4_FULL_VLLM_EP4,
-            high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
+            high_vram_megatron=_DSV4_FOUR_GPU_MEGATRON,
             high_vram_vllm=_DSV4_FULL_VLLM_EP2,
             streaming_weight_offload=True,
         ),

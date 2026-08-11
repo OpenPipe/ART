@@ -698,9 +698,21 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
     assert resources.native_vllm_lora.vllm.engine_args().get("max_loras", 2) == 2
 
 
-@pytest.mark.parametrize("stage_name", ["train_inf_mismatch", "merged_vllm_serving"])
+@pytest.mark.parametrize(
+    ("stage_name", "trainer_gpu_ids", "trainer_ep", "trainer_dp"),
+    [
+        ("train_inf_mismatch", [0, 1, 2, 3], 4, 2),
+        ("yes_no_trainability", [0, 1, 2, 3], 4, 2),
+        ("length_trainability", [0, 1, 2, 3], 4, 2),
+        ("merged_vllm_serving", [0, 1], 2, 1),
+    ],
+)
 def test_dsv4_resources_remap_to_four_high_vram_gpus(
-    monkeypatch, stage_name: str
+    monkeypatch,
+    stage_name: str,
+    trainer_gpu_ids: list[int],
+    trainer_ep: int,
+    trainer_dp: int,
 ) -> None:
     resources = handler_workflow_resources_for_base_model(
         "deepseek-ai/DeepSeek-V4-Flash"
@@ -722,9 +734,10 @@ def test_dsv4_resources_remap_to_four_high_vram_gpus(
 
     assert stage.megatron is not None
     assert stage.vllm is not None
-    assert stage.megatron.gpu_ids == [0, 1]
+    assert stage.megatron.gpu_ids == trainer_gpu_ids
     assert stage.megatron.topology.tp == 2
-    assert stage.megatron.topology.ep == 2
+    assert stage.megatron.topology.ep == trainer_ep
+    assert stage.megatron.topology.dp == trainer_dp
     assert stage.vllm.gpu_ids == [2, 3]
     assert stage.vllm.tensor_parallel_size == 2
     assert stage.vllm.engine_args()["moe_backend"] == "triton"
