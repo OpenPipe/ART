@@ -521,10 +521,12 @@ async def _collect_real_trajectory_groups(
 
     if config.rollouts_per_prompt < 2:
         raise ValueError("real-path mismatch requires at least two rollouts per prompt")
-    groups = [
-        art.TrajectoryGroup(
-            [
-                _rollout(
+    groups = []
+    for prompt_index, prompt in enumerate(prompts):
+        trajectories = []
+        for rollout_index in range(config.rollouts_per_prompt):
+            trajectories.append(
+                await _rollout(
                     model=model,
                     prompt=prompt,
                     max_completion_tokens=config.max_completion_tokens,
@@ -536,15 +538,9 @@ async def _collect_real_trajectory_groups(
                     ),
                     extra_body=extra_body,
                 )
-                for rollout_index in range(config.rollouts_per_prompt)
-            ]
-        )
-        for prompt_index, prompt in enumerate(prompts)
-    ]
-    return await art.gather_trajectory_groups(
-        cast(Any, groups),
-        pbar_desc="real-path-rollouts",
-    )
+            )
+        groups.append(art.TrajectoryGroup(trajectories))
+    return groups
 
 
 def _parse_token_id(raw: str | None) -> int:

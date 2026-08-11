@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -225,9 +226,16 @@ def test_real_path_default_generates_16_tokens_per_rollout() -> None:
 @pytest.mark.asyncio
 async def test_real_path_rollouts_use_stable_unique_request_seeds() -> None:
     calls = []
+    active_requests = 0
+    max_active_requests = 0
 
     async def create(**kwargs):
+        nonlocal active_requests, max_active_requests
         calls.append(kwargs)
+        active_requests += 1
+        max_active_requests = max(max_active_requests, active_requests)
+        await asyncio.sleep(0)
+        active_requests -= 1
         return SimpleNamespace(
             choices=[
                 Choice(
@@ -258,6 +266,7 @@ async def test_real_path_rollouts_use_stable_unique_request_seeds() -> None:
     )
 
     assert len(groups) == 2
+    assert max_active_requests == 1
     assert sorted(call["seed"] for call in calls) == list(range(41, 47))
     assert all(
         call["extra_body"] == {"return_tokens_as_token_ids": True} for call in calls
