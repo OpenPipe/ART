@@ -433,6 +433,16 @@ class Model(
     )
     ``
 
+    Or, if you're pointing at [OrcaRouter](https://www.orcarouter.ai):
+
+    ``python model = art.Model(
+        name="gemini-2.5-pro", project="my-project",
+        inference_api_key=os.getenv("ORCAROUTER_API_KEY"),
+        inference_base_url="https://api.orcarouter.ai/v1",
+        inference_model_name="orcarouter/auto",
+    )
+    ``
+
     For trainable (`art.TrainableModel`) models the inference values will be
     populated automatically by `model.register(api)` so you generally don't need
     to think about them.
