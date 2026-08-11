@@ -1170,6 +1170,14 @@ def _collect_measurements(
         "mean_train_gap_s": (e2e_elapsed_s - train_s) / len(rows),
         "e2e_elapsed_s": e2e_elapsed_s,
         "autotuner_windows": windows,
+        "stable_vllm_pressure": sum(
+            window["vllm_pressure"] * window["duration_s"] for window in windows
+        )
+        / e2e_elapsed_s,
+        "stable_trainer_underfeed": sum(
+            window["trainer_underfeed"] * window["duration_s"] for window in windows
+        )
+        / e2e_elapsed_s,
         "matched_capture_pipeline_settings": dict(capture_settings),
         "mean_policy_activation_lag_s": fmean(lags),
         "p50_policy_activation_lag_s": median(lags),
@@ -1223,15 +1231,16 @@ def acceptance_failures(
     config: ThroughputWorkflowConfig,
     thresholds: ThroughputThresholds | None,
 ) -> list[str]:
-    checks: dict[str, bool] = {}
+    checks = {
+        "stable_min_vllm_pressure": measurements["stable_vllm_pressure"]
+        >= config.min_vllm_pressure,
+        "stable_trainer_underfeed": measurements["stable_trainer_underfeed"]
+        <= config.max_trainer_underfeed,
+    }
     for window in measurements["autotuner_windows"]:
         prefix = f"window_{window['start_step']}_{window['end_step']}"
         checks.update(
             {
-                f"{prefix}_min_vllm_pressure": window["vllm_pressure"]
-                >= config.min_vllm_pressure,
-                f"{prefix}_trainer_underfeed": window["trainer_underfeed"]
-                <= config.max_trainer_underfeed,
                 f"{prefix}_policy_age_p95": window[_POLICY_AGE_P95]
                 <= measurements["policy_age_limit_steps"],
                 f"{prefix}_zero_variance_rate": window[

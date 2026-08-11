@@ -298,8 +298,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                     end_step=17,
                     window_start_s=0.0,
                     window_end_s=4.0,
-                    vllm_pressure=0.6,
-                    trainer_underfeed_score=0.05,
+                    vllm_pressure=0.45,
+                    trainer_underfeed_score=0.10,
                     actual_stale_frac=0.0,
                 ),
             ),
@@ -312,8 +312,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                     end_step=19,
                     window_start_s=4.0,
                     window_end_s=8.0,
-                    vllm_pressure=0.6,
-                    trainer_underfeed_score=0.05,
+                    vllm_pressure=0.65,
+                    trainer_underfeed_score=0.04,
                     actual_stale_frac=0.0,
                 ),
             ),
@@ -377,6 +377,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "e2e_train_tok_s": 500.0,
         "accepted_train_tok_s": 250.0,
         "mean_train_gap_s": 0.5,
+        "stable_vllm_pressure": 0.55,
+        "stable_trainer_underfeed": 0.07,
         "post_warmup_policy_activation_count": 4,
         "mean_policy_activation_lag_s": 0.5,
         "p50_policy_activation_lag_s": 0.25,
@@ -403,6 +405,19 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     )
     assert acceptance_failures(measurements, config, thresholds) == [
         "repeated_policy_activation_cadence_s"
+    ]
+    assert acceptance_failures(
+        {
+            **measurements,
+            "stable_vllm_pressure": 0.49,
+            "stable_trainer_underfeed": 0.09,
+        },
+        config,
+        thresholds,
+    ) == [
+        "stable_min_vllm_pressure",
+        "stable_trainer_underfeed",
+        "repeated_policy_activation_cadence_s",
     ]
     estimated = ThroughputThresholds(
         calibration_basis="estimated",

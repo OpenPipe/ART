@@ -537,8 +537,8 @@ _THROUGHPUT_CONFIGS = {
     "glm52": ThroughputWorkflowConfig(
         num_layers=12,
         prompt_tokens=3836,
-        completion_tokens=640,
-        groups_per_step=20,
+        completion_tokens=1024,
+        groups_per_step=16,
         initial_model_calls_per_inference_gpu=19,
     ),
     "gpt_oss_moe": ThroughputWorkflowConfig(
