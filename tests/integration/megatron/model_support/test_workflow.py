@@ -364,6 +364,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "mean_train_gap_s": 0.5,
         "post_warmup_policy_activation_count": 4,
         "mean_policy_activation_lag_s": 0.5,
+        "p50_policy_activation_lag_s": 0.25,
+        "p95_policy_activation_lag_s": 1.1,
         "max_policy_activation_lag_s": 1.25,
         "mean_policy_activation_interval_s": 2.4375,
         "max_policy_activation_interval_s": 3.0,
@@ -377,6 +379,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         min_accepted_train_tok_s=1.0,
         min_e2e_to_isolated_ratio=0.5,
         min_matched_core_to_isolated_ratio=0.95,
+        max_mean_policy_activation_lag_s=1.5,
         max_policy_activation_lag_s=2.0,
         max_policy_activation_interval_s=2.5,
     )
@@ -390,12 +393,28 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         min_accepted_train_tok_s=1.0,
         min_e2e_to_isolated_ratio=0.5,
         min_matched_core_to_isolated_ratio=0.95,
+        max_mean_policy_activation_lag_s=1.5,
         max_policy_activation_lag_s=2.0,
         max_policy_activation_interval_s=2.5,
     )
     assert acceptance_failures(measurements, config, estimated) == [
         "policy_activation_cadence_s",
         "calibration_basis",
+    ]
+    lag_failures = acceptance_failures(
+        measurements,
+        config,
+        thresholds.model_copy(
+            update={
+                "max_mean_policy_activation_lag_s": 0.4,
+                "max_policy_activation_lag_s": 1.0,
+                "max_policy_activation_interval_s": 3.5,
+            }
+        ),
+    )
+    assert lag_failures == [
+        "mean_policy_activation_lag_s",
+        "max_policy_activation_lag_s",
     ]
     measurements["matched_e2e_core_train_tok_s"] *= 1.1
     assert "matched_core_to_isolated_ratio_max" in acceptance_failures(

@@ -26,7 +26,8 @@ class ThroughputThresholds(BaseModel):
     max_matched_core_to_isolated_ratio: float = Field(
         default=1.05, gt=1.0, allow_inf_nan=False
     )
-    max_policy_activation_lag_s: float = Field(gt=0.0, le=2.0, allow_inf_nan=False)
+    max_mean_policy_activation_lag_s: float = Field(gt=0.0, le=1.5, allow_inf_nan=False)
+    max_policy_activation_lag_s: float = Field(gt=0.0, le=3.5, allow_inf_nan=False)
     max_policy_activation_interval_s: float = Field(gt=0.0, allow_inf_nan=False)
 
     @model_validator(mode="after")
@@ -619,7 +620,8 @@ def _throughput_threshold(
         min_accepted_train_tok_s=accepted,
         min_e2e_to_isolated_ratio=ratio,
         min_matched_core_to_isolated_ratio=0.95,
-        max_policy_activation_lag_s=2.0,
+        max_mean_policy_activation_lag_s=1.5,
+        max_policy_activation_lag_s=3.5,
         max_policy_activation_interval_s=cadence,
     )
 

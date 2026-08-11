@@ -9,7 +9,7 @@ from multiprocessing import resource_tracker, shared_memory
 import os
 from pathlib import Path
 import shutil
-from statistics import fmean
+from statistics import fmean, median, quantiles
 import struct
 import subprocess
 import sys
@@ -1121,6 +1121,8 @@ def _collect_measurements(
         "e2e_elapsed_s": e2e_elapsed_s,
         "autotuner_windows": windows,
         "mean_policy_activation_lag_s": fmean(lags),
+        "p50_policy_activation_lag_s": median(lags),
+        "p95_policy_activation_lag_s": quantiles(lags, n=20, method="inclusive")[18],
         "max_policy_activation_lag_s": max(lags),
         "post_warmup_policy_activation_count": len(window_events),
         "mean_policy_activation_interval_s": fmean(intervals),
@@ -1206,7 +1208,9 @@ def acceptance_failures(
         ]
         / measurements["isolated_train_tok_s"]
         <= thresholds.max_matched_core_to_isolated_ratio,
-        "policy_activation_lag_s": measurements["max_policy_activation_lag_s"]
+        "mean_policy_activation_lag_s": measurements["mean_policy_activation_lag_s"]
+        <= thresholds.max_mean_policy_activation_lag_s,
+        "max_policy_activation_lag_s": measurements["max_policy_activation_lag_s"]
         <= thresholds.max_policy_activation_lag_s,
         "policy_activation_cadence_s": measurements["max_policy_activation_interval_s"]
         <= thresholds.max_policy_activation_interval_s,
