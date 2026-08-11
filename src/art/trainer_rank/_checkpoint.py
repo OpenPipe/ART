@@ -1132,7 +1132,11 @@ def _serialize_snapshot_optimizer(
     for component in ("master", "exp_avg", "exp_avg_sq"):
         component_records: dict[str, TensorRecord] = {}
         for index, block in enumerate(blocks):
-            block_metadata = [item for item in metadata if item.block == block]
+            block_metadata = [
+                item._replace(dtype_name=_dtype_name(torch.float32))
+                for item in metadata
+                if item.block == block
+            ]
             local_tensors: dict[str, torch.Tensor] = {}
             error: BaseException | None = None
             try:

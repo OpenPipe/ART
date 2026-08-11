@@ -2602,6 +2602,7 @@ def _portable_topology_worker(
     init_method: str,
     source_path: str,
     output_path: str,
+    dtype_name: str = "float32",
 ) -> None:
     torch.distributed.init_process_group(
         "gloo", rank=rank, world_size=world_size, init_method=init_method
@@ -2627,7 +2628,7 @@ def _portable_topology_worker(
             4 // world_size,
             2,
             2,
-            torch.float32,
+            getattr(torch, dtype_name),
             torch.device("cpu"),
             b_parallel_spec=LoRAParallelSpec(sharded=True, shard_dim=-1),
         )
@@ -2979,6 +2980,25 @@ def test_lora_exchange_coordinates_asymmetric_preparation_failure(
     )
 
 
+def test_lora_exchange_rejects_mismatched_metadata() -> None:
+    key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+    metadata = LoraShardMeta(
+        key=key,
+        owner_rank=0,
+        shape=(2,),
+        dtype_name="bfloat16",
+        manifest={"sharded": False, "shard_world_size": 1, "shard_rank": 0},
+        block="base_model.model.model.layers.0",
+    )
+    with pytest.raises(RuntimeError, match="dtype 'float32'.*metadata 'bfloat16'"):
+        lora_publish._prepare_exchange_buffers(
+            (metadata,),
+            local_tensors={key: torch.ones(2)},
+            rank=0,
+            device=torch.device("cpu"),
+        )
+
+
 def test_checkpoint_loads_follow_call_order_across_ranks(tmp_path: Path) -> None:
     first = tmp_path / "prefetch-first"
     second = tmp_path / "prefetch-second"
@@ -3153,7 +3173,7 @@ def test_trainer_rank_checkpoint_restores_1_to_2_to_1(
     tmp_path: Path,
 ) -> None:
     original = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.bfloat16, torch.device("cpu"))
     )
     _install_portable_checkpoint(original)
     original._dynamic_optimizers["student"] = original._new_dynamic_optimizer(
@@ -3173,14 +3193,22 @@ def test_trainer_rank_checkpoint_restores_1_to_2_to_1(
             f"file://{tmp_path / 'topology-init'}",
             str(one_rank),
             str(two_rank),
+            "bfloat16",
         ),
         nprocs=2,
         join=True,
     )
 
     restored = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.bfloat16, torch.device("cpu"))
     )
+    manifest = validate_checkpoint(two_rank, require_optimizer=True)
+    assert manifest is not None
+    assert {
+        record.dtype
+        for parameter in manifest.parameters.values()
+        for record in (parameter.master, parameter.exp_avg, parameter.exp_avg_sq)
+    } == {"float32"}
     load_trainer_checkpoint(
         restored,
         prepare_checkpoint(str(two_rank)),

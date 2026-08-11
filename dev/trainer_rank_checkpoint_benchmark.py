@@ -219,14 +219,6 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("checkpoint benchmark requires CUDA")
-    device = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(device)
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    topology = _topology(args, world_size)
     for key, value in (
         ("TENSOR_MODEL", args.tp),
         ("PIPELINE_MODEL", args.pp),
@@ -235,6 +227,14 @@ def main() -> None:
         ("EXPERT_TENSOR", args.etp),
     ):
         os.environ[f"ART_MEGATRON_{key}_PARALLEL_SIZE"] = str(value)
+    if not torch.cuda.is_available():
+        raise RuntimeError("checkpoint benchmark requires CUDA")
+    device = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(device)
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    topology = _topology(args, world_size)
 
     try:
         from art.megatron import train as megatron_train

@@ -392,6 +392,17 @@ def _prepare_exchange_buffers(
         identity = (meta.owner_rank, meta.key)
         if rank == meta.owner_rank:
             tensor = local_tensors[meta.key].detach().contiguous()
+            if tuple(tensor.shape) != meta.shape:
+                raise RuntimeError(
+                    f"Tensor {meta.key!r} shape {tuple(tensor.shape)} does not match "
+                    f"exchange metadata {meta.shape}"
+                )
+            dtype_name = _dtype_name(tensor.dtype)
+            if dtype_name != meta.dtype_name:
+                raise RuntimeError(
+                    f"Tensor {meta.key!r} dtype {dtype_name!r} does not match "
+                    f"exchange metadata {meta.dtype_name!r}"
+                )
             if rank == 0:
                 received[identity] = tensor.cpu().contiguous()
             else:
