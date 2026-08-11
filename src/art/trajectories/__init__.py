@@ -15,6 +15,7 @@ from enum import IntFlag
 import time
 from types import TracebackType
 from typing import (
+    TYPE_CHECKING,
     Annotated,
     Any,
     Generic,
@@ -22,6 +23,7 @@ from typing import (
     Protocol,
     TypeAlias,
     TypeVar,
+    Union,
     overload,
 )
 
@@ -57,7 +59,17 @@ from openai.types.responses.response_create_params import (
     Conversation as ResponsesConversation,
 )
 import pydantic
-from typing_extensions import TypedDict, deprecated
+from typing_extensions import TypedDict, TypeForm, deprecated
+
+if TYPE_CHECKING:
+    import torch
+
+    from .tensors import (
+        TensorizedHistory,
+        TensorizedMultiHistoryTrajectory,
+        TensorizedTrajectory,
+        TensorizedTrajectoryGroup,
+    )
 
 from ..types import Messages, MessagesAndChoices, Tools
 from ._serialization import (
@@ -89,6 +101,14 @@ type CompactTrajectoryKind = Literal[
     "tokenized_multi_history_trajectories",
     "tokenized_trajectory_group",
     "tokenized_trajectory_groups",
+    "tensorized_history",
+    "tensorized_histories",
+    "tensorized_trajectory",
+    "tensorized_trajectories",
+    "tensorized_multi_history_trajectory",
+    "tensorized_multi_history_trajectories",
+    "tensorized_trajectory_group",
+    "tensorized_trajectory_groups",
 ]
 
 
@@ -320,6 +340,24 @@ class LegacyHistory(pydantic.BaseModel):
             chat_template_kwargs=chat_template_kwargs,
         )
 
+    def tensorize(
+        self,
+        *,
+        model: str,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+        device: torch.device | str | None = None,
+    ) -> TensorizedHistory:
+        return self.tokenize(
+            model=model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        ).tensorize(device=device)
+
 
 class History:
     """Mutable, protocol-native view of one tokenizable sequence."""
@@ -349,6 +387,22 @@ class History:
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
         )
+
+    def tensorize(
+        self,
+        *,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+        device: torch.device | str | None = None,
+    ) -> TensorizedHistory:
+        return self.tokenize(
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        ).tensorize(device=device)
 
 
 @dataclass(frozen=True, slots=True)
@@ -742,6 +796,56 @@ class Trajectory(_CompactModel):
             chat_template_kwargs=chat_template_kwargs,
         )
 
+    @overload
+    def tensorize(
+        self,
+        *,
+        multi_history: Literal[False] = False,
+        reconcile_text_equivalent_tokenizations: bool = False,
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+        device: torch.device | str | None = None,
+    ) -> TensorizedTrajectory: ...
+
+    @overload
+    def tensorize(
+        self,
+        *,
+        multi_history: Literal[True],
+        reconcile_text_equivalent_tokenizations: bool = False,
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+        device: torch.device | str | None = None,
+    ) -> TensorizedMultiHistoryTrajectory: ...
+
+    def tensorize(
+        self,
+        *,
+        multi_history: bool = False,
+        reconcile_text_equivalent_tokenizations: bool = False,
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+        device: torch.device | str | None = None,
+    ) -> TensorizedTrajectory | TensorizedMultiHistoryTrajectory:
+        return self.tokenize(
+            multi_history=multi_history,
+            reconcile_text_equivalent_tokenizations=reconcile_text_equivalent_tokenizations,
+            model=model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        ).tensorize(device=device)
+
     def messages(self) -> Messages:
         from ._history import trajectory_messages
 
@@ -916,13 +1020,66 @@ class TrajectoryGroup(_CompactModel):
             chat_template_kwargs=chat_template_kwargs,
         )
 
+    @overload
+    def tensorize(
+        self,
+        *,
+        multi_history: Literal[False] = False,
+        reconcile_text_equivalent_tokenizations: bool = False,
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+        device: torch.device | str | None = None,
+    ) -> TensorizedTrajectoryGroup[TensorizedTrajectory]: ...
+
+    @overload
+    def tensorize(
+        self,
+        *,
+        multi_history: Literal[True],
+        reconcile_text_equivalent_tokenizations: bool = False,
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+        device: torch.device | str | None = None,
+    ) -> TensorizedTrajectoryGroup[TensorizedMultiHistoryTrajectory]: ...
+
+    def tensorize(
+        self,
+        *,
+        multi_history: bool = False,
+        reconcile_text_equivalent_tokenizations: bool = False,
+        model: str | None = None,
+        base_model: str | None = None,
+        tokenizer: Tokenizer | None = None,
+        chat_template: str | None = None,
+        chat_template_kwargs: Mapping[str, object] | None = None,
+        device: torch.device | str | None = None,
+    ) -> (
+        TensorizedTrajectoryGroup[TensorizedTrajectory]
+        | TensorizedTrajectoryGroup[TensorizedMultiHistoryTrajectory]
+    ):
+        return self.tokenize(
+            multi_history=multi_history,
+            reconcile_text_equivalent_tokenizations=reconcile_text_equivalent_tokenizations,
+            model=model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        ).tensorize(device=device)
+
 
 class TokenizedHistory(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
 
     history: TrajectoryHistory
     model: str
-    token_ids: list[int]
+    tokens: list[int]
     logprobs: list[float]
     flags: list[TokenFlag]
 
@@ -939,10 +1096,15 @@ class TokenizedHistory(pydantic.BaseModel):
 
     @pydantic.model_validator(mode="after")
     def validate_tokenwise_lengths(self) -> TokenizedHistory:
-        if not (len(self.token_ids) == len(self.logprobs) == len(self.flags)):
+        if not (len(self.tokens) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tokenized history fields differ in length")
         _intern_string_graph(self)
         return self
+
+    def tensorize(
+        self, *, device: torch.device | str | None = None
+    ) -> TensorizedHistory:
+        return _load_tensors().tensorize_history(self, device=device)
 
     def compact_dump(self) -> CompactTrajectoryPayload:
         """Return a compact representation retaining the source history."""
@@ -954,9 +1116,30 @@ class TokenizedHistory(pydantic.BaseModel):
 
 class TokenizedTrajectory(TokenizedHistory):
     trajectory: Trajectory
-    reward: float
-    metrics: dict[str, float | int | bool]
-    metadata: dict[str, MetadataValue]
+
+    @property
+    def reward(self) -> float:
+        return self.trajectory.reward
+
+    @reward.setter
+    def reward(self, value: float) -> None:
+        self.trajectory.reward = value
+
+    @property
+    def metrics(self) -> dict[str, float | int | bool]:
+        return self.trajectory.metrics
+
+    @metrics.setter
+    def metrics(self, value: dict[str, float | int | bool]) -> None:
+        self.trajectory.metrics = value
+
+    @property
+    def metadata(self) -> dict[str, MetadataValue]:
+        return self.trajectory.metadata
+
+    @metadata.setter
+    def metadata(self, value: dict[str, MetadataValue]) -> None:
+        self.trajectory.metadata = value
 
     @pydantic.model_validator(mode="after")
     def _bind_source_trajectory(self) -> TokenizedTrajectory:
@@ -970,15 +1153,41 @@ class TokenizedTrajectory(TokenizedHistory):
 
         return dump_tokenized_trajectory(self)
 
+    def tensorize(
+        self, *, device: torch.device | str | None = None
+    ) -> TensorizedTrajectory:
+        return _load_tensors().tensorize_trajectory(self, device=device)
+
 
 class TokenizedMultiHistoryTrajectory(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
 
     trajectory: Trajectory
     histories: list[TokenizedHistory]
-    reward: float
-    metrics: dict[str, float | int | bool]
-    metadata: dict[str, MetadataValue]
+
+    @property
+    def reward(self) -> float:
+        return self.trajectory.reward
+
+    @reward.setter
+    def reward(self, value: float) -> None:
+        self.trajectory.reward = value
+
+    @property
+    def metrics(self) -> dict[str, float | int | bool]:
+        return self.trajectory.metrics
+
+    @metrics.setter
+    def metrics(self, value: dict[str, float | int | bool]) -> None:
+        self.trajectory.metrics = value
+
+    @property
+    def metadata(self) -> dict[str, MetadataValue]:
+        return self.trajectory.metadata
+
+    @metadata.setter
+    def metadata(self, value: dict[str, MetadataValue]) -> None:
+        self.trajectory.metadata = value
 
     @pydantic.model_validator(mode="after")
     def _intern_source_graph(self) -> TokenizedMultiHistoryTrajectory:
@@ -994,6 +1203,11 @@ class TokenizedMultiHistoryTrajectory(pydantic.BaseModel):
 
         return dump_tokenized_multi_history_trajectory(self)
 
+    def tensorize(
+        self, *, device: torch.device | str | None = None
+    ) -> TensorizedMultiHistoryTrajectory:
+        return _load_tensors().tensorize_multi_history_trajectory(self, device=device)
+
 
 TokenizedTrajectoryT = TypeVar(
     "TokenizedTrajectoryT", TokenizedTrajectory, TokenizedMultiHistoryTrajectory
@@ -1005,8 +1219,22 @@ class TokenizedTrajectoryGroup(pydantic.BaseModel, Generic[TokenizedTrajectoryT]
 
     trajectory_group: TrajectoryGroup
     trajectories: list[TokenizedTrajectoryT]
-    metrics: dict[str, float | int | bool]
-    metadata: dict[str, MetadataValue]
+
+    @property
+    def metrics(self) -> dict[str, float | int | bool]:
+        return self.trajectory_group.metrics
+
+    @metrics.setter
+    def metrics(self, value: dict[str, float | int | bool]) -> None:
+        self.trajectory_group.metrics = value
+
+    @property
+    def metadata(self) -> dict[str, MetadataValue]:
+        return self.trajectory_group.metadata
+
+    @metadata.setter
+    def metadata(self, value: dict[str, MetadataValue]) -> None:
+        self.trajectory_group.metadata = value
 
     @pydantic.model_validator(mode="after")
     def _intern_source_graph(self) -> TokenizedTrajectoryGroup[TokenizedTrajectoryT]:
@@ -1033,28 +1261,30 @@ class TokenizedTrajectoryGroup(pydantic.BaseModel, Generic[TokenizedTrajectoryT]
 
         return dump_tokenized_trajectory_group(self)
 
+    def tensorize(
+        self, *, device: torch.device | str | None = None
+    ) -> (
+        TensorizedTrajectoryGroup[TensorizedTrajectory]
+        | TensorizedTrajectoryGroup[TensorizedMultiHistoryTrajectory]
+    ):
+        return _load_tensors().tensorize_group(self, device=device)
 
-type CompactDumpable = (
-    Trajectory
-    | TrajectoryGroup
-    | TokenizedHistory
-    | TokenizedTrajectory
-    | TokenizedMultiHistoryTrajectory
-    | TokenizedTrajectoryGroup[TokenizedTrajectory]
-    | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
-)
-type _CompactValidated = (
-    CompactDumpable
-    | list[Trajectory]
-    | list[TrajectoryGroup]
-    | list[TokenizedHistory]
-    | list[TokenizedTrajectory]
-    | list[TokenizedMultiHistoryTrajectory]
-    | list[
-        TokenizedTrajectoryGroup[TokenizedTrajectory]
-        | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
-    ]
-)
+
+CompactDumpable: TypeAlias = Union[
+    Trajectory,
+    TrajectoryGroup,
+    TokenizedHistory,
+    TokenizedTrajectory,
+    TokenizedMultiHistoryTrajectory,
+    TokenizedTrajectoryGroup[TokenizedTrajectory],
+    TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory],
+    "TensorizedHistory",
+    "TensorizedTrajectory",
+    "TensorizedMultiHistoryTrajectory",
+    "TensorizedTrajectoryGroup[TensorizedTrajectory]",
+    "TensorizedTrajectoryGroup[TensorizedMultiHistoryTrajectory]",
+]
+_CompactValidated: TypeAlias = Union[CompactDumpable, list[CompactDumpable]]
 
 
 def compact_dump(
@@ -1068,101 +1298,34 @@ def compact_dump(
 
 
 @overload
-def compact_validate(
-    payload: Mapping[str, object], *, kind: Literal["trajectory"]
-) -> Trajectory: ...
-
-
-@overload
-def compact_validate(
-    payload: Mapping[str, object], *, kind: Literal["trajectories"]
-) -> list[Trajectory]: ...
-
-
-@overload
-def compact_validate(
-    payload: Mapping[str, object], *, kind: Literal["trajectory_group"]
-) -> TrajectoryGroup: ...
-
-
-@overload
-def compact_validate(
-    payload: Mapping[str, object], *, kind: Literal["trajectory_groups"]
-) -> list[TrajectoryGroup]: ...
-
-
-@overload
-def compact_validate(
-    payload: Mapping[str, object], *, kind: Literal["tokenized_history"]
-) -> TokenizedHistory: ...
-
-
-@overload
-def compact_validate(
-    payload: Mapping[str, object], *, kind: Literal["tokenized_histories"]
-) -> list[TokenizedHistory]: ...
-
-
-@overload
-def compact_validate(
-    payload: Mapping[str, object], *, kind: Literal["tokenized_trajectory"]
-) -> TokenizedTrajectory: ...
-
-
-@overload
-def compact_validate(
-    payload: Mapping[str, object], *, kind: Literal["tokenized_trajectories"]
-) -> list[TokenizedTrajectory]: ...
+def compact_validate[T](
+    payload: Mapping[str, object],
+    *,
+    type: TypeForm[T],
+    device: torch.device | str | None = None,
+) -> T: ...
 
 
 @overload
 def compact_validate(
     payload: Mapping[str, object],
     *,
-    kind: Literal["tokenized_multi_history_trajectory"],
-) -> TokenizedMultiHistoryTrajectory: ...
-
-
-@overload
-def compact_validate(
-    payload: Mapping[str, object],
-    *,
-    kind: Literal["tokenized_multi_history_trajectories"],
-) -> list[TokenizedMultiHistoryTrajectory]: ...
-
-
-@overload
-def compact_validate(
-    payload: Mapping[str, object], *, kind: Literal["tokenized_trajectory_group"]
-) -> (
-    TokenizedTrajectoryGroup[TokenizedTrajectory]
-    | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
-): ...
-
-
-@overload
-def compact_validate(
-    payload: Mapping[str, object], *, kind: Literal["tokenized_trajectory_groups"]
-) -> list[
-    TokenizedTrajectoryGroup[TokenizedTrajectory]
-    | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
-]: ...
-
-
-@overload
-def compact_validate(
-    payload: Mapping[str, object], *, kind: CompactTrajectoryKind
+    type: None = None,
+    device: torch.device | str | None = None,
 ) -> _CompactValidated: ...
 
 
-def compact_validate(
-    payload: Mapping[str, object], *, kind: CompactTrajectoryKind
-) -> _CompactValidated:
-    """Validate one compact value or homogeneous collection of ``kind``."""
+def compact_validate[T](
+    payload: Mapping[str, object],
+    *,
+    type: TypeForm[T] | None = None,
+    device: torch.device | str | None = None,
+) -> T | _CompactValidated:
+    """Validate a compact value, inferring or checking its requested type."""
 
     from ._compact import validate
 
-    return validate(payload, kind)
+    return validate(payload, type=type, device=device)
 
 
 @overload
@@ -1212,6 +1375,39 @@ def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
     return messages_from_legacy_history(messages_and_choices)
 
 
+_TENSOR_EXPORTS = frozenset(
+    {
+        "TensorizedHistory",
+        "TensorizedMultiHistoryTrajectory",
+        "TensorizedTrajectory",
+        "TensorizedTrajectoryGroup",
+    }
+)
+
+
+def _load_tensors():
+    from importlib import import_module
+
+    try:
+        return import_module(f"{__name__}.tensors")
+    except ModuleNotFoundError as error:
+        if error.name == "torch":
+            raise ModuleNotFoundError(
+                "Tensorized trajectories require openpipe-art[tensors]"
+            ) from error
+        raise
+
+
+def __getattr__(name: str) -> object:
+    if name in _TENSOR_EXPORTS:
+        return getattr(_load_tensors(), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _TENSOR_EXPORTS)
+
+
 __all__ = [
     "ChatCompletionsRequest",
     "CompletionsRequest",
@@ -1243,6 +1439,10 @@ __all__ = [
     "TokenizedHistory",
     "TokenizedMultiHistoryTrajectory",
     "TokenizedTrajectoryGroup",
+    "TensorizedHistory",
+    "TensorizedMultiHistoryTrajectory",
+    "TensorizedTrajectory",
+    "TensorizedTrajectoryGroup",
     "Tokenizer",
     "TokenFlag",
     "MetadataValue",

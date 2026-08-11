@@ -98,7 +98,7 @@ class _HistoryTokenizationTrace:
     sources: dict[_SampledSourceKey, object]
 
     def validate(self, tokenized: TokenizedHistory) -> None:
-        if len(self.source_keys) != len(tokenized.token_ids):
+        if len(self.source_keys) != len(tokenized.tokens):
             raise AssertionError(
                 "Tokenization trace differs in length from tokenized data"
             )
@@ -1715,7 +1715,7 @@ def _legacy_tokenize(
     return TokenizedHistory(
         history=history,
         model=model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -1988,7 +1988,7 @@ def _tokenize_exchange_trajectory(
     tokenized = TokenizedHistory(
         history=history,
         model=selected_model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -2891,7 +2891,7 @@ def _tokenize_exact_responses_history(
     tokenized = TokenizedHistory(
         history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -3132,7 +3132,7 @@ def _tokenize_exact_projected_chat_history(
     tokenized = TokenizedHistory(
         history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -4319,7 +4319,7 @@ def _tokenize_chat_view(
     tokenized = TokenizedHistory(
         history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -4387,7 +4387,7 @@ def _tokenize_completions_token_history(
     tokenized = TokenizedHistory(
         history=history,
         model=history.model,
-        token_ids=list(history.prompt),
+        tokens=list(history.prompt),
         logprobs=logprobs,
         flags=flags,
     )
@@ -4568,7 +4568,7 @@ def _tokenize_completions_string_history(
     tokenized = TokenizedHistory(
         history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -4831,13 +4831,10 @@ def _materialize_trajectory(
     return TokenizedTrajectory(
         history=tokenized.history,
         model=tokenized.model,
-        token_ids=tokenized.token_ids,
+        tokens=tokenized.tokens,
         logprobs=tokenized.logprobs,
         flags=tokenized.flags,
         trajectory=trajectory,
-        reward=trajectory.reward,
-        metrics=dict(trajectory.metrics),
-        metadata=dict(trajectory.metadata),
     )
 
 
@@ -4887,9 +4884,6 @@ def tokenize_trajectory(
     return TokenizedMultiHistoryTrajectory(
         trajectory=trajectory,
         histories=tokenized,
-        reward=trajectory.reward,
-        metrics=dict(trajectory.metrics),
-        metadata=dict(trajectory.metadata),
     )
 
 
@@ -4934,9 +4928,6 @@ def _tokenize_trajectory_with_trace(
         TokenizedMultiHistoryTrajectory(
             trajectory=trajectory,
             histories=tokenized_histories,
-            reward=trajectory.reward,
-            metrics=dict(trajectory.metrics),
-            metadata=dict(trajectory.metadata),
         ),
         traces,
     )
@@ -4973,12 +4964,8 @@ def tokenize_group(
         return TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory](
             trajectory_group=group,
             trajectories=trajectories,
-            metrics=dict(group.metrics),
-            metadata=dict(group.metadata),
         )
     return TokenizedTrajectoryGroup[TokenizedTrajectory](
         trajectory_group=group,
         trajectories=trajectories,
-        metrics=dict(group.metrics),
-        metadata=dict(group.metadata),
     )

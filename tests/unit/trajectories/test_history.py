@@ -585,7 +585,7 @@ def test_history_accepts_user_authored_messages_with_none_source() -> None:
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
-    assert tokenized.token_ids == [10, 20, 30]
+    assert tokenized.tokens == [10, 20, 30]
     assert tokenized.flags[1] == tr.TokenFlag.SAMPLED
 
 
@@ -1546,7 +1546,7 @@ def test_chat_reasoning_split_does_not_reuse_divergent_sampled_source() -> None:
     assert source.request_index == 1
     assert source.choice_index is None
     tokenized = histories[1].tokenize()
-    assert tokenized.token_ids == [1, 500, 3, 4]
+    assert tokenized.tokens == [1, 500, 3, 4]
     assert not tokenized.flags[1] & tr.TokenFlag.SAMPLED
 
 
@@ -1695,7 +1695,7 @@ def test_anthropic_exact_regeneration_preserves_sampled_source() -> None:
     assert source.exchange is first
     assert source.request_index is None
     tokenized = regenerated_history.as_chat_completions_history().tokenize()
-    assert tokenized.token_ids == [1, 101, 3, 5]
+    assert tokenized.tokens == [1, 101, 3, 5]
     assert tokenized.logprobs[1] == -101.0
     assert tokenized.flags[1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
 

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import builtins
 from collections.abc import Iterable, Mapping
 import json
 import re
-from typing import TypeGuard, cast
+from typing import TypeGuard, cast, get_args, get_origin
 
 import pydantic
 
@@ -17,6 +18,7 @@ from . import (
     TokenizedTrajectoryGroup,
     Trajectory,
     TrajectoryGroup,
+    _load_tensors,
 )
 from ._serialization import _intern_strings as _intern_string_graph
 from ._serialization import _rebind_history_sources, _StringPool
@@ -33,18 +35,26 @@ _SOURCE_MARKERS = {
     "generation_index",
     "prompt_index",
 }
-type _CompactValidated = (
-    CompactDumpable
-    | list[Trajectory]
-    | list[TrajectoryGroup]
-    | list[TokenizedHistory]
-    | list[TokenizedTrajectory]
-    | list[TokenizedMultiHistoryTrajectory]
-    | list[
-        TokenizedTrajectoryGroup[TokenizedTrajectory]
-        | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
-    ]
-)
+type _CompactValidated = CompactDumpable | list[CompactDumpable]
+
+_PLURAL_BY_SINGULAR: dict[CompactTrajectoryKind, CompactTrajectoryKind] = {
+    "trajectory": "trajectories",
+    "trajectory_group": "trajectory_groups",
+    "tokenized_history": "tokenized_histories",
+    "tokenized_trajectory": "tokenized_trajectories",
+    "tokenized_multi_history_trajectory": "tokenized_multi_history_trajectories",
+    "tokenized_trajectory_group": "tokenized_trajectory_groups",
+    "tensorized_history": "tensorized_histories",
+    "tensorized_trajectory": "tensorized_trajectories",
+    "tensorized_multi_history_trajectory": "tensorized_multi_history_trajectories",
+    "tensorized_trajectory_group": "tensorized_trajectory_groups",
+}
+_SINGULAR_BY_PLURAL = {
+    plural: singular for singular, plural in _PLURAL_BY_SINGULAR.items()
+}
+_SINGULAR_KINDS = _PLURAL_BY_SINGULAR.keys()
+_PLURAL_KINDS = _SINGULAR_BY_PLURAL.keys()
+_KINDS = _SINGULAR_KINDS | _PLURAL_KINDS
 
 
 def dump(
@@ -104,78 +114,168 @@ def dump_tokenized_trajectory_group(
 
 
 def validate(
-    payload: Mapping[str, object], kind: CompactTrajectoryKind
+    payload: Mapping[str, object], *, type: object = None, device: object = None
 ) -> _CompactValidated:
-    """Decode the value identified by the caller's concrete envelope kind."""
+    """Decode one compact value, inferring or checking its requested type."""
 
+    kind = _payload_kind(payload)
+    target_model: builtins.type[pydantic.BaseModel] | None = None
+    if type is not None:
+        expected_kind, target_model = _target(type)
+        if kind != expected_kind:
+            raise ValueError(
+                f"Requested compact type expects kind {expected_kind!r}, got {kind!r}"
+            )
+    if device is not None and not kind.startswith("tensorized_"):
+        raise ValueError("device is only valid for tensorized compact payloads")
     data = _decode(payload, kind)
-    if kind in {
-        "trajectories",
-        "trajectory_groups",
-        "tokenized_histories",
-        "tokenized_trajectories",
-        "tokenized_multi_history_trajectories",
-        "tokenized_trajectory_groups",
-    }:
+    if kind in _PLURAL_KINDS:
         if not isinstance(data, list):
             raise ValueError("Compact collection payload data must be a list")
         singular = _singular_kind(kind)
-        values = [_validate_value(item, singular) for item in data]
+        values = [
+            _validate_value(item, singular, target_model, device=device)
+            for item in data
+        ]
         pool: _StringPool = {}
         for value in values:
             _finish(value, pool)
         return cast(_CompactValidated, values)
-    return _finish(_validate_value(data, kind))
+    return _finish(_validate_value(data, kind, target_model, device=device))
 
 
-def _validate_value(value: object, kind: CompactTrajectoryKind) -> CompactDumpable:
+def _validate_value(
+    value: object,
+    kind: CompactTrajectoryKind,
+    cls: type[pydantic.BaseModel] | None,
+    *,
+    device: object,
+) -> CompactDumpable:
     if kind == "trajectory":
         return Trajectory.model_validate(value)
     if kind == "trajectory_group":
         return TrajectoryGroup.model_validate(value)
     if kind == "tokenized_history":
-        return _validate_history(value, TokenizedHistory)
+        return _validate_history(value, cls or TokenizedHistory)
     if kind == "tokenized_trajectory":
-        return _validate_trajectory(value, TokenizedTrajectory)
+        return _validate_trajectory(value, cls or TokenizedTrajectory)
     if kind == "tokenized_multi_history_trajectory":
-        return _validate_multi(value, TokenizedMultiHistoryTrajectory)
+        return _validate_multi(value, cls or TokenizedMultiHistoryTrajectory)
     if kind == "tokenized_trajectory_group":
-        return _validate_group(value, TokenizedTrajectoryGroup)
+        return _validate_group(value, cls or TokenizedTrajectoryGroup)
+    if kind.startswith("tensorized_"):
+        tensors = _tensors()
+        models: dict[CompactTrajectoryKind, type[pydantic.BaseModel]] = {
+            "tensorized_history": tensors.TensorizedHistory,
+            "tensorized_trajectory": tensors.TensorizedTrajectory,
+            "tensorized_multi_history_trajectory": (
+                tensors.TensorizedMultiHistoryTrajectory
+            ),
+            "tensorized_trajectory_group": tensors.TensorizedTrajectoryGroup,
+        }
+        model = cls or models[kind]
+        if kind == "tensorized_history":
+            result = _validate_history(value, model)
+        elif kind == "tensorized_trajectory":
+            result = _validate_trajectory(value, model)
+        elif kind == "tensorized_multi_history_trajectory":
+            result = _validate_multi(value, model)
+        else:
+            result = _validate_group(value, model)
+        if device is not None:
+            move = getattr(result, "to", None)
+            if not callable(move):
+                raise AssertionError("Tensorized compact value has no device mover")
+            move(device)
+        return cast(CompactDumpable, result)
     raise ValueError(f"Compact kind {kind!r} does not identify one value")
 
 
 def _plural_kind(kind: CompactTrajectoryKind) -> CompactTrajectoryKind:
-    kinds: dict[CompactTrajectoryKind, CompactTrajectoryKind] = {
-        "trajectory": "trajectories",
-        "trajectory_group": "trajectory_groups",
-        "tokenized_history": "tokenized_histories",
-        "tokenized_trajectory": "tokenized_trajectories",
-        "tokenized_multi_history_trajectory": ("tokenized_multi_history_trajectories"),
-        "tokenized_trajectory_group": "tokenized_trajectory_groups",
-    }
     try:
-        return kinds[kind]
+        return _PLURAL_BY_SINGULAR[kind]
     except KeyError as error:
         raise ValueError(f"Compact kind {kind!r} is already plural") from error
 
 
 def _singular_kind(kind: CompactTrajectoryKind) -> CompactTrajectoryKind:
-    kinds: dict[CompactTrajectoryKind, CompactTrajectoryKind] = {
-        "trajectories": "trajectory",
-        "trajectory_groups": "trajectory_group",
-        "tokenized_histories": "tokenized_history",
-        "tokenized_trajectories": "tokenized_trajectory",
-        "tokenized_multi_history_trajectories": ("tokenized_multi_history_trajectory"),
-        "tokenized_trajectory_groups": "tokenized_trajectory_group",
-    }
     try:
-        return kinds[kind]
+        return _SINGULAR_BY_PLURAL[kind]
     except KeyError as error:
         raise ValueError(f"Compact kind {kind!r} is already singular") from error
 
 
+def _tensors():
+    return _load_tensors()
+
+
+def _is_tensorized(value: object) -> bool:
+    return (
+        value.__class__.__module__ == "art.trajectories.tensors"
+        and value.__class__.__name__.split("[", 1)[0]
+        in {
+            "TensorizedHistory",
+            "TensorizedTrajectory",
+            "TensorizedMultiHistoryTrajectory",
+            "TensorizedTrajectoryGroup",
+        }
+    )
+
+
+def _target(value: object) -> tuple[CompactTrajectoryKind, type[pydantic.BaseModel]]:
+    origin = get_origin(value)
+    plural = origin is list
+    if plural:
+        arguments = get_args(value)
+        if len(arguments) != 1:
+            raise TypeError("Compact collection type must have exactly one item type")
+        value = arguments[0]
+    if not isinstance(value, type) or not issubclass(value, pydantic.BaseModel):
+        raise TypeError("type must be a supported compact model or list[model]")
+    kind = _model_kind(value)
+    return (_plural_kind(kind) if plural else kind), value
+
+
+def _model_kind(value: type[pydantic.BaseModel]) -> CompactTrajectoryKind:
+    if issubclass(value, TokenizedTrajectory):
+        return "tokenized_trajectory"
+    if issubclass(value, TokenizedHistory):
+        return "tokenized_history"
+    if issubclass(value, TokenizedMultiHistoryTrajectory):
+        return "tokenized_multi_history_trajectory"
+    if issubclass(value, TokenizedTrajectoryGroup):
+        return "tokenized_trajectory_group"
+    if issubclass(value, TrajectoryGroup):
+        return "trajectory_group"
+    if issubclass(value, Trajectory):
+        return "trajectory"
+    if value.__module__ == "art.trajectories.tensors":
+        tensors = _tensors()
+        if issubclass(value, tensors.TensorizedTrajectory):
+            return "tensorized_trajectory"
+        if issubclass(value, tensors.TensorizedHistory):
+            return "tensorized_history"
+        if issubclass(value, tensors.TensorizedMultiHistoryTrajectory):
+            return "tensorized_multi_history_trajectory"
+        if issubclass(value, tensors.TensorizedTrajectoryGroup):
+            return "tensorized_trajectory_group"
+    raise TypeError(f"Unsupported compact type: {value!r}")
+
+
+def _payload_kind(payload: Mapping[str, object]) -> CompactTrajectoryKind:
+    if set(payload) != _FIELDS:
+        raise ValueError(
+            "Compact trajectory payload must contain exactly "
+            "format, version, kind, strings, and data"
+        )
+    kind = payload.get("kind")
+    if not isinstance(kind, str) or kind not in _KINDS:
+        raise ValueError(f"Unsupported compact trajectory kind: {kind!r}")
+    return kind
+
+
 def _is_dumpable(value: object) -> TypeGuard[CompactDumpable]:
-    return isinstance(
+    return _is_tensorized(value) or isinstance(
         value,
         (
             Trajectory,
@@ -188,6 +288,8 @@ def _is_dumpable(value: object) -> TypeGuard[CompactDumpable]:
 
 
 def _kind(value: CompactDumpable) -> CompactTrajectoryKind:
+    if _is_tensorized(value):
+        return _model_kind(cast(type[pydantic.BaseModel], type(value)))
     if isinstance(value, TokenizedTrajectory):
         return "tokenized_trajectory"
     if isinstance(value, TokenizedHistory):
@@ -211,19 +313,20 @@ def _dump_value(
             raise AssertionError("Plain compact values must be Pydantic models")
         return _dump_model(value)
     data = _dump_model(cast(pydantic.BaseModel, value))
-    if isinstance(value, TokenizedHistory) and not isinstance(
-        value, TokenizedTrajectory
-    ):
+    if kind in {"tokenized_history", "tensorized_history"}:
         registry = _ExchangeDataRegistry()
         _replace_source_exchanges(data["history"], registry, encode=True)
         return {"value": data, "exchanges": registry.exchanges}
-    if isinstance(value, TokenizedTrajectory):
+    if kind in {"tokenized_trajectory", "tensorized_trajectory"}:
         _compact_trajectory_data(data)
         return data
-    if isinstance(value, TokenizedMultiHistoryTrajectory):
+    if kind in {
+        "tokenized_multi_history_trajectory",
+        "tensorized_multi_history_trajectory",
+    }:
         _compact_multi_data(data)
         return data
-    if isinstance(value, TokenizedTrajectoryGroup):
+    if kind in {"tokenized_trajectory_group", "tensorized_trajectory_group"}:
         _compact_group_data(data)
         return data
     raise AssertionError("Compact kind and value disagree")
@@ -325,7 +428,7 @@ def _compact_group_data(data: dict[str, pydantic.JsonValue]) -> None:
         cast(list[pydantic.JsonValue], tokenized)[index] = child
 
 
-def _validate_history[ValueT: TokenizedHistory](
+def _validate_history[ValueT: pydantic.BaseModel](
     value: object, cls: type[ValueT]
 ) -> ValueT:
     wrapper = _mapping(value, "Compact tokenized history")
@@ -343,7 +446,7 @@ def _validate_history[ValueT: TokenizedHistory](
     return cls.model_validate(data)
 
 
-def _validate_trajectory[ValueT: TokenizedTrajectory](
+def _validate_trajectory[ValueT: pydantic.BaseModel](
     value: object, cls: type[ValueT]
 ) -> ValueT:
     data = dict(_mapping(value, "Compact tokenized trajectory"))
@@ -352,7 +455,7 @@ def _validate_trajectory[ValueT: TokenizedTrajectory](
     return cls.model_validate(data)
 
 
-def _validate_multi[ValueT: TokenizedMultiHistoryTrajectory](
+def _validate_multi[ValueT: pydantic.BaseModel](
     value: object, cls: type[ValueT]
 ) -> ValueT:
     data = dict(_mapping(value, "Compact multi-history trajectory"))
@@ -366,7 +469,7 @@ def _validate_multi[ValueT: TokenizedMultiHistoryTrajectory](
     return cls.model_validate(data)
 
 
-def _validate_group[ValueT: TokenizedTrajectoryGroup](
+def _validate_group[ValueT: pydantic.BaseModel](
     value: object, cls: type[ValueT]
 ) -> ValueT:
     data = dict(_mapping(value, "Compact tokenized group"))
@@ -399,7 +502,7 @@ def _validate_group[ValueT: TokenizedTrajectoryGroup](
         else:
             _replace_source_exchanges(child.get("history"), registry, encode=False)
         cast(list[pydantic.JsonValue], tokenized)[index] = child
-    model: type[TokenizedTrajectoryGroup]
+    model: type[pydantic.BaseModel]
     if cls is TokenizedTrajectoryGroup:
         model = cast(
             type[TokenizedTrajectoryGroup],
@@ -408,6 +511,15 @@ def _validate_group[ValueT: TokenizedTrajectoryGroup](
                 if multi
                 else TokenizedTrajectoryGroup[TokenizedTrajectory]
             ),
+        )
+    elif cls.__module__ == "art.trajectories.tensors" and cls.__name__ == (
+        "TensorizedTrajectoryGroup"
+    ):
+        tensors = _tensors()
+        model = (
+            tensors.TensorizedTrajectoryGroup[tensors.TensorizedMultiHistoryTrajectory]
+            if multi
+            else tensors.TensorizedTrajectoryGroup[tensors.TensorizedTrajectory]
         )
     else:
         model = cls
@@ -441,6 +553,8 @@ def _replace_source_exchanges(
 
 def _finish[ValueT](value: ValueT, pool: _StringPool | None = None) -> ValueT:
     if isinstance(value, TokenizedHistory):
+        _rebind_history_sources(value.history)
+    elif _is_tensorized(value) and hasattr(value, "history"):
         _rebind_history_sources(value.history)
     _intern(value, pool)
     return value

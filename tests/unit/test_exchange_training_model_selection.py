@@ -611,7 +611,7 @@ def test_training_rejects_sampled_token_without_causal_predecessor(
         ]
     )
     tokenized = group.trajectories[0].tokenize()
-    assert tokenized.token_ids == output_token_ids
+    assert tokenized.tokens == output_token_ids
     assert all(flag & tr.TokenFlag.SAMPLED for flag in tokenized.flags)
 
     weight_writes = 0

@@ -771,7 +771,7 @@ def tokenize_trajectory_groups(
                 ):
                     if (
                         _max_sequence_length is not None
-                        and len(exchange_result.token_ids) > _max_sequence_length
+                        and len(exchange_result.tokens) > _max_sequence_length
                     ):
                         preview_seen = set(seen_source_keys)
                         would_train = _first_introduction_mask(
@@ -782,11 +782,9 @@ def tokenize_trajectory_groups(
                                 TokenizedResult(
                                     advantage=advantage,
                                     chat="",
-                                    token_ids=exchange_result.token_ids,
-                                    input_pos=list(
-                                        range(len(exchange_result.token_ids))
-                                    ),
-                                    assistant_mask=[0] * len(exchange_result.token_ids),
+                                    token_ids=exchange_result.tokens,
+                                    input_pos=list(range(len(exchange_result.tokens))),
+                                    assistant_mask=[0] * len(exchange_result.tokens),
                                     logprobs=exchange_result.logprobs,
                                     pixel_values=None,
                                     image_grid_thw=None,
@@ -825,7 +823,7 @@ def tokenize_trajectory_groups(
                             (trace.sources[key], key.index)
                             for key in ordered_source_keys
                         ),
-                        exchange_result.token_ids,
+                        exchange_result.tokens,
                         exchange_result.flags,
                     )
                     if chat_trace is not None:
@@ -841,7 +839,7 @@ def tokenize_trajectory_groups(
                             if any(trainable[start : start + length])
                         ]
                         moe_routes, moe_stats = align_choice_routes_to_tokenized_result(
-                            token_ids=exchange_result.token_ids,
+                            token_ids=exchange_result.tokens,
                             choices=[
                                 chat_trace.choices[index] for index in selected_choices
                             ],
@@ -866,8 +864,8 @@ def tokenize_trajectory_groups(
                         TokenizedResult(
                             advantage=advantage,
                             chat="",
-                            token_ids=exchange_result.token_ids,
-                            input_pos=list(range(len(exchange_result.token_ids))),
+                            token_ids=exchange_result.tokens,
+                            input_pos=list(range(len(exchange_result.tokens))),
                             assistant_mask=[int(value) for value in trainable],
                             logprobs=exchange_result.logprobs,
                             pixel_values=None,

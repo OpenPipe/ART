@@ -22,6 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 plotting = ["matplotlib>=3.10.1", "seaborn>=0.13.2"]
+tensors = ["torch==2.11.0"]
 
 backend = [
     "peft>=0.14.0",

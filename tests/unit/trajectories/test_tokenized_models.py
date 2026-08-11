@@ -9,7 +9,7 @@ def _history() -> tr.TokenizedHistory:
     return tr.TokenizedHistory(
         history=tr.LegacyHistory(messages_and_choices=[]),
         model="policy",
-        token_ids=[1, 2],
+        tokens=[1, 2],
         logprobs=[math.nan, -0.25],
         flags=[
             tr.TokenFlag.EXACT,
@@ -23,7 +23,7 @@ def _assert_history_round_trip(
     expected: tr.TokenizedHistory,
 ) -> None:
     assert restored.model == expected.model
-    assert restored.token_ids == expected.token_ids
+    assert restored.tokens == expected.tokens
     assert restored.flags == expected.flags
     assert math.isnan(restored.logprobs[0])
     assert restored.logprobs[1:] == expected.logprobs[1:]
@@ -38,13 +38,12 @@ def test_tokenized_history_nan_json_round_trip() -> None:
 
 
 def test_tokenized_trajectory_nan_json_round_trip() -> None:
-    trajectory = art.Trajectory()
+    trajectory = art.Trajectory(
+        reward=1.0, metrics={"count": 1}, metadata={"source": "test"}
+    )
     value = tr.TokenizedTrajectory(
         **_history().model_dump(),
         trajectory=trajectory,
-        reward=1.0,
-        metrics={"count": 1},
-        metadata={"source": "test"},
     )
     restored = tr.TokenizedTrajectory.model_validate_json(value.model_dump_json())
     _assert_history_round_trip(restored, value)
@@ -54,19 +53,14 @@ def test_tokenized_trajectory_nan_json_round_trip() -> None:
 
 
 def test_nested_tokenized_models_nan_json_round_trip() -> None:
-    source = art.Trajectory()
+    source = art.Trajectory(reward=1.0)
     trajectory = tr.TokenizedMultiHistoryTrajectory(
         trajectory=source,
         histories=[_history()],
-        reward=1.0,
-        metrics={},
-        metadata={},
     )
     group = tr.TokenizedTrajectoryGroup[tr.TokenizedMultiHistoryTrajectory](
         trajectory_group=art.TrajectoryGroup([source]),
         trajectories=[trajectory],
-        metrics={},
-        metadata={},
     )
     restored = tr.TokenizedTrajectoryGroup[
         tr.TokenizedMultiHistoryTrajectory
@@ -206,7 +200,7 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     assert isinstance(history, tr.ChatCompletionsHistory)
 
     restored_history = art.trajectories.compact_validate(
-        history.tokenize().compact_dump(), kind="tokenized_history"
+        history.tokenize().compact_dump(), type=tr.TokenizedHistory
     )
     assert isinstance(restored_history.history, tr.ChatCompletionsHistory)
     first_source = restored_history.history.message_sources[0]
@@ -215,7 +209,7 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     assert first_source.exchange is last_source.exchange
 
     restored = art.trajectories.compact_validate(
-        tokenized.compact_dump(), kind="tokenized_trajectory"
+        tokenized.compact_dump(), type=tr.TokenizedTrajectory
     )
     assert isinstance(restored.history, tr.ChatCompletionsHistory)
     restored_source = restored.history.message_sources[0]
@@ -234,17 +228,14 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
             tr.TokenizedHistory(
                 history=tokenized.history,
                 model=tokenized.model,
-                token_ids=tokenized.token_ids,
+                tokens=tokenized.tokens,
                 logprobs=tokenized.logprobs,
                 flags=tokenized.flags,
             )
         ],
-        reward=tokenized.reward,
-        metrics=tokenized.metrics,
-        metadata=tokenized.metadata,
     )
     restored_multi = art.trajectories.compact_validate(
-        tokenized_multi.compact_dump(), kind="tokenized_multi_history_trajectory"
+        tokenized_multi.compact_dump(), type=tr.TokenizedMultiHistoryTrajectory
     )
     assert isinstance(restored_multi.histories[0].history, tr.ChatCompletionsHistory)
     restored_multi_source = restored_multi.histories[0].history.message_sources[0]
@@ -255,7 +246,8 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     )
 
     restored_group = art.trajectories.compact_validate(
-        tokenized_group.compact_dump(), kind="tokenized_trajectory_group"
+        tokenized_group.compact_dump(),
+        type=tr.TokenizedTrajectoryGroup[tr.TokenizedTrajectory],
     )
     restored_child = restored_group.trajectories[0]
     assert isinstance(restored_child, tr.TokenizedTrajectory)
@@ -270,14 +262,14 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
 
     payload = art.trajectories.compact_dump([tokenized])
     restored_list = art.trajectories.compact_validate(
-        payload, kind="tokenized_trajectories"
+        payload, type=list[tr.TokenizedTrajectory]
     )
     assert restored_list[0].model_dump() == tokenized.model_dump()
     history_payload = art.trajectories.compact_dump([history.tokenize()])
     assert (
         len(
             art.trajectories.compact_validate(
-                history_payload, kind="tokenized_histories"
+                history_payload, type=list[tr.TokenizedHistory]
             )
         )
         == 1
@@ -286,7 +278,7 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     assert (
         len(
             art.trajectories.compact_validate(
-                multi_payload, kind="tokenized_multi_history_trajectories"
+                multi_payload, type=list[tr.TokenizedMultiHistoryTrajectory]
             )
         )
         == 1
@@ -295,7 +287,8 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     assert (
         len(
             art.trajectories.compact_validate(
-                group_payload, kind="tokenized_trajectory_groups"
+                group_payload,
+                type=list[tr.TokenizedTrajectoryGroup[tr.TokenizedTrajectory]],
             )
         )
         == 1

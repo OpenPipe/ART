@@ -479,7 +479,7 @@ async def test_rollout_captures_two_turn_tool_exchange_with_exact_tokens() -> No
     assert trajectory.tools is None
     restored = art.Trajectory.model_validate_json(trajectory.model_dump_json())
     tokenized = restored.tokenize()
-    assert tokenized.token_ids == [10, 11, 12, 13, 14]
+    assert tokenized.tokens == [10, 11, 12, 13, 14]
     assert tokenized.logprobs[2] == -0.25
     assert tokenized.logprobs[3] != tokenized.logprobs[3]
     assert tokenized.logprobs[4] == -0.5
