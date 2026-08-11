@@ -78,7 +78,7 @@ class TrainingRunSpec(_Spec):
     optimizer_state_path: str = Field(min_length=1)
     initial_event_timeout_s: float | None = Field(default=None, gt=0)
     event_timeout_s: float = Field(default=300.0, gt=0)
-    shutdown_timeout_s: float = Field(default=60.0, gt=0)
+    shutdown_timeout_s: float = Field(default=240.0, gt=0)
 
 
 class CurrentTrainConfig(TrainConfig):
