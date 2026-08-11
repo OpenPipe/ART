@@ -1346,13 +1346,14 @@ def _patch_dsv4_cuda_o_proj_lora(attn_cls: Any, o_proj_mod: Any) -> None:
     original = attn_cls._o_proj
 
     def _o_proj(self: Any, o: Any, positions: Any) -> Any:
+        cos_sin_cache = _dsv4_fp32_cos_sin_cache(self.rotary_emb)
         if not _is_active_lora_wrapped_linear(self.wo_a):
             return original(self, o, positions)
         return _dsv4_deep_gemm_fp8_o_proj_with_lora(
             o_proj_mod,
             o,
             positions,
-            _dsv4_fp32_cos_sin_cache(self.rotary_emb),
+            cos_sin_cache,
             self.wo_a,
             self.wo_b,
             n_groups=self.n_local_groups,

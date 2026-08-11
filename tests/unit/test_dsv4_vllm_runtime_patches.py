@@ -65,6 +65,29 @@ def test_dsv4_fp8_o_proj_normalizes_rope_cache_once() -> None:
     assert patches._dsv4_fp32_cos_sin_cache(rotary_emb) is cache
 
 
+def test_dsv4_native_o_proj_receives_fp32_rope_cache() -> None:
+    patches = _load_dsv4_patches_module()
+    seen: list[torch.Tensor] = []
+
+    class Attention:
+        def __init__(self) -> None:
+            self.rotary_emb = SimpleNamespace(
+                cos_sin_cache=torch.ones(4, 8, dtype=torch.bfloat16)
+            )
+            self.wo_a = SimpleNamespace()
+
+        def _o_proj(self, _o, _positions):
+            seen.append(self.rotary_emb.cos_sin_cache)
+            return "native"
+
+    patches._patch_dsv4_cuda_o_proj_lora(Attention, SimpleNamespace())
+    attention = Attention()
+
+    assert attention._o_proj(None, None) == "native"
+    assert seen == [attention.rotary_emb.cos_sin_cache]
+    assert seen[0].dtype == torch.float32
+
+
 def test_dsv4_layerwise_reload_restores_merged_column_metadata() -> None:
     patches = _load_dsv4_patches_module()
     param = torch.nn.Parameter(torch.empty(3, 4), requires_grad=False)
