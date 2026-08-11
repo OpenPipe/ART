@@ -51,7 +51,7 @@ from art.megatron.weights.lora_publish import (
     merge_sharded_adapter_entries,
     save_vllm_lora_from_model,
 )
-from art.trainer_rank import AdamParams, TrainerRank
+from art.trainer_rank import AdamParams, TrainerRank, TrainerRankSlotStateError
 from art.trainer_rank._checkpoint import (
     _PreparedSave,
     materialize_lora,
@@ -2002,7 +2002,10 @@ def test_prepared_checkpoint_pins_a_symlink_target(tmp_path: Path) -> None:
     checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
     assert prepared.path == first.resolve()
     _assert_tensors_equal(
-        checkpoint_module._load_stage_lora(trainer, prepared), _PORTABLE_ADAPTER
+        checkpoint_module._load_stage_lora(
+            trainer, prepared, int(_PORTABLE_CONFIG["r"])
+        ),
+        _PORTABLE_ADAPTER,
     )
 
 
@@ -2178,6 +2181,29 @@ def test_checkpoint_prepare_captures_immutable_state_and_finish_is_idempotent(
                 rtol=0,
             )
     assert not list(tmp_path.glob(".immutable.snapshot-*"))
+
+
+def test_checkpoint_idempotence_rejects_corrupt_existing_payload(
+    tmp_path: Path,
+) -> None:
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(trainer)
+    output = tmp_path / "corrupt-existing"
+    trainer.save_checkpoint(str(output), "student")
+    tensors = load_file(output / "adapter_model.safetensors")
+    key = next(iter(tensors))
+    tensors[key].add_(1)
+    save_file(tensors, output / "adapter_model.safetensors")
+
+    with pytest.raises(RuntimeError, match="Checkpoint digest mismatch"):
+        trainer.save_checkpoint(str(output), "student")
+
+    with pytest.raises(RuntimeError, match="Checkpoint digest mismatch"):
+        validate_checkpoint(output)
+    assert not list(tmp_path.glob(".corrupt-existing.snapshot-*"))
+    assert not list(tmp_path.glob(".corrupt-existing.tmp-*"))
 
 
 def test_checkpoint_finalizers_run_fifo_and_clean_snapshots(
@@ -2924,6 +2950,44 @@ def test_checkpoint_commit_failure_rolls_back_every_rank(tmp_path: Path) -> None
     )
 
 
+def test_checkpoint_reload_rejects_accumulated_gradients(tmp_path: Path) -> None:
+    source_trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(source_trainer)
+    source = tmp_path / "reload-source"
+    source_trainer.save_checkpoint(str(source), "student")
+
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(trainer)
+    trainer._dynamic_optimizers["student"] = trainer._new_dynamic_optimizer(
+        "student", AdamParams(learning_rate=3e-4)
+    )
+    params = trainer._checkpoint_slot_params_by_name["student"]
+    params[0].grad = torch.ones_like(params[0])
+    values = tuple(param.detach().clone() for param in params)
+    dynamic = trainer._dynamic_optimizers["student"]
+
+    with pytest.raises(TrainerRankSlotStateError, match="accumulated gradients"):
+        load_trainer_checkpoint(trainer, prepare_checkpoint(str(source)), "student")
+
+    assert trainer._checkpoint_slot_params_by_name["student"] is params
+    assert trainer._dynamic_optimizers["student"] is dynamic
+    assert params[0].grad is not None
+    for expected, actual in zip(values, params, strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert all(
+        not (ref.name or "").startswith("__art_loading_")
+        for ref in next(
+            module
+            for module in trainer.runtime.model[0].modules()
+            if isinstance(module, LoRA)
+        )._slot_keys
+    )
+
+
 def test_trainer_rank_checkpoint_deduplicates_data_parallel_replicas(
     tmp_path: Path,
 ) -> None:
@@ -3066,6 +3130,26 @@ def test_trainer_rank_checkpoint_restores_1_to_2_to_1(
             torch.testing.assert_close(
                 actual_state[key], expected_state[key], atol=0, rtol=0
             )
+
+
+def test_checkpoint_restores_different_adapter_rank(tmp_path: Path) -> None:
+    original = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(original)
+    output = tmp_path / "rank-two"
+    _save_before_next_step(original, output)
+
+    ambient = LoRA(_PORTABLE_PREFIX, 3, 4, 4, 4, torch.float32, torch.device("cpu"))
+    restored = _portable_trainer(ambient)
+    load_trainer_checkpoint(restored, prepare_checkpoint(str(output)), "student")
+    assert ambient.A_T.shape[-1] == 4
+    assert all(
+        parameter.shape[-1] == 2 or parameter.shape[-2] == 2
+        for parameter in restored._checkpoint_slot_params_by_name["student"]
+    )
+    _step_portable_checkpoint(restored, -0.125)
+    _assert_checkpoint_state_equal(original, restored)
 
 
 def test_checkpoint_restores_pipeline_parallel_next_step(tmp_path: Path) -> None:

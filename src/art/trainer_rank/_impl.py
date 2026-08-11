@@ -2087,17 +2087,21 @@ class TrainerRank:
         return bool(self._slot_graphs().get(ref))
 
     def _guard_slot_can_load(self, ref: "LoRASlotRef") -> None:
-        if not self._has_live_slot_graph(ref):
-            return
-        raise TrainerRankSlotStateError(
-            f"Cannot load checkpoint {ref.name!r} while outputs from an "
-            "earlier forward using that slot still have a live backward graph. "
-            "Activation checkpoint recompute resolves slots by name, so replacing "
-            "the slot before backward can compute gradients with different LoRA "
-            "weights than the original forward. Finish backward first; if the "
-            "forward was abandoned, release all references to its outputs; or load "
-            "the new weights under a different slot name."
-        )
+        if self._has_live_slot_graph(ref):
+            raise TrainerRankSlotStateError(
+                f"Cannot load checkpoint {ref.name!r} while outputs from an "
+                "earlier forward using that slot still have a live backward graph. "
+                "Activation checkpoint recompute resolves slots by name, so replacing "
+                "the slot before backward can compute gradients with different LoRA "
+                "weights than the original forward. Finish backward first; if the "
+                "forward was abandoned, release all references to its outputs; or load "
+                "the new weights under a different slot name."
+            )
+        if any(param.grad is not None for param in self._iter_slot_parameters(ref)):
+            raise TrainerRankSlotStateError(
+                f"Cannot load checkpoint {ref.name!r} with accumulated gradients. "
+                "Call optim_step() or zero_grad() before replacing the checkpoint."
+            )
 
     def _guard_checkpoint_can_step(self, name: str) -> None:
         ref = self._slot_ref(name)
@@ -3366,16 +3370,3 @@ def _nested_forward_children(inputs: ForwardInputs) -> Iterator[ForwardInputs]:
             "TrainerRank forward inputs must be ForwardInput objects or nested "
             "iterables of ForwardInput objects"
         ) from exc
-
-
-__all__ = [
-    "AdamParams",
-    "ForwardInput",
-    "ForwardOutput",
-    "MicroBatch",
-    "MicroBatchStats",
-    "TopK",
-    "TrainerRank",
-    "TrainerRankMemoryError",
-    "TrainerRankSlotStateError",
-]

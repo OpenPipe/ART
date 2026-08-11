@@ -232,7 +232,7 @@ def _tp_head_backward_worker(rank: int, world: int, init_method: str) -> None:
 
         from megatron.core import tensor_parallel
 
-        local_hidden = torch.randn(2, 1, 3, device=device)
+        local_hidden = torch.randn(2, 1, 3, device=device, requires_grad=True)
         gathered_hidden = tensor_parallel.gather_from_sequence_parallel_region(
             local_hidden,
             tensor_parallel_output_grad=False,

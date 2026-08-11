@@ -508,10 +508,10 @@ def _export_lora_files(
 
 
 def _load_stage_lora(
-    trainer: TrainerRank, source: PreparedCheckpoint
+    trainer: TrainerRank, source: PreparedCheckpoint, adapter_rank: int
 ) -> dict[str, torch.Tensor]:
     if _native_checkpoint(source):
-        return _load_native_lora(trainer, source)
+        return _load_native_lora(trainer, source, adapter_rank)
     local_layers = {
         match.group("layer")
         for key in trainer._local_adapter_keys()
@@ -546,6 +546,7 @@ def _native_checkpoint(source: PreparedCheckpoint) -> bool:
 
 def _local_tensor_plan(
     trainer: TrainerRank,
+    adapter_rank: int,
 ) -> dict[str, tuple[LoraShardManifest, tuple[int, ...]]]:
     from art.megatron.lora import LoRA
 
@@ -559,7 +560,9 @@ def _local_tensor_plan(
                 keys = module._expected_weight_keys(suffix)
                 for expert, key in enumerate(keys):
                     local = parameter[expert] if parameter.ndim == 3 else parameter
-                    plan[key] = (manifest, tuple(reversed(local.shape)))
+                    shape = list(reversed(local.shape))
+                    shape[0 if suffix == "lora_A" else -1] = adapter_rank
+                    plan[key] = (manifest, tuple(shape))
     return plan
 
 
@@ -616,11 +619,11 @@ def _read_local_slice(
 
 
 def _load_native_lora(
-    trainer: TrainerRank, source: PreparedCheckpoint
+    trainer: TrainerRank, source: PreparedCheckpoint, adapter_rank: int
 ) -> dict[str, torch.Tensor]:
     from art.megatron.model_support.lora_disk import safe_open
 
-    plan = _local_tensor_plan(trainer)
+    plan = _local_tensor_plan(trainer, adapter_rank)
     tensors: dict[str, torch.Tensor] = {}
     with safe_open(source.path / "adapter_model.safetensors", framework="pt") as file:
         keys = set(file.keys())
@@ -645,7 +648,7 @@ def load_checkpoint(
     adapter_model: dict[str, torch.Tensor] = {}
     read_error: BaseException | None = None
     try:
-        adapter_model = _load_stage_lora(trainer, source)
+        adapter_model = _load_stage_lora(trainer, source, int(config["r"]))
     except BaseException as exc:
         read_error = exc
     _raise_distributed(read_error, "read checkpoint")
@@ -698,7 +701,9 @@ def load_checkpoint(
         staged_params = tuple(trainer._iter_slot_parameters(temporary_ref))
         trainer._checkpoint_slot_params_by_name[temporary_name] = staged_params
         if source.manifest is not None and source.manifest.optimizer is not None:
-            local_optimizer = _load_local_optimizer(trainer, source, temporary_name)
+            local_optimizer = _load_local_optimizer(
+                trainer, source, temporary_name, int(config["r"])
+            )
             dynamic = trainer._restore_canonical_optimizer(
                 temporary_name, local_optimizer
             )
@@ -1325,10 +1330,11 @@ def _load_local_optimizer(
     trainer: TrainerRank,
     source: PreparedCheckpoint,
     name: str,
+    adapter_rank: int,
 ) -> LocalOptimizerState:
     manifest = source.manifest
     assert manifest is not None and manifest.optimizer is not None
-    plan = _local_tensor_plan(trainer)
+    plan = _local_tensor_plan(trainer, adapter_rank)
     localized: dict[str, tuple[torch.Tensor, ...]] = {}
     for component in ("master", "exp_avg", "exp_avg_sq"):
         records = {
@@ -1484,6 +1490,7 @@ def _commit_output(temporary: Path, destination: Path, digest: str) -> None:
                 existing_manifest.read_text()
             )
             if existing.digest == digest:
+                _checkpoint_metadata(destination)
                 return
         if any(destination.iterdir()):
             raise FileExistsError(f"Checkpoint output is not empty: {destination}")
