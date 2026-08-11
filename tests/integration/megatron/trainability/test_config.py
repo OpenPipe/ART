@@ -454,7 +454,7 @@ def test_yes_no_prompts_form_prefix_tree_by_default(monkeypatch) -> None:
 def test_qwen3_5_length_trainability_uses_stable_moe_defaults() -> None:
     assert _default_learning_rate("Qwen/Qwen3.5-35B-A3B") == 1e-4
     assert _length_rollouts_per_prompt("Qwen/Qwen3.5-35B-A3B") == 32
-    assert _length_max_steps("Qwen/Qwen3.5-35B-A3B") == 30
+    assert _length_max_steps("Qwen/Qwen3.5-35B-A3B") == 40
     assert _length_max_steps("meta-llama/Llama-3.2-1B-Instruct") == 30
     assert _length_rollout_seed("Qwen/Qwen3.5-35B-A3B") == 20261833
     assert _length_rollout_temperature("Qwen/Qwen3.5-35B-A3B") == 0.8

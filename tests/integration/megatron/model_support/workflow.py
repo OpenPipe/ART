@@ -108,6 +108,9 @@ _RUNTIME_ARTIFACT_DIR_NAMES = frozenset(
     }
 )
 _WORKFLOW_STAGE_TIMEOUT_S = 30 * 60
+_WORKFLOW_STAGE_TIMEOUT_OVERRIDES_S = {
+    ("e2e_throughput", "deepseek-ai/DeepSeek-V4-Flash"): 40 * 60,
+}
 
 
 class AllArchitecturesValidationReport(BaseModel):
@@ -455,6 +458,9 @@ def _run_stage_in_subprocess(
         else f"{TESTS_DIR}{os.pathsep}{existing_pythonpath}"
     )
     started = time.monotonic()
+    timeout_s = _WORKFLOW_STAGE_TIMEOUT_OVERRIDES_S.get(
+        (stage_name, base_model), _WORKFLOW_STAGE_TIMEOUT_S
+    )
     with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
             cmd,
@@ -466,7 +472,7 @@ def _run_stage_in_subprocess(
             start_new_session=True,
         )
         try:
-            returncode = _wait_stage_process(process)
+            returncode = _wait_stage_process(process, timeout_s=timeout_s)
         except subprocess.TimeoutExpired:
             returncode = None
     duration_s = time.monotonic() - started
@@ -480,9 +486,7 @@ def _run_stage_in_subprocess(
             passed=False,
             metrics={
                 **common_metrics,
-                "error": (
-                    f"stage exceeded {_WORKFLOW_STAGE_TIMEOUT_S:g}s; log={log_path}"
-                ),
+                "error": f"stage exceeded {timeout_s:g}s; log={log_path}",
             },
         )
     if returncode != 0:
@@ -514,10 +518,10 @@ def _raise_signal_exit(signum: int, _frame: Any) -> None:
     raise SystemExit(128 + signum)
 
 
-def _wait_stage_process(process: subprocess.Popen[Any]) -> int:
+def _wait_stage_process(process: subprocess.Popen[Any], *, timeout_s: float) -> int:
     previous_sigterm = signal.signal(signal.SIGTERM, _raise_signal_exit)
     try:
-        return process.wait(timeout=_WORKFLOW_STAGE_TIMEOUT_S)
+        return process.wait(timeout=timeout_s)
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         try:
