@@ -785,7 +785,8 @@ def test_checkpoint_slot_adapter_config_rejects_cross_rank_mismatch(
     monkeypatch.setattr("art.trainer_rank.dist.get_world_size", lambda: 2)
 
     def gather(output: list[object], value: object) -> None:
-        output[:] = [value, {"different": True}]
+        revision = value[1] if isinstance(value, tuple) and len(value) == 2 else None
+        output[:] = [value, ({"different": True}, revision)]
 
     monkeypatch.setattr("art.trainer_rank.dist.all_gather_object", gather)
 

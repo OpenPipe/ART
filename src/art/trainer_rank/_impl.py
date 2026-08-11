@@ -827,11 +827,19 @@ class TrainerRank:
                 None
             ] * dist.get_world_size()
             dist.all_gather_object(gathered, (config, runtime_revision))
-            if any(value is None or value[0] != config for value in gathered):
+            if any(
+                not isinstance(value, tuple) or len(value) != 2 or value[0] != config
+                for value in gathered
+            ):
                 raise ValueError(
                     f"Adapter config for checkpoint slot {name!r} differs across ranks"
                 )
-            if any(value is None or value[1] != runtime_revision for value in gathered):
+            if any(
+                not isinstance(value, tuple)
+                or len(value) != 2
+                or value[1] != runtime_revision
+                for value in gathered
+            ):
                 raise ValueError("Runtime model revision differs across ranks")
         if config is None:
             return None
