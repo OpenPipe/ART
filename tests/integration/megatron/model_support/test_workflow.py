@@ -470,7 +470,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     inconsistent = [dict(row) for row in rows]
     inconsistent[-1]["pipeline_settings/num_rollout_workers"] = 14
     history_path.write_text("".join(json.dumps(row) + "\n" for row in inconsistent))
-    with pytest.raises(RuntimeError, match="history rows executed different"):
+    with pytest.raises(RuntimeError, match="two trailing same-setting"):
         collect(isolated_phase)
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     capture_settings = measured_settings.model_dump(mode="json")
