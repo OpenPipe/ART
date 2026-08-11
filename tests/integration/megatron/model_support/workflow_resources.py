@@ -552,43 +552,43 @@ _THROUGHPUT_CONFIGS = {
 # values are estimates from the prior H200 workflow and remain fingerprint-free.
 _B300_THROUGHPUT_FLOORS = {
     "llama3_dense": (
-        "421297e73e35aacdd0f2dc321dec0548adf354789840debd1b2b5b546d3bd7ba",
+        "984ae23c1c40d6729b1c5c67eb8a8b0476cd56a5a6035729ce278275e420aed4",
         (49_500, 47_300, 12_900, 0.90, 4.5),
     ),
     "qwen3_dense": (
-        "1dc5ba0da1547fb17535549ccdeabc9b18a8d0a70bbcf187f4a0ff7957ed5135",
+        "3f8392a00a37f20493a36cef9bba68089787d52e69bd19ab4310c9058311a9b9",
         (40_200, 37_600, 8_600, 0.88, 4.5),
     ),
     "qwen3_moe": (
-        "999e014167fbe2b8570d124e5ea38450104041d5f735a08433616cb9d19d91c8",
+        "d17692a5a671d2fe4c0425557b49929b9a8887889516df12c3d047fd150064e3",
         (49_900, 43_700, 2_050, 0.82, 4.5),
     ),
     "qwen3_5_dense": (
-        "b2c0a9395ad09d3821082a4aac0337a5be5e9b3580953ece61079785d4b158d4",
+        "9eccb19f712ffec4ced0fa48b67aac8c40c6f0072ddf5d898586343a0871fe93",
         (64_800, 60_000, 3_750, 0.87, 3.5),
     ),
     "qwen3_5_moe": (
-        "38475e5ec324f9fcf21cb0da0e202247814ba317c7f2dbb9b6c1646c8732b761",
+        "56695e23c68e6c9770d0c3f5fd205be0a2defa5959ca61026e3301ce0fbd64b3",
         (32_600, 30_800, 257, 0.89, 5.5),
     ),
     "gemma4_dense": (
-        "74228dd6f0d2c4872b0b68ba90f4f72a99aace2c622b4adb1b47a5260416c374",
+        "b3ae36186b0af5e30f73e29aa8b903b35b9b8def51f83320713da107ffc407bf",
         (23_100, 22_700, 2_390, 0.93, 7.0),
     ),
     "gemma4_moe": (
-        "934a6106a961eb1eedc0f50059f389b223b3b7a5538ab10a7086d44ac440bd10",
+        "9ca28dbc5fb9f80c78ac760d45b049648780b20f2dcb9f851e4d0f17d9134187",
         (40_300, 38_500, 4_740, 0.90, 5.0),
     ),
     "dsv4": (
-        "94cc2ad031210a54ad0f46a83d8fe277eae9e77068acc91055b5cd420ff77901",
+        "ec00600931b926e309b2811b25a777c2accd01805c384a18adde82f98c3ec5fe",
         (7_050, 7_020, 1_350, 0.94, 43.0),
     ),
     "glm52": (
-        "702f7d8f96ba8c4501c6e2e386e5c9b95d11fe1c3ab760bd5c9df9600572627e",
+        "47776cf0d2bd53734ffb32bf22f3d30431c8ba408a303e7c14bce94b66c12af5",
         (14_880, 14_330, 5_730, 0.91, 12.0),
     ),
     "gpt_oss_moe": (
-        "c69902095a0b42735d59ad29a8b098483966f1677cc27ec3a4b4be2375d05a2d",
+        "d6fc68fcfc091ac7cc98b789a0dcb50047b8e2972211644823f1298eb3aa792d",
         (81_700, 76_400, 4_850, 0.88, 2.5),
     ),
 }
