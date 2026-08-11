@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -45,7 +46,7 @@ _POLICY_AGE_P95 = "offpolicy/token_weighted_policy_age_p95_steps"
 _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
-_MEASUREMENT_CONTRACT_VERSION = 6
+_MEASUREMENT_CONTRACT_VERSION = 7
 _ISOLATED_WARMUP_STEPS = 1
 _ISOLATED_MEASURED_STEPS = 2
 _CAPTURE_GUARD_STEPS = 1
@@ -103,6 +104,36 @@ class TrainerPhaseEvidence(NamedTuple):
 def _same_executed_settings(decisions: list[Any]) -> bool:
     first, second = decisions[-2:]
     return first.previous == first.updated == second.previous
+
+
+@contextmanager
+def _hold_pipeline_settings_after_step(trainer: Any, step: int) -> Iterator[None]:
+    apply = trainer.apply_pipeline_settings
+
+    def apply_before_step(settings: Any) -> None:
+        # The terminal decision is future evidence; matched capture must retain the
+        # setting that executed the measured windows.
+        if trainer.state.next_training_step < step:
+            apply(settings)
+
+    setattr(trainer, "apply_pipeline_settings", apply_before_step)
+    try:
+        yield
+    finally:
+        setattr(trainer, "apply_pipeline_settings", apply)
+
+
+def _current_pipeline_settings(trainer: Any) -> dict[str, int]:
+    return {
+        name: int(getattr(trainer, name))
+        for name in (
+            "num_rollout_workers",
+            "min_batch_size",
+            "max_batch_size",
+            "queue_maxsize",
+            "target_groups_per_step",
+        )
+    }
 
 
 def _text(config: dict[str, Any]) -> dict[str, Any]:
@@ -973,6 +1004,7 @@ def _collect_measurements(
     events: list[PolicyActivationEvent],
     isolated: TrainerPhaseEvidence,
     e2e: TrainerPhaseEvidence,
+    capture_settings: Mapping[str, int],
     calibration_fingerprint: str,
 ) -> dict[str, Any]:
     _require(
@@ -999,6 +1031,12 @@ def _collect_measurements(
     _require(
         len(selected) == 2 and _same_executed_settings(selected),
         "throughput evidence requires two trailing windows executed with one setting",
+    )
+    executed_settings = selected[-1].previous.model_dump(mode="json")
+    _require(
+        dict(capture_settings) == executed_settings,
+        "matched capture did not use the measured pipeline settings: "
+        f"{dict(capture_settings)} != {executed_settings}",
     )
     stats = [decision.stats for decision in selected]
     assert all(window is not None for window in stats)
@@ -1120,6 +1158,7 @@ def _collect_measurements(
         "mean_train_gap_s": (e2e_elapsed_s - train_s) / len(rows),
         "e2e_elapsed_s": e2e_elapsed_s,
         "autotuner_windows": windows,
+        "matched_capture_pipeline_settings": dict(capture_settings),
         "mean_policy_activation_lag_s": fmean(lags),
         "p50_policy_activation_lag_s": median(lags),
         "p95_policy_activation_lag_s": quantiles(lags, n=20, method="inclusive")[18],
@@ -1302,7 +1341,7 @@ async def _run_e2e_throughput_async(
     e2e_phase: TrainerPhaseEvidence | None = None
     isolated_phase: TrainerPhaseEvidence | None = None
     captured_training_input: (
-        tuple[tuple[Any, ...], str, Mapping[str, Any], int] | None
+        tuple[tuple[Any, ...], str, Mapping[str, Any], int, dict[str, int]] | None
     ) = None
     bundles_path = stage_dir / "matched_packed_input.msgpack"
     autotune = PipelineAutotuneConfig(
@@ -1482,12 +1521,14 @@ async def _run_e2e_throughput_async(
                         *captured,
                         result.metrics,
                         step,
+                        _current_pipeline_settings(trainer),
                     )
                 return result
 
             setattr(backend, "train", tracked_train)
             try:
-                await trainer.train(handle_signals=False)
+                with _hold_pipeline_settings_after_step(trainer, config.max_steps):
+                    await trainer.train(handle_signals=False)
                 if train_call_count != capture_train_call:
                     raise RuntimeError(
                         "online pipeline did not execute measurement plus capture steps: "
@@ -1504,7 +1545,9 @@ async def _run_e2e_throughput_async(
                 raise RuntimeError(
                     "online pipeline never captured a matched train batch"
                 )
-            bundles, packed_fingerprint, metrics, step = captured_training_input
+            bundles, packed_fingerprint, metrics, step, capture_settings = (
+                captured_training_input
+            )
             bundle_payload = await asyncio.to_thread(_bundle_bytes, bundles)
             await asyncio.to_thread(bundles_path.write_bytes, bundle_payload)
             e2e_phase = _phase_evidence(
@@ -1537,6 +1580,7 @@ async def _run_e2e_throughput_async(
         events=events,
         isolated=isolated_phase,
         e2e=e2e_phase,
+        capture_settings=capture_settings,
         calibration_fingerprint=calibration_fingerprint,
     )
     activation_path = stage_dir / "policy_activation_timeline.json"

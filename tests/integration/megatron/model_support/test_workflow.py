@@ -11,6 +11,7 @@ from art.megatron.model_support.spec import (
     ArchitectureReport,
     LayerFamilyInstance,
 )
+from art.pipeline_tuner import PipelineTuneSettings
 from tests.integration.megatron.train_inf_mismatch import (
     workflow_stage as mismatch_workflow_stage,
 )
@@ -60,6 +61,7 @@ from .workflow_throughput import (
     ThroughputFixture,
     _collect_matched_packing_shapes,
     _collect_measurements,
+    _hold_pipeline_settings_after_step,
     _packed_input_fingerprint,
     _phase_evidence,
     _reduced_config,
@@ -272,13 +274,21 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     ]
     history_path = tmp_path / "history.jsonl"
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    measured_settings = PipelineTuneSettings(
+        num_rollout_workers=16,
+        min_batch_size=8,
+        max_batch_size=32,
+        queue_maxsize=48,
+        target_groups_per_step=24,
+    )
+    future_settings = measured_settings.model_copy(update={"num_rollout_workers": 14})
     profile = SimpleNamespace(
         config=SimpleNamespace(mode="online", window_steps=2),
         decisions=[
             SimpleNamespace(
                 action="hold",
-                previous={"workers": 16},
-                updated={"workers": 16},
+                previous=measured_settings,
+                updated=measured_settings,
                 stats=SimpleNamespace(
                     start_step=16,
                     end_step=17,
@@ -291,8 +301,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             ),
             SimpleNamespace(
                 action="decrease_workers",
-                previous={"workers": 16},
-                updated={"workers": 14},
+                previous=measured_settings,
+                updated=future_settings,
                 stats=SimpleNamespace(
                     start_step=18,
                     end_step=19,
@@ -346,6 +356,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             events=events,
             isolated=isolated,
             e2e=e2e_phase,
+            capture_settings=measured_settings.model_dump(mode="json"),
             calibration_fingerprint="a" * 64,
         )
 
@@ -423,10 +434,27 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     assert "matched_core_to_isolated_ratio_max" in acceptance_failures(
         measurements, config, thresholds
     )
-    profile.decisions[1].previous = {"workers": 14}
+    profile.decisions[1].previous = future_settings
     with pytest.raises(RuntimeError, match="executed with one setting"):
         collect(isolated_phase)
-    profile.decisions[1].previous = {"workers": 16}
+    profile.decisions[1].previous = measured_settings
+    capture_settings = measured_settings.model_dump(mode="json")
+    capture_settings["num_rollout_workers"] = 14
+    with pytest.raises(
+        RuntimeError, match="did not use the measured pipeline settings"
+    ):
+        _collect_measurements(
+            fixture=fixture,
+            config=config,
+            hardware="b300",
+            model_output_dir=tmp_path,
+            profile=profile,
+            events=events,
+            isolated=isolated_phase,
+            e2e=e2e_phase,
+            capture_settings=capture_settings,
+            calibration_fingerprint="a" * 64,
+        )
     fractional = [dict(row) for row in rows]
     fractional[0]["data/step_nonpadding_logical_tokens"] = 999.5
     history_path.write_text("".join(json.dumps(row) + "\n" for row in fractional))
@@ -435,6 +463,24 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     with pytest.raises(RuntimeError, match="same packed input"):
         collect(phase("isolated", "input-b", (22, 23)))
+
+
+def test_throughput_capture_holds_terminal_future_settings() -> None:
+    applied = []
+    trainer = SimpleNamespace(
+        state=SimpleNamespace(next_training_step=18),
+        apply_pipeline_settings=applied.append,
+    )
+    original = trainer.apply_pipeline_settings
+
+    with _hold_pipeline_settings_after_step(trainer, 19):
+        trainer.apply_pipeline_settings("measured")
+        trainer.state.next_training_step = 19
+        trainer.apply_pipeline_settings("future")
+
+    trainer.apply_pipeline_settings("restored")
+    assert applied == ["measured", "restored"]
+    assert trainer.apply_pipeline_settings == original
 
 
 def test_dsv4_throughput_reduction_preserves_hash_moe_prefix() -> None:
