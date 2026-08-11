@@ -379,7 +379,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
 
     e2e_phase, isolated_phase = (
         phase("e2e", "input-a", tuple(range(21, 27))),
-        phase("isolated", "input-a", tuple(range(30, 36))),
+        phase("isolated", "input-a", tuple(range(28, 34))),
     )
 
     def collect(isolated):
@@ -515,7 +515,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         collect(isolated_phase)
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     with pytest.raises(RuntimeError, match="same packed input"):
-        collect(phase("isolated", "input-b", tuple(range(40, 46))))
+        collect(phase("isolated", "input-b", tuple(range(28, 34))))
 
 
 def test_throughput_measurement_freezes_actual_settings() -> None:
