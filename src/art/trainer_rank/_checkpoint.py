@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -286,7 +287,8 @@ def prepare_checkpoint_save(
     if output_dir in trainer._prepared_checkpoint_saves:
         raise RuntimeError(f"Checkpoint save is already pending: {output_dir}")
     with trainer._checkpoint_save_condition:
-        trainer._completed_checkpoint_saves.discard(output_dir)
+        if output_dir in trainer._completed_checkpoint_saves:
+            trainer._completed_checkpoint_saves.remove(output_dir)
     _ensure_checkpoint_group(trainer)
     _validate_save_state(trainer, checkpoint_name)
     adapter_config = deepcopy(dict(_checkpoint_config(trainer, checkpoint_name)))
@@ -448,7 +450,7 @@ def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
         with condition:
             trainer._checkpoint_finishing_saves.discard(output_dir)
             if error is None and cleanup_error is None:
-                trainer._completed_checkpoint_saves.add(output_dir)
+                trainer._completed_checkpoint_saves.append(output_dir)
             trainer._checkpoint_finish_sequence += 1
             condition.notify_all()
     if error is not None and cleanup_error is not None:
@@ -853,7 +855,7 @@ def _ensure_checkpoint_save_state(trainer: TrainerRank) -> None:
     trainer._checkpoint_finish_sequence = 0
     trainer._prepared_checkpoint_saves = {}
     trainer._checkpoint_finishing_saves = set()
-    trainer._completed_checkpoint_saves = set()
+    trainer._completed_checkpoint_saves = deque(maxlen=128)
 
 
 def _ensure_checkpoint_group(trainer: TrainerRank) -> dist.ProcessGroup | None:

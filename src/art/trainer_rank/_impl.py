@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import (
     Awaitable,
     Callable,
@@ -572,7 +573,7 @@ class TrainerRank:
         self._checkpoint_finish_sequence = 0
         self._prepared_checkpoint_saves: dict[str, _PreparedSave] = {}
         self._checkpoint_finishing_saves: set[str] = set()
-        self._completed_checkpoint_saves: set[str] = set()
+        self._completed_checkpoint_saves: deque[str] = deque(maxlen=128)
         self._pending_slot_graphs: dict[
             LoRASlotRef, list[weakref.ReferenceType[torch.Tensor]]
         ] = {}

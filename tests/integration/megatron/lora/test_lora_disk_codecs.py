@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 from collections.abc import Sequence
 import importlib.util
 import json
@@ -2181,6 +2182,30 @@ def test_checkpoint_prepare_captures_immutable_state_and_finish_is_idempotent(
                 rtol=0,
             )
     assert not list(tmp_path.glob(".immutable.snapshot-*"))
+
+
+def test_checkpoint_completed_save_idempotency_cache_is_bounded(
+    tmp_path: Path,
+) -> None:
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(trainer)
+    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
+    checkpoint_module._ensure_checkpoint_save_state(trainer)
+    trainer._completed_checkpoint_saves = deque(maxlen=2)
+
+    outputs = [tmp_path / f"completed-{index}" for index in range(3)]
+    for output in outputs:
+        trainer.save_checkpoint(str(output), "student")
+
+    assert list(trainer._completed_checkpoint_saves) == [
+        str(outputs[1]),
+        str(outputs[2]),
+    ]
+    trainer._finish_checkpoint_save(str(outputs[1]))
+    with pytest.raises(RuntimeError, match="Checkpoint save was not prepared"):
+        trainer._finish_checkpoint_save(str(outputs[0]))
 
 
 def test_checkpoint_idempotence_rejects_corrupt_existing_payload(
