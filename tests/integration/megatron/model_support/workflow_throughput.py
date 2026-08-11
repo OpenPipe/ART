@@ -46,7 +46,7 @@ _POLICY_AGE_P95 = "offpolicy/token_weighted_policy_age_p95_steps"
 _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
-_MEASUREMENT_CONTRACT_VERSION = 9
+_MEASUREMENT_CONTRACT_VERSION = 10
 _ISOLATED_WARMUP_STEPS = 1
 _MATCHED_MEASURED_STEPS = 2
 _CAPTURE_GUARD_STEPS = 1
@@ -133,6 +133,55 @@ def _freeze_pipeline_settings_from_step(trainer: Any, step: int) -> Iterator[Non
 
 def _current_pipeline_settings(trainer: Any) -> dict[str, int]:
     return {name: int(getattr(trainer, name)) for name in _PIPELINE_SETTING_NAMES}
+
+
+def _row_pipeline_settings(row: Mapping[str, Any], step: int) -> dict[str, int]:
+    return {
+        name: _nonnegative_integer(
+            row.get(f"pipeline_settings/{name}"),
+            name=f"step {step} pipeline setting {name}",
+        )
+        for name in _PIPELINE_SETTING_NAMES
+    }
+
+
+def _same_setting_decision_suffix(
+    decisions: list[Any],
+    by_step: Mapping[int, Mapping[str, Any]],
+    capture_settings: Mapping[str, int],
+) -> list[Any]:
+    expected = dict(capture_settings)
+    selected: list[Any] = []
+    later: Any | None = None
+    for decision in reversed(decisions):
+        stats = decision.stats
+        assert stats is not None
+        if later is not None:
+            _require(
+                stats.end_step + 1 == later.start_step
+                and math.isclose(
+                    float(stats.window_end_s),
+                    float(later.window_start_s),
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ),
+                "autotuner windows are not contiguous",
+            )
+        steps = range(stats.start_step, stats.end_step + 1)
+        missing = [step for step in steps if step not in by_step]
+        _require(not missing, f"autotuner decision window lacks train rows: {missing}")
+        if not all(
+            _row_pipeline_settings(by_step[step], step) == expected for step in steps
+        ):
+            break
+        selected.append(decision)
+        later = stats
+    selected.reverse()
+    _require(
+        len(selected) >= 2,
+        "throughput evidence requires two trailing same-setting autotuner windows",
+    )
+    return selected
 
 
 def _text(config: dict[str, Any]) -> dict[str, Any]:
@@ -1082,14 +1131,9 @@ def _collect_measurements(
     decisions = [
         decision for decision in profile.decisions if decision.stats is not None
     ]
-    selected = decisions[-2:]
-    _require(
-        len(selected) == 2,
-        "throughput evidence requires two trailing autotuner windows",
-    )
-    stats = [decision.stats for decision in selected]
-    assert all(window is not None for window in stats)
-    first_stats, last_stats = stats
+    _require(bool(decisions), "throughput evidence requires autotuner windows")
+    last_stats = decisions[-1].stats
+    assert last_stats is not None
     expected_window = (
         config.max_steps - profile.config.window_steps + 1,
         config.max_steps,
@@ -1098,36 +1142,22 @@ def _collect_measurements(
         (last_stats.start_step, last_stats.end_step) == expected_window,
         f"final autotuner window is not {expected_window[0]}..{expected_window[1]}",
     )
-    for left, right in zip(stats, stats[1:]):
-        _require(
-            left.end_step + 1 == right.start_step
-            and math.isclose(
-                float(left.window_end_s),
-                float(right.window_start_s),
-                rel_tol=0.0,
-                abs_tol=1e-6,
-            ),
-            "trailing autotuner windows are not contiguous",
-        )
     history_rows = _training_rows(model_output_dir)
     by_step = {int(row["step"]): row for row in history_rows}
     _require(
         len(by_step) == len(history_rows),
         "throughput history contains duplicate training steps",
     )
+    selected = _same_setting_decision_suffix(decisions, by_step, capture_settings)
+    stats = [decision.stats for decision in selected]
+    assert all(window is not None for window in stats)
+    first_stats, last_stats = stats
     steps = list(range(first_stats.start_step, last_stats.end_step + 1))
     missing = [step for step in steps if step not in by_step]
     _require(not missing, f"autotuner decision window lacks train rows: {missing}")
     rows = [by_step[step] for step in steps]
     executed_settings_by_step = [
-        {
-            name: _nonnegative_integer(
-                row.get(f"pipeline_settings/{name}"),
-                name=f"step {step} pipeline setting {name}",
-            )
-            for name in _PIPELINE_SETTING_NAMES
-        }
-        for step, row in zip(steps, rows, strict=True)
+        _row_pipeline_settings(row, step) for step, row in zip(steps, rows, strict=True)
     ]
     executed_settings = executed_settings_by_step[0]
     _require(

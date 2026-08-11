@@ -69,6 +69,7 @@ from .workflow_throughput import (
     _packed_input_fingerprint,
     _phase_evidence,
     _reduced_config,
+    _same_setting_decision_suffix,
     _throughput_config_for_hardware,
     acceptance_failures,
 )
@@ -533,6 +534,46 @@ def test_throughput_measurement_freezes_actual_settings() -> None:
     trainer.apply_pipeline_settings(future)
     assert _current_pipeline_settings(trainer) == future.model_dump(mode="json")
     assert trainer.apply_pipeline_settings == original
+
+
+def test_throughput_measurement_uses_full_same_setting_suffix() -> None:
+    measured = PipelineTuneSettings(
+        num_rollout_workers=16,
+        min_batch_size=8,
+        max_batch_size=32,
+        queue_maxsize=48,
+        target_groups_per_step=24,
+    )
+    previous = measured.model_copy(update={"num_rollout_workers": 14})
+
+    def decision(start_step: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            stats=SimpleNamespace(
+                start_step=start_step,
+                end_step=start_step + 1,
+                window_start_s=float(start_step),
+                window_end_s=float(start_step + 2),
+            )
+        )
+
+    def rows(settings: PipelineTuneSettings, *steps: int) -> dict[int, dict[str, int]]:
+        values = settings.model_dump(mode="json")
+        return {
+            step: {f"pipeline_settings/{name}": value for name, value in values.items()}
+            for step in steps
+        }
+
+    by_step = {
+        **rows(previous, 10, 11),
+        **rows(measured, 12, 13, 14, 15, 16, 17),
+    }
+    selected = _same_setting_decision_suffix(
+        [decision(10), decision(12), decision(14), decision(16)],
+        by_step,
+        measured.model_dump(mode="json"),
+    )
+
+    assert [item.stats.start_step for item in selected] == [12, 14, 16]
 
 
 def test_throughput_provenance_ignores_local_editable_paths() -> None:
