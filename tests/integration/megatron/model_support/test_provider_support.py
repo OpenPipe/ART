@@ -429,6 +429,32 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     assert dispatcher_calls == []
 
 
+def test_get_provider_bundle_pins_hf_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    fake_bridge = _FakeBridge(model_bridge=object(), provider=provider)
+    call: dict[str, object] = {}
+
+    def from_hf_pretrained(model: str, **kwargs: object) -> _FakeBridge:
+        call["model"] = model
+        call.update(kwargs)
+        return fake_bridge
+
+    monkeypatch.setattr(
+        provider_module.AutoBridge, "from_hf_pretrained", from_hf_pretrained
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 1)
+    revision = "a" * 40
+
+    bundle = provider_module.get_provider_bundle(
+        "Qwen/Qwen3-30B-A3B-Instruct-2507", model_revision=revision
+    )
+
+    assert call["revision"] == revision
+    assert bundle.model_revision == revision
+
+
 def test_get_provider_bundle_honors_single_gpu_env_topology(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

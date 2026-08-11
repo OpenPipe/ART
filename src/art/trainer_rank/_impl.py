@@ -21,6 +21,7 @@ from typing import (
     TYPE_CHECKING,
     Generic,
     Literal,
+    NotRequired,
     Self,
     TypedDict,
     TypeVar,
@@ -85,6 +86,7 @@ _MEMORY_PROFILE_TRUST_GROWTH = 8
 
 class _AdapterConfig(TypedDict):
     base_model_name_or_path: str
+    revision: NotRequired[str | None]
     r: int
     lora_alpha: float
     target_modules: str | list[str]
@@ -819,15 +821,36 @@ class TrainerRank:
         alpha: float | None,
     ) -> _AdapterConfig | None:
         config = None if adapter_config is None else deepcopy(dict(adapter_config))
+        runtime_revision = getattr(self.runtime, "model_revision", None)
         if dist.is_available() and dist.is_initialized():
-            gathered: list[dict[str, object] | None] = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered, config)
-            if any(value != config for value in gathered):
+            gathered: list[tuple[dict[str, object] | None, object] | None] = [
+                None
+            ] * dist.get_world_size()
+            dist.all_gather_object(gathered, (config, runtime_revision))
+            if any(value is None or value[0] != config for value in gathered):
                 raise ValueError(
                     f"Adapter config for checkpoint slot {name!r} differs across ranks"
                 )
+            if any(value is None or value[1] != runtime_revision for value in gathered):
+                raise ValueError("Runtime model revision differs across ranks")
         if config is None:
             return None
+        source_revision = config.get("revision")
+        if source_revision is not None and not isinstance(source_revision, str):
+            raise TypeError("adapter_config['revision'] must be a string or null")
+        if runtime_revision is not None and not isinstance(runtime_revision, str):
+            raise TypeError("runtime model_revision must be a string or null")
+        if (
+            source_revision is not None
+            and runtime_revision is not None
+            and source_revision != runtime_revision
+        ):
+            raise ValueError(
+                f"Checkpoint {name!r} base-model revision {source_revision!r} "
+                f"does not match runtime revision {runtime_revision!r}"
+            )
+        if runtime_revision is not None:
+            config["revision"] = runtime_revision
         required = {"base_model_name_or_path", "r", "lora_alpha", "target_modules"}
         if missing := sorted(required - config.keys()):
             raise ValueError(

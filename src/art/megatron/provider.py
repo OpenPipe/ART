@@ -81,6 +81,7 @@ class ProviderBundle(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     model_identifier: str
+    model_revision: str | None = None
     provider: GPTModelProvider
     bridge: AutoBridge
     handler: ModelSupportHandler
@@ -612,6 +613,7 @@ def _register_art_flex_attention_mapping_types() -> None:
 def _build_provider_bundle(
     model: str,
     *,
+    model_revision: str | None = None,
     torch_dtype: torch.dtype,
     allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
@@ -623,6 +625,7 @@ def _build_provider_bundle(
     handler = get_model_support_handler_for_spec(spec)
     bridge = AutoBridge.from_hf_pretrained(
         model,
+        revision=model_revision,
         dtype=torch_dtype,
         trust_remote_code=True,
     )
@@ -630,6 +633,7 @@ def _build_provider_bundle(
     handler.patch_bridge(bridge)
     return ProviderBundle(
         model_identifier=model,
+        model_revision=model_revision,
         provider=provider,
         bridge=bridge,
         handler=handler,
@@ -640,12 +644,14 @@ def _build_provider_bundle(
 def prepare_provider_bundle(
     model: str,
     *,
+    model_revision: str | None = None,
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
     runtime_env = _ProviderRuntimeEnv.from_environ()
     bundle = _build_provider_bundle(
         model,
+        model_revision=model_revision,
         torch_dtype=torch_dtype,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
@@ -765,12 +771,14 @@ def _validate_art_gdn_context_parallel_provider(provider: GPTModelProvider) -> N
 def get_provider_bundle(
     model: str,
     *,
+    model_revision: str | None = None,
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
     return finalize_provider_bundle(
         prepare_provider_bundle(
             model,
+            model_revision=model_revision,
             torch_dtype=torch_dtype,
             allow_unvalidated_arch=allow_unvalidated_arch,
         )
@@ -780,11 +788,13 @@ def get_provider_bundle(
 def get_provider(
     model: str,
     *,
+    model_revision: str | None = None,
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
 ) -> GPTModelProvider:
     return get_provider_bundle(
         model,
+        model_revision=model_revision,
         torch_dtype=torch_dtype,
         allow_unvalidated_arch=allow_unvalidated_arch,
     ).provider

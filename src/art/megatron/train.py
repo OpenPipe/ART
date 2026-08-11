@@ -189,6 +189,10 @@ class TrainingRuntime(BaseModel):
         return self.provider_bundle.model_identifier
 
     @property
+    def model_revision(self) -> str | None:
+        return self.provider_bundle.model_revision
+
+    @property
     def bridge(self) -> Any:
         return self.provider_bundle.bridge
 
@@ -374,6 +378,7 @@ def _enable_native_moe_routing_replay(provider: Any) -> None:
 def build_training_runtime(
     *,
     model_identifier: str | None = None,
+    model_revision: str | None = None,
     provider_torch_dtype: torch.dtype = torch.bfloat16,
     provider_bundle_configure: Callable[[ProviderBundle], None] | None = None,
     provider_configure: Callable[[Any], None] | None = None,
@@ -396,6 +401,7 @@ def build_training_runtime(
     provider_bundle = prepare_provider_bundle(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
+        model_revision=model_revision,
         torch_dtype=provider_torch_dtype,
         allow_unvalidated_arch=(
             os.environ.get("ART_MEGATRON_ALLOW_UNVALIDATED_ARCH", "").strip().lower()

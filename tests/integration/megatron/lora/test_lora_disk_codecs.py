@@ -1800,6 +1800,7 @@ def _portable_trainer(
     rank: int = 0,
     world_size: int = 1,
     model_identifier: str = str(_PORTABLE_CONFIG["base_model_name_or_path"]),
+    model_revision: str | None = None,
     model_names: tuple[str, ...] = (),
 ) -> TrainerRank:
     trainer = TrainerRank.__new__(TrainerRank)
@@ -1809,6 +1810,7 @@ def _portable_trainer(
         rank=rank,
         world_size=world_size,
         model_identifier=model_identifier,
+        model_revision=model_revision,
         model_support_spec=SimpleNamespace(model_names=model_names),
     )
     trainer.device = torch.device("cpu")
@@ -1889,6 +1891,55 @@ def _save_before_next_step(trainer: TrainerRank, path: Path) -> None:
     _step_portable_checkpoint(trainer, 0.25)
     trainer.save_checkpoint(str(path), "student")
     _step_portable_checkpoint(trainer, -0.125)
+
+
+@pytest.mark.parametrize("source_revision", [None, "a" * 40])
+def test_checkpoint_load_pins_runtime_revision(
+    tmp_path: Path, source_revision: str | None
+) -> None:
+    revision = "a" * 40
+    source = tmp_path / "source"
+    config = dict(_PORTABLE_CONFIG)
+    if source_revision is not None:
+        config["revision"] = source_revision
+    save_vllm_lora_tensors(source, _PORTABLE_ADAPTER, config)
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu")),
+        model_revision=revision,
+    )
+
+    load_trainer_checkpoint(trainer, prepare_checkpoint(str(source)), "student")
+
+    assert trainer._checkpoint_slot_adapter_configs["student"]["revision"] == revision
+
+
+def test_checkpoint_load_rejects_conflicting_runtime_revision_transactionally(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    save_vllm_lora_tensors(
+        source,
+        _PORTABLE_ADAPTER,
+        {**_PORTABLE_CONFIG, "revision": "a" * 40},
+    )
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu")),
+        model_revision="b" * 40,
+    )
+    _install_portable_checkpoint(trainer)
+    previous_params = trainer._checkpoint_slot_params_by_name["student"]
+    previous_values = tuple(param.detach().clone() for param in previous_params)
+    previous_config = trainer._checkpoint_slot_adapter_configs["student"]
+
+    with pytest.raises(ValueError, match="base-model revision"):
+        load_trainer_checkpoint(trainer, prepare_checkpoint(str(source)), "student")
+
+    restored_params = trainer._checkpoint_slot_params_by_name["student"]
+    assert tuple(map(id, restored_params)) == tuple(map(id, previous_params))
+    assert trainer._checkpoint_slot_adapter_configs["student"] is previous_config
+    assert trainer._checkpoint_revisions["student"] == 0
+    for expected, actual in zip(previous_values, restored_params, strict=True):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_single_local_expert_uses_global_expert_keys(
