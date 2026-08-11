@@ -366,9 +366,9 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     )
 
     def phase(kind: str, packed: str, steps: tuple[int, ...]):
-        phase_rows = [dict(rows[-1]), dict(rows[-1])]
-        phase_rows[1]["data/step_nonpadding_logical_tokens"] += 1
-        phase_rows[1]["data/step_unused_packed_capacity_tokens"] -= 1
+        phase_rows = [dict(rows[-1]) for _ in range(6)]
+        phase_rows[-1]["data/step_nonpadding_logical_tokens"] += 1
+        phase_rows[-1]["data/step_unused_packed_capacity_tokens"] -= 1
         return _phase_evidence(
             phase=cast(Any, kind),
             runtime_fingerprint="runtime-a",
@@ -378,8 +378,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         )
 
     e2e_phase, isolated_phase = (
-        phase("e2e", "input-a", (21, 22)),
-        phase("isolated", "input-a", (24, 25)),
+        phase("e2e", "input-a", tuple(range(21, 27))),
+        phase("isolated", "input-a", tuple(range(30, 36))),
     )
 
     def collect(isolated):
@@ -403,8 +403,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "nonpadding_logical_tokens": 6_000,
         "loss_bearing_tokens": 3_000,
         "accepted_train_tokens": 3_000,
-        "isolated_train_tok_s": 2_001 / 3.0,
-        "matched_e2e_core_train_tok_s": 2_001 / 3.0,
+        "isolated_train_tok_s": 6_001 / 9.0,
+        "matched_e2e_core_train_tok_s": 6_001 / 9.0,
         "e2e_core_train_tok_s": 6_000 / 9.0,
         "e2e_train_tok_s": 500.0,
         "accepted_train_tok_s": 250.0,
@@ -515,7 +515,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         collect(isolated_phase)
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     with pytest.raises(RuntimeError, match="same packed input"):
-        collect(phase("isolated", "input-b", (22, 23)))
+        collect(phase("isolated", "input-b", tuple(range(40, 46))))
 
 
 def test_throughput_measurement_freezes_actual_settings() -> None:

@@ -46,9 +46,10 @@ _POLICY_AGE_P95 = "offpolicy/token_weighted_policy_age_p95_steps"
 _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
-_MEASUREMENT_CONTRACT_VERSION = 10
+_MEASUREMENT_CONTRACT_VERSION = 11
 _ISOLATED_WARMUP_STEPS = 1
-_MATCHED_MEASURED_STEPS = 2
+# Average enough exact E2E/isolated pairs to absorb one transient GPU tail.
+_MATCHED_MEASURED_STEPS = 6
 _CAPTURE_GUARD_STEPS = 1
 _PIPELINE_SETTING_NAMES = (
     "num_rollout_workers",
