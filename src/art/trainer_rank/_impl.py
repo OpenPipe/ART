@@ -585,6 +585,7 @@ class TrainerRank:
         self._checkpoint_aborted_save_sequences: set[int] = set()
         self._prepared_checkpoint_saves: dict[str, _PreparedSave] = {}
         self._checkpoint_finishing_saves: set[str] = set()
+        self._checkpoint_collective_busy = False
         self._completed_checkpoint_saves: deque[str] = deque(maxlen=128)
         self._pending_slot_graphs: dict[
             LoRASlotRef, list[weakref.ReferenceType[torch.Tensor]]

@@ -464,6 +464,7 @@ def _admit_checkpoint_save_action(
             lambda: (
                 output_dir not in trainer._checkpoint_preparing_saves
                 and output_dir not in trainer._checkpoint_finishing_saves
+                and not trainer._checkpoint_collective_busy
             )
         )
         prepared = trainer._prepared_checkpoint_saves.get(output_dir)
@@ -475,6 +476,7 @@ def _admit_checkpoint_save_action(
             else "missing"
         )
         trainer._checkpoint_finishing_saves.add(output_dir)
+        trainer._checkpoint_collective_busy = True
 
     try:
         admissions = _gather_objects(
@@ -497,6 +499,7 @@ def _admit_checkpoint_save_action(
             if states == {"completed"}:
                 with condition:
                     trainer._checkpoint_finishing_saves.discard(output_dir)
+                    trainer._checkpoint_collective_busy = False
                     condition.notify_all()
                 return None
             if states == {"missing"}:
@@ -508,13 +511,20 @@ def _admit_checkpoint_save_action(
             assert prepared is not None
             sequence = prepared.sequence
             with condition:
+                trainer._checkpoint_collective_busy = False
+                condition.notify_all()
                 condition.wait_for(
-                    lambda: sequence == trainer._checkpoint_finish_sequence
+                    lambda: (
+                        sequence == trainer._checkpoint_finish_sequence
+                        and not trainer._checkpoint_collective_busy
+                    )
                 )
+                trainer._checkpoint_collective_busy = True
             return prepared
     except BaseException:
         with condition:
             trainer._checkpoint_finishing_saves.discard(output_dir)
+            trainer._checkpoint_collective_busy = False
             condition.notify_all()
         raise
 
@@ -523,6 +533,7 @@ def _admit_checkpoint_save_action(
         trainer._checkpoint_aborted_save_sequences.update(sequences)
         _advance_finish_sequence(trainer)
         trainer._checkpoint_finishing_saves.discard(output_dir)
+        trainer._checkpoint_collective_busy = False
         condition.notify_all()
     if prepared is not None:
         shutil.rmtree(prepared.snapshot, ignore_errors=True)
@@ -576,6 +587,7 @@ def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
         with condition:
             trainer._prepared_checkpoint_saves.pop(output_dir, None)
             trainer._checkpoint_finishing_saves.discard(output_dir)
+            trainer._checkpoint_collective_busy = False
             if error is None:
                 trainer._completed_checkpoint_saves.append(output_dir)
             trainer._checkpoint_finish_sequence += 1

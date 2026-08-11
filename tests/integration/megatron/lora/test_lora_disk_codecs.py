@@ -1907,6 +1907,7 @@ def _portable_trainer(
     trainer._checkpoint_aborted_save_sequences = set()
     trainer._prepared_checkpoint_saves = {}
     trainer._checkpoint_finishing_saves = set()
+    trainer._checkpoint_collective_busy = False
     trainer._completed_checkpoint_saves = deque(maxlen=128)
     return trainer
 
@@ -2600,7 +2601,9 @@ def test_checkpoint_finish_barrier_precedes_next_fifo_entry(
     checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
     original_finish = checkpoint_module._finish_prepared_save
     original_raise = checkpoint_module._raise_distributed
+    original_gather = checkpoint_module._gather_objects
     order: list[str] = []
+    admissions = 0
     barrier_entered = threading.Event()
     release = threading.Event()
 
@@ -2619,8 +2622,17 @@ def test_checkpoint_finish_barrier_precedes_next_fifo_entry(
             assert release.wait(10)
         original_raise(error, phase, group=group)
 
+    def record_admission(
+        value: object, *, group: torch.distributed.ProcessGroup | None = None
+    ) -> tuple[object, ...]:
+        nonlocal admissions
+        if isinstance(value, tuple) and len(value) == 4:
+            admissions += 1
+        return original_gather(value, group=group)
+
     monkeypatch.setattr(checkpoint_module, "_finish_prepared_save", record_finish)
     monkeypatch.setattr(checkpoint_module, "_raise_distributed", pause_first_barrier)
+    monkeypatch.setattr(checkpoint_module, "_gather_objects", record_admission)
     first_thread = threading.Thread(
         target=trainer._finish_checkpoint_save, args=(str(first),)
     )
@@ -2631,11 +2643,13 @@ def test_checkpoint_finish_barrier_precedes_next_fifo_entry(
     assert barrier_entered.wait(10)
     second_thread.start()
     assert order == ["barrier-first"]
+    assert admissions == 1
     release.set()
     first_thread.join(10)
     second_thread.join(10)
     assert not first_thread.is_alive() and not second_thread.is_alive()
     assert order == ["barrier-first", "barrier-second"]
+    assert admissions == 2
 
 
 def test_checkpoint_abort_advances_out_of_order_finish(
