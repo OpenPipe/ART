@@ -429,7 +429,7 @@ def _real_path_max_model_len(
 
 def _prepare_real_path_prompts(
     config: RealPathConfig,
-) -> tuple[list[str], dict[str, Any] | None, int]:
+) -> tuple[list[str], dict[str, Any] | None, int, list[int]]:
     from transformers import AutoTokenizer
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -469,7 +469,28 @@ def _prepare_real_path_prompts(
             else None
         ),
         max_model_len,
+        _deterministic_rollout_token_ids(tokenizer, config.rollouts_per_prompt),
     )
+
+
+def _deterministic_rollout_token_ids(tokenizer: Any, count: int) -> list[int]:
+    special_ids = set(tokenizer.all_special_ids)
+    token_ids: list[int] = []
+    for text in (" yes", " no", " maybe", " true", " false", " correct", " wrong"):
+        candidates = tokenizer.encode(text, add_special_tokens=False)
+        token_id = next(
+            (
+                int(value)
+                for value in reversed(candidates)
+                if int(value) not in special_ids
+            ),
+            None,
+        )
+        if token_id is not None and token_id not in token_ids:
+            token_ids.append(token_id)
+        if len(token_ids) == count:
+            return token_ids
+    raise RuntimeError(f"Tokenizer provides fewer than {count} stable rollout tokens")
 
 
 async def _rollout(
@@ -479,14 +500,14 @@ async def _rollout(
     max_completion_tokens: int,
     reward: float,
     seed: int,
+    forced_token_id: int,
     extra_body: dict[str, Any] | None,
 ) -> Any:
     import art
 
     messages = [{"role": "user", "content": prompt}]
-    request_kwargs: dict[str, Any] = {}
-    if extra_body is not None:
-        request_kwargs["extra_body"] = extra_body
+    # vLLM captures raw logprobs before sampling processors, so this fixes only
+    # the sampled tokens while preserving the logits under comparison.
     response = await model.openai_client().chat.completions.create(
         model=model.get_inference_name(),
         messages=messages,
@@ -495,18 +516,24 @@ async def _rollout(
         seed=seed,
         logprobs=True,
         top_logprobs=TOP_K,
-        **request_kwargs,
+        extra_body={
+            **(extra_body or {}),
+            "allowed_token_ids": [forced_token_id],
+            "ignore_eos": True,
+            "min_tokens": max_completion_tokens,
+        },
     )
     choice = response.choices[0]
     logprobs = choice.logprobs
+    if logprobs is None or logprobs.content is None:
+        raise RuntimeError("Deterministic real-path rollout is missing logprobs")
+    completion_token_ids = [_parse_token_id(entry.token) for entry in logprobs.content]
+    if completion_token_ids != [forced_token_id] * max_completion_tokens:
+        raise RuntimeError("vLLM did not honor the deterministic rollout token")
     return art.Trajectory(
         messages_and_choices=[*messages, choice],
         reward=reward,
-        metrics={
-            "completion_tokens": (
-                len(logprobs.content or []) if logprobs is not None else 0
-            )
-        },
+        metrics={"completion_tokens": len(completion_token_ids)},
     )
 
 
@@ -515,12 +542,15 @@ async def _collect_real_trajectory_groups(
     model: Any,
     config: RealPathConfig,
     prompts: list[str],
+    forced_token_ids: list[int],
     extra_body: dict[str, Any] | None,
 ) -> list[Any]:
     import art
 
     if config.rollouts_per_prompt < 2:
         raise ValueError("real-path mismatch requires at least two rollouts per prompt")
+    if len(forced_token_ids) != config.rollouts_per_prompt:
+        raise ValueError("real-path mismatch requires one forced token per rollout")
     groups = []
     for prompt_index, prompt in enumerate(prompts):
         trajectories = []
@@ -536,6 +566,7 @@ async def _collect_real_trajectory_groups(
                         + prompt_index * config.rollouts_per_prompt
                         + rollout_index
                     ),
+                    forced_token_id=forced_token_ids[rollout_index],
                     extra_body=extra_body,
                 )
             )
@@ -777,6 +808,7 @@ async def _score_base_real_generation_path(
     artifact_dir: Path,
     is_moe: bool,
     prompts: list[str],
+    forced_token_ids: list[int],
     extra_body: dict[str, Any] | None,
     max_model_len: int,
 ) -> RealPathBaseDiagnosticBundle:
@@ -853,6 +885,7 @@ async def _score_base_real_generation_path(
             model=model,
             config=config,
             prompts=prompts,
+            forced_token_ids=forced_token_ids,
             extra_body=extra_body,
         )
 
@@ -1650,7 +1683,9 @@ async def run_real_path_train_inf_mismatch(
 
     parity_config = config.output_parity
     _apply_sliding_window_prompt_defaults(config)
-    prompts, extra_body, max_model_len = _prepare_real_path_prompts(config)
+    prompts, extra_body, max_model_len, forced_token_ids = _prepare_real_path_prompts(
+        config
+    )
     rollout_mode = _real_path_rollout_mode(parity_config)
     is_moe = model_support_is_moe(
         parity_config.base_model,
@@ -1715,6 +1750,7 @@ async def run_real_path_train_inf_mismatch(
             model=model,
             config=config,
             prompts=prompts,
+            forced_token_ids=forced_token_ids,
             extra_body=extra_body,
         )
         packed_tensors = backend._get_packed_tensors(
@@ -1789,6 +1825,7 @@ async def run_real_path_train_inf_mismatch(
                 artifact_dir=artifact_dir,
                 is_moe=is_moe,
                 prompts=prompts,
+                forced_token_ids=forced_token_ids,
                 extra_body=extra_body,
                 max_model_len=max_model_len,
             )

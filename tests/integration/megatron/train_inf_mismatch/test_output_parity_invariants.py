@@ -262,14 +262,22 @@ async def test_real_path_rollouts_use_stable_unique_request_seeds() -> None:
         model=model,
         config=config,
         prompts=["first", "second"],
+        forced_token_ids=[101, 102, 103],
         extra_body={"return_tokens_as_token_ids": True},
     )
 
     assert len(groups) == 2
     assert max_active_requests == 1
     assert sorted(call["seed"] for call in calls) == list(range(41, 47))
+    assert [call["extra_body"]["allowed_token_ids"] for call in calls] == [
+        [101],
+        [102],
+        [103],
+    ] * 2
+    assert all(call["extra_body"]["ignore_eos"] is True for call in calls)
+    assert all(call["extra_body"]["min_tokens"] == 16 for call in calls)
     assert all(
-        call["extra_body"] == {"return_tokens_as_token_ids": True} for call in calls
+        call["extra_body"]["return_tokens_as_token_ids"] is True for call in calls
     )
 
 
