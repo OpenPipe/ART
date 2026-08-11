@@ -409,6 +409,7 @@ from vllm.v1.request import Request
 from art_vllm_runtime.policy_spans import (
     PolicyLoRARequest,
     _policy_history_from_cache_salt,
+    _patch_policy_cache_hashing,
     _request_has_executed,
     _set_policy_cache_salt,
     _transition_scheduler_policy_history,
@@ -417,6 +418,7 @@ from art_vllm_runtime.policy_spans import (
 def hash_value(value):
     return hashlib.sha256(repr(value).encode()).digest()
 
+_patch_policy_cache_hashing()
 init_none_hash(hash_value)
 block_hasher = get_request_block_hasher(4, hash_value)
 old = PolicyLoRARequest(
