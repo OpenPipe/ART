@@ -281,32 +281,47 @@ def prepare_checkpoint_save(
 ) -> None:
     """Capture immutable rank-local state without retaining live tensors."""
     destination = Path(output_dir)
-    if output_dir in trainer._prepared_checkpoint_saves:
-        raise RuntimeError(f"Checkpoint save is already pending: {output_dir}")
-    with trainer._checkpoint_save_condition:
+    condition = trainer._checkpoint_save_condition
+    with condition:
+        condition.wait_for(
+            lambda: (
+                not trainer._checkpoint_preparing_saves
+                and output_dir not in trainer._checkpoint_finishing_saves
+            )
+        )
+        if output_dir in trainer._prepared_checkpoint_saves:
+            raise RuntimeError(f"Checkpoint save is already pending: {output_dir}")
         if output_dir in trainer._completed_checkpoint_saves:
             trainer._completed_checkpoint_saves.remove(output_dir)
-    _ensure_checkpoint_group(trainer)
-    _validate_save_state(trainer, checkpoint_name)
-    adapter_config = deepcopy(dict(_checkpoint_config(trainer, checkpoint_name)))
-    dynamic = trainer._dynamic_optimizers.get(checkpoint_name)
-    initialized = dynamic is not None
-    if any(value != initialized for value in _gather_objects(initialized)):
-        raise trainer._slot_state_error(
-            "Checkpoint optimizer initialization differs across ranks"
-        )
-    optimizer: AdamWRecord | None = None
-    with _collective_errors("prepare optimizer snapshot metadata"):
-        if dynamic is not None:
-            optimizer = _optimizer_config(dynamic)
-    if any(value != optimizer for value in _gather_objects(optimizer)):
-        raise trainer._slot_state_error(
-            "Checkpoint optimizer config differs across ranks"
-        )
-
-    sequence = trainer._checkpoint_save_sequence
-    if any(value != sequence for value in _gather_objects(sequence)):
-        raise RuntimeError("Checkpoint save sequence differs across ranks")
+        trainer._checkpoint_preparing_saves.add(output_dir)
+        sequence = trainer._checkpoint_save_sequence
+        trainer._checkpoint_save_sequence += 1
+    try:
+        _ensure_checkpoint_group(trainer)
+        with _collective_errors("validate checkpoint snapshot state"):
+            _validate_save_state(trainer, checkpoint_name)
+            adapter_config = deepcopy(
+                dict(_checkpoint_config(trainer, checkpoint_name))
+            )
+            dynamic = trainer._dynamic_optimizers.get(checkpoint_name)
+            initialized = dynamic is not None
+        if any(value != initialized for value in _gather_objects(initialized)):
+            raise trainer._slot_state_error(
+                "Checkpoint optimizer initialization differs across ranks"
+            )
+        optimizer: AdamWRecord | None = None
+        with _collective_errors("prepare optimizer snapshot metadata"):
+            if dynamic is not None:
+                optimizer = _optimizer_config(dynamic)
+        if any(value != optimizer for value in _gather_objects(optimizer)):
+            raise trainer._slot_state_error(
+                "Checkpoint optimizer config differs across ranks"
+            )
+        if any(value != sequence for value in _gather_objects(sequence)):
+            raise RuntimeError("Checkpoint save sequence differs across ranks")
+    except BaseException:
+        _abort_preparation_sequence(trainer, output_dir, sequence)
+        raise
     snapshot = destination.with_name(
         f".{destination.name}.snapshot-r{_rank()}-{uuid.uuid4().hex}"
     )
@@ -407,10 +422,55 @@ def prepare_checkpoint_save(
         _raise_distributed(error, "prepare immutable checkpoint snapshot")
     except BaseException:
         shutil.rmtree(snapshot, ignore_errors=True)
+        _abort_preparation_sequence(trainer, output_dir, sequence)
         raise
     assert prepared is not None
-    trainer._prepared_checkpoint_saves[output_dir] = prepared
-    trainer._checkpoint_save_sequence += 1
+    with condition:
+        trainer._prepared_checkpoint_saves[output_dir] = prepared
+        trainer._checkpoint_preparing_saves.discard(output_dir)
+        condition.notify_all()
+
+
+def _advance_finish_sequence(trainer: TrainerRank) -> None:
+    while (
+        trainer._checkpoint_finish_sequence
+        in trainer._checkpoint_aborted_save_sequences
+    ):
+        trainer._checkpoint_aborted_save_sequences.remove(
+            trainer._checkpoint_finish_sequence
+        )
+        trainer._checkpoint_finish_sequence += 1
+
+
+def _abort_preparation_sequence(
+    trainer: TrainerRank, output_dir: str, sequence: int
+) -> None:
+    with trainer._checkpoint_save_condition:
+        trainer._checkpoint_preparing_saves.discard(output_dir)
+        trainer._checkpoint_aborted_save_sequences.add(sequence)
+        _advance_finish_sequence(trainer)
+        trainer._checkpoint_save_condition.notify_all()
+
+
+def abort_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
+    """Discard a prepared snapshot while preserving finish FIFO progress."""
+    condition = trainer._checkpoint_save_condition
+    with condition:
+        condition.wait_for(
+            lambda: (
+                output_dir not in trainer._checkpoint_preparing_saves
+                and output_dir not in trainer._checkpoint_finishing_saves
+            )
+        )
+        if output_dir in trainer._completed_checkpoint_saves:
+            return
+        prepared = trainer._prepared_checkpoint_saves.pop(output_dir, None)
+        if prepared is None:
+            return
+        trainer._checkpoint_aborted_save_sequences.add(prepared.sequence)
+        _advance_finish_sequence(trainer)
+        condition.notify_all()
+    shutil.rmtree(prepared.snapshot, ignore_errors=True)
 
 
 def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
@@ -418,7 +478,10 @@ def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
     condition = trainer._checkpoint_save_condition
     with condition:
         condition.wait_for(
-            lambda: output_dir not in trainer._checkpoint_finishing_saves
+            lambda: (
+                output_dir not in trainer._checkpoint_finishing_saves
+                and output_dir not in trainer._checkpoint_preparing_saves
+            )
         )
         if output_dir in trainer._completed_checkpoint_saves:
             return
@@ -443,22 +506,27 @@ def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
     except BaseException as exc:
         cleanup_error = exc
     finally:
-        trainer._prepared_checkpoint_saves.pop(output_dir, None)
         with condition:
+            trainer._prepared_checkpoint_saves.pop(output_dir, None)
             trainer._checkpoint_finishing_saves.discard(output_dir)
-            if error is None and cleanup_error is None:
+            if error is None:
                 trainer._completed_checkpoint_saves.append(output_dir)
             trainer._checkpoint_finish_sequence += 1
+            _advance_finish_sequence(trainer)
             condition.notify_all()
+    final_error: BaseException | None = error
     if error is not None and cleanup_error is not None:
-        raise BaseExceptionGroup(
+        final_error = BaseExceptionGroup(
             "checkpoint finalization and snapshot cleanup both failed",
             [error, cleanup_error],
         )
-    if error is not None:
-        raise error
-    if cleanup_error is not None:
-        raise cleanup_error
+    elif cleanup_error is not None:
+        final_error = cleanup_error
+    _raise_distributed(
+        final_error,
+        "clean up finalized checkpoint snapshot",
+        group=trainer._checkpoint_process_group,
+    )
 
 
 def export_lora(

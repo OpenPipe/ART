@@ -751,6 +751,31 @@ def test_checkpoint_slot_adapter_config_is_validated_and_copied() -> None:
         trainer._validate_checkpoint_adapter_config("student", {"r": 8}, alpha=None)
 
 
+def test_qwen35_checkpoint_adapter_config_captures_attention_dimensions() -> None:
+    runtime = _runtime()
+    runtime.provider.num_attention_heads = 16
+    runtime.provider.num_query_groups = 4
+    runtime.provider.kv_channels = 128
+    trainer = TrainerRank(runtime)
+
+    retained = trainer._validate_checkpoint_adapter_config(
+        "student",
+        {
+            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "r": 8,
+            "lora_alpha": 16,
+            "target_modules": ["q_proj"],
+        },
+        alpha=16,
+    )
+
+    assert retained is not None
+    assert retained["num_attention_heads"] == 16
+    assert retained["num_key_value_heads"] == 4
+    assert retained["head_dim"] == 128
+    assert retained["hidden_size"] == 4
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     (

@@ -1473,6 +1473,45 @@ def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
     )
 
 
+def test_vllm_lora_merge_failure_crosses_collective_barrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local = SimpleNamespace(
+        metadata=(),
+        tensors={},
+        packed_metadata=(),
+        packed_tensors={},
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(lora_publish, "_prepare_local_lora_export", lambda **_kw: local)
+    monkeypatch.setattr(lora_publish, "_exchange_tensors", lambda *_a, **_kw: {})
+
+    def fail_merge(**_kwargs: object) -> None:
+        raise ValueError("injected merge failure")
+
+    monkeypatch.setattr(lora_publish, "_rank0_vllm_lora_tensors", fail_merge)
+    barriers: list[tuple[BaseException | None, str]] = []
+
+    def barrier(error: BaseException | None, phase: str) -> None:
+        barriers.append((error, phase))
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(lora_publish, "_raise_rank_errors", barrier)
+    with pytest.raises(ValueError, match="injected merge failure"):
+        lora_publish.build_vllm_lora_tensors_from_model(
+            model=cast(Any, []),
+            adapter_dtypes={},
+            handler=cast(ModelSupportHandler, SimpleNamespace()),
+            adapter_config=_config("Qwen/Qwen3-8B"),
+            rank=0,
+            world_size=1,
+        )
+    assert len(barriers) == 1
+    assert isinstance(barriers[0][0], ValueError)
+    assert barriers[0][1] == "merge vLLM LoRA tensors"
+
+
 def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path):
     prefix = "base_model.model.model.layers.0.mlp.experts.0"
     full = {
@@ -1864,6 +1903,8 @@ def _portable_trainer(
     trainer._checkpoint_save_condition = threading.Condition()
     trainer._checkpoint_save_sequence = 0
     trainer._checkpoint_finish_sequence = 0
+    trainer._checkpoint_preparing_saves = set()
+    trainer._checkpoint_aborted_save_sequences = set()
     trainer._prepared_checkpoint_saves = {}
     trainer._checkpoint_finishing_saves = set()
     trainer._completed_checkpoint_saves = deque(maxlen=128)
@@ -2378,6 +2419,80 @@ def test_checkpoint_finalizers_run_fifo_and_clean_snapshots(
     assert not list(tmp_path.glob(".*.snapshot-*"))
 
 
+def test_checkpoint_prepare_reserves_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(trainer)
+    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
+    original_save_file = checkpoint_module._save_file
+    entered = threading.Event()
+    release = threading.Event()
+    first = True
+
+    def pause_first_save(tensors: dict[str, torch.Tensor], path: Path) -> None:
+        nonlocal first
+        if first:
+            first = False
+            entered.set()
+            assert release.wait(10)
+        original_save_file(tensors, path)
+
+    monkeypatch.setattr(checkpoint_module, "_save_file", pause_first_save)
+    output = tmp_path / "reserved"
+    errors: list[BaseException] = []
+
+    def prepare() -> None:
+        try:
+            trainer._prepare_checkpoint_save(str(output), "student")
+        except BaseException as exc:
+            errors.append(exc)
+
+    first_thread = threading.Thread(target=prepare)
+    second_thread = threading.Thread(target=prepare)
+    first_thread.start()
+    assert entered.wait(10)
+    second_thread.start()
+    release.set()
+    first_thread.join(10)
+    second_thread.join(10)
+    assert not first_thread.is_alive() and not second_thread.is_alive()
+    assert len(errors) == 1
+    assert "already pending" in str(errors[0])
+    trainer._abort_checkpoint_save(str(output))
+    assert not list(tmp_path.glob(".reserved.snapshot-*"))
+
+
+def test_checkpoint_abort_advances_out_of_order_finish(
+    tmp_path: Path,
+) -> None:
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(trainer)
+    first = tmp_path / "aborted"
+    second = tmp_path / "finished"
+    trainer._prepare_checkpoint_save(str(first), "student")
+    trainer._prepare_checkpoint_save(str(second), "student")
+    done = threading.Event()
+
+    def finish_second() -> None:
+        trainer._finish_checkpoint_save(str(second))
+        done.set()
+
+    thread = threading.Thread(target=finish_second)
+    thread.start()
+    assert not done.wait(0.1)
+    trainer._abort_checkpoint_save(str(first))
+    thread.join(10)
+    assert not thread.is_alive()
+    assert done.is_set() and second.is_dir()
+    assert not list(tmp_path.glob(".*.snapshot-*"))
+
+
 def test_checkpoint_prepare_failure_does_not_advance_or_wedge_fifo(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2396,8 +2511,8 @@ def test_checkpoint_prepare_failure_does_not_advance_or_wedge_fifo(
     failed = tmp_path / "prepare-failure"
     with pytest.raises(OSError, match="injected checkpoint snapshot failure"):
         trainer._prepare_checkpoint_save(str(failed), "student")
-    assert trainer._checkpoint_save_sequence == 0
-    assert trainer._checkpoint_finish_sequence == 0
+    assert trainer._checkpoint_save_sequence == 1
+    assert trainer._checkpoint_finish_sequence == 1
     assert not trainer._prepared_checkpoint_saves
     assert not list(tmp_path.glob(".prepare-failure.snapshot-*"))
 
@@ -2405,8 +2520,8 @@ def test_checkpoint_prepare_failure_does_not_advance_or_wedge_fifo(
     recovered = tmp_path / "prepare-recovered"
     trainer.save_checkpoint(str(recovered), "student")
     assert recovered.is_dir()
-    assert trainer._checkpoint_save_sequence == 1
-    assert trainer._checkpoint_finish_sequence == 1
+    assert trainer._checkpoint_save_sequence == 2
+    assert trainer._checkpoint_finish_sequence == 2
 
 
 def test_checkpoint_finalizer_failure_cleans_and_can_retry(
@@ -2436,6 +2551,36 @@ def test_checkpoint_finalizer_failure_cleans_and_can_retry(
     trainer._finish_checkpoint_save(str(output))
     assert output.is_dir()
     assert not list(tmp_path.glob(".retry.snapshot-*"))
+
+
+def test_checkpoint_snapshot_cleanup_failure_is_idempotently_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(trainer)
+    output = tmp_path / "cleanup-retry"
+    trainer._prepare_checkpoint_save(str(output), "student")
+    snapshot = trainer._prepared_checkpoint_saves[str(output)].snapshot
+    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
+    original_rmtree = checkpoint_module.shutil.rmtree
+    failed = False
+
+    def fail_snapshot_once(path: Path, ignore_errors: bool = False) -> None:
+        nonlocal failed
+        if Path(path) == snapshot and not failed:
+            failed = True
+            raise OSError("injected snapshot cleanup failure")
+        original_rmtree(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(checkpoint_module.shutil, "rmtree", fail_snapshot_once)
+    with pytest.raises(OSError, match="injected snapshot cleanup failure"):
+        trainer._finish_checkpoint_save(str(output))
+    assert output.is_dir()
+    trainer._finish_checkpoint_save(str(output))
+    original_rmtree(snapshot)
 
 
 def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(

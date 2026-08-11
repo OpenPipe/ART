@@ -788,17 +788,22 @@ def build_vllm_lora_tensors_from_model(
         device=local.device,
     )
 
-    if rank != 0:
-        return None
-
-    return _rank0_vllm_lora_tensors(
-        metadata=local.metadata,
-        tensors_by_owner_key=exchanged_tensors,
-        packed_expert_metadata=local.packed_metadata,
-        packed_expert_tensors_by_owner_key=exchanged_packed_tensors,
-        handler=handler,
-        adapter_config=adapter_config,
-    )
+    result: tuple[dict[str, torch.Tensor], dict[str, Any]] | None = None
+    error: BaseException | None = None
+    try:
+        if rank == 0:
+            result = _rank0_vllm_lora_tensors(
+                metadata=local.metadata,
+                tensors_by_owner_key=exchanged_tensors,
+                packed_expert_metadata=local.packed_metadata,
+                packed_expert_tensors_by_owner_key=exchanged_packed_tensors,
+                handler=handler,
+                adapter_config=adapter_config,
+            )
+    except BaseException as exc:
+        error = exc
+    _raise_rank_errors(error, "merge vLLM LoRA tensors")
+    return result
 
 
 def save_vllm_lora_from_model(

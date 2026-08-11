@@ -90,6 +90,10 @@ class _AdapterConfig(TypedDict):
     r: int
     lora_alpha: float
     target_modules: str | list[str]
+    num_attention_heads: NotRequired[int]
+    num_key_value_heads: NotRequired[int]
+    head_dim: NotRequired[int]
+    hidden_size: NotRequired[int]
 
 
 class _Unset:
@@ -577,6 +581,8 @@ class TrainerRank:
         self._checkpoint_save_condition = threading.Condition()
         self._checkpoint_save_sequence = 0
         self._checkpoint_finish_sequence = 0
+        self._checkpoint_preparing_saves: set[str] = set()
+        self._checkpoint_aborted_save_sequences: set[int] = set()
         self._prepared_checkpoint_saves: dict[str, _PreparedSave] = {}
         self._checkpoint_finishing_saves: set[str] = set()
         self._completed_checkpoint_saves: deque[str] = deque(maxlen=128)
@@ -736,6 +742,11 @@ class TrainerRank:
 
         _checkpoint.finish_checkpoint_save(self, output_dir)
 
+    def _abort_checkpoint_save(self, output_dir: str) -> None:
+        from . import _checkpoint
+
+        _checkpoint.abort_checkpoint_save(self, output_dir)
+
     def export_lora(
         self,
         output_dir: str,
@@ -869,6 +880,28 @@ class TrainerRank:
             raise TypeError(
                 "adapter_config['base_model_name_or_path'] must be a string"
             )
+        if base_model.startswith(("Qwen/Qwen3.5-", "Qwen/Qwen3.6-")):
+            provider = getattr(self.runtime, "provider", None)
+            dimensions = {
+                "num_attention_heads": getattr(provider, "num_attention_heads", None),
+                "num_key_value_heads": getattr(provider, "num_query_groups", None),
+                "head_dim": getattr(provider, "kv_channels", None),
+                "hidden_size": getattr(provider, "hidden_size", None),
+            }
+            for key, value in dimensions.items():
+                if value is None:
+                    continue
+                value = int(value)
+                existing = config.get(key)
+                if existing is not None:
+                    if not isinstance(existing, int) or isinstance(existing, bool):
+                        raise TypeError(f"adapter_config[{key!r}] must be an integer")
+                    if existing != value:
+                        raise ValueError(
+                            f"adapter_config[{key!r}]={existing!r} conflicts with "
+                            f"runtime {value!r}"
+                        )
+                config[key] = value
         if not isinstance(rank, int) or isinstance(rank, bool):
             raise TypeError("adapter_config['r'] must be an integer")
         if not isinstance(config_alpha_value, int | float) or isinstance(
