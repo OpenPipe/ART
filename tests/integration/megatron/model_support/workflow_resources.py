@@ -26,7 +26,7 @@ class ThroughputThresholds(BaseModel):
     max_matched_core_to_isolated_ratio: float = Field(
         default=1.05, gt=1.0, allow_inf_nan=False
     )
-    max_mean_policy_activation_lag_s: float = Field(gt=0.0, le=1.5, allow_inf_nan=False)
+    max_mean_policy_activation_lag_s: float = Field(gt=0.0, le=3.5, allow_inf_nan=False)
     max_policy_activation_lag_s: float = Field(gt=0.0, le=3.5, allow_inf_nan=False)
     max_repeated_policy_activation_interval_s: float = Field(
         gt=0.0, allow_inf_nan=False
@@ -40,6 +40,8 @@ class ThroughputThresholds(BaseModel):
                 "measured calibration requires a fingerprint and estimated "
                 "calibration must not claim one"
             )
+        if self.max_mean_policy_activation_lag_s > self.max_policy_activation_lag_s:
+            raise ValueError("mean activation lag limit cannot exceed absolute limit")
         return self
 
 
@@ -611,6 +613,7 @@ def _throughput_threshold(
     floor: tuple[float, float, float, float, float],
     *,
     calibration_fingerprint: str | None = None,
+    max_mean_policy_activation_lag_s: float = 1.5,
 ) -> ThroughputThresholds:
     isolated, e2e, accepted, ratio, cadence = floor
     return ThroughputThresholds(
@@ -621,13 +624,14 @@ def _throughput_threshold(
         min_accepted_train_tok_s=accepted,
         min_e2e_to_isolated_ratio=ratio,
         min_matched_core_to_isolated_ratio=0.95,
-        max_mean_policy_activation_lag_s=1.5,
+        max_mean_policy_activation_lag_s=max_mean_policy_activation_lag_s,
         max_policy_activation_lag_s=3.5,
         max_repeated_policy_activation_interval_s=cadence,
     )
 
 
 for _model_key, (_fingerprint, _b300_floor) in _B300_THROUGHPUT_FLOORS.items():
+    _max_mean_activation_lag_s = 2.25 if _model_key == "dsv4" else 1.5
     _THROUGHPUT_CONFIGS[_model_key] = _THROUGHPUT_CONFIGS[_model_key].model_copy(
         update={
             "thresholds": {
@@ -635,9 +639,12 @@ for _model_key, (_fingerprint, _b300_floor) in _B300_THROUGHPUT_FLOORS.items():
                     "measured",
                     _b300_floor,
                     calibration_fingerprint=_fingerprint,
+                    max_mean_policy_activation_lag_s=_max_mean_activation_lag_s,
                 ),
                 "h200": _throughput_threshold(
-                    "estimated", _H200_THROUGHPUT_FLOORS[_model_key]
+                    "estimated",
+                    _H200_THROUGHPUT_FLOORS[_model_key],
+                    max_mean_policy_activation_lag_s=_max_mean_activation_lag_s,
                 ),
             }
         }

@@ -49,6 +49,7 @@ from .workflow_fixtures import (
     _validate_tokenizer_compatible_fixture,
 )
 from .workflow_resources import (
+    _THROUGHPUT_CONFIGS,
     HANDLER_WORKFLOW_RESOURCES,
     ThroughputThresholds,
     ThroughputWorkflowConfig,
@@ -785,6 +786,16 @@ def test_h200_throughput_depth_only_reduces_memory_bound_handlers() -> None:
     assert _throughput_config_for_hardware("dsv4", config, "h200").num_layers == 4
     assert _throughput_config_for_hardware("glm52", config, "b300") is config
     assert _throughput_config_for_hardware("llama3_dense", config, "h200") is config
+
+
+@pytest.mark.parametrize("hardware", ("b300", "h200"))
+def test_dsv4_uses_model_specific_activation_lag_limit(hardware: str) -> None:
+    for handler_key, config in _THROUGHPUT_CONFIGS.items():
+        thresholds = config.thresholds[hardware]
+        assert thresholds.max_mean_policy_activation_lag_s == (
+            2.25 if handler_key == "dsv4" else 1.5
+        )
+        assert thresholds.max_policy_activation_lag_s == 3.5
 
 
 @pytest.mark.parametrize("handler_key", sorted(HANDLER_WORKFLOW_RESOURCES))
