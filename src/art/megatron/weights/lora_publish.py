@@ -114,16 +114,21 @@ def collect_local_lora_entries(
     owner_rank: int,
     packed_expert_groups: Sequence[ExpertPackedLoraGroup] = (),
     slot_ref: LoRASlotRef | None = None,
+    include_replicas: bool = False,
 ) -> tuple[dict[str, torch.Tensor], list[LoraShardMeta]]:
     local_tensors: dict[str, torch.Tensor] = {}
     local_manifest: dict[str, LoraShardManifest] = {}
     for module in iter_lora_modules(model_chunks):
         if _uses_packed_expert_publish(module, packed_expert_groups, slot_ref):
             continue
-        for key, value in module.sharded_lora_state_dict(slot_ref).items():
+        for key, value in module.sharded_lora_state_dict(
+            slot_ref, include_replicas=include_replicas
+        ).items():
             target_dtype = adapter_dtypes[key] if key in adapter_dtypes else value.dtype
             local_tensors[key] = value.to(target_dtype)
-        local_manifest.update(module.sharded_lora_manifest(slot_ref))
+        local_manifest.update(
+            module.sharded_lora_manifest(slot_ref, include_replicas=include_replicas)
+        )
 
     if set(local_tensors) != set(local_manifest):
         raise RuntimeError(

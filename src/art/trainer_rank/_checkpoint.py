@@ -321,6 +321,7 @@ def prepare_checkpoint_save(
             {},
             owner_rank=_rank(),
             slot_ref=trainer._slot_ref(checkpoint_name),
+            include_replicas=True,
         )
         local_optimizer = (
             ()
@@ -1263,7 +1264,7 @@ def _local_optimizer_shards(
         for module in chunk.modules():
             if not isinstance(module, LoRA):
                 continue
-            for key, param, expert in module._export_items(ref):
+            for key, param, expert in module._export_items(ref, include_replicas=True):
                 master = masters.get(id(param))
                 if master is None:
                     raise trainer._slot_state_error(

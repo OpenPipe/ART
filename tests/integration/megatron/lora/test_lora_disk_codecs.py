@@ -2933,7 +2933,6 @@ def _portable_replica_worker(
             torch.float32,
             torch.device("cpu"),
         )
-        setattr(lora, "_should_export_parameter", lambda _param: True)
         trainer = _portable_trainer(lora, rank=rank, world_size=world_size)
         _install_portable_checkpoint(trainer)
         trainer._dynamic_optimizers["student"] = trainer._new_dynamic_optimizer(

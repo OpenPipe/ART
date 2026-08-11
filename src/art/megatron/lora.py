@@ -766,11 +766,14 @@ class LoRA(torch.nn.Module):
         ]
 
     def _export_items(
-        self, ref: LoRASlotRef | None = None
+        self,
+        ref: LoRASlotRef | None = None,
+        *,
+        include_replicas: bool = False,
     ) -> list[tuple[str, torch.nn.Parameter, int | None]]:
         export_items: list[tuple[str, torch.nn.Parameter, int | None]] = []
         for key, param in self._lora_params(ref):
-            if not self._should_export_parameter(param):
+            if not include_replicas and not self._should_export_parameter(param):
                 continue
             if "{expert}" in self.adapter_model_prefix:
                 for expert in range(self.num_local_experts):
@@ -783,18 +786,28 @@ class LoRA(torch.nn.Module):
         return export_items
 
     def sharded_lora_manifest(
-        self, ref: LoRASlotRef | None = None
+        self,
+        ref: LoRASlotRef | None = None,
+        *,
+        include_replicas: bool = False,
     ) -> dict[str, LoraShardManifest]:
         return {
             key: self._manifest_for_param(param)
-            for key, param, _expert in self._export_items(ref)
+            for key, param, _expert in self._export_items(
+                ref, include_replicas=include_replicas
+            )
         }
 
     def sharded_lora_state_dict(
-        self, ref: LoRASlotRef | None = None
+        self,
+        ref: LoRASlotRef | None = None,
+        *,
+        include_replicas: bool = False,
     ) -> dict[str, torch.Tensor]:
         state: dict[str, torch.Tensor] = {}
-        for key, param, expert in self._export_items(ref):
+        for key, param, expert in self._export_items(
+            ref, include_replicas=include_replicas
+        ):
             state[key] = param.data[expert].T if expert is not None else param.data.T
         return state
 
