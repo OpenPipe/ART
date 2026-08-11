@@ -1,5 +1,7 @@
+from collections.abc import Iterable, Mapping
 from itertools import islice
 import os
+from typing import cast
 
 import torch
 import torch.distributed as dist
@@ -35,7 +37,12 @@ def main(
 
         tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
         inputs: list[ForwardInput[torch.Tensor, None, None, None]] = []
-        rows = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
+        rows = cast(
+            Iterable[Mapping[str, object]],
+            load_dataset("roneneldan/TinyStories", split="train", streaming=True),
+        )
+        if not callable(tokenizer):
+            raise TypeError("Tokenizer backend is not callable")
         for row in islice(rows, samples):
             token_ids = tokenizer(
                 str(row["text"]),  # type: ignore[index]
@@ -45,9 +52,12 @@ def main(
                 return_tensors="pt",
             )["input_ids"].reshape(-1)
             inputs.append(
-                ForwardInput(
-                    input_tokens=token_ids[:-1],
-                    target_tokens=token_ids[1:],
+                cast(
+                    ForwardInput[torch.Tensor, None, None, None],
+                    ForwardInput(
+                        input_tokens=token_ids[:-1],
+                        target_tokens=token_ids[1:],
+                    ),
                 )
             )
 
@@ -58,7 +68,7 @@ def main(
         )
         rank = TrainerRank(runtime)
         (slot,) = load_random_checkpoint_slots(runtime, rank, 1, lora_rank=lora_rank)
-        rank.set_checkpoint(slot)
+        rank._set_default_slot(rank._slot_ref(slot))
 
         for step in range(steps):
             loss_sum = torch.tensor(0.0, device=rank.device)

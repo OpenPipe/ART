@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import pytest
 import torch
 
 pytest.importorskip("megatron.bridge")
 
+from megatron.bridge import AutoBridge
+from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.core.transformer.enums import AttnBackend
 
 from art.megatron.context_parallel.core_attention import ArtContextParallelCoreAttention
@@ -24,9 +27,29 @@ import art.megatron.provider as provider_module
 from art.megatron.runtime.bridge_runtime import load_unique_hf_keys_once
 
 
-class _FakeProvider:
+class _CoreAttentionSubmodules(Protocol):
+    core_attention: object
+
+
+class _SelfAttentionSpec(Protocol):
+    submodules: _CoreAttentionSubmodules
+
+
+class _TransformerLayerSubmodules(Protocol):
+    self_attention: _SelfAttentionSpec
+
+
+class _TransformerLayerSpec(Protocol):
+    submodules: _TransformerLayerSubmodules
+
+
+class _TransformerLayerSpecFactory(Protocol):
+    def __call__(self, provider: object, *, vp_stage: int) -> _TransformerLayerSpec: ...
+
+
+class _FakeProvider(GPTModelProvider):
     def __init__(self) -> None:
-        self.transformer_layer_spec = self._base_layer_spec
+        cast(Any, self).transformer_layer_spec = self._base_layer_spec
         self.finalized = False
         self.overlap_moe_expert_parallel_comm = False
         self.moe_shared_expert_overlap = False
@@ -39,7 +62,7 @@ class _FakeProvider:
         self.window_size: int | tuple[int, int] = (128, 0)
         self.moe_hybridep_num_sms = 16
         self.moe_flex_dispatcher_backend = "hybridep"
-        self.moe_token_dispatcher_type = ""
+        cast(Any, self).moe_token_dispatcher_type = ""
         self.recompute_granularity: str | None = None
         self.recompute_method: str | None = None
         self.recompute_num_layers: int | None = None
@@ -101,13 +124,20 @@ class _FakeGdnCpProvider(_FakeProvider):
         self.finalized = True
 
 
-class _FakeBridge:
+class _FakeBridge(AutoBridge):
     def __init__(self, *, model_bridge: object, provider: _FakeProvider) -> None:
-        self._model_bridge = model_bridge
+        self._fake_model_bridge = model_bridge
         self._provider = provider
-        self.hf_pretrained = SimpleNamespace(model_name_or_path="unused")
+        cast(Any, self).hf_pretrained = SimpleNamespace(model_name_or_path="unused")
 
-    def to_megatron_provider(self) -> _FakeProvider:
+    @property
+    def _model_bridge(self) -> Any:
+        return self._fake_model_bridge
+
+    def to_megatron_provider(
+        self, load_weights: bool = True, hf_path: str | Path | None = None
+    ) -> _FakeProvider:
+        del load_weights, hf_path
         return self._provider
 
 
@@ -431,7 +461,9 @@ def test_get_provider_bundle_honors_single_gpu_env_topology(
     assert resolved.recompute_method == "uniform"
     assert resolved.recompute_num_layers == 1
 
-    layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=0)
+    layer_spec = cast(_TransformerLayerSpecFactory, resolved.transformer_layer_spec)(
+        resolved, vp_stage=0
+    )
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
         is FlexDotProductAttention
@@ -464,7 +496,9 @@ def test_get_provider_bundle_honors_context_parallel_env_topology(
     assert resolved.context_parallel_size == 2
     assert resolved.expert_model_parallel_size == 1
     assert resolved.expert_tensor_parallel_size == 1
-    layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=0)
+    layer_spec = cast(_TransformerLayerSpecFactory, resolved.transformer_layer_spec)(
+        resolved, vp_stage=0
+    )
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
         is ArtContextParallelCoreAttention

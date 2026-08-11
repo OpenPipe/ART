@@ -1,21 +1,52 @@
 from collections.abc import Iterable, Sequence
+import hashlib
+from pathlib import Path
 from typing import Any, NamedTuple
 
+from safetensors.torch import save_file
 import torch
 
+from art.megatron._collective import (
+    collective_errors as _collective_errors,
+)
+from art.megatron._collective import (
+    device as _device,
+)
+from art.megatron._collective import (
+    distributed as _distributed_ready,
+)
+from art.megatron._collective import (
+    dtype_from_name as _dtype_from_name,
+)
+from art.megatron._collective import (
+    gather_objects as _gather_objects,
+)
+from art.megatron._collective import (
+    raise_distributed as _raise_rank_errors,
+)
+from art.megatron._collective import (
+    rank as _rank,
+)
 from art.megatron.lora import (
     LoRA,
-    LoRAPublishPlanner,
+    LoraShardManifest,
     LoraShardMeta,
     LoRASlotRef,
     _block_for_key,
     _dtype_name,
 )
-from art.megatron.lora import (
-    _distributed_initialized as _distributed_ready,
+from art.megatron.model_support.lora_disk import (
+    ART_LORA_FORMAT_CONFIG_KEY,
+    ART_LORA_FORMAT_MEGATRON,
+    ART_LORA_FORMAT_VLLM,
+    _consolidate_safetensors,
+    save_adapter_config,
 )
-from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
-from art.megatron.model_support.spec import ExpertPackedLoraGroup, ExpertPackedLoraSlot
+from art.megatron.model_support.spec import (
+    ExpertPackedLoraGroup,
+    ExpertPackedLoraSlot,
+    ModelSupportHandler,
+)
 from art.megatron.training.model_chunks import ModelChunks
 
 
@@ -24,7 +55,7 @@ class PackedExpertShardMeta(NamedTuple):
     owner_rank: int
     shape: tuple[int, ...]
     dtype_name: str
-    manifest: dict[str, Any]
+    manifest: LoraShardManifest
     expert_start: int
     expert_count: int
     pack_layout: str
@@ -37,45 +68,11 @@ class PackedExpertShardMeta(NamedTuple):
         return total
 
 
-class _PinnedCpuStager:
-    def __init__(self) -> None:
-        self._events: list[torch.cuda.Event] = []
-        self._stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-
-    def stage(self, tensor: torch.Tensor) -> torch.Tensor:
-        source = tensor.detach()
-        if self._stream is None or not source.is_cuda:
-            return source.cpu()
-
-        source = source.contiguous()
-        target = torch.empty_like(source, device="cpu", pin_memory=True)
-        source_stream = torch.cuda.current_stream(source.device)
-        self._stream.wait_stream(source_stream)
-        with torch.cuda.stream(self._stream):
-            target.copy_(source, non_blocking=True)
-            source.record_stream(self._stream)
-            event = torch.cuda.Event()
-            event.record(self._stream)
-        self._events.append(event)
-        return target
-
-    def finish(self) -> None:
-        for event in self._events:
-            event.synchronize()
-        self._events.clear()
-
-
 def iter_lora_modules(model_chunks: ModelChunks) -> Iterable[LoRA]:
     for chunk in model_chunks:
         for module in chunk.modules():
             if isinstance(module, LoRA):
                 yield module
-
-
-def _dtype_from_name(name: str) -> torch.dtype:
-    if isinstance(dtype := getattr(torch, name, None), torch.dtype):
-        return dtype
-    raise RuntimeError(f"Unsupported LoRA tensor dtype={name!r}")
 
 
 def _packed_expert_slot(
@@ -119,13 +116,13 @@ def collect_local_lora_entries(
     slot_ref: LoRASlotRef | None = None,
 ) -> tuple[dict[str, torch.Tensor], list[LoraShardMeta]]:
     local_tensors: dict[str, torch.Tensor] = {}
-    local_manifest: dict[str, dict[str, Any]] = {}
+    local_manifest: dict[str, LoraShardManifest] = {}
     for module in iter_lora_modules(model_chunks):
         if _uses_packed_expert_publish(module, packed_expert_groups, slot_ref):
             continue
         for key, value in module.sharded_lora_state_dict(slot_ref).items():
             target_dtype = adapter_dtypes[key] if key in adapter_dtypes else value.dtype
-            local_tensors[key] = value.to(target_dtype).contiguous()
+            local_tensors[key] = value.to(target_dtype)
         local_manifest.update(module.sharded_lora_manifest(slot_ref))
 
     if set(local_tensors) != set(local_manifest):
@@ -173,14 +170,14 @@ def collect_local_packed_expert_entries(
                 continue
             group_prefix, slot = slot_match
             key = f"{group_prefix}.{slot.output_suffix}"
-            tensor = param.data.transpose(1, 2).contiguous()
+            tensor = param.data.transpose(1, 2)
             source_keys = module._expected_weight_keys(suffix.removesuffix(".weight"))
             target_dtype = (
                 adapter_dtypes[source_keys[0]]
                 if source_keys and source_keys[0] in adapter_dtypes
                 else tensor.dtype
             )
-            tensor = tensor.to(target_dtype).contiguous()
+            tensor = tensor.to(target_dtype)
             if key in local_tensors:
                 raise RuntimeError(f"Duplicate packed expert LoRA tensor: {key}")
             local_tensors[key] = tensor
@@ -199,96 +196,11 @@ def collect_local_packed_expert_entries(
     return local_tensors, metadata
 
 
-def _global_packed_expert_metadata(
-    planner: LoRAPublishPlanner,
-    adapter_dtypes: dict[str, torch.dtype],
-    packed_expert_groups: Sequence[ExpertPackedLoraGroup],
-) -> list[PackedExpertShardMeta]:
-    metadata: list[PackedExpertShardMeta] = []
-    for template in planner.templates:
-        if int(template.num_local_experts) <= 1:
-            continue
-        slot_match = _packed_expert_slot(
-            template.adapter_model_prefix,
-            template.suffix,
-            packed_expert_groups,
-        )
-        if slot_match is None:
-            continue
-        group_prefix, slot = slot_match
-        shard_ranks = range(template.shard_world_size) if template.sharded else (0,)
-        ep_world_size = 1
-        if _distributed_ready():
-            from megatron.core import parallel_state as ps
-
-            ep_world_size = ps.get_expert_model_parallel_world_size()
-        for ep_rank in range(ep_world_size):
-            expert_start = ep_rank * template.num_local_experts
-            expert_key = (
-                f"{template.adapter_model_prefix.format(expert=expert_start)}."
-                f"{template.suffix}"
-            )
-            for shard_rank in shard_ranks:
-                owner_rank = planner._expert_owner_rank(ep_rank, shard_rank)
-                per_expert_meta = planner._make_metadata(
-                    template,
-                    key=expert_key,
-                    owner_rank=owner_rank,
-                    shard_rank=shard_rank,
-                    adapter_dtypes=adapter_dtypes,
-                )
-                metadata.append(
-                    PackedExpertShardMeta(
-                        key=f"{group_prefix}.{slot.output_suffix}",
-                        owner_rank=owner_rank,
-                        shape=(template.num_local_experts, *per_expert_meta.shape),
-                        dtype_name=per_expert_meta.dtype_name,
-                        manifest=per_expert_meta.manifest,
-                        expert_start=expert_start,
-                        expert_count=template.num_local_experts,
-                        pack_layout=slot.pack_layout,
-                    )
-                )
-    return metadata
-
-
-def _global_regular_metadata(
-    planner: LoRAPublishPlanner,
-    adapter_dtypes: dict[str, torch.dtype],
-    packed_expert_groups: Sequence[ExpertPackedLoraGroup],
-) -> list[LoraShardMeta]:
-    if not packed_expert_groups:
-        return planner.global_metadata(adapter_dtypes)
-    if _distributed_ready():
-        from megatron.core import parallel_state as ps
-
-        pp_world_size = ps.get_pipeline_model_parallel_world_size()
-        if pp_world_size != 1:
-            raise RuntimeError(
-                "LoRA publish planner requires pipeline_model_parallel_size=1; "
-                f"got {pp_world_size}. Rank-local modules cannot describe remote "
-                "pipeline stages without exchanging templates."
-            )
-    metadata: list[LoraShardMeta] = []
-    for template in planner.templates:
-        if (
-            _packed_expert_slot(
-                template.adapter_model_prefix,
-                template.suffix,
-                packed_expert_groups,
-            )
-            is not None
-        ):
-            continue
-        metadata.extend(planner._metadata_for_template(template, adapter_dtypes))
-    return metadata
-
-
 def _merge_sharded_tensor(
     key: str,
     *,
     ordered_shards: Sequence[torch.Tensor],
-    manifest: dict[str, Any],
+    manifest: LoraShardManifest,
 ) -> torch.Tensor:
     strategy = manifest.get("export_shard_strategy")
     assert strategy is not None
@@ -322,9 +234,9 @@ def _merge_sharded_tensor(
 
 def _merge_manifest_entries(
     key: str,
-    key_entries: Sequence[tuple[dict[str, Any], torch.Tensor]],
+    key_entries: Sequence[tuple[LoraShardManifest, torch.Tensor]],
     *,
-    manifest: dict[str, Any] | None = None,
+    manifest: LoraShardManifest | None = None,
 ) -> torch.Tensor:
     first_manifest = key_entries[0][0]
     sharded = bool(first_manifest["sharded"])
@@ -365,7 +277,7 @@ def _merge_manifest_entries(
 
 
 def merge_sharded_adapter_entries(
-    entries_by_key: dict[str, list[tuple[dict[str, Any], torch.Tensor]]],
+    entries_by_key: dict[str, list[tuple[LoraShardManifest, torch.Tensor]]],
 ) -> dict[str, torch.Tensor]:
     return {
         key: _merge_manifest_entries(key, key_entries)
@@ -373,102 +285,190 @@ def merge_sharded_adapter_entries(
     }
 
 
-def _rank_and_device() -> tuple[int, torch.device]:
-    return (
-        torch.distributed.get_rank() if _distributed_ready() else 0,  # type: ignore[possibly-missing-attribute]
-        torch.device("cuda", torch.cuda.current_device())
-        if torch.cuda.is_available()
-        else torch.device("cpu"),
-    )
+def _gather_metadata[T](
+    local: list[T], *, group: torch.distributed.ProcessGroup | None = None
+) -> list[T]:
+    return [item for values in _gather_objects(local, group=group) for item in values]
 
 
-def _metadata_by_owner_dtype(
-    metadata: Sequence[Any],
-) -> dict[tuple[int, str], list[Any]]:
-    grouped: dict[tuple[int, str], list[Any]] = {}
-    for meta in metadata:
-        grouped.setdefault((meta.owner_rank, meta.dtype_name), []).append(meta)
-    return {
-        key: sorted(group, key=lambda meta: meta.key)
-        for key, group in sorted(grouped.items())
-    }
+def _tensor_digest(tensor: torch.Tensor) -> str:
+    """Hash a tensor with bounded host staging and a bounded collective payload."""
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(_dtype_name(tensor.dtype).encode())
+    digest.update(repr(tuple(tensor.shape)).encode())
+    data = tensor.detach().contiguous().reshape(-1).view(torch.uint8)
+    chunk_bytes = 1024 * 1024
+    for offset in range(0, data.numel(), chunk_bytes):
+        chunk = data.narrow(0, offset, min(chunk_bytes, data.numel() - offset))
+        digest.update(chunk.cpu().numpy().tobytes())
+    return digest.hexdigest()
 
 
-def _pack_metadata_tensors(
-    metadata: Sequence[Any],
-    tensors: dict[str, torch.Tensor],
-) -> torch.Tensor:
-    return torch.cat(
-        [tensors[meta.key].detach().contiguous().view(-1) for meta in metadata]
-    )
+def _contributor_identity(
+    metadata: LoraShardMeta | PackedExpertShardMeta,
+) -> tuple[object, ...]:
+    shard_rank = int(metadata.manifest.get("shard_rank", 0))
+    if isinstance(metadata, PackedExpertShardMeta):
+        return ("packed", metadata.key, metadata.expert_start, shard_rank)
+    return ("lora", metadata.key, shard_rank)
 
 
-def _views_from_flat(
-    *,
-    owner_rank: int,
-    metadata: Sequence[Any],
-    flat: torch.Tensor,
-) -> dict[tuple[int, str], torch.Tensor]:
-    views: dict[tuple[int, str], torch.Tensor] = {}
-    offset = 0
-    for meta in metadata:
-        views[(owner_rank, meta.key)] = flat.narrow(0, offset, meta.numel).view(
-            meta.shape
+def _validate_replica_digests(
+    records: Iterable[tuple[LoraShardMeta | PackedExpertShardMeta, str]],
+) -> None:
+    digests: dict[tuple[object, ...], str] = {}
+    for metadata, digest in records:
+        identity = _contributor_identity(metadata)
+        previous = digests.setdefault(identity, digest)
+        if previous != digest:
+            raise RuntimeError(
+                f"Inconsistent replicated tensor contents for {metadata.key!r}"
+            )
+
+
+def _elect_lora_contributors(
+    metadata: list[LoraShardMeta],
+) -> list[LoraShardMeta]:
+    elected: dict[tuple[str, int], LoraShardMeta] = {}
+    for candidate in metadata:
+        identity = (candidate.key, int(candidate.manifest.get("shard_rank", 0)))
+        current = elected.get(identity)
+        if current is not None and (
+            current.shape != candidate.shape
+            or current.dtype_name != candidate.dtype_name
+            or current.manifest != candidate.manifest
+            or current.block != candidate.block
+        ):
+            raise RuntimeError(
+                f"Inconsistent replicated LoRA metadata for {candidate.key!r}"
+            )
+        if current is None or candidate.owner_rank < current.owner_rank:
+            elected[identity] = candidate
+    return list(elected.values())
+
+
+def _elect_packed_expert_contributors(
+    metadata: list[PackedExpertShardMeta],
+) -> list[PackedExpertShardMeta]:
+    elected: dict[tuple[str, int, int], PackedExpertShardMeta] = {}
+    for candidate in metadata:
+        identity = (
+            candidate.key,
+            candidate.expert_start,
+            int(candidate.manifest.get("shard_rank", 0)),
         )
-        offset += meta.numel
-    return views
+        current = elected.get(identity)
+        if (
+            current is not None
+            and current._replace(owner_rank=candidate.owner_rank) != candidate
+        ):
+            raise RuntimeError(
+                f"Inconsistent replicated packed LoRA metadata for {candidate.key!r}"
+            )
+        if current is None or candidate.owner_rank < current.owner_rank:
+            elected[identity] = candidate
+    return list(elected.values())
 
 
-def _exchange_batched_tensors(
-    metadata: Sequence[Any],
+def _rank_and_device() -> tuple[int, torch.device]:
+    return _rank(), _device()
+
+
+def _prepare_exchange_buffers(
+    metadata: Sequence[LoraShardMeta | PackedExpertShardMeta],
     *,
     local_tensors: dict[str, torch.Tensor],
     rank: int,
     device: torch.device,
-) -> dict[tuple[int, str], torch.Tensor]:
-    if not _distributed_ready():
-        return {
-            (rank, meta.key): local_tensors[meta.key].contiguous() for meta in metadata
-        }
-
+) -> tuple[
+    dict[tuple[int, str], torch.Tensor],
+    dict[tuple[int, str], torch.Tensor],
+    dict[tuple[int, str], torch.Tensor],
+]:
+    sends: dict[tuple[int, str], torch.Tensor] = {}
+    receives: dict[tuple[int, str], torch.Tensor] = {}
     received: dict[tuple[int, str], torch.Tensor] = {}
-    for (owner_rank, dtype_name), group_metadata in _metadata_by_owner_dtype(
-        metadata
-    ).items():
-        if rank == owner_rank:
-            flat = _pack_metadata_tensors(group_metadata, local_tensors)
+    for meta in metadata:
+        identity = (meta.owner_rank, meta.key)
+        if rank == meta.owner_rank:
+            tensor = local_tensors[meta.key].detach().contiguous()
             if rank == 0:
-                received.update(
-                    _views_from_flat(
-                        owner_rank=owner_rank,
-                        metadata=group_metadata,
-                        flat=flat,
-                    )
-                )
+                received[identity] = tensor.cpu().contiguous()
             else:
-                torch.distributed.send(flat, dst=0)  # type: ignore[possibly-missing-attribute]
+                sends[identity] = tensor
         elif rank == 0:
-            flat = torch.empty(
-                sum(meta.numel for meta in group_metadata),
-                dtype=_dtype_from_name(dtype_name),
+            receives[identity] = torch.empty(
+                meta.shape,
+                dtype=_dtype_from_name(meta.dtype_name),
                 device=device,
             )
-            torch.distributed.recv(flat, src=owner_rank)  # type: ignore[possibly-missing-attribute]
-            received.update(
-                _views_from_flat(
-                    owner_rank=owner_rank,
-                    metadata=group_metadata,
-                    flat=flat,
-                )
+    return sends, receives, received
+
+
+def _exchange_tensors(
+    metadata: Sequence[LoraShardMeta | PackedExpertShardMeta],
+    *,
+    local_tensors: dict[str, torch.Tensor],
+    rank: int,
+    device: torch.device,
+    group: torch.distributed.ProcessGroup | None = None,
+) -> dict[tuple[int, str], torch.Tensor]:
+    ordered = sorted(
+        metadata,
+        key=lambda meta: (
+            meta.owner_rank,
+            meta.key,
+            int(meta.manifest.get("shard_rank", 0)),
+        ),
+    )
+    if not _distributed_ready():
+        return {
+            (rank, meta.key): local_tensors[meta.key].detach().cpu().contiguous()
+            for meta in ordered
+        }
+
+    sends: dict[tuple[int, str], torch.Tensor] = {}
+    receives: dict[tuple[int, str], torch.Tensor] = {}
+    received: dict[tuple[int, str], torch.Tensor] = {}
+    error: BaseException | None = None
+    try:
+        sends, receives, received = _prepare_exchange_buffers(
+            ordered,
+            local_tensors=local_tensors,
+            rank=rank,
+            device=device,
+        )
+    except BaseException as exc:
+        error = exc
+    _raise_rank_errors(error, "prepare tensor exchange", group=group)
+
+    for meta in ordered:
+        identity = (meta.owner_rank, meta.key)
+        if rank == meta.owner_rank and rank != 0:
+            torch.distributed.send(sends[identity], dst=0, group=group)  # type: ignore[possibly-missing-attribute]
+        elif rank == 0 and meta.owner_rank != 0:
+            torch.distributed.recv(  # type: ignore[possibly-missing-attribute]
+                receives[identity], src=meta.owner_rank, group=group
             )
+
+    error = None
+    try:
+        if rank == 0:
+            received.update(
+                (identity, tensor.cpu().contiguous())
+                for identity, tensor in receives.items()
+            )
+    except BaseException as exc:
+        error = exc
+    _raise_rank_errors(error, "finalize tensor exchange", group=group)
     return received
 
 
 def _entries_by_key(
     metadata: list[LoraShardMeta],
     tensors_by_owner_key: dict[tuple[int, str], torch.Tensor],
-) -> dict[str, list[tuple[dict[str, Any], torch.Tensor]]]:
-    entries: dict[str, list[tuple[dict[str, Any], torch.Tensor]]] = {}
+) -> dict[str, list[tuple[LoraShardManifest, torch.Tensor]]]:
+    entries: dict[str, list[tuple[LoraShardManifest, torch.Tensor]]] = {}
     for meta in metadata:
         entries.setdefault(meta.key, []).append(
             (meta.manifest, tensors_by_owner_key[(meta.owner_rank, meta.key)])
@@ -476,13 +476,41 @@ def _entries_by_key(
     return entries
 
 
+def _gather_merged_adapter_tensors(
+    metadata: Sequence[LoraShardMeta],
+    *,
+    local_tensors: dict[str, torch.Tensor],
+    rank: int,
+    device: torch.device,
+    group: torch.distributed.ProcessGroup | None = None,
+) -> dict[str, torch.Tensor]:
+    exchanged = _exchange_tensors(
+        metadata,
+        local_tensors=local_tensors,
+        rank=rank,
+        device=device,
+        group=group,
+    )
+    merged: dict[str, torch.Tensor] = {}
+    error: BaseException | None = None
+    try:
+        if rank == 0:
+            merged = merge_sharded_adapter_entries(
+                _entries_by_key(list(metadata), exchanged)
+            )
+    except BaseException as exc:
+        error = exc
+    _raise_rank_errors(error, "merge adapter tensors", group=group)
+    return merged
+
+
 def _merge_packed_expert_block(
     key: str,
-    key_entries: list[tuple[dict[str, Any], torch.Tensor]],
+    key_entries: list[tuple[LoraShardManifest, torch.Tensor]],
 ) -> torch.Tensor:
-    manifest = dict(key_entries[0][0])
-    if bool(manifest["sharded"]):
-        manifest["export_shard_dim"] = int(manifest["export_shard_dim"]) + 1
+    manifest: LoraShardManifest = {**key_entries[0][0]}
+    if manifest["sharded"]:
+        manifest["export_shard_dim"] = manifest.get("export_shard_dim", 0) + 1
     return _merge_manifest_entries(key, key_entries, manifest=manifest)
 
 
@@ -556,7 +584,7 @@ def merge_packed_expert_adapter_entries(
 ) -> dict[str, torch.Tensor]:
     entries_by_key_start: dict[
         tuple[str, int],
-        list[tuple[PackedExpertShardMeta, dict[str, Any], torch.Tensor]],
+        list[tuple[PackedExpertShardMeta, LoraShardManifest, torch.Tensor]],
     ] = {}
     for meta in metadata:
         entries_by_key_start.setdefault((meta.key, meta.expert_start), []).append(
@@ -582,60 +610,6 @@ def merge_packed_expert_adapter_entries(
     }
 
 
-def _stage_published_tensors(
-    tensors: dict[str, torch.Tensor],
-    stager: _PinnedCpuStager,
-) -> dict[str, torch.Tensor]:
-    grouped: dict[tuple[str, int | None, str], list[tuple[str, torch.Tensor]]] = {}
-    for key, tensor in tensors.items():
-        dtype_name = _dtype_name(tensor.dtype)
-        group_key = (tensor.device.type, tensor.device.index, dtype_name)
-        grouped.setdefault(group_key, []).append((key, tensor))
-
-    staged: dict[str, torch.Tensor] = {}
-    for _group_key, group in sorted(grouped.items()):
-        flat = torch.cat(
-            [tensor.detach().contiguous().view(-1) for _key, tensor in sorted(group)]
-        )
-        staged_flat = stager.stage(flat)
-        offset = 0
-        for key, tensor in sorted(group):
-            numel = tensor.numel()
-            if key in staged:
-                raise RuntimeError(
-                    f"Duplicate vLLM LoRA tensor after conversion: {key}"
-                )
-            staged[key] = staged_flat.narrow(0, offset, numel).view(tensor.shape)
-            offset += numel
-    return staged
-
-
-def _save_rank0_vllm_lora(
-    *,
-    metadata: list[LoraShardMeta],
-    tensors_by_owner_key: dict[tuple[int, str], torch.Tensor],
-    packed_expert_metadata: list[PackedExpertShardMeta] | None = None,
-    packed_expert_tensors_by_owner_key: (
-        dict[tuple[int, str], torch.Tensor] | None
-    ) = None,
-    handler: Any,
-    adapter_config: dict[str, Any],
-    output_dir: str,
-) -> None:
-    vllm_tensors, published_config = _rank0_vllm_lora_tensors(
-        metadata=metadata,
-        tensors_by_owner_key=tensors_by_owner_key,
-        packed_expert_metadata=packed_expert_metadata,
-        packed_expert_tensors_by_owner_key=packed_expert_tensors_by_owner_key,
-        handler=handler,
-        adapter_config=adapter_config,
-    )
-    stager = _PinnedCpuStager()
-    published_tensors = _stage_published_tensors(vllm_tensors, stager)
-    stager.finish()
-    save_vllm_lora_tensors(output_dir, published_tensors, published_config)
-
-
 def _rank0_vllm_lora_tensors(
     *,
     metadata: list[LoraShardMeta],
@@ -644,7 +618,7 @@ def _rank0_vllm_lora_tensors(
     packed_expert_tensors_by_owner_key: (
         dict[tuple[int, str], torch.Tensor] | None
     ) = None,
-    handler: Any,
+    handler: ModelSupportHandler,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     merged_tensors = merge_sharded_adapter_entries(
@@ -667,80 +641,144 @@ def _rank0_vllm_lora_tensors(
     )
 
 
+class _LocalLoraExport(NamedTuple):
+    rank: int
+    device: torch.device
+    tensors: dict[str, torch.Tensor]
+    metadata: list[LoraShardMeta]
+    packed_tensors: dict[str, torch.Tensor]
+    packed_metadata: list[PackedExpertShardMeta]
+    blocks: tuple[str, ...]
+
+
+def _prepare_local_lora_export(
+    *,
+    model: ModelChunks,
+    adapter_dtypes: dict[str, torch.dtype],
+    handler: ModelSupportHandler,
+    rank: int,
+    world_size: int,
+    slot_ref: LoRASlotRef | None = None,
+    native_format: bool = False,
+) -> _LocalLoraExport:
+    actual_rank, device = _rank_and_device()
+    local_tensors: dict[str, torch.Tensor] = {}
+    local_metadata: list[LoraShardMeta] = []
+    local_digests: dict[str, str] = {}
+    local_packed_tensors: dict[str, torch.Tensor] = {}
+    local_packed_metadata: list[PackedExpertShardMeta] = []
+    local_packed_digests: dict[str, str] = {}
+    with _collective_errors("prepare LoRA export"):
+        if _distributed_ready():
+            actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
+            if actual_rank != rank or actual_world_size != world_size:
+                raise RuntimeError(
+                    "LoRA publisher rank/world-size mismatch: "
+                    f"runtime=({rank}, {world_size}) "
+                    f"distributed=({actual_rank}, {actual_world_size})"
+                )
+        elif rank != 0 or world_size != 1:
+            raise RuntimeError(
+                "Non-distributed LoRA publish requires rank=0 and world_size=1, "
+                f"got rank={rank} world_size={world_size}"
+            )
+        packed_expert_groups = (
+            () if native_format else tuple(handler.expert_packed_lora_groups())
+        )
+        local_tensors, local_metadata = collect_local_lora_entries(
+            model,
+            adapter_dtypes,
+            owner_rank=rank,
+            packed_expert_groups=packed_expert_groups,
+            slot_ref=slot_ref,
+        )
+        (local_packed_tensors, local_packed_metadata) = (
+            collect_local_packed_expert_entries(
+                model,
+                adapter_dtypes,
+                owner_rank=rank,
+                packed_expert_groups=packed_expert_groups,
+                slot_ref=slot_ref,
+            )
+        )
+        local_digests = {
+            key: _tensor_digest(tensor) for key, tensor in local_tensors.items()
+        }
+        local_packed_digests = {
+            key: _tensor_digest(tensor) for key, tensor in local_packed_tensors.items()
+        }
+    gathered_metadata = _gather_metadata(
+        [(metadata, local_digests[metadata.key]) for metadata in local_metadata]
+    )
+    gathered_packed_metadata = _gather_metadata(
+        [
+            (metadata, local_packed_digests[metadata.key])
+            for metadata in local_packed_metadata
+        ]
+    )
+    _validate_replica_digests(gathered_metadata)
+    _validate_replica_digests(gathered_packed_metadata)
+    metadata = _elect_lora_contributors(
+        [metadata for metadata, _digest in gathered_metadata]
+    )
+    packed_metadata = _elect_packed_expert_contributors(
+        [metadata for metadata, _digest in gathered_packed_metadata]
+    )
+    blocks = tuple(
+        sorted(
+            {item.block for item in metadata}
+            | {_block_for_key(item.key) for item in packed_metadata}
+        )
+    )
+    return _LocalLoraExport(
+        rank,
+        device,
+        local_tensors,
+        metadata,
+        local_packed_tensors,
+        packed_metadata,
+        blocks,
+    )
+
+
 def build_vllm_lora_tensors_from_model(
     *,
     model: ModelChunks,
     adapter_dtypes: dict[str, torch.dtype],
-    handler: Any,
+    handler: ModelSupportHandler,
     adapter_config: dict[str, Any],
     rank: int,
     world_size: int,
     slot_ref: LoRASlotRef | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]] | None:
-    actual_rank, device = _rank_and_device()
-    if _distributed_ready():
-        actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
-        if actual_rank != rank or actual_world_size != world_size:
-            raise RuntimeError(
-                "LoRA publisher rank/world-size mismatch: "
-                f"runtime=({rank}, {world_size}) distributed=({actual_rank}, {actual_world_size})"
-            )
-    else:
-        if rank != 0 or world_size != 1:
-            raise RuntimeError(
-                "Non-distributed LoRA publish requires rank=0 and world_size=1, "
-                f"got rank={rank} world_size={world_size}"
-            )
-        rank = 0
-    packed_expert_groups = tuple(handler.expert_packed_lora_groups())
-    planner = LoRAPublishPlanner(model, slot_ref)
-    local_tensors, local_metadata = collect_local_lora_entries(
-        model,
-        adapter_dtypes,
-        owner_rank=rank,
-        packed_expert_groups=packed_expert_groups,
+    local = _prepare_local_lora_export(
+        model=model,
+        adapter_dtypes=adapter_dtypes,
+        handler=handler,
+        rank=rank,
+        world_size=world_size,
         slot_ref=slot_ref,
     )
-    local_packed_tensors, local_packed_metadata = collect_local_packed_expert_entries(
-        model,
-        adapter_dtypes,
-        owner_rank=rank,
-        packed_expert_groups=packed_expert_groups,
-        slot_ref=slot_ref,
-    )
-    all_packed_metadata = (
-        _global_packed_expert_metadata(planner, adapter_dtypes, packed_expert_groups)
-        if rank == 0
-        else local_packed_metadata
-    )
-    if rank == 0:
-        all_metadata = _global_regular_metadata(
-            planner,
-            adapter_dtypes,
-            packed_expert_groups if all_packed_metadata else (),
-        )
-    else:
-        all_metadata = local_metadata
-    exchanged_tensors = _exchange_batched_tensors(
-        all_metadata,
-        local_tensors=local_tensors,
+    exchanged_tensors = _exchange_tensors(
+        local.metadata,
+        local_tensors=local.tensors,
         rank=rank,
-        device=device,
+        device=local.device,
     )
-    exchanged_packed_tensors = _exchange_batched_tensors(
-        all_packed_metadata,
-        local_tensors=local_packed_tensors,
+    exchanged_packed_tensors = _exchange_tensors(
+        local.packed_metadata,
+        local_tensors=local.packed_tensors,
         rank=rank,
-        device=device,
+        device=local.device,
     )
 
     if rank != 0:
         return None
 
     return _rank0_vllm_lora_tensors(
-        metadata=all_metadata,
+        metadata=local.metadata,
         tensors_by_owner_key=exchanged_tensors,
-        packed_expert_metadata=all_packed_metadata,
+        packed_expert_metadata=local.packed_metadata,
         packed_expert_tensors_by_owner_key=exchanged_packed_tensors,
         handler=handler,
         adapter_config=adapter_config,
@@ -751,26 +789,110 @@ def save_vllm_lora_from_model(
     *,
     model: ModelChunks,
     adapter_dtypes: dict[str, torch.dtype],
-    handler: Any,
+    handler: ModelSupportHandler,
     adapter_config: dict[str, Any],
     output_dir: str,
     rank: int,
     world_size: int,
     slot_ref: LoRASlotRef | None = None,
-) -> None:
-    result = build_vllm_lora_tensors_from_model(
+    native_format: bool = False,
+) -> _LocalLoraExport:
+    local = _prepare_local_lora_export(
         model=model,
         adapter_dtypes=adapter_dtypes,
         handler=handler,
-        adapter_config=adapter_config,
         rank=rank,
         world_size=world_size,
         slot_ref=slot_ref,
+        native_format=native_format,
     )
-    if result is None:
-        return
-    vllm_tensors, published_config = result
-    stager = _PinnedCpuStager()
-    published_tensors = _stage_published_tensors(vllm_tensors, stager)
-    stager.finish()
-    save_vllm_lora_tensors(output_dir, published_tensors, published_config)
+    blocks = local.blocks
+    root = Path(output_dir)
+    shards: list[Path] = []
+    published_config = dict(adapter_config)
+    written: set[str] = set()
+    with _collective_errors("prepare LoRA output"):
+        if rank == 0:
+            root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for index, block in enumerate(blocks):
+            metadata = [meta for meta in local.metadata if meta.block == block]
+            packed_metadata = [
+                meta
+                for meta in local.packed_metadata
+                if _block_for_key(meta.key) == block
+            ]
+            exchanged = _exchange_tensors(
+                metadata,
+                local_tensors=local.tensors,
+                rank=rank,
+                device=local.device,
+            )
+            exchanged_packed = _exchange_tensors(
+                packed_metadata,
+                local_tensors=local.packed_tensors,
+                rank=rank,
+                device=local.device,
+            )
+            with _collective_errors(f"serialize LoRA block {block}"):
+                if rank == 0:
+                    if native_format:
+                        tensors = merge_sharded_adapter_entries(
+                            _entries_by_key(metadata, exchanged)
+                        )
+                        block_config = adapter_config
+                    else:
+                        tensors, block_config = _rank0_vllm_lora_tensors(
+                            metadata=metadata,
+                            tensors_by_owner_key=exchanged,
+                            packed_expert_metadata=packed_metadata,
+                            packed_expert_tensors_by_owner_key=exchanged_packed,
+                            handler=handler,
+                            adapter_config=adapter_config,
+                        )
+                    if duplicates := written & tensors.keys():
+                        raise RuntimeError(
+                            "Duplicate LoRA tensors across model blocks: "
+                            f"{sorted(duplicates)}"
+                        )
+                    written.update(tensors)
+                    if block_config != adapter_config:
+                        if (
+                            published_config != adapter_config
+                            and published_config != block_config
+                        ):
+                            raise RuntimeError(
+                                "Model blocks produced inconsistent LoRA configs"
+                            )
+                        published_config = block_config
+                    shard = root / f".adapter_model-{index:06d}.safetensors"
+                    shards.append(shard)
+                    save_file(
+                        {
+                            key: tensor.detach().cpu().contiguous()
+                            for key, tensor in tensors.items()
+                        },
+                        shard,
+                    )
+        with _collective_errors("finalize LoRA export"):
+            if rank == 0:
+                if not shards:
+                    raise RuntimeError("No LoRA tensors were available to export")
+                _consolidate_safetensors(shards, root / "adapter_model.safetensors")
+                save_adapter_config(
+                    root,
+                    {
+                        **published_config,
+                        ART_LORA_FORMAT_CONFIG_KEY: (
+                            ART_LORA_FORMAT_MEGATRON
+                            if native_format
+                            else ART_LORA_FORMAT_VLLM
+                        ),
+                    },
+                )
+    finally:
+        if rank == 0:
+            for shard in shards:
+                shard.unlink(missing_ok=True)
+    return local

@@ -1,26 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, TypedDict, cast, overload
+import asyncio
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Literal, cast, overload
 
 import torch
 import torch.distributed as dist
-
-
-class TrainerRankOptimizerLayout(TypedDict):
-    parallel: tuple[int, int, int, int, int, int, int, int]
-    parameters: tuple[
-        tuple[tuple[int, ...], str, str, bool, int | None, str, tuple[int, ...]],
-        ...,
-    ]
-
-
-class TrainerRankOptimizerState(TypedDict):
-    format_version: Literal[1]
-    layout: TrainerRankOptimizerLayout
-    master_params: tuple[torch.Tensor, ...]
-    optimizer: dict[str, object]
-
 
 from . import _impl  # noqa: E402
 
@@ -42,7 +27,7 @@ TopKT = _impl.TopKT
 TrainerRankMemoryError = _impl.TrainerRankMemoryError
 TrainerRankSlotStateError = _impl.TrainerRankSlotStateError
 Unset = _impl.Unset
-_PushedSlot = _impl._PushedSlot
+PushedCheckpoint = _impl.PushedCheckpoint
 
 if TYPE_CHECKING:
     from art.megatron.train import TrainingRuntime
@@ -56,8 +41,7 @@ for _public_type in (
     MicroBatchStats,
     TopK,
     TrainerRankMemoryError,
-    TrainerRankOptimizerLayout,
-    TrainerRankOptimizerState,
+    PushedCheckpoint,
     TrainerRankSlotStateError,
 ):
     _public_type.__module__ = __name__
@@ -85,55 +69,31 @@ class TrainerRank(_impl.TrainerRank):
     def zero_grad(self) -> None:
         super().zero_grad()
 
-    def set_checkpoint(self, name: str | None) -> None:
-        super().set_checkpoint(name)
+    def prefetch_checkpoints(self, *paths: str) -> asyncio.Task[None]:
+        return super().prefetch_checkpoints(*paths)
 
-    def set_lora(self, name: str | None) -> None:
-        super().set_lora(name)
+    def load_checkpoint(self, path: str | None) -> asyncio.Task[None]:
+        return super().load_checkpoint(path)
 
-    def push_checkpoint(self, name: str | None) -> _PushedSlot:
-        return super().push_checkpoint(name)
+    def push_checkpoint(self, path: str | None) -> PushedCheckpoint:
+        return super().push_checkpoint(path)
 
-    def push_lora(self, name: str | None) -> _PushedSlot:
-        return super().push_lora(name)
+    def pop_checkpoint(self) -> None:
+        super().pop_checkpoint()
 
-    def pop_pushed_lora_or_checkpoint(self) -> None:
-        super().pop_pushed_lora_or_checkpoint()
-
-    def load_checkpoint_slot(
+    def save_checkpoint(
         self,
-        name: str,
-        adapter_model: Mapping[str, torch.Tensor],
-        *,
-        optimizer_state: TrainerRankOptimizerState | None = None,
-        alpha: float | None = None,
-        adapter_config: Mapping[str, object] | None = None,
-    ) -> int:
-        return super().load_checkpoint_slot(
-            name,
-            adapter_model,
-            optimizer_state=optimizer_state,
-            alpha=alpha,
-            adapter_config=adapter_config,
-        )
+        output_dir: str,
+        checkpoint_path: str | Literal["active"] = "active",
+    ) -> None:
+        super().save_checkpoint(output_dir, checkpoint_path)
 
-    def checkpoint_slot_optimizer_state(
-        self, name: str
-    ) -> TrainerRankOptimizerState | None:
-        return super().checkpoint_slot_optimizer_state(name)
-
-    def save_checkpoint_slot_lora(self, name: str, output_dir: str) -> None:
-        """Collectively publish a trained checkpoint slot as a vLLM LoRA."""
-        super().save_checkpoint_slot_lora(name, output_dir)
-
-    def load_lora_slot(
+    def export_lora(
         self,
-        name: str,
-        adapter_model: Mapping[str, torch.Tensor],
-        *,
-        alpha: float | None = None,
+        output_dir: str,
+        checkpoint_path: str | Literal["active"] = "active",
     ) -> int:
-        return super().load_lora_slot(name, adapter_model, alpha=alpha)
+        return super().export_lora(output_dir, checkpoint_path)
 
     @overload
     def forward_micro_batches(
@@ -290,8 +250,7 @@ __all__ = [
     "TopK",
     "TrainerRank",
     "TrainerRankMemoryError",
-    "TrainerRankOptimizerLayout",
-    "TrainerRankOptimizerState",
+    "PushedCheckpoint",
     "TrainerRankSlotStateError",
     "Unset",
 ]

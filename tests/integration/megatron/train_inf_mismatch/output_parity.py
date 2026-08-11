@@ -899,14 +899,22 @@ def _build_deterministic_nonzero_lora(
 
 
 def _merge_sharded_lora(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
+    import torch
+
+    from art.megatron.lora import LoraShardManifest
     from art.megatron.weights.lora_publish import merge_sharded_adapter_entries
 
-    entries_by_key: dict[str, list[tuple[dict[str, Any], Any]]] = {}
+    entries_by_key: dict[str, list[tuple[LoraShardManifest, torch.Tensor]]] = {}
     for rank_entry in shards_by_rank:
         state = rank_entry["state"]
         manifest = rank_entry["manifest"]
         for key, tensor in state.items():
-            entries_by_key.setdefault(key, []).append((manifest[key], tensor))
+            entries_by_key.setdefault(key, []).append(
+                (
+                    cast(LoraShardManifest, manifest[key]),
+                    cast(torch.Tensor, tensor),
+                )
+            )
     return merge_sharded_adapter_entries(entries_by_key)
 
 

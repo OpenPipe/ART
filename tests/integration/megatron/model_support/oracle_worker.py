@@ -195,9 +195,10 @@ def provider_topology_env(topology: Topology):
 
 def _merge_sharded_dicts(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
     """Merges rank-sharded LoRA tensors into a full state dict on rank 0."""
+    from art.megatron.lora import LoraShardManifest
     from art.megatron.weights.lora_publish import merge_sharded_adapter_entries
 
-    entries_by_key: dict[str, list[tuple[dict[str, Any], torch.Tensor]]] = {}
+    entries_by_key: dict[str, list[tuple[LoraShardManifest, torch.Tensor]]] = {}
     for rank_entry in shards_by_rank:
         rank_state = rank_entry["state"]
         rank_manifest = rank_entry["manifest"]
@@ -205,7 +206,7 @@ def _merge_sharded_dicts(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]
             if key not in rank_manifest:
                 raise RuntimeError(f"Missing manifest entry for sharded key '{key}'")
             entries_by_key.setdefault(key, []).append(
-                (rank_manifest[key], tensor.detach().cpu())
+                (cast(LoraShardManifest, rank_manifest[key]), tensor.detach().cpu())
             )
     return merge_sharded_adapter_entries(entries_by_key)
 
