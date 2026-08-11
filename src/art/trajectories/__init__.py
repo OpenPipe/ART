@@ -20,7 +20,6 @@ from typing import (
     Generic,
     Literal,
     Protocol,
-    Self,
     TypeAlias,
     TypeVar,
     overload,
@@ -79,12 +78,17 @@ MetadataValue = Any
 
 type CompactTrajectoryKind = Literal[
     "trajectory",
+    "trajectories",
     "trajectory_group",
+    "trajectory_groups",
     "tokenized_history",
+    "tokenized_histories",
     "tokenized_trajectory",
+    "tokenized_trajectories",
     "tokenized_multi_history_trajectory",
+    "tokenized_multi_history_trajectories",
     "tokenized_trajectory_group",
-    "list",
+    "tokenized_trajectory_groups",
 ]
 
 
@@ -517,14 +521,6 @@ class Trajectory(_CompactModel):
 
         return dump_trajectory(self)
 
-    @classmethod
-    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
-        """Validate and decode a compact trajectory payload."""
-
-        from ._compact import validate_trajectory
-
-        return validate_trajectory(payload, cls)
-
     def __enter__(self) -> Trajectory:
         from ._scope import enter_trajectory
 
@@ -781,14 +777,6 @@ class TrajectoryGroup(_CompactModel):
 
         return dump_trajectory_group(self)
 
-    @classmethod
-    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
-        """Validate and decode a compact trajectory-group payload."""
-
-        from ._compact import validate_trajectory_group
-
-        return validate_trajectory_group(payload, cls)
-
     @overload
     def __new__(
         cls,
@@ -963,14 +951,6 @@ class TokenizedHistory(pydantic.BaseModel):
 
         return dump_tokenized_history(self)
 
-    @classmethod
-    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
-        """Validate a compact tokenized-history payload."""
-
-        from ._compact import validate_tokenized_history
-
-        return validate_tokenized_history(payload, cls)
-
 
 class TokenizedTrajectory(TokenizedHistory):
     trajectory: Trajectory
@@ -989,14 +969,6 @@ class TokenizedTrajectory(TokenizedHistory):
         from ._compact import dump_tokenized_trajectory
 
         return dump_tokenized_trajectory(self)
-
-    @classmethod
-    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
-        """Validate a compact tokenized-trajectory payload."""
-
-        from ._compact import validate_tokenized_trajectory
-
-        return validate_tokenized_trajectory(payload, cls)
 
 
 class TokenizedMultiHistoryTrajectory(pydantic.BaseModel):
@@ -1021,14 +993,6 @@ class TokenizedMultiHistoryTrajectory(pydantic.BaseModel):
         from ._compact import dump_tokenized_multi_history_trajectory
 
         return dump_tokenized_multi_history_trajectory(self)
-
-    @classmethod
-    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
-        """Validate a compact multi-history trajectory payload."""
-
-        from ._compact import validate_tokenized_multi_history_trajectory
-
-        return validate_tokenized_multi_history_trajectory(payload, cls)
 
 
 TokenizedTrajectoryT = TypeVar(
@@ -1069,14 +1033,6 @@ class TokenizedTrajectoryGroup(pydantic.BaseModel, Generic[TokenizedTrajectoryT]
 
         return dump_tokenized_trajectory_group(self)
 
-    @classmethod
-    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
-        """Validate a compact tokenized-group payload."""
-
-        from ._compact import validate_tokenized_trajectory_group
-
-        return validate_tokenized_trajectory_group(payload, cls)
-
 
 type CompactDumpable = (
     Trajectory
@@ -1086,6 +1042,18 @@ type CompactDumpable = (
     | TokenizedMultiHistoryTrajectory
     | TokenizedTrajectoryGroup[TokenizedTrajectory]
     | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
+)
+type _CompactValidated = (
+    CompactDumpable
+    | list[Trajectory]
+    | list[TrajectoryGroup]
+    | list[TokenizedHistory]
+    | list[TokenizedTrajectory]
+    | list[TokenizedMultiHistoryTrajectory]
+    | list[
+        TokenizedTrajectoryGroup[TokenizedTrajectory]
+        | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
+    ]
 )
 
 
@@ -1099,67 +1067,102 @@ def compact_dump(
     return dump(value)
 
 
-def trajectories_compact_validate(
+@overload
+def compact_validate(
+    payload: Mapping[str, object], *, kind: Literal["trajectory"]
+) -> Trajectory: ...
+
+
+@overload
+def compact_validate(
+    payload: Mapping[str, object], *, kind: Literal["trajectories"]
+) -> list[Trajectory]: ...
+
+
+@overload
+def compact_validate(
+    payload: Mapping[str, object], *, kind: Literal["trajectory_group"]
+) -> TrajectoryGroup: ...
+
+
+@overload
+def compact_validate(
+    payload: Mapping[str, object], *, kind: Literal["trajectory_groups"]
+) -> list[TrajectoryGroup]: ...
+
+
+@overload
+def compact_validate(
+    payload: Mapping[str, object], *, kind: Literal["tokenized_history"]
+) -> TokenizedHistory: ...
+
+
+@overload
+def compact_validate(
+    payload: Mapping[str, object], *, kind: Literal["tokenized_histories"]
+) -> list[TokenizedHistory]: ...
+
+
+@overload
+def compact_validate(
+    payload: Mapping[str, object], *, kind: Literal["tokenized_trajectory"]
+) -> TokenizedTrajectory: ...
+
+
+@overload
+def compact_validate(
+    payload: Mapping[str, object], *, kind: Literal["tokenized_trajectories"]
+) -> list[TokenizedTrajectory]: ...
+
+
+@overload
+def compact_validate(
     payload: Mapping[str, object],
-) -> list[Trajectory]:
-    """Validate trajectories from a shared compact payload."""
-
-    from ._compact import validate_trajectories
-
-    return validate_trajectories(payload)
+    *,
+    kind: Literal["tokenized_multi_history_trajectory"],
+) -> TokenizedMultiHistoryTrajectory: ...
 
 
-def trajectory_groups_compact_validate(
+@overload
+def compact_validate(
     payload: Mapping[str, object],
-) -> list[TrajectoryGroup]:
-    """Validate trajectory groups from a shared compact payload."""
-
-    from ._compact import validate_trajectory_groups
-
-    return validate_trajectory_groups(payload)
+    *,
+    kind: Literal["tokenized_multi_history_trajectories"],
+) -> list[TokenizedMultiHistoryTrajectory]: ...
 
 
-def tokenized_histories_compact_validate(
-    payload: Mapping[str, object],
-) -> list[TokenizedHistory]:
-    """Validate tokenized histories from a shared compact payload."""
-
-    from ._compact import validate_tokenized_histories
-
-    return validate_tokenized_histories(payload)
-
-
-def tokenized_trajectories_compact_validate(
-    payload: Mapping[str, object],
-) -> list[TokenizedTrajectory]:
-    """Validate tokenized trajectories from a shared compact payload."""
-
-    from ._compact import validate_tokenized_trajectories
-
-    return validate_tokenized_trajectories(payload)
+@overload
+def compact_validate(
+    payload: Mapping[str, object], *, kind: Literal["tokenized_trajectory_group"]
+) -> (
+    TokenizedTrajectoryGroup[TokenizedTrajectory]
+    | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
+): ...
 
 
-def tokenized_multi_history_trajectories_compact_validate(
-    payload: Mapping[str, object],
-) -> list[TokenizedMultiHistoryTrajectory]:
-    """Validate multi-history trajectories from a shared compact payload."""
-
-    from ._compact import validate_tokenized_multi_history_trajectories
-
-    return validate_tokenized_multi_history_trajectories(payload)
-
-
-def tokenized_trajectory_groups_compact_validate(
-    payload: Mapping[str, object],
+@overload
+def compact_validate(
+    payload: Mapping[str, object], *, kind: Literal["tokenized_trajectory_groups"]
 ) -> list[
     TokenizedTrajectoryGroup[TokenizedTrajectory]
     | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
-]:
-    """Validate tokenized groups from a shared compact payload."""
+]: ...
 
-    from ._compact import validate_tokenized_trajectory_groups
 
-    return validate_tokenized_trajectory_groups(payload)
+@overload
+def compact_validate(
+    payload: Mapping[str, object], *, kind: CompactTrajectoryKind
+) -> _CompactValidated: ...
+
+
+def compact_validate(
+    payload: Mapping[str, object], *, kind: CompactTrajectoryKind
+) -> _CompactValidated:
+    """Validate one compact value or homogeneous collection of ``kind``."""
+
+    from ._compact import validate
+
+    return validate(payload, kind)
 
 
 @overload
@@ -1247,12 +1250,7 @@ __all__ = [
     "CompactTrajectoryKind",
     "CompactTrajectoryPayload",
     "compact_dump",
-    "trajectories_compact_validate",
-    "trajectory_groups_compact_validate",
-    "tokenized_histories_compact_validate",
-    "tokenized_trajectories_compact_validate",
-    "tokenized_multi_history_trajectories_compact_validate",
-    "tokenized_trajectory_groups_compact_validate",
+    "compact_validate",
     "current_trajectory",
     "no_capture",
     "trajectory",

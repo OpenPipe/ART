@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 import json
 import re
-from typing import TypeGuard, TypeVar, cast
+from typing import TypeGuard, cast
 
 import pydantic
 
@@ -33,12 +33,18 @@ _SOURCE_MARKERS = {
     "generation_index",
     "prompt_index",
 }
-_TrajectoryT = TypeVar("_TrajectoryT", bound=Trajectory)
-_TrajectoryGroupT = TypeVar("_TrajectoryGroupT", bound=TrajectoryGroup)
-_TokenizedHistoryT = TypeVar("_TokenizedHistoryT", bound=TokenizedHistory)
-_TokenizedTrajectoryT = TypeVar("_TokenizedTrajectoryT", bound=TokenizedTrajectory)
-_TokenizedMultiT = TypeVar("_TokenizedMultiT", bound=TokenizedMultiHistoryTrajectory)
-_TokenizedGroupT = TypeVar("_TokenizedGroupT", bound=TokenizedTrajectoryGroup)
+type _CompactValidated = (
+    CompactDumpable
+    | list[Trajectory]
+    | list[TrajectoryGroup]
+    | list[TokenizedHistory]
+    | list[TokenizedTrajectory]
+    | list[TokenizedMultiHistoryTrajectory]
+    | list[
+        TokenizedTrajectoryGroup[TokenizedTrajectory]
+        | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
+    ]
+)
 
 
 def dump(
@@ -52,7 +58,7 @@ def dump(
         return _encode(kind, _dump_value(value, kind))
     values = list(cast(Iterable[CompactDumpable], value))
     if not values:
-        return _encode("list", [])
+        raise ValueError("compact_dump() cannot infer the kind of an empty iterable")
     if any(not _is_dumpable(item) for item in values):
         raise TypeError("compact_dump() received an unsupported value")
     kinds = [_kind(item) for item in values]
@@ -62,11 +68,8 @@ def dump(
     for item in values:
         _intern(item, pool)
     return _encode(
-        "list",
-        [
-            {"kind": kind, "data": _dump_value(item, kind)}
-            for item, kind in zip(values, kinds, strict=True)
-        ],
+        _plural_kind(kinds[0]),
+        [_dump_value(item, kind) for item, kind in zip(values, kinds, strict=True)],
     )
 
 
@@ -74,34 +77,12 @@ def dump_trajectory(trajectory: Trajectory) -> CompactTrajectoryPayload:
     return dump(trajectory)
 
 
-def validate_trajectory(
-    payload: Mapping[str, object], cls: type[_TrajectoryT]
-) -> _TrajectoryT:
-    value = cls.model_validate(_decode(payload, "trajectory"))
-    value._intern_strings()
-    return value
-
-
 def dump_trajectory_group(group: TrajectoryGroup) -> CompactTrajectoryPayload:
     return dump(group)
 
 
-def validate_trajectory_group(
-    payload: Mapping[str, object], cls: type[_TrajectoryGroupT]
-) -> _TrajectoryGroupT:
-    value = cls.model_validate(_decode(payload, "trajectory_group"))
-    value._intern_strings()
-    return value
-
-
 def dump_tokenized_history(value: TokenizedHistory) -> CompactTrajectoryPayload:
     return dump(value)
-
-
-def validate_tokenized_history(
-    payload: Mapping[str, object], cls: type[_TokenizedHistoryT]
-) -> _TokenizedHistoryT:
-    return _finish(_validate_history(_decode(payload, "tokenized_history"), cls))
 
 
 def dump_tokenized_trajectory(
@@ -110,24 +91,10 @@ def dump_tokenized_trajectory(
     return dump(value)
 
 
-def validate_tokenized_trajectory(
-    payload: Mapping[str, object], cls: type[_TokenizedTrajectoryT]
-) -> _TokenizedTrajectoryT:
-    return _finish(_validate_trajectory(_decode(payload, "tokenized_trajectory"), cls))
-
-
 def dump_tokenized_multi_history_trajectory(
     value: TokenizedMultiHistoryTrajectory,
 ) -> CompactTrajectoryPayload:
     return dump(value)
-
-
-def validate_tokenized_multi_history_trajectory(
-    payload: Mapping[str, object], cls: type[_TokenizedMultiT]
-) -> _TokenizedMultiT:
-    return _finish(
-        _validate_multi(_decode(payload, "tokenized_multi_history_trajectory"), cls)
-    )
 
 
 def dump_tokenized_trajectory_group(
@@ -136,92 +103,75 @@ def dump_tokenized_trajectory_group(
     return dump(value)
 
 
-def validate_tokenized_trajectory_group(
-    payload: Mapping[str, object], cls: type[_TokenizedGroupT]
-) -> _TokenizedGroupT:
-    return _finish(_validate_group(_decode(payload, "tokenized_trajectory_group"), cls))
+def validate(
+    payload: Mapping[str, object], kind: CompactTrajectoryKind
+) -> _CompactValidated:
+    """Decode the value identified by the caller's concrete envelope kind."""
+
+    data = _decode(payload, kind)
+    if kind in {
+        "trajectories",
+        "trajectory_groups",
+        "tokenized_histories",
+        "tokenized_trajectories",
+        "tokenized_multi_history_trajectories",
+        "tokenized_trajectory_groups",
+    }:
+        if not isinstance(data, list):
+            raise ValueError("Compact collection payload data must be a list")
+        singular = _singular_kind(kind)
+        values = [_validate_value(item, singular) for item in data]
+        pool: _StringPool = {}
+        for value in values:
+            _finish(value, pool)
+        return cast(_CompactValidated, values)
+    return _finish(_validate_value(data, kind))
 
 
-def validate_trajectories(payload: Mapping[str, object]) -> list[Trajectory]:
-    return _validate_list(payload, "trajectory", Trajectory.model_validate)
+def _validate_value(value: object, kind: CompactTrajectoryKind) -> CompactDumpable:
+    if kind == "trajectory":
+        return Trajectory.model_validate(value)
+    if kind == "trajectory_group":
+        return TrajectoryGroup.model_validate(value)
+    if kind == "tokenized_history":
+        return _validate_history(value, TokenizedHistory)
+    if kind == "tokenized_trajectory":
+        return _validate_trajectory(value, TokenizedTrajectory)
+    if kind == "tokenized_multi_history_trajectory":
+        return _validate_multi(value, TokenizedMultiHistoryTrajectory)
+    if kind == "tokenized_trajectory_group":
+        return _validate_group(value, TokenizedTrajectoryGroup)
+    raise ValueError(f"Compact kind {kind!r} does not identify one value")
 
 
-def validate_trajectory_groups(
-    payload: Mapping[str, object],
-) -> list[TrajectoryGroup]:
-    return _validate_list(payload, "trajectory_group", TrajectoryGroup.model_validate)
+def _plural_kind(kind: CompactTrajectoryKind) -> CompactTrajectoryKind:
+    kinds: dict[CompactTrajectoryKind, CompactTrajectoryKind] = {
+        "trajectory": "trajectories",
+        "trajectory_group": "trajectory_groups",
+        "tokenized_history": "tokenized_histories",
+        "tokenized_trajectory": "tokenized_trajectories",
+        "tokenized_multi_history_trajectory": ("tokenized_multi_history_trajectories"),
+        "tokenized_trajectory_group": "tokenized_trajectory_groups",
+    }
+    try:
+        return kinds[kind]
+    except KeyError as error:
+        raise ValueError(f"Compact kind {kind!r} is already plural") from error
 
 
-def validate_tokenized_histories(
-    payload: Mapping[str, object],
-) -> list[TokenizedHistory]:
-    return _validate_list(payload, "tokenized_history", _validate_history_base)
-
-
-def validate_tokenized_trajectories(
-    payload: Mapping[str, object],
-) -> list[TokenizedTrajectory]:
-    return _validate_list(payload, "tokenized_trajectory", _validate_trajectory_base)
-
-
-def validate_tokenized_multi_history_trajectories(
-    payload: Mapping[str, object],
-) -> list[TokenizedMultiHistoryTrajectory]:
-    return _validate_list(
-        payload, "tokenized_multi_history_trajectory", _validate_multi_base
-    )
-
-
-def validate_tokenized_trajectory_groups(
-    payload: Mapping[str, object],
-) -> list[
-    TokenizedTrajectoryGroup[TokenizedTrajectory]
-    | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
-]:
-    return _validate_list(payload, "tokenized_trajectory_group", _validate_group_base)
-
-
-def _validate_list[ValueT](
-    payload: Mapping[str, object],
-    expected_item_kind: CompactTrajectoryKind,
-    validator: Callable[[object], ValueT],
-) -> list[ValueT]:
-    data = _decode(payload, "list")
-    if not isinstance(data, list):
-        raise ValueError("Compact list payload data must be a list")
-    values: list[ValueT] = []
-    for item in data:
-        record = _mapping(item, "Compact list item")
-        if set(record) != {"kind", "data"} or record["kind"] != expected_item_kind:
-            raise ValueError(
-                f"Expected compact list items of kind {expected_item_kind!r}"
-            )
-        values.append(validator(record["data"]))
-    pool: _StringPool = {}
-    for value in values:
-        _finish(value, pool)
-    return values
-
-
-def _validate_history_base(value: object) -> TokenizedHistory:
-    return _validate_history(value, TokenizedHistory)
-
-
-def _validate_trajectory_base(value: object) -> TokenizedTrajectory:
-    return _validate_trajectory(value, TokenizedTrajectory)
-
-
-def _validate_multi_base(value: object) -> TokenizedMultiHistoryTrajectory:
-    return _validate_multi(value, TokenizedMultiHistoryTrajectory)
-
-
-def _validate_group_base(
-    value: object,
-) -> (
-    TokenizedTrajectoryGroup[TokenizedTrajectory]
-    | TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]
-):
-    return _validate_group(value, TokenizedTrajectoryGroup)
+def _singular_kind(kind: CompactTrajectoryKind) -> CompactTrajectoryKind:
+    kinds: dict[CompactTrajectoryKind, CompactTrajectoryKind] = {
+        "trajectories": "trajectory",
+        "trajectory_groups": "trajectory_group",
+        "tokenized_histories": "tokenized_history",
+        "tokenized_trajectories": "tokenized_trajectory",
+        "tokenized_multi_history_trajectories": ("tokenized_multi_history_trajectory"),
+        "tokenized_trajectory_groups": "tokenized_trajectory_group",
+    }
+    try:
+        return kinds[kind]
+    except KeyError as error:
+        raise ValueError(f"Compact kind {kind!r} is already singular") from error
 
 
 def _is_dumpable(value: object) -> TypeGuard[CompactDumpable]:

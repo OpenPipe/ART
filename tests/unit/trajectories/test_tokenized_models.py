@@ -202,8 +202,8 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     history = tokenized.history
     assert isinstance(history, art.ChatCompletionsHistory)
 
-    restored_history = art.TokenizedHistory.compact_validate(
-        history.tokenize().compact_dump()
+    restored_history = art.trajectories.compact_validate(
+        history.tokenize().compact_dump(), kind="tokenized_history"
     )
     assert isinstance(restored_history.history, art.ChatCompletionsHistory)
     first_source = restored_history.history.message_sources[0]
@@ -211,7 +211,9 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     assert first_source is not None and last_source is not None
     assert first_source.exchange is last_source.exchange
 
-    restored = art.TokenizedTrajectory.compact_validate(tokenized.compact_dump())
+    restored = art.trajectories.compact_validate(
+        tokenized.compact_dump(), kind="tokenized_trajectory"
+    )
     assert isinstance(restored.history, art.ChatCompletionsHistory)
     restored_source = restored.history.message_sources[0]
     assert restored_source is not None
@@ -238,8 +240,8 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
         metrics=tokenized.metrics,
         metadata=tokenized.metadata,
     )
-    restored_multi = art.TokenizedMultiHistoryTrajectory.compact_validate(
-        tokenized_multi.compact_dump()
+    restored_multi = art.trajectories.compact_validate(
+        tokenized_multi.compact_dump(), kind="tokenized_multi_history_trajectory"
     )
     assert isinstance(restored_multi.histories[0].history, art.ChatCompletionsHistory)
     restored_multi_source = restored_multi.histories[0].history.message_sources[0]
@@ -249,10 +251,11 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
         is restored_multi.trajectory.exchanges.chat_completions[0]
     )
 
-    restored_group = art.TokenizedTrajectoryGroup[
-        art.TokenizedTrajectory
-    ].compact_validate(tokenized_group.compact_dump())
+    restored_group = art.trajectories.compact_validate(
+        tokenized_group.compact_dump(), kind="tokenized_trajectory_group"
+    )
     restored_child = restored_group.trajectories[0]
+    assert isinstance(restored_child, art.TokenizedTrajectory)
     assert isinstance(restored_child.history, art.ChatCompletionsHistory)
     assert restored_child.trajectory is restored_group.trajectory_group.trajectories[0]
     restored_group_source = restored_child.history.message_sources[0]
@@ -263,17 +266,24 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     )
 
     payload = art.trajectories.compact_dump([tokenized])
-    restored_list = art.trajectories.tokenized_trajectories_compact_validate(payload)
+    restored_list = art.trajectories.compact_validate(
+        payload, kind="tokenized_trajectories"
+    )
     assert restored_list[0].model_dump() == tokenized.model_dump()
     history_payload = art.trajectories.compact_dump([history.tokenize()])
     assert (
-        len(art.trajectories.tokenized_histories_compact_validate(history_payload)) == 1
+        len(
+            art.trajectories.compact_validate(
+                history_payload, kind="tokenized_histories"
+            )
+        )
+        == 1
     )
     multi_payload = art.trajectories.compact_dump([tokenized_multi])
     assert (
         len(
-            art.trajectories.tokenized_multi_history_trajectories_compact_validate(
-                multi_payload
+            art.trajectories.compact_validate(
+                multi_payload, kind="tokenized_multi_history_trajectories"
             )
         )
         == 1
@@ -281,7 +291,9 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     group_payload = art.trajectories.compact_dump([tokenized_group])
     assert (
         len(
-            art.trajectories.tokenized_trajectory_groups_compact_validate(group_payload)
+            art.trajectories.compact_validate(
+                group_payload, kind="tokenized_trajectory_groups"
+            )
         )
         == 1
     )

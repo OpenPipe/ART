@@ -251,7 +251,7 @@ def test_compact_trajectory_round_trip_and_literal_reference_collision() -> None
     assert payload["kind"] == "trajectory"
     assert payload["strings"]["$0"] == "$0"
     assert payload["strings"]["$1"] == repeated
-    restored = art.Trajectory.compact_validate(payload)
+    restored = art.trajectories.compact_validate(payload, kind="trajectory")
     assert restored.model_dump() == trajectory.model_dump()
     assert restored.metadata["first"] is restored.metadata["second"]
     assert restored.metadata["literal"] == "$0"
@@ -270,7 +270,7 @@ def test_compact_decode_is_one_level_and_unmatched_references_are_literal() -> N
         "data": {"metadata": {"mapped": "$0", "literal": "$2"}},
     }
 
-    restored = art.Trajectory.compact_validate(payload)
+    restored = art.trajectories.compact_validate(payload, kind="trajectory")
 
     assert restored.metadata == {"mapped": "$1", "literal": "$2"}
 
@@ -290,9 +290,9 @@ def test_compact_reference_literal_mapped_away_can_release_its_reference() -> No
         "$0": "$10",
         **{f"${index + 1}": value for index, value in enumerate(values)},
     }
-    assert art.Trajectory.compact_validate(payload).model_dump() == (
-        trajectory.model_dump()
-    )
+    assert art.trajectories.compact_validate(
+        payload, kind="trajectory"
+    ).model_dump() == (trajectory.model_dump())
 
 
 def test_compact_dictionary_keys_and_decode_collisions() -> None:
@@ -304,20 +304,21 @@ def test_compact_dictionary_keys_and_decode_collisions() -> None:
         }
     )
     payload = trajectory.compact_dump()
-    restored = art.Trajectory.compact_validate(payload)
+    restored = art.trajectories.compact_validate(payload, kind="trajectory")
     first = next(iter(restored.metadata["first"]))
     second = next(iter(restored.metadata["second"]))
     assert first is second
 
     with pytest.raises(ValueError, match="duplicate key"):
-        art.Trajectory.compact_validate(
+        art.trajectories.compact_validate(
             {
                 "format": "art.trajectories",
                 "version": 1,
                 "kind": "trajectory",
                 "strings": {"$0": "duplicate"},
                 "data": {"metadata": {"$0": 1, "duplicate": 2}},
-            }
+            },
+            kind="trajectory",
         )
 
 
@@ -391,7 +392,7 @@ def test_compact_validate_rejects_malformed_envelopes(
     payload: dict[str, object], message: str
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        art.Trajectory.compact_validate(payload)
+        art.trajectories.compact_validate(payload, kind="trajectory")
 
 
 def test_compact_collection_dump_materializes_once_and_shares_strings() -> None:
@@ -407,8 +408,13 @@ def test_compact_collection_dump_materializes_once_and_shares_strings() -> None:
     payload = art.trajectories.compact_dump(values())
 
     assert consumed == 2
+    assert payload["kind"] == "trajectories"
+    assert isinstance(payload["data"], list)
+    for item in payload["data"]:
+        assert isinstance(item, dict)
+        assert "kind" not in item
     assert list(payload["strings"].values()) == [repeated]
-    restored = art.trajectories.trajectories_compact_validate(payload)
+    restored = art.trajectories.compact_validate(payload, kind="trajectories")
     assert len(restored) == 2
     assert restored[0].metadata["value"] is restored[1].metadata["value"]
 
@@ -417,44 +423,59 @@ def test_compact_collection_dump_materializes_once_and_shares_strings() -> None:
         art.TrajectoryGroup([art.Trajectory(metadata={"value": _fresh(repeated)})]),
     ]
     group_payload = art.trajectories.compact_dump(groups)
-    restored_groups = art.trajectories.trajectory_groups_compact_validate(group_payload)
+    restored_groups = art.trajectories.compact_validate(
+        group_payload, kind="trajectory_groups"
+    )
     assert (
         restored_groups[0].trajectories[0].metadata["value"]
         is restored_groups[1].trajectories[0].metadata["value"]
     )
 
 
-def test_compact_all_four_kinds_and_empty_collections() -> None:
+def test_compact_singular_plural_kinds_and_empty_collections() -> None:
     trajectory = art.Trajectory(metadata={"a": _long(), "b": _fresh(_long())})
     group = art.TrajectoryGroup([trajectory])
 
-    assert art.Trajectory.compact_validate(trajectory.compact_dump()).model_dump() == (
-        trajectory.model_dump()
-    )
-    assert art.TrajectoryGroup.compact_validate(group.compact_dump()).model_dump() == (
-        group.model_dump()
+    assert (
+        art.trajectories.compact_validate(
+            trajectory.compact_dump(), kind="trajectory"
+        ).model_dump()
+        == trajectory.model_dump()
     )
     assert (
-        art.trajectories.trajectories_compact_validate(
-            art.trajectories.compact_dump([trajectory])
+        art.trajectories.compact_validate(
+            group.compact_dump(), kind="trajectory_group"
+        ).model_dump()
+        == group.model_dump()
+    )
+    assert (
+        art.trajectories.compact_validate(
+            art.trajectories.compact_dump([trajectory]), kind="trajectories"
         )[0].model_dump()
         == trajectory.model_dump()
     )
     assert (
-        art.trajectories.trajectory_groups_compact_validate(
-            art.trajectories.compact_dump([group])
+        art.trajectories.compact_validate(
+            art.trajectories.compact_dump([group]), kind="trajectory_groups"
         )[0].model_dump()
         == group.model_dump()
     )
-    empty = art.trajectories.compact_dump([])
-    assert art.trajectories.trajectories_compact_validate(empty) == []
-    assert art.trajectories.trajectory_groups_compact_validate(empty) == []
+    with pytest.raises(ValueError, match="empty iterable"):
+        art.trajectories.compact_dump([])
+    empty: art.CompactTrajectoryPayload = {
+        "format": "art.trajectories",
+        "version": 1,
+        "kind": "trajectories",
+        "strings": {},
+        "data": [],
+    }
+    assert art.trajectories.compact_validate(empty, kind="trajectories") == []
 
     with pytest.raises(TypeError, match="homogeneous"):
         art.trajectories.compact_dump([trajectory, group])
-    with pytest.raises(ValueError, match="Expected compact list items"):
-        art.trajectories.trajectory_groups_compact_validate(
-            art.trajectories.compact_dump([trajectory])
+    with pytest.raises(ValueError, match="kind"):
+        art.trajectories.compact_validate(
+            art.trajectories.compact_dump([trajectory]), kind="trajectory_groups"
         )
 
 
@@ -491,9 +512,9 @@ def test_compact_deterministic_property_cases_lose_no_json_data() -> None:
     for _ in range(50):
         trajectory = art.Trajectory(metadata={"value": value(3)})
         payload = trajectory.compact_dump()
-        assert art.Trajectory.compact_validate(payload).model_dump() == (
-            trajectory.model_dump()
-        )
+        assert art.trajectories.compact_validate(
+            payload, kind="trajectory"
+        ).model_dump() == (trajectory.model_dump())
 
 
 def _protocol_trajectory() -> art.Trajectory:
@@ -577,7 +598,9 @@ def _protocol_trajectory() -> art.Trajectory:
 
 def test_compact_round_trip_all_protocols_and_legacy_histories() -> None:
     trajectory = _protocol_trajectory()
-    restored = art.Trajectory.compact_validate(trajectory.compact_dump())
+    restored = art.trajectories.compact_validate(
+        trajectory.compact_dump(), kind="trajectory"
+    )
     assert restored.model_dump() == trajectory.model_dump()
 
     legacy = art.Trajectory(
@@ -586,7 +609,9 @@ def test_compact_round_trip_all_protocols_and_legacy_histories() -> None:
             {"role": "user", "content": _fresh(_long())},
         ]
     )
-    restored_legacy = art.Trajectory.compact_validate(legacy.compact_dump())
+    restored_legacy = art.trajectories.compact_validate(
+        legacy.compact_dump(), kind="trajectory"
+    )
     assert restored_legacy.model_dump() == legacy.model_dump()
 
 
@@ -616,7 +641,9 @@ def test_tokenized_compact_round_trip_all_protocol_source_shapes() -> None:
         )
         assert ordinary.model_dump_json() == tokenized.model_dump_json()
 
-        restored = art.TokenizedTrajectory.compact_validate(tokenized.compact_dump())
+        restored = art.trajectories.compact_validate(
+            tokenized.compact_dump(), kind="tokenized_trajectory"
+        )
 
         assert restored.model_dump() == tokenized.model_dump()
         canonical = getattr(restored.trajectory.exchanges, protocol)[0]
