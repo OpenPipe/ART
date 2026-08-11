@@ -1156,7 +1156,7 @@ def _collect_measurements(
     selected = _same_setting_decision_suffix(decisions, by_step)
     stats = [decision.stats for decision in selected]
     assert all(window is not None for window in stats)
-    first_stats, last_stats = stats
+    first_stats, last_stats = stats[0], stats[-1]
     steps = list(range(first_stats.start_step, last_stats.end_step + 1))
     missing = [step for step in steps if step not in by_step]
     _require(not missing, f"autotuner decision window lacks train rows: {missing}")

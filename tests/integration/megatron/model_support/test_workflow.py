@@ -281,7 +281,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             "discarded/step/stale_groups": 0,
             "discarded/step/zero_variance_groups": 0,
         }
-        for step in range(16, 20)
+        for step in range(14, 20)
     ]
     history_path = tmp_path / "history.jsonl"
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -296,6 +296,22 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     profile = SimpleNamespace(
         config=SimpleNamespace(mode="online", window_steps=2),
         decisions=[
+            SimpleNamespace(
+                action="hold",
+                previous=measured_settings,
+                updated=measured_settings,
+                stats=SimpleNamespace(
+                    start_step=14,
+                    end_step=15,
+                    window_start_s=-4.0,
+                    window_end_s=0.0,
+                    vllm_pressure=0.6,
+                    vllm_waiting_capacity_request_s=6.0,
+                    vllm_running_request_s=10.0,
+                    trainer_underfeed_score=0.07,
+                    actual_stale_frac=0.0,
+                ),
+            ),
             SimpleNamespace(
                 action="decrease_workers",
                 previous=measured_settings,
@@ -332,7 +348,9 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         policy_age_limit_steps=4,
     )
     events = [
-        PolicyActivationEvent(15, -2.25, -2.0),
+        PolicyActivationEvent(13, -4.25, -4.0),
+        PolicyActivationEvent(14, -3.5, -3.25),
+        PolicyActivationEvent(15, -1.5, -1.25),
         PolicyActivationEvent(16, 0.5, 0.75),
         PolicyActivationEvent(17, 2.5, 2.75),
         PolicyActivationEvent(18, 4.5, 4.75),
@@ -381,27 +399,27 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     measurements = collect(isolated_phase)
 
     expected = {
-        "original_trajectory_tokens": 16_000,
-        "nonpadding_logical_tokens": 4_000,
-        "loss_bearing_tokens": 2_000,
-        "accepted_train_tokens": 2_000,
+        "original_trajectory_tokens": 24_000,
+        "nonpadding_logical_tokens": 6_000,
+        "loss_bearing_tokens": 3_000,
+        "accepted_train_tokens": 3_000,
         "isolated_train_tok_s": 2_001 / 3.0,
         "matched_e2e_core_train_tok_s": 2_001 / 3.0,
-        "e2e_core_train_tok_s": 4_000 / 6.0,
+        "e2e_core_train_tok_s": 6_000 / 9.0,
         "e2e_train_tok_s": 500.0,
         "accepted_train_tok_s": 250.0,
         "mean_train_gap_s": 0.5,
         "stable_vllm_pressure": 0.6,
         "stable_trainer_underfeed": 0.07,
-        "post_warmup_policy_activation_count": 4,
-        "mean_policy_activation_lag_s": 0.5,
+        "post_warmup_policy_activation_count": 6,
+        "mean_policy_activation_lag_s": 2.5 / 6.0,
         "p50_policy_activation_lag_s": 0.25,
-        "p95_policy_activation_lag_s": 1.1,
+        "p95_policy_activation_lag_s": 1.0,
         "max_policy_activation_lag_s": 1.25,
-        "mean_policy_activation_interval_s": 2.4375,
-        "p50_policy_activation_interval_s": 2.375,
-        "p95_policy_activation_interval_s": 2.9625,
-        "second_max_policy_activation_interval_s": 2.75,
+        "mean_policy_activation_interval_s": 11.75 / 6.0,
+        "p50_policy_activation_interval_s": 2.0,
+        "p95_policy_activation_interval_s": 2.75,
+        "second_max_policy_activation_interval_s": 2.0,
         "max_policy_activation_interval_s": 3.0,
     }
     assert {key: measurements[key] for key in expected} == pytest.approx(expected)
@@ -415,7 +433,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         min_matched_core_to_isolated_ratio=0.95,
         max_mean_policy_activation_lag_s=1.5,
         max_policy_activation_lag_s=2.0,
-        max_repeated_policy_activation_interval_s=2.5,
+        max_repeated_policy_activation_interval_s=1.5,
     )
     assert acceptance_failures(measurements, config, thresholds) == [
         "repeated_policy_activation_cadence_s"
@@ -442,7 +460,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         min_matched_core_to_isolated_ratio=0.95,
         max_mean_policy_activation_lag_s=1.5,
         max_policy_activation_lag_s=2.0,
-        max_repeated_policy_activation_interval_s=2.5,
+        max_repeated_policy_activation_interval_s=1.5,
     )
     assert acceptance_failures(measurements, config, estimated) == [
         "repeated_policy_activation_cadence_s",
