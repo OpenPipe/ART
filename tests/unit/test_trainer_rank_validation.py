@@ -543,6 +543,34 @@ async def test_shared_checkpoint_prefetch_survives_waiter_cancellation(
     assert trainer._checkpoint_prefetch_tasks == {}
 
 
+async def test_shared_checkpoint_prefetch_serves_successful_waiters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    source = object()
+    calls = 0
+
+    async def delayed_to_thread(_function: object, *_args: object) -> object:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return source
+
+    monkeypatch.setattr(asyncio, "to_thread", delayed_to_thread)
+    first = asyncio.create_task(trainer._prefetch_checkpoint("student"))
+    second = asyncio.create_task(trainer._prefetch_checkpoint("student"))
+    await started.wait()
+    await asyncio.sleep(0)
+    release.set()
+
+    assert await asyncio.gather(first, second) == [source, source]
+    assert calls == 1
+    assert trainer._checkpoint_prefetch_tasks == {}
+
+
 async def test_materialized_sources_keep_logical_checkpoint_identities(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -567,17 +595,16 @@ async def test_materialized_sources_keep_logical_checkpoint_identities(
     logical_b = "wandb-artifact:///entity/project/run-teacher:step1"
     logical_c = "wandb-artifact:///entity/project/run-reference:step1"
 
-    await trainer._prefetch_checkpoints_from_sources(
-        (logical_a, root_a), (logical_b, root_a), (logical_c, root_b)
-    )
-    assert sorted(prepared) == sorted(
-        (trainer._checkpoint_source_key(root_a), trainer._checkpoint_source_key(root_b))
-    )
-
     await asyncio.gather(
         trainer._load_checkpoint_from_source(logical_a, root_a),
         trainer._load_checkpoint_from_source(logical_b, root_a),
-        trainer._load_checkpoint_from_source(logical_c, root_b),
+    )
+    assert prepared == [trainer._checkpoint_source_key(root_a)]
+
+    await trainer._prefetch_checkpoints_from_sources((logical_c, root_b))
+    await trainer._load_checkpoint_from_source(logical_c, root_b)
+    assert sorted(prepared) == sorted(
+        (trainer._checkpoint_source_key(root_a), trainer._checkpoint_source_key(root_b))
     )
     assert [logical_path for logical_path, _source in installed] == [
         logical_a,
