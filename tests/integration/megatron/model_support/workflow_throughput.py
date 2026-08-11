@@ -46,7 +46,7 @@ _POLICY_AGE_P95 = "offpolicy/token_weighted_policy_age_p95_steps"
 _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
-_MEASUREMENT_CONTRACT_VERSION = 11
+_MEASUREMENT_CONTRACT_VERSION = 12
 _ISOLATED_WARMUP_STEPS = 1
 # Average enough exact E2E/isolated pairs to absorb one transient GPU tail.
 _MATCHED_MEASURED_STEPS = 6
@@ -1135,7 +1135,9 @@ def _collect_measurements(
         f"{policy_age_limit} != {config.max_steps_off_policy}",
     )
     decisions = [
-        decision for decision in profile.decisions if decision.stats is not None
+        decision
+        for decision in profile.decisions
+        if decision.stats is not None and decision.stats.end_step <= config.max_steps
     ]
     _require(bool(decisions), "throughput evidence requires autotuner windows")
     last_stats = decisions[-1].stats

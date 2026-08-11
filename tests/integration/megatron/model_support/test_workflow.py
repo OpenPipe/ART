@@ -344,6 +344,22 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                     actual_stale_frac=0.0,
                 ),
             ),
+            SimpleNamespace(
+                action="decrease_workers",
+                previous=future_settings,
+                updated=future_settings.model_copy(update={"num_rollout_workers": 12}),
+                stats=SimpleNamespace(
+                    start_step=20,
+                    end_step=21,
+                    window_start_s=8.0,
+                    window_end_s=12.0,
+                    vllm_pressure=0.1,
+                    vllm_waiting_capacity_request_s=1.0,
+                    vllm_running_request_s=10.0,
+                    trainer_underfeed_score=0.5,
+                    actual_stale_frac=0.0,
+                ),
+            ),
         ],
         policy_age_limit_steps=4,
     )
