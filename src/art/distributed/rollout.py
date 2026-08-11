@@ -378,6 +378,8 @@ class DistributedTrajectoryQueue:
         self.endpoint = endpoint
         self.owner_endpoints = owner_endpoints
         self.maxsize = maxsize
+        self._effective_maxsize = maxsize
+        self._minimum_take_size = 0
         self.capacity_records = capacity_records
         self.capacity_bytes = capacity_bytes
         self.queue_id = uuid.uuid4().hex
@@ -399,7 +401,7 @@ class DistributedTrajectoryQueue:
     async def start(self) -> None:
         if self._started:
             return
-        created_maxsize = self.maxsize
+        created_maxsize = self._effective_maxsize
         await self.endpoint.create(
             self.queue_id,
             created_maxsize,
@@ -407,8 +409,9 @@ class DistributedTrajectoryQueue:
             self.capacity_bytes,
         )
         self._started = True
-        if self.maxsize != created_maxsize:
-            self._schedule_resize()
+        if self._required_maxsize() != created_maxsize:
+            self._effective_maxsize = created_maxsize
+            self._sync_maxsize()
 
     def set_maxsize(self, maxsize: int) -> None:
         if maxsize < 1:
@@ -416,8 +419,7 @@ class DistributedTrajectoryQueue:
         if maxsize == self.maxsize:
             return
         self.maxsize = maxsize
-        if self._started and not self._closed:
-            self._schedule_resize()
+        self._sync_maxsize()
 
     async def put(
         self,
@@ -500,31 +502,44 @@ class DistributedTrajectoryQueue:
             raise ValueError("trajectory queue get count must be positive")
         self._raise_owner_cleanup_failure()
         async with self._take_lock:
-            closed = self._closed
-            while not closed:
-                item_available = asyncio.get_running_loop().create_future()
-                self._item_waiters.add(item_available)
-                try:
-                    # Negative counts retain best-effort bulk reads above the minimum.
-                    take = await self._take_trajectories(count if wait else -count)
-                    if take.leases:
-                        return await self._resolve_many(take.leases), take.closed
-                    closed = take.closed
-                    if closed or not wait:
-                        break
-                    self._notify_space()
+            minimum_reserved = wait and count <= self.maxsize
+            if minimum_reserved:
+                self._minimum_take_size = count
+                self._sync_maxsize()
+            try:
+                if wait:
+                    await self._flush_resizes()
+                closed = self._closed
+                while not closed:
+                    item_available = asyncio.get_running_loop().create_future()
+                    self._item_waiters.add(item_available)
                     try:
-                        await item_available
-                    except asyncio.CancelledError:
-                        if not self._closed:
-                            await self.endpoint.take(self.queue_id, self.consumer_id, 0)
-                        raise
-                    closed = self._closed
-                finally:
-                    self._item_waiters.discard(item_available)
-                    if not item_available.done():
-                        item_available.cancel()
-            return [], closed
+                        # Negative counts retain best-effort bulk reads above the minimum.
+                        take = await self._take_trajectories(count if wait else -count)
+                        if take.leases:
+                            return await self._resolve_many(take.leases), take.closed
+                        closed = take.closed
+                        if closed or not wait:
+                            break
+                        self._notify_space()
+                        try:
+                            await item_available
+                        except asyncio.CancelledError:
+                            if not self._closed:
+                                await self.endpoint.take(
+                                    self.queue_id, self.consumer_id, 0
+                                )
+                            raise
+                        closed = self._closed
+                    finally:
+                        self._item_waiters.discard(item_available)
+                        if not item_available.done():
+                            item_available.cancel()
+                return [], closed
+            finally:
+                if minimum_reserved:
+                    self._minimum_take_size = 0
+                    self._sync_maxsize()
 
     async def discard_group(self, group: TrajectoryGroup) -> None:
         selection = group._distributed_lease
@@ -593,7 +608,7 @@ class DistributedTrajectoryQueue:
         if not self._started or self._closed:
             return TrajectoryQueueSnapshot(
                 items=(),
-                max_ready_groups=self.maxsize,
+                max_ready_groups=self._effective_maxsize,
                 generation=self._resize_generation,
                 capacity_records=self.capacity_records,
                 capacity_bytes=self.capacity_bytes,
@@ -646,11 +661,22 @@ class DistributedTrajectoryQueue:
         if failures:
             raise BaseExceptionGroup("trajectory queue cleanup failed", failures)
 
-    def _schedule_resize(self) -> None:
+    def _required_maxsize(self) -> int:
+        return max(self.maxsize, self._minimum_take_size)
+
+    def _sync_maxsize(self) -> None:
+        maxsize = self._required_maxsize()
+        if maxsize == self._effective_maxsize:
+            return
+        self._effective_maxsize = maxsize
+        if self._started and not self._closed:
+            self._schedule_resize(maxsize)
+
+    def _schedule_resize(self, maxsize: int) -> None:
         self._resize_generation += 1
         operation = TrajectoryQueueResize(
             queue_id=self.queue_id,
-            maxsize=self.maxsize,
+            maxsize=maxsize,
             generation=self._resize_generation,
         )
 
