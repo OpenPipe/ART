@@ -178,7 +178,7 @@ class DistributedMegatronService:
     """One model's durable checkpoints and run-scoped distributed runtimes."""
 
     propagate_close_errors = True
-    close_timeout_s = 120.0
+    close_timeout_s = 300.0
 
     def __init__(
         self,
