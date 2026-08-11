@@ -327,6 +327,17 @@ class PipelineAutotuner:
             by_step=by_step,
             window_steps=window_steps,
         )
+        if not vllm_pressure_samples:
+            vllm_pressure_samples = _vllm_samples_from_metrics(vllm_metrics)
+        waiting_capacity_request_s, running_request_s = (
+            _vllm_request_seconds_from_samples(
+                vllm_pressure_samples,
+                window_start_s=t0,
+                window_end_s=t1,
+                metric_interval_s=self.config.vllm_metric_interval_s,
+                min_coverage=1.0 - self.config.vllm_metric_timeout_window_frac,
+            )
+        )
         return TunerWindowStats(
             start_step=window_steps[0],
             end_step=window_steps[-1],
@@ -337,23 +348,11 @@ class PipelineAutotuner:
                 idle_frac=trainer_idle_frac,
                 unused_and_dummy_ratio=unused_and_dummy_ratio_mean,
             ),
-            vllm_pressure=(
-                _vllm_pressure_from_samples(
-                    vllm_pressure_samples,
-                    window_start_s=t0,
-                    window_end_s=t1,
-                    metric_interval_s=self.config.vllm_metric_interval_s,
-                    min_coverage=1.0 - self.config.vllm_metric_timeout_window_frac,
-                )
-                if vllm_pressure_samples
-                else _vllm_pressure(
-                    vllm_metrics,
-                    window_start_s=t0,
-                    window_end_s=t1,
-                    metric_interval_s=self.config.vllm_metric_interval_s,
-                    min_coverage=1.0 - self.config.vllm_metric_timeout_window_frac,
-                )
+            vllm_pressure=_vllm_pressure_ratio(
+                waiting_capacity_request_s, running_request_s
             ),
+            vllm_waiting_capacity_request_s=waiting_capacity_request_s,
+            vllm_running_request_s=running_request_s,
             queue_put_wait_frac=queue_put_wait_s
             / max(queue_put_wait_s + rollout_s, 1e-9),
             predicted_stale_frac=_mean(step_values("queue/predicted_stale_fraction")),
@@ -1201,6 +1200,18 @@ def _vllm_pressure(
     metric_interval_s: float,
     min_coverage: float,
 ) -> float:
+    return _vllm_pressure_from_samples(
+        _vllm_samples_from_metrics(metrics),
+        window_start_s=window_start_s,
+        window_end_s=window_end_s,
+        metric_interval_s=metric_interval_s,
+        min_coverage=min_coverage,
+    )
+
+
+def _vllm_samples_from_metrics(
+    metrics: list[PipelineMetric],
+) -> list[tuple[float, float, float]]:
     wanted = {"vllm/num_requests_running", "vllm/num_requests_waiting_capacity"}
     rows: list[tuple[float, str, float]] = []
     for rec in metrics:
@@ -1222,13 +1233,7 @@ def _vllm_pressure(
         raise RuntimeError(
             "Pipeline autotuning requires complete vLLM running/capacity samples."
         )
-    return _vllm_pressure_from_samples(
-        samples,
-        window_start_s=window_start_s,
-        window_end_s=window_end_s,
-        metric_interval_s=metric_interval_s,
-        min_coverage=min_coverage,
-    )
+    return samples
 
 
 def _vllm_pressure_from_samples(
@@ -1239,6 +1244,25 @@ def _vllm_pressure_from_samples(
     metric_interval_s: float,
     min_coverage: float,
 ) -> float:
+    return _vllm_pressure_ratio(
+        *_vllm_request_seconds_from_samples(
+            samples,
+            window_start_s=window_start_s,
+            window_end_s=window_end_s,
+            metric_interval_s=metric_interval_s,
+            min_coverage=min_coverage,
+        )
+    )
+
+
+def _vllm_request_seconds_from_samples(
+    samples: Sequence[tuple[float, float, float]],
+    *,
+    window_start_s: float,
+    window_end_s: float,
+    metric_interval_s: float,
+    min_coverage: float,
+) -> tuple[float, float]:
     by_time = {
         t_s: (running, waiting_capacity)
         for t_s, running, waiting_capacity in samples
@@ -1266,17 +1290,23 @@ def _vllm_pressure_from_samples(
             f"covered {coverage:.1%} of the decision window; requires at least "
             f"{min_coverage:.1%}."
         )
-    capacity_wait_request_s = 0.0
+    waiting_capacity_request_s = 0.0
     running_request_s = 0.0
     for t_s, duration_s in intervals:
         running, waiting_capacity = by_time[t_s]
-        capacity_wait_request_s += max(0.0, waiting_capacity) * duration_s
+        waiting_capacity_request_s += max(0.0, waiting_capacity) * duration_s
         running_request_s += max(0.0, running) * duration_s
     if total_s <= 0.0:
         raise RuntimeError("Pipeline autotuning requires nonzero vLLM sample duration.")
+    return waiting_capacity_request_s, running_request_s
+
+
+def _vllm_pressure_ratio(
+    waiting_capacity_request_s: float, running_request_s: float
+) -> float:
     if running_request_s > 0.0:
-        return capacity_wait_request_s / running_request_s
-    return math.inf if capacity_wait_request_s > 0.0 else 0.0
+        return waiting_capacity_request_s / running_request_s
+    return math.inf if waiting_capacity_request_s > 0.0 else 0.0
 
 
 def _group_vllm_metric_rows(

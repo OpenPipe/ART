@@ -143,6 +143,8 @@ class TunerWindowStats(pydantic.BaseModel):
     collect_batch_s: float = 0.0
     trainer_underfeed_score: float = 0.0
     vllm_pressure: float = 0.0
+    vllm_waiting_capacity_request_s: float = pydantic.Field(default=0.0, ge=0.0)
+    vllm_running_request_s: float = pydantic.Field(default=0.0, ge=0.0)
     queue_put_wait_frac: float = 0.0
     predicted_stale_frac: float = 0.0
     actual_stale_frac: float = 0.0

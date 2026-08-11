@@ -267,6 +267,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             "pipeline/global_dummy_microbatches": 0,
             "time/step_train_s": 1.5,
             "time/step_wall_s": 2.0,
+            "time/step_collect_batch_s": 0.001068115234375,
             "queue/packed_get_wait_s": 0.1,
             "offpolicy/token_weighted_policy_age_steps": 1.0,
             "offpolicy/token_weighted_policy_age_p95_steps": 2.0,
@@ -299,6 +300,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                     window_start_s=0.0,
                     window_end_s=4.0,
                     vllm_pressure=0.45,
+                    vllm_waiting_capacity_request_s=4.5,
+                    vllm_running_request_s=10.0,
                     trainer_underfeed_score=0.10,
                     actual_stale_frac=0.0,
                 ),
@@ -313,6 +316,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                     window_start_s=4.0,
                     window_end_s=8.0,
                     vllm_pressure=0.65,
+                    vllm_waiting_capacity_request_s=19.5,
+                    vllm_running_request_s=30.0,
                     trainer_underfeed_score=0.04,
                     actual_stale_frac=0.0,
                 ),
@@ -346,8 +351,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         )
 
     e2e_phase, isolated_phase = (
-        phase("e2e", "input-a", (21,)),
-        phase("isolated", "input-a", (23, 24)),
+        phase("e2e", "input-a", (21, 22)),
+        phase("isolated", "input-a", (24, 25)),
     )
 
     def collect(isolated):
@@ -377,7 +382,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "e2e_train_tok_s": 500.0,
         "accepted_train_tok_s": 250.0,
         "mean_train_gap_s": 0.5,
-        "stable_vllm_pressure": 0.55,
+        "stable_vllm_pressure": 0.6,
         "stable_trainer_underfeed": 0.07,
         "post_warmup_policy_activation_count": 4,
         "mean_policy_activation_lag_s": 0.5,

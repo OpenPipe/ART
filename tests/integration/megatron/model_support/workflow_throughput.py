@@ -46,9 +46,9 @@ _POLICY_AGE_P95 = "offpolicy/token_weighted_policy_age_p95_steps"
 _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
-_MEASUREMENT_CONTRACT_VERSION = 7
+_MEASUREMENT_CONTRACT_VERSION = 8
 _ISOLATED_WARMUP_STEPS = 1
-_ISOLATED_MEASURED_STEPS = 2
+_MATCHED_MEASURED_STEPS = 2
 _CAPTURE_GUARD_STEPS = 1
 _REPO_ROOT = Path(__file__).parents[4]
 _MAIN_RUNTIME_PACKAGES = (
@@ -98,8 +98,13 @@ class TrainerPhaseEvidence(NamedTuple):
 
     @property
     def train_tok_s(self) -> float:
-        logical = self.metrics[0]["data/step_nonpadding_logical_tokens"]
-        return logical * self.sample_count / self.train_s
+        return (
+            sum(
+                metrics["data/step_nonpadding_logical_tokens"]
+                for metrics in self.metrics
+            )
+            / self.train_s
+        )
 
 
 def _same_executed_settings(decisions: list[Any]) -> bool:
@@ -350,6 +355,35 @@ def _bundle_bytes(bundles: tuple[Any, ...]) -> bytes:
     from msgspec import msgpack
 
     return msgpack.encode(tuple(bundle.model_dump(mode="python") for bundle in bundles))
+
+
+def _matched_input_fingerprints(
+    trajectory_fingerprints: list[str], packed_fingerprints: list[str]
+) -> tuple[str, str]:
+    _require(
+        len(trajectory_fingerprints)
+        == len(packed_fingerprints)
+        == _MATCHED_MEASURED_STEPS,
+        "matched trainer phases require complete paired inputs",
+    )
+    _require(
+        len(set(trajectory_fingerprints)) == _MATCHED_MEASURED_STEPS,
+        "matched E2E samples must use distinct trajectory inputs",
+    )
+    return _digest(trajectory_fingerprints), _digest(
+        list(zip(trajectory_fingerprints, packed_fingerprints, strict=True))
+    )
+
+
+async def _discard_prepared_pipeline_batch(backend: Any, groups: list[Any]) -> None:
+    for group in groups:
+        group._distributed_lease = None
+    await backend.discard_pipeline_batch(groups)
+
+
+def _matched_capture_steps(max_steps: int) -> tuple[int, ...]:
+    first = max_steps + _CAPTURE_GUARD_STEPS + 1
+    return tuple(range(first, first + _MATCHED_MEASURED_STEPS))
 
 
 def _packed_input_fingerprint(groups: list[Any]) -> str:
@@ -759,7 +793,7 @@ def _calibration_contract(
             "score_reference_rollouts_per_group": config.rollouts_per_group,
             "max_steps_off_policy": config.max_steps_off_policy,
             "isolated_warmup_steps": _ISOLATED_WARMUP_STEPS,
-            "isolated_measured_steps": _ISOLATED_MEASURED_STEPS,
+            "matched_measured_steps": _MATCHED_MEASURED_STEPS,
         },
         "packed_sequence_length": config.packed_sequence_length,
         "prompt_tokens": actual_prompt_tokens,
@@ -942,6 +976,8 @@ def _window_measurements(stats: Any, rows: list[dict[str, Any]]) -> dict[str, An
         "end_step": stats.end_step,
         "duration_s": duration_s,
         "vllm_pressure": float(stats.vllm_pressure),
+        "vllm_waiting_capacity_request_s": float(stats.vllm_waiting_capacity_request_s),
+        "vllm_running_request_s": float(stats.vllm_running_request_s),
         "trainer_underfeed": float(stats.trainer_underfeed_score),
         _POLICY_AGE_MEAN: _accepted_token_weighted(rows, _POLICY_AGE_MEAN),
         _POLICY_AGE_P95: max(_numeric_values(rows, _POLICY_AGE_P95)),
@@ -957,31 +993,41 @@ async def _run_isolated_backend_phase(
     model: Any,
     service: Any,
     train: Callable[..., Awaitable[Any]],
-    bundles_path: Path,
+    bundles_paths: tuple[Path, ...],
 ) -> TrainerPhaseEvidence:
     from art.distributed.trajectory_store import TrajectoryGroupBundle
 
-    trajectory_input_fingerprint = hashlib.sha256(bundles_path.read_bytes()).hexdigest()
-    source_bundles = _load_bundles(bundles_path)
-    packed_input_fingerprint: str | None = None
+    _require(
+        len(bundles_paths) == _MATCHED_MEASURED_STEPS,
+        "isolated phase requires every matched E2E input",
+    )
+    trajectory_input_fingerprints = [
+        hashlib.sha256(path.read_bytes()).hexdigest() for path in bundles_paths
+    ]
+    benchmark_paths = (bundles_paths[0],) * _ISOLATED_WARMUP_STEPS + bundles_paths
+    packed_input_fingerprints: list[str] = []
     samples: list[tuple[Mapping[str, Any], int]] = []
-    for sample_index in range(_ISOLATED_WARMUP_STEPS + _ISOLATED_MEASURED_STEPS):
+    for sample_index, bundles_path in enumerate(benchmark_paths):
+        expected_trajectory_fingerprint = hashlib.sha256(
+            bundles_path.read_bytes()
+        ).hexdigest()
+        source_bundles = _load_bundles(bundles_path)
         groups = [bundle.build() for bundle in source_bundles]
         rebuilt = tuple(TrajectoryGroupBundle.from_group(group) for group in groups)
         if (
             hashlib.sha256(_bundle_bytes(rebuilt)).hexdigest()
-            != trajectory_input_fingerprint
+            != expected_trajectory_fingerprint
         ):
             raise RuntimeError("isolated trajectory input changed during round trip")
         _collect_matched_packing_shapes(groups)
         packing = await backend.prepare_pipeline_batch(model, groups)
         if packing is None:
             raise RuntimeError("isolated backend benchmark produced no packed batch")
-        current_packed_fingerprint = _packed_input_fingerprint(groups)
-        if packed_input_fingerprint is None:
-            packed_input_fingerprint = current_packed_fingerprint
-        elif current_packed_fingerprint != packed_input_fingerprint:
-            raise RuntimeError("isolated packed tensors changed between samples")
+        try:
+            current_packed_fingerprint = _packed_input_fingerprint(groups)
+        except BaseException:
+            await _discard_prepared_pipeline_batch(backend, groups)
+            raise
         result = await train(
             model,
             groups,
@@ -994,9 +1040,14 @@ async def _run_isolated_backend_phase(
             optimizer_save_interval=5,
         )
         if sample_index >= _ISOLATED_WARMUP_STEPS:
+            packed_input_fingerprints.append(current_packed_fingerprint)
             samples.append((result.metrics, int(result.step)))
         await service.wait_for_serving(int(result.step))
-    assert packed_input_fingerprint is not None
+    trajectory_input_fingerprint, packed_input_fingerprint = (
+        _matched_input_fingerprints(
+            trajectory_input_fingerprints, packed_input_fingerprints
+        )
+    )
     return _phase_evidence(
         phase="isolated",
         runtime_fingerprint=service._runtime_spec().fingerprint,
@@ -1019,6 +1070,8 @@ def _collect_measurements(
     capture_settings: Mapping[str, int],
     calibration_fingerprint: str,
 ) -> dict[str, Any]:
+    from art.pipeline_tuner.autotune import _trainer_underfeed_score
+
     _require(
         profile.config.mode == "online",
         f"throughput stage requires online autotuning, got {profile.config.mode}",
@@ -1140,6 +1193,26 @@ def _collect_measurements(
     )
 
     stale_rate, zero_variance_rate = _discard_rates(rows)
+    waiting_request_s = sum(
+        window["vllm_waiting_capacity_request_s"] for window in windows
+    )
+    running_request_s = sum(window["vllm_running_request_s"] for window in windows)
+    stable_vllm_pressure = (
+        waiting_request_s / running_request_s
+        if running_request_s > 0.0
+        else math.inf
+        if waiting_request_s > 0.0
+        else 0.0
+    )
+    capacities = _numeric_values(rows, "data/step_nominal_schedule_capacity_tokens")
+    nonpadding = _numeric_values(rows, "data/step_nonpadding_logical_tokens")
+    stable_trainer_underfeed = _trainer_underfeed_score(
+        idle_frac=_total(rows, "time/step_collect_batch_s") / wall_s,
+        unused_and_dummy_ratio=fmean(
+            max(0.0, (capacity - used) / capacity)
+            for capacity, used in zip(capacities, nonpadding, strict=True)
+        ),
+    )
     thresholds = config.thresholds.get(hardware)
     measurements = {
         "hardware": hardware,
@@ -1170,14 +1243,8 @@ def _collect_measurements(
         "mean_train_gap_s": (e2e_elapsed_s - train_s) / len(rows),
         "e2e_elapsed_s": e2e_elapsed_s,
         "autotuner_windows": windows,
-        "stable_vllm_pressure": sum(
-            window["vllm_pressure"] * window["duration_s"] for window in windows
-        )
-        / e2e_elapsed_s,
-        "stable_trainer_underfeed": sum(
-            window["trainer_underfeed"] * window["duration_s"] for window in windows
-        )
-        / e2e_elapsed_s,
+        "stable_vllm_pressure": stable_vllm_pressure,
+        "stable_trainer_underfeed": stable_trainer_underfeed,
         "matched_capture_pipeline_settings": dict(capture_settings),
         "mean_policy_activation_lag_s": fmean(lags),
         "p50_policy_activation_lag_s": median(lags),
@@ -1207,15 +1274,19 @@ def _collect_measurements(
         not mismatches,
         f"isolated and E2E phases did not execute the same packed input: {mismatches}",
     )
-    capture_step = config.max_steps + _CAPTURE_GUARD_STEPS + 1
+    capture_steps = _matched_capture_steps(config.max_steps)
     _require(
-        e2e.policy_steps == (capture_step,),
-        f"matched E2E input was not captured at reserved step {capture_step}",
+        e2e.policy_steps == capture_steps,
+        f"matched E2E inputs were not captured at reserved steps {capture_steps}",
+    )
+    _require(
+        e2e.sample_count == isolated.sample_count == _MATCHED_MEASURED_STEPS,
+        "matched trainer phases have asymmetric sample counts",
     )
     expected_isolated_steps = tuple(
         range(
-            capture_step + 1 + _ISOLATED_WARMUP_STEPS,
-            capture_step + 1 + _ISOLATED_WARMUP_STEPS + isolated.sample_count,
+            capture_steps[-1] + 1 + _ISOLATED_WARMUP_STEPS,
+            capture_steps[-1] + 1 + _ISOLATED_WARMUP_STEPS + isolated.sample_count,
         )
     )
     _require(
@@ -1361,10 +1432,13 @@ async def _run_e2e_throughput_async(
     events: list[PolicyActivationEvent] = []
     e2e_phase: TrainerPhaseEvidence | None = None
     isolated_phase: TrainerPhaseEvidence | None = None
-    captured_training_input: (
-        tuple[tuple[Any, ...], str, dict[str, int], Mapping[str, Any], int] | None
-    ) = None
-    bundles_path = stage_dir / "matched_packed_input.msgpack"
+    captured_training_inputs: list[
+        tuple[tuple[Any, ...], str, dict[str, int], Mapping[str, Any], int]
+    ] = []
+    bundles_paths = tuple(
+        stage_dir / f"matched_packed_input_{index}.msgpack"
+        for index in range(_MATCHED_MEASURED_STEPS)
+    )
     autotune = PipelineAutotuneConfig(
         mode="online",
         output_name="throughput",
@@ -1386,7 +1460,7 @@ async def _run_e2e_throughput_async(
             f"warmup={autotune.warmup_ignore_steps}, window={autotune.window_steps}"
         )
     # Keep test-only trajectory materialization off the final measured publication.
-    capture_train_call = config.max_steps + _CAPTURE_GUARD_STEPS + 1
+    capture_train_calls = _matched_capture_steps(config.max_steps)
     runtime_contract = _calibration_contract(
         base_model=base_model,
         fixture=fixture,
@@ -1493,7 +1567,7 @@ async def _run_e2e_throughput_async(
                 autotune=autotune,
                 learning_rate=1e-6,
                 loss_fn="cispo",
-                max_steps=capture_train_call,
+                max_steps=capture_train_calls[-1],
                 eval_fn=None,
                 eval_every_n_steps=0,
                 eval_at_start=False,
@@ -1514,7 +1588,7 @@ async def _run_e2e_throughput_async(
             train_call_count = 0
 
             async def tracked_train(*args: Any, **kwargs: Any) -> Any:
-                nonlocal captured_training_input, train_call_count
+                nonlocal train_call_count
                 train_call_count += 1
                 if len(args) < 2:
                     raise RuntimeError(
@@ -1522,13 +1596,17 @@ async def _run_e2e_throughput_async(
                     )
                 groups = args[1]
                 captured: tuple[tuple[Any, ...], str, dict[str, int]] | None = None
-                if train_call_count == capture_train_call:
-                    _collect_matched_packing_shapes(groups)
-                    captured = (
-                        await _capture_training_bundles(groups),
-                        _packed_input_fingerprint(groups),
-                        _current_pipeline_settings(trainer),
-                    )
+                if train_call_count in capture_train_calls:
+                    try:
+                        _collect_matched_packing_shapes(groups)
+                        captured = (
+                            await _capture_training_bundles(groups),
+                            _packed_input_fingerprint(groups),
+                            _current_pipeline_settings(trainer),
+                        )
+                    except BaseException:
+                        await _discard_prepared_pipeline_batch(backend, groups)
+                        raise
                 result = await original_train(*args, **kwargs)
                 step = int(result.step)
                 if step in activation_tasks:
@@ -1539,21 +1617,17 @@ async def _run_e2e_throughput_async(
                     _activation_event(service, step)
                 )
                 if captured is not None:
-                    captured_training_input = (
-                        *captured,
-                        result.metrics,
-                        step,
-                    )
+                    captured_training_inputs.append((*captured, result.metrics, step))
                 return result
 
             setattr(backend, "train", tracked_train)
             try:
                 with _hold_pipeline_settings_after_step(trainer, config.max_steps):
                     await trainer.train(handle_signals=False)
-                if train_call_count != capture_train_call:
+                if train_call_count != capture_train_calls[-1]:
                     raise RuntimeError(
                         "online pipeline did not execute measurement plus capture steps: "
-                        f"{train_call_count} != {capture_train_call}"
+                        f"{train_call_count} != {capture_train_calls[-1]}"
                     )
                 events = sorted(
                     await asyncio.gather(*activation_tasks.values()),
@@ -1562,28 +1636,56 @@ async def _run_e2e_throughput_async(
             finally:
                 setattr(backend, "train", original_train)
                 await _cancel_activation_tasks(activation_tasks)
-            if captured_training_input is None:
+            if len(captured_training_inputs) != _MATCHED_MEASURED_STEPS:
                 raise RuntimeError(
-                    "online pipeline never captured a matched train batch"
+                    "online pipeline did not capture every matched train batch"
                 )
-            bundles, packed_fingerprint, capture_settings, metrics, step = (
-                captured_training_input
+            bundle_payloads = await asyncio.gather(
+                *(
+                    asyncio.to_thread(_bundle_bytes, captured[0])
+                    for captured in captured_training_inputs
+                )
             )
-            bundle_payload = await asyncio.to_thread(_bundle_bytes, bundles)
-            await asyncio.to_thread(bundles_path.write_bytes, bundle_payload)
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(path.write_bytes, payload)
+                    for path, payload in zip(
+                        bundles_paths, bundle_payloads, strict=True
+                    )
+                )
+            )
+            capture_settings = captured_training_inputs[0][2]
+            _require(
+                all(
+                    captured[2] == capture_settings
+                    for captured in captured_training_inputs[1:]
+                ),
+                "matched E2E samples used different pipeline settings",
+            )
+            trajectory_input_fingerprint, packed_input_fingerprint = (
+                _matched_input_fingerprints(
+                    [
+                        hashlib.sha256(payload).hexdigest()
+                        for payload in bundle_payloads
+                    ],
+                    [captured[1] for captured in captured_training_inputs],
+                )
+            )
             e2e_phase = _phase_evidence(
                 phase="e2e",
                 runtime_fingerprint=service._runtime_spec().fingerprint,
-                trajectory_input_fingerprint=hashlib.sha256(bundle_payload).hexdigest(),
-                packed_input_fingerprint=packed_fingerprint,
-                samples=[(metrics, step)],
+                trajectory_input_fingerprint=trajectory_input_fingerprint,
+                packed_input_fingerprint=packed_input_fingerprint,
+                samples=[
+                    (captured[3], captured[4]) for captured in captured_training_inputs
+                ],
             )
             isolated_phase = await _run_isolated_backend_phase(
                 backend=backend,
                 model=model,
                 service=service,
                 train=original_train,
-                bundles_path=bundles_path,
+                bundles_paths=bundles_paths,
             )
         finally:
             await client.close()
@@ -1619,7 +1721,7 @@ async def _run_e2e_throughput_async(
         "isolated": isolated_phase._asdict(),
         "e2e": e2e_phase._asdict(),
         "runtime_contract": runtime_contract,
-        "matched_trajectory_input": str(bundles_path),
+        "matched_trajectory_inputs": [str(path) for path in bundles_paths],
         "autotuner_profile": str(profile_path),
         "policy_activation_timeline": str(activation_path),
         "thresholds": thresholds.model_dump(mode="json") if thresholds else None,
