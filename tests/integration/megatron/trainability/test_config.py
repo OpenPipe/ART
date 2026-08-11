@@ -654,11 +654,11 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
     assert default_variant == "megatron_dedicated"
     assert variant.topology is not None
     assert variant.topology.tp == 2
-    assert variant.topology.ep == 2
+    assert variant.topology.ep == 4
     assert variant.topology.cp == 1
-    assert variant.topology.dp == 1
+    assert variant.topology.dp == 2
     assert variant.topology.sp is True
-    assert variant.trainer_gpu_ids == [0, 1]
+    assert variant.trainer_gpu_ids == [0, 1, 2, 3]
     assert variant.inference_gpu_ids == [2, 3]
     assert config["engine_args"]["tensor_parallel_size"] == 2
     assert config["engine_args"]["enable_expert_parallel"] is True
