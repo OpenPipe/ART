@@ -465,6 +465,7 @@ def test_qwen3_5_length_trainability_uses_stable_moe_defaults() -> None:
     assert _length_rollout_seed("Qwen/Qwen3-30B-A3B-Instruct-2507") is None
     assert _length_rollout_temperature("Qwen/Qwen3-30B-A3B-Instruct-2507") == 1.1
     assert _length_current_step_demand("Qwen/Qwen3-30B-A3B-Instruct-2507") is False
+    assert _length_rollout_seed("openai/gpt-oss-20b") == 20261833
     assert _length_current_step_demand("openai/gpt-oss-20b") is True
 
 
