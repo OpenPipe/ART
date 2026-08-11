@@ -2,20 +2,25 @@ import math
 import pickle
 
 import art
+import art.trajectories as tr
 
 
-def _history() -> art.TokenizedHistory:
-    return art.TokenizedHistory(
-        history=art.LegacyHistory(messages_and_choices=[]),
+def _history() -> tr.TokenizedHistory:
+    return tr.TokenizedHistory(
+        history=tr.LegacyHistory(messages_and_choices=[]),
         model="policy",
         token_ids=[1, 2],
         logprobs=[math.nan, -0.25],
-        flags=[art.TokenFlag.EXACT, art.TokenFlag.EXACT | art.TokenFlag.SAMPLED],
+        flags=[
+            tr.TokenFlag.EXACT,
+            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        ],
     )
 
 
 def _assert_history_round_trip(
-    restored: art.TokenizedHistory, expected: art.TokenizedHistory
+    restored: tr.TokenizedHistory,
+    expected: tr.TokenizedHistory,
 ) -> None:
     assert restored.model == expected.model
     assert restored.token_ids == expected.token_ids
@@ -28,20 +33,20 @@ def test_tokenized_history_nan_json_round_trip() -> None:
     value = _history()
     payload = value.model_dump_json()
     assert '"NaN"' in payload
-    restored = art.TokenizedHistory.model_validate_json(payload)
+    restored = tr.TokenizedHistory.model_validate_json(payload)
     _assert_history_round_trip(restored, value)
 
 
 def test_tokenized_trajectory_nan_json_round_trip() -> None:
     trajectory = art.Trajectory()
-    value = art.TokenizedTrajectory(
+    value = tr.TokenizedTrajectory(
         **_history().model_dump(),
         trajectory=trajectory,
         reward=1.0,
         metrics={"count": 1},
         metadata={"source": "test"},
     )
-    restored = art.TokenizedTrajectory.model_validate_json(value.model_dump_json())
+    restored = tr.TokenizedTrajectory.model_validate_json(value.model_dump_json())
     _assert_history_round_trip(restored, value)
     assert restored.reward == value.reward
     assert restored.metrics == value.metrics
@@ -50,21 +55,21 @@ def test_tokenized_trajectory_nan_json_round_trip() -> None:
 
 def test_nested_tokenized_models_nan_json_round_trip() -> None:
     source = art.Trajectory()
-    trajectory = art.TokenizedMultiHistoryTrajectory(
+    trajectory = tr.TokenizedMultiHistoryTrajectory(
         trajectory=source,
         histories=[_history()],
         reward=1.0,
         metrics={},
         metadata={},
     )
-    group = art.TokenizedTrajectoryGroup[art.TokenizedMultiHistoryTrajectory](
+    group = tr.TokenizedTrajectoryGroup[tr.TokenizedMultiHistoryTrajectory](
         trajectory_group=art.TrajectoryGroup([source]),
         trajectories=[trajectory],
         metrics={},
         metadata={},
     )
-    restored = art.TokenizedTrajectoryGroup[
-        art.TokenizedMultiHistoryTrajectory
+    restored = tr.TokenizedTrajectoryGroup[
+        tr.TokenizedMultiHistoryTrajectory
     ].model_validate_json(group.model_dump_json())
     restored_trajectory = restored.trajectories[0]
     _assert_history_round_trip(restored_trajectory.histories[0], _history())
@@ -141,7 +146,7 @@ def test_public_group_tokenization_nan_json_round_trip() -> None:
         ]
     ).tokenize()
     single_value = single.trajectories[0]
-    assert isinstance(single_value.history, art.ChatCompletionsHistory)
+    assert isinstance(single_value.history, tr.ChatCompletionsHistory)
     assert single.trajectory_group.trajectories[0] is single_value.trajectory
     assert single_value.history.message_sources[0] is not None
     assert (
@@ -150,16 +155,14 @@ def test_public_group_tokenization_nan_json_round_trip() -> None:
     )
     single_json = single.model_dump_json()
     assert '"NaN"' in single_json
-    art.TokenizedTrajectoryGroup[art.TokenizedTrajectory].model_validate_json(
-        single_json
-    )
+    tr.TokenizedTrajectoryGroup[tr.TokenizedTrajectory].model_validate_json(single_json)
 
     multi = group.tokenize(multi_history=True)
     multi_json = multi.model_dump_json()
     assert '"NaN"' in multi_json
-    art.TokenizedTrajectoryGroup[
-        art.TokenizedMultiHistoryTrajectory
-    ].model_validate_json(multi_json)
+    tr.TokenizedTrajectoryGroup[tr.TokenizedMultiHistoryTrajectory].model_validate_json(
+        multi_json
+    )
 
 
 def test_tokenized_compact_round_trips_retain_source_references() -> None:
@@ -200,12 +203,12 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     tokenized_group = source_group.tokenize()
     tokenized = tokenized_group.trajectories[0]
     history = tokenized.history
-    assert isinstance(history, art.ChatCompletionsHistory)
+    assert isinstance(history, tr.ChatCompletionsHistory)
 
     restored_history = art.trajectories.compact_validate(
         history.tokenize().compact_dump(), kind="tokenized_history"
     )
-    assert isinstance(restored_history.history, art.ChatCompletionsHistory)
+    assert isinstance(restored_history.history, tr.ChatCompletionsHistory)
     first_source = restored_history.history.message_sources[0]
     last_source = restored_history.history.message_sources[-1]
     assert first_source is not None and last_source is not None
@@ -214,21 +217,21 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     restored = art.trajectories.compact_validate(
         tokenized.compact_dump(), kind="tokenized_trajectory"
     )
-    assert isinstance(restored.history, art.ChatCompletionsHistory)
+    assert isinstance(restored.history, tr.ChatCompletionsHistory)
     restored_source = restored.history.message_sources[0]
     assert restored_source is not None
     assert restored_source.exchange is restored.trajectory.exchanges.chat_completions[0]
 
     pickled = pickle.loads(pickle.dumps(tokenized))
-    assert isinstance(pickled.history, art.ChatCompletionsHistory)
+    assert isinstance(pickled.history, tr.ChatCompletionsHistory)
     pickled_source = pickled.history.message_sources[0]
     assert pickled_source is not None
     assert pickled_source.exchange is pickled.trajectory.exchanges.chat_completions[0]
 
-    tokenized_multi = art.TokenizedMultiHistoryTrajectory(
+    tokenized_multi = tr.TokenizedMultiHistoryTrajectory(
         trajectory=tokenized.trajectory,
         histories=[
-            art.TokenizedHistory(
+            tr.TokenizedHistory(
                 history=tokenized.history,
                 model=tokenized.model,
                 token_ids=tokenized.token_ids,
@@ -243,7 +246,7 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
     restored_multi = art.trajectories.compact_validate(
         tokenized_multi.compact_dump(), kind="tokenized_multi_history_trajectory"
     )
-    assert isinstance(restored_multi.histories[0].history, art.ChatCompletionsHistory)
+    assert isinstance(restored_multi.histories[0].history, tr.ChatCompletionsHistory)
     restored_multi_source = restored_multi.histories[0].history.message_sources[0]
     assert restored_multi_source is not None
     assert (
@@ -255,8 +258,8 @@ def test_tokenized_compact_round_trips_retain_source_references() -> None:
         tokenized_group.compact_dump(), kind="tokenized_trajectory_group"
     )
     restored_child = restored_group.trajectories[0]
-    assert isinstance(restored_child, art.TokenizedTrajectory)
-    assert isinstance(restored_child.history, art.ChatCompletionsHistory)
+    assert isinstance(restored_child, tr.TokenizedTrajectory)
+    assert isinstance(restored_child.history, tr.ChatCompletionsHistory)
     assert restored_child.trajectory is restored_group.trajectory_group.trajectories[0]
     restored_group_source = restored_child.history.message_sources[0]
     assert restored_group_source is not None

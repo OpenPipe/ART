@@ -15,6 +15,7 @@ import pydantic
 import pytest
 
 import art
+import art.trajectories as tr
 from art.trajectories import _tokenize
 from art.trajectories._capture.core import begin, reset
 from art.trajectories._protocols import Endpoint, build_exchange
@@ -262,7 +263,7 @@ def test_compact_trajectory_round_trip_and_literal_reference_collision() -> None
 
 
 def test_compact_decode_is_one_level_and_unmatched_references_are_literal() -> None:
-    payload: art.CompactTrajectoryPayload = {
+    payload: tr.CompactTrajectoryPayload = {
         "format": "art.trajectories",
         "version": 1,
         "kind": "trajectory",
@@ -462,7 +463,7 @@ def test_compact_singular_plural_kinds_and_empty_collections() -> None:
     )
     with pytest.raises(ValueError, match="empty iterable"):
         art.trajectories.compact_dump([])
-    empty: art.CompactTrajectoryPayload = {
+    empty: tr.CompactTrajectoryPayload = {
         "format": "art.trajectories",
         "version": 1,
         "kind": "trajectories",
@@ -622,21 +623,24 @@ def test_tokenized_compact_round_trip_all_protocol_source_shapes() -> None:
         source_exchanges = getattr(source.exchanges, protocol)
         source_exchanges.extend(getattr(combined.exchanges, protocol))
         history = source.histories()[0]
-        assert isinstance(history, art.History)
+        assert isinstance(history, tr.History)
         assert history.model is not None
-        tokenized = art.TokenizedTrajectory(
+        tokenized = tr.TokenizedTrajectory(
             history=history,
             trajectory=source,
             model=history.model,
             token_ids=[1, 2],
             logprobs=[float("nan"), -0.1],
-            flags=[art.TokenFlag.EXACT, art.TokenFlag.EXACT | art.TokenFlag.SAMPLED],
+            flags=[
+                tr.TokenFlag.EXACT,
+                tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+            ],
             reward=1.0,
             metrics={},
             metadata={},
         )
 
-        ordinary = art.TokenizedTrajectory.model_validate_json(
+        ordinary = tr.TokenizedTrajectory.model_validate_json(
             tokenized.model_dump_json(warnings="error")
         )
         assert ordinary.model_dump_json() == tokenized.model_dump_json()
@@ -647,18 +651,21 @@ def test_tokenized_compact_round_trip_all_protocol_source_shapes() -> None:
 
         assert restored.model_dump() == tokenized.model_dump()
         canonical = getattr(restored.trajectory.exchanges, protocol)[0]
-        if isinstance(restored.history, art.ChatCompletionsHistory):
+        if isinstance(restored.history, tr.ChatCompletionsHistory):
             history_source = next(
                 item for item in restored.history.message_sources if item is not None
             )
             assert history_source.exchange is canonical
-        elif isinstance(restored.history, art.AnthropicMessagesHistory):
+        elif isinstance(restored.history, tr.AnthropicMessagesHistory):
             assert restored.history.system_source is canonical
-        elif isinstance(restored.history, art.ResponsesHistory):
+        elif isinstance(restored.history, tr.ResponsesHistory):
             assert restored.history.instructions_source is canonical
         elif isinstance(
             restored.history,
-            (art.CompletionsTokenHistory, art.CompletionsStringHistory),
+            (
+                tr.CompletionsTokenHistory,
+                tr.CompletionsStringHistory,
+            ),
         ):
             history_source = next(
                 span.source

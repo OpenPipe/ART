@@ -24,6 +24,7 @@ from openai.types.responses import (
 import pytest
 
 import art
+import art.trajectories as tr
 from art.trajectories import (
     ChatCompletionsExchange,
     ChatCompletionsMessageSource,
@@ -191,10 +192,10 @@ def test_exact_tokens_form_one_append_only_history_without_tokenizer(
 
     assert tokenized.token_ids == [1, 2, 3, 4]
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
     assert math.isnan(tokenized.logprobs[0])
     assert tokenized.logprobs[1] == -0.2
@@ -248,9 +249,9 @@ def test_messages_exact_prompt_and_output_do_not_load_a_tokenizer(
     assert all(math.isnan(value) for value in tokenized.logprobs[:2])
     assert tokenized.logprobs[2] == -0.3
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -351,7 +352,7 @@ def test_converted_anthropic_system_history_preserves_exact_assistant_evidence(
 
     assert tokenized.token_ids == [10, 11, 12]
     assert tokenized.logprobs[-1] == pytest.approx(-0.12)
-    assert tokenized.flags[-1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+    assert tokenized.flags[-1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
 
 
 def test_converted_anthropic_system_source_rejects_sampled_response_mutation() -> None:
@@ -399,7 +400,7 @@ def test_converted_responses_history_tokenizes_without_native_chat_exchange(
 
     assert tokenized.token_ids == [10, 11, 12]
     assert tokenized.logprobs[-1] == pytest.approx(-0.1)
-    assert tokenized.flags[-1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+    assert tokenized.flags[-1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
 
 
 def test_malformed_explicit_exact_token_metadata_fails_closed() -> None:
@@ -488,8 +489,8 @@ def test_completions_echo_preserves_prompt_logprobs_without_sampling_them() -> N
     assert tokenized.token_ids == [1, 2]
     assert tokenized.logprobs == [-0.1, -0.2]
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -526,9 +527,9 @@ def test_completions_echo_does_not_strip_repeated_prompt_token_from_completion()
 
     assert tokenized.token_ids == [1, 1, 2]
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.SAMPLED,
-        art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.SAMPLED,
     ]
     assert all(math.isnan(logprob) for logprob in tokenized.logprobs)
 
@@ -553,9 +554,9 @@ def test_completions_echo_strips_prompt_from_proven_combined_token_carrier() -> 
     assert tokenized.token_ids == [1, 1, 2]
     assert tokenized.logprobs[1:] == pytest.approx([-0.2, -0.3])
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -578,8 +579,8 @@ def test_completions_echo_strips_prompt_from_proven_textual_carrier() -> None:
     assert tokenized.token_ids == [1, 2]
     assert tokenized.logprobs == pytest.approx([-0.1, -0.2])
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -602,9 +603,9 @@ def test_completions_echo_prefers_full_logprob_carrier_to_id_prefix_heuristic() 
     assert tokenized.token_ids == [1, 1, 2]
     assert tokenized.logprobs == [-0.1, -0.2, -0.3]
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -638,7 +639,10 @@ def test_completions_echo_without_prompt_ids_falls_back_without_sampling_prompt(
     ).tokenize(tokenizer=Tokenizer())
 
     assert tokenized.token_ids == [1, 2]
-    assert tokenized.flags == [art.TokenFlag(0), art.TokenFlag.SAMPLED]
+    assert tokenized.flags == [
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
+    ]
     assert all(math.isnan(logprob) for logprob in tokenized.logprobs)
 
 
@@ -722,8 +726,8 @@ def test_mutated_completions_token_prompt_drops_stale_exact_evidence() -> None:
 
     assert tokenized.token_ids == [99, 2]
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -818,7 +822,7 @@ def test_completions_string_history_preserves_textual_logprobs() -> None:
 
     assert tokenized.token_ids == [1, 2]
     assert tokenized.logprobs[1] == -0.8
-    assert tokenized.flags[1] == art.TokenFlag.SAMPLED
+    assert tokenized.flags[1] == tr.TokenFlag.SAMPLED
 
 
 def test_mutated_completions_string_prompt_retokens_without_stale_exact() -> None:
@@ -854,7 +858,7 @@ def test_mutated_completions_string_prompt_retokens_without_stale_exact() -> Non
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.token_ids == [9, 2]
-    assert tokenized.flags[0] == art.TokenFlag(0)
+    assert tokenized.flags[0] == tr.TokenFlag(0)
 
 
 def test_batched_completions_map_each_choice_to_its_prompt() -> None:
@@ -899,8 +903,14 @@ def test_batched_completions_map_each_choice_to_its_prompt() -> None:
         [20, 21],
     ]
     assert [history.flags for history in tokenized.histories] == [
-        [art.TokenFlag.EXACT, art.TokenFlag.EXACT | art.TokenFlag.SAMPLED],
-        [art.TokenFlag.EXACT, art.TokenFlag.EXACT | art.TokenFlag.SAMPLED],
+        [
+            tr.TokenFlag.EXACT,
+            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        ],
+        [
+            tr.TokenFlag.EXACT,
+            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        ],
     ]
 
 
@@ -982,7 +992,10 @@ def test_randomized_completions_projection_preserves_every_choice_once() -> None
         assert [history.token_ids for history in tokenized.histories] == expected
         assert all(
             history.flags
-            == [art.TokenFlag.EXACT, art.TokenFlag.EXACT | art.TokenFlag.SAMPLED]
+            == [
+                tr.TokenFlag.EXACT,
+                tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+            ]
             for history in tokenized.histories
         )
         traced, traces = _tokenize_trajectory_with_trace(trajectory)
@@ -1048,7 +1061,7 @@ def test_legacy_additional_histories_require_multi_history_and_model() -> None:
     second = _chat_exchange([3], [4]).response.choices[0]
     trajectory = art.Trajectory(
         messages_and_choices=[first],
-        additional_histories=[art.LegacyHistory(messages_and_choices=[second])],
+        additional_histories=[tr.LegacyHistory(messages_and_choices=[second])],
     )
 
     with pytest.raises(ValueError, match="exactly one history"):
@@ -1110,7 +1123,10 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
 
     assert result.token_ids == [10, 11]
     assert loaded_base_models == ["base/model"]
-    assert result.flags == [art.TokenFlag(0), art.TokenFlag.SAMPLED]
+    assert result.flags == [
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
+    ]
     assert math.isnan(result.logprobs[1])
     assert len(tokenizer.calls) == 3
     assert [call["add_generation_prompt"] for call in tokenizer.calls] == [
@@ -1434,12 +1450,12 @@ def test_reasoning_stripped_messages_history_preserves_exact_tokens(
     assert tokenized.logprobs[-2] == pytest.approx(-10.0)
     assert tokenized.logprobs[-1] == pytest.approx(-20.1)
     assert tokenized.flags[1:3] == [
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
     assert tokenized.flags[-2:] == [
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -1631,11 +1647,11 @@ def test_chat_exact_hidden_suffix_preserves_rendered_trailing_scaffold() -> None
 
     assert tokenized.token_ids == [1, 99, 7, 8, 9]
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag(0),
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag(0),
+        tr.TokenFlag(0),
+        tr.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
     ]
 
 
@@ -1755,10 +1771,10 @@ def test_chat_fallback_anchors_sampled_text_away_from_equal_user_text() -> None:
 
     assert tokenized.token_ids == [1, 2, 2, 3]
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag.SAMPLED,
-        art.TokenFlag(0),
-        art.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
     ]
     assert tokenized.logprobs[1] == -0.1
     assert math.isnan(tokenized.logprobs[2])
@@ -1834,10 +1850,10 @@ def test_chat_view_preserves_two_turn_textual_logprobs_without_exact_ids() -> No
     assert tokenized.logprobs[1] == pytest.approx(-0.4)
     assert tokenized.logprobs[3] == pytest.approx(-0.5)
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag.SAMPLED,
-        art.TokenFlag(0),
-        art.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -1898,10 +1914,10 @@ def test_chat_view_uses_later_exact_prompt_when_first_is_missing() -> None:
     assert tokenized.token_ids == [10, 11, 20, 21]
     assert tokenized.logprobs[-1] == pytest.approx(-0.5)
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT,
-        art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -2027,8 +2043,8 @@ def test_empty_chat_prompt_ids_are_missing_evidence(
 
     assert tokenized.token_ids == [10, 2]
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -2075,8 +2091,8 @@ def test_missing_completion_renders_only_missing_region_when_prompt_is_exact(
     assert tokenized.token_ids == [99, 20]
     assert tokenized.logprobs[1] == -0.5
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -2330,10 +2346,10 @@ def test_cross_exchange_responses_reasoning_split_uses_later_prompt_backbone() -
     assert math.isnan(tokenized.histories[1].logprobs[2])
     assert tokenized.histories[1].logprobs[3] == -0.1
     assert tokenized.histories[1].flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -2399,8 +2415,8 @@ def test_responses_aggregates_complete_exact_pairs_across_content_blocks(
     assert result.token_ids == [10, 11, 12]
     assert result.logprobs[1:] == [-0.1, -0.2]
     assert result.flags[1:] == [
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -2691,10 +2707,10 @@ def test_responses_token_generations_preserve_every_generation() -> None:
     assert tokenized.logprobs[1] == -0.2
     assert tokenized.logprobs[3] == -0.4
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -2811,9 +2827,9 @@ def test_responses_split_preserves_unchanged_prior_generation_provenance() -> No
     tokenized = final.tokenize()
 
     assert tokenized.token_ids == [1, 2, 3, 500, 5, 6]
-    assert tokenized.flags[1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+    assert tokenized.flags[1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
     assert tokenized.logprobs[1] == -0.2
-    assert tokenized.flags[3] == art.TokenFlag.EXACT
+    assert tokenized.flags[3] == tr.TokenFlag.EXACT
     assert math.isnan(tokenized.logprobs[3])
 
 
@@ -2902,8 +2918,8 @@ def test_responses_terminal_generation_without_output_items_is_tokenized() -> No
     assert math.isnan(tokenized.logprobs[0])
     assert tokenized.logprobs[1] == pytest.approx(-0.2)
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
     assert history.as_chat_completions_history().messages[-1] == {
         "role": "assistant",
@@ -2946,8 +2962,8 @@ def test_responses_terminal_generation_without_output_items_survives_rerender() 
     assert math.isnan(tokenized.logprobs[0])
     assert tokenized.logprobs[1] == pytest.approx(-0.2)
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -3128,7 +3144,7 @@ def test_chat_prefix_retokenization_splits_unless_reconciled(
 
     assert tokenized.token_ids == [1, 101, 102, 3, 4]
     assert tokenized.logprobs[1:3] == [-10.1, -10.2]
-    assert all(tokenized.flags[index] & art.TokenFlag.EXACT for index in (1, 2, 4))
+    assert all(tokenized.flags[index] & tr.TokenFlag.EXACT for index in (1, 2, 4))
 
     direct = trajectory.tokenize(
         reconcile_text_equivalent_tokenizations=True,
@@ -3175,7 +3191,7 @@ def test_template_change_rerenders_scaffold_but_preserves_sampled_output() -> No
 
     assert tokenized.token_ids == [10, 2, 30]
     assert tokenized.logprobs[1] == -0.2
-    assert tokenized.flags[1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+    assert tokenized.flags[1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
 
 
 def test_template_change_preserves_complete_exact_sampled_suffix() -> None:
@@ -3206,9 +3222,9 @@ def test_template_change_preserves_complete_exact_sampled_suffix() -> None:
     assert tokenized.logprobs[1:3] == pytest.approx([-0.2, -0.3])
     assert math.isnan(tokenized.logprobs[3])
     assert tokenized.flags[1:] == [
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
     ]
 
 
@@ -3313,7 +3329,7 @@ def test_responses_generation_evidence_is_atomic_and_partial_edits_do_not_replay
     partial = history.tokenize(tokenizer=Tokenizer(), chat_template="custom")
     assert partial.token_ids == [1, 30, 9]
     assert 2 not in partial.token_ids
-    assert partial.flags[1] == art.TokenFlag.SAMPLED
+    assert partial.flags[1] == tr.TokenFlag.SAMPLED
     assert math.isnan(partial.logprobs[1])
 
 
@@ -3447,10 +3463,10 @@ def test_responses_chat_rerender_preserves_equal_length_generation_evidence() ->
     assert 40 not in tokenized.token_ids
     assert tokenized.logprobs[1::2] == pytest.approx([-0.2, -0.4])
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag(0),
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -3496,7 +3512,7 @@ def test_responses_chat_output_indices_reuse_one_complete_generation() -> None:
         2,
         prompt_token_ids=[1],
     )
-    history = art.ChatCompletionsHistory(
+    history = tr.ChatCompletionsHistory(
         model="test/model",
         messages=[
             {"role": "user", "content": "turn 0"},
@@ -3516,12 +3532,12 @@ def test_responses_chat_output_indices_reuse_one_complete_generation() -> None:
 
     assert tokenized.token_ids == [1, 2]
     assert tokenized.logprobs[-1] == pytest.approx(-0.1)
-    assert tokenized.flags[-1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+    assert tokenized.flags[-1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
 
 
 def test_responses_chat_output_indices_are_bounds_checked() -> None:
     exchange = _response_exchange("response-output-indices-invalid", 2)
-    history = art.ChatCompletionsHistory(
+    history = tr.ChatCompletionsHistory(
         model="test/model",
         messages=[{"role": "assistant", "content": "answer"}],
         message_sources=[
@@ -3537,7 +3553,7 @@ def test_responses_chat_output_indices_are_bounds_checked() -> None:
         history.tokenize()
 
 
-def _multi_output_responses_chat_history() -> art.ChatCompletionsHistory:
+def _multi_output_responses_chat_history() -> tr.ChatCompletionsHistory:
     exchange = _response_exchange("multi-output-generation", 2)
     data = exchange.response.model_dump(mode="python")
     data["output"][0]["content"][0]["text"] = "first"
@@ -3615,9 +3631,9 @@ def test_responses_multi_output_generation_is_rendered_without_duplicate_evidenc
     assert tokenized.token_ids == [1, 20, 30]
     assert all(math.isnan(value) for value in tokenized.logprobs)
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag.SAMPLED,
-        art.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -3668,9 +3684,9 @@ def test_responses_multi_output_chat_conversion_preserves_item_logprobs() -> Non
     assert math.isnan(tokenized.logprobs[0])
     assert tokenized.logprobs[1:] == [-0.1, -0.2]
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag.SAMPLED,
-        art.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -3717,9 +3733,9 @@ def test_mutable_chat_history_is_authoritative_and_does_not_replay_removed_turns
     assert tokenized.token_ids == [30, 40, 50]
     assert 20 not in tokenized.token_ids
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag(0),
+        tr.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
     ]
 
 
@@ -3757,8 +3773,8 @@ def test_request_assistant_messages_are_not_marked_sampled() -> None:
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.token_ids == [5, 20, 6, 30, 7, 40, 8]
-    assert not tokenized.flags[1] & art.TokenFlag.SAMPLED
-    assert tokenized.flags[5] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+    assert not tokenized.flags[1] & tr.TokenFlag.SAMPLED
+    assert tokenized.flags[5] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
 
 
 def test_rerender_constrains_exact_output_to_its_message_region() -> None:
@@ -3792,9 +3808,9 @@ def test_rerender_constrains_exact_output_to_its_message_region() -> None:
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag(0),
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
     assert math.isnan(tokenized.logprobs[0])
     assert tokenized.logprobs[2] == -0.7
@@ -3853,8 +3869,8 @@ def test_rerender_does_not_bind_unique_exact_id_outside_sampled_message() -> Non
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.token_ids == [42, 7, 99, 7]
-    assert not tokenized.flags[1] & art.TokenFlag.SAMPLED
-    assert tokenized.flags[-1] == (art.TokenFlag.EXACT | art.TokenFlag.SAMPLED)
+    assert not tokenized.flags[1] & tr.TokenFlag.SAMPLED
+    assert tokenized.flags[-1] == (tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED)
     assert math.isnan(tokenized.logprobs[1])
     assert tokenized.logprobs[-1] == -0.7
 
@@ -3915,8 +3931,8 @@ def test_rerender_does_not_duplicate_sampled_trailing_eos() -> None:
     assert tokenized.token_ids == [1, 99, 7, 2]
     assert tokenized.token_ids.count(2) == 1
     assert tokenized.flags[-2:] == [
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
     assert tokenized.logprobs[-2:] == [-0.7, -0.2]
 
@@ -4008,11 +4024,11 @@ def test_reasoning_stripped_chat_histories_tokenize_authoritative_views() -> Non
         [1, 2, 101, 102, 9],
         [1, 101, 102, 9, 4, 5, 6],
     ]
-    assert tokenized.histories[1].flags[1] & art.TokenFlag.SAMPLED
-    assert tokenized.histories[1].flags[1] & art.TokenFlag.EXACT
+    assert tokenized.histories[1].flags[1] & tr.TokenFlag.SAMPLED
+    assert tokenized.histories[1].flags[1] & tr.TokenFlag.EXACT
     assert tokenized.histories[1].logprobs[1:3] == [-10.1, -10.2]
     assert tokenized.histories[1].flags[3] == (
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
     )
     assert tokenized.histories[1].logprobs[3] == -0.9
     assert 2 not in tokenized.histories[1].token_ids
@@ -4178,8 +4194,8 @@ def test_reasoning_stripped_tool_call_keeps_exact_evidence_for_strict_training(
     assert second_history.token_ids == [1, 7, 8, 4, 5]
     assert second_history.logprobs[1:3] == [-0.7, -0.8]
     assert second_history.flags[1:3] == [
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
     preprocessing = list(
@@ -4328,9 +4344,9 @@ def test_rerender_marks_tool_call_only_generated_region_sampled() -> None:
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.token_ids == [1, 10, 20, 25, 30, 31, 26]
-    assert tokenized.flags[2:6] == [art.TokenFlag.SAMPLED] * 4
+    assert tokenized.flags[2:6] == [tr.TokenFlag.SAMPLED] * 4
     assert all(math.isnan(value) for value in tokenized.logprobs[2:6])
-    assert not tokenized.flags[0] & art.TokenFlag.SAMPLED
+    assert not tokenized.flags[0] & tr.TokenFlag.SAMPLED
 
 
 @pytest.mark.parametrize(
@@ -4388,7 +4404,7 @@ def test_tool_call_probe_handles_contextual_tokenization(
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.token_ids == [1, 10, 20, 25, 30, 26]
-    assert tokenized.flags[2:5] == [art.TokenFlag.SAMPLED] * 3
+    assert tokenized.flags[2:5] == [tr.TokenFlag.SAMPLED] * 3
     assert all(math.isnan(value) for value in tokenized.logprobs[2:5])
 
 
@@ -4461,12 +4477,12 @@ def test_rerender_proves_each_reasoning_and_content_part_separately() -> None:
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag(0),
-        art.TokenFlag.SAMPLED,
-        art.TokenFlag(0),
-        art.TokenFlag.SAMPLED,
-        art.TokenFlag(0),
+        tr.TokenFlag(0),
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
     ]
     assert tokenized.logprobs[4] == -0.7
 
@@ -4529,7 +4545,10 @@ def test_empty_sampled_messages_need_no_content_boundary() -> None:
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.token_ids == [1, 2]
-    assert tokenized.flags == [art.TokenFlag(0), art.TokenFlag(0)]
+    assert tokenized.flags == [
+        tr.TokenFlag(0),
+        tr.TokenFlag(0),
+    ]
 
 
 def test_empty_sampled_message_inserts_exact_control_token() -> None:
@@ -4561,7 +4580,7 @@ def test_empty_sampled_message_inserts_exact_control_token() -> None:
 
     assert tokenized.token_ids == [1, 99, 2, 9]
     assert tokenized.logprobs[2] == -0.2
-    assert tokenized.flags[2] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+    assert tokenized.flags[2] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
 
 
 def test_renderer_ignored_refusal_is_appended_for_tokenization() -> None:
@@ -4642,7 +4661,7 @@ def test_renderer_ignored_refusal_is_appended_for_tokenization() -> None:
 
     assert tokenized.token_ids == [1, 4, 5]
     assert tokenized.logprobs[1:] == [-0.4, -0.5]
-    assert tokenized.flags[1:] == [art.TokenFlag.SAMPLED] * 2
+    assert tokenized.flags[1:] == [tr.TokenFlag.SAMPLED] * 2
 
 
 def test_renderer_reasoning_content_alias_preserves_reasoning() -> None:
@@ -4683,9 +4702,9 @@ def test_renderer_reasoning_content_alias_preserves_reasoning() -> None:
 
     assert tokenized.token_ids == [1, 2, 3]
     assert tokenized.flags == [
-        art.TokenFlag(0),
-        art.TokenFlag.SAMPLED,
-        art.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -4766,7 +4785,7 @@ def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None
 
     assert tokenized.token_ids == [1, 1118, 2222, 220]
     assert tokenized.logprobs[1:] == [-0.4, -0.45, -0.5]
-    assert tokenized.flags[1:] == [art.TokenFlag.SAMPLED] * 3
+    assert tokenized.flags[1:] == [tr.TokenFlag.SAMPLED] * 3
 
 
 def test_textual_logprobs_reconstruct_split_utf8_bytes() -> None:
@@ -4971,12 +4990,14 @@ def test_trimmed_whitespace_output_inserts_authoritative_logprob_token(
         9,
     ]
     assert tokenized.logprobs[1] == -0.5
-    assert tokenized.flags[1] == art.TokenFlag.SAMPLED
+    assert tokenized.flags[1] == tr.TokenFlag.SAMPLED
     if adjacent_scaffold:
-        assert tokenized.flags[2] == art.TokenFlag(0)
+        assert tokenized.flags[2] == tr.TokenFlag(0)
 
 
-def _repeated_text_rerender_history(turn_count: int) -> art.ChatCompletionsHistory:
+def _repeated_text_rerender_history(
+    turn_count: int,
+) -> tr.ChatCompletionsHistory:
     exchanges: list[ChatCompletionsExchange] = []
     prompt: list[int] = []
     messages: list[ChatCompletionMessageParam] = []
@@ -5114,7 +5135,7 @@ def test_reasoning_split_trajectory_reuses_prevalidated_projections(
     original = _tokenize._history_matches_projection
     calls = 0
 
-    def counted(history: art.History) -> bool:
+    def counted(history: tr.History) -> bool:
         nonlocal calls
         calls += 1
         return original(history)
@@ -5196,9 +5217,9 @@ def test_responses_external_context_requires_or_uses_exact_prompt_tokens() -> No
 
     assert tokenized.token_ids == [7, 8, 2]
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
@@ -5288,7 +5309,7 @@ def test_private_trace_covers_sampled_tokens_for_every_protocol() -> None:
         trace = traces[0]
         trace.validate(history)
         assert sum(key is not None for key in trace.source_keys) == sum(
-            bool(flag & art.TokenFlag.SAMPLED) for flag in history.flags
+            bool(flag & tr.TokenFlag.SAMPLED) for flag in history.flags
         )
         assert len(trace.sources) == 1
 
@@ -5421,7 +5442,7 @@ def test_responses_fallback_trace_does_not_retrain_echoed_output_items() -> None
 
 
 def test_completions_history_requires_exhaustive_source_spans() -> None:
-    history = art.CompletionsTokenHistory(
+    history = tr.CompletionsTokenHistory(
         model="test/model",
         prompt=[1],
         prompt_sources=[],
