@@ -2554,6 +2554,38 @@ def test_duplicate_checkpoint_finish_and_abort_wait_for_owner(
     assert trainer._checkpoint_finish_sequence == 1
 
 
+def test_checkpoint_abort_wins_divergent_finish_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(trainer)
+    output = tmp_path / "divergent-admission"
+    trainer._prepare_checkpoint_save(str(output), "student")
+    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
+    original_gather = checkpoint_module._gather_objects
+
+    def gather(
+        value: object, *, group: torch.distributed.ProcessGroup | None = None
+    ) -> tuple[object, ...]:
+        if isinstance(value, tuple) and len(value) == 4:
+            return (value, ("abort", *value[1:]))
+        return original_gather(value, group=group)
+
+    monkeypatch.setattr(checkpoint_module, "_gather_objects", gather)
+    with pytest.raises(RuntimeError, match="concurrently aborted"):
+        trainer._finish_checkpoint_save(str(output))
+
+    assert trainer._checkpoint_finish_sequence == 1
+    assert not list(tmp_path.glob(".divergent-admission.snapshot-*"))
+    trainer._prepare_checkpoint_save(str(output), "student")
+    monkeypatch.setattr(checkpoint_module, "_gather_objects", original_gather)
+    trainer._finish_checkpoint_save(str(output))
+    assert output.is_dir()
+
+
 def test_checkpoint_finish_barrier_precedes_next_fifo_entry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3253,6 +3285,54 @@ def _portable_replica_worker(
         torch.distributed.destroy_process_group()
 
 
+def _publish_replica_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+) -> None:
+    torch.distributed.init_process_group(
+        "gloo", rank=rank, world_size=world_size, init_method=init_method
+    )
+    try:
+        lora_module.ps.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+        )
+        setattr(
+            lora_publish,
+            "_rank_and_device",
+            lambda: (rank, torch.device("cpu")),
+        )
+        lora = LoRA(
+            _PORTABLE_PREFIX,
+            3,
+            4,
+            2,
+            2,
+            torch.float32,
+            torch.device("cpu"),
+        )
+        with torch.no_grad():
+            lora.A_T.copy_(torch.arange(lora.A_T.numel()).reshape_as(lora.A_T))
+            lora.B_T.copy_(torch.arange(lora.B_T.numel()).reshape_as(lora.B_T))
+            if rank == 1:
+                lora.A_T.add_(1)
+        lora_publish.build_vllm_lora_tensors_from_model(
+            model=cast(Any, [lora]),
+            adapter_dtypes={},
+            handler=DEFAULT_DENSE_HANDLER,
+            adapter_config=_PORTABLE_CONFIG,
+            rank=rank,
+            world_size=world_size,
+        )
+    finally:
+        if lora_module.ps.model_parallel_is_initialized():
+            lora_module.ps.destroy_model_parallel()
+        torch.distributed.destroy_process_group()
+
+
 def _exchange_preparation_failure_worker(
     rank: int,
     world_size: int,
@@ -3537,6 +3617,20 @@ def test_trainer_rank_checkpoint_rejects_divergent_data_parallel_replicas(
         )
     assert not output.exists()
     assert not list(tmp_path.glob(".replica-mismatch.snapshot-*"))
+
+
+def test_lora_publish_rejects_divergent_data_parallel_replicas(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ProcessRaisedException, match="Inconsistent replicated tensor contents"
+    ):
+        mp.spawn(
+            _publish_replica_worker,
+            args=(2, f"file://{tmp_path / 'publish-replica-mismatch-init'}"),
+            nprocs=2,
+            join=True,
+        )
 
 
 def test_trainer_rank_checkpoint_restores_1_to_2_to_1(

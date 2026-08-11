@@ -157,6 +157,7 @@ def collect_local_packed_expert_entries(
     owner_rank: int,
     packed_expert_groups: Sequence[ExpertPackedLoraGroup],
     slot_ref: LoRASlotRef | None = None,
+    include_replicas: bool = False,
 ) -> tuple[dict[str, torch.Tensor], list[PackedExpertShardMeta]]:
     local_tensors: dict[str, torch.Tensor] = {}
     metadata: list[PackedExpertShardMeta] = []
@@ -171,7 +172,9 @@ def collect_local_packed_expert_entries(
                 suffix,
                 packed_expert_groups,
             )
-            if slot_match is None or not module._should_export_parameter(param):
+            if slot_match is None or (
+                not include_replicas and not module._should_export_parameter(param)
+            ):
                 continue
             group_prefix, slot = slot_match
             key = f"{group_prefix}.{slot.output_suffix}"
@@ -716,6 +719,7 @@ def _prepare_local_lora_export(
             owner_rank=rank,
             packed_expert_groups=packed_expert_groups,
             slot_ref=slot_ref,
+            include_replicas=True,
         )
         (local_packed_tensors, local_packed_metadata) = (
             collect_local_packed_expert_entries(
@@ -724,6 +728,7 @@ def _prepare_local_lora_export(
                 owner_rank=rank,
                 packed_expert_groups=packed_expert_groups,
                 slot_ref=slot_ref,
+                include_replicas=True,
             )
         )
         local_digests = {

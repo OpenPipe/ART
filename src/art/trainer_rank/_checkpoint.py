@@ -453,8 +453,11 @@ def _abort_preparation_sequence(
         trainer._checkpoint_save_condition.notify_all()
 
 
-def abort_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
-    """Discard a prepared snapshot while preserving finish FIFO progress."""
+def _admit_checkpoint_save_action(
+    trainer: TrainerRank,
+    output_dir: str,
+    action: Literal["abort", "finish"],
+) -> _PreparedSave | None:
     condition = trainer._checkpoint_save_condition
     with condition:
         condition.wait_for(
@@ -463,36 +466,82 @@ def abort_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
                 and output_dir not in trainer._checkpoint_finishing_saves
             )
         )
-        if output_dir in trainer._completed_checkpoint_saves:
-            return
+        prepared = trainer._prepared_checkpoint_saves.get(output_dir)
+        state = (
+            "completed"
+            if output_dir in trainer._completed_checkpoint_saves
+            else "prepared"
+            if prepared is not None
+            else "missing"
+        )
+        trainer._checkpoint_finishing_saves.add(output_dir)
+
+    try:
+        admissions = _gather_objects(
+            (
+                action,
+                output_dir,
+                state,
+                None if prepared is None else prepared.sequence,
+            ),
+            group=trainer._checkpoint_process_group,
+        )
+        if any(admission[1] != output_dir for admission in admissions):
+            raise RuntimeError("Checkpoint save actions differ across ranks")
+        actions = {admission[0] for admission in admissions}
+        states = {admission[2] for admission in admissions}
+        sequences = {
+            admission[3] for admission in admissions if admission[3] is not None
+        }
+        if "abort" not in actions:
+            if states == {"completed"}:
+                with condition:
+                    trainer._checkpoint_finishing_saves.discard(output_dir)
+                    condition.notify_all()
+                return None
+            if states == {"missing"}:
+                raise RuntimeError(f"Checkpoint save was not prepared: {output_dir}")
+            if states != {"prepared"} or len(sequences) != 1:
+                raise RuntimeError(
+                    f"Checkpoint save state differs across ranks: {output_dir}"
+                )
+            assert prepared is not None
+            sequence = prepared.sequence
+            with condition:
+                condition.wait_for(
+                    lambda: sequence == trainer._checkpoint_finish_sequence
+                )
+            return prepared
+    except BaseException:
+        with condition:
+            trainer._checkpoint_finishing_saves.discard(output_dir)
+            condition.notify_all()
+        raise
+
+    with condition:
         prepared = trainer._prepared_checkpoint_saves.pop(output_dir, None)
-        if prepared is None:
-            return
-        trainer._checkpoint_aborted_save_sequences.add(prepared.sequence)
+        trainer._checkpoint_aborted_save_sequences.update(sequences)
         _advance_finish_sequence(trainer)
+        trainer._checkpoint_finishing_saves.discard(output_dir)
         condition.notify_all()
-    shutil.rmtree(prepared.snapshot, ignore_errors=True)
+    if prepared is not None:
+        shutil.rmtree(prepared.snapshot, ignore_errors=True)
+    if action == "finish":
+        raise RuntimeError(f"Checkpoint save was concurrently aborted: {output_dir}")
+    return None
+
+
+def abort_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
+    """Discard a prepared snapshot while preserving finish FIFO progress."""
+    _admit_checkpoint_save_action(trainer, output_dir, "abort")
 
 
 def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
     """Finalize a prepared checkpoint without reading mutable trainer state."""
     condition = trainer._checkpoint_save_condition
-    with condition:
-        condition.wait_for(
-            lambda: (
-                output_dir not in trainer._checkpoint_finishing_saves
-                and output_dir not in trainer._checkpoint_preparing_saves
-            )
-        )
-        if output_dir in trainer._completed_checkpoint_saves:
-            return
-        prepared = trainer._prepared_checkpoint_saves.get(output_dir)
-        if prepared is None:
-            raise RuntimeError(f"Checkpoint save was not prepared: {output_dir}")
-        trainer._checkpoint_finishing_saves.add(output_dir)
-        condition.wait_for(
-            lambda: prepared.sequence == trainer._checkpoint_finish_sequence
-        )
+    prepared = _admit_checkpoint_save_action(trainer, output_dir, "finish")
+    if prepared is None:
+        return
 
     error: BaseException | None = None
     cleanup_error: BaseException | None = None
