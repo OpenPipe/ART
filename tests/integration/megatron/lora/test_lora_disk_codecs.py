@@ -2466,6 +2466,146 @@ def test_checkpoint_prepare_reserves_destination(
     assert not list(tmp_path.glob(".reserved.snapshot-*"))
 
 
+def test_checkpoint_prepare_validates_distributed_identity_before_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(trainer)
+    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
+
+    def gather(value: object) -> tuple[object, ...]:
+        if isinstance(value, tuple) and len(value) == 3:
+            return (value, (value[0], str(tmp_path / "other"), value[2]))
+        return (value,)
+
+    monkeypatch.setattr(checkpoint_module, "_gather_objects", gather)
+    with pytest.raises(RuntimeError, match="identity differs across ranks"):
+        trainer._prepare_checkpoint_save(str(tmp_path / "identity"), "student")
+    assert trainer._checkpoint_save_sequence == 1
+    assert trainer._checkpoint_finish_sequence == 1
+    assert not list(tmp_path.glob(".*.snapshot-*"))
+
+
+def test_checkpoint_prepare_invalid_destination_does_not_reserve_sequence() -> None:
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(trainer)
+
+    with pytest.raises(ValueError):
+        trainer._prepare_checkpoint_save("/", "student")
+    assert trainer._checkpoint_save_sequence == 0
+    assert trainer._checkpoint_finish_sequence == 0
+
+
+def test_duplicate_checkpoint_finish_and_abort_wait_for_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(trainer)
+    output = tmp_path / "finish-owner"
+    trainer._prepare_checkpoint_save(str(output), "student")
+    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
+    original_finish = checkpoint_module._finish_prepared_save
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def pause_finish(trainer_rank: TrainerRank, prepared: _PreparedSave) -> None:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(10)
+        original_finish(trainer_rank, prepared)
+
+    monkeypatch.setattr(checkpoint_module, "_finish_prepared_save", pause_finish)
+    errors: list[BaseException] = []
+
+    def finish() -> None:
+        try:
+            trainer._finish_checkpoint_save(str(output))
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=finish)
+    duplicate = threading.Thread(target=finish)
+    abort = threading.Thread(
+        target=trainer._abort_checkpoint_save,
+        args=(str(output),),
+    )
+    first.start()
+    assert entered.wait(10)
+    duplicate.start()
+    abort.start()
+    assert duplicate.is_alive() and abort.is_alive()
+    release.set()
+    for thread in (first, duplicate, abort):
+        thread.join(10)
+        assert not thread.is_alive()
+    assert not errors
+    assert calls == 1
+    assert output.is_dir()
+    assert trainer._checkpoint_finish_sequence == 1
+
+
+def test_checkpoint_finish_barrier_precedes_next_fifo_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = _portable_trainer(
+        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    )
+    _install_portable_checkpoint(trainer)
+    first, second = tmp_path / "barrier-first", tmp_path / "barrier-second"
+    trainer._prepare_checkpoint_save(str(first), "student")
+    trainer._prepare_checkpoint_save(str(second), "student")
+    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
+    original_finish = checkpoint_module._finish_prepared_save
+    original_raise = checkpoint_module._raise_distributed
+    order: list[str] = []
+    barrier_entered = threading.Event()
+    release = threading.Event()
+
+    def record_finish(trainer_rank: TrainerRank, prepared: _PreparedSave) -> None:
+        order.append(prepared.destination.name)
+        original_finish(trainer_rank, prepared)
+
+    def pause_first_barrier(
+        error: BaseException | None,
+        phase: str,
+        *,
+        group: torch.distributed.ProcessGroup | None = None,
+    ) -> None:
+        if not barrier_entered.is_set():
+            barrier_entered.set()
+            assert release.wait(10)
+        original_raise(error, phase, group=group)
+
+    monkeypatch.setattr(checkpoint_module, "_finish_prepared_save", record_finish)
+    monkeypatch.setattr(checkpoint_module, "_raise_distributed", pause_first_barrier)
+    first_thread = threading.Thread(
+        target=trainer._finish_checkpoint_save, args=(str(first),)
+    )
+    second_thread = threading.Thread(
+        target=trainer._finish_checkpoint_save, args=(str(second),)
+    )
+    first_thread.start()
+    assert barrier_entered.wait(10)
+    second_thread.start()
+    assert order == ["barrier-first"]
+    release.set()
+    first_thread.join(10)
+    second_thread.join(10)
+    assert not first_thread.is_alive() and not second_thread.is_alive()
+    assert order == ["barrier-first", "barrier-second"]
+
+
 def test_checkpoint_abort_advances_out_of_order_finish(
     tmp_path: Path,
 ) -> None:
@@ -3163,6 +3303,48 @@ def test_lora_exchange_coordinates_asymmetric_preparation_failure(
     mp.spawn(
         _exchange_preparation_failure_worker,
         args=(2, f"file://{tmp_path / 'exchange-failure-init'}"),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _gloo_exchange_device_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+) -> None:
+    torch.distributed.init_process_group(
+        "gloo", rank=rank, world_size=world_size, init_method=init_method
+    )
+    try:
+        key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
+        metadata = (
+            LoraShardMeta(
+                key=key,
+                owner_rank=1,
+                shape=(2,),
+                dtype_name="float32",
+                manifest={"sharded": False, "shard_world_size": 1, "shard_rank": 0},
+                block="base_model.model.model.layers.0",
+            ),
+        )
+        received = lora_publish._exchange_tensors(
+            metadata,
+            local_tensors={key: torch.ones(2)} if rank == 1 else {},
+            rank=rank,
+            device=torch.device("cuda"),
+        )
+        if rank == 0:
+            assert received[(1, key)].device.type == "cpu"
+            torch.testing.assert_close(received[(1, key)], torch.ones(2))
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_lora_exchange_uses_cpu_for_gloo(tmp_path: Path) -> None:
+    mp.spawn(
+        _gloo_exchange_device_worker,
+        args=(2, f"file://{tmp_path / 'gloo-device-init'}"),
         nprocs=2,
         join=True,
     )

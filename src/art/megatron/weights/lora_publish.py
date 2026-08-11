@@ -379,6 +379,14 @@ def _rank_and_device() -> tuple[int, torch.device]:
     return _rank(), _device()
 
 
+def _exchange_device(
+    group: torch.distributed.ProcessGroup | None,
+    fallback: torch.device,
+) -> torch.device:
+    backend = str(torch.distributed.get_backend(group)).lower()
+    return torch.device("cpu") if "gloo" in backend else fallback
+
+
 def _prepare_exchange_buffers(
     metadata: Sequence[LoraShardMeta | PackedExpertShardMeta],
     *,
@@ -396,7 +404,7 @@ def _prepare_exchange_buffers(
     for meta in metadata:
         identity = (meta.owner_rank, meta.key)
         if rank == meta.owner_rank:
-            tensor = local_tensors[meta.key].detach().contiguous()
+            tensor = local_tensors[meta.key].detach().to(device).contiguous()
             if tuple(tensor.shape) != meta.shape:
                 raise RuntimeError(
                     f"Tensor {meta.key!r} shape {tuple(tensor.shape)} does not match "
@@ -442,6 +450,7 @@ def _exchange_tensors(
             (rank, meta.key): local_tensors[meta.key].detach().cpu().contiguous()
             for meta in ordered
         }
+    device = _exchange_device(group, device)
 
     sends: dict[tuple[int, str], torch.Tensor] = {}
     receives: dict[tuple[int, str], torch.Tensor] = {}

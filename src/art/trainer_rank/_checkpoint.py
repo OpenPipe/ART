@@ -281,6 +281,9 @@ def prepare_checkpoint_save(
 ) -> None:
     """Capture immutable rank-local state without retaining live tensors."""
     destination = Path(output_dir)
+    snapshot = destination.with_name(
+        f".{destination.name}.snapshot-r{_rank()}-{uuid.uuid4().hex}"
+    )
     condition = trainer._checkpoint_save_condition
     with condition:
         condition.wait_for(
@@ -317,14 +320,12 @@ def prepare_checkpoint_save(
             raise trainer._slot_state_error(
                 "Checkpoint optimizer config differs across ranks"
             )
-        if any(value != sequence for value in _gather_objects(sequence)):
-            raise RuntimeError("Checkpoint save sequence differs across ranks")
+        identity = (sequence, output_dir, checkpoint_name)
+        if any(value != identity for value in _gather_objects(identity)):
+            raise RuntimeError("Checkpoint save identity differs across ranks")
     except BaseException:
         _abort_preparation_sequence(trainer, output_dir, sequence)
         raise
-    snapshot = destination.with_name(
-        f".{destination.name}.snapshot-r{_rank()}-{uuid.uuid4().hex}"
-    )
     prepared: _PreparedSave | None = None
     error: BaseException | None = None
     try:
@@ -488,10 +489,10 @@ def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
         prepared = trainer._prepared_checkpoint_saves.get(output_dir)
         if prepared is None:
             raise RuntimeError(f"Checkpoint save was not prepared: {output_dir}")
+        trainer._checkpoint_finishing_saves.add(output_dir)
         condition.wait_for(
             lambda: prepared.sequence == trainer._checkpoint_finish_sequence
         )
-        trainer._checkpoint_finishing_saves.add(output_dir)
 
     error: BaseException | None = None
     cleanup_error: BaseException | None = None
@@ -505,6 +506,23 @@ def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
         pass
     except BaseException as exc:
         cleanup_error = exc
+    final_error: BaseException | None = error
+    if error is not None and cleanup_error is not None:
+        final_error = BaseExceptionGroup(
+            "checkpoint finalization and snapshot cleanup both failed",
+            [error, cleanup_error],
+        )
+    elif cleanup_error is not None:
+        final_error = cleanup_error
+    distributed_error: BaseException | None = None
+    try:
+        _raise_distributed(
+            final_error,
+            "clean up finalized checkpoint snapshot",
+            group=trainer._checkpoint_process_group,
+        )
+    except BaseException as exc:
+        distributed_error = exc
     finally:
         with condition:
             trainer._prepared_checkpoint_saves.pop(output_dir, None)
@@ -514,19 +532,8 @@ def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
             trainer._checkpoint_finish_sequence += 1
             _advance_finish_sequence(trainer)
             condition.notify_all()
-    final_error: BaseException | None = error
-    if error is not None and cleanup_error is not None:
-        final_error = BaseExceptionGroup(
-            "checkpoint finalization and snapshot cleanup both failed",
-            [error, cleanup_error],
-        )
-    elif cleanup_error is not None:
-        final_error = cleanup_error
-    _raise_distributed(
-        final_error,
-        "clean up finalized checkpoint snapshot",
-        group=trainer._checkpoint_process_group,
-    )
+    if distributed_error is not None:
+        raise distributed_error
 
 
 def export_lora(
