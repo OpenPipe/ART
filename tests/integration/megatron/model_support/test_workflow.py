@@ -65,7 +65,7 @@ from .workflow_throughput import (
     _collect_measurements,
     _current_pipeline_settings,
     _environment_provenance,
-    _hold_pipeline_settings_after_step,
+    _freeze_pipeline_settings_from_step,
     _packed_input_fingerprint,
     _phase_evidence,
     _reduced_config,
@@ -265,6 +265,11 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             "data/step_num_gradient_steps": 1,
             "pipeline/global_real_microbatches": 1,
             "pipeline/global_dummy_microbatches": 0,
+            "pipeline_settings/num_rollout_workers": 16,
+            "pipeline_settings/min_batch_size": 8,
+            "pipeline_settings/max_batch_size": 32,
+            "pipeline_settings/queue_maxsize": 48,
+            "pipeline_settings/target_groups_per_step": 24,
             "time/step_train_s": 1.5,
             "time/step_wall_s": 2.0,
             "time/step_collect_batch_s": 0.001068115234375,
@@ -291,9 +296,9 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         config=SimpleNamespace(mode="online", window_steps=2),
         decisions=[
             SimpleNamespace(
-                action="hold",
+                action="decrease_workers",
                 previous=measured_settings,
-                updated=measured_settings,
+                updated=future_settings,
                 stats=SimpleNamespace(
                     start_step=16,
                     end_step=17,
@@ -307,8 +312,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                 ),
             ),
             SimpleNamespace(
-                action="decrease_workers",
-                previous=measured_settings,
+                action="hold",
+                previous=future_settings,
                 updated=future_settings,
                 stats=SimpleNamespace(
                     start_step=18,
@@ -342,12 +347,15 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     )
 
     def phase(kind: str, packed: str, steps: tuple[int, ...]):
+        phase_rows = [dict(rows[-1]), dict(rows[-1])]
+        phase_rows[1]["data/step_nonpadding_logical_tokens"] += 1
+        phase_rows[1]["data/step_unused_packed_capacity_tokens"] -= 1
         return _phase_evidence(
             phase=cast(Any, kind),
             runtime_fingerprint="runtime-a",
             trajectory_input_fingerprint="trajectory-a",
             packed_input_fingerprint=packed,
-            samples=[(rows[-1], step) for step in steps],
+            samples=list(zip(phase_rows, steps, strict=True)),
         )
 
     e2e_phase, isolated_phase = (
@@ -376,8 +384,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "nonpadding_logical_tokens": 4_000,
         "loss_bearing_tokens": 2_000,
         "accepted_train_tokens": 2_000,
-        "isolated_train_tok_s": 2_000 / 3.0,
-        "matched_e2e_core_train_tok_s": 2_000 / 3.0,
+        "isolated_train_tok_s": 2_001 / 3.0,
+        "matched_e2e_core_train_tok_s": 2_001 / 3.0,
         "e2e_core_train_tok_s": 4_000 / 6.0,
         "e2e_train_tok_s": 500.0,
         "accepted_train_tok_s": 250.0,
@@ -458,10 +466,12 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     assert "matched_core_to_isolated_ratio_max" in acceptance_failures(
         measurements, config, thresholds
     )
-    profile.decisions[1].previous = future_settings
-    with pytest.raises(RuntimeError, match="executed with one setting"):
+    inconsistent = [dict(row) for row in rows]
+    inconsistent[-1]["pipeline_settings/num_rollout_workers"] = 14
+    history_path.write_text("".join(json.dumps(row) + "\n" for row in inconsistent))
+    with pytest.raises(RuntimeError, match="history rows executed different"):
         collect(isolated_phase)
-    profile.decisions[1].previous = measured_settings
+    history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     capture_settings = measured_settings.model_dump(mode="json")
     capture_settings["num_rollout_workers"] = 14
     with pytest.raises(
@@ -489,7 +499,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         collect(phase("isolated", "input-b", (22, 23)))
 
 
-def test_throughput_capture_holds_terminal_future_settings() -> None:
+def test_throughput_measurement_freezes_actual_settings() -> None:
     measured = PipelineTuneSettings(
         num_rollout_workers=16,
         min_batch_size=8,
@@ -510,7 +520,7 @@ def test_throughput_capture_holds_terminal_future_settings() -> None:
     trainer.apply_pipeline_settings = apply
     original = trainer.apply_pipeline_settings
 
-    with _hold_pipeline_settings_after_step(trainer, 19):
+    with _freeze_pipeline_settings_from_step(trainer, 19):
         trainer.apply_pipeline_settings(measured)
         trainer.state.next_training_step = 19
         trainer.apply_pipeline_settings(future)

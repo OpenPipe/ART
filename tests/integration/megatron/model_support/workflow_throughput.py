@@ -46,10 +46,17 @@ _POLICY_AGE_P95 = "offpolicy/token_weighted_policy_age_p95_steps"
 _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
-_MEASUREMENT_CONTRACT_VERSION = 8
+_MEASUREMENT_CONTRACT_VERSION = 9
 _ISOLATED_WARMUP_STEPS = 1
 _MATCHED_MEASURED_STEPS = 2
 _CAPTURE_GUARD_STEPS = 1
+_PIPELINE_SETTING_NAMES = (
+    "num_rollout_workers",
+    "min_batch_size",
+    "max_batch_size",
+    "queue_maxsize",
+    "target_groups_per_step",
+)
 _REPO_ROOT = Path(__file__).parents[4]
 _MAIN_RUNTIME_PACKAGES = (
     "openpipe-art",
@@ -107,18 +114,13 @@ class TrainerPhaseEvidence(NamedTuple):
         )
 
 
-def _same_executed_settings(decisions: list[Any]) -> bool:
-    first, second = decisions[-2:]
-    return first.previous == first.updated == second.previous
-
-
 @contextmanager
-def _hold_pipeline_settings_after_step(trainer: Any, step: int) -> Iterator[None]:
+def _freeze_pipeline_settings_from_step(trainer: Any, step: int) -> Iterator[None]:
     apply = trainer.apply_pipeline_settings
 
     def apply_before_step(settings: Any) -> None:
-        # The terminal decision is future evidence; matched capture must retain the
-        # setting that executed the measured windows.
+        # Keep the measured windows and matched captures on one actual setting while
+        # the tuner continues recording the decisions it would have applied.
         if trainer.state.next_training_step < step:
             apply(settings)
 
@@ -130,16 +132,7 @@ def _hold_pipeline_settings_after_step(trainer: Any, step: int) -> Iterator[None
 
 
 def _current_pipeline_settings(trainer: Any) -> dict[str, int]:
-    return {
-        name: int(getattr(trainer, name))
-        for name in (
-            "num_rollout_workers",
-            "min_batch_size",
-            "max_batch_size",
-            "queue_maxsize",
-            "target_groups_per_step",
-        )
-    }
+    return {name: int(getattr(trainer, name)) for name in _PIPELINE_SETTING_NAMES}
 
 
 def _text(config: dict[str, Any]) -> dict[str, Any]:
@@ -331,13 +324,10 @@ def _phase_evidence(
         }
         for metrics in numeric_samples
     ]
-    if any(workload != workloads[0] for workload in workloads[1:]):
-        raise RuntimeError(f"{phase} trainer samples executed different workloads")
     train_s = sum(metrics.get("time/step_train_s", 0.0) for metrics in numeric_samples)
     if not math.isfinite(train_s) or train_s <= 0.0:
         raise RuntimeError(f"{phase} trainer timing is invalid: train={train_s}")
-    workload = workloads[0]
-    workload_fingerprint = _digest(workload)
+    workload_fingerprint = _digest(workloads)
     return TrainerPhaseEvidence(
         phase=phase,
         runtime_fingerprint=runtime_fingerprint,
@@ -1094,14 +1084,8 @@ def _collect_measurements(
     ]
     selected = decisions[-2:]
     _require(
-        len(selected) == 2 and _same_executed_settings(selected),
-        "throughput evidence requires two trailing windows executed with one setting",
-    )
-    executed_settings = selected[-1].previous.model_dump(mode="json")
-    _require(
-        dict(capture_settings) == executed_settings,
-        "matched capture did not use the measured pipeline settings: "
-        f"{dict(capture_settings)} != {executed_settings}",
+        len(selected) == 2,
+        "throughput evidence requires two trailing autotuner windows",
     )
     stats = [decision.stats for decision in selected]
     assert all(window is not None for window in stats)
@@ -1135,6 +1119,26 @@ def _collect_measurements(
     missing = [step for step in steps if step not in by_step]
     _require(not missing, f"autotuner decision window lacks train rows: {missing}")
     rows = [by_step[step] for step in steps]
+    executed_settings_by_step = [
+        {
+            name: _nonnegative_integer(
+                row.get(f"pipeline_settings/{name}"),
+                name=f"step {step} pipeline setting {name}",
+            )
+            for name in _PIPELINE_SETTING_NAMES
+        }
+        for step, row in zip(steps, rows, strict=True)
+    ]
+    executed_settings = executed_settings_by_step[0]
+    _require(
+        all(settings == executed_settings for settings in executed_settings_by_step),
+        "throughput history rows executed different pipeline settings",
+    )
+    _require(
+        dict(capture_settings) == executed_settings,
+        "matched capture did not use the measured pipeline settings: "
+        f"{dict(capture_settings)} != {executed_settings}",
+    )
     window_rows = [
         [by_step[step] for step in range(window.start_step, window.end_step + 1)]
         for window in stats
@@ -1622,7 +1626,8 @@ async def _run_e2e_throughput_async(
 
             setattr(backend, "train", tracked_train)
             try:
-                with _hold_pipeline_settings_after_step(trainer, config.max_steps):
+                measurement_start = config.max_steps - 2 * autotune.window_steps + 1
+                with _freeze_pipeline_settings_from_step(trainer, measurement_start):
                     await trainer.train(handle_signals=False)
                 if train_call_count != capture_train_calls[-1]:
                     raise RuntimeError(
