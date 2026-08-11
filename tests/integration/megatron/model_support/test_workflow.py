@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -61,6 +62,7 @@ from .workflow_throughput import (
     ThroughputFixture,
     _collect_matched_packing_shapes,
     _collect_measurements,
+    _environment_provenance,
     _hold_pipeline_settings_after_step,
     _packed_input_fingerprint,
     _phase_evidence,
@@ -481,6 +483,15 @@ def test_throughput_capture_holds_terminal_future_settings() -> None:
     trainer.apply_pipeline_settings("restored")
     assert applied == ["measured", "restored"]
     assert trainer.apply_pipeline_settings == original
+
+
+def test_throughput_provenance_ignores_local_editable_paths() -> None:
+    distributions = _environment_provenance(
+        Path(sys.executable), ("openpipe-art", "pydantic")
+    )["distributions"]
+
+    assert set(distributions["openpipe-art"]) == {"version", "metadata_sha256"}
+    assert {"direct_url_sha256", "record_sha256"} <= set(distributions["pydantic"])
 
 
 def test_dsv4_throughput_reduction_preserves_hash_moe_prefix() -> None:

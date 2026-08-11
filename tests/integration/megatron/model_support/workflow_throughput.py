@@ -73,6 +73,7 @@ _VLLM_RUNTIME_PACKAGES = (
     "flashinfer-python",
     "nvidia-nccl-cu13",
 )
+_LOCAL_SOURCE_PACKAGES = ("openpipe-art", "art-vllm-runtime")
 _H200_THROUGHPUT_NUM_LAYERS = {"dsv4": 4, "glm52": 6}
 
 
@@ -182,17 +183,22 @@ def sha(value):
     return hashlib.sha256(value.encode()).hexdigest() if value is not None else None
 
 distributions = {}
+local_source_packages = set(json.loads(sys.argv[2]))
 for name in json.loads(sys.argv[1]):
     try:
         dist = metadata.distribution(name)
     except metadata.PackageNotFoundError:
         continue
-    distributions[name] = {
+    provenance = {
         "version": dist.version,
         "metadata_sha256": sha(dist.read_text("METADATA")),
-        "direct_url_sha256": sha(dist.read_text("direct_url.json")),
-        "record_sha256": sha(dist.read_text("RECORD")),
     }
+    if name not in local_source_packages:
+        provenance.update({
+            "direct_url_sha256": sha(dist.read_text("direct_url.json")),
+            "record_sha256": sha(dist.read_text("RECORD")),
+        })
+    distributions[name] = provenance
 print(json.dumps({
     "python": {
         "version": platform.python_version(),
@@ -211,7 +217,13 @@ print(json.dumps({
     if not python.is_file():
         raise RuntimeError(f"calibration runtime Python is missing: {python}")
     result = subprocess.run(
-        [str(python), "-c", script, json.dumps(packages)],
+        [
+            str(python),
+            "-c",
+            script,
+            json.dumps(packages),
+            json.dumps(_LOCAL_SOURCE_PACKAGES),
+        ],
         check=True,
         capture_output=True,
         text=True,
