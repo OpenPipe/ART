@@ -508,11 +508,12 @@ def _is_self_attn_q_proj_lora_b(key: str) -> bool:
 
 
 @lru_cache(maxsize=8)
-def _qwen35_text_config(base_model_name_or_path: str) -> Any:
+def _qwen35_text_config(base_model_name_or_path: str, revision: str | None) -> Any:
     from transformers import AutoConfig
 
     config = AutoConfig.from_pretrained(
         base_model_name_or_path,
+        revision=revision,
         local_files_only=True,
         trust_remote_code=True,
     )
@@ -528,7 +529,10 @@ def _qwen35_attention_dims(adapter_config: dict[str, Any]) -> tuple[int, int, in
         base_model = adapter_config.get("base_model_name_or_path")
         if not base_model:
             raise RuntimeError("Qwen3.5 LoRA adapter config is missing base model path")
-        config = _qwen35_text_config(str(base_model))
+        revision = adapter_config.get("revision")
+        if revision is not None and not isinstance(revision, str):
+            raise RuntimeError("Qwen3.5 LoRA adapter revision must be a string")
+        config = _qwen35_text_config(str(base_model), revision)
         num_heads = getattr(config, "num_attention_heads")
         num_groups = getattr(config, "num_key_value_heads", num_heads)
         head_dim = getattr(config, "head_dim", None)

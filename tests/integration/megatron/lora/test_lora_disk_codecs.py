@@ -34,6 +34,7 @@ from art.megatron.model_support.handlers import (
     QWEN3_5_MOE_HANDLER,
     QWEN3_MOE_HANDLER,
 )
+from art.megatron.model_support.handlers import qwen3_5 as qwen35_module
 from art.megatron.model_support.handlers.dsv4 import DSV4_HANDLER
 from art.megatron.model_support.handlers.gemma4 import GEMMA4_MOE_HANDLER
 from art.megatron.model_support.lora_disk import (
@@ -763,6 +764,41 @@ def test_qwen3_target_parameter_identity_normalizes_to_per_expert_vllm_layout(
         "model.layers.0.mlp.experts.1.down_proj",
         "model.layers.0.mlp.experts.1.gate_proj",
         "model.layers.0.mlp.experts.1.up_proj",
+    ]
+
+
+def test_qwen35_config_lookup_uses_checkpoint_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import transformers
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def from_pretrained(base_model: str, **kwargs: object) -> object:
+        calls.append((base_model, kwargs))
+        return SimpleNamespace(
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=3,
+        )
+
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", from_pretrained)
+    qwen35_module._qwen35_text_config.cache_clear()
+    try:
+        assert qwen35_module._qwen35_attention_dims(
+            {"base_model_name_or_path": "Qwen/test", "revision": "abc123"}
+        ) == (4, 2, 3)
+    finally:
+        qwen35_module._qwen35_text_config.cache_clear()
+    assert calls == [
+        (
+            "Qwen/test",
+            {
+                "revision": "abc123",
+                "local_files_only": True,
+                "trust_remote_code": True,
+            },
+        )
     ]
 
 
