@@ -448,7 +448,9 @@ continued.num_computed_tokens = 4
 scheduler = SimpleNamespace(requests={
     continued.request_id: continued,
     waiting.request_id: waiting,
-})
+}, kv_cache_manager=SimpleNamespace(
+    block_pool=SimpleNamespace(hash_block_size=4),
+))
 transition = _transition_scheduler_policy_history(
     scheduler,
     lora_request=new,
@@ -456,6 +458,9 @@ transition = _transition_scheduler_policy_history(
     started_request_ids={continued.request_id},
 )
 continued_history = continued.cache_salt
+continued_hashes = list(continued.block_hashes)
+continued_transitions = continued._art_policy_cache_transitions
+not_executed_after_update = not _request_has_executed(continued)
 fresh = make_request("fresh")
 _set_policy_cache_salt(
     fresh, lora_slot=new.lora_name,
@@ -463,7 +468,6 @@ _set_policy_cache_salt(
 )
 fresh.block_hashes.clear()
 fresh.update_block_hashes()
-continued.num_computed_tokens = 0
 third = PolicyLoRARequest(
     lora_name="model:active", lora_int_id=1, lora_path="third",
     policy_version=4, update_seq=3,
@@ -475,9 +479,13 @@ _set_policy_cache_salt(
     policy_version=third.policy_version, update_seq=third.update_seq,
     previous_digest=old_history,
 )
-not_executed_after_reset = not _request_has_executed(continued)
 _transition_scheduler_policy_history(
-    SimpleNamespace(requests={continued.request_id: continued}),
+    SimpleNamespace(
+        requests={continued.request_id: continued},
+        kv_cache_manager=SimpleNamespace(
+            block_pool=SimpleNamespace(hash_block_size=4),
+        ),
+    ),
     lora_request=third,
     previous_policy=None,
     started_request_ids=set(),
@@ -491,7 +499,11 @@ print(json.dumps({
         != _policy_history_from_cache_salt(make_request("old").cache_salt)
     ),
     "block_hashes_changed": old_hashes != continued.block_hashes,
-    "not_executed_after_reset": not_executed_after_reset,
+    "computed_hash_preserved": old_hashes[0] == continued_hashes[0],
+    "future_hash_rekeyed": old_hashes[1] != continued_hashes[1],
+    "transition_boundary": continued_transitions[0][0],
+    "not_executed_after_update": not_executed_after_update,
+    "same_boundary_replaced": len(continued._art_policy_cache_transitions) == 1,
     "skipped_policy_replaced": continued.cache_salt == expected_third.cache_salt,
 }))
 """,
@@ -500,11 +512,15 @@ print(json.dumps({
     )
     assert json.loads(payload) == {
         "block_hashes_changed": True,
+        "computed_hash_preserved": True,
         "continued_differs": True,
-        "not_executed_after_reset": True,
+        "future_hash_rekeyed": True,
+        "not_executed_after_update": True,
+        "same_boundary_replaced": True,
         "same_version_reload_differs": True,
         "skipped_policy_replaced": True,
         "transition": {"continued_requests": 1, "updated_requests": 2},
+        "transition_boundary": 4,
         "waiting_matches_fresh": True,
     }
 

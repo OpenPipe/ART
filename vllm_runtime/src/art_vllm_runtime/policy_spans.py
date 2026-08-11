@@ -36,6 +36,8 @@ _LORA_UPDATE_COORDINATOR_FIELD = "_art_lora_update_coordinator"
 _EXECUTING_POLICY_CONTEXT_FIELD = "_art_executing_policy_context"
 _POLICY_EXECUTION_MARKER_FIELD = "_art_policy_execution_marker"
 _POLICY_HISTORY_BASE_FIELD = "_art_policy_history_before_current"
+_POLICY_CACHE_TRANSITIONS_FIELD = "_art_policy_cache_transitions"
+_POLICY_CACHE_TRANSITION_KEY = "art_policy_transition_v1"
 
 
 class _RequestAdmissionLease:
@@ -89,6 +91,7 @@ class PolicyLoRARequest(LoRARequest, omit_defaults=True, array_like=True):  # ty
 
 
 def patch_policy_token_spans() -> None:
+    _patch_policy_cache_hashing()
     _patch_model_runner_output_type()
     _patch_engine_core_output_type()
     _patch_worker_policy_span_capture()
@@ -99,6 +102,44 @@ def patch_policy_token_spans() -> None:
     _patch_engine_request_admission()
     _patch_load_inplace_storage()
     _patch_policy_lora_update_rpc()
+
+
+def _patch_policy_cache_hashing() -> None:
+    from vllm.v1.core import block_pool, kv_cache_utils
+
+    original = kv_cache_utils.generate_block_hash_extra_keys
+    if getattr(original, "__art_policy_spans_patched__", False):
+        return
+
+    def generate_block_hash_extra_keys(
+        request: Any,
+        start_token_idx: int,
+        end_token_idx: int,
+        start_mm_idx: int,
+    ) -> tuple[tuple[Any, ...] | None, int]:
+        extra_keys, next_mm_idx = original(
+            request, start_token_idx, end_token_idx, start_mm_idx
+        )
+        transitions = tuple(
+            transition
+            for transition in getattr(request, _POLICY_CACHE_TRANSITIONS_FIELD, ())
+            if start_token_idx <= transition[0] < end_token_idx
+        )
+        if transitions:
+            extra_keys = (
+                (*extra_keys, (_POLICY_CACHE_TRANSITION_KEY, transitions))
+                if extra_keys
+                else ((_POLICY_CACHE_TRANSITION_KEY, transitions),)
+            )
+        return extra_keys, next_mm_idx
+
+    setattr(generate_block_hash_extra_keys, "__art_policy_spans_patched__", True)
+    setattr(
+        kv_cache_utils, "generate_block_hash_extra_keys", generate_block_hash_extra_keys
+    )
+    setattr(
+        block_pool, "generate_block_hash_extra_keys", generate_block_hash_extra_keys
+    )
 
 
 class _SlotAdmissionState:
@@ -1134,10 +1175,6 @@ def _apply_policy_lora_update(
             if _request_uses_lora_slot(request, lora_request.lora_name)
             and _request_has_executed(request)
         }
-        engine_core._reset_caches(
-            reset_running_requests=True,
-            reset_connector=True,
-        )
         return _transition_scheduler_policy_history(
             engine_core.scheduler,
             lora_request=_policy_lora_request_from_payload(payload, load_inplace=False),
@@ -1190,12 +1227,42 @@ def _transition_scheduler_policy_history(
             update_seq=lora_request.update_seq,
             previous_digest=previous_digest,
         )
-        request.block_hashes.clear()
+        computed_tokens = int(getattr(request, "num_computed_tokens", 0) or 0)
+        if computed_tokens:
+            if computed_tokens > request.num_tokens:
+                raise RuntimeError(
+                    f"Started request {request.request_id!r} has "
+                    f"{computed_tokens} computed tokens but only {request.num_tokens} tokens"
+                )
+            history_digest = _policy_history_from_cache_salt(request.cache_salt)
+            assert history_digest is not None
+            transitions: list[tuple[int, str]] = list(
+                getattr(request, _POLICY_CACHE_TRANSITIONS_FIELD, ())
+            )
+            transition = (computed_tokens, history_digest)
+            if transitions and transitions[-1][0] == computed_tokens:
+                transitions[-1] = transition
+            else:
+                if transitions and transitions[-1][0] > computed_tokens:
+                    raise RuntimeError("Policy cache transitions are not monotonic")
+                transitions.append(transition)
+            setattr(request, _POLICY_CACHE_TRANSITIONS_FIELD, tuple(transitions))
+
+            # Requests hash their entire known prompt eagerly. Preserve only the
+            # blocks whose KV was computed before this weight transition.
+            first_changed_block = computed_tokens // _scheduler_hash_block_size(
+                scheduler
+            )
+            del request.block_hashes[first_changed_block:]
+        else:
+            setattr(request, _POLICY_CACHE_TRANSITIONS_FIELD, ())
+            request.block_hashes.clear()
         request.update_block_hashes()
         setattr(
             request,
             _POLICY_EXECUTION_MARKER_FIELD,
             (
+                computed_tokens,
                 int(getattr(request, "num_preemptions", 0) or 0),
                 len(getattr(request, "output_token_ids", ())),
             ),
@@ -1205,6 +1272,13 @@ def _transition_scheduler_policy_history(
         "updated_requests": updated,
         "continued_requests": continued,
     }
+
+
+def _scheduler_hash_block_size(scheduler: Any) -> int:
+    block_size = int(scheduler.kv_cache_manager.block_pool.hash_block_size)
+    if block_size <= 0:
+        raise RuntimeError("vLLM reported a non-positive KV hash block size")
+    return block_size
 
 
 def _policy_lora_request_from_payload(
@@ -1298,21 +1372,18 @@ def _request_uses_lora_slot(request: Any, lora_slot: str) -> bool:
 
 
 def _request_has_executed(request: Any) -> bool:
+    computed_tokens = int(getattr(request, "num_computed_tokens", 0) or 0)
     preemptions = int(getattr(request, "num_preemptions", 0) or 0)
     output_tokens = len(getattr(request, "output_token_ids", ()))
     marker = getattr(request, _POLICY_EXECUTION_MARKER_FIELD, None)
     if marker is not None:
-        baseline_preemptions, baseline_output_tokens = marker
+        baseline_computed_tokens, baseline_preemptions, baseline_output_tokens = marker
         return bool(
-            int(getattr(request, "num_computed_tokens", 0) or 0)
+            computed_tokens > baseline_computed_tokens
             or preemptions > baseline_preemptions
             or output_tokens > baseline_output_tokens
         )
-    return bool(
-        int(getattr(request, "num_computed_tokens", 0) or 0)
-        or output_tokens
-        or preemptions
-    )
+    return bool(computed_tokens or output_tokens or preemptions)
 
 
 def _policy_context_from_runner(runner: Any) -> dict[str, dict[str, Any]]:
