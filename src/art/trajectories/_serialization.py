@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
@@ -9,6 +9,77 @@ from pydantic import BaseModel
 from pydantic.main import IncEx
 
 from ..openai import ART_MOE_ROUTING_METADATA_KEY
+
+type _StringPool = dict[str, str]
+
+
+def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
+    """Share equal strings inside supported model and built-in container graphs."""
+
+    _intern_value(value, {} if pool is None else pool, {})
+
+
+def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> object:
+    if isinstance(value, str):
+        return pool.setdefault(value, value)
+    if isinstance(value, (bytes, bytearray, memoryview)) or value is None:
+        return value
+
+    value_id = id(value)
+    if value_id in memo:
+        return memo[value_id]
+
+    if isinstance(value, BaseModel):
+        memo[value_id] = value
+        for name, item in value.__dict__.items():
+            value.__dict__[name] = _intern_value(item, pool, memo)
+        extra = value.__pydantic_extra__
+        if extra is not None and id(extra) not in memo:
+            memo[id(extra)] = extra
+            _intern_mapping(cast(dict[object, object], extra), pool, memo)
+        return value
+    if isinstance(value, dict):
+        memo[value_id] = value
+        _intern_mapping(cast(dict[object, object], value), pool, memo)
+        return value
+    if isinstance(value, list):
+        memo[value_id] = value
+        items = cast(list[object], value)
+        for index, item in enumerate(items):
+            items[index] = _intern_value(item, pool, memo)
+        return value
+    if isinstance(value, tuple):
+        memo[value_id] = value
+        result = tuple(_intern_value(item, pool, memo) for item in value)
+        memo[value_id] = result
+        return result
+    if isinstance(value, set):
+        memo[value_id] = value
+        values = cast(set[object], value)
+        items = [_intern_value(item, pool, memo) for item in values]
+        values.clear()
+        values.update(items)
+        return value
+    if isinstance(value, frozenset):
+        memo[value_id] = value
+        result = frozenset(_intern_value(item, pool, memo) for item in value)
+        memo[value_id] = result
+        return result
+    return value
+
+
+def _intern_mapping(
+    value: dict[object, object], pool: _StringPool, memo: dict[int, object]
+) -> None:
+    items = [
+        (
+            _intern_value(key, pool, memo) if isinstance(key, str) else key,
+            _intern_value(item, pool, memo),
+        )
+        for key, item in value.items()
+    ]
+    value.clear()
+    value.update(items)
 
 
 def serialize_messages_and_choices(items: list[Any]) -> list[dict[str, Any]]:

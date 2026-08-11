@@ -20,6 +20,7 @@ from typing import (
     Generic,
     Literal,
     Protocol,
+    Self,
     TypeAlias,
     TypeVar,
     overload,
@@ -62,12 +63,35 @@ from typing_extensions import TypedDict, deprecated
 from ..types import Messages, MessagesAndChoices, Tools
 from ._serialization import (
     _CompactModel,
+    _StringPool,
     serialize_chat_completion,
     serialize_messages_and_choices,
+)
+from ._serialization import (
+    _intern_strings as _intern_string_graph,
 )
 
 # Deliberately open: Pydantic enforces serializability when callers dump in JSON mode.
 MetadataValue = Any
+
+type CompactTrajectoryKind = Literal[
+    "trajectory",
+    "trajectory_group",
+    "trajectories",
+    "trajectory_groups",
+]
+
+
+class CompactTrajectoryPayload(TypedDict):
+    """Versioned, JSON-compatible compact trajectory envelope."""
+
+    format: Literal["art.trajectories"]
+    version: Literal[1]
+    kind: CompactTrajectoryKind
+    # Maps readable references such as "$0" to literal string contents.
+    strings: dict[str, str]
+    # Ordinary Pydantic JSON data, with profitable strings replaced by references.
+    data: pydantic.JsonValue
 
 
 class Tokenizer(Protocol):
@@ -474,7 +498,26 @@ class Trajectory(_CompactModel):
             raise ValueError(
                 "A trajectory cannot contain both exchanges and legacy histories"
             )
+        self._intern_strings()
         return self
+
+    def _intern_strings(self, pool: _StringPool | None = None) -> None:
+        _intern_string_graph(self, pool)
+
+    def compact_dump(self) -> CompactTrajectoryPayload:
+        """Return the explicit string-table representation of this trajectory."""
+
+        from ._compact import dump_trajectory
+
+        return dump_trajectory(self)
+
+    @classmethod
+    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
+        """Validate and decode a compact trajectory payload."""
+
+        from ._compact import validate_trajectory
+
+        return validate_trajectory(payload, cls)
 
     def __enter__(self) -> Trajectory:
         from ._scope import enter_trajectory
@@ -496,6 +539,7 @@ class Trajectory(_CompactModel):
 
     def finish(self) -> Trajectory:
         self.metrics["duration"] = (datetime.now() - self.start_time).total_seconds()
+        self._intern_strings()
         return self
 
     @asynccontextmanager
@@ -684,6 +728,7 @@ class Trajectory(_CompactModel):
     ) -> TokenizedTrajectory | TokenizedMultiHistoryTrajectory:
         from ._tokenize import tokenize_trajectory
 
+        self._intern_strings()
         return tokenize_trajectory(
             self,
             multi_history=multi_history,
@@ -714,6 +759,29 @@ class TrajectoryGroup(_CompactModel):
     logs: list[str] = pydantic.Field(default_factory=list)
     _collect_packing_shape: bool = pydantic.PrivateAttr(default=False)
     _packed_group_shape: Any = pydantic.PrivateAttr(default=None)
+
+    @pydantic.model_validator(mode="after")
+    def _intern_string_graph(self) -> TrajectoryGroup:
+        self._intern_strings()
+        return self
+
+    def _intern_strings(self, pool: _StringPool | None = None) -> None:
+        _intern_string_graph(self, pool)
+
+    def compact_dump(self) -> CompactTrajectoryPayload:
+        """Return the explicit string-table representation of this group."""
+
+        from ._compact import dump_trajectory_group
+
+        return dump_trajectory_group(self)
+
+    @classmethod
+    def compact_validate(cls, payload: Mapping[str, object]) -> Self:
+        """Validate and decode a compact trajectory-group payload."""
+
+        from ._compact import validate_trajectory_group
+
+        return validate_trajectory_group(payload, cls)
 
     @overload
     def __new__(
@@ -842,6 +910,7 @@ class TrajectoryGroup(_CompactModel):
     ):
         from ._tokenize import tokenize_group
 
+        self._intern_strings()
         return tokenize_group(
             self,
             multi_history=multi_history,
@@ -891,6 +960,46 @@ class TokenizedTrajectoryGroup(pydantic.BaseModel, Generic[TokenizedTrajectoryT]
     trajectories: list[TokenizedTrajectoryT]
     metrics: dict[str, float | int | bool]
     metadata: dict[str, MetadataValue]
+
+
+def trajectories_compact_dump(
+    trajectories: Iterable[Trajectory],
+) -> CompactTrajectoryPayload:
+    """Compact trajectories with one shared string table."""
+
+    from ._compact import dump_trajectories
+
+    return dump_trajectories(trajectories)
+
+
+def trajectories_compact_validate(
+    payload: Mapping[str, object],
+) -> list[Trajectory]:
+    """Validate trajectories from a shared compact payload."""
+
+    from ._compact import validate_trajectories
+
+    return validate_trajectories(payload)
+
+
+def trajectory_groups_compact_dump(
+    groups: Iterable[TrajectoryGroup],
+) -> CompactTrajectoryPayload:
+    """Compact trajectory groups with one shared string table."""
+
+    from ._compact import dump_trajectory_groups
+
+    return dump_trajectory_groups(groups)
+
+
+def trajectory_groups_compact_validate(
+    payload: Mapping[str, object],
+) -> list[TrajectoryGroup]:
+    """Validate trajectory groups from a shared compact payload."""
+
+    from ._compact import validate_trajectory_groups
+
+    return validate_trajectory_groups(payload)
 
 
 @overload
@@ -974,6 +1083,12 @@ __all__ = [
     "Tokenizer",
     "TokenFlag",
     "MetadataValue",
+    "CompactTrajectoryKind",
+    "CompactTrajectoryPayload",
+    "trajectories_compact_dump",
+    "trajectories_compact_validate",
+    "trajectory_groups_compact_dump",
+    "trajectory_groups_compact_validate",
     "current_trajectory",
     "no_capture",
     "trajectory",
