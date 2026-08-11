@@ -555,7 +555,7 @@ class TrajectoryQueueStore:
             if (
                 pending is not None
                 and len(self._ready) < pending[1]
-                and self._minimum_cannot_make_progress(pending[0])
+                and self._minimum_cannot_make_progress()
             ):
                 return self._fail_pending_minimum(item, ", ".join(blockers))
             return TrajectoryEnqueueResult(status="full")
@@ -735,12 +735,8 @@ class TrajectoryQueueStore:
             status="minimum_unreachable", reason=self._minimum_error
         )
 
-    def _minimum_cannot_make_progress(self, consumer_id: str) -> bool:
-        return all(
-            entry.phase == "ready"
-            or (entry.phase == "packing" and entry.consumer_id == consumer_id)
-            for entry in self._entries.values()
-        )
+    def _minimum_cannot_make_progress(self) -> bool:
+        return all(entry.phase == "ready" for entry in self._entries.values())
 
 
 def _grouping_key(group: TrajectoryGroup, fallback: str) -> str:
