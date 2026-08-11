@@ -499,6 +499,7 @@ def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
     trainer._checkpoint_revisions = {"A": 0, "B": 0}
     trainer._checkpoint_sources = {}
     trainer._pending_slot_graphs = {}
+    trainer._checkpoint_mutation_tail = None
     return trainer
 
 
