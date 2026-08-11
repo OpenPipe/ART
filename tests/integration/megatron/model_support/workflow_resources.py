@@ -524,7 +524,7 @@ _THROUGHPUT_CONFIGS = {
     "dsv4": ThroughputWorkflowConfig(
         num_layers=8,
         prompt_tokens=12_800,
-        completion_tokens=768,
+        completion_tokens=736,
         groups_per_step=8,
         initial_model_calls_per_inference_gpu=20,
         max_num_seqs=60,

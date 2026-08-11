@@ -45,9 +45,10 @@ _POLICY_AGE_P95 = "offpolicy/token_weighted_policy_age_p95_steps"
 _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
-_MEASUREMENT_CONTRACT_VERSION = 4
+_MEASUREMENT_CONTRACT_VERSION = 5
 _ISOLATED_WARMUP_STEPS = 1
 _ISOLATED_MEASURED_STEPS = 2
+_CAPTURE_GUARD_STEPS = 1
 _REPO_ROOT = Path(__file__).parents[4]
 _MAIN_RUNTIME_PACKAGES = (
     "openpipe-art",
@@ -1140,7 +1141,7 @@ def _collect_measurements(
         not mismatches,
         f"isolated and E2E phases did not execute the same packed input: {mismatches}",
     )
-    capture_step = config.max_steps + 1
+    capture_step = config.max_steps + _CAPTURE_GUARD_STEPS + 1
     _require(
         e2e.policy_steps == (capture_step,),
         f"matched E2E input was not captured at reserved step {capture_step}",
@@ -1316,7 +1317,8 @@ async def _run_e2e_throughput_async(
             f"two measured windows: max_steps={config.max_steps}, "
             f"warmup={autotune.warmup_ignore_steps}, window={autotune.window_steps}"
         )
-    capture_train_call = config.max_steps + 1
+    # Keep test-only trajectory materialization off the final measured publication.
+    capture_train_call = config.max_steps + _CAPTURE_GUARD_STEPS + 1
     runtime_contract = _calibration_contract(
         base_model=base_model,
         fixture=fixture,
