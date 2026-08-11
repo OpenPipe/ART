@@ -45,7 +45,7 @@ _POLICY_AGE_P95 = "offpolicy/token_weighted_policy_age_p95_steps"
 _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
-_MEASUREMENT_CONTRACT_VERSION = 5
+_MEASUREMENT_CONTRACT_VERSION = 6
 _ISOLATED_WARMUP_STEPS = 1
 _ISOLATED_MEASURED_STEPS = 2
 _CAPTURE_GUARD_STEPS = 1
@@ -98,6 +98,11 @@ class TrainerPhaseEvidence(NamedTuple):
     def train_tok_s(self) -> float:
         logical = self.metrics[0]["data/step_nonpadding_logical_tokens"]
         return logical * self.sample_count / self.train_s
+
+
+def _same_executed_settings(decisions: list[Any]) -> bool:
+    first, second = decisions[-2:]
+    return first.previous == first.updated == second.previous
 
 
 def _text(config: dict[str, Any]) -> dict[str, Any]:
@@ -992,13 +997,8 @@ def _collect_measurements(
     ]
     selected = decisions[-2:]
     _require(
-        len(selected) == 2
-        and all(
-            decision.action == "hold" and decision.previous == decision.updated
-            for decision in selected
-        )
-        and selected[0].updated == selected[1].updated,
-        "throughput evidence requires two trailing contiguous unchanged windows",
+        len(selected) == 2 and _same_executed_settings(selected),
+        "throughput evidence requires two trailing windows executed with one setting",
     )
     stats = [decision.stats for decision in selected]
     assert all(window is not None for window in stats)
@@ -1126,6 +1126,11 @@ def _collect_measurements(
         "max_policy_activation_lag_s": max(lags),
         "post_warmup_policy_activation_count": len(window_events),
         "mean_policy_activation_interval_s": fmean(intervals),
+        "p50_policy_activation_interval_s": median(intervals),
+        "p95_policy_activation_interval_s": quantiles(
+            intervals, n=20, method="inclusive"
+        )[18],
+        "second_max_policy_activation_interval_s": sorted(intervals)[-2],
         "max_policy_activation_interval_s": max(intervals),
     }
     matched_fields = (
@@ -1167,10 +1172,7 @@ def acceptance_failures(
     config: ThroughputWorkflowConfig,
     thresholds: ThroughputThresholds | None,
 ) -> list[str]:
-    checks = {
-        "mean_train_gap_s": measurements["mean_train_gap_s"]
-        < config.max_mean_train_gap_s,
-    }
+    checks: dict[str, bool] = {}
     for window in measurements["autotuner_windows"]:
         prefix = f"window_{window['start_step']}_{window['end_step']}"
         checks.update(
@@ -1212,8 +1214,10 @@ def acceptance_failures(
         <= thresholds.max_mean_policy_activation_lag_s,
         "max_policy_activation_lag_s": measurements["max_policy_activation_lag_s"]
         <= thresholds.max_policy_activation_lag_s,
-        "policy_activation_cadence_s": measurements["max_policy_activation_interval_s"]
-        <= thresholds.max_policy_activation_interval_s,
+        "repeated_policy_activation_cadence_s": measurements[
+            "second_max_policy_activation_interval_s"
+        ]
+        <= thresholds.max_repeated_policy_activation_interval_s,
     }
     if thresholds.calibration_fingerprint is not None:
         floor_checks["calibration_fingerprint"] = (

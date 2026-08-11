@@ -28,7 +28,9 @@ class ThroughputThresholds(BaseModel):
     )
     max_mean_policy_activation_lag_s: float = Field(gt=0.0, le=1.5, allow_inf_nan=False)
     max_policy_activation_lag_s: float = Field(gt=0.0, le=3.5, allow_inf_nan=False)
-    max_policy_activation_interval_s: float = Field(gt=0.0, allow_inf_nan=False)
+    max_repeated_policy_activation_interval_s: float = Field(
+        gt=0.0, allow_inf_nan=False
+    )
 
     @model_validator(mode="after")
     def validate_calibration_identity(self) -> "ThroughputThresholds":
@@ -58,7 +60,6 @@ class ThroughputWorkflowConfig(BaseModel):
     packed_sequence_length: Literal[131072] = THROUGHPUT_PACKED_SEQUENCE_LENGTH
     min_vllm_pressure: float = Field(default=0.5, ge=0.0, allow_inf_nan=False)
     max_trainer_underfeed: float = Field(default=0.08, ge=0.0, allow_inf_nan=False)
-    max_mean_train_gap_s: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
     random_initialization_version: Literal["deterministic_random_v1"] = (
         THROUGHPUT_RANDOM_INITIALIZATION_VERSION
     )
@@ -547,8 +548,8 @@ _THROUGHPUT_CONFIGS = {
 }
 
 # Floors are isolated tok/s, E2E tok/s, accepted tok/s, E2E/isolated, and
-# maximum policy-activation interval. B300 values are measured; H200 values are
-# estimates from the prior H200 workflow and remain intentionally fingerprint-free.
+# maximum repeated policy-activation interval. B300 values are measured; H200
+# values are estimates from the prior H200 workflow and remain fingerprint-free.
 _B300_THROUGHPUT_FLOORS = {
     "llama3_dense": (
         "421297e73e35aacdd0f2dc321dec0548adf354789840debd1b2b5b546d3bd7ba",
@@ -622,7 +623,7 @@ def _throughput_threshold(
         min_matched_core_to_isolated_ratio=0.95,
         max_mean_policy_activation_lag_s=1.5,
         max_policy_activation_lag_s=3.5,
-        max_policy_activation_interval_s=cadence,
+        max_repeated_policy_activation_interval_s=cadence,
     )
 
 

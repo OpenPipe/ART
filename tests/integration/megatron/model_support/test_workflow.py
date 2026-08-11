@@ -290,9 +290,9 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                 ),
             ),
             SimpleNamespace(
-                action="hold",
+                action="decrease_workers",
                 previous={"workers": 16},
-                updated={"workers": 16},
+                updated={"workers": 14},
                 stats=SimpleNamespace(
                     start_step=18,
                     end_step=19,
@@ -368,6 +368,9 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "p95_policy_activation_lag_s": 1.1,
         "max_policy_activation_lag_s": 1.25,
         "mean_policy_activation_interval_s": 2.4375,
+        "p50_policy_activation_interval_s": 2.375,
+        "p95_policy_activation_interval_s": 2.9625,
+        "second_max_policy_activation_interval_s": 2.75,
         "max_policy_activation_interval_s": 3.0,
     }
     assert {key: measurements[key] for key in expected} == pytest.approx(expected)
@@ -381,10 +384,10 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         min_matched_core_to_isolated_ratio=0.95,
         max_mean_policy_activation_lag_s=1.5,
         max_policy_activation_lag_s=2.0,
-        max_policy_activation_interval_s=2.5,
+        max_repeated_policy_activation_interval_s=2.5,
     )
     assert acceptance_failures(measurements, config, thresholds) == [
-        "policy_activation_cadence_s"
+        "repeated_policy_activation_cadence_s"
     ]
     estimated = ThroughputThresholds(
         calibration_basis="estimated",
@@ -395,10 +398,10 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         min_matched_core_to_isolated_ratio=0.95,
         max_mean_policy_activation_lag_s=1.5,
         max_policy_activation_lag_s=2.0,
-        max_policy_activation_interval_s=2.5,
+        max_repeated_policy_activation_interval_s=2.5,
     )
     assert acceptance_failures(measurements, config, estimated) == [
-        "policy_activation_cadence_s",
+        "repeated_policy_activation_cadence_s",
         "calibration_basis",
     ]
     lag_failures = acceptance_failures(
@@ -408,7 +411,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             update={
                 "max_mean_policy_activation_lag_s": 0.4,
                 "max_policy_activation_lag_s": 1.0,
-                "max_policy_activation_interval_s": 3.5,
+                "max_repeated_policy_activation_interval_s": 3.5,
             }
         ),
     )
@@ -420,6 +423,10 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     assert "matched_core_to_isolated_ratio_max" in acceptance_failures(
         measurements, config, thresholds
     )
+    profile.decisions[1].previous = {"workers": 14}
+    with pytest.raises(RuntimeError, match="executed with one setting"):
+        collect(isolated_phase)
+    profile.decisions[1].previous = {"workers": 16}
     fractional = [dict(row) for row in rows]
     fractional[0]["data/step_nonpadding_logical_tokens"] = 999.5
     history_path.write_text("".join(json.dumps(row) + "\n" for row in fractional))
