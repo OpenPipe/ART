@@ -570,7 +570,6 @@ def test_throughput_measurement_uses_full_same_setting_suffix() -> None:
     selected = _same_setting_decision_suffix(
         [decision(10), decision(12), decision(14), decision(16)],
         by_step,
-        measured.model_dump(mode="json"),
     )
 
     assert [item.stats.start_step for item in selected] == [12, 14, 16]

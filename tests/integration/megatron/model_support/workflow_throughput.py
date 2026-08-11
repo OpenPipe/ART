@@ -148,9 +148,14 @@ def _row_pipeline_settings(row: Mapping[str, Any], step: int) -> dict[str, int]:
 def _same_setting_decision_suffix(
     decisions: list[Any],
     by_step: Mapping[int, Mapping[str, Any]],
-    capture_settings: Mapping[str, int],
 ) -> list[Any]:
-    expected = dict(capture_settings)
+    final = decisions[-1].stats
+    assert final is not None
+    _require(
+        final.end_step in by_step,
+        f"autotuner decision window lacks train row: {final.end_step}",
+    )
+    expected = _row_pipeline_settings(by_step[final.end_step], final.end_step)
     selected: list[Any] = []
     later: Any | None = None
     for decision in reversed(decisions):
@@ -1148,7 +1153,7 @@ def _collect_measurements(
         len(by_step) == len(history_rows),
         "throughput history contains duplicate training steps",
     )
-    selected = _same_setting_decision_suffix(decisions, by_step, capture_settings)
+    selected = _same_setting_decision_suffix(decisions, by_step)
     stats = [decision.stats for decision in selected]
     assert all(window is not None for window in stats)
     first_stats, last_stats = stats
