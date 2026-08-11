@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
@@ -13,7 +12,6 @@ import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
-import threading
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -282,7 +280,6 @@ def prepare_checkpoint_save(
     checkpoint_name: str,
 ) -> None:
     """Capture immutable rank-local state without retaining live tensors."""
-    _ensure_checkpoint_save_state(trainer)
     destination = Path(output_dir)
     if output_dir in trainer._prepared_checkpoint_saves:
         raise RuntimeError(f"Checkpoint save is already pending: {output_dir}")
@@ -417,7 +414,6 @@ def prepare_checkpoint_save(
 
 def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
     """Finalize a prepared checkpoint without reading mutable trainer state."""
-    _ensure_checkpoint_save_state(trainer)
     condition = trainer._checkpoint_save_condition
     with condition:
         condition.wait_for(
@@ -516,7 +512,7 @@ def _load_stage_lora(
         return _load_native_lora(trainer, source, adapter_rank)
     local_layers = {
         match.group("layer")
-        for key in trainer._local_adapter_keys()
+        for key in trainer._local_lora_adapter_templates()
         if (match := _LAYER_RE.search(key)) is not None
     }
     selected = {
@@ -846,18 +842,6 @@ def _discard_staged_checkpoint(trainer: TrainerRank, name: str) -> None:
     trainer._checkpoint_slot_params_by_name.pop(name, None)
 
 
-def _ensure_checkpoint_save_state(trainer: TrainerRank) -> None:
-    if hasattr(trainer, "_prepared_checkpoint_saves"):
-        return
-    trainer._checkpoint_process_group = None
-    trainer._checkpoint_save_condition = threading.Condition()
-    trainer._checkpoint_save_sequence = 0
-    trainer._checkpoint_finish_sequence = 0
-    trainer._prepared_checkpoint_saves = {}
-    trainer._checkpoint_finishing_saves = set()
-    trainer._completed_checkpoint_saves = deque(maxlen=128)
-
-
 def _ensure_checkpoint_group(trainer: TrainerRank) -> dist.ProcessGroup | None:
     if _distributed() and trainer._checkpoint_process_group is None:
         trainer._checkpoint_process_group = dist.new_group(backend="gloo")
@@ -1038,6 +1022,73 @@ def _snapshot_block_tensors(
     return {item.key: tensors[item.key] for item in selected}
 
 
+def _serialize_snapshot_component(
+    prepared: _PreparedSave,
+    output: Path,
+    metadata: list[LoraShardMeta],
+    blocks: Sequence[str],
+    component: Literal["lora", "master", "exp_avg", "exp_avg_sq"],
+    group: dist.ProcessGroup | None,
+) -> dict[str, TensorRecord]:
+    from art.megatron.weights.lora_publish import _gather_merged_adapter_tensors
+
+    label = "LoRA" if component == "lora" else f"optimizer {component}"
+    records: dict[str, TensorRecord] = {}
+    for index, block in enumerate(blocks):
+        block_metadata = [item for item in metadata if item.block == block]
+        if component != "lora":
+            block_metadata = [
+                item._replace(dtype_name=_dtype_name(torch.float32))
+                for item in block_metadata
+            ]
+        local_tensors: dict[str, torch.Tensor] = {}
+        error: BaseException | None = None
+        try:
+            local_tensors = _snapshot_block_tensors(prepared, block_metadata, component)
+        except BaseException as exc:
+            error = exc
+        _raise_distributed(
+            error,
+            f"read checkpoint {label} block {block}",
+            group=group,
+        )
+        canonical = _gather_merged_adapter_tensors(
+            block_metadata,
+            local_tensors=local_tensors,
+            rank=_rank(),
+            device=torch.device("cpu"),
+            group=group,
+        )
+        with _collective_errors(
+            f"serialize checkpoint {label} block {block}",
+            group=group,
+        ):
+            if _rank() != 0:
+                continue
+            relative = (
+                f".adapter_model-{index:06d}.safetensors"
+                if component == "lora"
+                else f"optimizer/{component}-{index:06d}.safetensors"
+            )
+            if component != "lora":
+                (output / "optimizer").mkdir(parents=True, exist_ok=True)
+            _save_file(canonical, output / relative)
+            if component != "lora":
+                records.update(
+                    (
+                        key,
+                        TensorRecord(
+                            file=relative,
+                            tensor=key,
+                            shape=tuple(int(dim) for dim in tensor.shape),
+                            dtype=_dtype_name(tensor.dtype),
+                        ),
+                    )
+                    for key, tensor in canonical.items()
+                )
+    return records
+
+
 def _serialize_snapshot_lora(
     prepared: _PreparedSave,
     output: Path,
@@ -1051,42 +1102,13 @@ def _serialize_snapshot_lora(
         _consolidate_safetensors,
         save_adapter_config,
     )
-    from art.megatron.weights.lora_publish import (
-        _gather_merged_adapter_tensors,
-    )
 
-    shards: list[Path] = []
+    shards = [
+        output / f".adapter_model-{index:06d}.safetensors"
+        for index in range(len(blocks))
+    ]
     try:
-        for index, block in enumerate(blocks):
-            block_metadata = [item for item in metadata if item.block == block]
-            local_tensors: dict[str, torch.Tensor] = {}
-            error: BaseException | None = None
-            try:
-                local_tensors = _snapshot_block_tensors(
-                    prepared, block_metadata, "lora"
-                )
-            except BaseException as exc:
-                error = exc
-            _raise_distributed(
-                error,
-                f"read checkpoint LoRA block {block}",
-                group=group,
-            )
-            canonical = _gather_merged_adapter_tensors(
-                block_metadata,
-                local_tensors=local_tensors,
-                rank=_rank(),
-                device=torch.device("cpu"),
-                group=group,
-            )
-            with _collective_errors(
-                f"serialize checkpoint LoRA block {block}",
-                group=group,
-            ):
-                if _rank() == 0:
-                    shard = output / f".adapter_model-{index:06d}.safetensors"
-                    _save_file(canonical, shard)
-                    shards.append(shard)
+        _serialize_snapshot_component(prepared, output, metadata, blocks, "lora", group)
         with _collective_errors("finalize checkpoint LoRA", group=group):
             if _rank() == 0:
                 if not shards:
@@ -1124,63 +1146,12 @@ def _serialize_snapshot_optimizer(
             digest="",
         )
 
-    from art.megatron.weights.lora_publish import (
-        _gather_merged_adapter_tensors,
-    )
-
-    records_by_component: dict[str, dict[str, TensorRecord]] = {}
-    for component in ("master", "exp_avg", "exp_avg_sq"):
-        component_records: dict[str, TensorRecord] = {}
-        for index, block in enumerate(blocks):
-            block_metadata = [
-                item._replace(dtype_name=_dtype_name(torch.float32))
-                for item in metadata
-                if item.block == block
-            ]
-            local_tensors: dict[str, torch.Tensor] = {}
-            error: BaseException | None = None
-            try:
-                local_tensors = _snapshot_block_tensors(
-                    prepared,
-                    block_metadata,
-                    component,
-                )
-            except BaseException as exc:
-                error = exc
-            _raise_distributed(
-                error,
-                f"read checkpoint optimizer {component} block {block}",
-                group=group,
-            )
-            canonical = _gather_merged_adapter_tensors(
-                block_metadata,
-                local_tensors=local_tensors,
-                rank=_rank(),
-                device=torch.device("cpu"),
-                group=group,
-            )
-            with _collective_errors(
-                f"serialize checkpoint optimizer {component} block {block}",
-                group=group,
-            ):
-                if _rank() == 0:
-                    relative = f"optimizer/{component}-{index:06d}.safetensors"
-                    (output / "optimizer").mkdir(parents=True, exist_ok=True)
-                    _save_file(canonical, output / relative)
-                    component_records.update(
-                        (
-                            key,
-                            TensorRecord(
-                                file=relative,
-                                tensor=key,
-                                shape=tuple(int(dim) for dim in tensor.shape),
-                                dtype=_dtype_name(tensor.dtype),
-                            ),
-                        )
-                        for key, tensor in canonical.items()
-                    )
-        records_by_component[component] = component_records
-
+    records_by_component = {
+        component: _serialize_snapshot_component(
+            prepared, output, metadata, blocks, component, group
+        )
+        for component in ("master", "exp_avg", "exp_avg_sq")
+    }
     parameters: dict[str, ParameterRecord] = {}
     with _collective_errors("validate checkpoint optimizer coverage", group=group):
         if _rank() == 0:

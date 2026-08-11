@@ -1857,6 +1857,16 @@ def _portable_trainer(
     trainer._checkpoint_slot_params_by_name = {}
     trainer._checkpoint_slot_adapter_configs = {}
     trainer._checkpoint_revisions = {}
+    trainer._checkpoint_sources = {}
+    trainer._checkpoint_prefetch_tasks = {}
+    trainer._checkpoint_process_group = None
+    trainer._checkpoint_mutation_tail = None
+    trainer._checkpoint_save_condition = threading.Condition()
+    trainer._checkpoint_save_sequence = 0
+    trainer._checkpoint_finish_sequence = 0
+    trainer._prepared_checkpoint_saves = {}
+    trainer._checkpoint_finishing_saves = set()
+    trainer._completed_checkpoint_saves = deque(maxlen=128)
     return trainer
 
 
@@ -2278,8 +2288,6 @@ def test_checkpoint_completed_save_idempotency_cache_is_bounded(
         LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     )
     _install_portable_checkpoint(trainer)
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    checkpoint_module._ensure_checkpoint_save_state(trainer)
     trainer._completed_checkpoint_saves = deque(maxlen=2)
 
     outputs = [tmp_path / f"completed-{index}" for index in range(3)]

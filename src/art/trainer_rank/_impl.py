@@ -568,6 +568,10 @@ class TrainerRank:
         ] = {}
         self._checkpoint_slot_adapter_configs: dict[str, _AdapterConfig] = {}
         self._checkpoint_revisions: dict[str, int] = {}
+        self._checkpoint_sources: dict[str, PreparedCheckpoint] = {}
+        self._checkpoint_prefetch_tasks: dict[
+            str, asyncio.Task[PreparedCheckpoint]
+        ] = {}
         self._checkpoint_process_group: dist.ProcessGroup | None = None
         self._checkpoint_mutation_tail: asyncio.Task[None] | None = None
         self._checkpoint_save_condition = threading.Condition()
@@ -682,7 +686,7 @@ class TrainerRank:
     def _checkpoint_mutation_task(
         self, operation: Callable[[], Awaitable[None]]
     ) -> asyncio.Task[None]:
-        predecessor = getattr(self, "_checkpoint_mutation_tail", None)
+        predecessor = self._checkpoint_mutation_tail
 
         async def ordered() -> None:
             if predecessor is not None:
@@ -749,29 +753,23 @@ class TrainerRank:
 
     async def _prefetch_checkpoint(self, source_path: str) -> PreparedCheckpoint:
         key = self._checkpoint_source_key(source_path)
-        sources = getattr(self, "_checkpoint_sources", None)
-        if sources is None:
-            sources = self._checkpoint_sources = {}
-        if key in sources:
-            return sources[key]
-        tasks = getattr(self, "_checkpoint_prefetch_tasks", None)
-        if tasks is None:
-            tasks = self._checkpoint_prefetch_tasks = {}
-        task = tasks.get(key)
+        if key in self._checkpoint_sources:
+            return self._checkpoint_sources[key]
+        task = self._checkpoint_prefetch_tasks.get(key)
         if task is None:
             from ._checkpoint import prepare_checkpoint
 
-            task = tasks[key] = asyncio.create_task(
+            task = self._checkpoint_prefetch_tasks[key] = asyncio.create_task(
                 asyncio.to_thread(prepare_checkpoint, key)
             )
         try:
             source = await asyncio.shield(task)
         except BaseException:
             if task.done():
-                tasks.pop(key, None)
+                self._checkpoint_prefetch_tasks.pop(key, None)
             raise
-        sources[key] = source
-        tasks.pop(key, None)
+        self._checkpoint_sources[key] = source
+        self._checkpoint_prefetch_tasks.pop(key, None)
         return source
 
     async def _load_checkpoint_path(
@@ -797,9 +795,8 @@ class TrainerRank:
         _checkpoint._raise_distributed(error, "prepare checkpoint")
         assert source is not None
         _checkpoint.load_checkpoint(self, source, logical_path)
-        sources = getattr(self, "_checkpoint_sources", None)
-        if sources is not None and sources.get(key) is source:
-            sources.pop(key)
+        if self._checkpoint_sources.get(key) is source:
+            self._checkpoint_sources.pop(key)
 
     def _resolve_checkpoint_name(self, checkpoint_path: str | Literal["active"]) -> str:
         if checkpoint_path != "active":
@@ -1263,9 +1260,6 @@ class TrainerRank:
                             for key in expected_weight_keys(suffix)
                         )
         return templates
-
-    def _local_adapter_keys(self) -> tuple[str, ...]:
-        return tuple(self._local_lora_adapter_templates())
 
     def _local_parameter_key_groups(self, name: str) -> tuple[tuple[str, ...], ...]:
         from art.megatron.lora import LoRA
