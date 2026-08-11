@@ -563,7 +563,9 @@ class MegatronBackend(LocalBackend):
                 generation_id=generation_id,
                 trajectory_groups=tuple(
                     TrajectoryGroupBundle.from_group(group)
-                    for group in (local_groups or tuple(trajectory_groups))
+                    for group in (
+                        local_groups if selected else tuple(trajectory_groups)
+                    )
                 ),
                 trajectory_sources=(
                     ()
