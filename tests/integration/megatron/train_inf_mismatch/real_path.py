@@ -478,6 +478,7 @@ async def _rollout(
     prompt: str,
     max_completion_tokens: int,
     reward: float,
+    seed: int,
     extra_body: dict[str, Any] | None,
 ) -> Any:
     import art
@@ -491,6 +492,7 @@ async def _rollout(
         messages=messages,
         max_tokens=max_completion_tokens,
         temperature=0.8,
+        seed=seed,
         logprobs=True,
         top_logprobs=TOP_K,
         **request_kwargs,
@@ -527,12 +529,17 @@ async def _collect_real_trajectory_groups(
                     prompt=prompt,
                     max_completion_tokens=config.max_completion_tokens,
                     reward=float(rollout_index % 2),
+                    seed=(
+                        config.output_parity.seed
+                        + prompt_index * config.rollouts_per_prompt
+                        + rollout_index
+                    ),
                     extra_body=extra_body,
                 )
                 for rollout_index in range(config.rollouts_per_prompt)
             ]
         )
-        for prompt in prompts
+        for prompt_index, prompt in enumerate(prompts)
     ]
     return await art.gather_trajectory_groups(
         cast(Any, groups),

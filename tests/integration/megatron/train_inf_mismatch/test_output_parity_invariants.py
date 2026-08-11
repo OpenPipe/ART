@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_message import ChatCompletionMessage
 import pytest
 
 torch = pytest.importorskip("torch")
+
+import art
 
 from . import workflow_stage
 from .output_parity import (
@@ -26,6 +31,7 @@ from .output_parity import (
 )
 from .real_path import (
     RealPathConfig,
+    _collect_real_trajectory_groups,
     _delete_adapter_safetensors_on_pass,
     _real_path_rollout_mode,
     _real_path_rollout_weights_mode,
@@ -214,6 +220,48 @@ def test_compare_rollout_reports_base_lora_and_delta_separately() -> None:
 
 def test_real_path_default_generates_16_tokens_per_rollout() -> None:
     assert RealPathConfig().max_completion_tokens == 16
+
+
+@pytest.mark.asyncio
+async def test_real_path_rollouts_use_stable_unique_request_seeds() -> None:
+    calls = []
+
+    async def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                Choice(
+                    finish_reason="stop",
+                    index=0,
+                    message=ChatCompletionMessage(role="assistant", content="maybe"),
+                )
+            ]
+        )
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    model = SimpleNamespace(
+        openai_client=lambda: client,
+        get_inference_name=lambda: "fake",
+    )
+    config = RealPathConfig(
+        output_parity=TrainInfOutputParityConfig(seed=41),
+        rollouts_per_prompt=3,
+    )
+
+    groups = await _collect_real_trajectory_groups(
+        model=model,
+        config=config,
+        prompts=["first", "second"],
+        extra_body={"return_tokens_as_token_ids": True},
+    )
+
+    assert len(groups) == 2
+    assert sorted(call["seed"] for call in calls) == list(range(41, 47))
+    assert all(
+        call["extra_body"] == {"return_tokens_as_token_ids": True} for call in calls
+    )
 
 
 def test_real_path_rollout_mode_follows_config() -> None:
