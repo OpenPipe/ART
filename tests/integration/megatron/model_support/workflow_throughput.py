@@ -700,10 +700,13 @@ def _gpu_identities(
         *(("trainer", gpu_id) for gpu_id in trainer_gpu_ids),
         *(("inference", gpu_id) for gpu_id in inference_gpu_ids),
     ]
-    if (len(trainer_gpu_ids), len(inference_gpu_ids)) != (2, 2):
+    if (
+        not trainer_gpu_ids
+        or not inference_gpu_ids
+        or len({gpu for _, gpu in roles}) != len(roles)
+    ):
         raise RuntimeError(
-            "throughput stage requires two trainer and two inference CUDA roles, "
-            f"got {roles}"
+            f"throughput stage requires non-empty, disjoint CUDA roles, got {roles}"
         )
 
     def uuid_key(value: str) -> str:
