@@ -210,33 +210,6 @@ _DSV4_TP2_EP2 = MegatronWorkflowTopology(
     pp=1,
     sp=True,
 )
-_DSV4_REPRESENTATIVE_NUM_LAYERS = 4
-_DSV4_REPRESENTATIVE_COMPRESS_RATIOS = [0, 0, 4, 128]
-_DSV4_REPRESENTATIVE_LAYER_TYPES = [
-    "sliding_attention",
-    "sliding_attention",
-    "compressed_sparse_attention",
-    "heavily_compressed_attention",
-]
-_DSV4_REPRESENTATIVE_MLP_LAYER_TYPES = ["moe"] * 4
-_DSV4_MEGATRON_ENV = {
-    "ART_DSV4_VALIDATION_NUM_LAYERS": str(_DSV4_REPRESENTATIVE_NUM_LAYERS)
-}
-_DSV4_HF_OVERRIDES = {
-    "num_hidden_layers": _DSV4_REPRESENTATIVE_NUM_LAYERS,
-    "num_hash_layers": 0,
-    # Keep DSV4's required FP8 linear path, but avoid the public checkpoint's
-    # MXFP4 experts, which cannot represent the reduced BF16 trainer fixture.
-    "expert_dtype": "fp8",
-    "compress_ratios": _DSV4_REPRESENTATIVE_COMPRESS_RATIOS,
-    "layer_types": _DSV4_REPRESENTATIVE_LAYER_TYPES,
-    "mlp_layer_types": _DSV4_REPRESENTATIVE_MLP_LAYER_TYPES,
-    "rope_parameters": {
-        "partial_rotary_factor": 0.125,
-        "rope_theta": 10000,
-        "rope_type": "default",
-    },
-}
 _DSV4_COMMON_VLLM_ENGINE_ARGS = {
     "compilation_config": {
         "cudagraph_mode": "NONE",
@@ -256,18 +229,6 @@ _DSV4_MERGED_VLLM_ENGINE_ARGS = {
 _DSV4_LORA_VLLM_ENGINE_ARGS = {
     **_DSV4_COMMON_VLLM_ENGINE_ARGS,
     "moe_backend": "triton",
-}
-_DSV4_REDUCED_VLLM_ENGINE_ARGS = {
-    **_DSV4_MERGED_VLLM_ENGINE_ARGS,
-    # The quick DSV4 vLLM serving gates use a reduced 4-layer validation model and then
-    # sync Megatron weights into vLLM through merged-weight transfer. Loading
-    # the full public checkpoint before that sync is incompatible with the
-    # reduced hf_overrides because vLLM still streams layer-4+ tensors.
-    "load_format": "dummy",
-}
-_DSV4_NATIVE_LORA_VLLM_ENGINE_ARGS = {
-    **_DSV4_LORA_VLLM_ENGINE_ARGS,
-    "load_format": "dummy",
 }
 _DSV4_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3, 4, 5, 6, 7],
@@ -293,26 +254,23 @@ _DSV4_FULL_VLLM_EP2 = VllmWorkflowResources(
     enable_expert_parallel=True,
     extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
 )
-_DSV4_REDUCED_VLLM_EP4 = VllmWorkflowResources(
+_DSV4_FUNCTIONAL_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[4, 5, 6, 7],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
-    hf_overrides=_DSV4_HF_OVERRIDES,
-    extra_engine_args=_DSV4_REDUCED_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
 )
-_DSV4_REDUCED_VLLM_EP2 = VllmWorkflowResources(
+_DSV4_FUNCTIONAL_VLLM_EP2 = VllmWorkflowResources(
     gpu_ids=[2, 3],
     tensor_parallel_size=2,
     enable_expert_parallel=True,
-    hf_overrides=_DSV4_HF_OVERRIDES,
-    extra_engine_args=_DSV4_REDUCED_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
 )
-_DSV4_REDUCED_NATIVE_VLLM_EP4 = VllmWorkflowResources(
+_DSV4_FUNCTIONAL_NATIVE_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
-    hf_overrides=_DSV4_HF_OVERRIDES,
-    extra_engine_args=_DSV4_NATIVE_LORA_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
 )
 _GLM52_REDUCED_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0],
@@ -373,14 +331,13 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             required_world_size=8,
             required_h200_equivalent_gpus=8,
             megatron=_DSV4_FOUR_GPU_MEGATRON,
-            vllm=_DSV4_REDUCED_VLLM_EP4,
+            vllm=_DSV4_FUNCTIONAL_VLLM_EP4,
             high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
-            high_vram_vllm=_DSV4_REDUCED_VLLM_EP2,
-            megatron_env=_DSV4_MEGATRON_ENV,
+            high_vram_vllm=_DSV4_FUNCTIONAL_VLLM_EP2,
         ),
         native_vllm_lora=WorkflowStageResources(
             required_world_size=4,
-            vllm=_DSV4_REDUCED_NATIVE_VLLM_EP4,
+            vllm=_DSV4_FUNCTIONAL_NATIVE_VLLM_EP4,
         ),
         yes_no_trainability=WorkflowStageResources(
             required_world_size=8,

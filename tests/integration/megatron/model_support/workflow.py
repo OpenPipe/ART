@@ -281,6 +281,9 @@ def _oracle_case_config(
     allow_unvalidated_arch: bool,
 ) -> Any:
     oracle_harness.ARTIFACT_ROOT = _stage_artifact_dir()
+    num_layers = int(
+        os.environ.get("ART_MODEL_SUPPORT_FUNCTIONAL_NUM_LAYERS", num_layers)
+    )
     return oracle_harness.OracleCaseConfig(
         base_model=base_model,
         model_support_key=model_support_key,

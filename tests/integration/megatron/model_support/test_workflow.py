@@ -110,6 +110,9 @@ def _stub_workflow_environment(monkeypatch, tmp_path) -> None:
                 tokenizer_compatible_path=str(tokenizer_compatible_path),
                 tokenizer_compatible_hf_home=str(tmp_path / "tokenizer_hf_home"),
                 tokenizer_compatible_manifest={"version": 1},
+                functional_path=str(fixture_path),
+                functional_hf_home=str(tmp_path / "hf_home"),
+                functional_manifest={"version": 1, "num_layers": 8},
                 canonical_path=str(fixture_path),
                 canonical_hf_home=str(tmp_path / "hf_home"),
             )
@@ -127,6 +130,9 @@ def _fixture(tmp_path: Path, model_key: str) -> WorkflowFixture:
         manifest={"version": 15},
         tokenizer_compatible_path=str(tmp_path / "tokenizer"),
         tokenizer_compatible_hf_home=str(tmp_path / "tokenizer_cache"),
+        functional_path=str(tmp_path / "functional"),
+        functional_hf_home=str(tmp_path / "functional_cache"),
+        functional_manifest={"version": 1, "num_layers": 8},
         canonical_path=str(tmp_path / "canonical"),
         canonical_hf_home=str(tmp_path / "canonical_cache"),
     )
@@ -135,16 +141,18 @@ def _fixture(tmp_path: Path, model_key: str) -> WorkflowFixture:
 def test_fixture_stage_contracts(tmp_path: Path) -> None:
     # fmt: off
     cases = {
-        ("gemma4_dense", "canonical"): ("hf_parity", "packing_invariance", "length_trainability"),
+        ("gemma4_dense", "canonical"): ("hf_parity", "packing_invariance"),
         ("gemma4_dense", "compact"): ("lora_coverage",),
-        ("gemma4_dense", "tokenizer"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "yes_no_trainability"),
+        ("gemma4_dense", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "length_trainability"),
+        ("gemma4_dense", "tokenizer"): ("yes_no_trainability",),
         ("llama3_dense", "compact"): ("hf_parity",),
-        ("llama3_dense", "tokenizer"): ("train_inf_mismatch",),
-        ("llama3_dense", "canonical"): ("length_trainability", "yes_no_trainability"),
-        ("gpt_oss_moe", "canonical"): ("train_inf_mismatch",),
-        ("gpt_oss_moe", "tokenizer"): ("merged_vllm_serving", "native_vllm_lora"),
-        ("glm52", "compact"): ("length_trainability", "yes_no_trainability"),
-        ("dsv4", "canonical"): ("train_inf_mismatch", "length_trainability", "yes_no_trainability"),
+        ("llama3_dense", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "length_trainability"),
+        ("llama3_dense", "canonical"): ("yes_no_trainability",),
+        ("gpt_oss_moe", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "length_trainability"),
+        ("glm52", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "length_trainability"),
+        ("glm52", "compact"): ("yes_no_trainability",),
+        ("dsv4", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "length_trainability"),
+        ("dsv4", "canonical"): ("yes_no_trainability",),
     }
     # fmt: on
     for (model_key, selected), stages in cases.items():
@@ -152,12 +160,18 @@ def test_fixture_stage_contracts(tmp_path: Path) -> None:
             environment = _fixture(tmp_path, model_key).environment(stage)
             assert environment[FIXTURE_PATH_ENV] == str(tmp_path / selected)
             assert environment["ART_ORACLE_BASE_MODEL"] == str(tmp_path / selected)
+            if selected == "functional":
+                assert environment["ART_MODEL_SUPPORT_FUNCTIONAL_NUM_LAYERS"] == "8"
 
 
 def test_fixture_stage_contracts_require_available_assets(tmp_path: Path) -> None:
     for stage, missing, contract in (
         ("hf_parity", "canonical_path", "canonical weights"),
-        ("train_inf_mismatch", "tokenizer_compatible_path", "canonical vocabulary"),
+        (
+            "train_inf_mismatch",
+            "functional_path",
+            "pretrained production-width functional weights",
+        ),
     ):
         fixture = _fixture(tmp_path, "gemma4_dense").model_copy(update={missing: None})
         with pytest.raises(RuntimeError, match=f"requires {contract}"):
@@ -816,11 +830,8 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert stage is not None
         assert stage.vllm is not None
         engine_args = stage.vllm.engine_args()
-        assert engine_args["load_format"] == "dummy"
-        hf_overrides = cast(dict[str, object], engine_args["hf_overrides"])
-        assert hf_overrides["num_hidden_layers"] == 4
-        assert hf_overrides["num_hash_layers"] == 0
-        assert hf_overrides["expert_dtype"] == "fp8"
+        assert engine_args.get("load_format") != "dummy"
+        assert "hf_overrides" not in engine_args
         assert engine_args["max_model_len"] == 1024
     assert resources.merged_vllm_serving is not None
     assert resources.merged_vllm_serving.required_world_size == 8
