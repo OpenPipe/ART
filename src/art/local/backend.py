@@ -18,6 +18,7 @@ import warnings
 
 from art.utils.lifecycle import (
     PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
+    cleanup_after_failure,
     complete_task,
     complete_to_thread,
     process_shutdown_timeout,
@@ -674,7 +675,14 @@ class LocalBackend:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        await self.close()
+        if exc is None:
+            await self.close()
+        else:
+            await cleanup_after_failure(
+                exc,
+                self.close,
+                message="backend operation and shutdown failed",
+            )
 
     async def close(self) -> None:
         task = asyncio.create_task(self._close_local_backend())
