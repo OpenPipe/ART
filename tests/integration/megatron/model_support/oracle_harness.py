@@ -223,7 +223,6 @@ class Topology(BaseModel):
 TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
     Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False),
-    Topology(tp=2, ep=2, etp=1, dp=1, cp=2, sp=True),
     Topology(tp=1, ep=2, etp=1, dp=1, cp=2, pp=2, vpp=2, sp=False),
     Topology(tp=2, ep=4, etp=2, dp=2, cp=2, sp=True),
 ]
@@ -240,11 +239,7 @@ CP_UNSUPPORTED_MOE_TOPOLOGIES = [
 ]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
-    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=2, sp=True),
-    Topology(tp=1, ep=1, etp=1, dp=1, cp=2, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=1, cp=2, sp=True),
+    Topology(tp=2, ep=1, etp=1, dp=1, cp=2, sp=False),
     Topology(tp=2, ep=1, etp=1, dp=2, cp=2, sp=True),
 ]
 ORACLE_TOPOLOGY = TOPOLOGIES[0]

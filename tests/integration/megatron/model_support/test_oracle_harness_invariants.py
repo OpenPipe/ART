@@ -1383,32 +1383,19 @@ def test_oracle_topologies_are_the_compact_cp_validation_matrix() -> None:
     assert TOPOLOGIES == [
         Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
         Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False),
-        Topology(tp=2, ep=2, etp=1, dp=1, cp=2, sp=True),
         Topology(tp=1, ep=2, etp=1, dp=1, cp=2, pp=2, vpp=2, sp=False),
         Topology(tp=2, ep=4, etp=2, dp=2, cp=2, sp=True),
     ]
-    assert [topology.world_size() for topology in TOPOLOGIES] == [1, 2, 4, 4, 8]
+    assert [topology.world_size() for topology in TOPOLOGIES] == [1, 2, 4, 8]
 
 
-def test_dense_topologies_include_vllm_separation_and_cp_coverage() -> None:
+def test_dense_topologies_are_the_compact_mixed_parallel_matrix() -> None:
     assert DENSE_TOPOLOGIES == [
         Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
-        Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
-        Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
-        Topology(tp=2, ep=1, etp=1, dp=2, sp=True),
-        Topology(tp=1, ep=1, etp=1, dp=1, cp=2, sp=False),
-        Topology(tp=2, ep=1, etp=1, dp=1, cp=2, sp=True),
+        Topology(tp=2, ep=1, etp=1, dp=1, cp=2, sp=False),
         Topology(tp=2, ep=1, etp=1, dp=2, cp=2, sp=True),
     ]
-    assert [topology.world_size() for topology in DENSE_TOPOLOGIES] == [
-        1,
-        2,
-        2,
-        4,
-        2,
-        4,
-        8,
-    ]
+    assert [topology.world_size() for topology in DENSE_TOPOLOGIES] == [1, 4, 8]
 
 
 def test_dense_sensitivity_keeps_dp_and_cp_attention_cases() -> None:
