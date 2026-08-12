@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
+import shlex
 import socket
 import subprocess
 import sys
@@ -59,6 +60,7 @@ _LIGHTWEIGHT_GPU_STAGES = frozenset(
 )
 _CPU_STAGES = frozenset({"chat_template_rollout"})
 _BASE_SESSION_STAGES = frozenset({"hf_parity", "packing_invariance"})
+_WORKFLOW_HOSTS_ENV = "ART_MODEL_SUPPORT_WORKFLOW_HOSTS"
 
 
 class PreparedWorkflow(BaseModel):
@@ -316,8 +318,16 @@ def _visible_devices() -> list[WorkflowDevice]:
         raise RuntimeError(
             f"CUDA_VISIBLE_DEVICES exposes {len(gpu_ids)} ids but torch sees {count} GPUs"
         )
-    host = socket.gethostname()
-    return [WorkflowDevice(host=host, gpu=gpu_id) for gpu_id in gpu_ids]
+    hosts = [
+        host.strip()
+        for host in os.environ.get(_WORKFLOW_HOSTS_ENV, socket.gethostname()).split(",")
+        if host.strip()
+    ]
+    if not hosts or len(set(hosts)) != len(hosts):
+        raise RuntimeError(f"{_WORKFLOW_HOSTS_ENV} must contain unique host names")
+    return [
+        WorkflowDevice(host=host, gpu=gpu_id) for host in hosts for gpu_id in gpu_ids
+    ]
 
 
 def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[ValidationReport]:
@@ -326,8 +336,16 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
     devices = _visible_devices()
     if not devices:
         raise RuntimeError("the scheduled model-support workflow requires CUDA GPUs")
+    gpu_counts = {
+        host: sum(device.host == host for device in devices)
+        for host in {device.host for device in devices}
+    }
+    if len(set(gpu_counts.values())) != 1:
+        raise RuntimeError(f"workflow hosts expose different GPU counts: {gpu_counts}")
     by_model_key = {prepared.report.model_key: prepared for prepared in workflows}
-    plan = compile_prepared_workflows(workflows, visible_gpu_count=len(devices))
+    plan = compile_prepared_workflows(
+        workflows, visible_gpu_count=next(iter(gpu_counts.values()))
+    )
 
     def runner(session: WorkflowSession, placement: WorkflowPlacement) -> list[str]:
         session_dir = (
@@ -392,6 +410,37 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             "--session-json",
             str(request_json),
         ]
+        placement_hosts = {device.host for device in placement.devices}
+        if len(placement_hosts) > 1:
+            raise RuntimeError("one workflow session cannot span hosts")
+        execution_host = next(iter(placement_hosts), socket.gethostname())
+        if execution_host != socket.gethostname():
+            remote_command = (
+                f"cd {shlex.quote(str(workflow.REPO_ROOT))} && exec "
+                + shlex.join(
+                    [
+                        "env",
+                        *(
+                            f"{key}={environment[key]}"
+                            for key in (
+                                "CUDA_VISIBLE_DEVICES",
+                                "PYTHONPATH",
+                                "WANDB_MODE",
+                            )
+                        ),
+                        *command,
+                    ]
+                )
+            )
+            command = [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                execution_host,
+                "bash",
+                "-lc",
+                shlex.quote(remote_command),
+            ]
         timeout_s = sum(
             workflow._WORKFLOW_STAGE_TIMEOUT_OVERRIDES_S.get(
                 (operation.stage, prepared.report.base_model),
