@@ -415,7 +415,15 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             raise RuntimeError("one workflow session cannot span hosts")
         execution_host = next(iter(placement_hosts), socket.gethostname())
         if execution_host != socket.gethostname():
+            runtime_profile = Path(sys.prefix) / "art-megatron-env.sh"
+            if not runtime_profile.is_file():
+                raise RuntimeError(
+                    "remote workflow sessions require the Megatron runtime profile: "
+                    f"{runtime_profile}"
+                )
             remote_command = (
+                "unset LD_LIBRARY_PATH && "
+                f"source {shlex.quote(str(runtime_profile))} && "
                 f"cd {shlex.quote(str(workflow.REPO_ROOT))} && exec "
                 + shlex.join(
                     [
@@ -437,8 +445,10 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
                 "-o",
                 "BatchMode=yes",
                 execution_host,
-                "bash",
-                "-lc",
+                "/bin/bash",
+                "--noprofile",
+                "--norc",
+                "-c",
                 shlex.quote(remote_command),
             ]
         timeout_s = sum(
