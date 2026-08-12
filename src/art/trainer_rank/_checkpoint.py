@@ -280,7 +280,7 @@ def prepare_checkpoint_save(
             adapter_config = deepcopy(
                 dict(_checkpoint_config(trainer, checkpoint_name))
             )
-            dynamic = trainer._dynamic_optimizers.get(checkpoint_name)
+            dynamic = trainer._checkpoint_slots[checkpoint_name].optimizer
             initialized = dynamic is not None
         if any(value != initialized for value in _gather_objects(initialized)):
             raise trainer._slot_state_error(
@@ -475,7 +475,7 @@ def export_lora(
 ) -> int:
     config = _checkpoint_config(trainer, checkpoint_name)
     _export_lora_files(trainer, output_dir, checkpoint_name, config)
-    return trainer._checkpoint_revisions.get(checkpoint_name, 0)
+    return trainer._checkpoint_slots[checkpoint_name].revision
 
 
 def _export_lora_files(
@@ -683,7 +683,11 @@ def load_checkpoint(
             )
             trainer._validate_loaded_checkpoint_config(temporary_name, config)
             staged_params = tuple(trainer._iter_slot_parameters(temporary_ref))
-            trainer._checkpoint_slot_params_by_name[temporary_name] = staged_params
+            from art.trainer_rank._impl import _CheckpointSlot
+
+            trainer._checkpoint_slots[temporary_name] = _CheckpointSlot(
+                staged_params, config
+            )
             if source.manifest is not None and source.manifest.optimizer is not None:
                 local_optimizer = _load_local_optimizer(
                     trainer, source, temporary_name, int(config["r"])
@@ -720,27 +724,15 @@ def load_checkpoint(
         raise
 
     slot_snapshot = _snapshot_lora_slots(trainer.runtime.model)
-    had_params = name in trainer._checkpoint_slot_params_by_name
-    previous_params = trainer._checkpoint_slot_params_by_name.get(name)
-    had_dynamic = name in trainer._dynamic_optimizers
-    previous_dynamic = trainer._dynamic_optimizers.get(name)
-    had_config = name in trainer._checkpoint_slot_adapter_configs
-    previous_config = trainer._checkpoint_slot_adapter_configs.get(name)
-    had_revision = name in trainer._checkpoint_revisions
-    previous_revision = trainer._checkpoint_revisions.get(name)
+    previous = trainer._checkpoint_slots.get(name)
     commit_error: BaseException | None = None
     try:
         replace_lora_slot_in_model(trainer.runtime.model, temporary_ref, target)
-        trainer._checkpoint_slot_params_by_name.pop(temporary_name, None)
-        trainer._checkpoint_slot_params_by_name[name] = params
-        if dynamic is None:
-            trainer._dynamic_optimizers.pop(name, None)
-        else:
-            trainer._dynamic_optimizers[name] = dynamic
-        trainer._checkpoint_slot_adapter_configs[name] = config
-        trainer._checkpoint_revisions[name] = (
-            trainer._checkpoint_revisions.get(name, -1) + 1
-        )
+        staged = trainer._checkpoint_slots.pop(temporary_name)
+        staged.params = params
+        staged.optimizer = dynamic
+        staged.revision = 0 if previous is None else previous.revision + 1
+        trainer._checkpoint_slots[name] = staged
     except BaseException as exc:
         commit_error = exc
     commit_errors = _gather_objects(
@@ -753,26 +745,10 @@ def load_checkpoint(
     try:
         _restore_lora_slots(slot_snapshot)
         _discard_staged_checkpoint(trainer, temporary_name)
-        if had_params:
-            assert previous_params is not None
-            trainer._checkpoint_slot_params_by_name[name] = previous_params
+        if previous is None:
+            trainer._checkpoint_slots.pop(name, None)
         else:
-            trainer._checkpoint_slot_params_by_name.pop(name, None)
-        if had_dynamic:
-            assert previous_dynamic is not None
-            trainer._dynamic_optimizers[name] = previous_dynamic
-        else:
-            trainer._dynamic_optimizers.pop(name, None)
-        if had_config:
-            assert previous_config is not None
-            trainer._checkpoint_slot_adapter_configs[name] = previous_config
-        else:
-            trainer._checkpoint_slot_adapter_configs.pop(name, None)
-        if had_revision:
-            assert previous_revision is not None
-            trainer._checkpoint_revisions[name] = previous_revision
-        else:
-            trainer._checkpoint_revisions.pop(name, None)
+            trainer._checkpoint_slots[name] = previous
     except BaseException as exc:
         rollback_error = exc
     rollback_errors = _gather_objects(
@@ -797,7 +773,7 @@ def _discard_staged_checkpoint(trainer: TrainerRank, name: str) -> None:
     from art.megatron.lora import delete_lora_slot_from_model
 
     delete_lora_slot_from_model(trainer.runtime.model, trainer._slot_ref(name))
-    trainer._checkpoint_slot_params_by_name.pop(name, None)
+    trainer._checkpoint_slots.pop(name, None)
 
 
 def _ensure_checkpoint_group(trainer: TrainerRank) -> dist.ProcessGroup | None:
@@ -1116,9 +1092,10 @@ def _serialize_snapshot_optimizer(
                     f"optimizer={sorted(expected)} lora={sorted(artifact_keys)}"
                 )
             parameters = {
-                key: tuple(
-                    records_by_component[component][key]
-                    for component in records_by_component
+                key: (
+                    records_by_component["master"][key],
+                    records_by_component["exp_avg"][key],
+                    records_by_component["exp_avg_sq"][key],
                 )
                 for key in sorted(expected)
             }
@@ -1191,7 +1168,7 @@ def _local_optimizer_shards(
 ) -> tuple[_LocalShard, ...]:
     from art.megatron.lora import LoRA, LoraShardMeta, _block_for_key
 
-    params = trainer._checkpoint_slot_params_by_name[name]
+    params = trainer._checkpoint_slots[name].params
     masters = {
         id(param): master
         for param, master in zip(params, dynamic.master_params, strict=True)
@@ -1298,14 +1275,14 @@ def _parameter_group_step(keys: Sequence[str], steps: Mapping[str, float]) -> fl
 
 
 def _checkpoint_config(trainer: TrainerRank, name: str) -> Mapping[str, object]:
-    loaded = name in trainer._checkpoint_slot_params_by_name
+    loaded = name in trainer._checkpoint_slots
     if any(value != loaded for value in _gather_objects(loaded)):
         raise trainer._slot_state_error(
             f"Checkpoint {name!r} is not loaded consistently across ranks"
         )
     if not loaded:
         raise ValueError(f"Unknown checkpoint: {name!r}")
-    config = trainer._checkpoint_slot_adapter_configs.get(name)
+    config = trainer._checkpoint_slots[name].config
     configs = _gather_objects(config)
     if any(value != config for value in configs):
         raise trainer._slot_state_error(

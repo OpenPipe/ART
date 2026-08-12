@@ -21,6 +21,7 @@ from art.trainer_rank import (
     Unset,
 )
 from art.trainer_rank._impl import (
+    _CheckpointSlot,
     _flatten,
     _MemoryCheck,
     _MemoryProfile,
@@ -443,9 +444,8 @@ def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
         staticmethod(lambda name: name),
     )
     rank._default_slot_ref = rank._slot_ref("student")
-    rank._checkpoint_slot_params_by_name.update(
-        {"student": (), "teacher": (), "critic": ()}
-    )
+    for name in ("student", "teacher", "critic"):
+        rank._checkpoint_slots.setdefault(name, _CheckpointSlot()).params = ()
     requests = [
         _target_request(_tokens(1, 2, 3), top_k=3),
         _target_request(_tokens(1, 2, 4), checkpoint=None, logits=True),

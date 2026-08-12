@@ -447,6 +447,14 @@ class _DynamicOptimizer:
     master_params: tuple[torch.nn.Parameter, ...]
 
 
+@dataclass
+class _CheckpointSlot:
+    params: tuple[torch.nn.Parameter, ...] = ()
+    config: _AdapterConfig | None = None
+    optimizer: _DynamicOptimizer | None = None
+    revision: int = 0
+
+
 @dataclass(frozen=True)
 class PushedCheckpoint:
     trainer: "TrainerRank"
@@ -566,16 +574,8 @@ class TrainerRank:
         )
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
-        self._dynamic_optimizers: dict[str, _DynamicOptimizer] = {}
-        self._checkpoint_slot_params_by_name: dict[
-            str, tuple[torch.nn.Parameter, ...]
-        ] = {}
-        self._checkpoint_slot_adapter_configs: dict[str, _AdapterConfig] = {}
-        self._checkpoint_revisions: dict[str, int] = {}
-        self._checkpoint_sources: dict[str, PreparedCheckpoint] = {}
-        self._checkpoint_prefetch_tasks: dict[
-            str, asyncio.Task[PreparedCheckpoint]
-        ] = {}
+        self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
+        self._checkpoint_prefetches: dict[str, asyncio.Task[PreparedCheckpoint]] = {}
         self._checkpoint_process_group: dist.ProcessGroup | None = None
         self._checkpoint_mutation_tail: asyncio.Task[None] | None = None
         self._checkpoint_save_lock = threading.Lock()
@@ -602,8 +602,8 @@ class TrainerRank:
         optimizer = self.runtime.optimizer
         if optimizer is not None:
             optimizer.zero_grad()
-        for params in self._checkpoint_slot_params_by_name.values():
-            for param in params:
+        for slot in self._checkpoint_slots.values():
+            for param in slot.params:
                 param.grad = None
         self._prune_slot_graphs()
 
@@ -667,13 +667,12 @@ class TrainerRank:
     ) -> PushedCheckpoint:
         prefetch = (
             asyncio.create_task(self._prefetch_checkpoint(source_path))
-            if source_path is not None
-            and logical_path not in self._checkpoint_slot_params_by_name
+            if source_path is not None and logical_path not in self._checkpoint_slots
             else None
         )
 
         async def push() -> None:
-            if prefetch is not None:
+            if prefetch is not None and logical_path not in self._checkpoint_slots:
                 assert logical_path is not None and source_path is not None
                 await self._load_checkpoint_path(
                     logical_path,
@@ -761,24 +760,19 @@ class TrainerRank:
 
     async def _prefetch_checkpoint(self, source_path: str) -> PreparedCheckpoint:
         key = self._checkpoint_source_key(source_path)
-        if key in self._checkpoint_sources:
-            return self._checkpoint_sources[key]
-        task = self._checkpoint_prefetch_tasks.get(key)
+        task = self._checkpoint_prefetches.get(key)
         if task is None:
             from ._checkpoint import prepare_checkpoint
 
-            task = self._checkpoint_prefetch_tasks[key] = asyncio.create_task(
+            task = self._checkpoint_prefetches[key] = asyncio.create_task(
                 asyncio.to_thread(prepare_checkpoint, key)
             )
         try:
-            source = await asyncio.shield(task)
+            return await asyncio.shield(task)
         except BaseException:
             if task.done():
-                self._checkpoint_prefetch_tasks.pop(key, None)
+                self._checkpoint_prefetches.pop(key, None)
             raise
-        self._checkpoint_sources[key] = source
-        self._checkpoint_prefetch_tasks.pop(key, None)
-        return source
 
     async def _load_checkpoint_path(
         self,
@@ -803,8 +797,7 @@ class TrainerRank:
         _checkpoint._raise_distributed(error, "prepare checkpoint")
         assert source is not None
         _checkpoint.load_checkpoint(self, source, logical_path)
-        if self._checkpoint_sources.get(key) is source:
-            self._checkpoint_sources.pop(key)
+        self._checkpoint_prefetches.pop(key, None)
 
     def _resolve_checkpoint_name(self, checkpoint_path: str | Literal["active"]) -> str:
         if checkpoint_path != "active":
@@ -1434,7 +1427,7 @@ class TrainerRank:
                     for request in requests
                     if request.checkpoint is not Unset
                     if (name := cast(str | None, request.checkpoint)) is not None
-                    if name not in self._checkpoint_slot_params_by_name
+                    if name not in self._checkpoint_slots
                 }
             )
         )
@@ -1449,7 +1442,7 @@ class TrainerRank:
     def _resolve_slot_ref(self, request: AnyForwardInput) -> "LoRASlotRef | None":
         if request.checkpoint is not Unset:
             name = cast(str | None, request.checkpoint)
-            if name is not None and name not in self._checkpoint_slot_params_by_name:
+            if name is not None and name not in self._checkpoint_slots:
                 raise TrainerRankSlotStateError(
                     f"Forward input selects unloaded checkpoint slot {name!r}. "
                     "Call load_checkpoint(...) before selecting it."
@@ -1465,7 +1458,7 @@ class TrainerRank:
         self,
         checkpoints: Sequence[str] | None,
     ) -> tuple[str, ...]:
-        loaded = set(self._checkpoint_slot_params_by_name)
+        loaded = set(self._checkpoint_slots)
         if not loaded:
             raise TrainerRankSlotStateError(
                 "TrainerRank.optim_step requires a loaded checkpoint slot. Call "
@@ -1512,7 +1505,7 @@ class TrainerRank:
             [
                 any(
                     param.grad is not None
-                    for param in self._checkpoint_slot_params_by_name[name]
+                    for param in self._checkpoint_slots[name].params
                 )
                 for name in names
             ],
@@ -1536,7 +1529,7 @@ class TrainerRank:
         selected = []
         for name in checkpoint_names:
             self._guard_checkpoint_can_step(name)
-            slot_params = self._checkpoint_slot_params_by_name[name]
+            slot_params = self._checkpoint_slots[name].params
             slot_grads = self._reduce_dynamic_grads(
                 slot_params, scale_grads=scale_grads
             )
@@ -1573,9 +1566,7 @@ class TrainerRank:
                     model.copy_(master)
                     model.grad = None
             self._prune_slot_graphs(self._slot_ref(name))
-            self._checkpoint_revisions[name] = (
-                self._checkpoint_revisions.get(name, 0) + 1
-            )
+            self._checkpoint_slots[name].revision += 1
         return {
             "learning_rate": float(params.learning_rate),
             "grad_norm": float(grad_norm),
@@ -1588,10 +1579,11 @@ class TrainerRank:
         name: str,
         params: AdamParams,
     ) -> _DynamicOptimizer:
-        dynamic = self._dynamic_optimizers.get(name)
+        slot = self._checkpoint_slots[name]
+        dynamic = slot.optimizer
         if dynamic is None:
             dynamic = self._new_dynamic_optimizer(name, params)
-            self._dynamic_optimizers[name] = dynamic
+            slot.optimizer = dynamic
             return dynamic
         for group in dynamic.optimizer.param_groups:
             group["lr"] = params.learning_rate
@@ -1606,7 +1598,7 @@ class TrainerRank:
         *,
         master_params: Sequence[torch.Tensor] | None = None,
     ) -> _DynamicOptimizer:
-        model_params = self._checkpoint_slot_params_by_name[name]
+        model_params = self._checkpoint_slots[name].params
         sources = model_params if master_params is None else tuple(master_params)
         if len(sources) != len(model_params) or any(
             not isinstance(source, torch.Tensor) for source in sources

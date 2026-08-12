@@ -26,6 +26,7 @@ from art.trainer_rank import (  # noqa: E402
 )
 from art.trainer_rank._checkpoint import AdamWRecord, LocalOptimizerState  # noqa: E402
 from art.trainer_rank._impl import (  # noqa: E402
+    _CheckpointSlot,
     _distributed_grad_norm,
     _vocab_parallel_log_z,
     _vocab_parallel_target_logprobs,
@@ -114,7 +115,7 @@ def _asymmetric_checkpoint_selection_worker(
     try:
         trainer = TrainerRank.__new__(TrainerRank)
         trainer.device = torch.device("cpu")
-        trainer._checkpoint_slot_params_by_name = {"student": ()}
+        trainer._checkpoint_slots = {"student": _CheckpointSlot()}
         request = ForwardInput(
             input_tokens=torch.tensor([1]),
             target_tokens=torch.tensor([1]),
@@ -321,7 +322,7 @@ def _assert_distributed_optimizer_restore(device: torch.device) -> None:
     restored_lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
     restored = _trainer_for(restored_lora, device)
     _install_checkpoint(restored, "A", adapter)
-    restored._dynamic_optimizers["A"] = restored._restore_canonical_optimizer(
+    restored._checkpoint_slots["A"].optimizer = restored._restore_canonical_optimizer(
         "A", state
     )
     with use_lora_slot(ref):
@@ -421,13 +422,13 @@ def _assert_reload_replaces_slot_optimizer(
     trainer: TrainerRank,
 ) -> None:
     assert ref.name is not None
-    old_params = trainer._checkpoint_slot_params_by_name[ref.name]
-    assert ref.name in trainer._dynamic_optimizers
+    old_params = trainer._checkpoint_slots[ref.name].params
+    assert trainer._checkpoint_slots[ref.name].optimizer is not None
 
     _install_checkpoint(trainer, ref.name, _adapter("dense", rank=3, seed=9))
 
-    new_params = trainer._checkpoint_slot_params_by_name[ref.name]
-    assert ref.name not in trainer._dynamic_optimizers
+    new_params = trainer._checkpoint_slots[ref.name].params
+    assert trainer._checkpoint_slots[ref.name].optimizer is None
     assert [tuple(param.shape) for param in new_params] == [(4, 3), (3, 5)]
     assert all(old is not new for old, new in zip(old_params, new_params, strict=True))
     slot = lora._slot(ref)
@@ -439,18 +440,17 @@ def _install_checkpoint(
     trainer: TrainerRank, name: str, adapter: dict[str, torch.Tensor]
 ) -> int:
     loaded = trainer._load_checkpoint_slot(name, adapter, alpha=32.0)
-    trainer._checkpoint_slot_params_by_name[name] = tuple(
-        trainer._iter_slot_parameters(trainer._slot_ref(name))
-    )
-    trainer._dynamic_optimizers.pop(name, None)
-    trainer._checkpoint_revisions[name] = (
-        trainer._checkpoint_revisions.get(name, -1) + 1
+    previous = trainer._checkpoint_slots.get(name)
+    trainer._checkpoint_slots[name] = _CheckpointSlot(
+        tuple(trainer._iter_slot_parameters(trainer._slot_ref(name))),
+        revision=0 if previous is None else previous.revision + 1,
     )
     return loaded
 
 
 def _optimizer_state(trainer: TrainerRank, name: str) -> LocalOptimizerState:
-    dynamic = trainer._dynamic_optimizers[name]
+    dynamic = trainer._checkpoint_slots[name].optimizer
+    assert dynamic is not None
     states = [
         cast(dict[str, torch.Tensor], dynamic.optimizer.state[master])
         for master in dynamic.master_params
@@ -490,14 +490,11 @@ def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
     trainer.device = device
     trainer._slot_stack = []
     trainer._default_slot_ref = None
-    trainer._dynamic_optimizers = {}
-    trainer._checkpoint_slot_params_by_name = {
-        "A": tuple(lora.lora_slot_params(LoRASlotRef("A"))),
-        "B": tuple(lora.lora_slot_params(LoRASlotRef("B"))),
+    trainer._checkpoint_slots = {
+        name: _CheckpointSlot(tuple(lora.lora_slot_params(LoRASlotRef(name))))
+        for name in ("A", "B")
     }
-    trainer._checkpoint_slot_adapter_configs = {}
-    trainer._checkpoint_revisions = {"A": 0, "B": 0}
-    trainer._checkpoint_sources = {}
+    trainer._checkpoint_prefetches = {}
     trainer._pending_slot_graphs = {}
     trainer._checkpoint_mutation_tail = None
     return trainer

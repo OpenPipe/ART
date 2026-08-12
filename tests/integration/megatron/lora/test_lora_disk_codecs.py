@@ -63,7 +63,7 @@ from art.trainer_rank._checkpoint import (
 from art.trainer_rank._checkpoint import (
     load_checkpoint as load_trainer_checkpoint,
 )
-from art.trainer_rank._impl import _AdapterConfig
+from art.trainer_rank._impl import _AdapterConfig, _CheckpointSlot
 from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
 REPO_ROOT = Path(__file__).parents[4]
@@ -800,6 +800,26 @@ def test_qwen35_config_lookup_uses_checkpoint_revision(
             },
         )
     ]
+
+
+def test_qwen35_config_lookup_fills_partial_attention_dimensions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        qwen35_module,
+        "_qwen35_text_config",
+        lambda *_args: SimpleNamespace(
+            num_attention_heads=64,
+            num_key_value_heads=8,
+            head_dim=128,
+        ),
+    )
+    assert qwen35_module._qwen35_attention_dims(
+        {
+            "base_model_name_or_path": "Qwen/test",
+            "num_attention_heads": 64,
+        }
+    ) == (64, 8, 128)
 
 
 def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
@@ -1591,17 +1611,13 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
     )
     trainer._slot_stack = []
     trainer._pending_slot_graphs = {}
-    trainer._dynamic_optimizers = {}
-    trainer._checkpoint_slot_params_by_name = {}
-    trainer._checkpoint_slot_adapter_configs = {}
-    trainer._checkpoint_revisions = {}
+    trainer._checkpoint_slots = {}
     config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
     assert trainer._load_checkpoint_slot("student", adapter, alpha=2) == 1
-    trainer._checkpoint_slot_params_by_name["student"] = tuple(
-        trainer._iter_slot_parameters(trainer._slot_ref("student"))
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(
+        tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
+        cast(_AdapterConfig, config),
     )
-    trainer._checkpoint_slot_adapter_configs["student"] = config
-    trainer._checkpoint_revisions["student"] = 0
     output_dir = tmp_path / "checkpoint"
 
     assert trainer.export_lora(str(output_dir), "student") == 0
@@ -1892,12 +1908,8 @@ def _portable_trainer(
     trainer._slot_stack = []
     trainer._default_slot_ref = None
     trainer._pending_slot_graphs = {}
-    trainer._dynamic_optimizers = {}
-    trainer._checkpoint_slot_params_by_name = {}
-    trainer._checkpoint_slot_adapter_configs = {}
-    trainer._checkpoint_revisions = {}
-    trainer._checkpoint_sources = {}
-    trainer._checkpoint_prefetch_tasks = {}
+    trainer._checkpoint_slots = {}
+    trainer._checkpoint_prefetches = {}
     trainer._checkpoint_process_group = None
     trainer._checkpoint_mutation_tail = None
     trainer._checkpoint_save_lock = threading.Lock()
@@ -1916,11 +1928,10 @@ def _install_checkpoint(
     alpha = config["lora_alpha"]
     assert isinstance(alpha, int | float)
     assert trainer._load_checkpoint_slot("student", adapter, alpha=float(alpha)) > 0
-    trainer._checkpoint_slot_params_by_name["student"] = tuple(
-        trainer._iter_slot_parameters(trainer._slot_ref("student"))
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(
+        tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
+        cast(_AdapterConfig, config),
     )
-    trainer._checkpoint_slot_adapter_configs["student"] = cast(_AdapterConfig, config)
-    trainer._checkpoint_revisions["student"] = 0
 
 
 def _install_portable_checkpoint(trainer: TrainerRank) -> None:
@@ -1928,14 +1939,15 @@ def _install_portable_checkpoint(trainer: TrainerRank) -> None:
 
 
 def _step_portable_checkpoint(trainer: TrainerRank, gradient: float) -> None:
-    dynamic = trainer._dynamic_optimizers["student"]
+    dynamic = trainer._checkpoint_slots["student"].optimizer
+    assert dynamic is not None
     for master in dynamic.master_params:
         master.grad = torch.full_like(master, gradient)
     dynamic.optimizer.step()
     dynamic.optimizer.zero_grad(set_to_none=True)
     with torch.no_grad():
         for model, master in zip(
-            trainer._checkpoint_slot_params_by_name["student"],
+            trainer._checkpoint_slots["student"].params,
             dynamic.master_params,
             strict=True,
         ):
@@ -1944,14 +1956,15 @@ def _step_portable_checkpoint(trainer: TrainerRank, gradient: float) -> None:
 
 
 def _assert_checkpoint_state_equal(expected: TrainerRank, actual: TrainerRank) -> None:
-    expected_params = expected._checkpoint_slot_params_by_name["student"]
-    actual_params = actual._checkpoint_slot_params_by_name["student"]
+    expected_params = expected._checkpoint_slots["student"].params
+    actual_params = actual._checkpoint_slots["student"].params
     for expected_param, actual_param in zip(
         expected_params, actual_params, strict=True
     ):
         torch.testing.assert_close(actual_param, expected_param, atol=0, rtol=0)
-    expected_optimizer = expected._dynamic_optimizers["student"]
-    actual_optimizer = actual._dynamic_optimizers["student"]
+    expected_optimizer = expected._checkpoint_slots["student"].optimizer
+    actual_optimizer = actual._checkpoint_slots["student"].optimizer
+    assert expected_optimizer is not None and actual_optimizer is not None
     for expected_master, actual_master in zip(
         expected_optimizer.master_params,
         actual_optimizer.master_params,
@@ -1968,7 +1981,7 @@ def _assert_checkpoint_state_equal(expected: TrainerRank, actual: TrainerRank) -
 
 
 def _save_before_next_step(trainer: TrainerRank, path: Path) -> None:
-    trainer._dynamic_optimizers["student"] = trainer._new_dynamic_optimizer(
+    trainer._checkpoint_slots["student"].optimizer = trainer._new_dynamic_optimizer(
         "student",
         AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95, weight_decay=0.1),
     )
@@ -1994,7 +2007,8 @@ def test_checkpoint_load_pins_runtime_revision(
 
     load_trainer_checkpoint(trainer, prepare_checkpoint(str(source)), "student")
 
-    assert trainer._checkpoint_slot_adapter_configs["student"]["revision"] == revision
+    config = trainer._checkpoint_slots["student"].config
+    assert config is not None and config["revision"] == revision
 
 
 def test_checkpoint_load_rejects_conflicting_runtime_revision_transactionally(
@@ -2011,17 +2025,17 @@ def test_checkpoint_load_rejects_conflicting_runtime_revision_transactionally(
         model_revision="b" * 40,
     )
     _install_portable_checkpoint(trainer)
-    previous_params = trainer._checkpoint_slot_params_by_name["student"]
+    previous_params = trainer._checkpoint_slots["student"].params
     previous_values = tuple(param.detach().clone() for param in previous_params)
-    previous_config = trainer._checkpoint_slot_adapter_configs["student"]
+    previous_config = trainer._checkpoint_slots["student"].config
 
     with pytest.raises(ValueError, match="base-model revision"):
         load_trainer_checkpoint(trainer, prepare_checkpoint(str(source)), "student")
 
-    restored_params = trainer._checkpoint_slot_params_by_name["student"]
+    restored_params = trainer._checkpoint_slots["student"].params
     assert tuple(map(id, restored_params)) == tuple(map(id, previous_params))
-    assert trainer._checkpoint_slot_adapter_configs["student"] is previous_config
-    assert trainer._checkpoint_revisions["student"] == 0
+    assert trainer._checkpoint_slots["student"].config is previous_config
+    assert trainer._checkpoint_slots["student"].revision == 0
     for expected, actual in zip(previous_values, restored_params, strict=True):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -2152,7 +2166,7 @@ def test_native_checkpoint_rejects_unmapped_optimizer_tensor(
         LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     )
     _install_portable_checkpoint(original)
-    original._dynamic_optimizers["student"] = original._new_dynamic_optimizer(
+    original._checkpoint_slots["student"].optimizer = original._new_dynamic_optimizer(
         "student", AdamParams(learning_rate=3e-4)
     )
     _step_portable_checkpoint(original, 0.25)
@@ -2197,7 +2211,7 @@ def test_native_checkpoint_rejects_unmapped_optimizer_tensor(
     )
     with pytest.raises(RuntimeError, match="coverage differs from the target runtime"):
         load_trainer_checkpoint(restored, prepared, "student")
-    assert not restored._checkpoint_slot_params_by_name
+    assert not restored._checkpoint_slots
 
 
 @pytest.mark.parametrize("with_optimizer", [False, True])
@@ -2210,7 +2224,9 @@ def test_canonical_checkpoint_rejects_different_model_in_same_support_spec(
     )
     _install_portable_checkpoint(original)
     if with_optimizer:
-        original._dynamic_optimizers["student"] = original._new_dynamic_optimizer(
+        original._checkpoint_slots[
+            "student"
+        ].optimizer = original._new_dynamic_optimizer(
             "student", AdamParams(learning_rate=3e-4)
         )
     output = tmp_path / f"canonical-model-{with_optimizer}"
@@ -2223,7 +2239,7 @@ def test_canonical_checkpoint_rejects_different_model_in_same_support_spec(
     )
     with pytest.raises(RuntimeError, match="Exact checkpoint base model"):
         load_trainer_checkpoint(restored, prepare_checkpoint(str(output)), "student")
-    assert not restored._checkpoint_slot_params_by_name
+    assert not restored._checkpoint_slots
 
 
 def test_lora_only_checkpoint_rejects_different_model_in_same_support_spec(
@@ -2241,7 +2257,7 @@ def test_lora_only_checkpoint_rejects_different_model_in_same_support_spec(
     )
     with pytest.raises(RuntimeError, match="Checkpoint base model"):
         load_trainer_checkpoint(restored, prepared, "student")
-    assert not restored._checkpoint_slot_params_by_name
+    assert not restored._checkpoint_slots
 
 
 def test_checkpoint_prepare_captures_immutable_state_and_finish_is_idempotent(
@@ -2251,16 +2267,15 @@ def test_checkpoint_prepare_captures_immutable_state_and_finish_is_idempotent(
         LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     )
     _install_portable_checkpoint(trainer)
-    trainer._dynamic_optimizers["student"] = trainer._new_dynamic_optimizer(
+    trainer._checkpoint_slots["student"].optimizer = trainer._new_dynamic_optimizer(
         "student",
         AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95),
     )
     _step_portable_checkpoint(trainer, 0.25)
     expected_params = tuple(
-        value.detach().clone()
-        for value in trainer._checkpoint_slot_params_by_name["student"]
+        value.detach().clone() for value in trainer._checkpoint_slots["student"].params
     )
-    dynamic = trainer._dynamic_optimizers["student"]
+    dynamic = trainer._checkpoint_slots["student"].optimizer
     expected_masters = tuple(value.detach().clone() for value in dynamic.master_params)
     expected_states = tuple(
         {
@@ -2274,7 +2289,7 @@ def test_checkpoint_prepare_captures_immutable_state_and_finish_is_idempotent(
     output = tmp_path / "immutable"
     trainer._prepare_checkpoint_save(str(output), "student")
     with torch.no_grad():
-        for value in trainer._checkpoint_slot_params_by_name["student"]:
+        for value in trainer._checkpoint_slots["student"].params:
             value.add_(100)
         for master in dynamic.master_params:
             master.add_(200)
@@ -2294,11 +2309,12 @@ def test_checkpoint_prepare_captures_immutable_state_and_finish_is_idempotent(
     )
     for expected, actual in zip(
         expected_params,
-        restored._checkpoint_slot_params_by_name["student"],
+        restored._checkpoint_slots["student"].params,
         strict=True,
     ):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    restored_dynamic = restored._dynamic_optimizers["student"]
+    restored_dynamic = restored._checkpoint_slots["student"].optimizer
+    assert restored_dynamic is not None
     for expected, expected_state, actual in zip(
         expected_masters,
         expected_states,
@@ -2653,7 +2669,7 @@ def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(
         LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     )
     _install_portable_checkpoint(original)
-    original._dynamic_optimizers["student"] = original._new_dynamic_optimizer(
+    original._checkpoint_slots["student"].optimizer = original._new_dynamic_optimizer(
         "student",
         AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95, weight_decay=0.1),
     )
@@ -2663,7 +2679,7 @@ def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(
     assert unstepped.manifest is not None
     assert set(unstepped.manifest.steps.values()) == {0.0}
     _step_portable_checkpoint(original, 0.25)
-    original_optimizer = original._dynamic_optimizers["student"]
+    original_optimizer = original._checkpoint_slots["student"].optimizer
     for step, master in enumerate(original_optimizer.master_params, start=2):
         original_optimizer.optimizer.state[master]["step"].fill_(step)
     output = tmp_path / "exact"
@@ -2783,13 +2799,13 @@ def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(
     source = prepare_checkpoint(str(output))
     load_trainer_checkpoint(restored, source, "student")
     assert source.manifest is not None and source.manifest.optimizer is not None
-    assert restored._checkpoint_revisions["student"] == 0
+    assert restored._checkpoint_slots["student"].revision == 0
 
     _step_portable_checkpoint(original, -0.125)
     _step_portable_checkpoint(restored, -0.125)
     for expected, actual in zip(
-        original._checkpoint_slot_params_by_name["student"],
-        restored._checkpoint_slot_params_by_name["student"],
+        original._checkpoint_slots["student"].params,
+        restored._checkpoint_slots["student"].params,
         strict=True,
     ):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -2803,7 +2819,7 @@ def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(
     _install_portable_checkpoint(failed)
     before = tuple(
         parameter.detach().clone()
-        for parameter in failed._checkpoint_slot_params_by_name["student"]
+        for parameter in failed._checkpoint_slots["student"].params
     )
 
     tampered_dtype = tmp_path / "tampered-dtype"
@@ -2819,11 +2835,11 @@ def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(
 
     with pytest.raises(RuntimeError, match="must use float32"):
         asyncio.run(load_tampered_dtype())
-    assert set(failed._checkpoint_slot_params_by_name) == {"student"}
+    assert set(failed._checkpoint_slots) == {"student"}
     assert failed._default_slot_ref is None
     for expected, actual in zip(
         before,
-        failed._checkpoint_slot_params_by_name["student"],
+        failed._checkpoint_slots["student"].params,
         strict=True,
     ):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -2834,10 +2850,10 @@ def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(
     monkeypatch.setattr(failed, "_restore_canonical_optimizer", reject_optimizer)
     with pytest.raises(RuntimeError, match="injected optimizer failure"):
         load_trainer_checkpoint(failed, source, "student")
-    assert set(failed._checkpoint_slot_params_by_name) == {"student"}
+    assert set(failed._checkpoint_slots) == {"student"}
     for expected, actual in zip(
         before,
-        failed._checkpoint_slot_params_by_name["student"],
+        failed._checkpoint_slots["student"].params,
         strict=True,
     ):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -3017,7 +3033,7 @@ def _reversed_prefetch_order_worker(
 
         asyncio.run(load_both())
         assert trainer._default_slot_ref == trainer._slot_ref(second_path)
-        assert set(trainer._checkpoint_slot_params_by_name) == {
+        assert set(trainer._checkpoint_slots) == {
             first_path,
             second_path,
         }
@@ -3058,15 +3074,15 @@ def _transactional_load_failure_worker(
         )
         trainer = _portable_trainer(lora, rank=rank, world_size=world_size)
         _install_portable_checkpoint(trainer)
-        trainer._dynamic_optimizers["student"] = trainer._new_dynamic_optimizer(
+        trainer._checkpoint_slots["student"].optimizer = trainer._new_dynamic_optimizer(
             "student", AdamParams(learning_rate=1e-3)
         )
         _step_portable_checkpoint(trainer, -0.5)
-        previous_params = trainer._checkpoint_slot_params_by_name["student"]
+        previous_params = trainer._checkpoint_slots["student"].params
         previous_values = tuple(
             parameter.detach().clone() for parameter in previous_params
         )
-        previous_dynamic = trainer._dynamic_optimizers["student"]
+        previous_dynamic = trainer._checkpoint_slots["student"].optimizer
         original_replace = lora_module.replace_lora_slot_in_model
         if rank == 1:
 
@@ -3085,13 +3101,13 @@ def _transactional_load_failure_worker(
         ):
             load_trainer_checkpoint(trainer, prepare_checkpoint(source_path), "student")
 
-        restored_params = trainer._checkpoint_slot_params_by_name["student"]
+        restored_params = trainer._checkpoint_slots["student"].params
         assert tuple(map(id, restored_params)) == tuple(map(id, previous_params))
         for expected, actual in zip(previous_values, restored_params, strict=True):
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        assert trainer._dynamic_optimizers["student"] is previous_dynamic
-        assert trainer._checkpoint_slot_adapter_configs["student"] == _PORTABLE_CONFIG
-        assert trainer._checkpoint_revisions["student"] == 0
+        assert trainer._checkpoint_slots["student"].optimizer is previous_dynamic
+        assert trainer._checkpoint_slots["student"].config == _PORTABLE_CONFIG
+        assert trainer._checkpoint_slots["student"].revision == 0
         assert all(
             not (ref.name or "").startswith("__art_loading_") for ref in lora._slot_keys
         )
@@ -3138,16 +3154,16 @@ def _portable_replica_worker(
         )
         trainer = _portable_trainer(lora, rank=rank, world_size=world_size)
         _install_portable_checkpoint(trainer)
-        trainer._dynamic_optimizers["student"] = trainer._new_dynamic_optimizer(
+        trainer._checkpoint_slots["student"].optimizer = trainer._new_dynamic_optimizer(
             "student",
             AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95, weight_decay=0.1),
         )
         _step_portable_checkpoint(trainer, 0.25)
         if diverge == "lora" and rank == 1:
             with torch.no_grad():
-                trainer._checkpoint_slot_params_by_name["student"][0].add_(1)
+                trainer._checkpoint_slots["student"].params[0].add_(1)
         elif diverge == "optimizer" and rank == 1:
-            dynamic = trainer._dynamic_optimizers["student"]
+            dynamic = trainer._checkpoint_slots["student"].optimizer
             master = dynamic.master_params[0]
             dynamic.optimizer.state[master]["exp_avg"].add_(1)
 
@@ -3363,8 +3379,10 @@ def test_checkpoint_commit_failure_rolls_back_every_rank(tmp_path: Path) -> None
         LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     )
     _install_portable_checkpoint(source_trainer)
-    source_trainer._dynamic_optimizers["student"] = (
-        source_trainer._new_dynamic_optimizer("student", AdamParams(learning_rate=3e-4))
+    source_trainer._checkpoint_slots[
+        "student"
+    ].optimizer = source_trainer._new_dynamic_optimizer(
+        "student", AdamParams(learning_rate=3e-4)
     )
     _step_portable_checkpoint(source_trainer, 0.25)
     source = tmp_path / "transaction-source"
@@ -3394,19 +3412,19 @@ def test_checkpoint_reload_rejects_accumulated_gradients(tmp_path: Path) -> None
         LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     )
     _install_portable_checkpoint(trainer)
-    trainer._dynamic_optimizers["student"] = trainer._new_dynamic_optimizer(
+    trainer._checkpoint_slots["student"].optimizer = trainer._new_dynamic_optimizer(
         "student", AdamParams(learning_rate=3e-4)
     )
-    params = trainer._checkpoint_slot_params_by_name["student"]
+    params = trainer._checkpoint_slots["student"].params
     params[0].grad = torch.ones_like(params[0])
     values = tuple(param.detach().clone() for param in params)
-    dynamic = trainer._dynamic_optimizers["student"]
+    dynamic = trainer._checkpoint_slots["student"].optimizer
 
     with pytest.raises(TrainerRankSlotStateError, match="accumulated gradients"):
         load_trainer_checkpoint(trainer, prepare_checkpoint(str(source)), "student")
 
-    assert trainer._checkpoint_slot_params_by_name["student"] is params
-    assert trainer._dynamic_optimizers["student"] is dynamic
+    assert trainer._checkpoint_slots["student"].params is params
+    assert trainer._checkpoint_slots["student"].optimizer is dynamic
     assert params[0].grad is not None
     for expected, actual in zip(values, params, strict=True):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -3427,7 +3445,7 @@ def test_trainer_rank_checkpoint_deduplicates_data_parallel_replicas(
         LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     )
     _install_portable_checkpoint(expected)
-    expected._dynamic_optimizers["student"] = expected._new_dynamic_optimizer(
+    expected._checkpoint_slots["student"].optimizer = expected._new_dynamic_optimizer(
         "student",
         AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95, weight_decay=0.1),
     )
@@ -3458,13 +3476,14 @@ def test_trainer_rank_checkpoint_deduplicates_data_parallel_replicas(
         "student",
     )
     for expected_param, actual_param in zip(
-        expected._checkpoint_slot_params_by_name["student"],
-        restored._checkpoint_slot_params_by_name["student"],
+        expected._checkpoint_slots["student"].params,
+        restored._checkpoint_slots["student"].params,
         strict=True,
     ):
         torch.testing.assert_close(actual_param, expected_param, atol=0, rtol=0)
-    expected_optimizer = expected._dynamic_optimizers["student"]
-    actual_optimizer = restored._dynamic_optimizers["student"]
+    expected_optimizer = expected._checkpoint_slots["student"].optimizer
+    actual_optimizer = restored._checkpoint_slots["student"].optimizer
+    assert expected_optimizer is not None and actual_optimizer is not None
     for expected_master, actual_master in zip(
         expected_optimizer.master_params,
         actual_optimizer.master_params,
@@ -3526,7 +3545,7 @@ def test_trainer_rank_checkpoint_restores_1_to_2_to_1(
         LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.bfloat16, torch.device("cpu"))
     )
     _install_portable_checkpoint(original)
-    original._dynamic_optimizers["student"] = original._new_dynamic_optimizer(
+    original._checkpoint_slots["student"].optimizer = original._new_dynamic_optimizer(
         "student",
         AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95, weight_decay=0.1),
     )
@@ -3565,13 +3584,14 @@ def test_trainer_rank_checkpoint_restores_1_to_2_to_1(
         "student",
     )
     for expected, actual in zip(
-        original._checkpoint_slot_params_by_name["student"],
-        restored._checkpoint_slot_params_by_name["student"],
+        original._checkpoint_slots["student"].params,
+        restored._checkpoint_slots["student"].params,
         strict=True,
     ):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    expected_optimizer = original._dynamic_optimizers["student"]
-    actual_optimizer = restored._dynamic_optimizers["student"]
+    expected_optimizer = original._checkpoint_slots["student"].optimizer
+    actual_optimizer = restored._checkpoint_slots["student"].optimizer
+    assert expected_optimizer is not None and actual_optimizer is not None
     for expected, actual in zip(
         expected_optimizer.master_params,
         actual_optimizer.master_params,
@@ -3600,7 +3620,7 @@ def test_checkpoint_restores_different_adapter_rank(tmp_path: Path) -> None:
     assert ambient.A_T.shape[-1] == 4
     assert all(
         parameter.shape[-1] == 2 or parameter.shape[-2] == 2
-        for parameter in restored._checkpoint_slot_params_by_name["student"]
+        for parameter in restored._checkpoint_slots["student"].params
     )
     _step_portable_checkpoint(restored, -0.125)
     _assert_checkpoint_state_equal(original, restored)

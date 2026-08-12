@@ -32,6 +32,7 @@ from art.trainer_rank._checkpoint import (
 )
 from art.trainer_rank._impl import (
     _anchor_disconnected_outputs,
+    _CheckpointSlot,
     _MemoryCheck,
     _MemoryProfile,
     _validate_top_k,
@@ -187,7 +188,7 @@ def _trainer_with_checkpoint(
 ) -> tuple[TrainerRank, torch.nn.Parameter]:
     trainer = TrainerRank(_runtime())
     param = torch.nn.Parameter(value.clone())
-    trainer._checkpoint_slot_params_by_name["student"] = (param,)
+    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (param,)
     monkeypatch.setattr(
         trainer,
         "_reduce_dynamic_grads",
@@ -252,7 +253,7 @@ def test_dp_rank_forward_accepts_base_or_loaded_explicit_checkpoint(
     checkpoint: str | None,
 ) -> None:
     trainer = TrainerRank(_runtime())
-    trainer._checkpoint_slot_params_by_name["student"] = ()
+    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = ()
     _stub_forward(monkeypatch, trainer)
     request = ForwardInput(
         input_tokens=torch.tensor([1]),
@@ -441,7 +442,7 @@ async def test_checkpoint_tasks_and_async_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
-    trainer._checkpoint_sources = {}
+    trainer._checkpoint_prefetches = {}
     fetched: list[str] = []
 
     async def prefetch(path: str) -> object:
@@ -449,8 +450,8 @@ async def test_checkpoint_tasks_and_async_context(
         return object()
 
     def install(trainer: TrainerRank, _source: object, path: str) -> None:
-        trainer._checkpoint_slot_params_by_name[path] = ()
-        trainer._checkpoint_revisions[path] = 0
+        trainer._checkpoint_slots.setdefault(path, _CheckpointSlot()).params = ()
+        trainer._checkpoint_slots[path].revision = 0
 
     monkeypatch.setattr(trainer, "_prefetch_checkpoint", prefetch)
     monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", install)
@@ -486,7 +487,7 @@ async def test_checkpoint_context_cancellation_after_successful_push_cleans_stac
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
-    trainer._checkpoint_slot_params_by_name["student"] = ()
+    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = ()
     parent = asyncio.current_task()
     assert parent is not None
     original_slot_ref = trainer._slot_ref
@@ -537,10 +538,8 @@ async def test_shared_checkpoint_prefetch_survives_waiter_cancellation(
     release.set()
 
     assert await second is source
-    assert (
-        trainer._checkpoint_sources[trainer._checkpoint_source_key("student")] is source
-    )
-    assert trainer._checkpoint_prefetch_tasks == {}
+    [cached] = trainer._checkpoint_prefetches.values()
+    assert cached.result() is source
 
 
 async def test_shared_checkpoint_prefetch_serves_successful_waiters(
@@ -568,7 +567,8 @@ async def test_shared_checkpoint_prefetch_serves_successful_waiters(
 
     assert await asyncio.gather(first, second) == [source, source]
     assert calls == 1
-    assert trainer._checkpoint_prefetch_tasks == {}
+    [cached] = trainer._checkpoint_prefetches.values()
+    assert cached.result() is source
 
 
 async def test_materialized_sources_keep_logical_checkpoint_identities(
@@ -584,8 +584,10 @@ async def test_materialized_sources_keep_logical_checkpoint_identities(
 
     def install(trainer: TrainerRank, source: object, logical_path: str) -> None:
         installed.append((logical_path, source))
-        trainer._checkpoint_slot_params_by_name[logical_path] = ()
-        trainer._checkpoint_revisions[logical_path] = 0
+        trainer._checkpoint_slots.setdefault(
+            logical_path, _CheckpointSlot()
+        ).params = ()
+        trainer._checkpoint_slots[logical_path].revision = 0
 
     monkeypatch.setattr("art.trainer_rank._checkpoint.prepare_checkpoint", prepare)
     monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", install)
@@ -611,7 +613,7 @@ async def test_materialized_sources_keep_logical_checkpoint_identities(
         logical_b,
         logical_c,
     ]
-    assert set(trainer._checkpoint_slot_params_by_name) == {
+    assert set(trainer._checkpoint_slots) == {
         logical_a,
         logical_b,
         logical_c,
@@ -640,7 +642,7 @@ async def test_checkpoint_mutations_follow_call_order_and_recover_from_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
-    trainer._checkpoint_sources = {}
+    trainer._checkpoint_prefetches = {}
     started = {name: asyncio.Event() for name in ("first", "second")}
     ready = {name: asyncio.Event() for name in ("first", "second")}
     installed: list[str] = []
@@ -656,8 +658,8 @@ async def test_checkpoint_mutations_follow_call_order_and_recover_from_failure(
         installed.append(path)
         if path == "bad":
             raise RuntimeError("injected load failure")
-        trainer._checkpoint_slot_params_by_name[path] = ()
-        trainer._checkpoint_revisions[path] = 0
+        trainer._checkpoint_slots.setdefault(path, _CheckpointSlot()).params = ()
+        trainer._checkpoint_slots[path].revision = 0
 
     monkeypatch.setattr(trainer, "_prefetch_checkpoint", prefetch)
     monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", install)
@@ -883,7 +885,7 @@ def test_checkpoint_export_requires_retained_adapter_config() -> None:
     with pytest.raises(ValueError, match="Unknown checkpoint"):
         trainer.export_lora("/unused", "missing")
 
-    trainer._checkpoint_slot_params_by_name["student"] = ()
+    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = ()
     with pytest.raises(TrainerRankSlotStateError, match="adapter_config"):
         trainer.export_lora("/unused", "student")
 
@@ -892,8 +894,10 @@ def test_checkpoint_save_rejects_accumulated_gradients() -> None:
     trainer = TrainerRank(_runtime())
     parameter = torch.nn.Parameter(torch.ones(2))
     parameter.grad = torch.ones_like(parameter)
-    trainer._checkpoint_slot_params_by_name["student"] = (parameter,)
-    trainer._checkpoint_slot_adapter_configs["student"] = {
+    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (
+        parameter,
+    )
+    trainer._checkpoint_slots["student"].config = {
         "base_model_name_or_path": "test",
         "r": 1,
         "lora_alpha": 1,
@@ -927,7 +931,7 @@ def test_optim_step_requires_loaded_checkpoint_slot() -> None:
 
 def test_optim_step_rejects_loaded_slots_without_grads() -> None:
     trainer = TrainerRank(_runtime())
-    trainer._checkpoint_slot_params_by_name["student"] = (
+    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (
         torch.nn.Parameter(torch.ones(2)),
     )
 
@@ -947,8 +951,10 @@ def test_optim_step_rejects_explicit_slot_subset_with_missing_grads(
     ready = torch.nn.Parameter(torch.ones(2))
     missing = torch.nn.Parameter(torch.ones(2))
     ready.grad = torch.ones_like(ready)
-    trainer._checkpoint_slot_params_by_name["ready"] = (ready,)
-    trainer._checkpoint_slot_params_by_name["missing"] = (missing,)
+    trainer._checkpoint_slots.setdefault("ready", _CheckpointSlot()).params = (ready,)
+    trainer._checkpoint_slots.setdefault("missing", _CheckpointSlot()).params = (
+        missing,
+    )
     monkeypatch.setattr(
         trainer,
         "_reduce_dynamic_grads",
@@ -969,8 +975,10 @@ def test_optim_step_implicitly_steps_only_slots_with_grads(
     ready = torch.nn.Parameter(torch.ones(2))
     untouched = torch.nn.Parameter(torch.ones(2))
     ready.grad = torch.ones_like(ready)
-    trainer._checkpoint_slot_params_by_name["ready"] = (ready,)
-    trainer._checkpoint_slot_params_by_name["untouched"] = (untouched,)
+    trainer._checkpoint_slots.setdefault("ready", _CheckpointSlot()).params = (ready,)
+    trainer._checkpoint_slots.setdefault("untouched", _CheckpointSlot()).params = (
+        untouched,
+    )
     monkeypatch.setattr(
         trainer,
         "_reduce_dynamic_grads",
@@ -983,8 +991,8 @@ def test_optim_step_implicitly_steps_only_slots_with_grads(
         params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
     )
 
-    assert "ready" in trainer._dynamic_optimizers
-    assert "untouched" not in trainer._dynamic_optimizers
+    assert trainer._checkpoint_slots["ready"].optimizer is not None
+    assert trainer._checkpoint_slots["untouched"].optimizer is None
     assert not torch.equal(before_ready, ready)
     torch.testing.assert_close(untouched, before_untouched)
 
@@ -1015,7 +1023,7 @@ def test_dynamic_optimizer_zeroes_internal_padding_grads_before_step(
         ),
     )
     trainer = TrainerRank(runtime)
-    trainer._checkpoint_slot_params_by_name["student"] = (param,)
+    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (param,)
     monkeypatch.setattr(
         trainer,
         "_reduce_dynamic_grads",
@@ -1047,10 +1055,11 @@ def test_canonical_optimizer_state_reproduces_exact_next_step(
     original, original_param = _trainer_with_checkpoint(
         monkeypatch, torch.tensor([0.5, -0.25], dtype=torch.bfloat16)
     )
-    original._checkpoint_revisions["student"] = 0
+    original._checkpoint_slots["student"].revision = 0
     original_param.grad = torch.tensor([0.2, -0.4], dtype=torch.bfloat16)
     original.optim_step(params=adam)
-    dynamic = original._dynamic_optimizers["student"]
+    dynamic = original._checkpoint_slots["student"].optimizer
+    assert dynamic is not None
     optimizer_state = dynamic.optimizer.state[dynamic.master_params[0]]
     group = dynamic.optimizer.param_groups[0]
     beta1, beta2 = cast(tuple[float, float], group["betas"])
@@ -1071,20 +1080,23 @@ def test_canonical_optimizer_state_reproduces_exact_next_step(
     restored, restored_param = _trainer_with_checkpoint(
         monkeypatch, original_param.detach()
     )
-    restored._dynamic_optimizers["student"] = restored._restore_canonical_optimizer(
-        "student", state
-    )
+    restored._checkpoint_slots[
+        "student"
+    ].optimizer = restored._restore_canonical_optimizer("student", state)
     for param in (original_param, restored_param):
         param.grad = torch.tensor([-0.3, 0.1], dtype=torch.bfloat16)
     original.optim_step(params=adam)
     restored.optim_step(params=adam)
 
     torch.testing.assert_close(restored_param, original_param, atol=0, rtol=0)
+    restored_optimizer = restored._checkpoint_slots["student"].optimizer
+    original_optimizer = original._checkpoint_slots["student"].optimizer
+    assert restored_optimizer is not None and original_optimizer is not None
     _assert_nested_tensors_equal(
-        restored._dynamic_optimizers["student"].optimizer.state_dict(),
-        original._dynamic_optimizers["student"].optimizer.state_dict(),
+        restored_optimizer.optimizer.state_dict(),
+        original_optimizer.optimizer.state_dict(),
     )
-    assert original._checkpoint_revisions["student"] == 2
+    assert original._checkpoint_slots["student"].revision == 2
 
 
 def test_dynamic_optimizer_keeps_fp32_master_weight_and_moments(
@@ -1104,7 +1116,8 @@ def test_dynamic_optimizer_keeps_fp32_master_weight_and_moments(
             )
         )
 
-    dynamic = trainer._dynamic_optimizers["student"]
+    dynamic = trainer._checkpoint_slots["student"].optimizer
+    assert dynamic is not None
     assert dynamic.master_params[0].dtype == torch.float32
     assert param.item() < torch.tensor(0.1, dtype=torch.bfloat16).item()
     state = dynamic.optimizer.state[dynamic.master_params[0]]
