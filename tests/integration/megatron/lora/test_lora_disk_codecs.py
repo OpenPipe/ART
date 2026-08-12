@@ -2169,16 +2169,13 @@ def test_native_checkpoint_rejects_unmapped_optimizer_tensor(
     save_file(adapter, output / "adapter_model.safetensors")
 
     source_record = manifest.parameters[source_key]
-    component_updates = {}
-    for component in ("master", "exp_avg", "exp_avg_sq"):
-        record = getattr(source_record, component)
-        tensors = load_file(output / record.file)
+    for file in source_record:
+        tensors = load_file(output / file)
         tensors[extra_key] = tensors[source_key].clone()
-        save_file(tensors, output / record.file)
-        component_updates[component] = record.model_copy(update={"tensor": extra_key})
+        save_file(tensors, output / file)
     parameters = {
         **manifest.parameters,
-        extra_key: source_record.model_copy(update=component_updates),
+        extra_key: source_record,
     }
     unsigned = manifest.model_copy(
         update={
@@ -2689,11 +2686,7 @@ def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(
         "optimizer//escape.safetensors",
         "./optimizer/escape.safetensors",
     ):
-        invalid_parameter = parameter.model_copy(
-            update={
-                "master": parameter.master.model_copy(update={"file": invalid_path})
-            }
-        )
+        invalid_parameter = (invalid_path, *parameter[1:])
         invalid_manifest = manifest.model_copy(
             update={
                 "parameters": {
@@ -2718,11 +2711,12 @@ def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(
     assert len(list((output / "optimizer").glob("*.safetensors"))) == 3
     malformed = tmp_path / "malformed"
     shutil.copytree(output, malformed)
-    malformed_manifest = json.loads((malformed / "checkpoint.json").read_text())
-    first = next(iter(malformed_manifest["parameters"].values()))
-    first["master"]["shape"][0] += 1
-    (malformed / "checkpoint.json").write_text(json.dumps(malformed_manifest))
-    with pytest.raises(RuntimeError, match="tensor metadata mismatch"):
+    first_key, first_files = next(iter(manifest.parameters.items()))
+    first_file = malformed / first_files[0]
+    tensors = load_file(first_file)
+    del tensors[first_key]
+    save_file(tensors, first_file)
+    with pytest.raises(RuntimeError, match="tensor index mismatch"):
         validate_checkpoint(malformed, require_optimizer=True)
     inference = tmp_path / "inference"
     materialize_lora(output, inference, require_optimizer=True)
@@ -2769,8 +2763,7 @@ def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(
             staged,
             tmp_path / "missing-entry",
             require_optimizer=True,
-            artifact_entries=entries
-            - {next(iter(manifest.parameters.values())).master.file},
+            artifact_entries=entries - {next(iter(manifest.parameters.values()))[0]},
             expected_digest=manifest.digest,
         )
     with pytest.raises(RuntimeError, match="durable artifact digest"):
@@ -2815,10 +2808,11 @@ def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(
 
     tampered_dtype = tmp_path / "tampered-dtype"
     shutil.copytree(output, tampered_dtype)
-    tampered_manifest = json.loads((tampered_dtype / "checkpoint.json").read_text())
-    tampered_parameter = next(iter(tampered_manifest["parameters"].values()))
-    tampered_parameter["exp_avg"]["dtype"] = "float16"
-    (tampered_dtype / "checkpoint.json").write_text(json.dumps(tampered_manifest))
+    parameter_key, parameter_files = next(iter(manifest.parameters.items()))
+    exp_avg = tampered_dtype / parameter_files[1]
+    tensors = load_file(exp_avg)
+    tensors[parameter_key] = tensors[parameter_key].to(torch.float16)
+    save_file(tensors, exp_avg)
 
     async def load_tampered_dtype() -> None:
         await failed.load_checkpoint(str(tampered_dtype))
@@ -3561,9 +3555,9 @@ def test_trainer_rank_checkpoint_restores_1_to_2_to_1(
     manifest = validate_checkpoint(two_rank, require_optimizer=True)
     assert manifest is not None
     assert {
-        record.dtype
-        for parameter in manifest.parameters.values()
-        for record in (parameter.master, parameter.exp_avg, parameter.exp_avg_sq)
+        str(tensor.dtype).removeprefix("torch.")
+        for file in {file for files in manifest.parameters.values() for file in files}
+        for tensor in load_file(two_rank / file).values()
     } == {"float32"}
     load_trainer_checkpoint(
         restored,

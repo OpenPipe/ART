@@ -53,23 +53,6 @@ MANIFEST_FILE = "checkpoint.json"
 _LAYER_RE = re.compile(r"\.layers\.(?P<layer>\d+)\.")
 
 
-class TensorRecord(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    file: str
-    tensor: str
-    shape: tuple[int, ...]
-    dtype: str
-
-
-class ParameterRecord(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    master: TensorRecord
-    exp_avg: TensorRecord
-    exp_avg_sq: TensorRecord
-
-
 class AdamWRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -88,7 +71,7 @@ class CheckpointManifest(BaseModel):
     optimizer_format: Literal["adamw"] = "adamw"
     base_model_name_or_path: str
     optimizer: AdamWRecord | None
-    parameters: dict[str, ParameterRecord]
+    parameters: dict[str, tuple[str, str, str]]
     steps: dict[str, Annotated[float, Field(ge=0)]]
     digest: str
 
@@ -997,11 +980,11 @@ def _serialize_snapshot_component(
     blocks: Sequence[str],
     component: Literal["lora", "master", "exp_avg", "exp_avg_sq"],
     group: dist.ProcessGroup | None,
-) -> dict[str, TensorRecord]:
+) -> dict[str, str]:
     from art.megatron.weights.lora_publish import _gather_merged_adapter_tensors
 
     label = "LoRA" if component == "lora" else f"optimizer {component}"
-    records: dict[str, TensorRecord] = {}
+    records: dict[str, str] = {}
     for index, block in enumerate(blocks):
         block_metadata = [item for item in metadata if item.block == block]
         if component != "lora":
@@ -1042,18 +1025,7 @@ def _serialize_snapshot_component(
                 (output / "optimizer").mkdir(parents=True, exist_ok=True)
             _save_file(canonical, output / relative)
             if component != "lora":
-                records.update(
-                    (
-                        key,
-                        TensorRecord(
-                            file=relative,
-                            tensor=key,
-                            shape=tuple(int(dim) for dim in tensor.shape),
-                            dtype=_dtype_name(tensor.dtype),
-                        ),
-                    )
-                    for key, tensor in canonical.items()
-                )
+                records.update(dict.fromkeys(canonical, relative))
     return records
 
 
@@ -1120,7 +1092,7 @@ def _serialize_snapshot_optimizer(
         )
         for component in ("master", "exp_avg", "exp_avg_sq")
     }
-    parameters: dict[str, ParameterRecord] = {}
+    parameters: dict[str, tuple[str, str, str]] = {}
     with _collective_errors("validate checkpoint optimizer coverage", group=group):
         if _rank() == 0:
             coverage = {
@@ -1144,10 +1116,9 @@ def _serialize_snapshot_optimizer(
                     f"optimizer={sorted(expected)} lora={sorted(artifact_keys)}"
                 )
             parameters = {
-                key: ParameterRecord(
-                    master=records_by_component["master"][key],
-                    exp_avg=records_by_component["exp_avg"][key],
-                    exp_avg_sq=records_by_component["exp_avg_sq"][key],
+                key: tuple(
+                    records_by_component[component][key]
+                    for component in records_by_component
                 )
                 for key in sorted(expected)
             }
@@ -1281,9 +1252,9 @@ def _load_local_optimizer(
     assert manifest is not None and manifest.optimizer is not None
     plan = _local_tensor_plan(trainer, adapter_rank)
     localized: dict[str, tuple[torch.Tensor, ...]] = {}
-    for component in ("master", "exp_avg", "exp_avg_sq"):
+    for index, component in enumerate(("master", "exp_avg", "exp_avg_sq")):
         records = {
-            key: cast(TensorRecord, getattr(record, component))
+            key: (record[index], key)
             for key, record in manifest.parameters.items()
             if key in plan
         }
@@ -1474,11 +1445,7 @@ def _hash_files(root: Path, files: Iterable[str], *, seed: bytes = b"") -> str:
 
 
 def _manifest_files(manifest: CheckpointManifest) -> set[str]:
-    return {
-        record.file
-        for value in manifest.parameters.values()
-        for record in (value.master, value.exp_avg, value.exp_avg_sq)
-    }
+    return {file for files in manifest.parameters.values() for file in files}
 
 
 def _safe_relative_path(relative: str) -> PurePosixPath:
@@ -1534,17 +1501,6 @@ def _validate_manifest(
                 "LoRA-only checkpoint unexpectedly contains optimizer parameters"
             )
         return
-    for key, parameter in manifest.parameters.items():
-        for component, record in (
-            ("master", parameter.master),
-            ("exp_avg", parameter.exp_avg),
-            ("exp_avg_sq", parameter.exp_avg_sq),
-        ):
-            if record.dtype != "float32":
-                raise RuntimeError(
-                    f"Checkpoint optimizer tensor {key!r} {component} must use "
-                    f"float32, got {record.dtype!r}"
-                )
     if parameter_keys != set(artifact_keys):
         missing = sorted(set(artifact_keys) - parameter_keys)
         extra = sorted(parameter_keys - set(artifact_keys))
@@ -1562,59 +1518,53 @@ def _validate_manifest(
 
 def _validate_files(root: Path, manifest: CheckpointManifest) -> None:
     safe_open = importlib.import_module("safetensors").safe_open
-    files: dict[str, dict[str, TensorRecord]] = {}
-    for key, value in manifest.parameters.items():
-        for record in (value.master, value.exp_avg, value.exp_avg_sq):
-            if record.tensor != key or record.tensor in files.setdefault(
-                record.file, {}
-            ):
-                raise RuntimeError(f"Invalid checkpoint tensor index: {record.file}")
-            files[record.file][record.tensor] = record
-    for relative, records in files.items():
+    files: dict[str, set[str]] = {}
+    for key, records in manifest.parameters.items():
+        for relative in records:
+            files.setdefault(relative, set()).add(key)
+    for relative, keys in files.items():
         candidate = (root / _safe_relative_path(relative)).resolve()
         if root.resolve() not in candidate.parents or not candidate.is_file():
             raise RuntimeError(f"Invalid checkpoint tensor path: {relative}")
         with safe_open(candidate, framework="pt") as handle:
-            if set(handle.keys()) != set(records):
+            if set(handle.keys()) != keys:
                 raise RuntimeError(f"Checkpoint tensor index mismatch: {relative}")
-            for key, record in records.items():
+            for key in keys:
                 view = handle.get_slice(key)
                 shape = tuple(view.get_shape())
                 empty = view[tuple(slice(0, 0) for _ in shape)]
-                if shape != record.shape or _dtype_name(empty.dtype) != record.dtype:
+                if _dtype_name(empty.dtype) != "float32":
                     raise RuntimeError(
-                        f"Checkpoint tensor metadata mismatch: {record.file}"
+                        f"Checkpoint optimizer tensor {key!r} must use float32"
                     )
 
 
 def _load_tensors(
     root: Path,
-    records: Mapping[str, TensorRecord],
+    records: Mapping[str, tuple[str, str]],
     *,
     plans: Mapping[str, tuple[LoraShardManifest, tuple[int, ...]]] | None = None,
 ) -> dict[str, torch.Tensor]:
     safe_open = importlib.import_module("safetensors").safe_open
-    files: dict[str, list[tuple[str, TensorRecord]]] = {}
-    for key, record in records.items():
-        files.setdefault(record.file, []).append((key, record))
+    files: dict[str, list[tuple[str, str]]] = {}
+    for key, (file, tensor) in records.items():
+        files.setdefault(file, []).append((key, tensor))
     tensors: dict[str, torch.Tensor] = {}
     for relative, file_records in files.items():
         with safe_open(root / relative, framework="pt") as handle:
-            for key, record in file_records:
+            for key, tensor_name in file_records:
                 if plans is None:
-                    tensor = handle.get_tensor(record.tensor)
-                    shape_matches = tuple(tensor.shape) == record.shape
+                    tensor = handle.get_tensor(tensor_name)
                 else:
                     manifest, expected_shape = plans[key]
                     tensor = _read_local_slice(
-                        handle, record.tensor, manifest, expected_shape
+                        handle, tensor_name, manifest, expected_shape
                     )
-                    shape_matches = True
-                if not shape_matches or _dtype_name(tensor.dtype) != record.dtype:
+                if _dtype_name(tensor.dtype) != "float32":
                     raise RuntimeError(
-                        f"Checkpoint tensor metadata mismatch: {record.file}"
+                        f"Checkpoint optimizer tensor {key!r} must use float32"
                     )
-                tensors[record.tensor] = tensor
+                tensors[tensor_name] = tensor
     return tensors
 
 
