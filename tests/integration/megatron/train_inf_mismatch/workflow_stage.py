@@ -99,10 +99,11 @@ def _retryable_attempt_failure(
     result: TrainInfMismatchWorkerResult | None,
     output: str,
 ) -> bool:
-    if result is not None and (
-        result.outcome != "error" or result.comparison_completed
-    ):
-        return False
+    if result is not None:
+        if result.outcome == "failed":
+            return result.comparison_completed
+        if result.outcome != "error" or result.comparison_completed:
+            return False
     if returncode in {-9, -15}:
         return True
     details = "\n".join(
