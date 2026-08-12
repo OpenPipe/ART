@@ -30,6 +30,8 @@ from ..model_support.workflow_resources import (
 
 _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 _INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
+_EXTERNAL_VLLM_URL_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL"
+_EXTERNAL_VLLM_API_KEY_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY"
 
 
 class NativeVllmLoraServingReport(BaseModel):
@@ -81,29 +83,19 @@ def _resolve_dedicated_gpu_ids() -> tuple[list[int], list[int]]:
     return [0], [1]
 
 
-async def _model_ids(client, base_url: str) -> list[str]:
-    response = await client.get(f"{base_url}/v1/models", timeout=60.0)
-    response.raise_for_status()
-    return [
-        str(model_info["id"])
-        for model_info in response.json().get("data", [])
-        if isinstance(model_info, dict) and "id" in model_info
-    ]
+async def _model_ids(client) -> list[str]:
+    return [model_info.id for model_info in (await client.models.list()).data]
 
 
-async def _completion_text(client, base_url: str, model_name: str) -> str:
-    response = await client.post(
-        f"{base_url}/v1/completions",
-        json={
-            "model": model_name,
-            "prompt": [100],
-            "max_tokens": 1,
-            "temperature": 0.0,
-        },
+async def _completion_text(client, model_name: str) -> str:
+    response = await client.completions.create(
+        model=model_name,
+        prompt=[100],
+        max_tokens=1,
+        temperature=0.0,
         timeout=900.0,
     )
-    response.raise_for_status()
-    return str(response.json().get("choices", [{}])[0].get("text", ""))
+    return response.choices[0].text
 
 
 def _init_runtime_config(case_config: OracleCaseConfig) -> None:
@@ -129,6 +121,10 @@ async def _run_native_vllm_lora(
     stage_resources = (
         workflow_resources.native_vllm_lora if workflow_resources is not None else None
     )
+    configured_gpu_ids = any(
+        _parse_gpu_id_env(name) is not None
+        for name in (_TRAINER_GPU_IDS_ENV, _INFERENCE_GPU_IDS_ENV)
+    )
     if stage_resources is not None:
         stage_resources = resolve_stage_resources_for_visible_gpus(
             "native_vllm_lora",
@@ -137,18 +133,23 @@ async def _run_native_vllm_lora(
         )
         if stage_resources.vllm is None:
             raise RuntimeError("native_vllm_lora resources require vLLM")
-        trainer_gpu_ids = [0]
-        inference_gpu_ids = list(stage_resources.vllm.gpu_ids)
-        validate_dedicated_test_resources(
-            stage_name="native_vllm_lora",
-            trainer_gpu_ids=trainer_gpu_ids,
-            inference_gpu_ids=inference_gpu_ids,
-            allow_overlap=True,
-        )
         engine_args = cast(dev.EngineArgs, stage_resources.vllm.engine_args())
     else:
-        trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
         engine_args = dev.EngineArgs(enforce_eager=True)
+    if configured_gpu_ids:
+        trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
+    elif stage_resources is not None:
+        assert stage_resources.vllm is not None
+        trainer_gpu_ids = [0]
+        inference_gpu_ids = list(stage_resources.vllm.gpu_ids)
+    else:
+        trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
+    validate_dedicated_test_resources(
+        stage_name="native_vllm_lora",
+        trainer_gpu_ids=trainer_gpu_ids,
+        inference_gpu_ids=inference_gpu_ids,
+        allow_overlap=True,
+    )
     service_name = "model_support_native_lora_validation"
     case_artifacts = ensure_case_artifacts(case_config)
     output_root = Path(case_artifacts.case_dir) / "native_vllm_lora"
@@ -159,6 +160,18 @@ async def _run_native_vllm_lora(
         allow_unvalidated_arch=case_config.allow_unvalidated_arch,
         engine_args=engine_args,
     )
+    external_url = os.environ.get(_EXTERNAL_VLLM_URL_ENV)
+    external_api_key = os.environ.get(_EXTERNAL_VLLM_API_KEY_ENV)
+    if (external_url is None) != (external_api_key is None):
+        raise RuntimeError(
+            f"{_EXTERNAL_VLLM_URL_ENV} and {_EXTERNAL_VLLM_API_KEY_ENV} must both be set"
+        )
+    if external_url is not None:
+        internal_config["vllm_runtime"] = {
+            "mode": "external",
+            "server_url": external_url,
+            "api_key": external_api_key,
+        }
     if set(trainer_gpu_ids).isdisjoint(inference_gpu_ids):
         internal_config["trainer_gpu_ids"] = trainer_gpu_ids
         internal_config["inference_gpu_ids"] = inference_gpu_ids
@@ -177,47 +190,36 @@ async def _run_native_vllm_lora(
             _internal_config=internal_config,
             report_metrics=[],
         )
-        port = _find_free_port()
+        port = _find_free_port() if external_url is None else None
         try:
-            await model.register(backend, {"server_args": {"port": port}})
+            await model.register(
+                backend,
+                {"server_args": {"port": port}} if port is not None else None,
+            )
             service = cast(
                 DistributedMegatronService, await backend._get_service(model)
             )
-            endpoint = urlparse(service._base_url or "")
+            endpoint = urlparse(model.inference_base_url or "")
             host, resolved_port = (
                 endpoint.hostname or "127.0.0.1",
-                int(endpoint.port or port),
+                int(endpoint.port or (443 if endpoint.scheme == "https" else 80)),
             )
-            output_dir = service.output_dir
-            import httpx
-
-            base_url = f"http://{host}:{resolved_port}"
-            step0_name = f"{service_name}@0"
-            step1_name = f"{service_name}@1"
-            api_key = service._api_key()
-            headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
-            async with httpx.AsyncClient(headers=headers) as client:
-                model_ids_before = await _model_ids(client, base_url)
-                step0_completion_text = await _completion_text(
-                    client,
-                    base_url,
-                    step0_name,
-                )
+            step0_name = model.get_inference_name(step=0)
+            step1_name = model.get_inference_name(step=1)
+            async with model.openai_client() as client:
+                model_ids_before = await _model_ids(client)
+                step0_completion_text = await _completion_text(client, step0_name)
                 await service.advance_without_training(
                     expected_step=0,
                     learner_version=1,
                 )
                 await service.wait_for_serving(1)
-                model_ids_after = await _model_ids(client, base_url)
-                step1_completion_text = await _completion_text(
-                    client,
-                    base_url,
-                    step1_name,
-                )
+                model_ids_after = await _model_ids(client)
+                step1_completion_text = await _completion_text(client, step1_name)
 
             return NativeVllmLoraServingReport(
                 base_model=case_config.base_model,
-                output_dir=output_dir,
+                output_dir=service.output_dir,
                 host=host,
                 port=resolved_port,
                 trainer_gpu_ids=trainer_gpu_ids,

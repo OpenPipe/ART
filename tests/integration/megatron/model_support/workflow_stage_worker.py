@@ -1,11 +1,19 @@
 import argparse
+import asyncio
+from collections.abc import Callable
+import os
 from pathlib import Path
 import time
 import traceback
 
+import httpx
 from pydantic import BaseModel, ConfigDict
 
 from art.megatron.model_support.spec import ArchitectureReport
+from art.serving_capabilities import FastMetricsSnapshot
+from art.utils.lifecycle import ChildProcessSupervisor
+from art.utils.network import find_free_tcp_port
+from art.vllm_runtime import ManagedVllmRuntime, VllmRuntimeLaunchConfig
 
 from .workflow import (
     run_chat_template_rollout_stage,
@@ -20,7 +28,10 @@ from .workflow import (
     run_train_inf_mismatch_stage,
     run_yes_no_trainability_stage,
 )
+from .workflow_fixtures import FIXTURE_PATH_ENV, ensure_workflow_fixture
 
+FUNCTIONAL_LORA_VLLM_MODE = "functional_lora_vllm"
+FUNCTIONAL_LORA_VLLM_STAGES = ("length_trainability", "native_vllm_lora")
 _STAGE_RUNNERS = {
     "hf_parity": run_hf_parity_stage,
     "lora_coverage": run_lora_coverage_stage,
@@ -51,6 +62,7 @@ class WorkflowStageWorkerSession(BaseModel):
     base_model: str
     architecture_json: str
     allow_unvalidated_arch: bool = False
+    functional_vllm: VllmRuntimeLaunchConfig | None = None
     items: tuple[WorkflowStageWorkerItem, ...]
 
 
@@ -77,7 +89,140 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
-def _run_session(request: WorkflowStageWorkerSession) -> None:
+def _runtime_json(client: httpx.Client, method: str, path: str, **kwargs):
+    response = client.request(method, path, **kwargs)
+    response.raise_for_status()
+    return response.json()
+
+
+def _reset_vllm(client: httpx.Client, baseline: tuple[str, ...]) -> None:
+    def model_ids() -> tuple[str, ...]:
+        models = _runtime_json(client, "GET", "/v1/models")["data"]
+        return tuple(sorted(str(model["id"]) for model in models))
+
+    def idle() -> None:
+        for _ in range(600):
+            metrics = FastMetricsSnapshot.model_validate(
+                _runtime_json(client, "GET", "/art/metrics")
+            ).metrics
+            if not any(
+                value
+                for key, value in metrics.items()
+                if key.startswith("num_requests_")
+            ):
+                return
+            time.sleep(0.1)
+        raise TimeoutError("functional vLLM requests did not drain")
+
+    idle()
+    for alias in sorted(set(model_ids()) - set(baseline)):
+        _runtime_json(
+            client,
+            "POST",
+            "/v1/unload_lora_adapter",
+            json={"lora_name": alias},
+        )
+    reset = _runtime_json(
+        client,
+        "POST",
+        "/art/reset_prefix_cache",
+        json={"reset_running_requests": False, "reset_connector": True},
+    )
+    idle()
+    if reset.get("success") is not True or (after := model_ids()) != baseline:
+        raise RuntimeError(
+            f"functional reset failed: baseline={baseline}, after={after}"
+        )
+
+
+async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
+    from . import workflow
+
+    spec = request.functional_vllm
+    assert spec is not None
+    stages = tuple(item.stage for item in request.items)
+    if stages != FUNCTIONAL_LORA_VLLM_STAGES:
+        raise ValueError("functional vLLM stages do not match worker items")
+    prepared = ensure_workflow_fixture(
+        request.base_model,
+        allow_unvalidated_arch=request.allow_unvalidated_arch,
+        required_stages=frozenset(FUNCTIONAL_LORA_VLLM_STAGES),
+    )
+    host_environments = {stage: prepared.environment(stage) for stage in stages}
+    host_paths = {
+        environment[FIXTURE_PATH_ENV] for environment in host_environments.values()
+    }
+    if len(host_paths) != 1:
+        raise RuntimeError(f"selected host prepared different fixtures: {host_paths}")
+    visible = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+    inference_gpu_ids = tuple(map(int, spec.visible_devices.split(",")))
+    launch = spec.model_copy(
+        update={
+            "base_model": host_paths.pop(),
+            "port": find_free_tcp_port(),
+            "cuda_visible_devices": ",".join(
+                visible[index] for index in inference_gpu_ids
+            ),
+        }
+    )
+    runtime = ManagedVllmRuntime()
+    supervisor = ChildProcessSupervisor(lambda _error: None)
+    try:
+        with workflow._temporary_env(**host_environments[stages[0]]):
+            await runtime.start(
+                launch_config=launch,
+                output_dir=str(
+                    Path(request.architecture_json).parent / "functional_vllm"
+                ),
+                child_processes=supervisor,
+                install_parent_cleanup=lambda: None,
+            )
+        assert runtime.api_key is not None
+        external = {
+            "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL": runtime.base_url,
+            "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY": runtime.api_key,
+            "ART_MODEL_SUPPORT_TRAINER_GPU_IDS": ",".join(
+                map(str, sorted(set(range(len(visible))) - set(inference_gpu_ids)))
+            ),
+            "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS": ",".join(
+                map(str, inference_gpu_ids)
+            ),
+        }
+        request = request.model_copy(
+            update={
+                "functional_vllm": None,
+                "items": tuple(
+                    item.model_copy(
+                        update={
+                            "environment": item.environment
+                            | host_environments[item.stage]
+                            | external
+                        }
+                    )
+                    for item in request.items
+                ),
+            }
+        )
+        with httpx.Client(
+            base_url=runtime.base_url, **runtime.request_kwargs()
+        ) as client:
+            models = _runtime_json(client, "GET", "/v1/models")["data"]
+            baseline = tuple(sorted(str(model["id"]) for model in models))
+
+            def reset() -> None:
+                supervisor.raise_if_failed()
+                _reset_vllm(client, baseline)
+
+            await asyncio.to_thread(_run_session, request, reset)
+    finally:
+        supervisor.close()
+        runtime.close()
+
+
+def _run_session(
+    request: WorkflowStageWorkerSession,
+    after_stage: Callable[[], None] | None = None,
+) -> None:
     from . import workflow
 
     architecture = ArchitectureReport.model_validate_json(
@@ -85,8 +230,7 @@ def _run_session(request: WorkflowStageWorkerSession) -> None:
     )
     for item in request.items:
         started = time.monotonic()
-        stage_dir = Path(item.stage_dir)
-        log_path = stage_dir / "worker.log"
+        log_path = Path(item.stage_dir) / "worker.log"
         try:
             with workflow._temporary_env(
                 **item.environment,
@@ -115,6 +259,8 @@ def _run_session(request: WorkflowStageWorkerSession) -> None:
         Path(item.output_json).write_text(
             result.model_dump_json(indent=2), encoding="utf-8"
         )
+        if after_stage is not None:
+            after_stage()
 
 
 def main() -> None:
@@ -123,20 +269,21 @@ def main() -> None:
         request = WorkflowStageWorkerSession.model_validate_json(
             Path(args.session_json).read_text(encoding="utf-8")
         )
-        _run_session(request)
+        if request.functional_vllm is not None:
+            asyncio.run(_run_functional_session(request))
+        else:
+            _run_session(request)
         return
     architecture = ArchitectureReport.model_validate_json(
         Path(args.architecture_json).read_text(encoding="utf-8")
     )
-    stage_runner = _STAGE_RUNNERS[args.stage]
-    result = stage_runner(
+    result = _STAGE_RUNNERS[args.stage](
         base_model=args.base_model,
         architecture=architecture,
         allow_unvalidated_arch=args.allow_unvalidated_arch,
     )
     Path(args.output_json).write_text(
-        result.model_dump_json(indent=2),
-        encoding="utf-8",
+        result.model_dump_json(indent=2), encoding="utf-8"
     )
 
 

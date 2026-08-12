@@ -13,14 +13,24 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, PrivateAttr
 
+from art.megatron.lora_config import (
+    MEGATRON_LORA_RANK_ENV,
+    default_lora_rank_for_handler,
+)
 from art.megatron.model_support.registry import (
     get_model_support_handler_for_spec,
     get_model_support_spec,
+    model_uses_expert_parallel,
 )
 from art.megatron.model_support.spec import ArchitectureReport
+from art.vllm_runtime import VllmRuntimeLaunchConfig
 
 from .validation_spec import ValidationReport, ValidationStageResult
-from .workflow_fixtures import WorkflowFixture, ensure_workflow_fixture
+from .workflow_fixtures import (
+    FIXTURE_PATH_ENV,
+    WorkflowFixture,
+    ensure_workflow_fixture,
+)
 from .workflow_resources import (
     HANDLER_WORKFLOW_RESOURCES,
     WorkflowStageResources,
@@ -37,6 +47,8 @@ from .workflow_runtime import (
     execute_workflow,
 )
 from .workflow_stage_worker import (
+    FUNCTIONAL_LORA_VLLM_MODE,
+    FUNCTIONAL_LORA_VLLM_STAGES,
     WorkflowStageWorkerItem,
     WorkflowStageWorkerSession,
 )
@@ -59,12 +71,10 @@ _LIGHTWEIGHT_GPU_STAGES = frozenset(
     {"hf_parity", "lora_coverage", "packing_invariance"}
 )
 _CPU_STAGES = frozenset({"chat_template_rollout"})
-_BASE_SESSION_STAGES = frozenset({"hf_parity", "packing_invariance"})
 _DEFAULT_STAGE_GPU_COUNTS = {
     "train_inf_mismatch": 4,
     "merged_vllm_serving": 2,
     "native_vllm_lora": 2,
-    "length_trainability": 2,
     "yes_no_trainability": 2,
 }
 _WORKFLOW_HOSTS_ENV = "ART_MODEL_SUPPORT_WORKFLOW_HOSTS"
@@ -238,9 +248,18 @@ def _stage_gpu_count(
             )
         )
     resources = getattr(
-        HANDLER_WORKFLOW_RESOURCES[prepared.report.model_key], stage_name, None
+        HANDLER_WORKFLOW_RESOURCES.get(prepared.report.model_key), stage_name, None
     )
     if resources is None:
+        if stage_name == "length_trainability":
+            return (
+                3
+                if model_uses_expert_parallel(
+                    prepared.report.base_model,
+                    allow_unvalidated_arch=prepared.allow_unvalidated_arch,
+                )
+                else 2
+            )
         try:
             return _DEFAULT_STAGE_GPU_COUNTS[stage_name]
         except KeyError:
@@ -261,9 +280,6 @@ def _runtime_key(
     if stage_name in _CPU_STAGES:
         kind = "cpu"
         mode = stage_name
-    elif stage_name in _BASE_SESSION_STAGES:
-        kind = "megatron"
-        mode = "base"
     elif stage_name in {"lora_coverage", "correctness_sensitivity"}:
         kind = "megatron"
         mode = stage_name
@@ -297,18 +313,131 @@ def _stage_gpu_share(prepared: PreparedWorkflow, stage_name: str) -> float:
     )
 
 
+def _functional_session(
+    prepared: PreparedWorkflow,
+    stage_gpu_counts: dict[str, int],
+) -> VllmRuntimeLaunchConfig | None:
+    stages = tuple(
+        stage for stage in prepared.stages if stage in FUNCTIONAL_LORA_VLLM_STAGES
+    )
+    if stages != FUNCTIONAL_LORA_VLLM_STAGES:
+        return None
+    support = get_model_support_spec(
+        prepared.report.base_model,
+        allow_unvalidated_arch=prepared.allow_unvalidated_arch,
+    )
+    if (
+        support.native_vllm_lora_status == "disabled"
+        or support.default_rollout_weights_mode != "lora"
+    ):
+        return None
+    handler = get_model_support_handler_for_spec(support)
+    counts = {stage_gpu_counts[stage] for stage in stages}
+    if len(counts) != 1:
+        return None
+    count = counts.pop()
+    length_env = os.environ | prepared.fixture.environment(stages[0])
+    capacities = {
+        "max_model_len": int(
+            length_env.get("ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN", 1024)
+        ),
+        "max_num_seqs": int(
+            length_env.get("ART_MODEL_SUPPORT_LENGTH_MAX_NUM_SEQS", 32)
+        ),
+        "max_loras": 2,
+        "max_lora_rank": int(
+            length_env.get(
+                MEGATRON_LORA_RANK_ENV, default_lora_rank_for_handler(handler)
+            )
+        ),
+    }
+    configured = HANDLER_WORKFLOW_RESOURCES.get(prepared.report.model_key)
+    engine_specs = []
+    for stage in stages:
+        stage_resources = getattr(configured, stage, None)
+        if stage_resources is None:
+            gpu_ids = (count - 1,)
+            engine_args: dict[str, object] = {"tensor_parallel_size": 1}
+        else:
+            resolved = resolve_stage_resources_for_visible_gpus(
+                stage, stage_resources, visible_gpu_count=count
+            )
+            if resolved.vllm is None:
+                return None
+            gpu_ids = tuple(resolved.vllm.gpu_ids)
+            if resolved.megatron is not None and set(resolved.megatron.gpu_ids) != set(
+                range(count)
+            ) - set(gpu_ids):
+                return None
+            engine_args = resolved.vllm.engine_args()
+        for key in (*capacities, "max_num_batched_tokens"):
+            value = engine_args.pop(key, None)
+            if value is not None:
+                if not isinstance(value, int):
+                    return None
+                capacities[key] = max(capacities.get(key, 0), value)
+        engine_specs.append((gpu_ids, engine_args))
+    fixtures = {
+        prepared.fixture.environment(stage)[FIXTURE_PATH_ENV] for stage in stages
+    }
+    if engine_specs[0] != engine_specs[1] or len(fixtures) != 1:
+        return None
+    inference_gpu_ids, resource_args = engine_specs[0]
+    return VllmRuntimeLaunchConfig(
+        base_model=fixtures.pop(),
+        port=0,
+        cuda_visible_devices=",".join(map(str, inference_gpu_ids)),
+        served_model_name="__art_functional_base__",
+        rollout_weights_mode="lora",
+        engine_args={
+            "enforce_eager": True,
+            "generation_config": "vllm",
+            "limit_mm_per_prompt": {"image": 0, "video": 0, "audio": 0},
+            **handler.vllm_engine_args(rollout_weights_mode="lora"),
+            **resource_args,
+            **capacities,
+        },
+        server_args={
+            "return_tokens_as_token_ids": True,
+            "enable_auto_tool_choice": True,
+            "tool_call_parser": "hermes",
+            **handler.vllm_server_args(),
+            "api_key": "art-functional-vllm",
+        },
+    )
+
+
 def compile_prepared_workflows(
     workflows: list[PreparedWorkflow], *, visible_gpu_count: int
 ):
     operations = []
     for prepared in workflows:
+        stage_gpu_counts = {
+            stage_name: _stage_gpu_count(prepared, stage_name, visible_gpu_count)
+            for stage_name in prepared.stages
+        }
+        functional_session = _functional_session(prepared, stage_gpu_counts)
         for stage_name in prepared.stages:
-            gpu_count = _stage_gpu_count(prepared, stage_name, visible_gpu_count)
+            shared = (
+                functional_session
+                if functional_session is not None
+                and stage_name in FUNCTIONAL_LORA_VLLM_STAGES
+                else None
+            )
+            gpu_count = stage_gpu_counts[stage_name]
+            runtime = _runtime_key(prepared, stage_name, gpu_count=gpu_count)
+            if shared is not None:
+                runtime = runtime.model_copy(
+                    update={
+                        "mode": FUNCTIONAL_LORA_VLLM_MODE,
+                        "static_options": shared.model_dump_json(),
+                    }
+                )
             operations.append(
                 WorkflowOperation(
                     id=f"{prepared.report.model_key}:{stage_name}",
                     stage=stage_name,
-                    runtime=_runtime_key(prepared, stage_name, gpu_count=gpu_count),
+                    runtime=runtime,
                     resources=WorkflowResourceRequest(
                         gpu_count=gpu_count,
                         gpu_share=_stage_gpu_share(prepared, stage_name),
@@ -393,6 +522,13 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             base_model=prepared.report.base_model,
             architecture_json=str(architecture_json),
             allow_unvalidated_arch=prepared.allow_unvalidated_arch,
+            functional_vllm=(
+                VllmRuntimeLaunchConfig.model_validate_json(
+                    session.runtime.static_options
+                )
+                if session.runtime.mode == FUNCTIONAL_LORA_VLLM_MODE
+                else None
+            ),
             items=tuple(items),
         )
         request_json.write_text(request.model_dump_json(indent=2), encoding="utf-8")
