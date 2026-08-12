@@ -22,9 +22,6 @@ from art.megatron._collective import (
     gather_objects as _gather_objects,
 )
 from art.megatron._collective import (
-    raise_distributed as _raise_rank_errors,
-)
-from art.megatron._collective import (
     rank as _rank,
 )
 from art.megatron.lora import (
@@ -37,7 +34,6 @@ from art.megatron.lora import (
 )
 from art.megatron.model_support.lora_disk import (
     ART_LORA_FORMAT_CONFIG_KEY,
-    ART_LORA_FORMAT_MEGATRON,
     ART_LORA_FORMAT_VLLM,
     _consolidate_safetensors,
     save_adapter_config,
@@ -59,13 +55,6 @@ class PackedExpertShardMeta(NamedTuple):
     expert_start: int
     expert_count: int
     pack_layout: str
-
-    @property
-    def numel(self) -> int:
-        total = 1
-        for dim in self.shape:
-            total *= dim
-        return total
 
 
 def iter_lora_modules(model_chunks: ModelChunks) -> Iterable[LoRA]:
@@ -458,17 +447,13 @@ def _exchange_tensors(
     sends: dict[tuple[int, str], torch.Tensor] = {}
     receives: dict[tuple[int, str], torch.Tensor] = {}
     received: dict[tuple[int, str], torch.Tensor] = {}
-    error: BaseException | None = None
-    try:
+    with _collective_errors("prepare tensor exchange", group=group):
         sends, receives, received = _prepare_exchange_buffers(
             ordered,
             local_tensors=local_tensors,
             rank=rank,
             device=device,
         )
-    except BaseException as exc:
-        error = exc
-    _raise_rank_errors(error, "prepare tensor exchange", group=group)
 
     for meta in ordered:
         identity = (meta.owner_rank, meta.key)
@@ -479,16 +464,12 @@ def _exchange_tensors(
                 receives[identity], src=meta.owner_rank, group=group
             )
 
-    error = None
-    try:
+    with _collective_errors("finalize tensor exchange", group=group):
         if rank == 0:
             received.update(
                 (identity, tensor.cpu().contiguous())
                 for identity, tensor in receives.items()
             )
-    except BaseException as exc:
-        error = exc
-    _raise_rank_errors(error, "finalize tensor exchange", group=group)
     return received
 
 
@@ -520,15 +501,11 @@ def _gather_merged_adapter_tensors(
         group=group,
     )
     merged: dict[str, torch.Tensor] = {}
-    error: BaseException | None = None
-    try:
+    with _collective_errors("merge adapter tensors", group=group):
         if rank == 0:
             merged = merge_sharded_adapter_entries(
                 _entries_by_key(list(metadata), exchanged)
             )
-    except BaseException as exc:
-        error = exc
-    _raise_rank_errors(error, "merge adapter tensors", group=group)
     return merged
 
 
@@ -687,7 +664,6 @@ def _prepare_local_lora_export(
     rank: int,
     world_size: int,
     slot_ref: LoRASlotRef | None = None,
-    native_format: bool = False,
 ) -> _LocalLoraExport:
     actual_rank, device = _rank_and_device()
     local_tensors: dict[str, torch.Tensor] = {}
@@ -710,9 +686,7 @@ def _prepare_local_lora_export(
                 "Non-distributed LoRA publish requires rank=0 and world_size=1, "
                 f"got rank={rank} world_size={world_size}"
             )
-        packed_expert_groups = (
-            () if native_format else tuple(handler.expert_packed_lora_groups())
-        )
+        packed_expert_groups = tuple(handler.expert_packed_lora_groups())
         local_tensors, local_metadata = collect_local_lora_entries(
             model,
             adapter_dtypes,
@@ -803,8 +777,7 @@ def build_vllm_lora_tensors_from_model(
     )
 
     result: tuple[dict[str, torch.Tensor], dict[str, Any]] | None = None
-    error: BaseException | None = None
-    try:
+    with _collective_errors("merge vLLM LoRA tensors"):
         if rank == 0:
             result = _rank0_vllm_lora_tensors(
                 metadata=local.metadata,
@@ -814,9 +787,6 @@ def build_vllm_lora_tensors_from_model(
                 handler=handler,
                 adapter_config=adapter_config,
             )
-    except BaseException as exc:
-        error = exc
-    _raise_rank_errors(error, "merge vLLM LoRA tensors")
     return result
 
 
@@ -830,8 +800,7 @@ def save_vllm_lora_from_model(
     rank: int,
     world_size: int,
     slot_ref: LoRASlotRef | None = None,
-    native_format: bool = False,
-) -> _LocalLoraExport:
+) -> None:
     local = _prepare_local_lora_export(
         model=model,
         adapter_dtypes=adapter_dtypes,
@@ -839,7 +808,6 @@ def save_vllm_lora_from_model(
         rank=rank,
         world_size=world_size,
         slot_ref=slot_ref,
-        native_format=native_format,
     )
     blocks = local.blocks
     root = Path(output_dir)
@@ -872,20 +840,14 @@ def save_vllm_lora_from_model(
             )
             with _collective_errors(f"serialize LoRA block {block}"):
                 if rank == 0:
-                    if native_format:
-                        tensors = merge_sharded_adapter_entries(
-                            _entries_by_key(metadata, exchanged)
-                        )
-                        block_config = adapter_config
-                    else:
-                        tensors, block_config = _rank0_vllm_lora_tensors(
-                            metadata=metadata,
-                            tensors_by_owner_key=exchanged,
-                            packed_expert_metadata=packed_metadata,
-                            packed_expert_tensors_by_owner_key=exchanged_packed,
-                            handler=handler,
-                            adapter_config=adapter_config,
-                        )
+                    tensors, block_config = _rank0_vllm_lora_tensors(
+                        metadata=metadata,
+                        tensors_by_owner_key=exchanged,
+                        packed_expert_metadata=packed_metadata,
+                        packed_expert_tensors_by_owner_key=exchanged_packed,
+                        handler=handler,
+                        adapter_config=adapter_config,
+                    )
                     if duplicates := written & tensors.keys():
                         raise RuntimeError(
                             "Duplicate LoRA tensors across model blocks: "
@@ -919,15 +881,10 @@ def save_vllm_lora_from_model(
                     root,
                     {
                         **published_config,
-                        ART_LORA_FORMAT_CONFIG_KEY: (
-                            ART_LORA_FORMAT_MEGATRON
-                            if native_format
-                            else ART_LORA_FORMAT_VLLM
-                        ),
+                        ART_LORA_FORMAT_CONFIG_KEY: ART_LORA_FORMAT_VLLM,
                     },
                 )
     finally:
         if rank == 0:
             for shard in shards:
                 shard.unlink(missing_ok=True)
-    return local

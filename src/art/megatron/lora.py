@@ -198,10 +198,6 @@ class LoraShardMeta(NamedTuple):
     manifest: LoraShardManifest
     block: str
 
-    @property
-    def numel(self) -> int:
-        return math.prod(self.shape)
-
 
 def _distributed_initialized() -> bool:
     is_initialized = getattr(torch.distributed, "is_initialized", None)

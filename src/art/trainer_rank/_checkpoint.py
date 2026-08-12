@@ -46,7 +46,6 @@ from art.megatron._collective import (
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoraShardManifest, LoraShardMeta
-    from art.megatron.weights.lora_publish import _LocalLoraExport
     from art.trainer_rank._impl import TrainerRank, _DynamicOptimizer
 
 
@@ -125,14 +124,12 @@ class _LocalShard:
 @dataclass(frozen=True)
 class _SnapshotShard:
     metadata: LoraShardMeta
-    lora_file: str
-    optimizer_files: Mapping[str, str] | None
+    file: str
     step: float | None
 
 
 @dataclass(frozen=True)
 class _PreparedSave:
-    sequence: int
     snapshot: Path
     destination: Path
     adapter_config: dict[str, object]
@@ -284,21 +281,15 @@ def prepare_checkpoint_save(
     snapshot = destination.with_name(
         f".{destination.name}.snapshot-r{_rank()}-{uuid.uuid4().hex}"
     )
-    condition = trainer._checkpoint_save_condition
-    with condition:
-        condition.wait_for(
-            lambda: (
-                not trainer._checkpoint_preparing_saves
-                and output_dir not in trainer._checkpoint_finishing_saves
-            )
-        )
-        if output_dir in trainer._prepared_checkpoint_saves:
+    with trainer._checkpoint_save_lock:
+        if (
+            output_dir in trainer._checkpoint_preparing_saves
+            or output_dir in trainer._prepared_checkpoint_saves
+        ):
             raise RuntimeError(f"Checkpoint save is already pending: {output_dir}")
         if output_dir in trainer._completed_checkpoint_saves:
             trainer._completed_checkpoint_saves.remove(output_dir)
         trainer._checkpoint_preparing_saves.add(output_dir)
-        sequence = trainer._checkpoint_save_sequence
-        trainer._checkpoint_save_sequence += 1
     try:
         _ensure_checkpoint_group(trainer)
         with _collective_errors("validate checkpoint snapshot state"):
@@ -320,11 +311,12 @@ def prepare_checkpoint_save(
             raise trainer._slot_state_error(
                 "Checkpoint optimizer config differs across ranks"
             )
-        identity = (sequence, output_dir, checkpoint_name)
+        identity = (output_dir, checkpoint_name)
         if any(value != identity for value in _gather_objects(identity)):
             raise RuntimeError("Checkpoint save identity differs across ranks")
     except BaseException:
-        _abort_preparation_sequence(trainer, output_dir, sequence)
+        with trainer._checkpoint_save_lock:
+            trainer._checkpoint_preparing_saves.discard(output_dir)
         raise
     prepared: _PreparedSave | None = None
     error: BaseException | None = None
@@ -356,61 +348,35 @@ def prepare_checkpoint_save(
         blocks = sorted({item.block for item in metadata})
         for index, block in enumerate(blocks):
             block_metadata = [item for item in metadata if item.block == block]
-            lora_file = f"lora-{index:06d}.safetensors"
-            _save_file(
-                {
-                    item.key: local_tensors[item.key].detach().cpu().contiguous()
-                    for item in block_metadata
-                },
-                snapshot / lora_file,
-            )
-            optimizer_files: dict[str, str] | None = None
+            relative = f"block-{index:06d}.safetensors"
+            tensors = {
+                f"lora/{item.key}": local_tensors[item.key].detach().cpu().contiguous()
+                for item in block_metadata
+            }
             if dynamic is not None:
-                optimizer_files = {}
                 for component in ("master", "exp_avg", "exp_avg_sq"):
-                    relative = f"{component}-{index:06d}.safetensors"
-                    _save_file(
+                    tensors.update(
                         {
-                            item.key: _optimizer_component(
+                            f"{component}/{item.key}": _optimizer_component(
                                 optimizer_by_key[item.key], component
                             )
                             .detach()
                             .cpu()
                             .contiguous()
                             for item in block_metadata
-                        },
-                        snapshot / relative,
+                        }
                     )
-                    optimizer_files[component] = relative
+            _save_file(tensors, snapshot / relative)
             records.extend(
                 _SnapshotShard(
                     item,
-                    lora_file,
-                    None if optimizer_files is None else dict(optimizer_files),
+                    relative,
                     (None if dynamic is None else optimizer_by_key[item.key].step),
                 )
                 for item in block_metadata
             )
 
-        manifest = {
-            "sequence": sequence,
-            "adapter_config": adapter_config,
-            "optimizer": None if optimizer is None else optimizer.model_dump(),
-            "shards": [
-                {
-                    "metadata": dict(record.metadata._asdict()),
-                    "lora_file": record.lora_file,
-                    "optimizer_files": record.optimizer_files,
-                    "step": record.step,
-                }
-                for record in records
-            ],
-        }
-        (snapshot / "snapshot.json").write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-        )
         prepared = _PreparedSave(
-            sequence,
             snapshot,
             destination,
             adapter_config,
@@ -423,50 +389,21 @@ def prepare_checkpoint_save(
         _raise_distributed(error, "prepare immutable checkpoint snapshot")
     except BaseException:
         shutil.rmtree(snapshot, ignore_errors=True)
-        _abort_preparation_sequence(trainer, output_dir, sequence)
+        with trainer._checkpoint_save_lock:
+            trainer._checkpoint_preparing_saves.discard(output_dir)
         raise
     assert prepared is not None
-    with condition:
+    with trainer._checkpoint_save_lock:
         trainer._prepared_checkpoint_saves[output_dir] = prepared
         trainer._checkpoint_preparing_saves.discard(output_dir)
-        condition.notify_all()
 
 
-def _advance_finish_sequence(trainer: TrainerRank) -> None:
-    while (
-        trainer._checkpoint_finish_sequence
-        in trainer._checkpoint_aborted_save_sequences
-    ):
-        trainer._checkpoint_aborted_save_sequences.remove(
-            trainer._checkpoint_finish_sequence
-        )
-        trainer._checkpoint_finish_sequence += 1
-
-
-def _abort_preparation_sequence(
-    trainer: TrainerRank, output_dir: str, sequence: int
-) -> None:
-    with trainer._checkpoint_save_condition:
-        trainer._checkpoint_preparing_saves.discard(output_dir)
-        trainer._checkpoint_aborted_save_sequences.add(sequence)
-        _advance_finish_sequence(trainer)
-        trainer._checkpoint_save_condition.notify_all()
-
-
-def _admit_checkpoint_save_action(
+def _prepared_checkpoint_save(
     trainer: TrainerRank,
     output_dir: str,
     action: Literal["abort", "finish"],
 ) -> _PreparedSave | None:
-    condition = trainer._checkpoint_save_condition
-    with condition:
-        condition.wait_for(
-            lambda: (
-                output_dir not in trainer._checkpoint_preparing_saves
-                and output_dir not in trainer._checkpoint_finishing_saves
-                and not trainer._checkpoint_collective_busy
-            )
-        )
+    with trainer._checkpoint_save_lock:
         prepared = trainer._prepared_checkpoint_saves.get(output_dir)
         state = (
             "completed"
@@ -475,139 +412,86 @@ def _admit_checkpoint_save_action(
             if prepared is not None
             else "missing"
         )
-        trainer._checkpoint_finishing_saves.add(output_dir)
-        trainer._checkpoint_collective_busy = True
-
-    try:
-        admissions = _gather_objects(
-            (
-                action,
-                output_dir,
-                state,
-                None if prepared is None else prepared.sequence,
-            ),
-            group=trainer._checkpoint_process_group,
-        )
-        if any(admission[1] != output_dir for admission in admissions):
-            raise RuntimeError("Checkpoint save actions differ across ranks")
-        actions = {admission[0] for admission in admissions}
-        states = {admission[2] for admission in admissions}
-        sequences = {
-            admission[3] for admission in admissions if admission[3] is not None
-        }
-        if "abort" not in actions:
-            if states == {"completed"}:
-                with condition:
-                    trainer._checkpoint_finishing_saves.discard(output_dir)
-                    trainer._checkpoint_collective_busy = False
-                    condition.notify_all()
-                return None
-            if states == {"missing"}:
-                raise RuntimeError(f"Checkpoint save was not prepared: {output_dir}")
-            if states != {"prepared"} or len(sequences) != 1:
-                raise RuntimeError(
-                    f"Checkpoint save state differs across ranks: {output_dir}"
-                )
-            assert prepared is not None
-            sequence = prepared.sequence
-            with condition:
-                trainer._checkpoint_collective_busy = False
-                condition.notify_all()
-                condition.wait_for(
-                    lambda: (
-                        sequence == trainer._checkpoint_finish_sequence
-                        and not trainer._checkpoint_collective_busy
-                    )
-                )
-                trainer._checkpoint_collective_busy = True
-            return prepared
-    except BaseException:
-        with condition:
-            trainer._checkpoint_finishing_saves.discard(output_dir)
-            trainer._checkpoint_collective_busy = False
-            condition.notify_all()
-        raise
-
-    with condition:
-        prepared = trainer._prepared_checkpoint_saves.pop(output_dir, None)
-        trainer._checkpoint_aborted_save_sequences.update(sequences)
-        _advance_finish_sequence(trainer)
-        trainer._checkpoint_finishing_saves.discard(output_dir)
-        trainer._checkpoint_collective_busy = False
-        condition.notify_all()
-    if prepared is not None:
-        shutil.rmtree(prepared.snapshot, ignore_errors=True)
-    if action == "finish":
-        raise RuntimeError(f"Checkpoint save was concurrently aborted: {output_dir}")
-    return None
+    admissions = _gather_objects(
+        (action, output_dir, state), group=trainer._checkpoint_process_group
+    )
+    if any(admission[:2] != admissions[0][:2] for admission in admissions):
+        raise RuntimeError("Checkpoint save actions differ across ranks")
+    states = {admission[2] for admission in admissions}
+    if len(states) != 1:
+        raise RuntimeError(f"Checkpoint save state differs across ranks: {output_dir}")
+    if state == "completed" or (state == "missing" and action == "abort"):
+        return None
+    if state == "missing":
+        raise RuntimeError(f"Checkpoint save was not prepared: {output_dir}")
+    assert prepared is not None
+    return prepared
 
 
 def abort_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
-    """Discard a prepared snapshot while preserving finish FIFO progress."""
-    _admit_checkpoint_save_action(trainer, output_dir, "abort")
+    """Discard a prepared snapshot."""
+    with trainer._checkpoint_finalize_lock:
+        prepared = _prepared_checkpoint_save(trainer, output_dir, "abort")
+        if prepared is None:
+            return
+        with _collective_errors(
+            "abort checkpoint save", group=trainer._checkpoint_process_group
+        ):
+            try:
+                shutil.rmtree(prepared.snapshot)
+            except FileNotFoundError:
+                pass
+        with trainer._checkpoint_save_lock:
+            trainer._prepared_checkpoint_saves.pop(output_dir, None)
 
 
 def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
     """Finalize a prepared checkpoint without reading mutable trainer state."""
-    condition = trainer._checkpoint_save_condition
-    prepared = _admit_checkpoint_save_action(trainer, output_dir, "finish")
-    if prepared is None:
-        return
+    with trainer._checkpoint_finalize_lock:
+        prepared = _prepared_checkpoint_save(trainer, output_dir, "finish")
+        if prepared is None:
+            return
 
-    error: BaseException | None = None
-    cleanup_error: BaseException | None = None
-    try:
-        _finish_prepared_save(trainer, prepared)
-    except BaseException as exc:
-        error = exc
-    try:
-        shutil.rmtree(prepared.snapshot)
-    except FileNotFoundError:
-        pass
-    except BaseException as exc:
-        cleanup_error = exc
-    final_error: BaseException | None = error
-    if error is not None and cleanup_error is not None:
-        final_error = BaseExceptionGroup(
-            "checkpoint finalization and snapshot cleanup both failed",
-            [error, cleanup_error],
-        )
-    elif cleanup_error is not None:
-        final_error = cleanup_error
-    distributed_error: BaseException | None = None
-    try:
-        _raise_distributed(
-            final_error,
-            "clean up finalized checkpoint snapshot",
-            group=trainer._checkpoint_process_group,
-        )
-    except BaseException as exc:
-        distributed_error = exc
-    finally:
-        with condition:
-            trainer._prepared_checkpoint_saves.pop(output_dir, None)
-            trainer._checkpoint_finishing_saves.discard(output_dir)
-            trainer._checkpoint_collective_busy = False
-            if error is None:
-                trainer._completed_checkpoint_saves.append(output_dir)
-            trainer._checkpoint_finish_sequence += 1
-            _advance_finish_sequence(trainer)
-            condition.notify_all()
-    if distributed_error is not None:
-        raise distributed_error
+        error: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        try:
+            _finish_prepared_save(trainer, prepared)
+        except BaseException as exc:
+            error = exc
+        try:
+            shutil.rmtree(prepared.snapshot)
+        except FileNotFoundError:
+            pass
+        except BaseException as exc:
+            cleanup_error = exc
+        final_error: BaseException | None = error
+        if error is not None and cleanup_error is not None:
+            final_error = BaseExceptionGroup(
+                "checkpoint finalization and snapshot cleanup both failed",
+                [error, cleanup_error],
+            )
+        elif cleanup_error is not None:
+            final_error = cleanup_error
+        try:
+            _raise_distributed(
+                final_error,
+                "clean up finalized checkpoint snapshot",
+                group=trainer._checkpoint_process_group,
+            )
+        finally:
+            with trainer._checkpoint_save_lock:
+                trainer._prepared_checkpoint_saves.pop(output_dir, None)
+                if error is None:
+                    trainer._completed_checkpoint_saves.append(output_dir)
 
 
 def export_lora(
     trainer: TrainerRank,
     output_dir: str,
     checkpoint_name: str,
-    *,
-    native_format: bool = False,
 ) -> int:
     config = _checkpoint_config(trainer, checkpoint_name)
-    _export_lora_files(
-        trainer, output_dir, checkpoint_name, config, native_format=native_format
-    )
+    _export_lora_files(trainer, output_dir, checkpoint_name, config)
     return trainer._checkpoint_revisions.get(checkpoint_name, 0)
 
 
@@ -616,15 +500,12 @@ def _export_lora_files(
     output_dir: str,
     checkpoint_name: str,
     config: Mapping[str, object],
-    *,
-    native_format: bool,
-) -> "_LocalLoraExport":
+) -> None:
     from art.megatron.weights.lora_publish import save_vllm_lora_from_model
 
-    result: _LocalLoraExport | None = None
     error: BaseException | None = None
     try:
-        result = save_vllm_lora_from_model(
+        save_vllm_lora_from_model(
             model=trainer.runtime.model,
             adapter_dtypes={},
             handler=trainer.runtime.model_support_handler,
@@ -633,13 +514,10 @@ def _export_lora_files(
             rank=trainer.runtime.rank,
             world_size=trainer.runtime.world_size,
             slot_ref=trainer._slot_ref(checkpoint_name),
-            native_format=native_format,
         )
     except BaseException as exc:
         error = exc
     _raise_distributed(error, "export LoRA")
-    assert result is not None
-    return result
 
 
 def _load_stage_lora(
@@ -781,15 +659,10 @@ def load_checkpoint(
             f"Checkpoint {name!r} content differs across ranks"
         )
     adapter_model: dict[str, torch.Tensor] = {}
-    read_error: BaseException | None = None
-    try:
+    with _collective_errors("read checkpoint"):
         adapter_model = _load_stage_lora(trainer, source, int(config["r"]))
-    except BaseException as exc:
-        read_error = exc
-    _raise_distributed(read_error, "read checkpoint")
     prepared: dict[str, torch.Tensor] = {}
-    validation_error: BaseException | None = None
-    try:
+    with _collective_errors("validate checkpoint"):
         prepared = trainer._preflight_adapter(
             name,
             adapter_model,
@@ -799,14 +672,10 @@ def load_checkpoint(
         )
         _validate_base_model(trainer, source, config)
         trainer._guard_slot_can_load(trainer._slot_ref(name))
-    except BaseException as exc:
-        validation_error = exc
-    _raise_distributed(validation_error, "validate checkpoint")
     expected_keys = {
         key for rank_keys in _gather_objects(tuple(prepared)) for key in rank_keys
     }
-    coverage_error: BaseException | None = None
-    try:
+    with _collective_errors("validate checkpoint coverage"):
         artifact_keys = set(source.artifact_keys)
         if native and expected_keys != artifact_keys:
             raise trainer._slot_state_error(
@@ -814,65 +683,44 @@ def load_checkpoint(
                 f"missing={sorted(artifact_keys - expected_keys)[:8]} "
                 f"unexpected={sorted(expected_keys - artifact_keys)[:8]}"
             )
-    except BaseException as exc:
-        coverage_error = exc
-    _raise_distributed(coverage_error, "validate checkpoint coverage")
 
     target = trainer._slot_ref(name)
     temporary_name = f"__art_loading_{uuid.uuid4().hex}"
     temporary_ref = trainer._slot_ref(temporary_name)
     dynamic: _DynamicOptimizer | None = None
     loaded = 0
-    stage_error: BaseException | None = None
     try:
-        loaded = trainer._load_checkpoint_slot(
-            temporary_name,
-            prepared,
-            alpha=float(config["lora_alpha"]),
-            _prepared=True,
-            _localized=native,
-        )
-        trainer._validate_loaded_checkpoint_config(temporary_name, config)
-        staged_params = tuple(trainer._iter_slot_parameters(temporary_ref))
-        trainer._checkpoint_slot_params_by_name[temporary_name] = staged_params
-        if source.manifest is not None and source.manifest.optimizer is not None:
-            local_optimizer = _load_local_optimizer(
-                trainer, source, temporary_name, int(config["r"])
+        with _collective_errors("stage checkpoint"):
+            loaded = trainer._load_checkpoint_slot(
+                temporary_name,
+                prepared,
+                alpha=float(config["lora_alpha"]),
+                _prepared=True,
+                _localized=native,
             )
-            dynamic = trainer._restore_canonical_optimizer(
-                temporary_name, local_optimizer
-            )
-    except BaseException as exc:
-        stage_error = exc
-    stage_errors = _gather_objects(None if stage_error is None else repr(stage_error))
-    if any(stage_errors):
+            trainer._validate_loaded_checkpoint_config(temporary_name, config)
+            staged_params = tuple(trainer._iter_slot_parameters(temporary_ref))
+            trainer._checkpoint_slot_params_by_name[temporary_name] = staged_params
+            if source.manifest is not None and source.manifest.optimizer is not None:
+                local_optimizer = _load_local_optimizer(
+                    trainer, source, temporary_name, int(config["r"])
+                )
+                dynamic = trainer._restore_canonical_optimizer(
+                    temporary_name, local_optimizer
+                )
+    except BaseException:
         _discard_staged_checkpoint(trainer, temporary_name)
-        if stage_error is not None:
-            raise stage_error
-        raise RuntimeError(
-            "Another rank failed to stage checkpoint: "
-            f"{next(item for item in stage_errors if item)}"
-        )
+        raise
 
-    consistency_error: BaseException | None = None
     params: tuple[torch.nn.Parameter, ...] = ()
     try:
-        params = trainer._validate_checkpoint_consistency(
-            temporary_name, loaded, expected_keys
-        )
-    except BaseException as exc:
-        consistency_error = exc
-    consistency_errors = _gather_objects(
-        None if consistency_error is None else repr(consistency_error)
-    )
-    if any(consistency_errors):
+        with _collective_errors("validate staged checkpoint"):
+            params = trainer._validate_checkpoint_consistency(
+                temporary_name, loaded, expected_keys
+            )
+    except BaseException:
         _discard_staged_checkpoint(trainer, temporary_name)
-        if consistency_error is not None:
-            raise consistency_error
-        raise RuntimeError(
-            "Another rank rejected staged checkpoint: "
-            f"{next(item for item in consistency_errors if item)}"
-        )
+        raise
 
     from art.megatron.lora import (
         _restore_lora_slots,
@@ -881,22 +729,12 @@ def load_checkpoint(
         validate_lora_slot_replacement,
     )
 
-    replacement_error: BaseException | None = None
     try:
-        validate_lora_slot_replacement(trainer.runtime.model, temporary_ref, target)
-    except BaseException as exc:
-        replacement_error = exc
-    replacement_errors = _gather_objects(
-        None if replacement_error is None else repr(replacement_error)
-    )
-    if any(replacement_errors):
+        with _collective_errors("validate checkpoint commit"):
+            validate_lora_slot_replacement(trainer.runtime.model, temporary_ref, target)
+    except BaseException:
         _discard_staged_checkpoint(trainer, temporary_name)
-        if replacement_error is not None:
-            raise replacement_error
-        raise RuntimeError(
-            "Another rank rejected checkpoint commit: "
-            f"{next(item for item in replacement_errors if item)}"
-        )
+        raise
 
     slot_snapshot = _snapshot_lora_slots(trainer.runtime.model)
     had_params = name in trainer._checkpoint_slot_params_by_name
@@ -1008,16 +846,26 @@ def _local_snapshot_digests(
     optimizer_records: list[tuple[tuple[str, int], float, str]] = []
     by_file: dict[str, list[_SnapshotShard]] = {}
     for record in prepared.shards:
-        by_file.setdefault(record.lora_file, []).append(record)
+        by_file.setdefault(record.file, []).append(record)
     for relative, records in sorted(by_file.items()):
         tensors = _load_snapshot_file(prepared, relative)
-        expected = {record.metadata.key for record in records}
+        keys = {record.metadata.key for record in records}
+        expected = {f"lora/{key}" for key in keys}
+        if prepared.optimizer is not None:
+            expected |= {
+                f"{component}/{key}"
+                for component in ("master", "exp_avg", "exp_avg_sq")
+                for key in keys
+            }
         if set(tensors) != expected:
             raise RuntimeError(
                 f"Checkpoint snapshot tensor coverage differs: {relative}"
             )
         lora_records.extend(
-            (record.metadata, _tensor_digest(tensors[record.metadata.key]))
+            (
+                record.metadata,
+                _tensor_digest(tensors[f"lora/{record.metadata.key}"]),
+            )
             for record in records
         )
         if prepared.optimizer is None:
@@ -1026,19 +874,8 @@ def _local_snapshot_digests(
             record.metadata.key: hashlib.blake2b(digest_size=16) for record in records
         }
         for component in ("master", "exp_avg", "exp_avg_sq"):
-            files = {
-                cast(Mapping[str, str], record.optimizer_files)[component]
-                for record in records
-            }
-            if len(files) != 1:
-                raise RuntimeError(
-                    f"Checkpoint snapshot {component} files differ within a block"
-                )
-            component_tensors = _load_snapshot_file(prepared, files.pop())
-            if set(component_tensors) != expected:
-                raise RuntimeError(f"Checkpoint snapshot {component} coverage differs")
             for key, hasher in hashers.items():
-                hasher.update(_tensor_digest(component_tensors[key]).encode())
+                hasher.update(_tensor_digest(tensors[f"{component}/{key}"]).encode())
         for record in records:
             if record.step is None:
                 raise RuntimeError(
@@ -1144,19 +981,13 @@ def _snapshot_block_tensors(
         _snapshot_identity(record.metadata): record for record in prepared.shards
     }
     selected_records = [records[_snapshot_identity(item)] for item in selected]
-    if component == "lora":
-        files = {record.lora_file for record in selected_records}
-    else:
-        files = {
-            cast(Mapping[str, str], record.optimizer_files)[component]
-            for record in selected_records
-        }
+    files = {record.file for record in selected_records}
     if len(files) != 1:
         raise RuntimeError(
             f"Checkpoint snapshot {component} tensors span unexpected files"
         )
     tensors = _load_snapshot_file(prepared, files.pop())
-    return {item.key: tensors[item.key] for item in selected}
+    return {item.key: tensors[f"{component}/{item.key}"] for item in selected}
 
 
 def _serialize_snapshot_component(

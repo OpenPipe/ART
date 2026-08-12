@@ -1900,14 +1900,10 @@ def _portable_trainer(
     trainer._checkpoint_prefetch_tasks = {}
     trainer._checkpoint_process_group = None
     trainer._checkpoint_mutation_tail = None
-    trainer._checkpoint_save_condition = threading.Condition()
-    trainer._checkpoint_save_sequence = 0
-    trainer._checkpoint_finish_sequence = 0
+    trainer._checkpoint_save_lock = threading.Lock()
+    trainer._checkpoint_finalize_lock = threading.Lock()
     trainer._checkpoint_preparing_saves = set()
-    trainer._checkpoint_aborted_save_sequences = set()
     trainer._prepared_checkpoint_saves = {}
-    trainer._checkpoint_finishing_saves = set()
-    trainer._checkpoint_collective_busy = False
     trainer._completed_checkpoint_saves = deque(maxlen=128)
     return trainer
 
@@ -2368,58 +2364,6 @@ def test_checkpoint_idempotence_rejects_corrupt_existing_payload(
     assert not list(tmp_path.glob(".corrupt-existing.tmp-*"))
 
 
-def test_checkpoint_finalizers_run_fifo_and_clean_snapshots(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    trainer._dynamic_optimizers["student"] = trainer._new_dynamic_optimizer(
-        "student", AdamParams(learning_rate=3e-4)
-    )
-    _step_portable_checkpoint(trainer, 0.25)
-    first = tmp_path / "fifo-first"
-    second = tmp_path / "fifo-second"
-    trainer._prepare_checkpoint_save(str(first), "student")
-    trainer._prepare_checkpoint_save(str(second), "student")
-
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    original_finish = checkpoint_module._finish_prepared_save
-    order: list[str] = []
-
-    def record_finish(trainer_rank: TrainerRank, prepared: _PreparedSave) -> None:
-        order.append(prepared.destination.name)
-        original_finish(trainer_rank, prepared)
-
-    monkeypatch.setattr(checkpoint_module, "_finish_prepared_save", record_finish)
-    second_started = threading.Event()
-    second_done = threading.Event()
-
-    def finish_second() -> None:
-        second_started.set()
-        trainer._finish_checkpoint_save(str(second))
-        second_done.set()
-
-    second_thread = threading.Thread(target=finish_second)
-    second_thread.start()
-    assert second_started.wait(1)
-    assert not second_done.wait(0.1)
-    first_thread = threading.Thread(
-        target=trainer._finish_checkpoint_save,
-        args=(str(first),),
-    )
-    first_thread.start()
-    first_thread.join(10)
-    second_thread.join(10)
-    assert not first_thread.is_alive()
-    assert not second_thread.is_alive()
-    assert order == ["fifo-first", "fifo-second"]
-    assert first.is_dir() and second.is_dir()
-    assert not list(tmp_path.glob(".*.snapshot-*"))
-
-
 def test_checkpoint_prepare_reserves_destination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2478,19 +2422,17 @@ def test_checkpoint_prepare_validates_distributed_identity_before_snapshot(
     checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
 
     def gather(value: object) -> tuple[object, ...]:
-        if isinstance(value, tuple) and len(value) == 3:
-            return (value, (value[0], str(tmp_path / "other"), value[2]))
+        if isinstance(value, tuple) and len(value) == 2:
+            return (value, (str(tmp_path / "other"), value[1]))
         return (value,)
 
     monkeypatch.setattr(checkpoint_module, "_gather_objects", gather)
     with pytest.raises(RuntimeError, match="identity differs across ranks"):
         trainer._prepare_checkpoint_save(str(tmp_path / "identity"), "student")
-    assert trainer._checkpoint_save_sequence == 1
-    assert trainer._checkpoint_finish_sequence == 1
     assert not list(tmp_path.glob(".*.snapshot-*"))
 
 
-def test_checkpoint_prepare_invalid_destination_does_not_reserve_sequence() -> None:
+def test_checkpoint_prepare_invalid_destination_does_not_reserve() -> None:
     trainer = _portable_trainer(
         LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     )
@@ -2498,8 +2440,8 @@ def test_checkpoint_prepare_invalid_destination_does_not_reserve_sequence() -> N
 
     with pytest.raises(ValueError):
         trainer._prepare_checkpoint_save("/", "student")
-    assert trainer._checkpoint_save_sequence == 0
-    assert trainer._checkpoint_finish_sequence == 0
+    assert not trainer._checkpoint_preparing_saves
+    assert not trainer._prepared_checkpoint_saves
 
 
 def test_duplicate_checkpoint_finish_and_abort_wait_for_owner(
@@ -2552,39 +2494,6 @@ def test_duplicate_checkpoint_finish_and_abort_wait_for_owner(
     assert not errors
     assert calls == 1
     assert output.is_dir()
-    assert trainer._checkpoint_finish_sequence == 1
-
-
-def test_checkpoint_abort_wins_divergent_finish_admission(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    output = tmp_path / "divergent-admission"
-    trainer._prepare_checkpoint_save(str(output), "student")
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    original_gather = checkpoint_module._gather_objects
-
-    def gather(
-        value: object, *, group: torch.distributed.ProcessGroup | None = None
-    ) -> tuple[object, ...]:
-        if isinstance(value, tuple) and len(value) == 4:
-            return (value, ("abort", *value[1:]))
-        return original_gather(value, group=group)
-
-    monkeypatch.setattr(checkpoint_module, "_gather_objects", gather)
-    with pytest.raises(RuntimeError, match="concurrently aborted"):
-        trainer._finish_checkpoint_save(str(output))
-
-    assert trainer._checkpoint_finish_sequence == 1
-    assert not list(tmp_path.glob(".divergent-admission.snapshot-*"))
-    trainer._prepare_checkpoint_save(str(output), "student")
-    monkeypatch.setattr(checkpoint_module, "_gather_objects", original_gather)
-    trainer._finish_checkpoint_save(str(output))
-    assert output.is_dir()
 
 
 def test_checkpoint_finish_barrier_precedes_next_fifo_entry(
@@ -2626,7 +2535,7 @@ def test_checkpoint_finish_barrier_precedes_next_fifo_entry(
         value: object, *, group: torch.distributed.ProcessGroup | None = None
     ) -> tuple[object, ...]:
         nonlocal admissions
-        if isinstance(value, tuple) and len(value) == 4:
+        if isinstance(value, tuple) and len(value) == 3:
             admissions += 1
         return original_gather(value, group=group)
 
@@ -2652,33 +2561,6 @@ def test_checkpoint_finish_barrier_precedes_next_fifo_entry(
     assert admissions == 2
 
 
-def test_checkpoint_abort_advances_out_of_order_finish(
-    tmp_path: Path,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    first = tmp_path / "aborted"
-    second = tmp_path / "finished"
-    trainer._prepare_checkpoint_save(str(first), "student")
-    trainer._prepare_checkpoint_save(str(second), "student")
-    done = threading.Event()
-
-    def finish_second() -> None:
-        trainer._finish_checkpoint_save(str(second))
-        done.set()
-
-    thread = threading.Thread(target=finish_second)
-    thread.start()
-    assert not done.wait(0.1)
-    trainer._abort_checkpoint_save(str(first))
-    thread.join(10)
-    assert not thread.is_alive()
-    assert done.is_set() and second.is_dir()
-    assert not list(tmp_path.glob(".*.snapshot-*"))
-
-
 def test_checkpoint_prepare_failure_does_not_advance_or_wedge_fifo(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2697,8 +2579,6 @@ def test_checkpoint_prepare_failure_does_not_advance_or_wedge_fifo(
     failed = tmp_path / "prepare-failure"
     with pytest.raises(OSError, match="injected checkpoint snapshot failure"):
         trainer._prepare_checkpoint_save(str(failed), "student")
-    assert trainer._checkpoint_save_sequence == 1
-    assert trainer._checkpoint_finish_sequence == 1
     assert not trainer._prepared_checkpoint_saves
     assert not list(tmp_path.glob(".prepare-failure.snapshot-*"))
 
@@ -2706,8 +2586,6 @@ def test_checkpoint_prepare_failure_does_not_advance_or_wedge_fifo(
     recovered = tmp_path / "prepare-recovered"
     trainer.save_checkpoint(str(recovered), "student")
     assert recovered.is_dir()
-    assert trainer._checkpoint_save_sequence == 2
-    assert trainer._checkpoint_finish_sequence == 2
 
 
 def test_checkpoint_finalizer_failure_cleans_and_can_retry(
