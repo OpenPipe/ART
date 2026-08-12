@@ -1588,7 +1588,7 @@ async def _run_e2e_throughput_async(
         mode="online",
         output_name="throughput",
         window_steps=3,
-        warmup_ignore_steps=1,
+        warmup_ignore_steps=3,
         initial_model_calls_per_inference_gpu=(
             config.initial_model_calls_per_inference_gpu
         ),
