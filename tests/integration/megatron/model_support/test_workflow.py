@@ -141,18 +141,21 @@ def _fixture(tmp_path: Path, model_key: str) -> WorkflowFixture:
 def test_fixture_stage_contracts(tmp_path: Path) -> None:
     # fmt: off
     cases = {
-        ("gemma4_dense", "canonical"): ("hf_parity", "packing_invariance"),
+        ("gemma4_dense", "canonical"): ("hf_parity", "packing_invariance", "length_trainability"),
         ("gemma4_dense", "compact"): ("lora_coverage",),
-        ("gemma4_dense", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "length_trainability"),
+        ("gemma4_dense", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora"),
         ("gemma4_dense", "tokenizer"): ("yes_no_trainability",),
         ("llama3_dense", "compact"): ("hf_parity",),
-        ("llama3_dense", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "length_trainability"),
-        ("llama3_dense", "canonical"): ("yes_no_trainability",),
-        ("gpt_oss_moe", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "length_trainability"),
-        ("glm52", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "length_trainability"),
+        ("llama3_dense", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora"),
+        ("llama3_dense", "canonical"): ("length_trainability", "yes_no_trainability"),
+        ("qwen3_5_moe", "canonical"): ("length_trainability",),
+        ("gpt_oss_moe", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora"),
+        ("gpt_oss_moe", "canonical"): ("length_trainability",),
+        ("glm52", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora"),
+        ("glm52", "canonical"): ("length_trainability",),
         ("glm52", "compact"): ("yes_no_trainability",),
-        ("dsv4", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora", "length_trainability"),
-        ("dsv4", "canonical"): ("yes_no_trainability",),
+        ("dsv4", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora"),
+        ("dsv4", "canonical"): ("length_trainability", "yes_no_trainability"),
     }
     # fmt: on
     for (model_key, selected), stages in cases.items():

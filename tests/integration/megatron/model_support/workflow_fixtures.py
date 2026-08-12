@@ -26,13 +26,12 @@ _CANONICAL_CACHE_ROOT = Path("/tmp/art-model-support-workflow/canonical-hf-cache
 _FUNCTIONAL_FIXTURE_ROOT = Path("/tmp/art-model-support-workflow/functional")
 _FUNCTIONAL_CACHE_ROOT = Path("/tmp/art-model-support-workflow/functional-hf-cache")
 _GEMMA_CANONICAL_WEIGHT_STAGES = frozenset({"hf_parity", "packing_invariance"})
-_PRETRAINED_WEIGHT_STAGES = frozenset({"yes_no_trainability"})
+_PRETRAINED_WEIGHT_STAGES = frozenset({"length_trainability", "yes_no_trainability"})
 _FUNCTIONAL_STAGES = frozenset(
     {
         "train_inf_mismatch",
         "merged_vllm_serving",
         "native_vllm_lora",
-        "length_trainability",
     }
 )
 _GEMMA_YES_NO_ENV = {
