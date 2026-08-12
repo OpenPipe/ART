@@ -1502,6 +1502,40 @@ def stage_optimizer_state_snapshot(
     )
 
 
+def stage_trainer_rank_optimizer_state_snapshot(
+    runtime: Any,
+    state: Any,
+    *,
+    generation_id: str,
+    step: int,
+    stager: PinnedCpuSnapshotStager,
+) -> PendingCpuSnapshot[OptimizerStateSnapshot]:
+    layout = state.get("layout")
+    if layout is None:
+        raise RuntimeError("TrainerRank optimizer state has no topology layout")
+    local = {
+        "rank": runtime.rank,
+        "runtime_sha256": _model_runtime_sha256(runtime),
+        "layout_sha256": _json_sha256(layout),
+    }
+    runtime_sha256, layouts = _validated_runtime_layouts(
+        runtime, _all_gather_objects(runtime, local)
+    )
+    builder = stager.begin()
+    return builder.finish(
+        OptimizerStateSnapshot(
+            generation_id=generation_id,
+            step=step,
+            rank=runtime.rank,
+            world_size=runtime.world_size,
+            runtime_sha256=runtime_sha256,
+            layout_sha256=layouts[runtime.rank],
+            topology=current_optimizer_topology(runtime.world_size),
+            state_dict=_stage_optimizer_value(state, builder),
+        )
+    )
+
+
 def write_optimizer_snapshot_shard(
     snapshot: OptimizerStateSnapshot,
     *,
@@ -1791,6 +1825,51 @@ def load_optimizer_state(
         finally:
             del loaded_state
         return shard_path
+
+
+def load_trainer_rank_optimizer_state(
+    runtime: Any,
+    *,
+    optimizer_state_path: str,
+    adapter_path: str,
+    adapter_step: int,
+    layout: Any,
+) -> Any:
+    """Collectively load one topology-strict dynamic LoRA optimizer shard."""
+    local = {
+        "rank": runtime.rank,
+        "runtime_sha256": _model_runtime_sha256(runtime),
+        "layout_sha256": _json_sha256(layout),
+    }
+    runtime_sha256, layouts = _validated_runtime_layouts(
+        runtime, _all_gather_objects(runtime, local)
+    )
+    path = Path(optimizer_state_path)
+    with _committed_generation_lease(path) as pointer:
+        if pointer is None:
+            raise RuntimeError("Dynamic LoRA resume requires committed optimizer state")
+        adapter = _loaded_adapter(adapter_path, adapter_step)
+        pinned = pin_optimizer_generation(
+            optimizer_state_path,
+            world_size=runtime.world_size,
+            runtime_sha256=runtime_sha256,
+            layout_sha256_by_rank=layouts,
+            adapter=adapter,
+            pointer=pointer,
+        )
+        assert pinned is not None
+
+        def load_shard() -> Any:
+            shard = resolve_optimizer_shard(
+                optimizer_state_path,
+                rank=runtime.rank,
+                world_size=runtime.world_size,
+                pointer=pinned,
+            )
+            assert shard is not None
+            return torch.load(shard, map_location="cpu", weights_only=True)
+
+        return _run_rank_operation(runtime, "dynamic optimizer shard load", load_shard)
 
 
 def _allow_unpaired_resume() -> bool:

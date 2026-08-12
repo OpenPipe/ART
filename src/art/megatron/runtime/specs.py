@@ -83,6 +83,14 @@ class TrainingRunSpec(_Spec):
     shutdown_timeout_s: float = Field(default=240.0, gt=0)
 
 
+class RunSlotRegistration(_Spec):
+    run_id: str = Field(min_length=1)
+    training_session_id: str = Field(min_length=1)
+    learner_version: int = Field(ge=0)
+    adapter_path: str = Field(min_length=1)
+    optimizer_state_path: str | None = Field(default=None, min_length=1)
+
+
 class CurrentTrainConfig(TrainConfig):
     model_config = ConfigDict(extra="forbid", frozen=True)
 

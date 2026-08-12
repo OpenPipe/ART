@@ -181,6 +181,7 @@ def _trainer_with_checkpoint(
     trainer = TrainerRank(_runtime())
     param = torch.nn.Parameter(value.clone())
     trainer._checkpoint_slot_params_by_name["student"] = (param,)
+    trainer._checkpoint_slot_param_names_by_name["student"] = (("student.weight",),)
     monkeypatch.setattr(
         trainer,
         "_reduce_dynamic_grads",

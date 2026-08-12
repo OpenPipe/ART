@@ -55,6 +55,7 @@ class AdamParams:
     learning_rate: float
     beta1: float = 0.9
     beta2: float = 0.99
+    eps: float = 1e-13
     weight_decay: float = 0.1
     grad_clip_norm: float = 0.1
 
@@ -568,6 +569,9 @@ class TrainerRank:
         self._checkpoint_slot_params_by_name: dict[
             str, tuple[torch.nn.Parameter, ...]
         ] = {}
+        self._checkpoint_slot_param_names_by_name: dict[
+            str, tuple[tuple[str, ...], ...]
+        ] = {}
         self._checkpoint_slot_adapter_configs: dict[str, _AdapterConfig] = {}
         self._pending_slot_graphs: dict[
             LoRASlotRef, list[weakref.ReferenceType[torch.Tensor]]
@@ -636,9 +640,25 @@ class TrainerRank:
         slot_params = self._validate_dynamic_slot_consistency(
             "checkpoint", name, loaded
         )
+        from art.megatron.lora import iter_lora_slot_named_parameters
+
+        named_params = tuple(
+            iter_lora_slot_named_parameters(
+                self.runtime.model, self._slot_ref("checkpoint", name)
+            )
+        )
+        if tuple(id(param) for _names, param in named_params) != tuple(
+            id(param) for param in slot_params
+        ):
+            raise TrainerRankSlotStateError(
+                f"Cannot identify every optimizer parameter for checkpoint slot {name!r}."
+            )
         if config is not None:
             self._validate_loaded_checkpoint_slot_config(name, config)
         self._checkpoint_slot_params_by_name[name] = slot_params
+        self._checkpoint_slot_param_names_by_name[name] = tuple(
+            names for names, _param in named_params
+        )
         if optimizer_state is None:
             self._dynamic_optimizers.pop(name, None)
         else:
@@ -674,6 +694,18 @@ class TrainerRank:
             ),
         }
         return state
+
+    def checkpoint_slot_optimizer_layout(self, name: str) -> TrainerRankOptimizerLayout:
+        if name not in self._checkpoint_slot_params_by_name:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}")
+        return self._dynamic_optimizer_layout(name)
+
+    def restore_checkpoint_slot_optimizer_state(
+        self, name: str, state: TrainerRankOptimizerState
+    ) -> None:
+        if name not in self._checkpoint_slot_params_by_name:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}")
+        self._dynamic_optimizers[name] = self._restore_dynamic_optimizer(name, state)
 
     def checkpoint_slot_parameters(self, name: str) -> tuple[torch.nn.Parameter, ...]:
         try:
@@ -1348,6 +1380,7 @@ class TrainerRank:
         for group in dynamic.optimizer.param_groups:
             group["lr"] = params.learning_rate
             group["betas"] = (params.beta1, params.beta2)
+            group["eps"] = params.eps
             group["weight_decay"] = params.weight_decay
         return dynamic
 
@@ -1381,6 +1414,7 @@ class TrainerRank:
             masters,
             lr=params.learning_rate,
             betas=(params.beta1, params.beta2),
+            eps=params.eps,
             weight_decay=params.weight_decay,
         )
         return _DynamicOptimizer(optimizer, masters)
@@ -1566,9 +1600,12 @@ class TrainerRank:
         return grads
 
     def _dynamic_optimizer_layout(self, name: str) -> TrainerRankOptimizerLayout:
+        params = self._checkpoint_slot_params_by_name[name]
+        names = self._checkpoint_slot_param_names_by_name[name]
         parameters = cast(
             tuple[
                 tuple[
+                    tuple[str, ...],
                     tuple[int, ...],
                     str,
                     str,
@@ -1581,6 +1618,7 @@ class TrainerRank:
             ],
             tuple(
                 (
+                    param_names,
                     tuple(param.shape),
                     str(param.dtype),
                     str(getattr(param, "lora_shard_domain", "tp")),
@@ -1589,7 +1627,7 @@ class TrainerRank:
                     str(getattr(param, "lora_tp_shard_strategy", "uniform")),
                     tuple(getattr(param, "lora_tp_component_sizes", ())),
                 )
-                for param in self._checkpoint_slot_params_by_name[name]
+                for param_names, param in zip(names, params, strict=True)
             ),
         )
         layout: TrainerRankOptimizerLayout = {

@@ -843,6 +843,48 @@ class ArtRuntime:
     async def start_trainer(
         self, runtime_spec: TrainerRuntimeSpec, run_spec: TrainingRunSpec
     ) -> Any:
+        actors, proc, supervision, rank_processes = await self._start_trainer_actors(
+            runtime_spec, owner_id=run_spec.run_id
+        )
+        from art.megatron.runtime.monarch import MonarchTrainerRun
+
+        run = MonarchTrainerRun(
+            runtime_spec, run_spec, actors, proc, supervision, rank_processes
+        )
+        self._trainer_runs.add(run)
+        return run
+
+    async def start_trainer_slot(
+        self,
+        runtime_spec: TrainerRuntimeSpec,
+        *,
+        slot_id: str,
+        command_timeout_s: float = 300.0,
+        shutdown_timeout_s: float = 240.0,
+    ) -> Any:
+        actors, proc, supervision, rank_processes = await self._start_trainer_actors(
+            runtime_spec, owner_id=slot_id
+        )
+        from art.megatron.runtime.monarch import MonarchTrainerSlot
+
+        slot = MonarchTrainerSlot(
+            runtime_spec,
+            actors,
+            proc,
+            supervision,
+            rank_processes,
+            command_timeout_s=command_timeout_s,
+            shutdown_timeout_s=shutdown_timeout_s,
+        )
+        self._trainer_runs.add(slot)
+        return slot
+
+    async def _start_trainer_actors(
+        self,
+        runtime_spec: TrainerRuntimeSpec,
+        *,
+        owner_id: str,
+    ) -> tuple[Any, Any, Any, Any]:
         self._require_open()
         if self.topology.trainer is None:
             raise RuntimeError("runtime topology has no trainer mesh")
@@ -874,12 +916,11 @@ class ArtRuntime:
         )
         selected = self.host_mesh.slice(hosts=slice(indices[0], indices[-1] + 1))
         from art.megatron.runtime.monarch import (
-            MonarchTrainerRun,
             MonarchTrainerSupervision,
             spawn_monarch_trainer_actors,
         )
 
-        supervision = MonarchTrainerSupervision(run_spec.run_id)
+        supervision = MonarchTrainerSupervision(owner_id)
         proc = None
         try:
             proc = selected.spawn_procs(
@@ -906,11 +947,7 @@ class ArtRuntime:
             finally:
                 supervision.close()
             raise
-        run = MonarchTrainerRun(
-            runtime_spec, run_spec, actors, proc, supervision, rank_processes
-        )
-        self._trainer_runs.add(run)
-        return run
+        return actors, proc, supervision, rank_processes
 
     async def stop_trainer(self, run: Any) -> None:
         await run.close()

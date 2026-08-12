@@ -7,6 +7,8 @@ from threading import BoundedSemaphore, Event, Lock
 import time
 from typing import TYPE_CHECKING, Any
 
+from pydantic import BaseModel, ConfigDict
+
 from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
 from ..tensor_snapshot import PinnedCpuSnapshotStager
@@ -29,7 +31,9 @@ from .specs import (
 from .trainer_run import EventSink
 
 if TYPE_CHECKING:
+    from art.megatron.lora import LoRASlotRef
     from art.megatron.optimizer_state import OptimizerAdapter
+    from art.trainer_rank import TrainerRankOptimizerState
 
 
 class MegatronTrainJobExecutor:
@@ -403,6 +407,226 @@ class MegatronTrainJobExecutor:
             raise RuntimeError("operation cannot discard open gradient contributions")
 
 
+class _ResidentRunState(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    run_id: str
+    training_session_id: str
+    learner_version: int
+    adapter_config: dict[str, Any]
+    gradients: Any
+
+
+class MCoreRunSlotExecutor:
+    """Train independent exact-shape LoRAs on one warm MCore runtime."""
+
+    def __init__(self, runtime: Any) -> None:
+        from art.trainer_rank import TrainerRank
+
+        self.runtime = runtime
+        self._slot_trainer = TrainerRank(runtime)
+        self._publisher = _GenerationPublisher(
+            runtime,
+            stager=PinnedCpuSnapshotStager(),
+            capacity=int(runtime.snapshot_pool_capacity),
+        )
+        self._runs: dict[str, _ResidentRunState] = {}
+        self._closed = False
+
+    def register_run(
+        self,
+        *,
+        run_id: str,
+        training_session_id: str,
+        learner_version: int,
+        adapter_path: str,
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("Megatron run slot is closed")
+        if run_id in self._runs:
+            raise RuntimeError(f"training run is already resident: {run_id!r}")
+        from art.megatron.model_support.lora_disk import (
+            load_adapter_config,
+            load_lora_tensors_for_megatron,
+        )
+        from art.megatron.training.gradient_accumulator import (
+            ParameterGradientAccumulator,
+        )
+
+        adapter_config = load_adapter_config(adapter_path)
+        adapter_model = load_lora_tensors_for_megatron(
+            adapter_path, handler=self.runtime.model_support_handler
+        )
+        self._slot_trainer.load_checkpoint_slot(
+            run_id,
+            adapter_model,
+            adapter_config=adapter_config,
+        )
+        self._runs[run_id] = _ResidentRunState(
+            run_id=run_id,
+            training_session_id=training_session_id,
+            learner_version=learner_version,
+            adapter_config=adapter_config,
+            gradients=ParameterGradientAccumulator(
+                parameters=self._slot_trainer.checkpoint_slot_parameters(run_id)
+            ),
+        )
+
+    def optimizer_layout(self, run_id: str) -> Any:
+        self._require_run(run_id)
+        return self._slot_trainer.checkpoint_slot_optimizer_layout(run_id)
+
+    def restore_optimizer_state(
+        self, run_id: str, state: "TrainerRankOptimizerState"
+    ) -> None:
+        self._require_run(run_id)
+        self._slot_trainer.restore_checkpoint_slot_optimizer_state(run_id, state)
+
+    def execute_forward_backward(
+        self,
+        job: ForwardBackwardJobSpec,
+        batch: InMemoryPackedBatch,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        state = self._require_run(job.run_id)
+        self._validate_parent(
+            state, job.training_session_id, job.expected_learner_version
+        )
+        validate_packed_batch(batch)
+        from art.megatron.train import (
+            execute_megatron_dynamic_lora_forward_backward_job,
+        )
+
+        result = execute_megatron_dynamic_lora_forward_backward_job(
+            self.runtime,
+            job,
+            batch.tensors,
+            slot_trainer=self._slot_trainer,
+            gradient_accumulator=state.gradients,
+            cancelled=cancelled,
+        )
+        step = result.result
+        return {
+            "operation_id": job.operation_id,
+            "metrics": result.metrics(),
+            "token_count": int(result.token_count.item()),
+            "token_logprobs": tuple(
+                tuple(float(item) for item in values.flatten().tolist())
+                for values in step.new_logprobs
+            ),
+        }
+
+    def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
+        state = self._require_run(job.run_id)
+        self._validate_parent(
+            state, job.training_session_id, job.expected_learner_version
+        )
+        state.gradients.seal(job.contributing_forward_backward_operation_ids)
+        gradients = state.gradients.prepare_optimizer()
+        from art.trainer_rank import AdamParams
+
+        started = time.perf_counter()
+        result = self._slot_trainer.optim_step_reduced(
+            job.run_id,
+            params=AdamParams(
+                learning_rate=job.optimizer.learning_rate,
+                beta1=job.optimizer.beta1,
+                beta2=job.optimizer.beta2,
+                eps=job.optimizer.eps,
+                weight_decay=job.optimizer.weight_decay,
+                grad_clip_norm=float(self.runtime.optimizer_config.clip_grad or 0.0),
+            ),
+            grads=gradients,
+        )
+        if not result["update_successful"] or not math.isfinite(result["grad_norm"]):
+            raise RuntimeError("dynamic LoRA optimizer rejected the update")
+        consumed = state.gradients.consume()
+        if consumed != job.contributing_forward_backward_operation_ids:
+            raise RuntimeError("optimizer consumed the wrong gradient contributions")
+        state.learner_version = job.learner_version
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.learner_version,
+            "contributing_forward_backward_operation_ids": consumed,
+            "metrics": {
+                "loss/learning_rate": job.optimizer.learning_rate,
+                "loss/grad_norm": result["grad_norm"],
+                "optimizer/update_successful": result["update_successful"],
+                "optimizer/num_zeros_in_grad": result["num_zeros_in_grad"],
+                "time/optimizer_step_s": time.perf_counter() - started,
+            },
+        }
+
+    def optimizer_state(self, run_id: str) -> "TrainerRankOptimizerState | None":
+        self._require_run(run_id)
+        return self._slot_trainer.checkpoint_slot_optimizer_state(run_id)
+
+    def execute_snapshot(
+        self,
+        job: GenerationSnapshotJobSpec,
+        sink: EventSink,
+    ) -> dict[str, Any]:
+        state = self._require_run(job.run_id)
+        self._validate_parent(state, job.training_session_id, job.learner_version)
+        if job.merged_weight_transfer is not None:
+            raise ValueError("multi-run slots publish LoRA weights, not merged weights")
+        from art.megatron.lora import LoRASlotRef
+
+        metrics = self._publisher.submit(
+            generation=job.generation,
+            optimizer_state_path=job.optimizer_state_path,
+            staging_adapter_path=job.staging_adapter_path,
+            existing_adapter=job.existing_adapter,
+            publication_targets=job.publication_targets,
+            adapter_dtypes={},
+            adapter_config=state.adapter_config,
+            save_optimizer=job.save_optimizer,
+            sink=sink,
+            slot_ref=LoRASlotRef("checkpoint", job.run_id),
+            trainer_rank_optimizer_state=(
+                self._slot_trainer.checkpoint_slot_optimizer_state(job.run_id)
+                if job.save_optimizer
+                else None
+            ),
+        )
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.learner_version,
+            "metrics": metrics,
+        }
+
+    def discard_run_gradients(self, run_id: str) -> None:
+        self._require_run(run_id).gradients.discard()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        for state in self._runs.values():
+            state.gradients.discard()
+        self._publisher.close()
+        self._closed = True
+
+    def _require_run(self, run_id: str) -> _ResidentRunState:
+        if self._closed:
+            raise RuntimeError("Megatron run slot is closed")
+        try:
+            return self._runs[run_id]
+        except KeyError as exc:
+            raise RuntimeError(f"training run is not resident: {run_id!r}") from exc
+
+    @staticmethod
+    def _validate_parent(
+        state: _ResidentRunState,
+        training_session_id: str,
+        learner_version: int,
+    ) -> None:
+        if (
+            state.training_session_id != training_session_id
+            or state.learner_version != learner_version
+        ):
+            raise RuntimeError("resident run state does not match command parent")
+
+
 class _GenerationPublisher:
     def __init__(
         self,
@@ -425,7 +649,7 @@ class _GenerationPublisher:
             max_workers=1, thread_name_prefix="art-publish-durable"
         )
         self._transport_sender: Any | None = None
-        self._lora_layout: SafetensorsLayout | None = None
+        self._lora_layouts: dict[tuple[Any, ...], SafetensorsLayout] = {}
         self._failures: list[BaseException] = []
         self._in_flight = 0
 
@@ -441,8 +665,13 @@ class _GenerationPublisher:
         adapter_config: dict[str, Any],
         save_optimizer: bool,
         sink: EventSink,
+        slot_ref: "LoRASlotRef | None" = None,
+        trainer_rank_optimizer_state: "TrainerRankOptimizerState | None" = None,
     ) -> dict[str, float]:
-        from art.megatron.optimizer_state import stage_optimizer_state_snapshot
+        from art.megatron.optimizer_state import (
+            stage_optimizer_state_snapshot,
+            stage_trainer_rank_optimizer_state_snapshot,
+        )
         from art.megatron.weights.lora_publish import (
             stage_vllm_lora_snapshot_from_model,
         )
@@ -464,6 +693,7 @@ class _GenerationPublisher:
                     rank=self.runtime.rank,
                     world_size=self.runtime.world_size,
                     stager=self.stager,
+                    slot_ref=slot_ref,
                 )
             lora_launch_s = time.perf_counter() - prepare_started
             lora_resolve_started = time.perf_counter()
@@ -479,16 +709,27 @@ class _GenerationPublisher:
                 publication_targets=publication_targets,
             )
             optimizer_started = time.perf_counter()
-            optimizer = (
-                stage_optimizer_state_snapshot(
+            if save_optimizer and slot_ref is not None:
+                if trainer_rank_optimizer_state is None:
+                    raise RuntimeError("dynamic LoRA snapshot has no optimizer state")
+                optimizer = stage_trainer_rank_optimizer_state_snapshot(
                     self.runtime,
+                    trainer_rank_optimizer_state,
                     generation_id=generation.generation_id,
                     step=generation.policy_step,
                     stager=self.stager,
                 )
-                if save_optimizer
-                else None
-            )
+            else:
+                optimizer = (
+                    stage_optimizer_state_snapshot(
+                        self.runtime,
+                        generation_id=generation.generation_id,
+                        step=generation.policy_step,
+                        stager=self.stager,
+                    )
+                    if save_optimizer
+                    else None
+                )
             if optimizer is not None:
                 self.runtime.optimizer_snapshot_barrier.register(optimizer)
             optimizer_handoff.set_result(optimizer)
@@ -565,9 +806,16 @@ class _GenerationPublisher:
     ) -> Future[TrainerRankPublication]:
         prepared_tensors = None
         if lora is not None:
-            if self._lora_layout is None:
-                self._lora_layout = SafetensorsLayout(lora.tensors)
-            prepared_tensors = self._lora_layout.bind(lora.tensors)
+            layout_key = tuple(
+                (key, tuple(tensor.shape), str(tensor.dtype))
+                for key, tensor in sorted(lora.tensors.items())
+            )
+            layout = self._lora_layouts.get(layout_key)
+            if layout is None:
+                layout = self._lora_layouts[layout_key] = SafetensorsLayout(
+                    lora.tensors
+                )
+            prepared_tensors = layout.bind(lora.tensors)
         failures: list[BaseException] = []
         if int(self.runtime.rank) == 0 and publication_targets:
             if lora is None or prepared_tensors is None:

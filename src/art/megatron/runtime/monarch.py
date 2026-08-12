@@ -37,6 +37,7 @@ from .specs import (
     GenerationSnapshotJobSpec,
     HybridEpRuntimeSpec,
     OptimizerJobSpec,
+    RunSlotRegistration,
     SFTJobSpec,
     TrainAccepted,
     TrainCancelled,
@@ -368,9 +369,10 @@ class MonarchTrainerActor(Actor):
         )
         from art.megatron.training.weight_offload import WeightOffloadManager
 
-        from .executor import MegatronTrainJobExecutor
+        from .executor import MCoreRunSlotExecutor, MegatronTrainJobExecutor
 
         self._executor = MegatronTrainJobExecutor(self._runtime)
+        self._run_slot_executor = MCoreRunSlotExecutor(self._runtime)
         self._weight_offload = WeightOffloadManager.from_config(
             model=self._runtime.model,
             rank=self._runtime.rank,
@@ -494,6 +496,124 @@ class MonarchTrainerActor(Actor):
             raise
 
     @endpoint
+    def register_run_slot(self, registration_json: str) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        registration = RunSlotRegistration.model_validate_json(registration_json)
+        self._run_slot_executor.register_run(
+            run_id=registration.run_id,
+            training_session_id=registration.training_session_id,
+            learner_version=registration.learner_version,
+            adapter_path=registration.adapter_path,
+        )
+        if registration.optimizer_state_path is not None:
+            from art.megatron.optimizer_state import (
+                load_trainer_rank_optimizer_state,
+            )
+
+            optimizer_state = load_trainer_rank_optimizer_state(
+                self._runtime,
+                optimizer_state_path=registration.optimizer_state_path,
+                adapter_path=registration.adapter_path,
+                adapter_step=registration.learner_version,
+                layout=self._run_slot_executor.optimizer_layout(registration.run_id),
+            )
+            self._run_slot_executor.restore_optimizer_state(
+                registration.run_id, optimizer_state
+            )
+        return {"rank": self._runtime.rank, "run_id": registration.run_id}
+
+    @endpoint
+    def execute_run_slot_forward_backward(
+        self,
+        job_json: str,
+        batch_json: str,
+    ) -> dict[str, Any]:
+        batch = None
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = ForwardBackwardJobSpec.model_validate_json(job_json)
+            leases = PackedBatchLeaseSet.model_validate_json(batch_json)
+            batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            result = self._run_slot_executor.execute_forward_backward(
+                job, batch, Event()
+            )
+            coordinator = self._runtime.rank == 0
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.expected_learner_version,
+                "token_count": result["token_count"],
+                "metrics": result["metrics"] if coordinator else {},
+                "token_logprobs": result["token_logprobs"] if coordinator else (),
+            }
+        except BaseException:
+            self._valid = False
+            raise
+        finally:
+            if batch is not None:
+                batch.close()
+
+    @endpoint
+    def execute_run_slot_optimizer(self, job_json: str) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = OptimizerJobSpec.model_validate_json(job_json)
+            result = self._run_slot_executor.execute_optimizer(job)
+            coordinator = self._runtime.rank == 0
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.learner_version,
+                "contributing_forward_backward_operation_ids": result[
+                    "contributing_forward_backward_operation_ids"
+                ],
+                "metrics": result["metrics"] if coordinator else {},
+            }
+        except BaseException:
+            self._valid = False
+            raise
+
+    @endpoint
+    def execute_run_slot_snapshot(
+        self,
+        job_json: str,
+        event_port: Port[dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = GenerationSnapshotJobSpec.model_validate_json(job_json)
+            coordinator = self._runtime.rank == 0
+            result = self._run_slot_executor.execute_snapshot(
+                job,
+                _ActorEventSink(event_port, coordinator=coordinator),
+            )
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.learner_version,
+                "metrics": result["metrics"] if coordinator else {},
+            }
+        except BaseException as error:
+            self._valid = False
+            event_port.send(
+                {
+                    "kind": "rank_failed",
+                    "rank": self._runtime.rank,
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+            raise
+
+    @endpoint
     def execute_snapshot(
         self,
         job_json: str,
@@ -593,6 +713,7 @@ class MonarchTrainerActor(Actor):
             self._executor.discard_open_gradients()
             self._weight_offload.after_job()
             self._command_job_open = False
+        self._run_slot_executor.close()
         self._executor.close()
         import torch
 
@@ -638,6 +759,7 @@ class MonarchTrainerActor(Actor):
     def __cleanup__(self, exc: Exception | None) -> None:
         if exc is not None:
             self._valid = False
+        self._run_slot_executor.close()
         self._executor.close()
 
 
@@ -706,6 +828,270 @@ class _PublicationState:
         self.active_waiters = 0
         self.late_waitable = True
         self.outcome_observed = False
+
+
+class MonarchTrainerSlot:
+    """One persistent Megatron mesh serving many sequenced training runs."""
+
+    def __init__(
+        self,
+        runtime_spec: TrainerRuntimeSpec,
+        actors: Any,
+        proc_mesh: ProcMesh,
+        supervision: MonarchTrainerSupervision,
+        rank_processes: tuple[_TrainerRankReady, ...],
+        *,
+        command_timeout_s: float,
+        shutdown_timeout_s: float,
+    ) -> None:
+        self.runtime_spec = runtime_spec
+        self._actors = actors
+        self._proc_mesh = proc_mesh
+        self._supervision = supervision
+        self._rank_processes = rank_processes
+        self._command_timeout_s = command_timeout_s
+        self._shutdown_timeout_s = shutdown_timeout_s
+        self._lock = asyncio.Lock()
+        self._closed = False
+        self._valid = True
+        self._stop_task: asyncio.Task[None] | None = None
+        self._publications: dict[
+            str, asyncio.Task[tuple[TrainerRankPublication, ...]]
+        ] = {}
+
+    @property
+    def valid(self) -> bool:
+        return self._valid
+
+    async def register_run(self, registration: RunSlotRegistration) -> None:
+        async with self._lock:
+            self._require_open()
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.register_run_slot.call(registration.model_dump_json()),
+                    timeout=self._command_timeout_s,
+                )
+                results = list(values.values())
+                if {result["rank"] for result in results} != set(
+                    range(len(self._rank_processes))
+                ) or {result["run_id"] for result in results} != {registration.run_id}:
+                    raise RuntimeError("trainer ranks disagree on run registration")
+            except BaseException as error:
+                await self._invalidate(error, "run registration and cleanup failed")
+                raise
+
+    async def forward_backward(
+        self,
+        job: ForwardBackwardJobSpec,
+        batch: PackedBatchLeaseSet,
+    ) -> dict[str, Any]:
+        async with self._lock:
+            self._require_open()
+            if batch.ref != job.batch:
+                raise ValueError("F/B batch ref does not match supplied packed batch")
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.execute_run_slot_forward_backward.call(
+                        job.model_dump_json(), batch.model_dump_json()
+                    ),
+                    timeout=self._command_timeout_s,
+                )
+                results = list(values.values())
+                self._validate_command_results(
+                    results,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                )
+                if {result["token_count"] for result in results} != {
+                    job.trainable_token_count
+                }:
+                    raise RuntimeError(
+                        "trainer F/B token count differs from packed provenance"
+                    )
+                return next(result for result in results if result["rank"] == 0)
+            except BaseException as error:
+                await self._invalidate(error, "F/B operation and cleanup failed")
+                raise
+
+    async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]:
+        async with self._lock:
+            self._require_open()
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.execute_run_slot_optimizer.call(job.model_dump_json()),
+                    timeout=self._command_timeout_s,
+                )
+                results = list(values.values())
+                self._validate_command_results(
+                    results,
+                    operation_id=job.operation_id,
+                    learner_version=job.learner_version,
+                )
+                contributions = {
+                    tuple(result["contributing_forward_backward_operation_ids"])
+                    for result in results
+                }
+                if contributions != {job.contributing_forward_backward_operation_ids}:
+                    raise RuntimeError(
+                        "trainer ranks consumed different F/B contributions"
+                    )
+                return next(result for result in results if result["rank"] == 0)
+            except BaseException as error:
+                await self._invalidate(error, "optimizer operation and cleanup failed")
+                raise
+
+    async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
+        async with self._lock:
+            self._require_open()
+            generation_id = job.generation.generation_id
+            if generation_id in self._publications:
+                raise RuntimeError(f"publication already exists: {generation_id}")
+            try:
+                send_port, receiver = Channel[dict[str, Any]].open()
+                values = await asyncio.wait_for(
+                    self._actors.execute_run_slot_snapshot.call(
+                        job.model_dump_json(), send_port
+                    ),
+                    timeout=self._command_timeout_s,
+                )
+                results = list(values.values())
+                self._validate_command_results(
+                    results,
+                    operation_id=job.operation_id,
+                    learner_version=job.learner_version,
+                )
+                publication = asyncio.create_task(
+                    self._collect_publication(receiver, job.generation),
+                    name=f"megatron-slot-publish-{generation_id}",
+                )
+                publication.add_done_callback(_consume_future)
+                self._publications[generation_id] = publication
+                return next(result for result in results if result["rank"] == 0)
+            except BaseException as error:
+                await self._invalidate(error, "snapshot operation and cleanup failed")
+                raise
+
+    def wait_for_publication(
+        self, generation_id: str
+    ) -> Awaitable[tuple[TrainerRankPublication, ...]]:
+        try:
+            publication = self._publications[generation_id]
+        except KeyError as exc:
+            raise RuntimeError(f"trainer has no publication {generation_id}") from exc
+
+        async def wait() -> tuple[TrainerRankPublication, ...]:
+            return await asyncio.shield(publication)
+
+        return wait()
+
+    async def _collect_publication(
+        self,
+        receiver: Any,
+        generation: TrainerGeneration,
+    ) -> tuple[TrainerRankPublication, ...]:
+        records: dict[int, TrainerRankPublication] = {}
+        supervision = asyncio.create_task(self._supervision.wait())
+        receive: asyncio.Future[Any] | None = None
+        try:
+            while len(records) < len(self._rank_processes):
+                receive = asyncio.ensure_future(receiver.recv())
+                done, _ = await asyncio.wait(
+                    {receive, supervision},
+                    timeout=self._shutdown_timeout_s,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    raise TimeoutError("trainer ranks produced no publication event")
+                if supervision in done:
+                    raise RuntimeError("trainer mesh failed: " + supervision.result())
+                payload = receive.result()
+                if payload["kind"] == "rank_failed":
+                    raise RuntimeError(
+                        f"trainer rank {payload['rank']} publication failed: "
+                        f"{payload['error_type']}: {payload['message']}"
+                    )
+                event = TRAINER_PUBLICATION_EVENT_ADAPTER.validate_python(payload)
+                if isinstance(event, TrainerPublicationFailed):
+                    raise RuntimeError(
+                        f"trainer rank {event.rank} publication failed "
+                        f"({event.error_type}): {event.message}"
+                    )
+                record = event.record
+                if record.generation != generation:
+                    raise RuntimeError("trainer rank published another generation")
+                if record.rank in records:
+                    raise RuntimeError("trainer rank published a generation twice")
+                records[record.rank] = record
+            return tuple(records[rank] for rank in range(len(self._rank_processes)))
+        finally:
+            supervision.cancel()
+            supervision.add_done_callback(_consume_future)
+            if receive is not None and not receive.done():
+                receive.cancel()
+                receive.add_done_callback(_consume_future)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._valid = False
+        primary: BaseException | None = None
+        try:
+            async with asyncio.timeout(self._shutdown_timeout_s * 0.8):
+                await _remote_teardown(self._actors.close.call())
+                await asyncio.gather(*self._publications.values())
+        except BaseException as error:
+            primary = error
+        try:
+            await self._force_stop()
+        except BaseException as error:
+            if primary is None:
+                primary = error
+            else:
+                primary.add_note(
+                    f"trainer slot cleanup failed: {type(error).__name__}: {error}"
+                )
+        if primary is not None:
+            raise primary
+
+    def _require_open(self) -> None:
+        if self._closed or not self._valid:
+            raise RuntimeError("trainer slot is invalid")
+
+    def _validate_command_results(
+        self,
+        results: list[dict[str, Any]],
+        *,
+        operation_id: str,
+        learner_version: int,
+    ) -> None:
+        if (
+            {result["rank"] for result in results}
+            != set(range(len(self._rank_processes)))
+            or {result["operation_id"] for result in results} != {operation_id}
+            or {result["learner_version"] for result in results} != {learner_version}
+        ):
+            raise RuntimeError("trainer ranks disagree on command completion")
+
+    async def _invalidate(self, error: BaseException, message: str) -> None:
+        self._valid = False
+        self._closed = True
+        await cleanup_after_failure(error, self._force_stop, message=message)
+
+    async def _force_stop(self) -> None:
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(
+                _remote_teardown(self._proc_mesh.stop())
+            )
+
+            def stopped(task: asyncio.Task[None]) -> None:
+                if not task.cancelled() and task.exception() is None:
+                    self._supervision.close()
+
+            self._stop_task.add_done_callback(stopped)
+        await asyncio.wait_for(
+            asyncio.shield(self._stop_task), self._shutdown_timeout_s
+        )
 
 
 class MonarchTrainerRun:

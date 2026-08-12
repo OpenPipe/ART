@@ -10,7 +10,16 @@ import torch.distributed as dist
 class TrainerRankOptimizerLayout(TypedDict):
     parallel: tuple[int, int, int, int, int, int, int, int]
     parameters: tuple[
-        tuple[tuple[int, ...], str, str, bool, int | None, str, tuple[int, ...]],
+        tuple[
+            tuple[str, ...],
+            tuple[int, ...],
+            str,
+            str,
+            bool,
+            int | None,
+            str,
+            tuple[int, ...],
+        ],
         ...,
     ]
 
@@ -121,6 +130,14 @@ class TrainerRank(_impl.TrainerRank):
         self, name: str
     ) -> TrainerRankOptimizerState | None:
         return super().checkpoint_slot_optimizer_state(name)
+
+    def checkpoint_slot_optimizer_layout(self, name: str) -> TrainerRankOptimizerLayout:
+        return super().checkpoint_slot_optimizer_layout(name)
+
+    def restore_checkpoint_slot_optimizer_state(
+        self, name: str, state: TrainerRankOptimizerState
+    ) -> None:
+        super().restore_checkpoint_slot_optimizer_state(name, state)
 
     def save_checkpoint_slot_lora(self, name: str, output_dir: str) -> None:
         """Collectively publish a trained checkpoint slot as a vLLM LoRA."""

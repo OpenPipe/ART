@@ -2111,14 +2111,27 @@ def iter_lora_slot_parameters(
     model: Sequence[torch.nn.Module],
     ref: LoRASlotRef,
 ) -> Iterator[torch.nn.Parameter]:
-    seen: set[int] = set()
-    for chunk in model:
+    for _names, param in iter_lora_slot_named_parameters(model, ref):
+        yield param
+
+
+def iter_lora_slot_named_parameters(
+    model: Sequence[torch.nn.Module],
+    ref: LoRASlotRef,
+) -> Iterator[tuple[tuple[str, ...], torch.nn.Parameter]]:
+    records: dict[int, tuple[list[str], torch.nn.Parameter]] = {}
+    order: list[int] = []
+    for chunk_index, chunk in enumerate(model):
         for module in chunk.modules():
             if not isinstance(module, LoRA):
                 continue
-            for param in module.lora_slot_params(ref):
+            for suffix, param in module._lora_params(ref):
                 param_id = id(param)
-                if param_id in seen:
-                    continue
-                seen.add(param_id)
-                yield param
+                identity = f"chunk.{chunk_index}.{module.adapter_model_prefix}.{suffix}"
+                if param_id not in records:
+                    records[param_id] = ([], param)
+                    order.append(param_id)
+                records[param_id][0].append(identity)
+    for param_id in order:
+        names, param = records[param_id]
+        yield tuple(sorted(set(names))), param

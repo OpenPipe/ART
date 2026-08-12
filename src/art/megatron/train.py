@@ -585,6 +585,7 @@ def _execute_megatron_rl_forward_backward_steps(
     after_step: Callable[[int, int, RLForwardBackwardState, float, float], None],
     cancelled: Event | None = None,
     replay_bundle: MoeRoutingReplayBundle | None = None,
+    state_is_resident: bool = False,
 ) -> tuple[dict[str, torch.dtype], float, int]:
     template = None
     zero_template = None
@@ -611,7 +612,9 @@ def _execute_megatron_rl_forward_backward_steps(
             strict=_moe_replay_strict(job),
         )
         replay_finalize_s = time.perf_counter() - replay_finalize_started
-        adapter_dtypes = _prepare_rl_training_state(runtime, job)
+        adapter_dtypes = (
+            {} if state_is_resident else _prepare_rl_training_state(runtime, job)
+        )
 
         template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
         zero_template = _zero_contribution_inputs(template)
@@ -923,6 +926,96 @@ def execute_megatron_rl_forward_backward_job(
     runtime.optimizer_state_loaded = True
     return MegatronForwardBackwardJobResult(
         result=result,
+        num_gradient_steps=len(states),
+        forward_backward_s=sum(durations) + time.perf_counter() - finish_started,
+        replay_finalize_s=replay_finalize_s,
+        token_count=token_count,
+    )
+
+
+def execute_megatron_dynamic_lora_forward_backward_job(
+    runtime: TrainingRuntime,
+    job: ForwardBackwardJobSpec,
+    packed_tensors: PackedTensors,
+    *,
+    slot_trainer: Any,
+    gradient_accumulator: Any,
+    cancelled: Event | None = None,
+    replay_bundle: MoeRoutingReplayBundle | None = None,
+) -> MegatronForwardBackwardJobResult:
+    """Run the MCore schedule against one exact-shape dynamic LoRA slot."""
+    from art.megatron.lora import LoRASlotRef, use_lora_slot
+    from art.megatron.training.gradient_accumulator import (
+        ParameterGradientAccumulator,
+    )
+
+    ref_path = _experimental_train_config(job).get("kl_ref_adapter_path")
+    if (
+        job.config.kl_penalty_coef > 0.0
+        and ref_path is not None
+        and os.path.abspath(ref_path) != os.path.abspath(job.source_adapter_path)
+    ):
+        raise NotImplementedError(
+            "dynamic MCore slots require the KL reference to be the current learner"
+        )
+    slot_name = job.run_id
+    slot_ref = LoRASlotRef("checkpoint", slot_name)
+    params = slot_trainer.checkpoint_slot_parameters(slot_name)
+    internal = ParameterGradientAccumulator(parameters=params)
+    states: list[RLForwardBackwardState] = []
+    durations: list[float] = []
+    global_token_counts: list[torch.Tensor] = []
+    gradient_accumulator.before_forward_backward()
+
+    def before_step(_step_index: int) -> None:
+        internal.before_forward_backward()
+
+    def record_step(
+        step_index: int,
+        _num_steps: int,
+        state: RLForwardBackwardState,
+        duration_s: float,
+        _replay_finalize_s: float,
+    ) -> None:
+        global_token_count = state.token_count.detach().clone()
+        torch.distributed.all_reduce(
+            global_token_count,
+            group=ps.get_data_parallel_group(with_context_parallel=True),
+        )
+        gradients = slot_trainer.reduce_checkpoint_slot_grads(
+            slot_name,
+            scale_grads=1.0 / float(global_token_count.item()),
+        )
+        internal.record(
+            f"{job.operation_id}:{step_index}", global_token_count, gradients
+        )
+        states.append(state)
+        durations.append(duration_s)
+        global_token_counts.append(global_token_count)
+
+    with use_lora_slot(slot_ref):
+        _, replay_finalize_s, _ = _execute_megatron_rl_forward_backward_steps(
+            runtime,
+            job,
+            packed_tensors,
+            before_step=before_step,
+            after_step=record_step,
+            cancelled=cancelled,
+            replay_bundle=replay_bundle,
+            state_is_resident=True,
+        )
+    finish_started = time.perf_counter()
+    internal.seal(internal.contribution_ids)
+    gradients = internal.prepare_optimizer()
+    token_count = sum(
+        global_token_counts,
+        torch.zeros_like(global_token_counts[0]),
+    )
+    gradient_accumulator.record(job.operation_id, token_count, gradients)
+    internal.consume()
+    slot_trainer.clear_checkpoint_slot_grads(slot_name)
+    return MegatronForwardBackwardJobResult(
+        result=_finish_megatron_rl_forward_backward_job(tuple(states)),
         num_gradient_steps=len(states),
         forward_backward_s=sum(durations) + time.perf_counter() - finish_started,
         replay_finalize_s=replay_finalize_s,
