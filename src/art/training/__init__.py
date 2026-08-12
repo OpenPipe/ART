@@ -25,10 +25,12 @@ from .contracts import (
     SupervisedTrajectoryBatch,
     TrainingBatch,
 )
+from .sequencing import CommandAdmission, RunCommandLedger
 
 __all__ = [
     "AdamConfig",
     "CheckpointRef",
+    "CommandAdmission",
     "Contract",
     "ForwardBackwardRequest",
     "ForwardBackwardResult",
@@ -44,6 +46,7 @@ __all__ = [
     "PackingOutcome",
     "PolicyTokenCount",
     "RlTrajectoryBatch",
+    "RunCommandLedger",
     "SamplerPublication",
     "SamplerWeightsResult",
     "SaveStateRequest",
