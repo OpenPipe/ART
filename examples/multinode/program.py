@@ -65,7 +65,10 @@ async def main(hosts: Any) -> None:
         )
         executor.set_workers(workers)
         model = art.TrainableModel(
-            name="multinode-smoke", project="art", base_model="not-loaded"
+            name="multinode-smoke",
+            project="art",
+            base_model="not-loaded",
+            run_name="multinode-smoke",
         )
         trajectories: list[art.Trajectory] = []
         for answer in REWARDS:
