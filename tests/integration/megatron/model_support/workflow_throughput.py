@@ -46,7 +46,8 @@ _POLICY_AGE_P95 = "offpolicy/token_weighted_policy_age_p95_steps"
 _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
-_MEASUREMENT_CONTRACT_VERSION = 12
+_INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gap_rank_"
+_MEASUREMENT_CONTRACT_VERSION = 13
 _ISOLATED_WARMUP_STEPS = 1
 # Average enough exact E2E/isolated pairs to absorb one transient GPU tail.
 _MATCHED_MEASURED_STEPS = 6
@@ -927,6 +928,84 @@ def _numeric_values(rows: list[dict[str, Any]], key: str) -> list[float]:
     return [float(value) for value in values if isinstance(value, int | float)]
 
 
+def _queue_ready_inter_forward_backward_gaps(
+    rows: list[dict[str, Any]], config: ThroughputWorkflowConfig
+) -> dict[str, int | float | None]:
+    rank_gaps: list[dict[int, float]] = []
+    for row in rows:
+        gaps: dict[int, float] = {}
+        for name, value in row.items():
+            if not (
+                name.startswith(_INTER_FORWARD_BACKWARD_GAP_PREFIX)
+                and name.endswith("_s")
+            ):
+                continue
+            rank_text = name[len(_INTER_FORWARD_BACKWARD_GAP_PREFIX) : -2]
+            _require(
+                rank_text.isdigit()
+                and isinstance(value, int | float)
+                and math.isfinite(float(value))
+                and float(value) >= 0.0,
+                f"invalid rank-local inter-forward/backward gap: {name}={value}",
+            )
+            gaps[int(rank_text)] = float(value)
+        rank_gaps.append(gaps)
+    ranks = set(rank_gaps[0]) if rank_gaps else set()
+    _require(
+        0 in ranks and all(set(gaps) == ranks for gaps in rank_gaps),
+        "throughput rows lack consistent rank-local inter-forward/backward gaps",
+    )
+    waits = _numeric_values(rows, "queue/packed_get_wait_s")
+    depths = _numeric_values(rows, "queue/packed_queue_depth")
+    _require(
+        all(wait >= 0.0 and depth >= 0.0 for wait, depth in zip(waits, depths)),
+        "packed queue readiness metrics must be nonnegative",
+    )
+    eligible = [
+        gaps
+        for gaps, wait, depth in zip(rank_gaps, waits, depths, strict=True)
+        if depth >= 1.0 and wait <= config.max_queue_ready_wait_s
+    ]
+
+    def summarize(rank: int) -> dict[str, int | float | None]:
+        values = [gaps[rank] for gaps in eligible]
+        return {
+            "p50_s": median(values) if values else None,
+            "p95_s": (
+                quantiles(values, n=20, method="inclusive")[18]
+                if len(values) > 1
+                else values[0]
+                if values
+                else None
+            ),
+            "max_s": max(values) if values else None,
+            "count": len(values),
+        }
+
+    summaries = {rank: summarize(rank) for rank in sorted(ranks)}
+    worst_rank = (
+        max(
+            summaries,
+            key=lambda rank: cast(float, summaries[rank]["p95_s"]),
+        )
+        if eligible
+        else None
+    )
+    rank_zero = summaries[0]
+    worst = summaries[cast(int, worst_rank)] if worst_rank is not None else rank_zero
+    return {
+        **{
+            f"queue_ready_inter_forward_backward_gap_rank_zero_{name}": value
+            for name, value in rank_zero.items()
+        },
+        "queue_ready_inter_forward_backward_gap_worst_rank": worst_rank,
+        **{
+            f"queue_ready_inter_forward_backward_gap_worst_rank_{name}": value
+            for name, value in worst.items()
+        },
+    }
+
+
 def _total(rows: list[dict[str, Any]], key: str) -> float:
     return sum(_numeric_values(rows, key))
 
@@ -1255,6 +1334,7 @@ def _collect_measurements(
             for capacity, used in zip(capacities, nonpadding, strict=True)
         ),
     )
+    inter_forward_backward_gaps = _queue_ready_inter_forward_backward_gaps(rows, config)
     thresholds = config.thresholds.get(hardware)
     measurements = {
         "hardware": hardware,
@@ -1273,6 +1353,7 @@ def _collect_measurements(
         "e2e_core_train_tok_s": logical / train_s,
         "e2e_train_tok_s": logical / e2e_elapsed_s,
         "accepted_train_tok_s": counts["accepted_train_tokens"] / e2e_elapsed_s,
+        **inter_forward_backward_gaps,
         _POLICY_AGE_MEAN: _accepted_token_weighted(rows, _POLICY_AGE_MEAN),
         _POLICY_AGE_P95: max(_numeric_values(rows, _POLICY_AGE_P95)),
         _FRESHNESS_DISCOUNT: _accepted_token_weighted(rows, _FRESHNESS_DISCOUNT),
@@ -1391,6 +1472,16 @@ def acceptance_failures(
             "second_max_policy_activation_interval_s"
         ]
         <= thresholds.max_repeated_policy_activation_interval_s,
+        "queue_ready_inter_forward_backward_gap_count": measurements[
+            "queue_ready_inter_forward_backward_gap_worst_rank_count"
+        ]
+        >= thresholds.min_queue_ready_inter_forward_backward_gap_count,
+        "queue_ready_inter_forward_backward_gap_p95_s": (
+            measurements["queue_ready_inter_forward_backward_gap_worst_rank_p95_s"]
+            is not None
+            and measurements["queue_ready_inter_forward_backward_gap_worst_rank_p95_s"]
+            <= thresholds.max_queue_ready_inter_forward_backward_gap_p95_s
+        ),
     }
     if thresholds.calibration_fingerprint is not None:
         floor_checks["calibration_fingerprint"] = (

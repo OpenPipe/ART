@@ -10,7 +10,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Mapping
 import uuid
 
 from pydantic import BaseModel, Field
@@ -422,8 +422,11 @@ def _run_stage_in_subprocess(
     base_model: str,
     architecture: ArchitectureReport,
     allow_unvalidated_arch: bool = False,
+    run_dir: Path | None = None,
+    stage_environment: Mapping[str, str] | None = None,
+    visible_gpu_ids: tuple[str, ...] | None = None,
 ) -> ValidationStageResult:
-    run_dir = Path(os.environ[WORKFLOW_RUN_DIR_ENV])
+    run_dir = run_dir or Path(os.environ[WORKFLOW_RUN_DIR_ENV])
     stage_dir = run_dir / stage_name
     stage_dir.mkdir(parents=True, exist_ok=False)
     architecture_json = stage_dir / "architecture.json"
@@ -449,6 +452,10 @@ def _run_stage_in_subprocess(
     if allow_unvalidated_arch:
         cmd.append("--allow-unsupported-arch")
     env = os.environ.copy()
+    if stage_environment is not None:
+        env.update(stage_environment)
+    if visible_gpu_ids is not None:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_gpu_ids)
     env["WANDB_MODE"] = "disabled"
     env[WORKFLOW_STAGE_DIR_ENV] = str(stage_dir)
     existing_pythonpath = env.get("PYTHONPATH")
@@ -1378,6 +1385,54 @@ def _print_stage_result(stage: ValidationStageResult, *, indent: str = "") -> No
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.only_stage is None and not args.stop_on_failure:
+        from .workflow_scheduler import build_scheduled_validation_reports
+
+        base_models = (
+            validated_architecture_representative_models()
+            if args.all_architectures
+            else [args.base_model]
+        )
+        output_json_by_model: dict[str, Path | None] = {
+            base_model: (
+                _per_architecture_output_json(
+                    args.output_json,
+                    get_model_support_spec(
+                        base_model,
+                        allow_unvalidated_arch=args.allow_unsupported_arch,
+                    ).key,
+                )
+                if args.all_architectures
+                else Path(args.output_json)
+            )
+            for base_model in base_models
+        }
+        reports = build_scheduled_validation_reports(
+            base_models=base_models,
+            include_sensitivity=args.include_sensitivity,
+            include_yes_no_trainability=args.include_yes_no_trainability,
+            output_json_by_model=output_json_by_model,
+            skip_stages=set(args.skip_stage),
+            allow_unvalidated_arch=args.allow_unsupported_arch,
+        )
+        if args.all_architectures:
+            all_report = AllArchitecturesValidationReport(
+                reports=reports,
+                passed=all(report.passed for report in reports),
+                complete=all(report.complete for report in reports),
+            )
+            _write_all_architectures_report(all_report, args.output_json)
+            for report in reports:
+                print(f"base_model={report.base_model}", flush=True)
+                for stage in report.stages:
+                    _print_stage_result(stage, indent="  ")
+            print(f"report_json={args.output_json}", flush=True)
+            return 0 if all_report.passed else 1
+        report = reports[0]
+        for stage in report.stages:
+            _print_stage_result(stage)
+        print(f"report_json={args.output_json}", flush=True)
+        return 0 if report.passed else 1
     if args.all_architectures:
         all_report = build_all_architectures_validation_report(
             include_yes_no_trainability=args.include_yes_no_trainability,

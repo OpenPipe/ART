@@ -132,6 +132,7 @@ from art.preprocessing.pack import PackedTensors
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 _optimizer_stats_printed = False
+_INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gap_rank_"
 
 __all__ = [
     "DEFAULT_MODEL_IDENTIFIER",
@@ -140,6 +141,13 @@ __all__ = [
     "execute_megatron_rl_job",
     "execute_megatron_sft_job",
 ]
+
+
+class _InterForwardBackwardTiming(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    metrics_group: Any | None = None
+    previous_schedule_end_s: float | None = None
 
 
 class TrainingRuntime(BaseModel):
@@ -166,6 +174,9 @@ class TrainingRuntime(BaseModel):
     moe_routing_replay_controller: MoeRoutingReplayController | None = None
     merged_weight_transfer_group: Any | None = None
     merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
+    inter_forward_backward_timing: _InterForwardBackwardTiming = Field(
+        default_factory=_InterForwardBackwardTiming
+    )
 
     @field_validator("model")
     @classmethod
@@ -490,6 +501,11 @@ def build_training_runtime(
 
     optimizer_config = optimizer_config or _default_optimizer_config()
     optimizer = _build_optimizer(model, optimizer_config) if build_optimizer else None
+    metrics_group = (
+        torch.distributed.new_group(backend="gloo")  # ty: ignore[possibly-missing-attribute]
+        if world_size > 1
+        else None
+    )
 
     runtime = TrainingRuntime(
         provider_bundle=provider_bundle,
@@ -501,6 +517,9 @@ def build_training_runtime(
         rank=rank,
         world_size=world_size,
         snapshot_pool_capacity=snapshot_pool_capacity,
+        inter_forward_backward_timing=_InterForwardBackwardTiming(
+            metrics_group=metrics_group
+        ),
     )
     configure_moe_routing_replay(
         runtime,
@@ -532,6 +551,7 @@ def execute_megatron_rl_job(
     zero_template = None
     ref_logprobs_by_index = None
     cp_lookahead_state = None
+    inter_schedule_metrics: dict[str, float] = {}
     next_step_first_micro = None
     next_step_first_ref_logprobs = None
     step_result = None
@@ -681,6 +701,7 @@ def execute_megatron_rl_job(
                 before_optimizer_step=(
                     runtime.optimizer_snapshot_barrier.wait_before_mutation
                 ),
+                inter_forward_backward_timing=(runtime.inter_forward_backward_timing),
             )
             train_step_s = time.perf_counter() - train_step_started
             print0(
@@ -694,6 +715,13 @@ def execute_megatron_rl_job(
                 num_gradient_steps=num_steps,
                 train_step_s=train_step_s,
             )
+            if step_index == 0:
+                inter_schedule_metrics = {
+                    name: value
+                    for name, value in step_result.pipeline_metrics.items()
+                    if name.startswith(_INTER_FORWARD_BACKWARD_GAP_PREFIX)
+                }
+            final_metrics.update(inter_schedule_metrics)
             final_metrics["time/replay_finalize_s"] = replay_finalize_s
             if runtime.rank == 0:
                 progress_sink(step_index, num_steps, final_metrics)
@@ -1944,6 +1972,51 @@ def run_megatron_sft_step(
     )
 
 
+def _run_training_schedule(
+    schedule: MCoreScheduleAdapter[Any],
+    forward_step_func: Callable[..., Any],
+    timing: _InterForwardBackwardTiming | None,
+) -> tuple[list[Any], Callable[[], dict[str, float]]]:
+    started_s = time.monotonic()
+    gap_s = (
+        None
+        if timing is None or timing.previous_schedule_end_s is None
+        else started_s - timing.previous_schedule_end_s
+    )
+    outputs = schedule.run(forward_step_func, forward_only=False)
+    ended_s = time.monotonic()
+    if timing is None:
+        return outputs, lambda: {}
+    timing.previous_schedule_end_s = ended_s
+    if gap_s is None:
+        return outputs, lambda: {}
+    world_size = torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
+    local_gap = torch.tensor(gap_s, dtype=torch.float64)
+    rank_gaps = [torch.empty_like(local_gap) for _ in range(world_size)]
+    work = None
+    if world_size == 1:
+        rank_gaps[0].copy_(local_gap)
+    else:
+        if timing.metrics_group is None:
+            raise RuntimeError("Multi-rank schedule timing requires a Gloo group")
+        work = torch.distributed.all_gather(  # ty: ignore[possibly-missing-attribute]
+            rank_gaps,
+            local_gap,
+            group=timing.metrics_group,
+            async_op=True,
+        )
+
+    def metrics() -> dict[str, float]:
+        if work is not None:
+            work.wait()
+        return {
+            f"{_INTER_FORWARD_BACKWARD_GAP_PREFIX}{rank}_s": float(gap.item())
+            for rank, gap in enumerate(rank_gaps)
+        }
+
+    return outputs, metrics
+
+
 def run_training_step(
     *,
     model_chunks: ModelChunks,
@@ -1963,6 +2036,7 @@ def run_training_step(
     next_step_first_ref_logprobs: torch.Tensor | None = None,
     hybridep_token_counts: list[int] | None = None,
     before_optimizer_step: Callable[[], None] | None = None,
+    inter_forward_backward_timing: _InterForwardBackwardTiming | None = None,
 ) -> TrainStepResult:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
@@ -2109,7 +2183,9 @@ def run_training_step(
 
         return token_output.token_losses, reduce_loss
 
-    forward_data_store = schedule.run(forward_step_func, forward_only=False)
+    forward_data_store, collect_inter_schedule_metrics = _run_training_schedule(
+        schedule, forward_step_func, inter_forward_backward_timing
+    )
     if moe_routing_replay_controller is not None:
         moe_routing_replay_controller.finalize_step(expect_recompute=True)
     pipeline_results = cast(
@@ -2176,7 +2252,10 @@ def run_training_step(
         loss_metrics=loss_diagnostics.to_metrics(
             group=ps.get_data_parallel_group(with_context_parallel=True),
         ),
-        pipeline_metrics=schedule.telemetry.metrics(),
+        pipeline_metrics={
+            **schedule.telemetry.metrics(),
+            **collect_inter_schedule_metrics(),
+        },
     )
 
 

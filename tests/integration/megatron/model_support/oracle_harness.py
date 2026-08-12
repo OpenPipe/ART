@@ -220,6 +220,7 @@ class Topology(BaseModel):
         return attention_world
 
 
+# Retained for focused/nightly sentinel runs; normal workflows use compositions below.
 TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
     Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False),
@@ -244,6 +245,15 @@ DENSE_TOPOLOGIES = [
 ]
 ORACLE_TOPOLOGY = TOPOLOGIES[0]
 DENSE_ORACLE_TOPOLOGY = DENSE_TOPOLOGIES[0]
+CP_MOE_COMPOSITION_TOPOLOGY = Topology(
+    tp=2, ep=2, etp=2, dp=1, cp=2, pp=2, vpp=2, sp=True
+)
+DENSE_COMPOSITION_TOPOLOGY = Topology(
+    tp=2, ep=1, etp=1, dp=1, cp=2, pp=2, vpp=2, sp=True
+)
+NO_CP_MOE_COMPOSITION_TOPOLOGY = Topology(
+    tp=2, ep=2, etp=2, dp=2, cp=1, pp=2, vpp=2, sp=True
+)
 SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
 CP_ATTENTION_SENSITIVITY_TOPOLOGY = Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False)
 DENSE_SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=1, etp=1, dp=1, sp=True)
@@ -781,30 +791,21 @@ def oracle_topology(*, is_moe: bool = True) -> Topology:
     return ORACLE_TOPOLOGY if is_moe else DENSE_ORACLE_TOPOLOGY
 
 
-def _filter_context_parallel_support(
-    topologies: list[Topology],
-    *,
-    is_moe: bool,
-    cp_supported: bool,
-) -> list[Topology]:
-    if cp_supported:
-        return topologies
-    if is_moe:
-        return list(CP_UNSUPPORTED_MOE_TOPOLOGIES)
-    return [_without_context_parallel(topology) for topology in topologies]
-
-
 def selected_suite_topologies(
     *,
     is_moe: bool = True,
     cp_supported: bool = True,
 ) -> list[Topology]:
-    """Returns the correctness topology list for a model family."""
-    return _filter_context_parallel_support(
-        list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES),
-        is_moe=is_moe,
-        cp_supported=cp_supported,
-    )
+    """Returns TP1 plus one composed correctness topology for a model family."""
+    if is_moe:
+        composition = (
+            CP_MOE_COMPOSITION_TOPOLOGY
+            if cp_supported
+            else NO_CP_MOE_COMPOSITION_TOPOLOGY
+        )
+    else:
+        composition = DENSE_COMPOSITION_TOPOLOGY
+    return [oracle_topology(is_moe=is_moe), composition]
 
 
 def stable_case_id(case_config: OracleCaseConfig) -> str:

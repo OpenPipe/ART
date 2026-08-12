@@ -274,7 +274,14 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             "time/step_train_s": 1.5,
             "time/step_wall_s": 2.0,
             "time/step_collect_batch_s": 0.001068115234375,
-            "queue/packed_get_wait_s": 0.1,
+            "queue/packed_get_wait_s": 0.1 if step == 19 else 0.001,
+            "queue/packed_queue_depth": 0.0 if step == 18 else 1.0,
+            "time/inter_forward_backward_gap_rank_0_s": (
+                1.0 if step >= 18 else 0.1 + (step - 14) * 0.01
+            ),
+            "time/inter_forward_backward_gap_rank_1_s": (
+                2.0 if step >= 18 else 0.11 + (step - 14) * 0.01
+            ),
             "offpolicy/token_weighted_policy_age_steps": 1.0,
             "offpolicy/token_weighted_policy_age_p95_steps": 2.0,
             "sample_efficiency/freshness_discount": 0.8,
@@ -424,6 +431,15 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "e2e_core_train_tok_s": 6_000 / 9.0,
         "e2e_train_tok_s": 500.0,
         "accepted_train_tok_s": 250.0,
+        "queue_ready_inter_forward_backward_gap_rank_zero_p50_s": 0.115,
+        "queue_ready_inter_forward_backward_gap_rank_zero_p95_s": 0.1285,
+        "queue_ready_inter_forward_backward_gap_rank_zero_max_s": 0.13,
+        "queue_ready_inter_forward_backward_gap_rank_zero_count": 4,
+        "queue_ready_inter_forward_backward_gap_worst_rank": 1,
+        "queue_ready_inter_forward_backward_gap_worst_rank_p50_s": 0.125,
+        "queue_ready_inter_forward_backward_gap_worst_rank_p95_s": 0.1385,
+        "queue_ready_inter_forward_backward_gap_worst_rank_max_s": 0.14,
+        "queue_ready_inter_forward_backward_gap_worst_rank_count": 4,
         "mean_train_gap_s": 0.5,
         "stable_vllm_pressure": 0.6,
         "stable_trainer_underfeed": 0.07,
@@ -454,6 +470,27 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     assert acceptance_failures(measurements, config, thresholds) == [
         "repeated_policy_activation_cadence_s"
     ]
+    robust = {
+        **measurements,
+        "queue_ready_inter_forward_backward_gap_worst_rank_max_s": 0.5,
+    }
+    assert "queue_ready_inter_forward_backward_gap_p95_s" not in acceptance_failures(
+        robust, config, thresholds
+    )
+    sparse = {
+        **measurements,
+        "queue_ready_inter_forward_backward_gap_worst_rank_count": 3,
+    }
+    assert "queue_ready_inter_forward_backward_gap_count" in acceptance_failures(
+        sparse, config, thresholds
+    )
+    with pytest.raises(ValueError):
+        ThroughputThresholds.model_validate(
+            {
+                **thresholds.model_dump(),
+                "max_queue_ready_inter_forward_backward_gap_p95_s": 0.201,
+            }
+        )
     assert acceptance_failures(
         {
             **measurements,

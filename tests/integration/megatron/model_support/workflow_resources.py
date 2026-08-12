@@ -31,6 +31,10 @@ class ThroughputThresholds(BaseModel):
     max_repeated_policy_activation_interval_s: float = Field(
         gt=0.0, allow_inf_nan=False
     )
+    max_queue_ready_inter_forward_backward_gap_p95_s: float = Field(
+        default=0.2, gt=0.0, le=0.2, allow_inf_nan=False
+    )
+    min_queue_ready_inter_forward_backward_gap_count: int = Field(default=4, ge=2)
 
     @model_validator(mode="after")
     def validate_calibration_identity(self) -> "ThroughputThresholds":
@@ -62,6 +66,9 @@ class ThroughputWorkflowConfig(BaseModel):
     packed_sequence_length: Literal[131072] = THROUGHPUT_PACKED_SEQUENCE_LENGTH
     min_vllm_pressure: float = Field(default=0.5, ge=0.0, allow_inf_nan=False)
     max_trainer_underfeed: float = Field(default=0.08, ge=0.0, allow_inf_nan=False)
+    max_queue_ready_wait_s: float = Field(
+        default=0.01, ge=0.0, le=0.2, allow_inf_nan=False
+    )
     random_initialization_version: Literal["deterministic_random_v1"] = (
         THROUGHPUT_RANDOM_INITIALIZATION_VERSION
     )

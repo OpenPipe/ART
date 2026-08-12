@@ -10,14 +10,15 @@ from . import oracle_harness
 from .forward_trace import ForwardTraceCapture, _extract_router_topk
 from .oracle_harness import (
     CP_ATTENTION_SENSITIVITY_MUTATIONS,
+    CP_MOE_COMPOSITION_TOPOLOGY,
+    DENSE_COMPOSITION_TOPOLOGY,
     DENSE_CP_ATTENTION_SENSITIVITY_TOPOLOGY,
     DENSE_DP_SENSITIVITY_TOPOLOGY,
-    DENSE_ORACLE_TOPOLOGY,
     DENSE_TOPOLOGIES,
     FORWARD_EXPERT_LORA_TRACE_NOISE_REASON,
     FORWARD_EXPERT_LORA_TRACE_NOISE_RELATIVE_L2_LIMIT,
+    NO_CP_MOE_COMPOSITION_TOPOLOGY,
     ORACLE_DEFAULT_MEAN_ABS_PCT_LIMIT,
-    ORACLE_TOPOLOGY,
     ROUTER_SCORE_MEAN_ABS_PCT_LIMIT,
     TEST_DEFAULT_FLEX_BACKEND,
     TOPOLOGIES,
@@ -33,6 +34,7 @@ from .oracle_harness import (
     _suite_variants,
     case_config,
     selected_sensitivity_mutations_for_objective,
+    selected_suite_topologies,
     sensitivity_topology_for_mutation,
 )
 from .oracle_worker import _matches_grad_sync_skip_mutation, _reset_optimizer_state
@@ -1345,38 +1347,109 @@ def test_forward_expert_lora_noise_pass_rejects_broad_escape_hatches() -> None:
 def test_suite_variants_skip_duplicate_oracle_replay_variant() -> None:
     variants = _suite_variants("rl")
 
-    assert variants
-    assert all(variant.topology != ORACLE_TOPOLOGY for variant in variants)
+    assert [variant.topology for variant in variants] == [CP_MOE_COMPOSITION_TOPOLOGY]
     assert all("oracle_replay" not in variant.name for variant in variants)
 
 
-def test_dense_suite_variants_preserve_dense_and_cp_topologies() -> None:
+def test_dense_suite_variants_use_composed_topology() -> None:
     variants = _suite_variants("rl", is_moe=False)
 
-    assert variants
-    assert all(variant.topology != DENSE_ORACLE_TOPOLOGY for variant in variants)
-    assert any(
-        variant.topology.tp == 2
-        and variant.topology.dp == 2
-        and variant.topology.cp == 1
-        for variant in variants
-    )
-    assert any(
-        variant.topology.tp == 2
-        and variant.topology.dp == 2
-        and variant.topology.cp == 2
-        for variant in variants
-    )
+    assert [variant.topology for variant in variants] == [DENSE_COMPOSITION_TOPOLOGY]
 
 
 def test_max_world_size_arg_filters_dense_variants() -> None:
-    variants = _suite_variants("rl", is_moe=False, max_world_size=2)
+    assert _suite_variants("rl", is_moe=False, max_world_size=2) == []
+    assert len(_suite_variants("rl", is_moe=False, max_world_size=8)) == 1
 
-    assert variants
-    assert all(variant.topology.world_size() <= 2 for variant in variants)
-    assert not any(
-        variant.topology.tp == 2 and variant.topology.dp == 2 for variant in variants
+
+@pytest.mark.parametrize(
+    ("is_moe", "cp_supported", "composition"),
+    [
+        (
+            True,
+            True,
+            Topology(tp=2, ep=2, etp=2, dp=1, cp=2, pp=2, vpp=2, sp=True),
+        ),
+        (
+            False,
+            True,
+            Topology(tp=2, ep=1, etp=1, dp=1, cp=2, pp=2, vpp=2, sp=True),
+        ),
+        (
+            True,
+            False,
+            Topology(tp=2, ep=2, etp=2, dp=2, cp=1, pp=2, vpp=2, sp=True),
+        ),
+    ],
+)
+def test_normal_suite_selects_oracle_plus_one_legal_composition(
+    is_moe: bool,
+    cp_supported: bool,
+    composition: Topology,
+) -> None:
+    topologies = selected_suite_topologies(
+        is_moe=is_moe,
+        cp_supported=cp_supported,
     )
+
+    assert topologies == [oracle_harness.oracle_topology(is_moe=is_moe), composition]
+    assert [topology.world_size() for topology in topologies] == [1, 8]
+
+
+def test_paired_objectives_reuse_composition_worker_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runs: list[tuple[str | None, list[VariantSpec]]] = []
+
+    class Runner:
+        def __init__(self, **kwargs: object) -> None:
+            paired_objective = kwargs.get("paired_objective")
+            assert paired_objective is None or isinstance(paired_objective, str)
+            self.paired_objective = paired_objective
+            self._oracle_initialized = False
+            self._oracle_regenerated = False
+
+        def run_suite(
+            self, variants: list[VariantSpec], **_kwargs: object
+        ) -> list[Any]:
+            runs.append((self.paired_objective, variants))
+            return []
+
+    monkeypatch.setattr(oracle_harness, "VariantRunner", Runner)
+    monkeypatch.setattr(
+        oracle_harness,
+        "_prune_completed_runners",
+        lambda *_args, **_kwargs: None,
+    )
+
+    oracle_harness._run_paired_objective_suite(
+        objectives=["rl", "sft"],
+        case_config=oracle_harness.OracleCaseConfig(
+            base_model="Qwen/Qwen3.5-35B-A3B",
+            model_support_key="qwen3_5_moe",
+        ),
+        max_world_size=None,
+        oracle_flex_backend=None,
+        variant_flex_backend=None,
+        cp_supported=True,
+        phase_pass_fns=None,
+        use_fp32_lora_reference=True,
+        prune_reference_artifacts=True,
+        prune_case_artifacts=True,
+    )
+
+    assert [
+        (paired, [variant.objective for variant in variants])
+        for paired, variants in runs
+    ] == [
+        ("sft", ["rl"]),
+        (None, ["sft"]),
+    ]
+    assert [[variant.topology for variant in variants] for _, variants in runs] == [
+        [CP_MOE_COMPOSITION_TOPOLOGY],
+        [CP_MOE_COMPOSITION_TOPOLOGY],
+    ]
+    assert not runs[1][1][0].force_regenerate
 
 
 def test_oracle_topologies_are_the_compact_cp_validation_matrix() -> None:
