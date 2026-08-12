@@ -25,6 +25,11 @@ from art.megatron.prefix_tree import parse_prefix_tree_row
 from art.megatron.prefix_tree_state import create_prefix_tree_state
 
 from ..artifacts import GitRepoState, pinned_git_state
+from .base_megatron_session import (
+    BaseMegatronResetReport,
+    BaseMegatronSessionKey,
+    active_base_megatron_session,
+)
 from .fp32_grouped_gemm import (
     allow_fp32_grouped_gemm_fallback_for_model_support_tests,
 )
@@ -175,6 +180,8 @@ class PackingInvarianceReport(BaseModel):
     output_dir: str
     num_layers: int
     precision: str
+    base_megatron_session_reused: bool = False
+    base_megatron_reset: BaseMegatronResetReport | None = None
     scenarios: list[PackingInvarianceScenario] = Field(default_factory=list)
 
 
@@ -690,6 +697,8 @@ def _run_packing_invariance_worker(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     runtime: megatron_train.TrainingRuntime | None = None
+    session = active_base_megatron_session()
+    reused_runtime = session is not None
     flex_patch_stack = ExitStack()
     flex_patch_stack.enter_context(
         _apply_requested_flex_backend_patch(TEST_DEFAULT_FLEX_BACKEND)
@@ -702,23 +711,38 @@ def _run_packing_invariance_worker(
             _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
         )
     try:
-        with provider_topology_env(ORACLE_TOPOLOGY):
-            runtime = _time_block(
-                "build_training_runtime",
-                lambda: megatron_train.build_training_runtime(
-                    model_identifier=base_model,
-                    provider_torch_dtype=_dtype_for_precision(precision),
-                    provider_configure=lambda provider: _configure_provider(
-                        provider,
-                        ORACLE_TOPOLOGY,
-                        case_config,
-                    ),
-                    print_env=False,
-                    build_optimizer=False,
-                    trainable_parameter_mode="base_model",
+        if session is not None:
+            runtime = session.reset_for_packing(
+                key=BaseMegatronSessionKey(
+                    base_model=base_model,
+                    model_key=spec.key,
+                    num_layers=num_layers,
+                    precision=precision,
                     allow_unvalidated_arch=allow_unvalidated_arch,
-                ),
+                )
             )
+            report.base_megatron_session_reused = True
+            report.base_megatron_reset = session.reset_report
+        else:
+            with provider_topology_env(ORACLE_TOPOLOGY):
+                runtime = _time_block(
+                    "build_training_runtime",
+                    lambda: megatron_train.build_training_runtime(
+                        model_identifier=base_model,
+                        provider_torch_dtype=_dtype_for_precision(precision),
+                        provider_configure=lambda provider: _configure_provider(
+                            provider,
+                            ORACLE_TOPOLOGY,
+                            case_config,
+                        ),
+                        print_env=False,
+                        build_optimizer=False,
+                        trainable_parameter_mode="base_model",
+                        allow_unvalidated_arch=allow_unvalidated_arch,
+                    ),
+                )
+        if runtime is None:
+            raise RuntimeError("packing invariance did not acquire a Megatron runtime")
         model_chunks = cast(list[Any], runtime.model)
         gpt_module = _locate_gpt_module(model_chunks)
         for chunk in model_chunks:
@@ -843,9 +867,10 @@ def _run_packing_invariance_worker(
         _debug_log("run complete; model deleted and cuda cache emptied")
     finally:
         flex_patch_stack.close()
-        del runtime
-        torch.cuda.empty_cache()
-        _cleanup_distributed_state()
+        if not reused_runtime:
+            del runtime
+            torch.cuda.empty_cache()
+            _cleanup_distributed_state()
 
     (output_dir / PACKING_INVARIANCE_REPORT_FILENAME).write_text(
         report.model_dump_json(indent=2),

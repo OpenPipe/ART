@@ -32,6 +32,10 @@ from art.megatron.training.trace import prepare_replay_local_input_token_uids
 from art.megatron.weights.merged_weight_export import build_art_conversion_tasks
 from art.preprocessing.pack import packed_tensors_from_dir
 
+from .base_megatron_session import (
+    BaseMegatronSessionKey,
+    active_base_megatron_session,
+)
 from .fp32_grouped_gemm import (
     allow_fp32_grouped_gemm_fallback_for_model_support_tests,
 )
@@ -1517,6 +1521,18 @@ def _run_megatron_sft_step(
         )
     _debug("initializing Megatron optimizer state")
     megatron_train._eager_initialize_optimizer_state(runtime.optimizer)
+    session = active_base_megatron_session()
+    if session is not None:
+        session.capture_runtime(
+            runtime,
+            key=BaseMegatronSessionKey(
+                base_model=request.case_config.base_model,
+                model_key=runtime.model_support_spec.key,
+                num_layers=request.case_config.num_layers,
+                precision=request.case_config.precision,
+                allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
+            ),
+        )
     _debug(f"built {len(tasks)} Megatron conversion tasks")
     for chunk in runtime.model:
         if hasattr(chunk, "zero_grad_buffer"):
@@ -1793,7 +1809,11 @@ def _worker_run(request: HfParityRunRequest) -> None:
         _debug("wrote HF parity report")
     finally:
         flex_patch_stack.close()
-        if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        session = active_base_megatron_session()
+        if (
+            (session is None or session.runtime is None)
+            and torch.distributed.is_initialized()  # ty: ignore[possibly-missing-attribute]
+        ):
             torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]
 
 
