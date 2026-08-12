@@ -45,7 +45,7 @@ jobs:
           git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
             || git fetch --no-tags origin "${BASE_SHA}"
 
-          pattern='^src/art/megatron/(_hybrid_ep/|hybrid_ep_setup\.py|setup\.sh|prefix_tree(_packing|_state)?\.py|context_parallel/|flex_attn/|gdn/|lora\.py|megatron_patches\.py|training/(finalize_grads|microbatches)\.py)'
+          pattern='^src/art/(trainer_rank/|megatron/(_hybrid_ep/|hybrid_ep_setup\.py|setup\.sh|prefix_tree(_packing|_state)?\.py|context_parallel/|flex_attn/|gdn/|lora\.py|megatron_patches\.py|training/(finalize_grads|microbatches)\.py))'
           changed="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")"
           critical="$(printf '%s\n' "${changed}" | grep -E "${pattern}" || true)"
           if [ -n "${critical}" ]; then
