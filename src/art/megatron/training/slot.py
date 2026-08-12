@@ -121,9 +121,14 @@ class MegatronTrainingSlot:
         registration = registration.model_copy(
             update={
                 "adapter_path": self._require_managed_path(registration.adapter_path),
-                "optimizer_state_path": (
-                    self._require_managed_path(registration.optimizer_state_path)
-                    if registration.optimizer_state_path is not None
+                "optimizer_state_path": self._require_managed_path(
+                    registration.optimizer_state_path
+                ),
+                "initial_optimizer_state_path": (
+                    self._require_managed_path(
+                        registration.initial_optimizer_state_path
+                    )
+                    if registration.initial_optimizer_state_path is not None
                     else None
                 ),
             }
@@ -242,10 +247,7 @@ class MegatronTrainingSlot:
             training_session_id=state.registration.training_session_id,
             expected_learner_version=ref.learner_parent_version,
             source=state.generation,
-            optimizer_state_path=(
-                state.registration.optimizer_state_path
-                or str(Path(state.output_dir) / "optimizer_states")
-            ),
+            optimizer_state_path=state.registration.optimizer_state_path,
             batch=prepared.packed.leases.ref,
             config=prepared.config,
             experimental_config=prepared.experimental_config,
@@ -284,10 +286,7 @@ class MegatronTrainingSlot:
             training_session_id=state.registration.training_session_id,
             expected_learner_version=ref.learner_parent_version,
             source=state.generation,
-            optimizer_state_path=(
-                state.registration.optimizer_state_path
-                or str(Path(state.output_dir) / "optimizer_states")
-            ),
+            optimizer_state_path=state.registration.optimizer_state_path,
             batch=prepared.packed.leases.ref,
             config=prepared.config,
             experimental_config=prepared.experimental_config,
@@ -468,9 +467,7 @@ class MegatronTrainingSlot:
             return cast(SaveStateResult, cached)
         adapter, metrics = await self._snapshot(ref, save_optimizer=True)
         state = self._require_run(ref.run_id)
-        optimizer_state_path = state.registration.optimizer_state_path or str(
-            Path(state.output_dir) / "optimizer_states"
-        )
+        optimizer_state_path = state.registration.optimizer_state_path
         result = SaveStateResult(
             operation_id=ref.operation_id,
             checkpoint=checkpoint_ref(
@@ -493,9 +490,7 @@ class MegatronTrainingSlot:
         existing = read_adapter_publication(
             generation.adapter_path, step=generation.policy_step
         )
-        optimizer_state_path = state.registration.optimizer_state_path or str(
-            Path(state.output_dir) / "optimizer_states"
-        )
+        optimizer_state_path = state.registration.optimizer_state_path
         staging = (
             None
             if existing is not None

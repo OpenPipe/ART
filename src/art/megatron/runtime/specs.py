@@ -88,7 +88,8 @@ class RunSlotRegistration(_Spec):
     training_session_id: str = Field(min_length=1)
     learner_version: int = Field(ge=0)
     adapter_path: str = Field(min_length=1)
-    optimizer_state_path: str | None = Field(default=None, min_length=1)
+    optimizer_state_path: str = Field(min_length=1)
+    initial_optimizer_state_path: str | None = Field(default=None, min_length=1)
 
 
 class CurrentTrainConfig(TrainConfig):

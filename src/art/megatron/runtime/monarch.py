@@ -553,14 +553,14 @@ class MonarchTrainerActor(Actor):
             learner_version=registration.learner_version,
             adapter_path=registration.adapter_path,
         )
-        if registration.optimizer_state_path is not None:
+        if registration.initial_optimizer_state_path is not None:
             from art.megatron.optimizer_state import (
                 load_trainer_rank_optimizer_state,
             )
 
             optimizer_state = load_trainer_rank_optimizer_state(
                 self._runtime,
-                optimizer_state_path=registration.optimizer_state_path,
+                optimizer_state_path=registration.initial_optimizer_state_path,
                 adapter_path=registration.adapter_path,
                 adapter_step=registration.learner_version,
                 layout=self._run_slot_executor.optimizer_layout(registration.run_id),
