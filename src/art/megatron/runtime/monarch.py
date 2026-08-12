@@ -34,6 +34,7 @@ from .specs import (
     TRAIN_EVENT_ADAPTER,
     AdapterReady,
     ForwardBackwardJobSpec,
+    GenerationSnapshotJobSpec,
     HybridEpRuntimeSpec,
     OptimizerJobSpec,
     SFTJobSpec,
@@ -477,11 +478,7 @@ class MonarchTrainerActor(Actor):
             job = OptimizerJobSpec.model_validate_json(job_json)
             if not self._command_job_open:
                 raise RuntimeError("optimizer has no resident F/B command interval")
-            try:
-                result = self._executor.execute_optimizer(job)
-            finally:
-                self._weight_offload.after_job()
-                self._command_job_open = False
+            result = self._executor.execute_optimizer(job)
             coordinator = self._runtime.rank == 0
             return {
                 "rank": self._runtime.rank,
@@ -494,6 +491,43 @@ class MonarchTrainerActor(Actor):
             }
         except BaseException:
             self._valid = False
+            raise
+
+    @endpoint
+    def execute_snapshot(
+        self,
+        job_json: str,
+        event_port: Port[dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = GenerationSnapshotJobSpec.model_validate_json(job_json)
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            coordinator = self._runtime.rank == 0
+            result = self._executor.execute_snapshot(
+                job,
+                _ActorEventSink(event_port, coordinator=coordinator),
+            )
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.learner_version,
+                "metrics": result["metrics"] if coordinator else {},
+            }
+        except BaseException as error:
+            self._valid = False
+            event_port.send(
+                {
+                    "kind": "rank_failed",
+                    "rank": self._runtime.rank,
+                    "error_type": type(error).__name__,
+                    "message": str(error),
+                    "traceback": traceback.format_exc(),
+                }
+            )
             raise
 
     @endpoint
@@ -836,8 +870,73 @@ class MonarchTrainerRun:
                 self._active_job_id = None
                 self._active_collective = None
 
+    async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
+        cached = self._operations.get(job.operation_id)
+        if cached is not None and cached[0] == job.fingerprint:
+            return cached[1]
+        async with self._lock:
+            cached = self._operations.get(job.operation_id)
+            if cached is not None:
+                if cached[0] != job.fingerprint:
+                    raise RuntimeError("operation_id was reused for another snapshot")
+                return cached[1]
+            self._validate_operation(job)
+            return await self._run_snapshot(job)
+
+    async def _run_snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
+        generation_id = job.generation.generation_id
+        if generation_id in self._publications:
+            raise RuntimeError(
+                f"publication generation already exists: {generation_id}"
+            )
+        self._expire_prior_publications()
+        publication = asyncio.get_running_loop().create_future()
+        publication.add_done_callback(_consume_future)
+        state = _PublicationState(generation_id, publication)
+        self._publications[generation_id] = state
+        send_port, receiver = Channel[dict[str, Any]].open()
+        collective = asyncio.ensure_future(
+            self._actors.execute_snapshot.call(job.model_dump_json(), send_port)
+        )
+        self._active_job_id = job.operation_id
+        self._active_collective = collective
+        try:
+            values = await asyncio.wait_for(
+                collective,
+                timeout=self.run_spec.event_timeout_s,
+            )
+            results = list(values.values())
+            self._validate_rank_command_results(
+                results,
+                operation_id=job.operation_id,
+                learner_version=job.learner_version,
+            )
+            result = next(result for result in results if result["rank"] == 0)
+            state.train_done = True
+            state.drain_done = False
+            drain = asyncio.create_task(self._drain_publication(receiver, state))
+            self._publication_drains.add(drain)
+            drain.add_done_callback(self._publication_drains.discard)
+            drain.add_done_callback(_consume_future)
+            self._next_operation_sequence += 1
+            self._operations[job.operation_id] = (job.fingerprint, result)
+            return result
+        except BaseException as error:
+            if not publication.done():
+                publication.set_exception(error)
+            state.records.clear()
+            state.train_done = True
+            await self._invalidate_command(error, "snapshot and cleanup failed")
+            raise
+        finally:
+            if self._active_job_id == job.operation_id:
+                self._active_job_id = None
+                self._active_collective = None
+            self._retire_publication(state)
+
     def _validate_operation(
-        self, job: ForwardBackwardJobSpec | OptimizerJobSpec
+        self,
+        job: ForwardBackwardJobSpec | OptimizerJobSpec | GenerationSnapshotJobSpec,
     ) -> None:
         if self._closed or not self._valid:
             raise RuntimeError("trainer runtime is invalid")
@@ -854,10 +953,15 @@ class MonarchTrainerRun:
                 "trainer operation sequence must be gapless: "
                 f"expected={self._next_operation_sequence}, got={job.sequence_id}"
             )
-        if job.expected_learner_version != self._learner_version:
+        learner_parent = (
+            job.learner_version
+            if isinstance(job, GenerationSnapshotJobSpec)
+            else job.expected_learner_version
+        )
+        if learner_parent != self._learner_version:
             raise ValueError(
                 "operation learner parent mismatch: "
-                f"operation={job.expected_learner_version}, "
+                f"operation={learner_parent}, "
                 f"runtime={self._learner_version}"
             )
 

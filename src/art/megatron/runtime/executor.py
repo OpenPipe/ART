@@ -19,6 +19,7 @@ from .publication import (
 )
 from .specs import (
     ForwardBackwardJobSpec,
+    GenerationSnapshotJobSpec,
     OptimizerJobSpec,
     SFTJobSpec,
     TrainerGeneration,
@@ -182,6 +183,42 @@ class MegatronTrainJobExecutor:
                 "optimizer/num_zeros_in_grad": float(result.num_zeros_in_grad or 0),
                 "time/optimizer_step_s": time.perf_counter() - started,
             },
+        }
+
+    def execute_snapshot(
+        self,
+        job: GenerationSnapshotJobSpec,
+        sink: EventSink,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        self._publisher.raise_if_failed()
+        runtime = self.runtime
+        if (
+            runtime.resident_training_session_id != job.training_session_id
+            or runtime.resident_policy_step != job.learner_version
+            or runtime.adapter_export_dtypes is None
+            or runtime.adapter_export_config is None
+        ):
+            raise RuntimeError("resident trainer state does not match snapshot learner")
+        if job.save_optimizer and (
+            not runtime.optimizer_state_loaded or runtime.optimizer is None
+        ):
+            raise RuntimeError("snapshot requested non-resident optimizer state")
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.learner_version,
+            "metrics": self._publisher.submit(
+                generation=job.generation,
+                optimizer_state_path=job.optimizer_state_path,
+                staging_adapter_path=job.staging_adapter_path,
+                existing_adapter=job.existing_adapter,
+                publication_targets=job.publication_targets,
+                adapter_dtypes=runtime.adapter_export_dtypes,
+                adapter_config=runtime.adapter_export_config,
+                save_optimizer=job.save_optimizer,
+                sink=sink,
+            ),
         }
 
     def discard_open_gradients(self) -> None:
@@ -392,7 +429,8 @@ class _GenerationPublisher:
         *,
         generation: TrainerGeneration,
         optimizer_state_path: str,
-        staging_adapter_path: str,
+        staging_adapter_path: str | None,
+        existing_adapter: "OptimizerAdapter | None" = None,
         publication_targets: tuple[Any, ...],
         adapter_dtypes: dict[str, Any],
         adapter_config: dict[str, Any],
@@ -409,15 +447,19 @@ class _GenerationPublisher:
         optimizer_handoff: Future[Any] = Future()
         transport: Future[Future[TrainerRankPublication]] | None = None
         try:
-            lora = stage_vllm_lora_snapshot_from_model(
-                model=self.runtime.model,
-                adapter_dtypes=adapter_dtypes,
-                handler=self.runtime.model_support_handler,
-                adapter_config=adapter_config,
-                rank=self.runtime.rank,
-                world_size=self.runtime.world_size,
-                stager=self.stager,
-            )
+            lora = None
+            if existing_adapter is None:
+                if staging_adapter_path is None:
+                    raise RuntimeError("new adapter snapshot has no staging path")
+                lora = stage_vllm_lora_snapshot_from_model(
+                    model=self.runtime.model,
+                    adapter_dtypes=adapter_dtypes,
+                    handler=self.runtime.model_support_handler,
+                    adapter_config=adapter_config,
+                    rank=self.runtime.rank,
+                    world_size=self.runtime.world_size,
+                    stager=self.stager,
+                )
             lora_launch_s = time.perf_counter() - prepare_started
             lora_resolve_started = time.perf_counter()
             lora = None if lora is None else lora.resolve()
@@ -427,7 +469,7 @@ class _GenerationPublisher:
                 optimizer_state_path=optimizer_state_path,
                 staging_adapter_path=staging_adapter_path,
                 lora=lora,
-                adapter=None,
+                adapter=(existing_adapter if int(self.runtime.rank) == 0 else None),
                 optimizer=optimizer_handoff,
                 publication_targets=publication_targets,
             )

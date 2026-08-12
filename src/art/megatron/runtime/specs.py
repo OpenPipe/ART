@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 from art.distributed.adapter_transport import AdapterTransferTarget
 from art.distributed.data_plane import PackedBatchRef
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
+from art.megatron.optimizer_state import OptimizerAdapter
 from art.training.contracts import AdamConfig
 from art.types import TrainConfig, TrainSFTConfig
 
@@ -283,6 +284,64 @@ class OptimizerJobSpec(_Spec):
             self.contributing_forward_backward_operation_ids
         ):
             raise ValueError("optimizer contribution IDs must be unique")
+        return self
+
+    @property
+    def fingerprint(self) -> str:
+        return _fingerprint(self)
+
+
+class GenerationSnapshotJobSpec(_Spec):
+    """Stage one immutable learner generation, optionally with optimizer state."""
+
+    operation_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    sequence_id: int = Field(ge=0)
+    training_session_id: str = Field(min_length=1)
+    learner_version: int = Field(ge=0)
+    generation: TrainerGeneration
+    optimizer_state_path: str = Field(min_length=1)
+    staging_adapter_path: str | None = Field(default=None, min_length=1)
+    existing_adapter: OptimizerAdapter | None = None
+    publication_targets: tuple[AdapterTransferTarget, ...] = ()
+    save_optimizer: bool = False
+
+    @model_validator(mode="after")
+    def _validate_snapshot(self) -> "GenerationSnapshotJobSpec":
+        if (
+            self.generation.training_session_id != self.training_session_id
+            or self.generation.policy_step != self.learner_version
+        ):
+            raise ValueError("snapshot generation does not identify the learner")
+        creating_adapter = self.staging_adapter_path is not None
+        if creating_adapter == (self.existing_adapter is not None):
+            raise ValueError(
+                "snapshot requires exactly one new or existing adapter source"
+            )
+        if creating_adapter:
+            if self.staging_adapter_path == self.generation.adapter_path:
+                raise ValueError("final and staging adapter paths must differ")
+        else:
+            adapter = self.existing_adapter
+            assert adapter is not None
+            if (
+                adapter.training_session_id,
+                adapter.step,
+                adapter.generation_id,
+                adapter.identity,
+            ) != (
+                self.generation.training_session_id,
+                self.generation.policy_step,
+                self.generation.generation_id,
+                self.generation.adapter_path,
+            ):
+                raise ValueError("existing adapter does not match snapshot generation")
+            if not self.save_optimizer:
+                raise ValueError("existing-adapter snapshot must add optimizer state")
+            if self.publication_targets:
+                raise ValueError(
+                    "existing adapter cannot be transferred as a new snapshot"
+                )
         return self
 
     @property
