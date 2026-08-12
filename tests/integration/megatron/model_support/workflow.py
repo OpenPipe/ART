@@ -42,6 +42,9 @@ WORKFLOW_STAGE_DIR_ENV = "ART_MODEL_SUPPORT_WORKFLOW_STAGE_DIR"
 SKIP_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_SKIP_SENSITIVITY"
 INCLUDE_FLASH_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_INCLUDE_FLASH_SENSITIVITY"
 KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
+CORRECTNESS_ARTIFACT_ROOT_ENV = "ART_MODEL_SUPPORT_CORRECTNESS_ARTIFACT_ROOT"
+CORRECTNESS_PHASE_ENV = "ART_MODEL_SUPPORT_CORRECTNESS_PHASE"
+CORRECTNESS_REFERENCE_STAGE = "correctness_reference"
 WORKFLOW_ARTIFACT_SUITE_NAME = "Megatron model-support validation workflow"
 FLASH_SENSITIVITY_MUTATION = "attn_skip_flash_lse_normalize"
 _HANDLER_INAPPLICABLE_SENSITIVITY_MUTATIONS = {
@@ -281,7 +284,10 @@ def _oracle_case_config(
     target_modules: list[str],
     allow_unvalidated_arch: bool,
 ) -> Any:
-    oracle_harness.ARTIFACT_ROOT = _stage_artifact_dir()
+    artifact_root = os.environ.get(CORRECTNESS_ARTIFACT_ROOT_ENV)
+    oracle_harness.ARTIFACT_ROOT = (
+        Path(artifact_root) if artifact_root is not None else _stage_artifact_dir()
+    )
     num_layers = int(
         os.environ.get("ART_MODEL_SUPPORT_FUNCTIONAL_NUM_LAYERS", num_layers)
     )
@@ -672,7 +678,15 @@ def run_correctness_sensitivity_stage(
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
     stage_dir = _workflow_stage_dir()
-    correctness_log = stage_dir / "correctness.log"
+    phase = os.environ.get(CORRECTNESS_PHASE_ENV, "all")
+    if phase not in {"all", "reference", "variants"}:
+        raise ValueError(f"unsupported correctness phase: {phase}")
+    artifact_root = os.environ.get(CORRECTNESS_ARTIFACT_ROOT_ENV)
+    correctness_log = (
+        Path(artifact_root).parent / "reference.log"
+        if phase == "reference" and artifact_root is not None
+        else stage_dir / "correctness.log"
+    )
     sensitivity_log = stage_dir / "sensitivity.log"
     live_training_log = stage_dir / "live_training.log"
     oracle_harness = _import_integration_module(
@@ -700,9 +714,13 @@ def run_correctness_sensitivity_stage(
     oracle_world_size = oracle_harness.oracle_topology(
         is_moe=handler.is_moe
     ).world_size()
-    required_gpu_count = max(
-        oracle_world_size,
-        *(topology.world_size() for topology in suite_topologies),
+    required_gpu_count = (
+        oracle_world_size
+        if phase == "reference"
+        else max(
+            oracle_world_size,
+            *(topology.world_size() for topology in suite_topologies),
+        )
     )
     if available_gpu_count < required_gpu_count:
         raise RuntimeError(
@@ -729,6 +747,33 @@ def run_correctness_sensitivity_stage(
         target_modules=list(spec.default_target_modules),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
+    if phase == "reference":
+        live_training_log.write_text("", encoding="utf-8")
+        with _temporary_env(**{oracle_harness.ORACLE_OBJECTIVE_ENV: "all"}):
+            with _temporary_env(
+                **{ORACLE_LIVE_TRAINING_LOG_ENV: str(live_training_log)}
+            ):
+                with _redirect_output(correctness_log):
+                    oracle_harness.prepare_suite_references(
+                        case_config=case_config,
+                        use_fp32_lora_reference=correctness_use_fp32_lora_reference,
+                    )
+        return ValidationStageResult(
+            name=CORRECTNESS_REFERENCE_STAGE,
+            passed=True,
+            metrics={
+                "correctness_reference_log_path": str(correctness_log),
+                "live_training_log_path": str(live_training_log),
+                "requested_num_layers": case_config.num_layers,
+                "precision": correctness_precision,
+                "use_fp32_lora_reference": correctness_use_fp32_lora_reference,
+                "is_moe": handler.is_moe,
+                "available_gpu_count": available_gpu_count,
+                "required_gpu_count": required_gpu_count,
+            },
+            artifact_dir=case_artifacts.case_dir,
+        )
     mutations: list[str] = []
     inapplicable_sensitivity_mutations: list[str] = []
     default_excluded_sensitivity_mutations: list[str] = []
@@ -788,6 +833,7 @@ def run_correctness_sensitivity_stage(
                     cp_supported=cp_supported,
                     phase_pass_fns=correctness_phase_pass_fns,
                     use_fp32_lora_reference=correctness_use_fp32_lora_reference,
+                    require_existing_references=phase == "variants",
                     prune_reference_artifacts=skip_sensitivity or not mutations,
                     prune_case_artifacts=skip_sensitivity or not mutations,
                 )
@@ -815,12 +861,16 @@ def run_correctness_sensitivity_stage(
                         mutations=mutations,
                         max_world_size=max_world_size,
                     )
-    case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
     return ValidationStageResult(
         name="correctness_sensitivity",
         passed=True,
         metrics={
             "correctness_log_path": str(correctness_log),
+            "correctness_reference_log_path": (
+                str(Path(artifact_root).parent / "reference.log")
+                if phase == "variants" and artifact_root is not None
+                else None
+            ),
             "sensitivity_log_path": str(sensitivity_log),
             "live_training_log_path": str(live_training_log),
             "requested_num_layers": case_config.num_layers,

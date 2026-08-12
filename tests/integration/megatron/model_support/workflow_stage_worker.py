@@ -17,6 +17,7 @@ from art.utils.network import find_free_tcp_port
 from art.vllm_runtime import ManagedVllmRuntime, VllmRuntimeLaunchConfig
 
 from .workflow import (
+    CORRECTNESS_REFERENCE_STAGE,
     run_chat_template_rollout_stage,
     run_correctness_sensitivity_stage,
     run_e2e_throughput_stage,
@@ -42,6 +43,7 @@ _STAGE_RUNNERS = {
     "train_inf_mismatch": run_train_inf_mismatch_stage,
     "merged_vllm_serving": run_merged_vllm_serving_stage,
     "correctness_sensitivity": run_correctness_sensitivity_stage,
+    CORRECTNESS_REFERENCE_STAGE: run_correctness_sensitivity_stage,
     "chat_template_rollout": run_chat_template_rollout_stage,
     "packing_invariance": run_packing_invariance_stage,
     "length_trainability": run_length_trainability_stage,

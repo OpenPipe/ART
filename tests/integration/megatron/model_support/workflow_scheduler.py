@@ -23,6 +23,11 @@ from art.megatron.model_support.spec import ArchitectureReport
 from art.vllm_runtime import VllmRuntimeLaunchConfig
 
 from .validation_spec import ValidationReport, ValidationStageResult
+from .workflow import (
+    CORRECTNESS_ARTIFACT_ROOT_ENV,
+    CORRECTNESS_PHASE_ENV,
+    CORRECTNESS_REFERENCE_STAGE,
+)
 from .workflow_fixtures import (
     FIXTURE_PATH_ENV,
     WorkflowFixture,
@@ -64,7 +69,8 @@ _STAGE_DURATION_ESTIMATES_S = {
     "lora_coverage": 60.0,
     "train_inf_mismatch": 360.0,
     "merged_vllm_serving": 180.0,
-    "correctness_sensitivity": 600.0,
+    "correctness_sensitivity": 480.0,
+    CORRECTNESS_REFERENCE_STAGE: 120.0,
     "chat_template_rollout": 45.0,
     "packing_invariance": 90.0,
     "length_trainability": 360.0,
@@ -279,6 +285,8 @@ def _stage_gpu_count(
         return 0
     if stage_name in _LIGHTWEIGHT_GPU_STAGES:
         return 1
+    if stage_name == CORRECTNESS_REFERENCE_STAGE:
+        return 1
     if stage_name == "correctness_sensitivity":
         from .oracle_harness import selected_suite_topologies
 
@@ -395,7 +403,7 @@ def _stage_runtime_topology(
 ) -> WorkflowRuntimeTopology:
     if stage_name in _CPU_STAGES:
         return WorkflowRuntimeTopology()
-    if stage_name == "correctness_sensitivity":
+    if stage_name in {"correctness_sensitivity", CORRECTNESS_REFERENCE_STAGE}:
         from .oracle_harness import selected_suite_topologies
 
         handler = get_model_support_handler_for_spec(
@@ -410,6 +418,8 @@ def _stage_runtime_topology(
                 cp_supported=bool(handler.cp_supported),
             )
         )
+        if stage_name == CORRECTNESS_REFERENCE_STAGE:
+            variants = variants[:1]
         names = tuple(topology.slug() for topology in variants)
         return WorkflowRuntimeTopology(
             trainer_variants=tuple(
@@ -529,11 +539,20 @@ def _runtime_key(
     *,
     gpu_count: int,
 ) -> WorkflowRuntimeKey:
-    environment = prepared.fixture.environment(stage_name)
+    fixture_stage = (
+        "correctness_sensitivity"
+        if stage_name == CORRECTNESS_REFERENCE_STAGE
+        else stage_name
+    )
+    environment = prepared.fixture.environment(fixture_stage)
     if stage_name in _CPU_STAGES:
         kind = "cpu"
         mode = stage_name
-    elif stage_name in {"lora_coverage", "correctness_sensitivity"}:
+    elif stage_name in {
+        "lora_coverage",
+        "correctness_sensitivity",
+        CORRECTNESS_REFERENCE_STAGE,
+    }:
         kind = "megatron"
         mode = stage_name
     elif stage_name == "e2e_throughput":
@@ -902,6 +921,24 @@ def compile_prepared_workflows(
                     }
                 )
             dependencies: tuple[str, ...] = ()
+            if stage_name == "correctness_sensitivity":
+                reference_id = (
+                    f"{prepared.report.model_key}:{CORRECTNESS_REFERENCE_STAGE}"
+                )
+                operations.append(
+                    WorkflowOperation(
+                        id=reference_id,
+                        stage=CORRECTNESS_REFERENCE_STAGE,
+                        runtime=_runtime_key(
+                            prepared, CORRECTNESS_REFERENCE_STAGE, gpu_count=1
+                        ),
+                        resources=WorkflowResourceRequest(gpu_count=1),
+                        estimated_duration_s=_STAGE_DURATION_ESTIMATES_S[
+                            CORRECTNESS_REFERENCE_STAGE
+                        ],
+                    )
+                )
+                dependencies = (reference_id,)
             if shared is not None and stage_name == FUNCTIONAL_LORA_VLLM_STAGES[1]:
                 dependencies = (
                     f"{prepared.report.model_key}:{FUNCTIONAL_LORA_VLLM_STAGES[0]}",
@@ -984,8 +1021,25 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             prepared = by_model_key[operation.runtime.handler]
             stage_dir = prepared.run_dir / operation.stage
             stage_dir.mkdir(parents=True, exist_ok=False)
-            environment = prepared.fixture.environment(operation.stage)
+            fixture_stage = (
+                "correctness_sensitivity"
+                if operation.stage == CORRECTNESS_REFERENCE_STAGE
+                else operation.stage
+            )
+            environment = prepared.fixture.environment(fixture_stage)
             environment[workflow.WORKFLOW_RUN_DIR_ENV] = str(prepared.run_dir)
+            if operation.stage in {
+                CORRECTNESS_REFERENCE_STAGE,
+                "correctness_sensitivity",
+            }:
+                environment[CORRECTNESS_ARTIFACT_ROOT_ENV] = str(
+                    prepared.run_dir / ".correctness" / "artifacts"
+                )
+                environment[CORRECTNESS_PHASE_ENV] = (
+                    "reference"
+                    if operation.stage == CORRECTNESS_REFERENCE_STAGE
+                    else "variants"
+                )
             if prepared.include_sensitivity is not None:
                 environment[workflow.SKIP_SENSITIVITY_ENV] = (
                     "0" if prepared.include_sensitivity else "1"
@@ -1080,6 +1134,28 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             result.metrics["workflow_session_worker_s"] = worker_wall_s
             result.metrics["workflow_session_operation_count"] = len(session.operations)
             result.metrics.update(forkservers.metrics(execution_host))
+            if operation.stage == CORRECTNESS_REFERENCE_STAGE:
+                completed.append(operation.id)
+                continue
+            if operation.stage == "correctness_sensitivity":
+                reference_result = ValidationStageResult.model_validate_json(
+                    (
+                        prepared.run_dir
+                        / CORRECTNESS_REFERENCE_STAGE
+                        / "stage_result.json"
+                    ).read_text(encoding="utf-8")
+                )
+                reference_s = float(
+                    reference_result.metrics["workflow_stage_duration_s"]
+                )
+                composition_s = float(result.metrics["workflow_stage_duration_s"])
+                result.metrics.update(
+                    {
+                        "correctness_reference_duration_s": reference_s,
+                        "correctness_composition_duration_s": composition_s,
+                        "correctness_total_compute_s": reference_s + composition_s,
+                    }
+                )
             prepared.record_fixture_metric(result.metrics)
             if operation.stage in workflow._RUNTIME_CLEANUP_STAGES:
                 try:

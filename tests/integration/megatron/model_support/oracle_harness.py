@@ -1546,7 +1546,7 @@ class VariantRunner:
             raise RuntimeError("Persisted MoE routing capture metadata does not match")
         _prune_topology_artifacts(capture_dir)
 
-    def ensure_oracle(self) -> Path:
+    def ensure_oracle(self, *, require_existing: bool = False) -> Path:
         """Ensures routing capture and the canonical replay-backed oracle exist once."""
         regenerate = regenerate_requested()
         if self._oracle_initialized and (not regenerate or self._oracle_regenerated):
@@ -1584,6 +1584,8 @@ class VariantRunner:
             regenerate=True,
         )
         if self.case_config.is_moe and need_capture:
+            if require_existing:
+                raise RuntimeError(f"missing prepared oracle capture: {self.case_dir}")
             run_oracle_topology(
                 output_slug=f"{self.oracle_slug}__oracle_capture",
                 replay_bundle_dir=None,
@@ -1595,7 +1597,7 @@ class VariantRunner:
                     objective=objective,
                     bundle_dir=bundle_dir,
                 )
-        if not (self.case_config.is_moe and need_capture) and (
+        need_oracle = not (self.case_config.is_moe and need_capture) and (
             regenerate
             or not self.shared_init_path.exists()
             or any(
@@ -1603,7 +1605,10 @@ class VariantRunner:
                 or not _manifest_has_live_comparisons(oracle_dir)
                 for _, oracle_dir, _, _ in objective_artifacts
             )
-        ):
+        )
+        if require_existing and need_oracle:
+            raise RuntimeError(f"missing prepared oracle reference: {self.case_dir}")
+        if need_oracle:
             run_oracle_topology(
                 output_slug=self.oracle_slug,
                 replay_bundle_dir=(
@@ -2300,6 +2305,26 @@ def _prune_completed_runners(
             _prune_case_artifacts(case_dir)
 
 
+def prepare_suite_references(
+    *,
+    case_config: OracleCaseConfig,
+    oracle_flex_backend: FlexBackend | None = None,
+    use_fp32_lora_reference: bool = True,
+) -> None:
+    """Materializes the canonical references without running a candidate topology."""
+    objectives = selected_oracle_objectives()
+    paired = objectives == list(SUPPORTED_ORACLE_OBJECTIVES)
+    paired_objective = objectives[1] if paired else None
+    for objective in objectives[:1] if paired else objectives:
+        VariantRunner(
+            objective=objective,
+            case_config=case_config,
+            oracle_flex_backend=oracle_flex_backend,
+            use_fp32_lora_reference=use_fp32_lora_reference,
+            paired_objective=paired_objective,
+        ).ensure_oracle()
+
+
 def _run_paired_objective_suite(
     *,
     objectives: list[OracleObjective],
@@ -2310,6 +2335,7 @@ def _run_paired_objective_suite(
     cp_supported: bool,
     phase_pass_fns: dict[str, PhasePassFn] | None,
     use_fp32_lora_reference: bool,
+    require_existing_references: bool = False,
     prune_reference_artifacts: bool,
     prune_case_artifacts: bool,
 ) -> list[VariantReport]:
@@ -2341,6 +2367,8 @@ def _run_paired_objective_suite(
 
     rl_runner = runner(rl_objective, sft_objective)
     try:
+        if require_existing_references:
+            rl_runner.ensure_oracle(require_existing=True)
         reports = rl_runner.run_suite(
             variants(rl_objective),
             prune_reference_artifacts=False,
@@ -2380,6 +2408,7 @@ def run_suite(
     cp_supported: bool = True,
     phase_pass_fns: dict[str, PhasePassFn] | None = None,
     use_fp32_lora_reference: bool = True,
+    require_existing_references: bool = False,
     prune_reference_artifacts: bool = True,
     prune_case_artifacts: bool = True,
 ) -> list[VariantReport]:
@@ -2395,6 +2424,7 @@ def run_suite(
             cp_supported=cp_supported,
             phase_pass_fns=phase_pass_fns,
             use_fp32_lora_reference=use_fp32_lora_reference,
+            require_existing_references=require_existing_references,
             prune_reference_artifacts=prune_reference_artifacts,
             prune_case_artifacts=prune_case_artifacts,
         )
@@ -2410,6 +2440,8 @@ def run_suite(
                 use_fp32_lora_reference=use_fp32_lora_reference,
             )
             runners.append(runner)
+            if require_existing_references:
+                runner.ensure_oracle(require_existing=True)
             reports.extend(
                 runner.run_suite(
                     _suite_variants(
