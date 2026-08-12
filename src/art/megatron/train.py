@@ -201,6 +201,34 @@ class TrainStepResult(BaseModel):
     pipeline_metrics: dict[str, float] = Field(default_factory=dict)
 
 
+class MegatronOptimizerStepResult(BaseModel):
+    update_successful: bool
+    grad_norm: float
+    num_zeros_in_grad: int | None
+
+
+class RLForwardBackwardState(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    raw_loss_sum: torch.Tensor
+    probs_corr_total: torch.Tensor
+    kl_values: tuple[float, ...]
+    new_logprobs: tuple[torch.Tensor, ...]
+    token_count: torch.Tensor
+    micro_count: int = Field(ge=1)
+    schedule: MCoreScheduleAdapter[PreparedRLMicroInputs]
+    loss_diagnostics: LossOffPolicyDiagnosticsAccumulator
+
+
+class SFTForwardBackwardState(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    raw_loss_sum: torch.Tensor
+    prepared_micros: tuple[PreparedSFTMicroInputs, ...]
+    device: torch.device
+    schedule: MCoreScheduleAdapter[PreparedSFTMicroInputs]
+
+
 def print0(rank: int, *values: Any) -> None:
     if rank == 0:
         print(*values)
@@ -1165,6 +1193,28 @@ def _optimizer_step(
     return update_successful, grad_norm, num_zeros_in_grad
 
 
+def run_megatron_optimizer_step(
+    *,
+    optimizer: Any,
+    learning_rate: float,
+    model_support_handler: Any | None = None,
+    model_chunks: ModelChunks | None = None,
+    before_step: Callable[[], None] | None = None,
+) -> MegatronOptimizerStepResult:
+    update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
+        optimizer,
+        learning_rate,
+        model_support_handler=model_support_handler,
+        model_chunks=model_chunks,
+        before_step=before_step,
+    )
+    return MegatronOptimizerStepResult(
+        update_successful=update_successful,
+        grad_norm=grad_norm,
+        num_zeros_in_grad=num_zeros_in_grad,
+    )
+
+
 def _reduce_loss_sum(
     loss_sum: torch.Tensor,
     token_count: torch.Tensor,
@@ -1789,20 +1839,17 @@ def _snapshot_trainable_parameters(
     return snapshot
 
 
-def run_megatron_sft_step(
+def run_megatron_sft_forward_backward_step(
     *,
     model_chunks: ModelChunks,
     provider: Any,
     model_support_handler: Any,
-    optimizer: Any,
-    learning_rate: float,
     inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
     step_index: int,
     sample_index: int | list[int | None],
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     hybridep_token_counts: list[int] | None = None,
-    before_optimizer_step: Callable[[], None] | None = None,
-) -> TrainStepResult:
+) -> SFTForwardBackwardState:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
         raise ValueError("run_megatron_sft_step requires at least one trajectory")
@@ -1918,39 +1965,77 @@ def run_megatron_sft_step(
         ),
         torch.zeros([], device=device, dtype=torch.float32),
     )
-    update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
-        optimizer,
-        learning_rate,
-        model_support_handler=model_support_handler,
-        model_chunks=model_chunks,
-        before_step=before_optimizer_step,
+    return SFTForwardBackwardState(
+        raw_loss_sum=raw_loss_sum,
+        prepared_micros=tuple(prepared_micros),
+        device=device,
+        schedule=schedule,
     )
-    num_tokens = _local_trainable_sft_token_count_tensor(prepared_micros, device=device)
+
+
+def _finish_megatron_sft_step(
+    state: SFTForwardBackwardState,
+    optimizer_result: MegatronOptimizerStepResult,
+) -> TrainStepResult:
+    num_tokens = _local_trainable_sft_token_count_tensor(
+        state.prepared_micros, device=state.device
+    )
     reduced_loss = _reduce_loss_sum(
-        raw_loss_sum,
+        state.raw_loss_sum,
         num_tokens,
         group=ps.get_data_parallel_group(with_context_parallel=True),
     )
-
     return TrainStepResult(
         reduced_loss=reduced_loss,
         probs_corr=1.0,
         new_logprobs=None,
-        update_successful=update_successful,
-        grad_norm=grad_norm,
-        num_zeros_in_grad=num_zeros_in_grad,
-        workload=schedule.training_workload(),
-        pipeline_metrics=schedule.telemetry.metrics(),
+        update_successful=optimizer_result.update_successful,
+        grad_norm=optimizer_result.grad_norm,
+        num_zeros_in_grad=optimizer_result.num_zeros_in_grad,
+        workload=state.schedule.training_workload(),
+        pipeline_metrics=state.schedule.telemetry.metrics(),
     )
 
 
-def run_training_step(
+def run_megatron_sft_step(
     *,
     model_chunks: ModelChunks,
     provider: Any,
     model_support_handler: Any,
     optimizer: Any,
     learning_rate: float,
+    inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
+    step_index: int,
+    sample_index: int | list[int | None],
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+    hybridep_token_counts: list[int] | None = None,
+    before_optimizer_step: Callable[[], None] | None = None,
+) -> TrainStepResult:
+    state = run_megatron_sft_forward_backward_step(
+        model_chunks=model_chunks,
+        provider=provider,
+        model_support_handler=model_support_handler,
+        inputs=inputs,
+        step_index=step_index,
+        sample_index=sample_index,
+        moe_routing_replay_controller=moe_routing_replay_controller,
+        hybridep_token_counts=hybridep_token_counts,
+    )
+    optimizer_result = run_megatron_optimizer_step(
+        optimizer=optimizer,
+        learning_rate=learning_rate,
+        model_support_handler=model_support_handler,
+        model_chunks=model_chunks,
+        before_step=before_optimizer_step,
+    )
+    return _finish_megatron_sft_step(state, optimizer_result)
+
+
+def run_megatron_rl_forward_backward_step(
+    *,
+    model_chunks: ModelChunks,
+    provider: Any,
+    model_support_handler: Any,
     inputs: PackedTensors | list[PackedTensors],
     config: types.TrainConfig,
     experimental_config: dev.TrainConfig,
@@ -1962,8 +2047,7 @@ def run_training_step(
     next_step_first_micro: PackedTensors | None = None,
     next_step_first_ref_logprobs: torch.Tensor | None = None,
     hybridep_token_counts: list[int] | None = None,
-    before_optimizer_step: Callable[[], None] | None = None,
-) -> TrainStepResult:
+) -> RLForwardBackwardState:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
         raise ValueError("run_training_step requires at least one packed sequence")
@@ -2149,35 +2233,91 @@ def run_training_step(
         [prepared.loss_inputs for prepared in prepared_micros],
         device=device,
     )
-    update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
-        optimizer,
-        learning_rate,
+    return RLForwardBackwardState(
+        raw_loss_sum=raw_loss_sum,
+        probs_corr_total=probs_corr_total,
+        kl_values=tuple(kl_values),
+        new_logprobs=tuple(
+            cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results
+        ),
+        token_count=token_count,
+        micro_count=micro_count,
+        schedule=schedule,
+        loss_diagnostics=loss_diagnostics,
+    )
+
+
+def _finish_megatron_rl_step(
+    state: RLForwardBackwardState,
+    optimizer_result: MegatronOptimizerStepResult,
+) -> TrainStepResult:
+    reduced_loss = _reduce_loss_sum(
+        state.raw_loss_sum,
+        state.token_count,
+        group=ps.get_data_parallel_group(with_context_parallel=True),
+    )
+    return TrainStepResult(
+        reduced_loss=reduced_loss,
+        probs_corr=float((state.probs_corr_total / state.micro_count).item()),
+        kl_policy_ref=(
+            sum(state.kl_values) / len(state.kl_values) if state.kl_values else None
+        ),
+        new_logprobs=list(state.new_logprobs),
+        update_successful=optimizer_result.update_successful,
+        grad_norm=optimizer_result.grad_norm,
+        num_zeros_in_grad=optimizer_result.num_zeros_in_grad,
+        workload=state.schedule.training_workload(),
+        loss_metrics=state.loss_diagnostics.to_metrics(
+            group=ps.get_data_parallel_group(with_context_parallel=True),
+        ),
+        pipeline_metrics=state.schedule.telemetry.metrics(),
+    )
+
+
+def run_training_step(
+    *,
+    model_chunks: ModelChunks,
+    provider: Any,
+    model_support_handler: Any,
+    optimizer: Any,
+    learning_rate: float,
+    inputs: PackedTensors | list[PackedTensors],
+    config: types.TrainConfig,
+    experimental_config: dev.TrainConfig,
+    step_index: int,
+    sample_index: int | list[int | None],
+    ref_logprobs: torch.Tensor | list[torch.Tensor] | None = None,
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+    cp_lookahead_state: CpBatchLookaheadState | None = None,
+    next_step_first_micro: PackedTensors | None = None,
+    next_step_first_ref_logprobs: torch.Tensor | None = None,
+    hybridep_token_counts: list[int] | None = None,
+    before_optimizer_step: Callable[[], None] | None = None,
+) -> TrainStepResult:
+    state = run_megatron_rl_forward_backward_step(
+        model_chunks=model_chunks,
+        provider=provider,
+        model_support_handler=model_support_handler,
+        inputs=inputs,
+        config=config,
+        experimental_config=experimental_config,
+        step_index=step_index,
+        sample_index=sample_index,
+        ref_logprobs=ref_logprobs,
+        moe_routing_replay_controller=moe_routing_replay_controller,
+        cp_lookahead_state=cp_lookahead_state,
+        next_step_first_micro=next_step_first_micro,
+        next_step_first_ref_logprobs=next_step_first_ref_logprobs,
+        hybridep_token_counts=hybridep_token_counts,
+    )
+    optimizer_result = run_megatron_optimizer_step(
+        optimizer=optimizer,
+        learning_rate=learning_rate,
         model_support_handler=model_support_handler,
         model_chunks=model_chunks,
         before_step=before_optimizer_step,
     )
-    reduced_loss = _reduce_loss_sum(
-        raw_loss_sum,
-        token_count,
-        group=ps.get_data_parallel_group(with_context_parallel=True),
-    )
-
-    return TrainStepResult(
-        reduced_loss=reduced_loss,
-        probs_corr=float((probs_corr_total / micro_count).item()),
-        kl_policy_ref=(sum(kl_values) / len(kl_values) if kl_values else None),
-        new_logprobs=[
-            cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results
-        ],
-        update_successful=update_successful,
-        grad_norm=grad_norm,
-        num_zeros_in_grad=num_zeros_in_grad,
-        workload=schedule.training_workload(),
-        loss_metrics=loss_diagnostics.to_metrics(
-            group=ps.get_data_parallel_group(with_context_parallel=True),
-        ),
-        pipeline_metrics=schedule.telemetry.metrics(),
-    )
+    return _finish_megatron_rl_step(state, optimizer_result)
 
 
 def _close_merged_weight_transfer_group(
