@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 from pathlib import Path
 import sys
 import time
-from typing import Any, cast
+from typing import Any, Literal, cast
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -18,6 +19,7 @@ from art.megatron.optimizer_state import (
     optimizer_adapter,
     read_adapter_publication,
 )
+from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.publication import commit_trainer_publication
 from art.megatron.runtime.specs import (
     ExperimentalTrainConfig,
@@ -29,9 +31,12 @@ from art.megatron.runtime.specs import (
     ResolvedCheckpointState,
     RlForwardBackwardConfig,
     RunSlotRegistration,
+    SftForwardBackwardJobSpec,
+    SftForwardJobSpec,
     TrainerGeneration,
     TrainerRuntimeSpec,
 )
+from art.preprocessing.sft import SftBatchTokenizer
 from art.training.contracts import (
     Contract,
     ForwardBackwardRequest,
@@ -65,18 +70,26 @@ class PreparedForward(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     ref: OperationRef
-    packed: DistributedPackedBatch
     packing: PackingOutcome
-    config: RlForwardBackwardConfig
-    experimental_config: ExperimentalTrainConfig
+    kind: Literal["rl", "sft"]
 
     @property
     def token_cost(self) -> int:
         return self.packing.physical_tokens
 
 
-class PreparedForwardBackward(PreparedForward):
-    pass
+class PreparedRlForward(PreparedForward):
+    kind: Literal["rl"] = "rl"
+    packed: DistributedPackedBatch
+    config: RlForwardBackwardConfig
+    experimental_config: ExperimentalTrainConfig
+
+
+class PreparedSftForward(PreparedForward):
+    kind: Literal["sft"] = "sft"
+    batch: SFTBatchData
+    global_grad_accumulation_sequences: int = Field(ge=1)
+    tokenization_s: float = Field(ge=0)
 
 
 class _ResidentRun(BaseModel):
@@ -107,6 +120,7 @@ class MegatronTrainingSlot:
         self.artifact_root = str(Path(artifact_root).resolve())
         self._runs: dict[str, _ResidentRun] = {}
         self._results: dict[str, tuple[str, Contract]] = {}
+        self._sft_tokenizer = SftBatchTokenizer()
         self._closed = False
 
     async def register_run(
@@ -173,9 +187,8 @@ class MegatronTrainingSlot:
         self,
         ref: OperationRef,
         request: ForwardBackwardRequest,
-    ) -> PreparedForwardBackward:
-        prepared = await self._prepare_forward(ref, request)
-        return PreparedForwardBackward.model_validate(prepared.model_dump())
+    ) -> PreparedForward:
+        return await self._prepare_forward(ref, request)
 
     async def prepare_forward(
         self,
@@ -190,8 +203,54 @@ class MegatronTrainingSlot:
         request: ForwardRequest | ForwardBackwardRequest,
     ) -> PreparedForward:
         state = self._require_run(ref.run_id)
-        if request.batch.kind != "rl":
-            raise ValueError("Megatron forward requires an RL trajectory batch")
+        if request.batch.kind == "sft":
+            started = time.perf_counter()
+            tokenized = await asyncio.to_thread(
+                self._sft_tokenizer.tokenize,
+                state.model.build(),
+                request.batch.trajectories,
+                assistant_turns=request.batch.assistant_turns,
+            )
+            if tokenized.num_trainable_tokens < 1:
+                raise ValueError("supervised batch produced no trainable tokens")
+            batch = SFTBatchData(
+                trajectory_tensors=tuple(tokenized.trajectory_tensors),
+                learning_rate=tokenized.learning_rate,
+                num_trajectories=tokenized.num_trajectories,
+                num_tokens=tokenized.num_tokens,
+                num_trainable_tokens=tokenized.num_trainable_tokens,
+                num_dropped_trajectories=tokenized.num_dropped_trajectories,
+            )
+            topology = self.runtime_spec.trainer_mesh.topology
+            data_parallel_size = len(self.runtime_spec.trainer_mesh.ranks) // (
+                topology.tp * topology.cp * topology.pp
+            )
+            grad_sequences = (
+                math.ceil(batch.num_trajectories / data_parallel_size)
+                * data_parallel_size
+            )
+            max_length = max(
+                int(tensors["input_ids"].numel())
+                for tensors in batch.trajectory_tensors
+            )
+            return PreparedSftForward(
+                ref=ref,
+                batch=batch,
+                global_grad_accumulation_sequences=grad_sequences,
+                tokenization_s=time.perf_counter() - started,
+                packing=PackingOutcome(
+                    packed_sequence_length=max_length,
+                    packed_sequences=batch.num_trajectories,
+                    target_packed_sequences=batch.num_trajectories,
+                    nominal_capacity_tokens=batch.num_tokens,
+                    physical_tokens=batch.num_tokens,
+                    non_padding_tokens=batch.num_tokens,
+                    loss_bearing_tokens=batch.num_trainable_tokens,
+                    trainable_assistant_tokens=batch.num_trainable_tokens,
+                    policy_token_counts=None,
+                    group_shapes=(),
+                ),
+            )
         config = experimental_train_config(request)
         if (
             config.packed_sequence_length is not None
@@ -226,7 +285,7 @@ class MegatronTrainingSlot:
         )
         if packed is None:
             raise ValueError("trajectory batch produced no trainable packed sequence")
-        return PreparedForward(
+        return PreparedRlForward(
             ref=ref,
             packed=packed,
             packing=packing_outcome(packed),
@@ -235,11 +294,29 @@ class MegatronTrainingSlot:
         )
 
     async def discard_prepared(self, prepared: PreparedForward) -> None:
-        await self.runtime.release_batch(prepared.packed)
+        if isinstance(prepared, PreparedRlForward):
+            await self.runtime.release_batch(prepared.packed)
 
     async def forward(self, prepared: PreparedForward) -> ForwardResult:
         ref = prepared.ref
         state = self._require_parent(ref)
+        if isinstance(prepared, PreparedSftForward):
+            job = SftForwardJobSpec(
+                operation_id=ref.operation_id,
+                run_id=ref.run_id,
+                sequence_id=ref.sequence_id,
+                training_session_id=state.registration.training_session_id,
+                expected_learner_version=ref.learner_parent_version,
+                batch_fingerprint=prepared.batch.fingerprint,
+                trainable_token_count=prepared.batch.num_trainable_tokens,
+                global_grad_accumulation_sequences=(
+                    prepared.global_grad_accumulation_sequences
+                ),
+            )
+            raw = await self.trainer.sft_forward(job, prepared.batch)
+            return self._sft_forward_result(prepared, raw, backward=False)
+        if not isinstance(prepared, PreparedRlForward):
+            raise TypeError("unknown prepared forward payload")
         job = ForwardJobSpec(
             operation_id=ref.operation_id,
             run_id=ref.run_id,
@@ -275,10 +352,30 @@ class MegatronTrainingSlot:
         )
 
     async def forward_backward(
-        self, prepared: PreparedForwardBackward
+        self, prepared: PreparedForward
     ) -> ForwardBackwardResult:
         ref = prepared.ref
         state = self._require_parent(ref)
+        if isinstance(prepared, PreparedSftForward):
+            job = SftForwardBackwardJobSpec(
+                operation_id=ref.operation_id,
+                run_id=ref.run_id,
+                sequence_id=ref.sequence_id,
+                training_session_id=state.registration.training_session_id,
+                expected_learner_version=ref.learner_parent_version,
+                batch_fingerprint=prepared.batch.fingerprint,
+                trainable_token_count=prepared.batch.num_trainable_tokens,
+                global_grad_accumulation_sequences=(
+                    prepared.global_grad_accumulation_sequences
+                ),
+            )
+            raw = await self.trainer.sft_forward_backward(job, prepared.batch)
+            return cast(
+                ForwardBackwardResult,
+                self._sft_forward_result(prepared, raw, backward=True),
+            )
+        if not isinstance(prepared, PreparedRlForward):
+            raise TypeError("unknown prepared F/B payload")
         job = ForwardBackwardJobSpec(
             operation_id=ref.operation_id,
             run_id=ref.run_id,
@@ -311,6 +408,29 @@ class MegatronTrainingSlot:
                 LossFnOutput(token_logprobs=values) for values in raw["token_logprobs"]
             ),
             metrics={**packing_metrics(prepared.packed), **raw["metrics"]},
+        )
+
+    @staticmethod
+    def _sft_forward_result(
+        prepared: PreparedSftForward,
+        raw: dict[str, Any],
+        *,
+        backward: bool,
+    ) -> ForwardResult:
+        result = ForwardBackwardResult if backward else ForwardResult
+        return result(
+            operation_id=prepared.ref.operation_id,
+            packing=prepared.packing,
+            loss_fn_outputs=tuple(
+                LossFnOutput(token_logprobs=values) for values in raw["token_logprobs"]
+            ),
+            metrics={
+                "time/step_tokenize_trajectory_groups_s": prepared.tokenization_s,
+                "data/step_num_dropped_trajectories": float(
+                    prepared.batch.num_dropped_trajectories
+                ),
+                **raw["metrics"],
+            },
         )
 
     async def optim_step(

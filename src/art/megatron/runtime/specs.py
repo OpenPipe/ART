@@ -295,6 +295,27 @@ class ForwardJobSpec(ForwardBackwardJobSpec):
     """One forward-only command against a fixed learner parent."""
 
 
+class SftForwardBackwardJobSpec(_Spec):
+    """One supervised F/B contribution against a resident run learner."""
+
+    operation_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    sequence_id: int = Field(ge=0)
+    training_session_id: str = Field(min_length=1)
+    expected_learner_version: int = Field(ge=0)
+    batch_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    trainable_token_count: int = Field(ge=1)
+    global_grad_accumulation_sequences: int = Field(ge=1)
+
+    @property
+    def fingerprint(self) -> str:
+        return _fingerprint(self)
+
+
+class SftForwardJobSpec(SftForwardBackwardJobSpec):
+    """One supervised forward-only command against a resident run learner."""
+
+
 class LoadStateJobSpec(_Spec):
     """Replace one resident run learner at an ordered command barrier."""
 

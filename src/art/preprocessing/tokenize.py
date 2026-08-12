@@ -1119,7 +1119,7 @@ def tokenize_sft_batch(
             }
         )
         num_tokens += sum(attention_mask)
-        num_trainable_tokens += sum(1 for l in labels if l != -100)
+        num_trainable_tokens += sum(1 for label in labels[1:] if label != -100)
 
     if num_dropped_trajectories:
         print(

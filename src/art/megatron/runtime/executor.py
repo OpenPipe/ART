@@ -25,6 +25,8 @@ from .specs import (
     GenerationSnapshotJobSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
+    SftForwardBackwardJobSpec,
+    SftForwardJobSpec,
     SFTJobSpec,
     TrainerGeneration,
     TrainerJobSpec,
@@ -589,6 +591,49 @@ class MCoreRunSlotExecutor:
                 for values in result["token_logprobs"]
             ),
         }
+
+    def execute_sft_forward_backward(
+        self,
+        job: SftForwardBackwardJobSpec,
+        batch: SFTBatchData,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        state = self._require_run(job.run_id)
+        self._validate_parent(
+            state, job.training_session_id, job.expected_learner_version
+        )
+        from art.megatron.train import (
+            execute_megatron_dynamic_lora_sft_forward_backward_job,
+        )
+
+        return execute_megatron_dynamic_lora_sft_forward_backward_job(
+            self.runtime,
+            job,
+            batch,
+            slot_trainer=self._slot_trainer,
+            gradient_accumulator=state.gradients,
+            cancelled=cancelled,
+        )
+
+    def execute_sft_forward(
+        self,
+        job: SftForwardJobSpec,
+        batch: SFTBatchData,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        state = self._require_run(job.run_id)
+        self._validate_parent(
+            state, job.training_session_id, job.expected_learner_version
+        )
+        self._publisher.raise_if_failed()
+        from art.megatron.train import execute_megatron_dynamic_lora_sft_forward_job
+
+        return execute_megatron_dynamic_lora_sft_forward_job(
+            self.runtime,
+            job,
+            batch,
+            cancelled=cancelled,
+        )
 
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
         state = self._require_run(job.run_id)

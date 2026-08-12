@@ -1,6 +1,6 @@
 from .bootstrap import LocalMegatronTrainingSlot, LocalMegatronTrainingSlotConfig
 from .client import LocalMegatronTrainingClient, LocalTrainingOperation
-from .slot import MegatronTrainingSlot, PreparedForward, PreparedForwardBackward
+from .slot import MegatronTrainingSlot, PreparedForward
 
 __all__ = [
     "LocalMegatronTrainingClient",
@@ -9,5 +9,4 @@ __all__ = [
     "LocalTrainingOperation",
     "MegatronTrainingSlot",
     "PreparedForward",
-    "PreparedForwardBackward",
 ]

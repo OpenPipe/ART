@@ -40,6 +40,8 @@ from .specs import (
     LoadStateJobSpec,
     OptimizerJobSpec,
     RunSlotRegistration,
+    SftForwardBackwardJobSpec,
+    SftForwardJobSpec,
     SFTJobSpec,
     TrainAccepted,
     TrainCancelled,
@@ -647,6 +649,62 @@ class MonarchTrainerActor(Actor):
                 batch.close()
 
     @endpoint
+    def execute_run_slot_sft_forward_backward(
+        self,
+        job_json: str,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = SftForwardBackwardJobSpec.model_validate_json(job_json)
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            result = self._run_slot_executor.execute_sft_forward_backward(
+                job, batch, Event()
+            )
+            coordinator = self._runtime.rank == 0
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.expected_learner_version,
+                "token_count": result["token_count"],
+                "metrics": result["metrics"] if coordinator else {},
+                "token_logprobs": result["token_logprobs"] if coordinator else (),
+            }
+        except BaseException:
+            self._valid = False
+            raise
+
+    @endpoint
+    def execute_run_slot_sft_forward(
+        self,
+        job_json: str,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = SftForwardJobSpec.model_validate_json(job_json)
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            result = self._run_slot_executor.execute_sft_forward(job, batch, Event())
+            coordinator = self._runtime.rank == 0
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.expected_learner_version,
+                "token_count": result["token_count"],
+                "metrics": result["metrics"] if coordinator else {},
+                "token_logprobs": result["token_logprobs"] if coordinator else (),
+            }
+        except BaseException:
+            self._valid = False
+            raise
+
+    @endpoint
     def execute_run_slot_optimizer(self, job_json: str) -> dict[str, Any]:
         try:
             if not self._valid:
@@ -1084,6 +1142,84 @@ class MonarchTrainerSlot:
                 return result
             except BaseException as error:
                 await self._invalidate(error, "forward operation and cleanup failed")
+                raise
+
+    async def sft_forward_backward(
+        self,
+        job: SftForwardBackwardJobSpec,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        async with self._lock:
+            self._require_open()
+            cached = self._cached_operation(job.operation_id, job.fingerprint)
+            if cached is not None:
+                return cached
+            if batch.fingerprint != job.batch_fingerprint:
+                raise ValueError("SFT F/B payload fingerprint differs from its job")
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.execute_run_slot_sft_forward_backward.call(
+                        job.model_dump_json(), batch
+                    ),
+                    timeout=self._command_timeout_s,
+                )
+                results = list(values.values())
+                self._validate_command_results(
+                    results,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                )
+                if {result["token_count"] for result in results} != {
+                    job.trainable_token_count
+                }:
+                    raise RuntimeError(
+                        "trainer SFT F/B token count differs from its payload"
+                    )
+                result = next(result for result in results if result["rank"] == 0)
+                self._operations[job.operation_id] = (job.fingerprint, result)
+                return result
+            except BaseException as error:
+                await self._invalidate(error, "SFT F/B operation and cleanup failed")
+                raise
+
+    async def sft_forward(
+        self,
+        job: SftForwardJobSpec,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        async with self._lock:
+            self._require_open()
+            cached = self._cached_operation(job.operation_id, job.fingerprint)
+            if cached is not None:
+                return cached
+            if batch.fingerprint != job.batch_fingerprint:
+                raise ValueError("SFT forward payload fingerprint differs from its job")
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.execute_run_slot_sft_forward.call(
+                        job.model_dump_json(), batch
+                    ),
+                    timeout=self._command_timeout_s,
+                )
+                results = list(values.values())
+                self._validate_command_results(
+                    results,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                )
+                if {result["token_count"] for result in results} != {
+                    job.trainable_token_count
+                }:
+                    raise RuntimeError(
+                        "trainer SFT forward token count differs from its payload"
+                    )
+                result = next(result for result in results if result["rank"] == 0)
+                self._operations[job.operation_id] = (job.fingerprint, result)
+                return result
+            except BaseException as error:
+                await self._invalidate(
+                    error, "SFT forward operation and cleanup failed"
+                )
                 raise
 
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]:
