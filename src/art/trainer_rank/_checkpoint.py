@@ -12,6 +12,7 @@ import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import struct
+import threading
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 import uuid
 
@@ -681,8 +682,8 @@ def _rank_zero_phase(
 def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
     from art.megatron.model_support.lora_disk import save_adapter_config
 
-    metadata = [item for values in _gather(prepared.shards) for item in values]
-    group = trainer._checkpoint_process_group
+    group = _ensure_finalize_group(trainer)
+    metadata = [item for values in _gather(prepared.shards, group) for item in values]
     identities: set[tuple[str, int]] = set()
     selected: list[LoraShardMeta] = []
     for item in sorted(metadata, key=lambda value: value.metadata.owner_rank):
@@ -754,7 +755,7 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
                 error = exc
             raise_distributed(error, "read checkpoint optimizer steps", group)
             step_values: dict[str, set[float]] = {}
-            for values in _gather(local_steps):
+            for values in _gather(local_steps, group):
                 for key, value in values.items():
                     step_values.setdefault(key, set()).add(value)
             if mismatched := {
@@ -875,16 +876,17 @@ def _finalize_checkpoint_save(
     output_dir: str,
     action: Literal["finish", "abort"],
 ) -> None:
-    with trainer._checkpoint_save_condition:
-        local = trainer._prepared_checkpoint_saves.get(output_dir)
-        sequence = None if local is None else local.sequence
-    states = _gather((action, output_dir, sequence), trainer._checkpoint_process_group)
-    if any(value != states[0] for value in states):
-        raise RuntimeError("Checkpoint save actions differ across ranks")
-    prepared = _claim_finalization(trainer, output_dir, action)
-    if prepared is None:
-        return
+    group = _ensure_finalize_group(trainer)
     with trainer._checkpoint_finalize_lock:
+        with trainer._checkpoint_save_condition:
+            local = trainer._prepared_checkpoint_saves.get(output_dir)
+            sequence = None if local is None else local.sequence
+        states = _gather((action, output_dir, sequence), group)
+        if any(value != states[0] for value in states):
+            raise RuntimeError("Checkpoint save actions differ across ranks")
+        prepared = _claim_finalization(trainer, output_dir, action)
+        if prepared is None:
+            return
         error: BaseException | None = None
         outcome = trainer._checkpoint_save_outcomes.get(output_dir)
         if outcome is None and action == "finish":
@@ -903,18 +905,14 @@ def _finalize_checkpoint_save(
         if _rank() == 0:
             paths.append(prepared.reservation)
         cleanup = _cleanup_paths(paths)
-        cleanup_failed = any(
-            _gather(cleanup is not None, trainer._checkpoint_process_group)
-        )
+        cleanup_failed = any(_gather(cleanup is not None, group))
         if cleanup is not None:
             error = BaseExceptionGroup(
                 "checkpoint finalization cleanup failed",
                 [*([error] if error is not None else []), cleanup],
             )
         try:
-            raise_distributed(
-                error, f"{action} checkpoint", trainer._checkpoint_process_group
-            )
+            raise_distributed(error, f"{action} checkpoint", group)
         finally:
             with trainer._checkpoint_save_condition:
                 trainer._checkpoint_finalizing_saves.pop(output_dir, None)
@@ -1002,9 +1000,11 @@ def _commit_slot(trainer: TrainerRank, source: str, destination: str) -> None:
                 continue
             slot = module._slot_modules[source_key]
             setattr(slot, "ref", destination_ref)
-            module._slot_keys[destination_ref] = source_key
-            if destination_key is not None and destination_key != source_key:
-                del module._slot_modules[destination_key]
+            target_key = destination_key or source_key
+            module._slot_keys[destination_ref] = target_key
+            if target_key != source_key:
+                module._slot_modules[target_key] = slot
+                del module._slot_modules[source_key]
 
 
 def _optimizer_state(
@@ -1275,9 +1275,32 @@ def export_lora(trainer: TrainerRank, output_dir: str, checkpoint_name: str) -> 
     return slot.revision
 
 
-def _ensure_group(trainer: TrainerRank) -> dist.ProcessGroup | None:
+def _ensure_groups(
+    trainer: TrainerRank,
+) -> tuple[dist.ProcessGroup | None, dist.ProcessGroup | None]:
     if not hasattr(trainer, "_checkpoint_process_group"):
         trainer._checkpoint_process_group = None
-    if _distributed() and trainer._checkpoint_process_group is None:
-        trainer._checkpoint_process_group = dist.new_group(backend="gloo")
-    return trainer._checkpoint_process_group
+    if not hasattr(trainer, "_checkpoint_finalize_process_group"):
+        trainer._checkpoint_finalize_process_group = None
+    if not hasattr(trainer, "_checkpoint_group_lock"):
+        trainer._checkpoint_group_lock = threading.Lock()
+    if _distributed():
+        with trainer._checkpoint_group_lock:
+            if trainer._checkpoint_process_group is None:
+                trainer._checkpoint_process_group = dist.new_group(backend="gloo")
+            if trainer._checkpoint_finalize_process_group is None:
+                trainer._checkpoint_finalize_process_group = dist.new_group(
+                    backend="gloo"
+                )
+    return (
+        trainer._checkpoint_process_group,
+        trainer._checkpoint_finalize_process_group,
+    )
+
+
+def _ensure_group(trainer: TrainerRank) -> dist.ProcessGroup | None:
+    return _ensure_groups(trainer)[0]
+
+
+def _ensure_finalize_group(trainer: TrainerRank) -> dist.ProcessGroup | None:
+    return _ensure_groups(trainer)[1]

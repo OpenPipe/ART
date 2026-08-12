@@ -24,6 +24,7 @@ from art.trainer_rank import (  # noqa: E402
 from art.trainer_rank._checkpoint import (  # noqa: E402
     LocalOptimizerState,
     OptimizerConfig,
+    _commit_slot,
 )
 from art.trainer_rank._impl import (  # noqa: E402
     _CheckpointSlot,
@@ -105,6 +106,41 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
         )
         _assert_step_updates_only(ref_a, ref_b, lora, trainer)
         _assert_reload_replaces_slot_optimizer(ref_a, lora, trainer)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
+def test_checkpoint_reload_does_not_alias_the_next_slot() -> None:
+    with _single_rank_model_parallel():
+        device = torch.device("cuda")
+        first = LoRA("first", 4, 5, 2, 32, torch.float32, device)
+        second = LoRA("second", 4, 5, 2, 32, torch.float32, device)
+        trainer = _trainer_for(first, device)
+        trainer.runtime.model = [torch.nn.Sequential(first, second)]
+
+        def adapter(
+            seed: int, *, include_second: bool = True
+        ) -> dict[str, torch.Tensor]:
+            return _adapter("first", rank=2, seed=seed) | (
+                _adapter("second", rank=2, seed=seed + 10) if include_second else {}
+            )
+
+        def stage(destination: str, state: dict[str, torch.Tensor]) -> None:
+            temporary = f"temporary-{destination}"
+            trainer._load_checkpoint_slot(temporary, state, alpha=32.0)
+            _commit_slot(trainer, temporary, destination)
+
+        stage("A", adapter(1))
+        stage("B", adapter(2))
+        slot_b = second._slot(trainer._slot_ref("B"))
+        assert slot_b is not None
+        expected_b = slot_b.A_T.detach().clone()
+        stage("A", adapter(3, include_second=False))
+        stage("C", adapter(4))
+
+        slot_b = second._slot(trainer._slot_ref("B"))
+        slot_c = second._slot(trainer._slot_ref("C"))
+        assert slot_b is not None and slot_c is not None and slot_b is not slot_c
+        torch.testing.assert_close(slot_b.A_T, expected_b)
 
 
 @pytest.mark.parametrize("tp_size", (2, 4))

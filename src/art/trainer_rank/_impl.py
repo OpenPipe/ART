@@ -639,6 +639,8 @@ class TrainerRank:
         self._checkpoint_prefetches: dict[str, asyncio.Task[PreparedCheckpoint]] = {}
         self._checkpoint_mutation_tail: asyncio.Task[None] | None = None
         self._checkpoint_process_group: dist.ProcessGroup | None = None
+        self._checkpoint_finalize_process_group: dist.ProcessGroup | None = None
+        self._checkpoint_group_lock = threading.Lock()
         self._checkpoint_prepare_lock = threading.Lock()
         self._checkpoint_finalize_lock = threading.Lock()
         self._checkpoint_save_condition = threading.Condition()
@@ -1193,6 +1195,7 @@ class TrainerRank:
 
         ref = self._slot_ref(name)
         self._guard_slot_can_load(ref)
+        self._compact_lora_slot_keys()
         return load_lora_slot_into_model(
             self.runtime.model,
             ref,
@@ -1200,6 +1203,24 @@ class TrainerRank:
             alpha=alpha,
             requires_grad=True,
         )
+
+    def _compact_lora_slot_keys(self) -> None:
+        from art.megatron.lora import LoRA
+
+        for chunk in self.runtime.model:
+            for module in chunk.modules():
+                if not isinstance(module, LoRA):
+                    continue
+                slots = [
+                    (ref, module._slot_modules[key])
+                    for ref, key in module._slot_keys.items()
+                ]
+                module._slot_keys = {
+                    ref: f"slot_{index}" for index, (ref, _slot) in enumerate(slots)
+                }
+                module._slot_modules = torch.nn.ModuleDict(
+                    {f"slot_{index}": slot for index, (_ref, slot) in enumerate(slots)}
+                )
 
     def _prepare_adapter_model(
         self,
