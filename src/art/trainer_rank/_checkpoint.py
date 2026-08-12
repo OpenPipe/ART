@@ -86,6 +86,12 @@ class _PreparedSave:
     optimizer: OptimizerConfig | None
 
 
+@dataclass(frozen=True)
+class _FinalizedSave:
+    sequence: int
+    outcome: Literal["finish", "abort"]
+
+
 type _SlotSnapshot = tuple[
     tuple[
         "LoRA",
@@ -545,8 +551,7 @@ def prepare_checkpoint_save(
         assert prepared is not None
         with trainer._checkpoint_save_condition:
             trainer._prepared_checkpoint_saves[output_dir] = prepared
-            if output_dir in trainer._completed_checkpoint_saves:
-                trainer._completed_checkpoint_saves.remove(output_dir)
+            trainer._finalized_checkpoint_saves.pop(output_dir, None)
             trainer._checkpoint_preparing_saves.discard(output_dir)
             trainer._checkpoint_save_condition.notify_all()
 
@@ -848,7 +853,7 @@ def _claim_finalization(
         while True:
             prepared = trainer._prepared_checkpoint_saves.get(output_dir)
             if prepared is None:
-                if output_dir in trainer._completed_checkpoint_saves:
+                if output_dir in trainer._finalized_checkpoint_saves:
                     return None
                 if action == "abort":
                     return None
@@ -880,47 +885,123 @@ def _finalize_checkpoint_save(
     with trainer._checkpoint_finalize_lock:
         with trainer._checkpoint_save_condition:
             local = trainer._prepared_checkpoint_saves.get(output_dir)
-            sequence = None if local is None else local.sequence
-        states = _gather((action, output_dir, sequence), group)
-        if any(value != states[0] for value in states):
-            raise RuntimeError("Checkpoint save actions differ across ranks")
-        prepared = _claim_finalization(trainer, output_dir, action)
-        if prepared is None:
-            return
-        error: BaseException | None = None
-        outcome = trainer._checkpoint_save_outcomes.get(output_dir)
-        if outcome is None and action == "finish":
-            try:
-                _finish(trainer, prepared)
-            except BaseException as exc:
-                error = exc
-        if outcome is None:
-            outcome = action if error is None else "abort"
-            with trainer._checkpoint_save_condition:
-                trainer._checkpoint_save_outcomes[output_dir] = outcome
-                if outcome == "abort":
-                    trainer._checkpoint_save_skipped.add(prepared.sequence)
-            _advance_save_queue(trainer, prepared.sequence)
-        paths = [prepared.snapshot]
-        if _rank() == 0:
-            paths.append(prepared.reservation)
-        cleanup = _cleanup_paths(paths)
-        cleanup_failed = any(_gather(cleanup is not None, group))
-        if cleanup is not None:
-            error = BaseExceptionGroup(
-                "checkpoint finalization cleanup failed",
-                [*([error] if error is not None else []), cleanup],
+            finalized = trainer._finalized_checkpoint_saves.get(output_dir)
+            sequence = (
+                local.sequence
+                if local is not None
+                else None
+                if finalized is None
+                else finalized.sequence
             )
+            outcome = (
+                trainer._checkpoint_save_outcomes.get(output_dir)
+                if finalized is None
+                else finalized.outcome
+            )
+        states = _gather((action, output_dir, sequence, outcome), group)
+        if any(not isinstance(value, tuple) or len(value) != 4 for value in states):
+            raise RuntimeError("Checkpoint finalization protocol is out of sync")
+        if any(value[:3] != states[0][:3] for value in states):
+            raise RuntimeError("Checkpoint save actions differ across ranks")
+        outcomes = {value[3] for value in states}
+        if len(outcomes) != 1:
+            raise RuntimeError("Checkpoint save outcomes differ across ranks")
+        if sequence is None:
+            if action == "abort":
+                return
+            raise RuntimeError(f"Checkpoint save was not prepared: {output_dir}")
+        finalized_ranks = _gather(finalized is not None, group)
+        if all(finalized_ranks):
+            if outcome == "finish" or action == "abort":
+                return
+            raise RuntimeError(f"Checkpoint save was already {outcome}ed: {output_dir}")
+        if outcome is not None and outcome != action:
+            raise RuntimeError(f"Checkpoint save was already {outcome}ed: {output_dir}")
+        prepared = (
+            _claim_finalization(trainer, output_dir, action)
+            if finalized is None
+            else None
+        )
+        assert prepared is not None or finalized is not None
+        error: BaseException | None = None
+        cleanup_failed = True
         try:
-            raise_distributed(error, f"{action} checkpoint", group)
+            if finalized is None and outcome is None and action == "finish":
+                try:
+                    assert prepared is not None
+                    _finish(trainer, prepared)
+                except BaseException as exc:
+                    error = exc
+            if finalized is None and outcome is None:
+                assert prepared is not None
+                outcome = action if error is None else "abort"
+                with trainer._checkpoint_save_condition:
+                    trainer._checkpoint_save_outcomes[output_dir] = outcome
+                    if outcome == "abort":
+                        trainer._checkpoint_save_skipped.add(prepared.sequence)
+                _advance_save_queue(trainer, prepared.sequence)
+            cleanup = None
+            if prepared is not None:
+                paths = [prepared.snapshot]
+                if _rank() == 0:
+                    paths.append(prepared.reservation)
+                cleanup = _cleanup_paths(paths)
+            try:
+                failures = _gather(
+                    (
+                        None if error is None else repr(error),
+                        None if cleanup is None else repr(cleanup),
+                    ),
+                    group,
+                )
+            except BaseException as exc:
+                local_failures = [
+                    *([error] if error is not None else []),
+                    *([cleanup] if cleanup is not None else []),
+                    exc,
+                ]
+                if len(local_failures) == 1:
+                    raise local_failures[0]
+                raise BaseExceptionGroup(
+                    "checkpoint finalization and coordination failed", local_failures
+                ) from None
+            if any(
+                not isinstance(failure, tuple)
+                or len(failure) != 2
+                or any(
+                    value is not None and not isinstance(value, str)
+                    for value in failure
+                )
+                for failure in failures
+            ):
+                raise RuntimeError("Checkpoint finalization protocol is out of sync")
+            cleanup_failed = any(
+                cleanup_error is not None for _, cleanup_error in failures
+            )
+            local_failures = [
+                *([error] if error is not None else []),
+                *([cleanup] if cleanup is not None else []),
+            ]
+            if local_failures:
+                if len(local_failures) == 1:
+                    raise local_failures[0]
+                raise BaseExceptionGroup(
+                    "checkpoint finalization failed", local_failures
+                )
+            if remote := next((failure for failure in failures if any(failure)), None):
+                raise RuntimeError(
+                    f"Another rank failed to {action} checkpoint: {remote}"
+                )
         finally:
             with trainer._checkpoint_save_condition:
                 trainer._checkpoint_finalizing_saves.pop(output_dir, None)
                 if not cleanup_failed:
                     trainer._prepared_checkpoint_saves.pop(output_dir, None)
                     trainer._checkpoint_save_outcomes.pop(output_dir, None)
-                    if outcome == "finish":
-                        trainer._completed_checkpoint_saves.append(output_dir)
+                    assert outcome is not None
+                    trainer._finalized_checkpoint_saves[output_dir] = _FinalizedSave(
+                        sequence, outcome
+                    )
                 trainer._checkpoint_save_condition.notify_all()
 
 

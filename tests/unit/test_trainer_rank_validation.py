@@ -38,6 +38,7 @@ from art.trainer_rank._checkpoint import (
     OptimizerConfig,
     PreparedCheckpoint,
     _file_digest,
+    _FinalizedSave,
     _manifest_digest,
     _merge_component,
     _PreparedSave,
@@ -788,7 +789,9 @@ async def test_checkpoint_prefetch_failures_are_coordinated(
             raise OSError("rank-local prefetch failed")
         return object()
 
-    def coordinated(error: BaseException | None, phase: str) -> None:
+    def coordinated(
+        error: BaseException | None, phase: str, _group: object | None = None
+    ) -> None:
         assert phase == "prepare checkpoint"
         assert isinstance(error, OSError) is local_failure
         raise RuntimeError("a rank failed to prepare checkpoint")
@@ -907,7 +910,14 @@ def test_checkpoint_slot_adapter_config_rejects_cross_rank_mismatch(
     monkeypatch.setattr("art.trainer_rank.dist.is_initialized", lambda: True)
     monkeypatch.setattr("art.trainer_rank.dist.get_world_size", lambda: 2)
 
-    def gather(output: list[object], value: object) -> None:
+    checkpoint_group = cast(dist.ProcessGroup, object())
+    trainer._checkpoint_process_group = checkpoint_group
+    trainer._checkpoint_finalize_process_group = cast(dist.ProcessGroup, object())
+
+    def gather(
+        output: list[object], value: object, *, group: object | None = None
+    ) -> None:
+        assert group is checkpoint_group
         revision = value[1] if isinstance(value, tuple) and len(value) == 2 else None
         output[:] = [value, ({"different": True}, revision)]
 
@@ -947,7 +957,17 @@ def test_slot_load_canonicalizes_only_local_incoming_adapter(
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
 
-    def gather_expected(values: list[set[str] | None], local: set[str]) -> None:
+    checkpoint_group = cast(dist.ProcessGroup, object())
+    trainer._checkpoint_process_group = checkpoint_group
+    trainer._checkpoint_finalize_process_group = cast(dist.ProcessGroup, object())
+
+    def gather_expected(
+        values: list[set[str] | None],
+        local: set[str],
+        *,
+        group: object | None = None,
+    ) -> None:
+        assert group is checkpoint_group
         values[:] = [local, {"remote_weight"}]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather_expected)
@@ -1351,6 +1371,96 @@ def test_checkpoint_cleanup_failure_can_be_retried(
     assert "save" not in trainer._prepared_checkpoint_saves
     assert not prepared.snapshot.exists()
     assert not prepared.reservation.exists()
+
+
+def test_checkpoint_cleanup_gather_failure_releases_finalizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from art.trainer_rank import _checkpoint
+
+    trainer = _save_state_trainer()
+    prepared = _prepared_save(tmp_path, 0)
+    trainer._prepared_checkpoint_saves = {"save": prepared}
+    original = _checkpoint._gather
+    failed = False
+
+    def fail_once(
+        value: object, group: dist.ProcessGroup | None = None
+    ) -> tuple[object, ...]:
+        nonlocal failed
+        if isinstance(value, tuple) and len(value) == 2 and not failed:
+            failed = True
+            raise RuntimeError("injected cleanup gather failure")
+        return original(value, group)
+
+    monkeypatch.setattr(_checkpoint, "_finish", lambda *_: None)
+    monkeypatch.setattr(_checkpoint, "_gather", fail_once)
+    with pytest.raises(RuntimeError, match="cleanup gather"):
+        finish_checkpoint_save(trainer, "save")
+    assert "save" not in trainer._checkpoint_finalizing_saves
+    finish_checkpoint_save(trainer, "save")
+    assert "save" not in trainer._prepared_checkpoint_saves
+
+
+def test_checkpoint_asymmetric_cleanup_gather_can_converge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from art.trainer_rank import _checkpoint
+
+    completed = _save_state_trainer()
+    retained = _save_state_trainer()
+    retained_root = tmp_path / "retained"
+    retained_root.mkdir()
+    retained_save = _prepared_save(retained_root, 0)
+    completed._finalized_checkpoint_saves["save"] = _FinalizedSave(0, "finish")
+    retained._prepared_checkpoint_saves["save"] = retained_save
+    retained._checkpoint_save_outcomes["save"] = "finish"
+
+    def mixed(
+        value: object, _group: dist.ProcessGroup | None = None
+    ) -> tuple[object, ...]:
+        if isinstance(value, bool):
+            return (True, False)
+        return (value, value)
+
+    monkeypatch.setattr(_checkpoint, "_gather", mixed)
+    finish_checkpoint_save(completed, "save")
+    finish_checkpoint_save(retained, "save")
+    assert "save" in completed._finalized_checkpoint_saves
+    assert "save" in retained._finalized_checkpoint_saves
+    assert "save" not in retained._prepared_checkpoint_saves
+
+
+def test_checkpoint_cleanup_gather_preserves_finish_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from art.trainer_rank import _checkpoint
+
+    trainer = _save_state_trainer()
+    prepared = _prepared_save(tmp_path, 0)
+    trainer._prepared_checkpoint_saves = {"save": prepared}
+    original = _checkpoint._gather
+
+    def fail_cleanup(
+        value: object, group: dist.ProcessGroup | None = None
+    ) -> tuple[object, ...]:
+        if isinstance(value, tuple) and len(value) == 2:
+            raise RuntimeError("cleanup collective failed")
+        return original(value, group)
+
+    def fail_finish(*_: object) -> None:
+        raise ValueError("snapshot failed")
+
+    monkeypatch.setattr(_checkpoint, "_finish", fail_finish)
+    monkeypatch.setattr(
+        _checkpoint, "_cleanup_paths", lambda *_: OSError("unlink failed")
+    )
+    monkeypatch.setattr(_checkpoint, "_gather", fail_cleanup)
+    with pytest.raises(BaseExceptionGroup) as raised:
+        finish_checkpoint_save(trainer, "save")
+    assert any(isinstance(error, ValueError) for error in raised.value.exceptions)
+    assert any(isinstance(error, OSError) for error in raised.value.exceptions)
+    assert any(isinstance(error, RuntimeError) for error in raised.value.exceptions)
 
 
 def test_checkpoint_prepare_preserves_foreign_reservation(tmp_path: Path) -> None:
