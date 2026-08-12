@@ -997,9 +997,9 @@ class MonarchTrainerSlot:
             cached = self._cached_operation(job.operation_id, job.fingerprint)
             if cached is not None:
                 return cached
-            generation_id = job.generation.generation_id
-            if generation_id in self._publications:
-                raise RuntimeError(f"publication already exists: {generation_id}")
+            operation_id = job.operation_id
+            if operation_id in self._publications:
+                raise RuntimeError(f"publication already exists: {operation_id}")
             try:
                 send_port, receiver = Channel[dict[str, Any]].open()
                 values = await asyncio.wait_for(
@@ -1016,10 +1016,10 @@ class MonarchTrainerSlot:
                 )
                 publication = asyncio.create_task(
                     self._collect_publication(receiver, job.generation),
-                    name=f"megatron-slot-publish-{generation_id}",
+                    name=f"megatron-slot-publish-{operation_id}",
                 )
                 publication.add_done_callback(_consume_future)
-                self._publications[generation_id] = publication
+                self._publications[operation_id] = publication
                 result = next(result for result in results if result["rank"] == 0)
                 self._operations[job.operation_id] = (job.fingerprint, result)
                 return result
@@ -1028,19 +1028,20 @@ class MonarchTrainerSlot:
                 raise
 
     def wait_for_publication(
-        self, generation_id: str
+        self, operation_id: str
     ) -> Awaitable[tuple[TrainerRankPublication, ...]]:
         try:
-            publication = self._publications[generation_id]
+            publication = self._publications[operation_id]
         except KeyError as exc:
-            raise RuntimeError(f"trainer has no publication {generation_id}") from exc
-
-        async def wait() -> tuple[TrainerRankPublication, ...]:
-            return await asyncio.shield(publication)
-
-        return wait()
+            raise RuntimeError(f"trainer has no publication {operation_id}") from exc
+        return asyncio.shield(publication)
 
     def retire_operation(self, operation_id: str) -> None:
+        publication = self._publications.get(operation_id)
+        if publication is not None:
+            if not publication.done():
+                raise RuntimeError("cannot retire an active trainer publication")
+            self._publications.pop(operation_id)
         self._operations.pop(operation_id, None)
 
     def _cached_operation(
