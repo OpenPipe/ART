@@ -1239,9 +1239,15 @@ def _dsv4_to_vllm_lora_tensors(
     canonical = _dsv4_from_vllm_lora_tensors(
         tensors,
         adapter_config=adapter_config,
+        split_experts=False,
     )
+    fused_prefixes: set[str] = set()
     grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
     for key, tensor in canonical.items():
+        fused_match = _DSV4_VLLM_MOE_KEY_RE.match(key)
+        if fused_match is not None:
+            fused_prefixes.add(fused_match.group("prefix"))
+            continue
         match = _DSV4_ART_MOE_EXPERT_KEY_RE.match(key)
         if match is not None:
             grouped.setdefault(match.group("prefix"), {}).setdefault(
@@ -1250,6 +1256,12 @@ def _dsv4_to_vllm_lora_tensors(
 
     transformed: dict[str, torch.Tensor] = {}
     used_keys: set[str] = set()
+    mixed_prefixes = fused_prefixes.intersection(grouped)
+    if mixed_prefixes:
+        raise RuntimeError(
+            f"Mixed fused and split DSV4 MoE LoRA block for {min(mixed_prefixes)}"
+        )
+
     for prefix, experts in grouped.items():
         vllm_prefix = _dsv4_to_vllm_lora_key(prefix)
         blocks = {
@@ -1301,6 +1313,7 @@ def _dsv4_from_vllm_lora_tensors(
     tensors: dict[str, torch.Tensor],
     *,
     adapter_config: dict[str, Any],
+    split_experts: bool = True,
 ) -> dict[str, torch.Tensor]:
     split_key = next(
         (key for key in tensors if _DSV4_SPLIT_MOE_EXPERT_KEY_RE.match(key)), None
@@ -1340,16 +1353,37 @@ def _dsv4_from_vllm_lora_tensors(
             raise RuntimeError(
                 f"Incomplete DSV4 vLLM MoE LoRA block for {prefix}"
             ) from exc
-        if gate_up_a.shape[0] % rank != 0:
+        non_2d = next(
+            (slot for slot, tensor in slots.items() if tensor.ndim != 2), None
+        )
+        if non_2d is not None:
+            raise RuntimeError(
+                f"{prefix}: {non_2d} must be 2D, got {tuple(slots[non_2d].shape)}"
+            )
+        if rank <= 0 or gate_up_a.shape[0] == 0 or gate_up_a.shape[0] % rank != 0:
             raise RuntimeError(
                 f"{prefix}: gate/up lora_A rows {gate_up_a.shape[0]} are not "
                 f"divisible by rank {rank}"
             )
-        if gate_up_b.shape[0] % 2 != 0:
-            raise RuntimeError(
-                f"{prefix}: gate/up lora_B rows {gate_up_b.shape[0]} are not even"
-            )
         num_experts = gate_up_a.shape[0] // rank
+        expected = {
+            "gate/up lora_B": (
+                tuple(gate_up_b.shape),
+                (2 * down_a.shape[1], gate_up_a.shape[0]),
+            ),
+            "down lora_A": (down_a.shape[0], gate_up_a.shape[0]),
+            "down lora_B": (
+                tuple(down_b.shape),
+                (gate_up_a.shape[1], gate_up_a.shape[0]),
+            ),
+        }
+        for slot, (actual, wanted) in expected.items():
+            if actual != wanted:
+                raise RuntimeError(
+                    f"{prefix}: {slot} shape {actual} does not match {wanted}"
+                )
+        if not split_experts:
+            continue
         gate_up_b_by_expert = _dsv4_unpack_vllm_3d_lora_b(
             gate_up_b,
             num_experts=num_experts,
@@ -1387,4 +1421,4 @@ def _dsv4_from_vllm_lora_tensors(
     for key, tensor in canonical.items():
         if key not in used_keys:
             transformed[key] = tensor
-    return transformed
+    return transformed if split_experts else canonical

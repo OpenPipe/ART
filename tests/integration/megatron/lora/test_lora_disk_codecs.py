@@ -890,6 +890,25 @@ def test_dsv4_vllm_canonical_moe_roundtrip(tmp_path: Path) -> None:
     assert "model.layers.4.attn.compressor.wgate" in loaded_modules
     assert "model.layers.4.attn.compressor.wkv" in loaded_modules
 
+    packed_art = {
+        key.replace(".ffn.experts", ".mlp.experts"): tensor
+        for key, tensor in vllm_tensors.items()
+        if ".ffn.experts" in key
+    }
+    reexported, _ = DSV4_HANDLER.to_vllm_lora_tensors(
+        packed_art,
+        adapter_config=config,
+    )
+    _assert_tensors_equal(
+        reexported,
+        {key: tensor for key, tensor in vllm_tensors.items() if ".ffn.experts" in key},
+    )
+    assert all(
+        reexported[key].data_ptr()
+        == packed_art[key.replace(".ffn.experts", ".mlp.experts")].data_ptr()
+        for key in reexported
+    )
+
 
 def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp(tmp_path: Path):
     art_prefix = "base_model.model.model.layers.0"
