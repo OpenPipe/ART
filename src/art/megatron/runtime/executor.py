@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import math
 from pathlib import Path
 from threading import BoundedSemaphore, Event, Lock
 import time
@@ -9,13 +10,21 @@ from typing import TYPE_CHECKING, Any
 from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
 from ..tensor_snapshot import PinnedCpuSnapshotStager
+from ..training.gradient_accumulator import GradientAccumulator
 from .data_plane import InMemoryPackedBatch, SFTBatchData, validate_packed_batch
 from .publication import (
     TrainerPublicationFailed,
     TrainerPublicationSucceeded,
     TrainerRankPublication,
 )
-from .specs import SFTJobSpec, TrainerGeneration, TrainerJobSpec, TrainJobSpec
+from .specs import (
+    ForwardBackwardJobSpec,
+    OptimizerJobSpec,
+    SFTJobSpec,
+    TrainerGeneration,
+    TrainerJobSpec,
+    TrainJobSpec,
+)
 from .trainer_run import EventSink
 
 if TYPE_CHECKING:
@@ -32,6 +41,8 @@ class MegatronTrainJobExecutor:
             stager=PinnedCpuSnapshotStager(),
             capacity=int(runtime.snapshot_pool_capacity),
         )
+        self._gradients = GradientAccumulator(model_chunks=runtime.model)
+        self._gradient_parent_version: int | None = None
         self._closed = False
 
     def execute(
@@ -43,6 +54,7 @@ class MegatronTrainJobExecutor:
     ) -> dict[str, float]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
+        self._require_no_open_gradients()
         validate_packed_batch(batch)
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_rl_job
@@ -69,6 +81,102 @@ class MegatronTrainJobExecutor:
             metrics["time/merged_weight_publish_s"] = time.perf_counter() - started
         return metrics
 
+    def execute_forward_backward(
+        self,
+        job: ForwardBackwardJobSpec,
+        batch: InMemoryPackedBatch,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        validate_packed_batch(batch)
+        self._publisher.raise_if_failed()
+        if self._gradient_parent_version not in {
+            None,
+            job.expected_learner_version,
+        }:
+            raise RuntimeError(
+                "F/B parent does not match the open gradient accumulator"
+            )
+        from art.megatron.train import execute_megatron_rl_forward_backward_job
+
+        result = execute_megatron_rl_forward_backward_job(
+            self.runtime,
+            job,
+            batch.tensors,
+            gradient_accumulator=self._gradients,
+            cancelled=cancelled,
+        )
+        self._gradient_parent_version = job.expected_learner_version
+        step = result.result
+        return {
+            "operation_id": job.operation_id,
+            "metrics": result.metrics(),
+            "token_count": int(result.token_count.item()),
+            "token_logprobs": tuple(
+                tuple(float(item) for item in values.flatten().tolist())
+                for values in step.new_logprobs
+            ),
+        }
+
+    def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        if self._gradient_parent_version != job.expected_learner_version:
+            raise RuntimeError("optimizer parent does not match accumulated gradients")
+        runtime = self.runtime
+        if runtime.optimizer is None:
+            raise RuntimeError("trainer has no resident optimizer")
+        self._gradients.seal(job.contributing_forward_backward_operation_ids)
+        self._gradients.prepare_optimizer()
+        for group in runtime.optimizer.param_groups:
+            group["betas"] = (job.optimizer.beta1, job.optimizer.beta2)
+            group["eps"] = job.optimizer.eps
+            group["weight_decay"] = job.optimizer.weight_decay
+        runtime.optimizer.config.adam_beta1 = job.optimizer.beta1
+        runtime.optimizer.config.adam_beta2 = job.optimizer.beta2
+        runtime.optimizer.config.adam_eps = job.optimizer.eps
+        runtime.optimizer.config.weight_decay = job.optimizer.weight_decay
+        from art.megatron.train import run_megatron_optimizer_step
+
+        started = time.perf_counter()
+        result = run_megatron_optimizer_step(
+            optimizer=runtime.optimizer,
+            learning_rate=job.optimizer.learning_rate,
+            model_support_handler=runtime.model_support_handler,
+            model_chunks=runtime.model,
+            before_step=runtime.optimizer_snapshot_barrier.wait_before_mutation,
+        )
+        if not result.update_successful or not math.isfinite(result.grad_norm):
+            raise RuntimeError(
+                "Megatron optimizer rejected the update: "
+                f"update_successful={result.update_successful}, "
+                f"grad_norm={result.grad_norm}"
+            )
+        consumed = self._gradients.consume()
+        if consumed != job.contributing_forward_backward_operation_ids:
+            raise RuntimeError("optimizer consumed the wrong gradient contributions")
+        runtime.resident_training_session_id = job.training_session_id
+        runtime.resident_policy_step = job.learner_version
+        runtime.optimizer_state_loaded = True
+        self._gradient_parent_version = None
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.learner_version,
+            "contributing_forward_backward_operation_ids": consumed,
+            "metrics": {
+                "loss/learning_rate": job.optimizer.learning_rate,
+                "loss/grad_norm": float(result.grad_norm),
+                "optimizer/update_successful": float(result.update_successful),
+                "optimizer/num_zeros_in_grad": float(result.num_zeros_in_grad or 0),
+                "time/optimizer_step_s": time.perf_counter() - started,
+            },
+        }
+
+    def discard_open_gradients(self) -> None:
+        self._gradients.discard()
+        self._gradient_parent_version = None
+
     def execute_sft(
         self,
         job: SFTJobSpec,
@@ -78,6 +186,7 @@ class MegatronTrainJobExecutor:
     ) -> dict[str, float]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
+        self._require_no_open_gradients()
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_sft_job
 
@@ -110,6 +219,7 @@ class MegatronTrainJobExecutor:
     ) -> dict[str, float]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
+        self._require_no_open_gradients()
         runtime = self.runtime
         if (
             runtime.resident_training_session_id != generation.training_session_id
@@ -169,6 +279,7 @@ class MegatronTrainJobExecutor:
     ) -> dict[str, float]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
+        self._require_no_open_gradients()
         if learner_version != expected_learner_version + 1:
             raise ValueError("a no-op learner transition must advance exactly one step")
         runtime = self.runtime
@@ -188,6 +299,10 @@ class MegatronTrainJobExecutor:
             return
         self._closed = True
         failures: list[BaseException] = []
+        try:
+            self._gradients.discard()
+        except BaseException as error:
+            failures.append(error)
         try:
             self._publisher.close()
             self.runtime.optimizer_snapshot_barrier.synchronize()
@@ -218,6 +333,10 @@ class MegatronTrainJobExecutor:
             raise failures[0]
         if failures:
             raise BaseExceptionGroup("Megatron executor close failed", failures)
+
+    def _require_no_open_gradients(self) -> None:
+        if self._gradients.contribution_ids:
+            raise RuntimeError("operation cannot discard open gradient contributions")
 
 
 class _GenerationPublisher:

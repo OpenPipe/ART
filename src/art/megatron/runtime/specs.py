@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 from art.distributed.adapter_transport import AdapterTransferTarget
 from art.distributed.data_plane import PackedBatchRef
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
+from art.training.contracts import AdamConfig
 from art.types import TrainConfig, TrainSFTConfig
 
 from .weight_transfer import MergedWeightTransferSpec
@@ -214,6 +215,73 @@ class TrainJobSpec(_TrainerJobSpec):
                 "batch source policy version cannot be newer than the learner"
             )
         return self
+
+
+class ForwardBackwardJobSpec(_Spec):
+    """One admitted RL F/B contribution against a fixed learner parent."""
+
+    operation_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    sequence_id: int = Field(ge=0)
+    training_session_id: str = Field(min_length=1)
+    expected_learner_version: int = Field(ge=0)
+    source: TrainerGeneration
+    optimizer_state_path: str = Field(min_length=1)
+    batch: PackedBatchRef
+    config: CurrentTrainConfig
+    experimental_config: ExperimentalTrainConfig = ExperimentalTrainConfig()
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> "ForwardBackwardJobSpec":
+        if (
+            self.source.training_session_id != self.training_session_id
+            or self.source.policy_step != self.expected_learner_version
+        ):
+            raise ValueError("source generation does not identify the F/B parent")
+        if self.batch.max_source_version > self.expected_learner_version:
+            raise ValueError(
+                "batch source policy version cannot be newer than the learner"
+            )
+        return self
+
+    @property
+    def fingerprint(self) -> str:
+        return _fingerprint(self)
+
+    @property
+    def source_policy_step(self) -> int:
+        return self.expected_learner_version
+
+    @property
+    def source_adapter_path(self) -> str:
+        return self.source.adapter_path
+
+
+class OptimizerJobSpec(_Spec):
+    """Seal exact F/B contributions into one learner transition."""
+
+    operation_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    sequence_id: int = Field(ge=0)
+    training_session_id: str = Field(min_length=1)
+    expected_learner_version: int = Field(ge=0)
+    learner_version: int = Field(ge=1)
+    contributing_forward_backward_operation_ids: tuple[str, ...] = Field(min_length=1)
+    optimizer: AdamConfig
+
+    @model_validator(mode="after")
+    def _validate_transition(self) -> "OptimizerJobSpec":
+        if self.learner_version != self.expected_learner_version + 1:
+            raise ValueError("optimizer learner version must advance exactly one step")
+        if len(set(self.contributing_forward_backward_operation_ids)) != len(
+            self.contributing_forward_backward_operation_ids
+        ):
+            raise ValueError("optimizer contribution IDs must be unique")
+        return self
+
+    @property
+    def fingerprint(self) -> str:
+        return _fingerprint(self)
 
 
 class SFTJobSpec(_TrainerJobSpec):

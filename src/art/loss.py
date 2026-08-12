@@ -96,6 +96,21 @@ class LossOffPolicyDiagnosticsAccumulator(BaseModel):
             self.ratio_histogram + diagnostics.ratio_histogram.detach()
         )
 
+    def extend(self, other: "LossOffPolicyDiagnosticsAccumulator") -> None:
+        if other.ratio_sum is None:
+            return
+        assert other.clipped_count is not None
+        assert other.token_count is not None
+        assert other.ratio_histogram is not None
+        self.add(
+            LossOffPolicyDiagnostics(
+                ratio_sum=other.ratio_sum,
+                clipped_count=other.clipped_count,
+                token_count=other.token_count,
+                ratio_histogram=other.ratio_histogram,
+            )
+        )
+
     def to_metrics(self, *, group: Any | None = None) -> dict[str, float]:
         if (
             self.ratio_sum is None
