@@ -175,6 +175,20 @@ def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_source_runtime(
     )
 
 
+def test_vllm_runtime_subprocess_env_pins_runtime_tools(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime_bin = tmp_path / "vllm_runtime/.venv/bin/art-vllm-runtime-server"
+    runtime_bin.parent.mkdir(parents=True)
+    runtime_bin.touch()
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    env = runtime._vllm_runtime_subprocess_env([str(runtime_bin)])
+
+    assert env["PATH"] == f"{runtime_bin.parent}{os.pathsep}/usr/bin"
+
+
 def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_managed_runtime(
     monkeypatch,
     tmp_path: Path,

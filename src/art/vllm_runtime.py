@@ -314,6 +314,9 @@ def _vllm_runtime_subprocess_env(
     )
     if runtime_dir is not None:
         env.pop("PYTHONPATH", None)
+        env["PATH"] = os.pathsep.join(
+            (str(runtime_dir / ".venv" / "bin"), env.get("PATH", ""))
+        )
         nvidia_libs = sorted(
             str(path)
             for site_packages in (runtime_dir / ".venv" / "lib").glob(
