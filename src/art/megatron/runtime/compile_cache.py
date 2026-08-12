@@ -18,8 +18,8 @@ from .specs import TrainerRuntimeSpec
 _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformers")
 
 
-def _support_instance_method_aliases() -> None:
-    from torch._dynamo.guards import GuardsStatePickler
+def _support_precompile_serialization() -> None:
+    from torch._dynamo.guards import CheckFunctionManager, GuardsStatePickler
 
     original = GuardsStatePickler.reducer_override
     if getattr(original, "_art_supports_instance_method_aliases", False):
@@ -35,6 +35,23 @@ def _support_instance_method_aliases() -> None:
 
     setattr(reducer_override, "_art_supports_instance_method_aliases", True)
     GuardsStatePickler.reducer_override = reducer_override
+
+    serialize = CheckFunctionManager.serialize_guards
+
+    def serialize_guards(
+        self: Any, builder: Any, sorted_guards: list[Any], output_graph: Any
+    ) -> bytes:
+        # PyTorch's first pass filters identity guards, but its second pass can add more.
+        unsupported = set(self.UNSUPPORTED_SERIALIZATION_GUARD_TYPES)
+        sorted_guards = [
+            guard
+            for guard in sorted_guards
+            if guard.create_fn_name() not in unsupported
+            and unsupported.isdisjoint(guard.guard_types or ())
+        ]
+        return serialize(self, builder, sorted_guards, output_graph)
+
+    CheckFunctionManager.serialize_guards = serialize_guards
 
 
 def _support_non_strict_package_bypass() -> None:
@@ -140,7 +157,7 @@ class TrainerCompileCache:
 
         if config.caching_precompile:
             raise RuntimeError("Dynamo precompile was enabled before trainer imports")
-        _support_instance_method_aliases()
+        _support_precompile_serialization()
         _support_non_strict_package_bypass()
         os.environ["TORCH_CACHING_PRECOMPILE"] = "1"
         config.caching_precompile = True
