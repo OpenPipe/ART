@@ -647,6 +647,19 @@ class LoRA(torch.nn.Module):
             return []
         return [slot.A_T, slot.B_T]
 
+    def unload_lora_slot(self, ref: LoRASlotRef) -> bool:
+        key = self._slot_keys.get(ref)
+        if key is None:
+            return False
+        if self._has_live_slot_grads(ref):
+            raise RuntimeError(
+                f"Cannot unload live LoRA slot {ref.kind}:{ref.name} for "
+                f"{self.adapter_model_prefix}; clear grads/backward graph first."
+            )
+        self._slot_modules.pop(key)
+        self._slot_keys.pop(ref)
+        return True
+
     def _slot(self, ref: LoRASlotRef) -> LoRASlot | None:
         key = self._slot_keys.get(ref)
         if key is None:

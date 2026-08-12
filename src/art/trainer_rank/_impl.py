@@ -707,6 +707,31 @@ class TrainerRank:
             raise ValueError(f"Unknown checkpoint slot: {name!r}")
         self._dynamic_optimizers[name] = self._restore_dynamic_optimizer(name, state)
 
+    def unload_checkpoint_slot(self, name: str) -> int:
+        if self._slot_stack:
+            raise RuntimeError("Cannot unload a LoRA/checkpoint while a slot is pushed")
+        params = self.checkpoint_slot_parameters(name)
+        if any(param.grad is not None for param in params):
+            raise RuntimeError(
+                f"Cannot unload checkpoint slot {name!r} with live gradients"
+            )
+        from art.megatron.lora import LoRA
+
+        ref = self._slot_ref("checkpoint", name)
+        unloaded = sum(
+            module.unload_lora_slot(ref)
+            for chunk in self.runtime.model
+            for module in chunk.modules()
+            if isinstance(module, LoRA)
+        )
+        if not unloaded:
+            raise RuntimeError(f"Checkpoint slot {name!r} owns no LoRA modules")
+        self._checkpoint_slot_params_by_name.pop(name)
+        self._checkpoint_slot_param_names_by_name.pop(name)
+        self._checkpoint_slot_adapter_configs.pop(name, None)
+        self._dynamic_optimizers.pop(name, None)
+        return unloaded
+
     def checkpoint_slot_parameters(self, name: str) -> tuple[torch.nn.Parameter, ...]:
         try:
             return self._checkpoint_slot_params_by_name[name]

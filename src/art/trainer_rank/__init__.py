@@ -139,6 +139,9 @@ class TrainerRank(_impl.TrainerRank):
     ) -> None:
         super().restore_checkpoint_slot_optimizer_state(name, state)
 
+    def unload_checkpoint_slot(self, name: str) -> int:
+        return super().unload_checkpoint_slot(name)
+
     def save_checkpoint_slot_lora(self, name: str, output_dir: str) -> None:
         """Collectively publish a trained checkpoint slot as a vLLM LoRA."""
         super().save_checkpoint_slot_lora(name, output_dir)

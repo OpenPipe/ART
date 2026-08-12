@@ -598,6 +598,12 @@ class MCoreRunSlotExecutor:
     def discard_run_gradients(self, run_id: str) -> None:
         self._require_run(run_id).gradients.discard()
 
+    def unregister_run(self, run_id: str) -> None:
+        state = self._require_run(run_id)
+        state.gradients.discard()
+        self._slot_trainer.unload_checkpoint_slot(run_id)
+        self._runs.pop(run_id)
+
     def close(self) -> None:
         if self._closed:
             return

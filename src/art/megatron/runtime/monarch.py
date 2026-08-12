@@ -524,6 +524,13 @@ class MonarchTrainerActor(Actor):
         return {"rank": self._runtime.rank, "run_id": registration.run_id}
 
     @endpoint
+    def unregister_run_slot(self, run_id: str) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        self._run_slot_executor.unregister_run(run_id)
+        return {"rank": self._runtime.rank, "run_id": run_id}
+
+    @endpoint
     def execute_run_slot_forward_backward(
         self,
         job_json: str,
@@ -878,6 +885,23 @@ class MonarchTrainerSlot:
                     raise RuntimeError("trainer ranks disagree on run registration")
             except BaseException as error:
                 await self._invalidate(error, "run registration and cleanup failed")
+                raise
+
+    async def unregister_run(self, run_id: str) -> None:
+        async with self._lock:
+            self._require_open()
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.unregister_run_slot.call(run_id),
+                    timeout=self._command_timeout_s,
+                )
+                results = list(values.values())
+                if {result["rank"] for result in results} != set(
+                    range(len(self._rank_processes))
+                ) or {result["run_id"] for result in results} != {run_id}:
+                    raise RuntimeError("trainer ranks disagree on run removal")
+            except BaseException as error:
+                await self._invalidate(error, "run removal and cleanup failed")
                 raise
 
     async def forward_backward(
