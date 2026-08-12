@@ -62,7 +62,12 @@ _TRITON_NUM_STAGES_2_FLEX_KERNEL_OPTIONS = cast(
 )
 _BLACKWELL_WIDE_HEAD_FLEX_KERNEL_OPTIONS = cast(
     FlexKernelOptions,
-    {"BACKEND": "TRITON", "num_stages": 2, "BLOCK_M": 32},
+    {
+        "BACKEND": "TRITON",
+        "num_stages": 2,
+        "BLOCK_M": 32,
+        "BLOCK_M1": 32,
+    },
 )
 _FORCED_FLEX_KERNEL_OPTIONS = cast(
     FlexKernelOptions,
