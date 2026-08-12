@@ -541,7 +541,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         config,
         thresholds.model_copy(
             update={
-                "max_mean_policy_activation_lag_s": 0.4,
+                "max_mean_policy_activation_lag_s": 0.35,
                 "max_policy_activation_lag_s": 1.0,
                 "max_repeated_policy_activation_interval_s": 3.5,
             }
