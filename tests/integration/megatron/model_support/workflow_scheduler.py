@@ -737,6 +737,8 @@ def _functional_stage_spec(
         **handler.vllm_engine_args(),
         **engine_args,
     }
+    if handler.is_moe:
+        engine_args["enable_return_routed_experts"] = True
     return _FunctionalStageSpec(
         stage=stage,
         trainer_gpu_count=trainer_gpu_count,
