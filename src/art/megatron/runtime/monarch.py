@@ -858,6 +858,8 @@ class MonarchTrainerRun:
             self._open_forward_backward_ids.clear()
             self._learner_version = job.learner_version
             self._next_operation_sequence += 1
+            for operation_id in job.contributing_forward_backward_operation_ids:
+                self._operations.pop(operation_id, None)
             self._operations[job.operation_id] = (job.fingerprint, result)
             return result
         except BaseException as error:

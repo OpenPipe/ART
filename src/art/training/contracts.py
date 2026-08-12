@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from collections.abc import Sequence
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.pipeline_tuner.config import PackedGroupShape
@@ -24,12 +25,48 @@ class RlTrajectoryBatch(Contract):
     groups: tuple[TrajectoryGroupBundle, ...] = Field(min_length=1)
     min_source_version: int = Field(ge=0)
     max_source_version: int = Field(ge=0)
+    _local_groups: tuple[Any, ...] | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _validate_source_versions(self) -> "RlTrajectoryBatch":
         if self.max_source_version < self.min_source_version:
             raise ValueError("max_source_version must be >= min_source_version")
         return self
+
+    @classmethod
+    def from_groups(
+        cls,
+        groups: Sequence[Any],
+        *,
+        default_source_version: int,
+    ) -> "RlTrajectoryBatch":
+        local_groups = tuple(groups)
+        versions = [
+            version
+            for group in local_groups
+            for trajectory in group.trajectories
+            for version in (
+                trajectory.initial_policy_version,
+                trajectory.final_policy_version,
+            )
+            if version is not None
+        ]
+        batch = cls(
+            groups=tuple(
+                TrajectoryGroupBundle.from_group(group) for group in local_groups
+            ),
+            min_source_version=min(versions, default=default_source_version),
+            max_source_version=max(versions, default=default_source_version),
+        )
+        object.__setattr__(batch, "_local_groups", local_groups)
+        return batch
+
+    def require_local_groups(self) -> tuple[Any, ...]:
+        if self._local_groups is None:
+            raise RuntimeError(
+                "local Megatron request has no in-process trajectory groups"
+            )
+        return self._local_groups
 
 
 class SupervisedTrajectoryBatch(Contract):

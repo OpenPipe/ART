@@ -304,6 +304,7 @@ class GenerationSnapshotJobSpec(_Spec):
     staging_adapter_path: str | None = Field(default=None, min_length=1)
     existing_adapter: OptimizerAdapter | None = None
     publication_targets: tuple[AdapterTransferTarget, ...] = ()
+    merged_weight_transfer: MergedWeightTransferSpec | None = None
     save_optimizer: bool = False
 
     @model_validator(mode="after")
@@ -336,12 +337,12 @@ class GenerationSnapshotJobSpec(_Spec):
                 self.generation.adapter_path,
             ):
                 raise ValueError("existing adapter does not match snapshot generation")
-            if not self.save_optimizer:
-                raise ValueError("existing-adapter snapshot must add optimizer state")
             if self.publication_targets:
                 raise ValueError(
                     "existing adapter cannot be transferred as a new snapshot"
                 )
+        if self.publication_targets and self.merged_weight_transfer is not None:
+            raise ValueError("snapshot cannot publish LoRA and merged weights together")
         return self
 
     @property

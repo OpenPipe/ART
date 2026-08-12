@@ -31,6 +31,7 @@ from art.serving_capabilities import (
     ServingCapabilities,
     discover_serving_capabilities,
 )
+from art.training.contracts import AdamConfig, OperationRef
 from art.utils.lifecycle import complete_task, complete_to_thread
 from art.utils.output_dirs import get_step_checkpoint_dir
 from art.vllm_runtime import (
@@ -76,7 +77,11 @@ from .runtime.specs import (
     CurrentTrainConfig,
     DurableTrainOutput,
     ExperimentalTrainConfig,
+    ForwardBackwardJobSpec,
+    GenerationSnapshotJobSpec,
     HybridEpRuntimeSpec,
+    OptimizerJobSpec,
+    RlForwardBackwardConfig,
     SFTJobSpec,
     TrainAccepted,
     TrainCancelled,
@@ -266,6 +271,10 @@ class DistributedMegatronService:
     @property
     def durable_optimizer_step(self) -> int:
         return self._durable_optimizer_step
+
+    @property
+    def optimizer_state_path(self) -> str:
+        return self._optimizer_state_path
 
     def drain_publication_metrics(self) -> dict[str, float]:
         metrics = {
@@ -553,14 +562,18 @@ class DistributedMegatronService:
             hybrid_ep=hybrid_ep,
         )
 
-    async def _ensure_trainer_locked(self) -> tuple[Any, tuple[int, str] | None]:
+    async def _ensure_trainer_locked(
+        self, *, run_id: str | None = None
+    ) -> tuple[Any, tuple[int, str] | None]:
         if self._trainer_is_current():
+            if run_id is not None and self._trainer.run_spec.run_id != run_id:
+                raise RuntimeError("resident trainer belongs to another command run")
             return self._trainer, None
         current, reconcile_step = await self._prepare_for_packing_locked()
         assert self._trainer is None
         runtime_spec = self._runtime_spec()
         run_spec = TrainingRunSpec(
-            run_id=uuid.uuid4().hex,
+            run_id=run_id or uuid.uuid4().hex,
             runtime_fingerprint=runtime_spec.fingerprint,
             training_session_id=self._training_session_id,
             initial_learner_version=self._latest_step,
@@ -1108,6 +1121,212 @@ class DistributedMegatronService:
             lineage_error="learner lineage changed during training",
         ):
             yield metrics
+
+    async def forward_backward_command(
+        self,
+        ref: OperationRef,
+        batch: DistributedPackedBatch,
+        config: RlForwardBackwardConfig,
+        experimental_config: ExperimentalTrainConfig,
+    ) -> dict[str, Any]:
+        async with self._train_lock, self._trainer_failure_boundary():
+            if self._temporal_gpu_sharing and self._base_url is not None:
+                async with self._serving_lock:
+                    await self._sleep_for_training_locked()
+            async with self._mutation_lock:
+                self._require_open()
+                self._raise_publication_failure()
+                trainer, reconcile = await self._ensure_trainer_locked(
+                    run_id=ref.run_id
+                )
+                source = self._learner_generation
+                if source is None or ref.learner_parent_version != self._latest_step:
+                    raise RuntimeError("F/B command learner parent changed")
+                job = ForwardBackwardJobSpec(
+                    operation_id=ref.operation_id,
+                    run_id=ref.run_id,
+                    sequence_id=ref.sequence_id,
+                    training_session_id=self._training_session_id,
+                    expected_learner_version=ref.learner_parent_version,
+                    source=source,
+                    optimizer_state_path=self._optimizer_state_path,
+                    batch=batch.leases.ref,
+                    config=config,
+                    experimental_config=experimental_config,
+                )
+                cold = self._trainer_resident_generation != source
+                source_adapter = (
+                    self._published_adapters.get(source.policy_step) if cold else None
+                )
+                if cold and (
+                    source_adapter is None
+                    or source_adapter.training_session_id != source.training_session_id
+                    or source_adapter.generation_id != source.generation_id
+                    or source_adapter.identity
+                    != str(Path(source.adapter_path).absolute())
+                ):
+                    raise RuntimeError("cold F/B source generation is not registered")
+            if reconcile is not None:
+                step, checkpoint = reconcile
+                async with self._serving_lock:
+                    await self._reconcile_serving_locked(step, checkpoint)
+            with (
+                adapter_generation_lease(source_adapter)
+                if source_adapter is not None
+                else nullcontext()
+            ):
+                result = await trainer.forward_backward(job, batch.leases)
+            async with self._mutation_lock:
+                if self._latest_step != ref.learner_parent_version:
+                    raise RuntimeError("learner advanced while F/B command executed")
+                self._trainer_resident_generation = source
+            return result
+
+    async def optimizer_command(
+        self,
+        ref: OperationRef,
+        optimizer: AdamConfig,
+        contributing_forward_backward_operation_ids: tuple[str, ...],
+    ) -> tuple[dict[str, Any], TrainerGeneration]:
+        output_version = ref.reserved_output_learner_version
+        if output_version is None:
+            raise ValueError("optimizer command has no reserved learner output")
+        async with self._train_lock, self._trainer_failure_boundary():
+            async with self._mutation_lock:
+                self._require_open()
+                self._raise_publication_failure()
+                trainer, reconcile = await self._ensure_trainer_locked(
+                    run_id=ref.run_id
+                )
+                if reconcile is not None:
+                    raise RuntimeError("optimizer command cannot start a cold trainer")
+                if ref.learner_parent_version != self._latest_step:
+                    raise RuntimeError("optimizer command learner parent changed")
+                job = OptimizerJobSpec(
+                    operation_id=ref.operation_id,
+                    run_id=ref.run_id,
+                    sequence_id=ref.sequence_id,
+                    training_session_id=self._training_session_id,
+                    expected_learner_version=ref.learner_parent_version,
+                    learner_version=output_version,
+                    contributing_forward_backward_operation_ids=(
+                        contributing_forward_backward_operation_ids
+                    ),
+                    optimizer=optimizer,
+                )
+            result = await trainer.optim_step(job)
+            generation = self._training_generation(output_version)
+            async with self._mutation_lock:
+                if self._latest_step != ref.learner_parent_version:
+                    raise RuntimeError("learner advanced while optimizer executed")
+                self._latest_step = output_version
+                self._learner_generation = generation
+                self._trainer_resident_generation = generation
+                self._record_policy_timestamp(
+                    self._trainer_completion_times, output_version
+                )
+            return result, generation
+
+    async def snapshot_command(
+        self,
+        ref: OperationRef,
+        *,
+        save_optimizer: bool,
+        activate_serving: bool,
+    ) -> tuple[dict[str, float], DurableTrainerPublication]:
+        async with self._train_lock, self._trainer_failure_boundary():
+            async with self._mutation_lock:
+                self._require_open()
+                self._raise_publication_failure()
+                trainer, reconcile = await self._ensure_trainer_locked(
+                    run_id=ref.run_id
+                )
+                if reconcile is not None:
+                    raise RuntimeError("snapshot command cannot start a cold trainer")
+                generation = self._learner_generation
+                if (
+                    generation is None
+                    or ref.learner_parent_version != self._latest_step
+                    or generation.policy_step != self._latest_step
+                ):
+                    raise RuntimeError("snapshot command learner parent changed")
+                existing = self._published_adapters.get(self._latest_step)
+
+            targets: tuple[Any, ...] = ()
+            merged: MergedWeightTransferSpec | None = None
+            if activate_serving and existing is None:
+                targets, merged = await self._prepare_serving_publication(
+                    trainer, generation.generation_id, generation.policy_step
+                )
+            elif activate_serving and self.rollout_weights_mode == "merged":
+                merged = await self._merged_weight_transfer_spec(
+                    self._serving_lora_name(generation.policy_step)
+                )
+
+            job = GenerationSnapshotJobSpec(
+                operation_id=ref.operation_id,
+                run_id=ref.run_id,
+                sequence_id=ref.sequence_id,
+                training_session_id=self._training_session_id,
+                learner_version=generation.policy_step,
+                generation=generation,
+                optimizer_state_path=self._optimizer_state_path,
+                staging_adapter_path=(
+                    f"{self.output_dir}/megatron_runtime/staging/"
+                    f"{generation.generation_id}"
+                    if existing is None
+                    else None
+                ),
+                existing_adapter=existing,
+                publication_targets=targets,
+                merged_weight_transfer=merged,
+                save_optimizer=save_optimizer,
+            )
+            result = await trainer.snapshot(job)
+            metrics = dict(result["metrics"])
+            snapshot_metrics = {
+                name: value
+                for name, value in metrics.items()
+                if name.startswith("snapshot_")
+            }
+            self._publication_metrics[generation.policy_step] = snapshot_metrics
+            self._emitted_publication_metrics[generation.policy_step] = set(
+                snapshot_metrics
+            )
+            if activate_serving:
+                self._schedule_publication(
+                    generation,
+                    trainer=trainer,
+                    publication_targets=targets,
+                )
+                await asyncio.shield(self._publication_tasks[generation.policy_step])
+                adapter = self._published_adapters[generation.policy_step]
+                pointer = read_committed_optimizer_pointer(self._optimizer_state_path)
+                pointer_step = pointer.step if pointer else 0
+                durable = DurableTrainerPublication(
+                    adapter=adapter,
+                    resume_step=generation.policy_step
+                    if save_optimizer
+                    else pointer_step,
+                    optimizer_step=pointer_step,
+                )
+            else:
+                durable, durable_s = await self._resolve_durable_publication(
+                    generation,
+                    durable=None,
+                    publication_waiter=trainer.wait_for_publication(
+                        generation.generation_id
+                    ),
+                    previous_publication=None,
+                )
+                metrics["snapshot_durable_s"] = durable_s
+                async with self._mutation_lock:
+                    self._published_adapters[generation.policy_step] = durable.adapter
+                    self._durable_step = max(self._durable_step, durable.resume_step)
+                    self._durable_optimizer_step = max(
+                        self._durable_optimizer_step, durable.optimizer_step
+                    )
+            return metrics, durable
 
     def _schedule_publication(
         self,

@@ -205,20 +205,25 @@ class MegatronTrainJobExecutor:
             not runtime.optimizer_state_loaded or runtime.optimizer is None
         ):
             raise RuntimeError("snapshot requested non-resident optimizer state")
+        metrics = self._publisher.submit(
+            generation=job.generation,
+            optimizer_state_path=job.optimizer_state_path,
+            staging_adapter_path=job.staging_adapter_path,
+            existing_adapter=job.existing_adapter,
+            publication_targets=job.publication_targets,
+            adapter_dtypes=runtime.adapter_export_dtypes,
+            adapter_config=runtime.adapter_export_config,
+            save_optimizer=job.save_optimizer,
+            sink=sink,
+        )
+        if job.merged_weight_transfer is not None:
+            started = time.perf_counter()
+            self._sync_merged(job.merged_weight_transfer)
+            metrics["time/merged_weight_publish_s"] = time.perf_counter() - started
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
-            "metrics": self._publisher.submit(
-                generation=job.generation,
-                optimizer_state_path=job.optimizer_state_path,
-                staging_adapter_path=job.staging_adapter_path,
-                existing_adapter=job.existing_adapter,
-                publication_targets=job.publication_targets,
-                adapter_dtypes=runtime.adapter_export_dtypes,
-                adapter_config=runtime.adapter_export_config,
-                save_optimizer=job.save_optimizer,
-                sink=sink,
-            ),
+            "metrics": metrics,
         }
 
     def discard_open_gradients(self) -> None:

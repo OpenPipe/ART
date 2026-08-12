@@ -78,6 +78,17 @@ class _PipelinePreparedBatch(BaseModel):
     metrics: dict[str, float]
 
 
+def _packing_metrics(packed: Any) -> dict[str, float]:
+    return {
+        "time/step_trajectory_fetch_s": packed.trajectory_fetch_s,
+        "time/step_packing_core_s": packed.packing_core_s,
+        "time/step_trajectory_log_wait_s": packed.trajectory_log_wait_s,
+        "time/step_packed_batch_finalize_s": packed.packed_batch_finalize_s,
+        "time/step_packing_rpc_s": packed.packing_rpc_s,
+        "time/step_packed_batch_fanout_s": packed.packed_batch_fanout_s,
+    }
+
+
 class MegatronBackend(LocalBackend):
     def __init__(
         self,
@@ -721,14 +732,7 @@ class MegatronBackend(LocalBackend):
                 "Megatron pipeline batch did not use the typed data plane"
             )
         distributed = payload.packed
-        metrics = {
-            "time/step_trajectory_fetch_s": distributed.trajectory_fetch_s,
-            "time/step_packing_core_s": distributed.packing_core_s,
-            "time/step_trajectory_log_wait_s": distributed.trajectory_log_wait_s,
-            "time/step_packed_batch_finalize_s": distributed.packed_batch_finalize_s,
-            "time/step_packing_rpc_s": distributed.packing_rpc_s,
-            "time/step_packed_batch_fanout_s": distributed.packed_batch_fanout_s,
-        }
+        metrics = _packing_metrics(distributed)
         prepared = _PipelinePreparedBatch(
             batch=batch,
             groups=tuple(trajectory_groups),
@@ -810,48 +814,9 @@ class MegatronBackend(LocalBackend):
             DistributedPackedBatch,
             payload.packed,
         )
-        source_release_s = 0.0
-        if payload.selections:
-            ref = distributed_batch.leases.ref
-            expected_groups = tuple(
-                selection.lease.item.ref.result_id for selection in payload.selections
-            )
-            expected_records = tuple(
-                record.record_id
-                for selection in payload.selections
-                for record in selection.lease.item.ref.records
-            )
-            versions = []
-            for selection in payload.selections:
-                item = selection.lease.item
-                descriptor = item.ref.descriptor
-                versions.extend(
-                    version
-                    for initial, final in zip(
-                        descriptor.trajectory_initial_policy_versions,
-                        descriptor.trajectory_final_policy_versions,
-                        strict=True,
-                    )
-                    for version in (
-                        initial
-                        if initial is not None
-                        else item.annotations.initial_policy_version,
-                        final
-                        if final is not None
-                        else item.annotations.final_policy_version,
-                    )
-                )
-            if (
-                distributed_batch.packing_generation_id != payload.generation_id
-                or ref.group_ids != expected_groups
-                or ref.record_ids != expected_records
-                or ref.min_source_version != min(versions)
-                or ref.max_source_version != max(versions)
-            ):
-                raise RuntimeError("packed batch policy provenance does not match")
-            release_started = time.perf_counter()
-            await self._release_trajectory_sources(batch, payload)
-            source_release_s = time.perf_counter() - release_started
+        release_started = time.perf_counter()
+        await self._release_trajectory_sources(batch, payload)
+        source_release_s = time.perf_counter() - release_started
         distributed_service = cast(DistributedMegatronService, service)
         async for result in distributed_service.train_packed(
             distributed_batch, config, service_dev_config
@@ -873,6 +838,41 @@ class MegatronBackend(LocalBackend):
         selections = payload.selections
         if not selections:
             return
+        distributed = payload.packed
+        ref = distributed.leases.ref
+        expected_groups = tuple(
+            selection.lease.item.ref.result_id for selection in selections
+        )
+        expected_records = tuple(
+            record.record_id
+            for selection in selections
+            for record in selection.lease.item.ref.records
+        )
+        versions = [
+            version
+            for selection in selections
+            for initial, final in zip(
+                selection.lease.item.ref.descriptor.trajectory_initial_policy_versions,
+                selection.lease.item.ref.descriptor.trajectory_final_policy_versions,
+                strict=True,
+            )
+            for version in (
+                initial
+                if initial is not None
+                else selection.lease.item.annotations.initial_policy_version,
+                final
+                if final is not None
+                else selection.lease.item.annotations.final_policy_version,
+            )
+        ]
+        if (
+            distributed.packing_generation_id != payload.generation_id
+            or ref.group_ids != expected_groups
+            or ref.record_ids != expected_records
+            or ref.min_source_version != min(versions)
+            or ref.max_source_version != max(versions)
+        ):
+            raise RuntimeError("packed batch policy provenance does not match")
         queue = selections[0].queue
         if any(selection.queue is not queue for selection in selections):
             raise RuntimeError("packed batch contains selections from multiple queues")
