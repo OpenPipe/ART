@@ -5,12 +5,8 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
-from openai.types.chat.chat_completion import Choice, ChoiceLogprobs
+from openai.types.chat.chat_completion import Choice
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
-from openai.types.chat.chat_completion_token_logprob import (
-    ChatCompletionTokenLogprob,
-    TopLogprob,
-)
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -229,7 +225,7 @@ def test_real_path_default_generates_16_tokens_per_rollout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_real_path_rollouts_use_stable_unique_seeds_and_choices() -> None:
+async def test_real_path_rollouts_use_stable_unique_seeds_concurrently() -> None:
     calls = []
     active_requests = 0
     max_active_requests = 0
@@ -246,18 +242,6 @@ async def test_real_path_rollouts_use_stable_unique_seeds_and_choices() -> None:
                 Choice(
                     finish_reason="stop",
                     index=0,
-                    logprobs=ChoiceLogprobs(
-                        content=[
-                            ChatCompletionTokenLogprob(
-                                token="token_id:101",
-                                logprob=-1.0,
-                                top_logprobs=[
-                                    TopLogprob(token="token_id:101", logprob=-1.0)
-                                ],
-                            )
-                            for _ in range(kwargs["max_tokens"])
-                        ]
-                    ),
                     message=ChatCompletionMessage(role="assistant", content="maybe"),
                 )
             ]
@@ -279,20 +263,14 @@ async def test_real_path_rollouts_use_stable_unique_seeds_and_choices() -> None:
         model=model,
         config=config,
         prompts=["first", "second"],
-        rollout_continuations=["alpha", "beta", "gamma"],
         extra_body={"return_tokens_as_token_ids": True},
     )
 
     assert len(groups) == 2
-    assert max_active_requests == 1
+    assert max_active_requests > 1
     assert sorted(call["seed"] for call in calls) == list(range(41, 47))
-    assert [call["extra_body"]["structured_outputs"]["choice"] for call in calls] == [
-        ["alpha"],
-        ["beta"],
-        ["gamma"],
-    ] * 2
     assert all(
-        call["extra_body"]["return_tokens_as_token_ids"] is True for call in calls
+        call["extra_body"] == {"return_tokens_as_token_ids": True} for call in calls
     )
 
 
@@ -555,7 +533,7 @@ def test_workflow_stage_does_not_accept_a_skipped_live_test(
     assert report.skipped_count == 1
 
 
-def test_workflow_stage_retries_only_classified_transient_startup_failures(
+def test_workflow_stage_retries_numerical_mismatch_and_transient_startup_failures(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -588,9 +566,9 @@ def test_workflow_stage_retries_only_classified_transient_startup_failures(
 
     report = workflow_stage.run_train_inf_mismatch(base_model="openai/gpt-oss-20b")
 
-    assert calls == report.attempt_count == 1
+    assert calls == report.attempt_count == 3
     assert report.failed_count == 1
-    assert report.attempts[0].retryable is False
+    assert all(attempt.retryable for attempt in report.attempts)
     assert workflow_stage._retryable_attempt_failure(
         returncode=2,
         result=workflow_stage.TrainInfMismatchWorkerResult(

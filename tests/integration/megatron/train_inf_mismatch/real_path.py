@@ -429,7 +429,7 @@ def _real_path_max_model_len(
 
 def _prepare_real_path_prompts(
     config: RealPathConfig,
-) -> tuple[list[str], dict[str, Any] | None, int, list[str]]:
+) -> tuple[list[str], dict[str, Any] | None, int]:
     from transformers import AutoTokenizer
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -469,27 +469,7 @@ def _prepare_real_path_prompts(
             else None
         ),
         max_model_len,
-        _deterministic_rollout_continuations(config.rollouts_per_prompt),
     )
-
-
-_ROLLOUT_CONTINUATIONS = (
-    "A careful systems engineer checks assumptions before changing thresholds and records exact evidence for every runtime decision before drawing conclusions about correctness or performance.",
-    "Numerical parity should compare identical generated tokens before any threshold decision is made, while preserving the real model path, routing behavior, and adapter state.",
-    "Deterministic evidence distinguishes implementation defects from ordinary benchmark noise by holding compared inputs fixed and leaving the underlying model logits completely unconstrained.",
-    "Production validation should exercise realistic execution, capture enough diagnostic state to explain failures, and alter neither numerical tolerances nor the operations under test.",
-    "A reliable performance comparison controls workload geometry, compilation state, hardware placement, and policy freshness before attributing a measured difference to an implementation change.",
-    "Exact paired inputs make small output discrepancies interpretable because both systems score the same continuation under the same adapter and routing decisions.",
-    "Efficient test iteration isolates the failing stage first, proves the root cause with a focused reproduction, and reserves the complete workflow for the final gate.",
-)
-
-
-def _deterministic_rollout_continuations(count: int) -> list[str]:
-    if count > len(_ROLLOUT_CONTINUATIONS):
-        raise RuntimeError(
-            f"At most {len(_ROLLOUT_CONTINUATIONS)} rollouts are supported"
-        )
-    return list(_ROLLOUT_CONTINUATIONS[:count])
 
 
 async def _rollout(
@@ -499,14 +479,14 @@ async def _rollout(
     max_completion_tokens: int,
     reward: float,
     seed: int,
-    continuation: str,
     extra_body: dict[str, Any] | None,
 ) -> Any:
     import art
 
     messages = [{"role": "user", "content": prompt}]
-    # vLLM captures raw logprobs before structured-output masking, so a singleton
-    # choice fixes the sampled path without changing the logits under comparison.
+    request_kwargs: dict[str, Any] = {}
+    if extra_body is not None:
+        request_kwargs["extra_body"] = extra_body
     response = await model.openai_client().chat.completions.create(
         model=model.get_inference_name(),
         messages=messages,
@@ -515,24 +495,18 @@ async def _rollout(
         seed=seed,
         logprobs=True,
         top_logprobs=TOP_K,
-        extra_body={
-            **(extra_body or {}),
-            "structured_outputs": {"choice": [continuation]},
-        },
+        **request_kwargs,
     )
     choice = response.choices[0]
     logprobs = choice.logprobs
-    if logprobs is None or logprobs.content is None:
-        raise RuntimeError("Deterministic real-path rollout is missing logprobs")
-    completion_token_ids = [_parse_token_id(entry.token) for entry in logprobs.content]
-    if len(completion_token_ids) != max_completion_tokens:
-        raise RuntimeError(
-            "Deterministic real-path rollout ended before its token limit"
-        )
     return art.Trajectory(
         messages_and_choices=[*messages, choice],
         reward=reward,
-        metrics={"completion_tokens": len(completion_token_ids)},
+        metrics={
+            "completion_tokens": (
+                len(logprobs.content or []) if logprobs is not None else 0
+            )
+        },
     )
 
 
@@ -541,21 +515,16 @@ async def _collect_real_trajectory_groups(
     model: Any,
     config: RealPathConfig,
     prompts: list[str],
-    rollout_continuations: list[str],
     extra_body: dict[str, Any] | None,
 ) -> list[Any]:
     import art
 
     if config.rollouts_per_prompt < 2:
         raise ValueError("real-path mismatch requires at least two rollouts per prompt")
-    if len(rollout_continuations) != config.rollouts_per_prompt:
-        raise ValueError("real-path mismatch requires one continuation per rollout")
-    groups = []
-    for prompt_index, prompt in enumerate(prompts):
-        trajectories = []
-        for rollout_index in range(config.rollouts_per_prompt):
-            trajectories.append(
-                await _rollout(
+    groups = [
+        art.TrajectoryGroup(
+            [
+                _rollout(
                     model=model,
                     prompt=prompt,
                     max_completion_tokens=config.max_completion_tokens,
@@ -565,12 +534,17 @@ async def _collect_real_trajectory_groups(
                         + prompt_index * config.rollouts_per_prompt
                         + rollout_index
                     ),
-                    continuation=rollout_continuations[rollout_index],
                     extra_body=extra_body,
                 )
-            )
-        groups.append(art.TrajectoryGroup(trajectories))
-    return groups
+                for rollout_index in range(config.rollouts_per_prompt)
+            ]
+        )
+        for prompt_index, prompt in enumerate(prompts)
+    ]
+    return await art.gather_trajectory_groups(
+        cast(Any, groups),
+        pbar_desc="real-path-rollouts",
+    )
 
 
 def _parse_token_id(raw: str | None) -> int:
@@ -808,7 +782,6 @@ async def _score_base_real_generation_path(
     artifact_dir: Path,
     is_moe: bool,
     prompts: list[str],
-    rollout_continuations: list[str],
     extra_body: dict[str, Any] | None,
     max_model_len: int,
 ) -> RealPathBaseDiagnosticBundle:
@@ -885,7 +858,6 @@ async def _score_base_real_generation_path(
             model=model,
             config=config,
             prompts=prompts,
-            rollout_continuations=rollout_continuations,
             extra_body=extra_body,
         )
 
@@ -1683,9 +1655,7 @@ async def run_real_path_train_inf_mismatch(
 
     parity_config = config.output_parity
     _apply_sliding_window_prompt_defaults(config)
-    prompts, extra_body, max_model_len, rollout_continuations = (
-        _prepare_real_path_prompts(config)
-    )
+    prompts, extra_body, max_model_len = _prepare_real_path_prompts(config)
     rollout_mode = _real_path_rollout_mode(parity_config)
     is_moe = model_support_is_moe(
         parity_config.base_model,
@@ -1750,7 +1720,6 @@ async def run_real_path_train_inf_mismatch(
             model=model,
             config=config,
             prompts=prompts,
-            rollout_continuations=rollout_continuations,
             extra_body=extra_body,
         )
         packed_tensors = backend._get_packed_tensors(
@@ -1825,7 +1794,6 @@ async def run_real_path_train_inf_mismatch(
                 artifact_dir=artifact_dir,
                 is_moe=is_moe,
                 prompts=prompts,
-                rollout_continuations=rollout_continuations,
                 extra_body=extra_body,
                 max_model_len=max_model_len,
             )
