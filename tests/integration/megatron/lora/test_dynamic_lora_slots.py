@@ -402,7 +402,7 @@ def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
         "A": tuple(lora.lora_slot_params(LoRASlotRef("checkpoint", "A"))),
         "B": tuple(lora.lora_slot_params(LoRASlotRef("checkpoint", "B"))),
     }
-    names = (("dense.lora_A.weight",), ("dense.lora_B.weight",))
+    names = (("chunk.0.dense.lora_A.weight",), ("chunk.0.dense.lora_B.weight",))
     trainer._checkpoint_slot_param_names_by_name = {"A": names, "B": names}
     return trainer
 
