@@ -5,7 +5,7 @@ import pytest
 
 from art import TrainableModel
 from art.costs import build_cost_calculator, get_model_pricing
-from art.model import _OpenAIChatCompletionsProxy
+from art.model import _OpenAIChatCompletionsProxy, _OpenAIClientProxy
 
 
 class _FakeUsage:
@@ -70,6 +70,28 @@ def _build_model() -> TrainableModel:
 
 
 class TestModelOpenAIClientCosts:
+    @pytest.mark.asyncio
+    async def test_openai_client_proxy_preserves_async_lifetime(self) -> None:
+        class _Client:
+            chat = type("Chat", (), {"completions": object()})()
+            entered = False
+            exited = False
+
+            async def __aenter__(self) -> "_Client":
+                self.entered = True
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                self.exited = True
+
+        client = _Client()
+        proxy = _OpenAIClientProxy(client, lambda _response: None)
+
+        async with proxy as entered:
+            assert entered is proxy
+            assert client.entered
+        assert client.exited
+
     @pytest.mark.asyncio
     async def test_openai_client_automatically_logs_train_tinker_costs(
         self,

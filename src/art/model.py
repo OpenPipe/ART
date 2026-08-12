@@ -305,6 +305,13 @@ class _OpenAIClientProxy:
             self._suppress_weave_trace,
         )
 
+    async def __aenter__(self) -> "_OpenAIClientProxy":
+        await self._client.__aenter__()
+        return self
+
+    async def __aexit__(self, *args: Any) -> Any:
+        return await self._client.__aexit__(*args)
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._client, name)
 

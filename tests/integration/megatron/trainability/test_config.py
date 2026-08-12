@@ -633,10 +633,14 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
         "get_device_properties",
         lambda device: SimpleNamespace(total_memory=284 * 1024**3),
     )
+
+    def unexpected_memory_probe(_device_ids) -> float:
+        raise AssertionError("external vLLM must not probe resident inference memory")
+
     monkeypatch.setattr(
         "tests.integration.megatron.trainability.yes_no_trainability."
         "_safe_gpu_memory_utilization",
-        lambda device_ids: 0.5,
+        unexpected_memory_probe,
     )
     monkeypatch.setenv("ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL", "http://127.0.0.1:8000")
     default_variant = _default_variant_name(

@@ -440,9 +440,18 @@ def _engine_args_for_yes_no_trainability(
     tensor_parallel_size: int = 1,
     enable_expert_parallel: bool = False,
     enable_sleep_mode: bool | None = None,
+    external_runtime: bool = False,
 ) -> dev.EngineArgs:
     engine_args: dict[str, object] = {
-        "gpu_memory_utilization": _safe_gpu_memory_utilization(inference_gpu_ids),
+        "gpu_memory_utilization": (
+            float(
+                os.environ.get(
+                    "ART_MODEL_SUPPORT_YES_NO_GPU_MEMORY_UTILIZATION", "0.85"
+                )
+            )
+            if external_runtime
+            else _safe_gpu_memory_utilization(inference_gpu_ids)
+        ),
         "max_model_len": _get_env_int(
             "ART_MODEL_SUPPORT_YES_NO_MAX_MODEL_LEN",
             _GPT_OSS_MAX_MODEL_LEN if _is_gpt_oss_model(base_model) else 128,
@@ -738,6 +747,7 @@ def _build_internal_config(
 ) -> dev.InternalModelConfig:
     shared = variant.placement_mode == "shared"
     inference_gpu_ids = variant.inference_gpu_ids
+    external_runtime = _external_vllm_runtime_config()
     stage_resources = _trainability_stage_resources(
         base_model,
         stage_name=resource_stage_name,
@@ -779,6 +789,7 @@ def _build_internal_config(
             )
         ),
         enable_sleep_mode=True if shared else None,
+        external_runtime=external_runtime is not None,
     )
     if vllm_resources is not None:
         engine_args.update(vllm_resources.engine_args())
@@ -795,7 +806,6 @@ def _build_internal_config(
         init_args=_variant_init_args(variant),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    external_runtime = _external_vllm_runtime_config()
     if (
         stage_resources is not None
         and stage_resources.requires_external_vllm
