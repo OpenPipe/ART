@@ -44,6 +44,7 @@ from . import (
     Tokenizer,
     Trajectory,
     TrajectoryGroup,
+    TrajectoryHistory,
 )
 from ._history import _model_matches
 from ._protocols import Exchange
@@ -97,7 +98,7 @@ class _HistoryTokenizationTrace:
     sources: dict[_SampledSourceKey, object]
 
     def validate(self, tokenized: TokenizedHistory) -> None:
-        if len(self.source_keys) != len(tokenized.token_ids):
+        if len(self.source_keys) != len(tokenized.tokens):
             raise AssertionError(
                 "Tokenization trace differs in length from tokenized data"
             )
@@ -1712,8 +1713,9 @@ def _legacy_tokenize(
     if not token_ids:
         raise ValueError("Trajectory contains no trainable choices")
     return TokenizedHistory(
+        history=history,
         model=model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -1721,6 +1723,7 @@ def _legacy_tokenize(
 
 def _tokenize_exchange_trajectory(
     trajectory: Trajectory,
+    history: History,
     base_model: str | None,
     *,
     model: str | None,
@@ -1983,8 +1986,9 @@ def _tokenize_exchange_trajectory(
         previous_render_state = (exchange, messages_override)
 
     tokenized = TokenizedHistory(
+        history=history,
         model=selected_model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -2885,8 +2889,9 @@ def _tokenize_exact_responses_history(
             )
         )
     tokenized = TokenizedHistory(
+        history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -3125,8 +3130,9 @@ def _tokenize_exact_projected_chat_history(
     if history.model is None:
         raise ValueError("History tokenization requires a model")
     tokenized = TokenizedHistory(
+        history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -4311,8 +4317,9 @@ def _tokenize_chat_view(
     if history.model is None:
         raise ValueError("History tokenization requires a model")
     tokenized = TokenizedHistory(
+        history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -4378,8 +4385,9 @@ def _tokenize_completions_token_history(
         if len(selected_logprobs) == span.end - span.start:
             logprobs[span.start : span.end] = selected_logprobs
     tokenized = TokenizedHistory(
+        history=history,
         model=history.model,
-        token_ids=list(history.prompt),
+        tokens=list(history.prompt),
         logprobs=logprobs,
         flags=flags,
     )
@@ -4558,8 +4566,9 @@ def _tokenize_completions_string_history(
         else:
             source_keys.extend([None] * len(ids))
     tokenized = TokenizedHistory(
+        history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -4647,7 +4656,7 @@ def _spans_are_exhaustive(length: int, spans: Sequence[object]) -> bool:
     return cursor == length
 
 
-def tokenize_history(
+def _tokenize_history(
     history: History | LegacyHistory,
     *,
     model: str | None,
@@ -4761,6 +4770,7 @@ def tokenize_history(
     history_kwargs = getattr(history, "chat_template_kwargs", None)
     return _tokenize_exchange_trajectory(
         trajectory,
+        history,
         base_model,
         model=model,
         chat_template=(
@@ -4776,14 +4786,55 @@ def tokenize_history(
     )
 
 
+def tokenize_history(
+    history: History | LegacyHistory,
+    *,
+    model: str | None,
+    base_model: str | None,
+    tokenizer: Tokenizer | None,
+    chat_template: str | None,
+    chat_template_kwargs: Mapping[str, object] | None,
+    _trace: _TraceBuilder | None = None,
+    _projection_validated: bool = False,
+) -> TokenizedHistory:
+    tokenized = _tokenize_history(
+        history,
+        model=model,
+        base_model=base_model,
+        tokenizer=tokenizer,
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+        _trace=_trace,
+        _projection_validated=_projection_validated,
+    )
+    # Internal protocol conversion is an implementation detail. The source is
+    # always the public history view the caller asked to tokenize.
+    if not isinstance(
+        history,
+        (
+            LegacyHistory,
+            ChatCompletionsHistory,
+            AnthropicMessagesHistory,
+            ResponsesHistory,
+            CompletionsTokenHistory,
+            CompletionsStringHistory,
+        ),
+    ):
+        raise TypeError(f"Unsupported history type: {type(history).__name__}")
+    tokenized.history = history
+    return tokenized
+
+
 def _materialize_trajectory(
     tokenized: TokenizedHistory, trajectory: Trajectory
 ) -> TokenizedTrajectory:
     return TokenizedTrajectory(
-        **tokenized.model_dump(),
-        reward=trajectory.reward,
-        metrics=dict(trajectory.metrics),
-        metadata=dict(trajectory.metadata),
+        history=tokenized.history,
+        model=tokenized.model,
+        tokens=tokenized.tokens,
+        logprobs=tokenized.logprobs,
+        flags=tokenized.flags,
+        trajectory=trajectory,
     )
 
 
@@ -4831,10 +4882,8 @@ def tokenize_trajectory(
     if not multi_history:
         return _materialize_trajectory(tokenized[0], trajectory)
     return TokenizedMultiHistoryTrajectory(
+        trajectory=trajectory,
         histories=tokenized,
-        reward=trajectory.reward,
-        metrics=dict(trajectory.metrics),
-        metadata=dict(trajectory.metadata),
     )
 
 
@@ -4877,10 +4926,8 @@ def _tokenize_trajectory_with_trace(
         traces.append(trace_builder.trace)
     return (
         TokenizedMultiHistoryTrajectory(
+            trajectory=trajectory,
             histories=tokenized_histories,
-            reward=trajectory.reward,
-            metrics=dict(trajectory.metrics),
-            metadata=dict(trajectory.metadata),
         ),
         traces,
     )
@@ -4915,12 +4962,10 @@ def tokenize_group(
     ]
     if multi_history:
         return TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory](
+            trajectory_group=group,
             trajectories=trajectories,
-            metrics=dict(group.metrics),
-            metadata=dict(group.metadata),
         )
     return TokenizedTrajectoryGroup[TokenizedTrajectory](
+        trajectory_group=group,
         trajectories=trajectories,
-        metrics=dict(group.metrics),
-        metadata=dict(group.metadata),
     )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from fnmatch import fnmatchcase
 import json
@@ -1231,13 +1231,13 @@ def _responses_split_prompt_source(
         return source
     if reconcile:
         return (
-            replace(source, generation_index=None)
+            source.model_copy(update={"generation_index": None})
             if source.exchange is current_exchange
             else source
         )
     if source.output_index is None and source.request_index is None:
         return None
-    return replace(source, generation_index=None)
+    return source.model_copy(update={"generation_index": None})
 
 
 def responses_history(

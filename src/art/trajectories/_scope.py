@@ -4,31 +4,47 @@ import asyncio
 from collections.abc import Coroutine, Iterable, Iterator
 from contextlib import contextmanager
 import contextvars
+from dataclasses import dataclass
 from types import TracebackType
 from typing import Any
 
 from . import PydanticException, Trajectory, TrajectoryGroup
 from ._compat import exception_model
+from ._serialization import _StringPool
 
-_trajectories: contextvars.ContextVar[tuple[Trajectory, ...]] = contextvars.ContextVar(
-    "art_trajectories", default=()
+
+@dataclass(frozen=True, slots=True)
+class _TrajectoryScope:
+    trajectory: Trajectory
+    strings: _StringPool
+
+
+_scopes: contextvars.ContextVar[tuple[_TrajectoryScope, ...]] = contextvars.ContextVar(
+    "art_trajectory_scopes", default=()
 )
 
 
 def get_current_trajectory(*, required: bool) -> Trajectory | None:
-    current = _trajectories.get()
+    current = _scopes.get()
     if current:
-        return current[-1]
+        return current[-1].trajectory
     if required:
         raise RuntimeError("No trajectory is active in this context")
     return None
+
+
+def _get_current_scope() -> _TrajectoryScope | None:
+    current = _scopes.get()
+    return current[-1] if current else None
 
 
 def enter_trajectory(trajectory: Trajectory) -> Trajectory:
     from ._capture import install
 
     install()
-    _trajectories.set((*_trajectories.get(), trajectory))
+    strings: _StringPool = {}
+    trajectory._intern_strings(strings)
+    _scopes.set((*_scopes.get(), _TrajectoryScope(trajectory, strings)))
     return trajectory
 
 
@@ -38,10 +54,10 @@ def exit_trajectory(
     _exc_value: BaseException | None,
     _traceback: TracebackType | None,
 ) -> None:
-    current = _trajectories.get()
-    if not current or current[-1] is not trajectory:
+    current = _scopes.get()
+    if not current or current[-1].trajectory is not trajectory:
         raise RuntimeError("Trajectory contexts must exit in stack order")
-    _trajectories.set(current[:-1])
+    _scopes.set(current[:-1])
     trajectory.finish()
 
 
@@ -49,11 +65,11 @@ def exit_trajectory(
 def no_capture() -> Iterator[None]:
     """Hide enclosing trajectory capture while allowing new nested scopes."""
 
-    token = _trajectories.set(())
+    token = _scopes.set(())
     try:
         yield
     finally:
-        _trajectories.reset(token)
+        _scopes.reset(token)
 
 
 def _require_raw_coroutine(value: object) -> None:

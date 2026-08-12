@@ -45,6 +45,8 @@ prewarm_namespace="${PREWARM_NAMESPACE:-default}"
 prewarm_name="${PREWARM_NAME:-art-gpu-image-prewarm}"
 prewarm_image_pull_secret="${PREWARM_IMAGE_PULL_SECRET:-art-gpu-registry-auth}"
 prewarm_node_selector="${PREWARM_NODE_SELECTOR:-node.coreweave.cloud/class=gpu}"
+prewarm_hypervisor_label="node.coreweave.cloud/hypervisor"
+prewarm_hypervisor_value="true"
 prewarm_timeout="${PREWARM_TIMEOUT:-30m}"
 prewarm_node_timeout="${PREWARM_NODE_TIMEOUT:-10m}"
 prewarm_delete_timeout="${PREWARM_DELETE_TIMEOUT:-60s}"
@@ -918,13 +920,22 @@ if [[ "${prewarm_nodes}" == "true" ]]; then
     echo "PREWARM_NODE_PARALLELISM must be a positive integer, got: ${prewarm_node_parallelism}" >&2
     exit 1
   fi
+  prewarm_eligible_node_selector="${prewarm_node_selector},${prewarm_hypervisor_label}!=${prewarm_hypervisor_value}"
+  mapfile -t hypervisor_gpu_nodes < <(
+    "${kubectl_cmd[@]}" get nodes \
+      -l "${prewarm_node_selector},${prewarm_hypervisor_label}=${prewarm_hypervisor_value}" \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+  )
+  if (( ${#hypervisor_gpu_nodes[@]} > 0 )); then
+    echo "Skipping ${#hypervisor_gpu_nodes[@]} hypervisor GPU node(s): ${hypervisor_gpu_nodes[*]}"
+  fi
   mapfile -t gpu_nodes < <(
-    "${kubectl_cmd[@]}" get nodes -l "${prewarm_node_selector}" \
+    "${kubectl_cmd[@]}" get nodes -l "${prewarm_eligible_node_selector}" \
       -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
   )
   gpu_node_count="${#gpu_nodes[@]}"
   if [[ "${gpu_node_count}" == "0" ]]; then
-    echo "Skipping GPU node prewarm: no nodes match ${prewarm_node_selector}"
+    echo "Skipping GPU node prewarm: no nodes match ${prewarm_eligible_node_selector}"
   else
     echo "Prewarming ${prewarm_display} on ${gpu_node_count} GPU node(s)"
     "${kubectl_cmd[@]}" create secret generic "${prewarm_image_pull_secret}" \
@@ -991,6 +1002,15 @@ spec:
     spec:
       nodeSelector:
         ${prewarm_node_selector_key}: ${prewarm_node_selector_value}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: ${prewarm_hypervisor_label}
+                    operator: NotIn
+                    values:
+                      - "${prewarm_hypervisor_value}"
       imagePullSecrets:
         - name: ${prewarm_image_pull_secret}
       tolerations:

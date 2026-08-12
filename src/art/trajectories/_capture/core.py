@@ -16,7 +16,8 @@ from .. import (
     Trajectory,
 )
 from .._protocols import Endpoint, Exchange, build_exchange, endpoint_for_url
-from .._scope import get_current_trajectory
+from .._scope import _get_current_scope
+from .._serialization import _intern_strings, _StringPool
 
 logger = logging.getLogger(__name__)
 _adapter_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -64,6 +65,7 @@ def _terminal_sse_event(endpoint: Endpoint, block: bytes) -> bool:
 @dataclass
 class CaptureState:
     trajectory: Trajectory
+    strings: _StringPool
     endpoint: Endpoint
     request: dict[str, Any]
     start_time: datetime = field(default_factory=datetime.now)
@@ -117,6 +119,7 @@ class CaptureState:
         except Exception as exc:
             logger.debug("Ignoring incomplete trajectory exchange: %s", exc)
             return
+        _intern_strings(exchange, self.strings)
         _append_exchange(self.trajectory, exchange)
 
 
@@ -166,11 +169,11 @@ def begin(
     url: str,
     body: object,
 ) -> tuple[CaptureState | None, contextvars.Token[bool] | None]:
-    trajectory = get_current_trajectory(required=False)
+    scope = _get_current_scope()
     endpoint = endpoint_for_url(url)
     request = _json_body(body)
     if (
-        trajectory is None
+        scope is None
         or method.upper() != "POST"
         or endpoint is None
         or request is None
@@ -178,7 +181,12 @@ def begin(
     ):
         return None, None
     return (
-        CaptureState(trajectory=trajectory, endpoint=endpoint, request=request),
+        CaptureState(
+            trajectory=scope.trajectory,
+            strings=scope.strings,
+            endpoint=endpoint,
+            request=request,
+        ),
         _adapter_active.set(True),
     )
 

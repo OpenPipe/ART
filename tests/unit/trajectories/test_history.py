@@ -12,6 +12,7 @@ from openai.types.responses import Response
 import pytest
 
 import art
+import art.trajectories as tr
 from art.trajectories import (
     ChatCompletionsExchange,
     CompletionsExchange,
@@ -220,7 +221,7 @@ def test_chat_history_resolves_one_model_and_append_only_sequence() -> None:
     with pytest.raises(ValueError, match="exactly one model"):
         trajectory.history()
     history = trajectory.history(model="test/model")
-    assert isinstance(history, art.ChatCompletionsHistory)
+    assert isinstance(history, tr.ChatCompletionsHistory)
     assert [message["role"] for message in history.messages] == [
         "user",
         "assistant",
@@ -350,8 +351,8 @@ def test_model_patterns_select_matching_histories_only() -> None:
     histories = trajectory.chat_completions_histories(model="policy@*")
     assert [history.model for history in histories] == ["policy@12", "policy@13"]
     generic_histories = trajectory.histories(model="policy@*")
-    assert all(isinstance(history, art.History) for history in generic_histories)
-    assert [cast(art.History, history).model for history in generic_histories] == [
+    assert all(isinstance(history, tr.History) for history in generic_histories)
+    assert [cast(tr.History, history).model for history in generic_histories] == [
         "policy@12",
         "policy@13",
     ]
@@ -386,11 +387,39 @@ def test_chat_history_preserves_provider_specific_nested_fields() -> None:
 
     content = cast(list[dict[str, object]], history.messages[0]["content"])
     assert content[0]["cache_control"] == {"type": "ephemeral"}
+    history_content = history.model_dump(mode="json", warnings="error")["messages"][0][
+        "content"
+    ]
+    assert history_content[0]["cache_control"] == {"type": "ephemeral"}
     dumped = trajectory.model_dump(mode="json", warnings="error")
     dumped_content = dumped["exchanges"]["chat_completions"][0]["request"]["messages"][
         0
     ]["content"]
     assert dumped_content[0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_protocol_histories_round_trip_as_pydantic_models() -> None:
+    histories: list[tr.History] = [
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(
+                chat_completions=[_chat([{"role": "user", "content": "hello"}], "hi")]
+            )
+        ).chat_completions_history(),
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(completions=[_completion([1], [2])])
+        ).completions_token_history(),
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(messages=[_message()])
+        ).anthropic_messages_history(),
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(responses=[_response("response-1", "hi")])
+        ).responses_history(),
+    ]
+
+    for history in histories:
+        dumped = history.model_dump(mode="json", warnings="error")
+        restored = type(history).model_validate(dumped)
+        assert restored == history
 
 
 def test_chat_choices_branch_and_identical_continuation_uses_first_choice() -> None:
@@ -584,8 +613,8 @@ def test_history_accepts_user_authored_messages_with_none_source() -> None:
 
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
-    assert tokenized.token_ids == [10, 20, 30]
-    assert tokenized.flags[1] == art.TokenFlag.SAMPLED
+    assert tokenized.tokens == [10, 20, 30]
+    assert tokenized.flags[1] == tr.TokenFlag.SAMPLED
 
 
 def test_protocol_histories_convert_to_chat_and_history_rejects_ambiguity() -> None:
@@ -594,7 +623,10 @@ def test_protocol_histories_convert_to_chat_and_history_rejects_ambiguity() -> N
     )
     messages_history = message_trajectory.anthropic_messages_history()
     assert messages_history.system == "Be concise"
-    assert not hasattr(messages_history, "model_dump")
+    restored = tr.AnthropicMessagesHistory.model_validate(
+        messages_history.model_dump(mode="json", warnings="error")
+    )
+    assert restored == messages_history
     assert [message["role"] for message in messages_history.messages] == [
         "user",
         "assistant",
@@ -613,7 +645,7 @@ def test_protocol_histories_convert_to_chat_and_history_rejects_ambiguity() -> N
     )
     with pytest.raises(ValueError, match="multiple protocol histories"):
         mixed.history()
-    assert isinstance(mixed.anthropic_messages_history(), art.AnthropicMessagesHistory)
+    assert isinstance(mixed.anthropic_messages_history(), tr.AnthropicMessagesHistory)
 
 
 def test_anthropic_chat_conversion_preserves_sources_for_expanded_messages() -> None:
@@ -1545,8 +1577,8 @@ def test_chat_reasoning_split_does_not_reuse_divergent_sampled_source() -> None:
     assert source.request_index == 1
     assert source.choice_index is None
     tokenized = histories[1].tokenize()
-    assert tokenized.token_ids == [1, 500, 3, 4]
-    assert not tokenized.flags[1] & art.TokenFlag.SAMPLED
+    assert tokenized.tokens == [1, 500, 3, 4]
+    assert not tokenized.flags[1] & tr.TokenFlag.SAMPLED
 
 
 def test_anthropic_tokenization_disagreement_splits_unless_reconciled() -> None:
@@ -1694,9 +1726,9 @@ def test_anthropic_exact_regeneration_preserves_sampled_source() -> None:
     assert source.exchange is first
     assert source.request_index is None
     tokenized = regenerated_history.as_chat_completions_history().tokenize()
-    assert tokenized.token_ids == [1, 101, 3, 5]
+    assert tokenized.tokens == [1, 101, 3, 5]
     assert tokenized.logprobs[1] == -101.0
-    assert tokenized.flags[1] == art.TokenFlag.EXACT | art.TokenFlag.SAMPLED
+    assert tokenized.flags[1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
 
 
 def test_reasoning_stripped_tool_call_keeps_first_sampled_source() -> None:
@@ -1758,9 +1790,9 @@ def test_legacy_messages_delegate_through_history() -> None:
         messages_and_choices=[{"role": "user", "content": "hello"}]
     )
 
-    assert isinstance(trajectory.history(), art.LegacyHistory)
+    assert isinstance(trajectory.history(), tr.LegacyHistory)
     assert trajectory.messages() == [{"role": "user", "content": "hello"}]
-    assert isinstance(trajectory.history(model="test/model"), art.LegacyHistory)
+    assert isinstance(trajectory.history(model="test/model"), tr.LegacyHistory)
     with pytest.raises(ValueError, match="requires model="):
         trajectory.tokenize()
 
@@ -1769,7 +1801,7 @@ def test_legacy_messages_preserve_primary_history_with_additional_histories() ->
     trajectory = art.Trajectory(
         messages_and_choices=[{"role": "user", "content": "primary"}],
         additional_histories=[
-            art.LegacyHistory(
+            tr.LegacyHistory(
                 messages_and_choices=[{"role": "user", "content": "alternate"}]
             )
         ],
