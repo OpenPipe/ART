@@ -137,7 +137,7 @@ def _checkpoint_metadata(
     verify_payload: bool = True,
     artifact_entries: Iterable[str] | None = None,
     expected_digest: str | None = None,
-) -> tuple[Path, dict[str, object], tuple[str, ...], CheckpointManifest | None, str]:
+) -> PreparedCheckpoint:
     if (artifact_entries is None) != (expected_digest is None):
         raise ValueError(
             "artifact_entries and expected_digest must be provided together"
@@ -182,14 +182,14 @@ def _checkpoint_metadata(
         if manifest is not None
         else _hash_files(root, ("adapter_config.json", "adapter_model.safetensors"))
     )
-    return root, adapter_config, artifact_keys, manifest, digest
+    return PreparedCheckpoint(root, adapter_config, manifest, artifact_keys, digest)
 
 
 def validate_checkpoint(
     path: str | Path, *, require_optimizer: bool = False
 ) -> CheckpointManifest | None:
     """Validate an ART checkpoint without materializing trainer-local state."""
-    return _checkpoint_metadata(path, require_optimizer=require_optimizer)[3]
+    return _checkpoint_metadata(path, require_optimizer=require_optimizer).manifest
 
 
 def materialize_lora(
@@ -201,7 +201,7 @@ def materialize_lora(
     expected_digest: str | None = None,
 ) -> None:
     """Copy only the inference adapter view from a validated checkpoint."""
-    root, _config, _keys, _manifest, _digest_value = _checkpoint_metadata(
+    source = _checkpoint_metadata(
         path,
         require_optimizer=require_optimizer,
         verify_payload=artifact_entries is None,
@@ -213,7 +213,7 @@ def materialize_lora(
     if destination.exists() and any(destination.iterdir()):
         raise FileExistsError(f"LoRA output directory is not empty: {destination}")
     shutil.copytree(
-        root,
+        source.path,
         destination,
         dirs_exist_ok=True,
         ignore=lambda _root, names: [
@@ -228,26 +228,7 @@ def materialize_lora(
 
 
 def prepare_checkpoint(path: str) -> PreparedCheckpoint:
-    root, adapter_config, artifact_keys, manifest, digest = _checkpoint_metadata(
-        path, verify_payload=_is_node_validator()
-    )
-
-    return PreparedCheckpoint(
-        root,
-        adapter_config,
-        manifest,
-        artifact_keys,
-        digest,
-    )
-
-
-def save_checkpoint(
-    trainer: TrainerRank,
-    output_dir: str,
-    checkpoint_name: str,
-) -> None:
-    prepare_checkpoint_save(trainer, output_dir, checkpoint_name)
-    finish_checkpoint_save(trainer, output_dir)
+    return _checkpoint_metadata(path, verify_payload=_is_node_validator())
 
 
 def prepare_checkpoint_save(
@@ -857,8 +838,7 @@ def _snapshot_plan(
     group: dist.ProcessGroup | None,
 ) -> tuple[list[LoraShardMeta], tuple[str, ...], dict[str, float]]:
     from art.megatron.weights.lora_publish import (
-        _elect_lora_contributors,
-        _validate_replica_digests,
+        _elect_contributors,
     )
 
     local_lora: list[tuple[LoraShardMeta, str]] = []
@@ -877,10 +857,7 @@ def _snapshot_plan(
     ]
     metadata: list[LoraShardMeta] = []
     with _collective_errors("elect checkpoint contributors", group=group):
-        _validate_replica_digests(gathered_lora)
-        metadata = _elect_lora_contributors(
-            [item for item, _digest_value in gathered_lora]
-        )
+        metadata = _elect_contributors(gathered_lora)
 
     optimizers = _gather_objects(prepared.optimizer, group=group)
     if any(value != prepared.optimizer for value in optimizers):

@@ -719,9 +719,10 @@ class TrainerRank:
     ) -> None:
         from . import _checkpoint
 
-        _checkpoint.save_checkpoint(
+        _checkpoint.prepare_checkpoint_save(
             self, output_dir, self._resolve_checkpoint_name(checkpoint_path)
         )
+        _checkpoint.finish_checkpoint_save(self, output_dir)
 
     def _prepare_checkpoint_save(
         self,

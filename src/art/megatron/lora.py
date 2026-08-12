@@ -1744,6 +1744,17 @@ def apply_lora_adapters(
     return list(model)
 
 
+def _iter_lora_modules(
+    model: Sequence[torch.nn.Module],
+) -> Iterator[LoRA]:
+    seen: set[int] = set()
+    for chunk in model:
+        for module in chunk.modules():
+            if isinstance(module, LoRA) and id(module) not in seen:
+                seen.add(id(module))
+                yield module
+
+
 def load_lora_slot_into_model(
     model: Sequence[torch.nn.Module],
     ref: LoRASlotRef,
@@ -1753,15 +1764,14 @@ def load_lora_slot_into_model(
     localized: bool = False,
 ) -> int:
     loaded = 0
-    for chunk in model:
-        for module in chunk.modules():
-            if isinstance(module, LoRA) and module.load_lora_slot(
-                ref,
-                adapter_model,
-                alpha=alpha,
-                localized=localized,
-            ):
-                loaded += 1
+    for module in _iter_lora_modules(model):
+        if module.load_lora_slot(
+            ref,
+            adapter_model,
+            alpha=alpha,
+            localized=localized,
+        ):
+            loaded += 1
     if loaded == 0 and ref.name is not None:
         raise RuntimeError(f"LoRA slot {ref.name!r} loaded no adapter sites")
     return loaded
@@ -1770,13 +1780,10 @@ def load_lora_slot_into_model(
 def delete_lora_slot_from_model(
     model: Sequence[torch.nn.Module], ref: LoRASlotRef
 ) -> None:
-    for chunk in model:
-        for module in chunk.modules():
-            if not isinstance(module, LoRA):
-                continue
-            key = module._slot_keys.pop(ref, None)
-            if key is not None and key in module._slot_modules:
-                del module._slot_modules[key]
+    for module in _iter_lora_modules(model):
+        key = module._slot_keys.pop(ref, None)
+        if key is not None and key in module._slot_modules:
+            del module._slot_modules[key]
 
 
 def _lora_slot_replacements(
@@ -1785,25 +1792,22 @@ def _lora_slot_replacements(
     destination: LoRASlotRef,
 ) -> list[tuple[LoRA, str | None, str | None]]:
     replacements: list[tuple[LoRA, str | None, str | None]] = []
-    for chunk in model:
-        for module in chunk.modules():
-            if not isinstance(module, LoRA):
+    for module in _iter_lora_modules(model):
+        source_key = module._slot_keys.get(source)
+        destination_key = module._slot_keys.get(destination)
+        for ref, key in ((source, source_key), (destination, destination_key)):
+            if key is None:
                 continue
-            source_key = module._slot_keys.get(source)
-            destination_key = module._slot_keys.get(destination)
-            for ref, key in ((source, source_key), (destination, destination_key)):
-                if key is None:
-                    continue
-                if key not in module._slot_modules:
-                    raise RuntimeError(
-                        f"LoRA slot {ref.name!r} maps to missing module {key!r}"
-                    )
-                slot = cast(LoRASlot, module._slot_modules[key])
-                if slot.ref != ref:
-                    raise RuntimeError(
-                        f"LoRA slot {ref.name!r} has inconsistent module metadata"
-                    )
-            replacements.append((module, source_key, destination_key))
+            if key not in module._slot_modules:
+                raise RuntimeError(
+                    f"LoRA slot {ref.name!r} maps to missing module {key!r}"
+                )
+            slot = cast(LoRASlot, module._slot_modules[key])
+            if slot.ref != ref:
+                raise RuntimeError(
+                    f"LoRA slot {ref.name!r} has inconsistent module metadata"
+                )
+        replacements.append((module, source_key, destination_key))
     return replacements
 
 
@@ -1822,23 +1826,18 @@ def _snapshot_lora_slots(
     model: Sequence[torch.nn.Module],
 ) -> _LoraSlotSnapshot:
     snapshots = []
-    seen: set[int] = set()
-    for chunk in model:
-        for module in chunk.modules():
-            if not isinstance(module, LoRA) or id(module) in seen:
-                continue
-            seen.add(id(module))
-            slots = {
-                key: cast(LoRASlot, slot) for key, slot in module._slot_modules.items()
-            }
-            snapshots.append(
-                (
-                    module,
-                    dict(module._slot_keys),
-                    slots,
-                    {key: slot.ref for key, slot in slots.items()},
-                )
+    for module in _iter_lora_modules(model):
+        slots = {
+            key: cast(LoRASlot, slot) for key, slot in module._slot_modules.items()
+        }
+        snapshots.append(
+            (
+                module,
+                dict(module._slot_keys),
+                slots,
+                {key: slot.ref for key, slot in slots.items()},
             )
+        )
     return tuple(snapshots)
 
 
@@ -1884,16 +1883,13 @@ def iter_lora_slot_parameters(
     ref: LoRASlotRef,
 ) -> Iterator[torch.nn.Parameter]:
     seen: set[int] = set()
-    for chunk in model:
-        for module in chunk.modules():
-            if not isinstance(module, LoRA):
+    for module in _iter_lora_modules(model):
+        for param in module.lora_slot_params(ref):
+            param_id = id(param)
+            if param_id in seen:
                 continue
-            for param in module.lora_slot_params(ref):
-                param_id = id(param)
-                if param_id in seen:
-                    continue
-                seen.add(param_id)
-                yield param
+            seen.add(param_id)
+            yield param
 
 
 def iter_lora_sites(

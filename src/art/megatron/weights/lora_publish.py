@@ -31,6 +31,7 @@ from art.megatron.lora import (
     LoRASlotRef,
     _block_for_key,
     _dtype_name,
+    _iter_lora_modules,
 )
 from art.megatron.model_support.lora_disk import (
     ART_LORA_FORMAT_CONFIG_KEY,
@@ -55,13 +56,6 @@ class PackedExpertShardMeta(NamedTuple):
     expert_start: int
     expert_count: int
     pack_layout: str
-
-
-def iter_lora_modules(model_chunks: ModelChunks) -> Iterable[LoRA]:
-    for chunk in model_chunks:
-        for module in chunk.modules():
-            if isinstance(module, LoRA):
-                yield module
 
 
 def _packed_expert_slot(
@@ -107,7 +101,7 @@ def collect_local_lora_entries(
 ) -> tuple[dict[str, torch.Tensor], list[LoraShardMeta]]:
     local_tensors: dict[str, torch.Tensor] = {}
     local_manifest: dict[str, LoraShardManifest] = {}
-    for module in iter_lora_modules(model_chunks):
+    for module in _iter_lora_modules(model_chunks):
         if _uses_packed_expert_publish(module, packed_expert_groups, slot_ref):
             continue
         for key, value in module.sharded_lora_state_dict(
@@ -150,7 +144,7 @@ def collect_local_packed_expert_entries(
 ) -> tuple[dict[str, torch.Tensor], list[PackedExpertShardMeta]]:
     local_tensors: dict[str, torch.Tensor] = {}
     metadata: list[PackedExpertShardMeta] = []
-    for module in iter_lora_modules(model_chunks):
+    for module in _iter_lora_modules(model_chunks):
         if not _uses_packed_expert_publish(module, packed_expert_groups, slot_ref):
             continue
         expert_start = int(module._expert_offset)
@@ -310,57 +304,25 @@ def _contributor_identity(
     return ("lora", metadata.key, shard_rank)
 
 
-def _validate_replica_digests(
-    records: Iterable[tuple[LoraShardMeta | PackedExpertShardMeta, str]],
-) -> None:
+def _elect_contributors[T: LoraShardMeta | PackedExpertShardMeta](
+    records: Iterable[tuple[T, str]],
+) -> list[T]:
     digests: dict[tuple[object, ...], str] = {}
-    for metadata, digest in records:
-        identity = _contributor_identity(metadata)
+    elected: dict[tuple[object, ...], T] = {}
+    for candidate, digest in records:
+        identity = _contributor_identity(candidate)
         previous = digests.setdefault(identity, digest)
         if previous != digest:
             raise RuntimeError(
-                f"Inconsistent replicated tensor contents for {metadata.key!r}"
+                f"Inconsistent replicated tensor contents for {candidate.key!r}"
             )
-
-
-def _elect_lora_contributors(
-    metadata: list[LoraShardMeta],
-) -> list[LoraShardMeta]:
-    elected: dict[tuple[str, int], LoraShardMeta] = {}
-    for candidate in metadata:
-        identity = (candidate.key, int(candidate.manifest.get("shard_rank", 0)))
-        current = elected.get(identity)
-        if current is not None and (
-            current.shape != candidate.shape
-            or current.dtype_name != candidate.dtype_name
-            or current.manifest != candidate.manifest
-            or current.block != candidate.block
-        ):
-            raise RuntimeError(
-                f"Inconsistent replicated LoRA metadata for {candidate.key!r}"
-            )
-        if current is None or candidate.owner_rank < current.owner_rank:
-            elected[identity] = candidate
-    return list(elected.values())
-
-
-def _elect_packed_expert_contributors(
-    metadata: list[PackedExpertShardMeta],
-) -> list[PackedExpertShardMeta]:
-    elected: dict[tuple[str, int, int], PackedExpertShardMeta] = {}
-    for candidate in metadata:
-        identity = (
-            candidate.key,
-            candidate.expert_start,
-            int(candidate.manifest.get("shard_rank", 0)),
-        )
         current = elected.get(identity)
         if (
             current is not None
             and current._replace(owner_rank=candidate.owner_rank) != candidate
         ):
             raise RuntimeError(
-                f"Inconsistent replicated packed LoRA metadata for {candidate.key!r}"
+                f"Inconsistent replicated LoRA metadata for {candidate.key!r}"
             )
         if current is None or candidate.owner_rank < current.owner_rank:
             elected[identity] = candidate
@@ -720,14 +682,8 @@ def _prepare_local_lora_export(
             for metadata in local_packed_metadata
         ]
     )
-    _validate_replica_digests(gathered_metadata)
-    _validate_replica_digests(gathered_packed_metadata)
-    metadata = _elect_lora_contributors(
-        [metadata for metadata, _digest in gathered_metadata]
-    )
-    packed_metadata = _elect_packed_expert_contributors(
-        [metadata for metadata, _digest in gathered_packed_metadata]
-    )
+    metadata = _elect_contributors(gathered_metadata)
+    packed_metadata = _elect_contributors(gathered_packed_metadata)
     blocks = tuple(
         sorted(
             {item.block for item in metadata}
