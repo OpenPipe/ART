@@ -60,6 +60,13 @@ _LIGHTWEIGHT_GPU_STAGES = frozenset(
 )
 _CPU_STAGES = frozenset({"chat_template_rollout"})
 _BASE_SESSION_STAGES = frozenset({"hf_parity", "packing_invariance"})
+_DEFAULT_STAGE_GPU_COUNTS = {
+    "train_inf_mismatch": 4,
+    "merged_vllm_serving": 2,
+    "native_vllm_lora": 2,
+    "length_trainability": 2,
+    "yes_no_trainability": 2,
+}
 _WORKFLOW_HOSTS_ENV = "ART_MODEL_SUPPORT_WORKFLOW_HOSTS"
 
 
@@ -234,9 +241,13 @@ def _stage_gpu_count(
         HANDLER_WORKFLOW_RESOURCES[prepared.report.model_key], stage_name, None
     )
     if resources is None:
-        raise RuntimeError(
-            f"missing workflow resources for {prepared.report.model_key}/{stage_name}"
-        )
+        try:
+            return _DEFAULT_STAGE_GPU_COUNTS[stage_name]
+        except KeyError:
+            raise RuntimeError(
+                "missing workflow resources for "
+                f"{prepared.report.model_key}/{stage_name}"
+            ) from None
     return _minimum_gpu_count(stage_name, resources, visible_gpu_count=available)
 
 
