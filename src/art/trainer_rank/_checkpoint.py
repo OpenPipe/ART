@@ -889,29 +889,30 @@ def _finalize_checkpoint_save(
             return
         error: BaseException | None = None
         outcome = trainer._checkpoint_save_outcomes.get(output_dir)
-        if outcome is None and action == "finish":
-            try:
-                _finish(trainer, prepared)
-            except BaseException as exc:
-                error = exc
-        if outcome is None:
-            outcome = action if error is None else "abort"
-            with trainer._checkpoint_save_condition:
-                trainer._checkpoint_save_outcomes[output_dir] = outcome
-                if outcome == "abort":
-                    trainer._checkpoint_save_skipped.add(prepared.sequence)
-            _advance_save_queue(trainer, prepared.sequence)
-        paths = [prepared.snapshot]
-        if _rank() == 0:
-            paths.append(prepared.reservation)
-        cleanup = _cleanup_paths(paths)
-        cleanup_failed = any(_gather(cleanup is not None, group))
-        if cleanup is not None:
-            error = BaseExceptionGroup(
-                "checkpoint finalization cleanup failed",
-                [*([error] if error is not None else []), cleanup],
-            )
+        cleanup_failed = True
         try:
+            if outcome is None and action == "finish":
+                try:
+                    _finish(trainer, prepared)
+                except BaseException as exc:
+                    error = exc
+            if outcome is None:
+                outcome = action if error is None else "abort"
+                with trainer._checkpoint_save_condition:
+                    trainer._checkpoint_save_outcomes[output_dir] = outcome
+                    if outcome == "abort":
+                        trainer._checkpoint_save_skipped.add(prepared.sequence)
+                _advance_save_queue(trainer, prepared.sequence)
+            paths = [prepared.snapshot]
+            if _rank() == 0:
+                paths.append(prepared.reservation)
+            cleanup = _cleanup_paths(paths)
+            cleanup_failed = any(_gather(cleanup is not None, group))
+            if cleanup is not None:
+                error = BaseExceptionGroup(
+                    "checkpoint finalization cleanup failed",
+                    [*([error] if error is not None else []), cleanup],
+                )
             raise_distributed(error, f"{action} checkpoint", group)
         finally:
             with trainer._checkpoint_save_condition:

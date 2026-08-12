@@ -878,7 +878,8 @@ class TrainerRank:
             source = await asyncio.shield(prefetch)
         except BaseException as exc:
             error = exc
-        _checkpoint.raise_distributed(error, "prepare checkpoint")
+        group = _checkpoint._ensure_group(self)
+        _checkpoint.raise_distributed(error, "prepare checkpoint", group)
         assert source is not None
         _checkpoint.load_checkpoint(self, source, logical_path)
         self._checkpoint_prefetches.pop(key, None)
@@ -895,6 +896,11 @@ class TrainerRank:
     def _slot_state_error(message: str) -> TrainerRankSlotStateError:
         return TrainerRankSlotStateError(message)
 
+    def _checkpoint_group(self) -> dist.ProcessGroup | None:
+        from ._checkpoint import _ensure_group
+
+        return _ensure_group(self)
+
     def _validate_checkpoint_adapter_config(
         self,
         name: str,
@@ -905,7 +911,7 @@ class TrainerRank:
         config = None if adapter_config is None else deepcopy(dict(adapter_config))
         if dist.is_available() and dist.is_initialized():
             gathered: list[dict[str, object] | None] = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered, config)
+            dist.all_gather_object(gathered, config, group=self._checkpoint_group())
             if any(value != config for value in gathered):
                 raise ValueError(
                     f"Adapter config for checkpoint slot {name!r} differs across ranks"
@@ -1234,7 +1240,7 @@ class TrainerRank:
         expected = set(templates)
         if dist.is_available() and dist.is_initialized():
             gathered: list[set[str] | None] = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered, expected)
+            dist.all_gather_object(gathered, expected, group=self._checkpoint_group())
             expected = set().union(*(value for value in gathered if value is not None))
         if unknown := sorted(keys - expected):
             preview = ", ".join(repr(key) for key in unknown[:8])
@@ -1316,7 +1322,7 @@ class TrainerRank:
             else [None] * dist.get_world_size()
         )
         if dist.is_available() and dist.is_initialized():
-            dist.all_gather_object(gathered, local_keys)
+            dist.all_gather_object(gathered, local_keys, group=self._checkpoint_group())
         covered = set().union(*(keys for keys in gathered if keys is not None))
         if loaded_sites < 1 or covered != expected_keys:
             raise TrainerRankSlotStateError(
