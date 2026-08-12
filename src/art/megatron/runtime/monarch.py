@@ -790,7 +790,7 @@ class MonarchTrainerRun:
         try:
             values = await asyncio.wait_for(
                 collective,
-                timeout=self.run_spec.event_timeout_s,
+                timeout=self._command_timeout_s(),
             )
             results = list(values.values())
             self._validate_rank_command_results(
@@ -840,7 +840,7 @@ class MonarchTrainerRun:
         try:
             values = await asyncio.wait_for(
                 collective,
-                timeout=self.run_spec.event_timeout_s,
+                timeout=self._command_timeout_s(),
             )
             results = list(values.values())
             self._validate_rank_command_results(
@@ -905,7 +905,7 @@ class MonarchTrainerRun:
         try:
             values = await asyncio.wait_for(
                 collective,
-                timeout=self.run_spec.event_timeout_s,
+                timeout=self._command_timeout_s(),
             )
             results = list(values.values())
             self._validate_rank_command_results(
@@ -966,6 +966,14 @@ class MonarchTrainerRun:
                 f"operation={learner_parent}, "
                 f"runtime={self._learner_version}"
             )
+
+    def _command_timeout_s(self) -> float:
+        if (
+            self._next_operation_sequence == 0
+            and self.run_spec.initial_event_timeout_s is not None
+        ):
+            return self.run_spec.initial_event_timeout_s
+        return self.run_spec.event_timeout_s
 
     def _validate_rank_command_results(
         self,
