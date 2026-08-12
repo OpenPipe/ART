@@ -5,7 +5,6 @@ from typing import cast
 
 from .model import (
     InternalModelConfig,
-    RolloutWeightsMode,
     RolloutWeightUpdateMode,
     VllmRuntimeMode,
 )
@@ -32,13 +31,6 @@ def is_dedicated_mode(config: InternalModelConfig) -> bool:
     )
 
 
-def _rollout_weights_mode(config: InternalModelConfig) -> RolloutWeightsMode:
-    mode = config.get("rollout_weights_mode", "lora")
-    if mode in {"lora", "merged"}:
-        return mode
-    raise ValueError("rollout_weights_mode must be either 'lora' or 'merged'")
-
-
 def _rollout_weight_update_mode(
     config: InternalModelConfig,
 ) -> RolloutWeightUpdateMode:
@@ -56,10 +48,13 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
     Raises ValueError if the configuration is invalid.
     Does nothing if neither trainer_gpu_ids nor inference_gpu_ids is set (shared mode).
     """
+    if "rollout_weights_mode" in config:
+        raise ValueError(
+            "rollout_weights_mode has been removed; ART always serves native LoRA adapters"
+        )
     has_trainer = "trainer_gpu_ids" in config
     has_inference = "inference_gpu_ids" in config
-    rollout_weights_mode = _rollout_weights_mode(config)
-    rollout_weight_update_mode = _rollout_weight_update_mode(config)
+    _rollout_weight_update_mode(config)
     external = is_external_vllm_mode(config)
 
     if external:
@@ -67,10 +62,6 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
         assert isinstance(runtime_config, Mapping)
         if not runtime_config.get("server_url"):
             raise ValueError("vllm_runtime.server_url is required for external mode")
-        if rollout_weights_mode != "lora":
-            raise ValueError(
-                "vllm_runtime.mode='external' requires rollout_weights_mode='lora'"
-            )
         if has_trainer and not config["trainer_gpu_ids"]:
             raise ValueError("trainer_gpu_ids must be non-empty")
         if "fast_inference" in config.get("init_args", {}):
@@ -78,34 +69,11 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
                 "fast_inference is no longer supported; ART always uses an external "
                 "vLLM runtime"
             )
-        if (
-            rollout_weight_update_mode == "in_flight_lora"
-            and rollout_weights_mode != "lora"
-        ):
-            raise ValueError(
-                "rollout_weight_update_mode='in_flight_lora' requires "
-                "rollout_weights_mode='lora'"
-            )
         return
 
     if has_trainer != has_inference:
         raise ValueError(
             "trainer_gpu_ids and inference_gpu_ids must both be set or both unset"
-        )
-
-    if rollout_weights_mode == "merged" and not has_trainer:
-        raise ValueError(
-            "rollout_weights_mode='merged' requires dedicated mode "
-            "(set both trainer_gpu_ids and inference_gpu_ids)"
-        )
-
-    if (
-        rollout_weight_update_mode == "in_flight_lora"
-        and rollout_weights_mode != "lora"
-    ):
-        raise ValueError(
-            "rollout_weight_update_mode='in_flight_lora' requires "
-            "rollout_weights_mode='lora'"
         )
 
     if "fast_inference" in config.get("init_args", {}):

@@ -24,8 +24,6 @@ from .workflow import (
     run_hf_parity_stage,
     run_length_trainability_stage,
     run_lora_coverage_stage,
-    run_merged_vllm_serving_stage,
-    run_native_vllm_lora_stage,
     run_packing_invariance_stage,
     run_train_inf_mismatch_stage,
     run_yes_no_trainability_stage,
@@ -33,7 +31,7 @@ from .workflow import (
 from .workflow_fixtures import FIXTURE_PATH_ENV, ensure_workflow_fixture
 
 FUNCTIONAL_LORA_VLLM_MODE = "functional_lora_vllm"
-FUNCTIONAL_LORA_VLLM_STAGES = ("length_trainability", "native_vllm_lora")
+FUNCTIONAL_LORA_VLLM_STAGES = ("train_inf_mismatch", "length_trainability")
 BASE_MEGATRON_MODE = "base_megatron"
 BASE_MEGATRON_STAGES = ("hf_parity", "packing_invariance")
 EXTERNAL_VLLM_ENGINE_ARGS_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_ENGINE_ARGS"
@@ -41,7 +39,6 @@ _STAGE_RUNNERS = {
     "hf_parity": run_hf_parity_stage,
     "lora_coverage": run_lora_coverage_stage,
     "train_inf_mismatch": run_train_inf_mismatch_stage,
-    "merged_vllm_serving": run_merged_vllm_serving_stage,
     "correctness_sensitivity": run_correctness_sensitivity_stage,
     CORRECTNESS_REFERENCE_STAGE: run_correctness_sensitivity_stage,
     "chat_template_rollout": run_chat_template_rollout_stage,
@@ -49,7 +46,6 @@ _STAGE_RUNNERS = {
     "length_trainability": run_length_trainability_stage,
     "e2e_throughput": run_e2e_throughput_stage,
     "yes_no_trainability": run_yes_no_trainability_stage,
-    "native_vllm_lora": run_native_vllm_lora_stage,
 }
 
 

@@ -14,7 +14,6 @@ if TYPE_CHECKING:
     from megatron.bridge import AutoBridge
     from megatron.bridge.models.gpt_provider import GPTModelProvider
 
-RolloutWeightsMode = Literal["lora", "merged"]
 NativeVllmLoraStatus = Literal["disabled", "wip", "validated"]
 SharedExpertCompileState = Literal[
     "none",
@@ -104,7 +103,6 @@ class ModelSupportSpec(BaseModel):
     is_moe: bool = False
     model_names: tuple[str, ...] = ()
     default_target_modules: tuple[str, ...]
-    default_rollout_weights_mode: RolloutWeightsMode = "lora"
     native_vllm_lora_status: NativeVllmLoraStatus = "disabled"
     dependency_floor: DependencyFloor = Field(default_factory=DependencyFloor)
 
@@ -155,11 +153,7 @@ class ModelSupportHandler(Protocol):
         internal_config: Any,
     ) -> Any: ...
 
-    def vllm_engine_args(
-        self,
-        *,
-        rollout_weights_mode: RolloutWeightsMode,
-    ) -> dict[str, object]: ...
+    def vllm_engine_args(self) -> dict[str, object]: ...
 
     def vllm_server_args(self) -> dict[str, object]: ...
 

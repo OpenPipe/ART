@@ -178,7 +178,6 @@ class LengthTrainabilityReport(BaseModel):
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
     training_topology: dict[str, int | bool]
-    rollout_weights_mode: str
     rollouts_per_prompt: int
     prompt_tree_depth: int = 0
     prompt_tree_branch_count: int = 0
@@ -811,7 +810,6 @@ async def run_length_trainability_async(
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     chat_template_kwargs = _length_chat_template_kwargs(base_model, tokenizer)
-    rollout_weights_mode = internal_config["rollout_weights_mode"]
     with _temporary_env(backend_env):
         _init_megatron_runtime_config(
             variant,
@@ -986,7 +984,6 @@ async def run_length_trainability_async(
         trainer_gpu_ids=variant.trainer_gpu_ids,
         inference_gpu_ids=variant.inference_gpu_ids,
         training_topology=cast(dict[str, int | bool], topology.model_dump()),
-        rollout_weights_mode=rollout_weights_mode,
         rollouts_per_prompt=rollouts_per_prompt,
         prompt_tree_depth=prompt_tree_depth,
         prompt_tree_branch_count=prompt_tree_branch_count,

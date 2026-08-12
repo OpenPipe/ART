@@ -279,7 +279,6 @@ def test_megatron_variants_keep_short_packed_sequence_default(monkeypatch) -> No
         variant, base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"
     )
     assert config["init_args"]["max_seq_length"] == 1024
-    assert config["rollout_weights_mode"] == "lora"
     assert (
         _default_variant_name("Qwen/Qwen3-30B-A3B-Instruct-2507") == "megatron_shared"
     )
@@ -324,7 +323,6 @@ def test_qwen3_5_defaults_to_shared_lora_rollout() -> None:
     config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-35B-A3B")
 
     assert _default_variant_name("Qwen/Qwen3.5-35B-A3B") == "megatron_shared"
-    assert config["rollout_weights_mode"] == "lora"
     assert "trainer_gpu_ids" not in config
     assert "inference_gpu_ids" not in config
 
@@ -351,7 +349,6 @@ def test_yes_no_trainability_rejects_initially_saturated_stable_report() -> None
         output_dir="/tmp/report",
         trainer_gpu_ids=[0, 1],
         inference_gpu_ids=[0, 1],
-        rollout_weights_mode="lora",
         reward_threshold=0.9,
         max_steps=4,
         prompt_count=8,
@@ -386,7 +383,6 @@ def test_yes_no_trainability_requires_gradient_correlation_and_learning() -> Non
         output_dir="/tmp/report",
         trainer_gpu_ids=[0, 1],
         inference_gpu_ids=[2, 3],
-        rollout_weights_mode="lora",
         reward_threshold=0.9,
         max_steps=4,
         prompt_count=8,
@@ -508,7 +504,6 @@ def test_length_trainability_accepts_near_baseline_learning_signal() -> None:
         trainer_gpu_ids=[0],
         inference_gpu_ids=[1],
         training_topology={"tp": 1, "cp": 1, "ep": 1, "etp": 1, "dp": 1, "sp": False},
-        rollout_weights_mode="lora",
         rollouts_per_prompt=4,
         normalize_advantages=True,
         summary_log_path="/tmp/length_trainability.log",
@@ -602,7 +597,6 @@ def test_validated_dense_model_uses_dense_shared_topology(
     )
 
     config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-4B")
-    assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_sleep_mode"] is True
     assert "enable_expert_parallel" not in config["engine_args"]
 
@@ -619,7 +613,6 @@ def test_qwen3_5_moe_shared_variant_enables_expert_parallel(monkeypatch) -> None
 
     config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-35B-A3B")
 
-    assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_expert_parallel"] is True
 
 

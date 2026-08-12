@@ -1575,7 +1575,6 @@ async def _run_e2e_throughput_async(
     internal_config = {
         "trainer_gpu_ids": stage.megatron.gpu_ids,
         "inference_gpu_ids": stage.vllm.gpu_ids,
-        "rollout_weights_mode": "lora",
         "rollout_weight_update_mode": "in_flight_lora",
         "engine_args": engine_args,
         "init_args": {

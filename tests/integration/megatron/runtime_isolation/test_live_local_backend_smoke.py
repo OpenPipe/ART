@@ -42,7 +42,6 @@ def _safe_gpu_memory_utilization() -> float:
 
 def _live_test_config() -> art.dev.InternalModelConfig:
     return {
-        "rollout_weights_mode": "lora",
         "engine_args": {
             "gpu_memory_utilization": _safe_gpu_memory_utilization(),
             "max_model_len": int(

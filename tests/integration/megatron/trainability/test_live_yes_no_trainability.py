@@ -36,10 +36,7 @@ def _assert_passed(report) -> None:
     assert report.latest_step > 0
     assert report.step0_name in report.model_ids_before
     assert report.latest_name in report.model_ids_after
-    if report.rollout_weights_mode == "merged":
-        assert report.step0_name not in report.model_ids_after
-    else:
-        assert report.step0_name in report.model_ids_after
+    assert report.step0_name in report.model_ids_after
     assert report.latest_snapshot["has_logprobs"] is True
 
 

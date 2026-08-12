@@ -67,7 +67,6 @@ from art.megatron.routing_replay import (
 )
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.specs import SFTJobSpec, TrainJobSpec
-from art.megatron.runtime.weight_transfer import MergedWeightTransferInitInfo
 from art.megatron.selective_lm_head import (
     TokenLossOutput,
     forward_token_losses,
@@ -174,8 +173,6 @@ class TrainingRuntime(BaseModel):
     rank: int
     world_size: int
     moe_routing_replay_controller: MoeRoutingReplayController | None = None
-    merged_weight_transfer_group: Any | None = None
-    merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
     inter_forward_backward_timing: _InterForwardBackwardTiming = Field(
         default_factory=_InterForwardBackwardTiming
     )
@@ -2291,18 +2288,3 @@ def run_training_step(
             **collect_inter_schedule_metrics(),
         },
     )
-
-
-def _close_merged_weight_transfer_group(
-    runtime: TrainingRuntime, *, abort: bool = False
-) -> None:
-    weight_transfer_group = runtime.merged_weight_transfer_group
-    runtime.merged_weight_transfer_group = None
-    runtime.merged_weight_transfer_init_info = None
-    if weight_transfer_group is None:
-        return
-    shutdown = getattr(weight_transfer_group, "abort" if abort else "close", None)
-    if shutdown is None and abort:
-        shutdown = getattr(weight_transfer_group, "close", None)
-    if shutdown is not None:
-        shutdown()

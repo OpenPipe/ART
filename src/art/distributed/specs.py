@@ -202,7 +202,6 @@ class ModelServiceSpec(_Spec):
     model_revision: str | None = Field(default=None, min_length=1)
     runtime_fingerprint: str = Field(min_length=1)
     parallel: VllmParallelSpec
-    update_mode: Literal["lora", "merged"]
     temporal_gpu_sharing: bool = False
 
     @model_validator(mode="after")

@@ -429,16 +429,6 @@ class Dsv4Handler(DefaultMoeHandler):
                     )
         return adapter_weights_by_base
 
-    def iter_merged_vllm_weight_metadata(
-        self,
-        weight_export: Any,
-    ) -> Any:
-        bridge = getattr(weight_export.bridge, "_model_bridge", None)
-        metadata_iter = getattr(bridge, "iter_merged_vllm_weight_metadata", None)
-        if metadata_iter is None:
-            return None
-        return metadata_iter(weight_export)
-
     def from_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],

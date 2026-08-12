@@ -58,7 +58,7 @@ MEAN_ABS_PCT_DENOMINATOR_EPS = 1e-18
 TOP_K = 20
 ScoreRecord = tuple[int, float, list[int], list[float]]
 
-RolloutMode = Literal["native_lora", "merged"]
+RolloutMode = Literal["native_lora"]
 EngineSide = Literal["megatron", "vllm"]
 WeightState = Literal["base", "lora"]
 
@@ -246,7 +246,7 @@ def _parse_str_list(value: str) -> list[str]:
 
 def _parse_rollout_modes(value: str) -> list[RolloutMode]:
     modes = _parse_str_list(value)
-    invalid = sorted(set(modes) - {"native_lora", "merged"})
+    invalid = sorted(set(modes) - {"native_lora"})
     if invalid:
         raise ValueError(f"Unsupported rollout modes: {invalid}")
     return cast(list[RolloutMode], modes)
@@ -257,19 +257,8 @@ def default_rollout_modes_for_model(
     *,
     allow_unvalidated_arch: bool = False,
 ) -> list[RolloutMode]:
-    from art.megatron.model_support.registry import native_vllm_lora_status_for_model
-
-    modes: list[RolloutMode] = []
-    if (
-        native_vllm_lora_status_for_model(
-            base_model,
-            allow_unvalidated_arch=allow_unvalidated_arch,
-        )
-        != "disabled"
-    ):
-        modes.append("native_lora")
-    modes.append("merged")
-    return modes
+    del base_model, allow_unvalidated_arch
+    return ["native_lora"]
 
 
 def fwd_mean_abs_pct_limit_for_model(

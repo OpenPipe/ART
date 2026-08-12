@@ -260,7 +260,6 @@ def compile_local_runtime_topology(
                 model_revision=revision,
                 runtime_fingerprint=fingerprint,
                 parallel=parallel,
-                update_mode=config.get("rollout_weights_mode", "lora"),
                 temporal_gpu_sharing=not dedicated,
             ),
         )

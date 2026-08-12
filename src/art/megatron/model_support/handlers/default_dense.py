@@ -9,7 +9,6 @@ from art.megatron.model_support.spec import (
     HfWeightSource,
     LayerFamilyInstance,
     PrefixTreeModelStateContext,
-    RolloutWeightsMode,
     SharedExpertCompileState,
 )
 
@@ -122,12 +121,7 @@ class DefaultDenseHandler:
         del internal_config
         return tokenizer
 
-    def vllm_engine_args(
-        self,
-        *,
-        rollout_weights_mode: RolloutWeightsMode,
-    ) -> dict[str, object]:
-        del rollout_weights_mode
+    def vllm_engine_args(self) -> dict[str, object]:
         return {}
 
     def vllm_server_args(self) -> dict[str, object]:

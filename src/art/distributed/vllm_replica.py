@@ -611,7 +611,6 @@ class ReplicaManager:
             ),
             lora_path=self._template.lora_path,
             served_model_name=self._template.served_model_name,
-            rollout_weights_mode=self._spec.update_mode,
             engine_args=engine_args,
             server_args=self._template.server_args,
             nnodes=len(self._spec.members),

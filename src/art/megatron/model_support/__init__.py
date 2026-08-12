@@ -26,7 +26,6 @@ from art.megatron.model_support.registry import (
     get_model_support_spec_by_key,
     is_model_support_registered,
     list_model_support_specs,
-    model_requires_merged_rollout,
     model_supports_context_parallel,
     model_uses_expert_parallel,
     native_vllm_lora_status_for_model,
@@ -39,7 +38,6 @@ from art.megatron.model_support.spec import (
     ModelSupportHandler,
     ModelSupportSpec,
     NativeVllmLoraStatus,
-    RolloutWeightsMode,
 )
 
 _LAZY_EXPORT_MODULES = {
@@ -84,7 +82,6 @@ __all__ = [
     "QWEN3_MOE_SPEC",
     "QWEN3_5_MOE_SPEC",
     "PROBE_ONLY_MODEL_SUPPORT_SPECS",
-    "RolloutWeightsMode",
     "UnsupportedModelArchitectureError",
     "VALIDATED_MODEL_SUPPORT_SPECS",
     "default_target_modules_for_model",
@@ -98,7 +95,6 @@ __all__ = [
     "list_model_support_specs",
     "model_uses_expert_parallel",
     "model_supports_context_parallel",
-    "model_requires_merged_rollout",
     "native_vllm_lora_status_for_model",
     "vllm_lora_config_for_model",
     "summarize_layer_families",

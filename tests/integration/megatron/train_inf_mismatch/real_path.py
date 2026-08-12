@@ -20,7 +20,7 @@ import uuid
 from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, ConfigDict, Field
 
-from art.dev.model import InternalModelConfig, RolloutWeightsMode
+from art.dev.model import InternalModelConfig
 from art.megatron.prefix_tree import parse_prefix_tree
 from art.preprocessing.moe_routing import (
     MoeRoutingPackStats,
@@ -160,12 +160,6 @@ class AdapterCacheResult(BaseModel):
 
 def _real_path_rollout_mode(config: TrainInfOutputParityConfig) -> RolloutMode:
     return config.rollout_modes[0]
-
-
-def _real_path_rollout_weights_mode(
-    config: TrainInfOutputParityConfig,
-) -> RolloutWeightsMode:
-    return "lora" if _real_path_rollout_mode(config) == "native_lora" else "merged"
 
 
 _PROMPT_SENTENCES = [
@@ -626,8 +620,7 @@ async def _direct_vllm_runtime(
     config: TrainInfOutputParityConfig,
     artifact_dir: Path,
     served_model_name: str,
-    lora_path: str,
-    rollout_weights_mode: str,
+    lora_path: str | None,
     engine_args: dict[str, Any],
     server_args: dict[str, Any] | None = None,
     forward_trace_dir: Path | None = None,
@@ -642,7 +635,6 @@ async def _direct_vllm_runtime(
         cuda_visible_devices=_cuda_visible_devices_for_slots(config.inference_gpu_ids),
         lora_path=lora_path,
         served_model_name=served_model_name,
-        rollout_weights_mode=cast(Any, rollout_weights_mode),
         engine_args=engine_args,
         server_args={
             "return_tokens_as_token_ids": True,
@@ -796,8 +788,6 @@ async def _score_base_real_generation_path(
         allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
     )
     served_name = f"train_inf_real_base_{uuid.uuid4().hex[:8]}"
-    placeholder_lora = artifact_dir / "unused_base_lora_placeholder"
-    placeholder_lora.mkdir(exist_ok=True)
     engine_args = {
         "tensor_parallel_size": len(parity_config.inference_gpu_ids),
         "enable_expert_parallel": is_moe and len(parity_config.inference_gpu_ids) > 1,
@@ -805,7 +795,7 @@ async def _score_base_real_generation_path(
         "max_logprobs": TOP_K,
         **parity_config.engine_args,
     }
-    for key, value in handler.vllm_engine_args(rollout_weights_mode="merged").items():
+    for key, value in handler.vllm_engine_args().items():
         engine_args.setdefault(key, value)
     engine_args.setdefault("generation_config", "vllm")
     engine_args.pop("enable_lora", None)
@@ -830,8 +820,7 @@ async def _score_base_real_generation_path(
         config=parity_config,
         artifact_dir=artifact_dir,
         served_model_name=served_name,
-        lora_path=str(placeholder_lora),
-        rollout_weights_mode="merged",
+        lora_path=None,
         engine_args=engine_args,
         server_args={
             "enable_auto_tool_choice": True,
@@ -887,7 +876,7 @@ async def _score_base_real_generation_path(
         logical_map=logical_map,
         require_routing_metadata=is_moe,
         weight_state="base",
-        rollout_mode="merged",
+        rollout_mode="native_lora",
     )
     vllm_score_path = artifact_dir / "real_path_vllm_base_scores.json"
     _write_json(vllm_score_path, vllm_base.model_dump(mode="json"))
@@ -1676,7 +1665,6 @@ async def run_real_path_train_inf_mismatch(
         {
             "trainer_gpu_ids": parity_config.trainer_gpu_ids,
             "inference_gpu_ids": parity_config.inference_gpu_ids,
-            "rollout_weights_mode": _real_path_rollout_weights_mode(parity_config),
             "allow_unvalidated_arch": parity_config.allow_unvalidated_arch,
             "engine_args": {
                 "tensor_parallel_size": len(parity_config.inference_gpu_ids),

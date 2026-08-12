@@ -77,7 +77,6 @@ class VllmRuntimeLaunchConfig(BaseModel):
     local_gpu_ids: tuple[int, ...] | None = None
     lora_path: str | None = None
     served_model_name: str
-    rollout_weights_mode: Literal["lora", "merged"]
     engine_args: dict[str, object] = Field(default_factory=dict)
     server_args: dict[str, object] = Field(default_factory=dict)
     nnodes: int = Field(default=1, ge=1)
@@ -338,7 +337,6 @@ class ManagedVllmRuntime:
         self.host = host
         self.port = 0
         self.api_key: str | None = None
-        self.nccl_so_path: str | None = None
         self.process: subprocess.Popen[Any] | None = None
         self.log_file: Any = None
         self.log_path: str | None = None
@@ -368,11 +366,6 @@ class ManagedVllmRuntime:
         if api_key is not None and (not isinstance(api_key, str) or not api_key):
             raise ValueError("vLLM api_key must be a non-empty string")
         self.api_key = api_key
-        self.nccl_so_path = (
-            str(get_vllm_runtime_nccl_so_path())
-            if launch_config.rollout_weights_mode == "merged"
-            else None
-        )
 
         cmd = build_vllm_runtime_server_cmd(launch_config)
         install_parent_cleanup()
@@ -512,7 +505,6 @@ class ManagedVllmRuntime:
             self.log_file = None
         self.log_path = None
         self.api_key = None
-        self.nccl_so_path = None
         self.port = 0
 
     def _cleanup_after_start_error(
@@ -843,63 +835,6 @@ def ensure_vllm_runtime() -> Path:
         )
 
 
-def _runtime_python_for_nccl_discovery() -> Path:
-    override = os.environ.get("ART_VLLM_RUNTIME_BIN")
-    if override:
-        runtime_bin = Path(shlex.split(override)[0]).expanduser().resolve()
-        runtime_dir = _runtime_dir_from_bin(runtime_bin)
-        if runtime_dir is None:
-            raise RuntimeError(
-                "ART_VLLM_RUNTIME_BIN must point directly to a "
-                ".venv/bin/art-vllm-runtime-server executable"
-            )
-        return _runtime_python(runtime_dir)
-
-    source_runtime_bin = _source_runtime_bin()
-    if source_runtime_bin.exists():
-        runtime_dir = _runtime_dir_from_bin(source_runtime_bin)
-        assert runtime_dir is not None
-        return _runtime_python(runtime_dir)
-
-    runtime_bin = ensure_vllm_runtime()
-    runtime_dir = _runtime_dir_from_bin(runtime_bin)
-    assert runtime_dir is not None
-    return _runtime_python(runtime_dir)
-
-
-def get_vllm_runtime_nccl_so_path() -> Path:
-    runtime_python = _runtime_python_for_nccl_discovery()
-    script = (
-        "from pathlib import Path\n"
-        "import importlib.util\n"
-        "spec = importlib.util.find_spec('nvidia.nccl')\n"
-        "if spec is None or spec.submodule_search_locations is None:\n"
-        "    raise SystemExit('vLLM runtime is missing its NVIDIA NCCL package')\n"
-        "package_dir = Path(next(iter(spec.submodule_search_locations)))\n"
-        "path = package_dir / 'lib' / 'libnccl.so.2'\n"
-        "if not path.exists():\n"
-        "    raise SystemExit(f'vLLM runtime is missing {path}')\n"
-        "print(path.resolve())\n"
-    )
-    result = subprocess.run(
-        [str(runtime_python), "-c", script],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        output = (result.stdout + result.stderr)[-4000:]
-        raise RuntimeError(
-            "Failed to discover vLLM runtime NCCL library with "
-            f"{runtime_python}.\n{output}"
-        )
-    nccl_so_path = Path(result.stdout.strip()).resolve()
-    if not nccl_so_path.exists():
-        raise RuntimeError(
-            f"vLLM runtime reported a missing NCCL library: {nccl_so_path}"
-        )
-    return nccl_so_path
-
-
 def _runtime_command_prefix() -> list[str]:
     override = os.environ.get("ART_VLLM_RUNTIME_BIN")
     if override:
@@ -939,7 +874,6 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
     command.extend(
         [
             f"--served-model-name={config.served_model_name}",
-            f"--rollout-weights-mode={config.rollout_weights_mode}",
             f"--engine-args-json={json.dumps(config.engine_args)}",
             f"--server-args-json={json.dumps(server_args)}",
         ]

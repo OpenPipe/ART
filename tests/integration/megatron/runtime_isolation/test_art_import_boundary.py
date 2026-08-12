@@ -105,7 +105,7 @@ def test_service_modules_import_without_vllm(artifact_dir: Path) -> None:
                 "import importlib, json; "
                 "modules = ["
                 "'art.megatron.distributed_service', "
-                "'art.megatron.weights.merged_weight_export'"
+                "'art.megatron.weights.conversion_tasks'"
                 "]; "
                 "loaded = [importlib.import_module(name).__name__ for name in modules]; "
                 "print(json.dumps({'loaded': loaded}))"
@@ -116,7 +116,7 @@ def test_service_modules_import_without_vllm(artifact_dir: Path) -> None:
     payload = _load_json_from_stdout(result.stdout)
     assert payload["loaded"] == [
         "art.megatron.distributed_service",
-        "art.megatron.weights.merged_weight_export",
+        "art.megatron.weights.conversion_tasks",
     ]
 
 

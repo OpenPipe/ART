@@ -170,8 +170,6 @@ class HandlerWorkflowResources(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     train_inf_mismatch: WorkflowStageResources | None = None
-    merged_vllm_serving: WorkflowStageResources | None = None
-    native_vllm_lora: WorkflowStageResources | None = None
     yes_no_trainability: WorkflowStageResources | None = None
     length_trainability: WorkflowStageResources | None = None
     e2e_throughput: WorkflowStageResources | None = None
@@ -252,24 +250,6 @@ _DSV4_FULL_VLLM_EP2 = VllmWorkflowResources(
     enable_expert_parallel=True,
     extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
 )
-_DSV4_FUNCTIONAL_VLLM_EP4 = VllmWorkflowResources(
-    gpu_ids=[4, 5, 6, 7],
-    tensor_parallel_size=4,
-    enable_expert_parallel=True,
-    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
-)
-_DSV4_FUNCTIONAL_VLLM_EP2 = VllmWorkflowResources(
-    gpu_ids=[2, 3],
-    tensor_parallel_size=2,
-    enable_expert_parallel=True,
-    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
-)
-_DSV4_FUNCTIONAL_NATIVE_VLLM_EP4 = VllmWorkflowResources(
-    gpu_ids=[0, 1, 2, 3],
-    tensor_parallel_size=4,
-    enable_expert_parallel=True,
-    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
-)
 _GLM52_REDUCED_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0],
     topology=MegatronWorkflowTopology(),
@@ -298,20 +278,6 @@ _GPT_OSS_REDUCED_VLLM = VllmWorkflowResources(
         "max_model_len": 1024,
     },
 )
-_QWEN_MOE_REDUCED_MEGATRON = MegatronWorkflowResources(
-    gpu_ids=[0],
-    topology=MegatronWorkflowTopology(),
-)
-_QWEN_MOE_REDUCED_VLLM = VllmWorkflowResources(
-    gpu_ids=[1],
-    tensor_parallel_size=1,
-    extra_engine_args={
-        "enforce_eager": True,
-        "max_model_len": 1024,
-        "moe_backend": "triton",
-    },
-)
-
 # Explicitly for large models which do not fit in the default topology.
 HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
     "dsv4": HandlerWorkflowResources(
@@ -324,18 +290,6 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             high_vram_megatron=_DSV4_FOUR_GPU_MEGATRON,
             high_vram_vllm=_DSV4_FULL_VLLM_EP2,
             streaming_weight_offload=True,
-        ),
-        merged_vllm_serving=WorkflowStageResources(
-            required_world_size=8,
-            required_h200_equivalent_gpus=8,
-            megatron=_DSV4_FOUR_GPU_MEGATRON,
-            vllm=_DSV4_FUNCTIONAL_VLLM_EP4,
-            high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
-            high_vram_vllm=_DSV4_FUNCTIONAL_VLLM_EP2,
-        ),
-        native_vllm_lora=WorkflowStageResources(
-            required_world_size=4,
-            vllm=_DSV4_FUNCTIONAL_NATIVE_VLLM_EP4,
         ),
         yes_no_trainability=WorkflowStageResources(
             required_world_size=8,
@@ -365,15 +319,6 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             megatron=_GLM52_REDUCED_MEGATRON,
             vllm=_GLM52_REDUCED_VLLM,
         ),
-        merged_vllm_serving=WorkflowStageResources(
-            required_world_size=2,
-            megatron=_GLM52_REDUCED_MEGATRON,
-            vllm=_GLM52_REDUCED_VLLM,
-        ),
-        native_vllm_lora=WorkflowStageResources(
-            required_world_size=2,
-            vllm=_GLM52_REDUCED_VLLM,
-        ),
         yes_no_trainability=WorkflowStageResources(
             required_world_size=2,
             megatron=_GLM52_REDUCED_MEGATRON,
@@ -399,30 +344,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
                 tensor_parallel_size=1,
             ),
         ),
-        merged_vllm_serving=WorkflowStageResources(
-            required_world_size=2,
-            megatron=_GPT_OSS_REDUCED_MEGATRON,
-            vllm=_GPT_OSS_REDUCED_VLLM,
-        ),
-        native_vllm_lora=WorkflowStageResources(
-            required_world_size=2,
-            vllm=_GPT_OSS_REDUCED_VLLM,
-        ),
     ),
-    **{
-        handler_key: HandlerWorkflowResources(
-            merged_vllm_serving=WorkflowStageResources(
-                required_world_size=2,
-                megatron=_QWEN_MOE_REDUCED_MEGATRON,
-                vllm=_QWEN_MOE_REDUCED_VLLM,
-            ),
-            native_vllm_lora=WorkflowStageResources(
-                required_world_size=2,
-                vllm=_QWEN_MOE_REDUCED_VLLM,
-            ),
-        )
-        for handler_key in ("qwen3_moe", "qwen3_5_moe")
-    },
 }
 
 _THROUGHPUT_CONFIGS = {

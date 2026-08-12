@@ -49,7 +49,7 @@ def test_runtime_server_source_contains_only_required_custom_routes() -> None:
     source = (
         ROOT / "vllm_runtime" / "src" / "art_vllm_runtime" / "dedicated_server.py"
     ).read_text()
-    for route in ("/sleep", "/wake_up", "/is_sleeping", "/art/set_served_model_name"):
+    for route in ("/sleep", "/wake_up", "/is_sleeping"):
         assert route in source
 
 
@@ -1217,69 +1217,6 @@ print(json.dumps({
 def test_runtime_general_plugin_loads_full_patch_set() -> None:
     pyproject = (ROOT / "vllm_runtime" / "pyproject.toml").read_text()
     assert 'art = "art_vllm_runtime.patches:apply_vllm_runtime_patches"' in pyproject
-
-
-def test_runtime_patch_selects_checkpoint_weight_update_lifecycle(
-    artifact_dir: Path,
-) -> None:
-    payload = _runtime_python(
-        """
-import json
-from types import SimpleNamespace
-
-from art_vllm_runtime.patches import apply_vllm_runtime_patches
-
-apply_vllm_runtime_patches()
-from vllm.v1.worker.gpu_worker import Worker
-
-
-class Engine:
-    def __init__(self):
-        self.starts = self.updates = self.finishes = 0
-
-    def start_weight_update(self):
-        self.starts += 1
-
-    def update_weights(self, update_info):
-        self.updates += 1
-
-    def finish_weight_update(self):
-        self.finishes += 1
-
-
-def exercise(architecture):
-    engine = Engine()
-    worker = SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=[architecture])
-        ),
-        weight_transfer_engine=engine,
-        _weight_update_active=False,
-        _check_weight_transfer_engine=lambda: None,
-    )
-    Worker.start_weight_update(worker)
-    Worker.update_weights(worker, {"names": []})
-    Worker.finish_weight_update(worker)
-    return {
-        "starts": engine.starts,
-        "updates": engine.updates,
-        "finishes": engine.finishes,
-        "active": worker._weight_update_active,
-    }
-
-
-print(json.dumps({
-    "dense": exercise("Qwen3ForCausalLM"),
-    "gemma4": exercise("Gemma4ForConditionalGeneration"),
-}, sort_keys=True))
-""",
-        artifact_dir,
-        "checkpoint_weight_update_lifecycle",
-    )
-    assert json.loads(payload) == {
-        "dense": {"active": False, "finishes": 1, "starts": 1, "updates": 1},
-        "gemma4": {"active": False, "finishes": 0, "starts": 0, "updates": 1},
-    }
 
 
 def test_runtime_patch_set_does_not_install_lora_monkey_patches() -> None:

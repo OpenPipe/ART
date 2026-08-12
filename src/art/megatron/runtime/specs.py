@@ -12,8 +12,6 @@ from art.distributed.data_plane import PackedBatchRef
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
 from art.types import TrainConfig, TrainSFTConfig
 
-from .weight_transfer import MergedWeightTransferSpec
-
 
 class _Spec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -145,7 +143,6 @@ class _TrainerJobSpec(_Spec):
     source: TrainerGeneration
     output: DurableTrainOutput
     publication_targets: tuple[AdapterTransferTarget, ...] = ()
-    merged_weight_transfer: MergedWeightTransferSpec | None = None
 
     @model_validator(mode="after")
     def _validate_versions(self) -> "_TrainerJobSpec":

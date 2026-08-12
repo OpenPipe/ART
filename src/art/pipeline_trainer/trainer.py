@@ -762,7 +762,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if not isinstance(self.backend, LocalBackend):
             return
 
-        model_config = self.model._internal_config or art.dev.InternalModelConfig()
         if not self.backend._supports_concurrent_training_and_inference(self.model):
             raise ValueError(
                 "PipelineTrainer only supports LocalBackend in dedicated mode. "
@@ -770,15 +769,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 "a supported async PipelineTrainer path. Set both "
                 "trainer_gpu_ids and inference_gpu_ids on the TrainableModel "
                 "_internal_config to use LocalBackend with PipelineTrainer."
-            )
-        if (
-            self.eval_fn is not None
-            and model_config.get("tinker_args") is None
-            and model_config.get("rollout_weights_mode", "lora") != "lora"
-        ):
-            raise ValueError(
-                "PipelineTrainer eval requires rollout_weights_mode='lora' so "
-                "the requested checkpoint can remain immutable during eval."
             )
         if self.loss_fn not in {"cispo", "ppo"}:
             raise ValueError(

@@ -35,7 +35,6 @@ from .real_path import (
     _collect_real_trajectory_groups,
     _delete_adapter_safetensors_on_pass,
     _real_path_rollout_mode,
-    _real_path_rollout_weights_mode,
     _topk_from_chat_logprob,
 )
 
@@ -290,18 +289,11 @@ def test_real_path_topk_sorts_vllm_sampled_token_prefix() -> None:
 
 
 def test_real_path_rollout_mode_follows_config() -> None:
-    native_config = TrainInfOutputParityConfig(
+    config = TrainInfOutputParityConfig(
         base_model="Qwen/Qwen3.5-35B-A3B",
     )
-    merged_config = TrainInfOutputParityConfig(
-        base_model="unvalidated/native-disabled",
-        allow_unvalidated_arch=True,
-    )
 
-    assert _real_path_rollout_mode(native_config) == "native_lora"
-    assert _real_path_rollout_weights_mode(native_config) == "lora"
-    assert _real_path_rollout_mode(merged_config) == "merged"
-    assert _real_path_rollout_weights_mode(merged_config) == "merged"
+    assert _real_path_rollout_mode(config) == "native_lora"
 
 
 def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
@@ -433,14 +425,14 @@ def test_config_from_env_accepts_gdn_prefill_backend_override(
     assert config.engine_args["additional_config"] == {"gdn_prefill_backend": "triton"}
 
 
-def test_default_rollout_modes_follow_model_support_native_lora_status() -> None:
+def test_default_rollout_mode_is_native_lora() -> None:
     assert TrainInfOutputParityConfig(
         base_model="Qwen/Qwen3.5-35B-A3B"
-    ).rollout_modes == ["native_lora", "merged"]
+    ).rollout_modes == ["native_lora"]
     assert TrainInfOutputParityConfig(
         base_model="unvalidated/native-disabled",
         allow_unvalidated_arch=True,
-    ).rollout_modes == ["merged"]
+    ).rollout_modes == ["native_lora"]
 
 
 def test_config_from_env_rollout_modes_override_handler_default(

@@ -484,20 +484,6 @@ def native_vllm_lora_status_for_model(
     ).native_vllm_lora_status
 
 
-def model_requires_merged_rollout(
-    base_model: str,
-    *,
-    allow_unvalidated_arch: bool = False,
-) -> bool:
-    return (
-        get_model_support_spec(
-            base_model,
-            allow_unvalidated_arch=allow_unvalidated_arch,
-        ).default_rollout_weights_mode
-        == "merged"
-    )
-
-
 def model_uses_expert_parallel(
     base_model: str,
     *,

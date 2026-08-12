@@ -102,10 +102,6 @@ class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
         return self.app(scope, receive, send)
 
 
-class _SetServedModelNameRequest(BaseModel):
-    name: str = Field(min_length=1)
-
-
 class _ResetPrefixCacheRequest(BaseModel):
     reset_running_requests: bool = False
     reset_connector: bool = True
@@ -209,12 +205,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lora-path", help="Optional initial checkpoint path")
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument(
-        "--rollout-weights-mode",
-        choices=("lora", "merged"),
-        default="lora",
-        help="Whether the dedicated server serves LoRA adapters or merged weights",
-    )
-    parser.add_argument(
         "--engine-args-json", default="{}", help="Additional engine args as JSON"
     )
     parser.add_argument(
@@ -282,19 +272,6 @@ def _patch_art_runtime_routes() -> None:
             return JSONResponse(
                 content={"is_sleeping": await engine(raw_request).is_sleeping()}
             )
-
-        @router.post("/art/set_served_model_name")
-        async def set_served_model_name(
-            body: _SetServedModelNameRequest, raw_request: Request
-        ) -> JSONResponse:
-            models = raw_request.app.state.openai_serving_models
-            if not models.base_model_paths:
-                raise RuntimeError("vLLM runtime has no registered base model")
-            models.base_model_paths[0].name = body.name
-            _runtime_state["loaded_adapter"] = body.name
-            if "@" in body.name and body.name.rsplit("@", 1)[1].isdigit():
-                _runtime_state["policy_version"] = int(body.name.rsplit("@", 1)[1])
-            return JSONResponse(content={"name": body.name})
 
         @router.get("/art/state")
         async def art_state() -> JSONResponse:
@@ -601,8 +578,6 @@ def main(argv: list[str] | None = None) -> None:
     global _fast_metrics_port
 
     args = parse_args(argv)
-    if args.rollout_weights_mode == "merged" and not args.lora_path:
-        raise SystemExit("--lora-path is required for merged rollout weights")
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
     route_capture = engine_args.get("enable_return_routed_experts", False)
@@ -665,8 +640,6 @@ def main(argv: list[str] | None = None) -> None:
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
-    if args.rollout_weights_mode == "merged":
-        os.environ["VLLM_SERVER_DEV_MODE"] = "1"
     apply_vllm_runtime_patches()
 
     from vllm.engine.arg_utils import AsyncEngineArgs
@@ -689,6 +662,7 @@ def main(argv: list[str] | None = None) -> None:
         f"--port={args.port}",
         f"--host={args.host}",
         f"--served-model-name={args.served_model_name}",
+        "--enable-lora",
     ]
     if args.nnodes > 1:
         vllm_args.extend(
@@ -701,12 +675,8 @@ def main(argv: list[str] | None = None) -> None:
         )
         if args.headless:
             vllm_args.append("--headless")
-    if args.rollout_weights_mode == "lora":
-        vllm_args.append("--enable-lora")
-        if args.lora_path:
-            vllm_args.append(
-                f"--lora-modules={args.served_model_name}={args.lora_path}"
-            )
+    if args.lora_path:
+        vllm_args.append(f"--lora-modules={args.served_model_name}={args.lora_path}")
     for extra_args in (engine_args, server_args):
         for key, value in extra_args.items():
             _append_cli_arg(vllm_args, key, value)

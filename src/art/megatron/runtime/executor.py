@@ -62,10 +62,6 @@ class MegatronTrainJobExecutor:
             snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
             cancelled=cancelled,
         )
-        if job.merged_weight_transfer is not None:
-            started = time.perf_counter()
-            self._sync_merged(job.merged_weight_transfer)
-            metrics["time/merged_weight_publish_s"] = time.perf_counter() - started
         return metrics
 
     def execute_sft(
@@ -96,66 +92,7 @@ class MegatronTrainJobExecutor:
             snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
             cancelled=cancelled,
         )
-        if job.merged_weight_transfer is not None:
-            started = time.perf_counter()
-            self._sync_merged(job.merged_weight_transfer)
-            metrics["time/merged_weight_publish_s"] = time.perf_counter() - started
         return metrics
-
-    def sync_merged_source(
-        self,
-        generation: TrainerGeneration,
-        transfer: Any,
-    ) -> dict[str, float]:
-        if self._closed:
-            raise RuntimeError("Megatron executor is closed")
-        runtime = self.runtime
-        if (
-            runtime.resident_training_session_id != generation.training_session_id
-            or runtime.resident_policy_step != generation.policy_step
-        ):
-            from art.megatron.model_support.lora_disk import load_adapter_config
-            from art.megatron.train import _load_adapter_into_model
-
-            _load_adapter_into_model(
-                runtime.model,
-                generation.adapter_path,
-                runtime.rank,
-                handler=runtime.model_support_handler,
-            )
-            runtime.adapter_export_config = load_adapter_config(generation.adapter_path)
-            runtime.adapter_export_dtypes = {}
-            runtime.resident_training_session_id = None
-            runtime.resident_policy_step = None
-            runtime.optimizer_state_loaded = False
-        started = time.perf_counter()
-        self._sync_merged(transfer)
-        return {"time/merged_weight_publish_s": time.perf_counter() - started}
-
-    def _sync_merged(self, transfer: Any) -> None:
-        from art.megatron.weights.merged_weight_export import (
-            sync_merged_weights_to_vllm,
-        )
-
-        runtime = self.runtime
-        if runtime.adapter_export_config is None:
-            raise RuntimeError("merged publication has no adapter export config")
-        (
-            runtime.merged_weight_transfer_group,
-            runtime.merged_weight_transfer_init_info,
-        ) = sync_merged_weights_to_vllm(
-            bridge=runtime.bridge,
-            model=runtime.model,
-            model_support_handler=runtime.model_support_handler,
-            adapter_model={},
-            adapter_config=runtime.adapter_export_config,
-            rank=runtime.rank,
-            world_size=runtime.world_size,
-            merged_weight_transfer_group=runtime.merged_weight_transfer_group,
-            merged_weight_transfer_init_info=(runtime.merged_weight_transfer_init_info),
-            spec=transfer,
-            pause_generation=True,
-        )
 
     def advance_without_training(
         self,
@@ -200,12 +137,6 @@ class MegatronTrainJobExecutor:
                 failures.append(error)
             finally:
                 self.runtime.moe_routing_replay_controller = None
-        from art.megatron.train import _close_merged_weight_transfer_group
-
-        try:
-            _close_merged_weight_transfer_group(self.runtime)
-        except BaseException as error:
-            failures.append(error)
         try:
             import torch
 

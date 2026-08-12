@@ -29,7 +29,7 @@ from art.megatron.routing_replay import (
 )
 from art.megatron.training import microbatches as megatron_microbatches
 from art.megatron.training.trace import prepare_replay_local_input_token_uids
-from art.megatron.weights.merged_weight_export import build_art_conversion_tasks
+from art.megatron.weights.conversion_tasks import build_art_conversion_tasks
 from art.preprocessing.pack import packed_tensors_from_dir
 
 from .base_megatron_session import (

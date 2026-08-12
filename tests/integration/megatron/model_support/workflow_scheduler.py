@@ -69,14 +69,12 @@ _STAGE_DURATION_ESTIMATES_S = {
     "hf_parity": 120.0,
     "lora_coverage": 60.0,
     "train_inf_mismatch": 360.0,
-    "merged_vllm_serving": 180.0,
     "correctness_sensitivity": 480.0,
     CORRECTNESS_REFERENCE_STAGE: 120.0,
     "chat_template_rollout": 45.0,
     "packing_invariance": 90.0,
     "length_trainability": 360.0,
     "e2e_throughput": 360.0,
-    "native_vllm_lora": 180.0,
     "yes_no_trainability": 360.0,
 }
 _LIGHTWEIGHT_GPU_STAGES = frozenset(
@@ -85,8 +83,6 @@ _LIGHTWEIGHT_GPU_STAGES = frozenset(
 _CPU_STAGES = frozenset({"chat_template_rollout"})
 _DEFAULT_STAGE_GPU_COUNTS = {
     "train_inf_mismatch": 4,
-    "merged_vllm_serving": 2,
-    "native_vllm_lora": 2,
     "yes_no_trainability": 2,
 }
 _WORKFLOW_HOSTS_ENV = "ART_MODEL_SUPPORT_WORKFLOW_HOSTS"
@@ -176,7 +172,6 @@ class _SharedBaseSession(BaseModel):
 def _initialize_workflow(
     *,
     base_model: str,
-    include_native_vllm_lora: bool,
     include_yes_no_trainability: bool,
     output_json: Path | None,
     allow_unvalidated_arch: bool,
@@ -185,7 +180,6 @@ def _initialize_workflow(
 
     report = workflow.initialize_validation_report(
         base_model=base_model,
-        include_native_vllm_lora=include_native_vllm_lora,
         include_yes_no_trainability=include_yes_no_trainability,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
@@ -198,7 +192,6 @@ def _initialize_workflow(
 def prepare_workflow(
     *,
     base_model: str,
-    include_native_vllm_lora: bool,
     include_yes_no_trainability: bool,
     include_sensitivity: bool | None,
     output_json: Path | None,
@@ -210,7 +203,6 @@ def prepare_workflow(
 
     report, run_dir = initialized or _initialize_workflow(
         base_model=base_model,
-        include_native_vllm_lora=include_native_vllm_lora,
         include_yes_no_trainability=include_yes_no_trainability,
         output_json=output_json,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -460,10 +452,6 @@ def _stage_runtime_topology(
     if stage_name in FUNCTIONAL_LORA_VLLM_STAGES:
         spec = _functional_stage_spec(prepared, stage_name, gpu_count)
         trainer_gpu_ids = spec.trainer_gpu_ids
-        if stage_name == "native_vllm_lora" and set(trainer_gpu_ids) & set(
-            spec.inference_gpu_ids
-        ):
-            trainer_gpu_ids = spec.inference_gpu_ids
         trainer_topology = spec.trainer_topology
         if len(trainer_gpu_ids) != spec.trainer_gpu_count:
             trainer_topology = trainer_topology.model_copy(
@@ -522,16 +510,13 @@ def _stage_runtime_topology(
             tp=2,
             ep=trainer.ep > 1,
         )
-    elif stage_name == "merged_vllm_serving":
-        vllm_gpu_ids = (1,)
-        vllm = WorkflowVllmTopology(variant=stage_name)
     elif stage_name == "yes_no_trainability":
         support = get_model_support_spec(
             prepared.report.base_model,
             allow_unvalidated_arch=prepared.allow_unvalidated_arch,
         )
         handler = get_model_support_handler_for_spec(support)
-        if handler.is_moe and support.default_rollout_weights_mode != "merged":
+        if handler.is_moe:
             trainer = _trainer_topology(stage_name, cp=2, ep=2)
             trainer_gpu_ids = tuple(range(gpu_count))
             vllm_gpu_ids = trainer_gpu_ids
@@ -732,7 +717,7 @@ def _functional_stage_spec(
     if trainer_gpu_count < 1 or inference_gpu_count < 1:
         raise RuntimeError(f"{stage} requires non-empty trainer and inference roles")
     engine_args = {
-        **handler.vllm_engine_args(rollout_weights_mode="lora"),
+        **handler.vllm_engine_args(),
         **engine_args,
     }
     return _FunctionalStageSpec(
@@ -795,10 +780,7 @@ def _functional_session(
         prepared.report.base_model,
         allow_unvalidated_arch=prepared.allow_unvalidated_arch,
     )
-    if (
-        support.native_vllm_lora_status == "disabled"
-        or support.default_rollout_weights_mode != "lora"
-    ):
+    if support.native_vllm_lora_status == "disabled":
         return None
     handler = get_model_support_handler_for_spec(support)
     specs = tuple(
@@ -854,7 +836,6 @@ def _functional_session(
                 port=0,
                 cuda_visible_devices=",".join(map(str, inference_gpu_ids)),
                 served_model_name="__art_functional_base__",
-                rollout_weights_mode="lora",
                 engine_args={
                     "enforce_eager": True,
                     "generation_config": "vllm",
@@ -1227,7 +1208,6 @@ def run_prepared_workflows(
 def build_scheduled_validation_reports(
     *,
     base_models: list[str],
-    include_native_vllm_lora: bool = False,
     include_yes_no_trainability: bool = False,
     include_sensitivity: bool | None = None,
     output_json_by_model: dict[str, Path | None] | None = None,
@@ -1243,7 +1223,6 @@ def build_scheduled_validation_reports(
             base_model,
             _initialize_workflow(
                 base_model=base_model,
-                include_native_vllm_lora=include_native_vllm_lora,
                 include_yes_no_trainability=include_yes_no_trainability,
                 output_json=output_json_by_model.get(base_model),
                 allow_unvalidated_arch=allow_unvalidated_arch,
@@ -1256,7 +1235,6 @@ def build_scheduled_validation_reports(
         base_model, workflow_identity = item
         return prepare_workflow(
             base_model=base_model,
-            include_native_vllm_lora=include_native_vllm_lora,
             include_yes_no_trainability=include_yes_no_trainability,
             include_sensitivity=include_sensitivity,
             output_json=output_json_by_model.get(base_model),

@@ -47,7 +47,6 @@ from .specs import (
     TrainJobSpec,
     TrainProgress,
 )
-from .weight_transfer import MergedWeightTransferSpec
 
 
 class _ActorEventSink:
@@ -470,24 +469,6 @@ class MonarchTrainerActor(Actor):
                     "traceback": traceback.format_exc(),
                 }
             )
-            raise
-
-    @endpoint
-    def sync_merged(self, generation_json: str, transfer_json: str) -> dict[str, Any]:
-        if not self._valid:
-            raise RuntimeError("trainer actor runtime is invalid")
-        generation = TrainerGeneration.model_validate_json(generation_json)
-        transfer = MergedWeightTransferSpec.model_validate_json(transfer_json)
-        try:
-            with self._weight_offload.job():
-                metrics = self._executor.sync_merged_source(generation, transfer)
-            return {
-                "rank": self._runtime.rank,
-                "learner_version": generation.policy_step,
-                "metrics": metrics,
-            }
-        except BaseException:
-            self._valid = False
             raise
 
     @endpoint
@@ -1093,43 +1074,6 @@ class MonarchTrainerRun:
                 )
                 raise
             self._learner_version = learner_version
-            return next(result["metrics"] for result in results if result["rank"] == 0)
-
-    async def sync_merged(
-        self,
-        generation: TrainerGeneration,
-        transfer: MergedWeightTransferSpec,
-    ) -> dict[str, float]:
-        async with self._lock:
-            if self._closed or not self._valid:
-                raise RuntimeError("trainer runtime is invalid")
-            if self._active_job_id is not None:
-                raise RuntimeError("trainer has an active job")
-            if generation.policy_step != self._learner_version:
-                raise ValueError("merged source does not match the resident learner")
-            try:
-                values = await asyncio.wait_for(
-                    self._actors.sync_merged.call(
-                        generation.model_dump_json(), transfer.model_dump_json()
-                    ),
-                    timeout=self.run_spec.event_timeout_s,
-                )
-                results = list(values.values())
-                if {result["rank"] for result in results} != set(
-                    range(len(self.runtime_spec.trainer_mesh.ranks))
-                ) or {result["learner_version"] for result in results} != {
-                    generation.policy_step
-                }:
-                    raise RuntimeError("trainer ranks rejected merged publication")
-            except BaseException as exc:
-                self._valid = False
-                self._closed = True
-                await cleanup_after_failure(
-                    exc,
-                    self._force_stop,
-                    message="merged publication and trainer cleanup failed",
-                )
-                raise
             return next(result["metrics"] for result in results if result["rank"] == 0)
 
     def _validate_common(self, job: TrainerJobSpec) -> BaseException | None:

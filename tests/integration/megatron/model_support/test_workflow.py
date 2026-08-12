@@ -23,7 +23,6 @@ from .workflow import (
     INCLUDE_FLASH_SENSITIVITY_ENV,
     KEEP_TOPOLOGY_ARTIFACTS_ENV,
     MANDATORY_VALIDATION_STAGES,
-    NATIVE_VLLM_LORA_STAGE,
     SKIP_SENSITIVITY_ENV,
     WORKFLOW_STAGE_DIR_ENV,
     _inspect_architecture_for_workflow,
@@ -36,8 +35,6 @@ from .workflow import (
     run_correctness_sensitivity_stage,
     run_length_trainability_stage,
     run_lora_coverage_stage,
-    run_merged_vllm_serving_stage,
-    run_native_vllm_lora_stage,
     run_packing_invariance_stage,
     run_train_inf_mismatch_stage,
     run_yes_no_trainability_stage,
@@ -145,17 +142,17 @@ def test_fixture_stage_contracts(tmp_path: Path) -> None:
     cases = {
         ("gemma4_dense", "canonical"): ("hf_parity", "packing_invariance", "length_trainability"),
         ("gemma4_dense", "compact"): ("lora_coverage",),
-        ("gemma4_dense", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora"),
+        ("gemma4_dense", "functional"): ("train_inf_mismatch",),
         ("gemma4_dense", "tokenizer"): ("yes_no_trainability",),
         ("llama3_dense", "compact"): ("hf_parity",),
-        ("llama3_dense", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora"),
+        ("llama3_dense", "functional"): ("train_inf_mismatch",),
         ("llama3_dense", "canonical"): ("length_trainability", "yes_no_trainability"),
         ("qwen3_5_moe", "canonical"): ("length_trainability",),
-        ("gpt_oss_moe", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora"),
+        ("gpt_oss_moe", "functional"): ("train_inf_mismatch",),
         ("gpt_oss_moe", "canonical"): ("length_trainability",),
-        ("glm52", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora"),
+        ("glm52", "functional"): ("train_inf_mismatch",),
         ("glm52", "compact"): ("length_trainability", "yes_no_trainability"),
-        ("dsv4", "functional"): ("train_inf_mismatch", "merged_vllm_serving", "native_vllm_lora"),
+        ("dsv4", "functional"): ("train_inf_mismatch",),
         ("dsv4", "canonical"): ("length_trainability", "yes_no_trainability"),
     }
     # fmt: on
@@ -811,14 +808,6 @@ def _without_stage_duration(stage: ValidationStageResult) -> dict[str, object]:
 
 def test_build_validation_stage_names_has_fixed_order() -> None:
     assert build_validation_stage_names() == list(MANDATORY_VALIDATION_STAGES)
-    assert build_validation_stage_names(include_native_vllm_lora=True) == [
-        *MANDATORY_VALIDATION_STAGES,
-        NATIVE_VLLM_LORA_STAGE,
-    ]
-    assert build_validation_stage_names(native_vllm_lora_status="wip") == [
-        *MANDATORY_VALIDATION_STAGES,
-        NATIVE_VLLM_LORA_STAGE,
-    ]
     assert build_validation_stage_names(include_yes_no_trainability=True) == [
         *MANDATORY_VALIDATION_STAGES,
         "yes_no_trainability",
@@ -868,31 +857,6 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         assert stage.streaming_weight_offload is True
         assert stage.megatron_env == {}
 
-    for stage in (resources.merged_vllm_serving, resources.native_vllm_lora):
-        assert stage is not None
-        assert stage.vllm is not None
-        engine_args = stage.vllm.engine_args()
-        assert engine_args.get("load_format") != "dummy"
-        assert "hf_overrides" not in engine_args
-        assert engine_args["max_model_len"] == 1024
-    assert resources.merged_vllm_serving is not None
-    assert resources.merged_vllm_serving.required_world_size == 8
-    assert resources.merged_vllm_serving.megatron is not None
-    assert resources.merged_vllm_serving.vllm is not None
-    assert resources.merged_vllm_serving.megatron.gpu_ids == [0, 1, 2, 3]
-    assert resources.merged_vllm_serving.megatron.topology.tp == 2
-    assert resources.merged_vllm_serving.megatron.topology.ep == 4
-    assert resources.merged_vllm_serving.megatron.topology.dp == 2
-    assert resources.merged_vllm_serving.vllm.gpu_ids == [4, 5, 6, 7]
-    assert not (
-        set(resources.merged_vllm_serving.megatron.gpu_ids)
-        & set(resources.merged_vllm_serving.vllm.gpu_ids)
-    )
-    assert resources.merged_vllm_serving.vllm.engine_args()["kv_cache_dtype"] == "fp8"
-    assert resources.native_vllm_lora is not None
-    assert resources.native_vllm_lora.vllm is not None
-    assert resources.native_vllm_lora.vllm.engine_args().get("max_loras", 2) == 2
-
 
 @pytest.mark.parametrize(
     ("stage_name", "trainer_gpu_ids", "trainer_ep", "trainer_dp"),
@@ -900,7 +864,6 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         ("train_inf_mismatch", [0, 1, 2, 3], 4, 2),
         ("yes_no_trainability", [0, 1, 2, 3], 4, 2),
         ("length_trainability", [0, 1, 2, 3], 4, 2),
-        ("merged_vllm_serving", [0, 1], 2, 1),
     ],
 )
 def test_dsv4_resources_remap_to_four_high_vram_gpus(
@@ -945,7 +908,6 @@ def test_glm52_reduced_workflow_uses_portable_serving_backends() -> None:
     assert resources is not None
     joint_stages = (
         resources.train_inf_mismatch,
-        resources.merged_vllm_serving,
         resources.yes_no_trainability,
         resources.length_trainability,
     )
@@ -954,10 +916,7 @@ def test_glm52_reduced_workflow_uses_portable_serving_backends() -> None:
         assert stage.required_world_size == 2
         assert stage.megatron is not None
         assert stage.megatron.gpu_ids == [0]
-    assert resources.native_vllm_lora is not None
-    assert resources.native_vllm_lora.required_world_size == 2
-    assert resources.native_vllm_lora.megatron is None
-    for stage in (*joint_stages, resources.native_vllm_lora):
+    for stage in joint_stages:
         assert stage is not None
         assert stage.vllm is not None
         assert stage.vllm.gpu_ids == [1]
@@ -1155,27 +1114,6 @@ def test_mismatch_workflow_retries_only_executed_failures(
     assert report.duration_s >= report.attempts[0].duration_s
 
 
-@pytest.mark.parametrize("handler_key", ["qwen3_moe", "qwen3_5_moe"])
-def test_qwen_moe_reduced_serving_uses_plain_expert_storage(handler_key: str) -> None:
-    resources = HANDLER_WORKFLOW_RESOURCES[handler_key]
-    for stage in (resources.merged_vllm_serving, resources.native_vllm_lora):
-        assert stage is not None
-        assert stage.vllm is not None
-        assert stage.vllm.gpu_ids == [1]
-        engine_args = stage.vllm.engine_args()
-        assert engine_args["enforce_eager"] is True
-        assert engine_args["max_model_len"] == 1024
-        assert engine_args["moe_backend"] == "triton"
-
-
-def test_gpt_oss_reduced_serving_has_bounded_context() -> None:
-    resources = HANDLER_WORKFLOW_RESOURCES["gpt_oss_moe"]
-    for stage in (resources.merged_vllm_serving, resources.native_vllm_lora):
-        assert stage is not None
-        assert stage.vllm is not None
-        assert stage.vllm.engine_args()["max_model_len"] == 1024
-
-
 def test_inspect_architecture_for_workflow_uses_minimal_topology(monkeypatch) -> None:
     seen_env: dict[str, str | None] = {}
 
@@ -1305,12 +1243,6 @@ def test_build_validation_report_populates_architecture_stage(
                 metrics={"passed_count": 1, "failed_count": 0},
                 artifact_dir="/tmp/train-inf-mismatch",
             ),
-            "merged_vllm_serving": ValidationStageResult(
-                name="merged_vllm_serving",
-                passed=True,
-                metrics={"served_model_name": "validation@0"},
-                artifact_dir="/tmp/merged-serving",
-            ),
             "correctness_sensitivity": ValidationStageResult(
                 name="correctness_sensitivity",
                 passed=True,
@@ -1359,20 +1291,6 @@ def test_build_validation_report_populates_architecture_stage(
                 passed=True,
                 metrics={"accepted_train_tok_s": 1234.0},
                 artifact_dir="/tmp/e2e-throughput",
-            ),
-            "native_vllm_lora": ValidationStageResult(
-                name="native_vllm_lora",
-                passed=True,
-                metrics={
-                    "rollout_weights_mode": "lora",
-                    "step0_name": "validation@0",
-                    "step1_name": "validation@1",
-                    "model_ids_before": ["validation@0"],
-                    "model_ids_after": ["validation@0", "validation@1"],
-                    "step0_served": True,
-                    "step1_served": True,
-                },
-                artifact_dir="/tmp/native-vllm-lora",
             ),
         }[stage_name],
     )
@@ -1438,14 +1356,6 @@ def test_build_validation_report_populates_architecture_stage(
         "sensitivity_variant_count": 9,
     }
     assert correctness_stage.artifact_dir == "/tmp/correctness"
-    merged_stage = next(
-        stage for stage in report.stages if stage.name == "merged_vllm_serving"
-    )
-    assert merged_stage.passed is True
-    assert _without_stage_duration(merged_stage) == {
-        "served_model_name": "validation@0"
-    }
-    assert merged_stage.artifact_dir == "/tmp/merged-serving"
     chat_template_stage = next(
         stage for stage in report.stages if stage.name == "chat_template_rollout"
     )
@@ -1494,20 +1404,6 @@ def test_build_validation_report_populates_architecture_stage(
     ]
     assert len(fixture_durations) == 1 and fixture_durations[0] >= 0.0
     assert all(stage.name != "yes_no_trainability" for stage in report.stages)
-    native_vllm_lora_stage = next(
-        stage for stage in report.stages if stage.name == "native_vllm_lora"
-    )
-    assert native_vllm_lora_stage.passed is True
-    assert _without_stage_duration(native_vllm_lora_stage) == {
-        "rollout_weights_mode": "lora",
-        "step0_name": "validation@0",
-        "step1_name": "validation@1",
-        "model_ids_before": ["validation@0"],
-        "model_ids_after": ["validation@0", "validation@1"],
-        "step0_served": True,
-        "step1_served": True,
-    }
-    assert native_vllm_lora_stage.artifact_dir == "/tmp/native-vllm-lora"
 
 
 def test_build_validation_report_success_cleanup_does_not_implicitly_keep_traces(
@@ -2079,52 +1975,6 @@ def test_run_train_inf_mismatch_stage(monkeypatch) -> None:
     }
 
 
-def test_run_native_vllm_lora_stage(monkeypatch) -> None:
-    monkeypatch.setattr(
-        "tests.integration.megatron.model_support.workflow._import_integration_module",
-        lambda name: (
-            SimpleNamespace(
-                OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs),
-            )
-            if name == "integration.megatron.model_support.oracle_harness"
-            else SimpleNamespace(
-                run_native_vllm_lora=lambda case_config: SimpleNamespace(
-                    rollout_weights_mode="lora",
-                    step0_name="validation@0",
-                    step1_name="validation@1",
-                    model_ids_before=["validation@0"],
-                    model_ids_after=["validation@0", "validation@1"],
-                    step0_served=True,
-                    step1_served=True,
-                    output_dir="/tmp/native-vllm-lora",
-                    model_dump=lambda mode="json": {
-                        "rollout_weights_mode": "lora",
-                        "step0_name": "validation@0",
-                        "step1_name": "validation@1",
-                        "model_ids_before": ["validation@0"],
-                        "model_ids_after": ["validation@0", "validation@1"],
-                        "step0_served": True,
-                        "step1_served": True,
-                    },
-                )
-            )
-        ),
-    )
-
-    result = run_native_vllm_lora_stage(
-        base_model="Qwen/Qwen3.5-35B-A3B",
-        architecture=ArchitectureReport(
-            base_model="Qwen/Qwen3.5-35B-A3B",
-            model_key="qwen3_5_moe",
-            handler_key="qwen3_5_moe",
-        ),
-    )
-
-    assert result.name == "native_vllm_lora"
-    assert result.passed is True
-    assert result.artifact_dir == "/tmp/native-vllm-lora"
-
-
 def test_run_packing_invariance_stage(monkeypatch) -> None:
     calls: list[bool] = []
     monkeypatch.setattr(
@@ -2449,49 +2299,3 @@ def test_run_correctness_sensitivity_stage_can_skip_sensitivity_only(
     assert stage.metrics["sensitivity_skip_reason"] == f"{SKIP_SENSITIVITY_ENV}=1"
     assert stage.metrics["sensitivity_variant_count"] == 0
     assert stage.metrics["sensitivity_variants"] == []
-
-
-def test_run_merged_vllm_serving_stage_reports_served_model(monkeypatch) -> None:
-    architecture = ArchitectureReport(
-        base_model="Qwen/Qwen3.5-35B-A3B",
-        model_key="qwen3_5_moe",
-        handler_key="qwen3_5_moe",
-        recommended_min_layers=4,
-    )
-    oracle_module = SimpleNamespace(
-        OracleCaseConfig=lambda **kwargs: SimpleNamespace(**kwargs)
-    )
-    merged_module = SimpleNamespace(
-        run_merged_vllm_serving=lambda case_config: SimpleNamespace(
-            output_dir="/tmp/merged-serving",
-            model_ids=["validation@0"],
-            model_dump=lambda mode="json": {
-                "base_model": "Qwen/Qwen3.5-35B-A3B",
-                "served_model_name": "validation@0",
-            },
-        )
-    )
-
-    def _import_integration_module(name: str):
-        if name == "integration.megatron.model_support.oracle_harness":
-            return oracle_module
-        if name == "integration.megatron.lora.merged_vllm_serving":
-            return merged_module
-        raise AssertionError(name)
-
-    monkeypatch.setattr(
-        "tests.integration.megatron.model_support.workflow._import_integration_module",
-        _import_integration_module,
-    )
-
-    stage = run_merged_vllm_serving_stage(
-        base_model="Qwen/Qwen3.5-35B-A3B",
-        architecture=architecture,
-    )
-
-    assert stage.name == "merged_vllm_serving"
-    assert stage.passed is True
-    assert stage.metrics["base_model"] == "Qwen/Qwen3.5-35B-A3B"
-    assert stage.metrics["served_model_name"] == "validation@0"
-    assert "readable_summary" in stage.metrics
-    assert stage.artifact_dir == "/tmp/merged-serving"

@@ -30,8 +30,6 @@ _PRETRAINED_WEIGHT_STAGES = frozenset({"length_trainability", "yes_no_trainabili
 _FUNCTIONAL_STAGES = frozenset(
     {
         "train_inf_mismatch",
-        "merged_vllm_serving",
-        "native_vllm_lora",
     }
 )
 _GEMMA_YES_NO_ENV = {
