@@ -77,6 +77,17 @@ _STAGE_DURATION_ESTIMATES_S = {
     "e2e_throughput": 360.0,
     "yes_no_trainability": 360.0,
 }
+_STAGE_DURATION_ESTIMATE_OVERRIDES_S = {
+    # Rounded B300 workflow measurements; DSV4 is a deliberate architecture outlier.
+    ("e2e_throughput", "gpt_oss_moe"): 300.0,
+    ("e2e_throughput", "dsv4"): 690.0,
+}
+_SHARED_STARTUP_ESTIMATES_S = {
+    # Base phases measured 74-79s standalone and share the same model startup.
+    BASE_MEGATRON_MODE: 60.0,
+    # Conservative cross-handler budget for resident trainer and serving startup.
+    RESIDENT_FUNCTIONAL_MODE: 200.0,
+}
 _LIGHTWEIGHT_GPU_STAGES = frozenset(
     {"hf_parity", "lora_coverage", "packing_invariance"}
 )
@@ -167,6 +178,20 @@ class _SharedBaseSession(BaseModel):
     gpu_count: int
     fixture: str
     topology: WorkflowRuntimeTopology
+
+
+def _stage_duration_estimate(model_key: str, stage: str) -> float:
+    return _STAGE_DURATION_ESTIMATE_OVERRIDES_S.get(
+        (stage, model_key), _STAGE_DURATION_ESTIMATES_S[stage]
+    )
+
+
+def _shared_startup_estimate(mode: str, stage: str) -> float:
+    if mode == BASE_MEGATRON_MODE:
+        return _SHARED_STARTUP_ESTIMATES_S[mode]
+    if mode == RESIDENT_FUNCTIONAL_MODE and stage != "lora_coverage":
+        return _SHARED_STARTUP_ESTIMATES_S[mode]
+    return 0.0
 
 
 def _initialize_workflow(
@@ -979,9 +1004,9 @@ def compile_prepared_workflows(
                             prepared, CORRECTNESS_REFERENCE_STAGE, gpu_count=1
                         ),
                         resources=WorkflowResourceRequest(gpu_count=1),
-                        estimated_duration_s=_STAGE_DURATION_ESTIMATES_S[
-                            CORRECTNESS_REFERENCE_STAGE
-                        ],
+                        estimated_duration_s=_stage_duration_estimate(
+                            prepared.report.model_key, CORRECTNESS_REFERENCE_STAGE
+                        ),
                     )
                 )
                 dependencies = (reference_id,)
@@ -1010,7 +1035,12 @@ def compile_prepared_workflows(
                         ),
                     ),
                     dependencies=dependencies,
-                    estimated_duration_s=_STAGE_DURATION_ESTIMATES_S[stage_name],
+                    estimated_duration_s=_stage_duration_estimate(
+                        prepared.report.model_key, stage_name
+                    ),
+                    estimated_shared_startup_s=_shared_startup_estimate(
+                        runtime.mode, stage_name
+                    ),
                 )
             )
     return compile_workflow(operations)
@@ -1170,7 +1200,7 @@ def run_prepared_workflows(
         placement_hosts = {device.host for device in placement.devices}
         if len(placement_hosts) > 1:
             raise RuntimeError("one workflow session cannot span hosts")
-        execution_host = next(iter(placement_hosts), socket.gethostname())
+        execution_host = placement.host or socket.gethostname()
         timeout_s = sum(
             workflow._WORKFLOW_STAGE_TIMEOUT_OVERRIDES_S.get(
                 (operation.stage, prepared.report.base_model),

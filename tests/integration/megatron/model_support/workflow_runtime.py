@@ -101,6 +101,13 @@ class WorkflowOperation(BaseModel):
     resources: WorkflowResourceRequest = Field(default_factory=WorkflowResourceRequest)
     dependencies: tuple[str, ...] = ()
     estimated_duration_s: float = Field(default=0.0, ge=0.0)
+    estimated_shared_startup_s: float = Field(default=0.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def shared_startup_is_part_of_duration(self) -> "WorkflowOperation":
+        if self.estimated_shared_startup_s > self.estimated_duration_s:
+            raise ValueError("shared startup cannot exceed operation duration")
+        return self
 
 
 class WorkflowSession(BaseModel):
@@ -130,7 +137,17 @@ class WorkflowDevice(BaseModel):
 class WorkflowPlacement(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    host: str | None = None
     devices: tuple[WorkflowDevice, ...] = ()
+
+    @model_validator(mode="after")
+    def devices_are_on_placement_host(self) -> "WorkflowPlacement":
+        device_hosts = {device.host for device in self.devices}
+        if len(device_hosts) > 1 or (
+            self.host is not None and device_hosts and device_hosts != {self.host}
+        ):
+            raise ValueError("workflow placement devices must share its host")
+        return self
 
 
 class WorkflowSessionResult(BaseModel):
@@ -209,7 +226,16 @@ def compile_workflow(operations: Sequence[WorkflowOperation]) -> WorkflowPlan:
                 resources=resources,
                 dependencies=dependencies,
                 estimated_duration_s=sum(
-                    operation.estimated_duration_s for operation in grouped_operations
+                    operation.estimated_duration_s
+                    - operation.estimated_shared_startup_s
+                    for operation in grouped_operations
+                )
+                + max(
+                    (
+                        operation.estimated_shared_startup_s
+                        for operation in grouped_operations
+                    ),
+                    default=0.0,
                 ),
             )
         )
@@ -243,27 +269,49 @@ class _GpuPool:
         if len(set(devices)) != len(devices):
             raise ValueError("workflow devices must be unique")
         self._devices = tuple(devices)
+        self._hosts = tuple(dict.fromkeys(device.host for device in devices))
         self._available = {device: 1.0 for device in devices}
+        self._active_by_host = {host: 0 for host in self._hosts}
         self._lock = Lock()
 
     def acquire(self, request: WorkflowResourceRequest) -> WorkflowPlacement | None:
-        if request.gpu_count == 0:
-            return WorkflowPlacement()
         with self._lock:
+            if request.gpu_count == 0:
+                host = min(
+                    self._hosts,
+                    key=lambda value: (
+                        self._active_by_host[value],
+                        self._hosts.index(value),
+                    ),
+                    default=None,
+                )
+                if host is not None:
+                    self._active_by_host[host] += 1
+                return WorkflowPlacement(host=host)
             placements = self._candidate_placements(request)
             if placements:
-                selected = max(
+                selected = min(
                     placements,
-                    key=lambda devices: (
-                        min(self._available[device] for device in devices),
-                        sum(self._available[device] for device in devices),
-                        tuple(-self._devices.index(device) for device in devices),
-                    ),
+                    key=lambda devices: self._placement_priority(devices, request),
                 )
                 for device in selected:
                     self._available[device] -= request.gpu_share
-                return WorkflowPlacement(devices=selected)
+                host = selected[0].host
+                self._active_by_host[host] += 1
+                return WorkflowPlacement(host=host, devices=selected)
         return None
+
+    def _placement_priority(
+        self,
+        devices: tuple[WorkflowDevice, ...],
+        request: WorkflowResourceRequest,
+    ) -> tuple[Any, ...]:
+        host = devices[0].host
+        available = tuple(self._available[device] for device in devices)
+        indices = tuple(self._devices.index(device) for device in devices)
+        if request.gpu_share < 1.0:
+            return self._active_by_host[host], sum(available), indices
+        return self._active_by_host[host], -min(available), -sum(available), indices
 
     def _candidate_placements(
         self, request: WorkflowResourceRequest
@@ -309,6 +357,12 @@ class _GpuPool:
                 self._available[device] += request.gpu_share
                 if self._available[device] > 1.0 + 1e-9:
                     raise RuntimeError(f"released unowned workflow GPU {device}")
+            if placement.host is not None:
+                self._active_by_host[placement.host] -= 1
+                if self._active_by_host[placement.host] < 0:
+                    raise RuntimeError(
+                        f"released unowned workflow host {placement.host}"
+                    )
 
 
 def _contiguous(
@@ -350,8 +404,10 @@ def execute_workflow(
                     if set(sessions[session_id].dependencies) <= completed
                 ),
                 key=lambda session: (
-                    -critical_path[session.id],
+                    session.resources.gpu_count > 0
+                    and session.resources.gpu_share < 1.0,
                     -session.resources.gpu_count,
+                    -critical_path[session.id],
                     session.id,
                 ),
             )
