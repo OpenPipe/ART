@@ -127,11 +127,16 @@ def _configure_hybrid_ep_env(
             os.environ[name] = value
 
 
+def _training_runtime_builder() -> Any:
+    from art.megatron.train import build_training_runtime
+
+    return build_training_runtime
+
+
 def _build_training_runtime(spec: TrainerRuntimeSpec, *, rank: int) -> Any:
     import torch
 
-    from art.megatron.train import build_training_runtime
-
+    build_training_runtime = _training_runtime_builder()
     return build_training_runtime(
         model_identifier=spec.model_identifier,
         model_initialization=spec.model_initialization,
@@ -346,22 +351,6 @@ class MonarchTrainerActor(Actor):
 
         torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
         torch.cuda.set_device(local_rank)
-        self._compile_cache = None
-        self._compile_cache_metrics: dict[str, float] = {}
-        if runtime_spec.compile_cache:
-            from .compile_cache import TrainerCompileCache
-
-            self._compile_cache = TrainerCompileCache(
-                runtime_spec, rank=rank, cache_root=cache_root
-            )
-            event = self._compile_cache.load()
-            self._compile_cache_metrics.update(
-                {
-                    "hit": float(event.status == "hit"),
-                    "load_s": event.elapsed_s,
-                    "artifact_bytes": float(event.artifact_bytes),
-                }
-            )
         if topology.ep > 1:
             from art.megatron.hybrid_ep_setup import validate_hybrid_ep
 
@@ -376,6 +365,23 @@ class MonarchTrainerActor(Actor):
                 run_id=f"{hybrid_ep.run_id}-{run_id}-g{group_index}",
             )
             validate_hybrid_ep(require_multinode=hybrid_ep.multinode)
+        self._compile_cache = None
+        self._compile_cache_metrics: dict[str, float] = {}
+        if runtime_spec.compile_cache:
+            _training_runtime_builder()
+            from .compile_cache import TrainerCompileCache
+
+            self._compile_cache = TrainerCompileCache(
+                runtime_spec, rank=rank, cache_root=cache_root
+            )
+            event = self._compile_cache.load()
+            self._compile_cache_metrics.update(
+                {
+                    "hit": float(event.status == "hit"),
+                    "load_s": event.elapsed_s,
+                    "artifact_bytes": float(event.artifact_bytes),
+                }
+            )
         self._runtime = _build_training_runtime(runtime_spec, rank=rank)
         self._runtime.resident_run_id = run_id
         if self._runtime.model_support_handler.key != runtime_spec.handler_name:

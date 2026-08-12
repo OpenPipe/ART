@@ -94,8 +94,10 @@ class TrainerCompileCache:
     ) -> None:
         from torch._dynamo import config
 
-        if not config.caching_precompile:
-            raise RuntimeError("trainer compile cache requires Dynamo precompile")
+        if config.caching_precompile:
+            raise RuntimeError("Dynamo precompile was enabled before trainer imports")
+        os.environ["TORCH_CACHING_PRECOMPILE"] = "1"
+        config.caching_precompile = True
         self.key = _compile_cache_key(spec, rank)
         self.path = cache_root / "megatron" / "compile_cache" / "v2" / self.key
         self.path.parent.mkdir(parents=True, exist_ok=True)
