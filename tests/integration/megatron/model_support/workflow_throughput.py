@@ -507,29 +507,24 @@ def _packed_input_fingerprint(groups: list[Any]) -> str:
     return _packed_batch_fingerprint(_prepared_pipeline_batch(groups))
 
 
-async def _capture_training_bundles(prepared: Any) -> tuple[Any, ...]:
+async def _capture_training_bundles(selections: tuple[Any, ...]) -> tuple[Any, ...]:
     from art.distributed.trajectory_store import TrajectoryGroupBundle
-    from art.utils.trajectory_logging import read_trajectory_groups_parquet
 
-    path = prepared.batch.payload.packed.trajectory_log_path
-    if path is None:
-        raise RuntimeError("matched packed batch has no immutable trajectory log")
-
-    def read_bundles() -> tuple[Any, ...]:
-        return tuple(
-            TrajectoryGroupBundle.from_group(group)
-            for group in read_trajectory_groups_parquet(path)
-        )
-
-    return await asyncio.to_thread(read_bundles)
+    materialized = await asyncio.gather(
+        *(selection.queue.materialize_selection(selection) for selection in selections)
+    )
+    return await asyncio.to_thread(
+        lambda: tuple(TrajectoryGroupBundle.from_group(group) for group in materialized)
+    )
 
 
 async def _capture_training_input(
     prepared: Any,
+    selections: tuple[Any, ...],
     pipeline_settings: dict[str, int],
 ) -> tuple[tuple[Any, ...], str, str, dict[str, int]]:
     bundles, packed_fingerprint = await asyncio.gather(
-        _capture_training_bundles(prepared),
+        _capture_training_bundles(selections),
         asyncio.to_thread(_packed_batch_fingerprint, prepared),
     )
     trajectory_fingerprint = hashlib.sha256(
@@ -1739,23 +1734,67 @@ async def _run_e2e_throughput_async(
                 int,
                 asyncio.Task[tuple[tuple[Any, ...], str, str, dict[str, int]]],
             ] = {}
+            capture_requests: dict[
+                int, tuple[Any, tuple[Any, ...], dict[str, int]]
+            ] = {}
             original_train = backend.train
             original_finish_training_batch = backend._finish_training_batch
+            original_release_trajectory_sources = backend._release_trajectory_sources
             train_call_count = 0
+
+            async def capture_then_release(
+                batch: Any,
+                payload: Any,
+                prepared: Any,
+                selections: tuple[Any, ...],
+                settings: dict[str, int],
+            ) -> tuple[tuple[Any, ...], str, str, dict[str, int]]:
+                captured = None
+                failures = []
+                try:
+                    captured = await _capture_training_input(
+                        prepared, selections, settings
+                    )
+                except BaseException as error:
+                    failures.append(error)
+                try:
+                    await original_release_trajectory_sources(batch, payload)
+                except BaseException as error:
+                    failures.append(error)
+                if failures:
+                    raise BaseExceptionGroup(
+                        "throughput input capture or source release failed", failures
+                    )
+                assert captured is not None
+                return captured
+
+            async def release_trajectory_sources(batch: Any, payload: Any) -> None:
+                request = capture_requests.pop(id(batch), None)
+                if request is None:
+                    await original_release_trajectory_sources(batch, payload)
+                    return
+                prepared, selections, settings = request
+                capture_tasks[id(batch)] = asyncio.create_task(
+                    capture_then_release(batch, payload, prepared, selections, settings)
+                )
 
             async def finish_training_batch(batch: Any, *, failed: bool) -> None:
                 capture_task = capture_tasks.get(id(batch))
-                if capture_task is None:
+                failures = []
+                if capture_task is not None:
+                    try:
+                        await capture_task
+                    except BaseException as error:
+                        failures.append(error)
+                elif capture_requests.pop(id(batch), None) is not None:
+                    try:
+                        await original_release_trajectory_sources(batch, batch.payload)
+                    except BaseException as error:
+                        failures.append(error)
+                try:
                     await original_finish_training_batch(batch, failed=failed)
-                    return
-                results = await asyncio.gather(
-                    capture_task,
-                    original_finish_training_batch(batch, failed=failed),
-                    return_exceptions=True,
-                )
-                failures = [
-                    result for result in results if isinstance(result, BaseException)
-                ]
+                except BaseException as error:
+                    failures.append(error)
                 if failures:
                     raise BaseExceptionGroup(
                         "throughput input capture or batch release failed", failures
@@ -1769,7 +1808,6 @@ async def _run_e2e_throughput_async(
                         "PipelineTrainer did not pass trajectory groups positionally"
                     )
                 groups = args[1]
-                capture_task = None
                 captured_batch_id = None
                 if train_call_count in capture_train_calls:
                     try:
@@ -1782,14 +1820,12 @@ async def _run_e2e_throughput_async(
                             raise RuntimeError(
                                 "prepared throughput batch lacks exact queue selections"
                             )
-                        capture_task = asyncio.create_task(
-                            _capture_training_input(
-                                prepared,
-                                _current_pipeline_settings(trainer),
-                            )
-                        )
                         captured_batch_id = id(prepared.batch)
-                        capture_tasks[captured_batch_id] = capture_task
+                        capture_requests[captured_batch_id] = (
+                            prepared,
+                            selections,
+                            _current_pipeline_settings(trainer),
+                        )
                     except BaseException:
                         await _discard_prepared_pipeline_batch(backend, groups)
                         raise
@@ -1802,9 +1838,12 @@ async def _run_e2e_throughput_async(
                 activation_tasks[step] = asyncio.create_task(
                     _activation_event(service, step)
                 )
-                if capture_task is not None:
+                if captured_batch_id is not None:
+                    capture_task = capture_tasks.get(captured_batch_id)
+                    if capture_task is None:
+                        raise RuntimeError("trainer did not release captured sources")
                     bundles, trajectory, packed, settings = await capture_task
-                    capture_tasks.pop(cast(int, captured_batch_id))
+                    capture_tasks.pop(captured_batch_id)
                     captured_training_inputs.append(
                         CapturedTrainingInput(
                             bundles,
@@ -1819,6 +1858,11 @@ async def _run_e2e_throughput_async(
 
             setattr(backend, "train", tracked_train)
             setattr(backend, "_finish_training_batch", finish_training_batch)
+            setattr(
+                backend,
+                "_release_trajectory_sources",
+                release_trajectory_sources,
+            )
             try:
                 measurement_start = config.max_steps - 2 * autotune.window_steps + 1
                 with _freeze_pipeline_settings_from_step(trainer, measurement_start):
@@ -1838,6 +1882,11 @@ async def _run_e2e_throughput_async(
                     backend,
                     "_finish_training_batch",
                     original_finish_training_batch,
+                )
+                setattr(
+                    backend,
+                    "_release_trajectory_sources",
+                    original_release_trajectory_sources,
                 )
                 await _cancel_activation_tasks(activation_tasks)
             if len(captured_training_inputs) != _MATCHED_MEASURED_STEPS:
