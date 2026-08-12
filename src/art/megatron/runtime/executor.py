@@ -72,7 +72,18 @@ class MegatronTrainJobExecutor:
                 learner_version=job.learner_version,
                 adapter_path=job.output_adapter_path,
             ),
-            snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
+            snapshot_sink=lambda job, adapter_dtypes, adapter_config, save_optimizer: (
+                self._publisher.submit(
+                    generation=job.output.generation,
+                    optimizer_state_path=job.output.optimizer_state_path,
+                    staging_adapter_path=job.output.staging_adapter_path,
+                    publication_targets=job.publication_targets,
+                    adapter_dtypes=adapter_dtypes,
+                    adapter_config=adapter_config,
+                    save_optimizer=save_optimizer,
+                    sink=sink,
+                )
+            ),
             cancelled=cancelled,
         )
         if job.merged_weight_transfer is not None:
@@ -203,7 +214,18 @@ class MegatronTrainJobExecutor:
                 learner_version=job.learner_version,
                 adapter_path=job.output_adapter_path,
             ),
-            snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
+            snapshot_sink=lambda job, adapter_dtypes, adapter_config, save_optimizer: (
+                self._publisher.submit(
+                    generation=job.output.generation,
+                    optimizer_state_path=job.output.optimizer_state_path,
+                    staging_adapter_path=job.output.staging_adapter_path,
+                    publication_targets=job.publication_targets,
+                    adapter_dtypes=adapter_dtypes,
+                    adapter_config=adapter_config,
+                    save_optimizer=save_optimizer,
+                    sink=sink,
+                )
+            ),
             cancelled=cancelled,
         )
         if job.merged_weight_transfer is not None:
@@ -367,11 +389,14 @@ class _GenerationPublisher:
 
     def submit(
         self,
-        job: TrainerJobSpec,
+        *,
+        generation: TrainerGeneration,
+        optimizer_state_path: str,
+        staging_adapter_path: str,
+        publication_targets: tuple[Any, ...],
         adapter_dtypes: dict[str, Any],
         adapter_config: dict[str, Any],
         save_optimizer: bool,
-        *,
         sink: EventSink,
     ) -> dict[str, float]:
         from art.megatron.optimizer_state import stage_optimizer_state_snapshot
@@ -398,20 +423,20 @@ class _GenerationPublisher:
             lora = None if lora is None else lora.resolve()
             lora_resolve_s = time.perf_counter() - lora_resolve_started
             transport = self._enqueue_transport(
-                generation=job.output.generation,
-                optimizer_state_path=job.output.optimizer_state_path,
-                staging_adapter_path=job.output.staging_adapter_path,
+                generation=generation,
+                optimizer_state_path=optimizer_state_path,
+                staging_adapter_path=staging_adapter_path,
                 lora=lora,
                 adapter=None,
                 optimizer=optimizer_handoff,
-                publication_targets=getattr(job, "publication_targets", ()),
+                publication_targets=publication_targets,
             )
             optimizer_started = time.perf_counter()
             optimizer = (
                 stage_optimizer_state_snapshot(
                     self.runtime,
-                    generation_id=job.output_generation_id,
-                    step=job.learner_version,
+                    generation_id=generation.generation_id,
+                    step=generation.policy_step,
                     stager=self.stager,
                 )
                 if save_optimizer
@@ -432,7 +457,7 @@ class _GenerationPublisher:
             self._report_failure(
                 publication_error,
                 sink=sink,
-                generation=job.output.generation,
+                generation=generation,
                 remember=False,
             )
             raise
@@ -440,7 +465,7 @@ class _GenerationPublisher:
             lambda done: self._completed(
                 done,
                 sink=sink,
-                generation=job.output.generation,
+                generation=generation,
             )
         )
         return {
