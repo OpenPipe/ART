@@ -9,7 +9,6 @@ from openai.types.chat.chat_completion import Choice
 import pydantic
 from pydantic import BaseModel
 from pydantic.main import IncEx
-from pydantic_core import to_jsonable_python
 
 from ..openai import ART_MOE_ROUTING_METADATA_KEY
 
@@ -135,11 +134,13 @@ def serialize_history(history: object) -> dict[str, pydantic.JsonValue]:
     kind = kinds.get(type(history))
     if kind is None:
         raise TypeError(f"Unsupported history type: {type(history).__name__}")
+    if not isinstance(history, BaseModel):
+        raise TypeError(f"Unsupported history type: {type(history).__name__}")
     return cast(
         dict[str, pydantic.JsonValue],
         {
             "kind": kind,
-            "data": to_jsonable_python(history, serialize_unknown=True),
+            "data": history.model_dump(mode="json", warnings="error"),
         },
     )
 
@@ -149,21 +150,11 @@ def validate_history(value: object) -> object:
 
     from . import (
         AnthropicMessagesHistory,
-        AnthropicMessageSource,
-        ChatCompletionsExchange,
         ChatCompletionsHistory,
-        ChatCompletionsMessageSource,
-        CompletionsExchange,
-        CompletionsSource,
         CompletionsStringHistory,
-        CompletionsStringSourceSpan,
         CompletionsTokenHistory,
-        CompletionsTokenSourceSpan,
         LegacyHistory,
-        MessagesExchange,
-        ResponsesExchange,
         ResponsesHistory,
-        ResponsesItemSource,
     )
 
     history_types = (
@@ -183,84 +174,20 @@ def validate_history(value: object) -> object:
         raise ValueError("Serialized tokenized history data must be a dictionary")
     data = cast(dict[str, Any], dict(serialized["data"]))
 
-    def exchange(raw: object) -> object:
-        if isinstance(
-            raw,
-            (
-                ChatCompletionsExchange,
-                CompletionsExchange,
-                ResponsesExchange,
-                MessagesExchange,
-            ),
-        ):
-            return raw
-        if not isinstance(raw, dict) or not isinstance(raw.get("response"), dict):
-            raise ValueError("Serialized history source exchange is invalid")
-        exchange_data = cast(dict[str, Any], raw)
-        response = cast(dict[str, Any], exchange_data["response"])
-        if response.get("object") == "chat.completion":
-            return ChatCompletionsExchange.model_validate(exchange_data)
-        if response.get("object") == "text_completion":
-            return CompletionsExchange.model_validate(exchange_data)
-        if response.get("object") == "response":
-            return ResponsesExchange.model_validate(exchange_data)
-        if response.get("type") == "message":
-            return MessagesExchange.model_validate(exchange_data)
-        raise ValueError("Serialized history source protocol is unknown")
-
-    def source[SourceT](raw: object, model: type[SourceT]) -> SourceT | None:
-        if raw is None or isinstance(raw, model):
-            return raw
-        if not isinstance(raw, dict):
-            raise ValueError("Serialized history source is invalid")
-        values = dict(raw)
-        values["exchange"] = exchange(values.get("exchange"))
-        return pydantic.TypeAdapter(model).validate_python(values)
-
     kind = serialized["kind"]
-    if kind == "legacy":
-        return LegacyHistory.model_validate(data)
-    if kind == "chat_completions":
-        data["message_sources"] = [
-            source(item, ChatCompletionsMessageSource)
-            for item in data["message_sources"]
-        ]
-        return ChatCompletionsHistory(**data)
-    if kind == "messages":
-        data["message_sources"] = [
-            source(item, AnthropicMessageSource) for item in data["message_sources"]
-        ]
-        if data.get("system_source") is not None:
-            data["system_source"] = exchange(data["system_source"])
-        return AnthropicMessagesHistory(**data)
-    if kind == "responses":
-        data["input_sources"] = [
-            source(item, ResponsesItemSource) for item in data["input_sources"]
-        ]
-        if data.get("instructions_source") is not None:
-            data["instructions_source"] = exchange(data["instructions_source"])
-        return ResponsesHistory(**data)
-    if kind in {"completions_token", "completions_string"}:
-        span_type = (
-            CompletionsTokenSourceSpan
-            if kind == "completions_token"
-            else CompletionsStringSourceSpan
-        )
-        data["prompt_sources"] = [
-            span_type(
-                start=item["start"],
-                end=item["end"],
-                source=source(item.get("source"), CompletionsSource),
-            )
-            for item in data["prompt_sources"]
-        ]
-        model = (
-            CompletionsTokenHistory
-            if kind == "completions_token"
-            else CompletionsStringHistory
-        )
-        return model(**data)
-    raise ValueError(f"Unknown serialized history kind: {kind!r}")
+    models: dict[object, type[BaseModel]] = {
+        "legacy": LegacyHistory,
+        "chat_completions": ChatCompletionsHistory,
+        "messages": AnthropicMessagesHistory,
+        "responses": ResponsesHistory,
+        "completions_token": CompletionsTokenHistory,
+        "completions_string": CompletionsStringHistory,
+    }
+    try:
+        model = models[kind]
+    except KeyError as error:
+        raise ValueError(f"Unknown serialized history kind: {kind!r}") from error
+    return model.model_validate(data)
 
 
 def _rebind_history_sources(history: object, trajectory: object | None = None) -> None:
@@ -294,9 +221,15 @@ def _rebind_history_sources(history: object, trajectory: object | None = None) -
     identities = {id(exchange): exchange for exchange in canonical}
 
     def visit(value: object) -> None:
-        if is_dataclass(value):
-            for field in fields(value):
-                item = getattr(value, field.name)
+        if isinstance(value, BaseModel) or is_dataclass(value):
+            items = (
+                value.__dict__.items()
+                if isinstance(value, BaseModel)
+                else (
+                    (field.name, getattr(value, field.name)) for field in fields(value)
+                )
+            )
+            for name, item in items:
                 if isinstance(item, exchange_types):
                     if id(item) in identities:
                         continue
@@ -306,7 +239,7 @@ def _rebind_history_sources(history: object, trajectory: object | None = None) -
                         if type(exchange) is type(item) and exchange == item
                     ]
                     if matches:
-                        object.__setattr__(value, field.name, matches[0])
+                        object.__setattr__(value, name, matches[0])
                         identities[id(item)] = matches[0]
                     elif fixed:
                         raise ValueError(

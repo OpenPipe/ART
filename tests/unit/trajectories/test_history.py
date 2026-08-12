@@ -387,11 +387,39 @@ def test_chat_history_preserves_provider_specific_nested_fields() -> None:
 
     content = cast(list[dict[str, object]], history.messages[0]["content"])
     assert content[0]["cache_control"] == {"type": "ephemeral"}
+    history_content = history.model_dump(mode="json", warnings="error")["messages"][0][
+        "content"
+    ]
+    assert history_content[0]["cache_control"] == {"type": "ephemeral"}
     dumped = trajectory.model_dump(mode="json", warnings="error")
     dumped_content = dumped["exchanges"]["chat_completions"][0]["request"]["messages"][
         0
     ]["content"]
     assert dumped_content[0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_protocol_histories_round_trip_as_pydantic_models() -> None:
+    histories: list[tr.History] = [
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(
+                chat_completions=[_chat([{"role": "user", "content": "hello"}], "hi")]
+            )
+        ).chat_completions_history(),
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(completions=[_completion([1], [2])])
+        ).completions_token_history(),
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(messages=[_message()])
+        ).anthropic_messages_history(),
+        art.Trajectory(
+            exchanges=TrajectoryExchanges(responses=[_response("response-1", "hi")])
+        ).responses_history(),
+    ]
+
+    for history in histories:
+        dumped = history.model_dump(mode="json", warnings="error")
+        restored = type(history).model_validate(dumped)
+        assert restored == history
 
 
 def test_chat_choices_branch_and_identical_continuation_uses_first_choice() -> None:
@@ -595,7 +623,10 @@ def test_protocol_histories_convert_to_chat_and_history_rejects_ambiguity() -> N
     )
     messages_history = message_trajectory.anthropic_messages_history()
     assert messages_history.system == "Be concise"
-    assert not hasattr(messages_history, "model_dump")
+    restored = tr.AnthropicMessagesHistory.model_validate(
+        messages_history.model_dump(mode="json", warnings="error")
+    )
+    assert restored == messages_history
     assert [message["role"] for message in messages_history.messages] == [
         "user",
         "assistant",

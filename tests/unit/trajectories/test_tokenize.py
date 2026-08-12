@@ -2453,17 +2453,13 @@ def test_responses_tool_output_source_is_not_sampled_without_generation() -> Non
 
 
 def test_responses_source_rejects_boolean_generation_index() -> None:
-    from art.trajectories._tokenize import _responses_source_generation
-
     exchange = _response_exchange("response-bool-generation", 2)
-    source = ChatCompletionsMessageSource(
-        exchange=exchange,
-        output_indices=(0,),
-        generation_index=True,
-    )
-
-    with pytest.raises(ValueError, match="generation index is invalid"):
-        _responses_source_generation(source)
+    with pytest.raises(ValueError, match="valid integer"):
+        ChatCompletionsMessageSource(
+            exchange=exchange,
+            output_indices=(0,),
+            generation_index=True,
+        )
 
 
 def test_responses_missing_token_generations_falls_back_for_visible_output(

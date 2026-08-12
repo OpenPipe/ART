@@ -9,7 +9,6 @@ from collections.abc import (
     Mapping,
 )
 from contextlib import AbstractContextManager, asynccontextmanager
-from dataclasses import dataclass
 from datetime import datetime
 from enum import IntFlag
 import time
@@ -87,6 +86,10 @@ from ._serialization import (
 
 # Deliberately open: Pydantic enforces serializability when callers dump in JSON mode.
 MetadataValue = Any
+type _Preserved[T] = Annotated[
+    pydantic.SerializeAsAny[T],
+    pydantic.SkipValidation,
+]
 
 type CompactTrajectoryKind = Literal[
     "trajectory",
@@ -219,9 +222,7 @@ class MessagesRequest(TypedDict, total=False, extra_items=Any):
 
 
 class ChatCompletionsExchange(pydantic.BaseModel):
-    request: Annotated[
-        pydantic.SerializeAsAny[ChatCompletionsRequest], pydantic.SkipValidation
-    ]
+    request: _Preserved[ChatCompletionsRequest]
     response: ChatCompletion
     start_time: datetime
     end_time: datetime
@@ -238,9 +239,7 @@ class ChatCompletionsExchange(pydantic.BaseModel):
 
 
 class CompletionsExchange(pydantic.BaseModel):
-    request: Annotated[
-        pydantic.SerializeAsAny[CompletionsRequest], pydantic.SkipValidation
-    ]
+    request: _Preserved[CompletionsRequest]
     response: Completion
     start_time: datetime
     end_time: datetime
@@ -253,9 +252,7 @@ class CompletionsExchange(pydantic.BaseModel):
 
 
 class ResponsesExchange(pydantic.BaseModel):
-    request: Annotated[
-        pydantic.SerializeAsAny[ResponsesRequest], pydantic.SkipValidation
-    ]
+    request: _Preserved[ResponsesRequest]
     response: Response
     start_time: datetime
     end_time: datetime
@@ -268,9 +265,7 @@ class ResponsesExchange(pydantic.BaseModel):
 
 
 class MessagesExchange(pydantic.BaseModel):
-    request: Annotated[
-        pydantic.SerializeAsAny[MessagesRequest], pydantic.SkipValidation
-    ]
+    request: _Preserved[MessagesRequest]
     response: AnthropicMessage
     start_time: datetime
     end_time: datetime
@@ -359,8 +354,10 @@ class LegacyHistory(pydantic.BaseModel):
         ).tensorize(device=device)
 
 
-class History:
+class History(pydantic.BaseModel):
     """Mutable, protocol-native view of one tokenizable sequence."""
+
+    model_config = pydantic.ConfigDict(extra="forbid")
 
     model: str | None
 
@@ -405,56 +402,53 @@ class History:
         ).tensorize(device=device)
 
 
-@dataclass(frozen=True, slots=True)
-class ChatCompletionsMessageSource:
+class _HistorySource(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="forbid", frozen=True)
+
+
+class ChatCompletionsMessageSource(_HistorySource):
     exchange: ChatCompletionsExchange | MessagesExchange | ResponsesExchange
-    request_index: int | None = None
-    choice_index: int | None = None
-    output_indices: tuple[int, ...] | None = None
-    generation_index: int | None = None
+    request_index: pydantic.StrictInt | None = None
+    choice_index: pydantic.StrictInt | None = None
+    output_indices: tuple[pydantic.StrictInt, ...] | None = None
+    generation_index: pydantic.StrictInt | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class AnthropicMessageSource:
+class AnthropicMessageSource(_HistorySource):
     exchange: MessagesExchange
-    request_index: int | None = None
+    request_index: pydantic.StrictInt | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class ResponsesItemSource:
+class ResponsesItemSource(_HistorySource):
     exchange: ResponsesExchange
-    request_index: int | None = None
-    output_index: int | None = None
-    generation_index: int | None = None
+    request_index: pydantic.StrictInt | None = None
+    output_index: pydantic.StrictInt | None = None
+    generation_index: pydantic.StrictInt | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class CompletionsSource:
+class CompletionsSource(_HistorySource):
     exchange: CompletionsExchange
-    prompt_index: int
-    choice_index: int | None = None
+    prompt_index: pydantic.StrictInt
+    choice_index: pydantic.StrictInt | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class CompletionsTokenSourceSpan:
-    start: int
-    end: int
+class CompletionsTokenSourceSpan(_HistorySource):
+    start: pydantic.StrictInt
+    end: pydantic.StrictInt
     source: CompletionsSource | None
 
 
-@dataclass(frozen=True, slots=True)
-class CompletionsStringSourceSpan:
-    start: int
-    end: int
+class CompletionsStringSourceSpan(_HistorySource):
+    start: pydantic.StrictInt
+    end: pydantic.StrictInt
     source: CompletionsSource | None
 
 
-@dataclass
 class ChatCompletionsHistory(History):
     model: str | None
-    messages: Messages
+    messages: _Preserved[Messages]
     message_sources: list[ChatCompletionsMessageSource | None]
-    tools: Tools | None = None
+    tools: _Preserved[Tools | None] = None
     chat_template: str | None = None
     chat_template_kwargs: dict[str, Any] | None = None
 
@@ -462,14 +456,13 @@ class ChatCompletionsHistory(History):
         return self
 
 
-@dataclass
 class AnthropicMessagesHistory(History):
     model: str
-    messages: list[AnthropicMessageParam]
+    messages: _Preserved[list[AnthropicMessageParam]]
     message_sources: list[AnthropicMessageSource | None]
-    system: str | list[AnthropicTextBlockParam] | None = None
+    system: _Preserved[str | list[AnthropicTextBlockParam] | None] = None
     system_source: MessagesExchange | None = None
-    tools: list[AnthropicToolParam] | None = None
+    tools: _Preserved[list[AnthropicToolParam] | None] = None
     chat_template: str | None = None
     chat_template_kwargs: dict[str, Any] | None = None
 
@@ -479,15 +472,14 @@ class AnthropicMessagesHistory(History):
         return anthropic_as_chat_completions_history(self)
 
 
-@dataclass
 class ResponsesHistory(History):
     model: str
-    input: ResponseInputParam
+    input: _Preserved[ResponseInputParam]
     input_sources: list[ResponsesItemSource | None]
     instructions: str | None = None
     instructions_source: ResponsesExchange | None = None
-    tools: list[ResponsesToolParam] | None = None
-    conversation: ResponsesConversation | None = None
+    tools: _Preserved[list[ResponsesToolParam] | None] = None
+    conversation: _Preserved[ResponsesConversation | None] = None
     previous_response_id: str | None = None
     chat_template: str | None = None
     chat_template_kwargs: dict[str, Any] | None = None
@@ -498,7 +490,6 @@ class ResponsesHistory(History):
         return responses_as_chat_completions_history(self)
 
 
-@dataclass
 class CompletionsTokenHistory(History):
     model: str
     prompt: list[int]
@@ -509,7 +500,6 @@ class CompletionsTokenHistory(History):
         raise ValueError("Raw Completions history has no chat-message structure")
 
 
-@dataclass
 class CompletionsStringHistory(History):
     model: str
     prompt: str
