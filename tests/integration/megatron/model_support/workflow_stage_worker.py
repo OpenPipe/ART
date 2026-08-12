@@ -1,12 +1,12 @@
 import argparse
 import asyncio
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 import json
 import os
 from pathlib import Path
 import time
 import traceback
-from typing import Any, cast
+from typing import Any
 
 import httpx
 from pydantic import BaseModel, ConfigDict
@@ -177,32 +177,6 @@ async def _serving_baseline(
         return tuple(sorted(str(model["id"]) for model in response.json()["data"]))
 
 
-async def _run_after_serving_fence(
-    serving_ready: asyncio.Task[tuple[str, ...]],
-    run_session: Callable[[], Coroutine[Any, Any, Any]],
-) -> tuple[Any, tuple[str, ...]]:
-    from ..trainability import test_live_length_trainability as length_trainability
-
-    length_group = length_trainability._length_group
-
-    async def gated_length_group(*args: Any, **kwargs: Any) -> Any:
-        await serving_ready
-        return await length_group(*args, **kwargs)
-
-    length_module = cast(Any, length_trainability)
-    length_module._length_group = gated_length_group
-    session = asyncio.create_task(run_session(), name="resident-functional-session")
-    try:
-        results, baseline = await asyncio.gather(session, serving_ready)
-        return results, baseline
-    finally:
-        for task in (session, serving_ready):
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(session, serving_ready, return_exceptions=True)
-        length_module._length_group = length_group
-
-
 async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
     from . import workflow
 
@@ -303,12 +277,13 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
                         base_model=request.base_model,
                         allow_unvalidated_arch=request.allow_unvalidated_arch,
                         stage_dirs=stage_dirs,
+                        serving_ready=serving_ready,
                     )
 
+        session = asyncio.create_task(run_session(), name="resident-functional-session")
+        tasks.append(session)
         try:
-            results, baseline = await _run_after_serving_fence(
-                serving_ready, run_session
-            )
+            results, baseline = await asyncio.gather(session, serving_ready)
             with httpx.Client(
                 base_url=runtime.base_url, **runtime.request_kwargs()
             ) as client:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import time
 from typing import Any, Literal
@@ -13,6 +14,7 @@ async def run_resident_functional_session(
     base_model: str,
     allow_unvalidated_arch: bool,
     stage_dirs: dict[str, Path],
+    serving_ready: asyncio.Future[tuple[str, ...]] | None = None,
 ) -> tuple[ValidationStageResult, ...]:
     from art.megatron.runtime.specs import ResidentLoraInspectionResult
 
@@ -79,6 +81,8 @@ async def run_resident_functional_session(
             (artifact_dir / "resident_lora_coverage.json").write_text(
                 coverage_report.model_dump_json(indent=2) + "\n", encoding="utf-8"
             )
+            if serving_ready is not None:
+                await serving_ready
             return
         if phase != "first_update" or step != 1:
             raise RuntimeError(f"unexpected resident functional hook {phase}@{step}")
