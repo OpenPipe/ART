@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from art.trainer_rank._checkpoint import (
         LocalOptimizerState,
         PreparedCheckpoint,
+        _FinalizedSave,
         _PreparedSave,
     )
 
@@ -651,7 +652,7 @@ class TrainerRank:
         self._checkpoint_finalizing_saves: dict[str, Literal["finish", "abort"]] = {}
         self._checkpoint_save_outcomes: dict[str, Literal["finish", "abort"]] = {}
         self._prepared_checkpoint_saves: dict[str, _PreparedSave] = {}
-        self._completed_checkpoint_saves: list[str] = []
+        self._finalized_checkpoint_saves: dict[str, _FinalizedSave] = {}
         self._pending_slot_graphs: dict[
             LoRASlotRef, list[weakref.ReferenceType[torch.Tensor]]
         ] = {}
