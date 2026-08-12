@@ -451,6 +451,8 @@ def _merge_functional_engine_args(
 def _functional_session(
     prepared: PreparedWorkflow,
     stage_gpu_counts: dict[str, int],
+    *,
+    visible_gpu_count: int,
 ) -> FunctionalVllmSessionSpec | None:
     if not _ordered_stage_pair(prepared.stages, FUNCTIONAL_LORA_VLLM_STAGES):
         return None
@@ -465,22 +467,19 @@ def _functional_session(
     ):
         return None
     handler = get_model_support_handler_for_spec(support)
-    gpu_count = max(stage_gpu_counts[stage] for stage in stages)
     specs = tuple(
         _functional_stage_spec(prepared, stage, stage_gpu_counts[stage])
         for stage in stages
     )
     inference_gpu_count = max(spec.inference_gpu_count for spec in specs)
-    remaining_gpu_count = gpu_count - inference_gpu_count
-    length = specs[0]
-    if remaining_gpu_count != length.trainer_gpu_count:
+    gpu_count = inference_gpu_count + max(spec.trainer_gpu_count for spec in specs)
+    if gpu_count > visible_gpu_count:
         raise RuntimeError(
-            f"functional vLLM session is incompatible for {prepared.report.model_key}: "
-            f"max stage allocation={gpu_count}, inference topology="
-            f"{inference_gpu_count} GPUs, length training topology="
-            f"{length.trainer_gpu_count} ranks, remaining={remaining_gpu_count}"
+            f"functional vLLM session requires {gpu_count} GPUs, "
+            f"but the host exposes {visible_gpu_count}"
         )
-    for spec in specs[1:]:
+    remaining_gpu_count = gpu_count - inference_gpu_count
+    for spec in specs:
         if spec.trainer_gpu_count > remaining_gpu_count:
             raise RuntimeError(
                 f"functional vLLM session leaves {remaining_gpu_count} trainer GPUs "
@@ -546,7 +545,11 @@ def compile_prepared_workflows(
             stage_name: _stage_gpu_count(prepared, stage_name, visible_gpu_count)
             for stage_name in prepared.stages
         }
-        functional_session = _functional_session(prepared, stage_gpu_counts)
+        functional_session = _functional_session(
+            prepared,
+            stage_gpu_counts,
+            visible_gpu_count=visible_gpu_count,
+        )
         base_megatron = _ordered_stage_pair(prepared.stages, BASE_MEGATRON_STAGES)
         base_fixture = {
             prepared.fixture.environment(stage)[FIXTURE_PATH_ENV]
