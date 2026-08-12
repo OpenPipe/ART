@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import time
-from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
 
 from art.training.client import TrainingOperation
 from art.training.contracts import (
@@ -38,24 +38,38 @@ if TYPE_CHECKING:
 ResultT = TypeVar("ResultT", bound=Contract)
 
 
+def _consume_future(future: asyncio.Future[Any]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
+class _DeferredResult(NamedTuple, Generic[ResultT]):
+    completion: asyncio.Task[ResultT]
+
+
 class LocalTrainingOperation(Generic[ResultT]):
     def __init__(
-        self, admission: CommandAdmission, task: asyncio.Task[ResultT]
+        self,
+        admission: CommandAdmission,
+        ordered: asyncio.Task[None],
+        result: asyncio.Future[ResultT],
     ) -> None:
         self._admission = admission
-        self._task = task
+        self._ordered = ordered
+        self._result = result
 
     @property
     def ref(self):
         return self._admission.ref
 
     async def result(self) -> ResultT:
-        return await asyncio.shield(self._task)
+        return await asyncio.shield(self._result)
 
     async def cancel(self) -> None:
-        self._task.cancel()
+        self._ordered.cancel()
+        self._result.cancel()
         with suppress(asyncio.CancelledError):
-            await self._task
+            await self._ordered
 
 
 class LocalMegatronTrainingClient:
@@ -76,12 +90,21 @@ class LocalMegatronTrainingClient:
         self._service = service
         self._operations: dict[str, LocalTrainingOperation[Any]] = {}
         self._retired_operation_ids: set[str] = set()
+        self._completion_tasks: set[asyncio.Task[Any]] = set()
         self._tail: asyncio.Task[Any] | None = None
         self._closed = False
 
     @property
     def projected_learner_version(self) -> int:
         return self._ledger.projected_learner_version
+
+    @property
+    def run_id(self) -> str:
+        return self._ledger.run_id
+
+    @property
+    def next_sequence_id(self) -> int:
+        return self._ledger.next_sequence_id
 
     async def _submit(
         self,
@@ -99,15 +122,45 @@ class LocalMegatronTrainingClient:
             raise RuntimeError("completed F/B result is no longer retained")
         predecessor = self._tail
 
-        async def run() -> Any:
-            if predecessor is not None:
-                await asyncio.shield(predecessor)
-            return await execute(admission)
+        result = asyncio.get_running_loop().create_future()
+        result.add_done_callback(_consume_future)
 
-        task = asyncio.create_task(run(), name=f"megatron-{kind}-{request.sequence_id}")
-        operation = LocalTrainingOperation(admission, task)
+        async def settle(completion: asyncio.Task[Any]) -> None:
+            try:
+                value = await asyncio.shield(completion)
+            except BaseException as error:
+                if not result.done():
+                    result.set_exception(error)
+            else:
+                if not result.done():
+                    result.set_result(value)
+
+        async def run() -> None:
+            try:
+                if predecessor is not None:
+                    await asyncio.shield(predecessor)
+                value = await execute(admission)
+            except BaseException as error:
+                if not result.done():
+                    result.set_exception(error)
+                raise
+            if isinstance(value, _DeferredResult):
+                completion = asyncio.create_task(
+                    settle(value.completion),
+                    name=f"megatron-{kind}-result-{request.sequence_id}",
+                )
+                self._completion_tasks.add(completion)
+                completion.add_done_callback(self._completion_tasks.discard)
+            elif not result.done():
+                result.set_result(value)
+
+        ordered = asyncio.create_task(
+            run(), name=f"megatron-{kind}-{request.sequence_id}"
+        )
+        ordered.add_done_callback(_consume_future)
+        operation = LocalTrainingOperation(admission, ordered, result)
         self._operations[admission.ref.operation_id] = operation
-        self._tail = task
+        self._tail = ordered
         return operation
 
     async def forward(
@@ -121,35 +174,34 @@ class LocalMegatronTrainingClient:
     ) -> TrainingOperation[ForwardBackwardResult]:
         async def execute(admission: CommandAdmission) -> ForwardBackwardResult:
             batch = await self._prepare_rl_batch(request)
-            async with self._backend._training_batch_lifecycle(batch):
-                payload = batch.payload
-                from art.megatron.backend import _DistributedBatchPayload
+            payload = batch.payload
+            from art.megatron.backend import _DistributedBatchPayload
 
-                if not isinstance(payload, _DistributedBatchPayload):
-                    raise RuntimeError("local command did not use the typed data plane")
-                release_started = time.perf_counter()
-                await self._backend._release_trajectory_sources(batch, payload)
-                raw = await self._service.forward_backward_command(
-                    admission.ref,
-                    payload.packed,
-                    _forward_backward_config(request),
-                    _experimental_config(request),
-                )
-                return ForwardBackwardResult(
-                    operation_id=admission.ref.operation_id,
-                    packing=_packing_outcome(batch),
-                    loss_fn_outputs=tuple(
-                        LossFnOutput(token_logprobs=values)
-                        for values in raw["token_logprobs"]
+            if not isinstance(payload, _DistributedBatchPayload):
+                raise RuntimeError("local command did not use the typed data plane")
+            release_started = time.perf_counter()
+            await self._backend._release_trajectory_sources(batch, payload)
+            raw = await self._service.forward_backward_command(
+                admission.ref,
+                payload.packed,
+                _forward_backward_config(request),
+                _experimental_config(request),
+            )
+            return ForwardBackwardResult(
+                operation_id=admission.ref.operation_id,
+                packing=_packing_outcome(batch),
+                loss_fn_outputs=tuple(
+                    LossFnOutput(token_logprobs=values)
+                    for values in raw["token_logprobs"]
+                ),
+                metrics={
+                    **_packing_metrics(payload.packed),
+                    "time/step_source_lease_release_s": (
+                        time.perf_counter() - release_started
                     ),
-                    metrics={
-                        **_packing_metrics(payload.packed),
-                        "time/step_source_lease_release_s": (
-                            time.perf_counter() - release_started
-                        ),
-                        **raw["metrics"],
-                    },
-                )
+                    **raw["metrics"],
+                },
+            )
 
         return cast(
             TrainingOperation[ForwardBackwardResult],
@@ -194,24 +246,35 @@ class LocalMegatronTrainingClient:
     async def save_weights_for_sampler(
         self, request: SaveWeightsForSamplerRequest
     ) -> TrainingOperation[SamplerWeightsResult]:
-        _validate_publication_mode(request, self._service.rollout_weight_update_mode)
+        _validate_publication_mode(
+            request,
+            update_mode=self._service.rollout_weight_update_mode,
+            weights_mode=self._service.rollout_weights_mode,
+        )
 
-        async def execute(admission: CommandAdmission) -> SamplerWeightsResult:
-            metrics, durable = await self._service.snapshot_command(
+        async def execute(
+            admission: CommandAdmission,
+        ) -> SamplerWeightsResult | _DeferredResult[SamplerWeightsResult]:
+            launch = await self._service.snapshot_command(
                 admission.ref,
                 save_optimizer=False,
                 activate_serving=request.publication.mode != "none",
             )
-            return SamplerWeightsResult(
-                operation_id=admission.ref.operation_id,
-                checkpoint=_checkpoint_ref(
-                    admission.ref.run_id,
-                    durable.adapter.step,
-                    request.checkpoint_name,
-                ),
-                lora=durable.adapter.identity,
-                publication_metrics=metrics,
-            )
+
+            async def complete() -> SamplerWeightsResult:
+                durable = await launch.completion
+                return SamplerWeightsResult(
+                    operation_id=admission.ref.operation_id,
+                    checkpoint=_checkpoint_ref(
+                        admission.ref.run_id,
+                        durable.adapter.step,
+                        request.checkpoint_name,
+                    ),
+                    lora=durable.adapter.identity,
+                    publication_metrics=launch.metrics,
+                )
+
+            return _DeferredResult(completion=asyncio.create_task(complete()))
 
         return cast(
             TrainingOperation[SamplerWeightsResult],
@@ -221,21 +284,29 @@ class LocalMegatronTrainingClient:
     async def save_state(
         self, request: SaveStateRequest
     ) -> TrainingOperation[SaveStateResult]:
-        async def execute(admission: CommandAdmission) -> SaveStateResult:
-            _, durable = await self._service.snapshot_command(
+        async def execute(
+            admission: CommandAdmission,
+        ) -> SaveStateResult | _DeferredResult[SaveStateResult]:
+            launch = await self._service.snapshot_command(
                 admission.ref,
                 save_optimizer=True,
                 activate_serving=False,
             )
-            return SaveStateResult(
-                operation_id=admission.ref.operation_id,
-                checkpoint=_checkpoint_ref(
-                    admission.ref.run_id,
-                    durable.adapter.step,
-                    request.checkpoint_name,
-                ),
-                optimizer_state=self._service.optimizer_state_path,
-            )
+
+            async def complete() -> SaveStateResult:
+                durable = await launch.completion
+                return SaveStateResult(
+                    operation_id=admission.ref.operation_id,
+                    checkpoint=_checkpoint_ref(
+                        admission.ref.run_id,
+                        durable.adapter.step,
+                        request.checkpoint_name,
+                    ),
+                    optimizer_state=self._service.optimizer_state_path,
+                    metrics=launch.metrics,
+                )
+
+            return _DeferredResult(completion=asyncio.create_task(complete()))
 
         return cast(
             TrainingOperation[SaveStateResult],
@@ -257,45 +328,20 @@ class LocalMegatronTrainingClient:
         )
 
     async def _prepare_rl_batch(self, request: ForwardBackwardRequest):
-        from art.megatron.runtime_config import get_megatron_runtime_config
-
         if request.batch.kind != "rl":
             raise ValueError("Megatron RL F/B requires an RL trajectory batch")
-        groups = list(request.batch.require_local_groups())
-        values = request.loss.values
-        batch = await self._backend._prepare_training_batch(
-            self._model,
-            groups,
-            {
-                "advantage_balance": values.get("advantage_balance", 0.0),
-                "allow_training_without_logprobs": values.get(
-                    "allow_training_without_logprobs", False
-                ),
-                "scale_rewards": bool(values.get("scale_rewards", True))
-                and request.loss.normalize_advantages,
-                "plot_tensors": values.get("plot_tensors", False),
-                "packed_sequence_length": (
-                    get_megatron_runtime_config().packed_sequence_length
-                ),
-                "logprob_calculation_chunk_size": values.get(
-                    "logprob_calculation_chunk_size", 1024
-                ),
-            },
-            include_moe_routing=self._backend._model_uses_expert_replay(self._model),
-        )
-        if batch is None:
-            raise RuntimeError("F/B request contained no trainable trajectory groups")
-        return batch
+        request.batch.require_local_groups()
+        return request.batch.require_local_packed_batch()
 
     async def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         pending = tuple(
-            operation._task
+            operation._ordered
             for operation in self._operations.values()
-            if not operation._task.done()
-        )
+            if not operation._ordered.done()
+        ) + tuple(self._completion_tasks)
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
@@ -366,17 +412,24 @@ def _checkpoint_ref(run_id: str, learner_version: int, checkpoint_id: str):
 
 def _validate_publication_mode(
     request: SaveWeightsForSamplerRequest,
-    configured_mode: str,
+    *,
+    update_mode: str,
+    weights_mode: str,
 ) -> None:
     requested = request.publication.mode
     if requested == "none":
         return
     expected = (
-        "in_flight_lora" if configured_mode == "in_flight_lora" else "versioned_lora"
+        "merged_weights"
+        if weights_mode == "merged"
+        else "in_flight_lora"
+        if update_mode == "in_flight_lora"
+        else "versioned_lora"
     )
     if requested != expected:
         raise ValueError(
-            f"sampler publication mode {requested!r} conflicts with {configured_mode!r}"
+            f"sampler publication mode {requested!r} conflicts with "
+            f"weights={weights_mode!r}, update={update_mode!r}"
         )
 
 

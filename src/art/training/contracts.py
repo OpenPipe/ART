@@ -26,6 +26,7 @@ class RlTrajectoryBatch(Contract):
     min_source_version: int = Field(ge=0)
     max_source_version: int = Field(ge=0)
     _local_groups: tuple[Any, ...] | None = PrivateAttr(default=None)
+    _local_packed_batch: Any | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _validate_source_versions(self) -> "RlTrajectoryBatch":
@@ -39,6 +40,7 @@ class RlTrajectoryBatch(Contract):
         groups: Sequence[Any],
         *,
         default_source_version: int,
+        local_packed_batch: Any | None = None,
     ) -> "RlTrajectoryBatch":
         local_groups = tuple(groups)
         versions = [
@@ -59,6 +61,7 @@ class RlTrajectoryBatch(Contract):
             max_source_version=max(versions, default=default_source_version),
         )
         object.__setattr__(batch, "_local_groups", local_groups)
+        object.__setattr__(batch, "_local_packed_batch", local_packed_batch)
         return batch
 
     def require_local_groups(self) -> tuple[Any, ...]:
@@ -67,6 +70,11 @@ class RlTrajectoryBatch(Contract):
                 "local Megatron request has no in-process trajectory groups"
             )
         return self._local_groups
+
+    def require_local_packed_batch(self) -> Any:
+        if self._local_packed_batch is None:
+            raise RuntimeError("local Megatron request has no packed batch lease")
+        return self._local_packed_batch
 
 
 class SupervisedTrajectoryBatch(Contract):
@@ -110,9 +118,9 @@ class ForwardBackwardRequest(ForwardRequest):
 class AdamConfig(Contract):
     learning_rate: float = Field(ge=0)
     beta1: float = Field(default=0.9, ge=0, lt=1)
-    beta2: float = Field(default=0.95, ge=0, lt=1)
-    eps: float = Field(default=1e-8, gt=0)
-    weight_decay: float = Field(default=0.0, ge=0)
+    beta2: float = Field(default=0.99, ge=0, lt=1)
+    eps: float = Field(default=1e-13, gt=0)
+    weight_decay: float = Field(default=0.1, ge=0)
 
 
 class OptimStepRequest(RunCommand):
@@ -120,7 +128,7 @@ class OptimStepRequest(RunCommand):
 
 
 class SamplerPublication(Contract):
-    mode: Literal["none", "versioned_lora", "in_flight_lora"]
+    mode: Literal["none", "versioned_lora", "in_flight_lora", "merged_weights"]
     model_alias: str | None = None
 
     @model_validator(mode="after")
@@ -256,6 +264,7 @@ class SaveStateResult(Contract):
     operation_id: str = Field(min_length=1)
     checkpoint: CheckpointRef
     optimizer_state: str = Field(min_length=1)
+    metrics: dict[str, float] = Field(default_factory=dict)
 
 
 class LoadStateResult(Contract):

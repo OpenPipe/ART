@@ -12,7 +12,7 @@ from pathlib import Path
 import shutil
 import socket
 import time
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, NamedTuple, TypedDict, cast
 import uuid
 
 import httpx
@@ -102,6 +102,11 @@ from .runtime_config import get_megatron_runtime_config
 
 logger = logging.getLogger(__name__)
 _POLICY_TIMING_HISTORY = 64
+
+
+class GenerationSnapshotLaunch(NamedTuple):
+    metrics: dict[str, float]
+    completion: asyncio.Task[DurableTrainerPublication]
 
 
 class _TrainerJobFields(TypedDict):
@@ -229,6 +234,9 @@ class DistributedMegatronService:
         self._recovery_tasks: set[asyncio.Task[None]] = set()
         self._publication_tasks: dict[int, asyncio.Task[None]] = {}
         self._durability_tasks: set[asyncio.Task[Any]] = set()
+        self._snapshot_rank_tasks: dict[
+            int, asyncio.Task[tuple[TrainerRankPublication, ...]]
+        ] = {}
         self._prepared_adapter_transfers: dict[str, Any] = {}
         self._loaded_adapter_transfers: dict[int, tuple[Any, str]] = {}
         self._next_publication_preparation: (
@@ -1222,6 +1230,11 @@ class DistributedMegatronService:
                 self._latest_step = output_version
                 self._learner_generation = generation
                 self._trainer_resident_generation = generation
+                self._snapshot_rank_tasks = {
+                    step: task
+                    for step, task in self._snapshot_rank_tasks.items()
+                    if step >= output_version
+                }
                 self._record_policy_timestamp(
                     self._trainer_completion_times, output_version
                 )
@@ -1233,7 +1246,7 @@ class DistributedMegatronService:
         *,
         save_optimizer: bool,
         activate_serving: bool,
-    ) -> tuple[dict[str, float], DurableTrainerPublication]:
+    ) -> GenerationSnapshotLaunch:
         async with self._train_lock, self._trainer_failure_boundary():
             async with self._mutation_lock:
                 self._require_open()
@@ -1251,6 +1264,18 @@ class DistributedMegatronService:
                 ):
                     raise RuntimeError("snapshot command learner parent changed")
                 existing = self._published_adapters.get(self._latest_step)
+                preceding_rank_snapshot = self._snapshot_rank_tasks.get(
+                    self._latest_step
+                )
+
+            if existing is None and preceding_rank_snapshot is not None:
+                records = await asyncio.shield(preceding_rank_snapshot)
+                existing = records[0].adapter
+                if existing is None:
+                    raise RuntimeError("preceding snapshot has no rank-zero adapter")
+                async with self._mutation_lock:
+                    if self._latest_step != generation.policy_step:
+                        raise RuntimeError("learner advanced between snapshot commands")
 
             targets: tuple[Any, ...] = ()
             merged: MergedWeightTransferSpec | None = None
@@ -1284,49 +1309,77 @@ class DistributedMegatronService:
             )
             result = await trainer.snapshot(job)
             metrics = dict(result["metrics"])
-            snapshot_metrics = {
-                name: value
-                for name, value in metrics.items()
-                if name.startswith("snapshot_")
-            }
-            self._publication_metrics[generation.policy_step] = snapshot_metrics
-            self._emitted_publication_metrics[generation.policy_step] = set(
-                snapshot_metrics
+            rank_snapshot = asyncio.create_task(
+                trainer.wait_for_publication(generation.generation_id)
             )
+            self._snapshot_rank_tasks[generation.policy_step] = rank_snapshot
+            rank_snapshot.add_done_callback(_consume_task_result)
             if activate_serving:
-                self._schedule_publication(
+                self._publication_metrics[generation.policy_step] = metrics
+                self._emitted_publication_metrics[generation.policy_step] = set()
+                publication = self._schedule_publication(
                     generation,
                     trainer=trainer,
                     publication_targets=targets,
+                    publication_waiter=rank_snapshot,
                 )
-                await asyncio.shield(self._publication_tasks[generation.policy_step])
-                adapter = self._published_adapters[generation.policy_step]
-                pointer = read_committed_optimizer_pointer(self._optimizer_state_path)
-                pointer_step = pointer.step if pointer else 0
-                durable = DurableTrainerPublication(
-                    adapter=adapter,
-                    resume_step=generation.policy_step
-                    if save_optimizer
-                    else pointer_step,
-                    optimizer_step=pointer_step,
+                completion = asyncio.create_task(
+                    self._complete_activated_snapshot(
+                        generation,
+                        publication,
+                        save_optimizer=save_optimizer,
+                    )
                 )
             else:
-                durable, durable_s = await self._resolve_durable_publication(
-                    generation,
-                    durable=None,
-                    publication_waiter=trainer.wait_for_publication(
-                        generation.generation_id
-                    ),
-                    previous_publication=None,
-                )
-                metrics["snapshot_durable_s"] = durable_s
-                async with self._mutation_lock:
-                    self._published_adapters[generation.policy_step] = durable.adapter
-                    self._durable_step = max(self._durable_step, durable.resume_step)
-                    self._durable_optimizer_step = max(
-                        self._durable_optimizer_step, durable.optimizer_step
+                completion = asyncio.create_task(
+                    self._complete_durable_snapshot(
+                        generation,
+                        rank_snapshot,
+                        metrics,
                     )
-            return metrics, durable
+                )
+            self._durability_tasks.add(completion)
+            completion.add_done_callback(_consume_task_result)
+            completion.add_done_callback(self._durability_tasks.discard)
+            return GenerationSnapshotLaunch(metrics=metrics, completion=completion)
+
+    async def _complete_activated_snapshot(
+        self,
+        generation: TrainerGeneration,
+        publication: asyncio.Task[None],
+        *,
+        save_optimizer: bool,
+    ) -> DurableTrainerPublication:
+        await asyncio.shield(publication)
+        adapter = self._published_adapters[generation.policy_step]
+        pointer = read_committed_optimizer_pointer(self._optimizer_state_path)
+        pointer_step = pointer.step if pointer else 0
+        return DurableTrainerPublication(
+            adapter=adapter,
+            resume_step=generation.policy_step if save_optimizer else pointer_step,
+            optimizer_step=pointer_step,
+        )
+
+    async def _complete_durable_snapshot(
+        self,
+        generation: TrainerGeneration,
+        rank_snapshot: asyncio.Task[tuple[TrainerRankPublication, ...]],
+        metrics: dict[str, float],
+    ) -> DurableTrainerPublication:
+        durable, durable_s = await self._resolve_durable_publication(
+            generation,
+            durable=None,
+            publication_waiter=rank_snapshot,
+            previous_publication=None,
+        )
+        metrics["snapshot_durable_s"] = durable_s
+        async with self._mutation_lock:
+            self._published_adapters[generation.policy_step] = durable.adapter
+            self._durable_step = max(self._durable_step, durable.resume_step)
+            self._durable_optimizer_step = max(
+                self._durable_optimizer_step, durable.optimizer_step
+            )
+        return durable
 
     def _schedule_publication(
         self,
@@ -1335,7 +1388,8 @@ class DistributedMegatronService:
         trainer: Any = None,
         durable: DurableTrainerPublication | None = None,
         publication_targets: tuple[Any, ...] = (),
-    ) -> None:
+        publication_waiter: Awaitable[tuple[TrainerRankPublication, ...]] | None = None,
+    ) -> asyncio.Task[None]:
         if (trainer is None) == (durable is None):
             raise ValueError(
                 "publication requires exactly one trainer stream or durable result"
@@ -1348,11 +1402,8 @@ class DistributedMegatronService:
         )
         if publication_targets and transfer_manager is None:
             raise RuntimeError("adapter transfer publication is not prepared")
-        publication_waiter = (
-            trainer.wait_for_publication(generation.generation_id)
-            if trainer is not None
-            else None
-        )
+        if publication_waiter is None and trainer is not None:
+            publication_waiter = trainer.wait_for_publication(generation.generation_id)
         loop = asyncio.get_running_loop()
         previous = self._serving_futures.get(step - 1)
         if previous is None:
@@ -1393,6 +1444,7 @@ class DistributedMegatronService:
         task.add_done_callback(
             lambda done: _retire_completed(self._publication_tasks, step, done)
         )
+        return task
 
     async def _resolve_durable_publication(
         self,
@@ -2630,6 +2682,7 @@ class DistributedMegatronService:
             async with self._mutation_lock:
                 self._publication_tasks.clear()
                 self._durability_tasks.clear()
+                self._snapshot_rank_tasks.clear()
                 self._serving_futures.clear()
                 self._publication_metrics.clear()
                 self._emitted_publication_metrics.clear()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from typing import Any
 
 from pydantic import Field
 
@@ -74,9 +75,7 @@ class RunCommandLedger:
                 f"command run_id {request.run_id!r} does not match {self.run_id!r}"
             )
         prior = self._records.get(request.request_id)
-        request_fingerprint = json.dumps(
-            request.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
-        )
+        request_fingerprint = _request_fingerprint(request)
         if prior is not None:
             if (
                 prior.request_fingerprint != request_fingerprint
@@ -142,3 +141,29 @@ class RunCommandLedger:
             raise TypeError(
                 f"{kind} requires {expected.__name__}, got {type(request).__name__}"
             )
+
+
+def _request_fingerprint(request: RunCommand) -> str:
+    digest = hashlib.sha256()
+    exclude = (
+        {"batch": {"groups"}}
+        if isinstance(request, ForwardRequest) and request.batch.kind == "rl"
+        else None
+    )
+    metadata = json.dumps(
+        request.model_dump(mode="json", exclude=exclude),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    _update_digest(digest, metadata)
+    if isinstance(request, ForwardRequest) and request.batch.kind == "rl":
+        for group in request.batch.groups:
+            _update_digest(digest, group.header)
+            for record in group.records:
+                _update_digest(digest, record)
+    return digest.hexdigest()
+
+
+def _update_digest(digest: Any, value: bytes) -> None:
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)

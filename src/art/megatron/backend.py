@@ -15,6 +15,16 @@ from ..distributed.art_runtime import ArtRuntime
 from ..local.backend import LocalBackend, _PackedTrainingBatch
 from ..local.service import ModelService
 from ..model import Model, TrainableModel
+from ..training import (
+    AdamConfig,
+    ForwardBackwardRequest,
+    LossConfig,
+    OptimStepRequest,
+    RlTrajectoryBatch,
+    SamplerPublication,
+    SaveStateRequest,
+    SaveWeightsForSamplerRequest,
+)
 from ..trajectories import TrajectoryGroup
 from ..types import LocalTrainResult
 from ..utils.lifecycle import complete_task
@@ -28,6 +38,8 @@ class _DistributedBatchPayload(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     packed: Any
+    groups: tuple[Any, ...]
+    bundles: tuple[Any, ...]
     selections: tuple[Any, ...]
     generation_id: str = Field(min_length=1)
     runtime: Any
@@ -89,6 +101,30 @@ def _packing_metrics(packed: Any) -> dict[str, float]:
     }
 
 
+def _sampler_publication_mode(
+    service: Any,
+) -> Literal["versioned_lora", "in_flight_lora", "merged_weights"]:
+    if service.rollout_weights_mode == "merged":
+        return "merged_weights"
+    return (
+        "in_flight_lora"
+        if service.rollout_weight_update_mode == "in_flight_lora"
+        else "versioned_lora"
+    )
+
+
+def _should_save_optimizer(step: int, config: Any) -> bool:
+    return (
+        config.optimizer_save_interval == 1
+        or step <= 1
+        or step % config.optimizer_save_interval == 0
+        or (
+            config.final_training_step is not None
+            and step >= config.final_training_step
+        )
+    )
+
+
 class MegatronBackend(LocalBackend):
     def __init__(
         self,
@@ -126,6 +162,8 @@ class MegatronBackend(LocalBackend):
         self._owns_runtime = runtime is None
         self._runtime_lock = asyncio.Lock()
         self._service_lock = asyncio.Lock()
+        self._training_client_lock = asyncio.Lock()
+        self._training_clients: dict[tuple[str, str], Any] = {}
         self._owned_runtimes: dict[tuple[str, str], ArtRuntime] = {}
         from .runtime.local import LocalEndpointAllocator
 
@@ -392,6 +430,27 @@ class MegatronBackend(LocalBackend):
             self._services[storage_key] = service
             return service
 
+    async def training_client(self, model: TrainableModel):
+        from .distributed_service import DistributedMegatronService
+        from .training import LocalMegatronTrainingClient
+
+        storage_key = self._model_storage_key(model)
+        if client := self._training_clients.get(storage_key):
+            return client
+        async with self._training_client_lock:
+            if client := self._training_clients.get(storage_key):
+                return client
+            service = cast(DistributedMegatronService, await self._get_service(model))
+            client = LocalMegatronTrainingClient(
+                run_id=uuid.uuid4().hex,
+                learner_version=await service.prepare_for_packing(),
+                backend=self,
+                model=model,
+                service=service,
+            )
+            self._training_clients[storage_key] = client
+            return client
+
     async def _prepare_backend_for_training(
         self,
         model: AnyTrainableModel,
@@ -569,15 +628,22 @@ class MegatronBackend(LocalBackend):
                 if queue is not None and local_selections
                 else ()
             )
+            packing_bundles = tuple(
+                TrajectoryGroupBundle.from_group(group)
+                for group in (local_groups if selected else tuple(trajectory_groups))
+            )
+            command_bundles = (
+                packing_bundles
+                if not selected
+                else tuple(
+                    TrajectoryGroupBundle.from_group(group)
+                    for group in trajectory_groups
+                )
+            )
             request = PackingRequest(
                 model=RolloutModelSpec.from_model(model),
                 generation_id=generation_id,
-                trajectory_groups=tuple(
-                    TrajectoryGroupBundle.from_group(group)
-                    for group in (
-                        local_groups if selected else tuple(trajectory_groups)
-                    )
-                ),
+                trajectory_groups=packing_bundles,
                 trajectory_sources=(
                     ()
                     if local_selections
@@ -612,6 +678,8 @@ class MegatronBackend(LocalBackend):
             batch = _PackedTrainingBatch(
                 payload=_DistributedBatchPayload(
                     packed=packed,
+                    groups=tuple(trajectory_groups),
+                    bundles=command_bundles,
                     selections=selected,
                     generation_id=generation_id,
                     runtime=runtime,
@@ -800,32 +868,90 @@ class MegatronBackend(LocalBackend):
         grad_accumulation_sequences: int,
         verbose: bool,
     ) -> AsyncIterator[dict[str, float]]:
+        del verbose
         self._collect_batch_release_results()
         self._raise_batch_release_failures()
         self._collect_adapter_prune_result()
         self._raise_adapter_prune_failures()
-        from ..distributed.art_runtime import DistributedPackedBatch
         from .distributed_service import DistributedMegatronService
 
         payload = batch.payload
         if not isinstance(payload, _DistributedBatchPayload):
             raise RuntimeError("Megatron training did not use the typed data plane")
-        distributed_batch = cast(
-            DistributedPackedBatch,
-            payload.packed,
-        )
-        release_started = time.perf_counter()
-        await self._release_trajectory_sources(batch, payload)
-        source_release_s = time.perf_counter() - release_started
         distributed_service = cast(DistributedMegatronService, service)
-        async for result in distributed_service.train_packed(
-            distributed_batch, config, service_dev_config
-        ):
-            yield {
-                **result,
-                "time/step_source_lease_release_s": source_release_s,
-                **distributed_service.drain_publication_metrics(),
-            }
+        client = await self.training_client(model)
+        values = {
+            **service_dev_config,
+            "kl_penalty_coef": config.kl_penalty_coef,
+            "kl_penalty_source": config.kl_penalty_source,
+            "grad_accumulation_sequences": grad_accumulation_sequences,
+        }
+        rl_batch = RlTrajectoryBatch(
+            groups=payload.bundles,
+            min_source_version=payload.packed.leases.ref.min_source_version,
+            max_source_version=payload.packed.leases.ref.max_source_version,
+        )
+        object.__setattr__(rl_batch, "_local_groups", payload.groups)
+        object.__setattr__(rl_batch, "_local_packed_batch", batch)
+        sequence_id = client.next_sequence_id
+        forward = await client.forward_backward(
+            ForwardBackwardRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=sequence_id,
+                batch=rl_batch,
+                loss=LossConfig(
+                    name="ppo" if service_dev_config.get("ppo", False) else "cispo",
+                    normalize_advantages=bool(
+                        service_dev_config.get("scale_rewards", True)
+                    ),
+                    values=values,
+                ),
+                collect_packing_shapes=any(
+                    group._collect_packing_shape for group in payload.groups
+                ),
+            )
+        )
+        optimizer = await client.optim_step(
+            OptimStepRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=sequence_id + 1,
+                optimizer=AdamConfig(learning_rate=config.learning_rate),
+            )
+        )
+        next_step = optimizer.ref.reserved_output_learner_version
+        if next_step is None:
+            raise RuntimeError("optimizer did not reserve a learner version")
+        await client.save_weights_for_sampler(
+            SaveWeightsForSamplerRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=sequence_id + 2,
+                checkpoint_name=f"step-{next_step}",
+                publication=SamplerPublication(
+                    mode=_sampler_publication_mode(distributed_service),
+                    model_alias=model.name,
+                ),
+            )
+        )
+        if _should_save_optimizer(next_step, config):
+            await client.save_state(
+                SaveStateRequest(
+                    run_id=client.run_id,
+                    request_id=uuid.uuid4().hex,
+                    sequence_id=sequence_id + 3,
+                    checkpoint_name=f"step-{next_step}",
+                )
+            )
+        forward_result, optimizer_result = await asyncio.gather(
+            forward.result(), optimizer.result()
+        )
+        yield {
+            **forward_result.metrics,
+            **optimizer_result.metrics,
+            **distributed_service.drain_publication_metrics(),
+        }
 
     async def _release_training_batch(self, batch: _PackedTrainingBatch) -> None:
         await self._release_distributed_batch(batch, disposition="consumed")
@@ -971,6 +1097,15 @@ class MegatronBackend(LocalBackend):
 
     async def _close_megatron_backend(self) -> None:
         failures: list[BaseException] = []
+        clients, self._training_clients = tuple(self._training_clients.values()), {}
+        failures.extend(
+            result
+            for result in await asyncio.gather(
+                *(client.close() for client in clients),
+                return_exceptions=True,
+            )
+            if isinstance(result, BaseException)
+        )
         if self._batch_release_tasks:
             results = await asyncio.gather(
                 *self._batch_release_tasks, return_exceptions=True
