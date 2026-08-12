@@ -10,6 +10,61 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+class WorkflowTrainerTopology(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    variant: str = Field(min_length=1)
+    tp: int = Field(default=1, ge=1)
+    cp: int = Field(default=1, ge=1)
+    ep: int = Field(default=1, ge=1)
+    etp: int = Field(default=1, ge=1)
+    dp: int = Field(default=1, ge=1)
+    pp: int = Field(default=1, ge=1)
+    vpp: int = Field(default=1, ge=1)
+    sp: bool = False
+
+
+class WorkflowVllmTopology(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    variant: str = Field(min_length=1)
+    tp: int = Field(default=1, ge=1)
+    pp: int = Field(default=1, ge=1)
+    dp: int = Field(default=1, ge=1)
+    ep: bool = False
+
+
+class WorkflowRolePlacement(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    variant: str = Field(min_length=1)
+    trainer_gpu_ids: tuple[int, ...] = ()
+    vllm_gpu_ids: tuple[int, ...] = ()
+    vllm_external: bool = False
+
+    @model_validator(mode="after")
+    def validate_relative_gpu_ids(self) -> "WorkflowRolePlacement":
+        for role, gpu_ids in (
+            ("trainer", self.trainer_gpu_ids),
+            ("vLLM", self.vllm_gpu_ids),
+        ):
+            if len(set(gpu_ids)) != len(gpu_ids) or any(
+                gpu_id < 0 for gpu_id in gpu_ids
+            ):
+                raise ValueError(
+                    f"{role} relative GPU ids must be unique and non-negative"
+                )
+        return self
+
+
+class WorkflowRuntimeTopology(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    trainer_variants: tuple[WorkflowTrainerTopology, ...] = ()
+    vllm_variants: tuple[WorkflowVllmTopology, ...] = ()
+    role_placements: tuple[WorkflowRolePlacement, ...] = ()
+
+
 class WorkflowRuntimeKey(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -17,7 +72,7 @@ class WorkflowRuntimeKey(BaseModel):
     handler: str
     fixture: str
     kind: Literal["cpu", "megatron", "vllm", "joint"]
-    topology: str = ""
+    topology: WorkflowRuntimeTopology = Field(default_factory=WorkflowRuntimeTopology)
     mode: str = ""
     static_options: str = ""
 
