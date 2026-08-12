@@ -63,6 +63,18 @@ class MoeRoutingReplaySpec(_Contract):
 class PrefixTreePackingStatsSpec(_Contract):
     logical_tokens: int = Field(ge=0)
     physical_tokens: int = Field(ge=0)
+    policy_token_counts: dict[int, int] | None = None
+
+    @model_validator(mode="after")
+    def _validate_policy_token_counts(self) -> "PrefixTreePackingStatsSpec":
+        counts = self.policy_token_counts
+        if counts is not None and any(
+            version < 0 or count <= 0 for version, count in counts.items()
+        ):
+            raise ValueError(
+                "policy_token_counts require non-negative versions and positive counts"
+            )
+        return self
 
 
 class PackedBatchRef(_Contract):

@@ -31,6 +31,7 @@ DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH = 64
 class PrefixTreePackingStats(TypedDict):
     logical_tokens: int
     physical_tokens: int
+    policy_token_counts: dict[int, int] | None
 
 
 class PackedTensors(TypedDict):
@@ -69,6 +70,7 @@ class _PrefixTreePackItem(NamedTuple):
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
     moe_routes: MoeRouteArray | MoeRouteSegments | None
+    policy_versions: np.ndarray
 
 
 class _PrefixTreeRowPlan(NamedTuple):
@@ -367,6 +369,7 @@ def prefix_tree_pack(
         "prefix_tree_packing_stats": {
             "logical_tokens": sum(len(item.token_ids) for item in items),
             "physical_tokens": sum(plan.length for plan in row_plans),
+            "policy_token_counts": _packed_policy_token_counts(items),
         },
     }
     if include_moe_routing:
@@ -587,6 +590,17 @@ def _prefix_tree_pack_item(
         pixel_values=result.pixel_values,
         image_grid_thw=result.image_grid_thw,
         moe_routes=result.moe_routed_experts,
+        policy_versions=np.asarray(
+            (
+                [-1] * len(result.token_ids)
+                if result.policy_versions is None
+                else [
+                    -1 if version is None else version
+                    for version in result.policy_versions
+                ]
+            ),
+            dtype=np.int64,
+        ),
     )
     _validate_prefix_tree_pack_item(item)
     return _truncate_prefix_tree_pack_item(item, seq_len)
@@ -594,7 +608,7 @@ def _prefix_tree_pack_item(
 
 def _validate_prefix_tree_pack_item(item: _PrefixTreePackItem) -> None:
     token_count = len(item.token_ids)
-    for name in ("input_pos", "assistant_mask", "logprobs"):
+    for name in ("input_pos", "assistant_mask", "logprobs", "policy_versions"):
         value = getattr(item, name)
         if value.ndim != 1 or len(value) != token_count:
             raise RuntimeError(
@@ -655,7 +669,22 @@ def _truncate_prefix_tree_pack_item(
         pixel_values=item.pixel_values,
         image_grid_thw=item.image_grid_thw,
         moe_routes=item.moe_routes,
+        policy_versions=item.policy_versions[:seq_len],
     )
+
+
+def _packed_policy_token_counts(
+    items: list[_PrefixTreePackItem],
+) -> dict[int, int] | None:
+    versions = np.concatenate(
+        [item.policy_versions[item.assistant_mask] for item in items]
+    )
+    if np.any(versions < 0):
+        return None
+    unique, counts = np.unique(versions, return_counts=True)
+    return {
+        int(version): int(count) for version, count in zip(unique, counts, strict=True)
+    }
 
 
 def _first_trainable_token_index(

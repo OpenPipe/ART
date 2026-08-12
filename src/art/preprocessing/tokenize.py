@@ -43,6 +43,10 @@ from .moe_routing import (
     align_choice_routes_to_tokenized_result,
     choice_moe_routing_metadata,
 )
+from .policy_spans import (
+    choice_policy_token_spans,
+    validate_complete_policy_token_spans,
+)
 from .response_masking import (
     _TemplatePartTokenizer,
     response_only_labels,
@@ -408,6 +412,7 @@ class TokenizedResult:
     weight: float = 0.0
     prompt_id: int = 0
     prompt_length: int = 0
+    policy_versions: list[int | None] | None = None
 
     @cached_property
     def tokens(self) -> list[str]:
@@ -443,6 +448,11 @@ class TokenizedResult:
             weight=self.weight,
             prompt_id=self.prompt_id,
             prompt_length=0,
+            policy_versions=(
+                None
+                if self.policy_versions is None
+                else self.policy_versions[self.prompt_length :]
+            ),
         )
 
 
@@ -587,6 +597,34 @@ def _choice_extra_logprobs(
     return extra_logprobs
 
 
+def _choice_policy_versions(
+    *,
+    token_count: int,
+    choices: list[Choice],
+    choice_offsets: list[int],
+    choice_token_lengths: list[int],
+) -> list[int | None] | None:
+    versions: list[int | None] = [None] * token_count
+    for choice, offset, length in zip(
+        choices, choice_offsets, choice_token_lengths, strict=True
+    ):
+        spans = choice_policy_token_spans(choice)
+        if length > 0 and not spans:
+            return None
+        validate_complete_policy_token_spans(choice, completion_tokens=length)
+        if offset < 0 or offset + length > token_count:
+            raise RuntimeError(
+                "Policy token span choice bounds exceed tokenized result"
+            )
+        for span in spans:
+            start = offset + span.start_token
+            end = offset + span.end_token
+            if any(version is not None for version in versions[start:end]):
+                raise RuntimeError("Policy token spans overlap in tokenized result")
+            versions[start:end] = [span.policy_version] * (end - start)
+    return versions
+
+
 def _tokenized_result_from_vllm_choices(
     *,
     tokenizer: PreTrainedTokenizerBase,
@@ -627,6 +665,12 @@ def _tokenized_result_from_vllm_choices(
         moe_routed_experts=moe_routed_experts,
         moe_routing_alignment_stats=moe_routing_alignment_stats,
         _tokenizer=tokenizer,
+        policy_versions=_choice_policy_versions(
+            token_count=len(token_ids),
+            choices=choices,
+            choice_offsets=choice_offsets,
+            choice_token_lengths=choice_token_lengths,
+        ),
     )
 
 
@@ -875,9 +919,22 @@ def tokenize_trajectory_groups(
                             )
                             for index in selected_choices
                         ]
+                        policy_versions = _choice_policy_versions(
+                            token_count=len(exchange_result.token_ids),
+                            choices=[
+                                chat_trace.choices[index] for index in selected_choices
+                            ],
+                            choice_offsets=[
+                                chat_trace.offsets[index] for index in selected_choices
+                            ],
+                            choice_token_lengths=[
+                                chat_trace.lengths[index] for index in selected_choices
+                            ],
+                        )
                     else:
                         moe_routes = None
                         moe_stats = MoeRoutingAlignmentStats()
+                        policy_versions = None
                     trajectory_results.append(
                         TokenizedResult(
                             advantage=advantage,
@@ -894,6 +951,7 @@ def tokenize_trajectory_groups(
                             moe_routed_experts=moe_routes,
                             moe_routing_alignment_stats=moe_stats,
                             _tokenizer=tokenizer,
+                            policy_versions=policy_versions,
                         )
                     )
             else:
