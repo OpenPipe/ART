@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 import socket
@@ -32,6 +33,7 @@ _TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 _INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
 _EXTERNAL_VLLM_URL_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL"
 _EXTERNAL_VLLM_API_KEY_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY"
+_EXTERNAL_VLLM_ENGINE_ARGS_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_ENGINE_ARGS"
 
 
 class NativeVllmLoraServingReport(BaseModel):
@@ -42,6 +44,8 @@ class NativeVllmLoraServingReport(BaseModel):
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
     rollout_weights_mode: str = "lora"
+    external_vllm_reused: bool = False
+    vllm_engine_args: dict[str, object] = Field(default_factory=dict)
     step0_name: str
     step1_name: str
     model_ids_before: list[str] = Field(default_factory=list)
@@ -136,6 +140,23 @@ async def _run_native_vllm_lora(
         engine_args = cast(dev.EngineArgs, stage_resources.vllm.engine_args())
     else:
         engine_args = dev.EngineArgs(enforce_eager=True)
+    external_url = os.environ.get(_EXTERNAL_VLLM_URL_ENV)
+    external_api_key = os.environ.get(_EXTERNAL_VLLM_API_KEY_ENV)
+    if (external_url is None) != (external_api_key is None):
+        raise RuntimeError(
+            f"{_EXTERNAL_VLLM_URL_ENV} and {_EXTERNAL_VLLM_API_KEY_ENV} must both be set"
+        )
+    if raw_engine_args := os.environ.get(_EXTERNAL_VLLM_ENGINE_ARGS_ENV):
+        if external_url is None:
+            raise RuntimeError(
+                f"{_EXTERNAL_VLLM_ENGINE_ARGS_ENV} requires {_EXTERNAL_VLLM_URL_ENV}"
+            )
+        parsed_engine_args = json.loads(raw_engine_args)
+        if not isinstance(parsed_engine_args, dict):
+            raise RuntimeError(
+                f"{_EXTERNAL_VLLM_ENGINE_ARGS_ENV} must encode an object"
+            )
+        engine_args = cast(dev.EngineArgs, parsed_engine_args)
     if configured_gpu_ids:
         trainer_gpu_ids, inference_gpu_ids = _resolve_dedicated_gpu_ids()
     elif stage_resources is not None:
@@ -160,12 +181,6 @@ async def _run_native_vllm_lora(
         allow_unvalidated_arch=case_config.allow_unvalidated_arch,
         engine_args=engine_args,
     )
-    external_url = os.environ.get(_EXTERNAL_VLLM_URL_ENV)
-    external_api_key = os.environ.get(_EXTERNAL_VLLM_API_KEY_ENV)
-    if (external_url is None) != (external_api_key is None):
-        raise RuntimeError(
-            f"{_EXTERNAL_VLLM_URL_ENV} and {_EXTERNAL_VLLM_API_KEY_ENV} must both be set"
-        )
     if external_url is not None:
         internal_config["vllm_runtime"] = {
             "mode": "external",
@@ -224,6 +239,8 @@ async def _run_native_vllm_lora(
                 port=resolved_port,
                 trainer_gpu_ids=trainer_gpu_ids,
                 inference_gpu_ids=inference_gpu_ids,
+                external_vllm_reused=external_url is not None,
+                vllm_engine_args=dict(engine_args),
                 step0_name=step0_name,
                 step1_name=step1_name,
                 model_ids_before=model_ids_before,

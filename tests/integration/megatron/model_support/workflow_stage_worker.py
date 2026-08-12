@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 from collections.abc import Callable
+import json
 import os
 from pathlib import Path
 import time
@@ -32,6 +33,9 @@ from .workflow_fixtures import FIXTURE_PATH_ENV, ensure_workflow_fixture
 
 FUNCTIONAL_LORA_VLLM_MODE = "functional_lora_vllm"
 FUNCTIONAL_LORA_VLLM_STAGES = ("length_trainability", "native_vllm_lora")
+BASE_MEGATRON_MODE = "base_megatron"
+BASE_MEGATRON_STAGES = ("hf_parity", "packing_invariance")
+EXTERNAL_VLLM_ENGINE_ARGS_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_ENGINE_ARGS"
 _STAGE_RUNNERS = {
     "hf_parity": run_hf_parity_stage,
     "lora_coverage": run_lora_coverage_stage,
@@ -56,13 +60,22 @@ class WorkflowStageWorkerItem(BaseModel):
     environment: dict[str, str]
 
 
+class FunctionalVllmSessionSpec(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    gpu_count: int
+    launch: VllmRuntimeLaunchConfig
+    trainer_gpu_ids: dict[str, tuple[int, ...]]
+
+
 class WorkflowStageWorkerSession(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     base_model: str
     architecture_json: str
     allow_unvalidated_arch: bool = False
-    functional_vllm: VllmRuntimeLaunchConfig | None = None
+    functional_vllm: FunctionalVllmSessionSpec | None = None
+    base_megatron: bool = False
     items: tuple[WorkflowStageWorkerItem, ...]
 
 
@@ -95,12 +108,12 @@ def _runtime_json(client: httpx.Client, method: str, path: str, **kwargs):
     return response.json()
 
 
-def _reset_vllm(client: httpx.Client, baseline: tuple[str, ...]) -> None:
+def _reset_vllm(client: httpx.Client, baseline: tuple[str, ...]) -> dict[str, object]:
     def model_ids() -> tuple[str, ...]:
         models = _runtime_json(client, "GET", "/v1/models")["data"]
         return tuple(sorted(str(model["id"]) for model in models))
 
-    def idle() -> None:
+    def idle() -> dict[str, float]:
         for _ in range(600):
             metrics = FastMetricsSnapshot.model_validate(
                 _runtime_json(client, "GET", "/art/metrics")
@@ -110,12 +123,18 @@ def _reset_vllm(client: httpx.Client, baseline: tuple[str, ...]) -> None:
                 for key, value in metrics.items()
                 if key.startswith("num_requests_")
             ):
-                return
+                return {
+                    key: float(value)
+                    for key, value in metrics.items()
+                    if key.startswith("num_requests_")
+                }
             time.sleep(0.1)
         raise TimeoutError("functional vLLM requests did not drain")
 
-    idle()
-    for alias in sorted(set(model_ids()) - set(baseline)):
+    idle_before = idle()
+    before = model_ids()
+    aliases = tuple(sorted(set(before) - set(baseline)))
+    for alias in aliases:
         _runtime_json(
             client,
             "POST",
@@ -128,11 +147,20 @@ def _reset_vllm(client: httpx.Client, baseline: tuple[str, ...]) -> None:
         "/art/reset_prefix_cache",
         json={"reset_running_requests": False, "reset_connector": True},
     )
-    idle()
+    idle_after = idle()
     if reset.get("success") is not True or (after := model_ids()) != baseline:
         raise RuntimeError(
             f"functional reset failed: baseline={baseline}, after={after}"
         )
+    return {
+        "baseline_model_ids": baseline,
+        "model_ids_before": before,
+        "unloaded_aliases": aliases,
+        "prefix_cache_reset": True,
+        "model_ids_after": after,
+        "requests_before": idle_before,
+        "requests_after": idle_after,
+    }
 
 
 async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
@@ -140,9 +168,12 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
 
     spec = request.functional_vllm
     assert spec is not None
+    launch_spec = spec.launch
     stages = tuple(item.stage for item in request.items)
     if stages != FUNCTIONAL_LORA_VLLM_STAGES:
         raise ValueError("functional vLLM stages do not match worker items")
+    if tuple(spec.trainer_gpu_ids) != stages:
+        raise ValueError("functional vLLM trainer placements do not match worker items")
     prepared = ensure_workflow_fixture(
         request.base_model,
         allow_unvalidated_arch=request.allow_unvalidated_arch,
@@ -155,8 +186,12 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
     if len(host_paths) != 1:
         raise RuntimeError(f"selected host prepared different fixtures: {host_paths}")
     visible = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
-    inference_gpu_ids = tuple(map(int, spec.visible_devices.split(",")))
-    launch = spec.model_copy(
+    if len(visible) != spec.gpu_count:
+        raise RuntimeError(
+            f"functional vLLM expected {spec.gpu_count} GPUs, received {len(visible)}"
+        )
+    inference_gpu_ids = tuple(map(int, launch_spec.visible_devices.split(",")))
+    launch = launch_spec.model_copy(
         update={
             "base_model": host_paths.pop(),
             "port": find_free_tcp_port(),
@@ -181,13 +216,23 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
         external = {
             "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL": runtime.base_url,
             "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY": runtime.api_key,
-            "ART_MODEL_SUPPORT_TRAINER_GPU_IDS": ",".join(
-                map(str, sorted(set(range(len(visible))) - set(inference_gpu_ids)))
-            ),
             "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS": ",".join(
                 map(str, inference_gpu_ids)
             ),
+            EXTERNAL_VLLM_ENGINE_ARGS_ENV: json.dumps(
+                launch_spec.engine_args, sort_keys=True
+            ),
         }
+        for stage, trainer_gpu_ids in spec.trainer_gpu_ids.items():
+            if (
+                not trainer_gpu_ids
+                or set(trainer_gpu_ids) & set(inference_gpu_ids)
+                or any(gpu_id not in range(len(visible)) for gpu_id in trainer_gpu_ids)
+            ):
+                raise RuntimeError(
+                    f"invalid functional GPU partition for {stage}: "
+                    f"trainer={trainer_gpu_ids}, inference={inference_gpu_ids}"
+                )
         request = request.model_copy(
             update={
                 "functional_vllm": None,
@@ -197,6 +242,11 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
                             "environment": item.environment
                             | host_environments[item.stage]
                             | external
+                            | {
+                                "ART_MODEL_SUPPORT_TRAINER_GPU_IDS": ",".join(
+                                    map(str, spec.trainer_gpu_ids[item.stage])
+                                )
+                            }
                         }
                     )
                     for item in request.items
@@ -209,9 +259,9 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
             models = _runtime_json(client, "GET", "/v1/models")["data"]
             baseline = tuple(sorted(str(model["id"]) for model in models))
 
-            def reset() -> None:
+            def reset() -> dict[str, object]:
                 supervisor.raise_if_failed()
-                _reset_vllm(client, baseline)
+                return _reset_vllm(client, baseline)
 
             await asyncio.to_thread(_run_session, request, reset)
     finally:
@@ -221,7 +271,7 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
 
 def _run_session(
     request: WorkflowStageWorkerSession,
-    after_stage: Callable[[], None] | None = None,
+    after_stage: Callable[[], dict[str, object]] | None = None,
 ) -> None:
     from . import workflow
 
@@ -231,6 +281,7 @@ def _run_session(
     for item in request.items:
         started = time.monotonic()
         log_path = Path(item.stage_dir) / "worker.log"
+        reset_error: Exception | None = None
         try:
             with workflow._temporary_env(
                 **item.environment,
@@ -250,6 +301,17 @@ def _run_session(
                 passed=False,
                 metrics=workflow._stage_error_metrics(exc),
             )
+        if after_stage is not None:
+            try:
+                result.metrics["functional_vllm_reset"] = after_stage()
+            except Exception as exc:
+                with log_path.open("a", encoding="utf-8") as log:
+                    traceback.print_exc(file=log)
+                result.passed = False
+                result.metrics["functional_vllm_reset_error"] = (
+                    workflow._stage_error_metrics(exc)
+                )
+                reset_error = exc
         result.metrics.update(
             {
                 "workflow_stage_artifact_dir": item.stage_dir,
@@ -259,8 +321,20 @@ def _run_session(
         Path(item.output_json).write_text(
             result.model_dump_json(indent=2), encoding="utf-8"
         )
-        if after_stage is not None:
-            after_stage()
+        if reset_error is not None:
+            raise RuntimeError(
+                f"functional vLLM reset failed after {item.stage}"
+            ) from reset_error
+
+
+def _run_base_megatron_session(request: WorkflowStageWorkerSession) -> None:
+    stages = tuple(item.stage for item in request.items)
+    if stages != BASE_MEGATRON_STAGES:
+        raise ValueError("base Megatron stages do not match worker items")
+    from .base_megatron_session import base_megatron_session
+
+    with base_megatron_session():
+        _run_session(request.model_copy(update={"base_megatron": False}))
 
 
 def main() -> None:
@@ -271,6 +345,8 @@ def main() -> None:
         )
         if request.functional_vllm is not None:
             asyncio.run(_run_functional_session(request))
+        elif request.base_megatron:
+            _run_base_megatron_session(request)
         else:
             _run_session(request)
         return

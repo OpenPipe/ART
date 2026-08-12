@@ -47,8 +47,11 @@ from .workflow_runtime import (
     execute_workflow,
 )
 from .workflow_stage_worker import (
+    BASE_MEGATRON_MODE,
+    BASE_MEGATRON_STAGES,
     FUNCTIONAL_LORA_VLLM_MODE,
     FUNCTIONAL_LORA_VLLM_STAGES,
+    FunctionalVllmSessionSpec,
     WorkflowStageWorkerItem,
     WorkflowStageWorkerSession,
 )
@@ -78,6 +81,20 @@ _DEFAULT_STAGE_GPU_COUNTS = {
     "yes_no_trainability": 2,
 }
 _WORKFLOW_HOSTS_ENV = "ART_MODEL_SUPPORT_WORKFLOW_HOSTS"
+_VLLM_CAPACITY_ARGS = (
+    "gpu_memory_utilization",
+    "max_model_len",
+    "max_logprobs",
+    "max_num_seqs",
+    "max_loras",
+    "max_lora_rank",
+    "max_num_batched_tokens",
+)
+_VLLM_PARALLEL_ARGS = (
+    "tensor_parallel_size",
+    "pipeline_parallel_size",
+    "data_parallel_size",
+)
 
 
 class PreparedWorkflow(BaseModel):
@@ -116,6 +133,15 @@ class PreparedWorkflow(BaseModel):
                 return
             metrics["fixture_provisioning_s"] = self.fixture_provisioning_s
             self._fixture_metric_recorded = True
+
+
+class _FunctionalStageSpec(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    stage: str
+    trainer_gpu_count: int
+    inference_gpu_count: int
+    engine_args: dict[str, object]
 
 
 def prepare_workflow(
@@ -313,15 +339,122 @@ def _stage_gpu_share(prepared: PreparedWorkflow, stage_name: str) -> float:
     )
 
 
+def _ordered_stage_pair(stages: tuple[str, ...], pair: tuple[str, str]) -> bool:
+    selected = tuple(stage for stage in stages if stage in pair)
+    if len(selected) == len(pair) and selected != pair:
+        raise RuntimeError(f"shared stage order must be {pair}, found {selected}")
+    return selected == pair
+
+
+def _functional_stage_spec(
+    prepared: PreparedWorkflow, stage: str, gpu_count: int
+) -> _FunctionalStageSpec:
+    configured = HANDLER_WORKFLOW_RESOURCES.get(prepared.report.model_key)
+    resources = getattr(configured, stage, None)
+    if resources is None:
+        inference_gpu_count = 1
+        trainer_gpu_count = gpu_count - 1 if stage == "length_trainability" else 1
+        engine_args: dict[str, object] = {"tensor_parallel_size": 1}
+    else:
+        resolved = resolve_stage_resources_for_visible_gpus(
+            stage, resources, visible_gpu_count=gpu_count
+        )
+        if resolved.vllm is None:
+            raise RuntimeError(f"{stage} resources require vLLM")
+        inference_gpu_count = len(resolved.vllm.gpu_ids)
+        trainer_gpu_count = (
+            len(resolved.megatron.gpu_ids) if resolved.megatron is not None else 1
+        )
+        engine_args = resolved.vllm.engine_args()
+        if resolved.megatron is not None:
+            topology = resolved.megatron.topology
+            trainer_world_size = topology.tp * topology.cp * topology.pp * topology.dp
+            if trainer_world_size != trainer_gpu_count:
+                raise RuntimeError(
+                    f"{stage} trainer topology has world size {trainer_world_size} "
+                    f"but {trainer_gpu_count} GPU ids"
+                )
+    if trainer_gpu_count < 1 or inference_gpu_count < 1:
+        raise RuntimeError(f"{stage} requires non-empty trainer and inference roles")
+    return _FunctionalStageSpec(
+        stage=stage,
+        trainer_gpu_count=trainer_gpu_count,
+        inference_gpu_count=inference_gpu_count,
+        engine_args=engine_args,
+    )
+
+
+def _merge_functional_engine_args(
+    specs: tuple[_FunctionalStageSpec, ...], capacities: dict[str, int | float]
+) -> dict[str, object]:
+    merged: dict[str, object] = {}
+    load_formats: list[object | None] = []
+    topologies = []
+    for spec in specs:
+        engine_args = dict(spec.engine_args)
+        load_formats.append(engine_args.pop("load_format", None))
+        topology_values = []
+        for key in _VLLM_PARALLEL_ARGS:
+            value = engine_args.pop(key, 1)
+            if type(value) is not int:
+                raise RuntimeError(f"{spec.stage} {key} must be an integer")
+            topology_values.append(value)
+        topology = tuple(topology_values)
+        if topology[0] * topology[1] * topology[2] != spec.inference_gpu_count:
+            raise RuntimeError(
+                f"{spec.stage} vLLM topology {topology} does not match "
+                f"{spec.inference_gpu_count} inference GPUs"
+            )
+        topologies.append(topology)
+        for key in _VLLM_CAPACITY_ARGS:
+            value = engine_args.pop(key, None)
+            if value is not None:
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise RuntimeError(f"{spec.stage} {key} must be numeric")
+                capacities[key] = max(capacities.get(key, 0), value)
+        for key, value in engine_args.items():
+            if key == "enable_expert_parallel":
+                merged[key] = bool(merged.get(key, False) or value)
+            elif key in merged and merged[key] != value:
+                raise RuntimeError(
+                    f"functional vLLM engine option {key!r} conflicts: "
+                    f"{merged[key]!r} != {value!r} ({spec.stage})"
+                )
+            else:
+                merged[key] = value
+    real_load_formats = {
+        value for value in load_formats if value not in {None, "dummy"}
+    }
+    if len(real_load_formats) > 1:
+        raise RuntimeError(
+            f"functional vLLM load formats conflict: {sorted(map(str, real_load_formats))}"
+        )
+    if real_load_formats:
+        merged["load_format"] = real_load_formats.pop()
+    elif load_formats and all(value == "dummy" for value in load_formats):
+        merged["load_format"] = "dummy"
+    max_world_size = max(spec.inference_gpu_count for spec in specs)
+    selected = {
+        topology
+        for topology, spec in zip(topologies, specs, strict=True)
+        if spec.inference_gpu_count == max_world_size
+    }
+    if len(selected) != 1:
+        raise RuntimeError(f"functional vLLM topologies conflict: {sorted(selected)}")
+    return (
+        merged
+        | dict(zip(_VLLM_PARALLEL_ARGS, selected.pop(), strict=True))
+        | capacities
+    )
+
+
 def _functional_session(
     prepared: PreparedWorkflow,
     stage_gpu_counts: dict[str, int],
-) -> VllmRuntimeLaunchConfig | None:
-    stages = tuple(
-        stage for stage in prepared.stages if stage in FUNCTIONAL_LORA_VLLM_STAGES
-    )
-    if stages != FUNCTIONAL_LORA_VLLM_STAGES:
+) -> FunctionalVllmSessionSpec | None:
+    if not _ordered_stage_pair(prepared.stages, FUNCTIONAL_LORA_VLLM_STAGES):
         return None
+    stages = FUNCTIONAL_LORA_VLLM_STAGES
     support = get_model_support_spec(
         prepared.report.base_model,
         allow_unvalidated_arch=prepared.allow_unvalidated_arch,
@@ -332,12 +465,29 @@ def _functional_session(
     ):
         return None
     handler = get_model_support_handler_for_spec(support)
-    counts = {stage_gpu_counts[stage] for stage in stages}
-    if len(counts) != 1:
-        return None
-    count = counts.pop()
+    gpu_count = max(stage_gpu_counts[stage] for stage in stages)
+    specs = tuple(
+        _functional_stage_spec(prepared, stage, stage_gpu_counts[stage])
+        for stage in stages
+    )
+    inference_gpu_count = max(spec.inference_gpu_count for spec in specs)
+    remaining_gpu_count = gpu_count - inference_gpu_count
+    length = specs[0]
+    if remaining_gpu_count != length.trainer_gpu_count:
+        raise RuntimeError(
+            f"functional vLLM session is incompatible for {prepared.report.model_key}: "
+            f"max stage allocation={gpu_count}, inference topology="
+            f"{inference_gpu_count} GPUs, length training topology="
+            f"{length.trainer_gpu_count} ranks, remaining={remaining_gpu_count}"
+        )
+    for spec in specs[1:]:
+        if spec.trainer_gpu_count > remaining_gpu_count:
+            raise RuntimeError(
+                f"functional vLLM session leaves {remaining_gpu_count} trainer GPUs "
+                f"but {spec.stage} requires {spec.trainer_gpu_count}"
+            )
     length_env = os.environ | prepared.fixture.environment(stages[0])
-    capacities = {
+    capacities: dict[str, int | float] = {
         "max_model_len": int(
             length_env.get("ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN", 1024)
         ),
@@ -351,58 +501,38 @@ def _functional_session(
             )
         ),
     }
-    configured = HANDLER_WORKFLOW_RESOURCES.get(prepared.report.model_key)
-    engine_specs = []
-    for stage in stages:
-        stage_resources = getattr(configured, stage, None)
-        if stage_resources is None:
-            gpu_ids = (count - 1,)
-            engine_args: dict[str, object] = {"tensor_parallel_size": 1}
-        else:
-            resolved = resolve_stage_resources_for_visible_gpus(
-                stage, stage_resources, visible_gpu_count=count
-            )
-            if resolved.vllm is None:
-                return None
-            gpu_ids = tuple(resolved.vllm.gpu_ids)
-            if resolved.megatron is not None and set(resolved.megatron.gpu_ids) != set(
-                range(count)
-            ) - set(gpu_ids):
-                return None
-            engine_args = resolved.vllm.engine_args()
-        for key in (*capacities, "max_num_batched_tokens"):
-            value = engine_args.pop(key, None)
-            if value is not None:
-                if not isinstance(value, int):
-                    return None
-                capacities[key] = max(capacities.get(key, 0), value)
-        engine_specs.append((gpu_ids, engine_args))
     fixtures = {
         prepared.fixture.environment(stage)[FIXTURE_PATH_ENV] for stage in stages
     }
-    if engine_specs[0] != engine_specs[1] or len(fixtures) != 1:
-        return None
-    inference_gpu_ids, resource_args = engine_specs[0]
-    return VllmRuntimeLaunchConfig(
-        base_model=fixtures.pop(),
-        port=0,
-        cuda_visible_devices=",".join(map(str, inference_gpu_ids)),
-        served_model_name="__art_functional_base__",
-        rollout_weights_mode="lora",
-        engine_args={
-            "enforce_eager": True,
-            "generation_config": "vllm",
-            "limit_mm_per_prompt": {"image": 0, "video": 0, "audio": 0},
-            **handler.vllm_engine_args(rollout_weights_mode="lora"),
-            **resource_args,
-            **capacities,
-        },
-        server_args={
-            "return_tokens_as_token_ids": True,
-            "enable_auto_tool_choice": True,
-            "tool_call_parser": "hermes",
-            **handler.vllm_server_args(),
-            "api_key": "art-functional-vllm",
+    if len(fixtures) != 1:
+        raise RuntimeError(f"functional stages selected different fixtures: {fixtures}")
+    resource_args = _merge_functional_engine_args(specs, capacities)
+    inference_gpu_ids = tuple(range(remaining_gpu_count, gpu_count))
+    return FunctionalVllmSessionSpec(
+        gpu_count=gpu_count,
+        launch=VllmRuntimeLaunchConfig(
+            base_model=fixtures.pop(),
+            port=0,
+            cuda_visible_devices=",".join(map(str, inference_gpu_ids)),
+            served_model_name="__art_functional_base__",
+            rollout_weights_mode="lora",
+            engine_args={
+                "enforce_eager": True,
+                "generation_config": "vllm",
+                "limit_mm_per_prompt": {"image": 0, "video": 0, "audio": 0},
+                **handler.vllm_engine_args(rollout_weights_mode="lora"),
+                **resource_args,
+            },
+            server_args={
+                "return_tokens_as_token_ids": True,
+                "enable_auto_tool_choice": True,
+                "tool_call_parser": "hermes",
+                **handler.vllm_server_args(),
+                "api_key": "art-functional-vllm",
+            },
+        ),
+        trainer_gpu_ids={
+            spec.stage: tuple(range(spec.trainer_gpu_count)) for spec in specs
         },
     )
 
@@ -417,6 +547,15 @@ def compile_prepared_workflows(
             for stage_name in prepared.stages
         }
         functional_session = _functional_session(prepared, stage_gpu_counts)
+        base_megatron = _ordered_stage_pair(prepared.stages, BASE_MEGATRON_STAGES)
+        base_fixture = {
+            prepared.fixture.environment(stage)[FIXTURE_PATH_ENV]
+            for stage in BASE_MEGATRON_STAGES
+        }
+        if base_megatron and len(base_fixture) != 1:
+            raise RuntimeError(
+                f"base Megatron stages selected different fixtures: {base_fixture}"
+            )
         for stage_name in prepared.stages:
             shared = (
                 functional_session
@@ -425,12 +564,23 @@ def compile_prepared_workflows(
                 else None
             )
             gpu_count = stage_gpu_counts[stage_name]
+            if shared is not None:
+                gpu_count = shared.gpu_count
             runtime = _runtime_key(prepared, stage_name, gpu_count=gpu_count)
             if shared is not None:
                 runtime = runtime.model_copy(
                     update={
                         "mode": FUNCTIONAL_LORA_VLLM_MODE,
                         "static_options": shared.model_dump_json(),
+                    }
+                )
+            elif base_megatron and stage_name in BASE_MEGATRON_STAGES:
+                runtime = runtime.model_copy(
+                    update={
+                        "fixture": next(iter(base_fixture)),
+                        "kind": "megatron",
+                        "mode": BASE_MEGATRON_MODE,
+                        "static_options": "",
                     }
                 )
             operations.append(
@@ -523,12 +673,13 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             architecture_json=str(architecture_json),
             allow_unvalidated_arch=prepared.allow_unvalidated_arch,
             functional_vllm=(
-                VllmRuntimeLaunchConfig.model_validate_json(
+                FunctionalVllmSessionSpec.model_validate_json(
                     session.runtime.static_options
                 )
                 if session.runtime.mode == FUNCTIONAL_LORA_VLLM_MODE
                 else None
             ),
+            base_megatron=session.runtime.mode == BASE_MEGATRON_MODE,
             items=tuple(items),
         )
         request_json.write_text(request.model_dump_json(indent=2), encoding="utf-8")
