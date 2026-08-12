@@ -1,11 +1,12 @@
 import argparse
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 import json
 import os
 from pathlib import Path
 import time
 import traceback
+from typing import Any, cast
 
 import httpx
 from pydantic import BaseModel, ConfigDict
@@ -163,6 +164,45 @@ def _reset_vllm(client: httpx.Client, baseline: tuple[str, ...]) -> dict[str, ob
     }
 
 
+async def _serving_baseline(
+    runtime: ManagedVllmRuntime,
+    startup: asyncio.Task[tuple[str, int]],
+) -> tuple[str, ...]:
+    await startup
+    async with httpx.AsyncClient(
+        base_url=runtime.base_url, **runtime.request_kwargs()
+    ) as client:
+        response = await client.get("/v1/models")
+        response.raise_for_status()
+        return tuple(sorted(str(model["id"]) for model in response.json()["data"]))
+
+
+async def _run_after_serving_fence(
+    serving_ready: asyncio.Task[tuple[str, ...]],
+    run_session: Callable[[], Coroutine[Any, Any, Any]],
+) -> tuple[Any, tuple[str, ...]]:
+    from ..trainability import test_live_length_trainability as length_trainability
+
+    length_group = length_trainability._length_group
+
+    async def gated_length_group(*args: Any, **kwargs: Any) -> Any:
+        await serving_ready
+        return await length_group(*args, **kwargs)
+
+    length_module = cast(Any, length_trainability)
+    length_module._length_group = gated_length_group
+    session = asyncio.create_task(run_session(), name="resident-functional-session")
+    try:
+        results, baseline = await asyncio.gather(session, serving_ready)
+        return results, baseline
+    finally:
+        for task in (session, serving_ready):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(session, serving_ready, return_exceptions=True)
+        length_module._length_group = length_group
+
+
 async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
     from . import workflow
 
@@ -195,17 +235,29 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
     )
     runtime = ManagedVllmRuntime()
     supervisor = ChildProcessSupervisor(lambda _error: None)
+    tasks: list[asyncio.Task[Any]] = []
     try:
         with workflow._temporary_env(**host_environment):
-            await runtime.start(
-                launch_config=launch,
-                output_dir=str(
-                    Path(request.architecture_json).parent / "functional_vllm"
+            startup = asyncio.create_task(
+                runtime.start(
+                    launch_config=launch,
+                    output_dir=str(
+                        Path(request.architecture_json).parent / "functional_vllm"
+                    ),
+                    child_processes=supervisor,
+                    install_parent_cleanup=lambda: None,
                 ),
-                child_processes=supervisor,
-                install_parent_cleanup=lambda: None,
+                name="functional-vllm-startup",
             )
+            tasks.append(startup)
+            await asyncio.sleep(0)
+        if startup.done():
+            startup.result()
         assert runtime.api_key is not None
+        serving_ready = asyncio.create_task(
+            _serving_baseline(runtime, startup), name="functional-vllm-ready"
+        )
+        tasks.append(serving_ready)
         external = {
             "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL": runtime.base_url,
             "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY": runtime.api_key,
@@ -239,23 +291,27 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
             raise RuntimeError(
                 "resident functional stages resolved different environments"
             )
-        with httpx.Client(
-            base_url=runtime.base_url, **runtime.request_kwargs()
-        ) as client:
-            models = _runtime_json(client, "GET", "/v1/models")["data"]
-            baseline = tuple(sorted(str(model["id"]) for model in models))
-            from .resident_functional_session import run_resident_functional_session
+        from .resident_functional_session import run_resident_functional_session
 
-            stage_dirs = {item.stage: Path(item.stage_dir) for item in request.items}
-            log_path = stage_dirs["length_trainability"] / "worker.log"
-            try:
-                with workflow._temporary_env(**environments[0]):
-                    with workflow._redirect_output(log_path):
-                        results = await run_resident_functional_session(
-                            base_model=request.base_model,
-                            allow_unvalidated_arch=request.allow_unvalidated_arch,
-                            stage_dirs=stage_dirs,
-                        )
+        stage_dirs = {item.stage: Path(item.stage_dir) for item in request.items}
+        log_path = stage_dirs["length_trainability"] / "worker.log"
+
+        async def run_session():
+            with workflow._temporary_env(**environments[0]):
+                with workflow._redirect_output(log_path):
+                    return await run_resident_functional_session(
+                        base_model=request.base_model,
+                        allow_unvalidated_arch=request.allow_unvalidated_arch,
+                        stage_dirs=stage_dirs,
+                    )
+
+        try:
+            results, baseline = await _run_after_serving_fence(
+                serving_ready, run_session
+            )
+            with httpx.Client(
+                base_url=runtime.base_url, **runtime.request_kwargs()
+            ) as client:
                 supervisor.raise_if_failed()
                 reset = _reset_vllm(client, baseline)
                 for item, result in zip(request.items, results, strict=True):
@@ -263,23 +319,27 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
                     Path(item.output_json).write_text(
                         result.model_dump_json(indent=2), encoding="utf-8"
                     )
-            except Exception as exc:
-                for item in request.items:
-                    item_log = Path(item.stage_dir) / "worker.log"
-                    with item_log.open("a", encoding="utf-8") as log:
-                        traceback.print_exc(file=log)
-                    output = Path(item.output_json)
-                    if not output.exists():
-                        output.write_text(
-                            workflow.ValidationStageResult(
-                                name=item.stage,
-                                passed=False,
-                                metrics=workflow._stage_error_metrics(exc),
-                            ).model_dump_json(indent=2),
-                            encoding="utf-8",
-                        )
-                raise
+        except Exception as exc:
+            for item in request.items:
+                item_log = Path(item.stage_dir) / "worker.log"
+                with item_log.open("a", encoding="utf-8") as log:
+                    traceback.print_exc(file=log)
+                output = Path(item.output_json)
+                if not output.exists():
+                    output.write_text(
+                        workflow.ValidationStageResult(
+                            name=item.stage,
+                            passed=False,
+                            metrics=workflow._stage_error_metrics(exc),
+                        ).model_dump_json(indent=2),
+                        encoding="utf-8",
+                    )
+            raise
     finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         supervisor.close()
         runtime.close()
 
