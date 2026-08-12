@@ -351,13 +351,25 @@ class MegatronTrainingSlot:
         state.registration = state.registration.model_copy(
             update={"learner_version": output_version}
         )
+        commit_operation_id = f"{ref.operation_id}:optim-commit"
+        _adapter, snapshot_metrics = await self._snapshot(
+            OperationRef(
+                run_id=ref.run_id,
+                operation_id=commit_operation_id,
+                sequence_id=ref.sequence_id,
+                learner_parent_version=output_version,
+                kind="save_state",
+            ),
+            save_optimizer=True,
+        )
+        self.trainer.retire_operation(commit_operation_id)
         result = OptimStepResult(
             operation_id=ref.operation_id,
             contributing_forward_backward_operation_ids=contributions,
             checkpoint=checkpoint_ref(
                 ref.run_id, output_version, generation.generation_id
             ),
-            metrics=raw["metrics"],
+            metrics={**raw["metrics"], **snapshot_metrics},
         )
         self._results[ref.operation_id] = (fingerprint, result)
         return result
