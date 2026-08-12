@@ -578,6 +578,7 @@ class TrainerRank:
         self._checkpoint_prefetches: dict[str, asyncio.Task[PreparedCheckpoint]] = {}
         self._checkpoint_process_group: dist.ProcessGroup | None = None
         self._checkpoint_mutation_tail: asyncio.Task[None] | None = None
+        self._checkpoint_prepare_lock = threading.Lock()
         self._checkpoint_save_lock = threading.Lock()
         self._checkpoint_finalize_lock = threading.Lock()
         self._checkpoint_preparing_saves: set[str] = set()
@@ -778,20 +779,16 @@ class TrainerRank:
         self,
         logical_path: str,
         *,
-        source_path: str | None = None,
-        prefetch: asyncio.Task[PreparedCheckpoint] | None = None,
+        source_path: str,
+        prefetch: asyncio.Task[PreparedCheckpoint],
     ) -> None:
         from . import _checkpoint
 
-        key = self._checkpoint_source_key(source_path or logical_path)
+        key = self._checkpoint_source_key(source_path)
         source: PreparedCheckpoint | None = None
         error: BaseException | None = None
         try:
-            source = await asyncio.shield(
-                prefetch
-                if prefetch is not None
-                else asyncio.create_task(self._prefetch_checkpoint(key))
-            )
+            source = await asyncio.shield(prefetch)
         except BaseException as exc:
             error = exc
         _checkpoint._raise_distributed(error, "prepare checkpoint")
@@ -1212,11 +1209,10 @@ class TrainerRank:
         adapter_model: Mapping[str, torch.Tensor],
         config: _AdapterConfig,
         *,
-        localized: bool = False,
-        canonicalized: bool = False,
+        native: bool = False,
     ) -> dict[str, torch.Tensor]:
         prepared = self._prepare_adapter_model(
-            name, adapter_model, canonicalized=canonicalized
+            name, adapter_model, canonicalized=native
         )
         from art.megatron.lora import LoRA
 
@@ -1231,12 +1227,12 @@ class TrainerRank:
                     continue
                 a_t = (
                     weights[0]
-                    if localized
+                    if native
                     else module._localized_weight(weights[0], into=module.A_T)
                 )
                 b_t = (
                     weights[1]
-                    if localized
+                    if native
                     else module._localized_weight(weights[1], into=module.B_T)
                 )
                 if (
@@ -1300,8 +1296,6 @@ class TrainerRank:
         self,
         tensors: Mapping[str, torch.Tensor],
         name: str,
-        *,
-        localized: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         from art.megatron.lora import LoRA
 
@@ -1333,11 +1327,7 @@ class TrainerRank:
                         if module.num_local_experts > 1
                         else tensors[keys[0]].T
                     )
-                    value = (
-                        weight.contiguous()
-                        if localized
-                        else module._localized_weight(weight, into=template)
-                    )
+                    value = weight.contiguous()
                     if tuple(value.shape) != tuple(template.shape):
                         raise TrainerRankSlotStateError(
                             f"Canonical optimizer tensor for {keys[0]!r} has an "

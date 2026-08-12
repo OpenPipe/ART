@@ -127,11 +127,7 @@ class _SafeSlice(Protocol):
 
 
 class _SafeTensorFile(Protocol):
-    def keys(self) -> list[str]: ...
-
     def get_slice(self, key: str) -> _SafeSlice: ...
-
-    def get_tensor(self, key: str) -> torch.Tensor: ...
 
 
 def _checkpoint_metadata(
@@ -260,43 +256,57 @@ def prepare_checkpoint_save(
     checkpoint_name: str,
 ) -> None:
     """Capture immutable rank-local state without retaining live tensors."""
+    with trainer._checkpoint_prepare_lock:
+        _prepare_checkpoint_save(trainer, output_dir, checkpoint_name)
+
+
+def _prepare_checkpoint_save(
+    trainer: TrainerRank,
+    output_dir: str,
+    checkpoint_name: str,
+) -> None:
+    group = _ensure_checkpoint_group(trainer)
+    with trainer._checkpoint_save_lock:
+        pending = (
+            output_dir in trainer._checkpoint_preparing_saves
+            or output_dir in trainer._prepared_checkpoint_saves
+        )
+    admissions = _gather_objects((output_dir, checkpoint_name, pending), group=group)
+    if any(admission[:2] != admissions[0][:2] for admission in admissions):
+        raise RuntimeError("Checkpoint save identity differs across ranks")
+    if any(admission[2] != admissions[0][2] for admission in admissions):
+        raise RuntimeError(f"Checkpoint save state differs across ranks: {output_dir}")
+    if pending:
+        raise RuntimeError(f"Checkpoint save is already pending: {output_dir}")
+
     destination = Path(output_dir)
     snapshot = destination.with_name(
         f".{destination.name}.snapshot-r{_rank()}-{uuid.uuid4().hex}"
     )
     with trainer._checkpoint_save_lock:
-        if (
-            output_dir in trainer._checkpoint_preparing_saves
-            or output_dir in trainer._prepared_checkpoint_saves
-        ):
-            raise RuntimeError(f"Checkpoint save is already pending: {output_dir}")
         if output_dir in trainer._completed_checkpoint_saves:
             trainer._completed_checkpoint_saves.remove(output_dir)
         trainer._checkpoint_preparing_saves.add(output_dir)
     try:
-        _ensure_checkpoint_group(trainer)
-        with _collective_errors("validate checkpoint snapshot state"):
-            _validate_save_state(trainer, checkpoint_name)
-            adapter_config = deepcopy(
-                dict(_checkpoint_config(trainer, checkpoint_name))
-            )
-            dynamic = trainer._checkpoint_slots[checkpoint_name].optimizer
-            initialized = dynamic is not None
-        if any(value != initialized for value in _gather_objects(initialized)):
+        adapter_config = deepcopy(
+            dict(_validate_save_state(trainer, checkpoint_name, group=group))
+        )
+        dynamic = trainer._checkpoint_slots[checkpoint_name].optimizer
+        initialized = dynamic is not None
+        if any(
+            value != initialized for value in _gather_objects(initialized, group=group)
+        ):
             raise trainer._slot_state_error(
                 "Checkpoint optimizer initialization differs across ranks"
             )
         optimizer: AdamWRecord | None = None
-        with _collective_errors("prepare optimizer snapshot metadata"):
+        with _collective_errors("prepare optimizer snapshot metadata", group=group):
             if dynamic is not None:
                 optimizer = _optimizer_config(dynamic)
-        if any(value != optimizer for value in _gather_objects(optimizer)):
+        if any(value != optimizer for value in _gather_objects(optimizer, group=group)):
             raise trainer._slot_state_error(
                 "Checkpoint optimizer config differs across ranks"
             )
-        identity = (output_dir, checkpoint_name)
-        if any(value != identity for value in _gather_objects(identity)):
-            raise RuntimeError("Checkpoint save identity differs across ranks")
     except BaseException:
         with trainer._checkpoint_save_lock:
             trainer._checkpoint_preparing_saves.discard(output_dir)
@@ -369,7 +379,7 @@ def prepare_checkpoint_save(
     except BaseException as exc:
         error = exc
     try:
-        _raise_distributed(error, "prepare immutable checkpoint snapshot")
+        _raise_distributed(error, "prepare immutable checkpoint snapshot", group=group)
     except BaseException:
         shutil.rmtree(snapshot, ignore_errors=True)
         with trainer._checkpoint_save_lock:
@@ -474,16 +484,6 @@ def export_lora(
     checkpoint_name: str,
 ) -> int:
     config = _checkpoint_config(trainer, checkpoint_name)
-    _export_lora_files(trainer, output_dir, checkpoint_name, config)
-    return trainer._checkpoint_slots[checkpoint_name].revision
-
-
-def _export_lora_files(
-    trainer: TrainerRank,
-    output_dir: str,
-    checkpoint_name: str,
-    config: Mapping[str, object],
-) -> None:
     from art.megatron.weights.lora_publish import save_vllm_lora_from_model
 
     error: BaseException | None = None
@@ -501,6 +501,7 @@ def _export_lora_files(
     except BaseException as exc:
         error = exc
     _raise_distributed(error, "export LoRA")
+    return trainer._checkpoint_slots[checkpoint_name].revision
 
 
 def _load_stage_lora(
@@ -650,8 +651,7 @@ def load_checkpoint(
             name,
             adapter_model,
             config,
-            localized=native,
-            canonicalized=native,
+            native=native,
         )
         _validate_base_model(trainer, source, config)
         trainer._guard_slot_can_load(trainer._slot_ref(name))
@@ -1044,7 +1044,6 @@ def _serialize_snapshot_lora(
 
 
 def _serialize_snapshot_optimizer(
-    trainer: TrainerRank,
     prepared: _PreparedSave,
     output: Path,
     metadata: list[LoraShardMeta],
@@ -1125,7 +1124,6 @@ def _finish_prepared_save(
             group,
         )
         manifest = _serialize_snapshot_optimizer(
-            trainer,
             prepared,
             temporary,
             metadata,
@@ -1231,7 +1229,7 @@ def _load_local_optimizer(
     localized: dict[str, tuple[torch.Tensor, ...]] = {}
     for index, component in enumerate(("master", "exp_avg", "exp_avg_sq")):
         records = {
-            key: (record[index], key)
+            key: record[index]
             for key, record in manifest.parameters.items()
             if key in plan
         }
@@ -1240,9 +1238,7 @@ def _load_local_optimizer(
             records,
             plans={key: plan[key] for key in records},
         )
-        localized[component] = trainer._localize_adapter_tensors(
-            artifact_tensors, name, localized=True
-        )
+        localized[component] = trainer._localize_adapter_tensors(artifact_tensors, name)
 
     lengths = {len(values) for values in localized.values()}
     if len(lengths) != 1:
@@ -1274,16 +1270,21 @@ def _parameter_group_step(keys: Sequence[str], steps: Mapping[str, float]) -> fl
     return values.pop()
 
 
-def _checkpoint_config(trainer: TrainerRank, name: str) -> Mapping[str, object]:
+def _checkpoint_config(
+    trainer: TrainerRank,
+    name: str,
+    *,
+    group: dist.ProcessGroup | None = None,
+) -> Mapping[str, object]:
     loaded = name in trainer._checkpoint_slots
-    if any(value != loaded for value in _gather_objects(loaded)):
+    if any(value != loaded for value in _gather_objects(loaded, group=group)):
         raise trainer._slot_state_error(
             f"Checkpoint {name!r} is not loaded consistently across ranks"
         )
     if not loaded:
         raise ValueError(f"Unknown checkpoint: {name!r}")
     config = trainer._checkpoint_slots[name].config
-    configs = _gather_objects(config)
+    configs = _gather_objects(config, group=group)
     if any(value != config for value in configs):
         raise trainer._slot_state_error(
             f"Checkpoint {name!r} adapter config differs across ranks"
@@ -1295,17 +1296,25 @@ def _checkpoint_config(trainer: TrainerRank, name: str) -> Mapping[str, object]:
     return config
 
 
-def _validate_save_state(trainer: TrainerRank, name: str) -> None:
-    _checkpoint_config(trainer, name)
-    if any(trainer._checkpoint_grad_flags((name,))):
+def _validate_save_state(
+    trainer: TrainerRank,
+    name: str,
+    *,
+    group: dist.ProcessGroup | None = None,
+) -> Mapping[str, object]:
+    config = _checkpoint_config(trainer, name, group=group)
+    with _collective_errors("validate local checkpoint state", group=group):
+        has_grad = any(trainer._checkpoint_grad_flags((name,)))
+        live_graph = trainer._has_live_slot_graph(trainer._slot_ref(name))
+    if any(bool(value) for value in _gather_objects(has_grad, group=group)):
         raise trainer._slot_state_error(
             f"Cannot save checkpoint {name!r} with accumulated gradients"
         )
-    local_graph = trainer._has_live_slot_graph(trainer._slot_ref(name))
-    if any(bool(value) for value in _gather_objects(local_graph)):
+    if any(bool(value) for value in _gather_objects(live_graph, group=group)):
         raise trainer._slot_state_error(
             f"Cannot save checkpoint {name!r} with a live backward graph"
         )
+    return config
 
 
 def _validate_base_model(
@@ -1518,30 +1527,25 @@ def _validate_files(root: Path, manifest: CheckpointManifest) -> None:
 
 def _load_tensors(
     root: Path,
-    records: Mapping[str, tuple[str, str]],
+    records: Mapping[str, str],
     *,
-    plans: Mapping[str, tuple[LoraShardManifest, tuple[int, ...]]] | None = None,
+    plans: Mapping[str, tuple[LoraShardManifest, tuple[int, ...]]],
 ) -> dict[str, torch.Tensor]:
     safe_open = importlib.import_module("safetensors").safe_open
-    files: dict[str, list[tuple[str, str]]] = {}
-    for key, (file, tensor) in records.items():
-        files.setdefault(file, []).append((key, tensor))
+    files: dict[str, list[str]] = {}
+    for key, file in records.items():
+        files.setdefault(file, []).append(key)
     tensors: dict[str, torch.Tensor] = {}
     for relative, file_records in files.items():
         with safe_open(root / relative, framework="pt") as handle:
-            for key, tensor_name in file_records:
-                if plans is None:
-                    tensor = handle.get_tensor(tensor_name)
-                else:
-                    manifest, expected_shape = plans[key]
-                    tensor = _read_local_slice(
-                        handle, tensor_name, manifest, expected_shape
-                    )
+            for key in file_records:
+                manifest, expected_shape = plans[key]
+                tensor = _read_local_slice(handle, key, manifest, expected_shape)
                 if _dtype_name(tensor.dtype) != "float32":
                     raise RuntimeError(
                         f"Checkpoint optimizer tensor {key!r} must use float32"
                     )
-                tensors[tensor_name] = tensor
+                tensors[key] = tensor
     return tensors
 
 

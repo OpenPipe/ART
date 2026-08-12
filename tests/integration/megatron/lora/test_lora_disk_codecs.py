@@ -1911,6 +1911,7 @@ def _portable_trainer(
     trainer._checkpoint_slots = {}
     trainer._checkpoint_prefetches = {}
     trainer._checkpoint_process_group = None
+    trainer._checkpoint_prepare_lock = threading.Lock()
     trainer._checkpoint_mutation_tail = None
     trainer._checkpoint_save_lock = threading.Lock()
     trainer._checkpoint_finalize_lock = threading.Lock()
@@ -2433,10 +2434,17 @@ def test_checkpoint_prepare_validates_distributed_identity_before_snapshot(
     )
     _install_portable_checkpoint(trainer)
     checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
+    checkpoint_group = cast(torch.distributed.ProcessGroup, object())
+    monkeypatch.setattr(
+        checkpoint_module, "_ensure_checkpoint_group", lambda _: checkpoint_group
+    )
 
-    def gather(value: object) -> tuple[object, ...]:
-        if isinstance(value, tuple) and len(value) == 2:
-            return (value, (str(tmp_path / "other"), value[1]))
+    def gather(
+        value: object, *, group: torch.distributed.ProcessGroup | None = None
+    ) -> tuple[object, ...]:
+        assert group is checkpoint_group
+        if isinstance(value, tuple) and len(value) == 3:
+            return (value, (str(tmp_path / "other"), value[1], value[2]))
         return (value,)
 
     monkeypatch.setattr(checkpoint_module, "_gather_objects", gather)

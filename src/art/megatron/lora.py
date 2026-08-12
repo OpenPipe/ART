@@ -39,7 +39,12 @@ from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
 
-from art.megatron._collective import dtype_name as _dtype_name
+from art.megatron._collective import (
+    distributed as _distributed,
+)
+from art.megatron._collective import (
+    dtype_name as _dtype_name,
+)
 
 from .kernels.cute_grouped_lora_quack import (
     quack_grouped_lora,
@@ -199,17 +204,8 @@ class LoraShardMeta(NamedTuple):
     block: str
 
 
-def _distributed_initialized() -> bool:
-    is_initialized = getattr(torch.distributed, "is_initialized", None)
-    return (
-        torch.distributed.is_available()
-        and callable(is_initialized)
-        and bool(is_initialized())
-    )
-
-
 def _get_shard_world_size(domain: ShardDomain) -> int:
-    if not _distributed_initialized():
+    if not _distributed():
         return 1
     if domain == "tp":
         return ps.get_tensor_model_parallel_world_size()
@@ -220,7 +216,7 @@ def _get_shard_world_size(domain: ShardDomain) -> int:
 
 
 def _get_shard_rank(domain: ShardDomain) -> int:
-    if not _distributed_initialized():
+    if not _distributed():
         return 0
     if domain == "tp":
         return ps.get_tensor_model_parallel_rank()
