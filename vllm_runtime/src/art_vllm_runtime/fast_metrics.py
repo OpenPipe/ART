@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import secrets
 import select
+import signal
 import socket
 import struct
 import subprocess
@@ -330,7 +331,9 @@ class FastMetricsSidecar:
             raise RuntimeError("fast metrics sidecar did not stop after parent release")
         finally:
             self.writer.close()
-        if returncode != 0:
+        # vLLM's shutdown manager SIGTERMs child processes before the API
+        # server's finally block releases the sidecar lifetime pipe.
+        if returncode not in {0, -signal.SIGTERM}:
             raise RuntimeError(f"fast metrics sidecar exited with status {returncode}")
 
 

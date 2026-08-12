@@ -125,6 +125,13 @@ def test_fast_metrics_listener_stops_and_restarts_on_same_port() -> None:
     assert restarted.process.poll() == 0
 
 
+def test_fast_metrics_listener_accepts_parent_shutdown_sigterm() -> None:
+    sidecar = _start_sidecar(tokens=[])
+    sidecar.process.terminate()
+    sidecar.close()
+    assert sidecar.process.poll() < 0
+
+
 def test_fast_metrics_url_uses_controller_routable_host(monkeypatch) -> None:
     monkeypatch.setattr(dedicated_server, "_fast_metrics_port", 43123)
     monkeypatch.setitem(dedicated_server._runtime_state, "nnodes", 2)
