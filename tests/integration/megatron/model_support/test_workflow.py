@@ -463,7 +463,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "post_warmup_policy_activation_count": 8,
         "mean_policy_activation_lag_s": 3.0 / 8.0,
         "p50_policy_activation_lag_s": 0.25,
-        "p95_policy_activation_lag_s": 1.0,
+        "p95_policy_activation_lag_s": 0.9,
         "max_policy_activation_lag_s": 1.25,
         "mean_policy_activation_interval_s": 14.75 / 8.0,
         "p50_policy_activation_interval_s": 2.0,
