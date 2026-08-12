@@ -21,6 +21,13 @@ def _process_is_running(pid: int) -> bool:
     return state != "Z"
 
 
+def test_vllm_start_releases_the_host_service_mailbox() -> None:
+    from art.distributed.monarch_actor import ArtHostService
+
+    start = ArtHostService.__dict__["start_vllm_member"]
+    assert getattr(start._method, "_monarch_concurrent_endpoint_wrapper", False)
+
+
 @pytest.mark.asyncio
 async def test_publication_wait_is_reserved_before_next_train_can_expire_it() -> None:
     from art.megatron.runtime.monarch import (

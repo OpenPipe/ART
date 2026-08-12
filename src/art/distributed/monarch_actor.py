@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from functools import wraps
+from functools import partial, wraps
 import json
 import os
 from pathlib import Path
@@ -13,7 +13,11 @@ from typing import Any, Literal
 from urllib.request import urlopen
 
 # This module is imported only by explicit distributed runtime construction.
-from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
+from monarch.actor import (  # ty: ignore[unresolved-import]
+    Actor,
+    concurrent_endpoint,
+    endpoint,
+)
 
 from art.utils.lifecycle import complete_task, complete_to_thread
 
@@ -75,7 +79,10 @@ def _require_etcd_health(url: str, timeout_s: float) -> None:
         raise RuntimeError(f"etcd health check failed: {health!r}")
 
 
-def resilient_endpoint(function: Any) -> Any:
+def resilient_endpoint(function: Any = None, *, concurrent: bool = False) -> Any:
+    if function is None:
+        return partial(resilient_endpoint, concurrent=concurrent)
+
     @wraps(function)
     async def wrapped(*args: Any, **kwargs: Any) -> RemoteCallResult:
         try:
@@ -106,7 +113,7 @@ def resilient_endpoint(function: Any) -> Any:
                 )
             )
 
-    return endpoint(wrapped)
+    return (concurrent_endpoint if concurrent else endpoint)(wrapped)
 
 
 class AdapterTransferHostService(Actor):
@@ -434,7 +441,7 @@ class ArtHostService(Actor):
             )
         return self._vllm_launcher
 
-    @resilient_endpoint
+    @resilient_endpoint(concurrent=True)
     async def start_vllm_member(self, request: HostMemberLaunchRequest):
         if self._admission_report is None:
             raise RuntimeError("host has not passed ART runtime admission")
