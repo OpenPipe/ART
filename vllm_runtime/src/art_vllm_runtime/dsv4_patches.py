@@ -512,6 +512,42 @@ def patch_dsv4_lora_support() -> None:
     model_cls.__init__ = init_3d_lora_only
     model_cls._art_dsv4_lora_patched = True
     _patch_dsv4_lora_manager_indexer_skip(model_cls)
+    _patch_dsv4_local_dummy_lora(model_cls)
+
+
+def _patch_dsv4_local_dummy_lora(model_cls: type) -> None:
+    from vllm.lora.model_manager import LoRAModelManager
+
+    original_create = LoRAModelManager.create_dummy_lora
+    if getattr(original_create, "__art_dsv4_local_dummy_patched__", False):
+        return
+    original_stack = LoRAModelManager._stack_moe_lora_weights
+
+    def create_dummy_lora(self: Any, *args: Any, **kwargs: Any) -> Any:
+        lora_model = original_create(self, *args, **kwargs)
+        if isinstance(self.model, model_cls):
+            lora_model._art_local_3d_moe_lora = True
+        return lora_model
+
+    def stack_moe_lora_weights(
+        self: Any, lora_model: Any, module: Any, module_name: str
+    ) -> Any:
+        if not (
+            isinstance(self.model, model_cls)
+            and getattr(lora_model, "_art_local_3d_moe_lora", False)
+        ):
+            return original_stack(self, lora_model, module, module_name)
+        global_num_experts, ep_rank = module.global_num_experts, module.ep_rank
+        module.global_num_experts = module.w13_lora_a_stacked[0].shape[1]
+        module.ep_rank = 0
+        try:
+            return original_stack(self, lora_model, module, module_name)
+        finally:
+            module.global_num_experts, module.ep_rank = global_num_experts, ep_rank
+
+    create_dummy_lora.__art_dsv4_local_dummy_patched__ = True  # type: ignore[attr-defined]
+    LoRAModelManager.create_dummy_lora = create_dummy_lora  # type: ignore[method-assign]
+    LoRAModelManager._stack_moe_lora_weights = stack_moe_lora_weights  # type: ignore[method-assign]
 
 
 def _patch_dsv4_lora_manager_indexer_skip(model_cls: type) -> None:

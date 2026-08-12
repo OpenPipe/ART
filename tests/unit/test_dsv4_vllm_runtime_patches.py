@@ -32,6 +32,7 @@ def test_dsv4_lora_support_declares_vllm_025_manager_protocol(monkeypatch) -> No
         pass
 
     manager_patches: list[type] = []
+    dummy_patches: list[type] = []
     monkeypatch.setattr(
         patches.importlib,
         "import_module",
@@ -46,12 +47,18 @@ def test_dsv4_lora_support_declares_vllm_025_manager_protocol(monkeypatch) -> No
         "_patch_dsv4_lora_manager_indexer_skip",
         manager_patches.append,
     )
+    monkeypatch.setattr(
+        patches,
+        "_patch_dsv4_local_dummy_lora",
+        dummy_patches.append,
+    )
 
     patches.patch_dsv4_lora_support()
 
     assert getattr(FakeDeepseekV4ForCausalLM, "supports_lora") is True
     assert getattr(FakeDeepseekV4ForCausalLM, "lora_manager") is None
     assert manager_patches == [FakeDeepseekV4ForCausalLM]
+    assert dummy_patches == [FakeDeepseekV4ForCausalLM]
 
 
 def test_dsv4_fp8_o_proj_normalizes_rope_cache_once() -> None:
