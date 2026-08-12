@@ -420,6 +420,8 @@ def _stage_runtime_topology(
         )
         if stage_name == CORRECTNESS_REFERENCE_STAGE:
             variants = variants[:1]
+        else:
+            variants = variants[1:]
         names = tuple(topology.slug() for topology in variants)
         return WorkflowRuntimeTopology(
             trainer_variants=tuple(
