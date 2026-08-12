@@ -274,13 +274,13 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             "time/step_train_s": 1.5,
             "time/step_wall_s": 2.0,
             "time/step_collect_batch_s": 0.001068115234375,
-            "queue/packed_get_wait_s": 0.1 if step == 19 else 0.001,
-            "queue/packed_queue_depth": 0.0 if step == 18 else 1.0,
+            "queue/packed_get_wait_s": 0.1 if step == 7 else 0.001,
+            "queue/packed_queue_depth": 0.0 if step == 6 else 1.0,
             "time/inter_forward_backward_gap_rank_0_s": (
-                1.0 if step >= 18 else 0.1 + (step - 14) * 0.01
+                1.0 if step >= 6 else 0.1 + (step - 2) * 0.01
             ),
             "time/inter_forward_backward_gap_rank_1_s": (
-                2.0 if step >= 18 else 0.11 + (step - 14) * 0.01
+                2.0 if step >= 6 else 0.11 + (step - 2) * 0.01
             ),
             "offpolicy/token_weighted_policy_age_steps": 1.0,
             "offpolicy/token_weighted_policy_age_p95_steps": 2.0,
@@ -288,7 +288,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             "discarded/step/stale_groups": 0,
             "discarded/step/zero_variance_groups": 0,
         }
-        for step in range(14, 20)
+        for step in range(2, 8)
     ]
     history_path = tmp_path / "history.jsonl"
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -308,8 +308,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                 previous=measured_settings,
                 updated=measured_settings,
                 stats=SimpleNamespace(
-                    start_step=14,
-                    end_step=15,
+                    start_step=2,
+                    end_step=3,
                     window_start_s=-4.0,
                     window_end_s=0.0,
                     vllm_pressure=0.6,
@@ -324,8 +324,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                 previous=measured_settings,
                 updated=future_settings,
                 stats=SimpleNamespace(
-                    start_step=16,
-                    end_step=17,
+                    start_step=4,
+                    end_step=5,
                     window_start_s=0.0,
                     window_end_s=4.0,
                     vllm_pressure=0.45,
@@ -340,8 +340,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                 previous=future_settings,
                 updated=future_settings,
                 stats=SimpleNamespace(
-                    start_step=18,
-                    end_step=19,
+                    start_step=6,
+                    end_step=7,
                     window_start_s=4.0,
                     window_end_s=8.0,
                     vllm_pressure=0.65,
@@ -356,8 +356,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                 previous=future_settings,
                 updated=future_settings.model_copy(update={"num_rollout_workers": 12}),
                 stats=SimpleNamespace(
-                    start_step=20,
-                    end_step=21,
+                    start_step=8,
+                    end_step=9,
                     window_start_s=8.0,
                     window_end_s=12.0,
                     vllm_pressure=0.1,
@@ -371,15 +371,15 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         policy_age_limit_steps=4,
     )
     events = [
-        PolicyActivationEvent(13, -4.25, -4.0),
-        PolicyActivationEvent(14, -3.5, -3.25),
-        PolicyActivationEvent(15, -1.5, -1.25),
-        PolicyActivationEvent(16, 0.5, 0.75),
-        PolicyActivationEvent(17, 2.5, 2.75),
-        PolicyActivationEvent(18, 4.5, 4.75),
-        PolicyActivationEvent(19, 6.5, 7.75),
+        PolicyActivationEvent(1, -4.25, -4.0),
+        PolicyActivationEvent(2, -3.5, -3.25),
+        PolicyActivationEvent(3, -1.5, -1.25),
+        PolicyActivationEvent(4, 0.5, 0.75),
+        PolicyActivationEvent(5, 2.5, 2.75),
+        PolicyActivationEvent(6, 4.5, 4.75),
+        PolicyActivationEvent(7, 6.5, 7.75),
     ]
-    config = ThroughputWorkflowConfig(num_layers=2, completion_tokens=128, max_steps=19)
+    config = ThroughputWorkflowConfig(num_layers=2, completion_tokens=128)
     fixture = ThroughputFixture(
         model_key="llama3_dense",
         path="/tmp/llama-throughput",
@@ -389,7 +389,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     )
 
     def phase(kind: str, packed: str, steps: tuple[int, ...]):
-        phase_rows = [dict(rows[-1]) for _ in range(6)]
+        phase_rows = [dict(rows[-1]) for _ in range(3)]
         phase_rows[-1]["data/step_nonpadding_logical_tokens"] += 1
         phase_rows[-1]["data/step_unused_packed_capacity_tokens"] -= 1
         return _phase_evidence(
@@ -401,8 +401,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         )
 
     e2e_phase, isolated_phase = (
-        phase("e2e", "input-a", tuple(range(21, 27))),
-        phase("isolated", "input-a", tuple(range(28, 34))),
+        phase("e2e", "input-a", (5, 6, 7)),
+        phase("isolated", "input-a", (9, 10, 11)),
     )
 
     def collect(isolated):
@@ -426,8 +426,9 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "nonpadding_logical_tokens": 6_000,
         "loss_bearing_tokens": 3_000,
         "accepted_train_tokens": 3_000,
-        "isolated_train_tok_s": 6_001 / 9.0,
-        "matched_e2e_core_train_tok_s": 6_001 / 9.0,
+        "isolated_train_tok_s": 1_000 / 1.5,
+        "matched_e2e_core_train_tok_s": 1_000 / 1.5,
+        "matched_core_to_isolated_ratio": 1.0,
         "e2e_core_train_tok_s": 6_000 / 9.0,
         "e2e_train_tok_s": 500.0,
         "accepted_train_tok_s": 250.0,
@@ -534,7 +535,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "mean_policy_activation_lag_s",
         "max_policy_activation_lag_s",
     ]
-    measurements["matched_e2e_core_train_tok_s"] *= 1.1
+    measurements["matched_core_to_isolated_ratio"] *= 1.1
     assert "matched_core_to_isolated_ratio_max" in acceptance_failures(
         measurements, config, thresholds
     )
@@ -568,7 +569,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         collect(isolated_phase)
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     with pytest.raises(RuntimeError, match="same packed input"):
-        collect(phase("isolated", "input-b", tuple(range(28, 34))))
+        collect(phase("isolated", "input-b", (9, 10, 11)))
 
 
 def test_throughput_measurement_freezes_actual_settings() -> None:

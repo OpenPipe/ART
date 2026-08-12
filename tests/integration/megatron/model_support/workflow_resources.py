@@ -61,7 +61,7 @@ class ThroughputWorkflowConfig(BaseModel):
     max_num_seqs: int = Field(default=64, ge=1)
     max_num_batched_tokens: int = Field(default=65_536, ge=1)
     enable_prefix_caching: bool = False
-    max_steps: int = Field(default=31, ge=11)
+    max_steps: Literal[7] = 7
     max_steps_off_policy: int = Field(default=4, ge=0)
     packed_sequence_length: Literal[131072] = THROUGHPUT_PACKED_SEQUENCE_LENGTH
     min_vllm_pressure: float = Field(default=0.5, ge=0.0, allow_inf_nan=False)
@@ -478,7 +478,6 @@ _THROUGHPUT_CONFIGS = {
         rollouts_per_group=6,
         groups_per_step=24,
         initial_model_calls_per_inference_gpu=20,
-        max_steps=35,
     ),
     "qwen3_dense": ThroughputWorkflowConfig(
         num_layers=8,
@@ -486,7 +485,6 @@ _THROUGHPUT_CONFIGS = {
         rollouts_per_group=8,
         groups_per_step=25,
         initial_model_calls_per_inference_gpu=10,
-        max_steps=35,
     ),
     "qwen3_moe": ThroughputWorkflowConfig(
         num_layers=16,
@@ -495,7 +493,6 @@ _THROUGHPUT_CONFIGS = {
         rollouts_per_group=5,
         groups_per_step=27,
         initial_model_calls_per_inference_gpu=20,
-        max_steps=35,
     ),
     "qwen3_5_dense": ThroughputWorkflowConfig(
         num_layers=8,
@@ -503,7 +500,6 @@ _THROUGHPUT_CONFIGS = {
         completion_tokens=64,
         groups_per_step=31,
         initial_model_calls_per_inference_gpu=12,
-        max_steps=35,
         enable_prefix_caching=True,
     ),
     "qwen3_5_moe": ThroughputWorkflowConfig(
@@ -513,7 +509,6 @@ _THROUGHPUT_CONFIGS = {
         groups_per_step=17,
         initial_model_calls_per_inference_gpu=12,
         max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
-        max_steps=35,
         enable_prefix_caching=True,
     ),
     "gemma4_dense": ThroughputWorkflowConfig(
@@ -522,7 +517,6 @@ _THROUGHPUT_CONFIGS = {
         rollouts_per_group=7,
         groups_per_step=30,
         initial_model_calls_per_inference_gpu=11,
-        max_steps=35,
     ),
     "gemma4_moe": ThroughputWorkflowConfig(
         num_layers=12,
@@ -530,7 +524,6 @@ _THROUGHPUT_CONFIGS = {
         completion_tokens=128,
         groups_per_step=31,
         initial_model_calls_per_inference_gpu=26,
-        max_steps=35,
     ),
     "dsv4": ThroughputWorkflowConfig(
         num_layers=8,
@@ -552,7 +545,6 @@ _THROUGHPUT_CONFIGS = {
         num_layers=4,
         initial_model_calls_per_inference_gpu=21,
         max_num_seqs=48,
-        max_steps=35,
     ),
 }
 
