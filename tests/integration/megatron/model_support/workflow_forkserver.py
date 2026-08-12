@@ -60,9 +60,15 @@ def _signal_group(pid: int, sig: signal.Signals) -> None:
             pass
 
 
+def _raise_signal_exit(signum: int, _frame: Any) -> None:
+    raise SystemExit(128 + signum)
+
+
 def _run_child(worker: Any, request: dict[str, Any]) -> None:
     try:
         os.setsid()
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, _raise_signal_exit)
         log_fd = os.open(
             request["log_path"], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644
         )
@@ -480,9 +486,13 @@ class WorkflowForkserverPool:
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
         try:
             self.close()
-        except Exception:
+        except Exception as cleanup_error:
             if exc is None:
                 raise
+            raise BaseExceptionGroup(
+                "workflow execution and forkserver shutdown failed",
+                [exc, cleanup_error],
+            ) from None
         return False
 
 
