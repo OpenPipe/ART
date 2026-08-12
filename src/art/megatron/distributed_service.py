@@ -580,7 +580,7 @@ class DistributedMegatronService:
         if (
             self._trainer_is_current()
             or self._trainer_preparation_task is not None
-            or self._model_service_spec().temporal_gpu_sharing
+            or self._temporal_gpu_sharing
         ):
             return
         self._require_open()
