@@ -865,11 +865,19 @@ def _calibration_contract(
 
 
 def _calibration_fingerprint(contract: dict[str, Any]) -> str:
-    # Source identity remains diagnostic; measured performance decides whether a
-    # source or dependency change regressed the stable execution contract.
-    return _digest(
-        {key: value for key, value in contract.items() if key != "source_provenance"}
-    )
+    # Implementation hashes remain diagnostic; build and dependency identity
+    # still fence calibrations that are not comparable execution environments.
+    source_provenance = {
+        key: value
+        for key, value in contract["source_provenance"].items()
+        if key
+        not in {
+            "art_source_sha256",
+            "vllm_runtime_source_sha256",
+            "workflow_runtime_sha256",
+        }
+    }
+    return _digest({**contract, "source_provenance": source_provenance})
 
 
 def _chat_token_count(tokenizer: Any, prompt: str) -> int:

@@ -61,6 +61,7 @@ from .workflow_resources import (
 from .workflow_throughput import (
     PolicyActivationEvent,
     ThroughputFixture,
+    _calibration_fingerprint,
     _collect_matched_packing_shapes,
     _collect_measurements,
     _current_pipeline_settings,
@@ -674,6 +675,40 @@ def test_throughput_provenance_ignores_local_editable_paths() -> None:
 
     assert set(distributions["openpipe-art"]) == {"version", "metadata_sha256"}
     assert {"direct_url_sha256", "record_sha256"} <= set(distributions["pydantic"])
+
+
+def test_throughput_calibration_ignores_only_implementation_hashes() -> None:
+    contract = {
+        "measurement_contract_version": 1,
+        "source_provenance": {
+            "art_source_sha256": "art-a",
+            "vllm_runtime_source_sha256": "vllm-a",
+            "workflow_runtime_sha256": "workflow-a",
+            "build_contract_sha256": "build-a",
+            "root_lock_sha256": "lock-a",
+            "main_environment": {"torch": "2.9.1"},
+        },
+    }
+    baseline = _calibration_fingerprint(contract)
+    implementation_changed = {
+        **contract,
+        "source_provenance": {
+            **contract["source_provenance"],
+            "art_source_sha256": "art-b",
+            "vllm_runtime_source_sha256": "vllm-b",
+            "workflow_runtime_sha256": "workflow-b",
+        },
+    }
+    dependency_changed = {
+        **contract,
+        "source_provenance": {
+            **contract["source_provenance"],
+            "main_environment": {"torch": "2.10.0"},
+        },
+    }
+
+    assert _calibration_fingerprint(implementation_changed) == baseline
+    assert _calibration_fingerprint(dependency_changed) != baseline
 
 
 def test_dsv4_throughput_reduction_preserves_hash_moe_prefix() -> None:
