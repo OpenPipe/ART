@@ -46,7 +46,7 @@ class CheckpointManifest(TypedDict):
     optimizer: OptimizerConfig | None
     parameters: dict[str, list[str]]
     steps: dict[str, float]
-    lora_digest: str
+    files: dict[str, str]
     digest: str
 
 
@@ -156,6 +156,18 @@ def _manifest_seed(manifest: Mapping[str, object]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
+def _file_digest(path: Path) -> str:
+    digest = hashlib.blake2b(digest_size=32)
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _manifest_digest(manifest: Mapping[str, object]) -> str:
+    return hashlib.blake2b(_manifest_seed(manifest), digest_size=32).hexdigest()
+
+
 def _validate_manifest(
     manifest: CheckpointManifest,
     *,
@@ -165,14 +177,19 @@ def _validate_manifest(
     if manifest.get("format_version") != FORMAT:
         raise RuntimeError("Unsupported ART checkpoint format")
     digest = manifest.get("digest")
-    lora_digest = manifest.get("lora_digest")
+    file_digests = manifest.get("files")
     if (
         not isinstance(digest, str)
         or len(digest) != 64
         or any(character not in "0123456789abcdef" for character in digest)
-        or not isinstance(lora_digest, str)
-        or len(lora_digest) != 64
-        or any(character not in "0123456789abcdef" for character in lora_digest)
+        or not isinstance(file_digests, dict)
+        or any(
+            not isinstance(path, str)
+            or not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for path, value in file_digests.items()
+        )
     ):
         raise RuntimeError("Checkpoint digest is invalid")
     if manifest.get("base_model_name_or_path") != config.get("base_model_name_or_path"):
@@ -184,45 +201,54 @@ def _validate_manifest(
     steps = manifest.get("steps")
     if not isinstance(parameters, dict) or not isinstance(steps, dict):
         raise RuntimeError("Checkpoint optimizer mapping is invalid")
+    files: set[str] = set()
     if optimizer is None:
         if parameters or steps:
             raise RuntimeError("LoRA-only checkpoint contains optimizer metadata")
-        return set()
-    required = {"learning_rate", "beta1", "beta2", "eps", "weight_decay"}
-    optimizer_values = cast(dict[str, object], optimizer)
-    if (
-        not isinstance(optimizer, dict)
-        or set(optimizer_values) != required
-        or any(
-            not isinstance(optimizer_values[key], int | float)
-            or isinstance(optimizer_values[key], bool)
-            for key in required
-        )
-    ):
-        raise RuntimeError("Checkpoint optimizer config is invalid")
-    if set(parameters) != adapter_keys or set(steps) != adapter_keys:
-        raise RuntimeError(
-            "Checkpoint optimizer mapping differs from adapter tensors: "
-            f"parameters={sorted(set(parameters) ^ adapter_keys)[:8]} "
-            f"steps={sorted(set(steps) ^ adapter_keys)[:8]}"
-        )
-    files: set[str] = set()
-    for key, record in parameters.items():
+    else:
+        required = {"learning_rate", "beta1", "beta2", "eps", "weight_decay"}
+        optimizer_values = cast(dict[str, object], optimizer)
         if (
-            not isinstance(key, str)
-            or not isinstance(record, list | tuple)
-            or len(record) != 3
-            or not all(isinstance(item, str) for item in record)
+            not isinstance(optimizer, dict)
+            or set(optimizer_values) != required
+            or any(
+                not isinstance(optimizer_values[key], int | float)
+                or isinstance(optimizer_values[key], bool)
+                for key in required
+            )
         ):
-            raise RuntimeError(f"Checkpoint optimizer mapping is invalid for {key!r}")
-        normalized = [_safe_relative(item).as_posix() for item in record]
-        parameters[key] = normalized
-        files.update(normalized)
-    if any(
-        not isinstance(value, int | float) or isinstance(value, bool)
-        for value in steps.values()
-    ):
-        raise RuntimeError("Checkpoint optimizer steps are invalid")
+            raise RuntimeError("Checkpoint optimizer config is invalid")
+        if set(parameters) != adapter_keys or set(steps) != adapter_keys:
+            raise RuntimeError(
+                "Checkpoint optimizer mapping differs from adapter tensors: "
+                f"parameters={sorted(set(parameters) ^ adapter_keys)[:8]} "
+                f"steps={sorted(set(steps) ^ adapter_keys)[:8]}"
+            )
+        for key, record in parameters.items():
+            if (
+                not isinstance(key, str)
+                or not isinstance(record, list | tuple)
+                or len(record) != 3
+                or not all(isinstance(item, str) for item in record)
+            ):
+                raise RuntimeError(
+                    f"Checkpoint optimizer mapping is invalid for {key!r}"
+                )
+            normalized = [_safe_relative(item).as_posix() for item in record]
+            parameters[key] = normalized
+            files.update(normalized)
+        if any(
+            not isinstance(value, int | float) or isinstance(value, bool)
+            for value in steps.values()
+        ):
+            raise RuntimeError("Checkpoint optimizer steps are invalid")
+    expected_files = {
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        *files,
+    }
+    if set(file_digests) != expected_files:
+        raise RuntimeError("Checkpoint file digest mapping is invalid")
     return files
 
 
@@ -257,28 +283,25 @@ def prepare_checkpoint(
             *optimizer_files,
         }
         expected = manifest["digest"]
+        actual = _manifest_digest(manifest)
+        if actual != expected:
+            raise RuntimeError(f"Checkpoint digest mismatch: {actual} != {expected}")
         if artifact_entries is None:
-            files.remove(MANIFEST_FILE)
-            actual = _hash_files(root, files, seed=_manifest_seed(manifest))
-            if actual != expected:
-                raise RuntimeError(
-                    f"Checkpoint digest mismatch: {actual} != {expected}"
-                )
+            downloaded = files - {MANIFEST_FILE}
         else:
             available = {_safe_relative(entry).as_posix() for entry in artifact_entries}
             if missing := sorted(files - available):
                 raise RuntimeError(
                     f"Checkpoint artifact is missing entries: {missing[:8]}"
                 )
-            lora_actual = _hash_files(
-                root, ("adapter_config.json", "adapter_model.safetensors")
-            )
-            if lora_actual != manifest["lora_digest"]:
+            downloaded = {"adapter_config.json", "adapter_model.safetensors"}
+        for relative in downloaded:
+            file_actual = _file_digest(root / relative)
+            if file_actual != manifest["files"][relative]:
                 raise RuntimeError(
-                    "Checkpoint LoRA digest mismatch: "
-                    f"{lora_actual} != {manifest['lora_digest']}"
+                    f"Checkpoint file digest mismatch for {relative}: "
+                    f"{file_actual} != {manifest['files'][relative]}"
                 )
-            actual = expected
     else:
         if artifact_entries is not None:
             raise RuntimeError("Checkpoint artifact lacks a canonical manifest")
@@ -757,10 +780,7 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
                 "optimizer": prepared.optimizer,
                 "parameters": parameters,
                 "steps": steps,
-                "lora_digest": _hash_files(
-                    temporary,
-                    ("adapter_config.json", "adapter_model.safetensors"),
-                ),
+                "files": {},
                 "digest": "",
             }
             artifact_files = {
@@ -768,15 +788,19 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
                 "adapter_model.safetensors",
                 *(file for record in parameters.values() for file in record),
             }
-            digest = _hash_files(
-                temporary, artifact_files, seed=_manifest_seed(manifest)
-            )
-            manifest["digest"] = digest
+            manifest["files"] = {
+                relative: _file_digest(temporary / relative)
+                for relative in artifact_files
+            }
+            manifest["digest"] = _manifest_digest(manifest)
             (temporary / MANIFEST_FILE).write_text(
                 json.dumps(manifest, indent=2) + "\n"
             )
             if prepared.destination.exists():
-                if prepare_checkpoint(str(prepared.destination)).digest != digest:
+                if (
+                    prepare_checkpoint(str(prepared.destination)).digest
+                    != manifest["digest"]
+                ):
                     raise FileExistsError(
                         "Checkpoint path already contains different state: "
                         f"{prepared.destination}"

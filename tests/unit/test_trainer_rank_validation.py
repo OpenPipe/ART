@@ -37,8 +37,8 @@ from art.trainer_rank._checkpoint import (
     LocalOptimizerState,
     OptimizerConfig,
     PreparedCheckpoint,
-    _hash_files,
-    _manifest_seed,
+    _file_digest,
+    _manifest_digest,
     _merge_component,
     _PreparedSave,
     _validate_save_state,
@@ -1036,13 +1036,14 @@ def _canonical_checkpoint(root: Path) -> CheckpointManifest:
         ),
         "parameters": {key: files},
         "steps": {key: 3.0},
-        "lora_digest": _hash_files(
-            root, ("adapter_config.json", "adapter_model.safetensors")
-        ),
+        "files": {},
         "digest": "",
     }
     payloads = {"adapter_config.json", "adapter_model.safetensors", *files}
-    manifest["digest"] = _hash_files(root, payloads, seed=_manifest_seed(manifest))
+    manifest["files"] = {
+        relative: _file_digest(root / relative) for relative in payloads
+    }
+    manifest["digest"] = _manifest_digest(manifest)
     (root / "checkpoint.json").write_text(json.dumps(manifest))
     return manifest
 
@@ -1127,7 +1128,7 @@ def test_materialize_lora_validates_exact_artifact_without_optimizer_downloads(
         {next(iter(manifest["parameters"])): torch.zeros(1, 2)},
         local / "adapter_model.safetensors",
     )
-    with pytest.raises(RuntimeError, match="LoRA digest mismatch"):
+    with pytest.raises(RuntimeError, match="file digest mismatch"):
         materialize_lora(
             local,
             tmp_path / "corrupt-output",
@@ -1135,6 +1136,20 @@ def test_materialize_lora_validates_exact_artifact_without_optimizer_downloads(
             artifact_entries=entries,
             expected_digest=manifest["digest"],
         )
+
+    manifest["files"]["adapter_model.safetensors"] = _file_digest(
+        local / "adapter_model.safetensors"
+    )
+    (local / "checkpoint.json").write_text(json.dumps(manifest))
+    with pytest.raises(RuntimeError, match="Checkpoint digest mismatch"):
+        materialize_lora(
+            local,
+            tmp_path / "tampered-manifest-output",
+            require_optimizer=True,
+            artifact_entries=entries,
+            expected_digest=manifest["digest"],
+        )
+    (local / "checkpoint.json").write_bytes((source / "checkpoint.json").read_bytes())
 
     with pytest.raises(RuntimeError, match="digest mismatch"):
         materialize_lora(
@@ -1464,7 +1479,7 @@ def _checkpoint_load_failure_worker(
                 "optimizer": optimizer,
                 "parameters": {},
                 "steps": {},
-                "lora_digest": "digest",
+                "files": {},
                 "digest": "digest",
             }
             if phase != "read"
