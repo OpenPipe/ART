@@ -508,12 +508,11 @@ def _is_self_attn_q_proj_lora_b(key: str) -> bool:
 
 
 @lru_cache(maxsize=8)
-def _qwen35_text_config(base_model_name_or_path: str, revision: str | None) -> Any:
+def _qwen35_text_config(base_model_name_or_path: str) -> Any:
     from transformers import AutoConfig
 
     config = AutoConfig.from_pretrained(
         base_model_name_or_path,
-        revision=revision,
         local_files_only=True,
         trust_remote_code=True,
     )
@@ -525,26 +524,15 @@ def _qwen35_attention_dims(adapter_config: dict[str, Any]) -> tuple[int, int, in
     num_groups = adapter_config.get("num_key_value_heads")
     head_dim = adapter_config.get("head_dim")
     hidden_size = adapter_config.get("hidden_size")
-    if (
-        num_heads is None
-        or num_groups is None
-        or (head_dim is None and hidden_size is None)
-    ):
+    if num_heads is None:
         base_model = adapter_config.get("base_model_name_or_path")
         if not base_model:
             raise RuntimeError("Qwen3.5 LoRA adapter config is missing base model path")
-        revision = adapter_config.get("revision")
-        if revision is not None and not isinstance(revision, str):
-            raise RuntimeError("Qwen3.5 LoRA adapter revision must be a string")
-        config = _qwen35_text_config(str(base_model), revision)
-        if num_heads is None:
-            num_heads = getattr(config, "num_attention_heads")
-        if num_groups is None:
-            num_groups = getattr(config, "num_key_value_heads", num_heads)
-        if head_dim is None:
-            head_dim = getattr(config, "head_dim", None)
-        if hidden_size is None:
-            hidden_size = getattr(config, "hidden_size", None)
+        config = _qwen35_text_config(str(base_model))
+        num_heads = getattr(config, "num_attention_heads")
+        num_groups = getattr(config, "num_key_value_heads", num_heads)
+        head_dim = getattr(config, "head_dim", None)
+        hidden_size = getattr(config, "hidden_size", None)
     num_heads = int(num_heads)
     num_groups = int(num_groups if num_groups is not None else num_heads)
     if head_dim is None:

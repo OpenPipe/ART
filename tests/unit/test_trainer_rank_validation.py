@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
 import gc
 from importlib.util import find_spec
 import inspect
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -22,17 +20,13 @@ from art.trainer_rank import (
     TopK,
     TrainerRank,
     TrainerRankMemoryError,
+    TrainerRankOptimizerLayout,
+    TrainerRankOptimizerState,
     TrainerRankSlotStateError,
     Unset,
 )
-from art.trainer_rank._checkpoint import (
-    AdamWRecord,
-    LocalOptimizerState,
-    _validate_save_state,
-)
 from art.trainer_rank._impl import (
     _anchor_disconnected_outputs,
-    _CheckpointSlot,
     _MemoryCheck,
     _MemoryProfile,
     _validate_top_k,
@@ -52,6 +46,8 @@ def test_public_types_have_canonical_module_paths() -> None:
 
     assert {
         "AdapterSelection",
+        "TrainerRankOptimizerLayout",
+        "TrainerRankOptimizerState",
         "Unset",
     } <= set(art.trainer_rank.__all__)
     for public_type in (
@@ -61,6 +57,8 @@ def test_public_types_have_canonical_module_paths() -> None:
         TopK,
         TrainerRank,
         TrainerRankMemoryError,
+        TrainerRankOptimizerLayout,
+        TrainerRankOptimizerState,
         TrainerRankSlotStateError,
     ):
         assert public_type.__module__ == "art.trainer_rank"
@@ -101,6 +99,7 @@ class _NativeOptimizer:
 
 @dataclass(frozen=True)
 class _SlotRef:
+    kind: str
     name: str | None
 
 
@@ -123,21 +122,14 @@ def _runtime(
         model_support_handler=SimpleNamespace(
             build_gdn_execution_spec=True,
             canonicalize_loaded_lora_state=lambda state, _model: state,
-            from_vllm_lora_tensors=lambda state, **_kwargs: state,
-            to_vllm_lora_tensors=lambda state, **kwargs: (
-                state,
-                kwargs["adapter_config"],
-            ),
             zero_internal_padding_grads=lambda _model: None,
             zero_internal_padding_params=lambda _model: None,
         ),
-        rank=0,
-        world_size=1,
     )  # type: ignore
 
 
-def _slot_ref(name: str | None) -> "LoRASlotRef":
-    return _SlotRef(name)  # type: ignore
+def _slot_ref(kind: str, name: str | None) -> "LoRASlotRef":
+    return _SlotRef(kind, name)  # type: ignore
 
 
 def _target_request(token: int) -> ForwardInput[torch.Tensor, None, None, None]:
@@ -188,7 +180,7 @@ def _trainer_with_checkpoint(
 ) -> tuple[TrainerRank, torch.nn.Parameter]:
     trainer = TrainerRank(_runtime())
     param = torch.nn.Parameter(value.clone())
-    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (param,)
+    trainer._checkpoint_slot_params_by_name["student"] = (param,)
     monkeypatch.setattr(
         trainer,
         "_reduce_dynamic_grads",
@@ -218,7 +210,8 @@ def _tracked_targets(
 def test_forward_input_validation() -> None:
     with pytest.raises(ValueError, match="top_k must be >= 1"):
         ForwardInput(input_tokens=torch.tensor([1]), top_k=0)
-    assert "lora" not in ForwardInput.__dataclass_fields__
+    with pytest.raises(ValueError, match="cannot set both checkpoint and lora"):
+        ForwardInput(input_tokens=torch.tensor([1]), checkpoint="a", lora="b")
     with pytest.raises(ValueError, match="top_k=9 exceeds vocabulary size 8"):
         _validate_top_k(9, _Model())
 
@@ -230,40 +223,7 @@ def test_forward_input_distinguishes_unset_and_base_checkpoint(
     request = ForwardInput(input_tokens=torch.tensor([1]), checkpoint=checkpoint)
 
     assert request.checkpoint is expected
-
-
-def test_dp_rank_forward_rejects_unloaded_explicit_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())
-    _stub_forward(monkeypatch, trainer)
-    request = ForwardInput(
-        input_tokens=torch.tensor([1]),
-        target_tokens=torch.tensor([1]),
-        checkpoint="typo",
-    )
-
-    with pytest.raises(TrainerRankSlotStateError, match="unloaded.*'typo'"):
-        trainer.dp_rank_forward([request])
-
-
-@pytest.mark.parametrize("checkpoint", (None, "student"))
-def test_dp_rank_forward_accepts_base_or_loaded_explicit_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
-    checkpoint: str | None,
-) -> None:
-    trainer = TrainerRank(_runtime())
-    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = ()
-    _stub_forward(monkeypatch, trainer)
-    request = ForwardInput(
-        input_tokens=torch.tensor([1]),
-        target_tokens=torch.tensor([1]),
-        checkpoint=checkpoint,
-    )
-
-    output = trainer.dp_rank_forward([request])
-
-    assert isinstance(output[0], ForwardOutput)
+    assert request.lora is Unset
 
 
 def test_forward_input_preserves_public_runtime_shape() -> None:
@@ -428,279 +388,15 @@ def test_hybridep_rejects_buffer_growth_with_live_graph(
         )
 
 
-async def test_trainer_rank_checkpoint_stack_errors() -> None:
+def test_trainer_rank_adapter_stack_errors() -> None:
     trainer = TrainerRank(_runtime())
 
-    with pytest.raises(RuntimeError, match="No pushed checkpoint"):
-        trainer.pop_checkpoint()
+    with pytest.raises(RuntimeError, match="No pushed LoRA or checkpoint"):
+        trainer.pop_pushed_lora_or_checkpoint()
     trainer._slot_stack.append(object())  # type: ignore
-    with pytest.raises(RuntimeError, match="Cannot load a checkpoint"):
-        await trainer.load_checkpoint("teacher")
-
-
-async def test_checkpoint_tasks_and_async_context(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())
-    trainer._checkpoint_prefetches = {}
-    fetched: list[str] = []
-
-    async def prefetch(path: str) -> object:
-        fetched.append(path)
-        return object()
-
-    def install(trainer: TrainerRank, _source: object, path: str) -> None:
-        trainer._checkpoint_slots.setdefault(path, _CheckpointSlot()).params = ()
-        trainer._checkpoint_slots[path].revision = 0
-
-    monkeypatch.setattr(trainer, "_prefetch_checkpoint", prefetch)
-    monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", install)
-
-    task = trainer.load_checkpoint("student")
-    assert isinstance(task, asyncio.Task)
-    await task
-    assert fetched == ["student"]
-    assert trainer._default_slot_ref == trainer._slot_ref("student")
-
-    task = trainer.prefetch_checkpoints("teacher", "reference")
-    assert isinstance(task, asyncio.Task)
-    await task
-    assert fetched[-2:] == ["teacher", "reference"]
-
-    pushed = trainer.push_checkpoint("student")
-    await pushed
-    assert trainer._slot_stack == [trainer._slot_ref("student")]
-    trainer.pop_checkpoint()
-    async with trainer.push_checkpoint("student"):
-        assert trainer._slot_stack == [trainer._slot_ref("student")]
-        async with trainer.push_checkpoint("missing"):
-            assert trainer._slot_stack == [
-                trainer._slot_ref("student"),
-                trainer._slot_ref("missing"),
-            ]
-        assert trainer._slot_stack == [trainer._slot_ref("student")]
-    assert trainer._slot_stack == []
-    assert fetched[-1] == "missing"
-
-
-async def test_checkpoint_context_cancellation_after_successful_push_cleans_stack(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())
-    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = ()
-    parent = asyncio.current_task()
-    assert parent is not None
-    original_slot_ref = trainer._slot_ref
-    cancellation_scheduled = False
-
-    def cancel_parent_after_resolving(path: str | None):
-        nonlocal cancellation_scheduled
-        ref = original_slot_ref(path)
-        if not cancellation_scheduled:
-            cancellation_scheduled = True
-            asyncio.get_running_loop().call_soon(parent.cancel)
-        return ref
-
-    monkeypatch.setattr(trainer, "_slot_ref", cancel_parent_after_resolving)
-    pushed = trainer.push_checkpoint("student")
-    entered = False
-
-    with pytest.raises(asyncio.CancelledError):
-        async with pushed:
-            entered = True
-
-    assert cancellation_scheduled
-    assert pushed.task.done() and not pushed.task.cancelled()
-    assert not entered
-    assert trainer._slot_stack == []
-
-
-async def test_shared_checkpoint_prefetch_survives_waiter_cancellation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())
-    started = asyncio.Event()
-    release = asyncio.Event()
-    source = object()
-
-    async def delayed_to_thread(_function: object, *_args: object) -> object:
-        started.set()
-        await release.wait()
-        return source
-
-    monkeypatch.setattr(asyncio, "to_thread", delayed_to_thread)
-    first = asyncio.create_task(trainer._prefetch_checkpoint("student"))
-    second = asyncio.create_task(trainer._prefetch_checkpoint("student"))
-    await started.wait()
-    first.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await first
-    release.set()
-
-    assert await second is source
-    [cached] = trainer._checkpoint_prefetches.values()
-    assert cached.result() is source
-
-
-async def test_shared_checkpoint_prefetch_serves_successful_waiters(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())
-    started = asyncio.Event()
-    release = asyncio.Event()
-    source = object()
-    calls = 0
-
-    async def delayed_to_thread(_function: object, *_args: object) -> object:
-        nonlocal calls
-        calls += 1
-        started.set()
-        await release.wait()
-        return source
-
-    monkeypatch.setattr(asyncio, "to_thread", delayed_to_thread)
-    first = asyncio.create_task(trainer._prefetch_checkpoint("student"))
-    second = asyncio.create_task(trainer._prefetch_checkpoint("student"))
-    await started.wait()
-    await asyncio.sleep(0)
-    release.set()
-
-    assert await asyncio.gather(first, second) == [source, source]
-    assert calls == 1
-    [cached] = trainer._checkpoint_prefetches.values()
-    assert cached.result() is source
-
-
-async def test_materialized_sources_keep_logical_checkpoint_identities(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    trainer = TrainerRank(_runtime())
-    prepared: list[str] = []
-    installed: list[tuple[str, object]] = []
-
-    def prepare(source_path: str) -> object:
-        prepared.append(source_path)
-        return object()
-
-    def install(trainer: TrainerRank, source: object, logical_path: str) -> None:
-        installed.append((logical_path, source))
-        trainer._checkpoint_slots.setdefault(
-            logical_path, _CheckpointSlot()
-        ).params = ()
-        trainer._checkpoint_slots[logical_path].revision = 0
-
-    monkeypatch.setattr("art.trainer_rank._checkpoint.prepare_checkpoint", prepare)
-    monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", install)
-    root_a = str(tmp_path / "immutable-a")
-    root_b = str(tmp_path / "immutable-b")
-    logical_a = "wandb-artifact:///entity/project/run:step1"
-    logical_b = "wandb-artifact:///entity/project/run-teacher:step1"
-    logical_c = "wandb-artifact:///entity/project/run-reference:step1"
-
-    await asyncio.gather(
-        trainer._load_checkpoint_from_source(logical_a, root_a),
-        trainer._load_checkpoint_from_source(logical_b, root_a),
-    )
-    assert prepared == [trainer._checkpoint_source_key(root_a)]
-
-    await trainer._prefetch_checkpoints_from_sources((logical_c, root_b))
-    await trainer._load_checkpoint_from_source(logical_c, root_b)
-    assert sorted(prepared) == sorted(
-        (trainer._checkpoint_source_key(root_a), trainer._checkpoint_source_key(root_b))
-    )
-    assert [logical_path for logical_path, _source in installed] == [
-        logical_a,
-        logical_b,
-        logical_c,
-    ]
-    assert set(trainer._checkpoint_slots) == {
-        logical_a,
-        logical_b,
-        logical_c,
-    }
-    assert trainer._default_slot_ref == trainer._slot_ref(logical_c)
-    for logical_path in (logical_a, logical_b, logical_c):
-        request = ForwardInput(input_tokens=torch.tensor([1]), checkpoint=logical_path)
-        assert trainer._resolve_slot_ref(request) == trainer._slot_ref(logical_path)
-
-    refreshed_root = str(tmp_path / "immutable-new")
-    await trainer._load_checkpoint_from_source(logical_a, refreshed_root)
-    assert installed[-1][0] == logical_a
-    assert prepared[-1] == trainer._checkpoint_source_key(refreshed_root)
-
-    prepared_before_push = tuple(prepared)
-    pushed = trainer._push_checkpoint_from_source(
-        logical_a, str(tmp_path / "unused-while-loaded")
-    )
-    await pushed
-    assert tuple(prepared) == prepared_before_push
-    assert trainer._slot_stack == [trainer._slot_ref(logical_a)]
-    trainer.pop_checkpoint()
-
-
-async def test_checkpoint_mutations_follow_call_order_and_recover_from_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())
-    trainer._checkpoint_prefetches = {}
-    started = {name: asyncio.Event() for name in ("first", "second")}
-    ready = {name: asyncio.Event() for name in ("first", "second")}
-    installed: list[str] = []
-
-    async def prefetch(path: str) -> object:
-        event = started.get(path)
-        if event is not None:
-            event.set()
-            await ready[path].wait()
-        return object()
-
-    def install(trainer: TrainerRank, _source: object, path: str) -> None:
-        installed.append(path)
-        if path == "bad":
-            raise RuntimeError("injected load failure")
-        trainer._checkpoint_slots.setdefault(path, _CheckpointSlot()).params = ()
-        trainer._checkpoint_slots[path].revision = 0
-
-    monkeypatch.setattr(trainer, "_prefetch_checkpoint", prefetch)
-    monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", install)
-    first = trainer.load_checkpoint("first")
-    second = trainer.load_checkpoint("second")
-    await asyncio.gather(*(event.wait() for event in started.values()))
-    ready["second"].set()
-    await asyncio.sleep(0)
-    assert installed == []
-    ready["first"].set()
-    await asyncio.gather(first, second)
-    assert installed == ["first", "second"]
-
-    bad = trainer.load_checkpoint("bad")
-    after = trainer.load_checkpoint("after")
-    with pytest.raises(RuntimeError, match="injected load failure"):
-        await bad
-    await after
-    assert installed[-2:] == ["bad", "after"]
-
-
-@pytest.mark.parametrize("local_failure", [False, True])
-async def test_checkpoint_prefetch_failures_are_coordinated(
-    monkeypatch: pytest.MonkeyPatch, local_failure: bool
-) -> None:
-    trainer = TrainerRank(_runtime())
-
-    async def prefetch(_path: str) -> object:
-        if local_failure:
-            raise OSError("rank-local prefetch failed")
-        return object()
-
-    def coordinated(error: BaseException | None, phase: str) -> None:
-        assert phase == "prepare checkpoint"
-        assert isinstance(error, OSError) is local_failure
-        raise RuntimeError("a rank failed to prepare checkpoint")
-
-    monkeypatch.setattr(trainer, "_prefetch_checkpoint", prefetch)
-    monkeypatch.setattr("art.trainer_rank._checkpoint._raise_distributed", coordinated)
-    with pytest.raises(RuntimeError, match="a rank failed"):
-        await trainer.load_checkpoint("student")
+    for load in (trainer.load_checkpoint_slot, trainer.load_lora_slot):
+        with pytest.raises(RuntimeError, match="Cannot load a LoRA/checkpoint"):
+            load("teacher", {})
 
 
 def test_trainer_rank_rejects_adapter_keys_without_installed_lora_site() -> None:
@@ -709,10 +405,11 @@ def test_trainer_rank_rejects_adapter_keys_without_installed_lora_site() -> None
         "base.layer.lora_A.weight": torch.empty(1),
         "base.layer.lora_B.weight": torch.empty(1),
     }
-    trainer._prepare_adapter_model("student", valid)
+    trainer._prepare_adapter_model("checkpoint", "student", valid)
 
     with pytest.raises(ValueError, match="matching LoRA target modules"):
         trainer._prepare_adapter_model(
+            "checkpoint",
             "student",
             {**valid, "base.other.lora_A.weight": torch.empty(1)},
         )
@@ -726,7 +423,7 @@ def test_trainer_rank_normalizes_adapter_tensors_to_installed_site() -> None:
         "base.layer.lora_B.weight": torch.ones(5, 3, dtype=torch.float32),
     }
 
-    normalized = trainer._prepare_adapter_model("student", adapter)
+    normalized = trainer._prepare_adapter_model("checkpoint", "student", adapter)
 
     assert all(tensor.device == site.A_T.device for tensor in normalized.values())
     assert all(tensor.dtype == torch.bfloat16 for tensor in normalized.values())
@@ -741,41 +438,20 @@ def test_checkpoint_slot_adapter_config_is_validated_and_copied() -> None:
         "target_modules": ["q_proj"],
     }
 
-    retained = trainer._validate_checkpoint_adapter_config("student", config, alpha=16)
+    retained = trainer._validate_checkpoint_slot_adapter_config(
+        "student", config, alpha=16
+    )
 
     assert retained == config
     config["target_modules"].append("v_proj")  # type: ignore[union-attr]
     assert retained is not None
     assert retained["target_modules"] == ["q_proj"]
     with pytest.raises(ValueError, match="conflicts"):
-        trainer._validate_checkpoint_adapter_config("student", config, alpha=32)
+        trainer._validate_checkpoint_slot_adapter_config("student", config, alpha=32)
     with pytest.raises(ValueError, match="missing"):
-        trainer._validate_checkpoint_adapter_config("student", {"r": 8}, alpha=None)
-
-
-def test_qwen35_checkpoint_adapter_config_captures_attention_dimensions() -> None:
-    runtime = _runtime()
-    runtime.provider.num_attention_heads = 16
-    runtime.provider.num_query_groups = 4
-    runtime.provider.kv_channels = 128
-    trainer = TrainerRank(runtime)
-
-    retained = trainer._validate_checkpoint_adapter_config(
-        "student",
-        {
-            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
-            "r": 8,
-            "lora_alpha": 16,
-            "target_modules": ["q_proj"],
-        },
-        alpha=16,
-    )
-
-    assert retained is not None
-    assert retained["num_attention_heads"] == 16
-    assert retained["num_key_value_heads"] == 4
-    assert retained["head_dim"] == 128
-    assert retained["hidden_size"] == 4
+        trainer._validate_checkpoint_slot_adapter_config(
+            "student", {"r": 8}, alpha=None
+        )
 
 
 @pytest.mark.parametrize(
@@ -801,7 +477,7 @@ def test_checkpoint_slot_adapter_config_rejects_invalid_field_types(
     config[field] = value
 
     with pytest.raises(TypeError, match=field):
-        trainer._validate_checkpoint_adapter_config("student", config, alpha=None)
+        trainer._validate_checkpoint_slot_adapter_config("student", config, alpha=None)
 
 
 def test_checkpoint_slot_adapter_config_rejects_cross_rank_mismatch(
@@ -812,13 +488,42 @@ def test_checkpoint_slot_adapter_config_rejects_cross_rank_mismatch(
     monkeypatch.setattr("art.trainer_rank.dist.get_world_size", lambda: 2)
 
     def gather(output: list[object], value: object) -> None:
-        revision = value[1] if isinstance(value, tuple) and len(value) == 2 else None
-        output[:] = [value, ({"different": True}, revision)]
+        output[:] = [value, {"different": True}]
 
     monkeypatch.setattr("art.trainer_rank.dist.all_gather_object", gather)
 
     with pytest.raises(ValueError, match="differs across ranks"):
-        trainer._validate_checkpoint_adapter_config("student", None, alpha=None)
+        trainer._validate_checkpoint_slot_adapter_config("student", None, alpha=None)
+
+
+def test_load_checkpoint_slot_retains_config_and_uses_its_alpha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        trainer,
+        "_load_slot",
+        lambda *_args, **kwargs: seen.update(kwargs) or 1,
+    )
+    monkeypatch.setattr(trainer, "_validate_dynamic_slot_consistency", lambda *_: ())
+    monkeypatch.setattr(
+        trainer, "_validate_loaded_checkpoint_slot_config", lambda *_: None
+    )
+    config = {
+        "base_model_name_or_path": "Qwen/Qwen3-8B",
+        "r": 8,
+        "lora_alpha": 16,
+        "target_modules": ["q_proj"],
+    }
+
+    trainer.load_checkpoint_slot("student", {}, adapter_config=config)
+
+    assert seen["alpha"] == 16
+    assert trainer._checkpoint_slot_adapter_configs["student"] == config
+    trainer.load_checkpoint_slot("student", {}, alpha=7)
+    assert seen["alpha"] == 7
+    assert "student" not in trainer._checkpoint_slot_adapter_configs
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
@@ -828,20 +533,12 @@ def test_slot_load_canonicalizes_only_local_incoming_adapter(
     calls: list[tuple[dict[str, torch.Tensor], object]] = []
     loaded_state: dict[str, torch.Tensor] = {}
     runtime = _runtime()
-    monkeypatch.setattr(
-        runtime.model_support_handler,
-        "canonicalize_loaded_lora_state",
-        lambda state, model: (
-            calls.append((state, model))
-            or {key: torch.zeros_like(value) for key, value in state.items()}
-        ),
+    runtime.model_support_handler.canonicalize_loaded_lora_state = lambda state, model: (
+        calls.append((state, model))
+        or {key: torch.zeros_like(value) for key, value in state.items()}
     )
-    monkeypatch.setattr(
-        runtime.model_support_handler,
-        "zero_internal_padding_params",
-        lambda _model: pytest.fail(
-            "slot load must not mutate unrelated slot parameters"
-        ),
+    runtime.model_support_handler.zero_internal_padding_params = lambda _model: (
+        pytest.fail("slot load must not mutate unrelated slot parameters")
     )
     trainer = TrainerRank(runtime)
     monkeypatch.setattr(
@@ -872,7 +569,7 @@ def test_slot_load_canonicalizes_only_local_incoming_adapter(
     )
 
     adapter = {"weight": torch.ones(1), "remote_weight": torch.ones(1)}
-    trainer._load_checkpoint_slot("student", adapter, alpha=1.0)
+    trainer._load_slot("checkpoint", "student", adapter, trainable=True, alpha=None)
 
     assert calls == [({"weight": adapter["weight"]}, runtime.model)]
     torch.testing.assert_close(loaded_state["weight"], torch.zeros(1))
@@ -880,32 +577,15 @@ def test_slot_load_canonicalizes_only_local_incoming_adapter(
     torch.testing.assert_close(adapter["weight"], torch.ones(1))
 
 
-def test_checkpoint_export_requires_retained_adapter_config() -> None:
+def test_checkpoint_slot_publish_requires_retained_adapter_config() -> None:
     trainer = TrainerRank(_runtime())
-    with pytest.raises(ValueError, match="Unknown checkpoint"):
-        trainer.export_lora("/unused", "missing")
+    with pytest.raises(ValueError, match="Unknown checkpoint slot"):
+        trainer.save_checkpoint_slot_lora("missing", "/unused")
 
-    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = ()
+    trainer._checkpoint_slot_params_by_name["student"] = ()
+
     with pytest.raises(TrainerRankSlotStateError, match="adapter_config"):
-        trainer.export_lora("/unused", "student")
-
-
-def test_checkpoint_save_rejects_accumulated_gradients() -> None:
-    trainer = TrainerRank(_runtime())
-    parameter = torch.nn.Parameter(torch.ones(2))
-    parameter.grad = torch.ones_like(parameter)
-    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (
-        parameter,
-    )
-    trainer._checkpoint_slots["student"].config = {
-        "base_model_name_or_path": "test",
-        "r": 1,
-        "lora_alpha": 1,
-        "target_modules": [],
-    }
-
-    with pytest.raises(TrainerRankSlotStateError, match="accumulated gradients"):
-        _validate_save_state(trainer, "student")
+        trainer.save_checkpoint_slot_lora("student", "/unused")
 
 
 def test_trainer_rank_default_forward_uses_explicit_base_slot() -> None:
@@ -916,6 +596,7 @@ def test_trainer_rank_default_forward_uses_explicit_base_slot() -> None:
     assert len(plan.groups) == 1
     slot = plan.groups[0].slot_ref
     assert slot is not None
+    assert getattr(slot, "kind") == "checkpoint"
     assert getattr(slot, "name") is None
 
 
@@ -931,7 +612,7 @@ def test_optim_step_requires_loaded_checkpoint_slot() -> None:
 
 def test_optim_step_rejects_loaded_slots_without_grads() -> None:
     trainer = TrainerRank(_runtime())
-    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (
+    trainer._checkpoint_slot_params_by_name["student"] = (
         torch.nn.Parameter(torch.ones(2)),
     )
 
@@ -951,10 +632,8 @@ def test_optim_step_rejects_explicit_slot_subset_with_missing_grads(
     ready = torch.nn.Parameter(torch.ones(2))
     missing = torch.nn.Parameter(torch.ones(2))
     ready.grad = torch.ones_like(ready)
-    trainer._checkpoint_slots.setdefault("ready", _CheckpointSlot()).params = (ready,)
-    trainer._checkpoint_slots.setdefault("missing", _CheckpointSlot()).params = (
-        missing,
-    )
+    trainer._checkpoint_slot_params_by_name["ready"] = (ready,)
+    trainer._checkpoint_slot_params_by_name["missing"] = (missing,)
     monkeypatch.setattr(
         trainer,
         "_reduce_dynamic_grads",
@@ -975,10 +654,8 @@ def test_optim_step_implicitly_steps_only_slots_with_grads(
     ready = torch.nn.Parameter(torch.ones(2))
     untouched = torch.nn.Parameter(torch.ones(2))
     ready.grad = torch.ones_like(ready)
-    trainer._checkpoint_slots.setdefault("ready", _CheckpointSlot()).params = (ready,)
-    trainer._checkpoint_slots.setdefault("untouched", _CheckpointSlot()).params = (
-        untouched,
-    )
+    trainer._checkpoint_slot_params_by_name["ready"] = (ready,)
+    trainer._checkpoint_slot_params_by_name["untouched"] = (untouched,)
     monkeypatch.setattr(
         trainer,
         "_reduce_dynamic_grads",
@@ -991,8 +668,8 @@ def test_optim_step_implicitly_steps_only_slots_with_grads(
         params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
     )
 
-    assert trainer._checkpoint_slots["ready"].optimizer is not None
-    assert trainer._checkpoint_slots["untouched"].optimizer is None
+    assert "ready" in trainer._dynamic_optimizers
+    assert "untouched" not in trainer._dynamic_optimizers
     assert not torch.equal(before_ready, ready)
     torch.testing.assert_close(untouched, before_untouched)
 
@@ -1010,20 +687,12 @@ def test_dynamic_optimizer_zeroes_internal_padding_grads_before_step(
         assert param.grad is not None
         param.grad[-1] = 0.0
 
-    monkeypatch.setattr(
-        runtime.model_support_handler,
-        "zero_internal_padding_grads",
-        zero_padding_grads,
-    )
-    monkeypatch.setattr(
-        runtime.model_support_handler,
-        "zero_internal_padding_params",
-        lambda _model: pytest.fail(
-            "slot step must not mutate unrelated slot parameters"
-        ),
+    runtime.model_support_handler.zero_internal_padding_grads = zero_padding_grads
+    runtime.model_support_handler.zero_internal_padding_params = lambda _model: (
+        pytest.fail("slot step must not mutate unrelated slot parameters")
     )
     trainer = TrainerRank(runtime)
-    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (param,)
+    trainer._checkpoint_slot_params_by_name["student"] = (param,)
     monkeypatch.setattr(
         trainer,
         "_reduce_dynamic_grads",
@@ -1042,7 +711,7 @@ def test_dynamic_optimizer_zeroes_internal_padding_grads_before_step(
     assert param[-1].item() == 0.0
 
 
-def test_canonical_optimizer_state_reproduces_exact_next_step(
+def test_checkpoint_slot_optimizer_state_reproduces_exact_next_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adam = AdamParams(
@@ -1052,51 +721,31 @@ def test_canonical_optimizer_state_reproduces_exact_next_step(
         weight_decay=0.1,
         grad_clip_norm=10.0,
     )
+
     original, original_param = _trainer_with_checkpoint(
         monkeypatch, torch.tensor([0.5, -0.25], dtype=torch.bfloat16)
     )
-    original._checkpoint_slots["student"].revision = 0
     original_param.grad = torch.tensor([0.2, -0.4], dtype=torch.bfloat16)
     original.optim_step(params=adam)
-    dynamic = original._checkpoint_slots["student"].optimizer
-    assert dynamic is not None
-    optimizer_state = dynamic.optimizer.state[dynamic.master_params[0]]
-    group = dynamic.optimizer.param_groups[0]
-    beta1, beta2 = cast(tuple[float, float], group["betas"])
-    state = LocalOptimizerState(
-        masters=tuple(param.detach().clone() for param in dynamic.master_params),
-        exp_avgs=(cast(torch.Tensor, optimizer_state["exp_avg"]).clone(),),
-        exp_avg_sqs=(cast(torch.Tensor, optimizer_state["exp_avg_sq"]).clone(),),
-        steps=(float(cast(torch.Tensor, optimizer_state["step"]).item()),),
-        config=AdamWRecord(
-            learning_rate=float(group["lr"]),
-            beta1=beta1,
-            beta2=beta2,
-            eps=float(group["eps"]),
-            weight_decay=float(group["weight_decay"]),
-        ),
-    )
+    state = original.checkpoint_slot_optimizer_state("student")
+    assert state is not None
 
     restored, restored_param = _trainer_with_checkpoint(
         monkeypatch, original_param.detach()
     )
-    restored._checkpoint_slots[
-        "student"
-    ].optimizer = restored._restore_canonical_optimizer("student", state)
+    restored._dynamic_optimizers["student"] = restored._restore_dynamic_optimizer(
+        "student", state
+    )
     for param in (original_param, restored_param):
         param.grad = torch.tensor([-0.3, 0.1], dtype=torch.bfloat16)
     original.optim_step(params=adam)
     restored.optim_step(params=adam)
 
     torch.testing.assert_close(restored_param, original_param, atol=0, rtol=0)
-    restored_optimizer = restored._checkpoint_slots["student"].optimizer
-    original_optimizer = original._checkpoint_slots["student"].optimizer
-    assert restored_optimizer is not None and original_optimizer is not None
-    _assert_nested_tensors_equal(
-        restored_optimizer.optimizer.state_dict(),
-        original_optimizer.optimizer.state_dict(),
-    )
-    assert original._checkpoint_slots["student"].revision == 2
+    original_state = original.checkpoint_slot_optimizer_state("student")
+    restored_state = restored.checkpoint_slot_optimizer_state("student")
+    assert original_state is not None and restored_state is not None
+    _assert_nested_tensors_equal(restored_state, original_state)
 
 
 def test_dynamic_optimizer_keeps_fp32_master_weight_and_moments(
@@ -1116,8 +765,7 @@ def test_dynamic_optimizer_keeps_fp32_master_weight_and_moments(
             )
         )
 
-    dynamic = trainer._checkpoint_slots["student"].optimizer
-    assert dynamic is not None
+    dynamic = trainer._dynamic_optimizers["student"]
     assert dynamic.master_params[0].dtype == torch.float32
     assert param.item() < torch.tensor(0.1, dtype=torch.bfloat16).item()
     state = dynamic.optimizer.state[dynamic.master_params[0]]
@@ -1125,26 +773,35 @@ def test_dynamic_optimizer_keeps_fp32_master_weight_and_moments(
     assert state["exp_avg_sq"].dtype == torch.float32
 
 
-def test_canonical_optimizer_rejects_incompatible_local_shape(
+@pytest.mark.parametrize(
+    ("corruption", "error"),
+    (
+        ("layout", "topology or parameter layout"),
+        ("missing_master", "master parameters"),
+        ("shape", "topology or parameter layout"),
+    ),
+)
+def test_checkpoint_slot_optimizer_state_rejects_incompatible_state(
+    corruption: str,
+    error: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    trainer, _ = _trainer_with_checkpoint(monkeypatch, torch.ones(2))
-    state = LocalOptimizerState(
-        masters=(torch.ones(3),),
-        exp_avgs=(torch.zeros(3),),
-        exp_avg_sqs=(torch.zeros(3),),
-        steps=(1.0,),
-        config=AdamWRecord(
-            learning_rate=1e-3,
-            beta1=0.9,
-            beta2=0.99,
-            eps=1e-8,
-            weight_decay=0.0,
-        ),
+    trainer, param = _trainer_with_checkpoint(monkeypatch, torch.ones(2))
+    param.grad = torch.ones_like(param)
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
     )
-
-    with pytest.raises(TrainerRankSlotStateError, match="master parameter shape"):
-        trainer._restore_canonical_optimizer("student", state)
+    state = trainer.checkpoint_slot_optimizer_state("student")
+    assert state is not None
+    if corruption == "layout":
+        cast(dict[str, object], state)["layout"] = {"different": True}
+    elif corruption == "missing_master":
+        state["master_params"] = ()
+    restored, _ = _trainer_with_checkpoint(
+        monkeypatch, torch.ones(3 if corruption == "shape" else 2)
+    )
+    with pytest.raises(TrainerRankSlotStateError, match=error):
+        restored._restore_dynamic_optimizer("student", state)
 
 
 @pytest.mark.parametrize("operation", ("load", "step"))
@@ -1153,7 +810,7 @@ def test_trainer_rank_rejects_mutating_slot_with_pending_graph(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
-    ref = _slot_ref("teacher")
+    ref = _slot_ref("checkpoint", "teacher")
     monkeypatch.setattr(trainer, "_slot_ref", _slot_ref)
     target = _tracked_targets(trainer, ref, 2)[0]
     guard = (
@@ -1180,7 +837,7 @@ def test_trainer_rank_step_allows_missing_slot_graph_bookkeeping(
 
 def test_trainer_rank_zero_grad_does_not_clear_live_slot_graphs() -> None:
     trainer = TrainerRank(_runtime())
-    ref = _slot_ref("teacher")
+    ref = _slot_ref("lora", "teacher")
     output = ForwardOutput(
         None,
         TopK(
@@ -1201,7 +858,7 @@ def test_trainer_rank_zero_grad_does_not_clear_live_slot_graphs() -> None:
 
 def test_trainer_rank_retained_backward_keeps_slot_graph_guard() -> None:
     trainer = TrainerRank(_runtime())
-    ref = _slot_ref("teacher")
+    ref = _slot_ref("checkpoint", "teacher")
     target = _tracked_targets(trainer, ref, 2)[0]
 
     target.sum().backward(retain_graph=True)
@@ -1214,7 +871,7 @@ def test_trainer_rank_retained_backward_keeps_slot_graph_guard() -> None:
 
 def test_trainer_rank_tracks_each_independent_output_graph() -> None:
     trainer = TrainerRank(_runtime())
-    ref = _slot_ref("teacher")
+    ref = _slot_ref("checkpoint", "teacher")
     first, second = _tracked_targets(trainer, ref, 2, 3)
 
     first.sum().backward()
@@ -1227,7 +884,7 @@ def test_trainer_rank_tracks_each_independent_output_graph() -> None:
 
 def test_trainer_rank_tracks_graph_after_output_is_replaced_by_loss() -> None:
     trainer = TrainerRank(_runtime())
-    ref = _slot_ref("teacher")
+    ref = _slot_ref("checkpoint", "teacher")
     target = _tracked_targets(trainer, ref, 2)[0]
     loss = target.sum()
     del target
@@ -1242,7 +899,7 @@ def test_trainer_rank_tracks_graph_after_output_is_replaced_by_loss() -> None:
 
 def test_trainer_rank_releases_abandoned_output_graph() -> None:
     trainer = TrainerRank(_runtime())
-    ref = _slot_ref("teacher")
+    ref = _slot_ref("checkpoint", "teacher")
     target = _tracked_targets(trainer, ref, 2)[0]
     del target
     gc.collect()
@@ -1445,7 +1102,6 @@ def test_forward_micro_batches_rejects_mismatched_replicated_counts(
     monkeypatch.setattr(trainer_rank.dist, "is_available", lambda: True)
     monkeypatch.setattr(trainer_rank.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(trainer_rank.dist, "get_world_size", lambda: 2)
-    monkeypatch.setattr(trainer_rank.dist, "all_reduce", lambda *_args, **_kwargs: None)
 
     def gather(output, value):
         output[:] = [value, value + 1]

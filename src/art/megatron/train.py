@@ -49,10 +49,6 @@ from art.megatron.model_support.lora_disk import (
     load_adapter_config,
     load_lora_tensors_for_megatron,
 )
-from art.megatron.model_support.spec import (
-    ModelSupportHandler,
-    ModelSupportSpec,
-)
 from art.megatron.optimizer_state import (
     commit_optimizer_generation,
     optimizer_generation_files,
@@ -185,23 +181,15 @@ class TrainingRuntime(BaseModel):
         return value
 
     @property
-    def model_identifier(self) -> str:
-        return self.provider_bundle.model_identifier
-
-    @property
-    def model_revision(self) -> str | None:
-        return self.provider_bundle.model_revision
-
-    @property
     def bridge(self) -> Any:
         return self.provider_bundle.bridge
 
     @property
-    def model_support_handler(self) -> ModelSupportHandler:
+    def model_support_handler(self) -> Any:
         return self.provider_bundle.handler
 
     @property
-    def model_support_spec(self) -> ModelSupportSpec:
+    def model_support_spec(self) -> Any:
         return self.provider_bundle.spec
 
 
@@ -378,7 +366,6 @@ def _enable_native_moe_routing_replay(provider: Any) -> None:
 def build_training_runtime(
     *,
     model_identifier: str | None = None,
-    model_revision: str | None = None,
     provider_torch_dtype: torch.dtype = torch.bfloat16,
     provider_bundle_configure: Callable[[ProviderBundle], None] | None = None,
     provider_configure: Callable[[Any], None] | None = None,
@@ -401,7 +388,6 @@ def build_training_runtime(
     provider_bundle = prepare_provider_bundle(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
-        model_revision=model_revision,
         torch_dtype=provider_torch_dtype,
         allow_unvalidated_arch=(
             os.environ.get("ART_MEGATRON_ALLOW_UNVALIDATED_ARCH", "").strip().lower()
@@ -1014,7 +1000,7 @@ def _load_adapter_into_model(
     lora_path: str,
     rank: int,
     *,
-    handler: ModelSupportHandler | None = None,
+    handler: Any | None = None,
     optimizer: Any | None = None,
 ) -> dict[str, torch.Tensor]:
     print0(rank, "Loading adapter model from", lora_path)
@@ -1292,7 +1278,7 @@ def load_adapter_into_model(
     adapter_model: dict[str, torch.Tensor],
     optimizer: Any | None = None,
     *,
-    model_support_handler: ModelSupportHandler | None = None,
+    model_support_handler: Any | None = None,
 ) -> None:
     with torch.no_grad():
         for chunk in model_chunks:
@@ -1320,7 +1306,7 @@ def _optimizer_step(
     optimizer: Any,
     learning_rate: float,
     *,
-    model_support_handler: ModelSupportHandler | None = None,
+    model_support_handler: Any | None = None,
     model_chunks: ModelChunks | None = None,
 ) -> tuple[bool, float, int | None]:
     for param_group in optimizer.param_groups:
@@ -1506,7 +1492,7 @@ def _select_next_ref_logprobs(
 def _forward_prepared_rl_micro(
     *,
     model_chunks: ModelChunks,
-    model_support_handler: ModelSupportHandler,
+    model_support_handler: Any,
     prepared_micro: PreparedRLMicroInputs,
     device: torch.device,
 ) -> torch.Tensor:
@@ -1575,7 +1561,7 @@ def _calculate_megatron_logprobs(
     *,
     model_chunks: ModelChunks,
     provider: Any,
-    model_support_handler: ModelSupportHandler,
+    model_support_handler: Any,
     inputs: PackedTensors,
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     step_index: int | None = None,
@@ -1780,7 +1766,7 @@ def run_megatron_sft_step(
     *,
     model_chunks: ModelChunks,
     provider: Any,
-    model_support_handler: ModelSupportHandler,
+    model_support_handler: Any,
     optimizer: Any,
     learning_rate: float,
     inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
@@ -1924,7 +1910,7 @@ def run_training_step(
     *,
     model_chunks: ModelChunks,
     provider: Any,
-    model_support_handler: ModelSupportHandler,
+    model_support_handler: Any,
     optimizer: Any,
     learning_rate: float,
     inputs: PackedTensors | list[PackedTensors],

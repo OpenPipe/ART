@@ -21,7 +21,6 @@ from art.trainer_rank import (
     Unset,
 )
 from art.trainer_rank._impl import (
-    _CheckpointSlot,
     _flatten,
     _MemoryCheck,
     _MemoryProfile,
@@ -69,6 +68,7 @@ def _target_request(
     logits: bool = False,
     hidden_states: bool = False,
     checkpoint: AdapterSelection = Unset,
+    lora: AdapterSelection = Unset,
 ) -> ForwardInput:
     labels = (
         tokens
@@ -85,6 +85,7 @@ def _target_request(
         logits=logits,
         hidden_states=hidden_states,
         checkpoint=checkpoint,
+        lora=lora,
     )
 
 
@@ -441,15 +442,13 @@ def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     monkeypatch.setattr(
         TrainerRank,
         "_slot_ref",
-        staticmethod(lambda name: name),
+        staticmethod(lambda kind, name: (kind, name)),
     )
-    rank._default_slot_ref = rank._slot_ref("student")
-    for name in ("student", "teacher", "critic"):
-        rank._checkpoint_slots.setdefault(name, _CheckpointSlot()).params = ()
+    rank.set_checkpoint("student")
     requests = [
         _target_request(_tokens(1, 2, 3), top_k=3),
         _target_request(_tokens(1, 2, 4), checkpoint=None, logits=True),
-        _target_request(_tokens(1, 2, 5), checkpoint="teacher", hidden_states=True),
+        _target_request(_tokens(1, 2, 5), lora="teacher", hidden_states=True),
         _target_request(_tokens(1, 2, 6), checkpoint="critic", target_count=4),
     ]
 
@@ -463,10 +462,10 @@ def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     assert signature == plan.signature
     assert plan.signature.slot_group_count == 4
     assert {group.slot_ref for group in plan.groups} == {
-        "student",
-        None,
-        "teacher",
-        "critic",
+        ("checkpoint", "student"),
+        ("checkpoint", None),
+        ("lora", "teacher"),
+        ("checkpoint", "critic"),
     }
 
 

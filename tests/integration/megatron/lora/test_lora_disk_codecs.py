@@ -1,6 +1,3 @@
-import asyncio
-from collections import deque
-from collections.abc import Sequence
 import importlib.util
 import json
 import os
@@ -8,62 +5,39 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import threading
-import time
 from types import SimpleNamespace
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import pytest
 from safetensors.torch import load_file, save_file
 import torch
-import torch.multiprocessing as mp
-from torch.multiprocessing.spawn import ProcessRaisedException
 
 pytest.importorskip("megatron.bridge.models.gpt_provider")
 
 from art.megatron import lora as lora_module
-from art.megatron.lora import (
-    LoRA,
-    LoRAParallelSpec,
-    LoraShardManifest,
-    LoRASlotRef,
-)
+from art.megatron.lora import LoRA, LoRAParallelSpec, LoRAPublishPlanner, LoRASlotRef
 from art.megatron.model_support.handlers import (
     DEFAULT_DENSE_HANDLER,
     GPT_OSS_MOE_HANDLER,
     QWEN3_5_MOE_HANDLER,
     QWEN3_MOE_HANDLER,
 )
-from art.megatron.model_support.handlers import qwen3_5 as qwen35_module
 from art.megatron.model_support.handlers.dsv4 import DSV4_HANDLER
 from art.megatron.model_support.handlers.gemma4 import GEMMA4_MOE_HANDLER
 from art.megatron.model_support.lora_disk import (
     ART_LORA_FORMAT_CONFIG_KEY,
-    ART_LORA_FORMAT_MEGATRON,
     ART_LORA_FORMAT_VLLM,
     load_lora_tensors_for_megatron,
     normalize_lora_checkpoint_to_vllm,
-    save_adapter_config,
     save_vllm_lora_tensors,
 )
-from art.megatron.model_support.spec import ModelSupportHandler
 from art.megatron.weights import lora_publish
 from art.megatron.weights.lora_publish import (
     LoraShardMeta,
     merge_sharded_adapter_entries,
     save_vllm_lora_from_model,
 )
-from art.trainer_rank import AdamParams, TrainerRank, TrainerRankSlotStateError
-from art.trainer_rank._checkpoint import (
-    _PreparedSave,
-    materialize_lora,
-    prepare_checkpoint,
-    validate_checkpoint,
-)
-from art.trainer_rank._checkpoint import (
-    load_checkpoint as load_trainer_checkpoint,
-)
-from art.trainer_rank._impl import _AdapterConfig, _CheckpointSlot
+from art.trainer_rank import TrainerRank
 from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
 REPO_ROOT = Path(__file__).parents[4]
@@ -152,10 +126,6 @@ def _config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
     }
 
 
-def _manifest(**values: object) -> LoraShardManifest:
-    return cast(LoraShardManifest, values)
-
-
 def _qwen35_config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
     config = _config(base_model, rank=rank, alpha=alpha)
     config.update(
@@ -186,10 +156,10 @@ def _save_adapter(path: Path, tensors: dict[str, torch.Tensor], config: dict) ->
 def _old_merge_shard_files_to_vllm(
     lora_path: Path,
     *,
-    handler: ModelSupportHandler,
+    handler,
     adapter_config: dict,
 ) -> None:
-    entries_by_key: dict[str, list[tuple[LoraShardManifest, torch.Tensor]]] = {}
+    entries_by_key: dict[str, list[tuple[dict, torch.Tensor]]] = {}
     shard_paths = sorted(lora_path.glob("adapter_model-*-of-*.safetensors"))
     manifest_paths = sorted(lora_path.glob("adapter_manifest-*-of-*.json"))
     for shard_path in shard_paths:
@@ -202,9 +172,7 @@ def _old_merge_shard_files_to_vllm(
         shard_tensors = load_file(shard_path)
         assert set(shard_tensors) == set(manifest)
         for key, tensor in shard_tensors.items():
-            entries_by_key.setdefault(key, []).append(
-                (cast(LoraShardManifest, manifest[key]), tensor)
-            )
+            entries_by_key.setdefault(key, []).append((manifest[key], tensor))
 
     merged = merge_sharded_adapter_entries(entries_by_key)
     vllm_tensors, adapter_config = handler.to_vllm_lora_tensors(
@@ -767,61 +735,6 @@ def test_qwen3_target_parameter_identity_normalizes_to_per_expert_vllm_layout(
     ]
 
 
-def test_qwen35_config_lookup_uses_checkpoint_revision(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import transformers
-
-    calls: list[tuple[str, dict[str, object]]] = []
-
-    def from_pretrained(base_model: str, **kwargs: object) -> object:
-        calls.append((base_model, kwargs))
-        return SimpleNamespace(
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=3,
-        )
-
-    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", from_pretrained)
-    qwen35_module._qwen35_text_config.cache_clear()
-    try:
-        assert qwen35_module._qwen35_attention_dims(
-            {"base_model_name_or_path": "Qwen/test", "revision": "abc123"}
-        ) == (4, 2, 3)
-    finally:
-        qwen35_module._qwen35_text_config.cache_clear()
-    assert calls == [
-        (
-            "Qwen/test",
-            {
-                "revision": "abc123",
-                "local_files_only": True,
-                "trust_remote_code": True,
-            },
-        )
-    ]
-
-
-def test_qwen35_config_lookup_fills_partial_attention_dimensions(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        qwen35_module,
-        "_qwen35_text_config",
-        lambda *_args: SimpleNamespace(
-            num_attention_heads=64,
-            num_key_value_heads=8,
-            head_dim=128,
-        ),
-    )
-    assert qwen35_module._qwen35_attention_dims(
-        {
-            "base_model_name_or_path": "Qwen/test",
-            "num_attention_heads": 64,
-        }
-    ) == (64, 8, 128)
-
-
 def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
     art_prefix = "base_model.model.model.layers.0"
     original = _qwen35_moe_art_tensors(art_prefix)
@@ -1272,17 +1185,17 @@ def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(
         + 30,
     }
 
-    def unsharded() -> LoraShardManifest:
-        return _manifest(sharded=False, shard_world_size=1, shard_rank=0)
+    def unsharded() -> dict:
+        return {"sharded": False, "shard_world_size": 1, "shard_rank": 0}
 
-    def sharded(rank_id: int, dim: int) -> LoraShardManifest:
-        return _manifest(
-            sharded=True,
-            shard_world_size=2,
-            shard_rank=rank_id,
-            export_shard_dim=dim,
-            export_shard_strategy="uniform",
-        )
+    def sharded(rank_id: int, dim: int) -> dict:
+        return {
+            "sharded": True,
+            "shard_world_size": 2,
+            "shard_rank": rank_id,
+            "export_shard_dim": dim,
+            "export_shard_strategy": "uniform",
+        }
 
     shard0 = {
         f"{prefix}.gate_up_proj.lora_A.weight": full[
@@ -1357,7 +1270,7 @@ def test_lora_publish_keeps_same_key_shards_separate():
             owner_rank=0,
             shape=tuple(shard0.shape),
             dtype_name="float32",
-            manifest=_manifest(**manifest, shard_rank=0),
+            manifest={**manifest, "shard_rank": 0},
             block="base_model.model.model.layers.0",
         ),
         LoraShardMeta(
@@ -1365,7 +1278,7 @@ def test_lora_publish_keeps_same_key_shards_separate():
             owner_rank=1,
             shape=tuple(shard1.shape),
             dtype_name="float32",
-            manifest=_manifest(**manifest, shard_rank=1),
+            manifest={**manifest, "shard_rank": 1},
             block="base_model.model.model.layers.0",
         ),
     ]
@@ -1380,6 +1293,102 @@ def test_lora_publish_keeps_same_key_shards_separate():
     merged = merge_sharded_adapter_entries(entries)
 
     assert torch.equal(merged[key], torch.tensor([[1.0], [2.0], [3.0], [4.0]]))
+
+
+def test_lora_publish_planner_derives_metadata_from_lora_modules():
+    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+    b_parallel_spec = LoRAParallelSpec(sharded=True, shard_dim=-1)
+    lora = LoRA(
+        adapter_model_prefix=prefix,
+        in_features=4,
+        out_features=6,
+        rank=2,
+        alpha=4,
+        dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        b_parallel_spec=b_parallel_spec,
+    )
+    adapter_dtypes = {
+        f"{prefix}.lora_A.weight": torch.float32,
+        f"{prefix}.lora_B.weight": torch.float32,
+    }
+
+    metadata = LoRAPublishPlanner([torch.nn.Sequential(lora)]).global_metadata(
+        adapter_dtypes
+    )
+    by_key = {meta.key: meta for meta in metadata}
+
+    a_meta = by_key[f"{prefix}.lora_A.weight"]
+    assert a_meta.shape == (2, 4)
+    assert a_meta.dtype_name == "float32"
+    assert a_meta.owner_rank == 0
+    assert a_meta.manifest == {
+        "sharded": False,
+        "shard_world_size": 1,
+        "shard_rank": 0,
+    }
+    assert a_meta.block == "base_model.model.model.layers.0"
+
+    b_meta = by_key[f"{prefix}.lora_B.weight"]
+    assert b_meta.shape == (6, 2)
+    assert b_meta.dtype_name == "float32"
+    assert b_meta.owner_rank == 0
+    assert b_meta.manifest == {
+        "sharded": True,
+        "shard_world_size": 1,
+        "shard_rank": 0,
+        "export_shard_dim": 0,
+        "export_shard_strategy": "uniform",
+    }
+
+
+def test_lora_publish_planner_maps_expert_owner_ranks(monkeypatch):
+    monkeypatch.setattr(lora_module, "_distributed_initialized", lambda: True)
+    monkeypatch.setattr(
+        lora_module,
+        "_get_shard_world_size",
+        lambda domain: 2 if domain == "expert_tp" else 1,
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_model_parallel_world_size",
+        lambda: 4,
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_tensor_and_model_parallel_group",
+        lambda check_initialized=False: "joint",
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_model_parallel_group",
+        lambda: "ep",
+    )
+    monkeypatch.setattr(
+        lora_module.ps,
+        "get_expert_tensor_parallel_group",
+        lambda check_initialized=False: "etp",
+    )
+
+    row_major = {"joint": (0, 1, 2, 3, 4, 5, 6, 7), "ep": (0, 2, 4, 6), "etp": (0, 1)}
+    monkeypatch.setattr(
+        lora_module,
+        "_process_group_ranks",
+        lambda group: row_major[group],
+    )
+    assert LoRAPublishPlanner._expert_owner_rank(ep_rank=3, shard_rank=1) == 7
+
+    column_major = {
+        "joint": (0, 1, 2, 3, 4, 5, 6, 7),
+        "ep": (0, 1, 2, 3),
+        "etp": (0, 4),
+    }
+    monkeypatch.setattr(
+        lora_module,
+        "_process_group_ranks",
+        lambda group: column_major[group],
+    )
+    assert LoRAPublishPlanner._expert_owner_rank(ep_rank=3, shard_rank=1) == 7
 
 
 def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
@@ -1401,7 +1410,7 @@ def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
         uniform_key: full_uniform[2:],
         componentwise_key: torch.tensor([[10.0], [11.0], [12.0], [13.0]]),
     }
-    unsharded_manifest = _manifest(sharded=False, shard_world_size=1, shard_rank=0)
+    unsharded_manifest = {"sharded": False, "shard_world_size": 1, "shard_rank": 0}
     uniform_manifest = {
         "sharded": True,
         "shard_world_size": 2,
@@ -1417,12 +1426,12 @@ def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
     }
     manifest0 = {
         unsharded_key: unsharded_manifest,
-        uniform_key: _manifest(**uniform_manifest, shard_rank=0),
-        componentwise_key: _manifest(**componentwise_manifest, shard_rank=0),
+        uniform_key: {**uniform_manifest, "shard_rank": 0},
+        componentwise_key: {**componentwise_manifest, "shard_rank": 0},
     }
     manifest1 = {
-        uniform_key: _manifest(**uniform_manifest, shard_rank=1),
-        componentwise_key: _manifest(**componentwise_manifest, shard_rank=1),
+        uniform_key: {**uniform_manifest, "shard_rank": 1},
+        componentwise_key: {**componentwise_manifest, "shard_rank": 1},
     }
 
     class IdentityHandler:
@@ -1444,7 +1453,7 @@ def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
     handler = IdentityHandler()
     _old_merge_shard_files_to_vllm(
         old_dir,
-        handler=cast(ModelSupportHandler, handler),
+        handler=handler,
         adapter_config=adapter_config,
     )
 
@@ -1469,16 +1478,16 @@ def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
         )
         for key, tensor in shard1.items()
     ]
-    current_tensors, current_config = lora_publish._rank0_vllm_lora_tensors(
+    lora_publish._save_rank0_vllm_lora(
         metadata=metadata,
         tensors_by_owner_key={
             **{(0, key): tensor for key, tensor in shard0.items()},
             **{(1, key): tensor for key, tensor in shard1.items()},
         },
-        handler=cast(ModelSupportHandler, handler),
+        handler=handler,
         adapter_config=adapter_config,
+        output_dir=str(current_dir),
     )
-    save_vllm_lora_tensors(current_dir, current_tensors, current_config)
 
     old_tensors = load_file(old_dir / "adapter_model.safetensors")
     current_tensors = load_file(current_dir / "adapter_model.safetensors")
@@ -1491,45 +1500,6 @@ def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
     assert json.loads((current_dir / "adapter_config.json").read_text()) == json.loads(
         (old_dir / "adapter_config.json").read_text()
     )
-
-
-def test_vllm_lora_merge_failure_crosses_collective_barrier(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    local = SimpleNamespace(
-        metadata=(),
-        tensors={},
-        packed_metadata=(),
-        packed_tensors={},
-        device=torch.device("cpu"),
-    )
-    monkeypatch.setattr(lora_publish, "_prepare_local_lora_export", lambda **_kw: local)
-    monkeypatch.setattr(lora_publish, "_exchange_tensors", lambda *_a, **_kw: {})
-
-    def fail_merge(**_kwargs: object) -> None:
-        raise ValueError("injected merge failure")
-
-    monkeypatch.setattr(lora_publish, "_rank0_vllm_lora_tensors", fail_merge)
-    barriers: list[tuple[BaseException | None, str]] = []
-
-    def barrier(error: BaseException | None, phase: str) -> None:
-        barriers.append((error, phase))
-        if error is not None:
-            raise error
-
-    monkeypatch.setattr(lora_publish, "_raise_rank_errors", barrier)
-    with pytest.raises(ValueError, match="injected merge failure"):
-        lora_publish.build_vllm_lora_tensors_from_model(
-            model=cast(Any, []),
-            adapter_dtypes={},
-            handler=cast(ModelSupportHandler, SimpleNamespace()),
-            adapter_config=_config("Qwen/Qwen3-8B"),
-            rank=0,
-            world_size=1,
-        )
-    assert len(barriers) == 1
-    assert isinstance(barriers[0][0], ValueError)
-    assert barriers[0][1] == "merge vLLM LoRA tensors"
 
 
 def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path):
@@ -1611,16 +1581,14 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
     )
     trainer._slot_stack = []
     trainer._pending_slot_graphs = {}
-    trainer._checkpoint_slots = {}
+    trainer._dynamic_optimizers = {}
+    trainer._checkpoint_slot_params_by_name = {}
+    trainer._checkpoint_slot_adapter_configs = {}
     config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
-    assert trainer._load_checkpoint_slot("student", adapter, alpha=2) == 1
-    trainer._checkpoint_slots["student"] = _CheckpointSlot(
-        tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
-        cast(_AdapterConfig, config),
-    )
+    assert trainer.load_checkpoint_slot("student", adapter, adapter_config=config) == 1
     output_dir = tmp_path / "checkpoint"
 
-    assert trainer.export_lora(str(output_dir), "student") == 0
+    trainer.save_checkpoint_slot_lora("student", str(output_dir))
 
     _assert_tensors_equal(load_file(output_dir / "adapter_model.safetensors"), adapter)
     assert json.loads((output_dir / "adapter_config.json").read_text()) == {
@@ -1629,2104 +1597,6 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
     }
     assert torch.equal(lora.A_T, baseline[0])
     assert torch.equal(lora.B_T, baseline[1])
-    with pytest.raises(RuntimeError, match="canonical optimizer state"):
-        validate_checkpoint(output_dir, require_optimizer=True)
-
-
-def test_model_lora_disk_export_streams_one_layer_block_at_a_time(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    prefixes = [
-        f"base_model.model.model.layers.{index}.self_attn.q_proj" for index in range(2)
-    ]
-    loras = [
-        LoRA(prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-        for prefix in prefixes
-    ]
-    expected: dict[str, torch.Tensor] = {}
-    for index, lora in enumerate(loras):
-        lora.A_T.data.fill_(index + 1)
-        lora.B_T.data.fill_(index + 2)
-        expected.update(lora.sharded_lora_state_dict())
-
-    exchanged_blocks: list[set[str]] = []
-    original_exchange = lora_publish._exchange_tensors
-
-    def record_exchange(metadata, **kwargs):
-        if metadata:
-            exchanged_blocks.append({meta.block for meta in metadata})
-        return original_exchange(metadata, **kwargs)
-
-    monkeypatch.setattr(lora_publish, "_exchange_tensors", record_exchange)
-    save_vllm_lora_from_model(
-        model=cast(Any, [torch.nn.Sequential(*loras)]),
-        adapter_dtypes={},
-        handler=DEFAULT_DENSE_HANDLER,
-        adapter_config=_config("Qwen/Qwen3-8B", rank=2, alpha=2),
-        output_dir=str(tmp_path),
-        rank=0,
-        world_size=1,
-    )
-
-    assert exchanged_blocks == [
-        {prefixes[0].rsplit(".", 2)[0]},
-        {prefixes[1].rsplit(".", 2)[0]},
-    ]
-    _assert_tensors_equal(load_file(tmp_path / "adapter_model.safetensors"), expected)
-    assert not list(tmp_path.glob(".adapter_model-*.safetensors"))
-
-
-def test_checkpoint_load_fetches_only_local_pipeline_layer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    local_prefix = "base_model.model.model.layers.0.self_attn.q_proj"
-    remote_prefix = "base_model.model.model.layers.1.self_attn.q_proj"
-    tensors: dict[str, torch.Tensor] = {
-        f"{prefix}.lora_{side}.weight": torch.ones(shape)
-        for prefix in (local_prefix, remote_prefix)
-        for side, shape in (("A", (2, 3)), ("B", (4, 2)))
-    }
-    source = tmp_path / "two-layers"
-    save_vllm_lora_tensors(source, tensors, _config("Qwen/Qwen3-8B", rank=2, alpha=2))
-    prepared = prepare_checkpoint(str(source))
-    trainer = _portable_trainer(
-        LoRA(local_prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-
-    lora_disk = importlib.import_module("art.megatron.model_support.lora_disk")
-    original_safe_open = lora_disk.safe_open
-    fetched: list[str] = []
-
-    class TrackedSafeOpen:
-        def __init__(self, *args, **kwargs) -> None:
-            self._context = original_safe_open(*args, **kwargs)
-            self._file = None
-
-        def __enter__(self):
-            self._file = self._context.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self._context.__exit__(*args)
-
-        def get_tensor(self, key: str) -> torch.Tensor:
-            fetched.append(key)
-            assert self._file is not None
-            return self._file.get_tensor(key)
-
-    monkeypatch.setattr(lora_disk, "safe_open", TrackedSafeOpen)
-    load_trainer_checkpoint(trainer, prepared, "student")
-
-    assert set(fetched) == {
-        f"{local_prefix}.lora_A.weight",
-        f"{local_prefix}.lora_B.weight",
-    }
-    assert not any(remote_prefix in key for key in fetched)
-
-
-def test_native_megatron_lora_load_bypasses_vllm_decoder(tmp_path: Path) -> None:
-    source = tmp_path / "native"
-    source.mkdir()
-    save_file(_PORTABLE_ADAPTER, source / "adapter_model.safetensors")
-    save_adapter_config(
-        source,
-        {
-            **_PORTABLE_CONFIG,
-            ART_LORA_FORMAT_CONFIG_KEY: ART_LORA_FORMAT_MEGATRON,
-        },
-    )
-    handler = SimpleNamespace(
-        from_vllm_lora_tensors=lambda *_args, **_kwargs: pytest.fail(
-            "native checkpoint must not be decoded as vLLM"
-        )
-    )
-
-    _assert_tensors_equal(
-        load_lora_tensors_for_megatron(source, handler=cast(Any, handler)),
-        _PORTABLE_ADAPTER,
-    )
-
-
-def test_native_checkpoint_reader_materializes_only_local_shards() -> None:
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    tensor = torch.arange(24, dtype=torch.float32).reshape(12, 2)
-    requests: list[tuple[slice, ...]] = []
-
-    class TrackedSlice:
-        def get_shape(self) -> list[int]:
-            return list(tensor.shape)
-
-        def __getitem__(self, slices: tuple[slice, ...]) -> torch.Tensor:
-            requests.append(slices)
-            return tensor[slices]
-
-    class SliceOnlyFile:
-        def keys(self) -> list[str]:
-            return ["weight"]
-
-        def get_slice(self, key: str) -> TrackedSlice:
-            assert key == "weight"
-            return TrackedSlice()
-
-        def get_tensor(self, key: str) -> torch.Tensor:
-            del key
-            raise AssertionError("full canonical tensors must not be materialized")
-
-    uniform = checkpoint_module._read_local_slice(
-        SliceOnlyFile(),
-        "weight",
-        cast(
-            LoraShardManifest,
-            {
-                "sharded": True,
-                "shard_world_size": 2,
-                "shard_rank": 1,
-                "export_shard_dim": 0,
-                "export_shard_strategy": "uniform",
-            },
-        ),
-        (6, 2),
-    )
-    torch.testing.assert_close(uniform, tensor[6:12])
-    assert requests == [(slice(6, 12), slice(None))]
-
-    requests.clear()
-    componentwise = checkpoint_module._read_local_slice(
-        SliceOnlyFile(),
-        "weight",
-        cast(
-            LoraShardManifest,
-            {
-                "sharded": True,
-                "shard_world_size": 2,
-                "shard_rank": 1,
-                "export_shard_dim": 0,
-                "export_shard_strategy": "componentwise",
-                "component_sizes": (4, 8),
-            },
-        ),
-        (6, 2),
-    )
-    torch.testing.assert_close(componentwise, torch.cat((tensor[2:4], tensor[8:12])))
-    assert requests == [
-        (slice(2, 4), slice(None)),
-        (slice(8, 12), slice(None)),
-    ]
-
-
-_PORTABLE_PREFIX = "base_model.model.model.layers.0.self_attn.q_proj"
-_PORTABLE_CONFIG = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
-_PORTABLE_ADAPTER = {
-    f"{_PORTABLE_PREFIX}.lora_A.weight": torch.arange(6, dtype=torch.float32).reshape(
-        2, 3
-    ),
-    f"{_PORTABLE_PREFIX}.lora_B.weight": torch.arange(8, dtype=torch.float32).reshape(
-        4, 2
-    ),
-}
-
-
-_PIPELINE_PREFIXES = tuple(
-    f"base_model.model.model.layers.{index}.self_attn.q_proj" for index in range(2)
-)
-_PIPELINE_ADAPTER = {
-    f"{prefix}.lora_{side}.weight": tensor + 100 * layer
-    for layer, prefix in enumerate(_PIPELINE_PREFIXES)
-    for side, tensor in (
-        ("A", torch.arange(6, dtype=torch.float32).reshape(2, 3)),
-        ("B", torch.arange(8, dtype=torch.float32).reshape(4, 2)),
-    )
-}
-_MOE_PREFIX = "base_model.model.model.layers.0.mlp.experts.{expert}.gate_up_proj"
-_MOE_CONFIG = _config("Qwen/Qwen3.5-35B-A3B", rank=2, alpha=2)
-_MOE_ADAPTER = {
-    f"{_MOE_PREFIX.format(expert=expert)}.lora_{side}.weight": (tensor + 100 * expert)
-    for expert in range(2)
-    for side, tensor in (
-        ("A", torch.arange(6, dtype=torch.float32).reshape(2, 3)),
-        ("B", torch.arange(16, dtype=torch.float32).reshape(8, 2)),
-    )
-}
-
-
-def _pipeline_loras(*layers: int) -> list[LoRA]:
-    return [
-        LoRA(
-            _PIPELINE_PREFIXES[layer],
-            3,
-            4,
-            2,
-            2,
-            torch.float32,
-            torch.device("cpu"),
-        )
-        for layer in layers
-    ]
-
-
-def _moe_lora(*, num_local_experts: int, expert_tp: bool = False) -> LoRA:
-    a_parallel_spec = LoRAParallelSpec(shard_domain="expert_tp" if expert_tp else "tp")
-    b_parallel_spec = LoRAParallelSpec(
-        shard_domain="expert_tp" if expert_tp else "tp",
-        sharded=expert_tp,
-        shard_dim=-1 if expert_tp else None,
-    )
-    return LoRA(
-        _MOE_PREFIX,
-        3,
-        4 if expert_tp else 8,
-        2,
-        2,
-        torch.float32,
-        torch.device("cpu"),
-        num_local_experts=num_local_experts,
-        a_parallel_spec=a_parallel_spec,
-        b_parallel_spec=b_parallel_spec,
-    )
-
-
-def _portable_trainer(
-    lora: torch.nn.Module,
-    *,
-    rank: int = 0,
-    world_size: int = 1,
-    model_identifier: str = str(_PORTABLE_CONFIG["base_model_name_or_path"]),
-    model_revision: str | None = None,
-    model_names: tuple[str, ...] = (),
-) -> TrainerRank:
-    trainer = TrainerRank.__new__(TrainerRank)
-    trainer.runtime = SimpleNamespace(
-        model=[lora],
-        model_support_handler=DEFAULT_DENSE_HANDLER,
-        rank=rank,
-        world_size=world_size,
-        model_identifier=model_identifier,
-        model_revision=model_revision,
-        model_support_spec=SimpleNamespace(model_names=model_names),
-    )
-    trainer.device = torch.device("cpu")
-    trainer._slot_stack = []
-    trainer._default_slot_ref = None
-    trainer._pending_slot_graphs = {}
-    trainer._checkpoint_slots = {}
-    trainer._checkpoint_prefetches = {}
-    trainer._checkpoint_process_group = None
-    trainer._checkpoint_prepare_lock = threading.Lock()
-    trainer._checkpoint_mutation_tail = None
-    trainer._checkpoint_save_lock = threading.Lock()
-    trainer._checkpoint_finalize_lock = threading.Lock()
-    trainer._checkpoint_preparing_saves = set()
-    trainer._prepared_checkpoint_saves = {}
-    trainer._completed_checkpoint_saves = deque(maxlen=128)
-    return trainer
-
-
-def _install_checkpoint(
-    trainer: TrainerRank,
-    adapter: dict[str, torch.Tensor],
-    config: dict[str, object],
-) -> None:
-    alpha = config["lora_alpha"]
-    assert isinstance(alpha, int | float)
-    assert trainer._load_checkpoint_slot("student", adapter, alpha=float(alpha)) > 0
-    trainer._checkpoint_slots["student"] = _CheckpointSlot(
-        tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
-        cast(_AdapterConfig, config),
-    )
-
-
-def _install_portable_checkpoint(trainer: TrainerRank) -> None:
-    _install_checkpoint(trainer, _PORTABLE_ADAPTER, _PORTABLE_CONFIG)
-
-
-def _step_portable_checkpoint(trainer: TrainerRank, gradient: float) -> None:
-    dynamic = trainer._checkpoint_slots["student"].optimizer
-    assert dynamic is not None
-    for master in dynamic.master_params:
-        master.grad = torch.full_like(master, gradient)
-    dynamic.optimizer.step()
-    dynamic.optimizer.zero_grad(set_to_none=True)
-    with torch.no_grad():
-        for model, master in zip(
-            trainer._checkpoint_slots["student"].params,
-            dynamic.master_params,
-            strict=True,
-        ):
-            model.copy_(master)
-            model.grad = None
-
-
-def _assert_checkpoint_state_equal(expected: TrainerRank, actual: TrainerRank) -> None:
-    expected_params = expected._checkpoint_slots["student"].params
-    actual_params = actual._checkpoint_slots["student"].params
-    for expected_param, actual_param in zip(
-        expected_params, actual_params, strict=True
-    ):
-        torch.testing.assert_close(actual_param, expected_param, atol=0, rtol=0)
-    expected_optimizer = expected._checkpoint_slots["student"].optimizer
-    actual_optimizer = actual._checkpoint_slots["student"].optimizer
-    assert expected_optimizer is not None and actual_optimizer is not None
-    for expected_master, actual_master in zip(
-        expected_optimizer.master_params,
-        actual_optimizer.master_params,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual_master, expected_master, atol=0, rtol=0)
-        for key in ("step", "exp_avg", "exp_avg_sq"):
-            torch.testing.assert_close(
-                actual_optimizer.optimizer.state[actual_master][key],
-                expected_optimizer.optimizer.state[expected_master][key],
-                atol=0,
-                rtol=0,
-            )
-
-
-def _save_before_next_step(trainer: TrainerRank, path: Path) -> None:
-    trainer._checkpoint_slots["student"].optimizer = trainer._new_dynamic_optimizer(
-        "student",
-        AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95, weight_decay=0.1),
-    )
-    _step_portable_checkpoint(trainer, 0.25)
-    trainer.save_checkpoint(str(path), "student")
-    _step_portable_checkpoint(trainer, -0.125)
-
-
-@pytest.mark.parametrize("source_revision", [None, "a" * 40])
-def test_checkpoint_load_pins_runtime_revision(
-    tmp_path: Path, source_revision: str | None
-) -> None:
-    revision = "a" * 40
-    source = tmp_path / "source"
-    config = dict(_PORTABLE_CONFIG)
-    if source_revision is not None:
-        config["revision"] = source_revision
-    save_vllm_lora_tensors(source, _PORTABLE_ADAPTER, config)
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu")),
-        model_revision=revision,
-    )
-
-    load_trainer_checkpoint(trainer, prepare_checkpoint(str(source)), "student")
-
-    config = trainer._checkpoint_slots["student"].config
-    assert config is not None and config["revision"] == revision
-
-
-def test_checkpoint_load_rejects_conflicting_runtime_revision_transactionally(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "source"
-    save_vllm_lora_tensors(
-        source,
-        _PORTABLE_ADAPTER,
-        {**_PORTABLE_CONFIG, "revision": "a" * 40},
-    )
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu")),
-        model_revision="b" * 40,
-    )
-    _install_portable_checkpoint(trainer)
-    previous_params = trainer._checkpoint_slots["student"].params
-    previous_values = tuple(param.detach().clone() for param in previous_params)
-    previous_config = trainer._checkpoint_slots["student"].config
-
-    with pytest.raises(ValueError, match="base-model revision"):
-        load_trainer_checkpoint(trainer, prepare_checkpoint(str(source)), "student")
-
-    restored_params = trainer._checkpoint_slots["student"].params
-    assert tuple(map(id, restored_params)) == tuple(map(id, previous_params))
-    assert trainer._checkpoint_slots["student"].config is previous_config
-    assert trainer._checkpoint_slots["student"].revision == 0
-    for expected, actual in zip(previous_values, restored_params, strict=True):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-
-def test_single_local_expert_uses_global_expert_keys(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 1)
-    monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
-    module = _moe_lora(num_local_experts=1)
-    ref = LoRASlotRef("student")
-    expected = {
-        key: tensor for key, tensor in _MOE_ADAPTER.items() if ".experts.1." in key
-    }
-
-    assert module._expected_weight_keys("lora_A") == [
-        f"{_MOE_PREFIX.format(expert=1)}.lora_A.weight"
-    ]
-    assert module.load_lora_slot(ref, expected, alpha=2)
-    _assert_tensors_equal(module.sharded_lora_state_dict(ref), expected)
-    assert set(module.sharded_lora_manifest(ref)) == set(expected)
-
-
-def test_checkpoint_load_coordinates_rank_local_read_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source = tmp_path / "source"
-    save_vllm_lora_tensors(source, _PORTABLE_ADAPTER, _PORTABLE_CONFIG)
-    prepared = prepare_checkpoint(str(source))
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    monkeypatch.setattr(
-        checkpoint_module,
-        "_load_stage_lora",
-        lambda *_args: (_ for _ in ()).throw(OSError("rank-local read failed")),
-    )
-
-    def coordinated(error: BaseException | None, phase: str) -> None:
-        assert phase == "read checkpoint"
-        assert isinstance(error, OSError)
-        raise RuntimeError("coordinated read failure") from error
-
-    monkeypatch.setattr(checkpoint_module, "_raise_distributed", coordinated)
-    with pytest.raises(RuntimeError, match="coordinated read failure"):
-        load_trainer_checkpoint(trainer, prepared, "student")
-
-
-def test_checkpoint_load_rejects_same_keys_with_different_rank_content(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    paths = [tmp_path / "first", tmp_path / "second"]
-    save_vllm_lora_tensors(paths[0], _PORTABLE_ADAPTER, _PORTABLE_CONFIG)
-    save_vllm_lora_tensors(
-        paths[1],
-        {key: value + 1 for key, value in _PORTABLE_ADAPTER.items()},
-        _PORTABLE_CONFIG,
-    )
-    first, second = (prepare_checkpoint(str(path)) for path in paths)
-    assert first.artifact_keys == second.artifact_keys
-    assert first.digest != second.digest
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    monkeypatch.setattr(
-        checkpoint_module,
-        "_gather_objects",
-        lambda value: (value, second.digest),
-    )
-    monkeypatch.setattr(
-        checkpoint_module,
-        "_load_stage_lora",
-        lambda *_args: pytest.fail("mismatched content must fail before reading"),
-    )
-
-    with pytest.raises(RuntimeError, match="content differs across ranks"):
-        load_trainer_checkpoint(trainer, first, "student")
-
-
-def test_checkpoint_payload_validation_elects_one_rank_per_node(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    monkeypatch.setattr(checkpoint_module, "_distributed", lambda: True)
-    monkeypatch.setattr(checkpoint_module, "_rank", lambda: 7)
-    monkeypatch.delenv("LOCAL_RANK", raising=False)
-    assert checkpoint_module._is_node_validator()
-    monkeypatch.setenv("LOCAL_RANK", "1")
-    assert not checkpoint_module._is_node_validator()
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    assert checkpoint_module._is_node_validator()
-
-
-def test_prepared_checkpoint_pins_a_symlink_target(tmp_path: Path) -> None:
-    first = tmp_path / "first"
-    second = tmp_path / "second"
-    save_vllm_lora_tensors(first, _PORTABLE_ADAPTER, _PORTABLE_CONFIG)
-    save_vllm_lora_tensors(
-        second,
-        {key: tensor + 100 for key, tensor in _PORTABLE_ADAPTER.items()},
-        _PORTABLE_CONFIG,
-    )
-    latest = tmp_path / "latest"
-    latest.symlink_to(first, target_is_directory=True)
-    prepared = prepare_checkpoint(str(latest))
-    latest.unlink()
-    latest.symlink_to(second, target_is_directory=True)
-
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    assert prepared.path == first.resolve()
-    _assert_tensors_equal(
-        checkpoint_module._load_stage_lora(
-            trainer, prepared, int(_PORTABLE_CONFIG["r"])
-        ),
-        _PORTABLE_ADAPTER,
-    )
-
-
-def test_native_checkpoint_rejects_unmapped_optimizer_tensor(
-    tmp_path: Path,
-) -> None:
-    original = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(original)
-    original._checkpoint_slots["student"].optimizer = original._new_dynamic_optimizer(
-        "student", AdamParams(learning_rate=3e-4)
-    )
-    _step_portable_checkpoint(original, 0.25)
-    output = tmp_path / "exact-with-extra"
-    original.save_checkpoint(str(output), "student")
-
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    manifest = validate_checkpoint(output, require_optimizer=True)
-    assert manifest is not None and manifest.optimizer is not None
-    source_key = next(iter(manifest.parameters))
-    extra_key = f"{source_key}.unmapped"
-    adapter = load_file(output / "adapter_model.safetensors")
-    adapter[extra_key] = adapter[source_key].clone()
-    save_file(adapter, output / "adapter_model.safetensors")
-
-    source_record = manifest.parameters[source_key]
-    for file in source_record:
-        tensors = load_file(output / file)
-        tensors[extra_key] = tensors[source_key].clone()
-        save_file(tensors, output / file)
-    parameters = {
-        **manifest.parameters,
-        extra_key: source_record,
-    }
-    unsigned = manifest.model_copy(
-        update={
-            "parameters": parameters,
-            "steps": {**manifest.steps, extra_key: manifest.steps[source_key]},
-            "digest": "",
-        }
-    )
-    checkpoint_module._write_manifest(
-        output,
-        unsigned.model_copy(
-            update={"digest": checkpoint_module._digest(output, unsigned)}
-        ),
-    )
-
-    prepared = prepare_checkpoint(str(output))
-    restored = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    with pytest.raises(RuntimeError, match="coverage differs from the target runtime"):
-        load_trainer_checkpoint(restored, prepared, "student")
-    assert not restored._checkpoint_slots
-
-
-@pytest.mark.parametrize("with_optimizer", [False, True])
-def test_canonical_checkpoint_rejects_different_model_in_same_support_spec(
-    tmp_path: Path,
-    with_optimizer: bool,
-) -> None:
-    original = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(original)
-    if with_optimizer:
-        original._checkpoint_slots[
-            "student"
-        ].optimizer = original._new_dynamic_optimizer(
-            "student", AdamParams(learning_rate=3e-4)
-        )
-    output = tmp_path / f"canonical-model-{with_optimizer}"
-    original.save_checkpoint(str(output), "student")
-
-    restored = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu")),
-        model_identifier="Qwen/Qwen3-8B-Base",
-        model_names=("Qwen/Qwen3-8B", "Qwen/Qwen3-8B-Base"),
-    )
-    with pytest.raises(RuntimeError, match="Exact checkpoint base model"):
-        load_trainer_checkpoint(restored, prepare_checkpoint(str(output)), "student")
-    assert not restored._checkpoint_slots
-
-
-def test_lora_only_checkpoint_rejects_different_model_in_same_support_spec(
-    tmp_path: Path,
-) -> None:
-    source = tmp_path / "lora-only-different-model"
-    save_vllm_lora_tensors(source, _PORTABLE_ADAPTER, _PORTABLE_CONFIG)
-    prepared = prepare_checkpoint(str(source))
-    assert prepared.manifest is None
-
-    restored = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu")),
-        model_identifier="Qwen/Qwen3-8B-Base",
-        model_names=("Qwen/Qwen3-8B", "Qwen/Qwen3-8B-Base"),
-    )
-    with pytest.raises(RuntimeError, match="Checkpoint base model"):
-        load_trainer_checkpoint(restored, prepared, "student")
-    assert not restored._checkpoint_slots
-
-
-def test_checkpoint_prepare_captures_immutable_state_and_finish_is_idempotent(
-    tmp_path: Path,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    trainer._checkpoint_slots["student"].optimizer = trainer._new_dynamic_optimizer(
-        "student",
-        AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95),
-    )
-    _step_portable_checkpoint(trainer, 0.25)
-    expected_params = tuple(
-        value.detach().clone() for value in trainer._checkpoint_slots["student"].params
-    )
-    dynamic = trainer._checkpoint_slots["student"].optimizer
-    expected_masters = tuple(value.detach().clone() for value in dynamic.master_params)
-    expected_states = tuple(
-        {
-            key: value.detach().clone()
-            for key, value in dynamic.optimizer.state[master].items()
-            if isinstance(value, torch.Tensor)
-        }
-        for master in dynamic.master_params
-    )
-
-    output = tmp_path / "immutable"
-    trainer._prepare_checkpoint_save(str(output), "student")
-    with torch.no_grad():
-        for value in trainer._checkpoint_slots["student"].params:
-            value.add_(100)
-        for master in dynamic.master_params:
-            master.add_(200)
-            for value in dynamic.optimizer.state[master].values():
-                if isinstance(value, torch.Tensor):
-                    value.add_(300)
-    trainer._finish_checkpoint_save(str(output))
-    trainer._finish_checkpoint_save(str(output))
-
-    restored = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    load_trainer_checkpoint(
-        restored,
-        prepare_checkpoint(str(output)),
-        "student",
-    )
-    for expected, actual in zip(
-        expected_params,
-        restored._checkpoint_slots["student"].params,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    restored_dynamic = restored._checkpoint_slots["student"].optimizer
-    assert restored_dynamic is not None
-    for expected, expected_state, actual in zip(
-        expected_masters,
-        expected_states,
-        restored_dynamic.master_params,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        for key, value in expected_state.items():
-            torch.testing.assert_close(
-                restored_dynamic.optimizer.state[actual][key],
-                value,
-                atol=0,
-                rtol=0,
-            )
-    assert not list(tmp_path.glob(".immutable.snapshot-*"))
-
-
-def test_checkpoint_completed_save_idempotency_cache_is_bounded(
-    tmp_path: Path,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    trainer._completed_checkpoint_saves = deque(maxlen=2)
-
-    outputs = [tmp_path / f"completed-{index}" for index in range(3)]
-    for output in outputs:
-        trainer.save_checkpoint(str(output), "student")
-
-    assert list(trainer._completed_checkpoint_saves) == [
-        str(outputs[1]),
-        str(outputs[2]),
-    ]
-    trainer._finish_checkpoint_save(str(outputs[1]))
-    with pytest.raises(RuntimeError, match="Checkpoint save was not prepared"):
-        trainer._finish_checkpoint_save(str(outputs[0]))
-
-
-def test_checkpoint_idempotence_rejects_corrupt_existing_payload(
-    tmp_path: Path,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    output = tmp_path / "corrupt-existing"
-    trainer.save_checkpoint(str(output), "student")
-    tensors = load_file(output / "adapter_model.safetensors")
-    key = next(iter(tensors))
-    tensors[key].add_(1)
-    save_file(tensors, output / "adapter_model.safetensors")
-
-    with pytest.raises(RuntimeError, match="Checkpoint digest mismatch"):
-        trainer.save_checkpoint(str(output), "student")
-
-    with pytest.raises(RuntimeError, match="Checkpoint digest mismatch"):
-        validate_checkpoint(output)
-    assert not list(tmp_path.glob(".corrupt-existing.snapshot-*"))
-    assert not list(tmp_path.glob(".corrupt-existing.tmp-*"))
-
-
-def test_checkpoint_prepare_reserves_destination(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    original_save_file = checkpoint_module._save_file
-    entered = threading.Event()
-    release = threading.Event()
-    first = True
-
-    def pause_first_save(tensors: dict[str, torch.Tensor], path: Path) -> None:
-        nonlocal first
-        if first:
-            first = False
-            entered.set()
-            assert release.wait(10)
-        original_save_file(tensors, path)
-
-    monkeypatch.setattr(checkpoint_module, "_save_file", pause_first_save)
-    output = tmp_path / "reserved"
-    errors: list[BaseException] = []
-
-    def prepare() -> None:
-        try:
-            trainer._prepare_checkpoint_save(str(output), "student")
-        except BaseException as exc:
-            errors.append(exc)
-
-    first_thread = threading.Thread(target=prepare)
-    second_thread = threading.Thread(target=prepare)
-    first_thread.start()
-    assert entered.wait(10)
-    second_thread.start()
-    release.set()
-    first_thread.join(10)
-    second_thread.join(10)
-    assert not first_thread.is_alive() and not second_thread.is_alive()
-    assert len(errors) == 1
-    assert "already pending" in str(errors[0])
-    trainer._abort_checkpoint_save(str(output))
-    assert not list(tmp_path.glob(".reserved.snapshot-*"))
-
-
-def test_checkpoint_prepare_validates_distributed_identity_before_snapshot(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    checkpoint_group = cast(torch.distributed.ProcessGroup, object())
-    monkeypatch.setattr(
-        checkpoint_module, "_ensure_checkpoint_group", lambda _: checkpoint_group
-    )
-
-    def gather(
-        value: object, *, group: torch.distributed.ProcessGroup | None = None
-    ) -> tuple[object, ...]:
-        assert group is checkpoint_group
-        if isinstance(value, tuple) and len(value) == 3:
-            return (value, (str(tmp_path / "other"), value[1], value[2]))
-        return (value,)
-
-    monkeypatch.setattr(checkpoint_module, "_gather_objects", gather)
-    with pytest.raises(RuntimeError, match="identity differs across ranks"):
-        trainer._prepare_checkpoint_save(str(tmp_path / "identity"), "student")
-    assert not list(tmp_path.glob(".*.snapshot-*"))
-
-
-def test_checkpoint_prepare_invalid_destination_does_not_reserve() -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-
-    with pytest.raises(ValueError):
-        trainer._prepare_checkpoint_save("/", "student")
-    assert not trainer._checkpoint_preparing_saves
-    assert not trainer._prepared_checkpoint_saves
-
-
-def test_duplicate_checkpoint_finish_and_abort_wait_for_owner(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    output = tmp_path / "finish-owner"
-    trainer._prepare_checkpoint_save(str(output), "student")
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    original_finish = checkpoint_module._finish_prepared_save
-    entered = threading.Event()
-    release = threading.Event()
-    calls = 0
-
-    def pause_finish(trainer_rank: TrainerRank, prepared: _PreparedSave) -> None:
-        nonlocal calls
-        calls += 1
-        entered.set()
-        assert release.wait(10)
-        original_finish(trainer_rank, prepared)
-
-    monkeypatch.setattr(checkpoint_module, "_finish_prepared_save", pause_finish)
-    errors: list[BaseException] = []
-
-    def finish() -> None:
-        try:
-            trainer._finish_checkpoint_save(str(output))
-        except BaseException as exc:
-            errors.append(exc)
-
-    first = threading.Thread(target=finish)
-    duplicate = threading.Thread(target=finish)
-    abort = threading.Thread(
-        target=trainer._abort_checkpoint_save,
-        args=(str(output),),
-    )
-    first.start()
-    assert entered.wait(10)
-    duplicate.start()
-    abort.start()
-    assert duplicate.is_alive() and abort.is_alive()
-    release.set()
-    for thread in (first, duplicate, abort):
-        thread.join(10)
-        assert not thread.is_alive()
-    assert not errors
-    assert calls == 1
-    assert output.is_dir()
-
-
-def test_checkpoint_finish_barrier_precedes_next_fifo_entry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    first, second = tmp_path / "barrier-first", tmp_path / "barrier-second"
-    trainer._prepare_checkpoint_save(str(first), "student")
-    trainer._prepare_checkpoint_save(str(second), "student")
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    original_finish = checkpoint_module._finish_prepared_save
-    original_raise = checkpoint_module._raise_distributed
-    original_gather = checkpoint_module._gather_objects
-    order: list[str] = []
-    admissions = 0
-    barrier_entered = threading.Event()
-    release = threading.Event()
-
-    def record_finish(trainer_rank: TrainerRank, prepared: _PreparedSave) -> None:
-        order.append(prepared.destination.name)
-        original_finish(trainer_rank, prepared)
-
-    def pause_first_barrier(
-        error: BaseException | None,
-        phase: str,
-        *,
-        group: torch.distributed.ProcessGroup | None = None,
-    ) -> None:
-        if not barrier_entered.is_set():
-            barrier_entered.set()
-            assert release.wait(10)
-        original_raise(error, phase, group=group)
-
-    def record_admission(
-        value: object, *, group: torch.distributed.ProcessGroup | None = None
-    ) -> tuple[object, ...]:
-        nonlocal admissions
-        if isinstance(value, tuple) and len(value) == 3:
-            admissions += 1
-        return original_gather(value, group=group)
-
-    monkeypatch.setattr(checkpoint_module, "_finish_prepared_save", record_finish)
-    monkeypatch.setattr(checkpoint_module, "_raise_distributed", pause_first_barrier)
-    monkeypatch.setattr(checkpoint_module, "_gather_objects", record_admission)
-    first_thread = threading.Thread(
-        target=trainer._finish_checkpoint_save, args=(str(first),)
-    )
-    second_thread = threading.Thread(
-        target=trainer._finish_checkpoint_save, args=(str(second),)
-    )
-    first_thread.start()
-    assert barrier_entered.wait(10)
-    second_thread.start()
-    assert order == ["barrier-first"]
-    assert admissions == 1
-    release.set()
-    first_thread.join(10)
-    second_thread.join(10)
-    assert not first_thread.is_alive() and not second_thread.is_alive()
-    assert order == ["barrier-first", "barrier-second"]
-    assert admissions == 2
-
-
-def test_checkpoint_prepare_failure_does_not_advance_or_wedge_fifo(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    original_save_file = checkpoint_module._save_file
-
-    def fail_snapshot(*_args: object) -> None:
-        raise OSError("injected checkpoint snapshot failure")
-
-    monkeypatch.setattr(checkpoint_module, "_save_file", fail_snapshot)
-    failed = tmp_path / "prepare-failure"
-    with pytest.raises(OSError, match="injected checkpoint snapshot failure"):
-        trainer._prepare_checkpoint_save(str(failed), "student")
-    assert not trainer._prepared_checkpoint_saves
-    assert not list(tmp_path.glob(".prepare-failure.snapshot-*"))
-
-    monkeypatch.setattr(checkpoint_module, "_save_file", original_save_file)
-    recovered = tmp_path / "prepare-recovered"
-    trainer.save_checkpoint(str(recovered), "student")
-    assert recovered.is_dir()
-
-
-def test_checkpoint_finalizer_failure_cleans_and_can_retry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    output = tmp_path / "retry"
-    trainer._prepare_checkpoint_save(str(output), "student")
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    original_finish = checkpoint_module._finish_prepared_save
-
-    def fail_finish(*_args: object) -> None:
-        raise OSError("injected checkpoint finalization failure")
-
-    monkeypatch.setattr(checkpoint_module, "_finish_prepared_save", fail_finish)
-    with pytest.raises(OSError, match="injected checkpoint finalization failure"):
-        trainer._finish_checkpoint_save(str(output))
-    assert not output.exists()
-    assert not list(tmp_path.glob(".retry.snapshot-*"))
-
-    monkeypatch.setattr(checkpoint_module, "_finish_prepared_save", original_finish)
-    trainer._prepare_checkpoint_save(str(output), "student")
-    trainer._finish_checkpoint_save(str(output))
-    assert output.is_dir()
-    assert not list(tmp_path.glob(".retry.snapshot-*"))
-
-
-def test_checkpoint_snapshot_cleanup_failure_is_idempotently_retryable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    output = tmp_path / "cleanup-retry"
-    trainer._prepare_checkpoint_save(str(output), "student")
-    snapshot = trainer._prepared_checkpoint_saves[str(output)].snapshot
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    original_rmtree = checkpoint_module.shutil.rmtree
-    failed = False
-
-    def fail_snapshot_once(path: Path, ignore_errors: bool = False) -> None:
-        nonlocal failed
-        if Path(path) == snapshot and not failed:
-            failed = True
-            raise OSError("injected snapshot cleanup failure")
-        original_rmtree(path, ignore_errors=ignore_errors)
-
-    monkeypatch.setattr(checkpoint_module.shutil, "rmtree", fail_snapshot_once)
-    with pytest.raises(OSError, match="injected snapshot cleanup failure"):
-        trainer._finish_checkpoint_save(str(output))
-    assert output.is_dir()
-    trainer._finish_checkpoint_save(str(output))
-    original_rmtree(snapshot)
-
-
-def test_trainer_rank_checkpoint_roundtrip_preserves_next_adam_step(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-
-    original = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(original)
-    original._checkpoint_slots["student"].optimizer = original._new_dynamic_optimizer(
-        "student",
-        AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95, weight_decay=0.1),
-    )
-    unstepped_output = tmp_path / "unstepped"
-    original.save_checkpoint(str(unstepped_output), "student")
-    unstepped = prepare_checkpoint(str(unstepped_output))
-    assert unstepped.manifest is not None
-    assert set(unstepped.manifest.steps.values()) == {0.0}
-    _step_portable_checkpoint(original, 0.25)
-    original_optimizer = original._checkpoint_slots["student"].optimizer
-    for step, master in enumerate(original_optimizer.master_params, start=2):
-        original_optimizer.optimizer.state[master]["step"].fill_(step)
-    output = tmp_path / "exact"
-
-    original.save_checkpoint(str(output), "student")
-    original.save_checkpoint(str(output), "student")
-    manifest = validate_checkpoint(output, require_optimizer=True)
-    assert manifest is not None and manifest.optimizer is not None
-    assert set(manifest.steps.values()) == {2.0, 3.0}
-    checkpoint_module = importlib.import_module("art.trainer_rank._checkpoint")
-    parameter_key, parameter = next(iter(manifest.parameters.items()))
-    for invalid_path in (
-        "",
-        ".",
-        "../escape.safetensors",
-        "/tmp/escape.safetensors",
-        "optimizer/../escape.safetensors",
-        "optimizer\\escape.safetensors",
-        "C:/escape.safetensors",
-        "optimizer//escape.safetensors",
-        "./optimizer/escape.safetensors",
-    ):
-        invalid_parameter = (invalid_path, *parameter[1:])
-        invalid_manifest = manifest.model_copy(
-            update={
-                "parameters": {
-                    **manifest.parameters,
-                    parameter_key: invalid_parameter,
-                }
-            }
-        )
-        with pytest.raises(RuntimeError, match="Unsafe checkpoint tensor path"):
-            checkpoint_module._validate_manifest(
-                invalid_manifest, tuple(manifest.parameters)
-            )
-    source_adapter = (output / "adapter_model.safetensors").read_bytes()
-    source_config = (output / "adapter_config.json").read_bytes()
-    assert json.loads(source_config)[ART_LORA_FORMAT_CONFIG_KEY] == (
-        ART_LORA_FORMAT_MEGATRON
-    )
-    _assert_tensors_equal(
-        load_lora_tensors_for_megatron(output),
-        load_file(output / "adapter_model.safetensors"),
-    )
-    assert len(list((output / "optimizer").glob("*.safetensors"))) == 3
-    malformed = tmp_path / "malformed"
-    shutil.copytree(output, malformed)
-    first_key, first_files = next(iter(manifest.parameters.items()))
-    first_file = malformed / first_files[0]
-    tensors = load_file(first_file)
-    del tensors[first_key]
-    save_file(tensors, first_file)
-    with pytest.raises(RuntimeError, match="tensor index mismatch"):
-        validate_checkpoint(malformed, require_optimizer=True)
-    inference = tmp_path / "inference"
-    materialize_lora(output, inference, require_optimizer=True)
-    assert (output / "adapter_model.safetensors").read_bytes() == source_adapter
-    assert (output / "adapter_config.json").read_bytes() == source_config
-    assert (
-        json.loads((inference / "adapter_config.json").read_text())[
-            ART_LORA_FORMAT_CONFIG_KEY
-        ]
-        == ART_LORA_FORMAT_VLLM
-    )
-    assert {item.name for item in inference.iterdir()} == {
-        "adapter_config.json",
-        "adapter_model.safetensors",
-    }
-
-    entries = {
-        item.relative_to(output).as_posix()
-        for item in output.rglob("*")
-        if item.is_file()
-    }
-    staged = tmp_path / "selective-stage"
-    staged.mkdir()
-    for relative in (
-        "adapter_config.json",
-        "adapter_model.safetensors",
-        "checkpoint.json",
-    ):
-        shutil.copy2(output / relative, staged / relative)
-    selective = tmp_path / "selective-inference"
-    materialize_lora(
-        staged,
-        selective,
-        require_optimizer=True,
-        artifact_entries=entries,
-        expected_digest=manifest.digest,
-    )
-    assert {item.name for item in selective.iterdir()} == {
-        "adapter_config.json",
-        "adapter_model.safetensors",
-    }
-    with pytest.raises(RuntimeError, match="missing referenced files"):
-        materialize_lora(
-            staged,
-            tmp_path / "missing-entry",
-            require_optimizer=True,
-            artifact_entries=entries - {next(iter(manifest.parameters.values()))[0]},
-            expected_digest=manifest.digest,
-        )
-    with pytest.raises(RuntimeError, match="durable artifact digest"):
-        materialize_lora(
-            staged,
-            tmp_path / "wrong-digest",
-            require_optimizer=True,
-            artifact_entries=entries,
-            expected_digest="wrong",
-        )
-    with pytest.raises(FileExistsError, match="not empty"):
-        materialize_lora(output, inference, require_optimizer=True)
-
-    restored = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    source = prepare_checkpoint(str(output))
-    load_trainer_checkpoint(restored, source, "student")
-    assert source.manifest is not None and source.manifest.optimizer is not None
-    assert restored._checkpoint_slots["student"].revision == 0
-
-    _step_portable_checkpoint(original, -0.125)
-    _step_portable_checkpoint(restored, -0.125)
-    for expected, actual in zip(
-        original._checkpoint_slots["student"].params,
-        restored._checkpoint_slots["student"].params,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-    with pytest.raises(FileExistsError, match="not empty"):
-        original.save_checkpoint(str(output), "student")
-
-    failed = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(failed)
-    before = tuple(
-        parameter.detach().clone()
-        for parameter in failed._checkpoint_slots["student"].params
-    )
-
-    tampered_dtype = tmp_path / "tampered-dtype"
-    shutil.copytree(output, tampered_dtype)
-    parameter_key, parameter_files = next(iter(manifest.parameters.items()))
-    exp_avg = tampered_dtype / parameter_files[1]
-    tensors = load_file(exp_avg)
-    tensors[parameter_key] = tensors[parameter_key].to(torch.float16)
-    save_file(tensors, exp_avg)
-
-    async def load_tampered_dtype() -> None:
-        await failed.load_checkpoint(str(tampered_dtype))
-
-    with pytest.raises(RuntimeError, match="must use float32"):
-        asyncio.run(load_tampered_dtype())
-    assert set(failed._checkpoint_slots) == {"student"}
-    assert failed._default_slot_ref is None
-    for expected, actual in zip(
-        before,
-        failed._checkpoint_slots["student"].params,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-    def reject_optimizer(*_args: object) -> None:
-        raise RuntimeError("injected optimizer failure")
-
-    monkeypatch.setattr(failed, "_restore_canonical_optimizer", reject_optimizer)
-    with pytest.raises(RuntimeError, match="injected optimizer failure"):
-        load_trainer_checkpoint(failed, source, "student")
-    assert set(failed._checkpoint_slots) == {"student"}
-    for expected, actual in zip(
-        before,
-        failed._checkpoint_slots["student"].params,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-
-def _portable_topology_worker(
-    rank: int,
-    world_size: int,
-    init_method: str,
-    source_path: str,
-    output_path: str,
-    dtype_name: str = "float32",
-) -> None:
-    torch.distributed.init_process_group(
-        "gloo", rank=rank, world_size=world_size, init_method=init_method
-    )
-    try:
-        lora_module.ps.initialize_model_parallel(
-            tensor_model_parallel_size=world_size,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=1,
-            expert_model_parallel_size=1,
-        )
-        import art.trainer_rank._checkpoint as checkpoint_module
-
-        setattr(checkpoint_module, "_device", lambda: torch.device("cpu"))
-        setattr(
-            lora_publish,
-            "_rank_and_device",
-            lambda: (rank, torch.device("cpu")),
-        )
-        lora = LoRA(
-            _PORTABLE_PREFIX,
-            3,
-            4 // world_size,
-            2,
-            2,
-            getattr(torch, dtype_name),
-            torch.device("cpu"),
-            b_parallel_spec=LoRAParallelSpec(sharded=True, shard_dim=-1),
-        )
-        trainer = _portable_trainer(lora, rank=rank, world_size=world_size)
-        load_trainer_checkpoint(
-            trainer,
-            prepare_checkpoint(source_path),
-            "student",
-        )
-        _step_portable_checkpoint(trainer, -0.125)
-        trainer.save_checkpoint(output_path, "student")
-    finally:
-        if lora_module.ps.model_parallel_is_initialized():
-            lora_module.ps.destroy_model_parallel()
-        torch.distributed.destroy_process_group()
-
-
-def _advanced_topology_worker(
-    rank: int,
-    world_size: int,
-    init_method: str,
-    source_path: str,
-    output_path: str,
-    topology: Literal["pp", "ep", "etp", "cp"],
-    counts_path: str | None,
-) -> None:
-    torch.distributed.init_process_group(
-        "gloo", rank=rank, world_size=world_size, init_method=init_method
-    )
-    try:
-        lora_module.ps.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=2 if topology == "pp" else 1,
-            context_parallel_size=2 if topology == "cp" else 1,
-            expert_model_parallel_size=2 if topology == "ep" else 1,
-            expert_tensor_parallel_size=2 if topology == "etp" else None,
-        )
-        if topology == "pp":
-            modules = _pipeline_loras(rank)
-            model_identifier = str(_PORTABLE_CONFIG["base_model_name_or_path"])
-        elif topology == "ep":
-            modules = [_moe_lora(num_local_experts=1)]
-            model_identifier = str(_MOE_CONFIG["base_model_name_or_path"])
-        elif topology == "etp":
-            modules = [_moe_lora(num_local_experts=2, expert_tp=True)]
-            model_identifier = str(_MOE_CONFIG["base_model_name_or_path"])
-        else:
-            modules = [
-                LoRA(
-                    _PORTABLE_PREFIX,
-                    3,
-                    4,
-                    2,
-                    2,
-                    torch.float32,
-                    torch.device("cpu"),
-                )
-            ]
-            model_identifier = str(_PORTABLE_CONFIG["base_model_name_or_path"])
-        trainer = _portable_trainer(
-            torch.nn.Sequential(*modules),
-            rank=rank,
-            world_size=world_size,
-            model_identifier=model_identifier,
-        )
-        setattr(lora_publish, "_rank_and_device", lambda: (rank, torch.device("cpu")))
-        load_trainer_checkpoint(trainer, prepare_checkpoint(source_path), "student")
-        _step_portable_checkpoint(trainer, -0.125)
-
-        sends = 0
-        original_send = torch.distributed.send
-
-        def counted_send(*args, **kwargs):
-            nonlocal sends
-            sends += 1
-            return original_send(*args, **kwargs)
-
-        torch.distributed.send = counted_send
-        trainer.save_checkpoint(output_path, "student")
-        if counts_path is not None:
-            counts: list[int | None] = [None] * world_size
-            torch.distributed.all_gather_object(counts, sends)
-            if rank == 0:
-                Path(counts_path).write_text(json.dumps(counts))
-    finally:
-        if lora_module.ps.model_parallel_is_initialized():
-            lora_module.ps.destroy_model_parallel()
-        torch.distributed.destroy_process_group()
-
-
-def _reversed_prefetch_order_worker(
-    rank: int,
-    world_size: int,
-    init_method: str,
-    first_path: str,
-    second_path: str,
-) -> None:
-    torch.distributed.init_process_group(
-        "gloo", rank=rank, world_size=world_size, init_method=init_method
-    )
-    try:
-        lora_module.ps.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=1,
-            expert_model_parallel_size=1,
-        )
-        lora = LoRA(
-            _PORTABLE_PREFIX,
-            3,
-            4,
-            2,
-            2,
-            torch.float32,
-            torch.device("cpu"),
-        )
-        trainer = _portable_trainer(lora, rank=rank, world_size=world_size)
-        import art.trainer_rank._checkpoint as checkpoint_module
-
-        original_prepare = checkpoint_module.prepare_checkpoint
-        preparation_barrier = threading.Barrier(2)
-        completed: list[str] = []
-
-        def reversed_prepare(path: str):
-            preparation_barrier.wait(timeout=10)
-            slow_path = first_path if rank == 0 else second_path
-            if path == slow_path:
-                time.sleep(0.25)
-            source = original_prepare(path)
-            completed.append(path)
-            return source
-
-        setattr(checkpoint_module, "prepare_checkpoint", reversed_prepare)
-
-        async def load_both() -> None:
-            first = trainer.load_checkpoint(first_path)
-            second = trainer.load_checkpoint(second_path)
-            await asyncio.wait_for(asyncio.gather(first, second), timeout=30)
-
-        asyncio.run(load_both())
-        assert trainer._default_slot_ref == trainer._slot_ref(second_path)
-        assert set(trainer._checkpoint_slots) == {
-            first_path,
-            second_path,
-        }
-        orders: list[list[str] | None] = [None] * world_size
-        torch.distributed.all_gather_object(orders, completed)
-        assert orders[0] is not None and orders[0][0] == second_path
-        assert orders[1] is not None and orders[1][0] == first_path
-    finally:
-        if lora_module.ps.model_parallel_is_initialized():
-            lora_module.ps.destroy_model_parallel()
-        torch.distributed.destroy_process_group()
-
-
-def _transactional_load_failure_worker(
-    rank: int,
-    world_size: int,
-    init_method: str,
-    source_path: str,
-) -> None:
-    torch.distributed.init_process_group(
-        "gloo", rank=rank, world_size=world_size, init_method=init_method
-    )
-    try:
-        lora_module.ps.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=1,
-            expert_model_parallel_size=1,
-        )
-        lora = LoRA(
-            _PORTABLE_PREFIX,
-            3,
-            4,
-            2,
-            2,
-            torch.float32,
-            torch.device("cpu"),
-        )
-        trainer = _portable_trainer(lora, rank=rank, world_size=world_size)
-        _install_portable_checkpoint(trainer)
-        trainer._checkpoint_slots["student"].optimizer = trainer._new_dynamic_optimizer(
-            "student", AdamParams(learning_rate=1e-3)
-        )
-        _step_portable_checkpoint(trainer, -0.5)
-        previous_params = trainer._checkpoint_slots["student"].params
-        previous_values = tuple(
-            parameter.detach().clone() for parameter in previous_params
-        )
-        previous_dynamic = trainer._checkpoint_slots["student"].optimizer
-        original_replace = lora_module.replace_lora_slot_in_model
-        if rank == 1:
-
-            def fail_after_replacement(
-                model: Sequence[torch.nn.Module],
-                source: LoRASlotRef,
-                destination: LoRASlotRef,
-            ) -> None:
-                original_replace(model, source, destination)
-                raise RuntimeError("injected checkpoint commit failure")
-
-            setattr(lora_module, "replace_lora_slot_in_model", fail_after_replacement)
-
-        with pytest.raises(
-            RuntimeError, match="checkpoint commit failure|failed to commit"
-        ):
-            load_trainer_checkpoint(trainer, prepare_checkpoint(source_path), "student")
-
-        restored_params = trainer._checkpoint_slots["student"].params
-        assert tuple(map(id, restored_params)) == tuple(map(id, previous_params))
-        for expected, actual in zip(previous_values, restored_params, strict=True):
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        assert trainer._checkpoint_slots["student"].optimizer is previous_dynamic
-        assert trainer._checkpoint_slots["student"].config == _PORTABLE_CONFIG
-        assert trainer._checkpoint_slots["student"].revision == 0
-        assert all(
-            not (ref.name or "").startswith("__art_loading_") for ref in lora._slot_keys
-        )
-    finally:
-        if lora_module.ps.model_parallel_is_initialized():
-            lora_module.ps.destroy_model_parallel()
-        torch.distributed.destroy_process_group()
-
-
-def _portable_replica_worker(
-    rank: int,
-    world_size: int,
-    init_method: str,
-    output_path: str,
-    counts_path: str,
-    diverge: Literal["lora", "optimizer"] | None = None,
-) -> None:
-    torch.distributed.init_process_group(
-        "gloo", rank=rank, world_size=world_size, init_method=init_method
-    )
-    try:
-        lora_module.ps.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=1,
-            expert_model_parallel_size=1,
-        )
-        import art.trainer_rank._checkpoint as checkpoint_module
-
-        setattr(checkpoint_module, "_device", lambda: torch.device("cpu"))
-        setattr(
-            lora_publish,
-            "_rank_and_device",
-            lambda: (rank, torch.device("cpu")),
-        )
-        lora = LoRA(
-            _PORTABLE_PREFIX,
-            3,
-            4,
-            2,
-            2,
-            torch.float32,
-            torch.device("cpu"),
-        )
-        trainer = _portable_trainer(lora, rank=rank, world_size=world_size)
-        _install_portable_checkpoint(trainer)
-        trainer._checkpoint_slots["student"].optimizer = trainer._new_dynamic_optimizer(
-            "student",
-            AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95, weight_decay=0.1),
-        )
-        _step_portable_checkpoint(trainer, 0.25)
-        if diverge == "lora" and rank == 1:
-            with torch.no_grad():
-                trainer._checkpoint_slots["student"].params[0].add_(1)
-        elif diverge == "optimizer" and rank == 1:
-            dynamic = trainer._checkpoint_slots["student"].optimizer
-            master = dynamic.master_params[0]
-            dynamic.optimizer.state[master]["exp_avg"].add_(1)
-
-        sends = 0
-        original_send = torch.distributed.send
-
-        def counted_send(*args, **kwargs):
-            nonlocal sends
-            sends += 1
-            return original_send(*args, **kwargs)
-
-        torch.distributed.send = counted_send
-        trainer.save_checkpoint(output_path, "student")
-        counts: list[int | None] = [None] * world_size
-        torch.distributed.all_gather_object(counts, sends)
-        if rank == 0:
-            Path(counts_path).write_text(json.dumps(counts))
-    finally:
-        if lora_module.ps.model_parallel_is_initialized():
-            lora_module.ps.destroy_model_parallel()
-        torch.distributed.destroy_process_group()
-
-
-def _publish_replica_worker(
-    rank: int,
-    world_size: int,
-    init_method: str,
-) -> None:
-    torch.distributed.init_process_group(
-        "gloo", rank=rank, world_size=world_size, init_method=init_method
-    )
-    try:
-        lora_module.ps.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=1,
-            expert_model_parallel_size=1,
-        )
-        setattr(
-            lora_publish,
-            "_rank_and_device",
-            lambda: (rank, torch.device("cpu")),
-        )
-        lora = LoRA(
-            _PORTABLE_PREFIX,
-            3,
-            4,
-            2,
-            2,
-            torch.float32,
-            torch.device("cpu"),
-        )
-        with torch.no_grad():
-            lora.A_T.copy_(torch.arange(lora.A_T.numel()).reshape_as(lora.A_T))
-            lora.B_T.copy_(torch.arange(lora.B_T.numel()).reshape_as(lora.B_T))
-            if rank == 1:
-                lora.A_T.add_(1)
-        lora_publish.build_vllm_lora_tensors_from_model(
-            model=cast(Any, [lora]),
-            adapter_dtypes={},
-            handler=DEFAULT_DENSE_HANDLER,
-            adapter_config=_PORTABLE_CONFIG,
-            rank=rank,
-            world_size=world_size,
-        )
-    finally:
-        if lora_module.ps.model_parallel_is_initialized():
-            lora_module.ps.destroy_model_parallel()
-        torch.distributed.destroy_process_group()
-
-
-def _exchange_preparation_failure_worker(
-    rank: int,
-    world_size: int,
-    init_method: str,
-) -> None:
-    torch.distributed.init_process_group(
-        "gloo", rank=rank, world_size=world_size, init_method=init_method
-    )
-    try:
-        if rank == 1:
-
-            def fail_preparation(*_args: object, **_kwargs: object) -> None:
-                raise OSError("injected tensor exchange preparation failure")
-
-            setattr(
-                lora_publish,
-                "_prepare_exchange_buffers",
-                fail_preparation,
-            )
-        key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
-        metadata = (
-            LoraShardMeta(
-                key=key,
-                owner_rank=1,
-                shape=(2,),
-                dtype_name="float32",
-                manifest={"sharded": False, "shard_world_size": 1, "shard_rank": 0},
-                block="base_model.model.model.layers.0",
-            ),
-        )
-        with pytest.raises(
-            (OSError, RuntimeError),
-            match="injected tensor exchange preparation failure",
-        ):
-            lora_publish._exchange_tensors(
-                metadata,
-                local_tensors={key: torch.ones(2)} if rank == 1 else {},
-                rank=rank,
-                device=torch.device("cpu"),
-            )
-    finally:
-        torch.distributed.destroy_process_group()
-
-
-def test_lora_exchange_coordinates_asymmetric_preparation_failure(
-    tmp_path: Path,
-) -> None:
-    mp.spawn(
-        _exchange_preparation_failure_worker,
-        args=(2, f"file://{tmp_path / 'exchange-failure-init'}"),
-        nprocs=2,
-        join=True,
-    )
-
-
-def _gloo_exchange_device_worker(
-    rank: int,
-    world_size: int,
-    init_method: str,
-) -> None:
-    torch.distributed.init_process_group(
-        "gloo", rank=rank, world_size=world_size, init_method=init_method
-    )
-    try:
-        key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
-        metadata = (
-            LoraShardMeta(
-                key=key,
-                owner_rank=1,
-                shape=(2,),
-                dtype_name="float32",
-                manifest={"sharded": False, "shard_world_size": 1, "shard_rank": 0},
-                block="base_model.model.model.layers.0",
-            ),
-        )
-        received = lora_publish._exchange_tensors(
-            metadata,
-            local_tensors={key: torch.ones(2)} if rank == 1 else {},
-            rank=rank,
-            device=torch.device("cuda"),
-        )
-        if rank == 0:
-            assert received[(1, key)].device.type == "cpu"
-            torch.testing.assert_close(received[(1, key)], torch.ones(2))
-    finally:
-        torch.distributed.destroy_process_group()
-
-
-def test_lora_exchange_uses_cpu_for_gloo(tmp_path: Path) -> None:
-    mp.spawn(
-        _gloo_exchange_device_worker,
-        args=(2, f"file://{tmp_path / 'gloo-device-init'}"),
-        nprocs=2,
-        join=True,
-    )
-
-
-def test_lora_exchange_rejects_mismatched_metadata() -> None:
-    key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
-    metadata = LoraShardMeta(
-        key=key,
-        owner_rank=0,
-        shape=(2,),
-        dtype_name="bfloat16",
-        manifest={"sharded": False, "shard_world_size": 1, "shard_rank": 0},
-        block="base_model.model.model.layers.0",
-    )
-    with pytest.raises(RuntimeError, match="dtype 'float32'.*metadata 'bfloat16'"):
-        lora_publish._prepare_exchange_buffers(
-            (metadata,),
-            local_tensors={key: torch.ones(2)},
-            rank=0,
-            device=torch.device("cpu"),
-        )
-
-
-def test_checkpoint_loads_follow_call_order_across_ranks(tmp_path: Path) -> None:
-    first = tmp_path / "prefetch-first"
-    second = tmp_path / "prefetch-second"
-    save_vllm_lora_tensors(first, _PORTABLE_ADAPTER, _PORTABLE_CONFIG)
-    save_vllm_lora_tensors(
-        second,
-        {key: value + 1 for key, value in _PORTABLE_ADAPTER.items()},
-        _PORTABLE_CONFIG,
-    )
-
-    mp.spawn(
-        _reversed_prefetch_order_worker,
-        args=(
-            2,
-            f"file://{tmp_path / 'prefetch-order-init'}",
-            str(first),
-            str(second),
-        ),
-        nprocs=2,
-        join=True,
-    )
-
-
-def test_checkpoint_commit_failure_rolls_back_every_rank(tmp_path: Path) -> None:
-    source_trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(source_trainer)
-    source_trainer._checkpoint_slots[
-        "student"
-    ].optimizer = source_trainer._new_dynamic_optimizer(
-        "student", AdamParams(learning_rate=3e-4)
-    )
-    _step_portable_checkpoint(source_trainer, 0.25)
-    source = tmp_path / "transaction-source"
-    source_trainer.save_checkpoint(str(source), "student")
-
-    mp.spawn(
-        _transactional_load_failure_worker,
-        args=(
-            2,
-            f"file://{tmp_path / 'transaction-init'}",
-            str(source),
-        ),
-        nprocs=2,
-        join=True,
-    )
-
-
-def test_checkpoint_reload_rejects_accumulated_gradients(tmp_path: Path) -> None:
-    source_trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(source_trainer)
-    source = tmp_path / "reload-source"
-    source_trainer.save_checkpoint(str(source), "student")
-
-    trainer = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(trainer)
-    trainer._checkpoint_slots["student"].optimizer = trainer._new_dynamic_optimizer(
-        "student", AdamParams(learning_rate=3e-4)
-    )
-    params = trainer._checkpoint_slots["student"].params
-    params[0].grad = torch.ones_like(params[0])
-    values = tuple(param.detach().clone() for param in params)
-    dynamic = trainer._checkpoint_slots["student"].optimizer
-
-    with pytest.raises(TrainerRankSlotStateError, match="accumulated gradients"):
-        load_trainer_checkpoint(trainer, prepare_checkpoint(str(source)), "student")
-
-    assert trainer._checkpoint_slots["student"].params is params
-    assert trainer._checkpoint_slots["student"].optimizer is dynamic
-    assert params[0].grad is not None
-    for expected, actual in zip(values, params, strict=True):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    assert all(
-        not (ref.name or "").startswith("__art_loading_")
-        for ref in next(
-            module
-            for module in trainer.runtime.model[0].modules()
-            if isinstance(module, LoRA)
-        )._slot_keys
-    )
-
-
-def test_trainer_rank_checkpoint_deduplicates_data_parallel_replicas(
-    tmp_path: Path,
-) -> None:
-    expected = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(expected)
-    expected._checkpoint_slots["student"].optimizer = expected._new_dynamic_optimizer(
-        "student",
-        AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95, weight_decay=0.1),
-    )
-    _step_portable_checkpoint(expected, 0.25)
-
-    output = tmp_path / "replicated"
-    counts = tmp_path / "replicated-counts.json"
-    mp.spawn(
-        _portable_replica_worker,
-        args=(
-            2,
-            f"file://{tmp_path / 'replica-init'}",
-            str(output),
-            str(counts),
-            None,
-        ),
-        nprocs=2,
-        join=True,
-    )
-
-    assert json.loads(counts.read_text()) == [0, 0]
-    restored = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    load_trainer_checkpoint(
-        restored,
-        prepare_checkpoint(str(output)),
-        "student",
-    )
-    for expected_param, actual_param in zip(
-        expected._checkpoint_slots["student"].params,
-        restored._checkpoint_slots["student"].params,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual_param, expected_param, atol=0, rtol=0)
-    expected_optimizer = expected._checkpoint_slots["student"].optimizer
-    actual_optimizer = restored._checkpoint_slots["student"].optimizer
-    assert expected_optimizer is not None and actual_optimizer is not None
-    for expected_master, actual_master in zip(
-        expected_optimizer.master_params,
-        actual_optimizer.master_params,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual_master, expected_master, atol=0, rtol=0)
-        for key in ("step", "exp_avg", "exp_avg_sq"):
-            torch.testing.assert_close(
-                actual_optimizer.optimizer.state[actual_master][key],
-                expected_optimizer.optimizer.state[expected_master][key],
-                atol=0,
-                rtol=0,
-            )
-
-
-@pytest.mark.parametrize("diverge", ["lora", "optimizer"])
-def test_trainer_rank_checkpoint_rejects_divergent_data_parallel_replicas(
-    tmp_path: Path,
-    diverge: Literal["lora", "optimizer"],
-) -> None:
-    output = tmp_path / "replica-mismatch"
-    with pytest.raises(
-        ProcessRaisedException, match="Inconsistent replicated tensor contents"
-    ):
-        mp.spawn(
-            _portable_replica_worker,
-            args=(
-                2,
-                f"file://{tmp_path / 'replica-mismatch-init'}",
-                str(output),
-                str(tmp_path / "unused-counts.json"),
-                diverge,
-            ),
-            nprocs=2,
-            join=True,
-        )
-    assert not output.exists()
-    assert not list(tmp_path.glob(".replica-mismatch.snapshot-*"))
-
-
-def test_lora_publish_rejects_divergent_data_parallel_replicas(
-    tmp_path: Path,
-) -> None:
-    with pytest.raises(
-        ProcessRaisedException, match="Inconsistent replicated tensor contents"
-    ):
-        mp.spawn(
-            _publish_replica_worker,
-            args=(2, f"file://{tmp_path / 'publish-replica-mismatch-init'}"),
-            nprocs=2,
-            join=True,
-        )
-
-
-def test_trainer_rank_checkpoint_restores_1_to_2_to_1(
-    tmp_path: Path,
-) -> None:
-    original = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.bfloat16, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(original)
-    original._checkpoint_slots["student"].optimizer = original._new_dynamic_optimizer(
-        "student",
-        AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95, weight_decay=0.1),
-    )
-    _step_portable_checkpoint(original, 0.25)
-    one_rank = tmp_path / "one-rank"
-    original.save_checkpoint(str(one_rank), "student")
-    _step_portable_checkpoint(original, -0.125)
-
-    two_rank = tmp_path / "two-rank"
-    mp.spawn(
-        _portable_topology_worker,
-        args=(
-            2,
-            f"file://{tmp_path / 'topology-init'}",
-            str(one_rank),
-            str(two_rank),
-            "bfloat16",
-        ),
-        nprocs=2,
-        join=True,
-    )
-
-    restored = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.bfloat16, torch.device("cpu"))
-    )
-    manifest = validate_checkpoint(two_rank, require_optimizer=True)
-    assert manifest is not None
-    assert {
-        str(tensor.dtype).removeprefix("torch.")
-        for file in {file for files in manifest.parameters.values() for file in files}
-        for tensor in load_file(two_rank / file).values()
-    } == {"float32"}
-    load_trainer_checkpoint(
-        restored,
-        prepare_checkpoint(str(two_rank)),
-        "student",
-    )
-    for expected, actual in zip(
-        original._checkpoint_slots["student"].params,
-        restored._checkpoint_slots["student"].params,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    expected_optimizer = original._checkpoint_slots["student"].optimizer
-    actual_optimizer = restored._checkpoint_slots["student"].optimizer
-    assert expected_optimizer is not None and actual_optimizer is not None
-    for expected, actual in zip(
-        expected_optimizer.master_params,
-        actual_optimizer.master_params,
-        strict=True,
-    ):
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        expected_state = expected_optimizer.optimizer.state[expected]
-        actual_state = actual_optimizer.optimizer.state[actual]
-        for key in ("step", "exp_avg", "exp_avg_sq"):
-            torch.testing.assert_close(
-                actual_state[key], expected_state[key], atol=0, rtol=0
-            )
-
-
-def test_checkpoint_restores_different_adapter_rank(tmp_path: Path) -> None:
-    original = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(original)
-    output = tmp_path / "rank-two"
-    _save_before_next_step(original, output)
-
-    ambient = LoRA(_PORTABLE_PREFIX, 3, 4, 4, 4, torch.float32, torch.device("cpu"))
-    restored = _portable_trainer(ambient)
-    load_trainer_checkpoint(restored, prepare_checkpoint(str(output)), "student")
-    assert ambient.A_T.shape[-1] == 4
-    assert all(
-        parameter.shape[-1] == 2 or parameter.shape[-2] == 2
-        for parameter in restored._checkpoint_slots["student"].params
-    )
-    _step_portable_checkpoint(restored, -0.125)
-    _assert_checkpoint_state_equal(original, restored)
-
-
-def test_checkpoint_restores_pipeline_parallel_next_step(tmp_path: Path) -> None:
-    original = _portable_trainer(torch.nn.Sequential(*_pipeline_loras(0, 1)))
-    _install_checkpoint(original, _PIPELINE_ADAPTER, _PORTABLE_CONFIG)
-    source = tmp_path / "pipeline-source"
-    _save_before_next_step(original, source)
-    output = tmp_path / "pipeline-output"
-
-    mp.spawn(
-        _advanced_topology_worker,
-        args=(
-            2,
-            f"file://{tmp_path / 'pipeline-init'}",
-            str(source),
-            str(output),
-            "pp",
-            None,
-        ),
-        nprocs=2,
-        join=True,
-    )
-
-    restored = _portable_trainer(torch.nn.Sequential(*_pipeline_loras(0, 1)))
-    load_trainer_checkpoint(restored, prepare_checkpoint(str(output)), "student")
-    _assert_checkpoint_state_equal(original, restored)
-
-
-@pytest.mark.parametrize("topology", ["ep", "etp"])
-def test_checkpoint_restores_expert_parallel_next_step(
-    tmp_path: Path, topology: Literal["ep", "etp"]
-) -> None:
-    original = _portable_trainer(
-        _moe_lora(num_local_experts=2),
-        model_identifier=str(_MOE_CONFIG["base_model_name_or_path"]),
-    )
-    _install_checkpoint(original, _MOE_ADAPTER, _MOE_CONFIG)
-    source = tmp_path / f"{topology}-source"
-    _save_before_next_step(original, source)
-    output = tmp_path / f"{topology}-output"
-
-    mp.spawn(
-        _advanced_topology_worker,
-        args=(
-            2,
-            f"file://{tmp_path / f'{topology}-init'}",
-            str(source),
-            str(output),
-            topology,
-            None,
-        ),
-        nprocs=2,
-        join=True,
-    )
-
-    restored = _portable_trainer(
-        _moe_lora(num_local_experts=2),
-        model_identifier=str(_MOE_CONFIG["base_model_name_or_path"]),
-    )
-    load_trainer_checkpoint(restored, prepare_checkpoint(str(output)), "student")
-    _assert_checkpoint_state_equal(original, restored)
-
-
-def test_checkpoint_deduplicates_context_parallel_replicas(
-    tmp_path: Path,
-) -> None:
-    original = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    _install_portable_checkpoint(original)
-    source = tmp_path / "context-source"
-    _save_before_next_step(original, source)
-    output = tmp_path / "context-output"
-    counts = tmp_path / "context-counts.json"
-
-    mp.spawn(
-        _advanced_topology_worker,
-        args=(
-            2,
-            f"file://{tmp_path / 'context-init'}",
-            str(source),
-            str(output),
-            "cp",
-            str(counts),
-        ),
-        nprocs=2,
-        join=True,
-    )
-
-    restored = _portable_trainer(
-        LoRA(_PORTABLE_PREFIX, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    )
-    load_trainer_checkpoint(restored, prepare_checkpoint(str(output)), "student")
-    _assert_checkpoint_state_equal(original, restored)
-    assert json.loads(counts.read_text()) == [0, 0]
 
 
 @pytest.mark.parametrize(
@@ -3808,10 +1678,12 @@ def test_direct_3d_packed_expert_publish_matches_handler_vllm_exactly(
         down_lora.B_T.data[expert].copy_(tensors["down_proj.lora_B.weight"].T)
         offset += 1000
 
-    slot_ref = LoRASlotRef("student") if dynamic_slot else None
+    slot_ref = LoRASlotRef("checkpoint", "student") if dynamic_slot else None
     if slot_ref is not None:
-        assert gate_up_lora.load_lora_slot(slot_ref, full, alpha=rank)
-        assert down_lora.load_lora_slot(slot_ref, full, alpha=rank)
+        assert gate_up_lora.load_lora_slot(
+            slot_ref, full, alpha=rank, requires_grad=True
+        )
+        assert down_lora.load_lora_slot(slot_ref, full, alpha=rank, requires_grad=True)
 
     adapter_config = _config(base_model, rank=rank, alpha=rank)
     old_dir = tmp_path / "old"
@@ -3954,7 +1826,7 @@ def test_qwen35_megatron_shards_can_merge_to_separate_vllm_checkpoint(
     publish_dir = tmp_path / "published"
     adapter_config = _config("Qwen/Qwen3.5-35B-A3B", rank=1, alpha=1)
     entries_by_key = {
-        key: [(_manifest(sharded=False, shard_world_size=1, shard_rank=0), tensor)]
+        key: [({"sharded": False, "shard_world_size": 1, "shard_rank": 0}, tensor)]
         for key, tensor in full.items()
     }
     merged = merge_sharded_adapter_entries(entries_by_key)

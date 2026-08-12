@@ -17,13 +17,12 @@ def load_random_checkpoint_slots(
     assert count >= 0, "slots must be >= 0"
     if count == 0:
         return ()
-    from art.megatron.weights.lora_publish import collect_local_lora_entries
+    from art.megatron.lora import LoRAPublishPlanner
 
-    _tensors, local_metadata = collect_local_lora_entries(
-        runtime.model, {}, owner_rank=dist.get_rank()
-    )
     gathered: list[list[Any] | None] = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, local_metadata)
+    dist.all_gather_object(
+        gathered, LoRAPublishPlanner(runtime.model).global_metadata({})
+    )
     metadata = {meta.key: meta for values in gathered if values for meta in values}
     selected = sorted(metadata.values(), key=lambda item: item.key)
     if site_limit is not None:
@@ -59,11 +58,7 @@ def load_random_checkpoint_slots(
                 shape, device=rank.device, dtype=dtype, generator=generator
             )
             adapter[meta.key] = tensor if is_a else tensor.mul_(1e-3)
-        loaded = rank._load_checkpoint_slot(name, adapter, alpha=lora_rank)
-        assert loaded > 0, "TrainerRank check requires installed LoRA adapter sites"
-        ref = rank._slot_ref(name)
-        rank._checkpoint_slot_params_by_name[name] = tuple(
-            rank._iter_slot_parameters(ref)
+        assert rank.load_checkpoint_slot(name, adapter) > 0, (
+            "TrainerRank check requires installed LoRA adapter sites"
         )
-        rank._checkpoint_revisions[name] = 0
     return names

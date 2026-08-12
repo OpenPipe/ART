@@ -18,10 +18,7 @@ from art.megatron.model_support.registry import (
     get_model_support_handler_for_spec,
     get_model_support_spec,
 )
-from art.megatron.model_support.spec import (
-    ModelSupportHandler,
-    ModelSupportSpec,
-)
+from art.megatron.model_support.spec import ModelSupportSpec
 from art.megatron.runtime.bridge_runtime import install_art_bridge_runtime_patches
 
 install_art_bridge_runtime_patches()
@@ -80,11 +77,9 @@ _CHOICE_ENV_FIELDS = (
 class ProviderBundle(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    model_identifier: str
-    model_revision: str | None = None
-    provider: GPTModelProvider
-    bridge: AutoBridge
-    handler: ModelSupportHandler
+    provider: Any
+    bridge: Any
+    handler: Any
     spec: ModelSupportSpec
 
 
@@ -350,13 +345,13 @@ def _resolve_default_hybridep_num_sms() -> int:
     return 24
 
 
-def _handler_cp_supported(handler: ModelSupportHandler) -> bool:
+def _handler_cp_supported(handler: Any) -> bool:
     return bool(getattr(handler, "cp_supported", True))
 
 
 def _apply_default_parallel_topology(
     provider: GPTModelProvider,
-    handler: ModelSupportHandler,
+    handler: Any,
 ) -> None:
     visible_gpu_count = max(torch.cuda.device_count(), 1)
     cp_supported = _handler_cp_supported(handler)
@@ -373,7 +368,7 @@ def _apply_default_parallel_topology(
 
 def _apply_art_training_runtime_prepare_defaults(
     provider: GPTModelProvider,
-    handler: ModelSupportHandler,
+    handler: Any,
 ) -> None:
     provider.recompute_granularity = "full"
     provider.recompute_method = "uniform"
@@ -383,7 +378,7 @@ def _apply_art_training_runtime_prepare_defaults(
 
 
 def _validate_context_parallel_support(
-    handler: ModelSupportHandler,
+    handler: Any,
     runtime_env: _ProviderRuntimeEnv,
 ) -> None:
     if _handler_cp_supported(handler):
@@ -613,7 +608,6 @@ def _register_art_flex_attention_mapping_types() -> None:
 def _build_provider_bundle(
     model: str,
     *,
-    model_revision: str | None = None,
     torch_dtype: torch.dtype,
     allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
@@ -625,15 +619,12 @@ def _build_provider_bundle(
     handler = get_model_support_handler_for_spec(spec)
     bridge = AutoBridge.from_hf_pretrained(
         model,
-        revision=model_revision,
         dtype=torch_dtype,
         trust_remote_code=True,
     )
     provider = bridge.to_megatron_provider()
     handler.patch_bridge(bridge)
     return ProviderBundle(
-        model_identifier=model,
-        model_revision=model_revision,
         provider=provider,
         bridge=bridge,
         handler=handler,
@@ -644,14 +635,12 @@ def _build_provider_bundle(
 def prepare_provider_bundle(
     model: str,
     *,
-    model_revision: str | None = None,
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
     runtime_env = _ProviderRuntimeEnv.from_environ()
     bundle = _build_provider_bundle(
         model,
-        model_revision=model_revision,
         torch_dtype=torch_dtype,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
@@ -672,10 +661,8 @@ def prepare_provider_bundle(
     bundle.handler.configure_provider_for_runtime(provider)
     _validate_context_parallel_support(bundle.handler, runtime_env)
     _apply_runtime_env_overrides(provider, runtime_env)
-    setattr(
-        provider,
-        "art_flex_compile_crash_config",
-        bundle.handler.flex_attention_compile_crash_config(provider),
+    provider.art_flex_compile_crash_config = (
+        bundle.handler.flex_attention_compile_crash_config(provider)
     )
     provider.sequence_parallel = provider.tensor_model_parallel_size > 1
     _install_art_training_flex_attention(provider)
@@ -686,7 +673,7 @@ def prepare_provider_bundle(
 
 def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
     runtime_env = _ProviderRuntimeEnv.from_environ()
-    provider = provider_bundle.provider
+    provider = cast(GPTModelProvider, provider_bundle.provider)
     _apply_art_training_runtime_finalize_defaults(provider)
     _enforce_art_moe_grouped_gemm_fast_path(provider)
     _finalize_provider_with_art_overrides(provider)
@@ -771,14 +758,12 @@ def _validate_art_gdn_context_parallel_provider(provider: GPTModelProvider) -> N
 def get_provider_bundle(
     model: str,
     *,
-    model_revision: str | None = None,
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
 ) -> ProviderBundle:
     return finalize_provider_bundle(
         prepare_provider_bundle(
             model,
-            model_revision=model_revision,
             torch_dtype=torch_dtype,
             allow_unvalidated_arch=allow_unvalidated_arch,
         )
@@ -788,13 +773,11 @@ def get_provider_bundle(
 def get_provider(
     model: str,
     *,
-    model_revision: str | None = None,
     torch_dtype: torch.dtype = torch.bfloat16,
     allow_unvalidated_arch: bool = False,
 ) -> GPTModelProvider:
     return get_provider_bundle(
         model,
-        model_revision=model_revision,
         torch_dtype=torch_dtype,
         allow_unvalidated_arch=allow_unvalidated_arch,
     ).provider

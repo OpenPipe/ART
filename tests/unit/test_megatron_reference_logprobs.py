@@ -8,7 +8,6 @@ from torch import nn
 
 from art import types
 from art.megatron import train as megatron_train
-from art.megatron.model_support.spec import ModelSupportHandler
 from art.megatron.training import microbatches as megatron_microbatches
 from art.preprocessing.pack import PackedTensors
 
@@ -174,7 +173,7 @@ def test_calculate_megatron_logprobs_replays_routes(monkeypatch) -> None:
     logprobs = megatron_train._calculate_megatron_logprobs(
         model_chunks=cast(megatron_train.ModelChunks, [chunk]),
         provider=object(),
-        model_support_handler=cast(ModelSupportHandler, _Handler()),
+        model_support_handler=_Handler(),
         inputs=_packed_inputs(),
         moe_routing_replay_controller=cast(
             megatron_train.MoeRoutingReplayController, controller

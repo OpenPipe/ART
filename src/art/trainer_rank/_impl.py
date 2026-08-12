@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections import deque
 from collections.abc import (
-    Awaitable,
-    Callable,
     Iterable,
     Iterator,
     Mapping,
@@ -15,13 +11,11 @@ from collections.abc import (
 from copy import deepcopy
 from dataclasses import dataclass
 import os
-from pathlib import Path
-import threading
+from types import TracebackType
 from typing import (
     TYPE_CHECKING,
     Generic,
     Literal,
-    NotRequired,
     Self,
     TypedDict,
     TypeVar,
@@ -53,11 +47,7 @@ if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
     from art.megatron.prefix_tree_state import PrefixTreeAttentionState
     from art.megatron.train import TrainingRuntime
-    from art.trainer_rank._checkpoint import (
-        LocalOptimizerState,
-        PreparedCheckpoint,
-        _PreparedSave,
-    )
+    from art.trainer_rank import TrainerRankOptimizerLayout, TrainerRankOptimizerState
 
 
 @dataclass(frozen=True)
@@ -86,14 +76,9 @@ _MEMORY_PROFILE_TRUST_GROWTH = 8
 
 class _AdapterConfig(TypedDict):
     base_model_name_or_path: str
-    revision: NotRequired[str | None]
     r: int
     lora_alpha: float
     target_modules: str | list[str]
-    num_attention_heads: NotRequired[int]
-    num_key_value_heads: NotRequired[int]
-    head_dim: NotRequired[int]
-    hidden_size: NotRequired[int]
 
 
 class _Unset:
@@ -106,6 +91,7 @@ type AdapterSelection = str | None | _Unset
 
 @dataclass(frozen=True)
 class _LocalLoRASlotRef:
+    kind: Literal["checkpoint", "lora"]
     name: str | None
 
 
@@ -125,6 +111,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     logits: bool = False
     hidden_states: bool = False
     checkpoint: AdapterSelection = Unset
+    lora: AdapterSelection = Unset
 
     @overload
     def __new__(
@@ -136,6 +123,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[False] = False,
         hidden_states: Literal[False] = False,
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[None, None, None, None]": ...
 
     @overload
@@ -148,6 +136,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[False] = False,
         hidden_states: Literal[False] = False,
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, None, None, None]": ...
 
     @overload
@@ -160,6 +149,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[False] = False,
         hidden_states: Literal[False] = False,
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[None, TopK, None, None]": ...
 
     @overload
@@ -172,6 +162,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[True],
         hidden_states: Literal[False] = False,
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[None, None, torch.Tensor, None]": ...
 
     @overload
@@ -184,6 +175,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[False] = False,
         hidden_states: Literal[True],
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[None, None, None, torch.Tensor]": ...
 
     @overload
@@ -196,6 +188,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[False] = False,
         hidden_states: Literal[False] = False,
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, TopK, None, None]": ...
 
     @overload
@@ -208,6 +201,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[True],
         hidden_states: Literal[False] = False,
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, None, torch.Tensor, None]": ...
 
     @overload
@@ -220,6 +214,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[False] = False,
         hidden_states: Literal[True],
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, None, None, torch.Tensor]": ...
 
     @overload
@@ -232,6 +227,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[True],
         hidden_states: Literal[False] = False,
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[None, TopK, torch.Tensor, None]": ...
 
     @overload
@@ -244,6 +240,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[False] = False,
         hidden_states: Literal[True],
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[None, TopK, None, torch.Tensor]": ...
 
     @overload
@@ -256,6 +253,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[True],
         hidden_states: Literal[True],
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[None, None, torch.Tensor, torch.Tensor]": ...
 
     @overload
@@ -268,6 +266,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[True],
         hidden_states: Literal[False] = False,
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, TopK, torch.Tensor, None]": ...
 
     @overload
@@ -280,6 +279,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[False] = False,
         hidden_states: Literal[True],
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, TopK, None, torch.Tensor]": ...
 
     @overload
@@ -292,6 +292,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[True],
         hidden_states: Literal[True],
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, None, torch.Tensor, torch.Tensor]": ...
 
     @overload
@@ -304,6 +305,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[True],
         hidden_states: Literal[True],
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[None, TopK, torch.Tensor, torch.Tensor]": ...
 
     @overload
@@ -316,6 +318,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: Literal[True],
         hidden_states: Literal[True],
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, TopK, torch.Tensor, torch.Tensor]": ...
 
     @overload
@@ -328,6 +331,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: bool = False,
         hidden_states: bool = False,
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None]": ...
 
     def __new__(
@@ -339,12 +343,15 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         logits: bool = False,
         hidden_states: bool = False,
         checkpoint: AdapterSelection = Unset,
+        lora: AdapterSelection = Unset,
     ) -> Self:
         return object.__new__(cls)
 
     def __post_init__(self) -> None:
         if self.top_k is not None and self.top_k < 1:
             raise ValueError("top_k must be >= 1")
+        if self.checkpoint is not Unset and self.lora is not Unset:
+            raise ValueError("ForwardInput cannot set both checkpoint and lora")
 
 
 type AnyForwardInput = ForwardInput[
@@ -447,45 +454,26 @@ class _DynamicOptimizer:
     master_params: tuple[torch.nn.Parameter, ...]
 
 
-@dataclass
-class _CheckpointSlot:
-    params: tuple[torch.nn.Parameter, ...] = ()
-    config: _AdapterConfig | None = None
-    optimizer: _DynamicOptimizer | None = None
-    revision: int = 0
-
-
 @dataclass(frozen=True)
-class PushedCheckpoint:
+class _PushedSlot:
     trainer: "TrainerRank"
-    path: str | None
-    task: asyncio.Task[None]
+    ref: "LoRASlotRef"
 
-    def __await__(self):
-        return self.task.__await__()
-
-    async def __aenter__(self) -> "PushedCheckpoint":
-        try:
-            await self.task
-        except asyncio.CancelledError:
-            if (
-                self.task.done()
-                and not self.task.cancelled()
-                and self.task.exception() is None
-            ):
-                self._pop()
-            raise
+    def __enter__(self) -> "_PushedSlot":
         return self
 
-    async def __aexit__(self, *exc_info: object) -> bool:
-        self._pop()
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        if not self.trainer._slot_stack or self.trainer._slot_stack[-1] != self.ref:
+            raise RuntimeError(
+                "Pushed LoRA/checkpoint stack changed before context exit"
+            )
+        self.trainer.pop_pushed_lora_or_checkpoint()
         return False
-
-    def _pop(self) -> None:
-        ref = self.trainer._slot_ref(self.path)
-        if not self.trainer._slot_stack or self.trainer._slot_stack[-1] != ref:
-            raise RuntimeError("Pushed checkpoint stack changed before context exit")
-        self.trainer.pop_checkpoint()
 
 
 @dataclass(frozen=True)
@@ -574,16 +562,11 @@ class TrainerRank:
         )
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
-        self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
-        self._checkpoint_prefetches: dict[str, asyncio.Task[PreparedCheckpoint]] = {}
-        self._checkpoint_process_group: dist.ProcessGroup | None = None
-        self._checkpoint_mutation_tail: asyncio.Task[None] | None = None
-        self._checkpoint_prepare_lock = threading.Lock()
-        self._checkpoint_save_lock = threading.Lock()
-        self._checkpoint_finalize_lock = threading.Lock()
-        self._checkpoint_preparing_saves: set[str] = set()
-        self._prepared_checkpoint_saves: dict[str, _PreparedSave] = {}
-        self._completed_checkpoint_saves: deque[str] = deque(maxlen=128)
+        self._dynamic_optimizers: dict[str, _DynamicOptimizer] = {}
+        self._checkpoint_slot_params_by_name: dict[
+            str, tuple[torch.nn.Parameter, ...]
+        ] = {}
+        self._checkpoint_slot_adapter_configs: dict[str, _AdapterConfig] = {}
         self._pending_slot_graphs: dict[
             LoRASlotRef, list[weakref.ReferenceType[torch.Tensor]]
         ] = {}
@@ -603,213 +586,126 @@ class TrainerRank:
         optimizer = self.runtime.optimizer
         if optimizer is not None:
             optimizer.zero_grad()
-        for slot in self._checkpoint_slots.values():
-            for param in slot.params:
+        for params in self._checkpoint_slot_params_by_name.values():
+            for param in params:
                 param.grad = None
         self._prune_slot_graphs()
 
-    def prefetch_checkpoints(self, *paths: str) -> asyncio.Task[None]:
-        return self._prefetch_checkpoint_paths(paths)
+    def set_checkpoint(self, name: str | None) -> None:
+        self._set_default_slot(self._slot_ref("checkpoint", name))
 
-    def _prefetch_checkpoints_from_sources(
-        self, *sources: tuple[str, str]
-    ) -> asyncio.Task[None]:
-        return self._prefetch_checkpoint_paths(
-            source_path for _logical_path, source_path in sources
-        )
+    def set_lora(self, name: str | None) -> None:
+        self._set_default_slot(self._slot_ref("lora", name))
 
-    def _prefetch_checkpoint_paths(self, paths: Iterable[str]) -> asyncio.Task[None]:
-        async def prefetch() -> None:
-            await asyncio.gather(*(self._prefetch_checkpoint(path) for path in paths))
+    def push_checkpoint(self, name: str | None) -> _PushedSlot:
+        ref = self._slot_ref("checkpoint", name)
+        self._slot_stack.append(ref)
+        return _PushedSlot(self, ref)
 
-        return asyncio.create_task(prefetch())
+    def push_lora(self, name: str | None) -> _PushedSlot:
+        ref = self._slot_ref("lora", name)
+        self._slot_stack.append(ref)
+        return _PushedSlot(self, ref)
 
-    def load_checkpoint(self, path: str | None) -> asyncio.Task[None]:
-        return self._load_checkpoint(path, path)
-
-    def _load_checkpoint_from_source(
-        self, logical_path: str, source_path: str
-    ) -> asyncio.Task[None]:
-        return self._load_checkpoint(logical_path, source_path)
-
-    def _load_checkpoint(
-        self, logical_path: str | None, source_path: str | None
-    ) -> asyncio.Task[None]:
-        prefetch = (
-            None
-            if source_path is None
-            else asyncio.create_task(self._prefetch_checkpoint(source_path))
-        )
-
-        async def load() -> None:
-            if self._slot_stack:
-                raise RuntimeError("Cannot load a checkpoint while one is pushed")
-            if logical_path is None:
-                self._set_default_slot(self._slot_ref(None))
-                return
-            assert source_path is not None and prefetch is not None
-            await self._load_checkpoint_path(
-                logical_path, source_path=source_path, prefetch=prefetch
-            )
-            self._set_default_slot(self._slot_ref(logical_path))
-
-        return self._checkpoint_mutation_task(load)
-
-    def push_checkpoint(self, path: str | None) -> PushedCheckpoint:
-        return self._push_checkpoint(path, path)
-
-    def _push_checkpoint_from_source(
-        self, logical_path: str, source_path: str
-    ) -> PushedCheckpoint:
-        return self._push_checkpoint(logical_path, source_path)
-
-    def _push_checkpoint(
-        self, logical_path: str | None, source_path: str | None
-    ) -> PushedCheckpoint:
-        prefetch = (
-            asyncio.create_task(self._prefetch_checkpoint(source_path))
-            if source_path is not None and logical_path not in self._checkpoint_slots
-            else None
-        )
-
-        async def push() -> None:
-            if prefetch is not None and logical_path not in self._checkpoint_slots:
-                assert logical_path is not None and source_path is not None
-                await self._load_checkpoint_path(
-                    logical_path,
-                    source_path=source_path,
-                    prefetch=prefetch,
-                )
-            self._slot_stack.append(self._slot_ref(logical_path))
-
-        return PushedCheckpoint(
-            self, logical_path, self._checkpoint_mutation_task(push)
-        )
-
-    def _checkpoint_mutation_task(
-        self, operation: Callable[[], Awaitable[None]]
-    ) -> asyncio.Task[None]:
-        predecessor = self._checkpoint_mutation_tail
-
-        async def ordered() -> None:
-            if predecessor is not None:
-                try:
-                    await asyncio.shield(predecessor)
-                except asyncio.CancelledError:
-                    current = asyncio.current_task()
-                    if current is not None and current.cancelling():
-                        raise
-                except Exception:
-                    pass
-            await operation()
-
-        task = asyncio.create_task(ordered())
-        self._checkpoint_mutation_tail = task
-        return task
-
-    def pop_checkpoint(self) -> None:
+    def pop_pushed_lora_or_checkpoint(self) -> None:
         if not self._slot_stack:
-            raise RuntimeError("No pushed checkpoint to pop")
+            raise RuntimeError("No pushed LoRA or checkpoint to pop")
         self._slot_stack.pop()
 
-    def save_checkpoint(
+    def load_checkpoint_slot(
         self,
-        output_dir: str,
-        checkpoint_path: str | Literal["active"] = "active",
-    ) -> None:
-        from . import _checkpoint
-
-        _checkpoint.prepare_checkpoint_save(
-            self, output_dir, self._resolve_checkpoint_name(checkpoint_path)
-        )
-        _checkpoint.finish_checkpoint_save(self, output_dir)
-
-    def _prepare_checkpoint_save(
-        self,
-        output_dir: str,
-        checkpoint_path: str | Literal["active"] = "active",
-    ) -> None:
-        from . import _checkpoint
-
-        _checkpoint.prepare_checkpoint_save(
-            self, output_dir, self._resolve_checkpoint_name(checkpoint_path)
-        )
-
-    def _finish_checkpoint_save(self, output_dir: str) -> None:
-        from . import _checkpoint
-
-        _checkpoint.finish_checkpoint_save(self, output_dir)
-
-    def _abort_checkpoint_save(self, output_dir: str) -> None:
-        from . import _checkpoint
-
-        _checkpoint.abort_checkpoint_save(self, output_dir)
-
-    def export_lora(
-        self,
-        output_dir: str,
-        checkpoint_path: str | Literal["active"] = "active",
-    ) -> int:
-        from . import _checkpoint
-
-        return _checkpoint.export_lora(
-            self, output_dir, self._resolve_checkpoint_name(checkpoint_path)
-        )
-
-    @staticmethod
-    def _checkpoint_source_key(path: str) -> str:
-        return str(Path(path).resolve())
-
-    async def _prefetch_checkpoint(self, source_path: str) -> PreparedCheckpoint:
-        key = self._checkpoint_source_key(source_path)
-        task = self._checkpoint_prefetches.get(key)
-        if task is None:
-            from ._checkpoint import prepare_checkpoint
-
-            task = self._checkpoint_prefetches[key] = asyncio.create_task(
-                asyncio.to_thread(prepare_checkpoint, key)
-            )
-        try:
-            return await asyncio.shield(task)
-        except BaseException:
-            if task.done():
-                self._checkpoint_prefetches.pop(key, None)
-            raise
-
-    async def _load_checkpoint_path(
-        self,
-        logical_path: str,
+        name: str,
+        adapter_model: Mapping[str, torch.Tensor],
         *,
-        source_path: str,
-        prefetch: asyncio.Task[PreparedCheckpoint],
-    ) -> None:
-        from . import _checkpoint
+        optimizer_state: TrainerRankOptimizerState | None = None,
+        alpha: float | None = None,
+        adapter_config: Mapping[str, object] | None = None,
+    ) -> int:
+        config = self._validate_checkpoint_slot_adapter_config(
+            name, adapter_config, alpha=alpha
+        )
+        loaded = self._load_slot(
+            "checkpoint",
+            name,
+            adapter_model,
+            trainable=True,
+            alpha=alpha if config is None else float(config["lora_alpha"]),
+        )
+        slot_params = self._validate_dynamic_slot_consistency(
+            "checkpoint", name, loaded
+        )
+        if config is not None:
+            self._validate_loaded_checkpoint_slot_config(name, config)
+        self._checkpoint_slot_params_by_name[name] = slot_params
+        if optimizer_state is None:
+            self._dynamic_optimizers.pop(name, None)
+        else:
+            self._dynamic_optimizers[name] = self._restore_dynamic_optimizer(
+                name, optimizer_state
+            )
+        configs = getattr(self, "_checkpoint_slot_adapter_configs", None)
+        if configs is None:
+            configs = self._checkpoint_slot_adapter_configs = {}
+        if config is None:
+            configs.pop(name, None)
+        else:
+            configs[name] = config
+        return loaded
 
-        key = self._checkpoint_source_key(source_path)
-        source: PreparedCheckpoint | None = None
-        error: BaseException | None = None
-        try:
-            source = await asyncio.shield(prefetch)
-        except BaseException as exc:
-            error = exc
-        _checkpoint._raise_distributed(error, "prepare checkpoint")
-        assert source is not None
-        _checkpoint.load_checkpoint(self, source, logical_path)
-        self._checkpoint_prefetches.pop(key, None)
+    def checkpoint_slot_optimizer_state(
+        self, name: str
+    ) -> TrainerRankOptimizerState | None:
+        if name not in self._checkpoint_slot_params_by_name:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}")
+        dynamic = self._dynamic_optimizers.get(name)
+        if dynamic is None:
+            return None
+        state: TrainerRankOptimizerState = {
+            "format_version": 1,
+            "layout": self._dynamic_optimizer_layout(name),
+            "master_params": tuple(
+                param.detach().cpu().clone() for param in dynamic.master_params
+            ),
+            "optimizer": cast(
+                dict[str, object],
+                _state_to_cpu(dynamic.optimizer.state_dict()),
+            ),
+        }
+        return state
 
-    def _resolve_checkpoint_name(self, checkpoint_path: str | Literal["active"]) -> str:
-        if checkpoint_path != "active":
-            return checkpoint_path
-        ref = self._slot_stack[-1] if self._slot_stack else self._default_slot_ref
-        if ref is None or ref.name is None:
-            raise TrainerRankSlotStateError("No active trainable checkpoint")
-        return ref.name
+    def save_checkpoint_slot_lora(self, name: str, output_dir: str) -> None:
+        """Collectively publish a trained checkpoint slot as a vLLM LoRA."""
+        known = name in self._checkpoint_slot_params_by_name
+        if dist.is_available() and dist.is_initialized():
+            gathered: list[tuple[str, bool] | None] = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, (name, known))
+            if any(state != (name, True) for state in gathered):
+                raise ValueError(
+                    "Checkpoint slot publish requires the same loaded name on all "
+                    f"ranks; got {gathered}"
+                )
+        if not known:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}")
+        config = getattr(self, "_checkpoint_slot_adapter_configs", {}).get(name)
+        if config is None:
+            raise TrainerRankSlotStateError(
+                f"Checkpoint slot {name!r} was loaded without adapter_config; "
+                "reload it with adapter_config=... before publishing."
+            )
+        from art.megatron.weights.lora_publish import save_vllm_lora_from_model
 
-    @staticmethod
-    def _slot_state_error(message: str) -> TrainerRankSlotStateError:
-        return TrainerRankSlotStateError(message)
+        save_vllm_lora_from_model(
+            model=self.runtime.model,
+            adapter_dtypes={},
+            handler=self.runtime.model_support_handler,
+            adapter_config=config,
+            output_dir=output_dir,
+            rank=self.runtime.rank,
+            world_size=self.runtime.world_size,
+            slot_ref=self._slot_ref("checkpoint", name),
+        )
 
-    def _validate_checkpoint_adapter_config(
+    def _validate_checkpoint_slot_adapter_config(
         self,
         name: str,
         adapter_config: Mapping[str, object] | None,
@@ -817,44 +713,15 @@ class TrainerRank:
         alpha: float | None,
     ) -> _AdapterConfig | None:
         config = None if adapter_config is None else deepcopy(dict(adapter_config))
-        runtime_revision = getattr(self.runtime, "model_revision", None)
         if dist.is_available() and dist.is_initialized():
-            gathered: list[tuple[dict[str, object] | None, object] | None] = [
-                None
-            ] * dist.get_world_size()
-            dist.all_gather_object(gathered, (config, runtime_revision))
-            if any(
-                not isinstance(value, tuple) or len(value) != 2 or value[0] != config
-                for value in gathered
-            ):
+            gathered: list[dict[str, object] | None] = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, config)
+            if any(value != config for value in gathered):
                 raise ValueError(
                     f"Adapter config for checkpoint slot {name!r} differs across ranks"
                 )
-            if any(
-                not isinstance(value, tuple)
-                or len(value) != 2
-                or value[1] != runtime_revision
-                for value in gathered
-            ):
-                raise ValueError("Runtime model revision differs across ranks")
         if config is None:
             return None
-        source_revision = config.get("revision")
-        if source_revision is not None and not isinstance(source_revision, str):
-            raise TypeError("adapter_config['revision'] must be a string or null")
-        if runtime_revision is not None and not isinstance(runtime_revision, str):
-            raise TypeError("runtime model_revision must be a string or null")
-        if (
-            source_revision is not None
-            and runtime_revision is not None
-            and source_revision != runtime_revision
-        ):
-            raise ValueError(
-                f"Checkpoint {name!r} base-model revision {source_revision!r} "
-                f"does not match runtime revision {runtime_revision!r}"
-            )
-        if runtime_revision is not None:
-            config["revision"] = runtime_revision
         required = {"base_model_name_or_path", "r", "lora_alpha", "target_modules"}
         if missing := sorted(required - config.keys()):
             raise ValueError(
@@ -868,28 +735,6 @@ class TrainerRank:
             raise TypeError(
                 "adapter_config['base_model_name_or_path'] must be a string"
             )
-        if base_model.startswith(("Qwen/Qwen3.5-", "Qwen/Qwen3.6-")):
-            provider = getattr(self.runtime, "provider", None)
-            dimensions = {
-                "num_attention_heads": getattr(provider, "num_attention_heads", None),
-                "num_key_value_heads": getattr(provider, "num_query_groups", None),
-                "head_dim": getattr(provider, "kv_channels", None),
-                "hidden_size": getattr(provider, "hidden_size", None),
-            }
-            for key, value in dimensions.items():
-                if value is None:
-                    continue
-                value = int(value)
-                existing = config.get(key)
-                if existing is not None:
-                    if not isinstance(existing, int) or isinstance(existing, bool):
-                        raise TypeError(f"adapter_config[{key!r}] must be an integer")
-                    if existing != value:
-                        raise ValueError(
-                            f"adapter_config[{key!r}]={existing!r} conflicts with "
-                            f"runtime {value!r}"
-                        )
-                config[key] = value
         if not isinstance(rank, int) or isinstance(rank, bool):
             raise TypeError("adapter_config['r'] must be an integer")
         if not isinstance(config_alpha_value, int | float) or isinstance(
@@ -912,12 +757,12 @@ class TrainerRank:
             )
         return cast(_AdapterConfig, config)
 
-    def _validate_loaded_checkpoint_config(
+    def _validate_loaded_checkpoint_slot_config(
         self, name: str, config: _AdapterConfig
     ) -> None:
         from art.megatron.lora import LoRA
 
-        ref = self._slot_ref(name)
+        ref = self._slot_ref("checkpoint", name)
         slots = [
             slot
             for chunk in self.runtime.model
@@ -932,6 +777,19 @@ class TrainerRank:
                 f"Adapter config for checkpoint slot {name!r} declares "
                 f"rank/alpha={expected}, loaded weights use {sorted(actual)}"
             )
+
+    def load_lora_slot(
+        self,
+        name: str,
+        adapter_model: Mapping[str, torch.Tensor],
+        *,
+        alpha: float | None = None,
+    ) -> int:
+        loaded = self._load_slot(
+            "lora", name, adapter_model, trainable=False, alpha=alpha
+        )
+        self._validate_dynamic_slot_consistency("lora", name, loaded)
+        return loaded
 
     @overload
     def forward_micro_batches(
@@ -1001,7 +859,6 @@ class TrainerRank:
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
         items = [_materialize(item) for item in inputs]
         requests = list(_flatten(items))
-        self._validate_distributed_checkpoint_selections(requests)
         for _, indices in self._group_active_request_indices(requests):
             for index in indices:
                 self._forward_item(requests[index])
@@ -1085,9 +942,7 @@ class TrainerRank:
 
     def dp_rank_forward(self, inputs: ForwardInputs) -> ForwardOutputs:
         materialized = _materialize(inputs)
-        requests = list(_flatten(materialized))
-        self._validate_distributed_checkpoint_selections(requests)
-        plan = self._plan_flat_forward(requests)
+        plan = self._plan_flat_forward(list(_flatten(materialized)))
         check = self._memory_check(plan)
         if not check.fits:
             self._raise_memory_error(
@@ -1132,38 +987,35 @@ class TrainerRank:
             scale_grads=scale_grads,
         )
 
-    def _load_checkpoint_slot(
+    def _load_slot(
         self,
+        kind: Literal["checkpoint", "lora"],
         name: str,
         adapter_model: Mapping[str, torch.Tensor],
         *,
-        alpha: float,
-        _prepared: bool = False,
-        _localized: bool = False,
+        trainable: bool,
+        alpha: float | None,
     ) -> int:
-        adapter_model = (
-            dict(adapter_model)
-            if _prepared
-            else self._prepare_adapter_model(name, adapter_model)
-        )
-        from art.megatron.lora import load_lora_slot_into_model
+        if self._slot_stack:
+            raise RuntimeError("Cannot load a LoRA/checkpoint while a slot is pushed")
+        adapter_model = self._prepare_adapter_model(kind, name, adapter_model)
+        from art.megatron.lora import LORA_ALPHA, load_lora_slot_into_model
 
-        ref = self._slot_ref(name)
+        ref = self._slot_ref(kind, name)
         self._guard_slot_can_load(ref)
         return load_lora_slot_into_model(
             self.runtime.model,
             ref,
             adapter_model,
-            alpha=alpha,
-            localized=_localized,
+            alpha=LORA_ALPHA if alpha is None else alpha,
+            requires_grad=trainable,
         )
 
     def _prepare_adapter_model(
         self,
+        kind: Literal["checkpoint", "lora"],
         name: str,
         adapter_model: Mapping[str, torch.Tensor],
-        *,
-        canonicalized: bool = False,
     ) -> dict[str, torch.Tensor]:
         templates = self._local_lora_adapter_templates()
         keys = set(adapter_model)
@@ -1176,24 +1028,22 @@ class TrainerRank:
             preview = ", ".join(repr(key) for key in unknown[:8])
             more = "" if len(unknown) <= 8 else f", ... +{len(unknown) - 8} more"
             raise ValueError(
-                f"Checkpoint {name!r} contains keys that do not match installed "
-                f"LoRA wrapper sites: {preview}{more}. Configure the runtime with "
-                "matching LoRA target modules before loading."
+                f"Adapter for {kind} slot {name!r} contains keys that do not match "
+                f"installed LoRA wrapper sites: {preview}{more}. Configure the "
+                "Megatron runtime with matching LoRA target modules before loading."
             )
         local_state = {
             key: tensor for key, tensor in adapter_model.items() if key in templates
         }
         adapter_model = (
-            local_state
-            if canonicalized
-            else self.runtime.model_support_handler.canonicalize_loaded_lora_state(
+            self.runtime.model_support_handler.canonicalize_loaded_lora_state(
                 local_state, self.runtime.model
             )
         )
         if set(adapter_model) != set(local_state):
             raise TrainerRankSlotStateError(
                 "Model-specific LoRA canonicalization changed the adapter key set "
-                f"for checkpoint {name!r}."
+                f"for {kind} slot {name!r}."
             )
         return {
             key: tensor.to(
@@ -1203,64 +1053,6 @@ class TrainerRank:
             )
             for key, tensor in adapter_model.items()
         }
-
-    def _preflight_adapter(
-        self,
-        name: str,
-        adapter_model: Mapping[str, torch.Tensor],
-        config: _AdapterConfig,
-        *,
-        native: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        prepared = self._prepare_adapter_model(
-            name, adapter_model, canonicalized=native
-        )
-        from art.megatron.lora import LoRA
-
-        rank = int(config["r"])
-        loaded = 0
-        for chunk in self.runtime.model:
-            for module in chunk.modules():
-                if not isinstance(module, LoRA):
-                    continue
-                weights = module._adapter_weights(prepared, require=False)
-                if weights is None:
-                    continue
-                a_t = (
-                    weights[0]
-                    if native
-                    else module._localized_weight(weights[0], into=module.A_T)
-                )
-                b_t = (
-                    weights[1]
-                    if native
-                    else module._localized_weight(weights[1], into=module.B_T)
-                )
-                if (
-                    a_t.ndim != module.A_T.ndim
-                    or tuple(a_t.shape[:-1]) != tuple(module.A_T.shape[:-1])
-                    or int(a_t.shape[-1]) != rank
-                ):
-                    raise TrainerRankSlotStateError(
-                        f"Checkpoint {name!r} has incompatible LoRA-A shape "
-                        f"{tuple(a_t.shape)} for {module.adapter_model_prefix}"
-                    )
-                if (
-                    b_t.ndim != module.B_T.ndim
-                    or tuple(b_t.shape[:-2]) != tuple(module.B_T.shape[:-2])
-                    or int(b_t.shape[-2]) != rank
-                    or int(b_t.shape[-1]) != int(module.B_T.shape[-1])
-                ):
-                    raise TrainerRankSlotStateError(
-                        f"Checkpoint {name!r} has incompatible LoRA-B shape "
-                        f"{tuple(b_t.shape)} for {module.adapter_model_prefix}"
-                    )
-                loaded += 1
-        if loaded == 0:
-            raise TrainerRankSlotStateError(
-                f"Checkpoint {name!r} loaded no adapter sites"
-            )
-        return prepared
 
     def _local_lora_adapter_templates(self) -> dict[str, torch.Tensor]:
         templates: dict[str, torch.Tensor] = {}
@@ -1274,186 +1066,89 @@ class TrainerRank:
                     ("lora_B", "B_T"),
                 ):
                     parameter = getattr(module, parameter_name, None)
-                    if isinstance(parameter, torch.Tensor):
-                        templates.update(
-                            (str(key), parameter)
-                            for key in expected_weight_keys(suffix)
-                        )
-        return templates
-
-    def _local_parameter_key_groups(self, name: str) -> tuple[tuple[str, ...], ...]:
-        from art.megatron.lora import LoRA
-
-        ref = self._slot_ref(name)
-        return tuple(
-            tuple(str(key) for key in module._expected_weight_keys(suffix))
-            for chunk in self.runtime.model
-            for module in chunk.modules()
-            if isinstance(module, LoRA) and module._slot(ref) is not None
-            for suffix in ("lora_A", "lora_B")
-        )
-
-    def _localize_adapter_tensors(
-        self,
-        tensors: Mapping[str, torch.Tensor],
-        name: str,
-    ) -> tuple[torch.Tensor, ...]:
-        from art.megatron.lora import LoRA
-
-        key_groups = self._local_parameter_key_groups(name)
-        if missing := sorted(
-            key for group in key_groups for key in group if key not in tensors
-        ):
-            raise TrainerRankSlotStateError(
-                f"Canonical optimizer is missing local tensors: {missing[:8]}"
-            )
-        values: list[torch.Tensor] = []
-        ref = self._slot_ref(name)
-        for chunk in self.runtime.model:
-            for module in chunk.modules():
-                if not isinstance(module, LoRA):
-                    continue
-                slot = module._slot(ref)
-                if slot is None:
-                    continue
-                for suffix, template in (
-                    ("lora_A", slot.A_T),
-                    ("lora_B", slot.B_T),
-                ):
-                    keys = module._expected_weight_keys(suffix)
-                    if not all(key in tensors for key in keys):
+                    if not isinstance(parameter, torch.Tensor):
                         continue
-                    weight = (
-                        torch.stack([tensors[key].T for key in keys])
-                        if module.num_local_experts > 1
-                        else tensors[keys[0]].T
+                    templates.update(
+                        (str(key), parameter) for key in expected_weight_keys(suffix)
                     )
-                    value = weight.contiguous()
-                    if tuple(value.shape) != tuple(template.shape):
-                        raise TrainerRankSlotStateError(
-                            f"Canonical optimizer tensor for {keys[0]!r} has an "
-                            f"incompatible local shape {tuple(value.shape)}; expected "
-                            f"{tuple(template.shape)}"
-                        )
-                    values.append(value)
-        if len(values) != len(key_groups):
-            raise TrainerRankSlotStateError(
-                "Canonical optimizer did not map every local checkpoint parameter"
-            )
-        return tuple(values)
+        return templates
 
     def _set_default_slot(self, ref: "LoRASlotRef") -> None:
         if self._slot_stack:
-            raise RuntimeError("Cannot select a checkpoint while one is pushed")
+            raise RuntimeError("Cannot set a LoRA/checkpoint while a slot is pushed")
         self._default_slot_ref = ref
 
     @staticmethod
-    def _slot_ref(name: str | None) -> "LoRASlotRef":
+    def _slot_ref(
+        kind: Literal["checkpoint", "lora"], name: str | None
+    ) -> "LoRASlotRef":
         try:
             from art.megatron.lora import LoRASlotRef
         except ModuleNotFoundError as exc:
             if exc.name is None or not exc.name.startswith("megatron"):
                 raise
-            return cast("LoRASlotRef", _LocalLoRASlotRef(name=name))
-        return LoRASlotRef(name=name)
 
-    def _iter_slot_parameters(self, ref: "LoRASlotRef") -> Iterator[torch.nn.Parameter]:
-        from art.megatron.lora import iter_lora_slot_parameters
+            return cast("LoRASlotRef", _LocalLoRASlotRef(kind=kind, name=name))
 
-        return iter_lora_slot_parameters(self.runtime.model, ref)
+        return LoRASlotRef(kind=kind, name=name)
 
-    def _validate_checkpoint_consistency(
+    def _validate_dynamic_slot_consistency(
         self,
+        kind: Literal["checkpoint", "lora"],
         name: str,
         loaded_sites: int,
-        expected_keys: set[str],
     ) -> tuple[torch.nn.Parameter, ...]:
-        ref = self._slot_ref(name)
-        params = tuple(self._iter_slot_parameters(ref))
-        local_keys = {
-            key for group in self._local_parameter_key_groups(name) for key in group
-        }
-        from art.megatron.lora import LoRA
+        from art.megatron.lora import iter_lora_slot_parameters
 
-        actual_sites = sum(
-            module._slot(ref) is not None
-            for chunk in self.runtime.model
-            for module in chunk.modules()
-            if isinstance(module, LoRA)
-        )
-        local = (loaded_sites, actual_sites, local_keys, len(params))
+        ref = self._slot_ref(kind, name)
+        params = tuple(iter_lora_slot_parameters(self.runtime.model, ref))
         if not (dist.is_available() and dist.is_initialized()):
-            ranks = (local,)
-        else:
-            gathered: list[tuple[int, int, set[str], int] | None] = [
-                None
-            ] * dist.get_world_size()
-            dist.all_gather_object(gathered, local)
-            ranks = tuple(state for state in gathered if state is not None)
-        if any(loaded != actual for loaded, actual, _keys, _params in ranks):
-            raise RuntimeError(
-                f"Checkpoint {name!r} loaded an inconsistent number of sites: "
-                f"{[(loaded, actual) for loaded, actual, _keys, _params in ranks]}"
-            )
-        covered = set().union(*(keys for _loaded, _actual, keys, _params in ranks))
-        if covered != expected_keys:
-            raise RuntimeError(
-                f"Checkpoint {name!r} logical-key coverage differs: "
-                f"missing={sorted(expected_keys - covered)[:8]} "
-                f"extra={sorted(covered - expected_keys)[:8]}"
-            )
-        if any(keys and count == 0 for _loaded, _actual, keys, count in ranks):
-            raise RuntimeError(
-                f"Checkpoint {name!r} did not create parameters on every owning rank"
-            )
-        return params
+            return params
 
-    def _validate_distributed_checkpoint_selections(
-        self, requests: Sequence[AnyForwardInput]
-    ) -> None:
-        missing = tuple(
-            sorted(
-                {
-                    name
-                    for request in requests
-                    if request.checkpoint is not Unset
-                    if (name := cast(str | None, request.checkpoint)) is not None
-                    if name not in self._checkpoint_slots
-                }
+        signature = tuple(
+            (
+                tuple(param.shape),
+                str(param.dtype),
+                bool(getattr(param, "allreduce", True)),
+                str(getattr(param, "grad_sync_domain", "tp_default")),
+                str(getattr(param, "grad_sync_op", "none")),
             )
+            for param in params
         )
-        if self._all_ranks_true(not missing):
-            return
-        location = f": {list(missing)}" if missing else " on another distributed rank"
-        raise TrainerRankSlotStateError(
-            f"Forward inputs select unloaded checkpoint slots{location}. "
-            "Call load_checkpoint(...) before selecting them."
+        local = (int(loaded_sites), signature)
+        gathered: list[tuple[int, object] | None] = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, local)
+        ranks = [state for state in gathered if state is not None]
+        if all(state == ranks[0] for state in ranks[1:]):
+            return params
+        raise RuntimeError(
+            f"Dynamic LoRA slot {kind}:{name} is not loaded consistently across "
+            "distributed ranks. This usually means a sharded/exported LoRA state "
+            "dict was passed directly to TrainerRank; gather or materialize the "
+            "full adapter state before loading a dynamic slot. "
+            f"Loaded-site counts by rank: {[state[0] for state in ranks]}."
         )
 
     def _resolve_slot_ref(self, request: AnyForwardInput) -> "LoRASlotRef | None":
         if request.checkpoint is not Unset:
-            name = cast(str | None, request.checkpoint)
-            if name is not None and name not in self._checkpoint_slots:
-                raise TrainerRankSlotStateError(
-                    f"Forward input selects unloaded checkpoint slot {name!r}. "
-                    "Call load_checkpoint(...) before selecting it."
-                )
-            return self._slot_ref(name)
+            return self._slot_ref("checkpoint", cast(str | None, request.checkpoint))
+        if request.lora is not Unset:
+            return self._slot_ref("lora", cast(str | None, request.lora))
         if self._slot_stack:
             return self._slot_stack[-1]
         if self._default_slot_ref is not None:
             return self._default_slot_ref
-        return self._slot_ref(None)
+        return self._slot_ref("checkpoint", None)
 
     def _selected_dynamic_checkpoints(
         self,
         checkpoints: Sequence[str] | None,
     ) -> tuple[str, ...]:
-        loaded = set(self._checkpoint_slots)
+        loaded = set(self._checkpoint_slot_params_by_name)
         if not loaded:
             raise TrainerRankSlotStateError(
                 "TrainerRank.optim_step requires a loaded checkpoint slot. Call "
-                "load_checkpoint(...) and run backward on outputs produced by "
+                "load_checkpoint_slot(...) and run backward on outputs produced by "
                 "that slot before stepping."
             )
         requested = (
@@ -1496,7 +1191,7 @@ class TrainerRank:
             [
                 any(
                     param.grad is not None
-                    for param in self._checkpoint_slots[name].params
+                    for param in self._checkpoint_slot_params_by_name[name]
                 )
                 for name in names
             ],
@@ -1520,7 +1215,7 @@ class TrainerRank:
         selected = []
         for name in checkpoint_names:
             self._guard_checkpoint_can_step(name)
-            slot_params = self._checkpoint_slots[name].params
+            slot_params = self._checkpoint_slot_params_by_name[name]
             slot_grads = self._reduce_dynamic_grads(
                 slot_params, scale_grads=scale_grads
             )
@@ -1556,8 +1251,7 @@ class TrainerRank:
                 ):
                     model.copy_(master)
                     model.grad = None
-            self._prune_slot_graphs(self._slot_ref(name))
-            self._checkpoint_slots[name].revision += 1
+            self._prune_slot_graphs(self._slot_ref("checkpoint", name))
         return {
             "learning_rate": float(params.learning_rate),
             "grad_norm": float(grad_norm),
@@ -1570,11 +1264,10 @@ class TrainerRank:
         name: str,
         params: AdamParams,
     ) -> _DynamicOptimizer:
-        slot = self._checkpoint_slots[name]
-        dynamic = slot.optimizer
+        dynamic = self._dynamic_optimizers.get(name)
         if dynamic is None:
             dynamic = self._new_dynamic_optimizer(name, params)
-            slot.optimizer = dynamic
+            self._dynamic_optimizers[name] = dynamic
             return dynamic
         for group in dynamic.optimizer.param_groups:
             group["lr"] = params.learning_rate
@@ -1589,7 +1282,7 @@ class TrainerRank:
         *,
         master_params: Sequence[torch.Tensor] | None = None,
     ) -> _DynamicOptimizer:
-        model_params = self._checkpoint_slots[name].params
+        model_params = self._checkpoint_slot_params_by_name[name]
         sources = model_params if master_params is None else tuple(master_params)
         if len(sources) != len(model_params) or any(
             not isinstance(source, torch.Tensor) for source in sources
@@ -1597,13 +1290,6 @@ class TrainerRank:
             raise TrainerRankSlotStateError(
                 f"Optimizer state for checkpoint slot {name!r} has "
                 f"{len(sources)} master parameters; expected {len(model_params)}."
-            )
-        if any(
-            tuple(source.shape) != tuple(model.shape)
-            for source, model in zip(sources, model_params, strict=True)
-        ):
-            raise TrainerRankSlotStateError(
-                f"Optimizer master parameter shape does not match checkpoint {name!r}"
             )
         masters = tuple(
             torch.nn.Parameter(
@@ -1623,54 +1309,134 @@ class TrainerRank:
         )
         return _DynamicOptimizer(optimizer, masters)
 
-    def _restore_canonical_optimizer(
+    def _restore_dynamic_optimizer(
         self,
         name: str,
-        state: LocalOptimizerState,
+        state: TrainerRankOptimizerState,
     ) -> _DynamicOptimizer:
-        dynamic = self._new_dynamic_optimizer(
-            name,
-            AdamParams(
-                learning_rate=state.config.learning_rate,
-                beta1=state.config.beta1,
-                beta2=state.config.beta2,
-                weight_decay=state.config.weight_decay,
-            ),
-            master_params=state.masters,
-        )
-        if not (
-            len(dynamic.master_params)
-            == len(state.exp_avgs)
-            == len(state.exp_avg_sqs)
-            == len(state.steps)
+        if state.get("format_version") != 1:
+            raise TrainerRankSlotStateError(
+                f"Unsupported optimizer state format for checkpoint slot {name!r}."
+            )
+        if state.get("layout") != self._dynamic_optimizer_layout(name):
+            raise TrainerRankSlotStateError(
+                f"Optimizer state for checkpoint slot {name!r} was saved for a "
+                "different topology or parameter layout. Save and restore one "
+                "optimizer shard per TrainerRank with matching TP/EP/ETP ranks."
+            )
+        master_params = state.get("master_params")
+        optimizer_state = state.get("optimizer")
+        if not isinstance(master_params, Sequence) or not isinstance(
+            optimizer_state, Mapping
         ):
             raise TrainerRankSlotStateError(
-                f"Canonical optimizer state for {name!r} has inconsistent lengths"
+                f"Optimizer state for checkpoint slot {name!r} is incomplete."
             )
-        dynamic.optimizer.param_groups[0]["eps"] = state.config.eps
-        for master, exp_avg, exp_avg_sq, step in zip(
-            dynamic.master_params,
-            state.exp_avgs,
-            state.exp_avg_sqs,
-            state.steps,
-            strict=True,
-        ):
-            if tuple(exp_avg.shape) != tuple(master.shape) or tuple(
-                exp_avg_sq.shape
-            ) != tuple(master.shape):
-                raise TrainerRankSlotStateError(
-                    f"Canonical optimizer moment shape does not match {name!r}"
-                )
-            dynamic.optimizer.state[master] = {
-                "step": torch.tensor(step, dtype=torch.float32),
-                "exp_avg": exp_avg.to(
-                    device=master.device, dtype=torch.float32
-                ).clone(),
-                "exp_avg_sq": exp_avg_sq.to(
-                    device=master.device, dtype=torch.float32
-                ).clone(),
-            }
+        dynamic = self._new_dynamic_optimizer(
+            name,
+            AdamParams(learning_rate=0.0),
+            master_params=cast(Sequence[torch.Tensor], master_params),
+        )
+        try:
+            dynamic.optimizer.load_state_dict(
+                {str(key): value for key, value in optimizer_state.items()}
+            )
+        except ValueError as exc:
+            raise TrainerRankSlotStateError(
+                f"Optimizer state for checkpoint slot {name!r} does not match the "
+                "loaded slot parameter groups."
+            ) from exc
+        for param in dynamic.master_params:
+            for state_name, value in dynamic.optimizer.state.get(param, {}).items():
+                if (
+                    isinstance(value, torch.Tensor)
+                    and int(value.ndim) > 0
+                    and tuple(value.shape) != tuple(param.shape)
+                ):
+                    raise TrainerRankSlotStateError(
+                        f"Optimizer state {state_name!r} for checkpoint slot "
+                        f"{name!r} has shape {tuple(value.shape)}, but the loaded "
+                        f"slot parameter has shape {tuple(param.shape)}."
+                    )
+        self._zero_dynamic_optimizer_padding(name, dynamic)
         return dynamic
+
+    def _zero_dynamic_optimizer_padding(
+        self,
+        name: str,
+        dynamic: _DynamicOptimizer,
+    ) -> None:
+        masks = self._dynamic_optimizer_padding_masks(name)
+        with torch.no_grad():
+            for param, mask in zip(dynamic.master_params, masks, strict=True):
+                param.masked_fill_(mask, 0)
+                for value in dynamic.optimizer.state.get(param, {}).values():
+                    if isinstance(value, torch.Tensor) and value.shape == param.shape:
+                        value.masked_fill_(mask, 0)
+
+    def _dynamic_optimizer_padding_masks(self, name: str) -> tuple[torch.Tensor, ...]:
+        params = self._checkpoint_slot_params_by_name[name]
+        masks = tuple(torch.zeros_like(param, dtype=torch.bool) for param in params)
+        param_indices = {id(param): index for index, param in enumerate(params)}
+        exported: dict[str, torch.Tensor] = {}
+        owners: dict[str, tuple[int, int | None]] = {}
+        mapped_indices: set[int] = set()
+        ref = self._slot_ref("checkpoint", name)
+
+        for chunk in self.runtime.model:
+            for module in chunk.modules():
+                lora_params = getattr(module, "_lora_params", None)
+                expected_keys = getattr(module, "_expected_weight_keys", None)
+                if not callable(lora_params) or not callable(expected_keys):
+                    continue
+                for suffix, param in lora_params(ref):
+                    index = param_indices.get(id(param))
+                    if index is None:
+                        continue
+                    mapped_indices.add(index)
+                    keys = expected_keys(str(suffix).removesuffix(".weight"))
+                    if int(param.ndim) == 3:
+                        if len(keys) != int(param.shape[0]):
+                            raise TrainerRankSlotStateError(
+                                f"Cannot map optimizer padding for checkpoint slot "
+                                f"{name!r}: {len(keys)} adapter keys describe "
+                                f"{int(param.shape[0])} local experts."
+                            )
+                        for expert, key in enumerate(keys):
+                            exported[str(key)] = torch.ones_like(param[expert].T)
+                            owners[str(key)] = (index, expert)
+                    else:
+                        if len(keys) != 1:
+                            raise TrainerRankSlotStateError(
+                                f"Cannot map optimizer padding for checkpoint slot "
+                                f"{name!r}: expected one adapter key, got {len(keys)}."
+                            )
+                        key = str(keys[0])
+                        exported[key] = torch.ones_like(param.T)
+                        owners[key] = (index, None)
+
+        if mapped_indices and (
+            missing := sorted(set(range(len(params))) - mapped_indices)
+        ):
+            raise TrainerRankSlotStateError(
+                f"Cannot map optimizer padding for checkpoint slot {name!r}: "
+                f"parameter indices {missing} do not belong to installed LoRA sites."
+            )
+
+        canonical = self.runtime.model_support_handler.canonicalize_loaded_lora_state(
+            exported, self.runtime.model
+        )
+        for key, value in canonical.items():
+            owner = owners.get(key)
+            if owner is None or not isinstance(value, torch.Tensor):
+                continue
+            index, expert = owner
+            mask = value.T == 0
+            if expert is None:
+                masks[index].copy_(mask)
+            else:
+                masks[index][expert].copy_(mask)
+        return masks
 
     def _reduce_dynamic_grads(
         self,
@@ -1722,6 +1488,39 @@ class TrainerRank:
         for group, op, bucket_grads in buckets.values():
             coalesced_all_reduce(bucket_grads, group=group, op=op)
         return grads
+
+    def _dynamic_optimizer_layout(self, name: str) -> TrainerRankOptimizerLayout:
+        parameters = cast(
+            tuple[
+                tuple[
+                    tuple[int, ...],
+                    str,
+                    str,
+                    bool,
+                    int | None,
+                    str,
+                    tuple[int, ...],
+                ],
+                ...,
+            ],
+            tuple(
+                (
+                    tuple(param.shape),
+                    str(param.dtype),
+                    str(getattr(param, "lora_shard_domain", "tp")),
+                    bool(getattr(param, "lora_tp_sharded", False)),
+                    getattr(param, "lora_tp_shard_dim", None),
+                    str(getattr(param, "lora_tp_shard_strategy", "uniform")),
+                    tuple(getattr(param, "lora_tp_component_sizes", ())),
+                )
+                for param in self._checkpoint_slot_params_by_name[name]
+            ),
+        )
+        layout: TrainerRankOptimizerLayout = {
+            "parallel": _parallel_optimizer_coordinates(),
+            "parameters": parameters,
+        }
+        return layout
 
     def _select_next_micro_batch(
         self,
@@ -2126,24 +1925,20 @@ class TrainerRank:
         return bool(self._slot_graphs().get(ref))
 
     def _guard_slot_can_load(self, ref: "LoRASlotRef") -> None:
-        if self._has_live_slot_graph(ref):
-            raise TrainerRankSlotStateError(
-                f"Cannot load checkpoint {ref.name!r} while outputs from an "
-                "earlier forward using that slot still have a live backward graph. "
-                "Activation checkpoint recompute resolves slots by name, so replacing "
-                "the slot before backward can compute gradients with different LoRA "
-                "weights than the original forward. Finish backward first; if the "
-                "forward was abandoned, release all references to its outputs; or load "
-                "the new weights under a different slot name."
-            )
-        if any(param.grad is not None for param in self._iter_slot_parameters(ref)):
-            raise TrainerRankSlotStateError(
-                f"Cannot load checkpoint {ref.name!r} with accumulated gradients. "
-                "Call optim_step() or zero_grad() before replacing the checkpoint."
-            )
+        if not self._has_live_slot_graph(ref):
+            return
+        raise TrainerRankSlotStateError(
+            f"Cannot load {ref.kind} slot {ref.name!r} while outputs from an "
+            "earlier forward using that slot still have a live backward graph. "
+            "Activation checkpoint recompute resolves slots by name, so replacing "
+            "the slot before backward can compute gradients with different LoRA "
+            "weights than the original forward. Finish backward first; if the "
+            "forward was abandoned, release all references to its outputs; or load "
+            "the new weights under a different slot name."
+        )
 
     def _guard_checkpoint_can_step(self, name: str) -> None:
-        ref = self._slot_ref(name)
+        ref = self._slot_ref("checkpoint", name)
         if not self._has_live_slot_graph(ref):
             return
         raise TrainerRankSlotStateError(
@@ -3112,6 +2907,36 @@ def _include_in_distributed_grad_norm(param: torch.nn.Parameter) -> bool:
     return shard_group is None or shard_group.size() <= 1 or shard_group.rank() == 0
 
 
+def _parallel_optimizer_coordinates() -> tuple[int, int, int, int, int, int, int, int]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return (1, 0, 1, 0, 1, 0, 1, 0)
+    from megatron.core import parallel_state as ps
+
+    expert_tp_group = ps.get_expert_tensor_parallel_group(check_initialized=False)
+    return (
+        int(ps.get_tensor_model_parallel_world_size()),
+        int(ps.get_tensor_model_parallel_rank()),
+        int(ps.get_expert_model_parallel_world_size()),
+        int(ps.get_expert_model_parallel_rank()),
+        1 if expert_tp_group is None else int(expert_tp_group.size()),
+        0 if expert_tp_group is None else int(expert_tp_group.rank()),
+        int(ps.get_pipeline_model_parallel_world_size()),
+        int(ps.get_pipeline_model_parallel_rank()),
+    )
+
+
+def _state_to_cpu(value: object) -> object:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, Mapping):
+        return {key: _state_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_state_to_cpu(item) for item in value)
+    if isinstance(value, list):
+        return [_state_to_cpu(item) for item in value]
+    return value
+
+
 def _vocab_parallel_target_logprobs(
     local_logits: torch.Tensor,
     labels: torch.Tensor,
@@ -3409,3 +3234,16 @@ def _nested_forward_children(inputs: ForwardInputs) -> Iterator[ForwardInputs]:
             "TrainerRank forward inputs must be ForwardInput objects or nested "
             "iterables of ForwardInput objects"
         ) from exc
+
+
+__all__ = [
+    "AdamParams",
+    "ForwardInput",
+    "ForwardOutput",
+    "MicroBatch",
+    "MicroBatchStats",
+    "TopK",
+    "TrainerRank",
+    "TrainerRankMemoryError",
+    "TrainerRankSlotStateError",
+]

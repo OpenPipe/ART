@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
 import pytest
 import torch
 
 pytest.importorskip("megatron.bridge")
 
-from megatron.bridge import AutoBridge
-from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.core.transformer.enums import AttnBackend
 
 from art.megatron.context_parallel.core_attention import ArtContextParallelCoreAttention
@@ -27,29 +24,9 @@ import art.megatron.provider as provider_module
 from art.megatron.runtime.bridge_runtime import load_unique_hf_keys_once
 
 
-class _CoreAttentionSubmodules(Protocol):
-    core_attention: object
-
-
-class _SelfAttentionSpec(Protocol):
-    submodules: _CoreAttentionSubmodules
-
-
-class _TransformerLayerSubmodules(Protocol):
-    self_attention: _SelfAttentionSpec
-
-
-class _TransformerLayerSpec(Protocol):
-    submodules: _TransformerLayerSubmodules
-
-
-class _TransformerLayerSpecFactory(Protocol):
-    def __call__(self, provider: object, *, vp_stage: int) -> _TransformerLayerSpec: ...
-
-
-class _FakeProvider(GPTModelProvider):
+class _FakeProvider:
     def __init__(self) -> None:
-        cast(Any, self).transformer_layer_spec = self._base_layer_spec
+        self.transformer_layer_spec = self._base_layer_spec
         self.finalized = False
         self.overlap_moe_expert_parallel_comm = False
         self.moe_shared_expert_overlap = False
@@ -62,7 +39,7 @@ class _FakeProvider(GPTModelProvider):
         self.window_size: int | tuple[int, int] = (128, 0)
         self.moe_hybridep_num_sms = 16
         self.moe_flex_dispatcher_backend = "hybridep"
-        cast(Any, self).moe_token_dispatcher_type = ""
+        self.moe_token_dispatcher_type = ""
         self.recompute_granularity: str | None = None
         self.recompute_method: str | None = None
         self.recompute_num_layers: int | None = None
@@ -124,20 +101,13 @@ class _FakeGdnCpProvider(_FakeProvider):
         self.finalized = True
 
 
-class _FakeBridge(AutoBridge):
+class _FakeBridge:
     def __init__(self, *, model_bridge: object, provider: _FakeProvider) -> None:
-        self._fake_model_bridge = model_bridge
+        self._model_bridge = model_bridge
         self._provider = provider
-        cast(Any, self).hf_pretrained = SimpleNamespace(model_name_or_path="unused")
+        self.hf_pretrained = SimpleNamespace(model_name_or_path="unused")
 
-    @property
-    def _model_bridge(self) -> Any:
-        return self._fake_model_bridge
-
-    def to_megatron_provider(
-        self, load_weights: bool = True, hf_path: str | Path | None = None
-    ) -> _FakeProvider:
-        del load_weights, hf_path
+    def to_megatron_provider(self) -> _FakeProvider:
         return self._provider
 
 
@@ -429,32 +399,6 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     assert dispatcher_calls == []
 
 
-def test_get_provider_bundle_pins_hf_revision(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _FakeProvider()
-    fake_bridge = _FakeBridge(model_bridge=object(), provider=provider)
-    call: dict[str, object] = {}
-
-    def from_hf_pretrained(model: str, **kwargs: object) -> _FakeBridge:
-        call["model"] = model
-        call.update(kwargs)
-        return fake_bridge
-
-    monkeypatch.setattr(
-        provider_module.AutoBridge, "from_hf_pretrained", from_hf_pretrained
-    )
-    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 1)
-    revision = "a" * 40
-
-    bundle = provider_module.get_provider_bundle(
-        "Qwen/Qwen3-30B-A3B-Instruct-2507", model_revision=revision
-    )
-
-    assert call["revision"] == revision
-    assert bundle.model_revision == revision
-
-
 def test_get_provider_bundle_honors_single_gpu_env_topology(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -487,9 +431,7 @@ def test_get_provider_bundle_honors_single_gpu_env_topology(
     assert resolved.recompute_method == "uniform"
     assert resolved.recompute_num_layers == 1
 
-    layer_spec = cast(_TransformerLayerSpecFactory, resolved.transformer_layer_spec)(
-        resolved, vp_stage=0
-    )
+    layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=0)
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
         is FlexDotProductAttention
@@ -522,9 +464,7 @@ def test_get_provider_bundle_honors_context_parallel_env_topology(
     assert resolved.context_parallel_size == 2
     assert resolved.expert_model_parallel_size == 1
     assert resolved.expert_tensor_parallel_size == 1
-    layer_spec = cast(_TransformerLayerSpecFactory, resolved.transformer_layer_spec)(
-        resolved, vp_stage=0
-    )
+    layer_spec = resolved.transformer_layer_spec(resolved, vp_stage=0)
     assert (
         layer_spec.submodules.self_attention.submodules.core_attention
         is ArtContextParallelCoreAttention
