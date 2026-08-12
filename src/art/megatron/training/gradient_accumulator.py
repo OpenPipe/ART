@@ -141,3 +141,106 @@ class GradientAccumulator(BaseModel):
         if self._layout and tuple(id(grad) for grad in gradients) != self._layout:
             raise RuntimeError("trainable Megatron gradient layout changed")
         return tuple(gradients)
+
+
+class ParameterGradientContribution(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    operation_id: str = Field(min_length=1)
+    token_count: torch.Tensor
+    gradients: tuple[torch.Tensor, ...]
+
+
+class ParameterGradientAccumulator(BaseModel):
+    """Own token-normalized gradient contributions for dynamic parameters."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    parameters: tuple[torch.nn.Parameter, ...]
+    _layout: tuple[tuple[int, ...], ...] = PrivateAttr(default=())
+    _contributions: list[ParameterGradientContribution] = PrivateAttr(
+        default_factory=list
+    )
+    _sealed: tuple[str, ...] | None = PrivateAttr(default=None)
+
+    def model_post_init(self, _context: Any) -> None:
+        if not self.parameters:
+            raise RuntimeError("gradient accumulator requires trainable parameters")
+        self._layout = tuple(tuple(param.shape) for param in self.parameters)
+
+    @property
+    def contribution_ids(self) -> tuple[str, ...]:
+        return tuple(item.operation_id for item in self._contributions)
+
+    def before_forward_backward(self) -> None:
+        if self._sealed is not None:
+            raise RuntimeError("cannot add gradients to a sealed accumulator")
+        for param in self.parameters:
+            param.grad = None
+
+    def record(
+        self,
+        operation_id: str,
+        token_count: torch.Tensor,
+        gradients: tuple[torch.Tensor, ...],
+    ) -> None:
+        if self._sealed is not None:
+            raise RuntimeError("cannot add gradients to a sealed accumulator")
+        if operation_id in self.contribution_ids:
+            raise RuntimeError(f"duplicate gradient contribution {operation_id!r}")
+        if token_count.numel() != 1 or float(token_count.item()) <= 0:
+            raise ValueError(
+                "gradient contribution token_count must be positive scalar"
+            )
+        if tuple(tuple(grad.shape) for grad in gradients) != self._layout:
+            raise RuntimeError("gradient contribution layout changed")
+        self._contributions.append(
+            ParameterGradientContribution(
+                operation_id=operation_id,
+                token_count=token_count.detach().clone(),
+                gradients=gradients,
+            )
+        )
+
+    def seal(self, operation_ids: tuple[str, ...]) -> None:
+        if not operation_ids:
+            raise RuntimeError("optimizer requires at least one F/B contribution")
+        if self._sealed is not None:
+            raise RuntimeError("gradient accumulator is already sealed")
+        if operation_ids != self.contribution_ids:
+            raise RuntimeError(
+                "optimizer contribution order does not match the open accumulator"
+            )
+        self._sealed = operation_ids
+
+    def prepare_optimizer(self) -> tuple[torch.Tensor, ...]:
+        if self._sealed is None:
+            raise RuntimeError("gradient accumulator must be sealed before optimizer")
+        first = self._contributions[0]
+        if len(self._contributions) == 1:
+            return first.gradients
+        total_tokens = sum(
+            (item.token_count for item in self._contributions),
+            torch.zeros_like(first.token_count),
+        )
+        combined = [grad.mul(first.token_count) for grad in first.gradients]
+        for item in self._contributions[1:]:
+            for target, grad in zip(combined, item.gradients, strict=True):
+                target.add_(grad.mul(item.token_count))
+        for grad in combined:
+            grad.div_(total_tokens)
+        return tuple(combined)
+
+    def consume(self) -> tuple[str, ...]:
+        if self._sealed is None:
+            raise RuntimeError("cannot consume an unsealed gradient accumulator")
+        consumed = self._sealed
+        self._contributions.clear()
+        self._sealed = None
+        return consumed
+
+    def discard(self) -> None:
+        for param in self.parameters:
+            param.grad = None
+        self._contributions.clear()
+        self._sealed = None

@@ -533,12 +533,7 @@ class TrainerRank:
         memory_reserve_fraction: float = 0.03,
     ) -> None:
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
-        if pp_size > 1 or len(runtime.model) > 1:
-            raise NotImplementedError(
-                "TrainerRank does not use the MCore forward/backward schedule and "
-                "therefore requires PP=1 with exactly one local model chunk; "
-                f"got pp={pp_size}, chunks={len(runtime.model)}"
-            )
+        self._direct_forward_topology = (pp_size, len(runtime.model))
         if head_chunk_tokens < 1:
             raise ValueError("head_chunk_tokens must be >= 1")
         if shared_prefix_max_depth < 0:
@@ -679,6 +674,41 @@ class TrainerRank:
             ),
         }
         return state
+
+    def checkpoint_slot_parameters(self, name: str) -> tuple[torch.nn.Parameter, ...]:
+        try:
+            return self._checkpoint_slot_params_by_name[name]
+        except KeyError as exc:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}") from exc
+
+    def clear_checkpoint_slot_grads(self, name: str) -> None:
+        for param in self.checkpoint_slot_parameters(name):
+            param.grad = None
+
+    def reduce_checkpoint_slot_grads(
+        self,
+        name: str,
+        *,
+        scale_grads: float,
+    ) -> tuple[torch.Tensor, ...]:
+        return self._reduce_dynamic_grads(
+            self.checkpoint_slot_parameters(name), scale_grads=scale_grads
+        )
+
+    def optim_step_reduced(
+        self,
+        name: str,
+        *,
+        params: AdamParams,
+        grads: Sequence[torch.Tensor],
+    ) -> dict[str, float]:
+        self._guard_checkpoint_can_step(name)
+        model_params = self.checkpoint_slot_parameters(name)
+        if len(grads) != len(model_params):
+            raise ValueError("reduced gradient layout does not match checkpoint slot")
+        return self._step_dynamic_optimizer(
+            ((name, model_params, tuple(grads)),), params=params
+        )
 
     def save_checkpoint_slot_lora(self, name: str, output_dir: str) -> None:
         """Collectively publish a trained checkpoint slot as a vLLM LoRA."""
@@ -864,6 +894,7 @@ class TrainerRank:
         self,
         inputs: Iterable[ForwardInputs],
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        self._require_direct_forward_topology()
         items = [_materialize(item) for item in inputs]
         requests = list(_flatten(items))
         for _, indices in self._group_active_request_indices(requests):
@@ -948,6 +979,7 @@ class TrainerRank:
     ]: ...
 
     def dp_rank_forward(self, inputs: ForwardInputs) -> ForwardOutputs:
+        self._require_direct_forward_topology()
         materialized = _materialize(inputs)
         plan = self._plan_flat_forward(list(_flatten(materialized)))
         check = self._memory_check(plan)
@@ -1228,10 +1260,37 @@ class TrainerRank:
             )
             selected.append((name, slot_params, slot_grads))
 
+        return self._step_dynamic_optimizer(tuple(selected), params=params)
+
+    def _step_dynamic_optimizer(
+        self,
+        selected: Sequence[
+            tuple[
+                str,
+                tuple[torch.nn.Parameter, ...],
+                tuple[torch.Tensor, ...],
+            ]
+        ],
+        *,
+        params: AdamParams,
+    ) -> dict[str, float]:
+        masked = []
+        for name, model_params, grads in selected:
+            masks = self._dynamic_optimizer_padding_masks(name)
+            masked.append(
+                (
+                    name,
+                    model_params,
+                    tuple(
+                        grad.masked_fill(mask, 0)
+                        for grad, mask in zip(grads, masks, strict=True)
+                    ),
+                )
+            )
         all_params = tuple(
-            param for _, slot_params, _ in selected for param in slot_params
+            param for _, slot_params, _ in masked for param in slot_params
         )
-        all_grads = tuple(grad for _, _, slot_grads in selected for grad in slot_grads)
+        all_grads = tuple(grad for _, _, slot_grads in masked for grad in slot_grads)
         grad_norm = _distributed_grad_norm(all_params, all_grads)
         if not torch.isfinite(torch.tensor(grad_norm)):
             self.zero_grad()
@@ -1246,7 +1305,7 @@ class TrainerRank:
             if params.grad_clip_norm > 0.0
             else 1.0
         )
-        for name, model_params, grads in selected:
+        for name, model_params, grads in masked:
             dynamic = self._dynamic_optimizer(name, params)
             for master, grad in zip(dynamic.master_params, grads, strict=True):
                 master.grad = grad.mul(clip)
@@ -1265,6 +1324,16 @@ class TrainerRank:
             "update_successful": 1.0,
             "num_zeros_in_grad": 0.0,
         }
+
+    def _require_direct_forward_topology(self) -> None:
+        pp_size, chunks = self._direct_forward_topology
+        if pp_size > 1 or chunks > 1:
+            raise NotImplementedError(
+                "TrainerRank direct forward does not use the MCore schedule and "
+                "requires PP=1 with exactly one local model chunk; "
+                f"got pp={pp_size}, chunks={chunks}. Checkpoint-slot state remains "
+                "usable by MCore-scheduled training."
+            )
 
     def _dynamic_optimizer(
         self,
