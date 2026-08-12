@@ -39,6 +39,7 @@ from art.trainer_rank._checkpoint import (
     PreparedCheckpoint,
     _hash_files,
     _manifest_seed,
+    _merge_component,
     _PreparedSave,
     _validate_save_state,
     abort_checkpoint_save,
@@ -557,6 +558,44 @@ async def test_checkpoint_context_cancellation_after_successful_push_cleans_stac
     assert trainer._slot_stack == []
 
 
+async def test_checkpoint_context_cancellation_while_push_is_pending_does_not_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def prefetch(_path: str) -> object:
+        started.set()
+        await release.wait()
+        return object()
+
+    monkeypatch.setattr(trainer, "_prefetch_checkpoint", prefetch)
+    pushed = trainer.push_checkpoint("student")
+    entering = asyncio.create_task(pushed.__aenter__())
+    await started.wait()
+    entering.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await entering
+    release.set()
+    await asyncio.sleep(0)
+
+    assert pushed._task is not None and pushed._task.cancelled()
+    assert trainer._slot_stack == []
+
+
+def test_pushed_checkpoint_cannot_be_reused() -> None:
+    trainer = TrainerRank(_runtime())
+    trainer._checkpoint_slots["student"] = _CheckpointSlot()
+    pushed = trainer.push_checkpoint("student")
+
+    with pushed:
+        pass
+    with pytest.raises(RuntimeError, match="cannot be entered twice"):
+        with pushed:
+            pass
+
+
 async def test_shared_checkpoint_prefetch_survives_waiter_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -997,6 +1036,9 @@ def _canonical_checkpoint(root: Path) -> CheckpointManifest:
         ),
         "parameters": {key: files},
         "steps": {key: 3.0},
+        "lora_digest": _hash_files(
+            root, ("adapter_config.json", "adapter_model.safetensors")
+        ),
         "digest": "",
     }
     payloads = {"adapter_config.json", "adapter_model.safetensors", *files}
@@ -1079,6 +1121,21 @@ def test_materialize_lora_validates_exact_artifact_without_optimizer_downloads(
         "adapter_model.safetensors",
     }
 
+    from safetensors.torch import save_file
+
+    save_file(
+        {next(iter(manifest["parameters"])): torch.zeros(1, 2)},
+        local / "adapter_model.safetensors",
+    )
+    with pytest.raises(RuntimeError, match="LoRA digest mismatch"):
+        materialize_lora(
+            local,
+            tmp_path / "corrupt-output",
+            require_optimizer=True,
+            artifact_entries=entries,
+            expected_digest=manifest["digest"],
+        )
+
     with pytest.raises(RuntimeError, match="digest mismatch"):
         materialize_lora(
             local,
@@ -1117,6 +1174,45 @@ def _prepared_save(root: Path, sequence: int) -> _PreparedSave:
     )
 
 
+def test_optimizer_shards_are_received_as_float32(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from art.megatron.lora import LoraShardMeta
+
+    prepared = _prepared_save(tmp_path, 0)
+    metadata = [
+        LoraShardMeta(
+            "weight",
+            1,
+            (2, 3),
+            "bfloat16",
+            {"kind": "replicated"},
+            "block",
+        )
+    ]
+    received: list[torch.dtype] = []
+    monkeypatch.setattr("art.trainer_rank._checkpoint._rank", lambda: 0)
+    monkeypatch.setattr(
+        "art.trainer_rank._checkpoint.raise_distributed", lambda *_args: None
+    )
+
+    def recv(tensor: torch.Tensor, **_kwargs: object) -> None:
+        received.append(tensor.dtype)
+
+    monkeypatch.setattr(dist, "recv", recv)
+    monkeypatch.setattr(
+        "art.megatron.weights.lora_publish.merge_sharded_adapter_entries",
+        lambda entries: {
+            key: values[0][1] for key, values in cast(dict, entries).items()
+        },
+    )
+
+    merged = _merge_component(prepared, metadata, "master", None)
+
+    assert received == [torch.float32]
+    assert merged["weight"].dtype == torch.float32
+
+
 def test_checkpoint_fifo_abort_and_failure_do_not_block_later_save(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1144,6 +1240,23 @@ def test_checkpoint_fifo_abort_and_failure_do_not_block_later_save(
 
     assert calls == [1, 2]
     assert trainer._checkpoint_save_next == 3
+
+
+def test_checkpoint_out_of_order_finalization_fails_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trainer = _save_state_trainer()
+    first = _prepared_save(tmp_path, 0)
+    second = _prepared_save(tmp_path, 1)
+    trainer._prepared_checkpoint_saves = {"first": first, "second": second}
+    monkeypatch.setattr("art.trainer_rank._checkpoint._finish", lambda *_args: None)
+
+    with pytest.raises(RuntimeError, match="finalized in preparation order"):
+        finish_checkpoint_save(trainer, "second")
+    finish_checkpoint_save(trainer, "first")
+    finish_checkpoint_save(trainer, "second")
+
+    assert trainer._checkpoint_save_next == 2
 
 
 def test_concurrent_checkpoint_finish_runs_once(
@@ -1351,6 +1464,7 @@ def _checkpoint_load_failure_worker(
                 "optimizer": optimizer,
                 "parameters": {},
                 "steps": {},
+                "lora_digest": "digest",
                 "digest": "digest",
             }
             if phase != "read"

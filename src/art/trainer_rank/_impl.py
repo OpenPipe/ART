@@ -471,12 +471,13 @@ class PushedCheckpoint:
     _directory: str | None
     _task: asyncio.Task[None] | None = None
     _entered: bool = False
+    _closed: bool = False
 
     def __await__(self) -> Generator[object, None, None]:
         return self._ensure_task().__await__()
 
     def __enter__(self) -> "PushedCheckpoint":
-        if self._entered:
+        if self._entered or self._closed:
             raise RuntimeError("Pushed checkpoint context cannot be entered twice")
         if self._task is not None:
             if not self._task.done():
@@ -499,7 +500,7 @@ class PushedCheckpoint:
         return False
 
     async def __aenter__(self) -> "PushedCheckpoint":
-        if self._entered:
+        if self._entered or self._closed:
             raise RuntimeError("Pushed checkpoint context cannot be entered twice")
         task = self._ensure_task()
         try:
@@ -545,6 +546,7 @@ class PushedCheckpoint:
             raise RuntimeError("Pushed checkpoint stack changed before context exit")
         self._trainer.pop_checkpoint()
         self._entered = False
+        self._closed = True
 
 
 @dataclass(frozen=True)

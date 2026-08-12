@@ -46,6 +46,7 @@ class CheckpointManifest(TypedDict):
     optimizer: OptimizerConfig | None
     parameters: dict[str, list[str]]
     steps: dict[str, float]
+    lora_digest: str
     digest: str
 
 
@@ -164,10 +165,14 @@ def _validate_manifest(
     if manifest.get("format_version") != FORMAT:
         raise RuntimeError("Unsupported ART checkpoint format")
     digest = manifest.get("digest")
+    lora_digest = manifest.get("lora_digest")
     if (
         not isinstance(digest, str)
         or len(digest) != 64
         or any(character not in "0123456789abcdef" for character in digest)
+        or not isinstance(lora_digest, str)
+        or len(lora_digest) != 64
+        or any(character not in "0123456789abcdef" for character in lora_digest)
     ):
         raise RuntimeError("Checkpoint digest is invalid")
     if manifest.get("base_model_name_or_path") != config.get("base_model_name_or_path"):
@@ -264,6 +269,14 @@ def prepare_checkpoint(
             if missing := sorted(files - available):
                 raise RuntimeError(
                     f"Checkpoint artifact is missing entries: {missing[:8]}"
+                )
+            lora_actual = _hash_files(
+                root, ("adapter_config.json", "adapter_model.safetensors")
+            )
+            if lora_actual != manifest["lora_digest"]:
+                raise RuntimeError(
+                    "Checkpoint LoRA digest mismatch: "
+                    f"{lora_actual} != {manifest['lora_digest']}"
                 )
             actual = expected
     else:
@@ -563,7 +576,11 @@ def _merge_component(
             else:
                 dist.send(tensor, dst=0, group=group)
         elif _rank() == 0:
-            dtype = getattr(torch, item.dtype_name)
+            dtype = (
+                getattr(torch, item.dtype_name)
+                if component == "lora"
+                else torch.float32
+            )
             tensor = torch.empty(item.shape, dtype=dtype)
             dist.recv(tensor, src=item.owner_rank, group=group)
             exchanged[identity] = tensor
@@ -740,6 +757,10 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
                 "optimizer": prepared.optimizer,
                 "parameters": parameters,
                 "steps": steps,
+                "lora_digest": _hash_files(
+                    temporary,
+                    ("adapter_config.json", "adapter_model.safetensors"),
+                ),
                 "digest": "",
             }
             artifact_files = {
@@ -816,8 +837,11 @@ def _claim_finalization(
                 trainer._checkpoint_save_condition.wait()
                 continue
             if outcome is None and prepared.sequence != trainer._checkpoint_save_next:
-                trainer._checkpoint_save_condition.wait()
-                continue
+                raise RuntimeError(
+                    "Checkpoint saves must be finalized in preparation order: "
+                    f"expected sequence {trainer._checkpoint_save_next}, got "
+                    f"{prepared.sequence}"
+                )
             trainer._checkpoint_finalizing_saves[output_dir] = action
             return prepared
 
@@ -827,17 +851,15 @@ def _finalize_checkpoint_save(
     output_dir: str,
     action: Literal["finish", "abort"],
 ) -> None:
+    with trainer._checkpoint_save_condition:
+        local = trainer._prepared_checkpoint_saves.get(output_dir)
+        sequence = None if local is None else local.sequence
+    states = _gather((action, output_dir, sequence), trainer._checkpoint_process_group)
+    if any(value != states[0] for value in states):
+        raise RuntimeError("Checkpoint save actions differ across ranks")
     prepared = _claim_finalization(trainer, output_dir, action)
     if prepared is None:
         return
-    states = _gather(
-        (action, output_dir, prepared.sequence), trainer._checkpoint_process_group
-    )
-    if any(value != states[0] for value in states):
-        with trainer._checkpoint_save_condition:
-            trainer._checkpoint_finalizing_saves.pop(output_dir, None)
-            trainer._checkpoint_save_condition.notify_all()
-        raise RuntimeError("Checkpoint save actions differ across ranks")
     with trainer._checkpoint_finalize_lock:
         error: BaseException | None = None
         outcome = trainer._checkpoint_save_outcomes.get(output_dir)
