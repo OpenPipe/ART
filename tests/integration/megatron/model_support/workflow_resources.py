@@ -63,7 +63,9 @@ class ThroughputWorkflowConfig(BaseModel):
     enable_prefix_caching: bool = False
     max_steps: Literal[7] = 7
     max_steps_off_policy: int = Field(default=4, ge=0)
-    packed_sequence_length: Literal[131072] = THROUGHPUT_PACKED_SEQUENCE_LENGTH
+    packed_sequence_length: int = Field(
+        default=THROUGHPUT_PACKED_SEQUENCE_LENGTH, ge=1024
+    )
     min_vllm_pressure: float = Field(default=0.5, ge=0.0, allow_inf_nan=False)
     max_trainer_underfeed: float = Field(default=0.08, ge=0.0, allow_inf_nan=False)
     max_queue_ready_wait_s: float = Field(
@@ -480,6 +482,7 @@ _THROUGHPUT_CONFIGS = {
     ),
     "dsv4": ThroughputWorkflowConfig(
         num_layers=8,
+        packed_sequence_length=32_768,
         prompt_tokens=12_800,
         completion_tokens=736,
         groups_per_step=8,

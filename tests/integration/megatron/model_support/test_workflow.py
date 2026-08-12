@@ -51,6 +51,7 @@ from .workflow_fixtures import (
 from .workflow_resources import (
     _THROUGHPUT_CONFIGS,
     HANDLER_WORKFLOW_RESOURCES,
+    THROUGHPUT_PACKED_SEQUENCE_LENGTH,
     ThroughputThresholds,
     ThroughputWorkflowConfig,
     _h200_equivalent_slots_for_total_gib,
@@ -980,6 +981,15 @@ def test_h200_throughput_depth_only_reduces_memory_bound_handlers() -> None:
     assert _throughput_config_for_hardware("dsv4", config, "h200").num_layers == 4
     assert _throughput_config_for_hardware("glm52", config, "b300") is config
     assert _throughput_config_for_hardware("llama3_dense", config, "h200") is config
+
+
+def test_dsv4_throughput_uses_shorter_packed_sequence() -> None:
+    assert _THROUGHPUT_CONFIGS["dsv4"].packed_sequence_length == 32_768
+    assert all(
+        config.packed_sequence_length == THROUGHPUT_PACKED_SEQUENCE_LENGTH
+        for key, config in _THROUGHPUT_CONFIGS.items()
+        if key != "dsv4"
+    )
 
 
 @pytest.mark.parametrize("hardware", ("b300", "h200"))
