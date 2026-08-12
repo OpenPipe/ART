@@ -46,7 +46,7 @@ class PinnedCpuSnapshotBuilder:
         if device is None:
             raise RuntimeError("CUDA snapshot tensor has no device index")
         stream = self._stager.stream(device)
-        target = torch.empty_like(source, device="cpu", pin_memory=True)
+        target = self._stager.target_like(source)
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
             target.copy_(source, non_blocking=True)
@@ -67,8 +67,10 @@ class PinnedCpuSnapshotBuilder:
 
 
 class PinnedCpuSnapshotStager:
-    def __init__(self) -> None:
+    def __init__(self, *, reusable: bool = False) -> None:
         self._streams: dict[int, torch.cuda.Stream] = {}
+        self._buffers: list[torch.Tensor] | None = [] if reusable else None
+        self._next_buffer = 0
 
     def stream(self, device: int) -> torch.cuda.Stream:
         stream = self._streams.get(device)
@@ -77,6 +79,25 @@ class PinnedCpuSnapshotStager:
                 stream = torch.cuda.Stream()
             self._streams[device] = stream
         return stream
+
+    def reset(self) -> None:
+        self._next_buffer = 0
+
+    def target_like(self, source: torch.Tensor) -> torch.Tensor:
+        if self._buffers is None:
+            return torch.empty_like(source, device="cpu", pin_memory=True)
+        index = self._next_buffer
+        self._next_buffer += 1
+        required = source.nbytes
+        if index == len(self._buffers):
+            self._buffers.append(
+                torch.empty(required, dtype=torch.uint8, device="cpu", pin_memory=True)
+            )
+        elif self._buffers[index].numel() < required:
+            self._buffers[index] = torch.empty(
+                required, dtype=torch.uint8, device="cpu", pin_memory=True
+            )
+        return self._buffers[index][:required].view(source.dtype).view(source.shape)
 
     def begin(self) -> PinnedCpuSnapshotBuilder:
         return PinnedCpuSnapshotBuilder(self)

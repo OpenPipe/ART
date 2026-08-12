@@ -29,7 +29,6 @@ class MegatronTrainJobExecutor:
         self.runtime = runtime
         self._publisher = _GenerationPublisher(
             runtime,
-            stager=PinnedCpuSnapshotStager(),
             capacity=int(runtime.snapshot_pool_capacity),
         )
         self._closed = False
@@ -225,16 +224,17 @@ class _GenerationPublisher:
         self,
         runtime: Any,
         *,
-        stager: PinnedCpuSnapshotStager,
         capacity: int,
     ) -> None:
         if capacity < 1:
             raise ValueError("snapshot pool capacity must be positive")
         self.runtime = runtime
-        self.stager = stager
         self.capacity = capacity
         self._slots = BoundedSemaphore(capacity)
         self._lock = Lock()
+        self._available_stagers = [
+            PinnedCpuSnapshotStager(reusable=True) for _ in range(capacity)
+        ]
         self._transport_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="art-publish-transport"
         )
@@ -260,7 +260,7 @@ class _GenerationPublisher:
             stage_vllm_lora_snapshot_from_model,
         )
 
-        wait_s, in_flight = self._acquire_slot()
+        wait_s, in_flight, stager = self._acquire_slot()
         prepare_started = time.perf_counter()
         optimizer_handoff: Future[Any] = Future()
         transport: Future[Future[TrainerRankPublication]] | None = None
@@ -272,7 +272,7 @@ class _GenerationPublisher:
                 adapter_config=adapter_config,
                 rank=self.runtime.rank,
                 world_size=self.runtime.world_size,
-                stager=self.stager,
+                stager=stager,
             )
             lora_launch_s = time.perf_counter() - prepare_started
             lora_resolve_started = time.perf_counter()
@@ -293,7 +293,7 @@ class _GenerationPublisher:
                     self.runtime,
                     generation_id=job.output_generation_id,
                     step=job.learner_version,
-                    stager=self.stager,
+                    stager=stager,
                 )
                 if save_optimizer
                 else None
@@ -315,6 +315,7 @@ class _GenerationPublisher:
                 sink=sink,
                 generation=job.output.generation,
                 remember=False,
+                stager=stager,
             )
             raise
         persistence.add_done_callback(
@@ -322,6 +323,7 @@ class _GenerationPublisher:
                 done,
                 sink=sink,
                 generation=job.output.generation,
+                stager=stager,
             )
         )
         return {
@@ -335,14 +337,16 @@ class _GenerationPublisher:
             "snapshot_launch_s": time.perf_counter() - prepare_started,
         }
 
-    def _acquire_slot(self) -> tuple[float, int]:
+    def _acquire_slot(self) -> tuple[float, int, PinnedCpuSnapshotStager]:
         self.raise_if_failed()
         started = time.perf_counter()
         self._slots.acquire()
         wait_s = time.perf_counter() - started
         with self._lock:
+            stager = self._available_stagers.pop()
+            stager.reset()
             self._in_flight += 1
-            return wait_s, self._in_flight
+            return wait_s, self._in_flight, stager
 
     def _enqueue_transport(
         self,
@@ -519,11 +523,12 @@ class _GenerationPublisher:
         *,
         sink: EventSink,
         generation: TrainerGeneration,
+        stager: PinnedCpuSnapshotStager,
     ) -> None:
         try:
             event = TrainerPublicationSucceeded(record=future.result())
         except BaseException as error:
-            self._failed(error, sink=sink, generation=generation)
+            self._failed(error, sink=sink, generation=generation, stager=stager)
             return
         try:
             sink.publication(event)
@@ -531,7 +536,7 @@ class _GenerationPublisher:
             with self._lock:
                 self._failures.append(error)
         finally:
-            self._release_slot()
+            self._release_slot(stager)
 
     def _failed(
         self,
@@ -539,8 +544,15 @@ class _GenerationPublisher:
         *,
         sink: EventSink,
         generation: TrainerGeneration,
+        stager: PinnedCpuSnapshotStager,
     ) -> None:
-        self._report_failure(error, sink=sink, generation=generation, remember=True)
+        self._report_failure(
+            error,
+            sink=sink,
+            generation=generation,
+            remember=True,
+            stager=stager,
+        )
 
     def _report_failure(
         self,
@@ -549,6 +561,7 @@ class _GenerationPublisher:
         sink: EventSink,
         generation: TrainerGeneration,
         remember: bool,
+        stager: PinnedCpuSnapshotStager,
     ) -> None:
         if remember:
             with self._lock:
@@ -565,11 +578,12 @@ class _GenerationPublisher:
             with self._lock:
                 self._failures.append(sink_error)
         finally:
-            self._release_slot()
+            self._release_slot(stager)
 
-    def _release_slot(self) -> None:
+    def _release_slot(self, stager: PinnedCpuSnapshotStager) -> None:
         with self._lock:
             self._in_flight -= 1
+            self._available_stagers.append(stager)
         self._slots.release()
 
     def raise_if_failed(self) -> None:
