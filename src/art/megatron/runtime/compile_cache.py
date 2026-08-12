@@ -37,6 +37,30 @@ def _support_instance_method_aliases() -> None:
     GuardsStatePickler.reducer_override = reducer_override
 
 
+def _support_non_strict_package_bypass() -> None:
+    from torch._dynamo.convert_frame import DynamoOutput
+
+    original = DynamoOutput.build_guards
+    if getattr(original, "_art_supports_package_bypass", False):
+        return
+
+    def build_guards(self: Any, *args: Any, **kwargs: Any) -> Any:
+        manager = original(self, *args, **kwargs)
+        output = self.tracer_output.output_graph
+        if (
+            kwargs.get("save")
+            and manager.guards_state is None
+            and output is not None
+            and output.package is None
+        ):
+            # The package entry is already marked as bypassed, so this is not stored.
+            manager.guards_state = b""
+        return manager
+
+    setattr(build_guards, "_art_supports_package_bypass", True)
+    DynamoOutput.build_guards = build_guards
+
+
 class CompileCacheEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -117,6 +141,7 @@ class TrainerCompileCache:
         if config.caching_precompile:
             raise RuntimeError("Dynamo precompile was enabled before trainer imports")
         _support_instance_method_aliases()
+        _support_non_strict_package_bypass()
         os.environ["TORCH_CACHING_PRECOMPILE"] = "1"
         config.caching_precompile = True
         self.key = _compile_cache_key(spec, rank)
