@@ -59,6 +59,7 @@ jobs:
           cd "$project_dir"
           uv init --name art-install-smoke --python 3.12 --bare
           uv add --index https://download.pytorch.org/whl/cu128 \
+            --index-strategy unsafe-best-match \
             "openpipe-art[backend] @ file://${wheel_path}"
           uv sync
 
