@@ -310,6 +310,7 @@ class _FunctionalPlan(BaseModel):
     config_key: str | None = None
     checkpoint: str = "model.safetensors.index.json"
     vision: tuple[str, str] | None = None
+    auxiliary: tuple[str, str] | None = None
 
 
 def _plan(depth: int, prefix: str, **values: Any) -> _FunctionalPlan:
@@ -327,7 +328,7 @@ _FUNCTIONAL_PLANS = {
     "qwen3_5_moe": _plan(8, "model.language_model.layers", config_key="text_config", vision=("model.visual.blocks", "depth")),
     "gemma4_dense": _plan(12, "model.language_model.layers", config_key="text_config", vision=("model.vision_tower.encoder.layers", "num_hidden_layers")),
     "gemma4_moe": _plan(12, "model.language_model.layers", config_key="text_config", vision=("model.vision_tower.encoder.layers", "num_hidden_layers")),
-    "dsv4": _plan(6, "layers"),
+    "dsv4": _plan(6, "layers", auxiliary=("mtp", "num_nextn_predict_layers")),
     "glm52": _plan(10, "model.layers"),
     "gpt_oss_moe": _plan(4, "model.layers"),
 }
@@ -478,6 +479,12 @@ def _functional_config(
     reduced = json.loads(json.dumps(source))
     reduced_text = _config_text(reduced, plan)
     reduced_text["num_hidden_layers"] = plan.depth
+    if plan.auxiliary:
+        _, count_field = plan.auxiliary
+        count = text.get(count_field)
+        if type(count) is not int or count < 0:
+            raise RuntimeError(f"{model_key} has invalid {count_field}")
+        reduced_text[count_field] = 0
     patterns: dict[str, list[object]] = {}
     for field in _FUNCTIONAL_LAYER_FIELDS:
         if (values := text.get(field)) is not None:
@@ -489,12 +496,13 @@ def _functional_config(
         if tuple(patterns.get(field, ())) != expected:
             raise RuntimeError(f"{model_key} production {field} pattern changed")
 
-    width = {
-        "text": _config_shape(text, "num_hidden_layers", *_FUNCTIONAL_LAYER_FIELDS)
-    }
-    if width["text"] != _config_shape(
-        reduced_text, "num_hidden_layers", *_FUNCTIONAL_LAYER_FIELDS
-    ):
+    shape_exclusions = (
+        "num_hidden_layers",
+        *_FUNCTIONAL_LAYER_FIELDS,
+        *((plan.auxiliary[1],) if plan.auxiliary else ()),
+    )
+    width = {"text": _config_shape(text, *shape_exclusions)}
+    if width["text"] != _config_shape(reduced_text, *shape_exclusions):
         raise RuntimeError(f"{model_key} functional fixture changed text width")
     vision_policy: object = "not_applicable"
     if plan.vision:
@@ -586,6 +594,7 @@ def _select_functional_weights(
     source_depth = int(text_config["num_hidden_layers"])
     text_layers: set[int] = set()
     vision_layers: set[int] = set()
+    auxiliary_layers: set[int] = set()
     selected: dict[str, str] = {}
     for name, shard in weights.items():
         text_layer = _layer_index(name, plan.prefix)
@@ -594,21 +603,32 @@ def _select_functional_weights(
             if text_layer is None and plan.vision
             else None
         )
+        auxiliary_layer = (
+            _layer_index(name, plan.auxiliary[0])
+            if text_layer is None and vision_layer is None and plan.auxiliary
+            else None
+        )
         text_layers.update(() if text_layer is None else (text_layer,))
         vision_layers.update(() if vision_layer is None else (vision_layer,))
+        auxiliary_layers.update(() if auxiliary_layer is None else (auxiliary_layer,))
         if (
             text_layer is None
             and vision_layer is None
+            and auxiliary_layer is None
             or text_layer is not None
             and text_layer < plan.depth
             or vision_layer == 0
         ):
             selected[name] = shard
-    expected = set(
-        range(source_depth + int(text_config.get("num_nextn_predict_layers", 0)))
-    )
+    expected = set(range(source_depth))
     if text_layers != expected:
         raise RuntimeError(f"{model_key} canonical text-layer coverage changed")
+    if plan.auxiliary:
+        count = text_config.get(plan.auxiliary[1])
+        if type(count) is not int or auxiliary_layers != set(range(count)):
+            raise RuntimeError(
+                f"{model_key} canonical auxiliary-layer coverage changed"
+            )
     if plan.vision:
         vision = config.get("vision_config")
         if not isinstance(vision, dict):

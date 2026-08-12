@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Mapping
 import uuid
@@ -529,11 +530,15 @@ def _raise_signal_exit(signum: int, _frame: Any) -> None:
 
 
 def _wait_stage_process(process: subprocess.Popen[Any], *, timeout_s: float) -> int:
-    previous_sigterm = signal.signal(signal.SIGTERM, _raise_signal_exit)
+    owns_signals = threading.current_thread() is threading.main_thread()
+    previous_sigterm = (
+        signal.signal(signal.SIGTERM, _raise_signal_exit) if owns_signals else None
+    )
     try:
         return process.wait(timeout=timeout_s)
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm)
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
