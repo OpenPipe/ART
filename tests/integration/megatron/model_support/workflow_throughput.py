@@ -864,6 +864,14 @@ def _calibration_contract(
     }
 
 
+def _calibration_fingerprint(contract: dict[str, Any]) -> str:
+    # Source identity remains diagnostic; measured performance decides whether a
+    # source or dependency change regressed the stable execution contract.
+    return _digest(
+        {key: value for key, value in contract.items() if key != "source_provenance"}
+    )
+
+
 def _chat_token_count(tokenizer: Any, prompt: str) -> int:
     return len(
         _flatten_token_ids(
@@ -1616,7 +1624,7 @@ async def _run_e2e_throughput_async(
         actual_prompt_tokens=actual_prompt_tokens,
         gpu_identities=gpu_identities,
     )
-    calibration_fingerprint = _digest(runtime_contract)
+    calibration_fingerprint = _calibration_fingerprint(runtime_contract)
 
     async with MegatronBackend(
         path=str(stage_dir / "art"),
