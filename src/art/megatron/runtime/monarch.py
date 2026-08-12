@@ -607,7 +607,7 @@ async def spawn_monarch_trainer_actors(
         f"art_megatron_trainer_{supervision.token}",
         MonarchTrainerActor,
         runtime_spec.model_dump_json(),
-        supervision.token,
+        supervision.run_id,
     )
     supervision.own_mesh(await actors._name)
     await actors.initialized
