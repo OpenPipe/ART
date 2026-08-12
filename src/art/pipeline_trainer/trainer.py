@@ -1198,7 +1198,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     train_kwargs["grad_accumulation_sequences"] = (
                         self.grad_accumulation_sequences
                     )
-                if stop_at_step is not None:
+                from art.local.backend import LocalBackend
+
+                if stop_at_step is not None and isinstance(self.backend, LocalBackend):
                     train_kwargs["final_training_step"] = stop_at_step
                 if self.kl_penalty_coef > 0.0:
                     kl_penalty_reference_step = self._kl_penalty_reference_step(

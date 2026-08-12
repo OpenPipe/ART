@@ -279,6 +279,7 @@ async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
         "save_checkpoint": False,
         "adam_params": None,
         "optimizer_save_interval": 5,
+        "final_training_step": 1,
     }
 
 
