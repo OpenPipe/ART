@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,15 +57,27 @@ _PAYLOAD = struct.Struct(f"<dQQ{len(FAST_METRIC_NAMES)}d")
 _SLOT_HEADER = struct.Struct("<QI")
 _SLOT_SIZE = _SLOT_HEADER.size + _PAYLOAD.size
 _STATE_SIZE = _CONTROL.size + 2 * _SLOT_SIZE
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_MEMFD_CREATE = _LIBC.memfd_create
+_MEMFD_CREATE.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+_MEMFD_CREATE.restype = ctypes.c_int
 
 
 def _slot_offset(sequence: int) -> int:
     return _CONTROL.size + (sequence & 1) * _SLOT_SIZE
 
 
+def _memfd_create(name: str) -> int:
+    fd = _MEMFD_CREATE(name.encode(), 1)  # MFD_CLOEXEC
+    if fd < 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    return fd
+
+
 class FastMetricsSharedWriter:
     def __init__(self) -> None:
-        self.fd = os.memfd_create("art-fast-metrics", os.MFD_CLOEXEC)
+        self.fd = _memfd_create("art-fast-metrics")
         os.ftruncate(self.fd, _STATE_SIZE)
         self._mapping = mmap.mmap(self.fd, _STATE_SIZE)
         self._sequence = 0
@@ -289,7 +302,7 @@ class FastMetricsSidecar:
                     f"fast metrics sidecar exited before readiness: {returncode=}"
                 )
             return cls(
-                process=cast(subprocess.Popen[bytes], process),
+                process=process,
                 writer=writer,
                 lifetime_fd=lifetime_write,
                 port=int(message),
