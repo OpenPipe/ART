@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import time
+from types import MethodType
 from typing import Any, Literal
 import uuid
 
@@ -15,6 +16,25 @@ from pydantic import BaseModel, ConfigDict, Field
 from .specs import TrainerRuntimeSpec
 
 _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformers")
+
+
+def _support_instance_method_aliases() -> None:
+    from torch._dynamo.guards import GuardsStatePickler
+
+    original = GuardsStatePickler.reducer_override
+    if getattr(original, "_art_supports_instance_method_aliases", False):
+        return
+
+    def reducer_override(self: Any, obj: Any) -> Any:
+        # PyTorch assumes a bound method is installed under its function name.
+        if isinstance(obj, MethodType) and not hasattr(
+            obj.__self__, obj.__func__.__name__
+        ):
+            return type(self)._unpickle_bound_method, (obj.__func__, obj.__self__)
+        return original(self, obj)
+
+    setattr(reducer_override, "_art_supports_instance_method_aliases", True)
+    GuardsStatePickler.reducer_override = reducer_override
 
 
 class CompileCacheEvent(BaseModel):
@@ -96,6 +116,7 @@ class TrainerCompileCache:
 
         if config.caching_precompile:
             raise RuntimeError("Dynamo precompile was enabled before trainer imports")
+        _support_instance_method_aliases()
         os.environ["TORCH_CACHING_PRECOMPILE"] = "1"
         config.caching_precompile = True
         self.key = _compile_cache_key(spec, rank)
