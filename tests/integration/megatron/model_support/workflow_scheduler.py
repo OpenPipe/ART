@@ -3,10 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
-import shlex
 import socket
-import subprocess
-import sys
 from threading import Lock
 import time
 from typing import Any
@@ -31,6 +28,7 @@ from .workflow_fixtures import (
     WorkflowFixture,
     ensure_workflow_fixture,
 )
+from .workflow_forkserver import WorkflowForkserverPool
 from .workflow_resources import (
     HANDLER_WORKFLOW_RESOURCES,
     WorkflowStageResources,
@@ -951,6 +949,8 @@ def _visible_devices() -> list[WorkflowDevice]:
 
 
 def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[ValidationReport]:
+    import torch
+
     from . import workflow
 
     devices = _visible_devices()
@@ -1031,54 +1031,10 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
                 "WANDB_MODE": "disabled",
             }
         )
-        command = [
-            sys.executable,
-            "-m",
-            "integration.megatron.model_support.workflow_stage_worker",
-            "--session-json",
-            str(request_json),
-        ]
         placement_hosts = {device.host for device in placement.devices}
         if len(placement_hosts) > 1:
             raise RuntimeError("one workflow session cannot span hosts")
         execution_host = next(iter(placement_hosts), socket.gethostname())
-        if execution_host != socket.gethostname():
-            runtime_profile = Path(sys.prefix) / "art-megatron-env.sh"
-            if not runtime_profile.is_file():
-                raise RuntimeError(
-                    "remote workflow sessions require the Megatron runtime profile: "
-                    f"{runtime_profile}"
-                )
-            remote_command = (
-                "unset LD_LIBRARY_PATH && "
-                f"source {shlex.quote(str(runtime_profile))} && "
-                f"cd {shlex.quote(str(workflow.REPO_ROOT))} && exec "
-                + shlex.join(
-                    [
-                        "env",
-                        *(
-                            f"{key}={environment[key]}"
-                            for key in (
-                                "CUDA_VISIBLE_DEVICES",
-                                "PYTHONPATH",
-                                "WANDB_MODE",
-                            )
-                        ),
-                        *command,
-                    ]
-                )
-            )
-            command = [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                execution_host,
-                "/bin/bash",
-                "--noprofile",
-                "--norc",
-                "-c",
-                shlex.quote(remote_command),
-            ]
         timeout_s = sum(
             workflow._WORKFLOW_STAGE_TIMEOUT_OVERRIDES_S.get(
                 (operation.stage, prepared.report.base_model),
@@ -1086,22 +1042,16 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             )
             for operation in session.operations
         )
-        worker_started = time.monotonic()
-        with session_log.open("w", encoding="utf-8") as output:
-            process = subprocess.Popen(
-                command,
-                cwd=workflow.REPO_ROOT,
-                env=environment,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                text=True,
-                start_new_session=True,
-            )
-            try:
-                returncode = workflow._wait_stage_process(process, timeout_s=timeout_s)
-            except subprocess.TimeoutExpired:
-                returncode = None
-        worker_wall_s = time.monotonic() - worker_started
+        fork_result = forkservers.run(
+            execution_host,
+            request_json=request_json,
+            log_path=session_log,
+            environment=environment,
+            torch_threads=torch.get_num_threads(),
+            timeout_s=timeout_s,
+        )
+        returncode = fork_result["returncode"]
+        worker_wall_s = float(fork_result["child_wall_s"])
         completed = []
         for operation, item in zip(session.operations, items, strict=True):
             output_json = Path(item.output_json)
@@ -1129,6 +1079,7 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             ]
             result.metrics["workflow_session_worker_s"] = worker_wall_s
             result.metrics["workflow_session_operation_count"] = len(session.operations)
+            result.metrics.update(forkservers.metrics(execution_host))
             prepared.record_fixture_metric(result.metrics)
             if operation.stage in workflow._RUNTIME_CLEANUP_STAGES:
                 try:
@@ -1146,7 +1097,13 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             completed.append(operation.id)
         return completed
 
-    execute_workflow(plan, devices=devices, runner=runner)
+    with WorkflowForkserverPool(
+        hosts=sorted(gpu_counts),
+        repo_root=workflow.REPO_ROOT,
+        tests_dir=workflow.TESTS_DIR,
+        log_dir=workflows[0].run_dir / ".forkservers",
+    ) as forkservers:
+        execute_workflow(plan, devices=devices, runner=runner)
     for prepared in workflows:
         workflow._finalize_validation_report(prepared.report, partial=False)
         workflow._write_validation_report(prepared.report, prepared.output_json)

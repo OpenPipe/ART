@@ -334,18 +334,22 @@ def _run_base_megatron_session(request: WorkflowStageWorkerSession) -> None:
         _run_session(request.model_copy(update={"base_megatron": False}))
 
 
+def run_session_json(session_json: str | Path) -> None:
+    request = WorkflowStageWorkerSession.model_validate_json(
+        Path(session_json).read_text(encoding="utf-8")
+    )
+    if request.functional_vllm is not None:
+        asyncio.run(_run_functional_session(request))
+    elif request.base_megatron:
+        _run_base_megatron_session(request)
+    else:
+        _run_session(request)
+
+
 def main() -> None:
     args = _parse_args()
     if args.session_json is not None:
-        request = WorkflowStageWorkerSession.model_validate_json(
-            Path(args.session_json).read_text(encoding="utf-8")
-        )
-        if request.functional_vllm is not None:
-            asyncio.run(_run_functional_session(request))
-        elif request.base_megatron:
-            _run_base_megatron_session(request)
-        else:
-            _run_session(request)
+        run_session_json(args.session_json)
         return
     architecture = ArchitectureReport.model_validate_json(
         Path(args.architecture_json).read_text(encoding="utf-8")
