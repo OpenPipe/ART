@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
 
 from art.training.client import TrainingOperation
 from art.training.contracts import (
-    CheckpointRef,
     Contract,
     ForwardBackwardRequest,
     ForwardBackwardResult,
@@ -19,8 +18,6 @@ from art.training.contracts import (
     OperationKind,
     OptimStepRequest,
     OptimStepResult,
-    PackingOutcome,
-    PolicyTokenCount,
     SamplerWeightsResult,
     SaveStateRequest,
     SaveStateResult,
@@ -28,7 +25,13 @@ from art.training.contracts import (
 )
 from art.training.sequencing import CommandAdmission, RunCommandLedger
 
-from ..runtime.specs import ExperimentalTrainConfig, RlForwardBackwardConfig
+from .commands import (
+    checkpoint_ref,
+    experimental_train_config,
+    forward_backward_config,
+    packing_metrics,
+    packing_outcome,
+)
 
 if TYPE_CHECKING:
     from art.megatron.backend import MegatronBackend
@@ -184,18 +187,18 @@ class LocalMegatronTrainingClient:
             raw = await self._service.forward_backward_command(
                 admission.ref,
                 payload.packed,
-                _forward_backward_config(request),
-                _experimental_config(request),
+                forward_backward_config(request),
+                experimental_train_config(request),
             )
             return ForwardBackwardResult(
                 operation_id=admission.ref.operation_id,
-                packing=_packing_outcome(batch),
+                packing=packing_outcome(payload.packed),
                 loss_fn_outputs=tuple(
                     LossFnOutput(token_logprobs=values)
                     for values in raw["token_logprobs"]
                 ),
                 metrics={
-                    **_packing_metrics(payload.packed),
+                    **packing_metrics(payload.packed),
                     "time/step_source_lease_release_s": (
                         time.perf_counter() - release_started
                     ),
@@ -226,7 +229,7 @@ class LocalMegatronTrainingClient:
                 contributing_forward_backward_operation_ids=(
                     admission.contributing_forward_backward_operation_ids
                 ),
-                checkpoint=_checkpoint_ref(
+                checkpoint=checkpoint_ref(
                     admission.ref.run_id,
                     generation.policy_step,
                     generation.generation_id,
@@ -265,7 +268,7 @@ class LocalMegatronTrainingClient:
                 durable = await launch.completion
                 return SamplerWeightsResult(
                     operation_id=admission.ref.operation_id,
-                    checkpoint=_checkpoint_ref(
+                    checkpoint=checkpoint_ref(
                         admission.ref.run_id,
                         durable.adapter.step,
                         request.checkpoint_name,
@@ -297,7 +300,7 @@ class LocalMegatronTrainingClient:
                 durable = await launch.completion
                 return SaveStateResult(
                     operation_id=admission.ref.operation_id,
-                    checkpoint=_checkpoint_ref(
+                    checkpoint=checkpoint_ref(
                         admission.ref.run_id,
                         durable.adapter.step,
                         request.checkpoint_name,
@@ -347,69 +350,6 @@ class LocalMegatronTrainingClient:
         await asyncio.gather(*pending, return_exceptions=True)
 
 
-def _forward_backward_config(
-    request: ForwardBackwardRequest,
-) -> RlForwardBackwardConfig:
-    values = request.loss.values
-    kl_penalty_coef = values.get("kl_penalty_coef", 0.0)
-    if not isinstance(kl_penalty_coef, int | float):
-        raise TypeError("kl_penalty_coef must be numeric")
-    return RlForwardBackwardConfig(
-        kl_penalty_coef=float(kl_penalty_coef),
-        kl_penalty_source=cast(Any, values.get("kl_penalty_source", "current_learner")),
-        grad_accumulation_sequences=cast(
-            int | None, values.get("grad_accumulation_sequences")
-        ),
-    )
-
-
-def _experimental_config(request: ForwardBackwardRequest) -> ExperimentalTrainConfig:
-    values = {
-        name: value
-        for name, value in request.loss.values.items()
-        if name in ExperimentalTrainConfig.model_fields
-    }
-    values["ppo"] = request.loss.name == "ppo"
-    values["scale_rewards"] = bool(values.get("scale_rewards", True))
-    return ExperimentalTrainConfig.model_validate(values)
-
-
-def _packing_outcome(batch: Any) -> PackingOutcome:
-    ref = batch.payload.packed.leases.ref
-    stats = ref.prefix_tree_packing_stats
-    if stats is None or stats.policy_token_counts is None:
-        raise RuntimeError("RL packed batch has no exact policy-token provenance")
-    shapes = tuple(
-        shape for shape in batch.payload.packed.packed_group_shapes if shape is not None
-    )
-    return PackingOutcome(
-        packed_sequence_length=batch.sequence_length,
-        packed_sequences=batch.num_sequences,
-        target_packed_sequences=batch.num_sequences,
-        nominal_capacity_tokens=batch.num_sequences * batch.sequence_length,
-        physical_tokens=stats.physical_tokens,
-        non_padding_tokens=batch.non_padding_tokens,
-        loss_bearing_tokens=batch.loss_bearing_tokens,
-        trainable_assistant_tokens=batch.trainable_assistant_tokens,
-        policy_token_counts=tuple(
-            PolicyTokenCount(
-                policy_version=version,
-                trainable_assistant_tokens=count,
-            )
-            for version, count in sorted(stats.policy_token_counts.items())
-        ),
-        group_shapes=shapes,
-    )
-
-
-def _checkpoint_ref(run_id: str, learner_version: int, checkpoint_id: str):
-    return CheckpointRef(
-        run_id=run_id,
-        learner_version=learner_version,
-        checkpoint_id=checkpoint_id,
-    )
-
-
 def _validate_publication_mode(
     request: SaveWeightsForSamplerRequest,
     *,
@@ -431,9 +371,3 @@ def _validate_publication_mode(
             f"sampler publication mode {requested!r} conflicts with "
             f"weights={weights_mode!r}, update={update_mode!r}"
         )
-
-
-def _packing_metrics(packed: Any) -> dict[str, float]:
-    from art.megatron.backend import _packing_metrics as build_metrics
-
-    return build_metrics(packed)
