@@ -135,12 +135,9 @@ def _reset_vllm(client: httpx.Client, baseline: tuple[str, ...]) -> dict[str, ob
     before = model_ids()
     aliases = tuple(sorted(set(before) - set(baseline)))
     for alias in aliases:
-        _runtime_json(
-            client,
-            "POST",
-            "/v1/unload_lora_adapter",
-            json={"lora_name": alias},
-        )
+        client.post(
+            "/v1/unload_lora_adapter", json={"lora_name": alias}
+        ).raise_for_status()
     reset = _runtime_json(
         client,
         "POST",
