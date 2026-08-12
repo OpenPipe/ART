@@ -288,7 +288,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             "time/step_train_s": 1.5,
             "time/step_wall_s": 2.0,
             "time/step_collect_batch_s": 0.001068115234375,
-            "queue/packed_get_wait_s": 0.1 if step == 7 else 0.001,
+            "queue/packed_get_wait_s": 0.1 if step >= 7 else 0.001,
             "queue/packed_queue_depth": 0.0 if step == 6 else 1.0,
             "time/inter_forward_backward_gap_rank_0_s": (
                 1.0 if step >= 6 else 0.1 + (step - 2) * 0.01
@@ -302,7 +302,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             "discarded/step/stale_groups": 0,
             "discarded/step/zero_variance_groups": 0,
         }
-        for step in range(2, 8)
+        for step in range(2, 10)
     ]
     history_path = tmp_path / "history.jsonl"
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -374,8 +374,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
                     end_step=9,
                     window_start_s=8.0,
                     window_end_s=12.0,
-                    vllm_pressure=0.1,
-                    vllm_waiting_capacity_request_s=1.0,
+                    vllm_pressure=0.6,
+                    vllm_waiting_capacity_request_s=6.0,
                     vllm_running_request_s=10.0,
                     trainer_underfeed_score=0.5,
                     actual_stale_frac=0.0,
@@ -392,6 +392,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         PolicyActivationEvent(5, 2.5, 2.75),
         PolicyActivationEvent(6, 4.5, 4.75),
         PolicyActivationEvent(7, 6.5, 7.75),
+        PolicyActivationEvent(8, 8.5, 8.75),
+        PolicyActivationEvent(9, 10.5, 10.75),
     ]
     config = ThroughputWorkflowConfig(num_layers=2, completion_tokens=128)
     fixture = ThroughputFixture(
@@ -415,8 +417,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         )
 
     e2e_phase, isolated_phase = (
-        phase("e2e", "input-a", (5, 6, 7)),
-        phase("isolated", "input-a", (9, 10, 11)),
+        phase("e2e", "input-a", (7, 8, 9)),
+        phase("isolated", "input-a", (11, 12, 13)),
     )
 
     def collect(isolated):
@@ -436,14 +438,14 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     measurements = collect(isolated_phase)
 
     expected = {
-        "original_trajectory_tokens": 24_000,
-        "nonpadding_logical_tokens": 6_000,
-        "loss_bearing_tokens": 3_000,
-        "accepted_train_tokens": 3_000,
+        "original_trajectory_tokens": 32_000,
+        "nonpadding_logical_tokens": 8_000,
+        "loss_bearing_tokens": 4_000,
+        "accepted_train_tokens": 4_000,
         "isolated_train_tok_s": 1_000 / 1.5,
         "matched_e2e_core_train_tok_s": 1_000 / 1.5,
         "matched_core_to_isolated_ratio": 1.0,
-        "e2e_core_train_tok_s": 6_000 / 9.0,
+        "e2e_core_train_tok_s": 8_000 / 12.0,
         "e2e_train_tok_s": 500.0,
         "accepted_train_tok_s": 250.0,
         "queue_ready_inter_forward_backward_gap_rank_zero_p50_s": 0.115,
@@ -458,14 +460,14 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "mean_train_gap_s": 0.5,
         "stable_vllm_pressure": 0.6,
         "stable_trainer_underfeed": 0.07,
-        "post_warmup_policy_activation_count": 6,
-        "mean_policy_activation_lag_s": 2.5 / 6.0,
+        "post_warmup_policy_activation_count": 8,
+        "mean_policy_activation_lag_s": 3.0 / 8.0,
         "p50_policy_activation_lag_s": 0.25,
         "p95_policy_activation_lag_s": 1.0,
         "max_policy_activation_lag_s": 1.25,
-        "mean_policy_activation_interval_s": 11.75 / 6.0,
+        "mean_policy_activation_interval_s": 14.75 / 8.0,
         "p50_policy_activation_interval_s": 2.0,
-        "p95_policy_activation_interval_s": 2.75,
+        "p95_policy_activation_interval_s": 2.65,
         "second_max_policy_activation_interval_s": 2.0,
         "max_policy_activation_interval_s": 3.0,
     }
