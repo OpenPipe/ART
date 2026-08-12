@@ -281,6 +281,45 @@ class ForwardBackwardJobSpec(_Spec):
         return sum(counts.policy_token_counts.values())
 
 
+class ForwardJobSpec(ForwardBackwardJobSpec):
+    """One forward-only command against a fixed learner parent."""
+
+
+class LoadStateJobSpec(_Spec):
+    """Replace one resident run learner at an ordered command barrier."""
+
+    operation_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    sequence_id: int = Field(ge=0)
+    training_session_id: str = Field(min_length=1)
+    expected_learner_version: int = Field(ge=0)
+    learner_version: int = Field(ge=1)
+    adapter_path: str = Field(min_length=1)
+    adapter_step: int = Field(ge=0)
+    optimizer_state_path: str | None = Field(default=None, min_length=1)
+    restore_optimizer: bool = False
+
+    @model_validator(mode="after")
+    def _validate_transition(self) -> "LoadStateJobSpec":
+        if self.learner_version != self.expected_learner_version + 1:
+            raise ValueError("load learner version must advance exactly one step")
+        if self.restore_optimizer != (self.optimizer_state_path is not None):
+            raise ValueError(
+                "optimizer_state_path is required exactly for optimizer-exact load"
+            )
+        return self
+
+    @property
+    def fingerprint(self) -> str:
+        return _fingerprint(self)
+
+
+class ResolvedCheckpointState(_Spec):
+    adapter_path: str = Field(min_length=1)
+    adapter_step: int = Field(ge=0)
+    optimizer_state_path: str | None = Field(default=None, min_length=1)
+
+
 class OptimizerJobSpec(_Spec):
     """Seal exact F/B contributions into one learner transition."""
 

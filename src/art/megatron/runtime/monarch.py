@@ -34,8 +34,10 @@ from .specs import (
     TRAIN_EVENT_ADAPTER,
     AdapterReady,
     ForwardBackwardJobSpec,
+    ForwardJobSpec,
     GenerationSnapshotJobSpec,
     HybridEpRuntimeSpec,
+    LoadStateJobSpec,
     OptimizerJobSpec,
     RunSlotRegistration,
     SFTJobSpec,
@@ -473,6 +475,34 @@ class MonarchTrainerActor(Actor):
                 batch.close()
 
     @endpoint
+    def execute_forward(self, job_json: str, batch_json: str) -> dict[str, Any]:
+        batch = None
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = ForwardJobSpec.model_validate_json(job_json)
+            leases = PackedBatchLeaseSet.model_validate_json(batch_json)
+            batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            result = self._executor.execute_forward(job, batch, Event())
+            coordinator = self._runtime.rank == 0
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.expected_learner_version,
+                "metrics": result["metrics"] if coordinator else {},
+                "token_logprobs": result["token_logprobs"] if coordinator else (),
+            }
+        except BaseException:
+            self._valid = False
+            raise
+        finally:
+            if batch is not None:
+                batch.close()
+
+    @endpoint
     def execute_optimizer(self, job_json: str) -> dict[str, Any]:
         try:
             if not self._valid:
@@ -490,6 +520,23 @@ class MonarchTrainerActor(Actor):
                     "contributing_forward_backward_operation_ids"
                 ],
                 "metrics": result["metrics"] if coordinator else {},
+            }
+        except BaseException:
+            self._valid = False
+            raise
+
+    @endpoint
+    def execute_load_state(self, job_json: str) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = LoadStateJobSpec.model_validate_json(job_json)
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            return {
+                "rank": self._runtime.rank,
+                **self._executor.execute_load_state(job),
             }
         except BaseException:
             self._valid = False
@@ -566,6 +613,38 @@ class MonarchTrainerActor(Actor):
                 batch.close()
 
     @endpoint
+    def execute_run_slot_forward(
+        self,
+        job_json: str,
+        batch_json: str,
+    ) -> dict[str, Any]:
+        batch = None
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = ForwardJobSpec.model_validate_json(job_json)
+            leases = PackedBatchLeaseSet.model_validate_json(batch_json)
+            batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            result = self._run_slot_executor.execute_forward(job, batch, Event())
+            coordinator = self._runtime.rank == 0
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.expected_learner_version,
+                "metrics": result["metrics"] if coordinator else {},
+                "token_logprobs": result["token_logprobs"] if coordinator else (),
+            }
+        except BaseException:
+            self._valid = False
+            raise
+        finally:
+            if batch is not None:
+                batch.close()
+
+    @endpoint
     def execute_run_slot_optimizer(self, job_json: str) -> dict[str, Any]:
         try:
             if not self._valid:
@@ -582,6 +661,18 @@ class MonarchTrainerActor(Actor):
                 ],
                 "metrics": result["metrics"] if coordinator else {},
             }
+        except BaseException:
+            self._valid = False
+            raise
+
+    @endpoint
+    def execute_run_slot_load_state(self, job_json: str) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = LoadStateJobSpec.model_validate_json(job_json)
+            result = self._run_slot_executor.execute_load_state(job)
+            return {"rank": self._runtime.rank, **result}
         except BaseException:
             self._valid = False
             raise
@@ -959,6 +1050,40 @@ class MonarchTrainerSlot:
                 await self._invalidate(error, "F/B operation and cleanup failed")
                 raise
 
+    async def forward(
+        self,
+        job: ForwardJobSpec,
+        batch: PackedBatchLeaseSet,
+    ) -> dict[str, Any]:
+        async with self._lock:
+            self._require_open()
+            cached = self._cached_operation(job.operation_id, job.fingerprint)
+            if cached is not None:
+                return cached
+            if batch.ref != job.batch:
+                raise ValueError(
+                    "forward batch ref does not match supplied packed batch"
+                )
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.execute_run_slot_forward.call(
+                        job.model_dump_json(), batch.model_dump_json()
+                    ),
+                    timeout=self._command_timeout_s,
+                )
+                results = list(values.values())
+                self._validate_command_results(
+                    results,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                )
+                result = next(result for result in results if result["rank"] == 0)
+                self._operations[job.operation_id] = (job.fingerprint, result)
+                return result
+            except BaseException as error:
+                await self._invalidate(error, "forward operation and cleanup failed")
+                raise
+
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]:
         async with self._lock:
             self._require_open()
@@ -989,6 +1114,38 @@ class MonarchTrainerSlot:
                 return result
             except BaseException as error:
                 await self._invalidate(error, "optimizer operation and cleanup failed")
+                raise
+
+    async def load_state(self, job: LoadStateJobSpec) -> dict[str, Any]:
+        async with self._lock:
+            self._require_open()
+            cached = self._cached_operation(job.operation_id, job.fingerprint)
+            if cached is not None:
+                return cached
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.execute_run_slot_load_state.call(
+                        job.model_dump_json()
+                    ),
+                    timeout=self._command_timeout_s,
+                )
+                results = list(values.values())
+                self._validate_command_results(
+                    results,
+                    operation_id=job.operation_id,
+                    learner_version=job.learner_version,
+                )
+                if {result["optimizer_restored"] for result in results} != {
+                    job.restore_optimizer
+                }:
+                    raise RuntimeError(
+                        "trainer ranks disagree on optimizer restoration"
+                    )
+                result = next(result for result in results if result["rank"] == 0)
+                self._operations[job.operation_id] = (job.fingerprint, result)
+                return result
+            except BaseException as error:
+                await self._invalidate(error, "load operation and cleanup failed")
                 raise
 
     async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
@@ -1231,6 +1388,68 @@ class MonarchTrainerRun:
                 )
             return await self._run_forward_backward(job, batch)
 
+    async def forward(
+        self,
+        job: ForwardJobSpec,
+        batch: PackedBatchLeaseSet,
+    ) -> dict[str, Any]:
+        cached = self._operations.get(job.operation_id)
+        if cached is not None and cached[0] == job.fingerprint:
+            return cached[1]
+        async with self._lock:
+            cached = self._operations.get(job.operation_id)
+            if cached is not None:
+                if cached[0] != job.fingerprint:
+                    raise RuntimeError("operation_id was reused for another forward")
+                return cached[1]
+            self._validate_operation(job)
+            if batch.ref != job.batch:
+                raise ValueError(
+                    "forward batch ref does not match supplied packed batch"
+                )
+            if job.batch.sequence_length != self.runtime_spec.packed_sequence_length:
+                raise ValueError(
+                    "packed batch sequence length does not match the trainer runtime"
+                )
+            return await self._run_forward(job, batch)
+
+    async def _run_forward(
+        self,
+        job: ForwardJobSpec,
+        batch: PackedBatchLeaseSet,
+    ) -> dict[str, Any]:
+        collective = asyncio.ensure_future(
+            self._actors.execute_forward.call(
+                job.model_dump_json(), batch.model_dump_json()
+            )
+        )
+        self._active_job_id = job.operation_id
+        self._active_collective = collective
+        try:
+            values = await asyncio.wait_for(
+                collective,
+                timeout=self._command_timeout_s(),
+            )
+            results = list(values.values())
+            self._validate_rank_command_results(
+                results,
+                operation_id=job.operation_id,
+                learner_version=job.expected_learner_version,
+            )
+            result = next(result for result in results if result["rank"] == 0)
+            self._next_operation_sequence += 1
+            self._operations[job.operation_id] = (job.fingerprint, result)
+            return result
+        except BaseException as error:
+            await self._invalidate_command(
+                error, "forward operation and cleanup failed"
+            )
+            raise
+        finally:
+            if self._active_job_id == job.operation_id:
+                self._active_job_id = None
+                self._active_collective = None
+
     async def _run_forward_backward(
         self,
         job: ForwardBackwardJobSpec,
@@ -1332,6 +1551,56 @@ class MonarchTrainerRun:
                 self._active_job_id = None
                 self._active_collective = None
 
+    async def load_state(self, job: LoadStateJobSpec) -> dict[str, Any]:
+        cached = self._operations.get(job.operation_id)
+        if cached is not None and cached[0] == job.fingerprint:
+            return cached[1]
+        async with self._lock:
+            cached = self._operations.get(job.operation_id)
+            if cached is not None:
+                if cached[0] != job.fingerprint:
+                    raise RuntimeError("operation_id was reused for another load")
+                return cached[1]
+            self._validate_operation(job)
+            if self._open_forward_backward_ids:
+                raise RuntimeError("load_state cannot discard open F/B contributions")
+            collective = asyncio.ensure_future(
+                self._actors.execute_load_state.call(job.model_dump_json())
+            )
+            self._active_job_id = job.operation_id
+            self._active_collective = collective
+            try:
+                values = await asyncio.wait_for(
+                    collective,
+                    timeout=self._command_timeout_s(),
+                )
+                results = list(values.values())
+                self._validate_rank_command_results(
+                    results,
+                    operation_id=job.operation_id,
+                    learner_version=job.learner_version,
+                )
+                if {result["optimizer_restored"] for result in results} != {
+                    job.restore_optimizer
+                }:
+                    raise RuntimeError(
+                        "trainer ranks disagree on optimizer restoration"
+                    )
+                result = next(result for result in results if result["rank"] == 0)
+                self._learner_version = job.learner_version
+                self._next_operation_sequence += 1
+                self._operations[job.operation_id] = (job.fingerprint, result)
+                return result
+            except BaseException as error:
+                await self._invalidate_command(
+                    error, "load operation and cleanup failed"
+                )
+                raise
+            finally:
+                if self._active_job_id == job.operation_id:
+                    self._active_job_id = None
+                    self._active_collective = None
+
     async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
         cached = self._operations.get(job.operation_id)
         if cached is not None and cached[0] == job.fingerprint:
@@ -1398,7 +1667,13 @@ class MonarchTrainerRun:
 
     def _validate_operation(
         self,
-        job: ForwardBackwardJobSpec | OptimizerJobSpec | GenerationSnapshotJobSpec,
+        job: (
+            ForwardJobSpec
+            | ForwardBackwardJobSpec
+            | OptimizerJobSpec
+            | LoadStateJobSpec
+            | GenerationSnapshotJobSpec
+        ),
     ) -> None:
         if self._closed or not self._valid:
             raise RuntimeError("trainer runtime is invalid")

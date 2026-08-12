@@ -68,6 +68,8 @@ from art.megatron.routing_replay import (
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.specs import (
     ForwardBackwardJobSpec,
+    ForwardJobSpec,
+    LoadStateJobSpec,
     RlForwardBackwardConfig,
     SFTJobSpec,
     TrainJobSpec,
@@ -1023,6 +1025,135 @@ def execute_megatron_dynamic_lora_forward_backward_job(
     )
 
 
+def execute_megatron_rl_forward_job(
+    runtime: TrainingRuntime,
+    job: ForwardJobSpec,
+    packed_tensors: PackedTensors,
+    *,
+    cancelled: Event | None = None,
+    replay_bundle: MoeRoutingReplayBundle | None = None,
+) -> dict[str, Any]:
+    """Run one packed forward without changing gradients or optimizer state."""
+    started = time.perf_counter()
+    global_sequences = resolve_global_grad_accumulation_sequences(
+        job.config.grad_accumulation_sequences
+    )
+    if replay_bundle is None and packed_tensors.get("moe_routing_replay") is not None:
+        replay_bundle = build_moe_routing_replay_bundle_from_packed_tensors(
+            packed_tensors=packed_tensors,
+            global_grad_accumulation_sequences=global_sequences,
+        )
+    configure_moe_routing_replay(
+        runtime,
+        replay_bundle=replay_bundle,
+        strict=_moe_replay_strict(job),
+    )
+    replay_finalize_s = time.perf_counter() - started
+    num_sequences = int(packed_tensors["tokens"].shape[0])
+    num_steps = math.ceil(num_sequences / global_sequences)
+    if ps.get_expert_model_parallel_world_size() > 1:
+        topology = _infer_parallel_topology(runtime.model)
+        required_capacity = max(
+            (
+                count
+                for step_index in range(num_steps)
+                for count in build_rl_hybridep_token_counts(
+                    packed_tensors=packed_tensors,
+                    step_index=step_index,
+                    num_sequences=num_sequences,
+                    global_grad_accumulation_sequences=global_sequences,
+                    topology=topology,
+                    provider=runtime.provider,
+                    model_support_handler=runtime.model_support_handler,
+                )
+            ),
+            default=0,
+        )
+        _ensure_hybridep_capacity(
+            runtime,
+            packed_sequence_length=int(packed_tensors["tokens"].shape[1]),
+            context_parallel_size=topology.cp,
+            required_capacity=required_capacity,
+        )
+
+    outputs = _precompute_reference_logprobs(
+        runtime=runtime,
+        packed_tensors=packed_tensors,
+        sample_step_indices=_reference_sample_step_indices(
+            num_sequences=num_sequences,
+            num_steps=num_steps,
+            global_grad_accumulation_sequences=global_sequences,
+        ),
+        global_grad_accumulation_sequences=global_sequences,
+        cancelled=cancelled,
+        purpose="forward-only",
+    )
+    return {
+        "operation_id": job.operation_id,
+        "token_logprobs": tuple(outputs[index] for index in sorted(outputs)),
+        "metrics": {
+            "time/forward_s": time.perf_counter() - started,
+            "time/replay_finalize_s": replay_finalize_s,
+        },
+    }
+
+
+def execute_megatron_dynamic_lora_forward_job(
+    runtime: TrainingRuntime,
+    job: ForwardJobSpec,
+    packed_tensors: PackedTensors,
+    *,
+    cancelled: Event | None = None,
+    replay_bundle: MoeRoutingReplayBundle | None = None,
+) -> dict[str, Any]:
+    from art.megatron.lora import LoRASlotRef, use_lora_slot
+
+    with use_lora_slot(LoRASlotRef("checkpoint", job.run_id)):
+        return execute_megatron_rl_forward_job(
+            runtime,
+            job,
+            packed_tensors,
+            cancelled=cancelled,
+            replay_bundle=replay_bundle,
+        )
+
+
+def execute_megatron_load_state_job(
+    runtime: TrainingRuntime,
+    job: LoadStateJobSpec,
+) -> None:
+    """Replace resident single-run weights and reset or restore Adam exactly."""
+    runtime.optimizer_snapshot_barrier.synchronize()
+    runtime.resident_training_session_id = None
+    runtime.resident_policy_step = None
+    runtime.optimizer_state_loaded = False
+    runtime.adapter_export_config = None
+    runtime.optimizer = None
+    _load_adapter_into_model(
+        runtime.model,
+        job.adapter_path,
+        runtime.rank,
+        handler=runtime.model_support_handler,
+    )
+    runtime.optimizer = _build_optimizer(runtime.model, runtime.optimizer_config)
+    if job.restore_optimizer:
+        assert job.optimizer_state_path is not None
+        _load_optimizer(
+            runtime,
+            optimizer_state_path=job.optimizer_state_path,
+            adapter_path=job.adapter_path,
+            adapter_step=job.adapter_step,
+            allow_missing=False,
+        )
+    else:
+        _eager_initialize_optimizer_state(runtime.optimizer)
+    runtime.adapter_export_dtypes = {}
+    runtime.adapter_export_config = load_adapter_config(job.adapter_path)
+    runtime.resident_training_session_id = job.training_session_id
+    runtime.resident_policy_step = job.learner_version
+    runtime.optimizer_state_loaded = True
+
+
 def execute_megatron_sft_job(
     runtime: TrainingRuntime,
     job: SFTJobSpec,
@@ -1152,7 +1283,7 @@ def execute_megatron_sft_job(
 
 
 def _experimental_train_config(
-    job: TrainJobSpec | ForwardBackwardJobSpec,
+    job: TrainJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
 ) -> dev.TrainConfig:
     return cast(
         dev.TrainConfig,
@@ -1160,7 +1291,9 @@ def _experimental_train_config(
     )
 
 
-def _moe_replay_strict(job: TrainJobSpec | ForwardBackwardJobSpec) -> bool:
+def _moe_replay_strict(
+    job: TrainJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
+) -> bool:
     return job.experimental_config.moe_routing_replay_strict
 
 
@@ -1200,7 +1333,7 @@ def _load_lora_and_optimizer(
 
 def _prepare_rl_training_state(
     runtime: TrainingRuntime,
-    job: TrainJobSpec | SFTJobSpec | ForwardBackwardJobSpec,
+    job: TrainJobSpec | SFTJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
 ) -> dict[str, torch.dtype]:
     state_is_resident = (
         runtime.optimizer_persistent
@@ -1934,10 +2067,12 @@ def _precompute_reference_logprobs(
     packed_tensors: PackedTensors,
     sample_step_indices: dict[int, int],
     global_grad_accumulation_sequences: int,
+    cancelled: Event | None = None,
+    purpose: str = "KL reference",
 ) -> dict[int, torch.Tensor]:
     print0(
         runtime.rank,
-        "Precomputing KL reference logprobs for",
+        f"Precomputing {purpose} logprobs for",
         len(sample_step_indices),
         "local sequences",
     )
@@ -1946,6 +2081,10 @@ def _precompute_reference_logprobs(
     results: dict[int, torch.Tensor] = {}
     if not ps.model_parallel_is_initialized():
         for sample_index, step_index in sorted(sample_step_indices.items()):
+            if cancelled is not None and cancelled.is_set():
+                from art.megatron.runtime.trainer_run import TrainingCancelledError
+
+                raise TrainingCancelledError("forward job was cancelled")
             results[sample_index] = _calculate_megatron_logprobs(
                 model_chunks=runtime.model,
                 provider=runtime.provider,
@@ -1963,6 +2102,10 @@ def _precompute_reference_logprobs(
         _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
     )
     for step_index in sorted(set(sample_step_indices.values())):
+        if cancelled is not None and cancelled.is_set():
+            from art.megatron.runtime.trainer_run import TrainingCancelledError
+
+            raise TrainingCancelledError("forward job was cancelled")
         micro_indices = build_micro_sample_indices(
             step_index=step_index,
             num_sequences=num_sequences,

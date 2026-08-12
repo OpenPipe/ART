@@ -74,8 +74,11 @@ from .runtime.specs import (
     DurableTrainOutput,
     ExperimentalTrainConfig,
     ForwardBackwardJobSpec,
+    ForwardJobSpec,
     GenerationSnapshotJobSpec,
+    LoadStateJobSpec,
     OptimizerJobSpec,
+    ResolvedCheckpointState,
     RlForwardBackwardConfig,
     SFTJobSpec,
     TrainAccepted,
@@ -1039,6 +1042,30 @@ class DistributedMegatronService:
         config: RlForwardBackwardConfig,
         experimental_config: ExperimentalTrainConfig,
     ) -> dict[str, Any]:
+        return await self._forward_command(
+            ref, batch, config, experimental_config, backward=True
+        )
+
+    async def forward_command(
+        self,
+        ref: OperationRef,
+        batch: DistributedPackedBatch,
+        config: RlForwardBackwardConfig,
+        experimental_config: ExperimentalTrainConfig,
+    ) -> dict[str, Any]:
+        return await self._forward_command(
+            ref, batch, config, experimental_config, backward=False
+        )
+
+    async def _forward_command(
+        self,
+        ref: OperationRef,
+        batch: DistributedPackedBatch,
+        config: RlForwardBackwardConfig,
+        experimental_config: ExperimentalTrainConfig,
+        *,
+        backward: bool,
+    ) -> dict[str, Any]:
         async with self._train_lock, self._trainer_failure_boundary():
             if self._temporal_gpu_sharing and self._base_url is not None:
                 async with self._serving_lock:
@@ -1052,7 +1079,7 @@ class DistributedMegatronService:
                 source = self._learner_generation
                 if source is None or ref.learner_parent_version != self._latest_step:
                     raise RuntimeError("F/B command learner parent changed")
-                job = ForwardBackwardJobSpec(
+                job = (ForwardBackwardJobSpec if backward else ForwardJobSpec)(
                     operation_id=ref.operation_id,
                     run_id=ref.run_id,
                     sequence_id=ref.sequence_id,
@@ -1075,7 +1102,9 @@ class DistributedMegatronService:
                     or source_adapter.identity
                     != str(Path(source.adapter_path).absolute())
                 ):
-                    raise RuntimeError("cold F/B source generation is not registered")
+                    raise RuntimeError(
+                        "cold forward source generation is not registered"
+                    )
             if reconcile is not None:
                 step, checkpoint = reconcile
                 async with self._serving_lock:
@@ -1085,10 +1114,16 @@ class DistributedMegatronService:
                 if source_adapter is not None
                 else nullcontext()
             ):
-                result = await trainer.forward_backward(job, batch.leases)
+                result = await (
+                    trainer.forward_backward(job, batch.leases)
+                    if backward
+                    else trainer.forward(job, batch.leases)
+                )
             async with self._mutation_lock:
                 if self._latest_step != ref.learner_parent_version:
-                    raise RuntimeError("learner advanced while F/B command executed")
+                    raise RuntimeError(
+                        "learner advanced while forward command executed"
+                    )
                 self._trainer_resident_generation = source
             return result
 
@@ -1142,13 +1177,18 @@ class DistributedMegatronService:
                 )
             return result, generation
 
-    async def snapshot_command(
+    async def load_state_command(
         self,
         ref: OperationRef,
+        source: ResolvedCheckpointState,
         *,
-        save_optimizer: bool,
-        activate_serving: bool,
-    ) -> GenerationSnapshotLaunch:
+        restore_optimizer: bool,
+    ) -> tuple[dict[str, Any], TrainerGeneration, dict[str, float]]:
+        output_version = ref.reserved_output_learner_version
+        if output_version is None:
+            raise ValueError("load command has no reserved learner output")
+        if restore_optimizer and source.optimizer_state_path is None:
+            raise ValueError("optimizer-exact load has no optimizer state")
         async with self._train_lock, self._trainer_failure_boundary():
             async with self._mutation_lock:
                 self._require_open()
@@ -1157,93 +1197,158 @@ class DistributedMegatronService:
                     run_id=ref.run_id
                 )
                 if reconcile is not None:
-                    raise RuntimeError("snapshot command cannot start a cold trainer")
-                generation = self._learner_generation
-                if (
-                    generation is None
-                    or ref.learner_parent_version != self._latest_step
-                    or generation.policy_step != self._latest_step
-                ):
-                    raise RuntimeError("snapshot command learner parent changed")
-                existing = self._published_adapters.get(self._latest_step)
-                preceding_rank_snapshot = self._snapshot_rank_tasks.get(
-                    self._latest_step
+                    raise RuntimeError("load command cannot start a cold trainer")
+                if ref.learner_parent_version != self._latest_step:
+                    raise RuntimeError("load command learner parent changed")
+                job = LoadStateJobSpec(
+                    operation_id=ref.operation_id,
+                    run_id=ref.run_id,
+                    sequence_id=ref.sequence_id,
+                    training_session_id=self._training_session_id,
+                    expected_learner_version=ref.learner_parent_version,
+                    learner_version=output_version,
+                    adapter_path=source.adapter_path,
+                    adapter_step=source.adapter_step,
+                    optimizer_state_path=(
+                        source.optimizer_state_path if restore_optimizer else None
+                    ),
+                    restore_optimizer=restore_optimizer,
                 )
-
-            if existing is None and preceding_rank_snapshot is not None:
-                records = await asyncio.shield(preceding_rank_snapshot)
-                existing = records[0].adapter
-                if existing is None:
-                    raise RuntimeError("preceding snapshot has no rank-zero adapter")
-                async with self._mutation_lock:
-                    if self._latest_step != generation.policy_step:
-                        raise RuntimeError("learner advanced between snapshot commands")
-
-            targets: tuple[Any, ...] = ()
-            merged: MergedWeightTransferSpec | None = None
-            if activate_serving and existing is None:
-                targets, merged = await self._prepare_serving_publication(
-                    trainer, generation.generation_id, generation.policy_step
-                )
-            elif activate_serving and self.rollout_weights_mode == "merged":
-                merged = await self._merged_weight_transfer_spec(
-                    self._serving_lora_name(generation.policy_step)
-                )
-
-            job = GenerationSnapshotJobSpec(
-                operation_id=ref.operation_id,
-                run_id=ref.run_id,
-                sequence_id=ref.sequence_id,
-                training_session_id=self._training_session_id,
-                learner_version=generation.policy_step,
-                generation=generation,
-                optimizer_state_path=self._optimizer_state_path,
-                staging_adapter_path=(
-                    f"{self.output_dir}/megatron_runtime/staging/"
-                    f"{generation.generation_id}"
-                    if existing is None
-                    else None
+            result = await trainer.load_state(job)
+            generation = self._training_generation(output_version)
+            async with self._mutation_lock:
+                if self._latest_step != ref.learner_parent_version:
+                    raise RuntimeError("learner advanced while load executed")
+                self._latest_step = output_version
+                self._learner_generation = generation
+                self._trainer_resident_generation = generation
+                self._published_adapters = {
+                    step: adapter
+                    for step, adapter in self._published_adapters.items()
+                    if step < output_version
+                }
+            commit_operation_id = f"{ref.operation_id}:load-commit"
+            launch = await self._snapshot_command_locked(
+                OperationRef(
+                    run_id=ref.run_id,
+                    operation_id=commit_operation_id,
+                    sequence_id=ref.sequence_id,
+                    learner_parent_version=output_version,
+                    kind="save_state",
                 ),
-                existing_adapter=existing,
-                publication_targets=targets,
-                merged_weight_transfer=merged,
+                save_optimizer=True,
+                activate_serving=False,
+            )
+            await asyncio.shield(launch.completion)
+            trainer.retire_operation(commit_operation_id)
+            return result, generation, launch.metrics
+
+    async def snapshot_command(
+        self,
+        ref: OperationRef,
+        *,
+        save_optimizer: bool,
+        activate_serving: bool,
+    ) -> GenerationSnapshotLaunch:
+        async with self._train_lock, self._trainer_failure_boundary():
+            return await self._snapshot_command_locked(
+                ref,
                 save_optimizer=save_optimizer,
+                activate_serving=activate_serving,
             )
-            result = await trainer.snapshot(job)
-            metrics = dict(result["metrics"])
-            rank_snapshot = asyncio.create_task(
-                trainer.wait_for_publication(generation.generation_id)
+
+    async def _snapshot_command_locked(
+        self,
+        ref: OperationRef,
+        *,
+        save_optimizer: bool,
+        activate_serving: bool,
+    ) -> GenerationSnapshotLaunch:
+        async with self._mutation_lock:
+            self._require_open()
+            self._raise_publication_failure()
+            trainer, reconcile = await self._ensure_trainer_locked(run_id=ref.run_id)
+            if reconcile is not None:
+                raise RuntimeError("snapshot command cannot start a cold trainer")
+            generation = self._learner_generation
+            if (
+                generation is None
+                or ref.learner_parent_version != self._latest_step
+                or generation.policy_step != self._latest_step
+            ):
+                raise RuntimeError("snapshot command learner parent changed")
+            existing = self._published_adapters.get(self._latest_step)
+            preceding_rank_snapshot = self._snapshot_rank_tasks.get(self._latest_step)
+
+        if existing is None and preceding_rank_snapshot is not None:
+            records = await asyncio.shield(preceding_rank_snapshot)
+            existing = records[0].adapter
+            if existing is None:
+                raise RuntimeError("preceding snapshot has no rank-zero adapter")
+            async with self._mutation_lock:
+                if self._latest_step != generation.policy_step:
+                    raise RuntimeError("learner advanced between snapshot commands")
+
+        targets: tuple[Any, ...] = ()
+        merged: MergedWeightTransferSpec | None = None
+        if activate_serving and existing is None:
+            targets, merged = await self._prepare_serving_publication(
+                trainer, generation.generation_id, generation.policy_step
             )
-            self._snapshot_rank_tasks[generation.policy_step] = rank_snapshot
-            rank_snapshot.add_done_callback(_consume_task_result)
-            if activate_serving:
-                self._publication_metrics[generation.policy_step] = metrics
-                self._emitted_publication_metrics[generation.policy_step] = set()
-                publication = self._schedule_publication(
+        elif activate_serving and self.rollout_weights_mode == "merged":
+            merged = await self._merged_weight_transfer_spec(
+                self._serving_lora_name(generation.policy_step)
+            )
+
+        job = GenerationSnapshotJobSpec(
+            operation_id=ref.operation_id,
+            run_id=ref.run_id,
+            sequence_id=ref.sequence_id,
+            training_session_id=self._training_session_id,
+            learner_version=generation.policy_step,
+            generation=generation,
+            optimizer_state_path=self._optimizer_state_path,
+            staging_adapter_path=(
+                f"{self.output_dir}/megatron_runtime/staging/{generation.generation_id}"
+                if existing is None
+                else None
+            ),
+            existing_adapter=existing,
+            publication_targets=targets,
+            merged_weight_transfer=merged,
+            save_optimizer=save_optimizer,
+        )
+        result = await trainer.snapshot(job)
+        metrics = dict(result["metrics"])
+        rank_snapshot = asyncio.create_task(
+            trainer.wait_for_publication(generation.generation_id)
+        )
+        self._snapshot_rank_tasks[generation.policy_step] = rank_snapshot
+        rank_snapshot.add_done_callback(_consume_task_result)
+        if activate_serving:
+            self._publication_metrics[generation.policy_step] = metrics
+            self._emitted_publication_metrics[generation.policy_step] = set()
+            publication = self._schedule_publication(
+                generation,
+                trainer=trainer,
+                publication_targets=targets,
+                publication_waiter=rank_snapshot,
+            )
+            completion = asyncio.create_task(
+                self._complete_activated_snapshot(
                     generation,
-                    trainer=trainer,
-                    publication_targets=targets,
-                    publication_waiter=rank_snapshot,
+                    publication,
+                    save_optimizer=save_optimizer,
                 )
-                completion = asyncio.create_task(
-                    self._complete_activated_snapshot(
-                        generation,
-                        publication,
-                        save_optimizer=save_optimizer,
-                    )
-                )
-            else:
-                completion = asyncio.create_task(
-                    self._complete_durable_snapshot(
-                        generation,
-                        rank_snapshot,
-                        metrics,
-                    )
-                )
-            self._durability_tasks.add(completion)
-            completion.add_done_callback(_consume_task_result)
-            completion.add_done_callback(self._durability_tasks.discard)
-            return GenerationSnapshotLaunch(metrics=metrics, completion=completion)
+            )
+        else:
+            completion = asyncio.create_task(
+                self._complete_durable_snapshot(generation, rank_snapshot, metrics)
+            )
+        self._durability_tasks.add(completion)
+        completion.add_done_callback(_consume_task_result)
+        completion.add_done_callback(self._durability_tasks.discard)
+        return GenerationSnapshotLaunch(metrics=metrics, completion=completion)
 
     async def _complete_activated_snapshot(
         self,

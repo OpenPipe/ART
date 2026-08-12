@@ -25,6 +25,7 @@ from art.training.contracts import (
 )
 from art.training.sequencing import CommandAdmission, RunCommandLedger
 
+from ..runtime.specs import ResolvedCheckpointState
 from .commands import (
     checkpoint_ref,
     experimental_train_config,
@@ -94,6 +95,7 @@ class LocalMegatronTrainingClient:
         self._operations: dict[str, LocalTrainingOperation[Any]] = {}
         self._retired_operation_ids: set[str] = set()
         self._completion_tasks: set[asyncio.Task[Any]] = set()
+        self._checkpoints: dict[str, ResolvedCheckpointState] = {}
         self._tail: asyncio.Task[Any] | None = None
         self._closed = False
 
@@ -169,13 +171,25 @@ class LocalMegatronTrainingClient:
     async def forward(
         self, request: ForwardRequest
     ) -> TrainingOperation[ForwardResult]:
-        del request
-        raise NotImplementedError("Megatron forward command is not implemented")
+        return await self._forward(request, backward=False)
 
     async def forward_backward(
         self, request: ForwardBackwardRequest
     ) -> TrainingOperation[ForwardBackwardResult]:
-        async def execute(admission: CommandAdmission) -> ForwardBackwardResult:
+        return cast(
+            TrainingOperation[ForwardBackwardResult],
+            await self._forward(request, backward=True),
+        )
+
+    async def _forward(
+        self,
+        request: ForwardRequest | ForwardBackwardRequest,
+        *,
+        backward: bool,
+    ) -> TrainingOperation[ForwardResult | ForwardBackwardResult]:
+        async def execute(
+            admission: CommandAdmission,
+        ) -> ForwardResult | ForwardBackwardResult:
             batch = await self._prepare_rl_batch(request)
             payload = batch.payload
             from art.megatron.backend import _DistributedBatchPayload
@@ -184,13 +198,23 @@ class LocalMegatronTrainingClient:
                 raise RuntimeError("local command did not use the typed data plane")
             release_started = time.perf_counter()
             await self._backend._release_trajectory_sources(batch, payload)
-            raw = await self._service.forward_backward_command(
-                admission.ref,
-                payload.packed,
-                forward_backward_config(request),
-                experimental_train_config(request),
+            raw = await (
+                self._service.forward_backward_command(
+                    admission.ref,
+                    payload.packed,
+                    forward_backward_config(request),
+                    experimental_train_config(request),
+                )
+                if backward
+                else self._service.forward_command(
+                    admission.ref,
+                    payload.packed,
+                    forward_backward_config(request),
+                    experimental_train_config(request),
+                )
             )
-            return ForwardBackwardResult(
+            result_type = ForwardBackwardResult if backward else ForwardResult
+            return result_type(
                 operation_id=admission.ref.operation_id,
                 packing=packing_outcome(payload.packed),
                 loss_fn_outputs=tuple(
@@ -206,13 +230,11 @@ class LocalMegatronTrainingClient:
                 },
             )
 
-        return cast(
-            TrainingOperation[ForwardBackwardResult],
-            await self._submit(
-                request,
-                kind="forward_backward",
-                execute=execute,
-            ),
+        kind: OperationKind = "forward_backward" if backward else "forward"
+        return await self._submit(
+            request,
+            kind=kind,
+            execute=execute,
         )
 
     async def optim_step(
@@ -266,6 +288,13 @@ class LocalMegatronTrainingClient:
 
             async def complete() -> SamplerWeightsResult:
                 durable = await launch.completion
+                self._remember_checkpoint(
+                    request.checkpoint_name,
+                    ResolvedCheckpointState(
+                        adapter_path=durable.adapter.identity,
+                        adapter_step=durable.adapter.step,
+                    ),
+                )
                 return SamplerWeightsResult(
                     operation_id=admission.ref.operation_id,
                     checkpoint=checkpoint_ref(
@@ -298,6 +327,14 @@ class LocalMegatronTrainingClient:
 
             async def complete() -> SaveStateResult:
                 durable = await launch.completion
+                self._remember_checkpoint(
+                    request.checkpoint_name,
+                    ResolvedCheckpointState(
+                        adapter_path=durable.adapter.identity,
+                        adapter_step=durable.adapter.step,
+                        optimizer_state_path=self._service.optimizer_state_path,
+                    ),
+                )
                 return SaveStateResult(
                     operation_id=admission.ref.operation_id,
                     checkpoint=checkpoint_ref(
@@ -319,18 +356,71 @@ class LocalMegatronTrainingClient:
     async def load_state(
         self, request: LoadStateRequest
     ) -> TrainingOperation[LoadStateResult]:
-        del request
-        raise NotImplementedError("Megatron load_state command is not implemented")
+        return await self._load_state(request, restore_optimizer=False)
 
     async def load_state_with_optimizer(
         self, request: LoadStateRequest
     ) -> TrainingOperation[LoadStateResult]:
-        del request
-        raise NotImplementedError(
-            "Megatron load_state_with_optimizer command is not implemented"
+        return await self._load_state(request, restore_optimizer=True)
+
+    async def _load_state(
+        self,
+        request: LoadStateRequest,
+        *,
+        restore_optimizer: bool,
+    ) -> TrainingOperation[LoadStateResult]:
+        async def execute(admission: CommandAdmission) -> LoadStateResult:
+            try:
+                source = self._checkpoints[request.checkpoint]
+            except KeyError as error:
+                raise ValueError(
+                    f"unknown local checkpoint: {request.checkpoint!r}"
+                ) from error
+            raw, generation, _metrics = await self._service.load_state_command(
+                admission.ref,
+                source,
+                restore_optimizer=restore_optimizer,
+            )
+            checkpoint = checkpoint_ref(
+                admission.ref.run_id,
+                generation.policy_step,
+                generation.generation_id,
+            )
+            self._remember_checkpoint(
+                checkpoint.checkpoint_id,
+                ResolvedCheckpointState(
+                    adapter_path=generation.adapter_path,
+                    adapter_step=generation.policy_step,
+                    optimizer_state_path=self._service.optimizer_state_path,
+                ),
+            )
+            return LoadStateResult(
+                operation_id=admission.ref.operation_id,
+                checkpoint=checkpoint,
+                optimizer_restored=bool(raw["optimizer_restored"]),
+            )
+
+        return cast(
+            TrainingOperation[LoadStateResult],
+            await self._submit(request, kind="load_state", execute=execute),
         )
 
-    async def _prepare_rl_batch(self, request: ForwardBackwardRequest):
+    def _remember_checkpoint(
+        self, checkpoint_id: str, checkpoint: ResolvedCheckpointState
+    ) -> None:
+        existing = self._checkpoints.get(checkpoint_id)
+        if existing is not None and (
+            existing.adapter_path != checkpoint.adapter_path
+            or existing.adapter_step != checkpoint.adapter_step
+        ):
+            raise RuntimeError(
+                f"checkpoint name {checkpoint_id!r} identifies different learners"
+            )
+        if existing is not None and checkpoint.optimizer_state_path is None:
+            return
+        self._checkpoints[checkpoint_id] = checkpoint
+
+    async def _prepare_rl_batch(self, request: ForwardRequest | ForwardBackwardRequest):
         if request.batch.kind != "rl":
             raise ValueError("Megatron RL F/B requires an RL trajectory batch")
         request.batch.require_local_groups()

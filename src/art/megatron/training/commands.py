@@ -6,6 +6,7 @@ from art.distributed.art_runtime import DistributedPackedBatch
 from art.training.contracts import (
     CheckpointRef,
     ForwardBackwardRequest,
+    ForwardRequest,
     PackingOutcome,
     PolicyTokenCount,
 )
@@ -14,7 +15,7 @@ from ..runtime.specs import ExperimentalTrainConfig, RlForwardBackwardConfig
 
 
 def forward_backward_config(
-    request: ForwardBackwardRequest,
+    request: ForwardRequest | ForwardBackwardRequest,
 ) -> RlForwardBackwardConfig:
     values = request.loss.values
     kl_penalty_coef = values.get("kl_penalty_coef", 0.0)
@@ -30,7 +31,7 @@ def forward_backward_config(
 
 
 def experimental_train_config(
-    request: ForwardBackwardRequest,
+    request: ForwardRequest | ForwardBackwardRequest,
 ) -> ExperimentalTrainConfig:
     values = {
         name: value

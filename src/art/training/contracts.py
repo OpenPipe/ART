@@ -154,6 +154,7 @@ class SaveStateRequest(RunCommand):
 
 class LoadStateRequest(RunCommand):
     checkpoint: str = Field(min_length=1)
+    restore_optimizer: bool = False
 
 
 OperationKind = Literal[

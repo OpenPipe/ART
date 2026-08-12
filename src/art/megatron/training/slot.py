@@ -22,8 +22,11 @@ from art.megatron.runtime.publication import commit_trainer_publication
 from art.megatron.runtime.specs import (
     ExperimentalTrainConfig,
     ForwardBackwardJobSpec,
+    ForwardJobSpec,
     GenerationSnapshotJobSpec,
+    LoadStateJobSpec,
     OptimizerJobSpec,
+    ResolvedCheckpointState,
     RlForwardBackwardConfig,
     RunSlotRegistration,
     TrainerGeneration,
@@ -33,6 +36,10 @@ from art.training.contracts import (
     Contract,
     ForwardBackwardRequest,
     ForwardBackwardResult,
+    ForwardRequest,
+    ForwardResult,
+    LoadStateRequest,
+    LoadStateResult,
     LossFnOutput,
     OperationRef,
     OptimStepRequest,
@@ -54,7 +61,7 @@ from .commands import (
 )
 
 
-class PreparedForwardBackward(BaseModel):
+class PreparedForward(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     ref: OperationRef
@@ -66,6 +73,10 @@ class PreparedForwardBackward(BaseModel):
     @property
     def token_cost(self) -> int:
         return self.packing.physical_tokens
+
+
+class PreparedForwardBackward(PreparedForward):
+    pass
 
 
 class _ResidentRun(BaseModel):
@@ -158,9 +169,24 @@ class MegatronTrainingSlot:
         ref: OperationRef,
         request: ForwardBackwardRequest,
     ) -> PreparedForwardBackward:
+        prepared = await self._prepare_forward(ref, request)
+        return PreparedForwardBackward.model_validate(prepared.model_dump())
+
+    async def prepare_forward(
+        self,
+        ref: OperationRef,
+        request: ForwardRequest,
+    ) -> PreparedForward:
+        return await self._prepare_forward(ref, request)
+
+    async def _prepare_forward(
+        self,
+        ref: OperationRef,
+        request: ForwardRequest | ForwardBackwardRequest,
+    ) -> PreparedForward:
         state = self._require_run(ref.run_id)
         if request.batch.kind != "rl":
-            raise ValueError("Megatron RL F/B requires an RL trajectory batch")
+            raise ValueError("Megatron forward requires an RL trajectory batch")
         config = experimental_train_config(request)
         if (
             config.packed_sequence_length is not None
@@ -195,7 +221,7 @@ class MegatronTrainingSlot:
         )
         if packed is None:
             raise ValueError("trajectory batch produced no trainable packed sequence")
-        return PreparedForwardBackward(
+        return PreparedForward(
             ref=ref,
             packed=packed,
             packing=packing_outcome(packed),
@@ -203,8 +229,48 @@ class MegatronTrainingSlot:
             experimental_config=config,
         )
 
-    async def discard_prepared(self, prepared: PreparedForwardBackward) -> None:
+    async def discard_prepared(self, prepared: PreparedForward) -> None:
         await self.runtime.release_batch(prepared.packed)
+
+    async def forward(self, prepared: PreparedForward) -> ForwardResult:
+        ref = prepared.ref
+        state = self._require_parent(ref)
+        job = ForwardJobSpec(
+            operation_id=ref.operation_id,
+            run_id=ref.run_id,
+            sequence_id=ref.sequence_id,
+            training_session_id=state.registration.training_session_id,
+            expected_learner_version=ref.learner_parent_version,
+            source=state.generation,
+            optimizer_state_path=(
+                state.registration.optimizer_state_path
+                or str(Path(state.output_dir) / "optimizer_states")
+            ),
+            batch=prepared.packed.leases.ref,
+            config=prepared.config,
+            experimental_config=prepared.experimental_config,
+        )
+        try:
+            raw = await self.trainer.forward(job, prepared.packed.leases)
+        finally:
+            primary = sys.exception()
+            try:
+                await self.runtime.release_batch(prepared.packed)
+            except BaseException as cleanup_error:
+                if primary is None:
+                    raise
+                primary.add_note(
+                    "packed-batch release also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+        return ForwardResult(
+            operation_id=ref.operation_id,
+            packing=prepared.packing,
+            loss_fn_outputs=tuple(
+                LossFnOutput(token_logprobs=values) for values in raw["token_logprobs"]
+            ),
+            metrics={**packing_metrics(prepared.packed), **raw["metrics"]},
+        )
 
     async def forward_backward(
         self, prepared: PreparedForwardBackward
@@ -292,6 +358,70 @@ class MegatronTrainingSlot:
                 ref.run_id, output_version, generation.generation_id
             ),
             metrics=raw["metrics"],
+        )
+        self._results[ref.operation_id] = (fingerprint, result)
+        return result
+
+    async def load_state(
+        self,
+        ref: OperationRef,
+        request: LoadStateRequest,
+        source: ResolvedCheckpointState,
+    ) -> LoadStateResult:
+        fingerprint = self._fingerprint(ref, request, source.model_dump_json())
+        if cached := self._cached_result(ref.operation_id, fingerprint):
+            return cast(LoadStateResult, cached)
+        state = self._require_parent(ref)
+        output_version = ref.reserved_output_learner_version
+        if output_version is None:
+            raise ValueError("load operation has no reserved learner version")
+        if request.restore_optimizer and source.optimizer_state_path is None:
+            raise ValueError("optimizer-exact load has no optimizer state")
+        job = LoadStateJobSpec(
+            operation_id=ref.operation_id,
+            run_id=ref.run_id,
+            sequence_id=ref.sequence_id,
+            training_session_id=state.registration.training_session_id,
+            expected_learner_version=ref.learner_parent_version,
+            learner_version=output_version,
+            adapter_path=self._require_managed_path(source.adapter_path),
+            adapter_step=source.adapter_step,
+            optimizer_state_path=(
+                self._require_managed_path(source.optimizer_state_path)
+                if request.restore_optimizer and source.optimizer_state_path is not None
+                else None
+            ),
+            restore_optimizer=request.restore_optimizer,
+        )
+        raw = await self.trainer.load_state(job)
+        generation = TrainerGeneration(
+            training_session_id=state.registration.training_session_id,
+            policy_step=output_version,
+            generation_id=(
+                f"step-{output_version:08d}-"
+                f"{hashlib.sha256(ref.operation_id.encode()).hexdigest()[:32]}"
+            ),
+            adapter_path=get_step_checkpoint_dir(state.output_dir, output_version),
+        )
+        state.generation = generation
+        state.registration = state.registration.model_copy(
+            update={"learner_version": output_version}
+        )
+        commit_ref = OperationRef(
+            run_id=ref.run_id,
+            operation_id=f"{ref.operation_id}:load-commit",
+            sequence_id=ref.sequence_id,
+            learner_parent_version=output_version,
+            kind="save_state",
+        )
+        await self._snapshot(commit_ref, save_optimizer=True)
+        self.trainer.retire_operation(commit_ref.operation_id)
+        result = LoadStateResult(
+            operation_id=ref.operation_id,
+            checkpoint=checkpoint_ref(
+                ref.run_id, output_version, generation.generation_id
+            ),
+            optimizer_restored=bool(raw["optimizer_restored"]),
         )
         self._results[ref.operation_id] = (fingerprint, result)
         return result

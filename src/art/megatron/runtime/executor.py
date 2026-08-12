@@ -21,7 +21,9 @@ from .publication import (
 )
 from .specs import (
     ForwardBackwardJobSpec,
+    ForwardJobSpec,
     GenerationSnapshotJobSpec,
+    LoadStateJobSpec,
     OptimizerJobSpec,
     SFTJobSpec,
     TrainerGeneration,
@@ -135,6 +137,36 @@ class MegatronTrainJobExecutor:
             ),
         }
 
+    def execute_forward(
+        self,
+        job: ForwardJobSpec,
+        batch: InMemoryPackedBatch,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        validate_packed_batch(batch)
+        self._publisher.raise_if_failed()
+        from art.megatron.train import (
+            _prepare_rl_training_state,
+            execute_megatron_rl_forward_job,
+        )
+
+        _prepare_rl_training_state(self.runtime, job)
+        result = execute_megatron_rl_forward_job(
+            self.runtime,
+            job,
+            batch.tensors,
+            cancelled=cancelled,
+        )
+        return {
+            **result,
+            "token_logprobs": tuple(
+                tuple(float(item) for item in values.flatten().tolist())
+                for values in result["token_logprobs"]
+            ),
+        }
+
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
@@ -187,6 +219,20 @@ class MegatronTrainJobExecutor:
                 "optimizer/num_zeros_in_grad": float(result.num_zeros_in_grad or 0),
                 "time/optimizer_step_s": time.perf_counter() - started,
             },
+        }
+
+    def execute_load_state(self, job: LoadStateJobSpec) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        self._require_no_open_gradients()
+        from art.megatron.train import execute_megatron_load_state_job
+
+        execute_megatron_load_state_job(self.runtime, job)
+        self._gradient_parent_version = None
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.learner_version,
+            "optimizer_restored": job.restore_optimizer,
         }
 
     def execute_snapshot(
@@ -516,6 +562,34 @@ class MCoreRunSlotExecutor:
             ),
         }
 
+    def execute_forward(
+        self,
+        job: ForwardJobSpec,
+        batch: InMemoryPackedBatch,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        state = self._require_run(job.run_id)
+        self._validate_parent(
+            state, job.training_session_id, job.expected_learner_version
+        )
+        validate_packed_batch(batch)
+        self._publisher.raise_if_failed()
+        from art.megatron.train import execute_megatron_dynamic_lora_forward_job
+
+        result = execute_megatron_dynamic_lora_forward_job(
+            self.runtime,
+            job,
+            batch.tensors,
+            cancelled=cancelled,
+        )
+        return {
+            **result,
+            "token_logprobs": tuple(
+                tuple(float(item) for item in values.flatten().tolist())
+                for values in result["token_logprobs"]
+            ),
+        }
+
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
         state = self._require_run(job.run_id)
         self._validate_parent(
@@ -560,6 +634,55 @@ class MCoreRunSlotExecutor:
     def optimizer_state(self, run_id: str) -> "TrainerRankOptimizerState | None":
         self._require_run(run_id)
         return self._slot_trainer.checkpoint_slot_optimizer_state(run_id)
+
+    def execute_load_state(self, job: LoadStateJobSpec) -> dict[str, Any]:
+        state = self._require_run(job.run_id)
+        self._validate_parent(
+            state, job.training_session_id, job.expected_learner_version
+        )
+        if state.gradients.contribution_ids:
+            raise RuntimeError("load_state cannot discard open gradient contributions")
+        from art.megatron.model_support.lora_disk import (
+            load_adapter_config,
+            load_lora_tensors_for_megatron,
+        )
+        from art.megatron.optimizer_state import load_trainer_rank_optimizer_state
+        from art.megatron.training.gradient_accumulator import (
+            ParameterGradientAccumulator,
+        )
+
+        config = load_adapter_config(job.adapter_path)
+        self._validate_adapter_layout(state.adapter_config, config)
+        optimizer_state = (
+            load_trainer_rank_optimizer_state(
+                self.runtime,
+                optimizer_state_path=job.optimizer_state_path,
+                adapter_path=job.adapter_path,
+                adapter_step=job.adapter_step,
+                layout=self._slot_trainer.checkpoint_slot_optimizer_layout(job.run_id),
+            )
+            if job.optimizer_state_path is not None
+            else None
+        )
+        adapter_model = load_lora_tensors_for_megatron(
+            job.adapter_path, handler=self.runtime.model_support_handler
+        )
+        self._slot_trainer.load_checkpoint_slot(
+            job.run_id,
+            adapter_model,
+            optimizer_state=optimizer_state,
+            adapter_config=config,
+        )
+        state.learner_version = job.learner_version
+        state.adapter_config = config
+        state.gradients = ParameterGradientAccumulator(
+            parameters=self._slot_trainer.checkpoint_slot_parameters(job.run_id)
+        )
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.learner_version,
+            "optimizer_restored": job.restore_optimizer,
+        }
 
     def execute_snapshot(
         self,
@@ -631,6 +754,18 @@ class MCoreRunSlotExecutor:
             or state.learner_version != learner_version
         ):
             raise RuntimeError("resident run state does not match command parent")
+
+    @staticmethod
+    def _validate_adapter_layout(
+        current: dict[str, Any], replacement: dict[str, Any]
+    ) -> None:
+        for key in ("base_model_name_or_path", "r", "lora_alpha"):
+            if replacement.get(key) != current.get(key):
+                raise ValueError(f"loaded adapter changes immutable {key}")
+        if set(replacement.get("target_modules", ())) != set(
+            current.get("target_modules", ())
+        ):
+            raise ValueError("loaded adapter changes immutable target_modules")
 
 
 class _GenerationPublisher:
