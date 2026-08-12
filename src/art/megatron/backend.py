@@ -947,11 +947,15 @@ class MegatronBackend(LocalBackend):
         forward_result, optimizer_result = await asyncio.gather(
             forward.result(), optimizer.result()
         )
-        yield {
+        metrics = {
             **forward_result.metrics,
             **optimizer_result.metrics,
             **distributed_service.drain_publication_metrics(),
         }
+        metrics["time/gradient_step_train_s"] = (
+            metrics["time/forward_backward_s"] + metrics["time/optimizer_step_s"]
+        )
+        yield metrics
 
     async def _release_training_batch(self, batch: _PackedTrainingBatch) -> None:
         await self._release_distributed_batch(batch, disposition="consumed")

@@ -908,6 +908,7 @@ def execute_megatron_rl_forward_backward_job(
         cancelled=cancelled,
         replay_bundle=replay_bundle,
     )
+    finish_started = time.perf_counter()
     internal.seal(internal.contribution_ids)
     internal.prepare_optimizer()
     internal.consume()
@@ -923,7 +924,7 @@ def execute_megatron_rl_forward_backward_job(
     return MegatronForwardBackwardJobResult(
         result=result,
         num_gradient_steps=len(states),
-        forward_backward_s=sum(durations),
+        forward_backward_s=sum(durations) + time.perf_counter() - finish_started,
         replay_finalize_s=replay_finalize_s,
         token_count=token_count,
     )
