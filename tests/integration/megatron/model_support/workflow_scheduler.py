@@ -550,7 +550,17 @@ def compile_prepared_workflows(
             stage_gpu_counts,
             visible_gpu_count=visible_gpu_count,
         )
-        base_megatron = _ordered_stage_pair(prepared.stages, BASE_MEGATRON_STAGES)
+        handler = get_model_support_handler_for_spec(
+            get_model_support_spec(
+                prepared.report.base_model,
+                allow_unvalidated_arch=prepared.allow_unvalidated_arch,
+            )
+        )
+        base_megatron = (
+            _ordered_stage_pair(prepared.stages, BASE_MEGATRON_STAGES)
+            if not handler.is_moe
+            else ()
+        )
         base_fixture = {
             prepared.fixture.environment(stage)[FIXTURE_PATH_ENV]
             for stage in BASE_MEGATRON_STAGES
