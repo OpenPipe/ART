@@ -9,7 +9,6 @@ Usage:
 
 Environment variables:
     BASE_MODEL: The base model to use (default: Qwen/Qwen3-0.6B)
-    WANDB_API_KEY: Required for ServerlessBackend test
     TINKER_API_KEY: Required for TinkerBackend test
 """
 
@@ -24,7 +23,7 @@ import pytest
 import art
 from art.local import LocalBackend
 from art.tinker import TinkerBackend
-from art.types import LocalTrainResult, ServerlessTrainResult, TrainResult
+from art.types import LocalTrainResult, TrainResult
 
 # Use a small model for fast testing
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-0.6B"
@@ -168,37 +167,3 @@ async def test_local_backend():
             await _run_inference_on_step(model, step=0)
         finally:
             await backend.close()
-
-
-@pytest.mark.skipif(
-    "WANDB_API_KEY" not in os.environ,
-    reason="WANDB_API_KEY not set - skipping ServerlessBackend test",
-)
-async def test_serverless_backend():
-    """Test multi-checkpoint inference with ServerlessBackend."""
-    model_name = f"test-multi-ckpt-serverless-{uuid.uuid4().hex[:8]}"
-    backend = art.ServerlessBackend()
-    model = art.TrainableModel(
-        run_name=model_name,
-        name=model_name,
-        project="integration-tests",
-        base_model="meta-llama/Llama-3.1-8B-Instruct",
-    )
-    try:
-        await model.register(backend)
-        results = await run_training_loop(
-            model, backend, num_steps=1, rollouts_per_step=2
-        )
-        # Verify TrainResult structure
-        assert len(results) == 1
-        assert isinstance(results[0], ServerlessTrainResult)
-        assert results[0].step > 0
-        assert results[0].artifact_name is not None
-        await _run_inference_on_step(model, step=results[-1].step)
-        await _run_inference_on_step(model, step=0)
-    finally:
-        try:
-            await backend.delete(model)
-        except Exception:
-            pass
-        await backend.close()

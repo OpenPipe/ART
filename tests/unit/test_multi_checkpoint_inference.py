@@ -12,7 +12,6 @@ The key features tested are:
 
 import asyncio
 from dataclasses import dataclass
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -139,9 +138,11 @@ class TestServerlessBackendModelInferenceName:
         """Without step, should return base W&B artifact name."""
         from art.serverless.backend import ServerlessBackend
 
-        # Create backend with mock client
-        with patch("art.serverless.backend.Client"):
-            backend = ServerlessBackend(api_key="test-key")
+        backend = ServerlessBackend(
+            api_key="test-key",
+            training_base_url="http://training.test/v1",
+            inference_base_url="http://inference.test/v1",
+        )
 
         model = TrainableModel(
             run_name="test-model",
@@ -152,14 +153,17 @@ class TestServerlessBackendModelInferenceName:
         model.entity = "test-entity"
 
         result = backend._model_inference_name(model)
-        assert result == "wandb-artifact:///test-entity/test-project/test-model"
+        assert result == "test-model"
 
     def test_model_inference_name_with_step(self):
         """With step, should append :step{N} suffix."""
         from art.serverless.backend import ServerlessBackend
 
-        with patch("art.serverless.backend.Client"):
-            backend = ServerlessBackend(api_key="test-key")
+        backend = ServerlessBackend(
+            api_key="test-key",
+            training_base_url="http://training.test/v1",
+            inference_base_url="http://inference.test/v1",
+        )
 
         model = TrainableModel(
             run_name="test-model",
@@ -170,17 +174,20 @@ class TestServerlessBackendModelInferenceName:
         model.entity = "test-entity"
 
         result = backend._model_inference_name(model, step=5)
-        assert result == "wandb-artifact:///test-entity/test-project/test-model:step5"
+        assert result == "test-model@5"
 
         result = backend._model_inference_name(model, step=0)
-        assert result == "wandb-artifact:///test-entity/test-project/test-model:step0"
+        assert result == "test-model@0"
 
     def test_model_inference_name_none_step_is_same_as_no_step(self):
         """Explicitly passing step=None should behave same as no step."""
         from art.serverless.backend import ServerlessBackend
 
-        with patch("art.serverless.backend.Client"):
-            backend = ServerlessBackend(api_key="test-key")
+        backend = ServerlessBackend(
+            api_key="test-key",
+            training_base_url="http://training.test/v1",
+            inference_base_url="http://inference.test/v1",
+        )
 
         model = TrainableModel(
             run_name="test-model",

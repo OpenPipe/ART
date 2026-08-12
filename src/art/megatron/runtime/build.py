@@ -4,10 +4,10 @@ import hashlib
 from itertools import groupby
 import json
 import os
-from pathlib import Path
 from typing import Literal, cast
 
 from art import dev
+from art._source_revision import art_source_revision
 from art.dev.get_model_config import default_target_modules
 from art.distributed.art_runtime import ArtRuntime
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
@@ -152,15 +152,6 @@ def trainer_dtype(
     if value not in {"bfloat16", "float16", "float32"}:
         raise ValueError(f"unsupported Megatron trainer dtype {value!r}")
     return cast(Literal["bfloat16", "float16", "float32"], value)
-
-
-def art_source_revision() -> str:
-    root = Path(__file__).resolve().parents[2]
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*.py")):
-        digest.update(str(path.relative_to(root)).encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
 
 
 def _random_state(config: dev.BackendModelConfig) -> int | None:

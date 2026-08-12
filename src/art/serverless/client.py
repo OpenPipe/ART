@@ -1,388 +1,455 @@
-import os
-from typing import Any, Iterable, Literal, Type, TypedDict, TypeVar, cast
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Mapping
+from typing import Any, Generic, TypeVar, cast
+import uuid
 
 import httpx
-from openai import AsyncOpenAI, BaseModel, _exceptions
-from openai._base_client import (
-    AsyncAPIClient,
-    AsyncPaginator,
-    make_request_options,
+
+from art.training.client import TrainingOperation
+from art.training.contracts import (
+    Contract,
+    ForwardBackwardRequest,
+    ForwardBackwardResult,
+    ForwardRequest,
+    ForwardResult,
+    LoadStateRequest,
+    LoadStateResult,
+    OperationKind,
+    OperationRef,
+    OperationResult,
+    OptimStepRequest,
+    OptimStepResult,
+    RunCommand,
+    SamplerWeightsResult,
+    SaveStateRequest,
+    SaveStateResult,
+    SaveWeightsForSamplerRequest,
 )
-from openai._compat import cached_property
-from openai._models import FinalRequestOptions
-from openai._qs import Querystring
-from openai._resource import AsyncAPIResource
-from openai._streaming import AsyncStream
-from openai._types import NOT_GIVEN, NotGiven, Omit
-from openai._utils import is_mapping, maybe_transform
-from openai._version import __version__
-from openai.pagination import AsyncCursorPage
-from typing_extensions import override
 
-from ..trajectories import TrajectoryGroup
-from ..types import SFTMetricLoggingConfig
+from .contracts import (
+    CancelOperationRequest,
+    CheckpointPage,
+    CheckpointView,
+    CloseRunRequest,
+    CreateTrainingRunRequest,
+    DeleteCheckpointResult,
+    OperationView,
+    SetCheckpointTtlRequest,
+    TrainingCapabilities,
+    TrainingRunView,
+)
 
-ResponseT = TypeVar("ResponseT")
-
-
-class Model(BaseModel):
-    id: str
-    entity: str
-    project: str
-    name: str
-    base_model: str
-    run_id: str | None
+ResultT = TypeVar("ResultT", bound=OperationResult)
+ResponseT = TypeVar("ResponseT", bound=Contract)
 
 
-class Checkpoint(BaseModel):
-    id: str
-    step: int
-    metrics: dict[str, float]
+class RemoteTrainingError(RuntimeError):
+    pass
 
 
-class CheckpointListParams(TypedDict, total=False):
-    after: str
-    limit: int
-    order: Literal["asc", "desc"]
+class RemoteTrainingHttpError(RemoteTrainingError):
+    def __init__(self, status_code: int, detail: object) -> None:
+        super().__init__(f"remote training HTTP {status_code}: {detail}")
+        self.status_code = status_code
+        self.detail = detail
 
 
-class DeleteCheckpointsResponse(BaseModel):
-    deleted_count: int
-    not_found_steps: list[int]
-
-
-class ExperimentalTrainingConfig(TypedDict, total=False):
-    advantage_balance: float | None
-    allow_training_without_logprobs: bool | None
-    epsilon: float | None
-    epsilon_high: float | None
-    importance_sampling_level: (
-        Literal["token", "sequence", "average", "geometric_average"] | None
-    )
-    kimi_k2_tau: float | None
-    kl_penalty_coef: float | None
-    kl_penalty_reference_step: int | None
-    kl_penalty_source: Literal["current_learner", "sample"] | None
-    kl_penalty_step_lag: int | None
-    kl_ref_adapter_path: str | None
-    learning_rate: float | None
-    logprob_calculation_chunk_size: int | None
-    loss_fn: Literal["cispo", "ppo"] | None
-    mask_prob_ratio: bool | None
-    max_negative_advantage_importance_sampling_weight: float | None
-    normalize_advantages: bool | None
-    num_trajectories_learning_rate_multiplier_power: float | None
-    packed_sequence_length: int | None
-    plot_tensors: bool | None
-    ppo: bool | None
-    precalculate_logprobs: bool | None
-    scale_learning_rate_by_reward_std_dev: bool | None
-    scale_rewards: bool | None
-    truncated_importance_sampling: float | None
-
-
-class SFTTrainingConfig(TypedDict, total=False):
-    batch_size: int | None
-    learning_rate: float | list[float] | None
-    assistant_turns: Literal["all", "last"]
-    metric_logging: SFTMetricLoggingConfig | None
-
-
-class TrainingJob(BaseModel):
-    id: str
-
-
-class SFTTrainingJob(BaseModel):
-    id: str
-
-
-class TrainingJobEventListParams(TypedDict, total=False):
-    after: str
-    limit: int
-
-
-class TrainingJobEvent(BaseModel):
-    id: str
-    type: Literal[
-        "training_started", "gradient_step", "training_ended", "training_failed"
-    ]
-    data: dict[str, Any]
-
-
-class Models(AsyncAPIResource):
-    async def create(
-        self,
-        *,
-        entity: str | None = None,
-        project: str | None = None,
-        name: str | None = None,
-        base_model: str,
-        return_existing: bool = False,
-    ) -> Model:
-        return await self._post(
-            "/preview/models",
-            cast_to=Model,
-            body={
-                "entity": entity,
-                "project": project,
-                "name": name,
-                "base_model": base_model,
-                "return_existing": return_existing,
-            },
+class RemoteTrainingOperationError(RemoteTrainingError):
+    def __init__(self, operation_id: str, error: Mapping[str, Any]) -> None:
+        super().__init__(
+            f"remote training operation {operation_id} failed: {dict(error)}"
         )
-
-    async def log(
-        self,
-        *,
-        model_id: str,
-        trajectory_groups: list[TrajectoryGroup],
-        split: str,
-    ) -> None:
-        return await self._post(
-            f"/preview/models/{model_id}/log",
-            body={
-                "model_id": model_id,
-                "trajectory_groups": [
-                    trajectory_group.model_dump(mode="json")
-                    for trajectory_group in trajectory_groups
-                ],
-                "split": split,
-            },
-            cast_to=type(None),
-        )
-
-    async def delete(self, *, model_id: str) -> None:
-        return await self._delete(
-            f"/preview/models/{model_id}",
-            cast_to=type(None),
-        )
-
-    @cached_property
-    def checkpoints(self) -> "Checkpoints":
-        return Checkpoints(cast(AsyncOpenAI, self._client))  # ty:ignore[redundant-cast]
+        self.operation_id = operation_id
+        self.error = dict(error)
 
 
-class Checkpoints(AsyncAPIResource):
-    def list(
-        self,
-        *,
-        after: str | NotGiven = NOT_GIVEN,
-        limit: int | NotGiven = NOT_GIVEN,
-        model_id: str,
-        order: Literal["asc", "desc"] | NotGiven = NOT_GIVEN,
-    ) -> AsyncPaginator[Checkpoint, AsyncCursorPage[Checkpoint]]:
-        return self._get_api_list(
-            f"/preview/models/{model_id}/checkpoints",
-            page=AsyncCursorPage[Checkpoint],
-            options=make_request_options(
-                query=maybe_transform(
-                    {
-                        "after": after,
-                        "limit": limit,
-                        "order": order,
-                    },
-                    CheckpointListParams,
-                ),
-            ),
-            model=Checkpoint,
-        )
-
-    async def delete(
-        self, *, model_id: str, steps: Iterable[int]
-    ) -> DeleteCheckpointsResponse:
-        return await self._delete(
-            f"/preview/models/{model_id}/checkpoints",
-            body={"steps": steps},
-            cast_to=DeleteCheckpointsResponse,
-        )
+class RemoteTrainingOperationCancelled(RemoteTrainingError):
+    pass
 
 
-class TrainingJobs(AsyncAPIResource):
-    async def create(
-        self,
-        *,
-        model_id: str,
-        trajectory_groups: list[TrajectoryGroup],
-        experimental_config: ExperimentalTrainingConfig | None = None,
-    ) -> TrainingJob:
-        return await self._post(
-            "/preview/training-jobs",
-            cast_to=TrainingJob,
-            body={
-                "model_id": model_id,
-                "trajectory_groups": [
-                    trajectory_group.model_dump(mode="json")
-                    for trajectory_group in trajectory_groups
-                ],
-                "experimental_config": experimental_config,
-            },
-        )
-
-    @cached_property
-    def events(self) -> "TrainingJobEvents":
-        return TrainingJobEvents(cast(AsyncOpenAI, self._client))  # ty:ignore[redundant-cast]
-
-
-class TrainingJobEvents(AsyncAPIResource):
-    def list(
-        self,
-        *,
-        training_job_id: str,
-        after: str | NotGiven = NOT_GIVEN,
-        limit: int | NotGiven = NOT_GIVEN,
-    ) -> AsyncPaginator[TrainingJobEvent, AsyncCursorPage[TrainingJobEvent]]:
-        return self._get_api_list(
-            f"/preview/training-jobs/{training_job_id}/events",
-            page=AsyncCursorPage[TrainingJobEvent],
-            options=make_request_options(
-                query=maybe_transform(
-                    {
-                        "after": after,
-                        "limit": limit,
-                    },
-                    TrainingJobEventListParams,
-                ),
-            ),
-            model=TrainingJobEvent,
-        )
-
-
-class SFTTrainingJobs(AsyncAPIResource):
-    async def create(
-        self,
-        *,
-        model_id: str,
-        training_data_url: str,
-        config: SFTTrainingConfig | None = None,
-    ) -> SFTTrainingJob:
-        return await self._post(
-            "/preview/sft-training-jobs",
-            cast_to=SFTTrainingJob,
-            body={
-                "model_id": model_id,
-                "training_data_url": training_data_url,
-                "config": config,
-            },
-        )
-
-    @cached_property
-    def events(self) -> "TrainingJobEvents":
-        return TrainingJobEvents(cast(AsyncOpenAI, self._client))  # ty:ignore[redundant-cast]
-
-
-class Client(AsyncAPIClient):
-    api_key: str
+class RemoteTrainingServiceClient:
+    """Typed HTTP transport for the Remote Training operation API."""
 
     def __init__(
-        self, *, api_key: str | None = None, base_url: str | None = None
-    ) -> None:
-        if api_key is None:
-            api_key = os.environ.get("WANDB_API_KEY")
-        if api_key is None:
-            raise ValueError(
-                "The api_key client option must be set either by passing api_key to the client or by setting the WANDB_API_KEY environment variable"
-            )
-        self.api_key = api_key
-        super().__init__(
-            version=__version__,
-            base_url=base_url or "https://api.training.wandb.ai/v1",
-            _strict_response_validation=False,
-            max_retries=3,
-        )
-
-    @override
-    async def request(
         self,
-        cast_to: Type[ResponseT],
-        options: FinalRequestOptions,
         *,
-        stream: bool = False,
-        stream_cls: type[AsyncStream[Any]] | None = None,
-    ) -> ResponseT | AsyncStream[Any]:
-        # Disable retries for POST requests
-        if options.method.upper() == "POST":
-            options.max_retries = 0
-        return await super().request(
-            cast_to=cast_to, options=options, stream=stream, stream_cls=stream_cls
+        api_key: str,
+        base_url: str,
+        http_client: httpx.AsyncClient | None = None,
+        request_timeout_s: float = 30.0,
+        max_retries: int = 3,
+    ) -> None:
+        if not api_key:
+            raise ValueError("remote training api_key must not be empty")
+        if request_timeout_s <= 0 or max_retries < 0:
+            raise ValueError("remote training timeout and retry count are invalid")
+        url = httpx.URL(base_url)
+        if url.path.rstrip("/").split("/")[-1] != "v1":
+            raise ValueError("remote training base_url must end in /v1")
+        self._client = http_client or httpx.AsyncClient(
+            base_url=str(url).rstrip("/") + "/",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=httpx.Timeout(
+                request_timeout_s, connect=min(request_timeout_s, 10)
+            ),
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
+        )
+        self._owns_client = http_client is None
+        self._max_retries = max_retries
+
+    async def create_run(self, request: CreateTrainingRunRequest) -> TrainingRunView:
+        return await self._request(
+            "POST", "training/runs", TrainingRunView, body=request
         )
 
-    @cached_property
-    def models(self) -> Models:
-        return Models(cast(AsyncOpenAI, self))
+    async def resolve_run(self, request: CreateTrainingRunRequest) -> TrainingRunView:
+        return await self._request(
+            "POST", "training/runs:resolve", TrainingRunView, body=request
+        )
 
-    @cached_property
-    def training_jobs(self) -> TrainingJobs:
-        return TrainingJobs(cast(AsyncOpenAI, self))
+    async def get_run(self, run_id: str) -> TrainingRunView:
+        return await self._request("GET", f"training/runs/{run_id}", TrainingRunView)
 
-    @cached_property
-    def sft_training_jobs(self) -> SFTTrainingJobs:
-        return SFTTrainingJobs(cast(AsyncOpenAI, self))
+    async def submit(self, kind: OperationKind, request: RunCommand) -> OperationRef:
+        endpoint = {
+            "forward": "forward",
+            "forward_backward": "forward_backward",
+            "optim_step": "optim_step",
+            "save_sampler": "save_weights_for_sampler",
+            "save_state": "save_state",
+            "load_state": (
+                "load_state_with_optimizer"
+                if isinstance(request, LoadStateRequest) and request.restore_optimizer
+                else "load_state"
+            ),
+        }[kind]
+        return await self._request(
+            "POST",
+            f"training/runs/{request.run_id}/{endpoint}",
+            OperationRef,
+            body=request,
+        )
 
-    ############################
-    # AsyncOpenAI overrides #
-    ############################
+    async def get_operation(self, operation_id: str) -> OperationView:
+        return await self._request(
+            "GET", f"training/operations/{operation_id}", OperationView
+        )
+
+    async def cancel_operation(
+        self, operation_id: str, request_id: str
+    ) -> OperationView:
+        return await self._request(
+            "POST",
+            f"training/operations/{operation_id}:cancel",
+            OperationView,
+            body=CancelOperationRequest(request_id=request_id),
+        )
+
+    async def close_run(self, run_id: str, request_id: str) -> TrainingRunView:
+        return await self._request(
+            "POST",
+            f"training/runs/{run_id}:close",
+            TrainingRunView,
+            body=CloseRunRequest(request_id=request_id),
+        )
+
+    async def capabilities(self) -> TrainingCapabilities:
+        return await self._request("GET", "training/capabilities", TrainingCapabilities)
+
+    async def list_checkpoints(self, run_id: str) -> CheckpointPage:
+        return await self._request(
+            "GET", f"training/runs/{run_id}/checkpoints", CheckpointPage
+        )
+
+    async def set_checkpoint_ttl(
+        self, run_id: str, checkpoint_id: str, ttl_seconds: int | None
+    ) -> CheckpointView:
+        return await self._request(
+            "POST",
+            f"training/runs/{run_id}/checkpoints/{checkpoint_id}:set_ttl",
+            CheckpointView,
+            body=SetCheckpointTtlRequest(ttl_seconds=ttl_seconds),
+        )
+
+    async def delete_checkpoint(
+        self, run_id: str, checkpoint_id: str
+    ) -> DeleteCheckpointResult:
+        return await self._request(
+            "DELETE",
+            f"training/runs/{run_id}/checkpoints/{checkpoint_id}",
+            DeleteCheckpointResult,
+        )
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        response_type: type[ResponseT],
+        *,
+        body: Contract | None = None,
+    ) -> ResponseT:
+        content = None if body is None else body.model_dump_json()
+        response: httpx.Response | None = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = await self._client.request(
+                    method,
+                    path,
+                    content=content,
+                    headers=None
+                    if body is None
+                    else {"Content-Type": "application/json"},
+                )
+            except httpx.TransportError:
+                if attempt == self._max_retries:
+                    raise
+            else:
+                if response.status_code not in {429, 502, 503, 504}:
+                    break
+                if attempt == self._max_retries:
+                    break
+            await asyncio.sleep(min(0.1 * 2**attempt, 1.0))
+        if response is None:
+            raise RuntimeError("remote training request produced no response")
+        if response.is_error:
+            try:
+                value = response.json()
+            except ValueError:
+                value = response.text
+            detail = value.get("detail", value) if isinstance(value, dict) else value
+            raise RemoteTrainingHttpError(response.status_code, detail)
+        return response_type.model_validate(response.json())
+
+    async def close(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+
+class RemoteTrainingOperation(Generic[ResultT]):
+    def __init__(
+        self,
+        ref: OperationRef,
+        service: RemoteTrainingServiceClient,
+        result_type: type[ResultT],
+        *,
+        poll_interval_s: float,
+    ) -> None:
+        self._ref = ref
+        self._service = service
+        self._result_type = result_type
+        self._poll_interval_s = poll_interval_s
+        self._completion: asyncio.Task[ResultT] | None = None
+        self._cancel_request_id = uuid.uuid4().hex
 
     @property
-    @override
-    def qs(self) -> Querystring:
-        return Querystring(array_format="brackets")
+    def ref(self) -> OperationRef:
+        return self._ref
+
+    async def result(self) -> ResultT:
+        if self._completion is None:
+            self._completion = asyncio.create_task(
+                self._wait(), name=f"remote-training-result-{self._ref.operation_id}"
+            )
+        return await asyncio.shield(self._completion)
+
+    async def _wait(self) -> ResultT:
+        while True:
+            operation = await self._service.get_operation(self._ref.operation_id)
+            if operation.ref != self._ref:
+                raise RemoteTrainingError("remote operation identity changed")
+            if operation.status == "succeeded":
+                if operation.result is None:
+                    raise RemoteTrainingError("successful operation has no result")
+                result = self._result_type.model_validate(operation.result)
+                if result.operation_id != self._ref.operation_id:
+                    raise RemoteTrainingError("operation result identity changed")
+                return result
+            if operation.status == "failed":
+                raise RemoteTrainingOperationError(
+                    self._ref.operation_id, operation.error or {}
+                )
+            if operation.status == "cancelled":
+                raise RemoteTrainingOperationCancelled(
+                    f"remote training operation {self._ref.operation_id} was cancelled"
+                )
+            await asyncio.sleep(self._poll_interval_s)
+
+    async def cancel(self) -> None:
+        await self._service.cancel_operation(
+            self._ref.operation_id, self._cancel_request_id
+        )
+
+
+class RemoteTrainingClient:
+    """Run-scoped implementation of ART's canonical training command API."""
+
+    def __init__(
+        self,
+        service: RemoteTrainingServiceClient,
+        run: TrainingRunView,
+        *,
+        poll_interval_s: float = 0.1,
+        close_timeout_s: float = 20.0,
+    ) -> None:
+        if run.status != "open":
+            raise ValueError(f"remote training run is {run.status}, not open")
+        if poll_interval_s <= 0 or close_timeout_s <= 0:
+            raise ValueError(
+                "remote training polling and close timeouts must be positive"
+            )
+        self._service = service
+        self._run = run
+        self._next_sequence_id = run.next_sequence_id
+        self._projected_learner_version = run.projected_learner_version
+        self._poll_interval_s = poll_interval_s
+        self._close_timeout_s = close_timeout_s
+        self._lock = asyncio.Lock()
+        self._operations: dict[str, tuple[str, RemoteTrainingOperation[Any]]] = {}
+        self._close_request_id = uuid.uuid4().hex
+        self._closed = False
+
+    @classmethod
+    async def create(
+        cls,
+        service: RemoteTrainingServiceClient,
+        request: CreateTrainingRunRequest,
+        **kwargs: Any,
+    ) -> "RemoteTrainingClient":
+        return cls(service, await service.create_run(request), **kwargs)
 
     @property
-    @override
-    def auth_headers(self) -> dict[str, str]:
-        api_key = self.api_key
-        return {"Authorization": f"Bearer {api_key}"}
-
-    def _auth_headers(self, security: Any | None = None) -> dict[str, str]:  # noqa: ARG002
-        return self.auth_headers
+    def run_id(self) -> str:
+        return self._run.run_id
 
     @property
-    @override
-    def default_headers(self) -> dict[str, str | Omit]:
-        return {
-            **super().default_headers,
-            "X-Stainless-Async": "false",
-            # "OpenAI-Organization": self.organization
-            # if self.organization is not None
-            # else Omit(),
-            # "OpenAI-Project": self.project if self.project is not None else Omit(),
-            **self._custom_headers,
-        }
+    def next_sequence_id(self) -> int:
+        return self._next_sequence_id
 
-    @override
-    def _make_status_error(
-        self, err_msg: str, *, body: object, response: httpx.Response
-    ) -> _exceptions.APIStatusError:
-        data = body.get("error", body) if is_mapping(body) else body
-        if response.status_code == 400:
-            return _exceptions.BadRequestError(err_msg, response=response, body=data)
+    @property
+    def projected_learner_version(self) -> int:
+        return self._projected_learner_version
 
-        if response.status_code == 401:
-            return _exceptions.AuthenticationError(
-                err_msg, response=response, body=data
+    async def _submit(
+        self,
+        request: RunCommand,
+        *,
+        kind: OperationKind,
+        result_type: type[ResultT],
+    ) -> TrainingOperation[ResultT]:
+        fingerprint = request.model_dump_json()
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("remote training client is closed")
+            if request.run_id != self.run_id:
+                raise ValueError("command run_id does not match the remote client")
+            if existing := self._operations.get(request.request_id):
+                if existing[0] != fingerprint:
+                    raise ValueError("request_id was reused with different content")
+                return cast(TrainingOperation[ResultT], existing[1])
+            if request.sequence_id != self._next_sequence_id:
+                raise ValueError(
+                    f"expected sequence {self._next_sequence_id}, "
+                    f"got {request.sequence_id}"
+                )
+            ref = await self._service.submit(kind, request)
+            if (
+                ref.run_id != self.run_id
+                or ref.sequence_id != request.sequence_id
+                or ref.kind != kind
+                or ref.learner_parent_version != self._projected_learner_version
+            ):
+                raise RemoteTrainingError("server admitted a divergent command")
+            operation = RemoteTrainingOperation(
+                ref,
+                self._service,
+                result_type,
+                poll_interval_s=self._poll_interval_s,
             )
+            self._operations[request.request_id] = (fingerprint, operation)
+            self._next_sequence_id += 1
+            if ref.reserved_output_learner_version is not None:
+                self._projected_learner_version = ref.reserved_output_learner_version
+            return operation
 
-        if response.status_code == 403:
-            return _exceptions.PermissionDeniedError(
-                err_msg, response=response, body=data
-            )
+    async def forward(
+        self, request: ForwardRequest
+    ) -> TrainingOperation[ForwardResult]:
+        return await self._submit(request, kind="forward", result_type=ForwardResult)
 
-        if response.status_code == 404:
-            return _exceptions.NotFoundError(err_msg, response=response, body=data)
+    async def forward_backward(
+        self, request: ForwardBackwardRequest
+    ) -> TrainingOperation[ForwardBackwardResult]:
+        return await self._submit(
+            request,
+            kind="forward_backward",
+            result_type=ForwardBackwardResult,
+        )
 
-        if response.status_code == 409:
-            return _exceptions.ConflictError(err_msg, response=response, body=data)
+    async def optim_step(
+        self, request: OptimStepRequest
+    ) -> TrainingOperation[OptimStepResult]:
+        return await self._submit(
+            request, kind="optim_step", result_type=OptimStepResult
+        )
 
-        if response.status_code == 422:
-            return _exceptions.UnprocessableEntityError(
-                err_msg, response=response, body=data
-            )
+    async def save_weights_for_sampler(
+        self, request: SaveWeightsForSamplerRequest
+    ) -> TrainingOperation[SamplerWeightsResult]:
+        return await self._submit(
+            request,
+            kind="save_sampler",
+            result_type=SamplerWeightsResult,
+        )
 
-        if response.status_code == 429:
-            return _exceptions.RateLimitError(err_msg, response=response, body=data)
+    async def save_state(
+        self, request: SaveStateRequest
+    ) -> TrainingOperation[SaveStateResult]:
+        return await self._submit(
+            request, kind="save_state", result_type=SaveStateResult
+        )
 
-        if response.status_code >= 500:
-            return _exceptions.InternalServerError(
-                err_msg, response=response, body=data
-            )
-        return _exceptions.APIStatusError(err_msg, response=response, body=data)
+    async def load_state(
+        self, request: LoadStateRequest
+    ) -> TrainingOperation[LoadStateResult]:
+        return await self._submit(
+            request.model_copy(update={"restore_optimizer": False}),
+            kind="load_state",
+            result_type=LoadStateResult,
+        )
+
+    async def load_state_with_optimizer(
+        self, request: LoadStateRequest
+    ) -> TrainingOperation[LoadStateResult]:
+        return await self._submit(
+            request.model_copy(update={"restore_optimizer": True}),
+            kind="load_state",
+            result_type=LoadStateResult,
+        )
+
+    async def close(self) -> None:
+        async with self._lock:
+            if self._run.status == "closed":
+                return
+            self._closed = True
+        await self._service.close_run(self.run_id, self._close_request_id)
+        async with asyncio.timeout(self._close_timeout_s):
+            while True:
+                run = await self._service.get_run(self.run_id)
+                if run.status == "closed":
+                    self._run = run
+                    return
+                if run.status == "failed":
+                    raise RemoteTrainingError("remote training run failed during close")
+                await asyncio.sleep(self._poll_interval_s)
+
+    async def abort_result_waiters(self) -> None:
+        tasks = tuple(
+            operation._completion
+            for _, operation in self._operations.values()
+            if operation._completion is not None and not operation._completion.done()
+        )
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

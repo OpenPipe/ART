@@ -9,6 +9,9 @@ from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.pipeline_tuner.config import PackedGroupShape
 from art.trajectories import Trajectory
 
+COMMAND_CONTRACT_VERSION = "art_training_commands_v1"
+PACKING_CONTRACT_VERSION = "art_prefix_tree_v1"
+
 
 class Contract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -236,8 +239,11 @@ class LossFnOutput(Contract):
     metrics: dict[str, float] = Field(default_factory=dict)
 
 
-class ForwardResult(Contract):
+class OperationResult(Contract):
     operation_id: str = Field(min_length=1)
+
+
+class ForwardResult(OperationResult):
     packing: PackingOutcome
     loss_fn_outputs: tuple[LossFnOutput, ...]
     metrics: dict[str, float] = Field(default_factory=dict)
@@ -247,28 +253,24 @@ class ForwardBackwardResult(ForwardResult):
     pass
 
 
-class OptimStepResult(Contract):
-    operation_id: str = Field(min_length=1)
+class OptimStepResult(OperationResult):
     contributing_forward_backward_operation_ids: tuple[str, ...] = Field(min_length=1)
     checkpoint: CheckpointRef
     metrics: dict[str, float] = Field(default_factory=dict)
 
 
-class SamplerWeightsResult(Contract):
-    operation_id: str = Field(min_length=1)
+class SamplerWeightsResult(OperationResult):
     checkpoint: CheckpointRef
     lora: str = Field(min_length=1)
     publication_metrics: dict[str, float] = Field(default_factory=dict)
 
 
-class SaveStateResult(Contract):
-    operation_id: str = Field(min_length=1)
+class SaveStateResult(OperationResult):
     checkpoint: CheckpointRef
     optimizer_state: str = Field(min_length=1)
     metrics: dict[str, float] = Field(default_factory=dict)
 
 
-class LoadStateResult(Contract):
-    operation_id: str = Field(min_length=1)
+class LoadStateResult(OperationResult):
     checkpoint: CheckpointRef
     optimizer_restored: bool

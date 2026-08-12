@@ -1,260 +1,266 @@
+from __future__ import annotations
+
 import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
 from contextlib import asynccontextmanager
+import os
 import time
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
-import warnings
+from typing import TYPE_CHECKING, Any, Literal
+import uuid
 
-from openai._types import NOT_GIVEN
-from tqdm import auto as tqdm
-
-from art.adapter_leases import pin_inference_step, pinned_inference_step
-from art.serverless.client import Client, ExperimentalTrainingConfig
-
-from .. import dev
-from .._backend_training import (
+from art._backend_training import (
     aggregate_rl_training_metrics,
     build_rl_train_configs,
 )
-from ..backend import AnyTrainableModel
-from ..metrics_taxonomy import (
-    TRAIN_GRADIENT_STEPS_KEY,
-    build_training_summary_metrics,
-    summarize_trajectory_groups,
+from art._source_revision import art_source_revision
+from art.adapter_leases import pin_inference_target, pinned_inference_name
+from art.backend import AnyModel, AnyTrainableModel
+from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
+from art.training.contracts import (
+    COMMAND_CONTRACT_VERSION,
+    PACKING_CONTRACT_VERSION,
+    AdamConfig,
+    ForwardBackwardRequest,
+    LossConfig,
+    OptimStepRequest,
+    RlTrajectoryBatch,
+    SamplerPublication,
+    SamplerWeightsResult,
+    SaveStateRequest,
+    SaveWeightsForSamplerRequest,
+    SupervisedTrajectoryBatch,
 )
-from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import (
-    ServerlessTrainResult,
-    SFTMetricLoggingConfig,
-    TrainConfig,
-    TrainSFTConfig,
-)
-from ..utils import wandb_sdk
-from ..utils.record_provenance import record_provenance
+from art.trajectories import Trajectory, TrajectoryGroup
+from art.types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
+
+from .. import dev
+from .client import RemoteTrainingClient, RemoteTrainingServiceClient
+from .contracts import AdapterSpec, CreateTrainingRunRequest, TrainingRunSpec
 
 if TYPE_CHECKING:
-    from wandb.sdk.artifacts.artifact import Artifact
+    from art.model import Model, TrainableModel
 
-    from ..model import Model, TrainableModel
-
-
-def _extract_step_from_wandb_artifact(artifact: "Artifact") -> int | None:
-    """Extract step number from a W&B artifact's aliases."""
-    for alias in artifact.aliases:
-        if alias.startswith("step"):
-            try:
-                return int(alias[4:])
-            except ValueError:
-                pass
-    return None
-
-
-_UPSTREAM_TRAIN_METRIC_KEYS = {
-    "reward": "train/reward",
-    "reward_std_dev": "train/reward_std_dev",
-    "exception_rate": "train/exception_rate",
-    "policy_loss": "loss/train",
-    "loss": "loss/train",
-    "entropy": "loss/entropy",
-    "kl_div": "loss/kl_div",
-    "kl_policy_ref": "loss/kl_policy_ref",
-    "grad_norm": "loss/grad_norm",
-    "learning_rate": "loss/learning_rate",
-    "num_groups_submitted": "data/step_num_groups_submitted",
-    "num_groups_trainable": "data/step_num_groups_trainable",
-    "num_trajectories": "data/step_num_trajectories",
-    "num_trainable_tokens": "data/step_trainable_assistant_tokens",
-    "train_tokens": "data/step_trainable_assistant_tokens",
-    "num_datums": "data/step_num_datums",
-}
-
-
-def _canonicalize_upstream_metric_key(metric: str) -> str:
-    if "/" in metric:
-        return metric
-    if metric == "tokens_per_second":
-        return ""
-    if metric.startswith("group_metric_"):
-        return f"train/group/{metric[len('group_metric_') :]}"
-    return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
-
-
-def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float]:
-    return {
-        canonical_key: float(value)
-        for key, value in metrics.items()
-        if (canonical_key := _canonicalize_upstream_metric_key(key))
-    }
+SamplerPublisher = Callable[
+    [AnyTrainableModel, SamplerWeightsResult],
+    Awaitable[dict[str, float] | None],
+]
 
 
 class ServerlessBackend:
-    def __init__(
-        self, *, api_key: str | None = None, base_url: str | None = None
-    ) -> None:
-        client = Client(api_key=api_key, base_url=base_url)
-        self._base_url = str(client.base_url)
-        self._client = client
+    """ART backend backed by the sequenced Remote Training command service."""
 
-    def logs_sft_metrics_remotely(self) -> bool:
-        return True
+    def __init__(
+        self,
+        *,
+        training_base_url: str,
+        inference_base_url: str,
+        api_key: str | None = None,
+        inference_api_key: str | None = None,
+        checkpoint: str | None = None,
+        restore_optimizer: bool = False,
+        sampler_publisher: SamplerPublisher | None = None,
+        close_timeout_s: float = 20.0,
+    ) -> None:
+        api_key = api_key or os.environ.get("WANDB_API_KEY")
+        if api_key is None:
+            raise ValueError("ServerlessBackend requires api_key or WANDB_API_KEY")
+        if not inference_base_url:
+            raise ValueError("ServerlessBackend requires an inference_base_url")
+        if restore_optimizer and checkpoint is None:
+            raise ValueError("restore_optimizer requires checkpoint")
+        if close_timeout_s <= 0:
+            raise ValueError("close_timeout_s must be positive")
+        self._service = RemoteTrainingServiceClient(
+            api_key=api_key,
+            base_url=training_base_url,
+        )
+        self._inference_base_url = inference_base_url
+        self._inference_api_key = inference_api_key or api_key
+        self._checkpoint = checkpoint
+        self._restore_optimizer = restore_optimizer
+        self._sampler_publisher = sampler_publisher
+        self._close_timeout_s = close_timeout_s
+        self._clients: dict[tuple[str | None, str, str, str], RemoteTrainingClient] = {}
+        self._register_lock = asyncio.Lock()
+        self._background: set[asyncio.Task[Any]] = set()
+        self._background_failures: list[BaseException] = []
+        self._closed = False
+
+    async def register(self, model: "Model") -> None:
+        from art.model import TrainableModel
+
+        if not isinstance(model, TrainableModel):
+            raise TypeError("ServerlessBackend only supports trainable models")
+        key = self._model_key(model)
+        async with self._register_lock:
+            if self._closed:
+                raise RuntimeError("ServerlessBackend is closed")
+            if key in self._clients:
+                raise RuntimeError("model is already registered")
+            await self._check_capabilities(model)
+            client = await RemoteTrainingClient.create(
+                self._service,
+                CreateTrainingRunRequest(
+                    spec=TrainingRunSpec(
+                        run_name=model.run_name,
+                        base_model=model.base_model,
+                        adapter=_adapter_spec(model),
+                        seed=int((model.lora_config or {}).get("random_state", 3407)),
+                        packing_contract_version=PACKING_CONTRACT_VERSION,
+                        art_version=art_source_revision(),
+                        metadata={
+                            "project": model.project,
+                            "model_alias": model.name,
+                            **({"entity": model.entity} if model.entity else {}),
+                        },
+                    ),
+                    checkpoint=self._checkpoint,
+                    restore_optimizer=self._restore_optimizer,
+                ),
+                close_timeout_s=self._close_timeout_s,
+            )
+            self._clients[key] = client
+            model.id = client.run_id
+            model.run_id = client.run_id
+
+    async def training_client(self, model: AnyTrainableModel) -> RemoteTrainingClient:
+        try:
+            return self._clients[self._model_key(model)]
+        except KeyError as error:
+            raise RuntimeError(
+                "model is not registered with ServerlessBackend"
+            ) from error
+
+    async def _check_capabilities(self, model: AnyTrainableModel) -> None:
+        capabilities = await self._service.capabilities()
+        if capabilities.command_contract_version != COMMAND_CONTRACT_VERSION:
+            raise RuntimeError("remote command contract version does not match ART")
+        if PACKING_CONTRACT_VERSION not in capabilities.packing_contract_versions:
+            raise RuntimeError("remote service does not support ART's packing contract")
+        if "bfloat16" not in capabilities.supported_dtypes:
+            raise RuntimeError("remote service does not support bfloat16 training")
+        if not {"cross_entropy", "cispo", "ppo"}.issubset(
+            capabilities.supported_losses
+        ):
+            raise RuntimeError("remote service does not support ART's named losses")
+        if _adapter_spec(model).rank > capabilities.max_lora_rank:
+            raise RuntimeError("requested LoRA rank exceeds remote service capacity")
 
     async def close(self) -> None:
-        await self._client.close()  # ty:ignore[possibly-missing-attribute]
+        if self._closed:
+            return
+        self._closed = True
+        failures: list[BaseException] = []
+        try:
+            async with asyncio.timeout(self._close_timeout_s):
+                results = await asyncio.gather(
+                    *(client.close() for client in self._clients.values()),
+                    return_exceptions=True,
+                )
+                failures.extend(
+                    result for result in results if isinstance(result, BaseException)
+                )
+                await self._drain_background()
+        except BaseException as error:
+            failures.append(error)
+            await asyncio.gather(
+                *(client.abort_result_waiters() for client in self._clients.values()),
+                return_exceptions=True,
+            )
+        finally:
+            await self._service.close()
+        if failures:
+            raise BaseExceptionGroup("ServerlessBackend shutdown failed", failures)
 
-    async def register(
-        self,
-        model: "Model",
-    ) -> None:
-        """
-        Registers a model with the Backend for logging and/or training.
-
-        Args:
-            model: An art.Model instance.
-        """
-        from art import TrainableModel
+    async def delete(self, model: "Model") -> None:
+        from art.model import TrainableModel
 
         if not isinstance(model, TrainableModel):
-            print(
-                "Registering a non-trainable model with the Serverless backend is not supported."
+            raise TypeError("ServerlessBackend only supports trainable models")
+        client = await self.training_client(model)
+        await client.close()
+        checkpoints = await self._service.list_checkpoints(client.run_id)
+        for checkpoint in checkpoints.checkpoints:
+            await self._service.delete_checkpoint(
+                client.run_id, checkpoint.checkpoint_id
             )
-            return
-        client_model = await self._client.models.create(  # ty:ignore[possibly-missing-attribute]
-            entity=model.entity,
-            project=model.project,
-            name=model._storage_name(),
-            base_model=model.base_model,
-            return_existing=True,
-        )
-        model.id = client_model.id
-        model.entity = client_model.entity
-        model.run_id = client_model.run_id
+        self._clients.pop(self._model_key(model))
 
-    async def delete(
-        self,
-        model: "Model",
-    ) -> None:
-        """
-        Deletes a model from the Backend.
+    def logs_sft_metrics_remotely(self) -> bool:
+        return False
 
-        Args:
-            model: An art.Model instance to delete.
-        """
-        from art import TrainableModel
-
-        if not isinstance(model, TrainableModel):
-            print(
-                "Deleting a non-trainable model from the Serverless backend is not supported."
-            )
-            return
-        assert model.id is not None, "Model ID is required"
-        await self._client.models.delete(model_id=model.id)  # ty:ignore[possibly-missing-attribute]
-
-    def _model_inference_name(self, model: "Model", step: int | None = None) -> str:
-        """Return the inference name for a model checkpoint.
-
-        Args:
-            model: The model.
-            step: If provided, returns name for specific checkpoint using
-                  W&B artifact versioning (e.g., :step5). If None, returns
-                  name for the pinned checkpoint when running inside an
-                  adapter_lease, otherwise latest checkpoint.
-        """
-        assert model.entity is not None, "Model entity is required"
-        if step is None:
-            step = pinned_inference_step(model._storage_name())
-        base_name = (
-            f"wandb-artifact:///{model.entity}/{model.project}/{model._storage_name()}"
-        )
-        if step is not None:
-            return f"{base_name}:step{step}"
-        return base_name
+    def _model_inference_name(self, model: AnyModel, step: int | None = None) -> str:
+        if name := pinned_inference_name(model.name, step):
+            return name
+        return model.name if step is None else f"{model.name}@{step}"
 
     @asynccontextmanager
     async def adapter_lease(
-        self,
-        model: AnyTrainableModel,
-        step: int,
+        self, model: AnyTrainableModel, step: int
     ) -> AsyncIterator[None]:
-        async with pin_inference_step(model._storage_name(), step):
+        async with pin_inference_target(
+            model.name, step=step, inference_name=model.name
+        ):
             yield
 
     @asynccontextmanager
     async def exact_adapter_lease(
-        self,
-        model: AnyTrainableModel,
-        step: int,
+        self, model: AnyTrainableModel, step: int
     ) -> AsyncIterator[None]:
-        async with pin_inference_step(model._storage_name(), step):
+        async with pin_inference_target(
+            model.name, step=step, inference_name=f"{model.name}@{step}"
+        ):
             yield
-
-    async def _get_step(self, model: "Model") -> int:
-        if model.trainable:
-            assert model.id is not None, "Model ID is required"
-            async for checkpoint in self._client.models.checkpoints.list(  # ty:ignore[possibly-missing-attribute]
-                limit=1, order="desc", model_id=model.id
-            ):
-                return checkpoint.step
-        # Non-trainable models do not have checkpoints/steps; default to 0
-        return 0
-
-    async def _delete_checkpoint_files(
-        self,
-        model: AnyTrainableModel,
-        steps_to_keep: list[int],
-    ) -> None:
-        """Delete checkpoint files, keeping only the specified steps."""
-        assert model.id is not None, "Model ID is required"
-        # Get all checkpoint steps
-        all_steps: list[int] = []
-        async for checkpoint in self._client.models.checkpoints.list(model_id=model.id):  # ty:ignore[possibly-missing-attribute]
-            all_steps.append(checkpoint.step)
-        # Delete all steps not in steps_to_keep
-        if steps_to_delete := [step for step in all_steps if step not in steps_to_keep]:
-            await self._client.models.checkpoints.delete(  # ty:ignore[possibly-missing-attribute]
-                model_id=model.id,
-                steps=steps_to_delete,
-            )
 
     async def _prepare_backend_for_training(
         self,
         model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None,
     ) -> tuple[str, str]:
-        return str(self._base_url), self._client.api_key  # ty:ignore[possibly-missing-attribute]
+        del model
+        if config is not None:
+            raise ValueError("remote inference does not accept a local server config")
+        return self._inference_base_url, self._inference_api_key
 
-    # Note: _log() method has been moved to the Model class (frontend)
-    # Trajectories are now saved locally by the Model.log() method
+    async def _get_step(self, model: AnyTrainableModel) -> int:
+        client = await self.training_client(model)
+        return (await self._service.get_run(client.run_id)).committed_learner_version
+
+    async def _delete_checkpoint_files(
+        self, model: AnyTrainableModel, steps_to_keep: list[int]
+    ) -> None:
+        client = await self.training_client(model)
+        page = await self._service.list_checkpoints(client.run_id)
+        keep = set(steps_to_keep)
+        for checkpoint in page.checkpoints:
+            if checkpoint.learner_version not in keep:
+                await self._service.delete_checkpoint(
+                    client.run_id, checkpoint.checkpoint_id
+                )
 
     async def train(  # type: ignore[override]
         self,
         model: AnyTrainableModel,
         trajectory_groups: Iterable[TrajectoryGroup],
         *,
-        # Core training parameters
         learning_rate: float = 5e-6,
-        loss_fn: Literal["cispo", "ppo"] | None = None,
+        loss_fn: Literal["cispo", "ppo"] = "cispo",
         loss_fn_config: dict | None = None,
         normalize_advantages: bool = True,
         adam_params: object | None = None,
-        # KL-penalized advantage adjustment
         kl_penalty_coef: float = 0.0,
         kl_penalty_reference_step: int | None = None,
-        kl_penalty_source: Literal["current_learner", "sample"] | None = None,
-        kl_penalty_step_lag: int | None = None,
         kl_ref_adapter_path: str | None = None,
-        # RL algorithm settings
-        ppo: bool | None = None,
+        kl_penalty_source: Literal["current_learner", "sample"] = "current_learner",
         epsilon: float | None = None,
         epsilon_high: float | None = None,
-        # Advantage computation
         advantage_balance: float = 0.0,
         scale_rewards: bool = True,
-        # Importance sampling
         importance_sampling_level: Literal[
             "token", "sequence", "average", "geometric_average"
         ] = "token",
         max_negative_advantage_importance_sampling_weight: float | None = None,
         mask_prob_ratio: bool = False,
-        # Experimental parameters
         kimi_k2_tau: float | None = None,
         precalculate_logprobs: bool = False,
         allow_training_without_logprobs: bool = False,
@@ -264,273 +270,140 @@ class ServerlessBackend:
         logprob_calculation_chunk_size: int = 1024,
         packed_sequence_length: int | None = None,
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
-        # Checkpoint behavior
         save_checkpoint: bool = True,
         optimizer_save_interval: int = 5,
-        # Verbosity
+        grad_accumulation_sequences: int | None = None,
         verbose: bool = False,
     ) -> ServerlessTrainResult:
-        """Train the model on the given trajectory groups.
-
-        This method does NOT automatically log trajectories or metrics. Call
-        model.log() explicitly before and/or after training if you want to log
-        data.
-
-        Args:
-            model: The trainable model to train.
-            trajectory_groups: Batches of trajectories to train on.
-            learning_rate: Learning rate for training. Defaults to 5e-6.
-            loss_fn: RL loss function. ServerlessBackend supports "cispo" and
-                "ppo". If unset, the legacy ppo argument is used.
-            loss_fn_config: Additional loss-function config. Not supported by
-                ServerlessBackend.
-            normalize_advantages: Backward-compatible alias for reward std scaling.
-                When False, ServerlessBackend centers rewards but does not divide
-                by group reward std dev.
-            adam_params: Custom optimizer params. Not supported by
-                ServerlessBackend.
-            kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
-                Defaults to 0.0 (disabled).
-            kl_penalty_reference_step: Checkpoint step of the training model to
-                use as the KL reference. When omitted, the backend may use
-                kl_ref_adapter_path or its default reference policy.
-            kl_penalty_source: Which policy's logprobs to compare against the
-                reference policy. When omitted, defaults to "sample" if KL is
-                enabled and "current_learner" otherwise.
-            kl_penalty_step_lag: Moving KL reference lag. The serverless
-                backend resolves this as max(0, current_step - lag). Mutually
-                exclusive with kl_penalty_reference_step.
-            kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
-                checkpoint to use as the KL reference.
-            ppo: Legacy flag for PPO clipping. Prefer loss_fn="ppo".
-            epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
-            epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
-            advantage_balance: Balance between negative and positive advantages
-                in range [-1.0, 1.0]. Defaults to 0.0 (balanced).
-            scale_rewards: Whether to scale rewards by standard deviation.
-                Defaults to True.
-            importance_sampling_level: Level at which to compute importance
-                sampling weights. Defaults to "token".
-            max_negative_advantage_importance_sampling_weight: Maximum weight
-                for negative advantage samples.
-            mask_prob_ratio: Whether to mask probability ratios. Defaults to False.
-            kimi_k2_tau: Tau parameter for Kimi K2 algorithm.
-            precalculate_logprobs: Whether to precalculate logprobs.
-            allow_training_without_logprobs: Allow training even when no logprobs
-                are available. Defaults to False.
-            plot_tensors: Whether to plot training tensors for debugging.
-                Defaults to False.
-            truncated_importance_sampling: Truncation threshold for importance
-                sampling weights.
-            scale_learning_rate_by_reward_std_dev: Whether to scale learning rate
-                by reward standard deviation. Defaults to False.
-            logprob_calculation_chunk_size: Chunk size for logprob calculation.
-                Defaults to 1024.
-            packed_sequence_length: Packed sequence length to use for training.
-            num_trajectories_learning_rate_multiplier_power: Power for learning
-                rate multiplier based on number of trajectories.
-            save_checkpoint: Accepted for PipelineTrainer compatibility. Serverless
-                training currently always saves a trainable checkpoint for the next
-                inference step.
-            optimizer_save_interval: Accepted for PipelineTrainer compatibility;
-                serverless training owns optimizer checkpoint cadence.
-            verbose: Whether to print verbose output. Defaults to False.
-
-        Returns:
-            ServerlessTrainResult with step number, training metrics, and artifact name.
-
-        Example:
-            await model.log(trajectory_groups, split="train")
-            result = await backend.train(model, trajectory_groups, learning_rate=5e-6)
-            # Optionally log training metrics:
-            # await model.log(metrics=result.metrics, step=result.step)
-        """
-        del optimizer_save_interval
-        groups_list = list(trajectory_groups)
-        if loss_fn is None:
-            resolved_loss_fn: Literal["cispo", "ppo"] = "ppo" if ppo else "cispo"
-        else:
-            resolved_loss_fn = loss_fn
-            if ppo is not None and ppo != (loss_fn == "ppo"):
-                raise ValueError("ServerlessBackend got conflicting loss_fn and ppo.")
-        if resolved_loss_fn not in {"cispo", "ppo"}:
-            raise ValueError(
-                "ServerlessBackend only supports loss_fn='cispo' or 'ppo'."
+        del optimizer_save_interval, verbose
+        self._raise_background_failures()
+        if self._sampler_publisher is None:
+            raise RuntimeError("remote RL training requires a sampler_publisher")
+        if loss_fn not in {"cispo", "ppo"}:
+            raise ValueError("ServerlessBackend supports only cispo and ppo")
+        if loss_fn_config is not None or adam_params is not None:
+            raise ValueError("custom loss and optimizer objects are not supported")
+        if kl_ref_adapter_path is not None:
+            raise ValueError("remote training does not accept client filesystem paths")
+        if kl_penalty_reference_step is not None:
+            raise NotImplementedError(
+                "remote KL checkpoint resolution is not implemented"
             )
-        if loss_fn_config is not None:
-            raise ValueError("ServerlessBackend requires loss_fn_config=None.")
+        groups = list(trajectory_groups)
+        if not groups:
+            raise ValueError("trajectory_groups must not be empty")
         if not normalize_advantages:
             scale_rewards = False
-        if adam_params is not None:
-            raise ValueError("ServerlessBackend requires adam_params=None.")
-        if kl_penalty_reference_step is not None and kl_penalty_reference_step < 0:
-            raise ValueError("kl_penalty_reference_step must be >= 0.")
-        if kl_penalty_step_lag is not None:
-            if kl_penalty_step_lag < 1:
-                raise ValueError("kl_penalty_step_lag must be >= 1.")
-            if kl_penalty_reference_step is not None:
-                raise ValueError(
-                    "Only one of kl_penalty_reference_step and "
-                    "kl_penalty_step_lag may be set."
-                )
-        resolved_kl_penalty_source: Literal["current_learner", "sample"] = (
-            kl_penalty_source
-            if kl_penalty_source is not None
-            else ("sample" if kl_penalty_coef > 0.0 else "current_learner")
-        )
-        _ = save_checkpoint
-
-        config, dev_config = build_rl_train_configs(
+        config, values = build_rl_train_configs(
             learning_rate=learning_rate,
             advantage_balance=advantage_balance,
             scale_rewards=scale_rewards,
             importance_sampling_level=importance_sampling_level,
             mask_prob_ratio=mask_prob_ratio,
-            ppo=resolved_loss_fn == "ppo",
+            ppo=loss_fn == "ppo",
             precalculate_logprobs=precalculate_logprobs,
             epsilon=epsilon,
             epsilon_high=epsilon_high,
-            max_negative_advantage_importance_sampling_weight=max_negative_advantage_importance_sampling_weight,
+            max_negative_advantage_importance_sampling_weight=(
+                max_negative_advantage_importance_sampling_weight
+            ),
             kimi_k2_tau=kimi_k2_tau,
             kl_penalty_coef=kl_penalty_coef,
-            kl_penalty_source=resolved_kl_penalty_source,
+            kl_penalty_source=kl_penalty_source,
             allow_training_without_logprobs=allow_training_without_logprobs,
             plot_tensors=plot_tensors,
             truncated_importance_sampling=truncated_importance_sampling,
-            scale_learning_rate_by_reward_std_dev=scale_learning_rate_by_reward_std_dev,
+            scale_learning_rate_by_reward_std_dev=(
+                scale_learning_rate_by_reward_std_dev
+            ),
             logprob_calculation_chunk_size=logprob_calculation_chunk_size,
             packed_sequence_length=packed_sequence_length,
-            num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
-            kl_ref_adapter_path=kl_ref_adapter_path,
+            num_trajectories_learning_rate_multiplier_power=(
+                num_trajectories_learning_rate_multiplier_power
+            ),
+            grad_accumulation_sequences=grad_accumulation_sequences,
         )
-        if kl_penalty_reference_step is not None:
-            dev_config["kl_penalty_reference_step"] = kl_penalty_reference_step
-        if kl_penalty_step_lag is not None:
-            dev_config["kl_penalty_step_lag"] = kl_penalty_step_lag
-
-        # Collect metrics from training
-        training_metrics: list[dict[str, float]] = []
-        trainer_started = time.monotonic()
-        async for metrics in self._train_model(
-            model, groups_list, config, dev_config, verbose
-        ):
-            training_metrics.append(metrics)
-
-        avg_metrics = aggregate_rl_training_metrics(
-            training_metrics=training_metrics,
-            trajectory_groups=groups_list,
-            trainer_started=trainer_started,
+        started = time.monotonic()
+        client = await self.training_client(model)
+        sequence = client.next_sequence_id
+        batch = RlTrajectoryBatch.from_groups(
+            groups, default_source_version=client.projected_learner_version
         )
-
-        # Get step and artifact name
-        step = await self._get_step(model)
-        artifact_name: str | None = None
-        if model.entity is not None:
-            artifact_name = (
-                f"{model.entity}/{model.project}/{model._storage_name()}:step{step}"
+        forward = await client.forward_backward(
+            ForwardBackwardRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=sequence,
+                batch=batch,
+                loss=LossConfig(
+                    name=loss_fn,
+                    normalize_advantages=scale_rewards,
+                    values={
+                        **values,
+                        "grad_accumulation_sequences": (
+                            config.grad_accumulation_sequences
+                        ),
+                    },
+                ),
+                collect_packing_shapes=any(
+                    group._collect_packing_shape for group in groups
+                ),
             )
-
-        # Record provenance on the latest W&B artifact
-        wandb_run = model._get_wandb_run()
-        if wandb_run is not None:
-            record_provenance(wandb_run, "serverless-rl")
-
+        )
+        optimizer = await client.optim_step(
+            OptimStepRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=sequence + 1,
+                optimizer=AdamConfig(learning_rate=learning_rate),
+            )
+        )
+        step = optimizer.ref.reserved_output_learner_version
+        if step is None:
+            raise RuntimeError("optimizer did not reserve a learner version")
+        sampler = await client.save_weights_for_sampler(
+            SaveWeightsForSamplerRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=sequence + 2,
+                checkpoint_name=f"step-{step}",
+                publication=SamplerPublication(
+                    mode="in_flight_lora", model_alias=model.name
+                ),
+            )
+        )
+        if save_checkpoint:
+            state = await client.save_state(
+                SaveStateRequest(
+                    run_id=client.run_id,
+                    request_id=uuid.uuid4().hex,
+                    sequence_id=sequence + 3,
+                    checkpoint_name=f"step-{step}",
+                )
+            )
+            self._track(state.result(), f"remote-state-{step}")
+        forward_result, optimizer_result, sampler_result = await asyncio.gather(
+            forward.result(), optimizer.result(), sampler.result()
+        )
+        publication_metrics = await self._sampler_publisher(model, sampler_result)
+        _attach_packing_shapes(groups, forward_result.packing.group_shapes)
+        metrics = aggregate_rl_training_metrics(
+            training_metrics=[
+                {
+                    **forward_result.metrics,
+                    **optimizer_result.metrics,
+                    **sampler_result.publication_metrics,
+                    **(publication_metrics or {}),
+                }
+            ],
+            trajectory_groups=groups,
+            trainer_started=started,
+        )
         return ServerlessTrainResult(
             step=step,
-            metrics=avg_metrics,
-            artifact_name=artifact_name,
+            metrics=metrics,
+            checkpoint_id=sampler_result.checkpoint.checkpoint_id,
         )
-
-    async def _train_model(
-        self,
-        model: AnyTrainableModel,
-        trajectory_groups: list[TrajectoryGroup],
-        config: TrainConfig,
-        dev_config: dev.TrainConfig,
-        verbose: bool = False,
-    ) -> AsyncIterator[dict[str, float]]:
-        summary = summarize_trajectory_groups(trajectory_groups)
-        base_metrics = build_training_summary_metrics(
-            summary,
-            include_trainable_groups=True,
-        )
-        assert model.id is not None, "Model ID is required"
-        training_job = await self._client.training_jobs.create(  # ty:ignore[possibly-missing-attribute]
-            model_id=model.id,
-            trajectory_groups=trajectory_groups,
-            experimental_config=ExperimentalTrainingConfig(
-                advantage_balance=dev_config.get("advantage_balance"),
-                allow_training_without_logprobs=dev_config.get(
-                    "allow_training_without_logprobs"
-                ),
-                epsilon=dev_config.get("epsilon"),
-                epsilon_high=dev_config.get("epsilon_high"),
-                importance_sampling_level=dev_config.get("importance_sampling_level"),
-                kimi_k2_tau=dev_config.get("kimi_k2_tau"),
-                kl_penalty_coef=dev_config.get("kl_penalty_coef"),
-                kl_penalty_reference_step=dev_config.get("kl_penalty_reference_step"),
-                kl_penalty_source=dev_config.get("kl_penalty_source"),
-                kl_penalty_step_lag=dev_config.get("kl_penalty_step_lag"),
-                kl_ref_adapter_path=dev_config.get("kl_ref_adapter_path"),
-                learning_rate=config.learning_rate,
-                logprob_calculation_chunk_size=dev_config.get(
-                    "logprob_calculation_chunk_size"
-                ),
-                loss_fn="ppo" if dev_config.get("ppo") else "cispo",
-                mask_prob_ratio=dev_config.get("mask_prob_ratio"),
-                max_negative_advantage_importance_sampling_weight=dev_config.get(
-                    "max_negative_advantage_importance_sampling_weight"
-                ),
-                normalize_advantages=dev_config.get("scale_rewards"),
-                num_trajectories_learning_rate_multiplier_power=dev_config.get(
-                    "num_trajectories_learning_rate_multiplier_power"
-                ),
-                packed_sequence_length=dev_config.get("packed_sequence_length"),
-                plot_tensors=dev_config.get("plot_tensors"),
-                ppo=dev_config.get("ppo"),
-                precalculate_logprobs=dev_config.get("precalculate_logprobs"),
-                scale_learning_rate_by_reward_std_dev=dev_config.get(
-                    "scale_learning_rate_by_reward_std_dev"
-                ),
-                scale_rewards=dev_config.get("scale_rewards"),
-                truncated_importance_sampling=dev_config.get(
-                    "truncated_importance_sampling"
-                ),
-            ),
-        )
-        after: str | None = None
-        num_sequences: int | None = None
-        pbar: tqdm.tqdm | None = None
-        while True:
-            await asyncio.sleep(1)
-            async for event in self._client.training_jobs.events.list(  # ty:ignore[possibly-missing-attribute]
-                training_job_id=training_job.id, after=after or NOT_GIVEN
-            ):
-                if event.type == "gradient_step":
-                    assert pbar is not None and num_sequences is not None
-                    pbar.update(1)
-                    pbar.set_postfix(event.data)
-                    metrics = _canonicalize_upstream_metrics(
-                        {k: float(v) for k, v in event.data.items()}
-                    )
-                    yield {
-                        **base_metrics,
-                        **metrics,
-                        TRAIN_GRADIENT_STEPS_KEY: float(num_sequences),
-                    }
-                elif event.type == "training_started":
-                    num_sequences = event.data["num_sequences"]
-                    if pbar is None:
-                        pbar = tqdm.tqdm(total=num_sequences, desc="train")
-                    continue
-                elif event.type == "training_ended":
-                    return
-                elif event.type == "training_failed":
-                    error_message = event.data.get(
-                        "error_message", "Training failed with an unknown error"
-                    )
-                    raise RuntimeError(f"Training job failed: {error_message}")
-                after = event.id
 
     async def _train_sft(
         self,
@@ -540,528 +413,126 @@ class ServerlessBackend:
         dev_config: dev.TrainSFTConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        """Train the model using supervised fine-tuning.
+        del dev_config, verbose
+        from art.utils.sft import resolve_sft_batch_size
 
-        For ServerlessBackend, this serializes trajectories to a JSONL file,
-        uploads it to W&B artifacts, and calls the SFT training API.
-
-        Args:
-            model: The trainable model to fine-tune.
-            trajectories: Iterable of Trajectory objects.
-            config: SFT configuration with batch size, learning rates, and assistant
-                turn selection.
-            dev_config: Developer configuration.
-            verbose: Whether to print detailed logs.
-
-        Yields:
-            Dictionary containing training metrics for each batch.
-        """
-        import json
-        import tempfile
-        import uuid
-
-        from ..utils.sft import resolve_sft_batch_size
-
-        assert model.id is not None, "Model ID is required"
-
-        # Get the user's default entity from W&B if not set
-        if model.entity is None:
-            api = wandb_sdk.api(api_key=self._client.api_key)
-            model.entity = api.default_entity
-
-        # Generate unique artifact name to avoid race conditions in distributed systems
-        artifact_id = uuid.uuid4().hex[:12]
-        artifact_name = f"{model._storage_name()}-sft-data-{artifact_id}"
-
-        if verbose:
-            print("Serializing trajectories to file (streaming)...")
-
-        # Serialize trajectories to a temporary JSONL file (streaming - no memory load)
-        num_trajectories = 0
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".jsonl", delete=False
-        ) as tmp_file:
-            for trajectory in trajectories:
-                # Convert trajectory to the expected JSONL format
-                line: dict[str, Any] = {
-                    "messages": trajectory.messages(),
-                }
-                if trajectory.tools:
-                    line["tools"] = trajectory.tools
-                tmp_file.write(json.dumps(line) + "\n")
-                num_trajectories += 1
-            tmp_file_path = tmp_file.name
-
-        if num_trajectories == 0:
-            if verbose:
-                print("No trajectories to train on")
-            import os
-
-            os.unlink(tmp_file_path)
+        values = list(trajectories)
+        if not values:
             return
-
-        if verbose:
-            print(f"Serialized {num_trajectories} trajectories")
-
-        try:
-            if verbose:
-                print("Uploading training data to W&B artifacts...")
-
-            # Upload the file to W&B as a dataset artifact
-            # Use the model's canonical run_id from database, or fall back to model name
-            run = wandb_sdk.init(
-                name=model._storage_name(),
-                id=model.run_id or model._storage_name(),
-                entity=model.entity,
-                project=model.project,
-                resume="allow",  # Resume if this run already exists
-                settings=wandb_sdk.settings(api_key=self._client.api_key),
-            )
-            try:
-                artifact = wandb_sdk.artifact(
-                    artifact_name,
-                    type="dataset",
-                    metadata={
-                        "format": "jsonl",
-                        "num_trajectories": num_trajectories,
-                    },
-                )
-                artifact.add_file(tmp_file_path, name="train.jsonl")
-                artifact = run.log_artifact(artifact)
-                try:
-                    artifact = artifact.wait()
-                except ValueError as e:
-                    if "Unable to fetch artifact with id" in str(e):
-                        if verbose:
-                            print(f"Warning: {e}")
-                    else:
-                        raise e
-            finally:
-                # Finish the run so the workflow can resume it later
-                # The workflow uses wandb_run with resume="must" to continue this run
-                run.finish()
-        finally:
-            # Clean up temporary file
-            import os
-
-            os.unlink(tmp_file_path)
-
-        # Construct the artifact URL with unique name (v0 is the first version)
-        training_data_url = (
-            f"wandb-artifact:///{model.entity}/{model.project}/{artifact_name}:v0"
+        batch_size = resolve_sft_batch_size(
+            batch_size=config.batch_size, default_batch_size=2
         )
-
-        if verbose:
-            print(f"Training data uploaded. Artifact URL: {training_data_url}")
-            print("Starting SFT training job...")
-
-        # Create SFT training job
-        from .client import SFTTrainingConfig
-
-        sft_config: SFTTrainingConfig = {}
-        if config.batch_size != "auto":
-            batch_size = resolve_sft_batch_size(
-                batch_size=config.batch_size,
-                default_batch_size=2,
-            )
-            sft_config["batch_size"] = batch_size
-        sft_config["learning_rate"] = config.learning_rate
-        sft_config["assistant_turns"] = config.assistant_turns
-        metric_logging = cast(
-            SFTMetricLoggingConfig,
-            dict(dev_config.get("metric_logging", {}) or {}),
+        batches = [
+            values[index : index + batch_size]
+            for index in range(0, len(values), batch_size)
+        ]
+        rates = (
+            config.learning_rate
+            if isinstance(config.learning_rate, list)
+            else [config.learning_rate] * len(batches)
         )
-        if metric_logging.get("enabled"):
-            sft_config["metric_logging"] = metric_logging
-
-        sft_training_job = await self._client.sft_training_jobs.create(
-            model_id=model.id,
-            training_data_url=training_data_url,
-            config=sft_config,
-        )
-
-        # Poll for events
-        after: str | None = None
-        num_batches: int | None = None
-        pbar: tqdm.tqdm | None = None
-        while True:
-            await asyncio.sleep(1)
-            async for event in self._client.sft_training_jobs.events.list(
-                training_job_id=sft_training_job.id, after=after or NOT_GIVEN
-            ):
-                if event.type == "gradient_step":
-                    assert pbar is not None and num_batches is not None
-                    pbar.update(1)
-                    pbar.set_postfix(event.data)
-                    metrics = _canonicalize_upstream_metrics(
-                        {k: float(v) for k, v in event.data.items()}
-                    )
-                    yield {
-                        **metrics,
-                        "data/step_num_trajectories": float(num_trajectories),
-                        TRAIN_GRADIENT_STEPS_KEY: float(num_batches),
-                    }
-                elif event.type == "training_started":
-                    num_batches = event.data.get("num_sequences", 0)
-                    if pbar is None:
-                        pbar = tqdm.tqdm(total=num_batches, desc="train sft")
-                    continue
-                elif event.type == "training_ended":
-                    if pbar is not None:
-                        pbar.close()
-                    # Record provenance on the latest W&B artifact for SFT training.
-                    wandb_run = model._get_wandb_run()
-                    if wandb_run is not None:
-                        record_provenance(wandb_run, "serverless-sft")
-                    return
-                elif event.type == "training_failed":
-                    if pbar is not None:
-                        pbar.close()
-                    error_message = event.data.get(
-                        "error_message", "SFT training failed with an unknown error"
-                    )
-                    raise RuntimeError(f"SFT training job failed: {error_message}")
-                after = event.id
-
-    # ------------------------------------------------------------------
-    # Experimental support for S3 and checkpoints
-    # ------------------------------------------------------------------
-
-    async def _experimental_pull_model_checkpoint(
-        self,
-        model: "TrainableModel",
-        *,
-        step: int | Literal["latest"] | None = None,
-        local_path: str | None = None,
-        verbose: bool = False,
-    ) -> str:
-        """Pull a model checkpoint from W&B artifacts to a local path.
-
-        For ServerlessBackend, this downloads the checkpoint from W&B artifact storage.
-
-        Args:
-            model: The model to pull checkpoint for.
-            step: The step to pull. Can be an int for a specific step,
-                 or "latest" to pull the latest checkpoint. If None, pulls latest.
-            local_path: Local directory to save the checkpoint. If None, uses temporary directory.
-            verbose: Whether to print verbose output.
-
-        Returns:
-            Path to the local checkpoint directory.
-        """
-        import os
-        import tempfile
-
-        assert model.id is not None, "Model ID is required"
-
-        # If entity is not set, use the user's default entity from W&B
-        api = wandb_sdk.api(api_key=self._client.api_key)
-        if model.entity is None:
-            model.entity = api.default_entity
-            if verbose:
-                print(f"Using default W&B entity: {model.entity}")
-
-        # Determine which step to use
-        resolved_step: int
-        if step is None or step == "latest":
-            # Get latest checkpoint from API
-            async for checkpoint in self._client.models.checkpoints.list(  # ty:ignore[possibly-missing-attribute]
-                limit=1, order="desc", model_id=model.id
-            ):
-                resolved_step = checkpoint.step
-                break
-            else:
-                raise ValueError(
-                    f"No checkpoints found for model {model._storage_name()}"
+        if len(rates) != len(batches):
+            raise ValueError("SFT learning-rate schedule must match batch count")
+        client = await self.training_client(model)
+        for batch, learning_rate in zip(batches, rates, strict=True):
+            sequence = client.next_sequence_id
+            forward = await client.forward_backward(
+                ForwardBackwardRequest(
+                    run_id=client.run_id,
+                    request_id=uuid.uuid4().hex,
+                    sequence_id=sequence,
+                    batch=SupervisedTrajectoryBatch(
+                        trajectories=tuple(batch),
+                        assistant_turns=config.assistant_turns,
+                    ),
+                    loss=LossConfig(name="cross_entropy"),
                 )
-        else:
-            resolved_step = step
-
-        if verbose:
-            print(f"Downloading checkpoint step {resolved_step} from W&B artifacts...")
-
-        # Download from W&B artifacts
-        # The artifact name follows the pattern: {entity}/{project}/{model_name}:step{step}
-        artifact_name = f"{model.entity}/{model.project}/{model._storage_name()}:step{resolved_step}"
-
-        # Use wandb API to download (api was already created above for entity lookup)
-        artifact = api.artifact(artifact_name, type="lora")
-
-        # Determine download path
-        if local_path is None:
-            # Create a temporary directory that won't be cleaned up automatically
-            checkpoint_dir = os.path.join(
-                tempfile.gettempdir(),
-                "art_checkpoints",
-                model.project,
-                model._storage_name(),
-                f"{resolved_step:04d}",
             )
-        else:
-            # Custom location - copy directly to local_path
-            checkpoint_dir = local_path
-
-        # Download artifact
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        artifact.download(root=checkpoint_dir)
-        if verbose:
-            print(f"Downloaded checkpoint to {checkpoint_dir}")
-
-        return checkpoint_dir
-
-    async def _experimental_pull_from_s3(
-        self,
-        model: "Model",
-        *,
-        s3_bucket: str | None = None,
-        prefix: str | None = None,
-        verbose: bool = False,
-        delete: bool = False,
-        only_step: int | Literal["latest"] | None = None,
-    ) -> None:
-        """Deprecated. Use `_experimental_pull_model_checkpoint` instead."""
-        warnings.warn(
-            "_experimental_pull_from_s3 is deprecated. Use _experimental_pull_model_checkpoint instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        raise NotImplementedError
-
-    async def _experimental_push_to_s3(
-        self,
-        model: "TrainableModel",
-        *,
-        s3_bucket: str | None = None,
-        prefix: str | None = None,
-        verbose: bool = False,
-        delete: bool = False,
-    ) -> None:
-        """Push model checkpoints from W&B artifacts to S3.
-
-        Downloads checkpoint(s) from W&B and uploads them to S3.
-
-        Args:
-            model: The model whose checkpoints to push.
-            s3_bucket: S3 bucket name. If None, uses BACKUP_BUCKET env var.
-            prefix: Optional S3 prefix path.
-            verbose: Whether to print verbose output.
-            delete: Whether to delete files from S3 that don't exist in source.
-        """
-        from art.utils.s3 import build_s3_path, ensure_bucket_exists, s3_sync
-
-        assert model.id is not None, "Model ID is required"
-
-        # Get all checkpoint steps
-        steps: list[int] = []
-        async for checkpoint in self._client.models.checkpoints.list(  # ty:ignore[possibly-missing-attribute]
-            model_id=model.id, order="asc"
-        ):
-            steps.append(checkpoint.step)
-
-        if not steps:
-            if verbose:
-                print("No checkpoints found to push.")
-            return
-
-        await ensure_bucket_exists(s3_bucket)
-
-        for step in steps:
-            if verbose:
-                print(f"Pushing checkpoint step {step} to S3...")
-
-            # Pull from W&B to local temp dir
-            checkpoint_dir = await self._experimental_pull_model_checkpoint(
-                model,
-                step=step,
-                verbose=verbose,
-            )
-
-            # Push to S3
-            s3_path = build_s3_path(
-                model_name=model._storage_name(),
-                project=model.project,
-                step=step,
-                s3_bucket=s3_bucket,
-                prefix=prefix,
-            )
-            await s3_sync(checkpoint_dir, s3_path, verbose=verbose, delete=delete)
-
-        if verbose:
-            print(f"Successfully pushed {len(steps)} checkpoint(s) to S3.")
-
-    async def _experimental_fork_checkpoint(
-        self,
-        model: "Model",
-        from_model: str,
-        from_project: str | None = None,
-        from_s3_bucket: str | None = None,
-        not_after_step: int | None = None,
-        verbose: bool = False,
-        prefix: str | None = None,
-    ) -> None:
-        """Fork a checkpoint from another model to initialize this model.
-
-        Pulls the source checkpoint from W&B artifacts (or S3 if from_s3_bucket
-        is provided) and uploads it as a W&B artifact for the destination model.
-
-        Note: This uploads the artifact directly to W&B. The ServerlessBackend's
-        checkpoint tracking may not immediately reflect the forked checkpoint
-        until the next training step.
-
-        Args:
-            model: The destination model to fork to.
-            from_model: The name of the source model to fork from.
-            from_project: The project of the source model. Defaults to model.project.
-            from_s3_bucket: Optional S3 bucket to pull the checkpoint from.
-            not_after_step: If provided, uses the latest checkpoint <= this step.
-            verbose: Whether to print verbose output.
-            prefix: Optional S3 prefix for bucket operations.
-        """
-        import os
-        import tempfile
-
-        from_project = from_project or model.project
-
-        if from_s3_bucket is not None:
-            # Pull from S3
-            from art.utils.s3 import build_s3_path, ensure_bucket_exists, s3_sync
-            from art.utils.s3_checkpoint_utils import (
-                get_checkpoint_step_not_after_from_s3,
-                get_latest_checkpoint_step_from_s3,
-            )
-
-            if not_after_step is None:
-                target_step = await get_latest_checkpoint_step_from_s3(
-                    model_name=from_model,
-                    project=from_project,
-                    s3_bucket=from_s3_bucket,
-                    prefix=prefix,
+            optimizer = await client.optim_step(
+                OptimStepRequest(
+                    run_id=client.run_id,
+                    request_id=uuid.uuid4().hex,
+                    sequence_id=sequence + 1,
+                    optimizer=AdamConfig(learning_rate=learning_rate),
                 )
-            else:
-                target_step = await get_checkpoint_step_not_after_from_s3(
-                    model_name=from_model,
-                    project=from_project,
-                    not_after_step=not_after_step,
-                    s3_bucket=from_s3_bucket,
-                    prefix=prefix,
-                )
-
-            if target_step is None:
-                raise ValueError(
-                    f"No suitable checkpoint found in S3 for model {from_model}"
-                )
-
-            if verbose:
-                print(f"Pulling checkpoint step {target_step} from S3...")
-
-            checkpoint_dir = os.path.join(
-                tempfile.gettempdir(),
-                "art_fork_checkpoints",
-                from_project,
-                from_model,
-                f"{target_step:04d}",
             )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-
-            s3_path = build_s3_path(
-                model_name=from_model,
-                project=from_project,
-                step=target_step,
-                s3_bucket=from_s3_bucket,
-                prefix=prefix,
+            forward_result, optimizer_result = await asyncio.gather(
+                forward.result(), optimizer.result()
             )
-            await ensure_bucket_exists(from_s3_bucket)
-            await s3_sync(s3_path, checkpoint_dir, verbose=verbose)
-            selected_step = target_step
-        else:
-            # Pull from W&B artifacts
-            api = wandb_sdk.api(api_key=self._client.api_key)
-            from_entity = model.entity or api.default_entity
+            yield {
+                **forward_result.metrics,
+                **optimizer_result.metrics,
+                "data/step_num_trajectories": float(len(values)),
+                "data/step_trainable_assistant_tokens": float(
+                    forward_result.packing.trainable_assistant_tokens
+                ),
+                "data/step_num_dropped_trajectories": 0.0,
+                TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
+            }
 
-            # Iterate all artifact versions to find the best step.
-            # We avoid relying on the W&B `:latest` alias because it
-            # may not correspond to the highest training step.
-            collection_path = f"{from_entity}/{from_project}/{from_model}"
-            versions = api.artifacts("lora", collection_path)
+    def _track(self, awaitable: Coroutine[Any, Any, Any], name: str) -> None:
+        task = asyncio.create_task(awaitable, name=name)
+        self._background.add(task)
 
-            best_step: int | None = None
-            best_artifact = None
-            for version in versions:
-                step_num = _extract_step_from_wandb_artifact(version)
-                if step_num is None:
-                    continue
-                if not_after_step is not None and step_num > not_after_step:
-                    continue
-                if best_step is None or step_num > best_step:
-                    best_step = step_num
-                    best_artifact = version
+        def completed(value: asyncio.Task[Any]) -> None:
+            self._background.discard(value)
+            if not value.cancelled() and (error := value.exception()) is not None:
+                self._background_failures.append(error)
 
-            if best_step is None or best_artifact is None:
-                if not_after_step is not None:
-                    raise ValueError(
-                        f"No checkpoints found not after step {not_after_step} "
-                        f"for model {from_model}"
-                    )
-                raise ValueError(f"No checkpoints found for model {from_model}")
-            selected_step = best_step
-            artifact = best_artifact
+        task.add_done_callback(completed)
 
-            checkpoint_dir = os.path.join(
-                tempfile.gettempdir(),
-                "art_fork_checkpoints",
-                from_project,
-                from_model,
-                f"{selected_step:04d}" if selected_step is not None else "latest",
+    async def _drain_background(self) -> None:
+        if self._background:
+            await asyncio.gather(*tuple(self._background), return_exceptions=True)
+        self._raise_background_failures()
+
+    def _raise_background_failures(self) -> None:
+        if self._background_failures:
+            failures, self._background_failures = self._background_failures, []
+            raise BaseExceptionGroup("remote background operations failed", failures)
+
+    @staticmethod
+    def _model_key(model: AnyTrainableModel) -> tuple[str | None, str, str, str]:
+        return model.entity, model.project, model._storage_name(), model.base_model
+
+
+def _adapter_spec(model: AnyTrainableModel) -> AdapterSpec:
+    from art.megatron.lora_config import LORA_ALPHA, default_lora_rank_for_handler
+    from art.megatron.model_support import (
+        default_target_modules_for_model,
+        get_model_support_handler_for_spec,
+        get_model_support_spec,
+    )
+
+    configured = model.lora_config or {}
+    allow_unvalidated = bool(
+        (model._internal_config or {}).get("allow_unvalidated_arch")
+    )
+    support = get_model_support_spec(
+        model.base_model, allow_unvalidated_arch=allow_unvalidated
+    )
+    handler = get_model_support_handler_for_spec(support)
+    alpha = int(configured.get("alpha", LORA_ALPHA))
+    if alpha != LORA_ALPHA:
+        raise ValueError(f"Megatron LoRA requires alpha={LORA_ALPHA}")
+    return AdapterSpec(
+        rank=int(configured.get("rank", default_lora_rank_for_handler(handler))),
+        alpha=alpha,
+        target_modules=tuple(
+            configured.get("target_modules")
+            or default_target_modules_for_model(
+                model.base_model, allow_unvalidated_arch=allow_unvalidated
             )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            artifact.download(root=checkpoint_dir)
+        ),
+    )
 
-            if verbose:
-                print(f"Downloaded source checkpoint step {selected_step} from W&B")
 
-        # Upload as W&B artifact for the destination model
-        assert model.entity is not None, "Model entity is required"
-
-        if verbose:
-            print(
-                "Uploading forked checkpoint as W&B artifact for "
-                f"{model._storage_name()}..."
-            )
-
-        wandb_sdk.login(key=self._client.api_key)
-        run = wandb_sdk.init(
-            project=model.project,
-            entity=model.entity,
-            job_type="checkpoint-fork",
-            name=f"fork-{from_model}-to-{model._storage_name()}",
-            settings=wandb_sdk.settings(silent=True),
-        )
-        assert run is not None
-
-        dest_artifact = wandb_sdk.artifact(name=model._storage_name(), type="lora")
-        dest_artifact.add_dir(checkpoint_dir)
-        aliases = ["latest"]
-        if selected_step is not None:
-            aliases.insert(0, f"step{selected_step}")
-        run.log_artifact(dest_artifact, aliases=aliases)
-        run.finish()
-
-        # Copy provenance from the source model's W&B run to the destination model
-        api = wandb_sdk.api(api_key=self._client.api_key)
-        try:
-            source_run = api.run(f"{model.entity}/{from_project}/{from_model}")
-            source_provenance = source_run.config.get("wandb.provenance")
-            if source_provenance is not None:
-                dest_run = model._get_wandb_run()
-                if dest_run is not None:
-                    dest_run.config.update(
-                        {"wandb.provenance": list(source_provenance)}
-                    )
-        except Exception:
-            pass  # Source run may not exist (e.g., S3-only models)
-
-        if verbose:
-            print(
-                f"Successfully forked checkpoint from {from_model} "
-                f"(step {selected_step}) to {model._storage_name()}"
-            )
+def _attach_packing_shapes(
+    groups: list[TrajectoryGroup], shapes: tuple[Any, ...]
+) -> None:
+    if not any(group._collect_packing_shape for group in groups):
+        return
+    if len(groups) != len(shapes):
+        raise RuntimeError("remote packing shapes do not match trajectory groups")
+    for group, shape in zip(groups, shapes, strict=True):
+        group._packed_group_shape = shape

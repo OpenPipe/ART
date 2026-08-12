@@ -123,8 +123,7 @@ class ServerlessTrainResult(TrainResult):
     Attributes:
         step: The training step after this training call completed.
         metrics: Aggregated training metrics (loss, gradient norms, etc.).
-        artifact_name: The W&B artifact name for the checkpoint
-            (e.g., "entity/project/model:step5").
+        checkpoint_id: Opaque remote checkpoint identity for the committed learner.
     """
 
-    artifact_name: str | None = None
+    checkpoint_id: str | None = None

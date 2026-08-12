@@ -26,7 +26,12 @@ TRAJECTORY_FORMAT = "art_trajectory_v1"
 
 
 class _Contract(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        ser_json_bytes="base64",
+        val_json_bytes="base64",
+    )
 
 
 class TrajectoryRecordRef(_Contract):
