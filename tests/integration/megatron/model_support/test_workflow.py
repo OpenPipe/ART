@@ -1057,7 +1057,12 @@ def test_backend_resources_stay_logical_until_topology_compilation(monkeypatch) 
             2,
             True,
         ),
-        (((1, {"outcome": "failed", "comparison_completed": True}),), False, 1, False),
+        (
+            ((1, {"outcome": "failed", "comparison_completed": True}),) * 3,
+            False,
+            3,
+            True,
+        ),
         (
             (
                 (
