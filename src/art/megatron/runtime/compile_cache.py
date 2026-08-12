@@ -66,7 +66,7 @@ def _compile_cache_key(spec: TrainerRuntimeSpec, rank: int) -> str:
         }
     )
     payload: dict[str, Any] = {
-        "schema": 1,
+        "schema": 2,
         "runtime": runtime,
         "environment": {
             "python": sys.implementation.cache_tag,
@@ -79,6 +79,7 @@ def _compile_cache_key(spec: TrainerRuntimeSpec, rank: int) -> str:
             "compile_workarounds": os.environ.get(
                 "ART_MEGATRON_COMPILE_WORKAROUNDS", "1"
             ),
+            "dynamo_precompile": True,
         },
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -91,12 +92,18 @@ class TrainerCompileCache:
     def __init__(
         self, spec: TrainerRuntimeSpec, *, rank: int, cache_root: Path
     ) -> None:
-        if os.environ.get("TORCH_CACHING_PRECOMPILE", "0") == "1":
-            raise RuntimeError("TORCH_CACHING_PRECOMPILE is not rank-qualified")
+        from torch._dynamo import config
+
+        if not config.caching_precompile:
+            raise RuntimeError("trainer compile cache requires Dynamo precompile")
         self.key = _compile_cache_key(spec, rank)
-        self.path = cache_root / "megatron" / "compile_cache" / "v1" / self.key
+        self.path = cache_root / "megatron" / "compile_cache" / "v2" / self.key
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.loaded = False
+
+    def _require_precompile(self, info: Any) -> None:
+        if not info.artifacts.get("precompile"):
+            raise RuntimeError(f"compile cache {self.key} has no Dynamo artifact")
 
     def load(self) -> CompileCacheEvent:
         import torch
@@ -107,8 +114,10 @@ class TrainerCompileCache:
                 status="miss", key=self.key, elapsed_s=time.perf_counter() - started
             )
         artifact = self.path.read_bytes()
-        if torch.compiler.load_cache_artifacts(artifact) is None:
+        info = torch.compiler.load_cache_artifacts(artifact)
+        if info is None:
             raise RuntimeError(f"PyTorch rejected compile cache {self.key}")
+        self._require_precompile(info)
         self.loaded = True
         return CompileCacheEvent(
             status="hit",
@@ -131,7 +140,8 @@ class TrainerCompileCache:
         saved = torch.compiler.save_cache_artifacts()
         if saved is None:
             raise RuntimeError("PyTorch produced no compiler cache after training")
-        artifact, _info = saved
+        artifact, info = saved
+        self._require_precompile(info)
         staging = self.path.with_name(f".{self.key}.{os.getpid()}.{uuid.uuid4().hex}")
         try:
             staging.write_bytes(artifact)
