@@ -82,7 +82,9 @@ jobs:
             --index-url https://download.pytorch.org/whl/cpu \
             "torch==2.11.0"
           uv pip install --python .venv/bin/python \
-            "openpipe-art[distributed] @ file://${wheel_path}"
+            "openpipe-art @ file://${wheel_path}" \
+            'aiohttp>=3.13.0' 'msgspec>=0.21.0' 'torchmonarch==0.6.0' \
+            'transformers>=5.2.0,<=5.12.1'
           uv pip install --python .venv/bin/python --no-deps \
             "openpipe-art[distributed,megatron] @ file://${wheel_path}"
 
