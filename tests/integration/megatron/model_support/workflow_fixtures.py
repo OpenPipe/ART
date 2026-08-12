@@ -582,7 +582,8 @@ def _select_functional_weights(
     weights: Mapping[str, str], config: dict[str, Any], *, model_key: str
 ) -> dict[str, str]:
     plan = _functional_plan(model_key)
-    source_depth = int(_config_text(config, plan)["num_hidden_layers"])
+    text_config = _config_text(config, plan)
+    source_depth = int(text_config["num_hidden_layers"])
     text_layers: set[int] = set()
     vision_layers: set[int] = set()
     selected: dict[str, str] = {}
@@ -603,7 +604,9 @@ def _select_functional_weights(
             or vision_layer == 0
         ):
             selected[name] = shard
-    expected = set(range(source_depth))
+    expected = set(
+        range(source_depth + int(text_config.get("num_nextn_predict_layers", 0)))
+    )
     if text_layers != expected:
         raise RuntimeError(f"{model_key} canonical text-layer coverage changed")
     if plan.vision:
