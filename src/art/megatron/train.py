@@ -66,7 +66,12 @@ from art.megatron.routing_replay import (
     build_moe_routing_replay_bundle_from_packed_tensors,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
-from art.megatron.runtime.specs import ForwardBackwardJobSpec, SFTJobSpec, TrainJobSpec
+from art.megatron.runtime.specs import (
+    ForwardBackwardJobSpec,
+    RlForwardBackwardConfig,
+    SFTJobSpec,
+    TrainJobSpec,
+)
 from art.megatron.runtime.weight_transfer import MergedWeightTransferInitInfo
 from art.megatron.selective_lm_head import (
     TokenLossOutput,
@@ -2191,7 +2196,7 @@ def run_megatron_rl_forward_backward_step(
     provider: Any,
     model_support_handler: Any,
     inputs: PackedTensors | list[PackedTensors],
-    config: types.TrainConfig,
+    config: types.TrainConfig | RlForwardBackwardConfig,
     experimental_config: dev.TrainConfig,
     step_index: int,
     sample_index: int | list[int | None],

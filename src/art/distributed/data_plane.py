@@ -63,7 +63,7 @@ class MoeRoutingReplaySpec(_Contract):
 class PrefixTreePackingStatsSpec(_Contract):
     logical_tokens: int = Field(ge=0)
     physical_tokens: int = Field(ge=0)
-    policy_token_counts: dict[int, int] | None = None
+    policy_token_counts: dict[int, int] | None
 
     @model_validator(mode="after")
     def _validate_policy_token_counts(self) -> "PrefixTreePackingStatsSpec":

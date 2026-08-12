@@ -86,6 +86,12 @@ class CurrentTrainConfig(TrainConfig):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class RlForwardBackwardConfig(_Spec):
+    kl_penalty_coef: float = Field(default=0.0, ge=0)
+    kl_penalty_source: Literal["current_learner", "sample"] = "current_learner"
+    grad_accumulation_sequences: int | None = Field(default=None, ge=1)
+
+
 class CurrentSFTConfig(TrainSFTConfig):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -228,7 +234,7 @@ class ForwardBackwardJobSpec(_Spec):
     source: TrainerGeneration
     optimizer_state_path: str = Field(min_length=1)
     batch: PackedBatchRef
-    config: CurrentTrainConfig
+    config: RlForwardBackwardConfig = RlForwardBackwardConfig()
     experimental_config: ExperimentalTrainConfig = ExperimentalTrainConfig()
 
     @model_validator(mode="after")
