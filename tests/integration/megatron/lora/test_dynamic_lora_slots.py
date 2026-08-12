@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import socket
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -23,8 +24,8 @@ from art.trainer_rank._checkpoint import (  # noqa: E402
 )
 from art.trainer_rank._impl import (  # noqa: E402
     AdamParams,
-    _CheckpointSlot,
     TrainerRank,
+    _CheckpointSlot,
     _distributed_grad_norm,
     _vocab_parallel_log_z,
     _vocab_parallel_target_logprobs,
