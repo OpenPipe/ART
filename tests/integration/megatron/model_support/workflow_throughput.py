@@ -507,24 +507,29 @@ def _packed_input_fingerprint(groups: list[Any]) -> str:
     return _packed_batch_fingerprint(_prepared_pipeline_batch(groups))
 
 
-async def _capture_training_bundles(selections: tuple[Any, ...]) -> tuple[Any, ...]:
+async def _capture_training_bundles(prepared: Any) -> tuple[Any, ...]:
     from art.distributed.trajectory_store import TrajectoryGroupBundle
+    from art.utils.trajectory_logging import read_trajectory_groups_parquet
 
-    materialized = await asyncio.gather(
-        *(selection.queue.materialize_selection(selection) for selection in selections)
-    )
-    return await asyncio.to_thread(
-        lambda: tuple(TrajectoryGroupBundle.from_group(group) for group in materialized)
-    )
+    path = prepared.batch.payload.packed.trajectory_log_path
+    if path is None:
+        raise RuntimeError("matched packed batch has no immutable trajectory log")
+
+    def read_bundles() -> tuple[Any, ...]:
+        return tuple(
+            TrajectoryGroupBundle.from_group(group)
+            for group in read_trajectory_groups_parquet(path)
+        )
+
+    return await asyncio.to_thread(read_bundles)
 
 
 async def _capture_training_input(
     prepared: Any,
-    selections: tuple[Any, ...],
     pipeline_settings: dict[str, int],
 ) -> tuple[tuple[Any, ...], str, str, dict[str, int]]:
     bundles, packed_fingerprint = await asyncio.gather(
-        _capture_training_bundles(selections),
+        _capture_training_bundles(prepared),
         asyncio.to_thread(_packed_batch_fingerprint, prepared),
     )
     trajectory_fingerprint = hashlib.sha256(
@@ -1780,7 +1785,6 @@ async def _run_e2e_throughput_async(
                         capture_task = asyncio.create_task(
                             _capture_training_input(
                                 prepared,
-                                selections,
                                 _current_pipeline_settings(trainer),
                             )
                         )
