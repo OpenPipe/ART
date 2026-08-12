@@ -823,7 +823,7 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
         engine_args = stage.vllm.engine_args()
         assert "hf_overrides" not in engine_args
         assert engine_args.get("load_format") != "dummy"
-        assert engine_args["moe_backend"] == "triton"
+        assert engine_args["moe_backend"] == "auto"
         assert engine_args["kv_cache_dtype"] == "fp8"
         assert stage.streaming_weight_offload is True
         assert stage.megatron_env == {}
@@ -896,7 +896,7 @@ def test_dsv4_resources_remap_to_four_high_vram_gpus(
     assert stage.megatron.topology.dp == trainer_dp
     assert stage.vllm.gpu_ids == [2, 3]
     assert stage.vllm.tensor_parallel_size == 2
-    assert stage.vllm.engine_args()["moe_backend"] == "triton"
+    assert stage.vllm.engine_args()["moe_backend"] == "auto"
     assert stage.vllm.engine_args()["kv_cache_dtype"] == "fp8"
 
 

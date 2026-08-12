@@ -663,7 +663,7 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
     assert config["engine_args"]["tensor_parallel_size"] == 2
     assert config["engine_args"]["enable_expert_parallel"] is True
     assert config["engine_args"]["kv_cache_dtype"] == "fp8"
-    assert config["engine_args"].get("moe_backend") == "triton"
+    assert config["engine_args"].get("moe_backend") == "auto"
     assert "megatron_topology" not in config
     assert config["vllm_runtime"] == {
         "mode": "external",

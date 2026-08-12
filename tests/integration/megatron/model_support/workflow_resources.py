@@ -222,13 +222,9 @@ _DSV4_COMMON_VLLM_ENGINE_ARGS = {
     "max_model_len": 1024,
     "max_num_batched_tokens": 1032,
 }
-_DSV4_MERGED_VLLM_ENGINE_ARGS = {
+_DSV4_VLLM_ENGINE_ARGS = {
     **_DSV4_COMMON_VLLM_ENGINE_ARGS,
-    "moe_backend": "triton",
-}
-_DSV4_LORA_VLLM_ENGINE_ARGS = {
-    **_DSV4_COMMON_VLLM_ENGINE_ARGS,
-    "moe_backend": "triton",
+    "moe_backend": "auto",
 }
 _DSV4_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3, 4, 5, 6, 7],
@@ -246,31 +242,31 @@ _DSV4_FULL_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[4, 5, 6, 7],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
-    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
 )
 _DSV4_FULL_VLLM_EP2 = VllmWorkflowResources(
     gpu_ids=[2, 3],
     tensor_parallel_size=2,
     enable_expert_parallel=True,
-    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
 )
 _DSV4_FUNCTIONAL_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[4, 5, 6, 7],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
-    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
 )
 _DSV4_FUNCTIONAL_VLLM_EP2 = VllmWorkflowResources(
     gpu_ids=[2, 3],
     tensor_parallel_size=2,
     enable_expert_parallel=True,
-    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
 )
 _DSV4_FUNCTIONAL_NATIVE_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
-    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
 )
 _GLM52_REDUCED_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0],
