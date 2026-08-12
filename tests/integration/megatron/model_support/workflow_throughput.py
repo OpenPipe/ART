@@ -47,7 +47,7 @@ _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
 _INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
-_MEASUREMENT_CONTRACT_VERSION = 15
+_MEASUREMENT_CONTRACT_VERSION = 16
 _ISOLATED_WARMUP_STEPS = 1
 _MATCHED_MEASURED_STEPS = 3
 _PIPELINE_SETTING_NAMES = (
@@ -1587,7 +1587,7 @@ async def _run_e2e_throughput_async(
     autotune = PipelineAutotuneConfig(
         mode="online",
         output_name="throughput",
-        window_steps=3,
+        window_steps=2,
         warmup_ignore_steps=3,
         initial_model_calls_per_inference_gpu=(
             config.initial_model_calls_per_inference_gpu

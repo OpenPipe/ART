@@ -61,7 +61,7 @@ class ThroughputWorkflowConfig(BaseModel):
     max_num_seqs: int = Field(default=64, ge=1)
     max_num_batched_tokens: int = Field(default=65_536, ge=1)
     enable_prefix_caching: bool = False
-    max_steps: Literal[9] = 9
+    max_steps: Literal[7] = 7
     max_steps_off_policy: int = Field(default=4, ge=0)
     packed_sequence_length: Literal[131072] = THROUGHPUT_PACKED_SEQUENCE_LENGTH
     min_vllm_pressure: float = Field(default=0.5, ge=0.0, allow_inf_nan=False)
