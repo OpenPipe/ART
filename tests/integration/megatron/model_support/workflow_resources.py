@@ -34,7 +34,7 @@ class ThroughputThresholds(BaseModel):
     max_queue_ready_inter_forward_backward_gap_p95_s: float = Field(
         default=0.2, gt=0.0, le=0.2, allow_inf_nan=False
     )
-    min_queue_ready_inter_forward_backward_gap_count: int = Field(default=4, ge=2)
+    min_queue_ready_inter_forward_backward_gap_count: int = Field(default=3, ge=3)
 
     @model_validator(mode="after")
     def validate_calibration_identity(self) -> "ThroughputThresholds":

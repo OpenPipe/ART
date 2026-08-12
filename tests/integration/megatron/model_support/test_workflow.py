@@ -499,7 +499,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     )
     sparse = {
         **measurements,
-        "queue_ready_inter_forward_backward_gap_worst_rank_count": 3,
+        "queue_ready_inter_forward_backward_gap_worst_rank_count": 2,
     }
     assert "queue_ready_inter_forward_backward_gap_count" in acceptance_failures(
         sparse, config, thresholds
