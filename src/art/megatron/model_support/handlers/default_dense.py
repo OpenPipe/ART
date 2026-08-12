@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Any, Callable, Literal, Sequence
 
 import torch
@@ -137,6 +138,13 @@ class DefaultDenseHandler:
     ) -> Callable[[Any, int], None] | None:
         del model_chunks
         return None
+
+    def preserve_pipeline_microbatch_activation(
+        self,
+        model_chunks: Sequence[Any],
+    ):
+        del model_chunks
+        return nullcontext()
 
     def build_prefix_tree_model_state(
         self,

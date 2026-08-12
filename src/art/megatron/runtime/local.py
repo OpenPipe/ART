@@ -276,6 +276,7 @@ def compile_local_runtime_topology(
             ),
             controller_host_id=host_id,
             artifact_root=artifact_root,
+            cache_root=os.environ.get("ART_MEGATRON_CACHE_ROOT"),
         ),
         rollout_host_ids=(),
         trainer=TrainerMeshSpec(

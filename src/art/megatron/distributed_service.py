@@ -75,6 +75,10 @@ from .runtime.specs import (
     DurableTrainOutput,
     ExperimentalTrainConfig,
     HybridEpRuntimeSpec,
+    ResidentLoraInspectionResult,
+    ResidentLoraInspectionSpec,
+    ResidentScoreJobSpec,
+    ResidentScoreResult,
     SFTJobSpec,
     TrainAccepted,
     TrainCancelled,
@@ -383,6 +387,16 @@ class DistributedMegatronService:
             and self._trainer.learner_version == self._latest_step
         )
 
+    def _resident_trainer_for_generation(
+        self, generation: TrainerGeneration
+    ) -> Any | None:
+        if (
+            self._trainer_is_current()
+            and self._trainer_resident_generation == generation
+        ):
+            return self._trainer
+        return None
+
     @property
     def _optimizer_state_path(self) -> str:
         path = optimizer_state_path(self.output_dir)
@@ -522,6 +536,7 @@ class DistributedMegatronService:
             packed_sequence_length=runtime_config.packed_sequence_length,
             snapshot_pool_capacity=runtime_config.snapshot_pool_capacity,
             compile_enabled=compile_enabled,
+            compile_cache=runtime_config.compile_cache and compile_enabled,
             compile_fingerprint=_digest({**identity, "compile": compile_enabled}),
             optimizer_layout_fingerprint=_digest(
                 {"mesh": mesh.model_dump(mode="json")}
@@ -1159,6 +1174,172 @@ class DistributedMegatronService:
             lineage_error="learner lineage changed during training",
         ):
             yield metrics
+
+    def _require_resident_score_locked(
+        self,
+        expected_learner_version: int,
+    ) -> tuple[Any, TrainerGeneration]:
+        self._require_open()
+        self._raise_publication_failure()
+        source = self._learner_generation
+        trainer = self._resident_trainer_for_generation(source) if source else None
+        if expected_learner_version != self._latest_step:
+            raise ValueError(
+                "resident diagnostic learner version mismatch: "
+                f"request={expected_learner_version}, current={self._latest_step}"
+            )
+        if (
+            source is None
+            or source.policy_step != expected_learner_version
+            or trainer is None
+        ):
+            raise RuntimeError(
+                "resident scoring requires the exact hydrated warm trainer generation"
+            )
+        return trainer, source
+
+    def _require_resident_inspection_locked(
+        self,
+        expected_learner_version: int,
+    ) -> tuple[Any, TrainerGeneration]:
+        self._require_open()
+        self._raise_publication_failure()
+        source = self._learner_generation
+        trainer = self._trainer
+        if expected_learner_version != self._latest_step:
+            raise ValueError(
+                "resident inspection learner version mismatch: "
+                f"request={expected_learner_version}, current={self._latest_step}"
+            )
+        if (
+            source is None
+            or source.policy_step != expected_learner_version
+            or trainer is None
+            or not self._trainer_is_current()
+            or trainer.run_spec.training_session_id != source.training_session_id
+            or self._trainer_resident_generation not in (None, source)
+        ):
+            raise RuntimeError(
+                "resident inspection requires the exact current warm trainer run"
+            )
+        return trainer, source
+
+    async def score_resident_packed(
+        self,
+        batch: DistributedPackedBatch,
+        *,
+        expected_learner_version: int,
+        global_grad_accumulation_sequences: int,
+        top_k: int = 20,
+    ) -> ResidentScoreResult:
+        await self._await_trainer_preparation()
+        async with self._train_lock:
+            async with self._mutation_lock:
+                trainer, source = self._require_resident_score_locked(
+                    expected_learner_version
+                )
+                job = ResidentScoreJobSpec(
+                    job_id=uuid.uuid4().hex,
+                    run_id=trainer.run_spec.run_id,
+                    learner=source,
+                    batch=batch.leases.ref,
+                    global_grad_accumulation_sequences=(
+                        global_grad_accumulation_sequences
+                    ),
+                    top_k=top_k,
+                )
+
+            try:
+                if self._temporal_gpu_sharing and self._base_url is not None:
+                    serving = self._serving_futures.get(expected_learner_version)
+                    if serving is not None:
+                        await asyncio.shield(serving)
+                    async with self._serving_lock:
+                        await self._sleep_for_training_locked()
+                async with self._trainer_failure_boundary():
+                    result = await trainer.score(job, batch.leases)
+                    async with self._mutation_lock:
+                        current_trainer, current_source = (
+                            self._require_resident_score_locked(
+                                expected_learner_version
+                            )
+                        )
+                        if current_trainer is not trainer or current_source != source:
+                            raise RuntimeError(
+                                "resident learner generation changed during scoring"
+                            )
+                    if result.learner != source:
+                        raise RuntimeError(
+                            "resident score returned a different learner generation"
+                        )
+                    if result.expected_score_count != batch.loss_bearing_tokens:
+                        raise RuntimeError(
+                            "resident score target coverage differs from packed data"
+                        )
+                    return result
+            finally:
+                if self._temporal_gpu_sharing and self._vllm_sleeping:
+                    async with self._serving_lock:
+                        await self._wake_for_serving_locked()
+
+    async def inspect_resident_lora(
+        self,
+        *,
+        expected_learner_version: int,
+    ) -> ResidentLoraInspectionResult:
+        await self._await_trainer_preparation()
+        async with self._train_lock:
+            trainer: Any = None
+            try:
+                if self._temporal_gpu_sharing and self._base_url is not None:
+                    serving = self._serving_futures.get(expected_learner_version)
+                    if serving is not None:
+                        await asyncio.shield(serving)
+                    async with self._serving_lock:
+                        await self._sleep_for_training_locked()
+                async with self._mutation_lock:
+                    trainer, reconcile = await self._ensure_trainer_locked()
+                    source_trainer, source = self._require_resident_inspection_locked(
+                        expected_learner_version
+                    )
+                    if source_trainer is not trainer:
+                        raise RuntimeError(
+                            "resident inspection selected another trainer"
+                        )
+                    request = ResidentLoraInspectionSpec(
+                        request_id=uuid.uuid4().hex,
+                        run_id=trainer.run_spec.run_id,
+                        learner=source,
+                        target_modules=trainer.runtime_spec.lora_target_modules,
+                    )
+                if reconcile is not None:
+                    reconcile_step, checkpoint = reconcile
+                    async with self._serving_lock:
+                        await self._reconcile_serving_locked(reconcile_step, checkpoint)
+                result = await trainer.inspect_resident_lora(request)
+                async with self._mutation_lock:
+                    current_trainer, current_source = (
+                        self._require_resident_inspection_locked(
+                            expected_learner_version
+                        )
+                    )
+                    if current_trainer is not trainer or current_source != source:
+                        raise RuntimeError(
+                            "resident learner generation changed during LoRA inspection"
+                        )
+                if result.learner != source:
+                    raise RuntimeError(
+                        "resident LoRA inspection returned another learner generation"
+                    )
+                return result
+            except BaseException as error:
+                if trainer is not None and not trainer.valid:
+                    await self._cleanup_failed_trainer_transaction(trainer, None, error)
+                raise
+            finally:
+                if self._temporal_gpu_sharing and self._vllm_sleeping:
+                    async with self._serving_lock:
+                        await self._wake_for_serving_locked()
 
     def _schedule_publication(
         self,
@@ -1955,11 +2136,11 @@ class DistributedMegatronService:
                     )
                 if learner_version != expected_step + 1:
                     raise ValueError("a no-op policy transition must advance one step")
-                trainer = self._trainer if self._trainer_is_current() else None
                 previous = self._publication_tasks.get(expected_step)
                 source = self._learner_generation
                 if source is None or source.policy_step != expected_step:
                     raise RuntimeError("no-op transition has no immutable source")
+                trainer = self._resident_trainer_for_generation(source)
             if previous is not None:
                 await asyncio.shield(previous)
             source_adapter = self._published_adapters.get(expected_step)
@@ -1981,8 +2162,8 @@ class DistributedMegatronService:
                 try:
                     snapshot_metrics.update(
                         await trainer.advance_without_training(
-                            expected_learner_version=expected_step,
-                            learner_version=learner_version,
+                            source=source,
+                            output=generation,
                             optimizer_state_path=self._optimizer_state_path,
                             adapter=None,
                         )

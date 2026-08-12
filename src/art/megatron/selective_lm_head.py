@@ -181,6 +181,32 @@ def forward_token_losses(
     )
 
 
+def forward_token_logits(
+    model: torch.nn.Module,
+    *,
+    selection: LmHeadTokenSelection,
+    forward_kwargs: dict[str, Any],
+) -> torch.Tensor:
+    """Project only selected token rows and return local vocabulary logits."""
+    if "labels" in forward_kwargs:
+        raise ValueError("forward_kwargs must not contain labels")
+    language_model = _language_model(model)
+    _validate_language_model(language_model)
+    with _select_output_rows(language_model.output_layer, selection):
+        logits = model(**forward_kwargs, labels=None)
+    if not isinstance(logits, torch.Tensor) or logits.ndim != 3:
+        raise TypeError("selected model output must be a [tokens, batch, vocab] tensor")
+    selected_tokens = int(selection.flat_indices.numel())
+    if tuple(logits.shape[:2]) == (selected_tokens, 1):
+        return logits[:, 0, :].contiguous()
+    if tuple(logits.shape[:2]) == (1, selected_tokens):
+        return logits[0, :, :].contiguous()
+    raise ValueError(
+        "selected logits do not match LM-head selection: "
+        f"logits={tuple(logits.shape)} selected_tokens={selected_tokens}"
+    )
+
+
 def _language_model(model: torch.nn.Module) -> Any:
     module: Any = model
     seen: set[int] = set()

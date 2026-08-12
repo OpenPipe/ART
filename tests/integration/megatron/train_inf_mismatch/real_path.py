@@ -28,6 +28,10 @@ from art.preprocessing.moe_routing import (
     choice_moe_routing_metadata,
 )
 from art.preprocessing.pack import DiskPackedTensors
+from art.preprocessing.policy_spans import (
+    choice_policy_token_spans,
+    validate_complete_policy_token_spans,
+)
 
 from .artifacts import REPO_ROOT
 from .output_parity import (
@@ -158,8 +162,61 @@ class AdapterCacheResult(BaseModel):
     cache_hit: bool
 
 
+class ResidentTrainInfAttempt(BaseModel):
+    attempt: int
+    logical_prompt_count: int
+    logical_token_count: int
+    lora: PairComparison
+    lora_topk: TopKComparison
+    moe_routing_packed_tokens: int
+    batch_fingerprint: str
+    passed: bool
+
+
+class ResidentTrainInfReport(BaseModel):
+    base_model: str
+    artifact_dir: str
+    run_id: str
+    policy_step: int
+    generation_id: str
+    attempt_count: int
+    max_attempts: int
+    attempts: list[ResidentTrainInfAttempt]
+    mean_abs_pct_limit: float
+    top20_kl_candidate_to_target_limit: float
+    passed: bool
+
+
 def _real_path_rollout_mode(config: TrainInfOutputParityConfig) -> RolloutMode:
     return config.rollout_modes[0]
+
+
+def _packed_batch_fingerprint(packed_tensors: dict[str, Any]) -> str:
+    digest = hashlib.sha256()
+    for name in ("tokens", "group_ids", "parent_ids", "input_pos", "assistant_mask"):
+        tensor = packed_tensors[name].detach().cpu().contiguous()
+        for value in (name, str(tuple(tensor.shape)), str(tensor.dtype)):
+            payload = value.encode()
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+        payload = tensor.numpy().tobytes()
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    replay = packed_tensors.get("moe_routing_replay")
+    if replay is not None:
+        tensor = replay.expert_indices.detach().cpu().contiguous()
+        for value in (
+            "moe_routing_replay",
+            str(tuple(tensor.shape)),
+            str(tensor.dtype),
+        ):
+            payload = value.encode()
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+        payload = tensor.numpy().tobytes()
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return digest.hexdigest()
 
 
 _PROMPT_SENTENCES = [
@@ -474,6 +531,7 @@ async def _rollout(
     reward: float,
     seed: int,
     extra_body: dict[str, Any] | None,
+    policy_step: int | None = None,
 ) -> Any:
     import art
 
@@ -482,7 +540,7 @@ async def _rollout(
     if extra_body is not None:
         request_kwargs["extra_body"] = extra_body
     response = await model.openai_client().chat.completions.create(
-        model=model.get_inference_name(),
+        model=model.get_inference_name(step=policy_step),
         messages=messages,
         max_tokens=max_completion_tokens,
         temperature=0.8,
@@ -493,14 +551,24 @@ async def _rollout(
     )
     choice = response.choices[0]
     logprobs = choice.logprobs
+    completion_tokens = len(logprobs.content or []) if logprobs is not None else 0
+    if policy_step is not None:
+        validate_complete_policy_token_spans(
+            choice, completion_tokens=completion_tokens
+        )
+        if any(
+            span.policy_version != policy_step
+            for span in choice_policy_token_spans(choice)
+        ):
+            raise RuntimeError(
+                f"policy-{policy_step} parity rollout returned another policy"
+            )
     return art.Trajectory(
         messages_and_choices=[*messages, choice],
         reward=reward,
-        metrics={
-            "completion_tokens": (
-                len(logprobs.content or []) if logprobs is not None else 0
-            )
-        },
+        metrics={"completion_tokens": completion_tokens},
+        initial_policy_version=policy_step,
+        final_policy_version=policy_step,
     )
 
 
@@ -510,6 +578,7 @@ async def _collect_real_trajectory_groups(
     config: RealPathConfig,
     prompts: list[str],
     extra_body: dict[str, Any] | None,
+    policy_step: int | None = None,
 ) -> list[Any]:
     import art
 
@@ -529,6 +598,7 @@ async def _collect_real_trajectory_groups(
                         + rollout_index
                     ),
                     extra_body=extra_body,
+                    policy_step=policy_step,
                 )
                 for rollout_index in range(config.rollouts_per_prompt)
             ]
@@ -1631,6 +1701,181 @@ def _delete_adapter_safetensors_on_pass(artifact_dir: Path, *, passed: bool) -> 
         return
     for path in artifact_dir.rglob("adapter_model.safetensors"):
         path.unlink()
+
+
+def _resident_score_bundle(
+    *,
+    result: Any,
+    logical_map: LogicalTokenMap,
+    rollout_mode: RolloutMode,
+) -> ScoreBundle:
+    scores = {(score.sample_index, score.logit_index): score for score in result.scores}
+    selected = []
+    for token in logical_map.tokens:
+        coordinate = token.sample_id, token.art_logit_index
+        score = scores.get(coordinate)
+        if score is None:
+            raise RuntimeError(f"resident score is missing logical token {coordinate}")
+        if score.target_token_id != token.token_id:
+            raise RuntimeError(
+                "resident score target token does not match packed input: "
+                f"coordinate={coordinate}, score={score.target_token_id}, "
+                f"packed={token.token_id}"
+            )
+        selected.append(score)
+    return ScoreBundle(
+        side="megatron",
+        weight_state="lora",
+        rollout_mode=rollout_mode,
+        target_logprobs=[score.target_logprob for score in selected],
+        topk=[
+            TokenTopK(
+                token_ids=list(score.top_token_ids),
+                logprobs=list(score.top_logprobs),
+            )
+            for score in selected
+        ],
+    )
+
+
+async def run_resident_train_inf_mismatch(
+    *,
+    backend: Any,
+    model: Any,
+    policy_step: int,
+    config: RealPathConfig,
+    artifact_dir: Path,
+    max_attempts: int = 3,
+) -> ResidentTrainInfReport:
+    import torch
+
+    parity_config = config.output_parity
+    _apply_sliding_window_prompt_defaults(config)
+    prompts, extra_body, _max_model_len = _prepare_real_path_prompts(config)
+    rollout_mode = _real_path_rollout_mode(parity_config)
+    is_moe = model_support_is_moe(
+        parity_config.base_model,
+        allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
+    )
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(artifact_dir / "resident_config.json", config.model_dump(mode="json"))
+    mean_abs_pct_limit = fwd_mean_abs_pct_limit_for_model(
+        parity_config.base_model,
+        allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
+    )
+    top20_kl_limit = top20_kl_candidate_to_target_limit_for_model(
+        parity_config.base_model,
+        allow_unvalidated_arch=parity_config.allow_unvalidated_arch,
+    )
+    attempts = []
+    run_id: str | None = None
+    generation_id: str | None = None
+    for attempt in range(1, max_attempts + 1):
+        groups = await _collect_real_trajectory_groups(
+            model=model,
+            config=config,
+            prompts=prompts,
+            extra_body=extra_body,
+            policy_step=policy_step,
+        )
+        packed = backend._get_packed_tensors(
+            model,
+            groups,
+            advantage_balance=0.0,
+            allow_training_without_logprobs=False,
+            scale_rewards=True,
+            plot_tensors=False,
+            packed_sequence_length=parity_config.packed.sequence_length,
+            logprob_calculation_chunk_size=1024,
+            include_moe_routing=is_moe,
+        )
+        if packed is None:
+            raise RuntimeError("resident ART path produced no packed tensors")
+        logical_map = build_logical_token_map(cast(dict[str, Any], packed))
+        vllm = _vllm_scores_from_real_choices(
+            trajectory_groups=groups,
+            logical_map=logical_map,
+            require_routing_metadata=is_moe,
+            weight_state="lora",
+            rollout_mode=rollout_mode,
+        )
+        result = await backend.score_resident(
+            model,
+            groups,
+            expected_learner_version=policy_step,
+            top_k=TOP_K,
+            grad_accumulation_sequences=int(packed["tokens"].shape[0]),
+        )
+        fingerprint = _packed_batch_fingerprint(cast(dict[str, Any], packed))
+        if result.batch_fingerprint != fingerprint:
+            raise RuntimeError(
+                "resident score did not use the locally reconstructed packed batch"
+            )
+        if run_id is not None and result.run_id != run_id:
+            raise RuntimeError("resident parity attempts used different trainer runs")
+        run_id = result.run_id
+        generation_id = result.learner.generation_id
+        megatron = _resident_score_bundle(
+            result=result,
+            logical_map=logical_map,
+            rollout_mode=rollout_mode,
+        )
+        for name, value in (
+            ("logical_token_map", logical_map),
+            ("vllm_scores", vllm),
+            ("megatron_scores", megatron),
+        ):
+            _write_json(
+                artifact_dir / f"attempt_{attempt}_{name}.json",
+                value.model_dump(mode="json"),
+            )
+        sequence_ids = [token.prompt_id for token in logical_map.tokens]
+        comparison = compare_pair(
+            candidate=torch.tensor(megatron.target_logprobs, dtype=torch.float32),
+            target=torch.tensor(vllm.target_logprobs, dtype=torch.float32),
+            sequence_ids=sequence_ids,
+        )
+        topk = compare_topk(megatron, vllm)
+        passed = (
+            comparison.mean_abs_pct <= mean_abs_pct_limit
+            and topk.top20_intersection_kl_candidate_to_target <= top20_kl_limit
+        )
+        attempt_report = ResidentTrainInfAttempt(
+            attempt=attempt,
+            logical_prompt_count=len(logical_map.prompts),
+            logical_token_count=len(logical_map.tokens),
+            lora=comparison,
+            lora_topk=topk,
+            moe_routing_packed_tokens=result.routing_replay_packed_tokens,
+            batch_fingerprint=fingerprint,
+            passed=passed,
+        )
+        attempts.append(attempt_report)
+        _write_json(
+            artifact_dir / f"attempt_{attempt}.json",
+            attempt_report.model_dump(mode="json"),
+        )
+        if passed:
+            break
+    assert run_id is not None and generation_id is not None
+    report = ResidentTrainInfReport(
+        base_model=parity_config.base_model,
+        artifact_dir=str(artifact_dir),
+        run_id=run_id,
+        policy_step=policy_step,
+        generation_id=generation_id,
+        attempt_count=len(attempts),
+        max_attempts=max_attempts,
+        attempts=attempts,
+        mean_abs_pct_limit=mean_abs_pct_limit,
+        top20_kl_candidate_to_target_limit=top20_kl_limit,
+        passed=attempts[-1].passed,
+    )
+    _write_json(
+        artifact_dir / "resident_comparison_report.json",
+        report.model_dump(mode="json"),
+    )
+    return report
 
 
 async def run_real_path_train_inf_mismatch(

@@ -30,8 +30,12 @@ from .workflow import (
 )
 from .workflow_fixtures import FIXTURE_PATH_ENV, ensure_workflow_fixture
 
-FUNCTIONAL_LORA_VLLM_MODE = "functional_lora_vllm"
-FUNCTIONAL_LORA_VLLM_STAGES = ("train_inf_mismatch", "length_trainability")
+RESIDENT_FUNCTIONAL_MODE = "resident_functional"
+RESIDENT_FUNCTIONAL_STAGES = (
+    "lora_coverage",
+    "train_inf_mismatch",
+    "length_trainability",
+)
 BASE_MEGATRON_MODE = "base_megatron"
 BASE_MEGATRON_STAGES = ("hf_parity", "packing_invariance")
 EXTERNAL_VLLM_ENGINE_ARGS_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_ENGINE_ARGS"
@@ -58,12 +62,13 @@ class WorkflowStageWorkerItem(BaseModel):
     environment: dict[str, str]
 
 
-class FunctionalVllmSessionSpec(BaseModel):
+class ResidentFunctionalSessionSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     gpu_count: int
     launch: VllmRuntimeLaunchConfig
-    trainer_gpu_ids: dict[str, tuple[int, ...]]
+    trainer_gpu_ids: tuple[int, ...]
+    trainer_environment: dict[str, str]
 
 
 class WorkflowStageWorkerSession(BaseModel):
@@ -72,7 +77,7 @@ class WorkflowStageWorkerSession(BaseModel):
     base_model: str
     architecture_json: str
     allow_unvalidated_arch: bool = False
-    functional_vllm: FunctionalVllmSessionSpec | None = None
+    resident_functional: ResidentFunctionalSessionSpec | None = None
     base_megatron: bool = False
     items: tuple[WorkflowStageWorkerItem, ...]
 
@@ -161,25 +166,18 @@ def _reset_vllm(client: httpx.Client, baseline: tuple[str, ...]) -> dict[str, ob
 async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
     from . import workflow
 
-    spec = request.functional_vllm
+    spec = request.resident_functional
     assert spec is not None
     launch_spec = spec.launch
     stages = tuple(item.stage for item in request.items)
-    if stages != FUNCTIONAL_LORA_VLLM_STAGES:
-        raise ValueError("functional vLLM stages do not match worker items")
-    if tuple(spec.trainer_gpu_ids) != stages:
-        raise ValueError("functional vLLM trainer placements do not match worker items")
+    if stages != RESIDENT_FUNCTIONAL_STAGES:
+        raise ValueError("resident functional stages do not match worker items")
     prepared = ensure_workflow_fixture(
         request.base_model,
         allow_unvalidated_arch=request.allow_unvalidated_arch,
-        required_stages=frozenset(FUNCTIONAL_LORA_VLLM_STAGES),
+        required_stages=frozenset(RESIDENT_FUNCTIONAL_STAGES),
     )
-    host_environments = {stage: prepared.environment(stage) for stage in stages}
-    host_paths = {
-        environment[FIXTURE_PATH_ENV] for environment in host_environments.values()
-    }
-    if len(host_paths) != 1:
-        raise RuntimeError(f"selected host prepared different fixtures: {host_paths}")
+    host_environment = prepared.resident_functional_environment()
     visible = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
     if len(visible) != spec.gpu_count:
         raise RuntimeError(
@@ -188,7 +186,7 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
     inference_gpu_ids = tuple(map(int, launch_spec.visible_devices.split(",")))
     launch = launch_spec.model_copy(
         update={
-            "base_model": host_paths.pop(),
+            "base_model": host_environment[FIXTURE_PATH_ENV],
             "port": find_free_tcp_port(),
             "cuda_visible_devices": ",".join(
                 visible[index] for index in inference_gpu_ids
@@ -198,7 +196,7 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
     runtime = ManagedVllmRuntime()
     supervisor = ChildProcessSupervisor(lambda _error: None)
     try:
-        with workflow._temporary_env(**host_environments[stages[0]]):
+        with workflow._temporary_env(**host_environment):
             await runtime.start(
                 launch_config=launch,
                 output_dir=str(
@@ -217,48 +215,70 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
             EXTERNAL_VLLM_ENGINE_ARGS_ENV: json.dumps(
                 launch_spec.engine_args, sort_keys=True
             ),
+            "ART_TRAIN_INF_MISMATCH_BASE_MODEL": request.base_model,
+            "ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH": (
+                "1" if request.allow_unvalidated_arch else "0"
+            ),
+            "BASE_MODEL": request.base_model,
         }
-        for stage, trainer_gpu_ids in spec.trainer_gpu_ids.items():
-            if (
-                not trainer_gpu_ids
-                or set(trainer_gpu_ids) & set(inference_gpu_ids)
-                or any(gpu_id not in range(len(visible)) for gpu_id in trainer_gpu_ids)
-            ):
-                raise RuntimeError(
-                    f"invalid functional GPU partition for {stage}: "
-                    f"trainer={trainer_gpu_ids}, inference={inference_gpu_ids}"
-                )
-        request = request.model_copy(
-            update={
-                "functional_vllm": None,
-                "items": tuple(
-                    item.model_copy(
-                        update={
-                            "environment": item.environment
-                            | host_environments[item.stage]
-                            | external
-                            | {
-                                "ART_MODEL_SUPPORT_TRAINER_GPU_IDS": ",".join(
-                                    map(str, spec.trainer_gpu_ids[item.stage])
-                                )
-                            }
-                        }
-                    )
-                    for item in request.items
-                ),
-            }
+        trainer_gpu_ids = spec.trainer_gpu_ids
+        if (
+            not trainer_gpu_ids
+            or set(trainer_gpu_ids) & set(inference_gpu_ids)
+            or any(gpu_id not in range(len(visible)) for gpu_id in trainer_gpu_ids)
+        ):
+            raise RuntimeError(
+                "invalid resident functional GPU partition: "
+                f"trainer={trainer_gpu_ids}, inference={inference_gpu_ids}"
+            )
+        environments = tuple(
+            item.environment | host_environment | external | spec.trainer_environment
+            for item in request.items
         )
+        if any(environment != environments[0] for environment in environments[1:]):
+            raise RuntimeError(
+                "resident functional stages resolved different environments"
+            )
         with httpx.Client(
             base_url=runtime.base_url, **runtime.request_kwargs()
         ) as client:
             models = _runtime_json(client, "GET", "/v1/models")["data"]
             baseline = tuple(sorted(str(model["id"]) for model in models))
+            from .resident_functional_session import run_resident_functional_session
 
-            def reset() -> dict[str, object]:
+            stage_dirs = {item.stage: Path(item.stage_dir) for item in request.items}
+            log_path = stage_dirs["length_trainability"] / "worker.log"
+            try:
+                with workflow._temporary_env(**environments[0]):
+                    with workflow._redirect_output(log_path):
+                        results = await run_resident_functional_session(
+                            base_model=request.base_model,
+                            allow_unvalidated_arch=request.allow_unvalidated_arch,
+                            stage_dirs=stage_dirs,
+                        )
                 supervisor.raise_if_failed()
-                return _reset_vllm(client, baseline)
-
-            await asyncio.to_thread(_run_session, request, reset)
+                reset = _reset_vllm(client, baseline)
+                for item, result in zip(request.items, results, strict=True):
+                    result.metrics["functional_vllm_reset"] = reset
+                    Path(item.output_json).write_text(
+                        result.model_dump_json(indent=2), encoding="utf-8"
+                    )
+            except Exception as exc:
+                for item in request.items:
+                    item_log = Path(item.stage_dir) / "worker.log"
+                    with item_log.open("a", encoding="utf-8") as log:
+                        traceback.print_exc(file=log)
+                    output = Path(item.output_json)
+                    if not output.exists():
+                        output.write_text(
+                            workflow.ValidationStageResult(
+                                name=item.stage,
+                                passed=False,
+                                metrics=workflow._stage_error_metrics(exc),
+                            ).model_dump_json(indent=2),
+                            encoding="utf-8",
+                        )
+                raise
     finally:
         supervisor.close()
         runtime.close()
@@ -336,7 +356,7 @@ def run_session_json(session_json: str | Path) -> None:
     request = WorkflowStageWorkerSession.model_validate_json(
         Path(session_json).read_text(encoding="utf-8")
     )
-    if request.functional_vllm is not None:
+    if request.resident_functional is not None:
         asyncio.run(_run_functional_session(request))
     elif request.base_megatron:
         _run_base_megatron_session(request)

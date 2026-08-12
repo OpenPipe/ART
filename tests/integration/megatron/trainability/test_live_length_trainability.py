@@ -7,7 +7,8 @@ import os
 from pathlib import Path
 import random
 import shutil
-from typing import Any, AsyncIterator, Literal, cast
+import time
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, cast
 import uuid
 
 from pydantic import BaseModel, Field
@@ -169,6 +170,13 @@ class LengthTrainabilityThresholds(BaseModel):
     success_abs_error_max: float
 
 
+class LengthTrainingPhaseReport(BaseModel):
+    name: Literal["complete", "first_update", "continuation"]
+    start_step: int
+    end_step: int
+    duration_s: float
+
+
 class LengthTrainabilityReport(BaseModel):
     base_model: str
     max_steps: int
@@ -192,6 +200,13 @@ class LengthTrainabilityReport(BaseModel):
     final_train_abs_error: float | None
     model_ids_after: list[str]
     samples: list[LengthSampleReport]
+    phases: list[LengthTrainingPhaseReport] = Field(default_factory=list)
+
+
+LengthResidentHook = Callable[
+    [Literal["registered", "first_update"], Any, art.TrainableModel, int],
+    Awaitable[None],
+]
 
 
 def _require_opt_in() -> None:
@@ -752,6 +767,7 @@ async def run_length_trainability_async(
     base_model: str = DEFAULT_BASE_MODEL,
     artifact_dir: Path | None = None,
     allow_unvalidated_arch: bool = False,
+    resident_hook: LengthResidentHook | None = None,
 ) -> LengthTrainabilityReport:
     artifact_dir = artifact_dir or _artifact_dir(base_model)
     variant = _build_variant(
@@ -788,7 +804,9 @@ async def run_length_trainability_async(
         current_step_demand = _length_current_step_demand(base_model)
     success_hit = False
     pending_trainable_step: int | None = None
+    scenario_index = 0
     samples: list[LengthSampleReport] = []
+    phases: list[LengthTrainingPhaseReport] = []
     backend_root = artifact_dir / "megatron_dedicated_workspace"
     summary_log_path = artifact_dir / "length_trainability.log"
     _init_summary_log(summary_log_path)
@@ -835,14 +853,16 @@ async def run_length_trainability_async(
             report_metrics=[],
         )
         await model.register(backend)
+        registered_step = await model.get_step()
+        if resident_hook is not None:
+            await resident_hook("registered", backend, model, registered_step)
 
         trainer: PipelineTrainer | None = None
 
         async def scenarios() -> AsyncIterator[dict[str, object]]:
-            nonlocal pending_trainable_step
-            index = 0
+            nonlocal pending_trainable_step, scenario_index
             while not success_hit and (
-                scenario_limit is None or index < scenario_limit
+                scenario_limit is None or scenario_index < scenario_limit
             ):
                 required_step = pending_trainable_step
                 if current_step_demand and required_step is not None:
@@ -858,12 +878,13 @@ async def run_length_trainability_async(
                     pending_trainable_step = None
                     if active_trainer.state.done:
                         return
+                index = scenario_index
+                scenario_index += 1
                 yield _scenario(
                     index,
                     target_step=0,
                     base_model=base_model,
                 ).model_dump()
-                index += 1
 
         async def rollout_fn(
             rollout_model: art.TrainableModel,
@@ -905,34 +926,68 @@ async def run_length_trainability_async(
                 success_hit = True
             return group
 
-        trainer = PipelineTrainer(
-            model=model,
-            backend=backend,
-            rollout_fn=rollout_fn,
-            scenarios=scenarios(),
-            config=None,
-            pipeline=PipelineRuntimeConfig(
-                num_rollout_workers=rollout_workers,
-                min_batch_size=1,
-                max_batch_size=1,
-            ),
-            max_steps_off_policy=max_steps_off_policy,
-            learning_rate=_get_env_float(
-                "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
-                _default_learning_rate(base_model),
-            ),
-            loss_fn="cispo",
-            normalize_advantages=normalize_advantages,
-            max_steps=max_steps,
-            eval_every_n_steps=0,
-            eval_at_start=False,
-            save_checkpoint=False,
-            total_scenarios=scenario_limit,
-            log_interval_seconds=30.0,
-            discard_queue_multiplier=zero_variance_discard_multiplier,
-            resume=False,
-        )
-        await trainer.train(handle_signals=False)
+        def build_trainer(steps: int) -> PipelineTrainer:
+            return PipelineTrainer(
+                model=model,
+                backend=backend,
+                rollout_fn=rollout_fn,
+                scenarios=scenarios(),
+                config=None,
+                pipeline=PipelineRuntimeConfig(
+                    num_rollout_workers=rollout_workers,
+                    min_batch_size=1,
+                    max_batch_size=1,
+                ),
+                max_steps_off_policy=max_steps_off_policy,
+                learning_rate=_get_env_float(
+                    "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
+                    _default_learning_rate(base_model),
+                ),
+                loss_fn="cispo",
+                normalize_advantages=normalize_advantages,
+                max_steps=steps,
+                eval_every_n_steps=0,
+                eval_at_start=False,
+                save_checkpoint=False,
+                total_scenarios=scenario_limit,
+                log_interval_seconds=30.0,
+                discard_queue_multiplier=zero_variance_discard_multiplier,
+                resume=False,
+            )
+
+        phase_steps = (1, max_steps - 1) if resident_hook is not None else (max_steps,)
+        for phase_index, steps in enumerate(phase_steps):
+            if steps <= 0 or (phase_index > 0 and success_hit):
+                continue
+            phase_start = await model.get_step()
+            started = time.monotonic()
+            trainer = build_trainer(steps)
+            await trainer.train(handle_signals=False)
+            if resident_hook is not None and phase_index == 0:
+                pending_trainable_step = None
+            phase_end = await model.get_step()
+            phases.append(
+                LengthTrainingPhaseReport(
+                    name=(
+                        "complete"
+                        if resident_hook is None
+                        else "first_update"
+                        if phase_index == 0
+                        else "continuation"
+                    ),
+                    start_step=phase_start,
+                    end_step=phase_end,
+                    duration_s=time.monotonic() - started,
+                )
+            )
+            if resident_hook is not None and phase_index == 0:
+                if phase_end != phase_start + 1:
+                    raise RuntimeError(
+                        "resident functional phase must advance exactly one policy step: "
+                        f"{phase_start} -> {phase_end}"
+                    )
+                async with backend.exact_adapter_lease(model, phase_end):
+                    await resident_hook("first_update", backend, model, phase_end)
 
         latest_step = await model.get_step()
         async with backend.exact_adapter_lease(model, latest_step):
@@ -998,6 +1053,7 @@ async def run_length_trainability_async(
         final_train_abs_error=final_train_abs_error,
         model_ids_after=model_ids_after,
         samples=samples,
+        phases=phases,
     )
     (artifact_dir / "length_trainability.json").write_text(
         json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",

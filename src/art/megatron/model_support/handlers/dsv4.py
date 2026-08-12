@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import os
 import re
-from typing import Any, Callable, Literal, Sequence, cast
+from typing import Any, Callable, Iterator, Literal, Sequence, cast
 
 import torch
 
@@ -310,6 +311,24 @@ class Dsv4Handler(DefaultMoeHandler):
             activators[chunk_index](input_ids, position_ids)
 
         return activate
+
+    @contextmanager
+    def preserve_pipeline_microbatch_activation(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> Iterator[None]:
+        states = [
+            (module, name, getattr(module, name))
+            for chunk in model_chunks
+            for module in chunk.modules()
+            for name in ("_dsv4_input_ids", "_dsv4_position_ids")
+            if hasattr(module, name)
+        ]
+        try:
+            yield
+        finally:
+            for module, name, value in states:
+                setattr(module, name, value)
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         ratios: list[int] = list(getattr(provider, "dsv4_compress_ratios", ()) or ())

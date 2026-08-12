@@ -15,7 +15,16 @@ from .publication import (
     TrainerPublicationSucceeded,
     TrainerRankPublication,
 )
-from .specs import SFTJobSpec, TrainerGeneration, TrainerJobSpec, TrainJobSpec
+from .specs import (
+    ResidentLoraInspectionShard,
+    ResidentLoraInspectionSpec,
+    ResidentScoreJobSpec,
+    ResidentScoreShard,
+    SFTJobSpec,
+    TrainerGeneration,
+    TrainerJobSpec,
+    TrainJobSpec,
+)
 from .trainer_run import EventSink
 
 if TYPE_CHECKING:
@@ -94,29 +103,98 @@ class MegatronTrainJobExecutor:
         )
         return metrics
 
+    def score(
+        self,
+        job: ResidentScoreJobSpec,
+        batch: InMemoryPackedBatch,
+    ) -> ResidentScoreShard:
+        self._validate_resident_score(job.run_id, job.learner)
+        validate_packed_batch(batch)
+        from art.megatron.train import execute_megatron_score_job
+
+        return execute_megatron_score_job(self.runtime, job, batch.tensors)
+
+    def inspect_resident_lora(
+        self,
+        request: ResidentLoraInspectionSpec,
+    ) -> ResidentLoraInspectionShard:
+        self._validate_resident_inspection(request.run_id, request.learner)
+        from art.megatron.train import inspect_resident_lora
+
+        return inspect_resident_lora(self.runtime, request)
+
+    def _validate_diagnostic_runtime(self) -> None:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        self._publisher.raise_if_failed()
+
+    def _validate_resident_score(self, run_id: str, learner: TrainerGeneration) -> None:
+        self._validate_diagnostic_runtime()
+        runtime = self.runtime
+        if (
+            runtime.resident_run_id != run_id
+            or runtime.resident_training_session_id != learner.training_session_id
+            or runtime.resident_policy_step != learner.policy_step
+            or runtime.resident_generation_id != learner.generation_id
+            or not runtime.optimizer_state_loaded
+            or runtime.optimizer is None
+        ):
+            raise RuntimeError("resident trainer state does not match score learner")
+
+    def _validate_resident_inspection(
+        self, run_id: str, learner: TrainerGeneration
+    ) -> None:
+        self._validate_diagnostic_runtime()
+        runtime = self.runtime
+        if runtime.resident_run_id != run_id:
+            raise RuntimeError("resident trainer run does not match inspection")
+        unhydrated = (
+            runtime.resident_training_session_id is None
+            and runtime.resident_policy_step is None
+            and runtime.resident_generation_id is None
+            and not runtime.optimizer_state_loaded
+        )
+        hydrated = (
+            runtime.resident_training_session_id == learner.training_session_id
+            and runtime.resident_policy_step == learner.policy_step
+            and runtime.resident_generation_id == learner.generation_id
+            and runtime.optimizer_state_loaded
+        )
+        if not (unhydrated or hydrated):
+            raise RuntimeError(
+                "resident trainer hydration markers are partial or do not match "
+                "the inspection learner"
+            )
+
     def advance_without_training(
         self,
         *,
-        training_session_id: str,
-        expected_learner_version: int,
-        learner_version: int,
+        source: TrainerGeneration,
+        output: TrainerGeneration,
         optimizer_state_path: str,
         adapter: "OptimizerAdapter | None",
     ) -> dict[str, float]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
-        if learner_version != expected_learner_version + 1:
-            raise ValueError("a no-op learner transition must advance exactly one step")
+        if (
+            output.training_session_id != source.training_session_id
+            or output.policy_step != source.policy_step + 1
+        ):
+            raise ValueError(
+                "a no-op transition must preserve session and advance one step"
+            )
         runtime = self.runtime
         if (
-            runtime.resident_training_session_id != training_session_id
-            or runtime.resident_policy_step != expected_learner_version
+            runtime.resident_training_session_id != source.training_session_id
+            or runtime.resident_policy_step != source.policy_step
+            or runtime.resident_generation_id != source.generation_id
             or not runtime.optimizer_state_loaded
             or runtime.optimizer is None
         ):
             raise RuntimeError("resident trainer state does not match no-op transition")
         del optimizer_state_path, adapter
-        runtime.resident_policy_step = learner_version
+        runtime.resident_policy_step = output.policy_step
+        runtime.resident_generation_id = output.generation_id
         return {}
 
     def close(self) -> None:

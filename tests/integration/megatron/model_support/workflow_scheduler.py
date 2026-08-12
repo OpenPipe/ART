@@ -57,9 +57,9 @@ from .workflow_runtime import (
 from .workflow_stage_worker import (
     BASE_MEGATRON_MODE,
     BASE_MEGATRON_STAGES,
-    FUNCTIONAL_LORA_VLLM_MODE,
-    FUNCTIONAL_LORA_VLLM_STAGES,
-    FunctionalVllmSessionSpec,
+    RESIDENT_FUNCTIONAL_MODE,
+    RESIDENT_FUNCTIONAL_STAGES,
+    ResidentFunctionalSessionSpec,
     WorkflowStageWorkerItem,
     WorkflowStageWorkerSession,
 )
@@ -157,7 +157,7 @@ class _FunctionalStageSpec(BaseModel):
 class _SharedFunctionalSession(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    worker: FunctionalVllmSessionSpec
+    worker: ResidentFunctionalSessionSpec
     topology: WorkflowRuntimeTopology
 
 
@@ -449,7 +449,7 @@ def _stage_runtime_topology(
                 for name, topology in zip(names, variants, strict=True)
             ),
         )
-    if stage_name in FUNCTIONAL_LORA_VLLM_STAGES:
+    if stage_name in {"train_inf_mismatch", "length_trainability"}:
         spec = _functional_stage_spec(prepared, stage_name, gpu_count)
         trainer_gpu_ids = spec.trainer_gpu_ids
         trainer_topology = spec.trainer_topology
@@ -593,8 +593,8 @@ def _stage_gpu_share(prepared: PreparedWorkflow, stage_name: str) -> float:
     )
 
 
-def _ordered_stage_pair(stages: tuple[str, ...], pair: tuple[str, str]) -> bool:
-    return tuple(stage for stage in stages if stage in pair) == pair
+def _ordered_stages(stages: tuple[str, ...], selected: tuple[str, ...]) -> bool:
+    return tuple(stage for stage in stages if stage in selected) == selected
 
 
 def _topology_shape(topology: WorkflowRuntimeTopology) -> tuple[object, ...]:
@@ -620,7 +620,7 @@ def _base_session(
     *,
     visible_gpu_count: int,
 ) -> _SharedBaseSession | None:
-    if not _ordered_stage_pair(prepared.stages, BASE_MEGATRON_STAGES):
+    if not _ordered_stages(prepared.stages, BASE_MEGATRON_STAGES):
         return None
     gpu_counts = {stage_gpu_counts[stage] for stage in BASE_MEGATRON_STAGES}
     fixtures = {
@@ -676,16 +676,30 @@ def _functional_stage_spec(
     configured = HANDLER_WORKFLOW_RESOURCES.get(prepared.report.model_key)
     resources = getattr(configured, stage, None)
     if resources is None:
-        inference_gpu_count = 1
-        trainer_gpu_count = gpu_count - 1 if stage == "length_trainability" else 1
+        if stage == "train_inf_mismatch":
+            trainer_topology = _default_mismatch_trainer_topology(prepared, stage)
+            trainer_gpu_count = (
+                trainer_topology.tp
+                * trainer_topology.cp
+                * trainer_topology.pp
+                * trainer_topology.dp
+            )
+            inference_gpu_count = gpu_count - trainer_gpu_count
+        else:
+            inference_gpu_count = 1
+            trainer_gpu_count = gpu_count - 1
+            trainer_topology = _trainer_topology(
+                stage,
+                cp=2 if handler.is_moe else 1,
+                ep=2 if handler.is_moe else 1,
+            )
         trainer_gpu_ids = tuple(range(trainer_gpu_count))
         inference_gpu_ids = tuple(range(trainer_gpu_count, gpu_count))
-        trainer_topology = _trainer_topology(
-            stage,
-            cp=2 if stage == "length_trainability" and handler.is_moe else 1,
-            ep=2 if stage == "length_trainability" and handler.is_moe else 1,
-        )
-        engine_args: dict[str, object] = {"tensor_parallel_size": 1}
+        engine_args: dict[str, object] = {
+            "tensor_parallel_size": inference_gpu_count,
+        }
+        if handler.is_moe and inference_gpu_count > 1:
+            engine_args["enable_expert_parallel"] = True
     else:
         resolved = resolve_stage_resources_for_visible_gpus(
             stage, resources, visible_gpu_count=gpu_count
@@ -706,16 +720,19 @@ def _functional_stage_spec(
             resolved.megatron.topology if resolved.megatron is not None else None,
         )
         engine_args = resolved.vllm.engine_args()
-        if resolved.megatron is not None:
-            topology = resolved.megatron.topology
-            trainer_world_size = topology.tp * topology.cp * topology.pp * topology.dp
-            if trainer_world_size != trainer_gpu_count:
-                raise RuntimeError(
-                    f"{stage} trainer topology has world size {trainer_world_size} "
-                    f"but {trainer_gpu_count} GPU ids"
-                )
     if trainer_gpu_count < 1 or inference_gpu_count < 1:
         raise RuntimeError(f"{stage} requires non-empty trainer and inference roles")
+    trainer_world_size = (
+        trainer_topology.tp
+        * trainer_topology.cp
+        * trainer_topology.pp
+        * trainer_topology.dp
+    )
+    if trainer_world_size != trainer_gpu_count:
+        raise RuntimeError(
+            f"{stage} trainer topology has world size {trainer_world_size} "
+            f"but {trainer_gpu_count} GPU ids"
+        )
     engine_args = {
         **handler.vllm_engine_args(),
         **engine_args,
@@ -739,10 +756,6 @@ def _merge_functional_engine_args(
     static_options: dict[str, object] | None = None
     topology = specs[0].vllm_topology
     for spec in specs:
-        if spec.vllm_topology.model_dump(exclude={"variant"}) != topology.model_dump(
-            exclude={"variant"}
-        ):
-            return None
         engine_args = dict(spec.engine_args)
         for key in _VLLM_PARALLEL_ARGS:
             engine_args.pop(key, None)
@@ -773,9 +786,8 @@ def _functional_session(
     *,
     visible_gpu_count: int,
 ) -> _SharedFunctionalSession | None:
-    if not _ordered_stage_pair(prepared.stages, FUNCTIONAL_LORA_VLLM_STAGES):
+    if not _ordered_stages(prepared.stages, RESIDENT_FUNCTIONAL_STAGES):
         return None
-    stages = FUNCTIONAL_LORA_VLLM_STAGES
     support = get_model_support_spec(
         prepared.report.base_model,
         allow_unvalidated_arch=prepared.allow_unvalidated_arch,
@@ -783,14 +795,12 @@ def _functional_session(
     if support.native_vllm_lora_status == "disabled":
         return None
     handler = get_model_support_handler_for_spec(support)
+    joint_stages = ("train_inf_mismatch", "length_trainability")
     specs = tuple(
         _functional_stage_spec(prepared, stage, stage_gpu_counts[stage])
-        for stage in stages
+        for stage in joint_stages
     )
     if any(
-        spec.vllm_external or set(spec.trainer_gpu_ids) & set(spec.inference_gpu_ids)
-        for spec in specs
-    ) or any(
         spec.trainer_topology.tp
         * spec.trainer_topology.cp
         * spec.trainer_topology.pp
@@ -799,7 +809,8 @@ def _functional_session(
         for spec in specs
     ):
         return None
-    length_env = os.environ | prepared.fixture.environment(stages[0])
+    functional_env = prepared.fixture.resident_functional_environment()
+    length_env = os.environ | functional_env
     capacities: dict[str, int | float] = {
         "max_model_len": int(
             length_env.get("ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN", 1024)
@@ -808,6 +819,7 @@ def _functional_session(
             length_env.get("ART_MODEL_SUPPORT_LENGTH_MAX_NUM_SEQS", 32)
         ),
         "max_loras": 2,
+        "max_logprobs": 20,
         "max_lora_rank": int(
             length_env.get(
                 MEGATRON_LORA_RANK_ENV, default_lora_rank_for_handler(handler)
@@ -817,22 +829,18 @@ def _functional_session(
     resource_args = _merge_functional_engine_args(specs, capacities)
     if resource_args is None:
         return None
-    inference_gpu_count = specs[0].inference_gpu_count
-    gpu_count = inference_gpu_count + max(spec.trainer_gpu_count for spec in specs)
+    mismatch = specs[0]
+    inference_gpu_count = mismatch.inference_gpu_count
+    gpu_count = inference_gpu_count + mismatch.trainer_gpu_count
     if gpu_count > visible_gpu_count:
         return None
-    remaining_gpu_count = gpu_count - inference_gpu_count
-    fixtures = {
-        prepared.fixture.environment(stage)[FIXTURE_PATH_ENV] for stage in stages
-    }
-    if len(fixtures) != 1:
-        return None
-    inference_gpu_ids = tuple(range(remaining_gpu_count, gpu_count))
+    inference_gpu_ids = tuple(range(mismatch.trainer_gpu_count, gpu_count))
+    trainer = mismatch.trainer_topology
     return _SharedFunctionalSession(
-        worker=FunctionalVllmSessionSpec(
+        worker=ResidentFunctionalSessionSpec(
             gpu_count=gpu_count,
             launch=VllmRuntimeLaunchConfig(
-                base_model=fixtures.pop(),
+                base_model=functional_env[FIXTURE_PATH_ENV],
                 port=0,
                 cuda_visible_devices=",".join(map(str, inference_gpu_ids)),
                 served_model_name="__art_functional_base__",
@@ -850,24 +858,52 @@ def _functional_session(
                     "api_key": "art-functional-vllm",
                 },
             ),
-            trainer_gpu_ids={
-                spec.stage: tuple(range(spec.trainer_gpu_count)) for spec in specs
+            trainer_gpu_ids=tuple(range(mismatch.trainer_gpu_count)),
+            trainer_environment={
+                "ART_MODEL_SUPPORT_TRAINER_GPU_IDS": ",".join(
+                    map(str, range(mismatch.trainer_gpu_count))
+                ),
+                "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS": ",".join(
+                    map(str, inference_gpu_ids)
+                ),
+                "ART_MODEL_SUPPORT_TP": str(trainer.tp),
+                "ART_MODEL_SUPPORT_CP": str(trainer.cp),
+                "ART_MODEL_SUPPORT_EP": str(trainer.ep),
+                "ART_MODEL_SUPPORT_ETP": str(trainer.etp),
+                "ART_MODEL_SUPPORT_DP": str(trainer.dp),
+                "ART_MODEL_SUPPORT_PP": str(trainer.pp),
+                "ART_MODEL_SUPPORT_VPP": str(trainer.vpp),
+                "ART_MODEL_SUPPORT_SP": "1" if trainer.sp else "0",
+                "ART_TRAIN_INF_MISMATCH_TRAINER_GPU_IDS": ",".join(
+                    map(str, range(mismatch.trainer_gpu_count))
+                ),
+                "ART_TRAIN_INF_MISMATCH_INFERENCE_GPU_IDS": ",".join(
+                    map(str, inference_gpu_ids)
+                ),
+                "ART_TRAIN_INF_MISMATCH_TP": str(trainer.tp),
+                "ART_TRAIN_INF_MISMATCH_CP": str(trainer.cp),
+                "ART_TRAIN_INF_MISMATCH_EP": str(trainer.ep),
+                "ART_TRAIN_INF_MISMATCH_ETP": str(trainer.etp),
+                "ART_TRAIN_INF_MISMATCH_DP": str(trainer.dp),
+                "ART_TRAIN_INF_MISMATCH_PP": str(trainer.pp),
             },
         ),
         topology=WorkflowRuntimeTopology(
-            trainer_variants=tuple(spec.trainer_topology for spec in specs),
+            trainer_variants=(
+                trainer.model_copy(update={"variant": RESIDENT_FUNCTIONAL_MODE}),
+            ),
             vllm_variants=(
-                specs[0].vllm_topology.model_copy(
-                    update={"variant": FUNCTIONAL_LORA_VLLM_MODE}
+                mismatch.vllm_topology.model_copy(
+                    update={"variant": RESIDENT_FUNCTIONAL_MODE}
                 ),
             ),
-            role_placements=tuple(
+            role_placements=(
                 WorkflowRolePlacement(
-                    variant=spec.stage,
-                    trainer_gpu_ids=tuple(range(spec.trainer_gpu_count)),
+                    variant=RESIDENT_FUNCTIONAL_MODE,
+                    trainer_gpu_ids=tuple(range(mismatch.trainer_gpu_count)),
                     vllm_gpu_ids=inference_gpu_ids,
-                )
-                for spec in specs
+                    vllm_external=mismatch.vllm_external,
+                ),
             ),
         ),
     )
@@ -896,7 +932,7 @@ def compile_prepared_workflows(
             shared = (
                 functional_session
                 if functional_session is not None
-                and stage_name in FUNCTIONAL_LORA_VLLM_STAGES
+                and stage_name in RESIDENT_FUNCTIONAL_STAGES
                 else None
             )
             stage_gpu_count = stage_gpu_counts[stage_name]
@@ -909,8 +945,12 @@ def compile_prepared_workflows(
             if shared is not None:
                 runtime = runtime.model_copy(
                     update={
+                        "fixture": prepared.fixture.resident_functional_environment()[
+                            FIXTURE_PATH_ENV
+                        ],
+                        "kind": "joint",
                         "topology": shared.topology,
-                        "mode": FUNCTIONAL_LORA_VLLM_MODE,
+                        "mode": RESIDENT_FUNCTIONAL_MODE,
                         "static_options": shared.worker.model_dump_json(),
                     }
                 )
@@ -943,10 +983,13 @@ def compile_prepared_workflows(
                     )
                 )
                 dependencies = (reference_id,)
-            if shared is not None and stage_name == FUNCTIONAL_LORA_VLLM_STAGES[1]:
-                dependencies = (
-                    f"{prepared.report.model_key}:{FUNCTIONAL_LORA_VLLM_STAGES[0]}",
-                )
+            if shared is not None:
+                stage_index = RESIDENT_FUNCTIONAL_STAGES.index(stage_name)
+                if stage_index:
+                    dependencies = (
+                        f"{prepared.report.model_key}:"
+                        f"{RESIDENT_FUNCTIONAL_STAGES[stage_index - 1]}",
+                    )
             elif base_megatron is not None and stage_name == BASE_MEGATRON_STAGES[1]:
                 dependencies = (
                     f"{prepared.report.model_key}:{BASE_MEGATRON_STAGES[0]}",
@@ -958,7 +1001,11 @@ def compile_prepared_workflows(
                     runtime=runtime,
                     resources=WorkflowResourceRequest(
                         gpu_count=gpu_count,
-                        gpu_share=_stage_gpu_share(prepared, stage_name),
+                        gpu_share=(
+                            1.0
+                            if shared is not None
+                            else _stage_gpu_share(prepared, stage_name)
+                        ),
                     ),
                     dependencies=dependencies,
                     estimated_duration_s=_STAGE_DURATION_ESTIMATES_S[stage_name],
@@ -1043,12 +1090,24 @@ def run_prepared_workflows(
             stage_dir = prepared.run_dir / operation.stage
             stage_dir.mkdir(parents=True, exist_ok=False)
             fixture_stage = (
-                "correctness_sensitivity"
+                None
+                if session.runtime.mode == RESIDENT_FUNCTIONAL_MODE
+                else "correctness_sensitivity"
                 if operation.stage == CORRECTNESS_REFERENCE_STAGE
                 else operation.stage
             )
-            environment = prepared.fixture.environment(fixture_stage)
+            environment = (
+                prepared.fixture.resident_functional_environment()
+                if session.runtime.mode == RESIDENT_FUNCTIONAL_MODE
+                else prepared.fixture.environment(fixture_stage)
+            )
             environment[workflow.WORKFLOW_RUN_DIR_ENV] = str(prepared.run_dir)
+            environment.update(
+                {
+                    "ART_MEGATRON_CACHE_ROOT": "/tmp/art-model-support-workflow/cache",
+                    "ART_MEGATRON_COMPILE_CACHE": "1",
+                }
+            )
             if operation.stage in {
                 CORRECTNESS_REFERENCE_STAGE,
                 "correctness_sensitivity",
@@ -1077,11 +1136,11 @@ def run_prepared_workflows(
             base_model=prepared.report.base_model,
             architecture_json=str(architecture_json),
             allow_unvalidated_arch=prepared.allow_unvalidated_arch,
-            functional_vllm=(
-                FunctionalVllmSessionSpec.model_validate_json(
+            resident_functional=(
+                ResidentFunctionalSessionSpec.model_validate_json(
                     session.runtime.static_options
                 )
-                if session.runtime.mode == FUNCTIONAL_LORA_VLLM_MODE
+                if session.runtime.mode == RESIDENT_FUNCTIONAL_MODE
                 else None
             ),
             base_megatron=session.runtime.mode == BASE_MEGATRON_MODE,

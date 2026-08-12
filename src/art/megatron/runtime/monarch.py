@@ -34,6 +34,14 @@ from .specs import (
     TRAIN_EVENT_ADAPTER,
     AdapterReady,
     HybridEpRuntimeSpec,
+    ResidentLoraExport,
+    ResidentLoraInspectionResult,
+    ResidentLoraInspectionShard,
+    ResidentLoraInspectionSpec,
+    ResidentLoraRankSummary,
+    ResidentScoreJobSpec,
+    ResidentScoreResult,
+    ResidentScoreShard,
     SFTJobSpec,
     TrainAccepted,
     TrainCancelled,
@@ -276,11 +284,11 @@ class MonarchTrainerActor(Actor):
     def __init__(
         self,
         runtime_spec_json: str,
-        trainer_generation: str,
+        run_id: str,
     ) -> None:
         runtime_spec = TrainerRuntimeSpec.model_validate_json(runtime_spec_json)
         topology = runtime_spec.trainer_mesh.topology
-        configure_model_cache_env(cache_root=runtime_spec.cache_root)
+        cache_root = configure_model_cache_env(cache_root=runtime_spec.cache_root)
         os.environ.update(
             {
                 "MODEL_IDENTIFIER": runtime_spec.model_identifier,
@@ -338,6 +346,22 @@ class MonarchTrainerActor(Actor):
 
         torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
         torch.cuda.set_device(local_rank)
+        self._compile_cache = None
+        self._compile_cache_metrics: dict[str, float] = {}
+        if runtime_spec.compile_cache:
+            from .compile_cache import TrainerCompileCache
+
+            self._compile_cache = TrainerCompileCache(
+                runtime_spec, rank=rank, cache_root=cache_root
+            )
+            event = self._compile_cache.load()
+            self._compile_cache_metrics.update(
+                {
+                    "hit": float(event.status == "hit"),
+                    "load_s": event.elapsed_s,
+                    "artifact_bytes": float(event.artifact_bytes),
+                }
+            )
         if topology.ep > 1:
             from art.megatron.hybrid_ep_setup import validate_hybrid_ep
 
@@ -349,10 +373,11 @@ class MonarchTrainerActor(Actor):
             group_index = rank // (topology.etp * topology.ep)
             _configure_hybrid_ep_env(
                 hybrid_ep,
-                run_id=f"{hybrid_ep.run_id}-{trainer_generation}-g{group_index}",
+                run_id=f"{hybrid_ep.run_id}-{run_id}-g{group_index}",
             )
             validate_hybrid_ep(require_multinode=hybrid_ep.multinode)
         self._runtime = _build_training_runtime(runtime_spec, rank=rank)
+        self._runtime.resident_run_id = run_id
         if self._runtime.model_support_handler.key != runtime_spec.handler_name:
             raise RuntimeError(
                 "resolved model-support handler does not match TrainerRuntimeSpec: "
@@ -376,6 +401,18 @@ class MonarchTrainerActor(Actor):
         )
         self._weight_offload.install()
         self._valid = True
+
+    def _publish_compile_cache(self) -> None:
+        if self._compile_cache is None or "publish_s" in self._compile_cache_metrics:
+            return
+        event = self._compile_cache.publish()
+        self._compile_cache_metrics.update(
+            {
+                "publish_s": event.elapsed_s,
+                "published": float(event.status == "published"),
+                "artifact_bytes": float(event.artifact_bytes),
+            }
+        )
 
     @endpoint
     def ready(self) -> dict[str, Any]:
@@ -409,12 +446,14 @@ class MonarchTrainerActor(Actor):
                     _ActorEventSink(event_port, coordinator=coordinator),
                     Event(),
                 )
+                self._publish_compile_cache()
             if coordinator:
                 event_port.send({"kind": "actor_completed", "metrics": metrics})
             return {
                 "rank": self._runtime.rank,
                 "learner_version": job.learner_version,
                 "metrics": metrics if coordinator else {},
+                "compile_cache": self._compile_cache_metrics,
             }
         except BaseException as error:
             self._valid = False
@@ -451,12 +490,14 @@ class MonarchTrainerActor(Actor):
                     _ActorEventSink(event_port, coordinator=coordinator),
                     Event(),
                 )
+                self._publish_compile_cache()
             if coordinator:
                 event_port.send({"kind": "actor_completed", "metrics": metrics})
             return {
                 "rank": self._runtime.rank,
                 "learner_version": job.learner_version,
                 "metrics": metrics if coordinator else {},
+                "compile_cache": self._compile_cache_metrics,
             }
         except BaseException as error:
             self._valid = False
@@ -472,6 +513,34 @@ class MonarchTrainerActor(Actor):
             raise
 
     @endpoint
+    def score(self, job_json: str, batch_json: str) -> dict[str, Any]:
+        batch = None
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = ResidentScoreJobSpec.model_validate_json(job_json)
+            leases = PackedBatchLeaseSet.model_validate_json(batch_json)
+            batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
+            with self._weight_offload.job():
+                result = self._executor.score(job, batch)
+            return result.model_dump(mode="json")
+        except BaseException:
+            self._valid = False
+            raise
+        finally:
+            if batch is not None:
+                batch.close()
+
+    @endpoint
+    def inspect_resident_lora(self, request_json: str) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        request = ResidentLoraInspectionSpec.model_validate_json(request_json)
+        with self._weight_offload.job():
+            result = self._executor.inspect_resident_lora(request)
+        return result.model_dump(mode="json")
+
+    @endpoint
     def close(self) -> None:
         self._executor.close()
         import torch
@@ -482,9 +551,8 @@ class MonarchTrainerActor(Actor):
     @endpoint
     def advance_without_training(
         self,
-        training_session_id: str,
-        expected_learner_version: int,
-        learner_version: int,
+        source_json: str,
+        output_json: str,
         optimizer_state_path: str,
         adapter_json: str | None,
     ) -> dict[str, Any]:
@@ -492,6 +560,8 @@ class MonarchTrainerActor(Actor):
             raise RuntimeError("trainer actor runtime is invalid")
         from art.megatron.optimizer_state import OptimizerAdapter
 
+        source = TrainerGeneration.model_validate_json(source_json)
+        output = TrainerGeneration.model_validate_json(output_json)
         adapter = (
             None
             if adapter_json is None
@@ -500,15 +570,14 @@ class MonarchTrainerActor(Actor):
         try:
             with self._weight_offload.job():
                 metrics = self._executor.advance_without_training(
-                    training_session_id=training_session_id,
-                    expected_learner_version=expected_learner_version,
-                    learner_version=learner_version,
+                    source=source,
+                    output=output,
                     optimizer_state_path=optimizer_state_path,
                     adapter=adapter,
                 )
             return {
                 "rank": self._runtime.rank,
-                "learner_version": learner_version,
+                "learner_version": output.policy_step,
                 "metrics": metrics,
             }
         except BaseException:
@@ -588,6 +657,148 @@ class _PublicationState:
         self.outcome_observed = False
 
 
+def _merge_resident_score_shards(
+    shards: tuple[ResidentScoreShard, ...],
+    *,
+    job: ResidentScoreJobSpec,
+    world_size: int,
+) -> ResidentScoreResult:
+    by_rank = {shard.rank: shard for shard in shards}
+    expected_ranks = set(range(world_size))
+    if len(by_rank) != len(shards) or set(by_rank) != expected_ranks:
+        raise RuntimeError("resident score did not return exactly one shard per rank")
+    ordered = tuple(by_rank[rank] for rank in range(world_size))
+    first = ordered[0]
+    for shard in ordered:
+        if (
+            shard.job_id != job.job_id
+            or shard.run_id != job.run_id
+            or shard.learner != job.learner
+            or shard.batch_id != job.batch.batch_id
+            or shard.batch_fingerprint != first.batch_fingerprint
+            or shard.top_k != job.top_k
+            or shard.expected_score_count != first.expected_score_count
+            or shard.routing_replay_packed_tokens != first.routing_replay_packed_tokens
+        ):
+            raise RuntimeError("resident score rank shards disagree on provenance")
+    expected_replay_tokens = (
+        0
+        if job.batch.moe_routing_replay is None
+        else job.batch.moe_routing_replay.packed_tokens
+    )
+    if first.routing_replay_packed_tokens != expected_replay_tokens:
+        raise RuntimeError("resident score routing replay does not match packed data")
+
+    scores: dict[tuple[int, int], Any] = {}
+    for shard in ordered:
+        for score in shard.scores:
+            key = score.sample_index, score.logit_index
+            previous = scores.get(key)
+            if previous is not None and previous != score:
+                raise RuntimeError(
+                    f"resident score replicas disagree at coordinate {key}"
+                )
+            scores[key] = score
+    merged = tuple(scores[key] for key in sorted(scores))
+    if len(merged) != first.expected_score_count:
+        raise RuntimeError(
+            "resident score did not cover every packed target: "
+            f"expected={first.expected_score_count}, got={len(merged)}"
+        )
+    return ResidentScoreResult(
+        job_id=job.job_id,
+        run_id=job.run_id,
+        learner=job.learner,
+        batch_id=job.batch.batch_id,
+        batch_fingerprint=first.batch_fingerprint,
+        ranks=tuple(range(world_size)),
+        top_k=job.top_k,
+        expected_score_count=first.expected_score_count,
+        routing_replay_packed_tokens=first.routing_replay_packed_tokens,
+        scores=merged,
+    )
+
+
+def _merge_resident_lora_shards(
+    shards: tuple[ResidentLoraInspectionShard, ...],
+    *,
+    request: ResidentLoraInspectionSpec,
+    world_size: int,
+) -> ResidentLoraInspectionResult:
+    by_rank = {shard.rank: shard for shard in shards}
+    expected_ranks = set(range(world_size))
+    if len(by_rank) != len(shards) or set(by_rank) != expected_ranks:
+        raise RuntimeError("resident LoRA inspection did not return one shard per rank")
+    ordered = tuple(by_rank[rank] for rank in range(world_size))
+    for shard in ordered:
+        if (
+            shard.request_id != request.request_id
+            or shard.run_id != request.run_id
+            or shard.learner != request.learner
+            or shard.target_modules != request.target_modules
+        ):
+            raise RuntimeError("resident LoRA rank shards disagree on provenance")
+
+    exports: dict[str, set[str | None]] = {}
+    for shard in ordered:
+        for export in shard.exports:
+            exports.setdefault(export.base_name, set()).update(export.adapter_keys)
+    return ResidentLoraInspectionResult(
+        request_id=request.request_id,
+        run_id=request.run_id,
+        learner=request.learner,
+        target_modules=request.target_modules,
+        rank_summaries=tuple(
+            ResidentLoraRankSummary(
+                rank=shard.rank,
+                module_count=shard.module_count,
+                trainable_parameter_count=len(shard.trainable_lora_parameter_names),
+                trainable_numel=shard.trainable_numel,
+            )
+            for shard in ordered
+        ),
+        wrapped_adapter_prefixes=tuple(
+            sorted(
+                {
+                    prefix
+                    for shard in ordered
+                    for prefix in shard.wrapped_adapter_prefixes
+                }
+            )
+        ),
+        exports=tuple(
+            ResidentLoraExport(
+                base_name=base_name,
+                adapter_keys=tuple(
+                    sorted(
+                        adapter_keys,
+                        key=lambda value: "" if value is None else value,
+                    )
+                ),
+            )
+            for base_name, adapter_keys in sorted(exports.items())
+        ),
+        trainable_lora_parameter_names=tuple(
+            sorted(
+                {
+                    name
+                    for shard in ordered
+                    for name in shard.trainable_lora_parameter_names
+                }
+            )
+        ),
+        unexpected_trainable_parameter_names=tuple(
+            sorted(
+                {
+                    name
+                    for shard in ordered
+                    for name in shard.unexpected_trainable_parameter_names
+                }
+            )
+        ),
+    )
+
+
 class MonarchTrainerRun:
     def __init__(
         self,
@@ -628,6 +839,91 @@ class MonarchTrainerRun:
     @property
     def valid(self) -> bool:
         return self._valid
+
+    async def score(
+        self,
+        job: ResidentScoreJobSpec,
+        batch: PackedBatchLeaseSet,
+    ) -> ResidentScoreResult:
+        async with self._lock:
+            if error := self._validate_resident_score(job, batch):
+                raise error
+            values = await self._run_resident_collective(
+                job.job_id,
+                self._actors.score.call(job.model_dump_json(), batch.model_dump_json()),
+                invalidate_on_error=True,
+            )
+            shards = tuple(
+                ResidentScoreShard.model_validate(value) for value in values.values()
+            )
+            return _merge_resident_score_shards(
+                shards,
+                job=job,
+                world_size=len(self.runtime_spec.trainer_mesh.ranks),
+            )
+
+    async def inspect_resident_lora(
+        self,
+        request: ResidentLoraInspectionSpec,
+    ) -> ResidentLoraInspectionResult:
+        async with self._lock:
+            if error := self._validate_resident_inspection(request):
+                raise error
+            values = await self._run_resident_collective(
+                request.request_id,
+                self._actors.inspect_resident_lora.call(request.model_dump_json()),
+                invalidate_on_error=False,
+            )
+            shards = tuple(
+                ResidentLoraInspectionShard.model_validate(value)
+                for value in values.values()
+            )
+            return _merge_resident_lora_shards(
+                shards,
+                request=request,
+                world_size=len(self.runtime_spec.trainer_mesh.ranks),
+            )
+
+    async def _run_resident_collective(
+        self,
+        request_id: str,
+        operation: Awaitable[Any],
+        *,
+        invalidate_on_error: bool,
+    ) -> Any:
+        collective = asyncio.ensure_future(operation)
+        supervision = asyncio.create_task(self._supervision.wait())
+        self._active_job_id = request_id
+        self._active_collective = collective
+        try:
+            done, _ = await asyncio.wait(
+                {collective, supervision},
+                timeout=self.run_spec.event_timeout_s,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise TimeoutError(
+                    "trainer ranks produced no resident diagnostic result for "
+                    f"{self.run_spec.event_timeout_s:g}s"
+                )
+            if supervision in done:
+                raise RuntimeError("trainer mesh failed: " + supervision.result())
+            return await collective
+        except BaseException as exc:
+            if invalidate_on_error or not collective.done() or supervision.done():
+                self._valid = False
+                self._closed = True
+                self._cancel_active()
+                await cleanup_after_failure(
+                    exc,
+                    self._force_stop,
+                    message="resident diagnostic and trainer cleanup failed",
+                )
+            raise
+        finally:
+            supervision.cancel()
+            supervision.add_done_callback(_consume_future)
+            self._clear_active(request_id)
 
     async def train(
         self, job: TrainJobSpec, batch: PackedBatchLeaseSet
@@ -801,6 +1097,35 @@ class MonarchTrainerRun:
                                 "trainer ranks did not agree on job completion"
                             )
                         metrics = dict(payload["metrics"])
+                        cache_metrics = [
+                            result.get("compile_cache", {}) for result in results
+                        ]
+                        if any(cache_metrics):
+                            metrics.update(
+                                {
+                                    "trainer/compile_cache_hit_fraction": sum(
+                                        value.get("hit", 0.0) for value in cache_metrics
+                                    )
+                                    / len(cache_metrics),
+                                    "trainer/compile_cache_published_fraction": sum(
+                                        value.get("published", 0.0)
+                                        for value in cache_metrics
+                                    )
+                                    / len(cache_metrics),
+                                    "trainer/compile_cache_artifact_bytes_max": max(
+                                        value.get("artifact_bytes", 0.0)
+                                        for value in cache_metrics
+                                    ),
+                                    "time/trainer_compile_cache_load_max_s": max(
+                                        value.get("load_s", 0.0)
+                                        for value in cache_metrics
+                                    ),
+                                    "time/trainer_compile_cache_publish_max_s": max(
+                                        value.get("publish_s", 0.0)
+                                        for value in cache_metrics
+                                    ),
+                                }
+                            )
                         if final_progress_received is not None:
                             metrics.update(
                                 {
@@ -1028,8 +1353,8 @@ class MonarchTrainerRun:
     async def advance_without_training(
         self,
         *,
-        expected_learner_version: int,
-        learner_version: int,
+        source: TrainerGeneration,
+        output: TrainerGeneration,
         optimizer_state_path: str,
         adapter: Any | None,
     ) -> dict[str, float]:
@@ -1038,20 +1363,25 @@ class MonarchTrainerRun:
                 raise RuntimeError("trainer runtime is invalid")
             if self._active_job_id is not None:
                 raise RuntimeError("trainer has an active job")
-            if expected_learner_version != self._learner_version:
+            if (
+                source.training_session_id != self.run_spec.training_session_id
+                or source.policy_step != self._learner_version
+            ):
                 raise ValueError(
                     "expected learner version mismatch: "
-                    f"transition={expected_learner_version}, "
+                    f"transition={source.policy_step}, "
                     f"runtime={self._learner_version}"
                 )
-            if learner_version != expected_learner_version + 1:
+            if (
+                output.training_session_id != source.training_session_id
+                or output.policy_step != source.policy_step + 1
+            ):
                 raise ValueError("a no-op transition must advance exactly one step")
             try:
                 values = await asyncio.wait_for(
                     self._actors.advance_without_training.call(
-                        self.run_spec.training_session_id,
-                        expected_learner_version,
-                        learner_version,
+                        source.model_dump_json(),
+                        output.model_dump_json(),
                         optimizer_state_path,
                         None if adapter is None else adapter.model_dump_json(),
                     ),
@@ -1061,7 +1391,7 @@ class MonarchTrainerRun:
                 if {result["rank"] for result in results} != set(
                     range(len(self.runtime_spec.trainer_mesh.ranks))
                 ) or {result["learner_version"] for result in results} != {
-                    learner_version
+                    output.policy_step
                 }:
                     raise RuntimeError("trainer ranks rejected no-op transition")
             except BaseException as exc:
@@ -1073,8 +1403,66 @@ class MonarchTrainerRun:
                     message="no-op transition and trainer cleanup failed",
                 )
                 raise
-            self._learner_version = learner_version
+            self._learner_version = output.policy_step
             return next(result["metrics"] for result in results if result["rank"] == 0)
+
+    def _validate_resident_learner(
+        self,
+        *,
+        run_id: str,
+        learner: TrainerGeneration,
+    ) -> BaseException | None:
+        if self._closed or not self._valid:
+            return RuntimeError("trainer runtime is invalid")
+        if self._active_job_id is not None:
+            return RuntimeError("trainer has an active job")
+        if run_id != self.run_spec.run_id:
+            return ValueError("diagnostic run_id does not match this training run")
+        if learner.training_session_id != self.run_spec.training_session_id:
+            return ValueError("diagnostic learner does not match the training session")
+        if learner.policy_step != self._learner_version:
+            return ValueError(
+                "diagnostic learner version mismatch: "
+                f"request={learner.policy_step}, runtime={self._learner_version}"
+            )
+        return None
+
+    def _validate_resident_score(
+        self,
+        job: ResidentScoreJobSpec,
+        batch: PackedBatchLeaseSet,
+    ) -> BaseException | None:
+        if error := self._validate_resident_learner(
+            run_id=job.run_id,
+            learner=job.learner,
+        ):
+            return error
+        if batch.ref != job.batch:
+            return ValueError("resident score batch ref does not match its leases")
+        if job.batch.sequence_length != self.runtime_spec.packed_sequence_length:
+            return ValueError(
+                "resident score batch length does not match the trainer runtime"
+            )
+        if bool(job.batch.moe_routing_replay) != bool(
+            self.runtime_spec.enable_moe_routing_replay
+        ):
+            return ValueError(
+                "resident score routing replay does not match the trainer runtime"
+            )
+        return None
+
+    def _validate_resident_inspection(
+        self,
+        request: ResidentLoraInspectionSpec,
+    ) -> BaseException | None:
+        if error := self._validate_resident_learner(
+            run_id=request.run_id,
+            learner=request.learner,
+        ):
+            return error
+        if request.target_modules != self.runtime_spec.lora_target_modules:
+            return ValueError("resident LoRA targets do not match the trainer runtime")
+        return None
 
     def _validate_common(self, job: TrainerJobSpec) -> BaseException | None:
         if self._closed:

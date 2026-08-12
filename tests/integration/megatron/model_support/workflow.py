@@ -627,7 +627,8 @@ def run_lora_coverage_stage(
     return ValidationStageResult(
         name="lora_coverage",
         passed=not report.missing_wrapped_target_modules
-        and not report.missing_exported_target_modules,
+        and not report.missing_exported_target_modules
+        and not report.unexpected_trainable_parameter_names,
         metrics=report.model_dump(mode="json"),
     )
 

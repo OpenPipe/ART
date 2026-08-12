@@ -2066,6 +2066,7 @@ def test_run_lora_coverage_stage_reports_missing_targets(monkeypatch) -> None:
     coverage_report = SimpleNamespace(
         missing_wrapped_target_modules=["in_proj_z"],
         missing_exported_target_modules=[],
+        unexpected_trainable_parameter_names=[],
         model_dump=lambda mode="json": {
             "base_model": "Qwen/Qwen3.5-35B-A3B",
             "missing_wrapped_target_modules": ["in_proj_z"],

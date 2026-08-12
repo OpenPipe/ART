@@ -1,3 +1,4 @@
+from contextlib import AbstractContextManager
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -163,6 +164,11 @@ class ModelSupportHandler(Protocol):
         self,
         model_chunks: Sequence[Any],
     ) -> Callable[[Any, int], None] | None: ...
+
+    def preserve_pipeline_microbatch_activation(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> AbstractContextManager[None]: ...
 
     def build_prefix_tree_model_state(
         self,

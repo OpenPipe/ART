@@ -149,6 +149,12 @@ class WorkflowFixture(BaseModel):
             environment.update(reduced_trainability)
         return environment
 
+    def resident_functional_environment(self) -> dict[str, str]:
+        environment = self.environment("length_trainability")
+        if self.model_key == "glm52":
+            environment.update(self.environment("train_inf_mismatch"))
+        return environment
+
 
 def _set(config: Any, **values: Any) -> Any:
     for name, value in values.items():
