@@ -865,6 +865,9 @@ class MonarchTrainerSlot:
         self._publications: dict[
             str, asyncio.Task[tuple[TrainerRankPublication, ...]]
         ] = {}
+        self._registrations: dict[str, str] = {}
+        self._removed_runs: set[str] = set()
+        self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
 
     @property
     def valid(self) -> bool:
@@ -873,6 +876,13 @@ class MonarchTrainerSlot:
     async def register_run(self, registration: RunSlotRegistration) -> None:
         async with self._lock:
             self._require_open()
+            fingerprint = registration.model_dump_json()
+            if prior := self._registrations.get(registration.run_id):
+                if prior != fingerprint:
+                    raise RuntimeError("run_id was reused for another registration")
+                return
+            if registration.run_id in self._removed_runs:
+                raise RuntimeError("removed run_id cannot be registered again")
             try:
                 values = await asyncio.wait_for(
                     self._actors.register_run_slot.call(registration.model_dump_json()),
@@ -883,6 +893,7 @@ class MonarchTrainerSlot:
                     range(len(self._rank_processes))
                 ) or {result["run_id"] for result in results} != {registration.run_id}:
                     raise RuntimeError("trainer ranks disagree on run registration")
+                self._registrations[registration.run_id] = fingerprint
             except BaseException as error:
                 await self._invalidate(error, "run registration and cleanup failed")
                 raise
@@ -890,6 +901,10 @@ class MonarchTrainerSlot:
     async def unregister_run(self, run_id: str) -> None:
         async with self._lock:
             self._require_open()
+            if run_id in self._removed_runs:
+                return
+            if run_id not in self._registrations:
+                raise RuntimeError(f"training run is not registered: {run_id!r}")
             try:
                 values = await asyncio.wait_for(
                     self._actors.unregister_run_slot.call(run_id),
@@ -900,6 +915,8 @@ class MonarchTrainerSlot:
                     range(len(self._rank_processes))
                 ) or {result["run_id"] for result in results} != {run_id}:
                     raise RuntimeError("trainer ranks disagree on run removal")
+                self._registrations.pop(run_id)
+                self._removed_runs.add(run_id)
             except BaseException as error:
                 await self._invalidate(error, "run removal and cleanup failed")
                 raise
@@ -911,6 +928,9 @@ class MonarchTrainerSlot:
     ) -> dict[str, Any]:
         async with self._lock:
             self._require_open()
+            cached = self._cached_operation(job.operation_id, job.fingerprint)
+            if cached is not None:
+                return cached
             if batch.ref != job.batch:
                 raise ValueError("F/B batch ref does not match supplied packed batch")
             try:
@@ -932,7 +952,9 @@ class MonarchTrainerSlot:
                     raise RuntimeError(
                         "trainer F/B token count differs from packed provenance"
                     )
-                return next(result for result in results if result["rank"] == 0)
+                result = next(result for result in results if result["rank"] == 0)
+                self._operations[job.operation_id] = (job.fingerprint, result)
+                return result
             except BaseException as error:
                 await self._invalidate(error, "F/B operation and cleanup failed")
                 raise
@@ -940,6 +962,9 @@ class MonarchTrainerSlot:
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]:
         async with self._lock:
             self._require_open()
+            cached = self._cached_operation(job.operation_id, job.fingerprint)
+            if cached is not None:
+                return cached
             try:
                 values = await asyncio.wait_for(
                     self._actors.execute_run_slot_optimizer.call(job.model_dump_json()),
@@ -959,7 +984,9 @@ class MonarchTrainerSlot:
                     raise RuntimeError(
                         "trainer ranks consumed different F/B contributions"
                     )
-                return next(result for result in results if result["rank"] == 0)
+                result = next(result for result in results if result["rank"] == 0)
+                self._operations[job.operation_id] = (job.fingerprint, result)
+                return result
             except BaseException as error:
                 await self._invalidate(error, "optimizer operation and cleanup failed")
                 raise
@@ -967,6 +994,9 @@ class MonarchTrainerSlot:
     async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
         async with self._lock:
             self._require_open()
+            cached = self._cached_operation(job.operation_id, job.fingerprint)
+            if cached is not None:
+                return cached
             generation_id = job.generation.generation_id
             if generation_id in self._publications:
                 raise RuntimeError(f"publication already exists: {generation_id}")
@@ -990,7 +1020,9 @@ class MonarchTrainerSlot:
                 )
                 publication.add_done_callback(_consume_future)
                 self._publications[generation_id] = publication
-                return next(result for result in results if result["rank"] == 0)
+                result = next(result for result in results if result["rank"] == 0)
+                self._operations[job.operation_id] = (job.fingerprint, result)
+                return result
             except BaseException as error:
                 await self._invalidate(error, "snapshot operation and cleanup failed")
                 raise
@@ -1007,6 +1039,19 @@ class MonarchTrainerSlot:
             return await asyncio.shield(publication)
 
         return wait()
+
+    def retire_operation(self, operation_id: str) -> None:
+        self._operations.pop(operation_id, None)
+
+    def _cached_operation(
+        self, operation_id: str, fingerprint: str
+    ) -> dict[str, Any] | None:
+        cached = self._operations.get(operation_id)
+        if cached is None:
+            return None
+        if cached[0] != fingerprint:
+            raise RuntimeError("operation_id was reused for a different command")
+        return cached[1]
 
     async def _collect_publication(
         self,
