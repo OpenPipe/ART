@@ -770,6 +770,7 @@ async def run_length_trainability_async(
     resident_hook: LengthResidentHook | None = None,
 ) -> LengthTrainabilityReport:
     artifact_dir = artifact_dir or _artifact_dir(base_model)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     variant = _build_variant(
         "megatron_dedicated",
         base_model=base_model,
