@@ -1123,6 +1123,133 @@ def prune_optimizer_generations(
         )
 
 
+def delete_optimizer_generation(
+    optimizer_state_path: str,
+    generation: str,
+    *,
+    replacement_generation: str | None,
+) -> None:
+    """Delete one immutable generation without leaving a dangling root pointer."""
+    _validate_generation_name(generation)
+    if replacement_generation == generation:
+        raise ValueError("optimizer replacement must differ from deleted generation")
+    if replacement_generation is not None:
+        _validate_generation_name(replacement_generation)
+    path = Path(optimizer_state_path)
+    if not path.exists():
+        return
+    trash: list[Path] = []
+    with optimizer_model_lease(path), _writer_lease(path) as current:
+        target = optimizer_generation_path(optimizer_state_path, generation)
+        replacement = (
+            _generation_pointer(optimizer_state_path, replacement_generation)
+            if replacement_generation is not None
+            else None
+        )
+        if current is not None and current.generation == generation:
+            pointer_path = path / OPTIMIZER_POINTER
+            if replacement is None:
+                pointer_path.unlink()
+                _fsync_directory(path)
+            else:
+                _write_model_atomic(pointer_path, replacement)
+        policy = _read_policy_pointer(path)
+        if policy is not None and (
+            policy.policy_adapter.generation_id == generation
+            or (
+                policy.optimizer_anchor is not None
+                and policy.optimizer_anchor.generation == generation
+            )
+        ):
+            (path / OPTIMIZER_POLICY_POINTER).unlink()
+            _fsync_directory(path)
+        if target.exists():
+            with _generation_lease(path, generation, exclusive=True) as acquired:
+                if not acquired:
+                    raise RuntimeError(
+                        f"Could not exclusively lease optimizer generation {generation}"
+                    )
+                destination = target.parent / (
+                    f"{OPTIMIZER_TRASH_PREFIX}{generation}-{uuid4().hex}"
+                )
+                os.replace(target, destination)
+                trash.append(destination)
+                _fsync_directory(target.parent)
+            _generation_lease_path(path, generation).unlink(missing_ok=True)
+        trash.extend(
+            entry
+            for entry in (path / OPTIMIZER_GENERATIONS_DIR).glob(
+                f"{OPTIMIZER_TRASH_PREFIX}{generation}-*"
+            )
+            if entry.is_dir() and entry not in trash
+        )
+    for entry in trash:
+        shutil.rmtree(entry)
+
+
+def delete_adapter_generation(
+    adapter_path: str,
+    *,
+    step: int,
+    generation: str,
+    replacement_adapter_path: str | None,
+    replacement_step: int | None,
+) -> None:
+    """Delete one canonical adapter after all logical and physical leases end."""
+    if (replacement_adapter_path is None) != (replacement_step is None):
+        raise ValueError("replacement adapter path and step must be paired")
+    adapter = read_adapter_publication(adapter_path, step=step)
+    path = Path(adapter_path).absolute()
+    if adapter is None:
+        if path.exists():
+            raise RuntimeError(f"Unrecognized adapter generation path: {path}")
+        for trash in path.parent.glob(f".trash-{path.name}-*"):
+            if trash.is_dir():
+                shutil.rmtree(trash)
+        return
+    if adapter.generation_id != generation:
+        raise RuntimeError("adapter generation identity changed before deletion")
+    replacement = (
+        read_adapter_publication(replacement_adapter_path, step=replacement_step)
+        if replacement_adapter_path is not None and replacement_step is not None
+        else None
+    )
+    if replacement_adapter_path is not None and replacement is None:
+        raise RuntimeError("replacement adapter is not durably published")
+    lease_path = _adapter_generation_lease_path(path.parent.parent, generation)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    with lease_path.open("a+b") as lease:
+        fcntl.flock(lease.fileno(), fcntl.LOCK_EX)
+        latest_path = path.parent.parent / "megatron_runtime" / ADAPTER_LATEST_POINTER
+        latest = read_latest_adapter_pointer(path.parent.parent)
+        if latest is not None and latest.generation_id == generation:
+            if replacement is None:
+                latest_path.unlink()
+                _fsync_directory(latest_path.parent)
+            else:
+                _write_model_atomic(latest_path, replacement)
+        trash = path.with_name(f".trash-{path.name}-{uuid4().hex}")
+        os.replace(path, trash)
+        _fsync_directory(path.parent)
+    lease_path.unlink(missing_ok=True)
+    shutil.rmtree(trash)
+
+
+def _generation_pointer(
+    optimizer_state_path: str, generation: str
+) -> OptimizerGenerationPointer:
+    manifest = _read_manifest(
+        optimizer_generation_path(optimizer_state_path, generation)
+    )
+    if manifest.generation != generation:
+        raise RuntimeError("Optimizer generation manifest identity mismatch")
+    return OptimizerGenerationPointer(
+        generation=manifest.generation,
+        step=manifest.step,
+        adapter=manifest.adapter,
+    )
+
+
 @contextmanager
 def optimizer_retention_lease(
     output_dir: str, retain_adapter_steps: set[int]
