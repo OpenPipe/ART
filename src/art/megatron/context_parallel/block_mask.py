@@ -551,6 +551,7 @@ def _build_sparse_block_mask(
         full_blocks[q_slice, k_slice] |= is_full
 
     partial_blocks &= ~full_blocks
+    sliding_full_blocks = full_blocks.copy() if sliding_window is not None else None
     needs_refine = full_blocks | ((touch_counts > 1) & partial_blocks)
     if bool(needs_refine.any()):
         refined_partial = partial_blocks & needs_refine
@@ -568,8 +569,12 @@ def _build_sparse_block_mask(
         )
         partial_blocks = (partial_blocks & ~needs_refine) | refined_partial
         full_blocks = (full_blocks & ~needs_refine) | refined_full
-    # Partial blocks retain exact token masking through mask_mod. Refining every
-    # sliding-window token pair here costs more than executing the sparse extras.
+    if sliding_full_blocks is not None:
+        promoted = full_blocks & ~sliding_full_blocks
+        partial_blocks |= promoted
+        full_blocks &= sliding_full_blocks
+    # Partial blocks retain exact token masking through mask_mod. Keep ancestry
+    # refinement from promoting sliding-window boundary blocks to full blocks.
     kv_num_blocks, kv_indices = _dense_blocks_to_ordered(
         partial_blocks,
         device=device,

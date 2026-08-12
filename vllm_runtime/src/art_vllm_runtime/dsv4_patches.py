@@ -537,13 +537,28 @@ def _patch_dsv4_local_dummy_lora(model_cls: type) -> None:
             and getattr(lora_model, "_art_local_3d_moe_lora", False)
         ):
             return original_stack(self, lora_model, module, module_name)
-        global_num_experts, ep_rank = module.global_num_experts, module.ep_rank
-        module.global_num_experts = module.w13_lora_a_stacked[0].shape[1]
-        module.ep_rank = 0
-        try:
+        down = self._get_lora_layer_weights(lora_model, module_name)
+        gate_up = self._get_lora_layer_weights(lora_model, module_name + ".base_layer")
+        if down is None or gate_up is None or not torch.is_tensor(down.lora_a):
             return original_stack(self, lora_model, module, module_name)
-        finally:
-            module.global_num_experts, module.ep_rank = global_num_experts, ep_rank
+        local_experts = module.w13_lora_a_stacked[0].shape[1]
+        gate_up.lora_a = gate_up.lora_a.reshape(
+            local_experts, -1, gate_up.lora_a.shape[-1]
+        )
+        down.lora_a = down.lora_a.reshape(local_experts, -1, down.lora_a.shape[-1])
+        gate_up.lora_b = (
+            gate_up.lora_b.reshape(gate_up.lora_b.shape[0], -1, local_experts)
+            .permute(2, 0, 1)
+            .contiguous()
+        )
+        down.lora_b = (
+            down.lora_b.reshape(down.lora_b.shape[0], -1, local_experts)
+            .permute(2, 0, 1)
+            .contiguous()
+        )
+        down.lora_a = [gate_up.lora_a.contiguous(), down.lora_a.contiguous()]
+        down.lora_b = [gate_up.lora_b, down.lora_b]
+        return original_stack(self, lora_model, module, module_name)
 
     create_dummy_lora.__art_dsv4_local_dummy_patched__ = True  # type: ignore[attr-defined]
     LoRAModelManager.create_dummy_lora = create_dummy_lora  # type: ignore[method-assign]
