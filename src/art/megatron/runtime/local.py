@@ -288,3 +288,49 @@ def compile_local_runtime_topology(
         ),
         model_services=model_services,
     )
+
+
+def compile_local_training_topology(
+    *,
+    artifact_root: str,
+    trainer_gpu_ids: tuple[int, ...],
+    visible_gpu_count: int,
+    cache_root: str | None = None,
+    startup_timeout_s: float = 600.0,
+    rpc_timeout_s: float = 60.0,
+) -> RuntimeTopology:
+    if visible_gpu_count < 1:
+        raise RuntimeError("Megatron training requires at least one visible CUDA GPU")
+    resolved_gpu_ids = _host_gpu_ids(
+        trainer_gpu_ids, visible_gpu_count=visible_gpu_count
+    )
+    if not resolved_gpu_ids:
+        raise ValueError("Megatron trainer GPU placement must not be empty")
+    host_id = "local"
+    return RuntimeTopology(
+        cluster=ClusterSpec(
+            hosts=(
+                HostSpec(
+                    host_id=host_id,
+                    node_rank=0,
+                    worker_address="tcp://127.0.0.1:0",
+                    cpu_slots=max(1, os.cpu_count() or 1),
+                    gpu_ids=resolved_gpu_ids,
+                ),
+            ),
+            controller_host_id=host_id,
+            artifact_root=artifact_root,
+            cache_root=cache_root,
+            startup_timeout_s=startup_timeout_s,
+            rpc_timeout_s=rpc_timeout_s,
+        ),
+        rollout_host_ids=(),
+        trainer=TrainerMeshSpec(
+            ranks=tuple(
+                GpuPlacement(host_id=host_id, gpu_id=gpu_id)
+                for gpu_id in resolved_gpu_ids
+            ),
+            topology=get_megatron_runtime_config().topology,
+        ),
+        model_services=(),
+    )
