@@ -798,8 +798,12 @@ class MonarchTrainerRun:
                 operation_id=job.operation_id,
                 learner_version=job.expected_learner_version,
             )
-            if len({result["token_count"] for result in results}) != 1:
-                raise RuntimeError("trainer ranks disagree on F/B token count")
+            if {result["token_count"] for result in results} != {
+                job.trainable_token_count
+            }:
+                raise RuntimeError(
+                    "trainer F/B token count differs from packed policy provenance"
+                )
             result = next(result for result in results if result["rank"] == 0)
             self._open_forward_backward_ids.append(job.operation_id)
             self._next_operation_sequence += 1

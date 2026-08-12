@@ -249,6 +249,9 @@ class ForwardBackwardJobSpec(_Spec):
             raise ValueError(
                 "batch source policy version cannot be newer than the learner"
             )
+        stats = self.batch.prefix_tree_packing_stats
+        if stats is None or stats.policy_token_counts is None:
+            raise ValueError("F/B batch requires exact policy-token provenance")
         return self
 
     @property
@@ -262,6 +265,12 @@ class ForwardBackwardJobSpec(_Spec):
     @property
     def source_adapter_path(self) -> str:
         return self.source.adapter_path
+
+    @property
+    def trainable_token_count(self) -> int:
+        counts = self.batch.prefix_tree_packing_stats
+        assert counts is not None and counts.policy_token_counts is not None
+        return sum(counts.policy_token_counts.values())
 
 
 class OptimizerJobSpec(_Spec):

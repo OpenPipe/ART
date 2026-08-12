@@ -876,6 +876,7 @@ def execute_megatron_rl_forward_backward_job(
     internal = GradientAccumulator(model_chunks=runtime.model)
     states: list[RLForwardBackwardState] = []
     durations: list[float] = []
+    global_token_counts: list[torch.Tensor] = []
 
     def before_step(step_index: int) -> None:
         if step_index:
@@ -888,9 +889,15 @@ def execute_megatron_rl_forward_backward_job(
         duration_s: float,
         _replay_finalize_s: float,
     ) -> None:
-        internal.record(f"{job.operation_id}:{step_index}", state.token_count)
+        global_token_count = state.token_count.detach().clone()
+        torch.distributed.all_reduce(
+            global_token_count,
+            group=ps.get_data_parallel_group(with_context_parallel=True),
+        )
+        internal.record(f"{job.operation_id}:{step_index}", global_token_count)
         states.append(state)
         durations.append(duration_s)
+        global_token_counts.append(global_token_count)
 
     _, replay_finalize_s, _ = _execute_megatron_rl_forward_backward_steps(
         runtime,
@@ -905,8 +912,8 @@ def execute_megatron_rl_forward_backward_job(
     internal.prepare_optimizer()
     internal.consume()
     token_count = sum(
-        (state.token_count for state in states),
-        torch.zeros_like(states[0].token_count),
+        global_token_counts,
+        torch.zeros_like(global_token_counts[0]),
     )
     gradient_accumulator.record(job.operation_id, token_count)
     result = _finish_megatron_rl_forward_backward_job(tuple(states))
