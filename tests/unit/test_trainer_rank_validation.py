@@ -1388,7 +1388,7 @@ def test_checkpoint_cleanup_gather_failure_releases_finalizer(
         value: object, group: dist.ProcessGroup | None = None
     ) -> tuple[object, ...]:
         nonlocal failed
-        if isinstance(value, bool) and not failed:
+        if isinstance(value, tuple) and len(value) == 2 and not failed:
             failed = True
             raise RuntimeError("injected cleanup gather failure")
         return original(value, group)
@@ -1415,15 +1415,12 @@ def test_checkpoint_asymmetric_cleanup_gather_can_converge(
     completed._finalized_checkpoint_saves["save"] = _FinalizedSave(0, "finish")
     retained._prepared_checkpoint_saves["save"] = retained_save
     retained._checkpoint_save_outcomes["save"] = "finish"
-    boolean_gathers = 0
 
     def mixed(
         value: object, _group: dist.ProcessGroup | None = None
     ) -> tuple[object, ...]:
-        nonlocal boolean_gathers
         if isinstance(value, bool):
-            boolean_gathers += 1
-            return (True, False) if boolean_gathers % 2 else (False, False)
+            return (True, False)
         return (value, value)
 
     monkeypatch.setattr(_checkpoint, "_gather", mixed)
@@ -1443,16 +1440,12 @@ def test_checkpoint_cleanup_gather_preserves_finish_error(
     prepared = _prepared_save(tmp_path, 0)
     trainer._prepared_checkpoint_saves = {"save": prepared}
     original = _checkpoint._gather
-    boolean_gathers = 0
 
     def fail_cleanup(
         value: object, group: dist.ProcessGroup | None = None
     ) -> tuple[object, ...]:
-        nonlocal boolean_gathers
-        if isinstance(value, bool):
-            boolean_gathers += 1
-            if boolean_gathers == 2:
-                raise RuntimeError("cleanup collective failed")
+        if isinstance(value, tuple) and len(value) == 2:
+            raise RuntimeError("cleanup collective failed")
         return original(value, group)
 
     def fail_finish(*_: object) -> None:

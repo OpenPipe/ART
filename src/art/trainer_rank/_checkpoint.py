@@ -899,6 +899,8 @@ def _finalize_checkpoint_save(
                 else finalized.outcome
             )
         states = _gather((action, output_dir, sequence, outcome), group)
+        if any(not isinstance(value, tuple) or len(value) != 4 for value in states):
+            raise RuntimeError("Checkpoint finalization protocol is out of sync")
         if any(value[:3] != states[0][:3] for value in states):
             raise RuntimeError("Checkpoint save actions differ across ranks")
         outcomes = {value[3] for value in states}
@@ -945,22 +947,51 @@ def _finalize_checkpoint_save(
                     paths.append(prepared.reservation)
                 cleanup = _cleanup_paths(paths)
             try:
-                cleanup_failed = any(_gather(cleanup is not None, group))
+                failures = _gather(
+                    (
+                        None if error is None else repr(error),
+                        None if cleanup is None else repr(cleanup),
+                    ),
+                    group,
+                )
             except BaseException as exc:
-                failures = [
+                local_failures = [
                     *([error] if error is not None else []),
                     *([cleanup] if cleanup is not None else []),
                     exc,
                 ]
+                if len(local_failures) == 1:
+                    raise local_failures[0]
                 raise BaseExceptionGroup(
-                    "checkpoint finalization and coordination failed", failures
+                    "checkpoint finalization and coordination failed", local_failures
                 ) from None
-            if cleanup is not None:
-                error = BaseExceptionGroup(
-                    "checkpoint finalization cleanup failed",
-                    [*([error] if error is not None else []), cleanup],
+            if any(
+                not isinstance(failure, tuple)
+                or len(failure) != 2
+                or any(
+                    value is not None and not isinstance(value, str)
+                    for value in failure
                 )
-            raise_distributed(error, f"{action} checkpoint", group)
+                for failure in failures
+            ):
+                raise RuntimeError("Checkpoint finalization protocol is out of sync")
+            cleanup_failed = any(
+                cleanup_error is not None for _, cleanup_error in failures
+            )
+            local_failures = [
+                *([error] if error is not None else []),
+                *([cleanup] if cleanup is not None else []),
+            ]
+            if local_failures:
+                if len(local_failures) == 1:
+                    raise local_failures[0]
+                raise BaseExceptionGroup(
+                    "checkpoint finalization failed", local_failures
+                )
+            if remote := next((failure for failure in failures if any(failure)), None):
+                raise RuntimeError(
+                    f"Another rank failed to {action} checkpoint: {remote}"
+                )
         finally:
             with trainer._checkpoint_save_condition:
                 trainer._checkpoint_finalizing_saves.pop(output_dir, None)
