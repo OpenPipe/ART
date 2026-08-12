@@ -133,6 +133,7 @@ from art.preprocessing.pack import PackedTensors
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 _optimizer_stats_printed = False
 _INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gap_rank_"
+_INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
 
 __all__ = [
     "DEFAULT_MODEL_IDENTIFIER",
@@ -148,6 +149,7 @@ class _InterForwardBackwardTiming(BaseModel):
 
     metrics_group: Any | None = None
     previous_schedule_end_s: float | None = None
+    previous_schedule_cuda_end: torch.cuda.Event | None = None
 
 
 class TrainingRuntime(BaseModel):
@@ -719,7 +721,12 @@ def execute_megatron_rl_job(
                 inter_schedule_metrics = {
                     name: value
                     for name, value in step_result.pipeline_metrics.items()
-                    if name.startswith(_INTER_FORWARD_BACKWARD_GAP_PREFIX)
+                    if name.startswith(
+                        (
+                            _INTER_FORWARD_BACKWARD_GAP_PREFIX,
+                            _INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX,
+                        )
+                    )
                 }
             final_metrics.update(inter_schedule_metrics)
             final_metrics["time/replay_finalize_s"] = replay_finalize_s
@@ -1983,11 +1990,16 @@ def _run_training_schedule(
         if timing is None or timing.previous_schedule_end_s is None
         else started_s - timing.previous_schedule_end_s
     )
+    previous_cuda_end = (
+        timing.previous_schedule_cuda_end if timing is not None else None
+    )
     outputs = schedule.run(forward_step_func, forward_only=False)
     ended_s = time.monotonic()
     if timing is None:
         return outputs, lambda: {}
+    cuda_span = schedule.telemetry.cuda_span()
     timing.previous_schedule_end_s = ended_s
+    timing.previous_schedule_cuda_end = cuda_span[1] if cuda_span is not None else None
     if gap_s is None:
         return outputs, lambda: {}
     world_size = torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
@@ -2009,10 +2021,32 @@ def _run_training_schedule(
     def metrics() -> dict[str, float]:
         if work is not None:
             work.wait()
-        return {
+        values = {
             f"{_INTER_FORWARD_BACKWARD_GAP_PREFIX}{rank}_s": float(gap.item())
             for rank, gap in enumerate(rank_gaps)
         }
+        if previous_cuda_end is None or cuda_span is None:
+            return values
+        local_gpu_gap = torch.tensor(
+            previous_cuda_end.elapsed_time(cuda_span[0]) / 1e3,
+            dtype=torch.float64,
+        )
+        gpu_gaps = [torch.empty_like(local_gpu_gap) for _ in range(world_size)]
+        if world_size == 1:
+            gpu_gaps[0].copy_(local_gpu_gap)
+        else:
+            torch.distributed.all_gather(  # ty: ignore[possibly-missing-attribute]
+                gpu_gaps,
+                local_gpu_gap,
+                group=timing.metrics_group,
+            )
+        values.update(
+            {
+                f"{_INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX}{rank}_s": float(gap.item())
+                for rank, gap in enumerate(gpu_gaps)
+            }
+        )
+        return values
 
     return outputs, metrics
 

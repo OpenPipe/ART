@@ -5,9 +5,23 @@ from art.megatron import train
 
 
 class _Schedule:
+    def __init__(self, spans: tuple[tuple[Any, Any], ...] = ()) -> None:
+        self._spans = iter(spans)
+        self._span = None
+        self.telemetry = SimpleNamespace(cuda_span=lambda: self._span)
+
     def run(self, forward_step_func: Any, *, forward_only: bool) -> list[str]:
         assert callable(forward_step_func) and forward_only is False
+        self._span = next(self._spans, None)
         return ["output"]
+
+
+class _CudaEvent:
+    def __init__(self, timestamp_ms: float) -> None:
+        self.timestamp_ms = timestamp_ms
+
+    def elapsed_time(self, end: "_CudaEvent") -> float:
+        return end.timestamp_ms - self.timestamp_ms
 
 
 def test_inter_forward_backward_timing_uses_rank_local_monotonic_boundaries(
@@ -17,7 +31,15 @@ def test_inter_forward_backward_timing_uses_rank_local_monotonic_boundaries(
     monkeypatch.setattr(train.time, "monotonic", lambda: next(timestamps))
     monkeypatch.setattr(train.torch.distributed, "get_world_size", lambda: 1)
     timing = train._InterForwardBackwardTiming()
-    schedule = cast(Any, _Schedule())
+    schedule = cast(
+        Any,
+        _Schedule(
+            (
+                (_CudaEvent(100.0), _CudaEvent(200.0)),
+                (_CudaEvent(260.0), _CudaEvent(400.0)),
+            )
+        ),
+    )
 
     first, collect_first_metrics = train._run_training_schedule(
         schedule,
@@ -32,7 +54,10 @@ def test_inter_forward_backward_timing_uses_rank_local_monotonic_boundaries(
 
     assert first == second == ["output"]
     assert collect_first_metrics() == {}
-    assert collect_second_metrics() == {"time/inter_forward_backward_gap_rank_0_s": 3.0}
+    assert collect_second_metrics() == {
+        "time/inter_forward_backward_gap_rank_0_s": 3.0,
+        "time/inter_forward_backward_gpu_gap_rank_0_s": 0.06,
+    }
     assert timing.previous_schedule_end_s == 17.0
 
 

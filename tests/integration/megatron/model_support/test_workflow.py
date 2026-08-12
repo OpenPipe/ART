@@ -290,10 +290,10 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             "time/step_collect_batch_s": 0.001068115234375,
             "queue/packed_get_wait_s": 0.1 if step >= 7 else 0.001,
             "queue/packed_queue_depth": 0.0 if step == 6 else 1.0,
-            "time/inter_forward_backward_gap_rank_0_s": (
+            "time/inter_forward_backward_gpu_gap_rank_0_s": (
                 1.0 if step >= 6 else 0.1 + (step - 2) * 0.01
             ),
-            "time/inter_forward_backward_gap_rank_1_s": (
+            "time/inter_forward_backward_gpu_gap_rank_1_s": (
                 2.0 if step >= 6 else 0.11 + (step - 2) * 0.01
             ),
             "offpolicy/token_weighted_policy_age_steps": 1.0,
