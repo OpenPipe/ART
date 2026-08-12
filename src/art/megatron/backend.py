@@ -386,7 +386,11 @@ class MegatronBackend(LocalBackend):
         model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
+        from .distributed_service import DistributedMegatronService
+
+        service = cast(DistributedMegatronService, await self._get_service(model))
         if get_external_vllm_runtime_config(model._internal_config or {}) is not None:
+            service.prefetch_trainer()
             return await super()._prepare_backend_for_training(model, config)
         config_dict = dict(config or {})
         server_args = dict(config_dict.get("server_args", {}))
@@ -395,12 +399,6 @@ class MegatronBackend(LocalBackend):
             port = server_args["port"]
             if isinstance(port, bool) or not isinstance(port, int):
                 raise TypeError("OpenAI server port must be an integer")
-            from .distributed_service import DistributedMegatronService
-
-            service = cast(
-                DistributedMegatronService,
-                await self._get_service(cast(TrainableModel, model)),
-            )
             if (
                 service._managed_service_name is not None
                 and service.openai_server_port != port
@@ -408,11 +406,9 @@ class MegatronBackend(LocalBackend):
                 raise RuntimeError("cannot change a running OpenAI server port")
             await self._configure_owned_api_port(cast(TrainableModel, model), port)
         if "port" not in server_args and not self._owns_runtime:
-            from .distributed_service import DistributedMegatronService
-
-            service = cast(DistributedMegatronService, await self._get_service(model))
             server_args["port"] = service.openai_server_port
         config_dict["server_args"] = server_args
+        service.prefetch_trainer()
         return await super()._prepare_backend_for_training(
             model, cast(dev.OpenAIServerConfig, config_dict)
         )

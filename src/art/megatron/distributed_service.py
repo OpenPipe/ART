@@ -205,6 +205,9 @@ class DistributedMegatronService:
         self._learner_generation: TrainerGeneration | None = None
         self._trainer_resident_generation: TrainerGeneration | None = None
         self._trainer: Any = None
+        self._trainer_preparation_task: asyncio.Task[None] | None = None
+        self._trainer_preparation_step: asyncio.Future[int] | None = None
+        self._trainer_preparation_s = 0.0
         # Nested acquisitions must follow train -> serving -> mutation.
         self._train_lock = asyncio.Lock()
         self._mutation_lock = asyncio.Lock()
@@ -558,6 +561,12 @@ class DistributedMegatronService:
             return self._trainer, None
         current, reconcile_step = await self._prepare_for_packing_locked()
         assert self._trainer is None
+        self._trainer = await self._launch_trainer(current)
+        self._trainer_resident_generation = None
+        reconcile = None if reconcile_step is None else (reconcile_step, current)
+        return self._trainer, reconcile
+
+    async def _launch_trainer(self, current: str) -> Any:
         runtime_spec = self._runtime_spec()
         run_spec = TrainingRunSpec(
             run_id=uuid.uuid4().hex,
@@ -568,16 +577,85 @@ class DistributedMegatronService:
             optimizer_state_path=self._optimizer_state_path,
             initial_event_timeout_s=self.runtime.topology.cluster.startup_timeout_s,
         )
-        self._trainer = await self.runtime.start_trainer(runtime_spec, run_spec)
-        self._trainer_resident_generation = None
-        reconcile = None if reconcile_step is None else (reconcile_step, current)
-        return self._trainer, reconcile
+        return await self.runtime.start_trainer(runtime_spec, run_spec)
+
+    def prefetch_trainer(self) -> None:
+        if (
+            self._trainer_is_current()
+            or self._trainer_preparation_task is not None
+            or self._model_service_spec().temporal_gpu_sharing
+        ):
+            return
+        self._require_open()
+        source_step = asyncio.get_running_loop().create_future()
+        source_step.add_done_callback(_consume_task_result)
+        task = asyncio.create_task(self._prepare_trainer(source_step))
+        task.add_done_callback(_consume_task_result)
+        self._trainer_preparation_step = source_step
+        self._trainer_preparation_task = task
+
+    async def _prepare_trainer(self, source_step: asyncio.Future[int]) -> None:
+        started = time.perf_counter()
+        trainer: Any = None
+        assigned = False
+        try:
+            async with self._mutation_lock:
+                self._raise_publication_failure()
+                current, reconcile_step = await self._prepare_for_packing_locked()
+                step = self._latest_step
+                source_step.set_result(step)
+            trainer = await self._launch_trainer(current)
+            async with self._mutation_lock:
+                if self._trainer is not None:
+                    raise RuntimeError("trainer appeared during background preparation")
+                self._trainer = trainer
+                trainer = None
+                assigned = True
+                self._trainer_resident_generation = None
+                if self._latest_step != step:
+                    raise RuntimeError("learner changed during trainer preparation")
+            if reconcile_step is not None and self._base_url is not None:
+                async with self._serving_lock:
+                    await self._reconcile_serving_locked(reconcile_step, current)
+        except BaseException as error:
+            if not source_step.done():
+                source_step.set_exception(error)
+            if trainer is not None:
+                try:
+                    _, interrupted = await complete_task(
+                        asyncio.create_task(self.runtime.stop_trainer(trainer))
+                    )
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "trainer preparation and cleanup failed",
+                        [error, cleanup_error],
+                    ) from None
+                if interrupted is not None:
+                    error.add_note("trainer preparation cleanup observed cancellation")
+            elif assigned:
+                await self._cleanup_failed_trainer_transaction(
+                    self._trainer, None, error
+                )
+            raise
+        finally:
+            self._trainer_preparation_s = time.perf_counter() - started
+
+    async def _await_trainer_preparation(self) -> None:
+        task = self._trainer_preparation_task
+        if task is None:
+            return
+        await asyncio.shield(task)
+        if self._trainer_preparation_task is task:
+            self._trainer_preparation_task = None
+            self._trainer_preparation_step = None
 
     async def prepare_for_packing(self) -> int:
+        self._require_open()
+        self._raise_publication_failure()
+        if (source_step := self._trainer_preparation_step) is not None:
+            return await asyncio.shield(source_step)
         async with self._train_lock:
             async with self._mutation_lock:
-                self._require_open()
-                self._raise_publication_failure()
                 _current, reconcile_step = await self._prepare_for_packing_locked()
                 step = self._latest_step
             if reconcile_step is not None:
@@ -975,6 +1053,9 @@ class DistributedMegatronService:
         lineage_error: str,
         wait_for_serving: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        trainer_prepare_started = time.perf_counter()
+        await self._await_trainer_preparation()
+        trainer_prepare_wait_s = time.perf_counter() - trainer_prepare_started
         lock_started = time.perf_counter()
         async with self._train_lock:
             lock_wait_s = time.perf_counter() - lock_started
@@ -1074,6 +1155,12 @@ class DistributedMegatronService:
             final_metrics.update(
                 {
                     "time/step_service_lock_wait_s": lock_wait_s,
+                    "time/step_service_trainer_prepare_s": (
+                        self._trainer_preparation_s
+                    ),
+                    "time/step_service_trainer_prepare_wait_s": (
+                        trainer_prepare_wait_s
+                    ),
                     "time/step_service_job_setup_s": setup_s,
                     "time/step_service_publication_prepare_wait_s": (
                         preparation_wait_s
@@ -1990,6 +2077,7 @@ class DistributedMegatronService:
         return str(payload.get("lora_slot", name)), path
 
     async def register_lora_for_step(self, step: int, checkpoint: str) -> None:
+        await self._await_trainer_preparation()
         async with self._train_lock:
             self._require_open()
             policy = await asyncio.to_thread(
@@ -2030,6 +2118,7 @@ class DistributedMegatronService:
         expected_step: int,
         learner_version: int,
     ) -> dict[str, float]:
+        await self._await_trainer_preparation()
         async with self._train_lock:
             metrics = self.drain_publication_metrics()
             async with self._mutation_lock:
@@ -2376,8 +2465,19 @@ class DistributedMegatronService:
         await asyncio.shield(self._close_task)
 
     async def _close(self) -> None:
+        failures: list[BaseException] = []
+        preparation = self._trainer_preparation_task
+        if preparation is not None:
+            try:
+                _, interrupted = await complete_task(preparation)
+            except BaseException as error:
+                failures.append(error)
+            else:
+                if interrupted is not None:
+                    failures.append(interrupted)
+            self._trainer_preparation_task = None
+            self._trainer_preparation_step = None
         async with self._train_lock:
-            failures: list[BaseException] = []
             publications = tuple(self._publication_tasks.values())
             durability_tasks = tuple(self._durability_tasks)
             recovery_tasks = tuple(self._recovery_tasks)
