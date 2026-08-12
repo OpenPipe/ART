@@ -402,6 +402,9 @@ class MegatronTrainingSlot:
                 if request.restore_optimizer and source.optimizer_state_path is not None
                 else None
             ),
+            optimizer_generation_id=(
+                source.optimizer_generation_id if request.restore_optimizer else None
+            ),
             restore_optimizer=request.restore_optimizer,
         )
         raw = await self.trainer.load_state(job)

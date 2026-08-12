@@ -888,6 +888,26 @@ def _committed_generation_lease(
         stack.close()
 
 
+@contextmanager
+def optimizer_generation_lease(
+    optimizer_state_path: str, generation: str
+) -> Iterator[OptimizerGenerationPointer]:
+    path = Path(optimizer_state_path)
+    with _generation_lease(path, generation, exclusive=False) as acquired:
+        if not acquired:
+            raise RuntimeError(f"Could not lease optimizer generation {generation}")
+        manifest = _read_manifest(
+            optimizer_generation_path(optimizer_state_path, generation)
+        )
+        if manifest.generation != generation:
+            raise RuntimeError("Optimizer generation manifest identity mismatch")
+        yield OptimizerGenerationPointer(
+            generation=manifest.generation,
+            step=manifest.step,
+            adapter=manifest.adapter,
+        )
+
+
 def commit_optimizer_generation(
     optimizer_state_path: str,
     manifest: OptimizerGenerationManifest,
@@ -1745,6 +1765,7 @@ def load_optimizer_state(
     optimizer_state_path: str,
     adapter_path: str,
     adapter_step: int,
+    optimizer_generation_id: str | None,
     allow_missing: bool,
     initialize: Callable[[Any], None],
 ) -> Path | None:
@@ -1755,26 +1776,35 @@ def load_optimizer_state(
             runtime_sha256, layouts = _validated_runtime_layouts(runtime, records)
             adapter = _loaded_adapter(adapter_path, adapter_step)
             path = Path(optimizer_state_path)
-            leased_pointer = leases.enter_context(_committed_generation_lease(path))
-            policy = _committed_policy(
-                path,
-                leased_pointer,
-                initial_adapter_path=get_step_checkpoint_dir(
-                    str(path.absolute().parent), 0
-                ),
+            leased_pointer = leases.enter_context(
+                optimizer_generation_lease(
+                    optimizer_state_path, optimizer_generation_id
+                )
+                if optimizer_generation_id is not None
+                else _committed_generation_lease(path)
             )
-            if policy.policy_adapter == adapter:
-                if policy.optimizer_anchor is None:
-                    return None
-                assert policy.state_adapter is not None
-                pinned_adapter = policy.state_adapter
-            else:
+            if optimizer_generation_id is not None:
                 pinned_adapter = adapter
-            lineage_switch = (
-                leased_pointer is None or leased_pointer.adapter != pinned_adapter
-            ) and _sibling_optimizer_owns_adapter(optimizer_state_path, adapter)
-            if lineage_switch:
-                return None
+            else:
+                policy = _committed_policy(
+                    path,
+                    leased_pointer,
+                    initial_adapter_path=get_step_checkpoint_dir(
+                        str(path.absolute().parent), 0
+                    ),
+                )
+                if policy.policy_adapter == adapter:
+                    if policy.optimizer_anchor is None:
+                        return None
+                    assert policy.state_adapter is not None
+                    pinned_adapter = policy.state_adapter
+                else:
+                    pinned_adapter = adapter
+                lineage_switch = (
+                    leased_pointer is None or leased_pointer.adapter != pinned_adapter
+                ) and _sibling_optimizer_owns_adapter(optimizer_state_path, adapter)
+                if lineage_switch:
+                    return None
             pointer = pin_optimizer_generation(
                 optimizer_state_path,
                 world_size=runtime.world_size,
@@ -1833,6 +1863,7 @@ def load_trainer_rank_optimizer_state(
     optimizer_state_path: str,
     adapter_path: str,
     adapter_step: int,
+    optimizer_generation_id: str,
     layout: Any,
 ) -> Any:
     """Collectively load one topology-strict dynamic LoRA optimizer shard."""
@@ -1844,10 +1875,9 @@ def load_trainer_rank_optimizer_state(
     runtime_sha256, layouts = _validated_runtime_layouts(
         runtime, _all_gather_objects(runtime, local)
     )
-    path = Path(optimizer_state_path)
-    with _committed_generation_lease(path) as pointer:
-        if pointer is None:
-            raise RuntimeError("Dynamic LoRA resume requires committed optimizer state")
+    with optimizer_generation_lease(
+        optimizer_state_path, optimizer_generation_id
+    ) as pointer:
         adapter = _loaded_adapter(adapter_path, adapter_step)
         pinned = pin_optimizer_generation(
             optimizer_state_path,

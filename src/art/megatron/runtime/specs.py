@@ -90,6 +90,15 @@ class RunSlotRegistration(_Spec):
     adapter_path: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
     initial_optimizer_state_path: str | None = Field(default=None, min_length=1)
+    initial_optimizer_generation_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_initial_optimizer(self) -> "RunSlotRegistration":
+        if (self.initial_optimizer_state_path is None) != (
+            self.initial_optimizer_generation_id is None
+        ):
+            raise ValueError("initial optimizer path and generation must be paired")
+        return self
 
 
 class CurrentTrainConfig(TrainConfig):
@@ -298,15 +307,21 @@ class LoadStateJobSpec(_Spec):
     adapter_path: str = Field(min_length=1)
     adapter_step: int = Field(ge=0)
     optimizer_state_path: str | None = Field(default=None, min_length=1)
+    optimizer_generation_id: str | None = Field(default=None, min_length=1)
     restore_optimizer: bool = False
 
     @model_validator(mode="after")
     def _validate_transition(self) -> "LoadStateJobSpec":
         if self.learner_version != self.expected_learner_version + 1:
             raise ValueError("load learner version must advance exactly one step")
-        if self.restore_optimizer != (self.optimizer_state_path is not None):
+        if self.restore_optimizer != (
+            self.optimizer_state_path is not None
+            and self.optimizer_generation_id is not None
+        ) or (self.optimizer_state_path is None) != (
+            self.optimizer_generation_id is None
+        ):
             raise ValueError(
-                "optimizer_state_path is required exactly for optimizer-exact load"
+                "optimizer path and generation are required exactly for exact load"
             )
         return self
 
@@ -319,6 +334,15 @@ class ResolvedCheckpointState(_Spec):
     adapter_path: str = Field(min_length=1)
     adapter_step: int = Field(ge=0)
     optimizer_state_path: str | None = Field(default=None, min_length=1)
+    optimizer_generation_id: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_optimizer(self) -> "ResolvedCheckpointState":
+        if (self.optimizer_state_path is None) != (
+            self.optimizer_generation_id is None
+        ):
+            raise ValueError("optimizer path and generation must be paired")
+        return self
 
 
 class OptimizerJobSpec(_Spec):

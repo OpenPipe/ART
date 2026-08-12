@@ -653,17 +653,17 @@ class MCoreRunSlotExecutor:
 
         config = load_adapter_config(job.adapter_path)
         self._validate_adapter_layout(state.adapter_config, config)
-        optimizer_state = (
-            load_trainer_rank_optimizer_state(
+        optimizer_state = None
+        if job.optimizer_state_path is not None:
+            assert job.optimizer_generation_id is not None
+            optimizer_state = load_trainer_rank_optimizer_state(
                 self.runtime,
                 optimizer_state_path=job.optimizer_state_path,
                 adapter_path=job.adapter_path,
                 adapter_step=job.adapter_step,
+                optimizer_generation_id=job.optimizer_generation_id,
                 layout=self._slot_trainer.checkpoint_slot_optimizer_layout(job.run_id),
             )
-            if job.optimizer_state_path is not None
-            else None
-        )
         adapter_model = load_lora_tensors_for_megatron(
             job.adapter_path, handler=self.runtime.model_support_handler
         )

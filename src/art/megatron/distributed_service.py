@@ -1212,6 +1212,9 @@ class DistributedMegatronService:
                     optimizer_state_path=(
                         source.optimizer_state_path if restore_optimizer else None
                     ),
+                    optimizer_generation_id=(
+                        source.optimizer_generation_id if restore_optimizer else None
+                    ),
                     restore_optimizer=restore_optimizer,
                 )
             result = await trainer.load_state(job)

@@ -1143,6 +1143,7 @@ def execute_megatron_load_state_job(
             optimizer_state_path=job.optimizer_state_path,
             adapter_path=job.adapter_path,
             adapter_step=job.adapter_step,
+            optimizer_generation_id=job.optimizer_generation_id,
             allow_missing=False,
         )
     else:
@@ -1399,6 +1400,7 @@ def _load_optimizer(
     adapter_path: str,
     adapter_step: int,
     allow_missing: bool,
+    optimizer_generation_id: str | None = None,
 ) -> None:
     assert runtime.optimizer is not None
     shard_path = load_optimizer_state(
@@ -1406,6 +1408,7 @@ def _load_optimizer(
         optimizer_state_path=optimizer_state_path,
         adapter_path=adapter_path,
         adapter_step=adapter_step,
+        optimizer_generation_id=optimizer_generation_id,
         allow_missing=allow_missing,
         initialize=_eager_initialize_optimizer_state,
     )

@@ -333,6 +333,7 @@ class LocalMegatronTrainingClient:
                         adapter_path=durable.adapter.identity,
                         adapter_step=durable.adapter.step,
                         optimizer_state_path=self._service.optimizer_state_path,
+                        optimizer_generation_id=durable.adapter.generation_id,
                     ),
                 )
                 return SaveStateResult(
@@ -392,6 +393,7 @@ class LocalMegatronTrainingClient:
                     adapter_path=generation.adapter_path,
                     adapter_step=generation.policy_step,
                     optimizer_state_path=self._service.optimizer_state_path,
+                    optimizer_generation_id=generation.generation_id,
                 ),
             )
             return LoadStateResult(
