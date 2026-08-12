@@ -417,8 +417,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         )
 
     e2e_phase, isolated_phase = (
-        phase("e2e", "input-a", (7, 8, 9)),
-        phase("isolated", "input-a", (11, 12, 13)),
+        phase("e2e", "input-a", (5, 6, 7)),
+        phase("isolated", "input-a", (9, 10, 11)),
     )
 
     def collect(isolated):
