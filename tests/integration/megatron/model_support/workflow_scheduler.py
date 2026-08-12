@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import os
 from pathlib import Path
 import socket
@@ -172,6 +173,28 @@ class _SharedBaseSession(BaseModel):
     topology: WorkflowRuntimeTopology
 
 
+def _initialize_workflow(
+    *,
+    base_model: str,
+    include_native_vllm_lora: bool,
+    include_yes_no_trainability: bool,
+    output_json: Path | None,
+    allow_unvalidated_arch: bool,
+) -> tuple[ValidationReport, Path]:
+    from . import workflow
+
+    report = workflow.initialize_validation_report(
+        base_model=base_model,
+        include_native_vllm_lora=include_native_vllm_lora,
+        include_yes_no_trainability=include_yes_no_trainability,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    return report, workflow._new_workflow_run_dir(
+        output_json=output_json,
+        model_key=report.model_key,
+    )
+
+
 def prepare_workflow(
     *,
     base_model: str,
@@ -181,18 +204,16 @@ def prepare_workflow(
     output_json: Path | None,
     skip_stages: set[str],
     allow_unvalidated_arch: bool,
+    initialized: tuple[ValidationReport, Path] | None = None,
 ) -> PreparedWorkflow:
     from . import workflow
 
-    report = workflow.initialize_validation_report(
+    report, run_dir = initialized or _initialize_workflow(
         base_model=base_model,
         include_native_vllm_lora=include_native_vllm_lora,
         include_yes_no_trainability=include_yes_no_trainability,
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    run_dir = workflow._new_workflow_run_dir(
         output_json=output_json,
-        model_key=report.model_key,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
     dependency = next(
         stage for stage in report.stages if stage.name == "dependency_resolution"
@@ -965,6 +986,17 @@ def compile_prepared_workflows(
     return compile_workflow(operations)
 
 
+def _workflow_hosts() -> list[str]:
+    hosts = [
+        host.strip()
+        for host in os.environ.get(_WORKFLOW_HOSTS_ENV, socket.gethostname()).split(",")
+        if host.strip()
+    ]
+    if not hosts or len(set(hosts)) != len(hosts):
+        raise RuntimeError(f"{_WORKFLOW_HOSTS_ENV} must contain unique host names")
+    return hosts
+
+
 def _visible_devices() -> list[WorkflowDevice]:
     import torch
 
@@ -975,19 +1007,18 @@ def _visible_devices() -> list[WorkflowDevice]:
         raise RuntimeError(
             f"CUDA_VISIBLE_DEVICES exposes {len(gpu_ids)} ids but torch sees {count} GPUs"
         )
-    hosts = [
-        host.strip()
-        for host in os.environ.get(_WORKFLOW_HOSTS_ENV, socket.gethostname()).split(",")
-        if host.strip()
-    ]
-    if not hosts or len(set(hosts)) != len(hosts):
-        raise RuntimeError(f"{_WORKFLOW_HOSTS_ENV} must contain unique host names")
     return [
-        WorkflowDevice(host=host, gpu=gpu_id) for host in hosts for gpu_id in gpu_ids
+        WorkflowDevice(host=host, gpu=gpu_id)
+        for host in _workflow_hosts()
+        for gpu_id in gpu_ids
     ]
 
 
-def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[ValidationReport]:
+def run_prepared_workflows(
+    workflows: list[PreparedWorkflow],
+    *,
+    forkservers: WorkflowForkserverPool | None = None,
+) -> list[ValidationReport]:
     import torch
 
     from . import workflow
@@ -1004,6 +1035,13 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
     by_model_key = {prepared.report.model_key: prepared for prepared in workflows}
     plan = compile_prepared_workflows(
         workflows, visible_gpu_count=next(iter(gpu_counts.values()))
+    )
+    owns_forkservers = forkservers is None
+    active_forkservers = forkservers or WorkflowForkserverPool(
+        hosts=sorted(gpu_counts),
+        repo_root=workflow.REPO_ROOT,
+        tests_dir=workflow.TESTS_DIR,
+        log_dir=workflows[0].run_dir / ".forkservers",
     )
 
     def runner(session: WorkflowSession, placement: WorkflowPlacement) -> list[str]:
@@ -1098,7 +1136,7 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             )
             for operation in session.operations
         )
-        fork_result = forkservers.run(
+        fork_result = active_forkservers.run(
             execution_host,
             request_json=request_json,
             log_path=session_log,
@@ -1135,7 +1173,7 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             ]
             result.metrics["workflow_session_worker_s"] = worker_wall_s
             result.metrics["workflow_session_operation_count"] = len(session.operations)
-            result.metrics.update(forkservers.metrics(execution_host))
+            result.metrics.update(active_forkservers.metrics(execution_host))
             if operation.stage == CORRECTNESS_REFERENCE_STAGE:
                 completed.append(operation.id)
                 continue
@@ -1175,12 +1213,10 @@ def run_prepared_workflows(workflows: list[PreparedWorkflow]) -> list[Validation
             completed.append(operation.id)
         return completed
 
-    with WorkflowForkserverPool(
-        hosts=sorted(gpu_counts),
-        repo_root=workflow.REPO_ROOT,
-        tests_dir=workflow.TESTS_DIR,
-        log_dir=workflows[0].run_dir / ".forkservers",
-    ) as forkservers:
+    context = (
+        active_forkservers if owns_forkservers else nullcontext(active_forkservers)
+    )
+    with context:
         execute_workflow(plan, devices=devices, runner=runner)
     for prepared in workflows:
         workflow._finalize_validation_report(prepared.report, partial=False)
@@ -1198,10 +1234,26 @@ def build_scheduled_validation_reports(
     skip_stages: set[str] | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> list[ValidationReport]:
+    from . import workflow
+
     skip_stages = skip_stages or set()
     output_json_by_model = output_json_by_model or {}
+    initialized = [
+        (
+            base_model,
+            _initialize_workflow(
+                base_model=base_model,
+                include_native_vllm_lora=include_native_vllm_lora,
+                include_yes_no_trainability=include_yes_no_trainability,
+                output_json=output_json_by_model.get(base_model),
+                allow_unvalidated_arch=allow_unvalidated_arch,
+            ),
+        )
+        for base_model in base_models
+    ]
 
-    def prepare(base_model: str) -> PreparedWorkflow:
+    def prepare(item: tuple[str, tuple[ValidationReport, Path]]) -> PreparedWorkflow:
+        base_model, workflow_identity = item
         return prepare_workflow(
             base_model=base_model,
             include_native_vllm_lora=include_native_vllm_lora,
@@ -1210,8 +1262,29 @@ def build_scheduled_validation_reports(
             output_json=output_json_by_model.get(base_model),
             skip_stages=skip_stages,
             allow_unvalidated_arch=allow_unvalidated_arch,
+            initialized=workflow_identity,
         )
 
-    with ThreadPoolExecutor(max_workers=len(base_models)) as executor:
-        workflows = list(executor.map(prepare, base_models))
-    return run_prepared_workflows(workflows)
+    with ThreadPoolExecutor(max_workers=1) as forkserver_executor:
+        forkserver_future = forkserver_executor.submit(
+            WorkflowForkserverPool,
+            hosts=sorted(_workflow_hosts()),
+            repo_root=workflow.REPO_ROOT,
+            tests_dir=workflow.TESTS_DIR,
+            log_dir=initialized[0][1][1] / ".forkservers",
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=len(initialized)) as executor:
+                workflows = list(executor.map(prepare, initialized))
+        except BaseException as error:
+            try:
+                forkserver_future.result().close()
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "workflow preparation and forkserver cleanup failed",
+                    [error, cleanup_error],
+                ) from None
+            raise
+        forkservers = forkserver_future.result()
+        with forkservers:
+            return run_prepared_workflows(workflows, forkservers=forkservers)
