@@ -409,7 +409,7 @@ _THROUGHPUT_CONFIGS = {
         completion_tokens=184,
         groups_per_step=2,
         initial_model_calls_per_inference_gpu=20,
-        max_num_seqs=15,
+        max_num_seqs=14,
         max_num_batched_tokens=24_576,
     ),
     "glm52": ThroughputWorkflowConfig(
