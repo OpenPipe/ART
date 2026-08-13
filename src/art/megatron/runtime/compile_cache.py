@@ -140,11 +140,29 @@ def _module_global_reference(value: Any) -> tuple[str, str]:
 def _support_precompile_serialization() -> None:
     import torch
     from torch._dynamo import package
+    from torch._dynamo.eval_frame import innermost_fn
     from torch._dynamo.guards import CheckFunctionManager, GuardsStatePickler, _Missing
+    from torch._dynamo.package import CompilePackage
     from torch._dynamo.source import DefaultsSource
 
     if not getattr(package.pickle, "_art_scoped_reducers", False):
         setattr(package, "pickle", _CompilePackagePickle())
+
+    original_source_id_from_fn = CompilePackage.source_id_from_fn
+    if not getattr(
+        original_source_id_from_fn, "_art_supports_regional_instances", False
+    ):
+
+        def source_id_from_fn(fn: Any) -> str:
+            source_id = original_source_id_from_fn(fn)
+            owner = getattr(innermost_fn(fn), "__self__", None)
+            namespace = getattr(owner, "_art_compile_cache_namespace", None)
+            if namespace is None:
+                return source_id
+            return hashlib.sha256(f"{source_id}\0{namespace}".encode()).hexdigest()
+
+        setattr(source_id_from_fn, "_art_supports_regional_instances", True)
+        setattr(CompilePackage, "source_id_from_fn", staticmethod(source_id_from_fn))
 
     original = GuardsStatePickler.reducer_override
     if getattr(original, "_art_supports_instance_method_aliases", False):
@@ -306,7 +324,7 @@ def _compile_cache_key(
         }
     )
     payload: dict[str, Any] = {
-        "schema": 6,
+        "schema": 7,
         "runtime": runtime,
         "compile_plan": plan.model_dump(mode="json"),
         "environment": {
@@ -392,7 +410,7 @@ class TrainerCompileCache:
         if self.key is not None and self.key != key:
             raise RuntimeError("trainer compile plan changed after cache load")
         self.key = key
-        self.path = self._cache_root / "megatron" / "compile_cache" / "v6" / self.key
+        self.path = self._cache_root / "megatron" / "compile_cache" / "v7" / self.key
         self.path.parent.mkdir(parents=True, exist_ok=True)
         return self.key, self.path
 

@@ -48,9 +48,11 @@ def _set_child_module(
     setattr(parent, name, child)
 
 
-def _compile_transformer_layers(module: torch.nn.Module) -> None:
+def _compile_transformer_layers(module: torch.nn.Module, path: str) -> None:
     for name, child in list(module.named_children()):
+        child_path = f"{path}.{name}"
         if isinstance(child, TransformerLayer):
+            setattr(child, "_art_compile_cache_namespace", child_path)
             physical_forward = getattr(child, "_art_gdn_island_physical_forward", None)
             if callable(physical_forward):
                 setattr(
@@ -62,7 +64,7 @@ def _compile_transformer_layers(module: torch.nn.Module) -> None:
             compiled_child = cast(torch.nn.Module, torch.compile(child))
             _set_child_module(parent=module, name=name, child=compiled_child)
             continue
-        _compile_transformer_layers(child)
+        _compile_transformer_layers(child, child_path)
 
 
 def resolve_training_compile_plan(
@@ -109,6 +111,6 @@ def configure_training_compile(
             resolved_flags=plan.workaround_flags,
         )
     if plan.transformer_layers_compiled:
-        for chunk in model:
-            _compile_transformer_layers(chunk)
+        for chunk_index, chunk in enumerate(model):
+            _compile_transformer_layers(chunk, f"chunk_{chunk_index}")
     return plan.transformer_layers_compiled
