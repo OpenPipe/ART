@@ -452,6 +452,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "e2e_core_train_tok_s": 8_000 / 12.0,
         "e2e_train_tok_s": 500.0,
         "accepted_train_tok_s": 250.0,
+        "unused_and_dummy_ratio": 0.25,
         "queue_ready_inter_forward_backward_gap_rank_zero_p50_s": 0.115,
         "queue_ready_inter_forward_backward_gap_rank_zero_p95_s": 0.1285,
         "queue_ready_inter_forward_backward_gap_rank_zero_max_s": 0.13,
@@ -489,7 +490,8 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         max_repeated_policy_activation_interval_s=1.5,
     )
     assert acceptance_failures(measurements, config, thresholds) == [
-        "repeated_policy_activation_cadence_s"
+        "unused_and_dummy_ratio",
+        "repeated_policy_activation_cadence_s",
     ]
     robust = {
         **measurements,
@@ -523,6 +525,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     ) == [
         "stable_min_vllm_pressure",
         "stable_trainer_underfeed",
+        "unused_and_dummy_ratio",
         "repeated_policy_activation_cadence_s",
     ]
     estimated = ThroughputThresholds(
@@ -537,6 +540,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         max_repeated_policy_activation_interval_s=1.5,
     )
     assert acceptance_failures(measurements, config, estimated) == [
+        "unused_and_dummy_ratio",
         "repeated_policy_activation_cadence_s",
         "calibration_basis",
     ]
@@ -1025,10 +1029,11 @@ def test_dsv4_throughput_uses_shorter_packed_sequence() -> None:
         dsv4.packed_sequence_length,
         dsv4.completion_tokens,
         dsv4.groups_per_step,
-    ) == (32_768, 184, 2)
+    ) == (32_768, 184, 8)
     stage = HANDLER_WORKFLOW_RESOURCES["dsv4"].e2e_throughput
     assert stage is not None
-    assert _groups_per_packed_sequence(stage, dsv4) == 1
+    assert _groups_per_packed_sequence(stage, dsv4) == 4
+    assert _THROUGHPUT_CONFIGS["llama3_dense"].groups_per_step == 23
     assert all(
         config.packed_sequence_length == THROUGHPUT_PACKED_SEQUENCE_LENGTH
         for key, config in _THROUGHPUT_CONFIGS.items()

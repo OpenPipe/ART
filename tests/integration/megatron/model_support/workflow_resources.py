@@ -68,6 +68,9 @@ class ThroughputWorkflowConfig(BaseModel):
     )
     min_vllm_pressure: float = Field(default=0.5, ge=0.0, allow_inf_nan=False)
     max_trainer_underfeed: float = Field(default=0.08, ge=0.0, allow_inf_nan=False)
+    max_unused_and_dummy_ratio: float = Field(
+        default=0.15, ge=0.0, le=1.0, allow_inf_nan=False
+    )
     max_queue_ready_wait_s: float = Field(
         default=0.01, ge=0.0, le=0.2, allow_inf_nan=False
     )
@@ -353,7 +356,7 @@ _THROUGHPUT_CONFIGS = {
         prompt_tokens=3922,
         completion_tokens=256,
         rollouts_per_group=6,
-        groups_per_step=24,
+        groups_per_step=23,
         initial_model_calls_per_inference_gpu=20,
     ),
     "qwen3_dense": ThroughputWorkflowConfig(
@@ -407,7 +410,7 @@ _THROUGHPUT_CONFIGS = {
         packed_sequence_length=32_768,
         prompt_tokens=7136,
         completion_tokens=184,
-        groups_per_step=2,
+        groups_per_step=8,
         initial_model_calls_per_inference_gpu=20,
         max_num_seqs=14,
         max_num_batched_tokens=24_576,

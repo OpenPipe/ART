@@ -47,7 +47,7 @@ _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
 _INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
-_MEASUREMENT_CONTRACT_VERSION = 16
+_MEASUREMENT_CONTRACT_VERSION = 17
 _ISOLATED_WARMUP_STEPS = 1
 _MATCHED_MEASURED_STEPS = 3
 _PIPELINE_SETTING_NAMES = (
@@ -104,7 +104,9 @@ _PERFORMANCE_ACCEPTANCE_FAILURES = frozenset(
         "queue_ready_inter_forward_backward_gap_p95_s",
     }
 )
-_HARD_ACCEPTANCE_FAILURES = frozenset({"calibration_fingerprint", "calibration_basis"})
+_HARD_ACCEPTANCE_FAILURES = frozenset(
+    {"calibration_fingerprint", "calibration_basis", "unused_and_dummy_ratio"}
+)
 
 
 class ThroughputFixture(NamedTuple):
@@ -1431,6 +1433,10 @@ def _collect_measurements(
         "packed_sequence_length": config.packed_sequence_length,
         "width_fingerprint": fixture.width_fingerprint,
         **counts,
+        "unused_and_dummy_ratio": (
+            counts["nominal_capacity_tokens"] - counts["nonpadding_logical_tokens"]
+        )
+        / counts["nominal_capacity_tokens"],
         "isolated_train_tok_s": isolated.train_tok_s,
         "isolated_sample_train_tok_s": isolated.sample_train_tok_s,
         "matched_e2e_core_train_tok_s": e2e.train_tok_s,
@@ -1512,6 +1518,8 @@ def acceptance_failures(
         >= config.min_vllm_pressure,
         "stable_trainer_underfeed": measurements["stable_trainer_underfeed"]
         <= config.max_trainer_underfeed,
+        "unused_and_dummy_ratio": measurements["unused_and_dummy_ratio"]
+        <= config.max_unused_and_dummy_ratio,
     }
     for window in measurements["autotuner_windows"]:
         prefix = f"window_{window['start_step']}_{window['end_step']}"
