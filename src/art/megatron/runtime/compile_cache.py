@@ -28,6 +28,35 @@ if TYPE_CHECKING:
 
 _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformers")
 _DEFERRED_PRECOMPILE_INSTALLS: list[tuple[Any, dict[Any, Any]]] = []
+_CodeIdentity = tuple[str, str, str, int, CodeType]
+
+
+def _code_identity(code: CodeType) -> _CodeIdentity:
+    return (
+        code.co_filename,
+        code.co_qualname,
+        code.co_name,
+        code.co_firstlineno,
+        code,
+    )
+
+
+def _canonicalize_code(
+    code: CodeType, canonical_codes: dict[_CodeIdentity, CodeType]
+) -> CodeType:
+    if canonical := canonical_codes.get(_code_identity(code)):
+        return canonical
+    constants = tuple(
+        _canonicalize_code(value, canonical_codes)
+        if isinstance(value, CodeType)
+        else value
+        for value in code.co_consts
+    )
+    return (
+        code
+        if all(left is right for left, right in zip(constants, code.co_consts))
+        else code.replace(co_consts=constants)
+    )
 
 
 def _load_module_global(module_name: str, attribute: str) -> Any:
@@ -286,6 +315,26 @@ def _support_shared_code_precompile() -> None:
                 self._art_precompile_deferred = True
                 _DEFERRED_PRECOMPILE_INSTALLS.append((self, backends))
                 return
+            # Resume frames embed reconstructed source code in co_consts; execution
+            # strategies are attached by identity to the canonical code objects.
+            canonical_codes = {}
+            for code, entry in self._codes.items():
+                if not entry.code_source:
+                    continue
+                canonical = package._lookup_code(entry)
+                if code != canonical:
+                    raise RuntimeError("compile package code does not match its source")
+                canonical_codes[_code_identity(code)] = canonical
+
+            normalized = {
+                _canonicalize_code(code, canonical_codes): entry
+                for code, entry in self._codes.items()
+            }
+            if len(normalized) != len(self._codes):
+                raise RuntimeError(
+                    "compile package has ambiguous canonical code entries"
+                )
+            self._codes = normalized
             token = installing.set(True)
             try:
                 original_install(self, backends)
