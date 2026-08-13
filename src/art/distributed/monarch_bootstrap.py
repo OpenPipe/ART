@@ -369,9 +369,17 @@ def activate_child_virtualenv() -> None:
 
 
 def activate_trainer_child_virtualenv() -> None:
+    from threading import RLock
+
+    from tqdm import tqdm
+
     threads = os.environ.get("MKL_NUM_THREADS", os.environ.get("OMP_NUM_THREADS", "1"))
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(name, threads)
+    # Inductor's compile progress creates tqdm's multiprocessing lock lazily. Each
+    # rank owns separate output, so a process-local lock avoids leaking that named
+    # semaphore when Monarch terminates the rank process.
+    tqdm.set_lock(RLock())
     activate_child_virtualenv()
 
 
