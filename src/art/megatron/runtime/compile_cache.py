@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 import copyreg
@@ -270,6 +271,64 @@ def _support_shared_code_precompile() -> None:
         output_graph.OutputGraph.install_global = install_global
 
 
+def _support_serialized_code_resolution() -> None:
+    from torch._dynamo import package
+
+    original = package._get_code_source
+    if getattr(original, "_art_resolves_serialized_code", False):
+        return
+
+    def get_code_source(code: CodeType) -> tuple[str, str]:
+        try:
+            return original(code)
+        except package.PackageError:
+            module = inspect.getmodule(code)
+            owner: Any = module
+            for part in code.co_qualname.split("."):
+                if owner is None or not hasattr(owner, part):
+                    break
+                owner = getattr(owner, part)
+                if isinstance(owner, FunctionType):
+                    break
+            if not isinstance(owner, FunctionType):
+                raise
+
+            seen: set[int] = set()
+
+            def candidates(value: Any) -> Iterator[CodeType]:
+                if id(value) in seen:
+                    return
+                seen.add(id(value))
+                if isinstance(value, CodeType):
+                    if value == code:
+                        yield value
+                    for constant in value.co_consts:
+                        if isinstance(constant, CodeType):
+                            yield from candidates(constant)
+                elif isinstance(value, FunctionType):
+                    yield from candidates(value.__code__)
+                    for cell in value.__closure__ or ():
+                        try:
+                            contents = cell.cell_contents
+                        except ValueError:
+                            continue
+                        if isinstance(contents, (CodeType, FunctionType)):
+                            yield from candidates(contents)
+
+            resolved = set()
+            for candidate in candidates(owner):
+                try:
+                    resolved.add(original(candidate))
+                except package.PackageError:
+                    pass
+            if len(resolved) != 1:
+                raise
+            return resolved.pop()
+
+    setattr(get_code_source, "_art_resolves_serialized_code", True)
+    setattr(package, "_get_code_source", get_code_source)
+
+
 def _support_non_strict_package_bypass() -> None:
     from torch._dynamo.convert_frame import DynamoOutput
 
@@ -446,6 +505,7 @@ class TrainerCompileCache:
             raise RuntimeError("Dynamo precompile was enabled before trainer imports")
         _support_precompile_serialization()
         _support_shared_code_precompile()
+        _support_serialized_code_resolution()
         _support_non_strict_package_bypass()
         _support_cross_package_resume_codes()
         os.environ["TORCH_CACHING_PRECOMPILE"] = "1"
