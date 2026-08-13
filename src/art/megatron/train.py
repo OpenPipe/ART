@@ -565,6 +565,7 @@ def execute_megatron_rl_job(
     replay_bundle: MoeRoutingReplayBundle | None = None,
 ) -> dict[str, float]:
     """Execute one current RL update from an in-memory packed batch."""
+    job_prepare_started = time.perf_counter()
     adapter_dtypes = None
     template = None
     zero_template = None
@@ -642,7 +643,9 @@ def execute_megatron_rl_job(
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
         cp_lookahead_state = CpBatchLookaheadState() if int(topology.cp) > 1 else None
+        job_prepare_s = time.perf_counter() - job_prepare_started
         for step_index in range(num_steps):
+            step_input_prepare_started = time.perf_counter()
             if cancelled is not None and cancelled.is_set():
                 from art.megatron.runtime.trainer_run import TrainingCancelledError
 
@@ -699,6 +702,7 @@ def execute_megatron_rl_job(
                 )
                 else None
             )
+            step_input_prepare_s = time.perf_counter() - step_input_prepare_started
             train_step_started = time.perf_counter()
             step_result = run_training_step(
                 model_chunks=runtime.model,
@@ -723,6 +727,7 @@ def execute_megatron_rl_job(
                 inter_forward_backward_timing=(runtime.inter_forward_backward_timing),
             )
             train_step_s = time.perf_counter() - train_step_started
+            result_finalize_started = time.perf_counter()
             print0(
                 runtime.rank,
                 "Correlation between old and new probabilities:",
@@ -747,8 +752,16 @@ def execute_megatron_rl_job(
                 }
             final_metrics.update(inter_schedule_metrics)
             final_metrics["time/replay_finalize_s"] = replay_finalize_s
+            final_metrics["time/step_input_prepare_s"] = step_input_prepare_s
+            final_metrics["time/step_result_finalize_s"] = (
+                time.perf_counter() - result_finalize_started
+            )
             if runtime.rank == 0:
+                progress_started = time.perf_counter()
                 progress_sink(step_index, num_steps, final_metrics)
+                final_metrics["time/step_progress_emit_s"] = (
+                    time.perf_counter() - progress_started
+                )
 
         if cancelled is not None and cancelled.is_set():
             from art.megatron.runtime.trainer_run import TrainingCancelledError
@@ -772,7 +785,12 @@ def execute_megatron_rl_job(
                 ),
             )
         )
+        final_metrics["time/job_prepare_s"] = job_prepare_s
+        adapter_ready_started = time.perf_counter()
         adapter_ready_sink()
+        final_metrics["time/step_adapter_ready_emit_s"] = (
+            time.perf_counter() - adapter_ready_started
+        )
         runtime.resident_training_session_id = job.training_session_id
         runtime.resident_policy_step = job.step
         runtime.resident_generation_id = job.output_generation_id
@@ -2610,6 +2628,7 @@ def run_training_step(
     before_optimizer_step: Callable[[], None] | None = None,
     inter_forward_backward_timing: _InterForwardBackwardTiming | None = None,
 ) -> TrainStepResult:
+    schedule_prepare_started = time.perf_counter()
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
         raise ValueError("run_training_step requires at least one packed sequence")
@@ -2755,11 +2774,15 @@ def run_training_step(
 
         return token_output.token_losses, reduce_loss
 
+    schedule_prepare_s = time.perf_counter() - schedule_prepare_started
     forward_data_store, collect_inter_schedule_metrics = _run_training_schedule(
         schedule, forward_step_func, inter_forward_backward_timing
     )
+    replay_finalize_started = time.perf_counter()
     if moe_routing_replay_controller is not None:
         moe_routing_replay_controller.finalize_step(expect_recompute=True)
+    replay_finalize_s = time.perf_counter() - replay_finalize_started
+    result_collect_started = time.perf_counter()
     pipeline_results = cast(
         list[dict[str, Any]],
         _broadcast_from_pipeline_last(forward_data_store),
@@ -2797,6 +2820,8 @@ def run_training_step(
         [prepared.loss_inputs for prepared in prepared_micros],
         device=device,
     )
+    result_collect_s = time.perf_counter() - result_collect_started
+    optimizer_started = time.perf_counter()
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
         learning_rate,
@@ -2804,13 +2829,36 @@ def run_training_step(
         model_chunks=model_chunks,
         before_step=before_optimizer_step,
     )
+    optimizer_s = time.perf_counter() - optimizer_started
+    loss_reduce_started = time.perf_counter()
     reduced_loss = _reduce_loss_sum(
         raw_loss_sum,
         token_count,
         group=ps.get_data_parallel_group(with_context_parallel=True),
     )
+    loss_reduce_s = time.perf_counter() - loss_reduce_started
+    loss_metrics_started = time.perf_counter()
+    loss_metrics = loss_diagnostics.to_metrics(
+        group=ps.get_data_parallel_group(with_context_parallel=True),
+    )
+    loss_metrics_s = time.perf_counter() - loss_metrics_started
+    inter_metrics_started = time.perf_counter()
+    inter_metrics = collect_inter_schedule_metrics()
+    inter_metrics_s = time.perf_counter() - inter_metrics_started
 
-    return TrainStepResult(
+    result_build_started = time.perf_counter()
+    pipeline_metrics = {
+        **schedule.telemetry.metrics(),
+        **inter_metrics,
+        "time/schedule_prepare_s": schedule_prepare_s,
+        "time/post_schedule_replay_finalize_s": replay_finalize_s,
+        "time/post_schedule_result_collect_s": result_collect_s,
+        "time/post_schedule_optimizer_s": optimizer_s,
+        "time/post_schedule_loss_reduce_s": loss_reduce_s,
+        "time/post_schedule_loss_metrics_s": loss_metrics_s,
+        "time/post_schedule_inter_metrics_s": inter_metrics_s,
+    }
+    result = TrainStepResult(
         reduced_loss=reduced_loss,
         probs_corr=float((probs_corr_total / micro_count).item()),
         kl_policy_ref=(sum(kl_values) / len(kl_values) if kl_values else None),
@@ -2821,11 +2869,10 @@ def run_training_step(
         grad_norm=grad_norm,
         num_zeros_in_grad=num_zeros_in_grad,
         workload=schedule.training_workload(),
-        loss_metrics=loss_diagnostics.to_metrics(
-            group=ps.get_data_parallel_group(with_context_parallel=True),
-        ),
-        pipeline_metrics={
-            **schedule.telemetry.metrics(),
-            **collect_inter_schedule_metrics(),
-        },
+        loss_metrics=loss_metrics,
+        pipeline_metrics=pipeline_metrics,
     )
+    result.pipeline_metrics["time/post_schedule_result_build_s"] = (
+        time.perf_counter() - result_build_started
+    )
+    return result
