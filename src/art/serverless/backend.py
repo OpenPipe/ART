@@ -16,6 +16,7 @@ from art._source_revision import art_source_revision
 from art.adapter_leases import pin_inference_target, pinned_inference_name
 from art.backend import AnyModel, AnyTrainableModel
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
+from art.serving_capabilities import discover_serving_capabilities
 from art.training.contracts import (
     COMMAND_CONTRACT_VERSION,
     PACKING_CONTRACT_VERSION,
@@ -23,6 +24,7 @@ from art.training.contracts import (
     ForwardBackwardRequest,
     LossConfig,
     OptimStepRequest,
+    PackingOutcome,
     RlTrajectoryBatch,
     SamplerPublication,
     SamplerWeightsResult,
@@ -64,11 +66,12 @@ class ServerlessBackend:
         *,
         training_base_url: str,
         inference_base_url: str,
+        sampler_publisher: SamplerPublisher,
         api_key: str | None = None,
         inference_api_key: str | None = None,
         checkpoint: str | None = None,
         restore_optimizer: bool = False,
-        sampler_publisher: SamplerPublisher | None = None,
+        enable_expert_replay: bool = True,
         close_timeout_s: float = 20.0,
     ) -> None:
         api_key = api_key or os.environ.get("WANDB_API_KEY")
@@ -89,11 +92,13 @@ class ServerlessBackend:
         self._checkpoint = checkpoint
         self._restore_optimizer = restore_optimizer
         self._sampler_publisher = sampler_publisher
+        self._enable_expert_replay = enable_expert_replay
         self._close_timeout_s = close_timeout_s
         self._clients: dict[tuple[str | None, str, str, str], RemoteTrainingClient] = {}
         self._register_lock = asyncio.Lock()
         self._background: set[asyncio.Task[Any]] = set()
         self._background_failures: list[BaseException] = []
+        self._published_initial_models: set[tuple[str | None, str, str, str]] = set()
         self._closed = False
 
     async def register(self, model: "Model") -> None:
@@ -227,10 +232,66 @@ class ServerlessBackend:
         model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None,
     ) -> tuple[str, str]:
-        del model
         if config is not None:
             raise ValueError("remote inference does not accept a local server config")
+        root_url = _inference_root_url(self._inference_base_url)
+        capabilities = await discover_serving_capabilities(
+            base_url=root_url,
+            headers={"Authorization": f"Bearer {self._inference_api_key}"},
+            allow_openai_compatible=False,
+        )
+        capabilities.require(
+            "in_flight_lora_updates", operation="remote pipeline weight publication"
+        )
+        capabilities.require(
+            "policy_token_spans", operation="remote pipeline policy provenance"
+        )
+        object.__setattr__(model, "_serving_capabilities", capabilities)
+        object.__setattr__(model, "_inference_connection_errors_are_fatal", True)
+        if self._model_uses_expert_replay(model):
+            capabilities.require(
+                "binary_routed_experts", operation="remote MoE routing replay"
+            )
+            object.__setattr__(
+                model, "_art_binary_routes_base_url", f"{root_url}/art/v1"
+            )
+        model.inference_base_url = self._inference_base_url
+        model.inference_api_key = self._inference_api_key
+        model.inference_model_name = self._model_inference_name(model)
+        await self._publish_initial_sampler(model)
         return self._inference_base_url, self._inference_api_key
+
+    async def _publish_initial_sampler(self, model: AnyTrainableModel) -> None:
+        key = self._model_key(model)
+        if key in self._published_initial_models:
+            return
+        client = await self.training_client(model)
+        step = client.projected_learner_version
+        operation = await client.save_weights_for_sampler(
+            SaveWeightsForSamplerRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=client.next_sequence_id,
+                checkpoint_name=f"step-{step}",
+                publication=SamplerPublication(
+                    mode="in_flight_lora", model_alias=model.name
+                ),
+            )
+        )
+        await self._sampler_publisher(model, await operation.result())
+        self._published_initial_models.add(key)
+
+    def _model_uses_expert_replay(self, model: AnyTrainableModel) -> bool:
+        if not self._enable_expert_replay:
+            return False
+        from art.megatron.model_support import model_uses_expert_parallel
+
+        return model_uses_expert_parallel(
+            model.base_model,
+            allow_unvalidated_arch=bool(
+                (model._internal_config or {}).get("allow_unvalidated_arch")
+            ),
+        )
 
     async def _get_step(self, model: AnyTrainableModel) -> int:
         client = await self.training_client(model)
@@ -342,8 +403,6 @@ class ServerlessBackend:
     ) -> ServerlessTrainResult:
         del optimizer_save_interval, verbose
         self._raise_background_failures()
-        if self._sampler_publisher is None:
-            raise RuntimeError("remote RL training requires a sampler_publisher")
         if loss_fn not in {"cispo", "ppo"}:
             raise ValueError("ServerlessBackend supports only cispo and ppo")
         if loss_fn_config is not None or adam_params is not None:
@@ -459,6 +518,7 @@ class ServerlessBackend:
                     **optimizer_result.metrics,
                     **sampler_result.publication_metrics,
                     **(publication_metrics or {}),
+                    **_packing_outcome_metrics(forward_result.packing),
                 }
             ],
             trajectory_groups=groups,
@@ -480,8 +540,6 @@ class ServerlessBackend:
     ) -> AsyncIterator[dict[str, float]]:
         del dev_config, verbose
         self._raise_background_failures()
-        if self._sampler_publisher is None:
-            raise RuntimeError("remote SFT training requires a sampler_publisher")
         from art.utils.sft import resolve_sft_batch_size
 
         values = list(trajectories)
@@ -533,6 +591,7 @@ class ServerlessBackend:
             pending = {
                 **forward_result.metrics,
                 **optimizer_result.metrics,
+                **_packing_outcome_metrics(forward_result.packing),
                 "data/step_num_trajectories": float(len(values)),
                 "data/step_trainable_assistant_tokens": float(
                     forward_result.packing.trainable_assistant_tokens
@@ -639,3 +698,17 @@ def _attach_packing_shapes(
         raise RuntimeError("remote packing shapes do not match trajectory groups")
     for group, shape in zip(groups, shapes, strict=True):
         group._packed_group_shape = shape
+
+
+def _packing_outcome_metrics(packing: PackingOutcome) -> dict[str, float]:
+    return {
+        "pipeline/packed_sequence_length": float(packing.packed_sequence_length),
+        "pipeline/target_packed_sequences": float(packing.target_packed_sequences),
+        "data/step_packed_sequences": float(packing.packed_sequences),
+        "data/step_physical_tokens": float(packing.physical_tokens),
+    }
+
+
+def _inference_root_url(base_url: str) -> str:
+    value = base_url.rstrip("/")
+    return value[:-3] if value.endswith("/v1") else value

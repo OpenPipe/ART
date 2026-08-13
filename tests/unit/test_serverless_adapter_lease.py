@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 import art
 from art.serverless.backend import ServerlessBackend
 
@@ -7,6 +9,7 @@ async def test_serverless_adapter_lease_pins_inference_step() -> None:
         api_key="test-api-key",
         training_base_url="http://training.test/v1",
         inference_base_url="http://inference.test/v1",
+        sampler_publisher=AsyncMock(),
     )
     model = art.TrainableModel(
         run_name="test-model",
@@ -34,6 +37,7 @@ async def test_serverless_adapter_lease_is_model_scoped() -> None:
         api_key="test-api-key",
         training_base_url="http://training.test/v1",
         inference_base_url="http://inference.test/v1",
+        sampler_publisher=AsyncMock(),
     )
     model_a = art.TrainableModel(
         run_name="model-a",
