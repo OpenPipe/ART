@@ -563,30 +563,29 @@ def _collect_matched_packing_shapes(groups: Any) -> None:
         group._collect_packing_shape = True
 
 
-def _reduced_config(
+def _sized_config(
     source: dict[str, Any], *, model_key: str, num_layers: int
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    reduced = json.loads(json.dumps(source))
-    text = _text(reduced)
+    sized = json.loads(json.dumps(source))
+    text = _text(sized)
     source_text = _text(source)
     source_layers = int(source_text["num_hidden_layers"])
-    if num_layers > source_layers:
+    layer_fields = tuple(field for field in _LAYER_LIST_FIELDS if field in source_text)
+    if num_layers > source_layers and layer_fields:
         raise ValueError(
-            f"requested {num_layers} layers from {source_layers}-layer model"
+            f"cannot expand {model_key} with per-layer fields {layer_fields}"
         )
     text["num_hidden_layers"] = num_layers
-    for field in _LAYER_LIST_FIELDS:
-        if field not in source_text:
-            continue
+    for field in layer_fields:
         values = source_text[field]
         if len(values) < num_layers:
             raise ValueError(f"{model_key} {field} has only {len(values)} entries")
         text[field] = values[:num_layers]
     source_width = _width_fingerprint(source)
-    if not source_width or source_width != _width_fingerprint(reduced):
+    if not source_width or source_width != _width_fingerprint(sized):
         raise ValueError("throughput fixture changed or lost production-width fields")
     prefix = "text_config." if "text_config" in source else ""
-    return reduced, {
+    return sized, {
         "source_num_layers": source_layers,
         "changed_paths": [
             f"{prefix}{field}"
@@ -642,31 +641,29 @@ def ensure_throughput_fixture(
             f"correctness fixture lacks pinned production config: {source_config_path}"
         )
     source = json.loads(source_config_path.read_text())
-    reduced, reduction = _reduced_config(
-        source, model_key=model_key, num_layers=num_layers
-    )
+    sized, sizing = _sized_config(source, model_key=model_key, num_layers=num_layers)
     vocabulary_contract: dict[str, object] = {
-        "config_vocab_size": int(_text(reduced)["vocab_size"])
+        "config_vocab_size": int(_text(sized)["vocab_size"])
     }
     _validate_tokenizer_compatible_fixture(correctness_fixture, vocabulary_contract)
     manifest = {
-        "version": 1,
+        "version": 2,
         "canonical_model": canonical_model,
         "model_key": model_key,
         "num_layers": num_layers,
         "source_config_sha256": _digest(source),
-        "reduced_config_sha256": _digest(reduced),
+        "sized_config_sha256": _digest(sized),
         "initialization": initialization_version,
         "random_seed": random_seed,
         "vocabulary_contract": vocabulary_contract,
-        **reduction,
+        **sizing,
     }
     output.mkdir()
     _copy_metadata(correctness_fixture, output)
-    (output / "config.json").write_text(json.dumps(reduced, indent=2) + "\n")
+    (output / "config.json").write_text(json.dumps(sized, indent=2) + "\n")
     from safetensors.torch import save_file
 
-    tensors = _config_only_tensors(reduced, model_key=model_key)
+    tensors = _config_only_tensors(sized, model_key=model_key)
     checkpoint = output / "model.safetensors"
     save_file(tensors, checkpoint)
     if model_key == "gemma4_moe":
@@ -684,7 +681,7 @@ def ensure_throughput_fixture(
         model_key=model_key,
         path=str(output),
         num_layers=num_layers,
-        width_fingerprint=reduction["width_fingerprint"],
+        width_fingerprint=sizing["width_fingerprint"],
         manifest=manifest,
     )
 
@@ -846,11 +843,10 @@ def _calibration_contract(
     manifest = fixture.manifest
     _require(
         all(
-            manifest.get(key)
-            for key in ("source_config_sha256", "reduced_config_sha256")
+            manifest.get(key) for key in ("source_config_sha256", "sized_config_sha256")
         )
         and manifest.get("width_fingerprint") == fixture.width_fingerprint,
-        "throughput fixture lacks source/reduced hashes or production width",
+        "throughput fixture lacks source/sized hashes or production width",
     )
     workload = config.model_dump(
         mode="json",
@@ -882,7 +878,7 @@ def _calibration_contract(
         "engine_args": {
             **stage.vllm.engine_args(),
             "seed": config.random_seed,
-            "model": f"fixture-sha256:{manifest['reduced_config_sha256']}",
+            "model": f"fixture-sha256:{manifest['sized_config_sha256']}",
         },
         "autotuner_config": autotune.model_dump(mode="json"),
         "workload_config": {**workload, "actual_prompt_tokens": actual_prompt_tokens},

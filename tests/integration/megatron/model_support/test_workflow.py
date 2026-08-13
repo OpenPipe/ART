@@ -69,9 +69,9 @@ from .workflow_throughput import (
     _groups_per_packed_sequence,
     _packed_input_fingerprint,
     _phase_evidence,
-    _reduced_config,
     _run_throughput_attempts,
     _same_setting_decision_suffix,
+    _sized_config,
     _throughput_config_for_hardware,
     acceptance_failures,
 )
@@ -802,10 +802,23 @@ def test_dsv4_throughput_reduction_preserves_hash_moe_prefix() -> None:
         "mlp_layer_types": ["hash_moe"] * 3 + ["moe"] * 7,
     }
 
-    reduced, _ = _reduced_config(source, model_key="dsv4", num_layers=8)
+    reduced, _ = _sized_config(source, model_key="dsv4", num_layers=8)
 
     assert "num_hash_layers" not in reduced
     assert reduced["mlp_layer_types"] == ["hash_moe"] * 3 + ["moe"] * 5
+
+
+def test_throughput_depth_expansion_requires_homogeneous_layers() -> None:
+    homogeneous = {"num_hidden_layers": 16, "hidden_size": 2048}
+    expanded, sizing = _sized_config(
+        homogeneous, model_key="llama3_dense", num_layers=24
+    )
+    assert expanded["num_hidden_layers"] == 24
+    assert sizing["source_num_layers"] == 16
+
+    patterned = {**homogeneous, "layer_types": ["attention"] * 16}
+    with pytest.raises(ValueError, match="per-layer fields"):
+        _sized_config(patterned, model_key="patterned", num_layers=24)
 
 
 def test_matched_batch_always_collects_packing_shapes() -> None:
