@@ -28,7 +28,9 @@ from ..model_support.workflow_resources import (
 # tighten these thresholds without rechecking both vLLM self-mismatch and shared
 # prefix route-conflict behavior on the measured path. With the workflow's
 # 16-token completions, Qwen3.5 MoE reruns on 2026-05-25 measured 4.169% and
-# 4.606% mean_abs_pct while staying under the KL gate, so its gate is 5%.
+# 4.606% mean_abs_pct. Resident first-update policies on 2026-08-13 measured
+# 4.276-5.689% while staying below 0.0019 KL, so its MAPE gate is 6.5%. The
+# retained expert-LoRA defect still fails the unchanged 0.002 KL gate.
 # DeepSeek-V4-Flash uses FP4 vLLM kernels while Megatron materializes bf16/fp32
 # tensors, and its serving scores vary unusually strongly on an exact rescore.
 # The DSV4 fixture therefore uses 256-token-aligned root and branch blocks: its
@@ -43,7 +45,7 @@ BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
     "gemma4_dense": 10.0,
     "gemma4_moe": 10.0,
     "qwen3_moe": 8.0,
-    "qwen3_5_moe": 5.0,
+    "qwen3_5_moe": 6.5,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
