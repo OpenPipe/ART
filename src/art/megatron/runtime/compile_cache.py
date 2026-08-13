@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from ..training.compile import TrainingCompilePlan
 
 _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformers")
+_DEFERRED_PRECOMPILE_INSTALLS: list[tuple[Any, dict[Any, Any]]] = []
 
 
 def _load_module_global(module_name: str, attribute: str) -> Any:
@@ -36,6 +37,15 @@ def _load_module_global(module_name: str, attribute: str) -> Any:
 def _load_autograd_backward(module_name: str, attribute: str) -> Any:
     backward = _load_module_global(module_name, attribute)._backward_cls
     return backward.__new__(backward)
+
+
+def _load_import_source(module_name: str) -> Any:
+    from torch._dynamo.source import ImportSource
+
+    # __init__ registers a trace-time guard; hydration restores already-saved guards.
+    source = ImportSource.__new__(ImportSource)
+    object.__setattr__(source, "module_name", module_name)
+    return source
 
 
 def _load_python_code(value: Any) -> Any:
@@ -151,7 +161,7 @@ def _support_precompile_serialization() -> None:
     from torch._dynamo.eval_frame import innermost_fn
     from torch._dynamo.guards import CheckFunctionManager, GuardsStatePickler, _Missing
     from torch._dynamo.package import CompilePackage
-    from torch._dynamo.source import DefaultsSource
+    from torch._dynamo.source import DefaultsSource, ImportSource
 
     if not getattr(package.pickle, "_art_scoped_reducers", False):
         setattr(package, "pickle", _CompilePackagePickle())
@@ -211,6 +221,8 @@ def _support_precompile_serialization() -> None:
             return _Missing, ("unguarded HybridEP runtime state",)
         if isinstance(obj, ContextVar):
             return _load_module_global, _module_global_reference(obj)
+        if isinstance(obj, ImportSource):
+            return _load_import_source, (obj.module_name,)
         if isinstance(obj, DefaultsSource):
             return type(obj), (obj.base, obj.idx_key, obj.is_kw)
         if isinstance(obj, torch.autograd.graph.Node):
@@ -247,7 +259,7 @@ def _support_precompile_serialization() -> None:
 
 
 def _support_shared_code_precompile() -> None:
-    from torch._dynamo import output_graph
+    from torch._dynamo import output_graph, package
     from torch._dynamo.package import CompilePackage
 
     original_install = CompilePackage.install
@@ -263,6 +275,17 @@ def _support_shared_code_precompile() -> None:
         def install(self: Any, backends: dict[Any, Any]) -> None:
             if getattr(self, "_art_precompile_installed", False):
                 raise RuntimeError("compile package was installed more than once")
+            try:
+                for entry in self._codes.values():
+                    for guarded_code in entry.guarded_codes:
+                        package.load_guards_state(guarded_code.guards_state)
+            except (AttributeError, ImportError):
+                # A decorated method can load before its enclosing class is published.
+                if getattr(self, "_art_precompile_deferred", False):
+                    raise
+                self._art_precompile_deferred = True
+                _DEFERRED_PRECOMPILE_INSTALLS.append((self, backends))
+                return
             token = installing.set(True)
             try:
                 original_install(self, backends)
@@ -287,6 +310,13 @@ def _support_shared_code_precompile() -> None:
 
         setattr(install_global, "_art_avoids_hydrated_globals", True)
         output_graph.OutputGraph.install_global = install_global
+
+
+def finalize_precompile_imports() -> None:
+    pending = tuple(_DEFERRED_PRECOMPILE_INSTALLS)
+    _DEFERRED_PRECOMPILE_INSTALLS.clear()
+    for package, backends in pending:
+        package.install(backends)
 
 
 def _support_serialized_code_resolution() -> None:
@@ -455,7 +485,7 @@ def _compile_cache_key(
         }
     )
     payload: dict[str, Any] = {
-        "schema": 7,
+        "schema": 8,
         "runtime": runtime,
         "compile_plan": plan.model_dump(mode="json"),
         "environment": {
@@ -543,7 +573,7 @@ class TrainerCompileCache:
         if self.key is not None and self.key != key:
             raise RuntimeError("trainer compile plan changed after cache load")
         self.key = key
-        self.path = self._cache_root / "megatron" / "compile_cache" / "v7" / self.key
+        self.path = self._cache_root / "megatron" / "compile_cache" / "v8" / self.key
         self.path.parent.mkdir(parents=True, exist_ok=True)
         return self.key, self.path
 
@@ -557,6 +587,7 @@ class TrainerCompileCache:
             raise RuntimeError(f"compile cache {self.key} has no Dynamo artifact")
 
     def load(self, plan: TrainingCompilePlan) -> CompileCacheEvent:
+        finalize_precompile_imports()
         started = time.perf_counter()
         key, path = self._configure(plan)
         if not path.is_file():

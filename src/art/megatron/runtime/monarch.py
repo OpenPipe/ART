@@ -130,6 +130,9 @@ def _configure_hybrid_ep_env(
 def _training_runtime_builder() -> Any:
     from art.megatron.train import build_training_runtime
 
+    from .compile_cache import finalize_precompile_imports
+
+    finalize_precompile_imports()
     return build_training_runtime
 
 
