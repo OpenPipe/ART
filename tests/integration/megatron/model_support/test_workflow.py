@@ -65,6 +65,7 @@ from .workflow_throughput import (
     _current_pipeline_settings,
     _environment_provenance,
     _freeze_pipeline_settings_from_step,
+    _groups_per_packed_sequence,
     _packed_input_fingerprint,
     _phase_evidence,
     _reduced_config,
@@ -945,6 +946,9 @@ def test_h200_throughput_depth_only_reduces_memory_bound_handlers() -> None:
 def test_dsv4_throughput_uses_shorter_packed_sequence() -> None:
     dsv4 = _THROUGHPUT_CONFIGS["dsv4"]
     assert (dsv4.packed_sequence_length, dsv4.groups_per_step) == (32_768, 2)
+    stage = HANDLER_WORKFLOW_RESOURCES["dsv4"].e2e_throughput
+    assert stage is not None
+    assert _groups_per_packed_sequence(stage, dsv4) == 1
     assert all(
         config.packed_sequence_length == THROUGHPUT_PACKED_SEQUENCE_LENGTH
         for key, config in _THROUGHPUT_CONFIGS.items()
