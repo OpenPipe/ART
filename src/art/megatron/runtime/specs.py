@@ -12,7 +12,7 @@ from art.distributed.data_plane import PackedBatchRef
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
 from art.megatron.optimizer_state import OptimizerAdapter
 from art.training.contracts import AdamConfig
-from art.types import TrainConfig, TrainSFTConfig
+from art.types import TrainConfig
 
 from .weight_transfer import MergedWeightTransferSpec
 
@@ -109,10 +109,6 @@ class RlForwardBackwardConfig(_Spec):
     kl_penalty_coef: float = Field(default=0.0, ge=0)
     kl_penalty_source: Literal["current_learner", "sample"] = "current_learner"
     grad_accumulation_sequences: int | None = Field(default=None, ge=1)
-
-
-class CurrentSFTConfig(TrainSFTConfig):
-    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class ExperimentalTrainConfig(_Spec):
@@ -303,9 +299,28 @@ class SftForwardBackwardJobSpec(_Spec):
     sequence_id: int = Field(ge=0)
     training_session_id: str = Field(min_length=1)
     expected_learner_version: int = Field(ge=0)
+    source: TrainerGeneration
+    optimizer_state_path: str = Field(min_length=1)
     batch_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     trainable_token_count: int = Field(ge=1)
     global_grad_accumulation_sequences: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> "SftForwardBackwardJobSpec":
+        if (
+            self.source.training_session_id != self.training_session_id
+            or self.source.policy_step != self.expected_learner_version
+        ):
+            raise ValueError("source generation does not identify the SFT parent")
+        return self
+
+    @property
+    def source_policy_step(self) -> int:
+        return self.expected_learner_version
+
+    @property
+    def source_adapter_path(self) -> str:
+        return self.source.adapter_path
 
     @property
     def fingerprint(self) -> str:
@@ -452,25 +467,7 @@ class GenerationSnapshotJobSpec(_Spec):
         return _fingerprint(self)
 
 
-class SFTJobSpec(_TrainerJobSpec):
-    kind: Literal["sft"] = "sft"
-    batch_id: str = Field(min_length=1)
-    num_batches: int = Field(ge=1)
-    config: CurrentSFTConfig
-    weight_decay: float = Field(default=0.0, ge=0)
-    max_grad_norm: float = Field(default=1.0, gt=0)
-
-    @model_validator(mode="after")
-    def _validate_batch_size(self) -> "SFTJobSpec":
-        if not isinstance(self.config.batch_size, int):
-            raise ValueError("typed SFT jobs require a resolved integer batch size")
-        return self
-
-
-TrainerJobSpec: TypeAlias = Annotated[
-    TrainJobSpec | SFTJobSpec,
-    Field(discriminator="kind"),
-]
+TrainerJobSpec: TypeAlias = TrainJobSpec
 TRAIN_JOB_ADAPTER = TypeAdapter(TrainerJobSpec)
 
 

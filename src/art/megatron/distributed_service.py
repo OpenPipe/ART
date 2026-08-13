@@ -69,7 +69,6 @@ from .runtime.publication import (
 )
 from .runtime.specs import (
     AdapterReady,
-    CurrentSFTConfig,
     CurrentTrainConfig,
     DurableTrainOutput,
     ExperimentalTrainConfig,
@@ -80,7 +79,8 @@ from .runtime.specs import (
     OptimizerJobSpec,
     ResolvedCheckpointState,
     RlForwardBackwardConfig,
-    SFTJobSpec,
+    SftForwardBackwardJobSpec,
+    SftForwardJobSpec,
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
@@ -1127,6 +1127,100 @@ class DistributedMegatronService:
                 self._trainer_resident_generation = source
             return result
 
+    async def sft_forward_backward_command(
+        self,
+        ref: OperationRef,
+        batch: SFTBatchData,
+        global_grad_accumulation_sequences: int,
+    ) -> dict[str, Any]:
+        return await self._sft_forward_command(
+            ref,
+            batch,
+            global_grad_accumulation_sequences,
+            backward=True,
+        )
+
+    async def sft_forward_command(
+        self,
+        ref: OperationRef,
+        batch: SFTBatchData,
+        global_grad_accumulation_sequences: int,
+    ) -> dict[str, Any]:
+        return await self._sft_forward_command(
+            ref,
+            batch,
+            global_grad_accumulation_sequences,
+            backward=False,
+        )
+
+    async def _sft_forward_command(
+        self,
+        ref: OperationRef,
+        batch: SFTBatchData,
+        global_grad_accumulation_sequences: int,
+        *,
+        backward: bool,
+    ) -> dict[str, Any]:
+        async with self._train_lock, self._trainer_failure_boundary():
+            if self._temporal_gpu_sharing and self._base_url is not None:
+                async with self._serving_lock:
+                    await self._sleep_for_training_locked()
+            async with self._mutation_lock:
+                self._require_open()
+                self._raise_publication_failure()
+                trainer, reconcile = await self._ensure_trainer_locked(
+                    run_id=ref.run_id
+                )
+                source = self._learner_generation
+                if source is None or ref.learner_parent_version != self._latest_step:
+                    raise RuntimeError("SFT command learner parent changed")
+                job_type = SftForwardBackwardJobSpec if backward else SftForwardJobSpec
+                job = job_type(
+                    operation_id=ref.operation_id,
+                    run_id=ref.run_id,
+                    sequence_id=ref.sequence_id,
+                    training_session_id=self._training_session_id,
+                    expected_learner_version=ref.learner_parent_version,
+                    source=source,
+                    optimizer_state_path=self._optimizer_state_path,
+                    batch_fingerprint=batch.fingerprint,
+                    trainable_token_count=batch.num_trainable_tokens,
+                    global_grad_accumulation_sequences=(
+                        global_grad_accumulation_sequences
+                    ),
+                )
+                cold = self._trainer_resident_generation != source
+                source_adapter = (
+                    self._published_adapters.get(source.policy_step) if cold else None
+                )
+                if cold and (
+                    source_adapter is None
+                    or source_adapter.training_session_id != source.training_session_id
+                    or source_adapter.generation_id != source.generation_id
+                    or source_adapter.identity
+                    != str(Path(source.adapter_path).absolute())
+                ):
+                    raise RuntimeError("cold SFT source generation is not registered")
+            if reconcile is not None:
+                step, checkpoint = reconcile
+                async with self._serving_lock:
+                    await self._reconcile_serving_locked(step, checkpoint)
+            with (
+                adapter_generation_lease(source_adapter)
+                if source_adapter is not None
+                else nullcontext()
+            ):
+                result = await (
+                    trainer.sft_forward_backward(job, batch)
+                    if backward
+                    else trainer.sft_forward(job, batch)
+                )
+            async with self._mutation_lock:
+                if self._latest_step != ref.learner_parent_version:
+                    raise RuntimeError("learner advanced while SFT command executed")
+                self._trainer_resident_generation = source
+            return result
+
     async def optimizer_command(
         self,
         ref: OperationRef,
@@ -1706,6 +1800,19 @@ class DistributedMegatronService:
         assert mesh is not None
         topology = mesh.topology
         return len(mesh.ranks) // (topology.tp * topology.cp * topology.pp)
+
+    def resolve_sft_global_grad_accumulation_sequences(
+        self, num_trajectories: int
+    ) -> int:
+        if num_trajectories < 1:
+            raise ValueError("SFT batch requires at least one trajectory")
+        mesh = self.runtime.topology.trainer
+        assert mesh is not None
+        topology = mesh.topology
+        data_parallel_size = len(mesh.ranks) // (
+            topology.tp * topology.cp * topology.pp
+        )
+        return -(-num_trajectories // data_parallel_size) * data_parallel_size
 
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
@@ -2610,39 +2717,6 @@ class DistributedMegatronService:
 
     async def vllm_engine_is_sleeping(self) -> bool:
         return self._vllm_sleeping
-
-    async def train_sft(
-        self, batches: list[Any], config: Any, verbose: bool = False
-    ) -> AsyncIterator[dict[str, float]]:
-        del verbose
-        payload = tuple(
-            SFTBatchData(
-                trajectory_tensors=tuple(batch.trajectory_tensors),
-                learning_rate=float(batch.learning_rate),
-                num_trajectories=int(batch.num_trajectories),
-                num_tokens=int(batch.num_tokens),
-                num_trainable_tokens=int(batch.num_trainable_tokens),
-            )
-            for batch in batches
-        )
-        if not payload:
-            return
-
-        def build_job(fields: _TrainerJobFields) -> TrainerJobSpec:
-            return SFTJobSpec(
-                **fields,
-                batch_id=uuid.uuid4().hex,
-                num_batches=len(payload),
-                config=CurrentSFTConfig.model_validate(config.model_dump()),
-            )
-
-        async for metrics in self._run_train_job(
-            build_job,
-            lambda trainer, job: trainer.train_sft(job, payload),
-            lineage_error="learner lineage changed during SFT",
-            wait_for_serving=True,
-        ):
-            yield metrics
 
     async def aclose(self) -> None:
         if self._close_task is not None and self._close_task.done():

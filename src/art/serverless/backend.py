@@ -414,6 +414,9 @@ class ServerlessBackend:
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         del dev_config, verbose
+        self._raise_background_failures()
+        if self._sampler_publisher is None:
+            raise RuntimeError("remote SFT training requires a sampler_publisher")
         from art.utils.sft import resolve_sft_batch_size
 
         values = list(trajectories)
@@ -434,6 +437,7 @@ class ServerlessBackend:
         if len(rates) != len(batches):
             raise ValueError("SFT learning-rate schedule must match batch count")
         client = await self.training_client(model)
+        pending: dict[str, float] | None = None
         for batch, learning_rate in zip(batches, rates, strict=True):
             sequence = client.next_sequence_id
             forward = await client.forward_backward(
@@ -459,7 +463,9 @@ class ServerlessBackend:
             forward_result, optimizer_result = await asyncio.gather(
                 forward.result(), optimizer.result()
             )
-            yield {
+            if pending is not None:
+                yield pending
+            pending = {
                 **forward_result.metrics,
                 **optimizer_result.metrics,
                 "data/step_num_trajectories": float(len(values)),
@@ -469,6 +475,38 @@ class ServerlessBackend:
                 "data/step_num_dropped_trajectories": 0.0,
                 TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
             }
+        assert pending is not None
+        sequence = client.next_sequence_id
+        step = client.projected_learner_version
+        sampler = await client.save_weights_for_sampler(
+            SaveWeightsForSamplerRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=sequence,
+                checkpoint_name=f"step-{step}",
+                publication=SamplerPublication(
+                    mode="in_flight_lora", model_alias=model.name
+                ),
+            )
+        )
+        state = await client.save_state(
+            SaveStateRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=sequence + 1,
+                checkpoint_name=f"step-{step}",
+            )
+        )
+        sampler_result, state_result = await asyncio.gather(
+            sampler.result(), state.result()
+        )
+        publication_metrics = await self._sampler_publisher(model, sampler_result)
+        yield {
+            **pending,
+            **sampler_result.publication_metrics,
+            **state_result.metrics,
+            **(publication_metrics or {}),
+        }
 
     def _track(self, awaitable: Coroutine[Any, Any, Any], name: str) -> None:
         task = asyncio.create_task(awaitable, name=name)

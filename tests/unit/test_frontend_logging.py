@@ -1053,7 +1053,7 @@ class TestTrainSFTMetricsAggregation:
             }
 
         mock_backend._train_sft = mock_train_sft
-        mock_backend._get_step = AsyncMock(side_effect=[0, 1])
+        mock_backend._get_step = AsyncMock(return_value=1)
         model._backend = mock_backend
 
         # Create dummy trajectories
@@ -1114,7 +1114,7 @@ class TestTrainSFTMetricsAggregation:
                 yield {"loss": 1.0 - i * 0.1}
 
         mock_backend._train_sft = mock_train_sft
-        mock_backend._get_step = AsyncMock(side_effect=[0, 1])
+        mock_backend._get_step = AsyncMock(return_value=1)
         model._backend = mock_backend
 
         trajectories = [
@@ -1190,7 +1190,7 @@ class TestTrainSFTMetricsAggregation:
                 yield {"loss/train": 1.0 - i * 0.1}
 
         mock_backend._train_sft = mock_train_sft
-        mock_backend._get_step = AsyncMock(side_effect=[0, 1])
+        mock_backend._get_step = AsyncMock(return_value=1)
         model._backend = mock_backend
 
         await model.train_sft([])

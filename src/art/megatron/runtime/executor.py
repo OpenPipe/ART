@@ -27,7 +27,6 @@ from .specs import (
     OptimizerJobSpec,
     SftForwardBackwardJobSpec,
     SftForwardJobSpec,
-    SFTJobSpec,
     TrainerGeneration,
     TrainerJobSpec,
     TrainJobSpec,
@@ -169,6 +168,52 @@ class MegatronTrainJobExecutor:
             ),
         }
 
+    def execute_sft_forward_backward(
+        self,
+        job: SftForwardBackwardJobSpec,
+        batch: SFTBatchData,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        self._publisher.raise_if_failed()
+        if self._gradient_parent_version not in {
+            None,
+            job.expected_learner_version,
+        }:
+            raise RuntimeError(
+                "SFT F/B parent does not match the open gradient accumulator"
+            )
+        from art.megatron.train import execute_megatron_sft_forward_backward_job
+
+        result = execute_megatron_sft_forward_backward_job(
+            self.runtime,
+            job,
+            batch,
+            gradient_accumulator=self._gradients,
+            cancelled=cancelled,
+        )
+        self._gradient_parent_version = job.expected_learner_version
+        return result
+
+    def execute_sft_forward(
+        self,
+        job: SftForwardJobSpec,
+        batch: SFTBatchData,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        self._publisher.raise_if_failed()
+        from art.megatron.train import execute_megatron_sft_forward_job
+
+        return execute_megatron_sft_forward_job(
+            self.runtime,
+            job,
+            batch,
+            cancelled=cancelled,
+        )
+
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
@@ -281,52 +326,6 @@ class MegatronTrainJobExecutor:
     def discard_open_gradients(self) -> None:
         self._gradients.discard()
         self._gradient_parent_version = None
-
-    def execute_sft(
-        self,
-        job: SFTJobSpec,
-        batches: tuple[SFTBatchData, ...],
-        sink: EventSink,
-        cancelled: Event,
-    ) -> dict[str, float]:
-        if self._closed:
-            raise RuntimeError("Megatron executor is closed")
-        self._require_no_open_gradients()
-        self._publisher.raise_if_failed()
-        from art.megatron.train import execute_megatron_sft_job
-
-        metrics = execute_megatron_sft_job(
-            self.runtime,
-            job,
-            batches,
-            progress_sink=lambda step_index, num_steps, metrics: sink.progress(
-                step_index=step_index,
-                num_steps=num_steps,
-                metrics=metrics,
-            ),
-            adapter_ready_sink=lambda: sink.adapter_ready(
-                learner_version=job.learner_version,
-                adapter_path=job.output_adapter_path,
-            ),
-            snapshot_sink=lambda job, adapter_dtypes, adapter_config, save_optimizer: (
-                self._publisher.submit(
-                    generation=job.output.generation,
-                    optimizer_state_path=job.output.optimizer_state_path,
-                    staging_adapter_path=job.output.staging_adapter_path,
-                    publication_targets=job.publication_targets,
-                    adapter_dtypes=adapter_dtypes,
-                    adapter_config=adapter_config,
-                    save_optimizer=save_optimizer,
-                    sink=sink,
-                )
-            ),
-            cancelled=cancelled,
-        )
-        if job.merged_weight_transfer is not None:
-            started = time.perf_counter()
-            self._sync_merged(job.merged_weight_transfer)
-            metrics["time/merged_weight_publish_s"] = time.perf_counter() - started
-        return metrics
 
     def sync_merged_source(
         self,

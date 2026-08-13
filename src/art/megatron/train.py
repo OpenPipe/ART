@@ -12,7 +12,7 @@ install_art_bridge_runtime_patches()
 Public cross-repo API consumed by serverless-training:
 - build_training_runtime
 - execute_megatron_rl_job
-- execute_megatron_sft_job
+- execute_megatron_sft_forward_backward_job
 """
 
 import math
@@ -73,7 +73,6 @@ from art.megatron.runtime.specs import (
     RlForwardBackwardConfig,
     SftForwardBackwardJobSpec,
     SftForwardJobSpec,
-    SFTJobSpec,
     TrainJobSpec,
 )
 from art.megatron.runtime.weight_transfer import MergedWeightTransferInitInfo
@@ -146,9 +145,10 @@ __all__ = [
     "DEFAULT_MODEL_IDENTIFIER",
     "TrainingRuntime",
     "execute_megatron_rl_forward_backward_job",
+    "execute_megatron_sft_forward_backward_job",
+    "execute_megatron_sft_forward_job",
     "build_training_runtime",
     "execute_megatron_rl_job",
-    "execute_megatron_sft_job",
 ]
 
 
@@ -1171,6 +1171,83 @@ def _sft_command_result(
     }
 
 
+def execute_megatron_sft_forward_backward_job(
+    runtime: TrainingRuntime,
+    job: SftForwardBackwardJobSpec,
+    batch: SFTBatchData,
+    *,
+    gradient_accumulator: Any,
+    cancelled: Event | None = None,
+) -> dict[str, Any]:
+    """Run one supervised F/B against the resident single-run learner."""
+    if cancelled is not None and cancelled.is_set():
+        from art.megatron.runtime.trainer_run import TrainingCancelledError
+
+        raise TrainingCancelledError("SFT F/B job was cancelled")
+    started = time.perf_counter()
+    gradient_accumulator.before_forward_backward()
+    _prepare_rl_training_state(runtime, job)
+    inputs, indices, hybridep_token_counts = _sft_command_inputs(runtime, job, batch)
+    state = run_megatron_sft_forward_backward_step(
+        model_chunks=runtime.model,
+        provider=runtime.provider,
+        model_support_handler=runtime.model_support_handler,
+        inputs=inputs,
+        step_index=0,
+        sample_index=indices,
+        hybridep_token_counts=hybridep_token_counts,
+    )
+    reduced_loss, token_count = _global_sft_loss_and_tokens(state)
+    gradient_accumulator.record(job.operation_id, token_count)
+    runtime.resident_training_session_id = job.training_session_id
+    runtime.resident_policy_step = job.expected_learner_version
+    runtime.optimizer_state_loaded = True
+    return _sft_command_result(
+        job=job,
+        batch=batch,
+        state=state,
+        reduced_loss=reduced_loss,
+        token_count=token_count,
+        elapsed_s=time.perf_counter() - started,
+        backward=True,
+    )
+
+
+def execute_megatron_sft_forward_job(
+    runtime: TrainingRuntime,
+    job: SftForwardJobSpec,
+    batch: SFTBatchData,
+    *,
+    cancelled: Event | None = None,
+) -> dict[str, Any]:
+    """Run one supervised forward without mutating accumulated gradients."""
+    if cancelled is not None and cancelled.is_set():
+        from art.megatron.runtime.trainer_run import TrainingCancelledError
+
+        raise TrainingCancelledError("SFT forward job was cancelled")
+    started = time.perf_counter()
+    _prepare_rl_training_state(runtime, job)
+    inputs, indices, hybridep_token_counts = _sft_command_inputs(runtime, job, batch)
+    state = run_megatron_sft_forward_step(
+        model_chunks=runtime.model,
+        provider=runtime.provider,
+        model_support_handler=runtime.model_support_handler,
+        inputs=inputs,
+        sample_index=indices,
+        hybridep_token_counts=hybridep_token_counts,
+    )
+    reduced_loss, token_count = _global_sft_loss_and_tokens(state)
+    return _sft_command_result(
+        job=job,
+        batch=batch,
+        state=state,
+        reduced_loss=reduced_loss,
+        token_count=token_count,
+        elapsed_s=time.perf_counter() - started,
+        backward=False,
+    )
+
+
 def execute_megatron_dynamic_lora_sft_forward_backward_job(
     runtime: TrainingRuntime,
     job: SftForwardBackwardJobSpec,
@@ -1385,134 +1462,6 @@ def execute_megatron_load_state_job(
     runtime.optimizer_state_loaded = True
 
 
-def execute_megatron_sft_job(
-    runtime: TrainingRuntime,
-    job: SFTJobSpec,
-    batches: tuple[SFTBatchData, ...],
-    *,
-    progress_sink: Callable[[int, int, dict[str, float]], None],
-    adapter_ready_sink: Callable[[], None],
-    snapshot_sink: Callable[
-        [SFTJobSpec, dict[str, Any], dict[str, Any], bool], dict[str, float]
-    ]
-    | None = None,
-    cancelled: Event | None = None,
-) -> dict[str, float]:
-    """Execute SFT from in-memory batches; callers own transport and events."""
-    if len(batches) != job.num_batches:
-        raise ValueError("SFT job batch count does not match its payload")
-    adapter_dtypes = None
-    succeeded = False
-    final_metrics: dict[str, float] = {}
-    try:
-        configure_moe_routing_replay(runtime)
-        adapter_dtypes = _prepare_rl_training_state(runtime, job)
-        grad_accumulation_sequences = int(job.config.batch_size)
-        grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
-            grad_accumulation_sequences
-        )
-        assert runtime.optimizer is not None
-        runtime.optimizer.config.clip_grad = job.max_grad_norm
-        for param_group in runtime.optimizer.param_groups:
-            param_group["weight_decay"] = job.weight_decay
-        topology = _infer_parallel_topology(runtime.model)
-
-        for batch_index, batch in enumerate(batches):
-            if cancelled is not None and cancelled.is_set():
-                from art.megatron.runtime.trainer_run import TrainingCancelledError
-
-                raise TrainingCancelledError("SFT job was cancelled")
-            started = time.perf_counter()
-            trajectory_tensors = list(batch.trajectory_tensors)
-            template = _clone_sft_tensors(trajectory_tensors[0])
-            zero_template = _zero_contribution_sft_inputs(template)
-            # Scheduling uses run-global sample IDs while each payload only owns one
-            # batch. Prefix aliases place this window in global index space without
-            # copying tensors, then selected IDs are rebased for local lookup.
-            sample_offset = batch_index * grad_accumulation_sequences
-            scheduled_tensors = [
-                trajectory_tensors[0]
-            ] * sample_offset + trajectory_tensors
-            hybridep_token_counts = (
-                build_sft_hybridep_token_counts(
-                    trajectory_tensors=scheduled_tensors,
-                    step_index=batch_index,
-                    global_grad_accumulation_sequences=(grad_accumulation_sequences),
-                    topology=topology,
-                    provider=runtime.provider,
-                    model_support_handler=runtime.model_support_handler,
-                )
-                if ps.get_expert_model_parallel_world_size() > 1
-                else None
-            )
-            _ensure_hybridep_capacity(
-                runtime,
-                packed_sequence_length=max(
-                    int(inputs["input_ids"].numel()) for inputs in trajectory_tensors
-                ),
-                context_parallel_size=topology.cp,
-                required_capacity=max(hybridep_token_counts or (), default=0),
-            )
-            scheduled_indices = build_micro_sample_indices(
-                step_index=batch_index,
-                num_sequences=len(scheduled_tensors),
-                global_grad_accumulation_sequences=grad_accumulation_sequences,
-            )
-            micro_indices = [
-                None if index is None else index - sample_offset
-                for index in scheduled_indices
-            ]
-            step_result = run_megatron_sft_step(
-                model_chunks=runtime.model,
-                provider=runtime.provider,
-                model_support_handler=runtime.model_support_handler,
-                optimizer=runtime.optimizer,
-                learning_rate=batch.learning_rate,
-                inputs=select_sft_micro_inputs(
-                    trajectory_tensors, micro_indices, zero_template
-                ),
-                step_index=batch_index,
-                sample_index=micro_indices,
-                moe_routing_replay_controller=(runtime.moe_routing_replay_controller),
-                hybridep_token_counts=hybridep_token_counts,
-                before_optimizer_step=(
-                    runtime.optimizer_snapshot_barrier.wait_before_mutation
-                ),
-            )
-            elapsed = time.perf_counter() - started
-            final_metrics = {
-                "loss/train": float(step_result.reduced_loss.item()),
-                "loss/learning_rate": batch.learning_rate,
-                "loss/grad_norm": float(step_result.grad_norm),
-                "throughput/train_executed_tok_equiv_per_s": (
-                    batch.num_tokens / elapsed if elapsed else 0.0
-                ),
-                **step_result.pipeline_metrics,
-            }
-            if runtime.rank == 0:
-                progress_sink(batch_index, len(batches), final_metrics)
-            del step_result, template, zero_template
-
-        if snapshot_sink is None or runtime.adapter_export_config is None:
-            raise RuntimeError("typed SFT requires an immutable snapshot publisher")
-        final_metrics.update(
-            snapshot_sink(job, adapter_dtypes, runtime.adapter_export_config, True)
-        )
-        adapter_ready_sink()
-        runtime.resident_training_session_id = job.training_session_id
-        runtime.resident_policy_step = job.learner_version
-        runtime.optimizer_state_loaded = True
-        succeeded = True
-        return final_metrics
-    finally:
-        if not succeeded:
-            runtime.resident_training_session_id = None
-            runtime.resident_policy_step = None
-            runtime.optimizer_state_loaded = False
-        if adapter_dtypes is not None:
-            del adapter_dtypes
-
-
 def _experimental_train_config(
     job: TrainJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
 ) -> dev.TrainConfig:
@@ -1564,7 +1513,13 @@ def _load_lora_and_optimizer(
 
 def _prepare_rl_training_state(
     runtime: TrainingRuntime,
-    job: TrainJobSpec | SFTJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
+    job: (
+        TrainJobSpec
+        | ForwardBackwardJobSpec
+        | ForwardJobSpec
+        | SftForwardBackwardJobSpec
+        | SftForwardJobSpec
+    ),
 ) -> dict[str, torch.dtype]:
     state_is_resident = (
         runtime.optimizer_persistent
@@ -2492,7 +2447,7 @@ def _run_megatron_sft_schedule(
 ) -> SFTForwardBackwardState:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
-        raise ValueError("run_megatron_sft_step requires at least one trajectory")
+        raise ValueError("SFT schedule requires at least one trajectory")
 
     micro_sample_indices: list[int | None]
     if isinstance(sample_index, list):
@@ -2728,6 +2683,7 @@ def run_megatron_sft_step(
     hybridep_token_counts: list[int] | None = None,
     before_optimizer_step: Callable[[], None] | None = None,
 ) -> TrainStepResult:
+    """Low-level fused oracle primitive retained for handler workflow parity."""
     state = run_megatron_sft_forward_backward_step(
         model_chunks=model_chunks,
         provider=provider,

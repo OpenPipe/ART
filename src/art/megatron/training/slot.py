@@ -63,6 +63,8 @@ from .commands import (
     forward_backward_config,
     packing_metrics,
     packing_outcome,
+    sft_batch_data,
+    sft_packing_outcome,
 )
 
 
@@ -213,14 +215,7 @@ class MegatronTrainingSlot:
             )
             if tokenized.num_trainable_tokens < 1:
                 raise ValueError("supervised batch produced no trainable tokens")
-            batch = SFTBatchData(
-                trajectory_tensors=tuple(tokenized.trajectory_tensors),
-                learning_rate=tokenized.learning_rate,
-                num_trajectories=tokenized.num_trajectories,
-                num_tokens=tokenized.num_tokens,
-                num_trainable_tokens=tokenized.num_trainable_tokens,
-                num_dropped_trajectories=tokenized.num_dropped_trajectories,
-            )
+            batch = sft_batch_data(tokenized)
             topology = self.runtime_spec.trainer_mesh.topology
             data_parallel_size = len(self.runtime_spec.trainer_mesh.ranks) // (
                 topology.tp * topology.cp * topology.pp
@@ -229,27 +224,12 @@ class MegatronTrainingSlot:
                 math.ceil(batch.num_trajectories / data_parallel_size)
                 * data_parallel_size
             )
-            max_length = max(
-                int(tensors["input_ids"].numel())
-                for tensors in batch.trajectory_tensors
-            )
             return PreparedSftForward(
                 ref=ref,
                 batch=batch,
                 global_grad_accumulation_sequences=grad_sequences,
                 tokenization_s=time.perf_counter() - started,
-                packing=PackingOutcome(
-                    packed_sequence_length=max_length,
-                    packed_sequences=batch.num_trajectories,
-                    target_packed_sequences=batch.num_trajectories,
-                    nominal_capacity_tokens=batch.num_tokens,
-                    physical_tokens=batch.num_tokens,
-                    non_padding_tokens=batch.num_tokens,
-                    loss_bearing_tokens=batch.num_trainable_tokens,
-                    trainable_assistant_tokens=batch.num_trainable_tokens,
-                    policy_token_counts=None,
-                    group_shapes=(),
-                ),
+                packing=sft_packing_outcome(batch),
             )
         config = experimental_train_config(request)
         if (
@@ -307,6 +287,8 @@ class MegatronTrainingSlot:
                 sequence_id=ref.sequence_id,
                 training_session_id=state.registration.training_session_id,
                 expected_learner_version=ref.learner_parent_version,
+                source=state.generation,
+                optimizer_state_path=state.registration.optimizer_state_path,
                 batch_fingerprint=prepared.batch.fingerprint,
                 trainable_token_count=prepared.batch.num_trainable_tokens,
                 global_grad_accumulation_sequences=(
@@ -363,6 +345,8 @@ class MegatronTrainingSlot:
                 sequence_id=ref.sequence_id,
                 training_session_id=state.registration.training_session_id,
                 expected_learner_version=ref.learner_parent_version,
+                source=state.generation,
+                optimizer_state_path=state.registration.optimizer_state_path,
                 batch_fingerprint=prepared.batch.fingerprint,
                 trainable_token_count=prepared.batch.num_trainable_tokens,
                 global_grad_accumulation_sequences=(

@@ -14,6 +14,7 @@ from ..backend import AnyTrainableModel
 from ..distributed.art_runtime import ArtRuntime
 from ..local.backend import LocalBackend, _PackedTrainingBatch
 from ..local.service import ModelService
+from ..metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from ..model import Model, TrainableModel
 from ..training import (
     AdamConfig,
@@ -24,9 +25,10 @@ from ..training import (
     SamplerPublication,
     SaveStateRequest,
     SaveWeightsForSamplerRequest,
+    SupervisedTrajectoryBatch,
 )
-from ..trajectories import TrajectoryGroup
-from ..types import LocalTrainResult
+from ..trajectories import Trajectory, TrajectoryGroup
+from ..types import LocalTrainResult, TrainSFTConfig
 from ..utils.lifecycle import complete_task
 from ..utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 from ..vllm_runtime import get_external_vllm_runtime_config
@@ -450,6 +452,114 @@ class MegatronBackend(LocalBackend):
             )
             self._training_clients[storage_key] = client
             return client
+
+    async def _train_sft(
+        self,
+        model: AnyTrainableModel,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig,
+        dev_config: dev.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        del dev_config, verbose
+        from ..utils.sft import resolve_sft_batch_size
+
+        values = list(trajectories)
+        if not values:
+            return
+        batch_size = resolve_sft_batch_size(
+            batch_size=config.batch_size,
+            default_batch_size=self._default_sft_batch_size(),
+        )
+        batches = [
+            values[index : index + batch_size]
+            for index in range(0, len(values), batch_size)
+        ]
+        rates = (
+            config.learning_rate
+            if isinstance(config.learning_rate, list)
+            else [config.learning_rate] * len(batches)
+        )
+        if len(rates) != len(batches):
+            raise ValueError("SFT learning-rate schedule must match batch count")
+        client = await self.training_client(cast(TrainableModel, model))
+        pending: dict[str, float] | None = None
+        for batch, learning_rate in zip(batches, rates, strict=True):
+            sequence = client.next_sequence_id
+            forward = await client.forward_backward(
+                ForwardBackwardRequest(
+                    run_id=client.run_id,
+                    request_id=uuid.uuid4().hex,
+                    sequence_id=sequence,
+                    batch=SupervisedTrajectoryBatch(
+                        trajectories=tuple(batch),
+                        assistant_turns=config.assistant_turns,
+                    ),
+                    loss=LossConfig(name="cross_entropy"),
+                )
+            )
+            optimizer = await client.optim_step(
+                OptimStepRequest(
+                    run_id=client.run_id,
+                    request_id=uuid.uuid4().hex,
+                    sequence_id=sequence + 1,
+                    optimizer=AdamConfig(learning_rate=learning_rate),
+                )
+            )
+            forward_result, optimizer_result = await asyncio.gather(
+                forward.result(), optimizer.result()
+            )
+            if pending is not None:
+                yield pending
+            pending = {
+                **forward_result.metrics,
+                **optimizer_result.metrics,
+                "data/step_num_trajectories": float(len(values)),
+                "data/step_trainable_assistant_tokens": float(
+                    forward_result.packing.trainable_assistant_tokens
+                ),
+                "data/step_num_dropped_trajectories": float(
+                    forward_result.metrics.get(
+                        "data/step_num_dropped_trajectories", 0.0
+                    )
+                ),
+                TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
+            }
+        assert pending is not None
+        service = cast(
+            Any,
+            await self._get_service(cast(TrainableModel, model)),
+        )
+        sequence = client.next_sequence_id
+        step = client.projected_learner_version
+        sampler = await client.save_weights_for_sampler(
+            SaveWeightsForSamplerRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=sequence,
+                checkpoint_name=f"step-{step}",
+                publication=SamplerPublication(
+                    mode=_sampler_publication_mode(service),
+                    model_alias=model.name,
+                ),
+            )
+        )
+        state = await client.save_state(
+            SaveStateRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=sequence + 1,
+                checkpoint_name=f"step-{step}",
+            )
+        )
+        sampler_result, state_result = await asyncio.gather(
+            sampler.result(), state.result()
+        )
+        yield {
+            **pending,
+            **sampler_result.publication_metrics,
+            **state_result.metrics,
+        }
 
     async def _prepare_backend_for_training(
         self,

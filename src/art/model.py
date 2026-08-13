@@ -1689,7 +1689,6 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         # Train (backend yields metrics for each batch without logging)
         # Collect all metrics and aggregate them at the end for the checkpoint summary.
         training_metrics: list[dict[str, float]] = []
-        local_sft_checkpoint_step: int | None = None
         trainer_started = time.monotonic()
         async for metrics in backend._train_sft(
             self,
@@ -1699,24 +1698,20 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             verbose,
         ):
             training_metrics.append(metrics)
-            gradient_step = len(training_metrics)
-            if log_metrics and not backend_logs_sft_metrics:
-                if local_sft_checkpoint_step is None:
-                    local_sft_checkpoint_step = await self.get_step() + 1
-                await self._log_sft_metric_sample(
-                    metrics,
-                    checkpoint_step=local_sft_checkpoint_step,
-                    gradient_step=gradient_step,
-                )
         trainer_elapsed = time.monotonic() - trainer_started
 
         # Log aggregated training metrics once at the checkpoint step. For
         # remote-logging backends, the remote SFT job owns this row too.
         if training_metrics and log_metrics and not backend_logs_sft_metrics:
+            step = await self.get_step()
+            for gradient_step, metrics in enumerate(training_metrics, start=1):
+                await self._log_sft_metric_sample(
+                    metrics,
+                    checkpoint_step=step,
+                    gradient_step=gradient_step,
+                )
             avg_metrics = average_metric_samples(training_metrics)
             avg_metrics["time/step_backend_train_s"] = trainer_elapsed
-            # Get the current step after training
-            step = await self.get_step()
             await self.log(
                 trajectories=None, split="train", metrics=avg_metrics, step=step
             )

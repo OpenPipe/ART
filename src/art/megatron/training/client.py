@@ -5,6 +5,7 @@ from contextlib import suppress
 import time
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
 
+from art.preprocessing.sft import SftBatchTokenizer
 from art.training.client import TrainingOperation
 from art.training.contracts import (
     Contract,
@@ -32,6 +33,8 @@ from .commands import (
     forward_backward_config,
     packing_metrics,
     packing_outcome,
+    sft_batch_data,
+    sft_packing_outcome,
 )
 
 if TYPE_CHECKING:
@@ -96,6 +99,7 @@ class LocalMegatronTrainingClient:
         self._retired_operation_ids: set[str] = set()
         self._completion_tasks: set[asyncio.Task[Any]] = set()
         self._checkpoints: dict[str, ResolvedCheckpointState] = {}
+        self._sft_tokenizer = SftBatchTokenizer()
         self._tail: asyncio.Task[Any] | None = None
         self._closed = False
 
@@ -190,6 +194,49 @@ class LocalMegatronTrainingClient:
         async def execute(
             admission: CommandAdmission,
         ) -> ForwardResult | ForwardBackwardResult:
+            if request.batch.kind == "sft":
+                started = time.perf_counter()
+                tokenized = await asyncio.to_thread(
+                    self._sft_tokenizer.tokenize,
+                    self._model,
+                    request.batch.trajectories,
+                    assistant_turns=request.batch.assistant_turns,
+                )
+                if tokenized.num_trainable_tokens < 1:
+                    raise ValueError("supervised batch produced no trainable tokens")
+                batch = sft_batch_data(tokenized)
+                grad_sequences = (
+                    self._service.resolve_sft_global_grad_accumulation_sequences(
+                        batch.num_trajectories
+                    )
+                )
+                raw = await (
+                    self._service.sft_forward_backward_command(
+                        admission.ref, batch, grad_sequences
+                    )
+                    if backward
+                    else self._service.sft_forward_command(
+                        admission.ref, batch, grad_sequences
+                    )
+                )
+                result_type = ForwardBackwardResult if backward else ForwardResult
+                return result_type(
+                    operation_id=admission.ref.operation_id,
+                    packing=sft_packing_outcome(batch),
+                    loss_fn_outputs=tuple(
+                        LossFnOutput(token_logprobs=values)
+                        for values in raw["token_logprobs"]
+                    ),
+                    metrics={
+                        "time/step_tokenize_trajectory_groups_s": (
+                            time.perf_counter() - started
+                        ),
+                        "data/step_num_dropped_trajectories": float(
+                            batch.num_dropped_trajectories
+                        ),
+                        **raw["metrics"],
+                    },
+                )
             batch = await self._prepare_rl_batch(request)
             payload = batch.payload
             from art.megatron.backend import _DistributedBatchPayload

@@ -42,7 +42,6 @@ from .specs import (
     RunSlotRegistration,
     SftForwardBackwardJobSpec,
     SftForwardJobSpec,
-    SFTJobSpec,
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
@@ -505,6 +504,60 @@ class MonarchTrainerActor(Actor):
                 batch.close()
 
     @endpoint
+    def execute_sft_forward_backward(
+        self,
+        job_json: str,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = SftForwardBackwardJobSpec.model_validate_json(job_json)
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            result = self._executor.execute_sft_forward_backward(job, batch, Event())
+            coordinator = self._runtime.rank == 0
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.expected_learner_version,
+                "token_count": result["token_count"],
+                "metrics": result["metrics"] if coordinator else {},
+                "token_logprobs": result["token_logprobs"] if coordinator else (),
+            }
+        except BaseException:
+            self._valid = False
+            raise
+
+    @endpoint
+    def execute_sft_forward(
+        self,
+        job_json: str,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = SftForwardJobSpec.model_validate_json(job_json)
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            result = self._executor.execute_sft_forward(job, batch, Event())
+            coordinator = self._runtime.rank == 0
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.expected_learner_version,
+                "token_count": result["token_count"],
+                "metrics": result["metrics"] if coordinator else {},
+                "token_logprobs": result["token_logprobs"] if coordinator else (),
+            }
+        except BaseException:
+            self._valid = False
+            raise
+
+    @endpoint
     def execute_optimizer(self, job_json: str) -> dict[str, Any]:
         try:
             if not self._valid:
@@ -794,45 +847,6 @@ class MonarchTrainerActor(Actor):
                 "operation_id": job.operation_id,
                 "learner_version": job.learner_version,
                 "metrics": result["metrics"] if coordinator else {},
-            }
-        except BaseException as error:
-            self._valid = False
-            event_port.send(
-                {
-                    "kind": "rank_failed",
-                    "rank": self._runtime.rank,
-                    "error_type": type(error).__name__,
-                    "message": str(error),
-                    "traceback": traceback.format_exc(),
-                }
-            )
-            raise
-
-    @endpoint
-    def execute_sft(
-        self,
-        job_json: str,
-        batches: tuple[SFTBatchData, ...],
-        event_port: Port[dict[str, Any]],
-    ) -> dict[str, Any]:
-        try:
-            if not self._valid:
-                raise RuntimeError("trainer actor runtime is invalid")
-            job = SFTJobSpec.model_validate_json(job_json)
-            coordinator = self._runtime.rank == 0
-            with self._weight_offload.job():
-                metrics = self._executor.execute_sft(
-                    job,
-                    batches,
-                    _ActorEventSink(event_port, coordinator=coordinator),
-                    Event(),
-                )
-            if coordinator:
-                event_port.send({"kind": "actor_completed", "metrics": metrics})
-            return {
-                "rank": self._runtime.rank,
-                "learner_version": job.learner_version,
-                "metrics": metrics if coordinator else {},
             }
         except BaseException as error:
             self._valid = False
@@ -1630,6 +1644,81 @@ class MonarchTrainerRun:
                 self._active_job_id = None
                 self._active_collective = None
 
+    async def sft_forward_backward(
+        self,
+        job: SftForwardBackwardJobSpec,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        return await self._sft_forward(job, batch, backward=True)
+
+    async def sft_forward(
+        self,
+        job: SftForwardJobSpec,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        return await self._sft_forward(job, batch, backward=False)
+
+    async def _sft_forward(
+        self,
+        job: SftForwardBackwardJobSpec | SftForwardJobSpec,
+        batch: SFTBatchData,
+        *,
+        backward: bool,
+    ) -> dict[str, Any]:
+        cached = self._operations.get(job.operation_id)
+        if cached is not None and cached[0] == job.fingerprint:
+            return cached[1]
+        async with self._lock:
+            cached = self._operations.get(job.operation_id)
+            if cached is not None:
+                if cached[0] != job.fingerprint:
+                    raise RuntimeError(
+                        "operation_id was reused for another SFT command"
+                    )
+                return cached[1]
+            self._validate_operation(job)
+            if batch.fingerprint != job.batch_fingerprint:
+                raise ValueError("SFT payload fingerprint differs from its job")
+            collective = asyncio.ensure_future(
+                (
+                    self._actors.execute_sft_forward_backward
+                    if backward
+                    else self._actors.execute_sft_forward
+                ).call(job.model_dump_json(), batch)
+            )
+            self._active_job_id = job.operation_id
+            self._active_collective = collective
+            try:
+                values = await asyncio.wait_for(
+                    collective,
+                    timeout=self._command_timeout_s(),
+                )
+                results = list(values.values())
+                self._validate_rank_command_results(
+                    results,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                )
+                if {result["token_count"] for result in results} != {
+                    job.trainable_token_count
+                }:
+                    raise RuntimeError(
+                        "trainer SFT token count differs from its payload"
+                    )
+                result = next(item for item in results if item["rank"] == 0)
+                if backward:
+                    self._open_forward_backward_ids.append(job.operation_id)
+                self._next_operation_sequence += 1
+                self._operations[job.operation_id] = (job.fingerprint, result)
+                return result
+            except BaseException as error:
+                await self._invalidate_command(error, "SFT command and cleanup failed")
+                raise
+            finally:
+                if self._active_job_id == job.operation_id:
+                    self._active_job_id = None
+                    self._active_collective = None
+
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]:
         cached = self._operations.get(job.operation_id)
         if cached is not None and cached[0] == job.fingerprint:
@@ -1808,6 +1897,8 @@ class MonarchTrainerRun:
         job: (
             ForwardJobSpec
             | ForwardBackwardJobSpec
+            | SftForwardBackwardJobSpec
+            | SftForwardJobSpec
             | OptimizerJobSpec
             | LoadStateJobSpec
             | GenerationSnapshotJobSpec
@@ -1877,18 +1968,6 @@ class MonarchTrainerRun:
                 job.model_dump_json(), batch.model_dump_json(), port
             ),
             lambda: self._validate_rl(job, batch),
-        ):
-            yield event
-
-    async def train_sft(
-        self, job: SFTJobSpec, batches: tuple[SFTBatchData, ...]
-    ) -> AsyncIterator[TrainEvent]:
-        async for event in self._train(
-            job,
-            lambda port: self._actors.execute_sft.call(
-                job.model_dump_json(), batches, port
-            ),
-            lambda: self._validate_sft(job, batches),
         ):
             yield event
 
@@ -2391,15 +2470,6 @@ class MonarchTrainerRun:
             return ValueError(
                 "packed batch sequence length does not match the trainer runtime"
             )
-        return None
-
-    def _validate_sft(
-        self, job: SFTJobSpec, batches: tuple[SFTBatchData, ...]
-    ) -> BaseException | None:
-        if error := self._validate_common(job):
-            return error
-        if len(batches) != job.num_batches:
-            return ValueError("SFT job batch count does not match its payload")
         return None
 
     @staticmethod

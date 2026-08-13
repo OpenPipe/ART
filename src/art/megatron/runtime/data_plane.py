@@ -39,7 +39,7 @@ class SFTBatchData(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
 
     trajectory_tensors: tuple[dict[str, Any], ...]
-    learning_rate: float
+    learning_rate: float = 0.0
     num_trajectories: int
     num_tokens: int
     num_trainable_tokens: int

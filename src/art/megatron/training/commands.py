@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any, cast
 
 from art.distributed.art_runtime import DistributedPackedBatch
+from art.megatron.runtime.data_plane import SFTBatchData
+from art.preprocessing.tokenize import SFTBatch
 from art.training.contracts import (
     CheckpointRef,
     ForwardBackwardRequest,
@@ -79,6 +81,35 @@ def packing_metrics(packed: DistributedPackedBatch) -> dict[str, float]:
         "time/step_packing_rpc_s": packed.packing_rpc_s,
         "time/step_packed_batch_fanout_s": packed.packed_batch_fanout_s,
     }
+
+
+def sft_batch_data(batch: SFTBatch) -> SFTBatchData:
+    return SFTBatchData(
+        trajectory_tensors=tuple(batch.trajectory_tensors),
+        learning_rate=batch.learning_rate,
+        num_trajectories=batch.num_trajectories,
+        num_tokens=batch.num_tokens,
+        num_trainable_tokens=batch.num_trainable_tokens,
+        num_dropped_trajectories=batch.num_dropped_trajectories,
+    )
+
+
+def sft_packing_outcome(batch: SFTBatchData) -> PackingOutcome:
+    max_length = max(
+        int(tensors["input_ids"].numel()) for tensors in batch.trajectory_tensors
+    )
+    return PackingOutcome(
+        packed_sequence_length=max_length,
+        packed_sequences=batch.num_trajectories,
+        target_packed_sequences=batch.num_trajectories,
+        nominal_capacity_tokens=batch.num_tokens,
+        physical_tokens=batch.num_tokens,
+        non_padding_tokens=batch.num_tokens,
+        loss_bearing_tokens=batch.num_trainable_tokens,
+        trainable_assistant_tokens=batch.num_trainable_tokens,
+        policy_token_counts=None,
+        group_shapes=(),
+    )
 
 
 def checkpoint_ref(

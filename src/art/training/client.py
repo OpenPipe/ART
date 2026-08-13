@@ -33,6 +33,12 @@ class TrainingOperation(Protocol, Generic[ResultT_co]):
 
 class TrainingClient(Protocol):
     @property
+    def run_id(self) -> str: ...
+
+    @property
+    def next_sequence_id(self) -> int: ...
+
+    @property
     def projected_learner_version(self) -> int: ...
 
     async def forward(
