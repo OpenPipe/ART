@@ -626,13 +626,15 @@ def test_throughput_classification_is_fail_closed() -> None:
     assert future["unclassified_failures"] == ["future_acceptance_gate"]
 
 
-def test_throughput_load_retry_is_bounded_and_preserves_attempts(
+def test_throughput_retry_is_bounded_and_preserves_attempts(
     tmp_path: Path,
 ) -> None:
     plans = [
         ([[]], "accepted"),
-        ([["e2e_train_tok_s"]], "rejected"),
+        ([["e2e_train_tok_s"], []], "accepted"),
+        ([["e2e_train_tok_s"], ["e2e_train_tok_s"]], "rejected"),
         ([["stable_min_vllm_pressure", "calibration_basis"]], "rejected"),
+        ([["future_acceptance_gate"]], "rejected"),
         ([["stable_min_vllm_pressure"], []], "accepted"),
         (
             [["stable_min_vllm_pressure"], ["stable_trainer_underfeed"]],

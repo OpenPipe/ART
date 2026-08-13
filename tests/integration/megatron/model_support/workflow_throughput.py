@@ -1638,7 +1638,14 @@ def _run_throughput_attempts(
                 "acceptance_failures": result.metrics["acceptance_failures"],
             }
         )
-        terminal = status != "load_inconclusive" or attempt == _THROUGHPUT_MAX_ATTEMPTS
+        retryable = bool(
+            result.metrics["load_failures"] or result.metrics["performance_failures"]
+        ) and not (
+            result.metrics["hard_failures"] or result.metrics["unclassified_failures"]
+        )
+        terminal = (
+            status == "accepted" or not retryable or attempt == _THROUGHPUT_MAX_ATTEMPTS
+        )
         if terminal:
             result.metrics.update(
                 throughput_attempt_count=len(attempts),
