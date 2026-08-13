@@ -556,6 +556,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         ),
     )
     assert lag_failures == [
+        "unused_and_dummy_ratio",
         "mean_policy_activation_lag_s",
         "max_policy_activation_lag_s",
     ]
