@@ -1136,7 +1136,10 @@ def run_prepared_workflows(
             environment[workflow.WORKFLOW_RUN_DIR_ENV] = str(prepared.run_dir)
             environment.update(
                 {
-                    "ART_MEGATRON_CACHE_ROOT": "/tmp/art-model-support-workflow/cache",
+                    "ART_MEGATRON_CACHE_ROOT": os.environ.get(
+                        "ART_MEGATRON_CACHE_ROOT",
+                        "/tmp/art-model-support-workflow/cache",
+                    ),
                     "ART_MEGATRON_COMPILE_CACHE": "1",
                 }
             )
