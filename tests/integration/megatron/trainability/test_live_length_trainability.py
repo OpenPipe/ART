@@ -786,6 +786,10 @@ async def run_length_trainability_async(
     backend_env = stage_resources.megatron_env if stage_resources is not None else {}
     with _temporary_env(backend_env):
         max_steps = _length_max_steps(base_model)
+        if resident_hook is not None and max_steps < 2:
+            raise ValueError(
+                "resident functional validation requires at least two steps"
+            )
         max_steps_off_policy = _get_env_int(
             "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS_OFF_POLICY",
             0,
@@ -958,7 +962,7 @@ async def run_length_trainability_async(
 
         phase_steps = (1, max_steps - 1) if resident_hook is not None else (max_steps,)
         for phase_index, steps in enumerate(phase_steps):
-            if steps <= 0 or (phase_index > 0 and success_hit):
+            if steps <= 0:
                 continue
             phase_start = await model.get_step()
             started = time.monotonic()
@@ -989,6 +993,7 @@ async def run_length_trainability_async(
                     )
                 async with backend.exact_adapter_lease(model, phase_end):
                     await resident_hook("first_update", backend, model, phase_end)
+                success_hit = False
 
         latest_step = await model.get_step()
         async with backend.exact_adapter_lease(model, latest_step):
@@ -1076,6 +1081,23 @@ def run_length_trainability(
     )
 
 
+def _resident_phase_contract_passed(report: LengthTrainabilityReport) -> bool:
+    if all(phase.name == "complete" for phase in report.phases):
+        return True
+    if len(report.phases) != 2:
+        return False
+    first_update, continuation = report.phases
+    return (
+        first_update.name == "first_update"
+        and first_update.start_step == 0
+        and first_update.end_step == 1
+        and continuation.name == "continuation"
+        and continuation.start_step == 1
+        and continuation.end_step == report.latest_step
+        and continuation.end_step > continuation.start_step
+    )
+
+
 def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
     thresholds = report.thresholds
     train_samples = [sample for sample in report.samples if sample.split == "train"]
@@ -1085,6 +1107,7 @@ def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
     }
     return (
         bool(train_samples)
+        and _resident_phase_contract_passed(report)
         and report.latest_step <= report.max_steps
         and report.initial_train_abs_error is not None
         and _initial_abs_error_passed(report.initial_train_abs_error, thresholds)
@@ -1109,6 +1132,7 @@ def assert_length_trainability_passed(report: LengthTrainabilityReport) -> None:
         for step in {sample.step for sample in train_samples}
     }
     assert train_samples
+    assert _resident_phase_contract_passed(report)
     assert report.latest_step <= report.max_steps
     assert report.initial_train_abs_error is not None
     assert _initial_abs_error_passed(report.initial_train_abs_error, thresholds)
