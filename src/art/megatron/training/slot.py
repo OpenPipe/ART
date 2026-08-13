@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import math
 from pathlib import Path
 import sys
@@ -35,6 +34,7 @@ from art.megatron.runtime.specs import (
     SftForwardJobSpec,
     TrainerGeneration,
     TrainerRuntimeSpec,
+    operation_generation_id,
 )
 from art.preprocessing.sft import SftBatchTokenizer
 from art.training.contracts import (
@@ -444,10 +444,7 @@ class MegatronTrainingSlot:
         generation = TrainerGeneration(
             training_session_id=state.registration.training_session_id,
             policy_step=output_version,
-            generation_id=(
-                f"step-{output_version:08d}-"
-                f"{hashlib.sha256(ref.operation_id.encode()).hexdigest()[:32]}"
-            ),
+            generation_id=operation_generation_id(ref.operation_id, output_version),
             adapter_path=get_step_checkpoint_dir(state.output_dir, output_version),
         )
         state.generation = generation
@@ -515,10 +512,7 @@ class MegatronTrainingSlot:
         generation = TrainerGeneration(
             training_session_id=state.registration.training_session_id,
             policy_step=output_version,
-            generation_id=(
-                f"step-{output_version:08d}-"
-                f"{hashlib.sha256(ref.operation_id.encode()).hexdigest()[:32]}"
-            ),
+            generation_id=operation_generation_id(ref.operation_id, output_version),
             adapter_path=get_step_checkpoint_dir(state.output_dir, output_version),
         )
         state.generation = generation
