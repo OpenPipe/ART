@@ -788,6 +788,21 @@ def _stable_gpu_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _effective_groups_per_update(stage: Any, config: ThroughputWorkflowConfig) -> int:
+    if stage.megatron is None:
+        raise RuntimeError("throughput stage requires Megatron resources")
+    topology = stage.megatron.topology
+    sequence_world_size = topology.tp * topology.cp * topology.pp
+    target_sequences, remainder = divmod(
+        len(stage.megatron.gpu_ids), sequence_world_size
+    )
+    _require(
+        target_sequences > 0 and remainder == 0,
+        "throughput topology cannot resolve packed sequences per update",
+    )
+    return config.groups_per_step * target_sequences
+
+
 def _calibration_contract(
     *,
     base_model: str,
@@ -853,7 +868,9 @@ def _calibration_contract(
             "eval_at_start": False,
             "save_checkpoint": False,
             "resume": False,
-            "score_reference_groups_per_step": config.groups_per_step,
+            "score_reference_groups_per_step": _effective_groups_per_update(
+                stage, config
+            ),
             "score_reference_rollouts_per_group": config.rollouts_per_group,
             "max_steps_off_policy": config.max_steps_off_policy,
             "isolated_warmup_steps": _ISOLATED_WARMUP_STEPS,
@@ -1738,7 +1755,9 @@ async def _run_e2e_throughput_async(
                 save_checkpoint=False,
                 resume=False,
                 log_interval_seconds=30.0,
-                score_reference_groups_per_step=float(config.groups_per_step),
+                score_reference_groups_per_step=float(
+                    _effective_groups_per_update(stage, config)
+                ),
                 score_reference_rollouts_per_group=float(config.rollouts_per_group),
                 max_steps_off_policy=config.max_steps_off_policy,
             )
