@@ -10,6 +10,7 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
 from .. import dev
+from .._backend_training import merge_gradient_step_metrics
 from ..backend import AnyTrainableModel
 from ..distributed.art_runtime import ArtRuntime
 from ..local.backend import LocalBackend, _PackedTrainingBatch
@@ -512,8 +513,9 @@ class MegatronBackend(LocalBackend):
             if pending is not None:
                 yield pending
             pending = {
-                **forward_result.metrics,
-                **optimizer_result.metrics,
+                **merge_gradient_step_metrics(
+                    forward_result.metrics, optimizer_result.metrics
+                ),
                 "data/step_num_trajectories": float(len(values)),
                 "data/step_trainable_assistant_tokens": float(
                     forward_result.packing.trainable_assistant_tokens
@@ -1058,13 +1060,11 @@ class MegatronBackend(LocalBackend):
             forward.result(), optimizer.result()
         )
         metrics = {
-            **forward_result.metrics,
-            **optimizer_result.metrics,
+            **merge_gradient_step_metrics(
+                forward_result.metrics, optimizer_result.metrics
+            ),
             **distributed_service.drain_publication_metrics(),
         }
-        metrics["time/gradient_step_train_s"] = (
-            metrics["time/forward_backward_s"] + metrics["time/optimizer_step_s"]
-        )
         yield metrics
 
     async def _release_training_batch(self, batch: _PackedTrainingBatch) -> None:

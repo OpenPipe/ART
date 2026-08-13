@@ -11,6 +11,7 @@ import uuid
 from art._backend_training import (
     aggregate_rl_training_metrics,
     build_rl_train_configs,
+    merge_gradient_step_metrics,
 )
 from art._source_revision import art_source_revision
 from art.adapter_leases import pin_inference_target, pinned_inference_name
@@ -615,8 +616,9 @@ class ServerlessBackend:
         metrics = aggregate_rl_training_metrics(
             training_metrics=[
                 {
-                    **forward_result.metrics,
-                    **optimizer_result.metrics,
+                    **merge_gradient_step_metrics(
+                        forward_result.metrics, optimizer_result.metrics
+                    ),
                     **sampler_result.publication_metrics,
                     **(publication_metrics or {}),
                     **_packing_outcome_metrics(forward_result.packing),
@@ -690,8 +692,9 @@ class ServerlessBackend:
             if pending is not None:
                 yield pending
             pending = {
-                **forward_result.metrics,
-                **optimizer_result.metrics,
+                **merge_gradient_step_metrics(
+                    forward_result.metrics, optimizer_result.metrics
+                ),
                 **_packing_outcome_metrics(forward_result.packing),
                 "data/step_num_trajectories": float(len(values)),
                 "data/step_trainable_assistant_tokens": float(
