@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformers")
 _DEFERRED_PRECOMPILE_INSTALLS: list[tuple[Any, dict[Any, Any]]] = []
-_CodeIdentity = tuple[str, str, str, int, CodeType]
+_CodeIdentity = tuple[str, str, str, int]
 
 
 def _code_identity(code: CodeType) -> _CodeIdentity:
@@ -37,14 +37,14 @@ def _code_identity(code: CodeType) -> _CodeIdentity:
         code.co_qualname,
         code.co_name,
         code.co_firstlineno,
-        code,
     )
 
 
 def _canonicalize_code(
     code: CodeType, canonical_codes: dict[_CodeIdentity, CodeType]
 ) -> CodeType:
-    if canonical := canonical_codes.get(_code_identity(code)):
+    canonical = canonical_codes.get(_code_identity(code))
+    if canonical is not None and code == canonical:
         return canonical
     constants = tuple(
         _canonicalize_code(value, canonical_codes)
@@ -333,7 +333,11 @@ def _support_shared_code_precompile() -> None:
                 canonical = package._lookup_code(entry)
                 if code != canonical:
                     raise RuntimeError("compile package code does not match its source")
-                canonical_codes[_code_identity(code)] = canonical
+                identity = _code_identity(code)
+                existing = canonical_codes.get(identity)
+                if existing is not None and existing != canonical:
+                    raise RuntimeError("compile package has ambiguous source code")
+                canonical_codes[identity] = canonical
 
             normalized = {
                 _canonicalize_code(code, canonical_codes): entry
