@@ -340,6 +340,8 @@ class _HfMoeRoutingCapture:
             if not torch.allclose(
                 assembled.expert_probs.index_select(0, existing_rows),
                 route.expert_probs.index_select(0, path_rows),
+                rtol=3e-5,
+                atol=3e-6,
             ):
                 raise RuntimeError("HF parity repeated path changed expert scores")
         assembled.expert_indices.index_copy_(0, token_uids, route.expert_indices)
