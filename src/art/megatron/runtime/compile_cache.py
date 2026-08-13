@@ -7,9 +7,11 @@ import hashlib
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 import inspect
+from io import BytesIO
 import json
 import os
 from pathlib import Path
+import pickle
 import sys
 import time
 from types import CodeType, FunctionType, MethodType, ModuleType
@@ -39,6 +41,31 @@ def _load_python_code(value: Any) -> Any:
     return SerializedCode.to_code_object(value)
 
 
+def _reduce_python_code(code: CodeType) -> tuple[Any, tuple[Any, ...]]:
+    from torch._dynamo.package import SerializedCode
+
+    return _load_python_code, (SerializedCode.from_code_object(code),)
+
+
+class _CompilePackagePickle:
+    _art_scoped_reducers = True
+
+    @staticmethod
+    def dumps(value: Any, *args: Any, **kwargs: Any) -> bytes:
+        buffer = BytesIO()
+        pickler = pickle.Pickler(buffer, *args, **kwargs)
+        pickler.dispatch_table = copyreg.dispatch_table | {
+            ModuleType: lambda module: (import_module, (module.__name__,)),
+            CodeType: _reduce_python_code,
+        }
+        pickler.dump(value)
+        return buffer.getvalue()
+
+    @staticmethod
+    def loads(value: bytes) -> Any:
+        return pickle.loads(value)
+
+
 def _module_global_reference(value: Any) -> tuple[str, str]:
     matches = sorted(
         (module_name, attribute)
@@ -54,19 +81,16 @@ def _module_global_reference(value: Any) -> tuple[str, str]:
 
 def _support_precompile_serialization() -> None:
     import torch
+    from torch._dynamo import package
     from torch._dynamo.guards import CheckFunctionManager, GuardsStatePickler, _Missing
-    from torch._dynamo.package import SerializedCode
     from torch._dynamo.source import DefaultsSource
+
+    if not getattr(package.pickle, "_art_scoped_reducers", False):
+        setattr(package, "pickle", _CompilePackagePickle())
 
     original = GuardsStatePickler.reducer_override
     if getattr(original, "_art_supports_instance_method_aliases", False):
         return
-
-    copyreg.pickle(ModuleType, lambda module: (import_module, (module.__name__,)))
-    copyreg.pickle(
-        CodeType,
-        lambda code: (_load_python_code, (SerializedCode.from_code_object(code),)),
-    )
 
     def reducer_override(self: Any, obj: Any) -> Any:
         # Timers and routing replay retain transient events behind compiled modules.
