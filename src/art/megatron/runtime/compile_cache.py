@@ -151,6 +151,9 @@ def _support_precompile_serialization() -> None:
         return
 
     def reducer_override(self: Any, obj: Any) -> Any:
+        # Dtypes are singletons: a missing local dtype may also belong to a guarded tensor.
+        if isinstance(obj, torch.dtype):
+            return NotImplemented
         # Timers and routing replay retain transient events behind compiled modules.
         if isinstance(obj, torch.cuda.Event) and id(obj) not in self.guard_tree_values:
             return _Missing, ("unguarded CUDA event",)
