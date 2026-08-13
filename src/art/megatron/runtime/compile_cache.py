@@ -31,6 +31,7 @@ _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformer
 _DEFERRED_PRECOMPILE_INSTALLS: list[tuple[Any, dict[Any, Any]]] = []
 _CodeIdentity = tuple[str, str, str, int]
 _CanonicalCodes = dict[_CodeIdentity, list[CodeType]]
+_CANONICAL_CODES: _CanonicalCodes = {}
 
 
 def _code_identity(code: CodeType) -> _CodeIdentity:
@@ -62,9 +63,6 @@ def _source_code(code: CodeType) -> CodeType:
 
 def _canonicalize_code(code: CodeType, canonical_codes: _CanonicalCodes) -> CodeType:
     candidates = canonical_codes.setdefault(_code_identity(code), [])
-    canonical = next((candidate for candidate in candidates if code == candidate), None)
-    if canonical is not None:
-        return canonical
     from torch._dynamo import package
 
     try:
@@ -76,6 +74,9 @@ def _canonicalize_code(code: CodeType, canonical_codes: _CanonicalCodes) -> Code
             candidates.append(canonical)
         if code == canonical:
             return canonical
+    canonical = next((candidate for candidate in candidates if code == candidate), None)
+    if canonical is not None:
+        return canonical
     constants = tuple(
         _canonicalize_code(value, canonical_codes)
         if isinstance(value, CodeType)
@@ -87,9 +88,13 @@ def _canonicalize_code(code: CodeType, canonical_codes: _CanonicalCodes) -> Code
         if all(left is right for left, right in zip(constants, code.co_consts))
         else code.replace(co_consts=constants)
     )
-    return next(
-        (candidate for candidate in candidates if normalized == candidate), normalized
+    canonical = next(
+        (candidate for candidate in candidates if normalized == candidate), None
     )
+    if canonical is not None:
+        return canonical
+    candidates.append(normalized)
+    return normalized
 
 
 def _canonicalize_serialized_code(
@@ -359,7 +364,7 @@ def _support_shared_code_precompile() -> None:
                 return
             # Resume frames embed reconstructed source code in co_consts; execution
             # strategies are attached by identity to the canonical code objects.
-            canonical_codes: _CanonicalCodes = {}
+            canonical_codes = _CANONICAL_CODES
             for code, entry in self._codes.items():
                 if not entry.code_source:
                     continue
@@ -529,6 +534,25 @@ def _support_cross_package_resume_codes() -> None:
 
     setattr(code_context, "_art_supports_cross_package_resumes", True)
     CompilePackage.code_context = code_context
+
+    original_lookup = ContinueExecutionCache.lookup
+    if getattr(original_lookup, "_art_canonicalizes_hydrated_resumes", False):
+        return
+
+    def lookup(
+        cls: Any, code: CodeType, lineno: int, init_offset: int, *key: Any
+    ) -> CodeType:
+        generated = original_lookup(code, lineno, init_offset, *key)
+        canonical = _canonicalize_code(generated, _CANONICAL_CODES)
+        if canonical is not generated:
+            metadata = ContinueExecutionCache.generated_code_metadata.get(generated)
+            if metadata is not None:
+                ContinueExecutionCache.generated_code_metadata[canonical] = metadata
+            ContinueExecutionCache.cache[code][tuple(key)] = canonical
+        return canonical
+
+    setattr(lookup, "_art_canonicalizes_hydrated_resumes", True)
+    setattr(ContinueExecutionCache, "lookup", classmethod(lookup))
 
 
 class CompileCacheEvent(BaseModel):
