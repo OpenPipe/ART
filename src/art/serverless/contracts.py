@@ -14,6 +14,7 @@ from art.training.contracts import (
 )
 
 TRAINING_DATA_FORMAT = "art_training_batch_msgpack_v1"
+OPERATION_RESULT_FORMAT = "art_operation_result_msgpack_v1"
 
 
 class TrainingDataRef(Contract):
@@ -21,6 +22,12 @@ class TrainingDataRef(Contract):
     byte_count: int = Field(ge=1)
     format: Literal["art_training_batch_msgpack_v1"] = TRAINING_DATA_FORMAT
     batch_kind: Literal["rl", "sft"]
+
+
+class OperationResultRef(Contract):
+    object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=1)
+    format: Literal["art_operation_result_msgpack_v1"] = OPERATION_RESULT_FORMAT
 
 
 class RemoteForwardRequest(RunCommand):
@@ -120,7 +127,7 @@ class OperationView(Contract):
     ref: OperationRef
     status: OperationStatus
     contributing_forward_backward_operation_ids: tuple[str, ...] = ()
-    result: dict[str, Any] | None = None
+    result: OperationResultRef | dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     event_cursor: int = Field(ge=1)
     created_at: datetime

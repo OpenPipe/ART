@@ -37,6 +37,7 @@ from .contracts import (
     CloseRunRequest,
     CreateTrainingRunRequest,
     DeleteCheckpointResult,
+    OperationResultRef,
     OperationView,
     RemoteForwardRequest,
     SetCheckpointTtlRequest,
@@ -44,7 +45,7 @@ from .contracts import (
     TrainingDataRef,
     TrainingRunView,
 )
-from .data_plane import encode_training_batch
+from .data_plane import decode_operation_result, encode_training_batch
 
 ResultT = TypeVar("ResultT", bound=OperationResult)
 ResponseT = TypeVar("ResponseT", bound=Contract)
@@ -159,6 +160,20 @@ class RemoteTrainingServiceClient:
         return await self._request(
             "GET", f"training/operations/{operation_id}", OperationView
         )
+
+    async def get_operation_result(
+        self, operation_id: str, ref: OperationResultRef
+    ) -> bytes:
+        response = await self._send(
+            "GET",
+            f"training/operations/{operation_id}/result",
+            content=None,
+            headers=None,
+        )
+        payload = response.content
+        if len(payload) != ref.byte_count:
+            raise RemoteTrainingError("remote operation result byte count changed")
+        return payload
 
     async def cancel_operation(
         self, operation_id: str, request_id: str
@@ -325,7 +340,22 @@ class RemoteTrainingOperation(Generic[ResultT]):
             if operation.status == "succeeded":
                 if operation.result is None:
                     raise RemoteTrainingError("successful operation has no result")
-                result = self._result_type.model_validate(operation.result)
+                remote = operation.result
+                if self._ref.kind in {"forward", "forward_backward"}:
+                    if not isinstance(remote, OperationResultRef):
+                        raise RemoteTrainingError(
+                            "remote forward result has no binary sidecar"
+                        )
+                    payload = await self._service.get_operation_result(
+                        self._ref.operation_id, remote
+                    )
+                    result = decode_operation_result(remote, payload, self._result_type)
+                else:
+                    if isinstance(remote, OperationResultRef):
+                        raise RemoteTrainingError(
+                            "remote control result unexpectedly uses a sidecar"
+                        )
+                    result = self._result_type.model_validate(remote)
                 if result.operation_id != self._ref.operation_id:
                     raise RemoteTrainingError("operation result identity changed")
                 return result
