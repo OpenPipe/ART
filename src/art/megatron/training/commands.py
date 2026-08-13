@@ -45,7 +45,9 @@ def experimental_train_config(
     return ExperimentalTrainConfig.model_validate(values)
 
 
-def packing_outcome(packed: DistributedPackedBatch) -> PackingOutcome:
+def packing_outcome(
+    packed: DistributedPackedBatch, *, target_packed_sequences: int
+) -> PackingOutcome:
     ref = packed.leases.ref
     stats = ref.prefix_tree_packing_stats
     if stats is None or stats.policy_token_counts is None:
@@ -53,7 +55,7 @@ def packing_outcome(packed: DistributedPackedBatch) -> PackingOutcome:
     return PackingOutcome(
         packed_sequence_length=ref.sequence_length,
         packed_sequences=ref.num_sequences,
-        target_packed_sequences=ref.num_sequences,
+        target_packed_sequences=target_packed_sequences,
         nominal_capacity_tokens=ref.num_sequences * ref.sequence_length,
         physical_tokens=stats.physical_tokens,
         non_padding_tokens=packed.non_padding_tokens,

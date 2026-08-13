@@ -25,6 +25,7 @@ from art.training.contracts import (
     SaveWeightsForSamplerRequest,
 )
 from art.training.sequencing import CommandAdmission, RunCommandLedger
+from art.types import TrainConfig
 
 from ..runtime.specs import ResolvedCheckpointState
 from .commands import (
@@ -245,25 +246,37 @@ class LocalMegatronTrainingClient:
                 raise RuntimeError("local command did not use the typed data plane")
             release_started = time.perf_counter()
             await self._backend._release_trajectory_sources(batch, payload)
+            training_config = forward_backward_config(request)
             raw = await (
                 self._service.forward_backward_command(
                     admission.ref,
                     payload.packed,
-                    forward_backward_config(request),
+                    training_config,
                     experimental_train_config(request),
                 )
                 if backward
                 else self._service.forward_command(
                     admission.ref,
                     payload.packed,
-                    forward_backward_config(request),
+                    training_config,
                     experimental_train_config(request),
                 )
             )
             result_type = ForwardBackwardResult if backward else ForwardResult
             return result_type(
                 operation_id=admission.ref.operation_id,
-                packing=packing_outcome(payload.packed),
+                packing=packing_outcome(
+                    payload.packed,
+                    target_packed_sequences=(
+                        await self._service.resolve_global_grad_accumulation_sequences(
+                            TrainConfig(
+                                grad_accumulation_sequences=(
+                                    training_config.grad_accumulation_sequences
+                                )
+                            )
+                        )
+                    ),
+                ),
                 loss_fn_outputs=tuple(
                     LossFnOutput(token_logprobs=values)
                     for values in raw["token_logprobs"]

@@ -233,6 +233,7 @@ class MegatronTrainingSlot:
                 packing=sft_packing_outcome(batch),
             )
         config = experimental_train_config(request)
+        training_config = forward_backward_config(request)
         if (
             config.packed_sequence_length is not None
             and config.packed_sequence_length
@@ -269,9 +270,21 @@ class MegatronTrainingSlot:
         return PreparedRlForward(
             ref=ref,
             packed=packed,
-            packing=packing_outcome(packed),
-            config=forward_backward_config(request),
+            packing=packing_outcome(
+                packed,
+                target_packed_sequences=(
+                    training_config.grad_accumulation_sequences
+                    or self._data_parallel_size()
+                ),
+            ),
+            config=training_config,
             experimental_config=config,
+        )
+
+    def _data_parallel_size(self) -> int:
+        topology = self.runtime_spec.trainer_mesh.topology
+        return len(self.runtime_spec.trainer_mesh.ranks) // (
+            topology.tp * topology.cp * topology.pp
         )
 
     async def discard_prepared(self, prepared: PreparedForward) -> None:
