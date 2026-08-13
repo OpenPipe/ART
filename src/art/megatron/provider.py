@@ -250,6 +250,13 @@ class _ProviderRuntimeEnv(BaseModel):
         return field_name in self.model_fields_set
 
 
+def provider_runtime_env_identity() -> dict[str, Any]:
+    return _ProviderRuntimeEnv.from_environ().model_dump(
+        mode="json",
+        exclude_unset=True,
+    )
+
+
 def _set_if_found(
     values: dict[str, Any],
     field_name: str,

@@ -280,6 +280,9 @@ class DefaultDenseHandler:
             shared_expert_state=self._shared_expert_compile_state(provider),
         )
 
+    def compile_cache_identity(self, provider: Any) -> dict[str, Any]:
+        return {"num_layers": int(provider.num_layers)}
+
     def flex_attention_compile_crash_config(
         self,
         provider: Any,

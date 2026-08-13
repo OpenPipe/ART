@@ -13,6 +13,7 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..training.compile import TrainingCompilePlan
 from .specs import TrainerRuntimeSpec
 
 _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformers")
@@ -101,7 +102,11 @@ def _package_versions() -> dict[str, str]:
     return result
 
 
-def _compile_cache_key(spec: TrainerRuntimeSpec, rank: int) -> str:
+def _compile_cache_key(
+    spec: TrainerRuntimeSpec,
+    rank: int,
+    plan: TrainingCompilePlan,
+) -> str:
     import torch
     import triton
 
@@ -131,8 +136,9 @@ def _compile_cache_key(spec: TrainerRuntimeSpec, rank: int) -> str:
         }
     )
     payload: dict[str, Any] = {
-        "schema": 2,
+        "schema": 3,
         "runtime": runtime,
+        "compile_plan": plan.model_dump(mode="json"),
         "environment": {
             "python": sys.implementation.cache_tag,
             "torch": torch.__version__,
@@ -141,9 +147,6 @@ def _compile_cache_key(spec: TrainerRuntimeSpec, rank: int) -> str:
             "cuda": torch.version.cuda,
             "sm": torch.cuda.get_device_capability(),
             "packages": _package_versions(),
-            "compile_workarounds": os.environ.get(
-                "ART_MEGATRON_COMPILE_WORKAROUNDS", "1"
-            ),
             "dynamo_precompile": True,
         },
     }
@@ -165,32 +168,49 @@ class TrainerCompileCache:
         _support_non_strict_package_bypass()
         os.environ["TORCH_CACHING_PRECOMPILE"] = "1"
         config.caching_precompile = True
-        self.key = _compile_cache_key(spec, rank)
-        self.path = cache_root / "megatron" / "compile_cache" / "v2" / self.key
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._spec = spec
+        self._rank = rank
+        self._cache_root = cache_root
+        self.key: str | None = None
+        self.path: Path | None = None
         self.loaded = False
+
+    def _configure(self, plan: TrainingCompilePlan) -> tuple[str, Path]:
+        key = _compile_cache_key(self._spec, self._rank, plan)
+        if self.key is not None and self.key != key:
+            raise RuntimeError("trainer compile plan changed after cache load")
+        self.key = key
+        self.path = self._cache_root / "megatron" / "compile_cache" / "v3" / self.key
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        return self.key, self.path
+
+    def _configured(self) -> tuple[str, Path]:
+        if self.key is None or self.path is None:
+            raise RuntimeError("trainer compile cache was not given a compile plan")
+        return self.key, self.path
 
     def _require_precompile(self, info: Any) -> None:
         if not info.artifacts.get("precompile"):
             raise RuntimeError(f"compile cache {self.key} has no Dynamo artifact")
 
-    def load(self) -> CompileCacheEvent:
+    def load(self, plan: TrainingCompilePlan) -> CompileCacheEvent:
         import torch
 
         started = time.perf_counter()
-        if not self.path.is_file():
+        key, path = self._configure(plan)
+        if not path.is_file():
             return CompileCacheEvent(
-                status="miss", key=self.key, elapsed_s=time.perf_counter() - started
+                status="miss", key=key, elapsed_s=time.perf_counter() - started
             )
-        artifact = self.path.read_bytes()
+        artifact = path.read_bytes()
         info = torch.compiler.load_cache_artifacts(artifact)
         if info is None:
-            raise RuntimeError(f"PyTorch rejected compile cache {self.key}")
+            raise RuntimeError(f"PyTorch rejected compile cache {key}")
         self._require_precompile(info)
         self.loaded = True
         return CompileCacheEvent(
             status="hit",
-            key=self.key,
+            key=key,
             elapsed_s=time.perf_counter() - started,
             artifact_bytes=len(artifact),
         )
@@ -199,28 +219,29 @@ class TrainerCompileCache:
         import torch
 
         started = time.perf_counter()
-        if self.loaded or self.path.is_file():
+        key, path = self._configured()
+        if self.loaded or path.is_file():
             return CompileCacheEvent(
                 status="existing",
-                key=self.key,
+                key=key,
                 elapsed_s=time.perf_counter() - started,
-                artifact_bytes=self.path.stat().st_size,
+                artifact_bytes=path.stat().st_size,
             )
         saved = torch.compiler.save_cache_artifacts()
         if saved is None:
             raise RuntimeError("PyTorch produced no compiler cache after training")
         artifact, info = saved
         self._require_precompile(info)
-        staging = self.path.with_name(f".{self.key}.{os.getpid()}.{uuid.uuid4().hex}")
+        staging = path.with_name(f".{key}.{os.getpid()}.{uuid.uuid4().hex}")
         try:
             staging.write_bytes(artifact)
-            os.replace(staging, self.path)
+            os.replace(staging, path)
         finally:
             staging.unlink(missing_ok=True)
         self.loaded = True
         return CompileCacheEvent(
             status="published",
-            key=self.key,
+            key=key,
             elapsed_s=time.perf_counter() - started,
             artifact_bytes=len(artifact),
         )

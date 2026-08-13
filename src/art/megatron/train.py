@@ -68,6 +68,7 @@ from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,
     build_moe_routing_replay_bundle_from_packed_tensors,
+    prepare_moe_routing_replay_boundaries,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.specs import (
@@ -87,7 +88,9 @@ from art.megatron.selective_lm_head import (
 )
 from art.megatron.tensor_snapshot import SnapshotReadBarrier
 from art.megatron.training.compile import (
+    TrainingCompilePlan,
     configure_training_compile,
+    resolve_training_compile_plan,
 )
 from art.megatron.training.finalize_grads import (
     finalize_model_grads_extended,
@@ -423,6 +426,7 @@ def build_training_runtime(
     allow_unvalidated_arch: bool | None = None,
     model_support_key: str | None = None,
     snapshot_pool_capacity: int = 2,
+    before_compile: Callable[[TrainingCompilePlan], None] | None = None,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -459,10 +463,11 @@ def build_training_runtime(
     provider = provider_bundle.provider
     if provider_configure is not None:
         provider_configure(provider)
-    if _moe_routing_replay_requested(
+    replay_requested = _moe_routing_replay_requested(
         replay_bundle_path=moe_routing_replay_path,
         replay_bundle=moe_routing_replay_bundle,
-    ):
+    )
+    if replay_requested:
         _enable_native_moe_routing_replay(provider)
     finalize_provider_bundle(provider_bundle)
     _register_trainable_parameter_mode(
@@ -510,10 +515,19 @@ def build_training_runtime(
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
     provider_bundle.handler.install_preprocess_patch(model)
+    if replay_requested:
+        prepare_moe_routing_replay_boundaries(model)
+    compile_plan = resolve_training_compile_plan(
+        provider=provider,
+        provider_bundle=provider_bundle,
+    )
+    if before_compile is not None:
+        before_compile(compile_plan)
     transformer_layers_compiled = configure_training_compile(
         model=model,
         provider=provider,
         provider_bundle=provider_bundle,
+        plan=compile_plan,
     )
 
     optimizer_config = optimizer_config or _default_optimizer_config()

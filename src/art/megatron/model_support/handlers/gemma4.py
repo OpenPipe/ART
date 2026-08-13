@@ -10,10 +10,8 @@ from types import MethodType
 from typing import Any, Sequence, cast
 
 from megatron.core import tensor_parallel
-from megatron.core.extensions.transformer_engine import (
-    TERowParallelLinear,
-    te_checkpoint,
-)
+from megatron.core.extensions import transformer_engine as te_extensions
+from megatron.core.extensions.transformer_engine import TERowParallelLinear
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 import torch
@@ -1418,7 +1416,7 @@ def _install_gemma4_full_recompute_patch(model_chunks: Sequence[Any]) -> None:
                     padding_mask,
                 )
                 if self.config.fp8 or self.config.fp4:
-                    return te_checkpoint(
+                    return te_extensions.te_checkpoint(
                         forward_func,
                         self.config.distribute_saved_activations,
                         tensor_parallel.random.get_cuda_rng_tracker,

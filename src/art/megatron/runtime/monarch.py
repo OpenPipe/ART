@@ -133,7 +133,12 @@ def _training_runtime_builder() -> Any:
     return build_training_runtime
 
 
-def _build_training_runtime(spec: TrainerRuntimeSpec, *, rank: int) -> Any:
+def _build_training_runtime(
+    spec: TrainerRuntimeSpec,
+    *,
+    rank: int,
+    before_compile: Callable[[Any], None] | None = None,
+) -> Any:
     import torch
 
     build_training_runtime = _training_runtime_builder()
@@ -148,6 +153,7 @@ def _build_training_runtime(spec: TrainerRuntimeSpec, *, rank: int) -> Any:
         print_env=rank == 0,
         model_support_key=spec.model_support_key,
         snapshot_pool_capacity=spec.snapshot_pool_capacity,
+        before_compile=before_compile,
     )
 
 
@@ -374,7 +380,10 @@ class MonarchTrainerActor(Actor):
             self._compile_cache = TrainerCompileCache(
                 runtime_spec, rank=rank, cache_root=cache_root
             )
-            event = self._compile_cache.load()
+
+        def load_compile_cache(plan: Any) -> None:
+            assert self._compile_cache is not None
+            event = self._compile_cache.load(plan)
             self._compile_cache_metrics.update(
                 {
                     "hit": float(event.status == "hit"),
@@ -382,7 +391,12 @@ class MonarchTrainerActor(Actor):
                     "artifact_bytes": float(event.artifact_bytes),
                 }
             )
-        self._runtime = _build_training_runtime(runtime_spec, rank=rank)
+
+        self._runtime = _build_training_runtime(
+            runtime_spec,
+            rank=rank,
+            before_compile=load_compile_cache if self._compile_cache else None,
+        )
         self._runtime.resident_run_id = run_id
         if self._runtime.model_support_handler.key != runtime_spec.handler_name:
             raise RuntimeError(
