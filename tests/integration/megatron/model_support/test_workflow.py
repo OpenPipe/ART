@@ -452,7 +452,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "e2e_core_train_tok_s": 8_000 / 12.0,
         "e2e_train_tok_s": 500.0,
         "accepted_train_tok_s": 250.0,
-        "unused_and_dummy_ratio": 0.25,
+        "unused_and_dummy_ratio": 1.0 - 1_000 / 131_072,
         "queue_ready_inter_forward_backward_gap_rank_zero_p50_s": 0.115,
         "queue_ready_inter_forward_backward_gap_rank_zero_p95_s": 0.1285,
         "queue_ready_inter_forward_backward_gap_rank_zero_max_s": 0.13,
@@ -606,7 +606,11 @@ def test_throughput_classification_is_fail_closed() -> None:
     assert load["acceptance_status"] == "load_inconclusive"
     assert load["load_failures"] == ["stable_trainer_underfeed"]
     assert load["performance_failures"] == ["accepted_train_tok_s"]
-    for hard_failure in ("calibration_fingerprint", "window_4_5_policy_age_p95"):
+    for hard_failure in (
+        "calibration_fingerprint",
+        "unused_and_dummy_ratio",
+        "window_4_5_policy_age_p95",
+    ):
         classified = _classify_acceptance_failures(
             ["stable_min_vllm_pressure", hard_failure]
         )
