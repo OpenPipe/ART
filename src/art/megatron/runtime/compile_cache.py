@@ -59,6 +59,15 @@ def _canonicalize_code(
     )
 
 
+def _canonicalize_serialized_code(
+    serialized_code: Any, canonical_codes: dict[_CodeIdentity, CodeType]
+) -> None:
+    from torch._dynamo import package
+
+    code = package.SerializedCode.to_code_object(serialized_code)
+    package._CODE_CACHE[serialized_code] = _canonicalize_code(code, canonical_codes)
+
+
 def _load_module_global(module_name: str, attribute: str) -> Any:
     return getattr(import_module(module_name), attribute)
 
@@ -335,6 +344,11 @@ def _support_shared_code_precompile() -> None:
                     "compile package has ambiguous canonical code entries"
                 )
             self._codes = normalized
+            for entry in self._codes.values():
+                for guarded_code in entry.guarded_codes:
+                    _canonicalize_serialized_code(
+                        guarded_code.dynamo_code, canonical_codes
+                    )
             token = installing.set(True)
             try:
                 original_install(self, backends)
