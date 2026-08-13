@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -40,11 +41,37 @@ def _code_identity(code: CodeType) -> _CodeIdentity:
     )
 
 
+def _source_code(code: CodeType) -> CodeType:
+    from torch._dynamo import package
+
+    function, source = package._get_code_source(code)
+    value: Any = inspect.getmodule(code)
+    for part in function.split("."):
+        value = getattr(value, part)
+    for part in source.split("."):
+        if part.endswith("]"):
+            attribute, index = part[:-1].split("[", 1)
+            value = getattr(value, attribute)[ast.literal_eval(index)]
+        else:
+            value = getattr(value, part)
+    if not isinstance(value, CodeType):
+        raise package.PackageError(f"code source resolved to {value!r}")
+    return value
+
+
 def _canonicalize_code(
     code: CodeType, canonical_codes: dict[_CodeIdentity, CodeType]
 ) -> CodeType:
     canonical = canonical_codes.get(_code_identity(code))
+    if canonical is None:
+        from torch._dynamo import package
+
+        try:
+            canonical = _source_code(code)
+        except package.PackageError:
+            pass
     if canonical is not None and code == canonical:
+        canonical_codes.setdefault(_code_identity(code), canonical)
         return canonical
     constants = tuple(
         _canonicalize_code(value, canonical_codes)
