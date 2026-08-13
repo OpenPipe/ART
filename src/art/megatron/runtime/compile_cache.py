@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
 import hashlib
+from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 import json
 import os
@@ -19,6 +21,23 @@ from .specs import TrainerRuntimeSpec
 _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformers")
 
 
+def _load_module_global(module_name: str, attribute: str) -> Any:
+    return getattr(import_module(module_name), attribute)
+
+
+def _module_global_reference(value: Any) -> tuple[str, str]:
+    matches = sorted(
+        (module_name, attribute)
+        for module_name, module in tuple(sys.modules.items())
+        if module is not None and module_name != "__main__"
+        for attribute, candidate in vars(module).items()
+        if candidate is value and attribute.isidentifier()
+    )
+    if not matches:
+        raise TypeError(f"compile guard has no stable module global for {value!r}")
+    return matches[0]
+
+
 def _support_precompile_serialization() -> None:
     import torch
     from torch._dynamo.guards import CheckFunctionManager, GuardsStatePickler, _Missing
@@ -31,6 +50,8 @@ def _support_precompile_serialization() -> None:
         # Timers and routing replay retain transient events behind compiled modules.
         if isinstance(obj, torch.cuda.Event) and id(obj) not in self.guard_tree_values:
             return _Missing, ("unguarded CUDA event",)
+        if isinstance(obj, ContextVar):
+            return _load_module_global, _module_global_reference(obj)
         # PyTorch assumes a bound method is installed under its function name.
         if isinstance(obj, MethodType) and not hasattr(
             obj.__self__, obj.__func__.__name__
