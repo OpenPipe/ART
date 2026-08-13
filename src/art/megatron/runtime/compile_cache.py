@@ -174,6 +174,11 @@ def _support_precompile_serialization() -> None:
         return
 
     def reducer_override(self: Any, obj: Any) -> Any:
+        obj_type = type(obj)
+        if obj_type.__name__ == "HybridEPHandle" and obj_type.__module__.endswith(
+            ".hybrid_ep_buffer"
+        ):
+            return obj_type, (tuple(obj), obj.logical_num_tokens)
         # Dtypes are singletons: a missing local dtype may also belong to a guarded tensor.
         if isinstance(obj, torch.dtype):
             return NotImplemented
