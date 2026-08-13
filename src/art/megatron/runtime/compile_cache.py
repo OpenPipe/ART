@@ -227,6 +227,49 @@ def _support_precompile_serialization() -> None:
     CheckFunctionManager.serialize_guards = serialize_guards
 
 
+def _support_shared_code_precompile() -> None:
+    from torch._dynamo import output_graph
+    from torch._dynamo.package import CompilePackage
+
+    original_install = CompilePackage.install
+    if not getattr(original_install, "_art_supports_shared_code", False):
+        original_uninstall = CompilePackage.uninstall
+        # Regional layer packages share one code object, so hydration must be additive.
+        installing = ContextVar("art_precompile_installing", default=False)
+
+        def uninstall(self: Any) -> None:
+            if not installing.get():
+                original_uninstall(self)
+
+        def install(self: Any, backends: dict[Any, Any]) -> None:
+            if getattr(self, "_art_precompile_installed", False):
+                raise RuntimeError("compile package was installed more than once")
+            token = installing.set(True)
+            try:
+                original_install(self, backends)
+            finally:
+                installing.reset(token)
+            self._art_precompile_installed = True
+
+        setattr(install, "_art_supports_shared_code", True)
+        CompilePackage.uninstall = uninstall
+        CompilePackage.install = install
+
+    original_global = output_graph.OutputGraph.install_global
+    if not getattr(original_global, "_art_avoids_hydrated_globals", False):
+
+        def install_global(self: Any, prefix: str, value: Any) -> str:
+            # Hydration does not advance Dynamo's process-local unique-id counter.
+            while True:
+                name = output_graph.unique_id(prefix)
+                if name not in self.global_scope:
+                    self.install_global_unsafe(name, value)
+                    return name
+
+        setattr(install_global, "_art_avoids_hydrated_globals", True)
+        output_graph.OutputGraph.install_global = install_global
+
+
 def _support_non_strict_package_bypass() -> None:
     from torch._dynamo.convert_frame import DynamoOutput
 
@@ -402,6 +445,7 @@ class TrainerCompileCache:
         if config.caching_precompile:
             raise RuntimeError("Dynamo precompile was enabled before trainer imports")
         _support_precompile_serialization()
+        _support_shared_code_precompile()
         _support_non_strict_package_bypass()
         _support_cross_package_resume_codes()
         os.environ["TORCH_CACHING_PRECOMPILE"] = "1"
