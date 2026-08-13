@@ -768,6 +768,7 @@ async def run_length_trainability_async(
     artifact_dir: Path | None = None,
     allow_unvalidated_arch: bool = False,
     resident_hook: LengthResidentHook | None = None,
+    first_update_learning_rate: float | None = None,
 ) -> LengthTrainabilityReport:
     artifact_dir = artifact_dir or _artifact_dir(base_model)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -931,7 +932,12 @@ async def run_length_trainability_async(
                 success_hit = True
             return group
 
-        def build_trainer(steps: int) -> PipelineTrainer:
+        learning_rate = _get_env_float(
+            "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
+            _default_learning_rate(base_model),
+        )
+
+        def build_trainer(steps: int, phase_learning_rate: float) -> PipelineTrainer:
             return PipelineTrainer(
                 model=model,
                 backend=backend,
@@ -944,10 +950,7 @@ async def run_length_trainability_async(
                     max_batch_size=1,
                 ),
                 max_steps_off_policy=max_steps_off_policy,
-                learning_rate=_get_env_float(
-                    "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
-                    _default_learning_rate(base_model),
-                ),
+                learning_rate=phase_learning_rate,
                 loss_fn="cispo",
                 normalize_advantages=normalize_advantages,
                 max_steps=steps,
@@ -966,7 +969,12 @@ async def run_length_trainability_async(
                 continue
             phase_start = await model.get_step()
             started = time.monotonic()
-            trainer = build_trainer(steps)
+            phase_learning_rate = (
+                first_update_learning_rate
+                if phase_index == 0 and first_update_learning_rate is not None
+                else learning_rate
+            )
+            trainer = build_trainer(steps, phase_learning_rate)
             await trainer.train(handle_signals=False)
             if resident_hook is not None and phase_index == 0:
                 pending_trainable_step = None

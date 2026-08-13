@@ -8,6 +8,8 @@ from typing import Any, Literal
 from .lora_coverage import build_lora_coverage_report
 from .validation_spec import ValidationStageResult
 
+_PARITY_LEARNING_RATE = 1e-6
+
 
 async def run_resident_functional_session(
     *,
@@ -108,6 +110,7 @@ async def run_resident_functional_session(
             artifact_dir=length_dir,
             allow_unvalidated_arch=allow_unvalidated_arch,
             resident_hook=hook,
+            first_update_learning_rate=_PARITY_LEARNING_RATE,
         )
     finally:
         from .workflow import _cleanup_stage_workspace
