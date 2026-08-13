@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformers")
 _DEFERRED_PRECOMPILE_INSTALLS: list[tuple[Any, dict[Any, Any]]] = []
 _CodeIdentity = tuple[str, str, str, int]
+_CanonicalCodes = dict[_CodeIdentity, list[CodeType]]
 
 
 def _code_identity(code: CodeType) -> _CodeIdentity:
@@ -59,35 +60,40 @@ def _source_code(code: CodeType) -> CodeType:
     return value
 
 
-def _canonicalize_code(
-    code: CodeType, canonical_codes: dict[_CodeIdentity, CodeType]
-) -> CodeType:
-    canonical = canonical_codes.get(_code_identity(code))
-    if canonical is None:
-        from torch._dynamo import package
-
-        try:
-            canonical = _source_code(code)
-        except package.PackageError:
-            pass
-    if canonical is not None and code == canonical:
-        canonical_codes.setdefault(_code_identity(code), canonical)
+def _canonicalize_code(code: CodeType, canonical_codes: _CanonicalCodes) -> CodeType:
+    candidates = canonical_codes.setdefault(_code_identity(code), [])
+    canonical = next((candidate for candidate in candidates if code == candidate), None)
+    if canonical is not None:
         return canonical
+    from torch._dynamo import package
+
+    try:
+        canonical = _source_code(code)
+    except package.PackageError:
+        pass
+    else:
+        if all(candidate is not canonical for candidate in candidates):
+            candidates.append(canonical)
+        if code == canonical:
+            return canonical
     constants = tuple(
         _canonicalize_code(value, canonical_codes)
         if isinstance(value, CodeType)
         else value
         for value in code.co_consts
     )
-    return (
+    normalized = (
         code
         if all(left is right for left, right in zip(constants, code.co_consts))
         else code.replace(co_consts=constants)
     )
+    return next(
+        (candidate for candidate in candidates if normalized == candidate), normalized
+    )
 
 
 def _canonicalize_serialized_code(
-    serialized_code: Any, canonical_codes: dict[_CodeIdentity, CodeType]
+    serialized_code: Any, canonical_codes: _CanonicalCodes
 ) -> None:
     from torch._dynamo import package
 
@@ -353,7 +359,7 @@ def _support_shared_code_precompile() -> None:
                 return
             # Resume frames embed reconstructed source code in co_consts; execution
             # strategies are attached by identity to the canonical code objects.
-            canonical_codes = {}
+            canonical_codes: _CanonicalCodes = {}
             for code, entry in self._codes.items():
                 if not entry.code_source:
                     continue
@@ -361,10 +367,7 @@ def _support_shared_code_precompile() -> None:
                 if code != canonical:
                     raise RuntimeError("compile package code does not match its source")
                 identity = _code_identity(code)
-                existing = canonical_codes.get(identity)
-                if existing is not None and existing != canonical:
-                    raise RuntimeError("compile package has ambiguous source code")
-                canonical_codes[identity] = canonical
+                canonical_codes.setdefault(identity, []).append(canonical)
 
             normalized = {
                 _canonicalize_code(code, canonical_codes): entry
@@ -375,6 +378,8 @@ def _support_shared_code_precompile() -> None:
                     "compile package has ambiguous canonical code entries"
                 )
             self._codes = normalized
+            for code in self._codes:
+                canonical_codes.setdefault(_code_identity(code), []).append(code)
             for entry in self._codes.values():
                 for guarded_code in entry.guarded_codes:
                     _canonicalize_serialized_code(
