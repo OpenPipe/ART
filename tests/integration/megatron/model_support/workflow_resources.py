@@ -406,10 +406,10 @@ _THROUGHPUT_CONFIGS = {
         num_layers=8,
         packed_sequence_length=32_768,
         prompt_tokens=7136,
-        completion_tokens=512,
+        completion_tokens=184,
         groups_per_step=2,
         initial_model_calls_per_inference_gpu=20,
-        max_num_seqs=60,
+        max_num_seqs=4,
         max_num_batched_tokens=24_576,
     ),
     "glm52": ThroughputWorkflowConfig(
