@@ -251,7 +251,7 @@ async def test_real_path_rollouts_use_stable_unique_seeds_concurrently() -> None
     )
     model = SimpleNamespace(
         openai_client=lambda: client,
-        get_inference_name=lambda: "fake",
+        get_inference_name=lambda *, step=None: "fake",
     )
     config = RealPathConfig(
         output_parity=TrainInfOutputParityConfig(seed=41),
