@@ -297,8 +297,6 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
                     Path(item.output_json).write_text(
                         result.model_dump_json(indent=2), encoding="utf-8"
                     )
-                    if not result.passed:
-                        break
         except Exception as exc:
             for item in request.items:
                 output = Path(item.output_json)
@@ -315,7 +313,6 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
                     ).model_dump_json(indent=2),
                     encoding="utf-8",
                 )
-                break
             raise
     finally:
         for task in tasks:
