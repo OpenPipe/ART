@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import copyreg
 import hashlib
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
@@ -11,7 +12,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from types import FunctionType, MethodType
+from types import FunctionType, MethodType, ModuleType
 from typing import Any, Literal
 import uuid
 
@@ -48,10 +49,13 @@ def _module_global_reference(value: Any) -> tuple[str, str]:
 def _support_precompile_serialization() -> None:
     import torch
     from torch._dynamo.guards import CheckFunctionManager, GuardsStatePickler, _Missing
+    from torch._dynamo.source import DefaultsSource
 
     original = GuardsStatePickler.reducer_override
     if getattr(original, "_art_supports_instance_method_aliases", False):
         return
+
+    copyreg.pickle(ModuleType, lambda module: (import_module, (module.__name__,)))
 
     def reducer_override(self: Any, obj: Any) -> Any:
         # Timers and routing replay retain transient events behind compiled modules.
@@ -64,6 +68,8 @@ def _support_precompile_serialization() -> None:
             return _Missing, ("unguarded HybridEP runtime state",)
         if isinstance(obj, ContextVar):
             return _load_module_global, _module_global_reference(obj)
+        if isinstance(obj, DefaultsSource):
+            return type(obj), (obj.base, obj.idx_key, obj.is_kw)
         if isinstance(obj, torch.autograd.graph.Node):
             forward = getattr(type(obj), "_forward_cls", None)
             if forward is None:
@@ -204,7 +210,7 @@ def _compile_cache_key(
         }
     )
     payload: dict[str, Any] = {
-        "schema": 3,
+        "schema": 4,
         "runtime": runtime,
         "compile_plan": plan.model_dump(mode="json"),
         "environment": {
@@ -251,7 +257,7 @@ class TrainerCompileCache:
         if self.key is not None and self.key != key:
             raise RuntimeError("trainer compile plan changed after cache load")
         self.key = key
-        self.path = self._cache_root / "megatron" / "compile_cache" / "v3" / self.key
+        self.path = self._cache_root / "megatron" / "compile_cache" / "v4" / self.key
         self.path.parent.mkdir(parents=True, exist_ok=True)
         return self.key, self.path
 
