@@ -891,7 +891,7 @@ class ArtRuntime:
                     / "megatron"
                     / "compile_cache"
                     / "runtime"
-                    / runtime_spec.fingerprint
+                    / runtime_spec.compile_fingerprint
                 )
 
                 def bootstrap_command(point: Any) -> Any:

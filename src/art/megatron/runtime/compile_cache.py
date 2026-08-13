@@ -555,6 +555,15 @@ class TrainerCompileCache:
         )
         self._require_precompile(info)
         self.loaded = True
+        if os.environ.get("TORCH_STRICT_PRECOMPILE", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            import torch
+
+            torch.compiler.set_stance("fail_on_recompile")
         return CompileCacheEvent(
             status="hit",
             key=key,
