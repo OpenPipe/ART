@@ -297,21 +297,25 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
                     Path(item.output_json).write_text(
                         result.model_dump_json(indent=2), encoding="utf-8"
                     )
+                    if not result.passed:
+                        break
         except Exception as exc:
             for item in request.items:
+                output = Path(item.output_json)
+                if output.exists():
+                    continue
                 item_log = Path(item.stage_dir) / "worker.log"
                 with item_log.open("a", encoding="utf-8") as log:
                     traceback.print_exc(file=log)
-                output = Path(item.output_json)
-                if not output.exists():
-                    output.write_text(
-                        workflow.ValidationStageResult(
-                            name=item.stage,
-                            passed=False,
-                            metrics=workflow._stage_error_metrics(exc),
-                        ).model_dump_json(indent=2),
-                        encoding="utf-8",
-                    )
+                output.write_text(
+                    workflow.ValidationStageResult(
+                        name=item.stage,
+                        passed=False,
+                        metrics=workflow._stage_error_metrics(exc),
+                    ).model_dump_json(indent=2),
+                    encoding="utf-8",
+                )
+                break
             raise
     finally:
         for task in tasks:
@@ -378,6 +382,8 @@ def _run_session(
             raise RuntimeError(
                 f"functional vLLM reset failed after {item.stage}"
             ) from reset_error
+        if not result.passed:
+            break
 
 
 def _run_base_megatron_session(request: WorkflowStageWorkerSession) -> None:

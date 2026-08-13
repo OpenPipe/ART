@@ -158,13 +158,25 @@ class WorkflowSessionResult(BaseModel):
     started_monotonic_s: float
     ended_monotonic_s: float
     output: Any = None
+    failed_operation_id: str | None = None
 
 
 class WorkflowExecution(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     results: dict[str, WorkflowSessionResult]
+    blocked_by_failed_operations: dict[str, tuple[str, ...]] = Field(
+        default_factory=dict
+    )
     elapsed_s: float
+
+
+class WorkflowOperationFailed(RuntimeError):
+    def __init__(self, operation_id: str) -> None:
+        if not operation_id:
+            raise ValueError("failed workflow operation id cannot be empty")
+        self.operation_id = operation_id
+        super().__init__(f"workflow operation failed: {operation_id}")
 
 
 def compile_workflow(operations: Sequence[WorkflowOperation]) -> WorkflowPlan:
@@ -389,6 +401,8 @@ def execute_workflow(
     critical_path = _critical_path_durations(sessions)
     pending = set(sessions)
     completed: set[str] = set()
+    failed_dependencies: dict[str, tuple[str, ...]] = {}
+    blocked_by_failed_operations: dict[str, tuple[str, ...]] = {}
     running: dict[Future[Any], tuple[WorkflowSession, WorkflowPlacement, float]] = {}
     results: dict[str, WorkflowSessionResult] = {}
     pool = _GpuPool(devices)
@@ -397,6 +411,28 @@ def execute_workflow(
         max_workers=max_workers or max(1, len(sessions))
     ) as executor:
         while pending or running:
+            while newly_blocked := {
+                session_id: tuple(
+                    sorted(
+                        {
+                            failed_operation
+                            for dependency in sessions[session_id].dependencies
+                            for failed_operation in failed_dependencies.get(
+                                dependency, ()
+                            )
+                        }
+                    )
+                )
+                for session_id in sorted(pending)
+                if any(
+                    dependency in failed_dependencies
+                    for dependency in sessions[session_id].dependencies
+                )
+            }:
+                for session_id, failed_operations in newly_blocked.items():
+                    pending.remove(session_id)
+                    failed_dependencies[session_id] = failed_operations
+                    blocked_by_failed_operations[session_id] = failed_operations
             ready = sorted(
                 (
                     sessions[session_id]
@@ -436,8 +472,19 @@ def execute_workflow(
                 done, _ = wait(running, return_when=FIRST_COMPLETED)
             for future in done:
                 session, placement, session_started = running.pop(future)
+                failure: WorkflowOperationFailed | None = None
                 try:
                     output = future.result()
+                except WorkflowOperationFailed as exc:
+                    if exc.operation_id not in {
+                        operation.id for operation in session.operations
+                    }:
+                        raise RuntimeError(
+                            f"session {session.id} reported failure for unknown operation "
+                            f"{exc.operation_id}"
+                        ) from exc
+                    failure = exc
+                    output = None
                 finally:
                     pool.release(placement, session.resources)
                 results[session.id] = WorkflowSessionResult(
@@ -446,9 +493,19 @@ def execute_workflow(
                     started_monotonic_s=session_started,
                     ended_monotonic_s=time.monotonic(),
                     output=output,
+                    failed_operation_id=(
+                        failure.operation_id if failure is not None else None
+                    ),
                 )
-                completed.add(session.id)
-    return WorkflowExecution(results=results, elapsed_s=time.monotonic() - started)
+                if failure is None:
+                    completed.add(session.id)
+                else:
+                    failed_dependencies[session.id] = (failure.operation_id,)
+    return WorkflowExecution(
+        results=results,
+        blocked_by_failed_operations=blocked_by_failed_operations,
+        elapsed_s=time.monotonic() - started,
+    )
 
 
 def _critical_path_durations(

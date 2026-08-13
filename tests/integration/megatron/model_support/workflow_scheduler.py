@@ -43,6 +43,7 @@ from .workflow_resources import (
 from .workflow_runtime import (
     WorkflowDevice,
     WorkflowOperation,
+    WorkflowOperationFailed,
     WorkflowPlacement,
     WorkflowResourceRequest,
     WorkflowRolePlacement,
@@ -1103,6 +1104,50 @@ def run_prepared_workflows(
         tests_dir=workflow.TESTS_DIR,
         log_dir=workflows[0].run_dir / ".forkservers",
     )
+    failure_evidence: dict[str, dict[str, object]] = {}
+    failure_evidence_lock = Lock()
+
+    def remember_failure(
+        operation: WorkflowOperation,
+        output_json: Path,
+        result: ValidationStageResult,
+    ) -> None:
+        evidence: dict[str, object] = {"stage": operation.stage}
+        if output_json.is_file():
+            evidence["stage_result_json"] = str(output_json)
+        if error := result.metrics.get("error"):
+            evidence["error"] = error
+        if result.artifact_dir is not None:
+            evidence["artifact_dir"] = result.artifact_dir
+        with failure_evidence_lock:
+            failure_evidence[operation.id] = evidence
+
+    def record_blocked(
+        operations: tuple[WorkflowOperation, ...],
+        failed_operations: tuple[str, ...],
+    ) -> None:
+        with failure_evidence_lock:
+            evidence = {
+                operation_id: dict(failure_evidence.get(operation_id, {}))
+                for operation_id in failed_operations
+            }
+        for operation in operations:
+            if operation.stage == CORRECTNESS_REFERENCE_STAGE:
+                continue
+            by_model_key[operation.runtime.handler].record(
+                ValidationStageResult(
+                    name=operation.stage,
+                    skipped=True,
+                    metrics={
+                        "skipped": True,
+                        "reason": "blocked by failed workflow operation(s): "
+                        + ", ".join(failed_operations),
+                        "workflow_failed_dependencies": list(failed_operations),
+                        "workflow_failure_evidence": evidence,
+                        "workflow_stage_duration_s": 0.0,
+                    },
+                )
+            )
 
     def runner(session: WorkflowSession, placement: WorkflowPlacement) -> list[str]:
         session_dir = (
@@ -1222,7 +1267,9 @@ def run_prepared_workflows(
         returncode = fork_result["returncode"]
         worker_wall_s = float(fork_result["child_wall_s"])
         completed = []
-        for operation, item in zip(session.operations, items, strict=True):
+        for operation_index, (operation, item) in enumerate(
+            zip(session.operations, items, strict=True)
+        ):
             output_json = Path(item.output_json)
             if output_json.exists():
                 result = ValidationStageResult.model_validate_json(
@@ -1250,6 +1297,12 @@ def run_prepared_workflows(
             result.metrics["workflow_session_operation_count"] = len(session.operations)
             result.metrics.update(active_forkservers.metrics(execution_host))
             if operation.stage == CORRECTNESS_REFERENCE_STAGE:
+                if not result.passed:
+                    remember_failure(operation, output_json, result)
+                    record_blocked(
+                        session.operations[operation_index + 1 :], (operation.id,)
+                    )
+                    raise WorkflowOperationFailed(operation.id)
                 completed.append(operation.id)
                 continue
             if operation.stage == "correctness_sensitivity":
@@ -1285,6 +1338,12 @@ def run_prepared_workflows(
                         f"{type(exc).__name__}: {exc}"
                     )
             prepared.record(result)
+            if not result.passed:
+                remember_failure(operation, output_json, result)
+                record_blocked(
+                    session.operations[operation_index + 1 :], (operation.id,)
+                )
+                raise WorkflowOperationFailed(operation.id)
             completed.append(operation.id)
         return completed
 
@@ -1292,7 +1351,10 @@ def run_prepared_workflows(
         active_forkservers if owns_forkservers else nullcontext(active_forkservers)
     )
     with context:
-        execute_workflow(plan, devices=devices, runner=runner)
+        execution = execute_workflow(plan, devices=devices, runner=runner)
+    sessions = {session.id: session for session in plan.sessions}
+    for session_id, failed_operations in execution.blocked_by_failed_operations.items():
+        record_blocked(sessions[session_id].operations, failed_operations)
     for prepared in workflows:
         workflow._finalize_validation_report(prepared.report, partial=False)
         workflow._write_validation_report(prepared.report, prepared.output_json)
