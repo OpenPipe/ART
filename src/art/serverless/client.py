@@ -195,6 +195,15 @@ class RemoteTrainingServiceClient:
             body=SetCheckpointTtlRequest(ttl_seconds=ttl_seconds),
         )
 
+    async def archive_checkpoint(
+        self, run_id: str, checkpoint_id: str
+    ) -> CheckpointView:
+        return await self._request(
+            "POST",
+            f"training/runs/{run_id}/checkpoints/{checkpoint_id}:archive",
+            CheckpointView,
+        )
+
     async def delete_checkpoint(
         self, run_id: str, checkpoint_id: str
     ) -> DeleteCheckpointResult:
