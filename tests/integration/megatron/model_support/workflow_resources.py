@@ -405,9 +405,9 @@ _THROUGHPUT_CONFIGS = {
     "dsv4": ThroughputWorkflowConfig(
         num_layers=8,
         packed_sequence_length=32_768,
-        prompt_tokens=12_800,
-        completion_tokens=736,
-        groups_per_step=2,
+        prompt_tokens=7136,
+        completion_tokens=184,
+        groups_per_step=4,
         initial_model_calls_per_inference_gpu=20,
         max_num_seqs=60,
         max_num_batched_tokens=24_576,
@@ -459,7 +459,7 @@ _B300_THROUGHPUT_FLOORS = {
         (40_300, 38_500, 4_740, 0.90, 5.0),
     ),
     "dsv4": (
-        "9d380c5beb1b704b60c01ee5dd313878b09683d14b4b34f205f67c582b2408ca",
+        "93ece61c99e5e457acbc35a2cc0fe2b81ab61183e9a3de825532646fa586cd5c",
         (7_050, 7_020, 1_350, 0.94, 43.0),
     ),
     "glm52": (
