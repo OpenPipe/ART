@@ -1706,7 +1706,11 @@ class LocalBackend:
                 }
             )
             # The frontend applies reward scaling and logs the resulting metrics.
-            pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
+            pbar = tqdm.tqdm(
+                total=fallback_gradient_steps,
+                desc="train",
+                disable=not verbose,
+            )
             reported_gradient_steps: int | None = None
             try:
                 async for result in self._stream_prepared_training(
@@ -1740,8 +1744,9 @@ class LocalBackend:
                         **result,
                         TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
                     }
-                    pbar.update(1)
-                    pbar.set_postfix(result)
+                    if verbose:
+                        pbar.update(1)
+                        pbar.set_postfix(result)
             finally:
                 pbar.close()
             if verbose:
@@ -1969,19 +1974,20 @@ class LocalBackend:
         # Get the service and train
         service = await self._get_service(model)
 
-        pbar = tqdm.tqdm(total=len(batches), desc="sft train")
+        pbar = tqdm.tqdm(total=len(batches), desc="sft train", disable=not verbose)
         total_trainable_tokens = sum(batch.num_trainable_tokens for batch in batches)
         total_trajectories = len(trajectory_list)
         batch_count = 0
 
         async for result in service.train_sft(batches, service_config, verbose):
-            pbar.update(1)
-            postfix: dict[str, str | int] = {
-                "loss": f"{result.get('loss/train', 0):.4f}"
-            }
-            if total_dropped_trajectories:
-                postfix["dropped"] = total_dropped_trajectories
-            pbar.set_postfix(postfix)
+            if verbose:
+                pbar.update(1)
+                postfix: dict[str, str | int] = {
+                    "loss": f"{result.get('loss/train', 0):.4f}"
+                }
+                if total_dropped_trajectories:
+                    postfix["dropped"] = total_dropped_trajectories
+                pbar.set_postfix(postfix)
             batch_count += 1
             yield {
                 **result,

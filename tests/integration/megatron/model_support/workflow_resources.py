@@ -357,7 +357,7 @@ _THROUGHPUT_CONFIGS = {
         completion_tokens=256,
         rollouts_per_group=6,
         groups_per_step=23,
-        initial_model_calls_per_inference_gpu=20,
+        initial_model_calls_per_inference_gpu=26,
         enable_prefix_caching=True,
     ),
     "qwen3_dense": ThroughputWorkflowConfig(
@@ -412,9 +412,9 @@ _THROUGHPUT_CONFIGS = {
         prompt_tokens=7136,
         completion_tokens=184,
         groups_per_step=8,
-        initial_model_calls_per_inference_gpu=20,
-        max_num_seqs=14,
-        max_num_batched_tokens=24_576,
+        initial_model_calls_per_inference_gpu=16,
+        max_num_seqs=64,
+        max_num_batched_tokens=131_072,
         enable_prefix_caching=True,
     ),
     "glm52": ThroughputWorkflowConfig(
