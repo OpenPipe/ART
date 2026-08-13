@@ -3,7 +3,10 @@ from datetime import datetime, timezone
 import pytest
 
 from art.pipeline_trainer import CheckpointInfo, CheckpointRetentionContext
-from art.pipeline_trainer.checkpoint_retention import keep_recent_and_top
+from art.pipeline_trainer.checkpoint_retention import (
+    keep_recent_and_periodic,
+    keep_recent_and_top,
+)
 
 
 def _checkpoint(
@@ -36,7 +39,7 @@ def test_keep_recent_and_top_returns_kept_steps() -> None:
         ],
     )
 
-    assert set(strategy(context)) == {3, 4, 5}
+    assert strategy(context).retain_steps == {3, 4, 5}
 
 
 def test_keep_recent_and_top_uses_metric_presence_for_legacy_history() -> None:
@@ -50,7 +53,7 @@ def test_keep_recent_and_top_uses_metric_presence_for_legacy_history() -> None:
         ],
     )
 
-    assert set(strategy(context)) == {1}
+    assert strategy(context).retain_steps == {1}
 
 
 def test_keep_recent_and_top_handles_zero_limits() -> None:
@@ -60,7 +63,7 @@ def test_keep_recent_and_top_handles_zero_limits() -> None:
         checkpoints=[_checkpoint(0), _checkpoint(1), _checkpoint(2)],
     )
 
-    assert set(strategy(context)) == set()
+    assert strategy(context).retain_steps == set()
 
 
 @pytest.mark.parametrize(
@@ -74,3 +77,27 @@ def test_keep_recent_and_top_rejects_negative_limits(
 ) -> None:
     with pytest.raises(ValueError, match=match):
         keep_recent_and_top(recent=recent, top=top)
+
+
+def test_keep_recent_and_periodic_is_sparse() -> None:
+    strategy = keep_recent_and_periodic(recent=2, archive_interval=2, archives=2)
+    plan = strategy(
+        CheckpointRetentionContext(
+            current_step=6,
+            checkpoints=[_checkpoint(step) for step in range(7)],
+        )
+    )
+    assert plan.retain_steps == {5, 6}
+    assert plan.archive_steps == {4, 6}
+
+
+def test_keep_recent_and_periodic_handles_zero_limits() -> None:
+    strategy = keep_recent_and_periodic(recent=0, archives=0)
+    plan = strategy(
+        CheckpointRetentionContext(
+            current_step=2,
+            checkpoints=[_checkpoint(step) for step in range(3)],
+        )
+    )
+    assert not plan.retain_steps
+    assert not plan.archive_steps

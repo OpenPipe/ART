@@ -20,7 +20,9 @@ from art.megatron.train import load_adapter_into_model
 from art.pipeline_trainer import (
     CHECKPOINT_CREATED_AT_METRIC,
     CHECKPOINT_EVAL_COMPLETED_METRIC,
+    CheckpointInfo,
     CheckpointRetentionContext,
+    CheckpointRetentionPlan,
 )
 from art.pipeline_trainer.trainer import PipelineTrainer
 from art.preprocessing.tokenize import TokenizedResult
@@ -480,12 +482,22 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
     )
 
     backend = MagicMock()
-    backend._delete_checkpoint_files = AsyncMock()
+    backend._list_checkpoint_infos = AsyncMock(
+        return_value=[
+            CheckpointInfo(
+                step=step,
+                path=str(checkpoint_dir / f"{step:04d}"),
+                created_at=datetime.fromtimestamp(step + 1, timezone.utc),
+            )
+            for step in range(6)
+        ]
+    )
+    backend._apply_checkpoint_retention = AsyncMock()
     contexts: list[CheckpointRetentionContext] = []
 
-    def strategy(context: CheckpointRetentionContext) -> set[int]:
+    def strategy(context: CheckpointRetentionContext) -> CheckpointRetentionPlan:
         contexts.append(context)
-        return {1, 4, 99}
+        return CheckpointRetentionPlan(retain_steps={1, 4})
 
     trainer = _make_trainer(
         model=model,
@@ -498,14 +510,21 @@ async def test_pipeline_trainer_checkpoint_retention_only_passes_unprotected_ste
 
     await trainer._run_checkpoint_retention(5)
 
-    assert [checkpoint.step for checkpoint in contexts[0].checkpoints] == [0, 1, 2]
+    assert [checkpoint.step for checkpoint in contexts[0].checkpoints] == list(range(6))
+    assert {
+        checkpoint.step
+        for checkpoint in contexts[0].checkpoints
+        if checkpoint.deletion_eligible
+    } == {0, 1, 2}
     step_two = contexts[0].checkpoints[2]
     assert step_two.is_eval_step is True
     assert step_two.created_at == datetime.fromtimestamp(123.0, timezone.utc)
     assert step_two.metrics["val/reward"] == 2.0
-    backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
+    backend._apply_checkpoint_retention.assert_awaited_once_with(  # type: ignore[attr-defined]
         model,
-        [1, 3, 4, 5],
+        CheckpointRetentionPlan(
+            observed_steps=set(range(6)), retain_steps={1, 3, 4, 5}
+        ),
     )
 
 
@@ -525,12 +544,21 @@ async def test_pipeline_trainer_checkpoint_retention_protects_default_kl_referen
         (checkpoint_dir / f"{step:04d}").mkdir(parents=True)
 
     backend = MagicMock()
-    backend._delete_checkpoint_files = AsyncMock()
+    backend._list_checkpoint_infos = AsyncMock(
+        return_value=[
+            CheckpointInfo(
+                step=step,
+                created_at=datetime.fromtimestamp(step + 1, timezone.utc),
+            )
+            for step in range(4)
+        ]
+    )
+    backend._apply_checkpoint_retention = AsyncMock()
     contexts: list[CheckpointRetentionContext] = []
 
-    def strategy(context: CheckpointRetentionContext) -> set[int]:
+    def strategy(context: CheckpointRetentionContext) -> CheckpointRetentionPlan:
         contexts.append(context)
-        return set()
+        return CheckpointRetentionPlan()
 
     trainer = _make_trainer(
         model=model,
@@ -541,10 +569,10 @@ async def test_pipeline_trainer_checkpoint_retention_protects_default_kl_referen
 
     await trainer._run_checkpoint_retention(3)
 
-    assert [checkpoint.step for checkpoint in contexts[0].checkpoints] == [1, 2]
-    backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
+    assert [checkpoint.step for checkpoint in contexts[0].checkpoints] == list(range(4))
+    backend._apply_checkpoint_retention.assert_awaited_once_with(  # type: ignore[attr-defined]
         model,
-        [0, 3],
+        CheckpointRetentionPlan(observed_steps=set(range(4)), retain_steps={0, 3}),
     )
 
 
@@ -564,12 +592,21 @@ async def test_pipeline_trainer_checkpoint_retention_protects_lagged_kl_referenc
         (checkpoint_dir / f"{step:04d}").mkdir(parents=True)
 
     backend = MagicMock()
-    backend._delete_checkpoint_files = AsyncMock()
+    backend._list_checkpoint_infos = AsyncMock(
+        return_value=[
+            CheckpointInfo(
+                step=step,
+                created_at=datetime.fromtimestamp(step + 1, timezone.utc),
+            )
+            for step in range(7)
+        ]
+    )
+    backend._apply_checkpoint_retention = AsyncMock()
     contexts: list[CheckpointRetentionContext] = []
 
-    def strategy(context: CheckpointRetentionContext) -> set[int]:
+    def strategy(context: CheckpointRetentionContext) -> CheckpointRetentionPlan:
         contexts.append(context)
-        return set()
+        return CheckpointRetentionPlan()
 
     trainer = _make_trainer(
         model=model,
@@ -581,10 +618,12 @@ async def test_pipeline_trainer_checkpoint_retention_protects_lagged_kl_referenc
 
     await trainer._run_checkpoint_retention(6)
 
-    assert [checkpoint.step for checkpoint in contexts[0].checkpoints] == [0]
-    backend._delete_checkpoint_files.assert_awaited_once_with(  # type: ignore[attr-defined]
+    assert [checkpoint.step for checkpoint in contexts[0].checkpoints] == list(range(7))
+    backend._apply_checkpoint_retention.assert_awaited_once_with(  # type: ignore[attr-defined]
         model,
-        [1, 2, 3, 4, 5, 6],
+        CheckpointRetentionPlan(
+            observed_steps=set(range(7)), retain_steps={1, 2, 3, 4, 5, 6}
+        ),
     )
 
 
@@ -604,12 +643,21 @@ async def test_pipeline_trainer_checkpoint_retention_lag_warmup_protects_window(
         (checkpoint_dir / f"{step:04d}").mkdir(parents=True)
 
     backend = MagicMock()
-    backend._delete_checkpoint_files = AsyncMock()
+    backend._list_checkpoint_infos = AsyncMock(
+        return_value=[
+            CheckpointInfo(
+                step=step,
+                created_at=datetime.fromtimestamp(step + 1, timezone.utc),
+            )
+            for step in range(5)
+        ]
+    )
+    backend._apply_checkpoint_retention = AsyncMock()
     contexts: list[CheckpointRetentionContext] = []
 
-    def strategy(context: CheckpointRetentionContext) -> set[int]:
+    def strategy(context: CheckpointRetentionContext) -> CheckpointRetentionPlan:
         contexts.append(context)
-        return set()
+        return CheckpointRetentionPlan()
 
     trainer = _make_trainer(
         model=model,
@@ -621,8 +669,11 @@ async def test_pipeline_trainer_checkpoint_retention_lag_warmup_protects_window(
 
     await trainer._run_checkpoint_retention(4)
 
-    assert contexts == []
-    backend._delete_checkpoint_files.assert_not_awaited()  # type: ignore[attr-defined]
+    assert len(contexts) == 1
+    assert not any(
+        checkpoint.deletion_eligible for checkpoint in contexts[0].checkpoints
+    )
+    backend._apply_checkpoint_retention.assert_not_awaited()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

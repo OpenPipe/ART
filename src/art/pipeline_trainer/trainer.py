@@ -2146,7 +2146,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             self._checkpoint_log_tasks.add(task)
             task.add_done_callback(self._checkpoint_log_done)
             return
-        self._record_checkpoint_saved(step, path)
+        self._record_checkpoint_saved(
+            step,
+            path if path.exists() else None,
+            remote=bool(getattr(result, "checkpoint_id", None)),
+        )
 
     async def _log_checkpoint_when_ready(
         self, step: int, path: Path, ready: Awaitable[None]
@@ -2158,14 +2162,18 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             )
         self._record_checkpoint_saved(step, path)
 
-    def _record_checkpoint_saved(self, step: int, path: Path) -> None:
-        if not path.exists():
+    def _record_checkpoint_saved(
+        self, step: int, path: Path | None, *, remote: bool = False
+    ) -> None:
+        if path is None and not remote:
             return
         self._log_checkpoint_history(
             step,
             {
                 CHECKPOINT_SAVED_METRIC: 1.0,
-                CHECKPOINT_CREATED_AT_METRIC: path.stat().st_ctime,
+                CHECKPOINT_CREATED_AT_METRIC: (
+                    path.stat().st_ctime if path is not None else time.time()
+                ),
             },
         )
 
@@ -2217,38 +2225,32 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             for step, step_sums in sums.items()
         }
 
-    def _checkpoint_infos(self) -> list[CheckpointInfo]:
-        checkpoint_dir = Path(self.model._get_output_dir()) / "checkpoints"
-        if not checkpoint_dir.exists():
-            return []
+    async def _checkpoint_infos(self) -> list[CheckpointInfo]:
         metrics_by_step = self._checkpoint_metrics_by_step()
-        checkpoints: list[CheckpointInfo] = []
-        for path in checkpoint_dir.iterdir():
-            if not path.is_dir() or not path.name.isdigit():
-                continue
-            step = int(path.name)
-            stat = path.stat()
+        checkpoints = await self.backend._list_checkpoint_infos(self.model)
+        merged: list[CheckpointInfo] = []
+        for checkpoint in checkpoints:
+            step = checkpoint.step
             metrics = metrics_by_step.get(step, {})
             created_at_unix = metrics.get(CHECKPOINT_CREATED_AT_METRIC)
-            created_at = (
-                datetime.fromtimestamp(created_at_unix, timezone.utc)
-                if created_at_unix is not None
-                else datetime.fromtimestamp(stat.st_ctime, timezone.utc)
-            )
-            checkpoints.append(
-                CheckpointInfo(
-                    step=step,
-                    path=str(path),
-                    created_at=created_at,
-                    is_eval_step=(
-                        step in self.state.completed_eval_steps
-                        or metrics.get(CHECKPOINT_EVAL_COMPLETED_METRIC, 0.0) > 0.0
-                        or any(key.startswith(("val/", "test/")) for key in metrics)
-                    ),
-                    metrics=metrics,
+            merged.append(
+                checkpoint.model_copy(
+                    update={
+                        "created_at": (
+                            datetime.fromtimestamp(created_at_unix, timezone.utc)
+                            if created_at_unix is not None
+                            else checkpoint.created_at
+                        ),
+                        "is_eval_step": (
+                            step in self.state.completed_eval_steps
+                            or metrics.get(CHECKPOINT_EVAL_COMPLETED_METRIC, 0.0) > 0.0
+                            or any(key.startswith(("val/", "test/")) for key in metrics)
+                        ),
+                        "metrics": metrics,
+                    }
                 )
             )
-        return sorted(checkpoints, key=lambda checkpoint: checkpoint.step)
+        return sorted(merged, key=lambda checkpoint: checkpoint.step)
 
     def _protected_checkpoint_steps(self, current_step: int) -> set[int]:
         protected_steps = (
@@ -2271,31 +2273,58 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     async def _run_checkpoint_retention(self, current_step: int) -> None:
         strategy = self.checkpoint_retention_strategy
         if strategy is None:
+            default_strategy = getattr(
+                type(self.backend), "default_checkpoint_retention_strategy", None
+            )
+            strategy = (
+                None if default_strategy is None else default_strategy(self.backend)
+            )
+        if strategy is None:
             return
         if current_step % self.checkpoint_retention_interval != 0:
             return
-        all_checkpoints = self._checkpoint_infos()
+        all_checkpoints = await self._checkpoint_infos()
         if not all_checkpoints:
             return
         protected_steps = self._protected_checkpoint_steps(current_step)
-        eligible = [
-            checkpoint
+        eligible_steps = {
+            checkpoint.step
             for checkpoint in all_checkpoints
             if checkpoint.step not in protected_steps
-        ]
-        if not eligible:
-            return
+        }
         context = CheckpointRetentionContext(
             current_step=current_step,
-            checkpoints=eligible,
+            checkpoints=[
+                checkpoint.model_copy(
+                    update={"deletion_eligible": checkpoint.step in eligible_steps}
+                )
+                for checkpoint in all_checkpoints
+            ],
         )
-        eligible_steps = {checkpoint.step for checkpoint in eligible}
-        keep_eligible_steps = set(strategy(context)) & eligible_steps
+        plan = strategy(context)
+        selected = plan.retain_steps | plan.archive_steps
+        known_steps = {checkpoint.step for checkpoint in all_checkpoints}
+        unknown = selected - known_steps
+        if unknown:
+            raise ValueError(
+                f"checkpoint retention selected ineligible steps: {sorted(unknown)}"
+            )
+        keep_eligible_steps = plan.retain_steps & eligible_steps
         delete_steps = eligible_steps - keep_eligible_steps
-        if not delete_steps:
+        if not delete_steps and not plan.archive_steps:
             return
         keep_steps = {checkpoint.step for checkpoint in all_checkpoints} - delete_steps
-        await self.backend._delete_checkpoint_files(self.model, sorted(keep_steps))
+        await self.backend._apply_checkpoint_retention(
+            self.model,
+            plan.model_copy(
+                update={
+                    "observed_steps": {
+                        checkpoint.step for checkpoint in all_checkpoints
+                    },
+                    "retain_steps": keep_steps,
+                }
+            ),
+        )
 
     @staticmethod
     def _is_scalar_metadata(value: object) -> bool:

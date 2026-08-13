@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from datetime import datetime
 
 from pydantic import BaseModel, Field
@@ -12,8 +12,9 @@ CHECKPOINT_SAVED_METRIC = "checkpoint/saved"
 
 class CheckpointInfo(BaseModel):
     step: int
-    path: str
+    path: str | None = None
     created_at: datetime
+    deletion_eligible: bool = False
     is_eval_step: bool = False
     metrics: dict[str, float] = Field(default_factory=dict)
 
@@ -23,9 +24,17 @@ class CheckpointRetentionContext(BaseModel):
     checkpoints: list[CheckpointInfo] = Field(default_factory=list)
 
 
-# Strategies receive only checkpoints that ART has determined are eligible for
-# removal and return the subset of those checkpoint steps to keep.
-CheckpointRetentionStrategy = Callable[[CheckpointRetentionContext], Iterable[int]]
+class CheckpointRetentionPlan(BaseModel):
+    observed_steps: set[int] = Field(default_factory=set)
+    retain_steps: set[int] = Field(default_factory=set)
+    archive_steps: set[int] = Field(default_factory=set)
+
+
+# Strategies see every checkpoint. Only deletion-eligible checkpoints may be
+# removed, while archive selection is explicit and independent of retention.
+CheckpointRetentionStrategy = Callable[
+    [CheckpointRetentionContext], CheckpointRetentionPlan
+]
 
 
 def keep_recent_and_top(
@@ -40,8 +49,7 @@ def keep_recent_and_top(
     if top < 0:
         raise ValueError("top must be >= 0")
 
-    def strategy(context: CheckpointRetentionContext) -> set[int]:
-        eligible_steps = {checkpoint.step for checkpoint in context.checkpoints}
+    def strategy(context: CheckpointRetentionContext) -> CheckpointRetentionPlan:
         keep_steps: set[int] = set()
         if recent > 0:
             keep_steps.update(
@@ -57,7 +65,30 @@ def keep_recent_and_top(
         ]
         ranked.sort(key=lambda item: (item.metrics[metric], item.step), reverse=True)
         keep_steps.update(checkpoint.step for checkpoint in ranked[:top])
-        return keep_steps & eligible_steps
+        return CheckpointRetentionPlan(retain_steps=keep_steps)
+
+    return strategy
+
+
+def keep_recent_and_periodic(
+    *, recent: int = 5, archive_interval: int = 25, archives: int = 2
+) -> CheckpointRetentionStrategy:
+    if recent < 0 or archives < 0:
+        raise ValueError("recent and archives must be >= 0")
+    if archive_interval < 1:
+        raise ValueError("archive_interval must be >= 1")
+
+    def strategy(context: CheckpointRetentionContext) -> CheckpointRetentionPlan:
+        ordered = sorted(context.checkpoints, key=lambda item: item.step)
+        periodic = [
+            item.step
+            for item in ordered
+            if item.step > 0 and item.step % archive_interval == 0
+        ]
+        return CheckpointRetentionPlan(
+            retain_steps={item.step for item in ordered[-recent:]} if recent else set(),
+            archive_steps=set(periodic[-archives:]) if archives else set(),
+        )
 
     return strategy
 
@@ -68,6 +99,8 @@ __all__ = [
     "CHECKPOINT_SAVED_METRIC",
     "CheckpointInfo",
     "CheckpointRetentionContext",
+    "CheckpointRetentionPlan",
     "CheckpointRetentionStrategy",
+    "keep_recent_and_periodic",
     "keep_recent_and_top",
 ]

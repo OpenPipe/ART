@@ -514,6 +514,20 @@ class TinkerNativeBackend:
     ) -> None:
         print("Checkpoint deletion is not yet implemented for TinkerNativeBackend.")
 
+    async def _list_checkpoint_infos(self, model: TrainableModel):
+        del model
+        raise NotImplementedError(
+            "TinkerNativeBackend does not expose checkpoint retention metadata"
+        )
+
+    def default_checkpoint_retention_strategy(self):
+        return None
+
+    async def _apply_checkpoint_retention(self, model, plan) -> None:
+        await self._delete_checkpoint_files(
+            model, sorted(plan.retain_steps | plan.archive_steps)
+        )
+
     def _model_inference_name(self, model: Model, step: int | None = None) -> str:
         base_name = model.inference_model_name or model.name
         if "@" in base_name:

@@ -35,10 +35,20 @@ from art.types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
 
 from .. import dev
 from .client import RemoteTrainingClient, RemoteTrainingServiceClient
-from .contracts import AdapterSpec, CreateTrainingRunRequest, TrainingRunSpec
+from .contracts import (
+    AdapterSpec,
+    ApplyCheckpointRetentionRequest,
+    CheckpointRevision,
+    CreateTrainingRunRequest,
+    TrainingRunSpec,
+)
 
 if TYPE_CHECKING:
     from art.model import Model, TrainableModel
+    from art.pipeline_trainer.checkpoint_retention import (
+        CheckpointRetentionPlan,
+        CheckpointRetentionStrategy,
+    )
 
 SamplerPublisher = Callable[
     [AnyTrainableModel, SamplerWeightsResult],
@@ -237,6 +247,61 @@ class ServerlessBackend:
                 await self._service.delete_checkpoint(
                     client.run_id, checkpoint.checkpoint_id
                 )
+
+    async def _list_checkpoint_infos(self, model: AnyTrainableModel):
+        from art.pipeline_trainer.checkpoint_retention import CheckpointInfo
+
+        client = await self.training_client(model)
+        page = await self._service.list_checkpoints(client.run_id)
+        return [
+            CheckpointInfo(
+                step=checkpoint.learner_version,
+                created_at=checkpoint.created_at,
+            )
+            for checkpoint in page.checkpoints
+            if checkpoint.state == "ready"
+        ]
+
+    def default_checkpoint_retention_strategy(
+        self,
+    ) -> "CheckpointRetentionStrategy | None":
+        from art.pipeline_trainer.checkpoint_retention import keep_recent_and_periodic
+
+        return keep_recent_and_periodic()
+
+    async def _apply_checkpoint_retention(
+        self, model: AnyTrainableModel, plan: "CheckpointRetentionPlan"
+    ) -> None:
+        client = await self.training_client(model)
+        page = await self._service.list_checkpoints(client.run_id)
+        ready = tuple(
+            checkpoint for checkpoint in page.checkpoints if checkpoint.state == "ready"
+        )
+        actual_steps = {checkpoint.learner_version for checkpoint in ready}
+        if actual_steps != plan.observed_steps:
+            raise RuntimeError("remote checkpoint catalog changed during retention")
+        await self._service.apply_checkpoint_retention(
+            client.run_id,
+            ApplyCheckpointRetentionRequest(
+                observed=tuple(
+                    CheckpointRevision(
+                        checkpoint_id=checkpoint.checkpoint_id,
+                        revision=checkpoint.revision,
+                    )
+                    for checkpoint in ready
+                ),
+                retain_checkpoint_ids=tuple(
+                    checkpoint.checkpoint_id
+                    for checkpoint in ready
+                    if checkpoint.learner_version in plan.retain_steps
+                ),
+                archive_checkpoint_ids=tuple(
+                    checkpoint.checkpoint_id
+                    for checkpoint in ready
+                    if checkpoint.learner_version in plan.archive_steps
+                ),
+            ),
+        )
 
     async def train(  # type: ignore[override]
         self,

@@ -30,6 +30,7 @@ from art.training.contracts import (
 )
 
 from .contracts import (
+    ApplyCheckpointRetentionRequest,
     CancelOperationRequest,
     CheckpointPage,
     CheckpointView,
@@ -185,6 +186,16 @@ class RemoteTrainingServiceClient:
             "GET", f"training/runs/{run_id}/checkpoints", CheckpointPage
         )
 
+    async def apply_checkpoint_retention(
+        self, run_id: str, plan: ApplyCheckpointRetentionRequest
+    ) -> CheckpointPage:
+        return await self._request(
+            "POST",
+            f"training/runs/{run_id}/checkpoints:apply_retention",
+            CheckpointPage,
+            body=plan,
+        )
+
     async def set_checkpoint_ttl(
         self, run_id: str, checkpoint_id: str, ttl_seconds: int | None
     ) -> CheckpointView:
@@ -201,6 +212,13 @@ class RemoteTrainingServiceClient:
         return await self._request(
             "POST",
             f"training/runs/{run_id}/checkpoints/{checkpoint_id}:archive",
+            CheckpointView,
+        )
+
+    async def evict_checkpoint(self, run_id: str, checkpoint_id: str) -> CheckpointView:
+        return await self._request(
+            "POST",
+            f"training/runs/{run_id}/checkpoints/{checkpoint_id}:evict_local",
             CheckpointView,
         )
 

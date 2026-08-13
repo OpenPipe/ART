@@ -16,6 +16,11 @@ from .types import TrainResult, TrainSFTConfig
 
 if TYPE_CHECKING:
     from .model import Model, TrainableModel
+    from .pipeline_trainer.checkpoint_retention import (
+        CheckpointInfo,
+        CheckpointRetentionPlan,
+        CheckpointRetentionStrategy,
+    )
 
 # Type aliases for models with any config/state type (for backend method signatures)
 AnyModel: TypeAlias = "Model[Any, Any]"
@@ -37,6 +42,18 @@ class Backend(Protocol):
 
     async def _delete_checkpoint_files(
         self, model: AnyTrainableModel, steps_to_keep: list[int]
+    ) -> None: ...
+
+    async def _list_checkpoint_infos(
+        self, model: AnyTrainableModel
+    ) -> list["CheckpointInfo"]: ...
+
+    def default_checkpoint_retention_strategy(
+        self,
+    ) -> "CheckpointRetentionStrategy | None": ...
+
+    async def _apply_checkpoint_retention(
+        self, model: AnyTrainableModel, plan: "CheckpointRetentionPlan"
     ) -> None: ...
 
     async def _prepare_backend_for_training(

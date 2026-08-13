@@ -159,6 +159,7 @@ class TrainingCapabilities(Contract):
 
 class CheckpointView(Contract):
     checkpoint_id: str
+    revision: int = Field(ge=1)
     learner_version: int = Field(ge=0)
     aliases: tuple[str, ...] = ()
     has_optimizer: bool
@@ -167,12 +168,38 @@ class CheckpointView(Contract):
     optimizer_bytes: int | None = Field(default=None, ge=1)
     expires_at: datetime | None = None
     archive_ref: str | None = None
+    local_available: bool = True
     storage_error: str | None = None
     created_at: datetime
 
 
 class CheckpointPage(Contract):
     checkpoints: tuple[CheckpointView, ...]
+
+
+class CheckpointRevision(Contract):
+    checkpoint_id: str
+    revision: int = Field(ge=1)
+
+
+class ApplyCheckpointRetentionRequest(Contract):
+    observed: tuple[CheckpointRevision, ...]
+    retain_checkpoint_ids: tuple[str, ...] = ()
+    archive_checkpoint_ids: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_ids(self) -> "ApplyCheckpointRetentionRequest":
+        observed = [item.checkpoint_id for item in self.observed]
+        if len(observed) != len(set(observed)):
+            raise ValueError("observed checkpoint ids must be unique")
+        selected = self.retain_checkpoint_ids + self.archive_checkpoint_ids
+        if len(self.retain_checkpoint_ids) != len(set(self.retain_checkpoint_ids)):
+            raise ValueError("retained checkpoint ids must be unique")
+        if len(self.archive_checkpoint_ids) != len(set(self.archive_checkpoint_ids)):
+            raise ValueError("archived checkpoint ids must be unique")
+        if not set(selected).issubset(observed):
+            raise ValueError("retention selections must be observed checkpoints")
+        return self
 
 
 class SetCheckpointTtlRequest(Contract):

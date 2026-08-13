@@ -3,12 +3,14 @@ from __future__ import annotations
 from array import array
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import gc
 import hashlib
 import json
 import logging
 import math
 import os
+from pathlib import Path
 import shutil
 import socket
 import time
@@ -1230,6 +1232,30 @@ class LocalBackend:
                 delete_checkpoints(output_dir, sorted(protected))
 
         await asyncio.to_thread(delete_retained)
+
+    async def _list_checkpoint_infos(self, model: AnyTrainableModel):
+        from ..pipeline_trainer.checkpoint_retention import CheckpointInfo
+
+        root = Path(get_model_dir(model=model, art_path=self._path)) / "checkpoints"
+        if not root.is_dir():
+            return []
+        return [
+            CheckpointInfo(
+                step=int(path.name),
+                path=str(path),
+                created_at=datetime.fromtimestamp(path.stat().st_ctime, timezone.utc),
+            )
+            for path in root.iterdir()
+            if path.is_dir() and path.name.isdigit()
+        ]
+
+    def default_checkpoint_retention_strategy(self):
+        return None
+
+    async def _apply_checkpoint_retention(self, model, plan) -> None:
+        await self._delete_checkpoint_files(
+            model, sorted(plan.retain_steps | plan.archive_steps)
+        )
 
     async def _prepare_backend_for_training(
         self,
