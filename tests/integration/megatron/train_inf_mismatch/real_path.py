@@ -1804,7 +1804,6 @@ async def run_resident_train_inf_mismatch(
             groups,
             expected_learner_version=policy_step,
             top_k=TOP_K,
-            grad_accumulation_sequences=int(packed["tokens"].shape[0]),
         )
         fingerprint = _packed_batch_fingerprint(cast(dict[str, Any], packed))
         if result.batch_fingerprint != fingerprint:
