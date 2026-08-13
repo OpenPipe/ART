@@ -229,6 +229,7 @@ class TrainerCompileCache:
         self, spec: TrainerRuntimeSpec, *, rank: int, cache_root: Path
     ) -> None:
         from torch._dynamo import config
+        from torch._functorch import config as functorch_config
 
         if config.caching_precompile:
             raise RuntimeError("Dynamo precompile was enabled before trainer imports")
@@ -237,6 +238,7 @@ class TrainerCompileCache:
         _support_cross_package_resume_codes()
         os.environ["TORCH_CACHING_PRECOMPILE"] = "1"
         config.caching_precompile = True
+        functorch_config.bundled_autograd_cache = True
         self._spec = spec
         self._rank = rank
         self._cache_root = cache_root
