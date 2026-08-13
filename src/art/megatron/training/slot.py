@@ -17,6 +17,7 @@ from art.megatron.optimizer_state import (
     OptimizerAdapter,
     optimizer_adapter,
     read_adapter_publication,
+    read_committed_optimizer_pointer,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.publication import commit_trainer_publication
@@ -592,6 +593,21 @@ class MegatronTrainingSlot:
             generation.adapter_path, step=generation.policy_step
         )
         optimizer_state_path = state.registration.optimizer_state_path
+        pointer = read_committed_optimizer_pointer(optimizer_state_path)
+        if (
+            save_optimizer
+            and pointer is not None
+            and (pointer.generation == generation.generation_id)
+        ):
+            if (
+                pointer.step != generation.policy_step
+                or existing is None
+                or pointer.adapter != existing
+            ):
+                raise RuntimeError(
+                    "committed optimizer generation disagrees with resident learner"
+                )
+            return existing, {}
         staging = (
             None
             if existing is not None

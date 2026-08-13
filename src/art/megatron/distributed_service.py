@@ -1386,6 +1386,32 @@ class DistributedMegatronService:
                 if self._latest_step != generation.policy_step:
                     raise RuntimeError("learner advanced between snapshot commands")
 
+        pointer = read_committed_optimizer_pointer(self._optimizer_state_path)
+        if (
+            save_optimizer
+            and pointer is not None
+            and (pointer.generation == generation.generation_id)
+        ):
+            if (
+                pointer.step != generation.policy_step
+                or existing is None
+                or pointer.adapter != existing
+            ):
+                raise RuntimeError(
+                    "committed optimizer generation disagrees with resident learner"
+                )
+
+            async def completed() -> DurableTrainerPublication:
+                return DurableTrainerPublication(
+                    adapter=existing,
+                    resume_step=pointer.step,
+                    optimizer_step=pointer.step,
+                )
+
+            return GenerationSnapshotLaunch(
+                metrics={}, completion=asyncio.create_task(completed())
+            )
+
         targets: tuple[Any, ...] = ()
         merged: MergedWeightTransferSpec | None = None
         if activate_serving and existing is None:
