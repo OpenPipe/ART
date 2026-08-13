@@ -12,6 +12,7 @@ from art.megatron.dsv4.compressor import (
 from art.megatron.dsv4.kernel.precision_aligned_ops import linear_bf16_fp32
 
 _COMPRESSOR_TYPES = {"DeepseekV4CSACompressor", "DeepseekV4HCACompressor"}
+_RMS_NORM_TYPE = "DeepseekV4RMSNorm"
 
 
 def _aligned_linear_forward(module: nn.Linear, x: torch.Tensor) -> torch.Tensor:
@@ -42,6 +43,14 @@ def _cast_indexer_key(
 ) -> tuple[Any, ...]:
     q, compressed_kv, *rest = inputs
     return q, compressed_kv.to(q.dtype), *rest
+
+
+def _cast_norm_output(
+    _module: nn.Module,
+    inputs: tuple[Any, ...],
+    output: torch.Tensor,
+) -> torch.Tensor:
+    return output.to(inputs[0].dtype)
 
 
 def _gather_projected(tensor: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -235,6 +244,9 @@ def _patch_prefix_forward(module: Any, forward: Any) -> None:
 
 def prepare_hf_reference_model(model: Any) -> Any:
     """Align native HF compressor precision with the training/serving path."""
+    for module in model.modules():
+        if type(module).__name__ == _RMS_NORM_TYPE:
+            module.register_forward_hook(_cast_norm_output)
     compressors = [
         module
         for module in model.modules()
