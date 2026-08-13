@@ -37,6 +37,7 @@ _SHARED_GPU_IDS_ENV = "ART_MODEL_SUPPORT_SHARED_GPU_IDS"
 _VARIANT_ENV = "ART_MODEL_SUPPORT_YES_NO_VARIANT"
 _EXTERNAL_VLLM_URL_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL"
 _EXTERNAL_VLLM_API_KEY_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY"
+_EXTERNAL_VLLM_HEALTH_TIMEOUT_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_HEALTH_TIMEOUT"
 _TRAINABILITY_ROOT = (
     Path(__file__).resolve().parents[4] / ".local" / "model_support_validation"
 )
@@ -169,11 +170,14 @@ def _external_vllm_runtime_config() -> dev.VllmRuntimeArgs | None:
     server_url = os.environ.get(_EXTERNAL_VLLM_URL_ENV)
     if server_url is None or server_url.strip() == "":
         return None
-    return {
+    config: dev.VllmRuntimeArgs = {
         "mode": "external",
         "server_url": server_url,
         "api_key": os.environ.get(_EXTERNAL_VLLM_API_KEY_ENV, "art-external-vllm"),
     }
+    if timeout := os.environ.get(_EXTERNAL_VLLM_HEALTH_TIMEOUT_ENV):
+        config["health_timeout_s"] = float(timeout)
+    return config
 
 
 def _topology_with_env_overrides(topology: Topology) -> Topology:

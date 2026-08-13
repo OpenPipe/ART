@@ -235,6 +235,9 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
         external = {
             "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL": runtime.base_url,
             "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY": runtime.api_key,
+            "ART_MODEL_SUPPORT_EXTERNAL_VLLM_HEALTH_TIMEOUT": os.environ.get(
+                "ART_DEDICATED_VLLM_TIMEOUT", "1200"
+            ),
             "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS": ",".join(
                 map(str, inference_gpu_ids)
             ),

@@ -636,6 +636,7 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
         unexpected_memory_probe,
     )
     monkeypatch.setenv("ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_EXTERNAL_VLLM_HEALTH_TIMEOUT", "1200")
     default_variant = _default_variant_name(
         "deepseek-ai/DeepSeek-V4-Flash",
     )
@@ -666,6 +667,7 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
         "mode": "external",
         "server_url": "http://127.0.0.1:8000",
         "api_key": "art-external-vllm",
+        "health_timeout_s": 1200.0,
     }
 
 
