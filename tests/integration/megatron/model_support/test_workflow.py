@@ -399,7 +399,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         PolicyActivationEvent(8, 8.5, 8.75),
         PolicyActivationEvent(9, 10.5, 10.75),
     ]
-    config = ThroughputWorkflowConfig(num_layers=2, completion_tokens=128)
+    config = ThroughputWorkflowConfig(num_layers=2, completion_tokens=128, max_steps=7)
     fixture = ThroughputFixture(
         model_key="llama3_dense",
         path="/tmp/llama-throughput",
@@ -453,11 +453,13 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "e2e_train_tok_s": 500.0,
         "accepted_train_tok_s": 250.0,
         "unused_and_dummy_ratio": 1.0 - 1_000 / 131_072,
+        "queue_ready_inter_forward_backward_gap_rank_zero_mean_s": 0.115,
         "queue_ready_inter_forward_backward_gap_rank_zero_p50_s": 0.115,
         "queue_ready_inter_forward_backward_gap_rank_zero_p95_s": 0.1285,
         "queue_ready_inter_forward_backward_gap_rank_zero_max_s": 0.13,
         "queue_ready_inter_forward_backward_gap_rank_zero_count": 4,
         "queue_ready_inter_forward_backward_gap_worst_rank": 1,
+        "queue_ready_inter_forward_backward_gap_worst_rank_mean_s": 0.125,
         "queue_ready_inter_forward_backward_gap_worst_rank_p50_s": 0.125,
         "queue_ready_inter_forward_backward_gap_worst_rank_p95_s": 0.1385,
         "queue_ready_inter_forward_backward_gap_worst_rank_max_s": 0.14,
@@ -497,7 +499,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         **measurements,
         "queue_ready_inter_forward_backward_gap_worst_rank_max_s": 0.5,
     }
-    assert "queue_ready_inter_forward_backward_gap_p95_s" not in acceptance_failures(
+    assert "queue_ready_inter_forward_backward_gap_mean_s" not in acceptance_failures(
         robust, config, thresholds
     )
     sparse = {
@@ -511,7 +513,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         ThroughputThresholds.model_validate(
             {
                 **thresholds.model_dump(),
-                "max_queue_ready_inter_forward_backward_gap_p95_s": 0.201,
+                "max_queue_ready_inter_forward_backward_gap_mean_s": 0.201,
             }
         )
     assert acceptance_failures(

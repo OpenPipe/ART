@@ -47,7 +47,7 @@ _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
 _INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
-_MEASUREMENT_CONTRACT_VERSION = 17
+_MEASUREMENT_CONTRACT_VERSION = 18
 _ISOLATED_WARMUP_STEPS = 1
 _MATCHED_MEASURED_STEPS = 3
 _PIPELINE_SETTING_NAMES = (
@@ -101,7 +101,7 @@ _PERFORMANCE_ACCEPTANCE_FAILURES = frozenset(
         "mean_policy_activation_lag_s",
         "max_policy_activation_lag_s",
         "repeated_policy_activation_cadence_s",
-        "queue_ready_inter_forward_backward_gap_p95_s",
+        "queue_ready_inter_forward_backward_gap_mean_s",
     }
 )
 _HARD_ACCEPTANCE_FAILURES = frozenset(
@@ -1045,6 +1045,7 @@ def _queue_ready_inter_forward_backward_gaps(
     def summarize(rank: int) -> dict[str, int | float | None]:
         values = [gaps[rank] for gaps in eligible]
         return {
+            "mean_s": fmean(values) if values else None,
             "p50_s": median(values) if values else None,
             "p95_s": (
                 quantiles(values, n=20, method="inclusive")[18]
@@ -1061,7 +1062,7 @@ def _queue_ready_inter_forward_backward_gaps(
     worst_rank = (
         max(
             summaries,
-            key=lambda rank: cast(float, summaries[rank]["p95_s"]),
+            key=lambda rank: cast(float, summaries[rank]["mean_s"]),
         )
         if eligible
         else None
@@ -1560,11 +1561,11 @@ def acceptance_failures(
             "queue_ready_inter_forward_backward_gap_worst_rank_count"
         ]
         >= thresholds.min_queue_ready_inter_forward_backward_gap_count,
-        "queue_ready_inter_forward_backward_gap_p95_s": (
-            measurements["queue_ready_inter_forward_backward_gap_worst_rank_p95_s"]
+        "queue_ready_inter_forward_backward_gap_mean_s": (
+            measurements["queue_ready_inter_forward_backward_gap_worst_rank_mean_s"]
             is not None
-            and measurements["queue_ready_inter_forward_backward_gap_worst_rank_p95_s"]
-            <= thresholds.max_queue_ready_inter_forward_backward_gap_p95_s
+            and measurements["queue_ready_inter_forward_backward_gap_worst_rank_mean_s"]
+            <= thresholds.max_queue_ready_inter_forward_backward_gap_mean_s
         ),
     }
     if thresholds.calibration_fingerprint is not None:

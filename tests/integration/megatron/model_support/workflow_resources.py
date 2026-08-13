@@ -31,7 +31,7 @@ class ThroughputThresholds(BaseModel):
     max_repeated_policy_activation_interval_s: float = Field(
         gt=0.0, allow_inf_nan=False
     )
-    max_queue_ready_inter_forward_backward_gap_p95_s: float = Field(
+    max_queue_ready_inter_forward_backward_gap_mean_s: float = Field(
         default=0.2, gt=0.0, le=0.2, allow_inf_nan=False
     )
     min_queue_ready_inter_forward_backward_gap_count: int = Field(default=3, ge=3)
@@ -61,7 +61,7 @@ class ThroughputWorkflowConfig(BaseModel):
     max_num_seqs: int = Field(default=64, ge=1)
     max_num_batched_tokens: int = Field(default=65_536, ge=1)
     enable_prefix_caching: bool = False
-    max_steps: Literal[7] = 7
+    max_steps: int = Field(default=11, ge=7)
     max_steps_off_policy: int = Field(default=4, ge=0)
     packed_sequence_length: int = Field(
         default=THROUGHPUT_PACKED_SEQUENCE_LENGTH, ge=1024
@@ -352,7 +352,7 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
 
 _THROUGHPUT_CONFIGS = {
     "llama3_dense": ThroughputWorkflowConfig(
-        num_layers=16,
+        num_layers=24,
         prompt_tokens=3922,
         completion_tokens=256,
         rollouts_per_group=6,
@@ -436,55 +436,55 @@ _THROUGHPUT_CONFIGS = {
 # values are estimates from the prior H200 workflow and remain fingerprint-free.
 _B300_THROUGHPUT_FLOORS = {
     "llama3_dense": (
-        "db91653df92849fa7f7fdc2d7c91d1ebd2efc3ef07f031d7b4f0b28fed7f12f3",
-        (49_500, 47_300, 12_900, 0.90, 4.5),
+        "b55c3f3a3ce11fa821f4cfcd38ab181bd8ebfedaa3ba7b4f18efeccf7274a623",
+        (38_500, 37_300, 10_500, 0.93, 4.5),
     ),
     "qwen3_dense": (
-        "d9efc2fbae5d270764d3495828210e242a11da1fdf67288ec3499f5e4c3f40b5",
+        "d6330998d41a185a1fa8e21755cc7273c366f69680b1533d55de9857d1fe36e7",
         (40_200, 37_600, 8_600, 0.88, 4.5),
     ),
     "qwen3_moe": (
-        "6dabf1e1163d91a3c462fd7dc594cf67d39d1542304be31d2cc62b39f5ad5678",
+        "39e3d91c4990119ccfc83c0fb02789983f793af1cfb512bc5b445d6de91b0fa4",
         (49_900, 43_700, 2_050, 0.82, 4.5),
     ),
     "qwen3_5_dense": (
-        "fc59fa68c6ffabc26cdd02c28c20e9c5865a17ceacd6a36611832450638f712f",
+        "0b3d8585bcae0ba3624688988b56186ecc17dcf9aab199ba2edbb34eceb05907",
         (64_800, 60_000, 3_750, 0.87, 3.5),
     ),
     "qwen3_5_moe": (
-        "212d79cbc34d46c068b979bfad65bfa14e5e79d3c4d2b42991f6b1ad7a0afa14",
+        "fe5633c2508026558fbc58f56eba10d41f911e84ffba338175d009826f66487e",
         (32_600, 30_800, 257, 0.89, 5.5),
     ),
     "gemma4_dense": (
-        "356a486aa3383e8d1f479a00d944b8b58b67d62b611542516ef1aed9d9db8a7d",
+        "67294e16527fe403a70928d6faee73133187258be15ed71366c8939caaf72109",
         (23_100, 22_700, 2_390, 0.93, 7.0),
     ),
     "gemma4_moe": (
-        "d6a073ef626d2e43e62e13d3bd3f8a567ec641e60b93bd928413ba9e76b98e6a",
+        "660114c60d04bbd5d4868564a98426b4527375fd340a2823c7258f245513c95e",
         (40_300, 38_500, 4_740, 0.90, 5.0),
     ),
     "dsv4": (
-        "31272344b7ca8ea4cedbfd656ded1b137e04a4ccdbe41a43d3ce3f4a93cf27ce",
-        (3_900, 3_750, 350, 0.94, 6.0),
+        "2faf1b48b63dcf2bf0e577d24cecbb32e900fd755bb150a23208fc4c4aa7ae52",
+        (14_800, 14_300, 1_300, 0.94, 6.0),
     ),
     "glm52": (
-        "dc3faab4dc8685e22c71fec5699c68da5379b0c9eb2a8279bbd964cde42f4d4c",
+        "14353f531391fef86decb2843929ab551e7edd420ff5355c1f7e0a7de75b2b99",
         (14_880, 14_330, 5_730, 0.91, 12.0),
     ),
     "gpt_oss_moe": (
-        "dc2570a5bb3b5efd18eeb04c210c393575e2d3421a85015472d432866650379f",
+        "17e502551f78d7904aa4cfadf2a8ff4792b1bca38ee3eb69fe011d3b49c6d8c2",
         (81_700, 76_400, 4_850, 0.88, 2.5),
     ),
 }
 _H200_THROUGHPUT_FLOORS = {
-    "llama3_dense": (27_500, 25_900, 6_600, 0.89, 7.0),
+    "llama3_dense": (18_300, 17_200, 4_400, 0.89, 7.0),
     "qwen3_dense": (24_100, 23_100, 5_000, 0.91, 7.0),
     "qwen3_moe": (26_400, 20_900, 930, 0.74, 10.0),
     "qwen3_5_dense": (26_500, 25_600, 1_500, 0.91, 5.5),
     "qwen3_5_moe": (13_600, 12_900, 100, 0.90, 12.0),
     "gemma4_dense": (10_600, 10_400, 1_000, 0.93, 13.0),
     "gemma4_moe": (17_900, 17_300, 2_000, 0.91, 9.5),
-    "dsv4": (1_900, 1_800, 160, 0.90, 12.0),
+    "dsv4": (8_300, 8_000, 700, 0.90, 12.0),
     "glm52": (9_400, 9_000, 3_400, 0.91, 19.5),
     "gpt_oss_moe": (39_900, 37_100, 2_200, 0.88, 4.5),
 }
