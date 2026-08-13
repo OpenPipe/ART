@@ -118,6 +118,15 @@ class PackingLeafShape(pydantic.BaseModel):
     token_ids: array
     shareable_length: int = pydantic.Field(ge=0)
 
+    @pydantic.field_validator("token_ids", mode="before")
+    @classmethod
+    def load_token_ids(cls, value: array | list[int]) -> array:
+        return value if isinstance(value, array) else array("I", value)
+
+    @pydantic.field_serializer("token_ids", when_used="json")
+    def dump_token_ids(self, value: array) -> list[int]:
+        return value.tolist()
+
     @pydantic.model_validator(mode="after")
     def validate_shape(self) -> "PackingLeafShape":
         if self.token_ids.typecode != "I":
