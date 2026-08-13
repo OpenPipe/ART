@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, cast
 
 from art.distributed.art_runtime import DistributedPackedBatch
@@ -56,7 +57,11 @@ def packing_outcome(
         packed_sequence_length=ref.sequence_length,
         packed_sequences=ref.num_sequences,
         target_packed_sequences=target_packed_sequences,
-        nominal_capacity_tokens=ref.num_sequences * ref.sequence_length,
+        nominal_capacity_tokens=(
+            math.ceil(ref.num_sequences / target_packed_sequences)
+            * target_packed_sequences
+            * ref.sequence_length
+        ),
         physical_tokens=stats.physical_tokens,
         non_padding_tokens=packed.non_padding_tokens,
         loss_bearing_tokens=packed.loss_bearing_tokens,

@@ -138,6 +138,12 @@ def _weighted_percentile(points: list[tuple[float, float]], percentile: float) -
     return ordered[-1][0]
 
 
+def _quantile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    return sorted(values)[max(0, math.ceil(percentile * len(values)) - 1)]
+
+
 def _policy_age_exp(age: float) -> float:
     exponent = max(age, 0.0) / _SCORE_FRESHNESS_TAU_STEPS
     if exponent >= 700.0:
@@ -357,6 +363,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         ) = None
         self._producer_rollout_timings = (0.0, 0.0, 0.0)
         self._reported_producer_rollout_timings = (0.0, 0.0, 0.0)
+        self._producer_rollout_latencies: list[float] = []
+        self._producer_rollout_errors = 0
         self._packed_queue: asyncio.Queue[_PreparedPipelineItem | None] | None = None
         self._accept_prepared_batches = True
         self._eval_queue: asyncio.Queue[int] | None = None
@@ -1017,6 +1025,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     f"{self._scenario_error_context(scenario)}"
                 )
             finally:
+                if errored:
+                    self._producer_rollout_errors += 1
                 self._status.note_rollout_finished(errored=errored)
 
     async def _rollout_stage(self) -> None:
@@ -1247,6 +1257,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 actor_wall_s, actor_idle_s, queue_wait_s = (
                     self._consume_producer_rollout_timings()
                 )
+                rollout_latencies, rollout_errors = self._consume_rollout_supply()
                 self._status.note_training_batch(
                     batch, step=current_step, step_seconds=step_seconds
                 )
@@ -1278,6 +1289,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "queue/put_wait_s": queue_wait_s,
                     "queue/put_wait_frac": queue_wait_s
                     / max(queue_wait_s + actor_wall_s, 1e-9),
+                    "rollout/step/completed_groups": float(len(rollout_latencies)),
+                    "rollout/step/errored_groups": float(rollout_errors),
+                    "rollout/step/latency_p50_s": _quantile(rollout_latencies, 0.50),
+                    "rollout/step/latency_p95_s": _quantile(rollout_latencies, 0.95),
                     "queue/actual_stale_fraction": step_stale_groups
                     / max(step_dequeued_groups, 1),
                 }
@@ -2372,6 +2387,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             previous[1] + actor_idle_s,
             previous[2] + queue_wait_s,
         )
+        self._producer_rollout_latencies.append(rollout_wall_s)
 
     def _consume_producer_rollout_timings(self) -> tuple[float, float, float]:
         current = self._producer_rollout_timings
@@ -2382,3 +2398,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             max(0.0, current[1] - previous[1]),
             max(0.0, current[2] - previous[2]),
         )
+
+    def _consume_rollout_supply(self) -> tuple[list[float], int]:
+        latencies, self._producer_rollout_latencies = (
+            self._producer_rollout_latencies,
+            [],
+        )
+        errors, self._producer_rollout_errors = self._producer_rollout_errors, 0
+        return latencies, errors

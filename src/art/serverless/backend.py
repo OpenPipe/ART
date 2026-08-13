@@ -204,6 +204,9 @@ class ServerlessBackend:
     def logs_sft_metrics_remotely(self) -> bool:
         return False
 
+    def pipeline_autotuner_inference_observer(self) -> Literal["rollout_supply"]:
+        return "rollout_supply"
+
     def _model_inference_name(self, model: AnyModel, step: int | None = None) -> str:
         if name := pinned_inference_name(model.name, step):
             return name
