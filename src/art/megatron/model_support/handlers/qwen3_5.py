@@ -1227,6 +1227,11 @@ def ensure_qwen35_text_only_bridge_registered() -> None:
         def mapping_registry(self) -> Any:
             return _qwen35_text_only_mapping_registry(Qwen35VLMoEBridge)
 
+    # Lazy registration still needs stable module identities for Dynamo packages.
+    for bridge_type in (_ArtQwen35DenseTextOnlyBridge, _ArtQwen35TextOnlyBridge):
+        bridge_type.__qualname__ = bridge_type.__name__
+        globals()[bridge_type.__name__] = bridge_type
+
     _QWEN35_TEXT_ONLY_BRIDGE_REGISTERED = True
 
 
