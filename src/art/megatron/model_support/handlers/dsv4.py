@@ -519,13 +519,6 @@ class Dsv4Handler(DefaultMoeHandler):
             shared_expert_state=self._shared_expert_compile_state(provider),
         )
 
-    def compile_cache_identity(self, provider: Any) -> dict[str, Any]:
-        return {
-            **super().compile_cache_identity(provider),
-            "moe_layer_freq": provider.moe_layer_freq,
-            "compress_ratios": list(provider.dsv4_compress_ratios),
-        }
-
     def ensure_hf_reference_registered(self) -> None:
         from art.megatron.dsv4.hf_config import ensure_dsv4_hf_model_registered
 

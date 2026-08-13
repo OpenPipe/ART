@@ -4,13 +4,11 @@ import asyncio
 from collections import Counter
 from collections.abc import Awaitable, Callable
 import logging
-from pathlib import Path
 import time
 from typing import Any, Literal
 from urllib.parse import urlparse
 import uuid
 
-from monarch.actor import default_bootstrap_cmd
 from pydantic import BaseModel, ConfigDict
 
 from art.megatron.runtime.specs import TrainerRuntimeSpec, TrainingRunSpec
@@ -884,34 +882,9 @@ class ArtRuntime:
         supervision = MonarchTrainerSupervision(run_spec.run_id)
         proc = None
         try:
-            bootstrap_env = {
-                "TORCH_CACHING_PRECOMPILE": "1" if runtime_spec.compile_cache else "0"
-            }
-            if runtime_spec.compile_cache:
-                compile_runtime_root = (
-                    Path(runtime_spec.cache_root or "/tmp/art-cache")
-                    / "megatron"
-                    / "compile_cache"
-                    / "runtime"
-                    / runtime_spec.compile_fingerprint
-                )
-
-                def bootstrap_command(point: Any) -> Any:
-                    rank_root = compile_runtime_root / f"rank-{point.rank}"
-                    return default_bootstrap_cmd().with_env(
-                        bootstrap_env
-                        | {
-                            "TORCHINDUCTOR_CACHE_DIR": str(rank_root / "inductor"),
-                            "TRITON_CACHE_DIR": str(rank_root / "triton"),
-                        }
-                    )
-
-            else:
-                bootstrap_command = default_bootstrap_cmd().with_env(bootstrap_env)
             proc = selected.spawn_procs(
                 per_host={"trainer": next(iter(counts.values()))},
                 bootstrap=activate_trainer_child_virtualenv,
-                bootstrap_command=bootstrap_command,
                 name=monarch_identifier(
                     f"art_trainer_{supervision.token}_{self.runtime_id}"
                 ),

@@ -1068,9 +1068,6 @@ def _patch_router_gating_linear_empty_input() -> None:
             zero = zero + bias.to(router_dtype).sum() * 0.0
         return zero.expand(*inp.shape[:-1], int(weight.shape[0]))
 
-    _adopt_function_identity(
-        _router_gating_linear_empty_safe, original_router_gating_linear
-    )
     setattr(_router_gating_linear_empty_safe, "__art_empty_safe__", True)
     setattr(moe_utils, "router_gating_linear", _router_gating_linear_empty_safe)
     setattr(router, "router_gating_linear", _router_gating_linear_empty_safe)
@@ -1124,10 +1121,6 @@ def _patch_bias_swiglu_empty_input() -> None:
             )
         return _empty_swiglu_output(input, bias=bias, weights=weights)
 
-    _adopt_function_identity(_bias_swiglu_empty_safe, original_bias_swiglu_impl)
-    _adopt_function_identity(
-        _weighted_bias_swiglu_empty_safe, original_weighted_bias_swiglu_impl
-    )
     setattr(_bias_swiglu_empty_safe, "__art_empty_safe__", True)
     setattr(_weighted_bias_swiglu_empty_safe, "__art_empty_safe__", True)
     setattr(fused_bias_swiglu, "bias_swiglu_impl", _bias_swiglu_empty_safe)
@@ -1178,13 +1171,6 @@ def _patch_moe_unpermute_empty_input() -> None:
             zero = zero + probs.to(dtype=permuted_tokens.dtype).sum() * 0.0
         return zero.expand(tuple(int(dim) for dim in restore_shape)).clone()
 
-    _adopt_function_identity(_unpermute_empty_safe, original_unpermute)
     setattr(_unpermute_empty_safe, "__art_empty_safe__", True)
     setattr(moe_utils, "unpermute", _unpermute_empty_safe)
     setattr(token_dispatcher, "unpermute", _unpermute_empty_safe)
-
-
-def _adopt_function_identity(replacement: Any, original: Any) -> None:
-    replacement.__module__ = original.__module__
-    replacement.__name__ = original.__name__
-    replacement.__qualname__ = original.__qualname__

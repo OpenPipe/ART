@@ -241,11 +241,6 @@ class ModelSupportHandler(Protocol):
         provider: "GPTModelProvider",
     ) -> CompileWorkaroundConfig: ...
 
-    def compile_cache_identity(
-        self,
-        provider: "GPTModelProvider",
-    ) -> dict[str, Any]: ...
-
     def flex_attention_compile_crash_config(
         self,
         provider: "GPTModelProvider",

@@ -37,15 +37,15 @@ def _disable_attr(obj: Any, name: str) -> None:
     setattr(obj, name, _disable(_require_attr(obj, name)))
 
 
-def resolve_torch_compile_workaround_flags(
+def _selected_workaround_flags(
     config: CompileWorkaroundConfig | None,
-) -> tuple[str, ...]:
+) -> set[str]:
     raw = os.environ.get("ART_MEGATRON_COMPILE_WORKAROUNDS", "").strip()
     if not raw:
-        return tuple(sorted(() if config is None else config.flags))
+        return set(() if config is None else config.flags)
     if raw.lower() in {"none", "off"}:
-        return ()
-    return tuple(sorted({part.strip() for part in raw.split(",") if part.strip()}))
+        return set()
+    return {part.strip() for part in raw.split(",") if part.strip()}
 
 
 def _install_context_parallel_attention_workaround() -> None:
@@ -107,15 +107,9 @@ def _install_te_triton_mask_map_workaround() -> None:
 
 def install_torch_compile_workarounds(
     config: CompileWorkaroundConfig | None = None,
-    *,
-    resolved_flags: tuple[str, ...] | None = None,
 ) -> None:
     global _INSTALLED_CONFIG
-    flags = set(
-        resolve_torch_compile_workaround_flags(config)
-        if resolved_flags is None
-        else resolved_flags
-    )
+    flags = _selected_workaround_flags(config)
     shared_expert_state = "none" if config is None else config.shared_expert_state
     installed_config = (frozenset(flags), shared_expert_state)
     if _INSTALLED_CONFIG is not None:

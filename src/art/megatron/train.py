@@ -87,11 +87,7 @@ from art.megatron.selective_lm_head import (
     forward_token_losses,
 )
 from art.megatron.tensor_snapshot import SnapshotReadBarrier
-from art.megatron.training.compile import (
-    TrainingCompilePlan,
-    configure_training_compile,
-    resolve_training_compile_plan,
-)
+from art.megatron.training.compile import configure_training_compile
 from art.megatron.training.finalize_grads import (
     finalize_model_grads_extended,
     flush_param_grads_to_main_grads,
@@ -426,7 +422,6 @@ def build_training_runtime(
     allow_unvalidated_arch: bool | None = None,
     model_support_key: str | None = None,
     snapshot_pool_capacity: int = 2,
-    before_compile: Callable[[TrainingCompilePlan], None] | None = None,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -517,17 +512,10 @@ def build_training_runtime(
     provider_bundle.handler.install_preprocess_patch(model)
     if replay_requested:
         prepare_moe_routing_replay_boundaries(model)
-    compile_plan = resolve_training_compile_plan(
-        provider=provider,
-        provider_bundle=provider_bundle,
-    )
-    if before_compile is not None:
-        before_compile(compile_plan)
     transformer_layers_compiled = configure_training_compile(
         model=model,
         provider=provider,
         provider_bundle=provider_bundle,
-        plan=compile_plan,
     )
 
     optimizer_config = optimizer_config or _default_optimizer_config()
