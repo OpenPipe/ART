@@ -4759,7 +4759,7 @@ wheels = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.5.18"
+version = "0.5.19"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
