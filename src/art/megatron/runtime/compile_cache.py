@@ -63,6 +63,9 @@ def _source_code(code: CodeType) -> CodeType:
 
 def _canonicalize_code(code: CodeType, canonical_codes: _CanonicalCodes) -> CodeType:
     candidates = canonical_codes.setdefault(_code_identity(code), [])
+    canonical = next((candidate for candidate in candidates if code == candidate), None)
+    if canonical is not None:
+        return canonical
     from torch._dynamo import package
 
     try:
@@ -74,9 +77,6 @@ def _canonicalize_code(code: CodeType, canonical_codes: _CanonicalCodes) -> Code
             candidates.append(canonical)
         if code == canonical:
             return canonical
-    canonical = next((candidate for candidate in candidates if code == candidate), None)
-    if canonical is not None:
-        return canonical
     constants = tuple(
         _canonicalize_code(value, canonical_codes)
         if isinstance(value, CodeType)
