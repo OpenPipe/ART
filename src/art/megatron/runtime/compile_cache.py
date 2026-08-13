@@ -19,13 +19,17 @@ _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformer
 
 
 def _support_precompile_serialization() -> None:
-    from torch._dynamo.guards import CheckFunctionManager, GuardsStatePickler
+    import torch
+    from torch._dynamo.guards import CheckFunctionManager, GuardsStatePickler, _Missing
 
     original = GuardsStatePickler.reducer_override
     if getattr(original, "_art_supports_instance_method_aliases", False):
         return
 
     def reducer_override(self: Any, obj: Any) -> Any:
+        # Timers and routing replay retain transient events behind compiled modules.
+        if isinstance(obj, torch.cuda.Event) and id(obj) not in self.guard_tree_values:
+            return _Missing, ("unguarded CUDA event",)
         # PyTorch assumes a bound method is installed under its function name.
         if isinstance(obj, MethodType) and not hasattr(
             obj.__self__, obj.__func__.__name__
