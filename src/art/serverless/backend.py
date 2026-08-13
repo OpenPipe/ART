@@ -210,6 +210,7 @@ class ServerlessBackend:
             raise TypeError("ServerlessBackend only supports trainable models")
         client = await self.training_client(model)
         await client.close()
+        await client.wait_closed()
         checkpoints = await self._service.list_checkpoints(client.run_id)
         for checkpoint in checkpoints.checkpoints:
             await self._service.delete_checkpoint(

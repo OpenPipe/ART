@@ -532,11 +532,17 @@ class RemoteTrainingClient:
 
     async def close(self) -> None:
         async with self._lock:
-            if self._run.status == "closed":
+            if self._closed:
                 return
+            self._run = await self._service.close_run(
+                self.run_id, self._close_request_id
+            )
             self._closed = True
-        await self._service.close_run(self.run_id, self._close_request_id)
-        async with asyncio.timeout(self._close_timeout_s):
+
+    async def wait_closed(self, *, timeout_s: float | None = None) -> None:
+        if not self._closed:
+            raise RuntimeError("remote training run has not been closed")
+        async with asyncio.timeout(timeout_s or self._close_timeout_s):
             while True:
                 run = await self._service.get_run(self.run_id)
                 if run.status == "closed":
