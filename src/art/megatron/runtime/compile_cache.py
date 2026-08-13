@@ -55,6 +55,11 @@ def _support_precompile_serialization() -> None:
         # Timers and routing replay retain transient events behind compiled modules.
         if isinstance(obj, torch.cuda.Event) and id(obj) not in self.guard_tree_values:
             return _Missing, ("unguarded CUDA event",)
+        if (
+            type(obj).__module__ == "hybrid_ep_cpp"
+            and id(obj) not in self.guard_tree_values
+        ):
+            return _Missing, ("unguarded HybridEP runtime state",)
         if isinstance(obj, ContextVar):
             return _load_module_global, _module_global_reference(obj)
         if isinstance(obj, torch.autograd.graph.Node):
