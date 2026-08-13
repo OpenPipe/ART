@@ -1222,13 +1222,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     )
 
             try:
+                post_train_phases: dict[str, float] = {}
+                phase_started = time.monotonic()
                 current_step = result.step
                 self.state.policy_version = current_step
                 self.state.next_training_step = current_step
                 await self._log_checkpoint_saved(result)
                 await self._prune_model_adapters(current_step)
                 await self._run_checkpoint_retention(current_step)
+                post_train_phases["housekeeping"] = time.monotonic() - phase_started
 
+                phase_started = time.monotonic()
                 step_seconds = time.monotonic() - step_start
                 actor_wall_s, actor_idle_s, queue_wait_s = (
                     self._consume_producer_rollout_timings()
@@ -1309,30 +1313,45 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         age_metrics=policy_age_metrics,
                     )
                 )
+                post_train_phases["metrics"] = time.monotonic() - phase_started
+                phase_started = time.monotonic()
                 metrics.update(await self._queue_freshness_metrics(current_step))
                 metrics.update(self._pipeline_settings_metrics())
+                post_train_phases["queue_snapshot"] = time.monotonic() - phase_started
 
+                phase_started = time.monotonic()
                 await self._emit_packed_group_observations(
                     metrics, batch=batch, step=current_step
                 )
                 await self._emit_pipeline_metrics(metrics, step=current_step)
+                post_train_phases["autotuner"] = time.monotonic() - phase_started
+                phase_started = time.monotonic()
                 await self.model.log(
                     batch,
                     split="train",
                     step=current_step,
                     metrics=metrics,
                 )
+                post_train_phases["history"] = time.monotonic() - phase_started
+                phase_started = time.monotonic()
                 await self._log_zero_variance_groups(current_step)
 
                 if self.eval_fn is not None and should_eval_step:
                     await self._schedule_eval_step(current_step)
 
                 self._persist_state(current_step)
+                post_train_phases["persistence"] = time.monotonic() - phase_started
             finally:
                 self._status.note_training_end()
 
             async with self.state.policy_updated:
                 self.state.policy_updated.notify_all()
+            if os.getenv("ART_TRAIN_STEP_LOG"):
+                phases = " ".join(
+                    f"{name}={duration * 1e3:.1f}ms"
+                    for name, duration in post_train_phases.items()
+                )
+                print(f"[train] step {current_step} controller {phases}")
 
             if saw_sentinel:
                 stop_after_batch = True
