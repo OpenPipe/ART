@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+import hashlib
 from typing import Any, Generic, TypeVar, cast
 import uuid
 
@@ -36,10 +37,13 @@ from .contracts import (
     CreateTrainingRunRequest,
     DeleteCheckpointResult,
     OperationView,
+    RemoteForwardRequest,
     SetCheckpointTtlRequest,
     TrainingCapabilities,
+    TrainingDataRef,
     TrainingRunView,
 )
+from .data_plane import encode_training_batch
 
 ResultT = TypeVar("ResultT", bound=OperationResult)
 ResponseT = TypeVar("ResponseT", bound=Contract)
@@ -132,6 +136,24 @@ class RemoteTrainingServiceClient:
             body=request,
         )
 
+    async def put_training_data(
+        self, run_id: str, ref: TrainingDataRef, payload: bytes
+    ) -> None:
+        response = await self._send(
+            "PUT",
+            f"training/runs/{run_id}/data/{ref.object_id}",
+            content=payload,
+            headers={
+                "Content-Type": "application/vnd.art.training-batch+msgpack",
+                "X-Art-Training-Data-Format": ref.format,
+                "X-Art-Training-Batch-Kind": ref.batch_kind,
+                "X-Art-Training-Byte-Count": str(ref.byte_count),
+            },
+        )
+        received = TrainingDataRef.model_validate(response.json())
+        if received != ref:
+            raise RemoteTrainingError("remote training data identity changed")
+
     async def get_operation(self, operation_id: str) -> OperationView:
         return await self._request(
             "GET", f"training/operations/{operation_id}", OperationView
@@ -191,6 +213,22 @@ class RemoteTrainingServiceClient:
         body: Contract | None = None,
     ) -> ResponseT:
         content = None if body is None else body.model_dump_json()
+        response = await self._send(
+            method,
+            path,
+            content=content,
+            headers=None if body is None else {"Content-Type": "application/json"},
+        )
+        return response_type.model_validate(response.json())
+
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        content: str | bytes | None,
+        headers: dict[str, str] | None,
+    ) -> httpx.Response:
         response: httpx.Response | None = None
         for attempt in range(self._max_retries + 1):
             try:
@@ -198,9 +236,7 @@ class RemoteTrainingServiceClient:
                     method,
                     path,
                     content=content,
-                    headers=None
-                    if body is None
-                    else {"Content-Type": "application/json"},
+                    headers=headers,
                 )
             except httpx.TransportError:
                 if attempt == self._max_retries:
@@ -220,7 +256,7 @@ class RemoteTrainingServiceClient:
                 value = response.text
             detail = value.get("detail", value) if isinstance(value, dict) else value
             raise RemoteTrainingHttpError(response.status_code, detail)
-        return response_type.model_validate(response.json())
+        return response
 
     async def close(self) -> None:
         if self._owns_client:
@@ -338,7 +374,7 @@ class RemoteTrainingClient:
         kind: OperationKind,
         result_type: type[ResultT],
     ) -> TrainingOperation[ResultT]:
-        fingerprint = request.model_dump_json()
+        fingerprint = hashlib.sha256(request.model_dump_json().encode()).hexdigest()
         async with self._lock:
             if self._closed:
                 raise RuntimeError("remote training client is closed")
@@ -353,7 +389,16 @@ class RemoteTrainingClient:
                     f"expected sequence {self._next_sequence_id}, "
                     f"got {request.sequence_id}"
                 )
-            ref = await self._service.submit(kind, request)
+            wire_request: RunCommand = request
+            if isinstance(request, (ForwardRequest, ForwardBackwardRequest)):
+                batch_ref, payload = await asyncio.to_thread(
+                    encode_training_batch, request.batch
+                )
+                await self._service.put_training_data(
+                    request.run_id, batch_ref, payload
+                )
+                wire_request = RemoteForwardRequest.from_command(request, batch_ref)
+            ref = await self._service.submit(kind, wire_request)
             if (
                 ref.run_id != self.run_id
                 or ref.sequence_id != request.sequence_id

@@ -5,7 +5,60 @@ from typing import Any, Literal
 
 from pydantic import Field, model_validator
 
-from art.training.contracts import Contract, OperationRef
+from art.training.contracts import (
+    Contract,
+    ForwardRequest,
+    LossConfig,
+    OperationRef,
+    RunCommand,
+)
+
+TRAINING_DATA_FORMAT = "art_training_batch_msgpack_v1"
+
+
+class TrainingDataRef(Contract):
+    object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=1)
+    format: Literal["art_training_batch_msgpack_v1"] = TRAINING_DATA_FORMAT
+    batch_kind: Literal["rl", "sft"]
+
+
+class RemoteForwardRequest(RunCommand):
+    batch: TrainingDataRef
+    loss: LossConfig
+    collect_packing_shapes: bool = False
+
+    @classmethod
+    def from_command(
+        cls, command: ForwardRequest, batch: TrainingDataRef
+    ) -> "RemoteForwardRequest":
+        if command.batch.kind != batch.batch_kind:
+            raise ValueError("training data kind differs from the forward command")
+        return cls(
+            run_id=command.run_id,
+            request_id=command.request_id,
+            sequence_id=command.sequence_id,
+            batch=batch,
+            loss=command.loss,
+            collect_packing_shapes=command.collect_packing_shapes,
+        )
+
+    @model_validator(mode="after")
+    def _validate_loss(self) -> "RemoteForwardRequest":
+        expected = (
+            {"cross_entropy"}
+            if self.batch.batch_kind == "sft"
+            else {
+                "cispo",
+                "ppo",
+            }
+        )
+        if self.loss.name not in expected:
+            raise ValueError(
+                f"{self.batch.batch_kind} batches require one of {sorted(expected)}, "
+                f"got {self.loss.name!r}"
+            )
+        return self
 
 
 class AdapterSpec(Contract):
