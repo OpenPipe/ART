@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from types import FunctionType, MethodType, ModuleType
+from types import CodeType, FunctionType, MethodType, ModuleType
 from typing import Any, Literal
 import uuid
 
@@ -33,6 +33,12 @@ def _load_autograd_backward(module_name: str, attribute: str) -> Any:
     return backward.__new__(backward)
 
 
+def _load_python_code(value: Any) -> Any:
+    from torch._dynamo.package import SerializedCode
+
+    return SerializedCode.to_code_object(value)
+
+
 def _module_global_reference(value: Any) -> tuple[str, str]:
     matches = sorted(
         (module_name, attribute)
@@ -49,6 +55,7 @@ def _module_global_reference(value: Any) -> tuple[str, str]:
 def _support_precompile_serialization() -> None:
     import torch
     from torch._dynamo.guards import CheckFunctionManager, GuardsStatePickler, _Missing
+    from torch._dynamo.package import SerializedCode
     from torch._dynamo.source import DefaultsSource
 
     original = GuardsStatePickler.reducer_override
@@ -56,6 +63,10 @@ def _support_precompile_serialization() -> None:
         return
 
     copyreg.pickle(ModuleType, lambda module: (import_module, (module.__name__,)))
+    copyreg.pickle(
+        CodeType,
+        lambda code: (_load_python_code, (SerializedCode.from_code_object(code),)),
+    )
 
     def reducer_override(self: Any, obj: Any) -> Any:
         # Timers and routing replay retain transient events behind compiled modules.
@@ -210,7 +221,7 @@ def _compile_cache_key(
         }
     )
     payload: dict[str, Any] = {
-        "schema": 4,
+        "schema": 5,
         "runtime": runtime,
         "compile_plan": plan.model_dump(mode="json"),
         "environment": {
@@ -257,7 +268,7 @@ class TrainerCompileCache:
         if self.key is not None and self.key != key:
             raise RuntimeError("trainer compile plan changed after cache load")
         self.key = key
-        self.path = self._cache_root / "megatron" / "compile_cache" / "v4" / self.key
+        self.path = self._cache_root / "megatron" / "compile_cache" / "v5" / self.key
         self.path.parent.mkdir(parents=True, exist_ok=True)
         return self.key, self.path
 
