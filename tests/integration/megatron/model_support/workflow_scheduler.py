@@ -1137,9 +1137,8 @@ def run_prepared_workflows(
             by_model_key[operation.runtime.handler].record(
                 ValidationStageResult(
                     name=operation.stage,
-                    skipped=True,
                     metrics={
-                        "skipped": True,
+                        "blocked": True,
                         "reason": "blocked by failed workflow operation(s): "
                         + ", ".join(failed_operations),
                         "workflow_failed_dependencies": list(failed_operations),
@@ -1267,11 +1266,11 @@ def run_prepared_workflows(
         returncode = fork_result["returncode"]
         worker_wall_s = float(fork_result["child_wall_s"])
         completed = []
-        for operation_index, (operation, item) in enumerate(
-            zip(session.operations, items, strict=True)
-        ):
+        results: list[tuple[WorkflowOperation, Path, bool, ValidationStageResult]] = []
+        for operation, item in zip(session.operations, items, strict=True):
             output_json = Path(item.output_json)
-            if output_json.exists():
+            produced = output_json.exists()
+            if produced:
                 result = ValidationStageResult.model_validate_json(
                     output_json.read_text(encoding="utf-8")
                 )
@@ -1296,13 +1295,17 @@ def run_prepared_workflows(
             result.metrics["workflow_session_worker_s"] = worker_wall_s
             result.metrics["workflow_session_operation_count"] = len(session.operations)
             result.metrics.update(active_forkservers.metrics(execution_host))
+            results.append((operation, output_json, produced, result))
+
+        failed_operation_id: str | None = None
+        for operation, output_json, produced, result in results:
+            if not produced and failed_operation_id is not None:
+                record_blocked((operation,), (failed_operation_id,))
+                continue
             if operation.stage == CORRECTNESS_REFERENCE_STAGE:
                 if not result.passed:
                     remember_failure(operation, output_json, result)
-                    record_blocked(
-                        session.operations[operation_index + 1 :], (operation.id,)
-                    )
-                    raise WorkflowOperationFailed(operation.id)
+                    failed_operation_id = failed_operation_id or operation.id
                 completed.append(operation.id)
                 continue
             if operation.stage == "correctness_sensitivity":
@@ -1340,11 +1343,10 @@ def run_prepared_workflows(
             prepared.record(result)
             if not result.passed:
                 remember_failure(operation, output_json, result)
-                record_blocked(
-                    session.operations[operation_index + 1 :], (operation.id,)
-                )
-                raise WorkflowOperationFailed(operation.id)
+                failed_operation_id = failed_operation_id or operation.id
             completed.append(operation.id)
+        if failed_operation_id is not None:
+            raise WorkflowOperationFailed(failed_operation_id)
         return completed
 
     context = (

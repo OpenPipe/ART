@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 from integration.megatron.model_support import workflow_scheduler
 from integration.megatron.model_support import workflow_stage_worker as worker
 from integration.megatron.model_support.validation_spec import (
     ValidationReport,
     ValidationStageResult,
+)
+from integration.megatron.model_support.workflow import CORRECTNESS_REFERENCE_STAGE
+from integration.megatron.model_support.workflow_forkserver import (
+    WorkflowForkserverPool,
 )
 from integration.megatron.model_support.workflow_runtime import (
     WorkflowDevice,
@@ -16,6 +21,7 @@ from integration.megatron.model_support.workflow_runtime import (
     compile_workflow,
     execute_workflow,
 )
+from integration.megatron.model_support.workflow_scheduler import PreparedWorkflow
 from integration.megatron.model_support.workflow_stage_worker import (
     WorkflowStageWorkerItem,
     WorkflowStageWorkerSession,
@@ -142,15 +148,17 @@ class _Fixture:
 
 
 class _Prepared:
-    def __init__(self, run_dir: Path) -> None:
+    def __init__(self, run_dir: Path, stages: tuple[str, ...] | None = None) -> None:
+        stages = stages or (
+            "hf_parity",
+            "packing_invariance",
+            "length_trainability",
+        )
         self.report = ValidationReport(
             git={"commit": "test"},
             base_model="model",
             model_key="model",
-            stages=[
-                ValidationStageResult(name=stage)
-                for stage in ("hf_parity", "packing_invariance", "length_trainability")
-            ],
+            stages=[ValidationStageResult(name=stage) for stage in stages],
         )
         self.architecture = ArchitectureReport(
             base_model="model",
@@ -176,8 +184,10 @@ class _Prepared:
 
 
 class _Forkservers:
-    def __init__(self) -> None:
+    def __init__(self, *, fail: str | None = "hf_parity", stop: bool = True) -> None:
         self.calls: list[tuple[str, ...]] = []
+        self.fail = fail
+        self.stop = stop
 
     def run(self, _host: str, *, request_json: Path, **_kwargs):
         request = WorkflowStageWorkerSession.model_validate_json(
@@ -187,7 +197,7 @@ class _Forkservers:
         self.calls.append(stages)
         for item in request.items:
             result = ValidationStageResult(name=item.stage, passed=True)
-            if item.stage == "hf_parity":
+            if item.stage == self.fail:
                 result = ValidationStageResult(
                     name=item.stage,
                     passed=False,
@@ -196,7 +206,7 @@ class _Forkservers:
             Path(item.output_json).write_text(
                 result.model_dump_json(), encoding="utf-8"
             )
-            if not result.passed:
+            if not result.passed and self.stop:
                 break
         return {"returncode": 0, "child_wall_s": 0.01}
 
@@ -204,7 +214,14 @@ class _Forkservers:
         return {}
 
 
-def test_scheduler_records_failure_and_skips_blocked_operations(
+def _run(prepared: _Prepared, forkservers: _Forkservers) -> ValidationReport:
+    return workflow_scheduler.run_prepared_workflows(
+        [cast(PreparedWorkflow, prepared)],
+        forkservers=cast(WorkflowForkserverPool, forkservers),
+    )[0]
+
+
+def test_scheduler_records_failure_and_fails_blocked_operations(
     monkeypatch, tmp_path: Path
 ) -> None:
     runtime = _runtime("shared", handler="model")
@@ -235,17 +252,121 @@ def test_scheduler_records_failure_and_skips_blocked_operations(
         lambda: [WorkflowDevice(host="local", gpu="0")],
     )
 
-    reports = workflow_scheduler.run_prepared_workflows(
-        [prepared], forkservers=forkservers
-    )
+    report = _run(prepared, forkservers)
 
     assert forkservers.calls == [("hf_parity", "packing_invariance")]
-    stages = {stage.name: stage for stage in reports[0].stages}
+    stages = {stage.name: stage for stage in report.stages}
     assert stages["hf_parity"].metrics["error"] == "sentinel root failure"
     for stage_name in ("packing_invariance", "length_trainability"):
         stage = stages[stage_name]
-        assert stage.skipped is True
+        assert stage.skipped is False
+        assert stage.passed is False
+        assert stage.metrics["blocked"] is True
         assert stage.metrics["workflow_failed_dependencies"] == ["model:hf_parity"]
         evidence = stage.metrics["workflow_failure_evidence"]["model:hf_parity"]
         assert evidence["error"] == "sentinel root failure"
         assert Path(evidence["stage_result_json"]).is_file()
+    assert report.passed is False
+
+
+def test_scheduler_records_all_results_before_propagating_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runtime = _runtime("resident", handler="model")
+    stages = ("lora_coverage", "train_inf_mismatch", "length_trainability")
+    plan = compile_workflow(
+        tuple(
+            WorkflowOperation(
+                id=f"model:{stage}",
+                stage=stage,
+                runtime=runtime,
+                dependencies=((f"model:{stages[index - 1]}",) if index else ()),
+            )
+            for index, stage in enumerate(stages)
+        )
+    )
+    prepared = _Prepared(tmp_path / "run", stages)
+    forkservers = _Forkservers(fail="train_inf_mismatch", stop=False)
+    monkeypatch.setattr(
+        workflow_scheduler, "compile_prepared_workflows", lambda *_args, **_kwargs: plan
+    )
+    monkeypatch.setattr(
+        workflow_scheduler,
+        "_visible_devices",
+        lambda: [WorkflowDevice(host="local", gpu="0")],
+    )
+
+    report = _run(prepared, forkservers)
+
+    results = {stage.name: stage for stage in report.stages}
+    assert forkservers.calls == [stages]
+    assert results["lora_coverage"].passed is True
+    assert results["train_inf_mismatch"].passed is False
+    assert results["length_trainability"].passed is True
+    assert "workflow_failed_dependencies" not in results["length_trainability"].metrics
+    assert report.passed is False
+
+
+def test_hidden_correctness_failure_fails_visible_owner(
+    monkeypatch, tmp_path: Path
+) -> None:
+    reference = WorkflowOperation(
+        id=f"model:{CORRECTNESS_REFERENCE_STAGE}",
+        stage=CORRECTNESS_REFERENCE_STAGE,
+        runtime=_runtime("reference", handler="model"),
+    )
+    visible = WorkflowOperation(
+        id="model:correctness_sensitivity",
+        stage="correctness_sensitivity",
+        runtime=_runtime("variants", handler="model"),
+        dependencies=(reference.id,),
+    )
+    plan = compile_workflow((reference, visible))
+    prepared = _Prepared(tmp_path / "run", ("correctness_sensitivity",))
+    forkservers = _Forkservers(fail=CORRECTNESS_REFERENCE_STAGE)
+    monkeypatch.setattr(
+        workflow_scheduler, "compile_prepared_workflows", lambda *_args, **_kwargs: plan
+    )
+    monkeypatch.setattr(
+        workflow_scheduler,
+        "_visible_devices",
+        lambda: [WorkflowDevice(host="local", gpu="0")],
+    )
+
+    report = _run(prepared, forkservers)
+
+    owner = report.stages[0]
+    assert owner.name == "correctness_sensitivity"
+    assert owner.passed is False and owner.skipped is False
+    assert owner.metrics["blocked"] is True
+    assert owner.metrics["workflow_failed_dependencies"] == [reference.id]
+    assert report.passed is False
+
+
+def test_explicit_user_skip_does_not_fail_workflow(monkeypatch, tmp_path: Path) -> None:
+    prepared = _Prepared(tmp_path / "run", ("hf_parity", "packing_invariance"))
+    prepared.report.stages[1] = ValidationStageResult(
+        name="packing_invariance",
+        skipped=True,
+        metrics={"skipped": True, "reason": "--skip-stage"},
+    )
+    operation = WorkflowOperation(
+        id="model:hf_parity",
+        stage="hf_parity",
+        runtime=_runtime("base", handler="model"),
+    )
+    plan = compile_workflow((operation,))
+    monkeypatch.setattr(
+        workflow_scheduler, "compile_prepared_workflows", lambda *_args, **_kwargs: plan
+    )
+    monkeypatch.setattr(
+        workflow_scheduler,
+        "_visible_devices",
+        lambda: [WorkflowDevice(host="local", gpu="0")],
+    )
+
+    report = _run(prepared, _Forkservers(fail=None))
+
+    assert report.passed is True and report.complete is False
+    assert report.stages[1].skipped is True
+    assert report.stages[1].metrics["reason"] == "--skip-stage"

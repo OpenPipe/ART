@@ -366,14 +366,15 @@ def _support_cross_package_resume_codes() -> None:
         if (
             code not in self._codes
             and code in ContinueExecutionCache.generated_code_metadata
-            and (module := inspect.getmodule(code)) is not None
         ):
-            names = [
-                name
-                for name, value in vars(module).items()
-                if isinstance(value, FunctionType) and value.__code__ is code
-            ]
-            if names or any(value is code for value in vars(module).values()):
+            metadata = ContinueExecutionCache.generated_code_metadata[code]
+            module = inspect.getmodule(metadata.code)
+            if module is not None:
+                names = [
+                    name
+                    for name, value in vars(module).items()
+                    if isinstance(value, FunctionType) and value.__code__ is code
+                ]
                 for name in names or [None]:
                     self.add_resume_function(code, module.__name__, name)
         with original(self, code):
