@@ -2,14 +2,20 @@ from unittest.mock import AsyncMock
 
 import art
 from art.serverless.backend import ServerlessBackend
+from art.training.contracts import (
+    CheckpointRef,
+    SamplerPublication,
+    SamplerWeightsResult,
+)
 
 
 async def test_serverless_adapter_lease_pins_inference_step() -> None:
+    sampler_manager = AsyncMock()
     backend = ServerlessBackend(
         api_key="test-api-key",
         training_base_url="http://training.test/v1",
         inference_base_url="http://inference.test/v1",
-        sampler_publisher=AsyncMock(),
+        sampler_manager=sampler_manager,
     )
     model = art.TrainableModel(
         run_name="test-model",
@@ -19,6 +25,14 @@ async def test_serverless_adapter_lease_pins_inference_step() -> None:
         base_model="test-base-model",
     )
     model._backend = backend
+    weights = SamplerWeightsResult(
+        operation_id="save-3",
+        checkpoint=CheckpointRef(
+            run_id="run", learner_version=3, checkpoint_id="step-3"
+        ),
+        lora="/trainer/run/step-3",
+    )
+    backend._remember_sampler_result(model, weights)
 
     assert model.get_inference_name() == "serving-model"
 
@@ -30,6 +44,11 @@ async def test_serverless_adapter_lease_pins_inference_step() -> None:
 
     async with backend.exact_adapter_lease(model, 3):
         assert model.get_inference_name() == "serving-model@3"
+    publication = SamplerPublication(
+        mode="versioned_lora", model_alias="serving-model@3"
+    )
+    sampler_manager.publish.assert_awaited_once_with(model, weights, publication)
+    sampler_manager.remove.assert_awaited_once_with(model, publication)
 
 
 async def test_serverless_adapter_lease_is_model_scoped() -> None:
@@ -37,7 +56,7 @@ async def test_serverless_adapter_lease_is_model_scoped() -> None:
         api_key="test-api-key",
         training_base_url="http://training.test/v1",
         inference_base_url="http://inference.test/v1",
-        sampler_publisher=AsyncMock(),
+        sampler_manager=AsyncMock(),
     )
     model_a = art.TrainableModel(
         run_name="model-a",

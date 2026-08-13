@@ -143,7 +143,7 @@ class TestServerlessBackendModelInferenceName:
             api_key="test-key",
             training_base_url="http://training.test/v1",
             inference_base_url="http://inference.test/v1",
-            sampler_publisher=AsyncMock(),
+            sampler_manager=AsyncMock(),
         )
 
         model = TrainableModel(
@@ -165,7 +165,7 @@ class TestServerlessBackendModelInferenceName:
             api_key="test-key",
             training_base_url="http://training.test/v1",
             inference_base_url="http://inference.test/v1",
-            sampler_publisher=AsyncMock(),
+            sampler_manager=AsyncMock(),
         )
 
         model = TrainableModel(
@@ -190,7 +190,7 @@ class TestServerlessBackendModelInferenceName:
             api_key="test-key",
             training_base_url="http://training.test/v1",
             inference_base_url="http://inference.test/v1",
-            sampler_publisher=AsyncMock(),
+            sampler_manager=AsyncMock(),
         )
 
         model = TrainableModel(

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
+from collections.abc import AsyncIterator, Coroutine, Iterable
 from contextlib import asynccontextmanager
 import os
 import time
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 import uuid
 
 from art._backend_training import (
@@ -52,10 +52,18 @@ if TYPE_CHECKING:
         CheckpointRetentionStrategy,
     )
 
-SamplerPublisher = Callable[
-    [AnyTrainableModel, SamplerWeightsResult],
-    Awaitable[dict[str, float] | None],
-]
+
+class SamplerManager(Protocol):
+    async def publish(
+        self,
+        model: AnyTrainableModel,
+        weights: SamplerWeightsResult,
+        publication: SamplerPublication,
+    ) -> dict[str, float] | None: ...
+
+    async def remove(
+        self, model: AnyTrainableModel, publication: SamplerPublication
+    ) -> None: ...
 
 
 class ServerlessBackend:
@@ -66,7 +74,7 @@ class ServerlessBackend:
         *,
         training_base_url: str,
         inference_base_url: str,
-        sampler_publisher: SamplerPublisher,
+        sampler_manager: SamplerManager,
         api_key: str | None = None,
         inference_api_key: str | None = None,
         checkpoint: str | None = None,
@@ -91,7 +99,7 @@ class ServerlessBackend:
         self._inference_api_key = inference_api_key or api_key
         self._checkpoint = checkpoint
         self._restore_optimizer = restore_optimizer
-        self._sampler_publisher = sampler_publisher
+        self._sampler_manager = sampler_manager
         self._enable_expert_replay = enable_expert_replay
         self._close_timeout_s = close_timeout_s
         self._clients: dict[tuple[str | None, str, str, str], RemoteTrainingClient] = {}
@@ -99,6 +107,13 @@ class ServerlessBackend:
         self._background: set[asyncio.Task[Any]] = set()
         self._background_failures: list[BaseException] = []
         self._published_initial_models: set[tuple[str | None, str, str, str]] = set()
+        self._sampler_results: dict[
+            tuple[tuple[str | None, str, str, str], int], SamplerWeightsResult
+        ] = {}
+        self._exact_adapter_leases: dict[
+            tuple[tuple[str | None, str, str, str], int], int
+        ] = {}
+        self._exact_adapter_lock = asyncio.Lock()
         self._closed = False
 
     async def register(self, model: "Model") -> None:
@@ -225,10 +240,34 @@ class ServerlessBackend:
     async def exact_adapter_lease(
         self, model: AnyTrainableModel, step: int
     ) -> AsyncIterator[None]:
-        async with pin_inference_target(
-            model.name, step=step, inference_name=f"{model.name}@{step}"
-        ):
-            yield
+        key = self._sampler_key(model, step)
+        inference_name = f"{model.name}@{step}"
+        publication = SamplerPublication(
+            mode="versioned_lora", model_alias=inference_name
+        )
+        async with self._exact_adapter_lock:
+            weights = self._sampler_results.get(key)
+            if weights is None:
+                raise RuntimeError(
+                    f"exact sampler weights for learner step {step} are unavailable"
+                )
+            leases = self._exact_adapter_leases.get(key, 0)
+            if leases == 0:
+                await self._sampler_manager.publish(model, weights, publication)
+            self._exact_adapter_leases[key] = leases + 1
+        try:
+            async with pin_inference_target(
+                model.name, step=step, inference_name=inference_name
+            ):
+                yield
+        finally:
+            async with self._exact_adapter_lock:
+                leases = self._exact_adapter_leases[key]
+                if leases == 1:
+                    del self._exact_adapter_leases[key]
+                    await self._sampler_manager.remove(model, publication)
+                else:
+                    self._exact_adapter_leases[key] = leases - 1
 
     async def _prepare_backend_for_training(
         self,
@@ -281,8 +320,31 @@ class ServerlessBackend:
                 ),
             )
         )
-        await self._sampler_publisher(model, await operation.result())
+        result = await operation.result()
+        await self._publish_active_sampler(model, result)
         self._published_initial_models.add(key)
+
+    def _sampler_key(
+        self, model: AnyTrainableModel, step: int
+    ) -> tuple[tuple[str | None, str, str, str], int]:
+        return self._model_key(model), step
+
+    def _remember_sampler_result(
+        self, model: AnyTrainableModel, result: SamplerWeightsResult
+    ) -> None:
+        self._sampler_results[
+            self._sampler_key(model, result.checkpoint.learner_version)
+        ] = result
+
+    async def _publish_active_sampler(
+        self, model: AnyTrainableModel, result: SamplerWeightsResult
+    ) -> dict[str, float] | None:
+        self._remember_sampler_result(model, result)
+        return await self._sampler_manager.publish(
+            model,
+            result,
+            SamplerPublication(mode="in_flight_lora", model_alias=model.name),
+        )
 
     def _model_uses_expert_replay(self, model: AnyTrainableModel) -> bool:
         if not self._enable_expert_replay:
@@ -303,14 +365,44 @@ class ServerlessBackend:
     async def _delete_checkpoint_files(
         self, model: AnyTrainableModel, steps_to_keep: list[int]
     ) -> None:
-        client = await self.training_client(model)
-        page = await self._service.list_checkpoints(client.run_id)
         keep = set(steps_to_keep)
-        for checkpoint in page.checkpoints:
-            if checkpoint.learner_version not in keep:
-                await self._service.delete_checkpoint(
-                    client.run_id, checkpoint.checkpoint_id
-                )
+        async with self._exact_adapter_lock:
+            self._validate_sampler_retention(model, keep)
+            client = await self.training_client(model)
+            page = await self._service.list_checkpoints(client.run_id)
+            for checkpoint in page.checkpoints:
+                if checkpoint.learner_version not in keep:
+                    await self._service.delete_checkpoint(
+                        client.run_id, checkpoint.checkpoint_id
+                    )
+            self._forget_sampler_results(model, keep)
+
+    def _forget_sampler_results(
+        self, model: AnyTrainableModel, retain_steps: set[int]
+    ) -> None:
+        self._validate_sampler_retention(model, retain_steps)
+        model_key = self._model_key(model)
+        forgotten = [
+            key
+            for key in self._sampler_results
+            if key[0] == model_key and key[1] not in retain_steps
+        ]
+        for key in forgotten:
+            del self._sampler_results[key]
+
+    def _validate_sampler_retention(
+        self, model: AnyTrainableModel, retain_steps: set[int]
+    ) -> None:
+        model_key = self._model_key(model)
+        leased = [
+            step
+            for (key, step), leases in self._exact_adapter_leases.items()
+            if key == model_key and step not in retain_steps and leases > 0
+        ]
+        if leased:
+            raise RuntimeError(
+                f"checkpoint retention selected active exact adapter steps {leased}"
+            )
 
     async def _list_checkpoint_infos(self, model: AnyTrainableModel):
         from art.pipeline_trainer.checkpoint_retention import CheckpointInfo
@@ -336,36 +428,42 @@ class ServerlessBackend:
     async def _apply_checkpoint_retention(
         self, model: AnyTrainableModel, plan: "CheckpointRetentionPlan"
     ) -> None:
-        client = await self.training_client(model)
-        page = await self._service.list_checkpoints(client.run_id)
-        ready = tuple(
-            checkpoint for checkpoint in page.checkpoints if checkpoint.state == "ready"
-        )
-        actual_steps = {checkpoint.learner_version for checkpoint in ready}
-        if actual_steps != plan.observed_steps:
-            raise RuntimeError("remote checkpoint catalog changed during retention")
-        await self._service.apply_checkpoint_retention(
-            client.run_id,
-            ApplyCheckpointRetentionRequest(
-                observed=tuple(
-                    CheckpointRevision(
-                        checkpoint_id=checkpoint.checkpoint_id,
-                        revision=checkpoint.revision,
-                    )
-                    for checkpoint in ready
+        retained = set(plan.retain_steps)
+        async with self._exact_adapter_lock:
+            self._validate_sampler_retention(model, retained)
+            client = await self.training_client(model)
+            page = await self._service.list_checkpoints(client.run_id)
+            ready = tuple(
+                checkpoint
+                for checkpoint in page.checkpoints
+                if checkpoint.state == "ready"
+            )
+            actual_steps = {checkpoint.learner_version for checkpoint in ready}
+            if actual_steps != plan.observed_steps:
+                raise RuntimeError("remote checkpoint catalog changed during retention")
+            await self._service.apply_checkpoint_retention(
+                client.run_id,
+                ApplyCheckpointRetentionRequest(
+                    observed=tuple(
+                        CheckpointRevision(
+                            checkpoint_id=checkpoint.checkpoint_id,
+                            revision=checkpoint.revision,
+                        )
+                        for checkpoint in ready
+                    ),
+                    retain_checkpoint_ids=tuple(
+                        checkpoint.checkpoint_id
+                        for checkpoint in ready
+                        if checkpoint.learner_version in retained
+                    ),
+                    archive_checkpoint_ids=tuple(
+                        checkpoint.checkpoint_id
+                        for checkpoint in ready
+                        if checkpoint.learner_version in plan.archive_steps
+                    ),
                 ),
-                retain_checkpoint_ids=tuple(
-                    checkpoint.checkpoint_id
-                    for checkpoint in ready
-                    if checkpoint.learner_version in plan.retain_steps
-                ),
-                archive_checkpoint_ids=tuple(
-                    checkpoint.checkpoint_id
-                    for checkpoint in ready
-                    if checkpoint.learner_version in plan.archive_steps
-                ),
-            ),
-        )
+            )
+            self._forget_sampler_results(model, retained)
 
     async def train(  # type: ignore[override]
         self,
@@ -512,7 +610,7 @@ class ServerlessBackend:
         forward_result, optimizer_result, sampler_result = await asyncio.gather(
             forward.result(), optimizer.result(), sampler.result()
         )
-        publication_metrics = await self._sampler_publisher(model, sampler_result)
+        publication_metrics = await self._publish_active_sampler(model, sampler_result)
         _attach_packing_shapes(groups, forward_result.packing.group_shapes)
         metrics = aggregate_rl_training_metrics(
             training_metrics=[
@@ -627,7 +725,7 @@ class ServerlessBackend:
         sampler_result, state_result = await asyncio.gather(
             sampler.result(), state.result()
         )
-        publication_metrics = await self._sampler_publisher(model, sampler_result)
+        publication_metrics = await self._publish_active_sampler(model, sampler_result)
         yield {
             **pending,
             **sampler_result.publication_metrics,
