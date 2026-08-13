@@ -104,6 +104,17 @@ class _ResidentRun(BaseModel):
     generation: TrainerGeneration
 
 
+class _PendingSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    run_id: str
+    generation: TrainerGeneration
+    optimizer_state_path: str
+    metrics: dict[str, Any]
+    publication: Any
+    started: float
+
+
 class MegatronTrainingSlot:
     """Canonical pack-and-command facade for one persistent Megatron mesh."""
 
@@ -437,9 +448,18 @@ class MegatronTrainingSlot:
         request: OptimStepRequest,
         contributions: tuple[str, ...],
     ) -> OptimStepResult:
+        completion = await self.start_optim_step(ref, request, contributions)
+        return await asyncio.shield(completion)
+
+    async def start_optim_step(
+        self,
+        ref: OperationRef,
+        request: OptimStepRequest,
+        contributions: tuple[str, ...],
+    ) -> asyncio.Future[OptimStepResult]:
         fingerprint = self._fingerprint(ref, request, *contributions)
         if cached := self._cached_result(ref.operation_id, fingerprint):
-            return cast(OptimStepResult, cached)
+            return _resolved_future(cast(OptimStepResult, cached))
         state = self._require_parent(ref)
         output_version = ref.reserved_output_learner_version
         if output_version is None:
@@ -466,7 +486,7 @@ class MegatronTrainingSlot:
             update={"learner_version": output_version}
         )
         commit_operation_id = f"{ref.operation_id}:optim-commit"
-        _adapter, snapshot_metrics = await self._snapshot(
+        snapshot = await self._start_snapshot(
             OperationRef(
                 run_id=ref.run_id,
                 operation_id=commit_operation_id,
@@ -476,17 +496,24 @@ class MegatronTrainingSlot:
             ),
             save_optimizer=True,
         )
-        self.trainer.retire_operation(commit_operation_id)
-        result = OptimStepResult(
-            operation_id=ref.operation_id,
-            contributing_forward_backward_operation_ids=contributions,
-            checkpoint=checkpoint_ref(
-                ref.run_id, output_version, generation.generation_id
-            ),
-            metrics={**raw["metrics"], **snapshot_metrics},
+
+        async def complete() -> OptimStepResult:
+            _adapter, snapshot_metrics = await self._finish_snapshot(snapshot)
+            result = OptimStepResult(
+                operation_id=ref.operation_id,
+                contributing_forward_backward_operation_ids=contributions,
+                checkpoint=checkpoint_ref(
+                    ref.run_id, output_version, generation.generation_id
+                ),
+                metrics={**raw["metrics"], **snapshot_metrics},
+            )
+            self._results[ref.operation_id] = (fingerprint, result)
+            self.trainer.retire_operation(commit_operation_id)
+            return result
+
+        return asyncio.create_task(
+            complete(), name=f"megatron-optim-durable-{ref.operation_id}"
         )
-        self._results[ref.operation_id] = (fingerprint, result)
-        return result
 
     async def load_state(
         self,
@@ -600,11 +627,22 @@ class MegatronTrainingSlot:
         *,
         save_optimizer: bool,
     ) -> tuple[OptimizerAdapter, dict[str, float]]:
+        snapshot = await self._start_snapshot(ref, save_optimizer=save_optimizer)
+        return await self._finish_snapshot(snapshot)
+
+    async def _start_snapshot(
+        self,
+        ref: OperationRef,
+        *,
+        save_optimizer: bool,
+    ) -> tuple[OptimizerAdapter, dict[str, float]] | _PendingSnapshot:
         state = self._require_parent(ref)
         generation = state.generation
         existing = read_adapter_publication(
             generation.adapter_path, step=generation.policy_step
         )
+        if not save_optimizer and existing is not None:
+            return existing, {}
         optimizer_state_path = state.registration.optimizer_state_path
         pointer = read_committed_optimizer_pointer(optimizer_state_path)
         if (
@@ -646,11 +684,29 @@ class MegatronTrainingSlot:
                 save_optimizer=save_optimizer,
             )
         )
-        records = await self.trainer.wait_for_publication(ref.operation_id)
+        return _PendingSnapshot(
+            run_id=ref.run_id,
+            generation=generation,
+            optimizer_state_path=optimizer_state_path,
+            metrics=raw["metrics"],
+            publication=self.trainer.wait_for_publication(ref.operation_id),
+            started=started,
+        )
+
+    async def _finish_snapshot(
+        self,
+        snapshot: tuple[OptimizerAdapter, dict[str, float]] | _PendingSnapshot,
+    ) -> tuple[OptimizerAdapter, dict[str, float]]:
+        if isinstance(snapshot, tuple):
+            return snapshot
+        records = await snapshot.publication
+        state = self._require_run(snapshot.run_id)
+        if state.generation != snapshot.generation:
+            raise RuntimeError("resident learner changed before snapshot durability")
         durable = await asyncio.to_thread(
             commit_trainer_publication,
-            optimizer_state_path,
-            generation,
+            snapshot.optimizer_state_path,
+            snapshot.generation,
             records,
         )
         state.generation = TrainerGeneration(
@@ -660,8 +716,8 @@ class MegatronTrainingSlot:
             adapter_path=durable.adapter.identity,
         )
         return durable.adapter, {
-            **raw["metrics"],
-            "time/snapshot_durable_s": time.perf_counter() - started,
+            **snapshot.metrics,
+            "time/snapshot_durable_s": time.perf_counter() - snapshot.started,
         }
 
     def retire_operation(self, operation_id: str) -> None:
@@ -712,3 +768,9 @@ class MegatronTrainingSlot:
         if not resolved.is_relative_to(self.artifact_root):
             raise ValueError(f"training run path leaves artifact root: {resolved}")
         return str(resolved)
+
+
+def _resolved_future(value: OptimStepResult) -> asyncio.Future[OptimStepResult]:
+    future = asyncio.get_running_loop().create_future()
+    future.set_result(value)
+    return future
