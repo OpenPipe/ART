@@ -94,6 +94,11 @@ class _CompilePackagePickler(pickle.Pickler):
     }
 
     def reducer_override(self, value: Any) -> Any:
+        value_type = type(value)
+        if value_type.__name__ == "HybridEPHandle" and value_type.__module__.endswith(
+            ".hybrid_ep_buffer"
+        ):
+            return value_type, (tuple(value), value.logical_num_tokens)
         if isinstance(value, FunctionType) and not _globally_resolves(value):
             return _load_python_function, (
                 value.__code__,
