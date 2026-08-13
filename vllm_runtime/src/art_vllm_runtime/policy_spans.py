@@ -277,6 +277,17 @@ class LoraUpdateCoordinator:
             state.pending_update_seq = None
             state.condition.notify_all()
 
+    async def commit_removal(self, lora_slot: str, update_seq: int) -> None:
+        state = self._state(lora_slot)
+        async with state.condition:
+            self._require_pending(state, lora_slot, update_seq)
+            state.lora_request = None
+            state.update_active = False
+            state.blocked = False
+            state.poisoned = False
+            state.pending_update_seq = None
+            state.condition.notify_all()
+
     async def cancel_update(self, lora_slot: str, update_seq: int) -> None:
         state = self._state(lora_slot)
         async with state.condition:
@@ -414,6 +425,18 @@ def publish_lora_slot_policy(
         identities = {}
         setattr(models, "_art_lora_slot_policy_identities", identities)
     identities[lora_slot] = (int(policy_version), int(update_seq))
+
+
+def unregister_lora_slot(models: Any, lora_slot: str) -> tuple[str, ...]:
+    if lora_slot not in models.lora_requests:
+        raise RuntimeError(f"LoRA slot {lora_slot!r} is not loaded")
+    del models.lora_requests[lora_slot]
+    aliases = getattr(models, "_art_lora_aliases", {})
+    removed_aliases = tuple(name for name, slot in aliases.items() if slot == lora_slot)
+    for name in removed_aliases:
+        del aliases[name]
+    getattr(models, "_art_lora_slot_policy_identities", {}).pop(lora_slot, None)
+    return removed_aliases
 
 
 def _resolve_lora_alias(models: Any, model_name: str | None) -> Any | None:
@@ -1150,6 +1173,26 @@ def _patch_policy_lora_update_rpc() -> None:
 
         WorkerBase.art_declare_loaded_lora_policy = art_declare_loaded_lora_policy  # type: ignore[attr-defined]
 
+    if not hasattr(WorkerBase, "art_remove_lora_policy"):
+
+        def art_remove_lora_policy(
+            self: Any, payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            lora_request = _policy_lora_request_from_payload(
+                payload, load_inplace=False
+            )
+            lora_id = lora_request.lora_int_id
+            if lora_id not in self.list_loras():
+                raise RuntimeError(
+                    f"Policy LoRA {lora_id} is not loaded on this worker"
+                )
+            if not self.remove_lora(lora_id):
+                raise RuntimeError(f"Policy LoRA {lora_id} was not removed")
+            previous = _WORKER_LORA_POLICY_BY_ID.pop(lora_id, None)
+            return {"removed": True, "previous": previous, "lora_int_id": lora_id}
+
+        WorkerBase.art_remove_lora_policy = art_remove_lora_policy  # type: ignore[attr-defined]
+
     if not hasattr(EngineCore, "art_apply_lora_policy_update"):
 
         def art_apply_lora_policy_update(
@@ -1158,6 +1201,46 @@ def _patch_policy_lora_update_rpc() -> None:
             return _apply_policy_lora_update(self, payload)
 
         EngineCore.art_apply_lora_policy_update = art_apply_lora_policy_update  # type: ignore[attr-defined]
+
+    if not hasattr(EngineCore, "art_count_lora_policy_requests"):
+
+        def art_count_lora_policy_requests(self: Any, lora_slot: str) -> int:
+            return sum(
+                _request_uses_lora_slot(request, lora_slot)
+                for request in self.scheduler.requests.values()
+            )
+
+        EngineCore.art_count_lora_policy_requests = art_count_lora_policy_requests  # type: ignore[attr-defined]
+
+    if not hasattr(EngineCore, "art_remove_lora_policy"):
+
+        def art_remove_lora_policy(
+            self: Any, payload: dict[str, Any]
+        ) -> dict[str, int]:
+            if not self.is_scheduler_paused():
+                raise RuntimeError("Policy LoRA removal requires a paused scheduler")
+            lora_request = _policy_lora_request_from_payload(
+                payload, load_inplace=False
+            )
+            active = self.art_count_lora_policy_requests(lora_request.lora_name)
+            if active:
+                raise RuntimeError(
+                    f"LoRA slot {lora_request.lora_name!r} has {active} active requests"
+                )
+            acknowledgements = self.collective_rpc(
+                "art_remove_lora_policy", args=(payload,)
+            )
+            if not acknowledgements or any(
+                not item.get("removed")
+                or int(item.get("lora_int_id", -1)) != lora_request.lora_int_id
+                for item in acknowledgements
+            ):
+                raise RuntimeError(
+                    "Policy LoRA removal did not succeed on every worker"
+                )
+            return {"workers": len(acknowledgements)}
+
+        EngineCore.art_remove_lora_policy = art_remove_lora_policy  # type: ignore[attr-defined]
 
     if not hasattr(EngineCore, "art_declare_loaded_lora_policy"):
 

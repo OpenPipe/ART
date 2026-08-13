@@ -120,6 +120,10 @@ class _InFlightLoraUpdateRequest(BaseModel):
     is_3d_lora_weight: bool = False
 
 
+class _UnloadLoraPolicyRequest(BaseModel):
+    lora_slot: str = Field(min_length=1)
+
+
 def _index_shared_pp_partition(config: Any, pp_size: int) -> tuple[int, ...] | None:
     if pp_size <= 1 or not hasattr(config, "index_topk"):
         return None
@@ -488,6 +492,94 @@ def _patch_art_runtime_routes() -> None:
                     "cache_transition": cache_transition,
                 }
             )
+
+        @router.post("/art/unload_lora_policy")
+        async def unload_lora_policy(
+            body: _UnloadLoraPolicyRequest, raw_request: Request
+        ) -> JSONResponse:
+            from art_vllm_runtime.policy_spans import (
+                lora_update_coordinator,
+                policy_lora_request_payload,
+                unregister_lora_slot,
+            )
+
+            models = raw_request.app.state.openai_serving_models
+            engine_client = engine(raw_request)
+            coordinator = lora_update_coordinator(models, engine_client)
+            update_seq = await coordinator.begin_update(body.lora_slot)
+            mutation_started = False
+            try:
+                async with models.lora_resolver_lock[body.lora_slot]:
+                    lora_request = models.lora_requests.get(body.lora_slot)
+                    if lora_request is None:
+                        await coordinator.cancel_update(body.lora_slot, update_seq)
+                        return JSONResponse(
+                            content={
+                                "error": f"LoRA slot {body.lora_slot!r} is not loaded"
+                            },
+                            status_code=HTTPStatus.NOT_FOUND.value,
+                        )
+                    active_requests = (
+                        await engine_client.engine_core.call_utility_async(
+                            "art_count_lora_policy_requests", body.lora_slot
+                        )
+                    )
+                    if active_requests:
+                        await coordinator.cancel_update(body.lora_slot, update_seq)
+                        return JSONResponse(
+                            content={
+                                "error": (
+                                    f"LoRA slot {body.lora_slot!r} has "
+                                    f"{active_requests} active requests"
+                                )
+                            },
+                            status_code=HTTPStatus.CONFLICT.value,
+                        )
+                    await engine_client.engine_core.call_utility_async(
+                        "pause_scheduler", "keep", False
+                    )
+                    mutation_started = True
+                    removed = await engine_client.engine_core.call_utility_async(
+                        "art_remove_lora_policy",
+                        policy_lora_request_payload(lora_request),
+                    )
+                    removed_aliases = unregister_lora_slot(models, body.lora_slot)
+                    await engine_client.engine_core.call_utility_async(
+                        "resume_scheduler"
+                    )
+                    await coordinator.commit_removal(body.lora_slot, update_seq)
+                    mutation_started = False
+                if _runtime_state.get("loaded_adapter") in removed_aliases:
+                    _runtime_state.update(
+                        loaded_adapter=None,
+                        policy_version=None,
+                        update_identity=None,
+                    )
+                return JSONResponse(
+                    content={
+                        "status": "unloaded",
+                        "lora_slot": body.lora_slot,
+                        "aliases": removed_aliases,
+                        **removed,
+                    }
+                )
+            except BaseException:
+                if mutation_started:
+                    try:
+                        await asyncio.shield(
+                            engine_client.engine_core.call_utility_async(
+                                "pause_scheduler", "abort", True
+                            )
+                        )
+                    finally:
+                        await asyncio.shield(
+                            coordinator.fail_update(body.lora_slot, update_seq)
+                        )
+                else:
+                    await asyncio.shield(
+                        coordinator.cancel_update(body.lora_slot, update_seq)
+                    )
+                raise
 
         app.include_router(router)
         return app
