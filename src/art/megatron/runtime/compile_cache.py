@@ -14,7 +14,7 @@ from pathlib import Path
 import pickle
 import sys
 import time
-from types import CodeType, FunctionType, MethodType, ModuleType
+from types import CellType, CodeType, FunctionType, MethodType, ModuleType
 from typing import Any, Literal
 import uuid
 
@@ -47,17 +47,75 @@ def _reduce_python_code(code: CodeType) -> tuple[Any, tuple[Any, ...]]:
     return _load_python_code, (SerializedCode.from_code_object(code),)
 
 
+def _load_cell(value: Any) -> CellType:
+    def cell() -> Any:
+        return value
+
+    assert cell.__closure__ is not None
+    return cell.__closure__[0]
+
+
+def _load_python_function(
+    code: CodeType,
+    module_name: str,
+    name: str,
+    qualname: str,
+    defaults: tuple[Any, ...] | None,
+    closure: tuple[CellType, ...] | None,
+    kwdefaults: dict[str, Any] | None,
+    annotations: dict[str, Any],
+    state: dict[str, Any],
+) -> FunctionType:
+    function = FunctionType(
+        code, import_module(module_name).__dict__, name, defaults, closure
+    )
+    function.__qualname__ = qualname
+    function.__kwdefaults__ = kwdefaults
+    function.__annotations__ = annotations
+    function.__dict__.update(state)
+    return function
+
+
+def _globally_resolves(function: FunctionType) -> bool:
+    try:
+        value: Any = import_module(function.__module__)
+        for part in function.__qualname__.split("."):
+            value = getattr(value, part)
+    except (AttributeError, ImportError):
+        return False
+    return value is function
+
+
+class _CompilePackagePickler(pickle.Pickler):
+    dispatch_table = copyreg.dispatch_table | {
+        ModuleType: lambda module: (import_module, (module.__name__,)),
+        CodeType: _reduce_python_code,
+        CellType: lambda cell: (_load_cell, (cell.cell_contents,)),
+    }
+
+    def reducer_override(self, value: Any) -> Any:
+        if isinstance(value, FunctionType) and not _globally_resolves(value):
+            return _load_python_function, (
+                value.__code__,
+                value.__module__,
+                value.__name__,
+                value.__qualname__,
+                value.__defaults__,
+                value.__closure__,
+                value.__kwdefaults__,
+                value.__annotations__,
+                value.__dict__,
+            )
+        return NotImplemented
+
+
 class _CompilePackagePickle:
     _art_scoped_reducers = True
 
     @staticmethod
     def dumps(value: Any, *args: Any, **kwargs: Any) -> bytes:
         buffer = BytesIO()
-        pickler = pickle.Pickler(buffer, *args, **kwargs)
-        pickler.dispatch_table = copyreg.dispatch_table | {
-            ModuleType: lambda module: (import_module, (module.__name__,)),
-            CodeType: _reduce_python_code,
-        }
+        pickler = _CompilePackagePickler(buffer, *args, **kwargs)
         pickler.dump(value)
         return buffer.getvalue()
 
