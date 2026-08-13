@@ -60,6 +60,7 @@ from .workflow_throughput import (
     PolicyActivationEvent,
     ThroughputFixture,
     _calibration_fingerprint,
+    _classify_acceptance_failures,
     _collect_matched_packing_shapes,
     _collect_measurements,
     _current_pipeline_settings,
@@ -69,6 +70,7 @@ from .workflow_throughput import (
     _packed_input_fingerprint,
     _phase_evidence,
     _reduced_config,
+    _run_throughput_attempts,
     _same_setting_decision_suffix,
     _throughput_config_for_hardware,
     acceptance_failures,
@@ -590,6 +592,80 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     with pytest.raises(RuntimeError, match="same packed input"):
         collect(phase("isolated", "input-b", (9, 10, 11)))
+
+
+def test_throughput_classification_is_fail_closed() -> None:
+    assert _classify_acceptance_failures([])["acceptance_status"] == "accepted"
+    load = _classify_acceptance_failures(
+        ["stable_trainer_underfeed", "accepted_train_tok_s"]
+    )
+    assert load["acceptance_status"] == "load_inconclusive"
+    assert load["load_failures"] == ["stable_trainer_underfeed"]
+    assert load["performance_failures"] == ["accepted_train_tok_s"]
+    for hard_failure in ("calibration_fingerprint", "window_4_5_policy_age_p95"):
+        classified = _classify_acceptance_failures(
+            ["stable_min_vllm_pressure", hard_failure]
+        )
+        assert classified["acceptance_status"] == "rejected"
+        assert classified["hard_failures"] == [hard_failure]
+    future = _classify_acceptance_failures(
+        ["stable_min_vllm_pressure", "future_acceptance_gate"]
+    )
+    assert future["acceptance_status"] == "rejected"
+    assert future["unclassified_failures"] == ["future_acceptance_gate"]
+
+
+def test_throughput_load_retry_is_bounded_and_preserves_attempts(
+    tmp_path: Path,
+) -> None:
+    plans = [
+        ([[]], "accepted"),
+        ([["e2e_train_tok_s"]], "rejected"),
+        ([["stable_min_vllm_pressure", "calibration_basis"]], "rejected"),
+        ([["stable_min_vllm_pressure"], []], "accepted"),
+        (
+            [["stable_min_vllm_pressure"], ["stable_trainer_underfeed"]],
+            "load_inconclusive",
+        ),
+    ]
+    for case, (failures_by_attempt, expected_status) in enumerate(plans):
+        stage_dir = tmp_path / str(case)
+        calls: list[int] = []
+
+        def run_attempt(attempt: int, artifact_dir: Path) -> ValidationStageResult:
+            calls.append(attempt)
+            (artifact_dir / "complete.txt").write_text(str(attempt))
+            classification = _classify_acceptance_failures(
+                failures_by_attempt[attempt - 1]
+            )
+            return ValidationStageResult(
+                name="e2e_throughput",
+                passed=classification["acceptance_status"] == "accepted",
+                metrics={"selected_metric": attempt, **classification},
+                artifact_dir=str(artifact_dir),
+            )
+
+        result = _run_throughput_attempts(stage_dir, run_attempt)
+        expected_calls = len(failures_by_attempt)
+        assert calls == list(range(1, expected_calls + 1))
+        assert result.metrics["acceptance_status"] == expected_status
+        assert result.metrics["selected_metric"] == expected_calls
+        assert result.metrics["throughput_attempt_count"] == expected_calls
+        assert all(
+            (stage_dir / f"attempt_{attempt}" / "complete.txt").is_file()
+            for attempt in calls
+        )
+
+
+def test_throughput_attempt_error_is_not_retried(tmp_path: Path) -> None:
+    def fail(_attempt: int, artifact_dir: Path) -> ValidationStageResult:
+        (artifact_dir / "partial.txt").write_text("preserved")
+        raise TimeoutError("timed out")
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        _run_throughput_attempts(tmp_path, fail)
+    assert (tmp_path / "attempt_1" / "partial.txt").is_file()
+    assert not (tmp_path / "attempt_2").exists()
 
 
 def test_throughput_measurement_freezes_actual_settings() -> None:

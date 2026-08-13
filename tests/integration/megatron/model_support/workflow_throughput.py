@@ -82,6 +82,29 @@ _VLLM_RUNTIME_PACKAGES = (
 )
 _LOCAL_SOURCE_PACKAGES = ("openpipe-art", "art-vllm-runtime")
 _H200_THROUGHPUT_NUM_LAYERS = {"dsv4": 4, "glm52": 6}
+_THROUGHPUT_MAX_ATTEMPTS = 2
+_LOAD_ACCEPTANCE_FAILURES = frozenset(
+    {
+        "stable_min_vllm_pressure",
+        "stable_trainer_underfeed",
+        "queue_ready_inter_forward_backward_gap_count",
+    }
+)
+_PERFORMANCE_ACCEPTANCE_FAILURES = frozenset(
+    {
+        "isolated_train_tok_s",
+        "e2e_train_tok_s",
+        "accepted_train_tok_s",
+        "e2e_to_isolated_ratio",
+        "matched_core_to_isolated_ratio",
+        "matched_core_to_isolated_ratio_max",
+        "mean_policy_activation_lag_s",
+        "max_policy_activation_lag_s",
+        "repeated_policy_activation_cadence_s",
+        "queue_ready_inter_forward_backward_gap_p95_s",
+    }
+)
+_HARD_ACCEPTANCE_FAILURES = frozenset({"calibration_fingerprint", "calibration_basis"})
 
 
 class ThroughputFixture(NamedTuple):
@@ -1553,6 +1576,78 @@ def acceptance_failures(
     ]
 
 
+def _classify_acceptance_failures(failures: list[str]) -> dict[str, Any]:
+    load = [name for name in failures if name in _LOAD_ACCEPTANCE_FAILURES]
+    performance = [
+        name for name in failures if name in _PERFORMANCE_ACCEPTANCE_FAILURES
+    ]
+    hard = [
+        name
+        for name in failures
+        if name in _HARD_ACCEPTANCE_FAILURES
+        or name.startswith("missing_")
+        or name.startswith("window_")
+    ]
+    classified = {*load, *performance, *hard}
+    unclassified = [name for name in failures if name not in classified]
+    status = (
+        "accepted"
+        if not failures
+        else "rejected"
+        if hard or unclassified
+        else "load_inconclusive"
+        if load
+        else "rejected"
+    )
+    return {
+        "acceptance_status": status,
+        "acceptance_failures": failures,
+        "load_failures": load,
+        "performance_failures": performance,
+        "hard_failures": hard,
+        "unclassified_failures": unclassified,
+    }
+
+
+def _run_throughput_attempts(
+    stage_dir: Path,
+    run_attempt: Callable[[int, Path], ValidationStageResult],
+) -> ValidationStageResult:
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    attempts: list[dict[str, Any]] = []
+    for attempt in range(1, _THROUGHPUT_MAX_ATTEMPTS + 1):
+        artifact_dir = stage_dir / f"attempt_{attempt}"
+        artifact_dir.mkdir(parents=True, exist_ok=False)
+        result = run_attempt(attempt, artifact_dir)
+        status = result.metrics["acceptance_status"]
+        _require(
+            status in {"accepted", "rejected", "load_inconclusive"},
+            "throughput attempt lacks an acceptance classification",
+        )
+        result.passed = status == "accepted"
+        attempts.append(
+            {
+                "attempt": attempt,
+                "artifact_dir": str(artifact_dir),
+                "acceptance_status": status,
+                "acceptance_failures": result.metrics["acceptance_failures"],
+            }
+        )
+        terminal = status != "load_inconclusive" or attempt == _THROUGHPUT_MAX_ATTEMPTS
+        if terminal:
+            result.metrics.update(
+                throughput_attempt_count=len(attempts),
+                throughput_retry_performed=len(attempts) > 1,
+                throughput_attempts=attempts,
+            )
+            result.artifact_dir = str(stage_dir)
+            (stage_dir / "throughput_measurements.json").write_text(
+                json.dumps(result.metrics, indent=2) + "\n"
+            )
+            return result
+    raise AssertionError("unreachable")
+
+
 async def _run_e2e_throughput_async(
     *,
     base_model: str,
@@ -1562,6 +1657,7 @@ async def _run_e2e_throughput_async(
     fixture: ThroughputFixture,
     gpu_identities: list[dict[str, Any]],
     hardware: Literal["h200", "b300"],
+    artifact_dir: Path,
 ) -> ValidationStageResult:
     from transformers import AutoTokenizer
 
@@ -1576,8 +1672,7 @@ async def _run_e2e_throughput_async(
         raise RuntimeError(
             "E2E throughput requires separate Megatron and vLLM resources"
         )
-    stage_dir = Path(os.environ[_STAGE_DIR_ENV])
-    stage_dir.mkdir(parents=True, exist_ok=True)
+    stage_dir = artifact_dir
     topology = stage.megatron.topology
     art.init_megatron_runtime_config(
         topology=topology.to_megatron_config(),
@@ -1997,6 +2092,7 @@ async def _run_e2e_throughput_async(
     )
     thresholds = config.thresholds.get(hardware)
     failures = acceptance_failures(measurements, config, thresholds)
+    classification = _classify_acceptance_failures(failures)
     metrics = {
         **measurements,
         "gpu_identities": [
@@ -2017,14 +2113,14 @@ async def _run_e2e_throughput_async(
         "autotuner_profile": str(profile_path),
         "policy_activation_timeline": str(activation_path),
         "thresholds": thresholds.model_dump(mode="json") if thresholds else None,
-        "acceptance_failures": failures,
+        **classification,
     }
     (stage_dir / "throughput_measurements.json").write_text(
         json.dumps(metrics, indent=2) + "\n"
     )
     return ValidationStageResult(
         name="e2e_throughput",
-        passed=not failures,
+        passed=classification["acceptance_status"] == "accepted",
         metrics=metrics,
         artifact_dir=str(stage_dir),
     )
@@ -2068,6 +2164,7 @@ def run_e2e_throughput(
     correctness_path = os.environ.get(FIXTURE_PATH_ENV)
     if correctness_path is None:
         raise RuntimeError(f"missing {FIXTURE_PATH_ENV}")
+    stage_dir = Path(os.environ[_STAGE_DIR_ENV])
     fixture = ensure_throughput_fixture(
         canonical_model=base_model,
         model_key=spec.key,
@@ -2075,17 +2172,23 @@ def run_e2e_throughput(
         num_layers=config.num_layers,
         initialization_version=config.random_initialization_version,
         random_seed=config.random_seed,
-        output=Path(os.environ[_STAGE_DIR_ENV]) / "production_width_model",
+        output=stage_dir / "production_width_model",
     )
     os.environ["WANDB_MODE"] = "disabled"
-    return asyncio.run(
-        _run_e2e_throughput_async(
-            base_model=base_model,
-            allow_unvalidated_arch=allow_unvalidated_arch,
-            stage=stage,
-            config=config,
-            fixture=fixture,
-            gpu_identities=gpu_identities,
-            hardware=hardware,
+
+    def run_attempt(attempt: int, artifact_dir: Path) -> ValidationStageResult:
+        del attempt
+        return asyncio.run(
+            _run_e2e_throughput_async(
+                base_model=base_model,
+                allow_unvalidated_arch=allow_unvalidated_arch,
+                stage=stage,
+                config=config,
+                fixture=fixture,
+                gpu_identities=gpu_identities,
+                hardware=hardware,
+                artifact_dir=artifact_dir,
+            )
         )
-    )
+
+    return _run_throughput_attempts(stage_dir, run_attempt)
