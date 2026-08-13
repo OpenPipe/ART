@@ -27,6 +27,9 @@ class HybridEPHandle(tuple):
         handle.logical_num_tokens = logical_num_tokens
         return handle
 
+    def __reduce__(self):
+        return type(self), (tuple(self), self.logical_num_tokens)
+
 def indices_to_map(
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
