@@ -161,9 +161,18 @@ def _support_precompile_serialization() -> None:
         original_source_id_from_fn, "_art_supports_regional_instances", False
     ):
 
+        def precompile_function(fn: Any) -> Any:
+            fn = innermost_fn(fn)
+            if inspect.isclass(fn):
+                fn = innermost_fn(fn.__call__)
+            if not hasattr(fn, "__code__"):
+                raise TypeError(f"precompile target has no Python code: {fn!r}")
+            return fn
+
         def source_id_from_fn(fn: Any) -> str:
-            source_id = original_source_id_from_fn(fn)
-            owner = getattr(innermost_fn(fn), "__self__", None)
+            function = precompile_function(fn)
+            source_id = original_source_id_from_fn(function)
+            owner = getattr(function, "__self__", None)
             namespace = getattr(owner, "_art_compile_cache_namespace", None)
             if namespace is None:
                 return source_id
@@ -171,6 +180,13 @@ def _support_precompile_serialization() -> None:
 
         setattr(source_id_from_fn, "_art_supports_regional_instances", True)
         setattr(CompilePackage, "source_id_from_fn", staticmethod(source_id_from_fn))
+
+        original_initialize = CompilePackage.initialize
+
+        def initialize(self: Any, fn: Any, *args: Any, **kwargs: Any) -> None:
+            original_initialize(self, precompile_function(fn), *args, **kwargs)
+
+        CompilePackage.initialize = initialize
 
     original = GuardsStatePickler.reducer_override
     if getattr(original, "_art_supports_instance_method_aliases", False):
