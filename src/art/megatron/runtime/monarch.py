@@ -374,7 +374,6 @@ class MonarchTrainerActor(Actor):
         self._compile_cache = None
         self._compile_cache_metrics: dict[str, float] = {}
         if runtime_spec.compile_cache:
-            _training_runtime_builder()
             from .compile_cache import TrainerCompileCache
 
             self._compile_cache = TrainerCompileCache(

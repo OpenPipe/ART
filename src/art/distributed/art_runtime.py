@@ -884,7 +884,9 @@ class ArtRuntime:
         supervision = MonarchTrainerSupervision(run_spec.run_id)
         proc = None
         try:
-            bootstrap_env = {"TORCH_CACHING_PRECOMPILE": "0"}
+            bootstrap_env = {
+                "TORCH_CACHING_PRECOMPILE": "1" if runtime_spec.compile_cache else "0"
+            }
             if runtime_spec.compile_cache:
                 compile_runtime_root = (
                     Path(runtime_spec.cache_root or "/tmp/art-cache")

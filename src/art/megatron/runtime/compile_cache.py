@@ -16,13 +16,15 @@ import pickle
 import sys
 import time
 from types import CellType, CodeType, FunctionType, MethodType, ModuleType
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..training.compile import TrainingCompilePlan
 from .specs import TrainerRuntimeSpec
+
+if TYPE_CHECKING:
+    from ..training.compile import TrainingCompilePlan
 
 _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformers")
 
@@ -502,15 +504,15 @@ class TrainerCompileCache:
         from torch._dynamo import config
         from torch._functorch import config as functorch_config
 
-        if config.caching_precompile:
-            raise RuntimeError("Dynamo precompile was enabled before trainer imports")
+        if not config.caching_precompile:
+            raise RuntimeError(
+                "trainer compile cache requires Dynamo precompile at process bootstrap"
+            )
         _support_precompile_serialization()
         _support_shared_code_precompile()
         _support_serialized_code_resolution()
         _support_non_strict_package_bypass()
         _support_cross_package_resume_codes()
-        os.environ["TORCH_CACHING_PRECOMPILE"] = "1"
-        config.caching_precompile = True
         functorch_config.bundled_autograd_cache = True
         self._spec = spec
         self._rank = rank
