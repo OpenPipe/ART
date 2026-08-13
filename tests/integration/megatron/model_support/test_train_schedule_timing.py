@@ -46,6 +46,8 @@ def test_inter_forward_backward_timing_uses_rank_local_monotonic_boundaries(
         lambda: None,
         timing,
     )
+    timing.previous_job_complete_s = 12.5
+    timing.current_job_start_s = 14.0
     second, collect_second_metrics = train._run_training_schedule(
         schedule,
         lambda: None,
@@ -56,6 +58,9 @@ def test_inter_forward_backward_timing_uses_rank_local_monotonic_boundaries(
     assert collect_first_metrics() == {}
     assert collect_second_metrics() == {
         "time/inter_forward_backward_gap_rank_0_s": 3.0,
+        "time/inter_forward_backward_previous_job_tail_rank_0_s": 0.5,
+        "time/inter_forward_backward_worker_idle_rank_0_s": 1.5,
+        "time/inter_forward_backward_current_job_prepare_rank_0_s": 1.0,
         "time/inter_forward_backward_gpu_gap_rank_0_s": 0.06,
     }
     assert timing.previous_schedule_end_s == 17.0
@@ -76,12 +81,17 @@ def test_inter_forward_backward_timing_gathers_rank_durations_on_cpu_group(
         assert group is timing.metrics_group
         assert async_op is True and value.device.type == "cpu"
         output[0].copy_(value)
-        output[1].copy_(value + 0.25)
+        remote = value.clone()
+        remote[0] += 0.25
+        remote[3] += 0.25
+        output[1].copy_(remote)
         return SimpleNamespace(wait=lambda: waits.append(True))
 
     monkeypatch.setattr(train.torch.distributed, "all_gather", gather)
     schedule = cast(Any, _Schedule())
     train._run_training_schedule(schedule, lambda: None, timing)
+    timing.previous_job_complete_s = 2.5
+    timing.current_job_start_s = 3.0
     _, collect_metrics = train._run_training_schedule(
         schedule,
         lambda: None,
@@ -92,5 +102,11 @@ def test_inter_forward_backward_timing_gathers_rank_durations_on_cpu_group(
     assert collect_metrics() == {
         "time/inter_forward_backward_gap_rank_0_s": 2.0,
         "time/inter_forward_backward_gap_rank_1_s": 2.25,
+        "time/inter_forward_backward_previous_job_tail_rank_0_s": 0.5,
+        "time/inter_forward_backward_worker_idle_rank_0_s": 0.5,
+        "time/inter_forward_backward_current_job_prepare_rank_0_s": 1.0,
+        "time/inter_forward_backward_previous_job_tail_rank_1_s": 0.5,
+        "time/inter_forward_backward_worker_idle_rank_1_s": 0.5,
+        "time/inter_forward_backward_current_job_prepare_rank_1_s": 1.25,
     }
     assert waits == [True]

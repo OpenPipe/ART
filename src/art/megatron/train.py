@@ -146,6 +146,7 @@ DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 _optimizer_stats_printed = False
 _INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gap_rank_"
 _INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
+_INTER_FORWARD_BACKWARD_PHASE_PREFIX = "time/inter_forward_backward_"
 
 __all__ = [
     "DEFAULT_MODEL_IDENTIFIER",
@@ -164,6 +165,8 @@ class _InterForwardBackwardTiming(BaseModel):
     metrics_group: Any | None = None
     previous_schedule_end_s: float | None = None
     previous_schedule_cuda_end: torch.cuda.Event | None = None
+    previous_job_complete_s: float | None = None
+    current_job_start_s: float | None = None
 
 
 class TrainingRuntime(BaseModel):
@@ -2546,6 +2549,24 @@ def _run_training_schedule(
         if timing is None or timing.previous_schedule_end_s is None
         else started_s - timing.previous_schedule_end_s
     )
+    phase_s = (
+        None
+        if timing is None
+        or timing.previous_schedule_end_s is None
+        or timing.previous_job_complete_s is None
+        or timing.current_job_start_s is None
+        or not (
+            timing.previous_schedule_end_s
+            <= timing.previous_job_complete_s
+            <= timing.current_job_start_s
+            <= started_s
+        )
+        else (
+            timing.previous_job_complete_s - timing.previous_schedule_end_s,
+            timing.current_job_start_s - timing.previous_job_complete_s,
+            started_s - timing.current_job_start_s,
+        )
+    )
     previous_cuda_end = (
         timing.previous_schedule_cuda_end if timing is not None else None
     )
@@ -2559,17 +2580,19 @@ def _run_training_schedule(
     if gap_s is None:
         return outputs, lambda: {}
     world_size = torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
-    local_gap = torch.tensor(gap_s, dtype=torch.float64)
-    rank_gaps = [torch.empty_like(local_gap) for _ in range(world_size)]
+    local_timing = torch.tensor(
+        (gap_s, *(phase_s or (math.nan, math.nan, math.nan))), dtype=torch.float64
+    )
+    rank_timings = [torch.empty_like(local_timing) for _ in range(world_size)]
     work = None
     if world_size == 1:
-        rank_gaps[0].copy_(local_gap)
+        rank_timings[0].copy_(local_timing)
     else:
         if timing.metrics_group is None:
             raise RuntimeError("Multi-rank schedule timing requires a Gloo group")
         work = torch.distributed.all_gather(  # ty: ignore[possibly-missing-attribute]
-            rank_gaps,
-            local_gap,
+            rank_timings,
+            local_timing,
             group=timing.metrics_group,
             async_op=True,
         )
@@ -2578,9 +2601,20 @@ def _run_training_schedule(
         if work is not None:
             work.wait()
         values = {
-            f"{_INTER_FORWARD_BACKWARD_GAP_PREFIX}{rank}_s": float(gap.item())
-            for rank, gap in enumerate(rank_gaps)
+            f"{_INTER_FORWARD_BACKWARD_GAP_PREFIX}{rank}_s": float(parts[0].item())
+            for rank, parts in enumerate(rank_timings)
         }
+        phase_names = ("previous_job_tail", "worker_idle", "current_job_prepare")
+        values.update(
+            {
+                f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}{name}_rank_{rank}_s": float(
+                    parts[index].item()
+                )
+                for rank, parts in enumerate(rank_timings)
+                for index, name in enumerate(phase_names, start=1)
+                if not torch.isnan(parts[index])
+            }
+        )
         if previous_cuda_end is None or cuda_span is None:
             return values
         local_gpu_gap = torch.tensor(

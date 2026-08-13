@@ -51,6 +51,8 @@ class MegatronTrainJobExecutor:
     ) -> dict[str, float]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
+        timing = self.runtime.inter_forward_backward_timing
+        timing.current_job_start_s = time.monotonic()
         validate_packed_batch(batch)
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_rl_job
@@ -71,6 +73,7 @@ class MegatronTrainJobExecutor:
             snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
             cancelled=cancelled,
         )
+        timing.previous_job_complete_s = time.monotonic()
         return metrics
 
     def execute_sft(
@@ -82,6 +85,8 @@ class MegatronTrainJobExecutor:
     ) -> dict[str, float]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
+        timing = self.runtime.inter_forward_backward_timing
+        timing.current_job_start_s = time.monotonic()
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_sft_job
 
@@ -101,6 +106,7 @@ class MegatronTrainJobExecutor:
             snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
             cancelled=cancelled,
         )
+        timing.previous_job_complete_s = time.monotonic()
         return metrics
 
     def score(
