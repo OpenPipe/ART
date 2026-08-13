@@ -25,6 +25,11 @@ def _load_module_global(module_name: str, attribute: str) -> Any:
     return getattr(import_module(module_name), attribute)
 
 
+def _load_autograd_backward(module_name: str, attribute: str) -> Any:
+    backward = _load_module_global(module_name, attribute)._backward_cls
+    return backward.__new__(backward)
+
+
 def _module_global_reference(value: Any) -> tuple[str, str]:
     matches = sorted(
         (module_name, attribute)
@@ -52,6 +57,11 @@ def _support_precompile_serialization() -> None:
             return _Missing, ("unguarded CUDA event",)
         if isinstance(obj, ContextVar):
             return _load_module_global, _module_global_reference(obj)
+        if isinstance(obj, torch.autograd.graph.Node):
+            forward = getattr(type(obj), "_forward_cls", None)
+            if forward is None:
+                raise TypeError(f"guarded autograd node has no forward class: {obj!r}")
+            return _load_autograd_backward, _module_global_reference(forward)
         # PyTorch assumes a bound method is installed under its function name.
         if isinstance(obj, MethodType) and not hasattr(
             obj.__self__, obj.__func__.__name__
