@@ -304,6 +304,9 @@ print(json.dumps({
 """
     if not python.is_file():
         raise RuntimeError(f"calibration runtime Python is missing: {python}")
+    environment = os.environ.copy()
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
     result = subprocess.run(
         [
             str(python),
@@ -314,6 +317,7 @@ print(json.dumps({
         ],
         check=True,
         capture_output=True,
+        env=environment,
         text=True,
     )
     return cast(dict[str, Any], json.loads(result.stdout))

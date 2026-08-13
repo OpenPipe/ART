@@ -765,6 +765,23 @@ def test_throughput_provenance_ignores_local_editable_paths() -> None:
     assert {"direct_url_sha256", "record_sha256"} <= set(distributions["pydantic"])
 
 
+def test_throughput_provenance_isolates_target_interpreter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = tmp_path / "art_fake_runtime_package-9.9.dist-info"
+    fake.mkdir()
+    (fake / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: art-fake-runtime-package\nVersion: 9.9\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+
+    distributions = _environment_provenance(
+        Path(sys.executable), ("art-fake-runtime-package",)
+    )["distributions"]
+
+    assert distributions == {}
+
+
 def test_throughput_calibration_ignores_only_implementation_hashes() -> None:
     contract = {
         "measurement_contract_version": 1,
