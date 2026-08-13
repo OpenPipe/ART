@@ -306,7 +306,7 @@ def _compile_cache_key(
         }
     )
     payload: dict[str, Any] = {
-        "schema": 5,
+        "schema": 6,
         "runtime": runtime,
         "compile_plan": plan.model_dump(mode="json"),
         "environment": {
@@ -322,6 +322,44 @@ def _compile_cache_key(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _deserialize_cache_artifacts(serialized: bytes) -> dict[str, list[Any]]:
+    from torch.compiler._cache import CacheArtifactManager, _deserialize_single_cache
+    from torch.utils._appending_byte_serializer import AppendingByteSerializer
+
+    CacheArtifactManager._ensure_cache_artifacts_registered()
+    merged: dict[str, dict[str, Any]] = {}
+    for kind, artifacts in AppendingByteSerializer.to_list(
+        serialized, deserialize_fn=_deserialize_single_cache
+    ):
+        by_key = merged.setdefault(kind, {})
+        by_key.update((artifact.key, artifact) for artifact in artifacts)
+    return {kind: list(by_key.values()) for kind, by_key in merged.items()}
+
+
+def _serialize_cache_artifacts(
+    artifacts: dict[str, list[Any]],
+) -> tuple[bytes, Any]:
+    from torch.compiler._cache import CacheInfo, _serialize_single_cache
+    from torch.utils._appending_byte_serializer import AppendingByteSerializer
+
+    info = CacheInfo()
+    serializer = AppendingByteSerializer(serialize_fn=_serialize_single_cache)
+    serializer.extend(artifacts.items())
+    for values in artifacts.values():
+        for artifact in values:
+            info.add(artifact)
+    return serializer.to_bytes(), info
+
+
+def _merge_cache_artifacts(
+    target: dict[str, list[Any]], incoming: dict[str, list[Any]]
+) -> None:
+    for kind, artifacts in incoming.items():
+        by_key = {artifact.key: artifact for artifact in target.get(kind, ())}
+        by_key.update((artifact.key, artifact) for artifact in artifacts)
+        target[kind] = list(by_key.values())
 
 
 class TrainerCompileCache:
@@ -347,13 +385,14 @@ class TrainerCompileCache:
         self.key: str | None = None
         self.path: Path | None = None
         self.loaded = False
+        self._artifacts: dict[str, list[Any]] = {}
 
     def _configure(self, plan: TrainingCompilePlan) -> tuple[str, Path]:
         key = _compile_cache_key(self._spec, self._rank, plan)
         if self.key is not None and self.key != key:
             raise RuntimeError("trainer compile plan changed after cache load")
         self.key = key
-        self.path = self._cache_root / "megatron" / "compile_cache" / "v5" / self.key
+        self.path = self._cache_root / "megatron" / "compile_cache" / "v6" / self.key
         self.path.parent.mkdir(parents=True, exist_ok=True)
         return self.key, self.path
 
@@ -367,8 +406,6 @@ class TrainerCompileCache:
             raise RuntimeError(f"compile cache {self.key} has no Dynamo artifact")
 
     def load(self, plan: TrainingCompilePlan) -> CompileCacheEvent:
-        import torch
-
         started = time.perf_counter()
         key, path = self._configure(plan)
         if not path.is_file():
@@ -376,9 +413,13 @@ class TrainerCompileCache:
                 status="miss", key=key, elapsed_s=time.perf_counter() - started
             )
         artifact = path.read_bytes()
-        info = torch.compiler.load_cache_artifacts(artifact)
-        if info is None:
-            raise RuntimeError(f"PyTorch rejected compile cache {key}")
+        self._artifacts = _deserialize_cache_artifacts(artifact)
+        from torch.compiler._cache import CacheArtifactManager
+
+        info = CacheArtifactManager.populate_caches(self._artifacts)
+        CacheArtifactManager._seen_artifacts.update(
+            artifact for artifacts in self._artifacts.values() for artifact in artifacts
+        )
         self._require_precompile(info)
         self.loaded = True
         return CompileCacheEvent(
@@ -390,10 +431,13 @@ class TrainerCompileCache:
 
     def publish(self) -> CompileCacheEvent:
         import torch
+        from torch.compiler._cache import CacheArtifactManager
 
         started = time.perf_counter()
         key, path = self._configured()
-        if self.loaded or path.is_file():
+        if not CacheArtifactManager.need_serialize():
+            if not path.is_file():
+                raise RuntimeError("PyTorch produced no compiler cache after training")
             return CompileCacheEvent(
                 status="existing",
                 key=key,
@@ -403,7 +447,11 @@ class TrainerCompileCache:
         saved = torch.compiler.save_cache_artifacts()
         if saved is None:
             raise RuntimeError("PyTorch produced no compiler cache after training")
-        artifact, info = saved
+        new_artifact, _ = saved
+        _merge_cache_artifacts(
+            self._artifacts, _deserialize_cache_artifacts(new_artifact)
+        )
+        artifact, info = _serialize_cache_artifacts(self._artifacts)
         self._require_precompile(info)
         staging = path.with_name(f".{key}.{os.getpid()}.{uuid.uuid4().hex}")
         try:

@@ -423,13 +423,17 @@ class MonarchTrainerActor(Actor):
         self._valid = True
 
     def _publish_compile_cache(self) -> None:
-        if self._compile_cache is None or "publish_s" in self._compile_cache_metrics:
+        if self._compile_cache is None:
             return
         event = self._compile_cache.publish()
         self._compile_cache_metrics.update(
             {
-                "publish_s": event.elapsed_s,
-                "published": float(event.status == "published"),
+                "publish_s": self._compile_cache_metrics.get("publish_s", 0.0)
+                + event.elapsed_s,
+                "published": max(
+                    self._compile_cache_metrics.get("published", 0.0),
+                    float(event.status == "published"),
+                ),
                 "artifact_bytes": float(event.artifact_bytes),
             }
         )
@@ -466,7 +470,7 @@ class MonarchTrainerActor(Actor):
                     _ActorEventSink(event_port, coordinator=coordinator),
                     Event(),
                 )
-                self._publish_compile_cache()
+            self._publish_compile_cache()
             if coordinator:
                 event_port.send({"kind": "actor_completed", "metrics": metrics})
             return {
@@ -510,7 +514,7 @@ class MonarchTrainerActor(Actor):
                     _ActorEventSink(event_port, coordinator=coordinator),
                     Event(),
                 )
-                self._publish_compile_cache()
+            self._publish_compile_cache()
             if coordinator:
                 event_port.send({"kind": "actor_completed", "metrics": metrics})
             return {
@@ -543,6 +547,7 @@ class MonarchTrainerActor(Actor):
             batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
             with self._weight_offload.job():
                 result = self._executor.score(job, batch)
+            self._publish_compile_cache()
             return result.model_dump(mode="json")
         except BaseException:
             self._valid = False
