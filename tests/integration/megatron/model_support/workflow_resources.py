@@ -459,7 +459,7 @@ _B300_THROUGHPUT_FLOORS = {
         (40_300, 38_500, 4_740, 0.90, 5.0),
     ),
     "dsv4": (
-        "4a3b975b1c7cbf261015fd8b33e51295a780eeb472b1fe3d9c8e609414f1903b",
+        "31272344b7ca8ea4cedbfd656ded1b137e04a4ccdbe41a43d3ce3f4a93cf27ce",
         (3_900, 3_750, 350, 0.94, 6.0),
     ),
     "glm52": (
