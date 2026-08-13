@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 import hashlib
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
+import inspect
 import json
 import os
 from pathlib import Path
 import sys
 import time
-from types import MethodType
+from types import FunctionType, MethodType
 from typing import Any, Literal
 import uuid
 
@@ -119,6 +121,36 @@ def _support_non_strict_package_bypass() -> None:
     DynamoOutput.build_guards = build_guards
 
 
+def _support_cross_package_resume_codes() -> None:
+    from torch._dynamo.package import CompilePackage
+    from torch._dynamo.resume_execution import ContinueExecutionCache
+
+    original = CompilePackage.code_context
+    if getattr(original, "_art_supports_cross_package_resumes", False):
+        return
+
+    @contextmanager
+    def code_context(self: Any, code: Any) -> Any:
+        if (
+            code not in self._codes
+            and code in ContinueExecutionCache.generated_code_metadata
+            and (module := inspect.getmodule(code)) is not None
+        ):
+            names = [
+                name
+                for name, value in vars(module).items()
+                if isinstance(value, FunctionType) and value.__code__ is code
+            ]
+            if names or any(value is code for value in vars(module).values()):
+                for name in names or [None]:
+                    self.add_resume_function(code, module.__name__, name)
+        with original(self, code):
+            yield
+
+    setattr(code_context, "_art_supports_cross_package_resumes", True)
+    CompilePackage.code_context = code_context
+
+
 class CompileCacheEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -202,6 +234,7 @@ class TrainerCompileCache:
             raise RuntimeError("Dynamo precompile was enabled before trainer imports")
         _support_precompile_serialization()
         _support_non_strict_package_bypass()
+        _support_cross_package_resume_codes()
         os.environ["TORCH_CACHING_PRECOMPILE"] = "1"
         config.caching_precompile = True
         self._spec = spec
