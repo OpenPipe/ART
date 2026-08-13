@@ -697,9 +697,6 @@ class ServerlessBackend:
                 ),
                 **_packing_outcome_metrics(forward_result.packing),
                 "data/step_num_trajectories": float(len(values)),
-                "data/step_trainable_assistant_tokens": float(
-                    forward_result.packing.trainable_assistant_tokens
-                ),
                 "data/step_num_dropped_trajectories": 0.0,
                 TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
             }
@@ -810,6 +807,9 @@ def _packing_outcome_metrics(packing: PackingOutcome) -> dict[str, float]:
         "pipeline/target_packed_sequences": float(packing.target_packed_sequences),
         "data/step_packed_sequences": float(packing.packed_sequences),
         "data/step_physical_tokens": float(packing.physical_tokens),
+        "data/step_trainable_assistant_tokens": float(
+            packing.trainable_assistant_tokens
+        ),
     }
 
 
