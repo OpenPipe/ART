@@ -36,6 +36,10 @@ _GEMMA_YES_NO_ENV = {
     "ART_MODEL_SUPPORT_YES_NO_ALLOWED_TOKEN_IDS": "4443,951,7463",
     "ART_MODEL_SUPPORT_YES_NO_MAX_TOKENS": "1",
 }
+_RESIDENT_FUNCTIONAL_ENV = {
+    "gemma4_dense": {"ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN": "2560"},
+    "gemma4_moe": {"ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN": "2560"},
+}
 _REDUCED_TRAINABILITY_ENV: dict[str, dict[str, dict[str, str]]] = {
     "gemma4_dense": {"yes_no_trainability": _GEMMA_YES_NO_ENV},
     "gemma4_moe": {"yes_no_trainability": _GEMMA_YES_NO_ENV},
@@ -151,6 +155,7 @@ class WorkflowFixture(BaseModel):
 
     def resident_functional_environment(self) -> dict[str, str]:
         environment = self.environment("length_trainability")
+        environment.update(_RESIDENT_FUNCTIONAL_ENV.get(self.model_key, {}))
         if self.model_key == "glm52":
             environment.update(self.environment("train_inf_mismatch"))
         return environment
