@@ -2221,6 +2221,18 @@ def test_trainer_rank_zero_grad_does_not_clear_live_slot_graphs() -> None:
         trainer._guard_slot_can_load(ref)
 
 
+def test_trainer_rank_graph_tracking_does_not_copy_outputs() -> None:
+    trainer = TrainerRank(_runtime())
+    ref = _slot_ref("teacher")
+    source = torch.ones(4, requires_grad=True) * 2
+    output = ForwardOutput(source, None, None, None)
+
+    tracked = trainer._track_slot_graph_outputs(ref, [output])[0]
+
+    assert tracked.target_logprobs is not None
+    assert tracked.target_logprobs.data_ptr() == source.data_ptr()
+
+
 def test_trainer_rank_retained_backward_keeps_slot_graph_guard() -> None:
     trainer = TrainerRank(_runtime())
     ref = _slot_ref("teacher")

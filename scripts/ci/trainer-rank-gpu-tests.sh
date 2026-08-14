@@ -12,6 +12,7 @@ uv run --no-sync pytest --tb=short \
   'tests/integration/megatron/gdn_shared_prefix/test_gdn_cp_packed_correctness.py::test_gdn_cp_tree_trainability_updates_parameters[2]' \
   tests/integration/megatron/gdn_shared_prefix/test_real_gdn_tp_lora.py::test_real_qwen35_gdn_tp2_gradients_match_flattened \
   tests/integration/megatron/lora/test_dynamic_lora_slots.py::test_dynamic_lora_slots_capture_recompute_context_and_step_independently \
+  tests/integration/megatron/lora/test_dynamic_lora_slots.py::test_trainer_rank_custom_objects_train_and_become_stale_on_cuda \
   tests/integration/megatron/lora/test_dynamic_lora_slots.py::test_trainer_rank_custom_parameter_reduction_oracle \
   'tests/integration/megatron/lora/test_dynamic_lora_slots.py::test_trainer_rank_tp_head_backward_matches_unsharded_oracle[2]'
 

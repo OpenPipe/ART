@@ -27,7 +27,8 @@ if TYPE_CHECKING:
         _DynamicOptimizer,
     )
 
-FORMAT = 2
+FORMAT = 3
+DRAFT_FORMAT = 2
 LEGACY_FORMAT = 1
 MANIFEST_FILE = "checkpoint.json"
 _ART_FORMAT_KEY = "art_lora_format"
@@ -49,7 +50,7 @@ class CustomTensorRecord(TypedDict):
 
 
 class CheckpointManifest(TypedDict):
-    format_version: Literal[1, 2]
+    format_version: Literal[1, 3]
     base_model_name_or_path: str
     optimizer: OptimizerConfig | None
     parameters: dict[str, list[str]]
@@ -66,6 +67,14 @@ class PreparedCheckpoint:
     keys: tuple[str, ...]
     manifest: CheckpointManifest | None
     digest: str
+    custom: PreparedCustomPayload | None = None
+
+
+@dataclass(frozen=True)
+class PreparedCustomPayload:
+    records: dict[str, CustomTensorRecord]
+    tensors: dict[str, torch.Tensor]
+    optimizer: dict[str, torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -238,13 +247,14 @@ def _validate_manifest(
         trainable_keys = (
             record.get("trainable_keys", []) if isinstance(record, dict) else []
         )
+        kind = record.get("kind") if isinstance(record, dict) else None
         if (
             not isinstance(name, str)
             or not name
             or "." in name
             or "/" in name
             or not isinstance(record, dict)
-            or record.get("kind") not in ("module", "parameter", "buffer")
+            or kind not in ("module", "parameter", "buffer")
             or not isinstance(tensor_keys, list)
             or not isinstance(trainable_keys, list)
             or not all(isinstance(key, str) for key in tensor_keys)
@@ -252,6 +262,7 @@ def _validate_manifest(
             or len(set(tensor_keys)) != len(tensor_keys)
             or len(set(trainable_keys)) != len(trainable_keys)
             or not set(trainable_keys).issubset(tensor_keys)
+            or (kind == "buffer" and bool(trainable_keys))
         ):
             raise RuntimeError(
                 f"Checkpoint custom tensor mapping is invalid for {name!r}"
@@ -261,7 +272,7 @@ def _validate_manifest(
             valid_keys = all(key.startswith(f"{name}.") for key in keys)
         else:
             valid_keys = keys == {name}
-        if not valid_keys or custom_keys & keys or adapter_keys & keys:
+        if not valid_keys or custom_keys & keys:
             raise RuntimeError("Checkpoint custom tensor keys overlap")
         custom_keys.update(keys)
         trainable_custom_keys.update(trainable_keys)
@@ -284,7 +295,7 @@ def _validate_manifest(
             )
         ):
             raise RuntimeError("Checkpoint optimizer config is invalid")
-        optimizer_keys = adapter_keys | trainable_custom_keys
+        optimizer_keys = adapter_keys
         if set(parameters) != optimizer_keys or set(steps) != optimizer_keys:
             raise RuntimeError(
                 "Checkpoint optimizer mapping differs from trainable tensors: "
@@ -314,21 +325,35 @@ def _validate_manifest(
         "adapter_model.safetensors",
         *files,
         *({"custom_tensors.safetensors"} if custom else set()),
+        *(
+            {"optimizer/custom.safetensors"}
+            if optimizer is not None and trainable_custom_keys
+            else set()
+        ),
     }
     if set(file_digests) != expected_files:
         raise RuntimeError("Checkpoint file digest mapping is invalid")
     if custom:
         files.add("custom_tensors.safetensors")
+    if optimizer is not None and trainable_custom_keys:
+        files.add("optimizer/custom.safetensors")
     return files
 
 
-def _validate_custom_payloads(root: Path, manifest: CheckpointManifest) -> None:
+def _load_custom_payload(
+    root: Path, manifest: CheckpointManifest
+) -> PreparedCustomPayload | None:
     custom = manifest.get("custom_tensors", {})
     if not custom:
-        return
-    safe_open = importlib.import_module("safetensors").safe_open
-    with safe_open(root / "custom_tensors.safetensors", framework="pt") as handle:
-        actual = set(handle.keys())
+        return None
+    load = importlib.import_module("safetensors.torch").load_file
+    tensors = {
+        key: value.detach().cpu().clone()
+        for key, value in load(
+            root / "custom_tensors.safetensors", device="cpu"
+        ).items()
+    }
+    actual = set(tensors)
     expected = {key for record in custom.values() for key in record["tensor_keys"]}
     if actual != expected:
         raise RuntimeError(
@@ -343,15 +368,18 @@ def _validate_custom_payloads(root: Path, manifest: CheckpointManifest) -> None:
             raise RuntimeError(
                 "Checkpoint has custom optimizer state without parameters"
             )
-        return
+        return PreparedCustomPayload(deepcopy(custom), tensors, {})
     if manifest["optimizer"] is None:
         if optimizer_file.is_file():
             raise RuntimeError(
                 "Checkpoint has custom optimizer state without an optimizer"
             )
-        return
-    with safe_open(optimizer_file, framework="pt") as handle:
-        actual = set(handle.keys())
+        return PreparedCustomPayload(deepcopy(custom), tensors, {})
+    optimizer = {
+        key: value.detach().cpu().clone()
+        for key, value in load(optimizer_file, device="cpu").items()
+    }
+    actual = set(optimizer)
     expected = {
         f"{component}/{key}"
         for key in trainable
@@ -363,6 +391,7 @@ def _validate_custom_payloads(root: Path, manifest: CheckpointManifest) -> None:
             f"missing={sorted(expected - actual)[:8]} "
             f"unexpected={sorted(actual - expected)[:8]}"
         )
+    return PreparedCustomPayload(deepcopy(custom), tensors, optimizer)
 
 
 def prepare_checkpoint(
@@ -381,6 +410,11 @@ def prepare_checkpoint(
     manifest: CheckpointManifest | None = None
     if manifest_path.is_file():
         value = json.loads(manifest_path.read_text())
+        if isinstance(value, dict) and value.get("format_version") == DRAFT_FORMAT:
+            raise RuntimeError(
+                "Unsupported draft custom checkpoint format 2; regenerate the "
+                "checkpoint with the current TrainerRank implementation"
+            )
         if not isinstance(value, dict) or value.get("format_version") not in (
             LEGACY_FORMAT,
             FORMAT,
@@ -418,13 +452,15 @@ def prepare_checkpoint(
                     f"Checkpoint file digest mismatch for {relative}: "
                     f"{file_actual} != {manifest['files'][relative]}"
                 )
-        if artifact_entries is None:
-            _validate_custom_payloads(root, manifest)
+        custom = (
+            _load_custom_payload(root, manifest) if artifact_entries is None else None
+        )
     else:
         if artifact_entries is not None:
             raise RuntimeError("Checkpoint artifact lacks a canonical manifest")
         actual = _hash_files(root, ("adapter_config.json", "adapter_model.safetensors"))
-    return PreparedCheckpoint(root, config, keys, manifest, actual)
+        custom = None
+    return PreparedCheckpoint(root, config, keys, manifest, actual, custom)
 
 
 def validate_checkpoint(
@@ -467,46 +503,39 @@ def materialize_lora(
 
 
 def load_custom_tensors(
-    source: PreparedCheckpoint | None,
+    source: PreparedCustomPayload | None,
     name: str,
     kind: Literal["module", "parameter", "buffer"],
 ) -> dict[str, torch.Tensor] | None:
-    if source is None or source.manifest is None:
+    if source is None:
         return None
-    record = source.manifest.get("custom_tensors", {}).get(name)
+    record = source.records.get(name)
     if record is None:
         return None
     if record["kind"] != kind:
         raise RuntimeError(
             f"Checkpoint registers {name!r} as {record['kind']}, not {kind}"
         )
-    load = importlib.import_module("safetensors.torch").load_file
-    payload = load(source.path / "custom_tensors.safetensors")
     prefix = f"{name}."
     return {
-        key.removeprefix(prefix) if kind == "module" else "": payload[key]
+        key.removeprefix(prefix) if kind == "module" else "": source.tensors[key]
         for key in record["tensor_keys"]
     }
 
 
 def load_custom_optimizer(
-    source: PreparedCheckpoint | None,
+    source: PreparedCustomPayload | None,
     keys: Sequence[str],
 ) -> dict[str, CustomOptimizerState]:
-    if (
-        source is None
-        or source.manifest is None
-        or source.manifest["optimizer"] is None
-        or not keys
-    ):
+    if source is None or not source.optimizer or not keys:
         return {}
-    custom = source.manifest.get("custom_tensors", {})
-    saved = {key for record in custom.values() for key in record["trainable_keys"]}
+    saved = {
+        key for record in source.records.values() for key in record["trainable_keys"]
+    }
     selected = saved.intersection(keys)
     if not selected:
         return {}
-    load = importlib.import_module("safetensors.torch").load_file
-    payload = load(source.path / "optimizer/custom.safetensors")
+    payload = source.optimizer
     return {
         key: CustomOptimizerState(
             payload[f"master/{key}"],
@@ -550,19 +579,18 @@ def _custom_snapshot(
 
     slot = trainer._checkpoint_slots[name]
     records = (
-        {}
-        if slot.custom_source is None or slot.custom_source.manifest is None
-        else deepcopy(slot.custom_source.manifest.get("custom_tensors", {}))
+        {} if slot.custom_payload is None else deepcopy(slot.custom_payload.records)
     )
     tensors: dict[str, torch.Tensor] = {}
     optimizer: dict[str, torch.Tensor] = {}
     if records:
-        assert slot.custom_source is not None
-        load = importlib.import_module("safetensors.torch").load_file
-        tensors.update(load(slot.custom_source.path / "custom_tensors.safetensors"))
-        optimizer_file = slot.custom_source.path / "optimizer/custom.safetensors"
-        if optimizer_file.is_file():
-            optimizer.update(load(optimizer_file))
+        assert slot.custom_payload is not None
+        tensors.update(
+            (key, value.clone()) for key, value in slot.custom_payload.tensors.items()
+        )
+        optimizer.update(
+            (key, value.clone()) for key, value in slot.custom_payload.optimizer.items()
+        )
 
     dynamic = slot.optimizer
     masters = (
@@ -1059,6 +1087,7 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
             steps.update((key, values.pop()) for key, values in step_values.items())
 
         def commit() -> None:
+            safe_open = importlib.import_module("safetensors").safe_open
             _consolidate(lora_shards, temporary / "adapter_model.safetensors")
             for shard in lora_shards:
                 shard.unlink()
@@ -1076,19 +1105,6 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
                     shutil.copy2(
                         custom_optimizer,
                         temporary / "optimizer/custom.safetensors",
-                    )
-                    for record in prepared.custom_tensors.values():
-                        for key in record["trainable_keys"]:
-                            parameters[key] = ["optimizer/custom.safetensors"] * 3
-                    load = importlib.import_module("safetensors.torch").load_file
-                    payload = load(custom_optimizer)
-                    steps.update(
-                        (
-                            key.removeprefix("step/"),
-                            float(value.item()),
-                        )
-                        for key, value in payload.items()
-                        if key.startswith("step/")
                     )
             manifest: CheckpointManifest = {
                 "format_version": FORMAT if prepared.custom_tensors else LEGACY_FORMAT,
@@ -1108,12 +1124,26 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
                 "adapter_model.safetensors",
                 *(file for record in parameters.values() for file in record),
                 *({"custom_tensors.safetensors"} if prepared.custom_tensors else set()),
+                *(
+                    {"optimizer/custom.safetensors"}
+                    if (prepared.snapshot / "optimizer/custom.safetensors").is_file()
+                    else set()
+                ),
             }
             manifest["files"] = {
                 relative: _file_digest(temporary / relative)
                 for relative in artifact_files
             }
             manifest["digest"] = _manifest_digest(manifest)
+            with safe_open(
+                temporary / "adapter_model.safetensors", framework="pt"
+            ) as adapter:
+                adapter_keys = set(adapter.keys())
+            _validate_manifest(
+                manifest,
+                adapter_keys=adapter_keys,
+                config=prepared.config,
+            )
             (temporary / MANIFEST_FILE).write_text(
                 json.dumps(manifest, indent=2) + "\n"
             )
@@ -1596,7 +1626,7 @@ def load_checkpoint(
         from art.trainer_rank._impl import _CheckpointSlot
 
         trainer._checkpoint_slots[temporary] = _CheckpointSlot(
-            params, config, custom_source=source
+            params, config, custom_payload=source.custom
         )
         _phase(
             lambda: trainer._validate_loaded_checkpoint_config(temporary, config),

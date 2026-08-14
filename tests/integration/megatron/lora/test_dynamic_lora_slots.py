@@ -20,6 +20,7 @@ from art.megatron.lora import LoRA, LoRASlotRef, use_lora_slot  # noqa: E402
 from art.trainer_rank import (  # noqa: E402
     AdamParams,
     TrainerRank,
+    TrainerRankSlotStateError,
 )
 from art.trainer_rank._checkpoint import (  # noqa: E402
     LocalOptimizerState,
@@ -33,6 +34,15 @@ from art.trainer_rank._impl import (  # noqa: E402
     _vocab_parallel_target_logprobs,
     _vocab_parallel_topk_from_local,
 )
+
+
+class _CudaValueHead(torch.nn.Module):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(hidden_size, 1)
+
+    def score(self, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"value": self.projection(hidden)}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
@@ -106,6 +116,50 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
         )
         _assert_step_updates_only(ref_a, ref_b, lora, trainer)
         _assert_reload_replaces_slot_optimizer(ref_a, lora, trainer)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
+def test_trainer_rank_custom_objects_train_and_become_stale_on_cuda() -> None:
+    with _single_rank_model_parallel():
+        device = torch.device("cuda")
+        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
+        trainer = _trainer_for(lora, device)
+        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=1))
+        head = trainer.module(
+            "value_head", lambda: _CudaValueHead(4).to(device), checkpoint="A"
+        )
+        gain = trainer.parameter(
+            "gain", lambda: torch.ones((), device=device), checkpoint="A"
+        )
+        running = trainer.buffer(
+            "running", lambda: torch.tensor(0.25, device=device), checkpoint="A"
+        )
+
+        output = head.score(torch.randn(3, 4, device=device))["value"] * gain + running
+        with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+            trainer._guard_slot_can_load(trainer._slot_ref("A"))
+        output.sum().backward()
+        before = tuple(param.detach().clone() for param in head.parameters()) + (
+            gain.detach().clone(),
+        )
+        trainer.optim_step(
+            params=AdamParams(learning_rate=1e-3, weight_decay=0.0),
+            checkpoints=["A"],
+        )
+        after = tuple(head.parameters()) + (gain,)
+        assert all(
+            not torch.equal(old, new) for old, new in zip(before, after, strict=True)
+        )
+        torch.testing.assert_close(running, torch.tensor(0.25, device=device))
+
+        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=2))
+        for operation in (
+            lambda: head.score(torch.ones(1, 4, device=device)),
+            lambda: gain + 1,
+            lambda: running + 1,
+        ):
+            with pytest.raises(TrainerRankSlotStateError, match="stale"):
+                operation()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")

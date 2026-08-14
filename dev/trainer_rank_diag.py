@@ -30,7 +30,7 @@ def rank0_checked(label: str, check: Callable[[], T]) -> T | None:
 
 
 def all_ranks_checked(label: str, check: Callable[[], None]) -> None:
-    """Run a local check everywhere, then report every rank's failures together."""
+    """Report local failures after every rank has completed its collective work."""
 
     error: str | None = None
     cause: Exception | None = None

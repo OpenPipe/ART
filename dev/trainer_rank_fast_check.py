@@ -6,6 +6,7 @@ import sys
 
 FAST_TESTS = (
     "tests/unit/test_trainer_rank_custom_tensors.py",
+    "tests/unit/test_trainer_rank_check.py",
     "tests/unit/test_trainer_rank_validation.py",
     "tests/unit/test_trainer_rank_weird_shapes.py",
     "tests/unit/test_prefix_tree_packing.py",

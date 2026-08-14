@@ -346,7 +346,7 @@ def _compare_outputs(
                 _assert_stable_topk_tokens(actual_output, expected_output)
                 continue
             diff = _diff(actual_tensor, expected_tensor)
-            if key != "topk_logprobs" and diff.mean_abs_pct > tolerance:
+            if diff.mean_abs_pct > tolerance:
                 raise AssertionError(
                     f"{key} mean_abs_pct={diff.mean_abs_pct} exceeds {tolerance}"
                 )
@@ -398,8 +398,8 @@ def _assert_stable_topk_tokens(
     actual_tokens = cast(torch.Tensor, actual["topk_tokens"])
     expected_tokens = cast(torch.Tensor, expected["topk_tokens"])
     if torch.equal(
-        actual_tokens.sort(dim=-1).values,
-        expected_tokens.sort(dim=-1).values,
+        actual_tokens,
+        expected_tokens,
     ):
         return
     actual_logits = actual["logits"]
@@ -407,7 +407,7 @@ def _assert_stable_topk_tokens(
     if not isinstance(actual_logits, torch.Tensor) or not isinstance(
         expected_logits, torch.Tensor
     ):
-        return
+        raise AssertionError("top-k tokens differ for a top-k-only request")
     actual_rows = actual_tokens.reshape(-1, int(actual_tokens.shape[-1]))
     expected_rows = expected_tokens.reshape(-1, int(expected_tokens.shape[-1]))
     actual_logits_rows = actual_logits.reshape(-1, int(actual_logits.shape[-1])).float()
@@ -507,10 +507,17 @@ def _local_slot_backward_parity(
         int(ps.get_data_parallel_rank()) :: int(ps.get_data_parallel_world_size())
     ]
     combined = _slot_gradients(rank, local, slots)
+    split_by_slot = {
+        slot: _slot_gradients(
+            rank,
+            [request for request in local if request.checkpoint == slot],
+            slots,
+        )
+        for slot in slots
+    }
     worst = Diff()
     for slot in slots:
-        selected = [request for request in local if request.checkpoint == slot]
-        split = _slot_gradients(rank, selected, slots)
+        split = split_by_slot[slot]
         for other in slots:
             for gradient in split[other]:
                 if other != slot and bool(gradient.count_nonzero()):

@@ -22,10 +22,12 @@ import threading
 from types import TracebackType
 from typing import (
     TYPE_CHECKING,
+    Any,
     Generic,
     Literal,
     NotRequired,
     Self,
+    SupportsIndex,
     TypedDict,
     TypeVar,
     cast,
@@ -60,6 +62,7 @@ if TYPE_CHECKING:
         CustomOptimizerState,
         LocalOptimizerState,
         PreparedCheckpoint,
+        PreparedCustomPayload,
         _FinalizedSave,
         _PreparedSave,
     )
@@ -438,7 +441,7 @@ class _SlotGraphSentinel(torch.autograd.Function):
         marker: torch.Tensor,
     ) -> torch.Tensor:
         ctx.save_for_backward(marker)
-        return tensor.clone()
+        return tensor
 
     @staticmethod
     def backward(
@@ -447,20 +450,94 @@ class _SlotGraphSentinel(torch.autograd.Function):
         return grad_outputs[0], None
 
 
-class _TrackedParameter(torch.nn.Parameter):
+class _CustomSlotGraphSentinel(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: FunctionCtx,
+        tensor: torch.Tensor,
+        marker: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(marker)
+        return tensor
+
+    @staticmethod
+    def backward(
+        ctx: FunctionCtx, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
+        saved_tensors = cast(tuple[torch.Tensor, ...], getattr(ctx, "saved_tensors"))
+        (marker,) = saved_tensors
+
+        def finish() -> None:
+            try:
+                getattr(ctx, "saved_tensors")
+            except RuntimeError:
+                marker.fill_(True)
+
+        torch.autograd.Variable._execution_engine.queue_callback(finish)
+        return grad_outputs[0], None
+
+
+@dataclass(eq=False)
+class _CustomTensorTracker:
+    trainer: weakref.ReferenceType[TrainerRank]
+    ref: LoRASlotRef
+    name: str
+    generation: object
+    active: bool = False
+
+    def validate(self) -> TrainerRank:
+        trainer = self.trainer()
+        slot = (
+            None
+            if trainer is None or self.ref.name is None
+            else trainer._checkpoint_slots.get(self.ref.name)
+        )
+        current = None if slot is None else slot.custom.get(self.name)
+        if self.active and (
+            current is None or current.generation is not self.generation
+        ):
+            raise TrainerRankSlotStateError(
+                f"Custom checkpoint object {self.name!r} is stale because checkpoint "
+                f"{self.ref.name!r} was replaced. Register it again from the current "
+                "checkpoint before use."
+            )
+        if trainer is None:
+            raise TrainerRankSlotStateError(
+                f"Custom checkpoint object {self.name!r} no longer has a TrainerRank"
+            )
+        return trainer
+
+    def record(self, marker: torch.Tensor) -> None:
+        trainer = self.validate()
+        trainer._slot_graphs().setdefault(self.ref, []).append(weakref.ref(marker))
+
+
+class _TrackedTensor(torch.Tensor):
+    _art_tracker: _CustomTensorTracker
+
+    @staticmethod
     def __new__(
         cls,
         data: torch.Tensor,
-        track: Callable[[object], object],
+        tracker: _CustomTensorTracker,
     ) -> Self:
-        return super().__new__(cls, data, requires_grad=True)
+        value = torch.Tensor._make_subclass(cls, data, require_grad=False)
+        value._art_tracker = tracker
+        return value
 
-    def __init__(
-        self,
-        data: torch.Tensor,
-        track: Callable[[object], object],
-    ) -> None:
-        self._art_track_output = track
+    def __deepcopy__(self, memo: dict[int, object]) -> torch.Tensor:
+        existing = memo.get(id(self))
+        if isinstance(existing, torch.Tensor):
+            return existing
+        with torch._C.DisableTorchFunctionSubclass():
+            result = self.as_subclass(torch.Tensor).detach().clone()
+        memo[id(self)] = result
+        return result
+
+    def __reduce_ex__(self, proto: SupportsIndex) -> str | tuple[Any, ...]:
+        with torch._C.DisableTorchFunctionSubclass():
+            plain = self.as_subclass(torch.Tensor).detach().clone()
+        return cast(str | tuple[Any, ...], plain.__reduce_ex__(proto))
 
     @classmethod
     def __torch_function__(
@@ -470,15 +547,66 @@ class _TrackedParameter(torch.nn.Parameter):
         args: tuple[object, ...] = (),
         kwargs: dict[str, object] | None = None,
     ) -> object:
-        output = super().__torch_function__(func, types, args, kwargs or {})
-        trackers = {
-            id(value._art_track_output): value._art_track_output
-            for value in _walk_objects((args, kwargs))
-            if isinstance(value, _TrackedParameter)
-        }
-        for track in trackers.values():
-            output = track(output)
-        return output
+        return _tracked_tensor_function(func, types, args, kwargs or {})
+
+
+class _TrackedParameter(torch.nn.Parameter):
+    _art_tracker: _CustomTensorTracker
+
+    def __new__(
+        cls,
+        data: torch.Tensor,
+        tracker: _CustomTensorTracker,
+        requires_grad: bool = True,
+    ) -> Self:
+        value = super().__new__(cls, data, requires_grad=requires_grad)
+        value._art_tracker = tracker
+        return value
+
+    def __init__(
+        self,
+        data: torch.Tensor,
+        tracker: _CustomTensorTracker,
+        requires_grad: bool = True,
+    ) -> None:
+        del data, tracker, requires_grad
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "grad":
+            with torch._C.DisableTorchFunctionSubclass():
+                super().__setattr__(name, value)
+            return
+        super().__setattr__(name, value)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> torch.nn.Parameter:
+        existing = memo.get(id(self))
+        if isinstance(existing, torch.nn.Parameter):
+            return existing
+        with torch._C.DisableTorchFunctionSubclass():
+            data = self.as_subclass(torch.Tensor).detach().clone()
+            requires_grad = self.requires_grad
+        result = torch.nn.Parameter(data, requires_grad=requires_grad)
+        memo[id(self)] = result
+        return result
+
+    def __reduce_ex__(self, proto: SupportsIndex) -> str | tuple[Any, ...]:
+        with torch._C.DisableTorchFunctionSubclass():
+            data = self.as_subclass(torch.Tensor).detach().clone()
+            requires_grad = self.requires_grad
+        return cast(
+            str | tuple[Any, ...],
+            torch.nn.Parameter(data, requires_grad=requires_grad).__reduce_ex__(proto),
+        )
+
+    @classmethod
+    def __torch_function__(
+        cls,
+        func: Callable[..., object],
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        return _tracked_tensor_function(func, types, args, kwargs or {})
 
 
 @dataclass(frozen=True)
@@ -491,6 +619,7 @@ class _DynamicOptimizer:
 class _CustomObject:
     kind: Literal["module", "parameter", "buffer"]
     value: torch.nn.Module | torch.nn.Parameter | torch.Tensor
+    generation: object
 
 
 @dataclass
@@ -500,7 +629,7 @@ class _CheckpointSlot:
     optimizer: _DynamicOptimizer | None = None
     revision: int = 0
     custom: dict[str, _CustomObject] = dataclass_field(default_factory=dict)
-    custom_source: "PreparedCheckpoint | None" = None
+    custom_payload: "PreparedCustomPayload | None" = None
 
 
 @dataclass(frozen=True)
@@ -812,6 +941,7 @@ class TrainerRank:
         custom: _CustomObject | None = None
         try:
             value = factory()
+            generation = object()
             if kind == "module":
                 if not isinstance(value, torch.nn.Module):
                     raise TypeError("module() factory must return torch.nn.Module")
@@ -819,54 +949,55 @@ class TrainerRank:
             elif kind == "parameter":
                 if not isinstance(value, torch.Tensor):
                     raise TypeError("parameter() factory must return torch.Tensor")
-                ref = self._slot_ref(checkpoint_name)
-                value = _TrackedParameter(
-                    value.detach().to(device=self.device), lambda result: result
+                value = torch.nn.Parameter(
+                    value.detach().to(device=self.device).clone(), requires_grad=True
                 )
             else:
                 if not isinstance(value, torch.Tensor):
                     raise TypeError("buffer() factory must return torch.Tensor")
-                value = value.detach().to(device=self.device)
-            custom = _CustomObject(kind, value)
+                value = value.detach().to(device=self.device).clone()
+            custom = _CustomObject(kind, value, generation)
         except BaseException as exc:
             error = exc
         _checkpoint.raise_distributed(error, f"construct custom object {name!r}", group)
         assert custom is not None
         self._initialize_custom_object(checkpoint_name, name, custom)
-        named_params = tuple(
-            (key, parameter)
-            for key, parameter in _custom_named_parameters(name, custom)
-            if parameter.requires_grad
+        tracker: _CustomTensorTracker | None = None
+        named_params: tuple[tuple[str, torch.nn.Parameter], ...] = ()
+        new_params: tuple[torch.nn.Parameter, ...] = ()
+        extended_optimizer: _DynamicOptimizer | None = None
+        error = None
+        try:
+            tracker = _CustomTensorTracker(
+                weakref.ref(self),
+                self._slot_ref(checkpoint_name),
+                name,
+                custom.generation,
+            )
+            custom = _track_custom_object(custom, tracker)
+            named_params = tuple(
+                (key, parameter)
+                for key, parameter in _custom_named_parameters(name, custom)
+                if parameter.requires_grad
+            )
+            new_params = tuple(parameter for _key, parameter in named_params)
+            self._tag_custom_parameters(new_params)
+            if slot.optimizer is not None and new_params:
+                extended_optimizer = self._extend_dynamic_optimizer(
+                    checkpoint_name, named_params
+                )
+        except BaseException as exc:
+            error = exc
+        _checkpoint.raise_distributed(
+            error, f"stage custom checkpoint object {name!r}", group
         )
-        new_params = tuple(parameter for _key, parameter in named_params)
-        self._tag_custom_parameters(new_params)
-        if slot.optimizer is not None and new_params:
-            self._extend_dynamic_optimizer(checkpoint_name, named_params)
+        assert tracker is not None
+        if extended_optimizer is not None:
+            slot.optimizer = extended_optimizer
         slot.custom[name] = custom
         slot.params += new_params
-        if isinstance(value, _TrackedParameter):
-            parameter = value
-            value._art_track_output = lambda output: self._track_custom_output(
-                ref,
-                output,
-                name=name,
-                expected=parameter,
-            )
-        if isinstance(value, torch.nn.Module):
-            ref = self._slot_ref(checkpoint_name)
-            root = value
-            for module in value.modules():
-                module.register_forward_hook(
-                    lambda _module, _args, output, ref=ref, root=root: (
-                        self._track_custom_output(
-                            ref,
-                            output,
-                            name=name,
-                            expected=root,
-                        )
-                    )
-                )
-        return value
+        tracker.active = True
+        return custom.value
 
     def _resolve_custom_checkpoint(self, checkpoint: AdapterSelection) -> str:
         if checkpoint is Unset:
@@ -896,7 +1027,7 @@ class TrainerRank:
         values: dict[str, torch.Tensor] = {}
         try:
             loaded = _checkpoint.load_custom_tensors(
-                slot.custom_source, name, custom.kind
+                slot.custom_payload, name, custom.kind
             )
             if loaded is not None:
                 _load_custom_state(custom, loaded)
@@ -906,14 +1037,7 @@ class TrainerRank:
         _checkpoint.raise_distributed(
             error, f"initialize custom object {name!r}", group
         )
-        signature = (
-            name,
-            custom.kind,
-            tuple(
-                (key, tuple(value.shape), str(value.dtype))
-                for key, value in values.items()
-            ),
-        )
+        signature = _custom_signature(name, custom, values)
         signatures = _checkpoint._gather(signature, group)
         if any(value != signatures[0] for value in signatures):
             raise TrainerRankSlotStateError(
@@ -938,14 +1062,14 @@ class TrainerRank:
         self,
         name: str,
         params: Sequence[tuple[str, torch.nn.Parameter]],
-    ) -> None:
+    ) -> _DynamicOptimizer:
         from . import _checkpoint
 
         slot = self._checkpoint_slots[name]
         dynamic = slot.optimizer
         assert dynamic is not None
         restored = _checkpoint.load_custom_optimizer(
-            slot.custom_source, tuple(key for key, _param in params)
+            slot.custom_payload, tuple(key for key, _param in params)
         )
         masters = []
         for key, param in params:
@@ -959,48 +1083,42 @@ class TrainerRank:
             )
             masters.append(torch.nn.Parameter(source.clone()))
         master_params = tuple(masters)
-        group = {
-            key: value
-            for key, value in dynamic.optimizer.param_groups[0].items()
-            if key != "params"
-        }
-        dynamic.optimizer.add_param_group({**group, "params": master_params})
+        all_masters = dynamic.master_params + master_params
+        optimizer = torch.optim.AdamW(
+            all_masters,
+            **{
+                key: dynamic.optimizer.defaults[key]
+                for key in (
+                    "lr",
+                    "betas",
+                    "eps",
+                    "weight_decay",
+                    "amsgrad",
+                    "maximize",
+                    "foreach",
+                    "capturable",
+                    "differentiable",
+                    "fused",
+                )
+            },
+        )
+        optimizer.param_groups[0].update(
+            {
+                key: value
+                for key, value in dynamic.optimizer.param_groups[0].items()
+                if key != "params"
+            }
+        )
+        optimizer.state.update(dynamic.optimizer.state)
         for (key, _param), master in zip(params, master_params, strict=True):
             state = restored.get(key)
             if state is not None:
-                dynamic.optimizer.state[master] = {
+                optimizer.state[master] = {
                     "step": torch.tensor(state.step, device=master.device),
                     "exp_avg": state.exp_avg.to(master.device).clone(),
                     "exp_avg_sq": state.exp_avg_sq.to(master.device).clone(),
                 }
-        slot.optimizer = _DynamicOptimizer(
-            dynamic.optimizer, dynamic.master_params + master_params
-        )
-
-    def _track_custom_output(
-        self,
-        ref: "LoRASlotRef",
-        output: T,
-        *,
-        name: str | None = None,
-        expected: object | None = None,
-    ) -> T:
-        if name is not None:
-            slot = self._checkpoint_slots.get(cast(str, ref.name))
-            current = None if slot is None else slot.custom.get(name)
-            if current is None or current.value is not expected:
-                raise TrainerRankSlotStateError(
-                    f"Custom checkpoint object {name!r} is stale because checkpoint "
-                    f"{ref.name!r} was replaced. Register it again from the current "
-                    "checkpoint before use."
-                )
-        if not torch.is_grad_enabled():
-            return output
-        marker: list[torch.Tensor | None] = [None]
-        tracked = cast(T, _track_custom_value(output, marker))
-        if marker[0] is not None:
-            self._slot_graphs().setdefault(ref, []).append(weakref.ref(marker[0]))
-        return tracked
+        return _DynamicOptimizer(optimizer, all_masters)
 
     def prefetch_checkpoints(
         self, *checkpoints: str | MaterializedCheckpoint
@@ -1941,7 +2059,7 @@ class TrainerRank:
             )
             lora_count = len(model_params) - len(named)
             restored = load_custom_optimizer(
-                slot.custom_source, tuple(key for key, _param in named)
+                slot.custom_payload, tuple(key for key, _param in named)
             )
             for (key, _param), master in zip(named, masters[lora_count:], strict=True):
                 state = restored.get(key)
@@ -2533,7 +2651,9 @@ class TrainerRank:
         refs = tuple(graphs) if ref is None else (ref,)
         for current in refs:
             live = [
-                marker for marker in graphs.get(current, ()) if marker() is not None
+                marker
+                for marker in graphs.get(current, ())
+                if _graph_marker_is_live(marker)
             ]
             if live:
                 graphs[current] = live
@@ -3552,6 +3672,185 @@ def _walk_objects(value: object) -> Iterator[object]:
         yield value
 
 
+def _tracked_tensor_function(
+    func: Callable[..., object],
+    types: tuple[type, ...],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
+) -> object:
+    del types
+    tracked = tuple(
+        value
+        for value in _walk_objects((args, kwargs))
+        if isinstance(value, _TrackedParameter | _TrackedTensor)
+    )
+    trackers = {id(value._art_tracker): value._art_tracker for value in tracked}
+    for tracker in trackers.values():
+        tracker.validate()
+    if getattr(func, "__name__", "") in {
+        "__format__",
+        "__get__",
+        "__hash__",
+        "__len__",
+        "__repr__",
+        "__str__",
+    }:
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*args, **kwargs)
+
+    markers: dict[int, torch.Tensor] = {}
+    replacements: dict[int, torch.Tensor] = {}
+
+    def replace(value: object) -> object:
+        if isinstance(value, _TrackedParameter | _TrackedTensor):
+            cached = replacements.get(id(value))
+            if cached is not None:
+                return cached
+            tracker = value._art_tracker
+            with torch._C.DisableTorchFunctionSubclass():
+                if (
+                    tracker.active
+                    and isinstance(value, _TrackedParameter)
+                    and value.requires_grad
+                    and torch.is_grad_enabled()
+                ):
+                    marker = markers.get(id(tracker))
+                    if marker is None:
+                        marker = torch.zeros((), dtype=torch.bool)
+                        markers[id(tracker)] = marker
+                        tracker.record(marker)
+                    result = _CustomSlotGraphSentinel.apply(
+                        value.as_subclass(torch.Tensor), marker
+                    )
+                else:
+                    result = value.as_subclass(torch.Tensor)
+            replacements[id(value)] = result
+            return result
+        if isinstance(value, tuple):
+            values = tuple(replace(item) for item in value)
+            return type(value)(*values) if hasattr(value, "_fields") else values
+        if isinstance(value, list):
+            return [replace(item) for item in value]
+        if isinstance(value, dict):
+            return {key: replace(item) for key, item in value.items()}
+        return value
+
+    result = func(
+        *cast(tuple[object, ...], replace(args)),
+        **cast(dict[str, object], replace(kwargs)),
+    )
+    if markers and not any(
+        isinstance(value, torch.Tensor) and value.requires_grad
+        for value in _walk_objects(result)
+    ):
+        for marker in markers.values():
+            marker.fill_(True)
+    return result
+
+
+def _graph_marker_is_live(
+    marker_ref: weakref.ReferenceType[torch.Tensor],
+) -> bool:
+    marker = marker_ref()
+    return marker is not None and (marker.numel() == 0 or not bool(marker.item()))
+
+
+def _track_custom_object(
+    custom: _CustomObject,
+    tracker: _CustomTensorTracker,
+) -> _CustomObject:
+    if custom.kind == "parameter":
+        source = cast(torch.nn.Parameter, custom.value)
+        with torch.no_grad():
+            value = _TrackedParameter(
+                source.detach().clone(), tracker, source.requires_grad
+            )
+        value.__dict__.update(
+            (key, item)
+            for key, item in source.__dict__.items()
+            if key != "_art_tracker"
+        )
+        value._art_tracker = tracker
+        return _CustomObject(custom.kind, value, custom.generation)
+    if custom.kind == "buffer":
+        source = cast(torch.Tensor, custom.value)
+        with torch.no_grad():
+            value = _TrackedTensor(source.detach().clone(), tracker)
+        return _CustomObject(custom.kind, value, custom.generation)
+
+    module = cast(torch.nn.Module, custom.value)
+    parameters: dict[int, torch.nn.Parameter] = {}
+    buffers: dict[int, torch.Tensor] = {}
+    for child in module.modules():
+        for key, source in child._parameters.items():
+            if source is None:
+                continue
+            value = parameters.get(id(source))
+            if value is None:
+                with torch.no_grad():
+                    value = _TrackedParameter(
+                        source.detach().clone(), tracker, source.requires_grad
+                    )
+                value.__dict__.update(
+                    (attribute, item)
+                    for attribute, item in source.__dict__.items()
+                    if attribute != "_art_tracker"
+                )
+                value._art_tracker = tracker
+                parameters[id(source)] = value
+            child._parameters[key] = value
+        for key, source in child._buffers.items():
+            if source is None:
+                continue
+            value = buffers.get(id(source))
+            if value is None:
+                with torch.no_grad():
+                    value = _TrackedTensor(source.detach().clone(), tracker)
+                buffers[id(source)] = value
+            child._buffers[key] = value
+    return custom
+
+
+def _custom_signature(
+    name: str,
+    custom: _CustomObject,
+    values: Mapping[str, torch.Tensor],
+) -> tuple[object, ...]:
+    state = tuple(
+        (key, tuple(value.shape), str(value.dtype)) for key, value in values.items()
+    )
+    if custom.kind == "parameter":
+        parameter = cast(torch.nn.Parameter, custom.value)
+        parameters: tuple[object, ...] = ((name, parameter.requires_grad, 0),)
+        buffers: tuple[object, ...] = ()
+    elif custom.kind == "buffer":
+        parameters = ()
+        buffers = ((name, True, 0),)
+    else:
+        module = cast(torch.nn.Module, custom.value)
+        parameter_aliases: dict[int, int] = {}
+        parameters = tuple(
+            (
+                key,
+                parameter.requires_grad,
+                parameter_aliases.setdefault(id(parameter), len(parameter_aliases)),
+            )
+            for key, parameter in module.named_parameters(remove_duplicate=False)
+        )
+        buffer_aliases: dict[int, int] = {}
+        buffers = tuple(
+            (
+                f"{prefix}.{key}" if prefix else key,
+                key not in child._non_persistent_buffers_set,
+                buffer_aliases.setdefault(id(buffer), len(buffer_aliases)),
+            )
+            for prefix, child in module.named_modules()
+            for key, buffer in child._buffers.items()
+            if buffer is not None
+        )
+    return name, custom.kind, state, parameters, buffers
+
+
 def _custom_named_parameters(
     name: str, custom: _CustomObject
 ) -> Iterator[tuple[str, torch.nn.Parameter]]:
@@ -3632,26 +3931,6 @@ def _validate_custom_optimizer_state(
             f"expected FP32 tensors with shape {expected_shape} and a nonnegative "
             f"finite step (invalid={invalid}, step={state.step})."
         )
-
-
-def _track_custom_value(
-    value: object,
-    marker: list[torch.Tensor | None],
-) -> object:
-    if isinstance(value, torch.Tensor):
-        if not value.requires_grad:
-            return value
-        if marker[0] is None:
-            marker[0] = value.new_empty(0)
-        return _SlotGraphSentinel.apply(value, marker[0])
-    if isinstance(value, tuple):
-        values = tuple(_track_custom_value(item, marker) for item in value)
-        return type(value)(*values) if hasattr(value, "_fields") else values
-    if isinstance(value, list):
-        return [_track_custom_value(item, marker) for item in value]
-    if isinstance(value, dict):
-        return {key: _track_custom_value(item, marker) for key, item in value.items()}
-    return value
 
 
 def _vocab_parallel_target_logprobs(

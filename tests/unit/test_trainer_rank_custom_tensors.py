@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import copy
+from dataclasses import dataclass
+from datetime import timedelta
 from importlib.util import find_spec
+import io
 import json
 from pathlib import Path
+import shutil
 from types import SimpleNamespace
 from typing import Any, Protocol, TypeVar, cast
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from art.trainer_rank import (
     AdamParams,
@@ -72,6 +79,42 @@ class _ValueHead(torch.nn.Module):
         return self.proj(hidden) + self.offset
 
 
+@dataclass
+class _HeadOutput:
+    value: torch.Tensor
+
+
+class _DirectHead(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor([2.0]))
+
+    def score(self, value: torch.Tensor) -> _HeadOutput:
+        return _HeadOutput(value * self.weight)
+
+    def forward(self, value: torch.Tensor) -> _HeadOutput:
+        return self.score(value)
+
+
+class _CollisionProjection(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lora_A = torch.nn.Linear(1, 1, bias=False)
+
+
+class _CollisionHead(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.q_proj = _CollisionProjection()
+
+
+class _AliasHead(torch.nn.Module):
+    def __init__(self, *, tied: bool) -> None:
+        super().__init__()
+        self.left = torch.nn.Parameter(torch.ones(1))
+        self.right = self.left if tied else torch.nn.Parameter(torch.ones(1))
+
+
 def _runtime(model: torch.nn.Module | None = None) -> Any:
     return SimpleNamespace(
         model=[model or torch.nn.Linear(1, 1)],
@@ -112,6 +155,67 @@ def _trainer(*names: str) -> tuple[TrainerRank, _CustomTensorAPI]:
     for name in names:
         trainer._checkpoint_slots[name] = _CheckpointSlot(config=cast(Any, _config()))
     return trainer, cast(_CustomTensorAPI, trainer)
+
+
+def _distributed_custom_registration_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    mode: str,
+) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        trainer, api = _trainer("student")
+        slot = trainer._checkpoint_slots["student"]
+        if mode == "trainability":
+
+            def factory() -> _DirectHead:
+                head = _DirectHead()
+                head.weight.requires_grad_(rank == 0)
+                return head
+
+        elif mode == "aliases":
+
+            def factory() -> _AliasHead:
+                return _AliasHead(tied=rank == 0)
+
+        else:
+            existing = torch.nn.Parameter(torch.tensor(1.0))
+            trainer._tag_custom_parameters((existing,))
+            slot.params = (existing,)
+            slot.optimizer = trainer._new_dynamic_optimizer(
+                "student", AdamParams(learning_rate=1e-3)
+            )
+            original_optimizer = slot.optimizer
+
+            if rank == 0:
+
+                def fail(*_args: object, **_kwargs: object) -> None:
+                    raise RuntimeError("rank-local optimizer failure")
+
+                trainer._extend_dynamic_optimizer = cast(Any, fail)
+
+            with pytest.raises(RuntimeError, match="rank-local optimizer failure"):
+                api.parameter("added", lambda: torch.tensor(2.0), checkpoint="student")
+            assert "added" not in slot.custom
+            assert slot.params == (existing,)
+            assert slot.optimizer is original_optimizer
+            dist.barrier()
+            return
+
+        with pytest.raises(TrainerRankSlotStateError, match="differs across ranks"):
+            api.module("head", factory, checkpoint="student")
+        assert "head" not in slot.custom
+        assert not slot.params
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
 
 
 def test_module_accepts_class_and_lambda_factories_and_is_idempotent() -> None:
@@ -264,6 +368,64 @@ def test_custom_module_outputs_participate_in_checkpoint_graph_guards() -> None:
     trainer._guard_slot_can_load(ref)
 
 
+@pytest.mark.parametrize("use_forward", (False, True))
+def test_custom_module_tracks_direct_parameter_use_and_custom_outputs(
+    use_forward: bool,
+) -> None:
+    trainer, rank = _trainer("student")
+    head = rank.module("head", _DirectHead, checkpoint="student")
+    value = torch.tensor([3.0], requires_grad=True)
+
+    output = head(value) if use_forward else head.score(value)
+
+    assert isinstance(output, _HeadOutput)
+    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+        trainer._guard_slot_can_load(trainer._slot_ref("student"))
+    output.value.sum().backward()
+    trainer.zero_grad()
+    trainer._guard_slot_can_load(trainer._slot_ref("student"))
+
+
+def test_custom_module_tracks_direct_weight_operations() -> None:
+    trainer, rank = _trainer("student")
+    head = rank.module("head", _DirectHead, checkpoint="student")
+
+    assert "Parameter" in repr(head.weight)
+    trainer._guard_slot_can_load(trainer._slot_ref("student"))
+
+    loss = head.weight.square().sum()
+
+    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+        trainer._guard_slot_can_load(trainer._slot_ref("student"))
+    loss.backward()
+    trainer.zero_grad()
+    trainer._guard_slot_can_load(trainer._slot_ref("student"))
+
+
+def test_custom_parameter_graph_guard_tracks_retain_and_abandonment() -> None:
+    import gc
+
+    trainer, rank = _trainer("student")
+    parameter = rank.parameter(
+        "temperature", lambda: torch.tensor(2.0), checkpoint="student"
+    )
+    ref = trainer._slot_ref("student")
+    loss = parameter.square().sum()
+
+    loss.backward(retain_graph=True)
+    trainer.zero_grad()
+    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+        trainer._guard_slot_can_load(ref)
+    loss.backward()
+    trainer.zero_grad()
+    trainer._guard_slot_can_load(ref)
+
+    abandoned = parameter.square().sum()
+    del abandoned
+    gc.collect()
+    trainer._guard_slot_can_load(ref)
+
+
 def test_custom_module_graph_tracking_allows_in_place_layers() -> None:
     _trainer_rank, rank = _trainer("student")
     head = rank.module(
@@ -316,6 +478,46 @@ def test_checkpoint_load_rejects_custom_grads_and_stale_objects() -> None:
         head(torch.ones(1))
     with pytest.raises(TrainerRankSlotStateError, match="is stale"):
         parameter * 2
+
+
+def test_checkpoint_replacement_invalidates_buffers() -> None:
+    trainer, rank = _trainer("student")
+    buffer = rank.buffer("offset", lambda: torch.ones(1), checkpoint="student")
+
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(config=cast(Any, _config()))
+
+    with pytest.raises(TrainerRankSlotStateError, match="stale"):
+        buffer + 1
+
+
+def test_custom_objects_clone_factory_storage_and_deepcopy_independently() -> None:
+    trainer, rank = _trainer("student")
+    source_parameter = torch.tensor([2.0])
+    source_buffer = torch.tensor([3.0])
+    parameter = rank.parameter(
+        "temperature", lambda: source_parameter, checkpoint="student"
+    )
+    buffer = rank.buffer("offset", lambda: source_buffer, checkpoint="student")
+    head = rank.module("head", _DirectHead, checkpoint="student")
+    copied = copy.deepcopy(head)
+
+    source_parameter.fill_(7)
+    source_buffer.fill_(8)
+    torch.testing.assert_close(parameter, torch.tensor([2.0]))
+    torch.testing.assert_close(buffer, torch.tensor([3.0]))
+
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(config=cast(Any, _config()))
+    with pytest.raises(TrainerRankSlotStateError, match="stale"):
+        head(torch.ones(1))
+    assert isinstance(copied(torch.ones(1)), _HeadOutput)
+    assert type(copied.weight) is torch.nn.Parameter
+
+    stream = io.BytesIO()
+    torch.save(head, stream)
+    stream.seek(0)
+    restored = torch.load(stream, weights_only=False)
+    assert type(restored.weight) is torch.nn.Parameter
+    assert isinstance(restored(torch.ones(1)), _HeadOutput)
 
 
 def test_no_grad_custom_objects_do_not_create_graph_guards() -> None:
@@ -373,10 +575,21 @@ def test_parameter_can_be_added_after_checkpoint_optimizer_exists() -> None:
     assert slot.params == (existing, added)
     assert slot.optimizer is not None
     assert len(slot.optimizer.master_params) == 2
-    assert len(slot.optimizer.optimizer.param_groups) == 2
-    assert slot.optimizer.optimizer.param_groups[0]["lr"] == pytest.approx(
-        slot.optimizer.optimizer.param_groups[1]["lr"]
+    assert len(slot.optimizer.optimizer.param_groups) == 1
+    rebuilt = trainer._dynamic_optimizer(
+        "student", AdamParams(learning_rate=4e-3, beta1=0.7)
     )
+    assert rebuilt.optimizer.param_groups[0]["lr"] == 4e-3
+    assert rebuilt.optimizer.param_groups[0]["betas"][0] == 0.7
+
+
+def test_module_tracking_preserves_tied_parameter_identity() -> None:
+    trainer, rank = _trainer("student")
+
+    head = rank.module("head", lambda: _AliasHead(tied=True), checkpoint="student")
+
+    assert head.left is head.right
+    assert trainer._checkpoint_slots["student"].params == (head.left,)
 
 
 def test_failed_optimizer_extension_does_not_partially_register(
@@ -403,6 +616,19 @@ def test_failed_optimizer_extension_does_not_partially_register(
     assert slot.params == (existing,)
     assert slot.optimizer is not None
     assert len(slot.optimizer.master_params) == 1
+
+
+@pytest.mark.parametrize("mode", ("trainability", "aliases", "optimizer"))
+def test_distributed_custom_registration_fails_transactionally(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    mp.spawn(
+        _distributed_custom_registration_worker,
+        args=(2, f"file://{tmp_path / mode}", mode),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_custom_parameters_join_slot_optimizer_with_replicated_metadata() -> None:
@@ -497,7 +723,7 @@ def test_custom_tensor_checkpoint_artifacts_and_lora_export_are_separate(
         }
 
     manifest = json.loads((output / "checkpoint.json").read_text())
-    assert manifest["format_version"] == 2
+    assert manifest["format_version"] == 3
     assert manifest["custom_tensors"] == {
         "running_mean": {
             "kind": "buffer",
@@ -535,6 +761,97 @@ def test_custom_tensor_checkpoint_artifacts_and_lora_export_are_separate(
         "adapter_config.json",
         "adapter_model.safetensors",
     }
+
+
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+@pytest.mark.parametrize("corruption", ("draft_format", "trainable_buffer"))
+def test_custom_checkpoint_rejects_unreleased_or_invalid_manifests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    trainer, rank = _real_lora_trainer()
+    head, temperature, _buffer = _register_custom_tensors(rank)
+    _step_custom_tensors(trainer, head, temperature, monkeypatch)
+    output = tmp_path / "checkpoint"
+    trainer.save_checkpoint(str(output), "student")
+    manifest = json.loads((output / "checkpoint.json").read_text())
+    if corruption == "draft_format":
+        manifest["format_version"] = 2
+        message = "draft custom checkpoint format 2"
+    else:
+        manifest["custom_tensors"]["running_mean"]["trainable_keys"] = ["running_mean"]
+        message = "custom tensor mapping"
+    manifest["digest"] = _manifest_digest(manifest)
+    (output / "checkpoint.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(RuntimeError, match=message):
+        prepare_checkpoint(str(output))
+
+
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+def test_custom_tensor_names_cannot_corrupt_lora_optimizer_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, rank = _real_lora_trainer()
+    head = rank.module("layer", _CollisionHead, checkpoint="student")
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(
+            torch.zeros_like(param, dtype=torch.float32)
+            if param.grad is None
+            else param.grad.float()
+            for param in params
+        ),
+    )
+    head.q_proj.lora_A.weight.sum().backward()
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-3, weight_decay=0.0),
+        checkpoints=["student"],
+    )
+    output = tmp_path / "checkpoint"
+
+    trainer.save_checkpoint(str(output), "student")
+    prepared = prepare_checkpoint(str(output))
+
+    assert prepared.manifest is not None
+    assert (
+        prepared.manifest["parameters"]["layer.q_proj.lora_A.weight"]
+        != ["optimizer/custom.safetensors"] * 3
+    )
+
+
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+def test_loaded_custom_payload_is_owned_after_source_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.trainer_rank import _checkpoint
+
+    original, original_api = _real_lora_trainer()
+    original_head, original_temperature, _buffer = _register_custom_tensors(
+        original_api
+    )
+    _step_custom_tensors(original, original_head, original_temperature, monkeypatch)
+    saved = tmp_path / "saved"
+    original.save_checkpoint(str(saved), "student")
+
+    restored, restored_api = _empty_real_lora_trainer()
+    prepared = prepare_checkpoint(str(saved))
+    _checkpoint.load_checkpoint(restored, prepared, "student")
+    shutil.rmtree(saved)
+
+    resaved = tmp_path / "resaved-before-registration"
+    restored.save_checkpoint(str(resaved), "student")
+    restored_head, restored_temperature, _restored_buffer = _register_custom_tensors(
+        restored_api
+    )
+    assert restored_head.proj.weight.shape == original_head.proj.weight.shape
+    torch.testing.assert_close(
+        restored_temperature, original_temperature, atol=0, rtol=0
+    )
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
