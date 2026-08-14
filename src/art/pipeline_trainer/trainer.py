@@ -100,6 +100,19 @@ class _PreparedPipelineItem(BaseModel):
     handoff: asyncio.Event = Field(default_factory=asyncio.Event, exclude=True)
 
 
+class _PostTrainItem(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    batch: list[TrajectoryGroup]
+    result: Any
+    current_step: int = Field(ge=1)
+    training_policy_step: int = Field(ge=0)
+    should_eval_step: bool
+    step_seconds: float = Field(ge=0)
+    policy_age_metrics: dict[str, float]
+    metrics: dict[str, float]
+
+
 def _is_eval_mapping(
     result: Sequence[art.Trajectory | art.TrajectoryGroup]
     | Mapping[str, Sequence[art.Trajectory | art.TrajectoryGroup]],
@@ -344,6 +357,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._scheduled_eval_leases: dict[int, AsyncExitStack] = {}
         self._checkpoint_log_tasks: set[asyncio.Task[None]] = set()
         self._checkpoint_log_failure: BaseException | None = None
+        self._post_train_tasks: set[asyncio.Task[None]] = set()
 
         self.state = PipelineState()
         self._stop_event = asyncio.Event()
@@ -532,6 +546,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 await self._discard_pending_prepared_batches()
             except BaseException as exc:
                 cleanup_failures.append(exc)
+            if self._post_train_tasks:
+                results = await asyncio.gather(
+                    *tuple(self._post_train_tasks), return_exceptions=True
+                )
+                self._post_train_tasks.clear()
+                cleanup_failures.extend(
+                    result for result in results if isinstance(result, BaseException)
+                )
             if not training_failed:
                 try:
                     await self._finalize_backend_training()
@@ -1051,6 +1073,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self.model,
                 batch,
                 normalize_advantages=self.normalize_advantages,
+                grad_accumulation_sequences=self.grad_accumulation_sequences,
             )
             preparation_s = time.monotonic() - started
             if preparation_metrics is None:
@@ -1078,6 +1101,92 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if saw_sentinel:
                 return
 
+    async def _finalize_post_train(self, item: _PostTrainItem) -> None:
+        # Let the training coroutine dispatch a ready next batch before waking
+        # rollout waiters or doing controller-only work.
+        await asyncio.sleep(0)
+        async with self.state.policy_updated:
+            self.state.policy_updated.notify_all()
+
+        phases: dict[str, float] = {}
+        started = time.monotonic()
+        await self._log_checkpoint_saved(item.result)
+        await self._prune_model_adapters(item.current_step)
+        await self._run_checkpoint_retention(item.current_step)
+        phases["housekeeping"] = time.monotonic() - started
+
+        started = time.monotonic()
+        metrics = dict(item.metrics)
+        metrics.update(item.result.metrics)
+        attachment_metrics, attachment_owns_vllm_metrics = (
+            self._collect_attachment_train_step_metrics()
+        )
+        metrics.update(attachment_metrics)
+        vllm_metrics_collector = getattr(
+            self.backend, "collect_train_step_vllm_metrics", None
+        )
+        if (
+            callable(vllm_metrics_collector)
+            and not attachment_owns_vllm_metrics
+            and self.model._serving_capabilities is not None
+            and self.model._serving_capabilities.fast_metrics
+        ):
+            maybe_metrics = vllm_metrics_collector(self.model)
+            if inspect.isawaitable(maybe_metrics):
+                metrics.update(await maybe_metrics)
+        metrics.update(
+            self._score_metrics(
+                item.training_policy_step,
+                item.batch,
+                step_seconds=item.step_seconds,
+                result_metrics=metrics,
+                age_metrics=item.policy_age_metrics,
+            )
+        )
+        phases["metrics"] = time.monotonic() - started
+
+        started = time.monotonic()
+        metrics.update(await self._queue_freshness_metrics(item.current_step))
+        metrics.update(self._pipeline_settings_metrics())
+        phases["queue_snapshot"] = time.monotonic() - started
+
+        started = time.monotonic()
+        await self._emit_packed_group_observations(
+            metrics, batch=item.batch, step=item.current_step
+        )
+        await self._emit_pipeline_metrics(metrics, step=item.current_step)
+        phases["autotuner"] = time.monotonic() - started
+
+        started = time.monotonic()
+        await self.model.log(
+            item.batch,
+            split="train",
+            step=item.current_step,
+            metrics=metrics,
+        )
+        phases["history"] = time.monotonic() - started
+
+        started = time.monotonic()
+        await self._log_zero_variance_groups(item.current_step)
+        if self.eval_fn is not None and item.should_eval_step:
+            await self._schedule_eval_step(item.current_step)
+        self._persist_state(item.current_step)
+        phases["persistence"] = time.monotonic() - started
+
+        if os.getenv("ART_TRAIN_STEP_LOG"):
+            summary = " ".join(
+                f"{name}={duration * 1e3:.1f}ms" for name, duration in phases.items()
+            )
+            print(f"[train] step {item.current_step} controller {summary}")
+
+    async def _await_post_train(self, task: asyncio.Task[None] | None) -> None:
+        if task is None:
+            return
+        try:
+            await task
+        finally:
+            self._post_train_tasks.discard(task)
+
     async def _training_stage(self) -> None:
         if self._output_queue is None:
             return
@@ -1094,6 +1203,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         pending_stale_groups = 0
         pending_zero_variance_groups = 0
         pending_dequeued_groups = 0
+        post_train_task: asyncio.Task[None] | None = None
 
         while True:
             if stop_at_step is not None and current_step >= stop_at_step:
@@ -1164,9 +1274,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             should_eval_step = self._should_eval_step(expected_step)
             should_checkpoint = self.save_checkpoint and should_eval_step
 
-            async with self.state.policy_updated:
-                self.state.next_training_step = expected_step
-                self.state.policy_updated.notify_all()
+            self.state.next_training_step = expected_step
             if self._packed_queue is not None:
                 prepared.handoff.set()
 
@@ -1212,6 +1320,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     group._packed_group_shape = None
                     await self._discard_collected_group(group)
                 self._status.note_training_end()
+                await self._await_post_train(post_train_task)
                 raise
             finally:
                 train_call_elapsed = time.monotonic() - train_call_start
@@ -1221,143 +1330,91 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         f"{train_call_elapsed:.1f}s"
                     )
 
-            try:
-                post_train_phases: dict[str, float] = {}
-                phase_started = time.monotonic()
-                current_step = result.step
-                self.state.policy_version = current_step
-                self.state.next_training_step = current_step
-                await self._log_checkpoint_saved(result)
-                await self._prune_model_adapters(current_step)
-                await self._run_checkpoint_retention(current_step)
-                post_train_phases["housekeeping"] = time.monotonic() - phase_started
+            self._status.note_training_end()
+            post_train_wait_started = time.monotonic()
+            await self._await_post_train(post_train_task)
+            post_train_wait_s = time.monotonic() - post_train_wait_started
+            post_train_task = None
 
-                phase_started = time.monotonic()
-                step_seconds = time.monotonic() - step_start
-                actor_wall_s, actor_idle_s, queue_wait_s = (
-                    self._consume_producer_rollout_timings()
-                )
-                self._status.note_training_batch(
-                    batch, step=current_step, step_seconds=step_seconds
-                )
+            current_step = int(result.step)
+            self.state.policy_version = current_step
+            self.state.next_training_step = current_step
+            step_seconds = time.monotonic() - step_start
+            actor_wall_s, actor_idle_s, queue_wait_s = (
+                self._consume_producer_rollout_timings()
+            )
+            self._status.note_training_batch(
+                batch, step=current_step, step_seconds=step_seconds
+            )
 
-                stale_groups = float(self.state.discarded_stale_groups)
-                zero_variance_groups = float(self.state.discarded_zero_variance_groups)
-                self.state.accepted_trainable_groups += len(batch)
-                generated_groups_cum = (
-                    float(self.state.accepted_trainable_groups)
-                    + stale_groups
-                    + zero_variance_groups
-                )
-                metrics = {
-                    "discarded/cum/stale_groups": stale_groups,
-                    "discarded/cum/zero_variance_groups": zero_variance_groups,
-                    "discarded/step/stale_groups": float(step_stale_groups),
-                    "discarded/step/zero_variance_groups": float(
-                        step_zero_variance_groups
-                    ),
-                    "discarded/rate/stale_groups": stale_groups
-                    / max(generated_groups_cum, 1.0),
-                    "discarded/rate/zero_variance_groups": zero_variance_groups
-                    / max(generated_groups_cum, 1.0),
-                    "time/step_wall_s": step_seconds,
-                    "time/step_collect_batch_s": trainer_idle_s,
-                    "time/step_trainer_idle_s": trainer_idle_s,
-                    "time/step_rollout_s": actor_wall_s,
-                    "time/step_rollout_idle_s": actor_idle_s,
-                    "queue/put_wait_s": queue_wait_s,
-                    "queue/put_wait_frac": queue_wait_s
-                    / max(queue_wait_s + actor_wall_s, 1e-9),
-                    "queue/actual_stale_fraction": step_stale_groups
-                    / max(step_dequeued_groups, 1),
-                }
-                if self._packed_queue is not None:
-                    metrics.update(
-                        {
-                            "time/step_batch_selection_s": selection_s,
-                            "time/step_batch_prepare_s": preparation_s,
-                            "queue/packed_get_wait_s": trainer_idle_s,
-                            "queue/packed_queue_depth": float(packed_queue_depth),
-                            "queue/packed_queue_occupancy": packed_queue_depth
-                            / self._packed_queue.maxsize,
-                            "queue/packing_policy_lag_steps": float(
-                                current_step - packing_policy_step
-                            ),
-                        }
-                    )
-                    metrics.update(preparation_metrics)
-                metrics.setdefault("time/step_backend_train_s", train_call_elapsed)
-                metrics.update(result.metrics)
-                attachment_metrics, attachment_owns_vllm_metrics = (
-                    self._collect_attachment_train_step_metrics()
-                )
-                metrics.update(attachment_metrics)
-                vllm_metrics_collector = getattr(
-                    self.backend, "collect_train_step_vllm_metrics", None
-                )
-                if (
-                    callable(vllm_metrics_collector)
-                    and not attachment_owns_vllm_metrics
-                    and self.model._serving_capabilities is not None
-                    and self.model._serving_capabilities.fast_metrics
-                ):
-                    maybe_metrics = vllm_metrics_collector(self.model)
-                    if inspect.isawaitable(maybe_metrics):
-                        metrics.update(await maybe_metrics)
+            stale_groups = float(self.state.discarded_stale_groups)
+            zero_variance_groups = float(self.state.discarded_zero_variance_groups)
+            self.state.accepted_trainable_groups += len(batch)
+            generated_groups_cum = (
+                float(self.state.accepted_trainable_groups)
+                + stale_groups
+                + zero_variance_groups
+            )
+            metrics = {
+                "discarded/cum/stale_groups": stale_groups,
+                "discarded/cum/zero_variance_groups": zero_variance_groups,
+                "discarded/step/stale_groups": float(step_stale_groups),
+                "discarded/step/zero_variance_groups": float(step_zero_variance_groups),
+                "discarded/rate/stale_groups": stale_groups
+                / max(generated_groups_cum, 1.0),
+                "discarded/rate/zero_variance_groups": zero_variance_groups
+                / max(generated_groups_cum, 1.0),
+                "time/step_wall_s": step_seconds,
+                "time/step_collect_batch_s": trainer_idle_s,
+                "time/step_trainer_idle_s": trainer_idle_s,
+                "time/step_rollout_s": actor_wall_s,
+                "time/step_rollout_idle_s": actor_idle_s,
+                "time/step_backend_train_s": train_call_elapsed,
+                "time/step_post_train_backpressure_s": post_train_wait_s,
+                "queue/put_wait_s": queue_wait_s,
+                "queue/put_wait_frac": queue_wait_s
+                / max(queue_wait_s + actor_wall_s, 1e-9),
+                "queue/actual_stale_fraction": step_stale_groups
+                / max(step_dequeued_groups, 1),
+            }
+            if self._packed_queue is not None:
                 metrics.update(
-                    self._score_metrics(
-                        training_policy_step,
-                        batch,
+                    {
+                        "time/step_batch_selection_s": selection_s,
+                        "time/step_batch_prepare_s": preparation_s,
+                        "queue/packed_get_wait_s": trainer_idle_s,
+                        "queue/packed_queue_depth": float(packed_queue_depth),
+                        "queue/packed_queue_occupancy": packed_queue_depth
+                        / self._packed_queue.maxsize,
+                        "queue/packing_policy_lag_steps": float(
+                            current_step - packing_policy_step
+                        ),
+                        **preparation_metrics,
+                    }
+                )
+            post_train_task = asyncio.create_task(
+                self._finalize_post_train(
+                    _PostTrainItem(
+                        batch=batch,
+                        result=result,
+                        current_step=current_step,
+                        training_policy_step=training_policy_step,
+                        should_eval_step=should_eval_step,
                         step_seconds=step_seconds,
-                        result_metrics=metrics,
-                        age_metrics=policy_age_metrics,
+                        policy_age_metrics=policy_age_metrics,
+                        metrics=metrics,
                     )
-                )
-                post_train_phases["metrics"] = time.monotonic() - phase_started
-                phase_started = time.monotonic()
-                metrics.update(await self._queue_freshness_metrics(current_step))
-                metrics.update(self._pipeline_settings_metrics())
-                post_train_phases["queue_snapshot"] = time.monotonic() - phase_started
-
-                phase_started = time.monotonic()
-                await self._emit_packed_group_observations(
-                    metrics, batch=batch, step=current_step
-                )
-                await self._emit_pipeline_metrics(metrics, step=current_step)
-                post_train_phases["autotuner"] = time.monotonic() - phase_started
-                phase_started = time.monotonic()
-                await self.model.log(
-                    batch,
-                    split="train",
-                    step=current_step,
-                    metrics=metrics,
-                )
-                post_train_phases["history"] = time.monotonic() - phase_started
-                phase_started = time.monotonic()
-                await self._log_zero_variance_groups(current_step)
-
-                if self.eval_fn is not None and should_eval_step:
-                    await self._schedule_eval_step(current_step)
-
-                self._persist_state(current_step)
-                post_train_phases["persistence"] = time.monotonic() - phase_started
-            finally:
-                self._status.note_training_end()
-
-            async with self.state.policy_updated:
-                self.state.policy_updated.notify_all()
-            if os.getenv("ART_TRAIN_STEP_LOG"):
-                phases = " ".join(
-                    f"{name}={duration * 1e3:.1f}ms"
-                    for name, duration in post_train_phases.items()
-                )
-                print(f"[train] step {current_step} controller {phases}")
+                ),
+                name=f"post_train_step_{current_step}",
+            )
+            self._post_train_tasks.add(post_train_task)
 
             if saw_sentinel:
                 stop_after_batch = True
             if stop_after_batch:
                 break
 
+        await self._await_post_train(post_train_task)
         self.state.done = True
         self._accept_prepared_batches = False
         if isinstance(self._output_queue, DistributedTrajectoryQueue):
