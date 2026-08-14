@@ -264,6 +264,23 @@ def test_custom_module_outputs_participate_in_checkpoint_graph_guards() -> None:
     trainer._guard_slot_can_load(ref)
 
 
+def test_custom_module_graph_tracking_allows_in_place_layers() -> None:
+    _trainer_rank, rank = _trainer("student")
+    head = rank.module(
+        "head",
+        lambda: torch.nn.Sequential(
+            torch.nn.Linear(3, 3),
+            torch.nn.ReLU(inplace=True),
+        ),
+        checkpoint="student",
+    )
+
+    output = head(torch.ones(1, 3, requires_grad=True))
+    output.sum().backward()
+
+    assert head[0].weight.grad is not None
+
+
 def test_custom_parameter_outputs_participate_in_checkpoint_graph_guards() -> None:
     trainer, rank = _trainer("student")
     parameter = rank.parameter(

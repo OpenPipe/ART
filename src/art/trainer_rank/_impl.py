@@ -438,7 +438,7 @@ class _SlotGraphSentinel(torch.autograd.Function):
         marker: torch.Tensor,
     ) -> torch.Tensor:
         ctx.save_for_backward(marker)
-        return tensor
+        return tensor.clone()
 
     @staticmethod
     def backward(
