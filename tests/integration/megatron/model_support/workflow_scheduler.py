@@ -1035,7 +1035,10 @@ def compile_prepared_workflows(
                         f"{prepared.report.model_key}:"
                         f"{RESIDENT_FUNCTIONAL_STAGES[stage_index - 1]}",
                     )
-            elif base_megatron is not None and stage_name == BASE_MEGATRON_STAGES[1]:
+            elif (
+                stage_name == BASE_MEGATRON_STAGES[1]
+                and BASE_MEGATRON_STAGES[0] in prepared.stages
+            ):
                 dependencies = (
                     f"{prepared.report.model_key}:{BASE_MEGATRON_STAGES[0]}",
                 )
