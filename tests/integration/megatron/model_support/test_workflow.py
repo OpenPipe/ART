@@ -1066,12 +1066,15 @@ def test_dsv4_throughput_uses_shorter_packed_sequence() -> None:
     dsv4 = _THROUGHPUT_CONFIGS["dsv4"]
     assert (
         dsv4.packed_sequence_length,
+        dsv4.prompt_tokens,
+        dsv4.rollouts_per_group,
         dsv4.completion_tokens,
         dsv4.groups_per_step,
-    ) == (32_768, 184, 8)
+        dsv4.initial_model_calls_per_inference_gpu,
+    ) == (32_768, 14_515, 12, 128, 4, 6)
     stage = HANDLER_WORKFLOW_RESOURCES["dsv4"].e2e_throughput
     assert stage is not None
-    assert _groups_per_packed_sequence(stage, dsv4) == 4
+    assert _groups_per_packed_sequence(stage, dsv4) == 2
     assert _THROUGHPUT_CONFIGS["llama3_dense"].groups_per_step == 23
     assert all(
         config.packed_sequence_length == THROUGHPUT_PACKED_SEQUENCE_LENGTH
