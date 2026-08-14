@@ -823,10 +823,12 @@ async def run_length_trainability_async(
         allow_unvalidated_arch=allow_unvalidated_arch,
         resource_stage_name="length_trainability",
     )
-    internal_config["engine_args"]["max_model_len"] = _get_env_int(
+    max_model_len = _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN",
         1024,
     )
+    internal_config["engine_args"]["max_model_len"] = max_model_len
+    internal_config["init_args"]["max_seq_length"] = max_model_len
     internal_config["engine_args"]["max_num_seqs"] = _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_NUM_SEQS",
         max(4, rollouts_per_prompt),
