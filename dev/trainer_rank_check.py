@@ -419,10 +419,14 @@ def _assert_topk_only_oracle(outputs: Sequence[dict[str, object]]) -> None:
         if key == "topk_tokens":
             if not torch.equal(actual, expected):
                 raise AssertionError("top-k-only tokens differ from same-run oracle")
-        elif _diff(actual, expected).mean_abs_pct > 2e-4:
-            raise AssertionError(
-                "top-k-only logprobs differ from same-run oracle by more than 0.0002"
-            )
+        else:
+            diff = _diff(actual, expected)
+            if diff.mean_abs_pct > 2e-4:
+                raise AssertionError(
+                    "top-k-only logprobs differ from same-run oracle: "
+                    f"mean_abs_pct={diff.mean_abs_pct}, "
+                    f"max_abs_diff={diff.max_abs_diff}"
+                )
 
 
 def _assert_stable_topk_tokens(
