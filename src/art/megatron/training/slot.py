@@ -133,6 +133,7 @@ class MegatronTrainingSlot:
         self.artifact_root = str(Path(artifact_root).resolve())
         self._runs: dict[str, _ResidentRun] = {}
         self._results: dict[str, tuple[str, Contract]] = {}
+        self._pending_results: dict[str, tuple[str, asyncio.Future[Contract]]] = {}
         self._sft_tokenizer = SftBatchTokenizer()
         self._batch_releases: set[asyncio.Task[None]] = set()
         self._batch_release_failures: list[BaseException] = []
@@ -558,42 +559,78 @@ class MegatronTrainingSlot:
         ref: OperationRef,
         request: SaveWeightsForSamplerRequest,
     ) -> SamplerWeightsResult:
+        completion = await self.start_save_weights_for_sampler(ref, request)
+        return await asyncio.shield(completion)
+
+    async def start_save_weights_for_sampler(
+        self,
+        ref: OperationRef,
+        request: SaveWeightsForSamplerRequest,
+    ) -> asyncio.Future[SamplerWeightsResult]:
         fingerprint = self._fingerprint(ref, request)
         if cached := self._cached_result(ref.operation_id, fingerprint):
-            return cast(SamplerWeightsResult, cached)
-        adapter, metrics = await self._snapshot(ref, save_optimizer=False)
-        result = SamplerWeightsResult(
-            operation_id=ref.operation_id,
-            checkpoint=checkpoint_ref(
-                ref.run_id, adapter.step, request.checkpoint_name
-            ),
-            lora=adapter.identity,
-            publication_metrics=metrics,
+            return _resolved_future(cast(SamplerWeightsResult, cached))
+        if pending := self._pending_result(ref.operation_id, fingerprint):
+            return cast(asyncio.Future[SamplerWeightsResult], pending)
+        snapshot = await self._start_snapshot(ref, save_optimizer=False)
+
+        async def complete() -> SamplerWeightsResult:
+            adapter, metrics = await self._finish_snapshot(snapshot)
+            result = SamplerWeightsResult(
+                operation_id=ref.operation_id,
+                checkpoint=checkpoint_ref(
+                    ref.run_id, adapter.step, request.checkpoint_name
+                ),
+                lora=adapter.identity,
+                publication_metrics=metrics,
+            )
+            self._results[ref.operation_id] = (fingerprint, result)
+            return result
+
+        return cast(
+            asyncio.Future[SamplerWeightsResult],
+            self._start_pending_result(ref.operation_id, fingerprint, complete()),
         )
-        self._results[ref.operation_id] = (fingerprint, result)
-        return result
 
     async def save_state(
         self,
         ref: OperationRef,
         request: SaveStateRequest,
     ) -> SaveStateResult:
+        completion = await self.start_save_state(ref, request)
+        return await asyncio.shield(completion)
+
+    async def start_save_state(
+        self,
+        ref: OperationRef,
+        request: SaveStateRequest,
+    ) -> asyncio.Future[SaveStateResult]:
         fingerprint = self._fingerprint(ref, request)
         if cached := self._cached_result(ref.operation_id, fingerprint):
-            return cast(SaveStateResult, cached)
-        adapter, metrics = await self._snapshot(ref, save_optimizer=True)
+            return _resolved_future(cast(SaveStateResult, cached))
+        if pending := self._pending_result(ref.operation_id, fingerprint):
+            return cast(asyncio.Future[SaveStateResult], pending)
         state = self._require_run(ref.run_id)
         optimizer_state_path = state.registration.optimizer_state_path
-        result = SaveStateResult(
-            operation_id=ref.operation_id,
-            checkpoint=checkpoint_ref(
-                ref.run_id, adapter.step, request.checkpoint_name
-            ),
-            optimizer_state=optimizer_state_path,
-            metrics=metrics,
+        snapshot = await self._start_snapshot(ref, save_optimizer=True)
+
+        async def complete() -> SaveStateResult:
+            adapter, metrics = await self._finish_snapshot(snapshot)
+            result = SaveStateResult(
+                operation_id=ref.operation_id,
+                checkpoint=checkpoint_ref(
+                    ref.run_id, adapter.step, request.checkpoint_name
+                ),
+                optimizer_state=optimizer_state_path,
+                metrics=metrics,
+            )
+            self._results[ref.operation_id] = (fingerprint, result)
+            return result
+
+        return cast(
+            asyncio.Future[SaveStateResult],
+            self._start_pending_result(ref.operation_id, fingerprint, complete()),
         )
-        self._results[ref.operation_id] = (fingerprint, result)
-        return result
 
     async def _snapshot(
         self,
@@ -683,18 +720,16 @@ class MegatronTrainingSlot:
             snapshot.generation,
             records,
         )
-        state.generation = TrainerGeneration(
-            training_session_id=durable.adapter.training_session_id,
-            policy_step=durable.adapter.step,
-            generation_id=durable.adapter.generation_id,
-            adapter_path=durable.adapter.identity,
-        )
+        if state.generation.policy_step < snapshot.generation.policy_step:
+            raise RuntimeError("resident learner regressed behind completed snapshot")
         return durable.adapter, {
             **snapshot.metrics,
             "time/snapshot_durable_s": time.perf_counter() - snapshot.started,
         }
 
     def retire_operation(self, operation_id: str) -> None:
+        if operation_id in self._pending_results:
+            raise RuntimeError("cannot retire an incomplete training operation")
         self.trainer.retire_operation(operation_id)
         self._results.pop(operation_id, None)
 
@@ -704,6 +739,22 @@ class MegatronTrainingSlot:
         self._closed = True
         primary: BaseException | None = None
         try:
+            if self._pending_results:
+                outcomes = await asyncio.gather(
+                    *(pending[1] for pending in self._pending_results.values()),
+                    return_exceptions=True,
+                )
+                failures = [
+                    outcome
+                    for outcome in outcomes
+                    if isinstance(outcome, BaseException)
+                ]
+                if len(failures) == 1:
+                    raise failures[0]
+                if failures:
+                    raise BaseExceptionGroup(
+                        "pending snapshot completion failed", failures
+                    )
             if self._batch_releases:
                 await asyncio.gather(
                     *tuple(self._batch_releases), return_exceptions=True
@@ -781,6 +832,30 @@ class MegatronTrainingSlot:
             raise RuntimeError("operation_id was reused for a different command")
         return cached[1]
 
+    def _pending_result(
+        self, operation_id: str, fingerprint: str
+    ) -> asyncio.Future[Contract] | None:
+        pending = self._pending_results.get(operation_id)
+        if pending is None:
+            return None
+        if pending[0] != fingerprint:
+            raise RuntimeError("operation_id was reused for a different command")
+        return pending[1]
+
+    def _start_pending_result(
+        self, operation_id: str, fingerprint: str, completion: Any
+    ) -> asyncio.Future[Contract]:
+        task = asyncio.create_task(completion, name=f"megatron-save-{operation_id}")
+        self._pending_results[operation_id] = (fingerprint, task)
+
+        def completed(done: asyncio.Future[Contract]) -> None:
+            current = self._pending_results.get(operation_id)
+            if current is not None and current[1] is done:
+                self._pending_results.pop(operation_id)
+
+        task.add_done_callback(completed)
+        return task
+
     def _require_managed_path(self, path: str) -> str:
         resolved = Path(path).resolve()
         if not resolved.is_relative_to(self.artifact_root):
@@ -788,7 +863,7 @@ class MegatronTrainingSlot:
         return str(resolved)
 
 
-def _resolved_future(value: OptimStepResult) -> asyncio.Future[OptimStepResult]:
+def _resolved_future(value: Any) -> asyncio.Future[Any]:
     future = asyncio.get_running_loop().create_future()
     future.set_result(value)
     return future
