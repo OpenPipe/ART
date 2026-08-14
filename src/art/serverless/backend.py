@@ -212,6 +212,10 @@ class ServerlessBackend:
                 return_exceptions=True,
             )
         finally:
+            await asyncio.gather(
+                *(client.close_event_observer() for client in self._clients.values()),
+                return_exceptions=True,
+            )
             await self._service.close()
         if failures:
             raise BaseExceptionGroup("ServerlessBackend shutdown failed", failures)
@@ -224,6 +228,7 @@ class ServerlessBackend:
         client = await self.training_client(model)
         await client.close()
         await client.wait_closed()
+        await client.close_event_observer()
         checkpoints = await self._service.list_checkpoints(client.run_id)
         for checkpoint in checkpoints.checkpoints:
             await self._service.delete_checkpoint(

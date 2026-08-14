@@ -37,9 +37,11 @@ from .contracts import (
     CloseRunRequest,
     CreateTrainingRunRequest,
     DeleteCheckpointResult,
+    EventPage,
     OperationResultRef,
     OperationView,
     RemoteForwardRequest,
+    RunEvent,
     SetCheckpointTtlRequest,
     TrainingCapabilities,
     TrainingDataRef,
@@ -179,6 +181,13 @@ class RemoteTrainingServiceClient:
             raise RemoteTrainingError("remote operation result byte count changed")
         return payload
 
+    async def get_events(self, run_id: str, *, after: int) -> EventPage:
+        return await self._request(
+            "GET",
+            f"training/runs/{run_id}/events?after={after}&limit={_EVENT_PAGE_LIMIT}",
+            EventPage,
+        )
+
     async def cancel_operation(
         self, operation_id: str, request_id: str
     ) -> OperationView:
@@ -309,19 +318,97 @@ class RemoteTrainingServiceClient:
             await self._client.aclose()
 
 
+_EVENT_PAGE_LIMIT = 1000
+_TERMINAL_EVENTS = frozenset(
+    {"operation_succeeded", "operation_failed", "operation_cancelled"}
+)
+
+
+class _RunEventObserver:
+    def __init__(
+        self,
+        service: RemoteTrainingServiceClient,
+        run_id: str,
+        poll_interval_s: float,
+    ) -> None:
+        self._service = service
+        self._run_id = run_id
+        self._poll_interval_s = poll_interval_s
+        self._cursor = 0
+        self._terminal: dict[str, RunEvent] = {}
+        self._condition = asyncio.Condition()
+        self._task: asyncio.Task[None] | None = None
+        self._error: BaseException | None = None
+        self._closed = False
+
+    async def wait(self, operation_id: str) -> RunEvent:
+        async with self._condition:
+            if self._task is None:
+                self._task = asyncio.create_task(
+                    self._observe(), name=f"remote-training-events-{self._run_id}"
+                )
+            await self._condition.wait_for(
+                lambda: (
+                    operation_id in self._terminal
+                    or self._error is not None
+                    or self._closed
+                )
+            )
+            if self._error is not None:
+                raise self._error
+            if self._closed:
+                raise RemoteTrainingError("remote training event observer is closed")
+            return self._terminal.pop(operation_id)
+
+    async def close(self) -> None:
+        async with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            task, self._task = self._task, None
+            self._condition.notify_all()
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def _observe(self) -> None:
+        try:
+            while True:
+                page = await self._service.get_events(self._run_id, after=self._cursor)
+                async with self._condition:
+                    if page.next_cursor < self._cursor:
+                        raise RemoteTrainingError("remote event cursor moved backwards")
+                    self._cursor = page.next_cursor
+                    for event in page.events:
+                        if event.event in _TERMINAL_EVENTS:
+                            if event.operation_id is None:
+                                raise RemoteTrainingError(
+                                    "terminal operation event has no operation_id"
+                                )
+                            self._terminal[event.operation_id] = event
+                    self._condition.notify_all()
+                if len(page.events) < _EVENT_PAGE_LIMIT:
+                    await asyncio.sleep(self._poll_interval_s)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            async with self._condition:
+                self._error = error
+                self._condition.notify_all()
+
+
 class RemoteTrainingOperation(Generic[ResultT]):
     def __init__(
         self,
         ref: OperationRef,
         service: RemoteTrainingServiceClient,
+        events: _RunEventObserver,
         result_type: type[ResultT],
-        *,
-        poll_interval_s: float,
     ) -> None:
         self._ref = ref
         self._service = service
+        self._events = events
         self._result_type = result_type
-        self._poll_interval_s = poll_interval_s
         self._completion: asyncio.Task[ResultT] | None = None
         self._cancel_request_id = uuid.uuid4().hex
 
@@ -337,41 +424,26 @@ class RemoteTrainingOperation(Generic[ResultT]):
         return await asyncio.shield(self._completion)
 
     async def _wait(self) -> ResultT:
-        while True:
-            operation = await self._service.get_operation(self._ref.operation_id)
-            if operation.ref != self._ref:
-                raise RemoteTrainingError("remote operation identity changed")
-            if operation.status == "succeeded":
-                if operation.result is None:
-                    raise RemoteTrainingError("successful operation has no result")
-                remote = operation.result
-                if self._ref.kind in {"forward", "forward_backward"}:
-                    if not isinstance(remote, OperationResultRef):
-                        raise RemoteTrainingError(
-                            "remote forward result has no binary sidecar"
-                        )
-                    payload = await self._service.get_operation_result(
-                        self._ref.operation_id, remote
-                    )
-                    result = decode_operation_result(remote, payload, self._result_type)
-                else:
-                    if isinstance(remote, OperationResultRef):
-                        raise RemoteTrainingError(
-                            "remote control result unexpectedly uses a sidecar"
-                        )
-                    result = self._result_type.model_validate(remote)
-                if result.operation_id != self._ref.operation_id:
-                    raise RemoteTrainingError("operation result identity changed")
-                return result
-            if operation.status == "failed":
-                raise RemoteTrainingOperationError(
-                    self._ref.operation_id, operation.error or {}
-                )
-            if operation.status == "cancelled":
-                raise RemoteTrainingOperationCancelled(
-                    f"remote training operation {self._ref.operation_id} was cancelled"
-                )
-            await asyncio.sleep(self._poll_interval_s)
+        event = await self._events.wait(self._ref.operation_id)
+        if event.event == "operation_failed":
+            raise RemoteTrainingOperationError(self._ref.operation_id, event.payload)
+        if event.event == "operation_cancelled":
+            raise RemoteTrainingOperationCancelled(
+                f"remote training operation {self._ref.operation_id} was cancelled"
+            )
+        if event.event != "operation_succeeded":
+            raise RemoteTrainingError(f"unexpected terminal event {event.event!r}")
+        if self._ref.kind in {"forward", "forward_backward"}:
+            remote = OperationResultRef.model_validate(event.payload)
+            payload = await self._service.get_operation_result(
+                self._ref.operation_id, remote
+            )
+            result = decode_operation_result(remote, payload, self._result_type)
+        else:
+            result = self._result_type.model_validate(event.payload)
+        if result.operation_id != self._ref.operation_id:
+            raise RemoteTrainingError("operation result identity changed")
+        return result
 
     async def cancel(self) -> None:
         await self._service.cancel_operation(
@@ -401,6 +473,7 @@ class RemoteTrainingClient:
         self._next_sequence_id = run.next_sequence_id
         self._projected_learner_version = run.projected_learner_version
         self._poll_interval_s = poll_interval_s
+        self._events = _RunEventObserver(service, run.run_id, poll_interval_s)
         self._close_timeout_s = close_timeout_s
         self._lock = asyncio.Lock()
         self._operations: dict[str, tuple[str, RemoteTrainingOperation[Any]]] = {}
@@ -483,8 +556,8 @@ class RemoteTrainingClient:
             operation = RemoteTrainingOperation(
                 ref,
                 self._service,
+                self._events,
                 result_type,
-                poll_interval_s=self._poll_interval_s,
             )
             self._operations[request.request_id] = (fingerprint, operation)
             self._next_sequence_id += 1
@@ -590,3 +663,7 @@ class RemoteTrainingClient:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self._events.close()
+
+    async def close_event_observer(self) -> None:
+        await self._events.close()
