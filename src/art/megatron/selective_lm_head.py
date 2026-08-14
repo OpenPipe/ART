@@ -13,6 +13,7 @@ import torch
 from art.loss import AlignedLossInputs, LossInputs
 
 _ENABLE_ENV = "ART_MEGATRON_SELECTIVE_LM_HEAD"
+_ROW_ALIGNMENT = 16
 
 
 class LmHeadTokenSelection(BaseModel):
@@ -34,10 +35,21 @@ class LmHeadTokenSelection(BaseModel):
             raise ValueError(
                 f"LM-head labels must be [B, S], got {tuple(labels.shape)}"
             )
-        indices = torch.nonzero(labels.reshape(-1) != -100, as_tuple=False).reshape(-1)
-        if labels.numel() and not indices.numel():
-            # Keep one ignored row so zero-contribution microbatches retain a graph.
-            indices = torch.zeros(1, dtype=torch.long, device=labels.device)
+        flat_labels = labels.reshape(-1)
+        indices = torch.nonzero(flat_labels != -100, as_tuple=False).reshape(-1)
+        pad_rows = (
+            _ROW_ALIGNMENT
+            if labels.numel() and not indices.numel()
+            else -indices.numel() % _ROW_ALIGNMENT
+        )
+        if pad_rows:
+            # TE specializes n_rows divisibility into data-dependent Triton
+            # binaries. Ignored rows keep every compact launch on one path.
+            ignored = torch.nonzero(flat_labels == -100, as_tuple=False).reshape(-1)
+            if not ignored.numel():
+                raise ValueError("LM-head row alignment requires one ignored label")
+            repeats = (pad_rows + ignored.numel() - 1) // ignored.numel()
+            indices = torch.cat((indices, ignored.repeat(repeats)[:pad_rows]))
         if target_device is not None:
             indices = indices.to(device=target_device, non_blocking=True)
         return cls(
