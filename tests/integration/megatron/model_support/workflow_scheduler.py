@@ -1251,6 +1251,8 @@ def run_prepared_workflows(
             items=tuple(items),
         )
         request_json.write_text(request.model_dump_json(indent=2), encoding="utf-8")
+        if any(item.environment != items[0].environment for item in items[1:]):
+            raise RuntimeError("one workflow session requires one process environment")
         environment = os.environ.copy()
         environment.update(
             {
@@ -1285,6 +1287,7 @@ def run_prepared_workflows(
             request_json=request_json,
             log_path=session_log,
             environment=environment,
+            session_environment=items[0].environment,
             torch_threads=torch.get_num_threads(),
             timeout_s=timeout_s,
         )

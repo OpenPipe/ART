@@ -64,7 +64,7 @@ def _raise_signal_exit(signum: int, _frame: Any) -> None:
     raise SystemExit(128 + signum)
 
 
-def _run_child(worker: Any, request: dict[str, Any]) -> None:
+def _run_child(request: dict[str, Any]) -> None:
     try:
         os.setsid()
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -88,8 +88,10 @@ def _run_child(worker: Any, request: dict[str, Any]) -> None:
                 os.environ[key] = value
         import torch
 
+        from . import workflow_stage_worker
+
         torch.set_num_threads(int(request["torch_threads"]))
-        worker.run_session_json(request["request_json"])
+        workflow_stage_worker.run_session_json(request["request_json"])
     except BaseException:
         traceback.print_exc()
         os._exit(1)
@@ -99,14 +101,13 @@ def _run_child(worker: Any, request: dict[str, Any]) -> None:
 def _launch_child(
     selector: selectors.BaseSelector,
     children: dict[int, dict[str, Any]],
-    worker: Any,
     request: dict[str, Any],
 ) -> None:
     _assert_fork_safe()
     started = time.monotonic()
     pid = os.fork()
     if pid == 0:
-        _run_child(worker, request)
+        _run_child(request)
     pid_fd = os.pidfd_open(pid)
     child = {
         "id": request["id"],
@@ -147,8 +148,6 @@ def _finish_child(
 
 def _serve() -> None:
     started = time.monotonic()
-    from . import workflow_stage_worker
-
     state = _assert_fork_safe()
     _reply(
         {
@@ -191,7 +190,7 @@ def _serve() -> None:
                 elif stopping:
                     _reply({"id": request["id"], "ok": False, "error": "stopping"})
                 else:
-                    _launch_child(selector, children, workflow_stage_worker, request)
+                    _launch_child(selector, children, request)
         now = time.monotonic()
         for child in tuple(children.values()):
             if not child["timed_out"] and now >= child["deadline"]:
@@ -375,6 +374,7 @@ class _HostForkserver:
         request_json: Path,
         log_path: Path,
         environment: dict[str, str],
+        session_environment: dict[str, str],
         torch_threads: int,
         timeout_s: float,
     ) -> dict[str, Any]:
@@ -388,6 +388,7 @@ class _HostForkserver:
                 for key in ("CUDA_VISIBLE_DEVICES", "PYTHONPATH", "WANDB_MODE")
             }
         )
+        child_environment.update(session_environment)
         return self._request(
             {
                 "command": "run",
