@@ -57,8 +57,8 @@ from .checkpoint_retention import (
     CHECKPOINT_EVAL_COMPLETED_METRIC,
     CHECKPOINT_SAVED_METRIC,
     CheckpointInfo,
-    CheckpointRetentionContext,
     CheckpointRetentionStrategy,
+    plan_checkpoint_retention,
 )
 from .state import PipelineState
 from .status import StatusReporter
@@ -2301,45 +2301,15 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         all_checkpoints = await self._checkpoint_infos()
         if not all_checkpoints:
             return
-        protected_steps = self._protected_checkpoint_steps(current_step)
-        eligible_steps = {
-            checkpoint.step
-            for checkpoint in all_checkpoints
-            if checkpoint.step not in protected_steps
-        }
-        context = CheckpointRetentionContext(
+        plan = plan_checkpoint_retention(
             current_step=current_step,
-            checkpoints=[
-                checkpoint.model_copy(
-                    update={"deletion_eligible": checkpoint.step in eligible_steps}
-                )
-                for checkpoint in all_checkpoints
-            ],
+            checkpoints=all_checkpoints,
+            protected_steps=self._protected_checkpoint_steps(current_step),
+            strategy=strategy,
         )
-        plan = strategy(context)
-        selected = plan.retain_steps | plan.archive_steps
-        known_steps = {checkpoint.step for checkpoint in all_checkpoints}
-        unknown = selected - known_steps
-        if unknown:
-            raise ValueError(
-                f"checkpoint retention selected ineligible steps: {sorted(unknown)}"
-            )
-        keep_eligible_steps = plan.retain_steps & eligible_steps
-        delete_steps = eligible_steps - keep_eligible_steps
-        if not delete_steps and not plan.archive_steps:
+        if plan is None:
             return
-        keep_steps = {checkpoint.step for checkpoint in all_checkpoints} - delete_steps
-        await self.backend._apply_checkpoint_retention(
-            self.model,
-            plan.model_copy(
-                update={
-                    "observed_steps": {
-                        checkpoint.step for checkpoint in all_checkpoints
-                    },
-                    "retain_steps": keep_steps,
-                }
-            ),
-        )
+        await self.backend._apply_checkpoint_retention(self.model, plan)
 
     @staticmethod
     def _is_scalar_metadata(value: object) -> bool:

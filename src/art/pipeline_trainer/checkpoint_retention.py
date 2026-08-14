@@ -37,6 +37,42 @@ CheckpointRetentionStrategy = Callable[
 ]
 
 
+def plan_checkpoint_retention(
+    *,
+    current_step: int,
+    checkpoints: list[CheckpointInfo],
+    protected_steps: set[int],
+    strategy: CheckpointRetentionStrategy,
+) -> CheckpointRetentionPlan | None:
+    known_steps = {checkpoint.step for checkpoint in checkpoints}
+    eligible_steps = known_steps - protected_steps
+    plan = strategy(
+        CheckpointRetentionContext(
+            current_step=current_step,
+            checkpoints=[
+                checkpoint.model_copy(
+                    update={"deletion_eligible": checkpoint.step in eligible_steps}
+                )
+                for checkpoint in checkpoints
+            ],
+        )
+    )
+    unknown = (plan.retain_steps | plan.archive_steps) - known_steps
+    if unknown:
+        raise ValueError(
+            f"checkpoint retention selected unknown steps: {sorted(unknown)}"
+        )
+    delete_steps = eligible_steps - (plan.retain_steps & eligible_steps)
+    if not delete_steps and not plan.archive_steps:
+        return None
+    return plan.model_copy(
+        update={
+            "observed_steps": known_steps,
+            "retain_steps": known_steps - delete_steps,
+        }
+    )
+
+
 def keep_recent_and_top(
     *,
     recent: int = 5,
@@ -103,4 +139,5 @@ __all__ = [
     "CheckpointRetentionStrategy",
     "keep_recent_and_periodic",
     "keep_recent_and_top",
+    "plan_checkpoint_retention",
 ]
