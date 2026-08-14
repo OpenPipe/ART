@@ -3401,8 +3401,9 @@ def test_chat_prefix_retokenization_splits_unless_reconciled(
     assert grouped.trajectories[0].tokens == tokenized.tokens
 
 
+@pytest.mark.parametrize("length_changing_prompt", (False, True))
 def test_reconciled_reasoning_preserves_complete_outputs_after_prefix_retokenization(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, length_changing_prompt: bool
 ) -> None:
     class Tokenizer:
         chat_template = "{{ preserve_thinking }}"
@@ -3456,7 +3457,10 @@ def test_reconciled_reasoning_preserves_complete_outputs_after_prefix_retokeniza
             first_messages, add_generation_prompt=True, tokenize=True
         ),
     )
-    first_prompt = [900, *canonical_first_prompt]
+    first_prompt = list(canonical_first_prompt)
+    first_prompt[0] = 900
+    if length_changing_prompt:
+        first_prompt.insert(1, 902)
     first_message = {
         "role": "assistant",
         "reasoning": "thought-one",
@@ -3500,7 +3504,10 @@ def test_reconciled_reasoning_preserves_complete_outputs_after_prefix_retokeniza
             second_messages, add_generation_prompt=True, tokenize=True
         ),
     )
-    second_prompt = [900, *canonical_second_prompt]
+    second_prompt = list(canonical_second_prompt)
+    second_prompt[0] = 900
+    if length_changing_prompt:
+        second_prompt.insert(1, 902)
     second_message = {
         "role": "assistant",
         "reasoning": "thought-two",
