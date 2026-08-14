@@ -1071,7 +1071,7 @@ def test_dsv4_throughput_uses_shorter_packed_sequence() -> None:
         dsv4.completion_tokens,
         dsv4.groups_per_step,
         dsv4.initial_model_calls_per_inference_gpu,
-    ) == (32_768, 14_515, 12, 128, 4, 6)
+    ) == (32_768, 14_651, 14, 100, 4, 6)
     stage = HANDLER_WORKFLOW_RESOURCES["dsv4"].e2e_throughput
     assert stage is not None
     assert _groups_per_packed_sequence(stage, dsv4) == 2
