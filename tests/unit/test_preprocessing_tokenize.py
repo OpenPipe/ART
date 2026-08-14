@@ -11,10 +11,54 @@ from art.types import MessagesAndChoices, TrainSFTConfig
 from art.utils.chat_template import (
     chat_template_with_preserved_thinking,
     default_chat_template_kwargs_for_template,
+    normalize_tool_call_arguments_for_chat_template,
 )
 
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
+
+
+@pytest.mark.parametrize(
+    "template",
+    (
+        "{{ tool_call.arguments | items }}",
+        "{% for key, value in tool_call.arguments.items() %}",
+        (
+            "{% set structured = tool_call.arguments %}"
+            "{% for key, value in structured.items() %}"
+        ),
+    ),
+)
+def test_structured_tool_argument_templates_are_normalized(template: str) -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "lookup", "arguments": '{"id": 3}'}}],
+        }
+    ]
+
+    normalized = normalize_tool_call_arguments_for_chat_template(messages, template)
+
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {"id": 3}
+
+
+def test_unrelated_items_iteration_does_not_normalize_tool_arguments() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "lookup", "arguments": '{"id": 3}'}}],
+        }
+    ]
+    gpt_oss_style = (
+        "{% for name, schema in tools.items() %}{{ name }}{{ schema.arguments }}"
+        "{% endfor %}{{ tool_call.arguments }}"
+    )
+
+    normalized = normalize_tool_call_arguments_for_chat_template(
+        messages, gpt_oss_style
+    )
+
+    assert normalized is messages
 
 
 class _FakeTokenizer:

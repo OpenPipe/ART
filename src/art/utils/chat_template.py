@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Any
 
 THINKING_CHAT_TEMPLATE_KWARGS: dict[str, Any] = {
@@ -62,9 +63,18 @@ def merge_chat_template_kwargs(
 def _template_requires_structured_tool_arguments(chat_template: object) -> bool:
     if not isinstance(chat_template, str):
         return False
-    if "arguments|items" in chat_template.replace(" ", ""):
+    if re.search(r"\barguments\s*\|\s*items\b", chat_template):
         return True
-    return "arguments" in chat_template and ".items(" in chat_template
+    if re.search(r"\barguments\s*\.\s*items\s*\(", chat_template):
+        return True
+    aliases = re.findall(
+        r"{%[-+]?\s*set\s+([A-Za-z_]\w*)\s*=\s*[^%]*\barguments\b[^%]*[-+]?%}",
+        chat_template,
+    )
+    return any(
+        re.search(rf"\b{re.escape(alias)}\s*\.\s*items\s*\(", chat_template)
+        for alias in aliases
+    )
 
 
 def normalize_tool_call_arguments_for_chat_template(

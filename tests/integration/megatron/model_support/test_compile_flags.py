@@ -1,3 +1,7 @@
+from types import SimpleNamespace
+from typing import Any, cast
+
+import pytest
 import torch
 from torch._dynamo.testing import CompileCounter
 
@@ -5,6 +9,7 @@ from art.megatron.model_support.handlers.gemma4 import (
     GEMMA4_DENSE_HANDLER,
     GEMMA4_MOE_HANDLER,
 )
+from art.megatron.training import compile as compile_module
 from art.megatron.training.compile import _configure_dynamo
 
 
@@ -50,6 +55,31 @@ def test_dynamic_projection_parameters_reuse_compiled_graph() -> None:
         )
     finally:
         torch._dynamo.reset()
+
+
+def test_disabled_training_compile_does_not_change_dynamo_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(
+        disable_compile=False,
+        flags=(),
+        unconditional_flags=(),
+    )
+    bundle = SimpleNamespace(
+        handler=SimpleNamespace(
+            compile_workaround_config=lambda _provider: config,
+        )
+    )
+    monkeypatch.setattr(compile_module, "compile_enabled", lambda: False)
+    monkeypatch.setattr(
+        compile_module,
+        "_configure_dynamo",
+        lambda: pytest.fail("disabled compilation must not mutate Dynamo config"),
+    )
+
+    assert not compile_module.configure_training_compile(
+        model=[], provider=object(), provider_bundle=cast(Any, bundle)
+    )
 
 
 def test_gemma4_wide_global_attention_uses_lower_triton_stage_count() -> None:

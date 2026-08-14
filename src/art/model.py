@@ -668,6 +668,7 @@ class Model(
         return "none"
 
     def _default_chat_completion_extra_body(self) -> dict[str, Any] | None:
+        """Defaults for ART-managed inference while preserving caller overrides."""
         internal_config = getattr(self, "_internal_config", None)
         if internal_config is None and not self.trainable:
             return None
@@ -680,7 +681,7 @@ class Model(
             if internal_config is not None
             else None
         )
-        if self.trainable or configured_chat_template_kwargs is not None:
+        if self.trainable or internal_config is not None:
             body["chat_template_kwargs"] = {
                 "preserve_thinking": True,
                 **(configured_chat_template_kwargs or {}),

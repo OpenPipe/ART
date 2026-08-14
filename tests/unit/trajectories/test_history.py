@@ -1608,7 +1608,9 @@ def test_chat_reasoning_split_does_not_reuse_divergent_sampled_source() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[first, second])
     )
 
-    histories = trajectory.chat_completions_histories()
+    histories = trajectory.chat_completions_histories(
+        reconcile_text_equivalent_tokenizations=True
+    )
 
     source = histories[1].message_sources[1]
     assert source is not None

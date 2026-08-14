@@ -601,7 +601,8 @@ def chat_completions_histories(
                 )
             ]
             prompt_lineage_keys = [
-                _chat_message_key(message, visible_only=True) for message in prompt
+                _chat_message_key(message, visible_only=not reconcile)
+                for message in prompt
             ]
             choices = _ordered_choices(
                 exchange.response.choices, protocol="Chat Completions"
@@ -636,8 +637,8 @@ def chat_completions_histories(
                     for index in range(len(prompt))
                 ],
                 equivalent=lambda left, right: (
-                    _chat_message_key(left, visible_only=True)
-                    == _chat_message_key(right, visible_only=True)
+                    _chat_message_key(left, visible_only=not reconcile)
+                    == _chat_message_key(right, visible_only=not reconcile)
                 ),
                 continuation=source_continuation,
                 prompt_keys=prompt_lineage_keys,
@@ -666,7 +667,7 @@ def chat_completions_histories(
                     )
                 )
             output_lineage_keys = [
-                [_chat_message_key(output[0], visible_only=True)]
+                [_chat_message_key(output[0], visible_only=not reconcile)]
                 for _, output, _ in outputs
             ]
             _extend_branches(

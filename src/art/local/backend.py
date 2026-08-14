@@ -241,6 +241,17 @@ def _apply_configured_chat_template_server_args(
     *,
     base_model: str | None = None,
 ) -> None:
+    server_args = dict(config_dict.get("server_args", {}))
+    if server_args.get("chat_template") is not None:
+        if chat_template_content_format := internal_config.get(
+            "chat_template_content_format"
+        ):
+            server_args.setdefault(
+                "chat_template_content_format",
+                chat_template_content_format,
+            )
+        config_dict["server_args"] = server_args
+        return
     chat_template = _configured_chat_template_server_arg(internal_config)
     if chat_template is None and base_model is not None:
         chat_template = _model_support_default_chat_template(
@@ -251,14 +262,22 @@ def _apply_configured_chat_template_server_args(
         and base_model is not None
         and base_model.startswith(("Qwen/Qwen3-", "Qwen/Qwen3.5-", "OpenPipe/Qwen3-"))
     ):
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
-        default = getattr(tokenizer, "chat_template", None)
-        preserved = chat_template_with_preserved_thinking(default)
-        if preserved != default:
-            chat_template = cast(str, preserved)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(base_model)
+        except OSError as error:
+            warnings.warn(
+                f"Could not load {base_model!r} to configure prior-thinking "
+                f"preservation: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            default = getattr(tokenizer, "chat_template", None)
+            preserved = chat_template_with_preserved_thinking(default)
+            if preserved != default:
+                chat_template = cast(str, preserved)
     if chat_template is None:
         return
-    server_args = dict(config_dict.get("server_args", {}))
     server_args.setdefault("chat_template", chat_template)
     if chat_template_content_format := internal_config.get(
         "chat_template_content_format"

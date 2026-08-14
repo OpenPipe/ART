@@ -4007,10 +4007,15 @@ def _tokenize_chat_view(
             and marked_bounds[message_index][1] - marked_bounds[message_index][0]
             != len(full_exact)
         ):
-            prefix = render(messages[:message_index], add_generation_prompt=True)
-            completed = render(
-                messages[: message_index + 1], add_generation_prompt=False
-            )
+            try:
+                prefix = render(messages[:message_index], add_generation_prompt=True)
+                completed = render(
+                    messages[: message_index + 1], add_generation_prompt=False
+                )
+            except Exception:
+                marked_bounds.pop(message_index, None)
+                marked_part_bounds.pop(message_index, None)
+                prefix = completed = None
 
             def matches_rendered_prefix(probe: Sequence[int]) -> bool:
                 return rendered[: len(probe)] == list(probe) or bool(
@@ -4020,8 +4025,15 @@ def _tokenize_chat_view(
                     == list(probe[exact_prefix_length:])
                 )
 
-            if matches_rendered_prefix(prefix) and matches_rendered_prefix(completed):
+            if (
+                prefix is not None
+                and completed is not None
+                and matches_rendered_prefix(prefix)
+                and matches_rendered_prefix(completed)
+            ):
                 marked_bounds[message_index] = (len(prefix), len(completed))
+                # The marker-derived per-part offsets describe the old render.
+                marked_part_bounds.pop(message_index, None)
         source_boundary = False
         generation_start: int | None = None
         sampled_bounds: tuple[int, int] | None = None

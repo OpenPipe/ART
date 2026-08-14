@@ -69,6 +69,47 @@ def test_non_qwen_rollout_server_does_not_load_template(
     assert config == {}
 
 
+def test_explicit_server_template_avoids_tokenizer_loading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "art.local.backend._model_support_default_chat_template",
+        lambda *_args: pytest.fail("explicit template should win before model support"),
+    )
+    monkeypatch.setattr(
+        "art.local.backend.AutoTokenizer.from_pretrained",
+        lambda _model: pytest.fail("explicit template should avoid hub access"),
+    )
+    config: dict[str, Any] = {"server_args": {"chat_template": "explicit"}}
+
+    _apply_configured_chat_template_server_args(
+        config, {}, base_model="Qwen/Qwen3.5-4B"
+    )
+
+    assert config == {"server_args": {"chat_template": "explicit"}}
+
+
+def test_qwen_template_load_failure_is_a_warned_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "art.local.backend._model_support_default_chat_template",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "art.local.backend.AutoTokenizer.from_pretrained",
+        lambda _model: (_ for _ in ()).throw(OSError("offline")),
+    )
+    config: dict[str, Any] = {}
+
+    with pytest.warns(RuntimeWarning, match="offline"):
+        _apply_configured_chat_template_server_args(
+            config, {}, base_model="Qwen/Qwen3.5-4B"
+        )
+
+    assert config == {}
+
+
 @contextmanager
 def _local_sft_patches(
     backend: LocalBackend,

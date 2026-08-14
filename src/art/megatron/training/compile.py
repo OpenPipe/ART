@@ -15,6 +15,7 @@ _DYNAMO_CONFIG = cast(Any, dynamo_config)
 
 
 def _configure_dynamo() -> None:
+    """Set the process-wide Dynamo policy required by dynamic LoRA slots."""
     # Dynamic checkpoint slots register differently shaped projection parameters
     # behind one LoRA.forward code object. Let automatic dynamic shapes generalize
     # those parameter dimensions instead of compiling once per projection site.

@@ -27,6 +27,12 @@ Each trajectory can contain:
 
 Some models, like Qwen 3, use chat templates that remove special tokens (such as `<think>`) from previous turns in multi-turn conversations. This can interfere with training when you want the model to learn from its thinking process across all turns.
 
+ART-managed inference and SFT paths preserve prior-turn thinking by default when
+the model's chat template supports it. You can override that behavior explicitly
+with `chat_template_kwargs={"preserve_thinking": False}`. Additional histories
+remain useful for custom or externally managed templates that do not expose a
+prior-thinking preservation option.
+
 By splitting each turn into a separate history, you can preserve these tokens for training:
 
 ```python
