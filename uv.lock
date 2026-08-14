@@ -5512,6 +5512,7 @@ langgraph = [
 megatron = [
     { name = "aiohttp" },
     { name = "apex" },
+    { name = "boto3" },
     { name = "flash-attn-4" },
     { name = "flashinfer-cubin" },
     { name = "flashinfer-python" },
@@ -5543,6 +5544,7 @@ megatron = [
 megatron-cu130 = [
     { name = "aiohttp" },
     { name = "apex" },
+    { name = "boto3" },
     { name = "flash-attn-4" },
     { name = "flashinfer-cubin" },
     { name = "flashinfer-python" },
@@ -5625,6 +5627,8 @@ requires-dist = [
     { name = "awscli", marker = "extra == 'backend-cu130'", specifier = ">=1.38.1" },
     { name = "bitsandbytes", marker = "extra == 'backend'", specifier = ">=0.45.2,!=0.50.0" },
     { name = "bitsandbytes", marker = "extra == 'backend-cu130'", specifier = ">=0.45.2,!=0.50.0" },
+    { name = "boto3", marker = "extra == 'megatron'", specifier = ">=1.40.0" },
+    { name = "boto3", marker = "extra == 'megatron-cu130'", specifier = ">=1.40.0" },
     { name = "causal-conv1d", marker = "python_full_version < '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==1.6.1" },
     { name = "datrie", marker = "extra == 'tinker'", specifier = ">=0.8.3" },
     { name = "duckdb", marker = "extra == 'backend'", specifier = ">=1.0.0" },

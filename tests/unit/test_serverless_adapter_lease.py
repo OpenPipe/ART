@@ -31,6 +31,9 @@ async def test_serverless_adapter_lease_pins_inference_step() -> None:
             run_id="run", learner_version=3, checkpoint_id="step-3"
         ),
         lora="/trainer/run/step-3",
+        training_session_id="session",
+        generation_id="generation-3",
+        lora_bytes=1,
     )
     backend._remember_sampler_result(model, weights)
 

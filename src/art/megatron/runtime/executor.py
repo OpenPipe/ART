@@ -9,6 +9,21 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from art.distributed.object_store import (
+    BinaryObjectTarget,
+    S3BinaryObjectStore,
+)
+from art.megatron.model_support.lora_disk import (
+    ART_LORA_FORMAT_CONFIG_KEY,
+    ART_LORA_FORMAT_VLLM,
+    encode_adapter_config,
+)
+from art.megatron.optimizer_state import (
+    CheckpointFile,
+    OptimizerAdapter,
+    OptimizerShard,
+    OptimizerTopology,
+)
 from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
 from ..tensor_snapshot import PinnedCpuSnapshotStager
@@ -35,7 +50,6 @@ from .trainer_run import EventSink
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
-    from art.megatron.optimizer_state import OptimizerAdapter
     from art.trainer_rank import TrainerRankOptimizerState
 
 
@@ -329,15 +343,27 @@ class MegatronTrainJobExecutor:
             not runtime.optimizer_state_loaded or runtime.optimizer is None
         ):
             raise RuntimeError("snapshot requested non-resident optimizer state")
-        metrics = self._publisher.submit(
-            generation=job.generation,
-            optimizer_state_path=job.optimizer_state_path,
-            staging_adapter_path=job.staging_adapter_path,
-            existing_adapter=job.existing_adapter,
-            publication_targets=job.publication_targets,
-            save_optimizer=job.save_optimizer,
-            sink=sink,
-        )
+        stage_metrics = {}
+        if not self._publisher.has_generation(job.generation):
+            stage_metrics = self._publisher.stage(
+                run_id=job.run_id,
+                generation=job.generation,
+                adapter_dtypes=runtime.adapter_export_dtypes,
+                adapter_config=runtime.adapter_export_config,
+            )
+        metrics = {
+            **stage_metrics,
+            **self._publisher.submit(
+                generation=job.generation,
+                optimizer_state_path=job.optimizer_state_path,
+                staging_adapter_path=job.staging_adapter_path,
+                existing_adapter=job.existing_adapter,
+                publication_targets=job.publication_targets,
+                adapter_object_target=job.adapter_object_target,
+                save_optimizer=job.save_optimizer,
+                sink=sink,
+            ),
+        }
         if job.merged_weight_transfer is not None:
             started = time.perf_counter()
             self._sync_merged(job.merged_weight_transfer)
@@ -795,15 +821,35 @@ class MCoreRunSlotExecutor:
         self._validate_parent(state, job.training_session_id, job.learner_version)
         if job.merged_weight_transfer is not None:
             raise ValueError("multi-run slots publish LoRA weights, not merged weights")
-        metrics = self._publisher.submit(
-            generation=job.generation,
-            optimizer_state_path=job.optimizer_state_path,
-            staging_adapter_path=job.staging_adapter_path,
-            existing_adapter=job.existing_adapter,
-            publication_targets=job.publication_targets,
-            save_optimizer=job.save_optimizer,
-            sink=sink,
-        )
+        stage_metrics = {}
+        if not self._publisher.has_generation(job.generation):
+            from art.megatron.lora import LoRASlotRef
+
+            stage_metrics = self._publisher.stage(
+                run_id=job.run_id,
+                generation=job.generation,
+                adapter_dtypes={},
+                adapter_config=state.adapter_config,
+                slot_ref=LoRASlotRef("checkpoint", job.run_id),
+                trainer_rank_optimizer_state=(
+                    self._slot_trainer.checkpoint_slot_optimizer_snapshot_sources(
+                        job.run_id
+                    )
+                ),
+            )
+        metrics = {
+            **stage_metrics,
+            **self._publisher.submit(
+                generation=job.generation,
+                optimizer_state_path=job.optimizer_state_path,
+                staging_adapter_path=job.staging_adapter_path,
+                existing_adapter=job.existing_adapter,
+                publication_targets=job.publication_targets,
+                adapter_object_target=job.adapter_object_target,
+                save_optimizer=job.save_optimizer,
+                sink=sink,
+            ),
+        }
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -818,6 +864,7 @@ class MCoreRunSlotExecutor:
         state.gradients.discard()
         self._slot_trainer.unload_checkpoint_slot(run_id)
         self._runs.pop(run_id)
+        self._publisher.retire_run(run_id)
 
     def close(self) -> None:
         if self._closed:
@@ -875,8 +922,29 @@ class _CachedGeneration(BaseModel):
     generation: TrainerGeneration
     resolved: Future[_ResolvedGeneration]
     consumers: list[Future[TrainerRankPublication]] = Field(default_factory=list)
+    object_ids: set[str] = Field(default_factory=set)
     retired: bool = False
     released: bool = False
+
+
+class _SnapshotTransport(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    adapter: OptimizerAdapter | None = None
+    metrics: dict[str, float] = Field(default_factory=dict)
+
+
+class _RankSnapshotPersistence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    generation: TrainerGeneration
+    rank: int = Field(ge=0)
+    adapter: OptimizerAdapter | None = None
+    shard: OptimizerShard | None = None
+    runtime_sha256: str | None = None
+    topology: OptimizerTopology | None = None
+    saves_optimizer: bool
+    metrics: dict[str, float] = Field(default_factory=dict)
 
 
 class _GenerationPublisher:
@@ -898,7 +966,7 @@ class _GenerationPublisher:
             max_workers=capacity, thread_name_prefix="art-snapshot-resolve"
         )
         self._transport_pool = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="art-publish-transport"
+            max_workers=capacity, thread_name_prefix="art-publish-transport"
         )
         self._durability_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="art-publish-durable"
@@ -907,6 +975,9 @@ class _GenerationPublisher:
             max_workers=capacity, thread_name_prefix="art-publish-complete"
         )
         self._transport_sender: Any | None = None
+        self._transport_sender_lock = Lock()
+        self._object_store: S3BinaryObjectStore | None = None
+        self._object_publications: dict[str, Future[OptimizerAdapter]] = {}
         self._lora_layouts: dict[tuple[Any, ...], SafetensorsLayout] = {}
         self._cache: dict[str, _CachedGeneration] = {}
         self._latest_by_run: dict[str, str] = {}
@@ -1004,8 +1075,9 @@ class _GenerationPublisher:
         generation: TrainerGeneration,
         optimizer_state_path: str,
         staging_adapter_path: str | None,
-        existing_adapter: "OptimizerAdapter | None" = None,
+        existing_adapter: OptimizerAdapter | None = None,
         publication_targets: tuple[Any, ...],
+        adapter_object_target: BinaryObjectTarget | None,
         save_optimizer: bool,
         sink: EventSink,
     ) -> dict[str, float]:
@@ -1019,8 +1091,10 @@ class _GenerationPublisher:
         started = time.perf_counter()
         transport = self._transport_pool.submit(
             self._transfer_cached_snapshot,
-            entry.resolved,
+            entry,
             publication_targets,
+            adapter_object_target,
+            generation,
         )
         durability = self._durability_pool.submit(
             self._persist_cached_snapshot,
@@ -1073,10 +1147,19 @@ class _GenerationPublisher:
                 optimizer_state_path=optimizer_state_path,
                 staging_adapter_path=staging_adapter_path,
                 publication_targets=publication_targets,
+                adapter_object_target=None,
                 save_optimizer=save_optimizer,
                 sink=sink,
             ),
         }
+
+    def has_generation(self, generation: TrainerGeneration) -> bool:
+        with self._lock:
+            entry = self._cache.get(generation.generation_id)
+            return entry is not None and entry.generation == generation
+
+    def retire_run(self, run_id: str) -> None:
+        self._retire_previous(run_id)
 
     def _acquire_slot(self) -> tuple[float, int]:
         self.raise_if_failed()
@@ -1120,6 +1203,8 @@ class _GenerationPublisher:
             self._cache.pop(entry.generation.generation_id, None)
             if self._latest_by_run.get(entry.run_id) == entry.generation.generation_id:
                 self._latest_by_run.pop(entry.run_id)
+            for object_id in entry.object_ids:
+                self._object_publications.pop(object_id, None)
             self._in_flight -= 1
         self._slots.release()
 
@@ -1147,18 +1232,39 @@ class _GenerationPublisher:
 
     def _transfer_cached_snapshot(
         self,
-        resolved: Future[_ResolvedGeneration],
+        entry: _CachedGeneration,
         publication_targets: tuple[Any, ...],
-    ) -> None:
-        if int(self.runtime.rank) != 0 or not publication_targets:
-            return
-        snapshot = resolved.result()
+        object_target: BinaryObjectTarget | None,
+        generation: TrainerGeneration,
+    ) -> _SnapshotTransport:
+        started = time.perf_counter()
+        if int(self.runtime.rank) != 0:
+            return _SnapshotTransport()
+        snapshot = entry.resolved.result()
+        ready = time.perf_counter()
         if snapshot.lora is None or snapshot.prepared_tensors is None:
             raise RuntimeError("rank zero has no LoRA snapshot to transfer")
-        self._transfer_lora_snapshot(
-            snapshot.lora,
-            publication_targets,
-            prepared_tensors=snapshot.prepared_tensors,
+        adapter = None
+        if object_target is not None:
+            adapter = self._publish_lora_object_once(
+                entry,
+                object_target,
+                generation,
+                snapshot.lora,
+                snapshot.prepared_tensors,
+            )
+        elif publication_targets:
+            self._transfer_lora_snapshot(
+                snapshot.lora,
+                publication_targets,
+                prepared_tensors=snapshot.prepared_tensors,
+            )
+        return _SnapshotTransport(
+            adapter=adapter,
+            metrics={
+                "time/snapshot_transport_wait_s": ready - started,
+                "time/snapshot_transport_s": time.perf_counter() - ready,
+            },
         )
 
     def _persist_cached_snapshot(
@@ -1167,24 +1273,42 @@ class _GenerationPublisher:
         generation: TrainerGeneration,
         optimizer_state_path: str,
         staging_adapter_path: str | None,
-        adapter: "OptimizerAdapter | None",
+        adapter: OptimizerAdapter | None,
         save_optimizer: bool,
-    ) -> TrainerRankPublication:
+    ) -> _RankSnapshotPersistence:
+        started = time.perf_counter()
         snapshot = resolved.result()
-        return self._persist_generation(
+        ready = time.perf_counter()
+        result = self._persist_generation(
             generation=generation,
             optimizer_state_path=optimizer_state_path,
             staging_adapter_path=staging_adapter_path,
-            lora=snapshot.lora if adapter is None else None,
+            lora=(
+                snapshot.lora
+                if adapter is None and staging_adapter_path is not None
+                else None
+            ),
             adapter=adapter,
             optimizer=snapshot.optimizer if save_optimizer else None,
-            prepared_tensors=snapshot.prepared_tensors if adapter is None else None,
+            prepared_tensors=(
+                snapshot.prepared_tensors
+                if adapter is None and staging_adapter_path is not None
+                else None
+            ),
+        )
+        return result.model_copy(
+            update={
+                "metrics": {
+                    "time/snapshot_persistence_wait_s": ready - started,
+                    "time/snapshot_persistence_s": time.perf_counter() - ready,
+                }
+            }
         )
 
     @staticmethod
     def _complete_publication(
-        transport: Future[None],
-        durability: Future[TrainerRankPublication],
+        transport: Future[_SnapshotTransport],
+        durability: Future[_RankSnapshotPersistence],
     ) -> TrainerRankPublication:
         failures: list[BaseException] = []
         for future in (transport, durability):
@@ -1198,7 +1322,33 @@ class _GenerationPublisher:
             raise BaseExceptionGroup(
                 "adapter persistence and transport failed", failures
             )
-        return durability.result()
+        transferred = transport.result()
+        persisted = durability.result()
+        adapter = persisted.adapter or transferred.adapter
+        if persisted.rank == 0 and adapter is None:
+            raise RuntimeError("rank zero snapshot requires an adapter output")
+        if persisted.rank != 0 and (
+            adapter is not None or transferred.adapter is not None
+        ):
+            raise RuntimeError("nonzero rank unexpectedly published an adapter")
+        metrics = {**transferred.metrics, **persisted.metrics}
+        metrics["time/snapshot_publication_s"] = max(
+            metrics.get("time/snapshot_transport_wait_s", 0.0)
+            + metrics.get("time/snapshot_transport_s", 0.0),
+            metrics.get("time/snapshot_persistence_wait_s", 0.0)
+            + metrics.get("time/snapshot_persistence_s", 0.0),
+        )
+        return TrainerRankPublication(
+            generation=persisted.generation,
+            rank=persisted.rank,
+            adapter=adapter,
+            transport_adapter=transferred.adapter,
+            shard=persisted.shard,
+            runtime_sha256=persisted.runtime_sha256,
+            topology=persisted.topology,
+            saves_optimizer=persisted.saves_optimizer,
+            metrics=metrics,
+        )
 
     def _transfer_lora_snapshot(
         self,
@@ -1209,12 +1359,96 @@ class _GenerationPublisher:
     ) -> None:
         from art.distributed.adapter_transport import AdapterSnapshotSender
 
-        if self._transport_sender is None:
-            self._transport_sender = AdapterSnapshotSender()
-        self._transport_sender.send(
-            lora,
-            targets,
-            prepared_tensors=prepared_tensors,
+        with self._transport_sender_lock:
+            if self._transport_sender is None:
+                self._transport_sender = AdapterSnapshotSender()
+            self._transport_sender.send(
+                lora,
+                targets,
+                prepared_tensors=prepared_tensors,
+            )
+
+    def _publish_lora_object_once(
+        self,
+        entry: _CachedGeneration,
+        target: BinaryObjectTarget,
+        generation: TrainerGeneration,
+        lora: Any,
+        prepared_tensors: PreparedSafetensors,
+    ) -> OptimizerAdapter:
+        with self._lock:
+            publication = self._object_publications.get(target.object_id)
+            owner = publication is None
+            if publication is None:
+                publication = Future()
+                self._object_publications[target.object_id] = publication
+            entry.object_ids.add(target.object_id)
+        if not owner:
+            return publication.result()
+        try:
+            adapter = self._publish_lora_object(
+                target, generation, lora, prepared_tensors
+            )
+        except BaseException as error:
+            publication.set_exception(error)
+            raise
+        publication.set_result(adapter)
+        return adapter
+
+    def _publish_lora_object(
+        self,
+        target: BinaryObjectTarget,
+        generation: TrainerGeneration,
+        lora: Any,
+        prepared_tensors: PreparedSafetensors,
+    ) -> OptimizerAdapter:
+        expected_metadata = {
+            "training_session_id": generation.training_session_id,
+            "generation_id": generation.generation_id,
+            "policy_step": str(generation.policy_step),
+        }
+        if any(
+            target.metadata.get(key) != value
+            for key, value in expected_metadata.items()
+        ):
+            raise RuntimeError(
+                "adapter object target identifies another learner generation"
+            )
+        with self._lock:
+            if self._object_store is None:
+                self._object_store = S3BinaryObjectStore(target.store)
+            elif self._object_store.config != target.store:
+                raise RuntimeError("generation publisher cannot mix object stores")
+            store = self._object_store
+        config = encode_adapter_config(
+            {
+                **lora.adapter_config,
+                ART_LORA_FORMAT_CONFIG_KEY: ART_LORA_FORMAT_VLLM,
+            }
+        )
+        ref = store.publish(
+            target,
+            {
+                "adapter_model.safetensors": tuple(
+                    memoryview(chunk.numpy()).cast("B")
+                    for chunk in prepared_tensors.chunks
+                ),
+                "adapter_config.json": (memoryview(config),),
+            },
+        )
+        files = {file.relative_path: file for file in ref.files}
+        expected_files = ("adapter_config.json", "adapter_model.safetensors")
+        if set(files) != set(expected_files):
+            raise RuntimeError("adapter object manifest has unexpected files")
+        return OptimizerAdapter(
+            identity=ref.manifest_uri,
+            training_session_id=generation.training_session_id,
+            step=generation.policy_step,
+            generation_id=generation.generation_id,
+            files=tuple(
+                CheckpointFile(name=name, size_bytes=files[name].byte_count)
+                for name in expected_files
+            ),
         )
 
     def _persist_generation(
@@ -1227,7 +1461,7 @@ class _GenerationPublisher:
         adapter: "OptimizerAdapter | None",
         optimizer: Any,
         prepared_tensors: PreparedSafetensors | None,
-    ) -> TrainerRankPublication:
+    ) -> _RankSnapshotPersistence:
         from art.megatron.optimizer_state import (
             publish_adapter_checkpoint,
             write_optimizer_snapshot_shard,
@@ -1253,8 +1487,6 @@ class _GenerationPublisher:
                     training_session_id=generation.training_session_id,
                     generation_id=generation.generation_id,
                 )
-            if adapter is None:
-                raise RuntimeError("rank zero has no immutable adapter")
         shard = (
             write_optimizer_snapshot_shard(
                 optimizer,
@@ -1263,7 +1495,7 @@ class _GenerationPublisher:
             if optimizer is not None
             else None
         )
-        return TrainerRankPublication(
+        return _RankSnapshotPersistence(
             generation=generation,
             rank=rank,
             adapter=adapter,
@@ -1363,6 +1595,9 @@ class _GenerationPublisher:
         if self._transport_sender is not None:
             self._transport_sender.close()
             self._transport_sender = None
+        if self._object_store is not None:
+            self._object_store.close()
+            self._object_store = None
         with self._lock:
             in_flight = self._in_flight
         if in_flight:

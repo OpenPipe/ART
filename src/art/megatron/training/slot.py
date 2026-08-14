@@ -10,6 +10,11 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
+from art.distributed.object_store import (
+    BinaryObjectTarget,
+    S3ObjectStoreConfig,
+    vllm_lora_object_target,
+)
 from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
 from art.megatron.optimizer_state import (
@@ -124,6 +129,7 @@ class MegatronTrainingSlot:
         trainer: Any,
         runtime_spec: TrainerRuntimeSpec,
         artifact_root: str,
+        sampler_store: S3ObjectStoreConfig | None = None,
     ) -> None:
         if trainer.runtime_spec != runtime_spec:
             raise ValueError("trainer slot does not match its runtime spec")
@@ -131,6 +137,7 @@ class MegatronTrainingSlot:
         self.trainer = trainer
         self.runtime_spec = runtime_spec
         self.artifact_root = str(Path(artifact_root).resolve())
+        self.sampler_store = sampler_store
         self._runs: dict[str, _ResidentRun] = {}
         self._results: dict[str, tuple[str, Contract]] = {}
         self._pending_results: dict[str, tuple[str, asyncio.Future[Contract]]] = {}
@@ -542,13 +549,17 @@ class MegatronTrainingSlot:
             learner_parent_version=output_version,
             kind="save_state",
         )
-        await self._snapshot(commit_ref, save_optimizer=True)
+        adapter, _metrics = await self._snapshot(commit_ref, save_optimizer=True)
         self.trainer.retire_operation(commit_ref.operation_id)
         result = LoadStateResult(
             operation_id=ref.operation_id,
             checkpoint=checkpoint_ref(
                 ref.run_id, output_version, generation.generation_id
             ),
+            lora=adapter.identity,
+            training_session_id=adapter.training_session_id,
+            generation_id=adapter.generation_id,
+            lora_bytes=sum(file.size_bytes for file in adapter.files),
             optimizer_restored=bool(raw["optimizer_restored"]),
         )
         self._results[ref.operation_id] = (fingerprint, result)
@@ -582,6 +593,9 @@ class MegatronTrainingSlot:
                     ref.run_id, adapter.step, request.checkpoint_name
                 ),
                 lora=adapter.identity,
+                training_session_id=adapter.training_session_id,
+                generation_id=adapter.generation_id,
+                lora_bytes=sum(file.size_bytes for file in adapter.files),
                 publication_metrics=metrics,
             )
             self._results[ref.operation_id] = (fingerprint, result)
@@ -621,6 +635,10 @@ class MegatronTrainingSlot:
                 checkpoint=checkpoint_ref(
                     ref.run_id, adapter.step, request.checkpoint_name
                 ),
+                lora=adapter.identity,
+                training_session_id=adapter.training_session_id,
+                generation_id=adapter.generation_id,
+                lora_bytes=sum(file.size_bytes for file in adapter.files),
                 optimizer_state=optimizer_state_path,
                 metrics=metrics,
             )
@@ -649,13 +667,19 @@ class MegatronTrainingSlot:
     ) -> tuple[OptimizerAdapter, dict[str, float]] | _PendingSnapshot:
         state = self._require_parent(ref)
         generation = state.generation
+        object_target = (
+            self._sampler_object_target(ref.run_id, generation)
+            if self.sampler_store is not None
+            else None
+        )
         existing = read_adapter_publication(
             generation.adapter_path, step=generation.policy_step
         )
-        if not save_optimizer and existing is not None:
+        if not save_optimizer and existing is not None and object_target is None:
             return existing, {}
         optimizer_state_path = state.registration.optimizer_state_path
         pointer = read_committed_optimizer_pointer(optimizer_state_path)
+        persist_optimizer = save_optimizer
         if (
             save_optimizer
             and pointer is not None
@@ -663,16 +687,19 @@ class MegatronTrainingSlot:
         ):
             if (
                 pointer.step != generation.policy_step
-                or existing is None
-                or pointer.adapter != existing
+                or pointer.adapter.training_session_id != generation.training_session_id
             ):
                 raise RuntimeError(
                     "committed optimizer generation disagrees with resident learner"
                 )
-            return existing, {}
+            if object_target is None:
+                return pointer.adapter, {}
+            existing = pointer.adapter
+            persist_optimizer = False
         staging = (
             None
             if existing is not None
+            or (object_target is not None and not save_optimizer)
             else str(
                 Path(state.output_dir)
                 / "megatron_runtime"
@@ -692,7 +719,8 @@ class MegatronTrainingSlot:
                 optimizer_state_path=optimizer_state_path,
                 staging_adapter_path=staging,
                 existing_adapter=existing,
-                save_optimizer=save_optimizer,
+                adapter_object_target=object_target,
+                save_optimizer=persist_optimizer,
             )
         )
         return _PendingSnapshot(
@@ -702,6 +730,18 @@ class MegatronTrainingSlot:
             metrics=raw["metrics"],
             publication=self.trainer.wait_for_publication(ref.operation_id),
             started=started,
+        )
+
+    def _sampler_object_target(
+        self, run_id: str, generation: TrainerGeneration
+    ) -> BinaryObjectTarget:
+        assert self.sampler_store is not None
+        return vllm_lora_object_target(
+            self.sampler_store,
+            run_id=run_id,
+            training_session_id=generation.training_session_id,
+            generation_id=generation.generation_id,
+            policy_step=generation.policy_step,
         )
 
     async def _finish_snapshot(
@@ -725,8 +765,13 @@ class MegatronTrainingSlot:
         )
         if state.generation.policy_step < snapshot.generation.policy_step:
             raise RuntimeError("resident learner regressed behind completed snapshot")
-        return durable.adapter, {
+        rank_metrics = {
+            key: max(record.metrics.get(key, 0.0) for record in records)
+            for key in {key for record in records for key in record.metrics}
+        }
+        return durable.transport_adapter or durable.adapter, {
             **snapshot.metrics,
+            **rank_metrics,
             "time/snapshot_durable_s": time.perf_counter() - snapshot.started,
         }
 

@@ -261,15 +261,26 @@ class OptimStepResult(OperationResult):
 class SamplerWeightsResult(OperationResult):
     checkpoint: CheckpointRef
     lora: str = Field(min_length=1)
+    training_session_id: str = Field(min_length=1)
+    generation_id: str = Field(min_length=1)
+    lora_bytes: int = Field(gt=0)
     publication_metrics: dict[str, float] = Field(default_factory=dict)
 
 
 class SaveStateResult(OperationResult):
     checkpoint: CheckpointRef
+    lora: str = Field(min_length=1)
+    training_session_id: str = Field(min_length=1)
+    generation_id: str = Field(min_length=1)
+    lora_bytes: int = Field(gt=0)
     optimizer_state: str = Field(min_length=1)
     metrics: dict[str, float] = Field(default_factory=dict)
 
 
 class LoadStateResult(OperationResult):
     checkpoint: CheckpointRef
+    lora: str = Field(min_length=1)
+    training_session_id: str = Field(min_length=1)
+    generation_id: str = Field(min_length=1)
+    lora_bytes: int = Field(gt=0)
     optimizer_restored: bool

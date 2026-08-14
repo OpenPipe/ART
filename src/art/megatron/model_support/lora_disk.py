@@ -40,14 +40,13 @@ def load_adapter_config(lora_path: str | Path) -> dict[str, Any]:
 
 def save_adapter_config(lora_path: str | Path, adapter_config: dict[str, Any]) -> None:
     config_path = Path(lora_path) / "adapter_config.json"
-    with config_path.open("w", encoding="utf-8") as config_file:
-        json.dump(
-            _jsonable_config(adapter_config),
-            config_file,
-            indent=2,
-            sort_keys=True,
-        )
-        config_file.write("\n")
+    config_path.write_bytes(encode_adapter_config(adapter_config))
+
+
+def encode_adapter_config(adapter_config: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(_jsonable_config(adapter_config), indent=2, sort_keys=True) + "\n"
+    ).encode()
 
 
 def resolve_lora_handler(

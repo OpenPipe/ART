@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from art.distributed.adapter_transport import AdapterTransferTarget
 from art.distributed.data_plane import PackedBatchRef
+from art.distributed.object_store import BinaryObjectTarget
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
 from art.megatron.optimizer_state import OptimizerAdapter
 from art.training.contracts import AdamConfig
@@ -444,6 +445,7 @@ class GenerationSnapshotJobSpec(_Spec):
     staging_adapter_path: str | None = Field(default=None, min_length=1)
     existing_adapter: OptimizerAdapter | None = None
     publication_targets: tuple[AdapterTransferTarget, ...] = ()
+    adapter_object_target: BinaryObjectTarget | None = None
     merged_weight_transfer: MergedWeightTransferSpec | None = None
     save_optimizer: bool = False
 
@@ -455,16 +457,17 @@ class GenerationSnapshotJobSpec(_Spec):
         ):
             raise ValueError("snapshot generation does not identify the learner")
         creating_adapter = self.staging_adapter_path is not None
-        if creating_adapter == (self.existing_adapter is not None):
+        object_adapter = self.adapter_object_target is not None
+        local_adapters = int(creating_adapter) + int(self.existing_adapter is not None)
+        if local_adapters > 1 or not (local_adapters or object_adapter):
             raise ValueError(
-                "snapshot requires exactly one new or existing adapter source"
+                "snapshot requires an object output or exactly one local adapter output"
             )
         if creating_adapter:
             if self.staging_adapter_path == self.generation.adapter_path:
                 raise ValueError("final and staging adapter paths must differ")
-        else:
+        elif self.existing_adapter is not None:
             adapter = self.existing_adapter
-            assert adapter is not None
             if (
                 adapter.training_session_id,
                 adapter.step,
@@ -481,6 +484,8 @@ class GenerationSnapshotJobSpec(_Spec):
                 raise ValueError(
                     "existing adapter cannot be transferred as a new snapshot"
                 )
+        if object_adapter and self.publication_targets:
+            raise ValueError("object and direct adapter transports cannot be combined")
         if self.publication_targets and self.merged_weight_transfer is not None:
             raise ValueError("snapshot cannot publish LoRA and merged weights together")
         return self

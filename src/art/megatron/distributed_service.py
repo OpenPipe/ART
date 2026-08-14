@@ -1278,7 +1278,12 @@ class DistributedMegatronService:
         source: ResolvedCheckpointState,
         *,
         restore_optimizer: bool,
-    ) -> tuple[dict[str, Any], TrainerGeneration, dict[str, float]]:
+    ) -> tuple[
+        dict[str, Any],
+        TrainerGeneration,
+        dict[str, float],
+        DurableTrainerPublication,
+    ]:
         output_version = ref.reserved_output_learner_version
         if output_version is None:
             raise ValueError("load command has no reserved learner output")
@@ -1338,9 +1343,9 @@ class DistributedMegatronService:
                 save_optimizer=True,
                 activate_serving=False,
             )
-            await asyncio.shield(launch.completion)
+            durable = await asyncio.shield(launch.completion)
             trainer.retire_operation(commit_operation_id)
-            return result, generation, launch.metrics
+            return result, generation, launch.metrics, durable
 
     async def snapshot_command(
         self,

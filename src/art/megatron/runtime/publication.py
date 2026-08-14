@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
@@ -25,10 +24,12 @@ class TrainerRankPublication(_PublicationModel):
     generation: TrainerGeneration
     rank: int = Field(ge=0)
     adapter: OptimizerAdapter | None = None
+    transport_adapter: OptimizerAdapter | None = None
     shard: OptimizerShard | None = None
     runtime_sha256: str | None = None
     topology: OptimizerTopology | None = None
     saves_optimizer: bool
+    metrics: dict[str, float] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate_payload(self) -> "TrainerRankPublication":
@@ -44,20 +45,19 @@ class TrainerRankPublication(_PublicationModel):
         if self.rank == 0:
             if self.adapter is None:
                 raise ValueError("rank zero publication requires an adapter")
-            if (
-                self.adapter.training_session_id,
-                self.adapter.step,
-                self.adapter.generation_id,
-                self.adapter.identity,
-            ) != (
-                self.generation.training_session_id,
-                self.generation.policy_step,
-                self.generation.generation_id,
-                str(Path(self.generation.adapter_path).absolute()),
-            ):
-                raise ValueError("adapter and trainer generation identities differ")
-        elif self.adapter is not None:
-            raise ValueError("only rank zero may publish the adapter manifest")
+            for adapter in (self.adapter, self.transport_adapter):
+                if adapter is not None and (
+                    adapter.training_session_id,
+                    adapter.step,
+                    adapter.generation_id,
+                ) != (
+                    self.generation.training_session_id,
+                    self.generation.policy_step,
+                    self.generation.generation_id,
+                ):
+                    raise ValueError("adapter and trainer generation identities differ")
+        elif self.adapter is not None or self.transport_adapter is not None:
+            raise ValueError("only rank zero may publish adapter manifests")
         if self.shard is not None and self.shard.rank != self.rank:
             raise ValueError("optimizer shard identifies another trainer rank")
         return self
@@ -85,6 +85,7 @@ TRAINER_PUBLICATION_EVENT_ADAPTER = TypeAdapter(TrainerPublicationEvent)
 
 class DurableTrainerPublication(_PublicationModel):
     adapter: OptimizerAdapter
+    transport_adapter: OptimizerAdapter | None = None
     resume_step: int = Field(ge=0)
     optimizer_step: int = Field(ge=0)
 
@@ -134,6 +135,7 @@ def commit_trainer_publication(
     optimizer_step = 0 if committed is None else committed.step
     return DurableTrainerPublication(
         adapter=adapter,
+        transport_adapter=ordered[0].transport_adapter,
         resume_step=generation.policy_step if saves_optimizer else optimizer_step,
         optimizer_step=optimizer_step,
     )

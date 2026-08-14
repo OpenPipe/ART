@@ -343,21 +343,25 @@ class LocalMegatronTrainingClient:
 
             async def complete() -> SamplerWeightsResult:
                 durable = await launch.completion
+                adapter = durable.transport_adapter or durable.adapter
                 self._remember_checkpoint(
                     request.checkpoint_name,
                     ResolvedCheckpointState(
-                        adapter_path=durable.adapter.identity,
-                        adapter_step=durable.adapter.step,
+                        adapter_path=adapter.identity,
+                        adapter_step=adapter.step,
                     ),
                 )
                 return SamplerWeightsResult(
                     operation_id=admission.ref.operation_id,
                     checkpoint=checkpoint_ref(
                         admission.ref.run_id,
-                        durable.adapter.step,
+                        adapter.step,
                         request.checkpoint_name,
                     ),
-                    lora=durable.adapter.identity,
+                    lora=adapter.identity,
+                    training_session_id=adapter.training_session_id,
+                    generation_id=adapter.generation_id,
+                    lora_bytes=sum(file.size_bytes for file in adapter.files),
                     publication_metrics=launch.metrics,
                 )
 
@@ -398,6 +402,13 @@ class LocalMegatronTrainingClient:
                         durable.adapter.step,
                         request.checkpoint_name,
                     ),
+                    lora=(durable.transport_adapter or durable.adapter).identity,
+                    training_session_id=durable.adapter.training_session_id,
+                    generation_id=durable.adapter.generation_id,
+                    lora_bytes=sum(
+                        file.size_bytes
+                        for file in (durable.transport_adapter or durable.adapter).files
+                    ),
                     optimizer_state=self._service.optimizer_state_path,
                     metrics=launch.metrics,
                 )
@@ -432,7 +443,7 @@ class LocalMegatronTrainingClient:
                 raise ValueError(
                     f"unknown local checkpoint: {request.checkpoint!r}"
                 ) from error
-            raw, generation, _metrics = await self._service.load_state_command(
+            raw, generation, _metrics, durable = await self._service.load_state_command(
                 admission.ref,
                 source,
                 restore_optimizer=restore_optimizer,
@@ -442,6 +453,7 @@ class LocalMegatronTrainingClient:
                 generation.policy_step,
                 generation.generation_id,
             )
+            adapter = durable.transport_adapter or durable.adapter
             self._remember_checkpoint(
                 checkpoint.checkpoint_id,
                 ResolvedCheckpointState(
@@ -454,6 +466,10 @@ class LocalMegatronTrainingClient:
             return LoadStateResult(
                 operation_id=admission.ref.operation_id,
                 checkpoint=checkpoint,
+                lora=adapter.identity,
+                training_session_id=adapter.training_session_id,
+                generation_id=adapter.generation_id,
+                lora_bytes=sum(file.size_bytes for file in adapter.files),
                 optimizer_restored=bool(raw["optimizer_restored"]),
             )
 

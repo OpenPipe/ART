@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art import dev
 from art.distributed.art_runtime import ArtRuntime
+from art.distributed.object_store import S3ObjectStoreConfig
 from art.distributed.rollout import RolloutModelSpec
 from art.model import TrainableModel
 from art.types import MegatronRuntimeConfig
@@ -43,6 +44,7 @@ class LocalMegatronTrainingSlotConfig(BaseModel):
     chat_template: str | None = None
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     chat_template_tool_schema_format: Literal["default", "vllm_openai"] = "default"
+    sampler_store: S3ObjectStoreConfig | None = None
 
     @model_validator(mode="after")
     def _validate_lora(self) -> "LocalMegatronTrainingSlotConfig":
@@ -146,6 +148,7 @@ class LocalMegatronTrainingSlot:
                 trainer=trainer,
                 runtime_spec=runtime_spec,
                 artifact_root=artifact_root,
+                sampler_store=config.sampler_store,
             )
         except BaseException:
             await runtime.close()
