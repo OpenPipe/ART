@@ -32,8 +32,8 @@ from ..model_support.workflow_resources import (
 # 6.120-7.426% MAPE and 0.002258-0.004652 KL. Its 10%/0.005 gates cover that
 # natural learned-policy distribution while remaining tight enough for the
 # prior expert-LoRA defect to fail by a wide margin.
-# Three independently trained Qwen3.5 dense policies measured 7.986-10.887%
-# MAPE and 0.006147-0.007974 KL, with at least 0.960 top1 and 0.964 top20
+# Four independently trained Qwen3.5 dense policies measured 7.986-10.887%
+# MAPE and 0.006147-0.007974 KL, with at least 0.960 top1 and 0.957 top20
 # agreement. Its architecture-specific gates cover policy-to-policy variance
 # while preserving those independent agreement checks.
 # DeepSeek-V4-Flash uses FP4 vLLM kernels while Megatron materializes bf16/fp32
@@ -45,7 +45,7 @@ from ..model_support.workflow_resources import (
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
     "dsv4": 25.0,
-    # Exact learned-policy replays measured 10.658-13.087% for dense and
+    # Exact learned-policy replays measured 10.658-13.972% for dense and
     # 13.017-14.215% for MoE while preserving route provenance and top-k
     # agreement.
     "gemma4_dense": 15.0,
