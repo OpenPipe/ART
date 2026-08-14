@@ -994,9 +994,12 @@ async def run_length_trainability_async(
             )
             trainer = build_trainer(steps, phase_learning_rate)
             await trainer.train(handle_signals=False)
+            phase_end = await model.get_step()
             if resident_hook is not None and phase_index == 0:
                 pending_trainable_step = None
-            phase_end = await model.get_step()
+                if current_step_demand:
+                    # Trainer shutdown may prefetch but not execute the next scenario.
+                    scenario_index = phase_end
             phases.append(
                 LengthTrainingPhaseReport(
                     name=(
