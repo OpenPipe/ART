@@ -740,6 +740,8 @@ class ServerlessBackend:
                 if queue is not None
                 else tuple(trajectory_groups)
             )
+            for summary, group in zip(trajectory_groups, materialized, strict=True):
+                group._collect_packing_shape = summary._collect_packing_shape
             batch = RlTrajectoryBatch.from_groups(
                 materialized,
                 default_source_version=client.projected_learner_version,
