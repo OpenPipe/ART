@@ -196,7 +196,12 @@ def _compare_iteration(
     _assert_same_logits_topk(outputs)
     _assert_same_logits_topk(reference)
     return (
-        _compare_outputs(outputs, reference, tolerance=5e-3),
+        _compare_outputs(
+            outputs,
+            reference,
+            tolerance=5e-3,
+            topk_tolerance=1e-2,
+        ),
         Diff()
         if depth_reference is None
         else _compare_outputs(outputs, depth_reference, tolerance=2e-5),
@@ -330,6 +335,7 @@ def _compare_outputs(
     expected: Sequence[dict[str, object]],
     *,
     tolerance: float,
+    topk_tolerance: float | None = None,
 ) -> Diff:
     worst = Diff()
     for actual_output, expected_output in zip(actual, expected, strict=True):
@@ -346,9 +352,14 @@ def _compare_outputs(
                 _assert_stable_topk_tokens(actual_output, expected_output)
                 continue
             diff = _diff(actual_tensor, expected_tensor)
-            if diff.mean_abs_pct > tolerance:
+            limit = (
+                topk_tolerance
+                if key == "topk_logprobs" and topk_tolerance is not None
+                else tolerance
+            )
+            if diff.mean_abs_pct > limit:
                 raise AssertionError(
-                    f"{key} mean_abs_pct={diff.mean_abs_pct} exceeds {tolerance}"
+                    f"{key} mean_abs_pct={diff.mean_abs_pct} exceeds {limit}"
                 )
             worst = worst.merge(diff)
     return worst

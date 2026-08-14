@@ -41,6 +41,20 @@ def test_topk_only_comparison_rejects_logprob_corruption() -> None:
         _compare_outputs([actual], [expected], tolerance=1e-4)
 
 
+def test_topk_comparison_can_use_an_explicit_layout_tolerance() -> None:
+    expected = _topk_output(torch.tensor([[-1.0, -2.0]]), torch.tensor([[1, 2]]))
+    actual = _topk_output(torch.tensor([[-1.006, -2.012]]), torch.tensor([[1, 2]]))
+
+    _compare_outputs(
+        [actual],
+        [expected],
+        tolerance=1e-4,
+        topk_tolerance=1e-2,
+    )
+    with pytest.raises(AssertionError, match="topk_logprobs mean_abs_pct"):
+        _compare_outputs([actual], [expected], tolerance=1e-4)
+
+
 def test_all_ranks_checked_terminates_on_one_rank_failure(tmp_path: Path) -> None:
     mp.spawn(
         _all_ranks_checked_worker,
