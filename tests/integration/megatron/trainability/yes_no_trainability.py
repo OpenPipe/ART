@@ -659,6 +659,7 @@ def _variant_init_args(variant: _TrainabilityVariant) -> dev.InitArgs:
 def _init_megatron_runtime_config(
     variant: _TrainabilityVariant,
     *,
+    packed_sequence_length: int | None = None,
     streaming_weight_offload: bool = False,
 ) -> None:
     if variant.topology is None:
@@ -673,7 +674,11 @@ def _init_megatron_runtime_config(
             ep=variant.topology.ep,
             etp=variant.topology.etp,
         ),
-        packed_sequence_length=_variant_packed_sequence_length(variant),
+        packed_sequence_length=(
+            _variant_packed_sequence_length(variant)
+            if packed_sequence_length is None
+            else packed_sequence_length
+        ),
         streaming_weight_offload=streaming_weight_offload,
     )
 

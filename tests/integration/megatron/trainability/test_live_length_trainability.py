@@ -840,6 +840,7 @@ async def run_length_trainability_async(
     with _temporary_env(backend_env):
         _init_megatron_runtime_config(
             variant,
+            packed_sequence_length=max_model_len,
             streaming_weight_offload=(
                 stage_resources.streaming_weight_offload
                 if stage_resources is not None
