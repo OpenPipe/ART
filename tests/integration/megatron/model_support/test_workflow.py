@@ -1148,7 +1148,11 @@ def test_dsv4_throughput_uses_shorter_packed_sequence() -> None:
         dsv4.initial_model_calls_per_inference_gpu,
     ) == (32_768, 14_651, 20, 70, 4, 5)
     stage = HANDLER_WORKFLOW_RESOURCES["dsv4"].e2e_throughput
+    llama_stage = HANDLER_WORKFLOW_RESOURCES["llama3_dense"].e2e_throughput
     assert stage is not None
+    assert llama_stage is not None
+    assert stage.exclusive_host
+    assert not llama_stage.exclusive_host
     assert _groups_per_packed_sequence(stage, dsv4) == 2
     assert _THROUGHPUT_CONFIGS["llama3_dense"].groups_per_step == 23
     assert all(

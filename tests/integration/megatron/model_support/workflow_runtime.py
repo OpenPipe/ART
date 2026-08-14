@@ -85,11 +85,14 @@ class WorkflowResourceRequest(BaseModel):
     same_host: bool = True
     contiguous: bool = True
     host_affinity: str | None = Field(default=None, min_length=1)
+    exclusive_host: bool = False
 
     @model_validator(mode="after")
     def cpu_requests_do_not_reserve_gpu_capacity(self) -> "WorkflowResourceRequest":
         if self.gpu_count == 0 and self.gpu_share != 1.0:
             raise ValueError("CPU operations cannot reserve fractional GPU capacity")
+        if self.exclusive_host and (self.gpu_count == 0 or not self.same_host):
+            raise ValueError("exclusive host requests require same-host GPUs")
         return self
 
 
@@ -287,28 +290,33 @@ class _GpuPool:
         self._active_by_host = {host: 0 for host in self._hosts}
         self._affinity_hosts: dict[str, str] = {}
         self._affinity_bindings_by_host = {host: 0 for host in self._hosts}
+        self._exclusive_hosts: set[str] = set()
         self._lock = Lock()
 
     def acquire(self, request: WorkflowResourceRequest) -> WorkflowPlacement | None:
         with self._lock:
+            affinity_host = self._affinity_host(request)
             if request.gpu_count == 0:
-                host = self._affinity_hosts.get(request.host_affinity or "")
+                host = affinity_host
+                if host in self._exclusive_hosts:
+                    return None
                 if host is None:
                     host = min(
-                        self._hosts,
+                        (
+                            candidate
+                            for candidate in self._hosts
+                            if candidate not in self._exclusive_hosts
+                        ),
                         key=lambda value: (
-                            self._unbound_affinity_load(request, value),
                             self._active_by_host[value],
                             self._hosts.index(value),
                         ),
                         default=None,
                     )
                 if host is not None:
-                    self._bind_affinity(request, host)
                     self._active_by_host[host] += 1
                 return WorkflowPlacement(host=host)
             placements = self._candidate_placements(request)
-            affinity_host = self._affinity_hosts.get(request.host_affinity or "")
             if affinity_host is not None:
                 placements = [
                     devices
@@ -323,24 +331,28 @@ class _GpuPool:
                 for device in selected:
                     self._available[device] -= request.gpu_share
                 host = selected[0].host
-                self._bind_affinity(request, host)
+                if request.exclusive_host:
+                    self._exclusive_hosts.add(host)
                 self._active_by_host[host] += 1
                 return WorkflowPlacement(host=host, devices=selected)
         return None
 
-    def _bind_affinity(self, request: WorkflowResourceRequest, host: str) -> None:
+    def _affinity_host(self, request: WorkflowResourceRequest) -> str | None:
         affinity = request.host_affinity
-        if affinity is not None and affinity not in self._affinity_hosts:
+        if affinity is None:
+            return None
+        if affinity not in self._affinity_hosts:
+            host = min(
+                self._hosts,
+                key=lambda value: (
+                    self._affinity_bindings_by_host[value],
+                    self._active_by_host[value],
+                    self._hosts.index(value),
+                ),
+            )
             self._affinity_hosts[affinity] = host
             self._affinity_bindings_by_host[host] += 1
-
-    def _unbound_affinity_load(
-        self, request: WorkflowResourceRequest, host: str
-    ) -> int:
-        affinity = request.host_affinity
-        if affinity is None or affinity in self._affinity_hosts:
-            return 0
-        return self._affinity_bindings_by_host[host]
+        return self._affinity_hosts[affinity]
 
     def _placement_priority(
         self,
@@ -352,13 +364,11 @@ class _GpuPool:
         indices = tuple(self._devices.index(device) for device in devices)
         if request.gpu_share < 1.0:
             return (
-                self._unbound_affinity_load(request, host),
                 self._active_by_host[host],
                 sum(available),
                 indices,
             )
         return (
-            self._unbound_affinity_load(request, host),
             self._active_by_host[host],
             -min(available),
             -sum(available),
@@ -368,10 +378,17 @@ class _GpuPool:
     def _candidate_placements(
         self, request: WorkflowResourceRequest
     ) -> list[tuple[WorkflowDevice, ...]]:
+        eligible_hosts = {
+            host
+            for host in self._hosts
+            if host not in self._exclusive_hosts
+            and (not request.exclusive_host or self._active_by_host[host] == 0)
+        }
         eligible = [
             device
             for device in self._devices
-            if self._available[device] + 1e-9 >= request.gpu_share
+            if device.host in eligible_hosts
+            and self._available[device] + 1e-9 >= request.gpu_share
         ]
         by_host: dict[str, list[WorkflowDevice]] = defaultdict(list)
         for device in eligible:
@@ -415,6 +432,12 @@ class _GpuPool:
                     raise RuntimeError(
                         f"released unowned workflow host {placement.host}"
                     )
+                if request.exclusive_host:
+                    if placement.host not in self._exclusive_hosts:
+                        raise RuntimeError(
+                            f"released non-exclusive workflow host {placement.host}"
+                        )
+                    self._exclusive_hosts.remove(placement.host)
 
 
 def _contiguous(

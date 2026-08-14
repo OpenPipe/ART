@@ -162,6 +162,7 @@ class WorkflowStageResources(BaseModel):
     required_physical_gpus: int | None = None
     required_h200_equivalent_gpus: int | None = None
     allow_gpu_overlap: bool = False
+    exclusive_host: bool = False
     requires_external_vllm: bool = False
     megatron: MegatronWorkflowResources | None = None
     vllm: VllmWorkflowResources | None = None
@@ -576,6 +577,7 @@ def _throughput_stage_resources(model_key: str) -> WorkflowStageResources:
     return WorkflowStageResources(
         required_world_size=4,
         required_physical_gpus=4,
+        exclusive_host=model_key == "dsv4",
         megatron=MegatronWorkflowResources(
             gpu_ids=[0, 1],
             topology=MegatronWorkflowTopology(

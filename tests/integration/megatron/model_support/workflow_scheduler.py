@@ -970,6 +970,11 @@ def compile_prepared_workflows(
             visible_gpu_count=visible_gpu_count,
         )
         for stage_name in prepared.stages:
+            stage_resources = getattr(
+                HANDLER_WORKFLOW_RESOURCES.get(prepared.report.model_key),
+                stage_name,
+                None,
+            )
             shared = (
                 functional_session
                 if functional_session is not None
@@ -1058,6 +1063,9 @@ def compile_prepared_workflows(
                             correctness_affinity
                             if stage_name == "correctness_sensitivity"
                             else None
+                        ),
+                        exclusive_host=bool(
+                            stage_resources and stage_resources.exclusive_host
                         ),
                     ),
                     dependencies=dependencies,
@@ -1320,6 +1328,7 @@ def run_prepared_workflows(
             result.metrics["workflow_gpu_ids"] = [
                 device.gpu for device in placement.devices
             ]
+            result.metrics["workflow_host"] = execution_host
             result.metrics["workflow_session_worker_s"] = worker_wall_s
             result.metrics["workflow_session_operation_count"] = len(session.operations)
             result.metrics.update(active_forkservers.metrics(execution_host))
