@@ -286,6 +286,7 @@ class _GpuPool:
         self._available = {device: 1.0 for device in devices}
         self._active_by_host = {host: 0 for host in self._hosts}
         self._affinity_hosts: dict[str, str] = {}
+        self._affinity_bindings_by_host = {host: 0 for host in self._hosts}
         self._lock = Lock()
 
     def acquire(self, request: WorkflowResourceRequest) -> WorkflowPlacement | None:
@@ -296,6 +297,7 @@ class _GpuPool:
                     host = min(
                         self._hosts,
                         key=lambda value: (
+                            self._unbound_affinity_load(request, value),
                             self._active_by_host[value],
                             self._hosts.index(value),
                         ),
@@ -327,8 +329,18 @@ class _GpuPool:
         return None
 
     def _bind_affinity(self, request: WorkflowResourceRequest, host: str) -> None:
-        if request.host_affinity is not None:
-            self._affinity_hosts.setdefault(request.host_affinity, host)
+        affinity = request.host_affinity
+        if affinity is not None and affinity not in self._affinity_hosts:
+            self._affinity_hosts[affinity] = host
+            self._affinity_bindings_by_host[host] += 1
+
+    def _unbound_affinity_load(
+        self, request: WorkflowResourceRequest, host: str
+    ) -> int:
+        affinity = request.host_affinity
+        if affinity is None or affinity in self._affinity_hosts:
+            return 0
+        return self._affinity_bindings_by_host[host]
 
     def _placement_priority(
         self,
@@ -339,8 +351,19 @@ class _GpuPool:
         available = tuple(self._available[device] for device in devices)
         indices = tuple(self._devices.index(device) for device in devices)
         if request.gpu_share < 1.0:
-            return self._active_by_host[host], sum(available), indices
-        return self._active_by_host[host], -min(available), -sum(available), indices
+            return (
+                self._unbound_affinity_load(request, host),
+                self._active_by_host[host],
+                sum(available),
+                indices,
+            )
+        return (
+            self._unbound_affinity_load(request, host),
+            self._active_by_host[host],
+            -min(available),
+            -sum(available),
+            indices,
+        )
 
     def _candidate_placements(
         self, request: WorkflowResourceRequest

@@ -112,6 +112,28 @@ def test_cpu_sessions_are_distributed_across_explicit_hosts() -> None:
     ]
 
 
+def test_distinct_host_affinities_balance_and_remain_pinned() -> None:
+    pool = _GpuPool(_devices(hosts=3))
+    requests = [
+        WorkflowResourceRequest(gpu_count=1, host_affinity=f"model-{index}")
+        for index in range(6)
+    ]
+    hosts = []
+    for request in requests:
+        placement = pool.acquire(request)
+        assert placement is not None
+        hosts.append(placement.host)
+        pool.release(placement, request)
+
+    assert hosts == [f"host-{index % 3}" for index in range(6)]
+    for request, host in zip(requests, hosts, strict=True):
+        variant_request = request.model_copy(update={"gpu_count": 8})
+        placement = pool.acquire(variant_request)
+        assert placement is not None
+        assert placement.host == host
+        pool.release(placement, variant_request)
+
+
 def test_compiled_session_counts_shared_startup_once() -> None:
     runtime = _runtime()
     operations = tuple(
