@@ -42,7 +42,11 @@ torch = pytest.importorskip("torch")
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
 DEFAULT_LENGTH_LEARNING_RATE = 1e-4
-LENGTH_MAX_STEPS_BY_MODEL = {"llama3_dense": 30, "qwen3_5_moe": 40}
+LENGTH_MAX_STEPS_BY_MODEL = {
+    "llama3_dense": 30,
+    "qwen3_5_moe": 40,
+    "gpt_oss_moe": 30,
+}
 QWEN3_5_MOE_LENGTH_ROLLOUTS_PER_PROMPT = 32
 DETERMINISTIC_LENGTH_ROLLOUT_SEED = 20261833
 QWEN3_5_MOE_LENGTH_ROLLOUT_TEMPERATURE = 0.8
