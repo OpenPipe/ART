@@ -159,6 +159,66 @@ def test_trainer_rank_tp_head_backward_matches_unsharded_oracle(
     )
 
 
+@pytest.mark.parametrize("topology", ("dp", "tp", "cp"))
+def test_trainer_rank_custom_parameter_reduction_oracle(
+    topology: str,
+    tmp_path: Path,
+) -> None:
+    world = 2
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world:
+        pytest.skip("requires 2 CUDA devices")
+    init_file = tmp_path / f"custom_parameter_{topology}"
+    mp.spawn(
+        _custom_parameter_reduction_worker,
+        args=(world, f"file://{init_file}", topology),
+        nprocs=world,
+        join=True,
+    )
+
+
+def _custom_parameter_reduction_worker(
+    rank: int,
+    world: int,
+    init_method: str,
+    topology: str,
+) -> None:
+    torch.cuda.set_device(rank)
+    init_process_group("nccl", rank=rank, world_size=world, init_method=init_method)
+    try:
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=world if topology == "tp" else 1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=world if topology == "cp" else 1,
+            expert_model_parallel_size=1,
+        )
+        device = torch.device("cuda", rank)
+        ref = LoRASlotRef("checkpoint", "A")
+        lora = LoRA("dense", 1, 1, 1, 1, torch.float32, device)
+        lora.load_lora_slot(
+            ref,
+            {
+                "dense.lora_A.weight": torch.ones(1, 1, device=device),
+                "dense.lora_B.weight": torch.ones(1, 1, device=device),
+            },
+            requires_grad=True,
+        )
+        trainer = _trainer_for(lora, device)
+        parameter = trainer.parameter(
+            "gain",
+            lambda: torch.tensor(float(rank + 1), device=device),
+            checkpoint="A",
+        )
+        torch.testing.assert_close(parameter, torch.tensor(1.0, device=device))
+        (parameter * float(rank + 1)).backward()
+        (reduced,) = trainer._reduce_dynamic_grads((parameter,), scale_grads=1.0)
+        expected = 1.5 if topology == "tp" else 3.0
+        torch.testing.assert_close(reduced, torch.tensor(expected, device=device))
+    finally:
+        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+            ps.destroy_model_parallel()
+        destroy_process_group()
+
+
 def _tp_head_backward_worker(rank: int, world: int, init_method: str) -> None:
     torch.cuda.set_device(rank)
     init_process_group(

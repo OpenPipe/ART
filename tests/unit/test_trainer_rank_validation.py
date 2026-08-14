@@ -9,6 +9,7 @@ from importlib.util import find_spec
 import inspect
 import json
 from pathlib import Path
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -283,6 +284,119 @@ def test_dp_rank_forward_accepts_base_or_loaded_explicit_checkpoint(
     output = trainer.dp_rank_forward([request])
 
     assert isinstance(output[0], ForwardOutput)
+
+
+def test_forward_method_checkpoint_is_request_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    trainer._checkpoint_slots["method"] = _CheckpointSlot()
+    trainer._checkpoint_slots["request"] = _CheckpointSlot()
+    monkeypatch.setattr(trainer, "_slot_ref", _slot_ref)
+    seen: list[str | None] = []
+
+    def execute(plan: object, **_kwargs: object) -> list[ForwardOutput]:
+        seen.extend(group.slot_ref.name for group in cast(Any, plan).groups)
+        return _empty_outputs(plan)
+
+    _stub_forward(monkeypatch, trainer, execute)
+    inputs = [
+        ForwardInput(input_tokens=torch.tensor([1]), target_tokens=torch.tensor([1])),
+        ForwardInput(
+            input_tokens=torch.tensor([2]),
+            target_tokens=torch.tensor([2]),
+            checkpoint="request",
+        ),
+        ForwardInput(
+            input_tokens=torch.tensor([3]),
+            target_tokens=torch.tensor([3]),
+            checkpoint=None,
+        ),
+    ]
+
+    trainer.dp_rank_forward(inputs, checkpoint="method")
+
+    assert seen == ["method", "request", None]
+
+
+def test_forward_method_checkpoint_rejects_unloaded_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    _stub_forward(monkeypatch, trainer)
+
+    with pytest.raises(TrainerRankSlotStateError, match="unloaded.*'typo'"):
+        trainer.dp_rank_forward([_target_request(1)], checkpoint="typo")
+
+
+@pytest.mark.parametrize(
+    ("ambient_grad", "no_grad", "expected"),
+    (
+        (True, None, True),
+        (False, None, False),
+        (True, True, False),
+        (False, False, True),
+    ),
+)
+def test_dp_rank_forward_grad_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    ambient_grad: bool,
+    no_grad: bool | None,
+    expected: bool,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    seen: list[bool] = []
+
+    def execute(plan: object, **_kwargs: object) -> list[ForwardOutput]:
+        seen.append(torch.is_grad_enabled())
+        return _empty_outputs(plan)
+
+    _stub_forward(monkeypatch, trainer, execute)
+    with torch.set_grad_enabled(ambient_grad):
+        trainer.dp_rank_forward([_target_request(1)], no_grad=no_grad)
+
+    assert seen == [expected]
+
+
+def test_forward_micro_batches_keeps_grad_mode_across_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    seen: list[bool] = []
+
+    def execute(plan: object, **_kwargs: object) -> list[ForwardOutput]:
+        seen.append(torch.is_grad_enabled())
+        return _empty_outputs(plan)
+
+    _stub_forward(monkeypatch, trainer, execute, profiled=True)
+    batches = trainer.forward_micro_batches(
+        [_target_request(index) for index in range(3)], no_grad=True
+    )
+    assert torch.is_grad_enabled()
+
+    list(batches)
+
+    assert seen and not any(seen)
+    assert torch.is_grad_enabled()
+
+
+def test_forward_micro_batches_uses_method_checkpoint_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    trainer._checkpoint_slots["teacher"] = _CheckpointSlot()
+    monkeypatch.setattr(trainer, "_slot_ref", _slot_ref)
+    seen: list[str | None] = []
+
+    def execute(plan: object, **_kwargs: object) -> list[ForwardOutput]:
+        seen.extend(group.slot_ref.name for group in cast(Any, plan).groups)
+        return _empty_outputs(plan)
+
+    _stub_forward(monkeypatch, trainer, execute, profiled=True)
+
+    list(trainer.forward_micro_batches([_target_request(1)], checkpoint="teacher"))
+
+    assert seen == ["teacher"]
 
 
 def test_forward_input_preserves_public_runtime_shape() -> None:
@@ -996,6 +1110,31 @@ def test_slot_load_canonicalizes_only_local_incoming_adapter(
     torch.testing.assert_close(adapter["weight"], torch.ones(1))
 
 
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+def test_checkpoint_slot_snapshot_preserves_loaded_slot_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.megatron import lora as lora_module
+    from art.megatron.lora import LoRA, LoRASlotRef
+    from art.trainer_rank._checkpoint import _slot_snapshot
+
+    monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
+    lora = LoRA("layer", 3, 4, 2, 32, torch.float32, torch.device("cpu"))
+    ref = LoRASlotRef("checkpoint", "student")
+    assert lora.load_lora_slot(
+        ref,
+        {
+            "layer.lora_A.weight": torch.randn(2, 3),
+            "layer.lora_B.weight": torch.randn(4, 2),
+        },
+        requires_grad=True,
+    )
+
+    snapshot = _slot_snapshot(TrainerRank(_runtime(lora)))
+
+    assert snapshot[0][3] == {"slot_0": ref}
+
+
 def test_checkpoint_export_requires_retained_adapter_config() -> None:
     trainer = TrainerRank(_runtime())
     with pytest.raises(ValueError, match="Unknown checkpoint"):
@@ -1212,17 +1351,15 @@ def _prepared_save(root: Path, sequence: int) -> _PreparedSave:
 def test_optimizer_shards_are_received_as_float32(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from art.megatron.lora import LoraShardMeta
-
     prepared = _prepared_save(tmp_path, 0)
     metadata = [
-        LoraShardMeta(
-            "weight",
-            1,
-            (2, 3),
-            "bfloat16",
-            {"kind": "replicated"},
-            "block",
+        SimpleNamespace(
+            key="weight",
+            owner_rank=1,
+            shape=(2, 3),
+            dtype_name="bfloat16",
+            manifest={"kind": "replicated"},
+            block="block",
         )
     ]
     received: list[torch.dtype] = []
@@ -1235,14 +1372,17 @@ def test_optimizer_shards_are_received_as_float32(
         received.append(tensor.dtype)
 
     monkeypatch.setattr(dist, "recv", recv)
-    monkeypatch.setattr(
-        "art.megatron.weights.lora_publish.merge_sharded_adapter_entries",
-        lambda entries: {
-            key: values[0][1] for key, values in cast(dict, entries).items()
-        },
+    monkeypatch.setitem(
+        sys.modules,
+        "art.megatron.weights.lora_publish",
+        SimpleNamespace(
+            merge_sharded_adapter_entries=lambda entries: {
+                key: values[0][1] for key, values in cast(dict, entries).items()
+            }
+        ),
     )
 
-    merged = _merge_component(prepared, metadata, "master", None)
+    merged = _merge_component(prepared, cast(Any, metadata), "master", None)
 
     assert received == [torch.float32]
     assert merged["weight"].dtype == torch.float32
@@ -1536,6 +1676,8 @@ def _checkpoint_load_failure_worker(
         checkpoint_module._load_adapter,
         checkpoint_module._optimizer_state,
         checkpoint_module._commit_slot,
+        checkpoint_module._slot_snapshot,
+        checkpoint_module._restore_slots,
     )
     try:
         trainer = TrainerRank.__new__(TrainerRank)
@@ -1554,6 +1696,8 @@ def _checkpoint_load_failure_worker(
         trainer._validate_checkpoint_consistency = lambda *_args: ()  # type: ignore[method-assign]
         trainer._validate_loaded_checkpoint_config = lambda *_args: None  # type: ignore[method-assign]
         trainer._restore_canonical_optimizer = lambda *_args: cast(Any, object())  # type: ignore[method-assign]
+        setattr(checkpoint_module, "_slot_snapshot", lambda *_args: ())
+        setattr(checkpoint_module, "_restore_slots", lambda *_args: None)
         if phase == "export":
             if rank == 1:
                 trainer._checkpoint_slots["student"] = _CheckpointSlot(
@@ -1655,7 +1799,13 @@ def _checkpoint_load_failure_worker(
         assert completed.item() == world_size
     finally:
         for name, value in zip(
-            ("_load_adapter", "_optimizer_state", "_commit_slot"),
+            (
+                "_load_adapter",
+                "_optimizer_state",
+                "_commit_slot",
+                "_slot_snapshot",
+                "_restore_slots",
+            ),
             originals,
             strict=True,
         ):
@@ -2237,6 +2387,19 @@ def test_forward_micro_batches_ramps_after_first_success(
     assert batches[0].stats.cold_start
     assert batches[1].stats.global_count > 1
     assert not batches[1].stats.cold_start
+
+
+def test_memory_profiles_distinguish_grad_mode() -> None:
+    trainer = TrainerRank(_runtime())
+    request = _target_request(1)
+
+    grad_signature = trainer._plan_flat_forward([request]).signature
+    with torch.no_grad():
+        no_grad_signature = trainer._plan_flat_forward([request]).signature
+
+    assert grad_signature.grad_enabled
+    assert not no_grad_signature.grad_enabled
+    assert grad_signature != no_grad_signature
 
 
 def test_forward_micro_batches_does_not_overtrust_tiny_memory_profile(

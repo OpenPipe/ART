@@ -292,15 +292,15 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
     assert limit is not None
     limit_packed_tokens = limit[0]
 
-    def plan(requests):
+    def plan(requests, **kwargs):
         nonlocal plan_calls
         plan_calls += 1
-        return original_plan(requests)
+        return original_plan(requests, **kwargs)
 
-    def estimate(requests):
+    def estimate(requests, **kwargs):
         nonlocal estimate_calls
         estimate_calls += 1
-        return original_estimate(requests)
+        return original_estimate(requests, **kwargs)
 
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     monkeypatch.setattr(rank, "_estimate_flat_forward", estimate)
@@ -323,10 +323,10 @@ def test_adaptive_planner_globally_falls_back_when_one_rank_cannot_estimate(
     plans = 0
     original = rank._plan_flat_forward
 
-    def plan(requests):
+    def plan(requests, **kwargs):
         nonlocal plans
         plans += 1
-        return original(requests)
+        return original(requests, **kwargs)
 
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     candidate = rank._select_next_micro_batch(
@@ -342,7 +342,11 @@ def test_adaptive_planner_probes_new_heterogeneous_signatures(
 ) -> None:
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(rank, "_resolve_slot_ref", lambda request: request.checkpoint)
+    monkeypatch.setattr(
+        rank,
+        "_resolve_slot_ref",
+        lambda request, **_kwargs: request.checkpoint,
+    )
     inputs = [
         _target_request(_tokens(index), checkpoint=f"S{index % 4}")
         for index in range(16)
@@ -402,10 +406,10 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
     plan_calls = 0
     original_plan = rank._plan_flat_forward
 
-    def plan(requests):
+    def plan(requests, **kwargs):
         nonlocal plan_calls
         plan_calls += 1
-        return original_plan(requests)
+        return original_plan(requests, **kwargs)
 
     def run(plan, **_kwargs):
         if available["packed_tokens"] == first_limit_packed_tokens:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from typing import TYPE_CHECKING, Literal, cast, overload
+from typing import TYPE_CHECKING, Literal, TypeVar, cast, overload
 
 import torch
 import torch.distributed as dist
@@ -33,6 +33,8 @@ PushedCheckpoint = _impl.PushedCheckpoint
 
 if TYPE_CHECKING:
     from art.megatron.train import TrainingRuntime
+
+ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
 
 
 for _public_type in (
@@ -71,6 +73,36 @@ class TrainerRank(_impl.TrainerRank):
 
     def zero_grad(self) -> None:
         super().zero_grad()
+
+    def module(
+        self,
+        name: str,
+        factory: Callable[[], ModuleT],
+        *,
+        checkpoint: AdapterSelection = Unset,
+    ) -> ModuleT:
+        """Register or retrieve a checkpoint-owned PyTorch module."""
+        return super().module(name, factory, checkpoint=checkpoint)
+
+    def parameter(
+        self,
+        name: str,
+        factory: Callable[[], torch.Tensor | torch.nn.Parameter],
+        *,
+        checkpoint: AdapterSelection = Unset,
+    ) -> torch.nn.Parameter:
+        """Register or retrieve a checkpoint-owned trainable tensor."""
+        return super().parameter(name, factory, checkpoint=checkpoint)
+
+    def buffer(
+        self,
+        name: str,
+        factory: Callable[[], torch.Tensor],
+        *,
+        checkpoint: AdapterSelection = Unset,
+    ) -> torch.Tensor:
+        """Register or retrieve a checkpoint-owned persistent buffer."""
+        return super().buffer(name, factory, checkpoint=checkpoint)
 
     def prefetch_checkpoints(
         self,
@@ -122,6 +154,9 @@ class TrainerRank(_impl.TrainerRank):
     def forward_micro_batches(
         self,
         inputs: Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Iterator[
         MicroBatch[
             ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT],
@@ -135,6 +170,9 @@ class TrainerRank(_impl.TrainerRank):
         inputs: Iterable[
             Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Iterator[
         MicroBatch[
             Sequence[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
@@ -148,6 +186,9 @@ class TrainerRank(_impl.TrainerRank):
         inputs: Iterable[
             Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Iterator[
         MicroBatch[
             Sequence[Sequence[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]],
@@ -165,6 +206,9 @@ class TrainerRank(_impl.TrainerRank):
                 ]
             ]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Iterator[
         MicroBatch[
             Sequence[
@@ -181,21 +225,30 @@ class TrainerRank(_impl.TrainerRank):
     ]: ...
 
     def forward_micro_batches(
-        self, inputs: Iterable[ForwardInputs]
+        self,
+        inputs: Iterable[ForwardInputs],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        """Forward replicated inputs in adaptive data-parallel microbatches.
+
+        Per-input checkpoints override `checkpoint`. `no_grad=None` inherits the
+        ambient PyTorch grad mode; `True` disables grads and `False` enables them.
+        """
         forward = cast(
-            Callable[
-                [Iterable[ForwardInputs]],
-                Iterator[MicroBatch[ForwardInputs, ForwardOutputs]],
-            ],
+            Callable[..., Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]],
             super().forward_micro_batches,
         )
-        return forward(inputs)
+        return forward(inputs, checkpoint=checkpoint, no_grad=no_grad)
 
     @overload
     def dp_rank_forward(
         self,
         inputs: Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]: ...
 
     @overload
@@ -204,6 +257,9 @@ class TrainerRank(_impl.TrainerRank):
         inputs: Iterable[
             Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Sequence[
         Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
     ]: ...
@@ -214,6 +270,9 @@ class TrainerRank(_impl.TrainerRank):
         inputs: Iterable[
             Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Sequence[
         Sequence[Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
     ]: ...
@@ -228,18 +287,32 @@ class TrainerRank(_impl.TrainerRank):
                 ]
             ]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Sequence[
         Sequence[
             Sequence[Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
         ]
     ]: ...
 
-    def dp_rank_forward(self, inputs: ForwardInputs) -> ForwardOutputs:
+    def dp_rank_forward(
+        self,
+        inputs: ForwardInputs,
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
+    ) -> ForwardOutputs:
+        """Forward inputs already local to this data-parallel rank.
+
+        Per-input checkpoints override `checkpoint`. `no_grad=None` inherits the
+        ambient PyTorch grad mode; `True` disables grads and `False` enables them.
+        """
         forward = cast(
-            Callable[[ForwardInputs], ForwardOutputs],
+            Callable[..., ForwardOutputs],
             super().dp_rank_forward,
         )
-        return forward(inputs)
+        return forward(inputs, checkpoint=checkpoint, no_grad=no_grad)
 
     def dp_reduce(
         self,
