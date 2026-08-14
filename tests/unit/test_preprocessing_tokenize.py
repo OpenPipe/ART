@@ -45,6 +45,21 @@ def test_structured_tool_argument_templates_are_normalized(template: str) -> Non
     assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {"id": 3}
 
 
+def test_empty_structured_tool_arguments_are_normalized() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "lookup", "arguments": ""}}],
+        }
+    ]
+
+    normalized = normalize_tool_call_arguments_for_chat_template(
+        messages, "{{ tool_call.arguments | items }}"
+    )
+
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {}
+
+
 def test_unrelated_items_iteration_does_not_normalize_tool_arguments() -> None:
     messages = [
         {

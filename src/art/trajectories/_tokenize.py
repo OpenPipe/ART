@@ -481,7 +481,18 @@ def _chat_choice_output_tokens(
     values = _chat_logprob_entries(choice)
     message = _dump(choice.message)
     if token_ids == [] and (
-        values or any(message.get(key) for key in ("content", "refusal", "tool_calls"))
+        values
+        or any(
+            message.get(key)
+            for key in (
+                "content",
+                "refusal",
+                "reasoning",
+                "reasoning_content",
+                "tool_calls",
+                "function_call",
+            )
+        )
     ):
         token_ids = None
     pair_ids, pair_logprobs = _pairs(values, field="Chat Completions logprobs")
@@ -3155,7 +3166,9 @@ def _tokenize_exact_projected_chat_history(
 
 def _chat_message_parts(message: Mapping[str, object]) -> list[tuple[str, str]]:
     parts: list[tuple[str, str]] = []
-    reasoning = message.get("reasoning") or message.get("reasoning_content")
+    reasoning = message.get("reasoning")
+    if not isinstance(reasoning, str) or not reasoning:
+        reasoning = message.get("reasoning_content")
     if isinstance(reasoning, str) and reasoning:
         parts.append(("reasoning", reasoning))
     if content := _content_text(message.get("content")):
@@ -3529,7 +3542,9 @@ def _tokenize_chat_view(
             == exchange.request.get("chat_template_kwargs")
         )
 
+    canonical_rendered = rendered
     exact_prefix_length = 0
+    canonical_prefix_length = 0
     if (
         chat_template is None
         and chat_template_kwargs is None
@@ -3554,6 +3569,7 @@ def _tokenize_chat_view(
                         *rendered[len(rendered_prompt) :],
                     ]
                     exact_prefix_length = len(source_prompt)
+                    canonical_prefix_length = len(rendered_prompt)
                     break
 
     positions_by_first_token: dict[int, list[int]] = {}
@@ -3618,21 +3634,28 @@ def _tokenize_chat_view(
         direct_bounds = []
 
     def differing_span(probe: Sequence[int]) -> tuple[int, int] | None:
+        baseline = canonical_rendered if canonical_prefix_length else rendered
         prefix = 0
         while (
-            prefix < len(rendered)
+            prefix < len(baseline)
             and prefix < len(probe)
-            and rendered[prefix] == probe[prefix]
+            and baseline[prefix] == probe[prefix]
         ):
             prefix += 1
         suffix = 0
         while (
-            suffix < len(rendered) - prefix
+            suffix < len(baseline) - prefix
             and suffix < len(probe) - prefix
-            and rendered[-suffix - 1] == probe[-suffix - 1]
+            and baseline[-suffix - 1] == probe[-suffix - 1]
         ):
             suffix += 1
-        end = len(rendered) - suffix
+        end = len(baseline) - suffix
+        if canonical_prefix_length:
+            if prefix < canonical_prefix_length:
+                return None
+            delta = exact_prefix_length - canonical_prefix_length
+            prefix += delta
+            end += delta
         return (prefix, end) if prefix < end else None
 
     marked_bounds: dict[int, tuple[int, int]] = {}

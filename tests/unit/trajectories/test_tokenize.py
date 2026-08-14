@@ -3063,10 +3063,13 @@ def test_chat_rerender_normalizes_tool_arguments(arguments: object) -> None:
 
 
 @pytest.mark.parametrize("reasoning", (None, "think"), ids=("tool-only", "reasoning"))
+@pytest.mark.parametrize(
+    "exact_prompt", ([1], [900, 10]), ids=("shorter-prompt", "changed-prompt")
+)
 def test_structured_tool_arguments_remain_in_sampled_region_without_exact_tokens(
-    reasoning: str | None,
+    reasoning: str | None, exact_prompt: list[int]
 ) -> None:
-    exchange = _chat_exchange([1], [2])
+    exchange = _chat_exchange(exact_prompt, [2])
     data = exchange.response.model_dump(mode="python")
     choice = data["choices"][0]
     choice.pop("token_ids")
@@ -3127,9 +3130,13 @@ def test_structured_tool_arguments_remain_in_sampled_region_without_exact_tokens
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     sampled_tokens = [*([15, 16] if reasoning else []), 20, 25, 30, 31]
-    assert tokenized.tokens == [1, *sampled_tokens, 26]
-    assert tokenized.flags[1:-1] == [tr.TokenFlag.SAMPLED] * len(sampled_tokens)
-    assert all(math.isnan(value) for value in tokenized.logprobs[1:-1])
+    assert tokenized.tokens == [*exact_prompt, *sampled_tokens, 26]
+    assert tokenized.flags[: len(exact_prompt)] == [tr.TokenFlag.EXACT] * len(
+        exact_prompt
+    )
+    sampled = slice(len(exact_prompt), -1)
+    assert tokenized.flags[sampled] == [tr.TokenFlag.SAMPLED] * len(sampled_tokens)
+    assert all(math.isnan(value) for value in tokenized.logprobs[sampled])
 
 
 def test_reasoning_probe_failure_does_not_override_authoritative_render() -> None:
@@ -4933,6 +4940,23 @@ def test_empty_sampled_messages_need_no_content_boundary() -> None:
     ]
 
 
+def test_reasoning_only_choice_treats_empty_token_ids_as_missing() -> None:
+    from art.trajectories import _tokenize
+
+    exchange = _chat_exchange([], [])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice["logprobs"] = None
+    choice["message"] = {
+        "role": "assistant",
+        "reasoning": "unfinished thought",
+        "content": None,
+    }
+    parsed = ChatCompletion.model_validate(data).choices[0]
+
+    assert _tokenize._chat_choice_output_tokens(parsed)[0] is None
+
+
 def test_empty_sampled_message_inserts_exact_control_token() -> None:
     exchange = _chat_exchange([], [2])
     exchange.response.choices[0].message.content = ""
@@ -5088,6 +5112,23 @@ def test_renderer_reasoning_content_alias_preserves_reasoning() -> None:
         tr.TokenFlag.SAMPLED,
         tr.TokenFlag.SAMPLED,
     ]
+
+
+def test_nonstring_reasoning_uses_reasoning_content_slot() -> None:
+    from art.trajectories import _tokenize
+
+    message = {
+        "role": "assistant",
+        "reasoning": [{"type": "thinking", "thinking": "structured"}],
+        "reasoning_content": "think",
+        "content": "answer",
+    }
+
+    assert _tokenize._chat_message_parts(message) == [
+        ("reasoning", "think"),
+        ("content", "answer"),
+    ]
+    assert len(_tokenize._chat_message_text_slot_groups(message)) == 2
 
 
 def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None:

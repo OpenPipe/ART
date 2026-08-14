@@ -109,7 +109,7 @@ def normalize_tool_call_arguments_for_chat_template(
             if isinstance(arguments, str):
                 assert isinstance(function, dict)
                 try:
-                    arguments = json.loads(arguments)
+                    arguments = json.loads(arguments) if arguments.strip() else {}
                 except json.JSONDecodeError as error:
                     raise ValueError(
                         "tool-call arguments are not valid JSON"
