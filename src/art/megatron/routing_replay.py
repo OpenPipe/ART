@@ -910,10 +910,11 @@ class MoeRoutingReplayController:
             model_chunks,
             pipeline_model=pipeline_model,
         )
+        self._local_router_keys_by_chunk = {
+            chunk_index: set() for chunk_index in range(len(model_chunks))
+        }
         for router_key, binding in bindings.items():
             chunk_index = int(binding["chunk_index"])
-            if chunk_index not in self._local_router_keys_by_chunk:
-                self._local_router_keys_by_chunk[chunk_index] = set()
             if self.strict and router_key not in self.bundle.router_keys:
                 raise RuntimeError(
                     "Router key from model is missing in replay bundle: "

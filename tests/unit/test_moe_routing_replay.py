@@ -478,6 +478,28 @@ def test_tensor_controller_addresses_pp_global_layer(
     controller.remove_router_patches()
 
 
+def test_tensor_controller_accepts_pipeline_chunk_without_local_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topology = ParallelTopology(tp=1, ep=1, dp=1, cp=1, pp=2, vpp=2)
+    bundle = _make_tensor_bundle(topology=topology)
+    router_chunk = _FakeChunk()
+    empty_chunk = nn.Identity()
+    monkeypatch.setattr(
+        routing_replay_module,
+        "_global_layer_prefixes",
+        lambda chunk: [("decoder.layers.0", 0)] if chunk is router_chunk else [],
+    )
+    controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
+
+    controller.install_router_patches([empty_chunk, router_chunk])
+    controller.set_step(step_index=0, sample_index=[0])
+    controller.begin_micro(0, 0, chunk_index=0)
+    controller.begin_micro(0, 0, chunk_index=1)
+
+    controller.remove_router_patches()
+
+
 def test_controller_uses_native_router_replay_target_indices() -> None:
     bundle, route = _make_bundle()
     controller = MoeRoutingReplayController(bundle=bundle, strict=True, device="cpu")
