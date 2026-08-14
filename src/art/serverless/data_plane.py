@@ -6,7 +6,7 @@ import sys
 from typing import TypeVar
 
 from msgspec import msgpack
-from pydantic import TypeAdapter
+from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 from art.training.contracts import OperationResult, TrainingBatch
 
@@ -16,6 +16,14 @@ _BATCH_ADAPTER = TypeAdapter(TrainingBatch)
 _UINT32_ARRAY_EXT = 1
 _FLOAT32_ARRAY_EXT = 2
 ResultT = TypeVar("ResultT", bound=OperationResult)
+
+
+class EncodedTrainingBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    batch: TrainingBatch
+    ref: TrainingDataRef
+    payload: bytes
 
 
 def encode_training_batch(batch: TrainingBatch) -> tuple[TrainingDataRef, bytes]:
@@ -28,6 +36,11 @@ def encode_training_batch(batch: TrainingBatch) -> tuple[TrainingDataRef, bytes]
         ),
         payload,
     )
+
+
+def prepare_training_batch(batch: TrainingBatch) -> EncodedTrainingBatch:
+    ref, payload = encode_training_batch(batch)
+    return EncodedTrainingBatch(batch=batch, ref=ref, payload=payload)
 
 
 def decode_training_batch(ref: TrainingDataRef, payload: bytes) -> TrainingBatch:

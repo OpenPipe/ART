@@ -45,6 +45,7 @@ from .contracts import (
     CreateTrainingRunRequest,
     TrainingRunSpec,
 )
+from .data_plane import EncodedTrainingBatch, prepare_training_batch
 
 if TYPE_CHECKING:
     from art.model import Model, TrainableModel
@@ -553,30 +554,61 @@ class ServerlessBackend:
         started = time.monotonic()
         client = await self.training_client(model)
         sequence = client.next_sequence_id
-        batch = RlTrajectoryBatch.from_groups(
-            groups, default_source_version=client.projected_learner_version
-        )
-        forward = await client.forward_backward(
-            ForwardBackwardRequest(
-                run_id=client.run_id,
-                request_id=uuid.uuid4().hex,
-                sequence_id=sequence,
-                batch=batch,
-                loss=LossConfig(
-                    name=loss_fn,
-                    normalize_advantages=scale_rewards,
-                    values={
-                        **values,
-                        "grad_accumulation_sequences": (
-                            config.grad_accumulation_sequences
-                        ),
-                    },
-                ),
-                collect_packing_shapes=any(
-                    group._collect_packing_shape for group in groups
-                ),
+        prepared = groups[0]._prepared_training_batch
+        if prepared is not None:
+            local_groups = (
+                prepared.batch.require_local_groups()
+                if isinstance(prepared, EncodedTrainingBatch)
+                else ()
+            )
+            if (
+                not isinstance(prepared, EncodedTrainingBatch)
+                or len(local_groups) != len(groups)
+                or any(
+                    group._prepared_training_batch is not prepared for group in groups
+                )
+                or any(
+                    actual is not expected
+                    for actual, expected in zip(local_groups, groups, strict=True)
+                )
+            ):
+                raise RuntimeError("remote pipeline batch preparation is inconsistent")
+        batch = (
+            prepared.batch
+            if prepared is not None
+            else RlTrajectoryBatch.from_groups(
+                groups, default_source_version=client.projected_learner_version
             )
         )
+        request = ForwardBackwardRequest(
+            run_id=client.run_id,
+            request_id=uuid.uuid4().hex,
+            sequence_id=sequence,
+            batch=batch,
+            loss=LossConfig(
+                name=loss_fn,
+                normalize_advantages=scale_rewards,
+                values={
+                    **values,
+                    "grad_accumulation_sequences": config.grad_accumulation_sequences,
+                },
+            ),
+            collect_packing_shapes=any(
+                group._collect_packing_shape for group in groups
+            ),
+        )
+        submit_started = time.monotonic()
+        try:
+            forward = (
+                await client.forward_backward(request)
+                if prepared is None
+                else await client.forward_backward_prepared(request, prepared)
+            )
+            submit_s = time.monotonic() - submit_started
+        finally:
+            if prepared is not None:
+                for group in groups:
+                    group._prepared_training_batch = None
         optimizer = await client.optim_step(
             OptimStepRequest(
                 run_id=client.run_id,
@@ -623,6 +655,7 @@ class ServerlessBackend:
                     **sampler_result.publication_metrics,
                     **(publication_metrics or {}),
                     **_packing_outcome_metrics(forward_result.packing),
+                    "time/step_remote_forward_submit_s": submit_s,
                 }
             ],
             trajectory_groups=groups,
@@ -633,6 +666,47 @@ class ServerlessBackend:
             metrics=metrics,
             checkpoint_id=sampler_result.checkpoint.checkpoint_id,
         )
+
+    def supports_async_pipeline_packing(self, model: AnyTrainableModel) -> bool:
+        return self._model_key(model) in self._clients
+
+    async def prepare_pipeline_batch(
+        self,
+        model: AnyTrainableModel,
+        trajectory_groups: list[TrajectoryGroup],
+        *,
+        normalize_advantages: bool = True,
+    ) -> dict[str, float]:
+        del normalize_advantages
+        client = await self.training_client(model)
+        started = time.monotonic()
+        batch = RlTrajectoryBatch.from_groups(
+            trajectory_groups,
+            default_source_version=client.projected_learner_version,
+        )
+        prepared = await asyncio.to_thread(prepare_training_batch, batch)
+        if any(
+            group._prepared_training_batch is not None for group in trajectory_groups
+        ):
+            raise RuntimeError("trajectory group already owns a prepared batch")
+        for group in trajectory_groups:
+            group._prepared_training_batch = prepared
+        return {
+            "time/step_prepare_remote_batch_s": time.monotonic() - started,
+            "data/step_remote_batch_bytes": float(prepared.ref.byte_count),
+        }
+
+    async def discard_pipeline_batch(
+        self, trajectory_groups: list[TrajectoryGroup]
+    ) -> None:
+        prepared = trajectory_groups[0]._prepared_training_batch
+        if not isinstance(prepared, EncodedTrainingBatch) or any(
+            group._prepared_training_batch is not prepared
+            for group in trajectory_groups
+        ):
+            raise RuntimeError("remote pipeline batch is not prepared")
+        for group in trajectory_groups:
+            group._prepared_training_batch = None
 
     async def _train_sft(
         self,
