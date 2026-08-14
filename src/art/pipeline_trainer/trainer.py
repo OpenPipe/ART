@@ -1067,11 +1067,22 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 for group in batch:
                     group._collect_packing_shape = True
             started = time.monotonic()
-            preparation_metrics = await prepare(
-                self.model,
-                batch,
-                normalize_advantages=self.normalize_advantages,
-            )
+            prepare_kwargs: dict[str, Any] = {
+                "normalize_advantages": self.normalize_advantages
+            }
+            if callable(getattr(self.backend, "start_pipeline_train", None)):
+                expected_step = packing_policy_step + 1
+                prepare_kwargs.update(
+                    learner_parent_version=packing_policy_step,
+                    train_kwargs=self._train_kwargs(
+                        packing_policy_step,
+                        should_checkpoint=(
+                            self.save_checkpoint
+                            and self._should_eval_step(expected_step)
+                        ),
+                    ),
+                )
+            preparation_metrics = await prepare(self.model, batch, **prepare_kwargs)
             preparation_s = time.monotonic() - started
             if preparation_metrics is None:
                 if saw_sentinel:
@@ -1184,51 +1195,47 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             should_eval_step = self._should_eval_step(expected_step)
             should_checkpoint = self.save_checkpoint and should_eval_step
 
-            async with self.state.policy_updated:
-                self.state.next_training_step = expected_step
-                self.state.policy_updated.notify_all()
-            if self._packed_queue is not None:
-                prepared.handoff.set()
-
             self._status.note_training_start(len(batch))
             train_call_start = time.monotonic()
             if os.getenv("ART_TRAIN_STEP_LOG"):
                 print(f"[train] step {expected_step} starting (batch={len(batch)})")
             try:
-                train_kwargs: dict[str, Any] = {
-                    "learning_rate": self.learning_rate,
-                    "loss_fn": self.loss_fn,
-                    "loss_fn_config": self.loss_fn_config,
-                    "normalize_advantages": self.normalize_advantages,
-                    "save_checkpoint": should_checkpoint,
-                    "adam_params": self.adam_params,
-                    "optimizer_save_interval": self.optimizer_save_interval,
-                }
-                if self.grad_accumulation_sequences is not None:
-                    train_kwargs["grad_accumulation_sequences"] = (
-                        self.grad_accumulation_sequences
-                    )
-                from art.local.backend import LocalBackend
-
-                if stop_at_step is not None and isinstance(self.backend, LocalBackend):
-                    train_kwargs["final_training_step"] = stop_at_step
-                if self.kl_penalty_coef > 0.0:
-                    kl_penalty_reference_step = self._kl_penalty_reference_step(
-                        current_step
-                    )
-                    train_kwargs["kl_penalty_coef"] = self.kl_penalty_coef
-                    train_kwargs["kl_penalty_source"] = "sample"
-                    train_kwargs["kl_penalty_reference_step"] = (
-                        kl_penalty_reference_step
-                    )
+                train_kwargs = self._train_kwargs(
+                    current_step,
+                    should_checkpoint=should_checkpoint,
+                    stop_at_step=stop_at_step,
+                )
                 if self.autotune.mode != "off":
                     for group in batch:
                         group._collect_packing_shape = True
-                result = await self.backend.train(
-                    self.model,
-                    batch,
-                    **train_kwargs,
+                start_pipeline_train = getattr(
+                    self.backend, "start_pipeline_train", None
                 )
+                if self._packed_queue is not None and callable(start_pipeline_train):
+                    pending = await start_pipeline_train(
+                        self.model, batch, **train_kwargs
+                    )
+                    if pending.step != expected_step:
+                        raise RuntimeError(
+                            "pipeline optimizer reserved an unexpected learner: "
+                            f"expected={expected_step}, got={pending.step}"
+                        )
+                    async with self.state.policy_updated:
+                        self.state.next_training_step = pending.step
+                        self.state.policy_updated.notify_all()
+                    prepared.handoff.set()
+                    result = await pending.result()
+                else:
+                    async with self.state.policy_updated:
+                        self.state.next_training_step = expected_step
+                        self.state.policy_updated.notify_all()
+                    if self._packed_queue is not None:
+                        prepared.handoff.set()
+                    result = await self.backend.train(
+                        self.model,
+                        batch,
+                        **train_kwargs,
+                    )
                 self._backend_training_completed = True
             except Exception:
                 for group in batch:
@@ -1375,6 +1382,38 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         await self._discard_pending_prepared_batches()
         self._persist_state(current_step)
         self.request_stop()
+
+    def _train_kwargs(
+        self,
+        current_step: int,
+        *,
+        should_checkpoint: bool,
+        stop_at_step: int | None = None,
+    ) -> dict[str, Any]:
+        train_kwargs: dict[str, Any] = {
+            "learning_rate": self.learning_rate,
+            "loss_fn": self.loss_fn,
+            "loss_fn_config": self.loss_fn_config,
+            "normalize_advantages": self.normalize_advantages,
+            "save_checkpoint": should_checkpoint,
+            "adam_params": self.adam_params,
+            "optimizer_save_interval": self.optimizer_save_interval,
+        }
+        if self.grad_accumulation_sequences is not None:
+            train_kwargs["grad_accumulation_sequences"] = (
+                self.grad_accumulation_sequences
+            )
+        from art.local.backend import LocalBackend
+
+        if stop_at_step is not None and isinstance(self.backend, LocalBackend):
+            train_kwargs["final_training_step"] = stop_at_step
+        if self.kl_penalty_coef > 0.0:
+            train_kwargs.update(
+                kl_penalty_coef=self.kl_penalty_coef,
+                kl_penalty_source="sample",
+                kl_penalty_reference_step=self._kl_penalty_reference_step(current_step),
+            )
+        return train_kwargs
 
     async def _discard_pending_prepared_batches(self) -> None:
         if self._packed_queue is None:
