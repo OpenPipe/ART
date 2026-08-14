@@ -3633,8 +3633,30 @@ def _tokenize_chat_view(
     ):
         direct_bounds = []
 
+    def canonical_render_to_rendered(probe: Sequence[int]) -> list[int] | None:
+        if not exact_prefix_length:
+            return list(probe)
+        if (
+            len(probe) < canonical_prefix_length
+            or list(probe[:canonical_prefix_length])
+            != canonical_rendered[:canonical_prefix_length]
+        ):
+            return None
+        return [
+            *rendered[:exact_prefix_length],
+            *probe[canonical_prefix_length:],
+        ]
+
+    def canonical_span_to_rendered(start: int, end: int) -> tuple[int, int] | None:
+        if not exact_prefix_length:
+            return start, end
+        if start < canonical_prefix_length:
+            return None
+        delta = exact_prefix_length - canonical_prefix_length
+        return start + delta, end + delta
+
     def differing_span(probe: Sequence[int]) -> tuple[int, int] | None:
-        baseline = canonical_rendered if canonical_prefix_length else rendered
+        baseline = canonical_rendered if exact_prefix_length else rendered
         prefix = 0
         while (
             prefix < len(baseline)
@@ -3650,13 +3672,8 @@ def _tokenize_chat_view(
         ):
             suffix += 1
         end = len(baseline) - suffix
-        if canonical_prefix_length:
-            if prefix < canonical_prefix_length:
-                return None
-            delta = exact_prefix_length - canonical_prefix_length
-            prefix += delta
-            end += delta
-        return (prefix, end) if prefix < end else None
+        span = canonical_span_to_rendered(prefix, end)
+        return span if span is not None and span[0] < span[1] else None
 
     marked_bounds: dict[int, tuple[int, int]] = {}
     marked_part_bounds: dict[int, list[tuple[int, int]]] = {}
@@ -3787,16 +3804,16 @@ def _tokenize_chat_view(
                 if (
                     encoded is not None
                     and (
-                        encoded_ids == rendered
+                        encoded_ids == canonical_rendered
                         or (
                             exact_prefix_length
-                            and len(encoded_ids) == len(rendered)
-                            and encoded_ids[exact_prefix_length:]
-                            == rendered[exact_prefix_length:]
+                            and len(encoded_ids) == len(canonical_rendered)
+                            and encoded_ids[canonical_prefix_length:]
+                            == canonical_rendered[canonical_prefix_length:]
                         )
                     )
                     and isinstance(raw_offsets, list)
-                    and len(raw_offsets) == len(rendered)
+                    and len(raw_offsets) == len(encoded_ids)
                 ):
                     offsets: list[tuple[int, int]] = []
                     for value in raw_offsets:
@@ -3807,7 +3824,7 @@ def _tokenize_chat_view(
                         ):
                             break
                         offsets.append((value[0], value[1]))
-                    if len(offsets) == len(rendered):
+                    if len(offsets) == len(encoded_ids):
                         token_bounds: dict[tuple[int, int], tuple[int, int]] = {}
                         token_cursor = 0
                         for key, (char_start, char_end) in sorted(
@@ -3840,10 +3857,19 @@ def _tokenize_chat_view(
                                 if (message_index, part_index) in token_bounds
                             ]
                             if len(bounds) == part_count:
-                                marked_part_bounds[message_index] = bounds
+                                rendered_bounds = [
+                                    canonical_span_to_rendered(*bound)
+                                    for bound in bounds
+                                ]
+                                if any(bound is None for bound in rendered_bounds):
+                                    continue
+                                translated = cast(
+                                    list[tuple[int, int]], rendered_bounds
+                                )
+                                marked_part_bounds[message_index] = translated
                                 marked_bounds[message_index] = (
-                                    bounds[0][0],
-                                    bounds[-1][1],
+                                    translated[0][0],
+                                    translated[-1][1],
                                 )
         for message_index, bounds in list(marked_part_bounds.items()):
             whitespace_parts = [
@@ -3868,6 +3894,11 @@ def _tokenize_chat_view(
                         add_generation_prompt=not ends_with_assistant,
                     )
                 except Exception:
+                    marked_bounds.pop(message_index, None)
+                    marked_part_bounds.pop(message_index, None)
+                    break
+                empty_render = canonical_render_to_rendered(empty_render)
+                if empty_render is None:
                     marked_bounds.pop(message_index, None)
                     marked_part_bounds.pop(message_index, None)
                     break
@@ -3913,13 +3944,17 @@ def _tokenize_chat_view(
                         )
                     except Exception:
                         continue
+                    rendered_prefix = canonical_render_to_rendered(prefix)
+                    rendered_completed = canonical_render_to_rendered(completed)
                     if (
                         completed[: len(prefix)] == prefix
-                        and rendered[: len(completed)] == completed
+                        and rendered_prefix is not None
+                        and rendered_completed is not None
+                        and rendered[: len(rendered_completed)] == rendered_completed
                     ):
                         probed_bounds[message_index] = (
-                            len(prefix),
-                            len(prefix),
+                            len(rendered_prefix),
+                            len(rendered_prefix),
                         )
                 continue
             if any(part == "tool_call" for part, _ in parts):
@@ -3954,9 +3989,13 @@ def _tokenize_chat_view(
                 except Exception:
                     prefix = []
                 local = part_ids(parts[0][1])
-                if rendered == [*prefix, *local]:
+                rendered_prefix = canonical_render_to_rendered(prefix)
+                if rendered_prefix is not None and rendered == [
+                    *rendered_prefix,
+                    *local,
+                ]:
                     probed_bounds[message_index] = (
-                        len(prefix),
+                        len(rendered_prefix),
                         len(rendered),
                     )
                     continue
@@ -3967,13 +4006,16 @@ def _tokenize_chat_view(
                     )
                 except Exception:
                     completed = []
+                rendered_completed = canonical_render_to_rendered(completed)
                 if (
                     completed == [*prefix, *local]
-                    and rendered[: len(completed)] == completed
+                    and rendered_prefix is not None
+                    and rendered_completed is not None
+                    and rendered[: len(rendered_completed)] == rendered_completed
                 ):
                     probed_bounds[message_index] = (
-                        len(prefix),
-                        len(completed),
+                        len(rendered_prefix),
+                        len(rendered_completed),
                     )
                     continue
             probe_messages = deepcopy(messages)
@@ -4042,21 +4084,29 @@ def _tokenize_chat_view(
                 marked_part_bounds.pop(message_index, None)
                 prefix = completed = None
 
-            def matches_rendered_prefix(probe: Sequence[int]) -> bool:
-                return rendered[: len(probe)] == list(probe) or bool(
-                    exact_prefix_length
-                    and len(probe) >= exact_prefix_length
-                    and rendered[exact_prefix_length : len(probe)]
-                    == list(probe[exact_prefix_length:])
-                )
-
+            rendered_prefix = (
+                canonical_render_to_rendered(prefix) if prefix is not None else None
+            )
+            rendered_completed = (
+                canonical_render_to_rendered(completed)
+                if completed is not None
+                else None
+            )
+            corrected_bounds = (
+                canonical_span_to_rendered(len(prefix), len(completed))
+                if prefix is not None and completed is not None
+                else None
+            )
             if (
                 prefix is not None
                 and completed is not None
-                and matches_rendered_prefix(prefix)
-                and matches_rendered_prefix(completed)
+                and rendered_prefix is not None
+                and rendered_completed is not None
+                and corrected_bounds is not None
+                and rendered[: len(rendered_prefix)] == rendered_prefix
+                and rendered[: len(rendered_completed)] == rendered_completed
             ):
-                marked_bounds[message_index] = (len(prefix), len(completed))
+                marked_bounds[message_index] = corrected_bounds
                 # The marker-derived per-part offsets describe the old render.
                 marked_part_bounds.pop(message_index, None)
             else:
@@ -4093,15 +4143,20 @@ def _tokenize_chat_view(
                     prompt_render = probe_render(
                         messages[:message_index], add_generation_prompt=True
                     )
+                    rendered_prompt = (
+                        canonical_render_to_rendered(prompt_render)
+                        if prompt_render is not None
+                        else None
+                    )
                     if (
-                        prompt_render is None
-                        or rendered[: len(prompt_render)] != prompt_render
+                        rendered_prompt is None
+                        or rendered[: len(rendered_prompt)] != rendered_prompt
                     ):
                         raise ValueError(
                             "Could not locate a sampled history message in the "
                             "rendered history"
                         )
-                    generation_start = len(prompt_render)
+                    generation_start = len(rendered_prompt)
                     sampled_bounds = (generation_start, len(rendered))
                 else:
                     raise ValueError(

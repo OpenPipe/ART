@@ -3064,10 +3064,14 @@ def test_chat_rerender_normalizes_tool_arguments(arguments: object) -> None:
 
 @pytest.mark.parametrize("reasoning", (None, "think"), ids=("tool-only", "reasoning"))
 @pytest.mark.parametrize(
-    "exact_prompt", ([1], [900, 10]), ids=("shorter-prompt", "changed-prompt")
+    ("canonical_prompt", "exact_prompt"),
+    (([1, 10], [1]), ([1, 10], [900, 10]), ([], [900])),
+    ids=("shorter-prompt", "changed-prompt", "inserted-prompt"),
 )
 def test_structured_tool_arguments_remain_in_sampled_region_without_exact_tokens(
-    reasoning: str | None, exact_prompt: list[int]
+    reasoning: str | None,
+    canonical_prompt: list[int],
+    exact_prompt: list[int],
 ) -> None:
     exchange = _chat_exchange(exact_prompt, [2])
     data = exchange.response.model_dump(mode="python")
@@ -3108,17 +3112,16 @@ def test_structured_tool_arguments_remain_in_sampled_region_without_exact_tokens
         ) -> list[int]:
             del kwargs
             if messages[-1]["role"] != "assistant":
-                return [1, 10]
+                return canonical_prompt
             function = messages[-1]["tool_calls"][0]["function"]
             assert isinstance(function["arguments"], dict)
             if (
                 function["name"] != "lookup"
                 or messages[-1].get("reasoning") != reasoning
             ):
-                return [1, 10, 95, 96, 98, 25, 99, 26]
+                return [*canonical_prompt, 95, 96, 98, 25, 99, 26]
             return [
-                1,
-                10,
+                *canonical_prompt,
                 *([15, 16] if reasoning else []),
                 20,
                 25,
@@ -3447,13 +3450,13 @@ def test_reconciled_reasoning_preserves_complete_outputs_after_prefix_retokeniza
     first = _chat_exchange([], [])
     first_messages = [{"role": "user", "content": "one"}]
     first.request["messages"] = cast(list[ChatCompletionMessageParam], first_messages)
-    first_prompt = cast(
+    canonical_first_prompt = cast(
         list[int],
         tokenizer.apply_chat_template(
             first_messages, add_generation_prompt=True, tokenize=True
         ),
     )
-    first_prompt[0] = 900
+    first_prompt = [900, *canonical_first_prompt]
     first_message = {
         "role": "assistant",
         "reasoning": "thought-one",
@@ -3467,7 +3470,7 @@ def test_reconciled_reasoning_preserves_complete_outputs_after_prefix_retokeniza
             tokenize=True,
         ),
     )
-    first_output = first_completed[len(first_prompt) :]
+    first_output = first_completed[len(canonical_first_prompt) :]
     first_output[5] = 901
     first_data = first.response.model_dump(mode="python")
     first_data["choices"][0]["message"] = first_message
@@ -3491,13 +3494,13 @@ def test_reconciled_reasoning_preserves_complete_outputs_after_prefix_retokeniza
         {"role": "user", "content": "two"},
     ]
     second.request["messages"] = cast(list[ChatCompletionMessageParam], second_messages)
-    second_prompt = cast(
+    canonical_second_prompt = cast(
         list[int],
         tokenizer.apply_chat_template(
             second_messages, add_generation_prompt=True, tokenize=True
         ),
     )
-    second_prompt[0] = 900
+    second_prompt = [900, *canonical_second_prompt]
     second_message = {
         "role": "assistant",
         "reasoning": "thought-two",
@@ -3511,7 +3514,7 @@ def test_reconciled_reasoning_preserves_complete_outputs_after_prefix_retokeniza
             tokenize=True,
         ),
     )
-    second_output = second_completed[len(second_prompt) :]
+    second_output = second_completed[len(canonical_second_prompt) :]
     second_data = second.response.model_dump(mode="python")
     second_data["choices"][0]["message"] = second_message
     second_data["choices"][0]["prompt_token_ids"] = second_prompt
