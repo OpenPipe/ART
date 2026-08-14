@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import gc
 from pathlib import Path
 from threading import BoundedSemaphore, Event, Lock
 import time
@@ -40,6 +41,7 @@ class MegatronTrainJobExecutor:
             runtime,
             capacity=int(runtime.snapshot_pool_capacity),
         )
+        self._python_gc_stabilized = False
         self._closed = False
 
     def execute(
@@ -73,6 +75,7 @@ class MegatronTrainJobExecutor:
             snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
             cancelled=cancelled,
         )
+        metrics.update(self._stabilize_python_gc())
         timing.previous_job_complete_s = time.monotonic()
         return metrics
 
@@ -106,8 +109,22 @@ class MegatronTrainJobExecutor:
             snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
             cancelled=cancelled,
         )
+        metrics.update(self._stabilize_python_gc())
         timing.previous_job_complete_s = time.monotonic()
         return metrics
+
+    def _stabilize_python_gc(self) -> dict[str, float]:
+        if self._python_gc_stabilized or not self.runtime.transformer_layers_compiled:
+            return {}
+        started = time.perf_counter()
+        collected = gc.collect()
+        gc.freeze()
+        self._python_gc_stabilized = True
+        return {
+            "python_gc_stabilize_s": time.perf_counter() - started,
+            "python_gc_collected_objects": float(collected),
+            "python_gc_frozen_objects": float(gc.get_freeze_count()),
+        }
 
     def score(
         self,
