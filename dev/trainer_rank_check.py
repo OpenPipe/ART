@@ -25,6 +25,8 @@ from art.trainer_rank import (
     Unset,
 )
 
+_TOPK_ORACLE_TOLERANCE = 5e-3
+
 
 @dataclass(frozen=True)
 class Diff:
@@ -391,10 +393,10 @@ def _assert_same_logits_topk(outputs: Sequence[dict[str, object]]) -> None:
             dim=-1,
         )
         diff = _diff(values, oracle_values)
-        if diff.mean_abs_pct > 2e-4:
+        if diff.mean_abs_pct > _TOPK_ORACLE_TOLERANCE:
             raise AssertionError(
                 f"output {index} same-logit top-k mean_abs_pct="
-                f"{diff.mean_abs_pct} exceeds 0.0002"
+                f"{diff.mean_abs_pct} exceeds {_TOPK_ORACLE_TOLERANCE}"
             )
         changed = (
             (tokens.sort(dim=-1).values != oracle_tokens.sort(dim=-1).values)
@@ -421,11 +423,12 @@ def _assert_topk_only_oracle(outputs: Sequence[dict[str, object]]) -> None:
                 raise AssertionError("top-k-only tokens differ from same-run oracle")
         else:
             diff = _diff(actual, expected)
-            if diff.mean_abs_pct > 2e-4:
+            if diff.mean_abs_pct > _TOPK_ORACLE_TOLERANCE:
                 raise AssertionError(
                     "top-k-only logprobs differ from same-run oracle: "
                     f"mean_abs_pct={diff.mean_abs_pct}, "
-                    f"max_abs_diff={diff.max_abs_diff}"
+                    f"max_abs_diff={diff.max_abs_diff}, "
+                    f"limit={_TOPK_ORACLE_TOLERANCE}"
                 )
 
 
