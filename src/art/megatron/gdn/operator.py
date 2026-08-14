@@ -14,6 +14,7 @@ import triton.language as tl
 
 from .conv_gelu import packed_varlen_causal_conv
 from .fla_cp import chunk_gated_delta_rule_native_cp
+from .fla_kernel_config import configure_fla_gdn_hopper_backward
 from .gdn_prefix_tree import (
     GdnPackedExecutionSpec,
     GdnRankExecutionPlan,
@@ -66,24 +67,30 @@ def install_prefix_tree_gdn_hooks(model_chunks: Sequence[Any]) -> None:
     gated_delta_net_type = _optional_gated_delta_net_type()
     if gated_delta_net_type is None:
         return
+    modules = [
+        module
+        for chunk in model_chunks
+        for module in chunk.modules()
+        if isinstance(module, gated_delta_net_type)
+    ]
+    if not modules:
+        return
+    configure_fla_gdn_hopper_backward()
     next_gdn_index = 0
-    for chunk in model_chunks:
-        for module in chunk.modules():
-            if not isinstance(module, gated_delta_net_type):
-                continue
-            existing_index = getattr(module, "_art_gdn_index", None)
-            if existing_index is None:
-                module._art_gdn_index = next_gdn_index
-                module_index = next_gdn_index
-            else:
-                module_index = int(existing_index)
-            next_gdn_index = max(next_gdn_index, module_index + 1)
-            if getattr(module, "_art_prefix_tree_gdn_hooked", False):
-                continue
-            original_forward = module.forward
-            module._art_physical_forward = original_forward
-            module.forward = MethodType(_prefix_tree_forward, module)
-            module._art_prefix_tree_gdn_hooked = True
+    for module in modules:
+        existing_index = getattr(module, "_art_gdn_index", None)
+        if existing_index is None:
+            module._art_gdn_index = next_gdn_index
+            module_index = next_gdn_index
+        else:
+            module_index = int(existing_index)
+        next_gdn_index = max(next_gdn_index, module_index + 1)
+        if getattr(module, "_art_prefix_tree_gdn_hooked", False):
+            continue
+        original_forward = module.forward
+        module._art_physical_forward = original_forward
+        module.forward = MethodType(_prefix_tree_forward, module)
+        module._art_prefix_tree_gdn_hooked = True
 
 
 def install_gdn_island_hooks(model_chunks: Sequence[Any]) -> None:
