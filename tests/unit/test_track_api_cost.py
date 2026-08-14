@@ -60,6 +60,40 @@ class _OpenAIResponse:
         self.model = model
 
 
+class _OpenAIResponsesUsage:
+    def __init__(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        cached_tokens: int = 0,
+    ) -> None:
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.input_tokens_details = type(
+            "InputTokensDetails",
+            (),
+            {"cached_tokens": cached_tokens},
+        )()
+
+
+class _OpenAIResponsesResponse:
+    def __init__(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        cached_tokens: int = 0,
+        model: str | None = None,
+    ) -> None:
+        self.usage = _OpenAIResponsesUsage(
+            input_tokens,
+            output_tokens,
+            cached_tokens=cached_tokens,
+        )
+        self.model = model
+
+
 class _AnthropicUsage:
     def __init__(
         self,
@@ -161,6 +195,38 @@ class TestTrackApiCost:
 
         metrics = await builder.flush()
         assert metrics["costs/train/llm_judge/cached_openai"] == pytest.approx(0.00255)
+
+    @pytest.mark.asyncio
+    async def test_openai_cost_extraction_accounts_for_responses_cached_tokens(
+        self,
+    ) -> None:
+        builder = MetricsBuilder(cost_context="train")
+
+        @track_api_cost(
+            source="llm_judge/cached_openai_responses",
+            provider="openai",
+            model_name="openai/gpt-4.1",
+            prompt_price_per_million=2.0,
+            completion_price_per_million=8.0,
+            cached_prompt_price_per_million=0.5,
+        )
+        async def _judge() -> _OpenAIResponsesResponse:
+            return _OpenAIResponsesResponse(
+                input_tokens=2_000,
+                output_tokens=100,
+                cached_tokens=1_500,
+            )
+
+        token = builder.activate()
+        try:
+            await _judge()
+        finally:
+            token.var.reset(token)
+
+        metrics = await builder.flush()
+        assert metrics["costs/train/llm_judge/cached_openai_responses"] == pytest.approx(
+            0.00255
+        )
 
     @pytest.mark.asyncio
     async def test_anthropic_cost_extraction_uses_registered_model_pricing(
