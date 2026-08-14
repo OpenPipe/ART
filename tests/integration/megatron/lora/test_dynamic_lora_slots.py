@@ -213,14 +213,17 @@ def test_trainer_rank_tp_head_backward_matches_unsharded_oracle(
     )
 
 
-@pytest.mark.parametrize("topology", ("dp", "tp", "cp"))
+@pytest.mark.parametrize(
+    ("topology", "world"),
+    (("dp", 2), ("tp", 2), ("cp", 2), ("tp_cp", 4)),
+)
 def test_trainer_rank_custom_parameter_reduction_oracle(
     topology: str,
+    world: int,
     tmp_path: Path,
 ) -> None:
-    world = 2
     if not torch.cuda.is_available() or torch.cuda.device_count() < world:
-        pytest.skip("requires 2 CUDA devices")
+        pytest.skip(f"requires {world} CUDA devices")
     init_file = tmp_path / f"custom_parameter_{topology}"
     mp.spawn(
         _custom_parameter_reduction_worker,
@@ -239,10 +242,12 @@ def _custom_parameter_reduction_worker(
     torch.cuda.set_device(rank)
     init_process_group("nccl", rank=rank, world_size=world, init_method=init_method)
     try:
+        tp_size = 2 if topology == "tp_cp" else world if topology == "tp" else 1
+        cp_size = 2 if topology == "tp_cp" else world if topology == "cp" else 1
         ps.initialize_model_parallel(
-            tensor_model_parallel_size=world if topology == "tp" else 1,
+            tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=1,
-            context_parallel_size=world if topology == "cp" else 1,
+            context_parallel_size=cp_size,
             expert_model_parallel_size=1,
         )
         device = torch.device("cuda", rank)
@@ -265,7 +270,7 @@ def _custom_parameter_reduction_worker(
         torch.testing.assert_close(parameter, torch.tensor(1.0, device=device))
         (parameter * float(rank + 1)).backward()
         (reduced,) = trainer._reduce_dynamic_grads((parameter,), scale_grads=1.0)
-        expected = 1.5 if topology == "tp" else 3.0
+        expected = {"dp": 3.0, "tp": 1.5, "cp": 3.0, "tp_cp": 5.0}[topology]
         torch.testing.assert_close(reduced, torch.tensor(expected, device=device))
     finally:
         if getattr(ps, "model_parallel_is_initialized", lambda: False)():
