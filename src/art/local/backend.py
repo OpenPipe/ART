@@ -16,6 +16,10 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
+from art.utils.chat_template import (
+    chat_template_with_preserved_thinking,
+    configure_preserved_thinking_chat_template,
+)
 from art.utils.lifecycle import (
     PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
     process_shutdown_timeout,
@@ -242,6 +246,14 @@ def _apply_configured_chat_template_server_args(
         chat_template = _model_support_default_chat_template(
             base_model, internal_config
         )
+    if chat_template is None and base_model is not None and base_model.startswith(
+        ("Qwen/Qwen3-", "Qwen/Qwen3.5-", "OpenPipe/Qwen3-")
+    ):
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
+        default = getattr(tokenizer, "chat_template", None)
+        preserved = chat_template_with_preserved_thinking(default)
+        if preserved != default:
+            chat_template = cast(str, preserved)
     if chat_template is None:
         return
     server_args = dict(config_dict.get("server_args", {}))
@@ -269,7 +281,9 @@ def _tokenizer_cache_key(
 def _load_training_tokenizer(base_model: str) -> PreTrainedTokenizerBase:
     return cast(
         PreTrainedTokenizerBase,
-        AutoTokenizer.from_pretrained(base_model),
+        configure_preserved_thinking_chat_template(
+            AutoTokenizer.from_pretrained(base_model)
+        ),
     )
 
 
@@ -1130,7 +1144,9 @@ class LocalBackend:
     ) -> tuple[str, str]:
         config_dict: dict = dict(config or {})
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
-        _apply_configured_chat_template_server_args(config_dict, internal_config)
+        _apply_configured_chat_template_server_args(
+            config_dict, internal_config, base_model=model.base_model
+        )
         if self._model_uses_expert_replay(model):
             engine_args = dict(config_dict.get("engine_args", {}))
             engine_args["enable_return_routed_experts"] = True

@@ -21,6 +21,11 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.responses import Response
 from pydantic import BaseModel
 
+from ..utils.chat_template import (
+    chat_template_with_preserved_thinking,
+    configure_preserved_thinking_chat_template,
+    normalize_tool_call_arguments_for_chat_template,
+)
 from . import (
     AnthropicMessagesHistory,
     ChatCompletionsExchange,
@@ -972,7 +977,7 @@ def _cached_tokenizer(base_model: str, revision: str | None) -> Tokenizer:
             from ..megatron.dsv4.tokenizer import get_dsv4_tokenizer
 
             tokenizer = get_dsv4_tokenizer(cast("PreTrainedTokenizerBase", tokenizer))
-        return _as_tokenizer(tokenizer)
+        return _as_tokenizer(configure_preserved_thinking_chat_template(tokenizer))
     except Exception as exc:
         raise ValueError(
             f"Could not load tokenizer for {base_model!r}; pass base_model explicitly"
@@ -1380,9 +1385,16 @@ def _template_ids(
         kwargs.setdefault("enable_thinking", thinking.get("type") == "enabled")
         if budget := thinking.get("budget_tokens"):
             kwargs.setdefault("thinking_budget", budget)
-    template = chat_template or request.get("chat_template") or config.chat_template
+    template = (
+        chat_template
+        or request.get("chat_template")
+        or config.chat_template
+        or getattr(tokenizer, "chat_template", None)
+    )
+    if kwargs.get("preserve_thinking") is True:
+        template = chat_template_with_preserved_thinking(template)
     result = tokenizer.apply_chat_template(
-        messages,
+        normalize_tool_call_arguments_for_chat_template(messages, template),
         tools=tools,
         tokenize=True,
         add_generation_prompt=not completed,
@@ -3381,7 +3393,15 @@ def _tokenize_chat_view(
         kwargs.setdefault("enable_thinking", thinking.get("type") == "enabled")
         if budget := thinking.get("budget_tokens"):
             kwargs.setdefault("thinking_budget", budget)
-    template = chat_template or history.chat_template or config.chat_template
+    template = (
+        chat_template
+        or history.chat_template
+        or config.chat_template
+        or getattr(resolved_tokenizer, "chat_template", None)
+    )
+    if kwargs.get("preserve_thinking") is True:
+        template = chat_template_with_preserved_thinking(template)
+    messages = normalize_tool_call_arguments_for_chat_template(messages, template)
     ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
 
     def render(
@@ -3718,9 +3738,18 @@ def _tokenize_chat_view(
                     if encoded_data is not None
                     else None
                 )
+                encoded_ids = _ids(encoded) if encoded is not None else []
                 if (
                     encoded is not None
-                    and _ids(encoded) == rendered
+                    and (
+                        encoded_ids == rendered
+                        or (
+                            exact_prefix_length
+                            and len(encoded_ids) == len(rendered)
+                            and encoded_ids[exact_prefix_length:]
+                            == rendered[exact_prefix_length:]
+                        )
+                    )
                     and isinstance(raw_offsets, list)
                     and len(raw_offsets) == len(rendered)
                 ):
@@ -3966,8 +3995,33 @@ def _tokenize_chat_view(
         complete_sampled_message = (
             sampled
             and source is not None
-            and _source_covers_complete_sampled_message(message, source)
+            and _source_covers_complete_sampled_message(
+                history.messages[message_index], source
+            )
         )
+        if (
+            complete_sampled_message
+            and full_exact is not None
+            and message_index in marked_bounds
+            and isinstance(getattr(source, "exchange", None), ChatCompletionsExchange)
+            and marked_bounds[message_index][1] - marked_bounds[message_index][0]
+            != len(full_exact)
+        ):
+            prefix = render(messages[:message_index], add_generation_prompt=True)
+            completed = render(
+                messages[: message_index + 1], add_generation_prompt=False
+            )
+
+            def matches_rendered_prefix(probe: Sequence[int]) -> bool:
+                return rendered[: len(probe)] == list(probe) or bool(
+                    exact_prefix_length
+                    and len(probe) >= exact_prefix_length
+                    and rendered[exact_prefix_length : len(probe)]
+                    == list(probe[exact_prefix_length:])
+                )
+
+            if matches_rendered_prefix(prefix) and matches_rendered_prefix(completed):
+                marked_bounds[message_index] = (len(prefix), len(completed))
         source_boundary = False
         generation_start: int | None = None
         sampled_bounds: tuple[int, int] | None = None
@@ -4068,7 +4122,7 @@ def _tokenize_chat_view(
         if sampled and not content_bounds_proven:
             raise ValueError(
                 "Could not uniquely locate or prove the sampled content boundary "
-                "with this tokenizer"
+                f"for history message {message_index} with this tokenizer"
             )
         if (
             sampled

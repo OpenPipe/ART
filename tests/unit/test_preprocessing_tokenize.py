@@ -8,6 +8,10 @@ from transformers.tokenization_utils_base import BatchEncoding
 from art.preprocessing.tokenize import tokenize_sft_batch
 from art.trajectories import Trajectory
 from art.types import MessagesAndChoices, TrainSFTConfig
+from art.utils.chat_template import (
+    chat_template_with_preserved_thinking,
+    default_chat_template_kwargs_for_template,
+)
 
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
@@ -166,6 +170,34 @@ class _NonPrefixStableTokenizer(_LastAssistantTokenizer):
         ):
             return f"<changed>{rendered}"
         return rendered
+
+
+def test_legacy_qwen_template_gains_opt_in_thinking_preservation() -> None:
+    template = (
+        "{% if enable_thinking %}think{% endif %}"
+        "{%- if loop.index0 > ns.last_query_index %}reasoning{% endif %}"
+    )
+
+    configured = chat_template_with_preserved_thinking(template)
+
+    assert isinstance(configured, str)
+    assert "preserve_thinking is defined and preserve_thinking is true" in configured
+    assert default_chat_template_kwargs_for_template(configured) == {
+        "enable_thinking": False,
+        "preserve_thinking": True,
+    }
+
+
+def test_native_or_unrecognized_thinking_templates_are_unchanged() -> None:
+    native = (
+        "{% if enable_thinking %}think{% endif %}"
+        "{%- if (preserve_thinking is defined and preserve_thinking is true) or "
+        "(loop.index0 > ns.last_query_index) %}reasoning{% endif %}"
+    )
+    unrelated = "{%- if loop.index0 > ns.last_query_index %}content{% endif %}"
+
+    assert chat_template_with_preserved_thinking(native) == native
+    assert chat_template_with_preserved_thinking(unrelated) == unrelated
 
 
 def test_tokenize_sft_batch_masks_response_tokens_without_unsloth_import() -> None:

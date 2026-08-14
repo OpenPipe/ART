@@ -675,13 +675,16 @@ class Model(
         if self.trainable:
             body["return_token_ids"] = True
             body["return_tokens_as_token_ids"] = True
-        chat_template_kwargs = (
+        configured_chat_template_kwargs = (
             internal_config.get("chat_template_kwargs")
             if internal_config is not None
             else None
         )
-        if chat_template_kwargs is not None:
-            body["chat_template_kwargs"] = dict(chat_template_kwargs)
+        if self.trainable or configured_chat_template_kwargs is not None:
+            body["chat_template_kwargs"] = {
+                "preserve_thinking": True,
+                **(configured_chat_template_kwargs or {}),
+            }
         if not body:
             return None
         return body

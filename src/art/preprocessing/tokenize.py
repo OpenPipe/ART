@@ -4,7 +4,6 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import cached_property
 from itertools import takewhile
-import json
 import math
 import random
 from typing import TYPE_CHECKING, Any, Generator, Literal, Protocol, cast
@@ -33,6 +32,7 @@ from ..types import MessagesAndChoices
 from ..utils.chat_template import (
     default_chat_template_kwargs_for_tokenizer,
     merge_chat_template_kwargs,
+    normalize_tool_call_arguments_for_chat_template,
 )
 from .moe_routing import (
     MoeRouteArray,
@@ -323,34 +323,9 @@ def _normalize_tool_call_arguments_for_chat_template(
     tokenizer: _SFTTokenizer,
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    chat_template = tokenizer.chat_template
-    assert isinstance(chat_template, str)
-    if "tool_call.arguments|items" not in chat_template:
-        return messages
-
-    normalized_messages: list[dict[str, Any]] = []
-    for message in messages:
-        tool_calls = message.get("tool_calls")
-        if tool_calls is None:
-            normalized_messages.append(message)
-            continue
-
-        assert isinstance(tool_calls, list)
-        normalized_tool_calls = []
-        for tool_call in tool_calls:
-            assert isinstance(tool_call, dict)
-            function = tool_call["function"]
-            assert isinstance(function, dict)
-            arguments_json = function["arguments"]
-            assert isinstance(arguments_json, str)
-            arguments = json.loads(arguments_json)
-            assert isinstance(arguments, dict)
-            normalized_tool_calls.append(
-                {**tool_call, "function": {**function, "arguments": arguments}}
-            )
-        normalized_messages.append({**message, "tool_calls": normalized_tool_calls})
-
-    return normalized_messages
+    return normalize_tool_call_arguments_for_chat_template(
+        messages, tokenizer.chat_template
+    )
 
 
 def _messages_for_chat_template(

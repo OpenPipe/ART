@@ -213,3 +213,17 @@ class TestModelOpenAIClientCosts:
                 "preserve_thinking": True,
             },
         }
+
+    def test_trainable_model_preserves_prior_thinking_by_default(self) -> None:
+        model = TrainableModel(
+            run_name="test-run",
+            name="test-run",
+            project="test-project",
+            base_model="test-model",
+        )
+
+        assert model._default_chat_completion_extra_body() == {
+            "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
+            "chat_template_kwargs": {"preserve_thinking": True},
+        }

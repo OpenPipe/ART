@@ -303,6 +303,13 @@ async def test_rollout_supports_string_model_args(
 
     assert trajectory.reward == 1.0
     assert trajectory.metrics["cost/user"] == 0.25
+    assert trajectory.metrics["latency/environment_startup"] >= 0
+    assert trajectory.metrics["latency/policy"] >= 0
+    assert trajectory.metrics["latency/policy_max"] >= 0
+    assert trajectory.metrics["latency/environment"] >= 0
+    assert trajectory.metrics["latency/active"] >= 0
+    assert trajectory.metrics["tokens/prompt"] == 10
+    assert trajectory.metrics["tokens/completion"] == 5
     assert client.deleted == ["env-1"]
     assert client.create_kwargs["user_llm"] == "gpt-4.1-2025-04-14"
 

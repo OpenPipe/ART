@@ -1544,6 +1544,45 @@ def test_chat_template_stripped_reasoning_splits_exact_histories() -> None:
         trajectory.tokenize()
 
 
+def test_chat_reasoning_retokenization_reconciles_when_text_is_preserved() -> None:
+    first = _chat([{"role": "user", "content": "one"}], "first")
+    first_data = first.response.model_dump(mode="python")
+    first_data["prompt_token_ids"] = [1]
+    first_data["choices"][0]["message"]["reasoning"] = "thought-one"
+    first_data["choices"][0]["token_ids"] = [2, 101]
+    first.response = ChatCompletion.model_validate(first_data)
+
+    second = _chat(
+        [
+            {"role": "user", "content": "one"},
+            {
+                "role": "assistant",
+                "content": "first",
+                "reasoning": "thought-one",
+            },
+            {"role": "user", "content": "two"},
+        ],
+        "second",
+        offset=1,
+    )
+    second_data = second.response.model_dump(mode="python")
+    second_data["prompt_token_ids"] = [1, 500, 3]
+    second_data["choices"][0]["token_ids"] = [4]
+    second.response = ChatCompletion.model_validate(second_data)
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    )
+
+    assert len(trajectory.chat_completions_histories()) == 2
+    reconciled = trajectory.chat_completions_history(
+        reconcile_text_equivalent_tokenizations=True
+    )
+    source = reconciled.message_sources[1]
+    assert source is not None
+    assert source.exchange is first
+    assert source.choice_index == 0
+
+
 def test_chat_reasoning_split_does_not_reuse_divergent_sampled_source() -> None:
     first = _chat([{"role": "user", "content": "one"}], "first")
     first_data = first.response.model_dump(mode="python")

@@ -9,6 +9,7 @@ import torch
 
 from art import TrainableModel, Trajectory
 from art.local import LocalBackend
+from art.local.backend import _apply_configured_chat_template_server_args
 from art.preprocessing.tokenize import SFTBatch
 from art.types import TrainSFTConfig
 
@@ -20,6 +21,52 @@ def _trajectory(content: str) -> Trajectory:
             {"role": "assistant", "content": content},
         ]
     )
+
+
+def test_qwen_rollout_server_uses_preserve_thinking_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    template = (
+        "{% if enable_thinking %}think{% endif %}"
+        "{%- if loop.index0 > ns.last_query_index %}reasoning{% endif %}"
+    )
+    tokenizer = type("Tokenizer", (), {"chat_template": template})()
+    monkeypatch.setattr(
+        "art.local.backend._model_support_default_chat_template",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "art.local.backend.AutoTokenizer.from_pretrained",
+        lambda _model: tokenizer,
+    )
+    config: dict[str, Any] = {}
+
+    _apply_configured_chat_template_server_args(
+        config, {}, base_model="Qwen/Qwen3.5-4B"
+    )
+
+    configured = config["server_args"]["chat_template"]
+    assert "preserve_thinking is defined and preserve_thinking is true" in configured
+
+
+def test_non_qwen_rollout_server_does_not_load_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "art.local.backend._model_support_default_chat_template",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "art.local.backend.AutoTokenizer.from_pretrained",
+        lambda _model: pytest.fail("non-Qwen templates should not be loaded eagerly"),
+    )
+    config: dict[str, Any] = {}
+
+    _apply_configured_chat_template_server_args(
+        config, {}, base_model="meta-llama/Llama-3.1-8B-Instruct"
+    )
+
+    assert config == {}
 
 
 @contextmanager

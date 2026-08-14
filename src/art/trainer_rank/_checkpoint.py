@@ -1038,7 +1038,7 @@ def _localized(
 
 
 def _slot_snapshot(trainer: TrainerRank) -> _SlotSnapshot:
-    from art.megatron.lora import LoRA
+    from art.megatron.lora import LoRA, LoRASlotRef
 
     return tuple(
         (

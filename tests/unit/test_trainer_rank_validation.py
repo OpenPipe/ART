@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 import threading
 import time
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -42,12 +42,14 @@ from art.trainer_rank._checkpoint import (
     _manifest_digest,
     _merge_component,
     _PreparedSave,
+    _slot_snapshot,
     _validate_save_state,
     abort_checkpoint_save,
     finish_checkpoint_save,
     materialize_lora,
     prepare_checkpoint,
     prepare_checkpoint_save,
+    validate_checkpoint,
 )
 from art.trainer_rank._impl import (
     _anchor_disconnected_outputs,
@@ -1024,7 +1026,9 @@ def test_checkpoint_save_rejects_accumulated_gradients() -> None:
         _validate_save_state(trainer, "student")
 
 
-def _canonical_checkpoint(root: Path) -> CheckpointManifest:
+def _canonical_checkpoint(
+    root: Path, *, with_optimizer: bool = True
+) -> CheckpointManifest:
     from safetensors.torch import save_file
 
     root.mkdir()
@@ -1038,24 +1042,29 @@ def _canonical_checkpoint(root: Path) -> CheckpointManifest:
     (root / "adapter_config.json").write_text(json.dumps(config))
     key = "layer.q_proj.lora_A.weight"
     save_file({key: torch.ones(1, 2)}, root / "adapter_model.safetensors")
-    (root / "optimizer").mkdir()
     files = []
-    for component in ("master", "exp_avg", "exp_avg_sq"):
-        relative = f"optimizer/{component}.safetensors"
-        save_file({key: torch.ones(1, 2)}, root / relative)
-        files.append(relative)
+    if with_optimizer:
+        (root / "optimizer").mkdir()
+        for component in ("master", "exp_avg", "exp_avg_sq"):
+            relative = f"optimizer/{component}.safetensors"
+            save_file({key: torch.ones(1, 2)}, root / relative)
+            files.append(relative)
     manifest: CheckpointManifest = {
         "format_version": 1,
         "base_model_name_or_path": "test/model",
-        "optimizer": OptimizerConfig(
-            learning_rate=1e-3,
-            beta1=0.9,
-            beta2=0.99,
-            eps=1e-8,
-            weight_decay=0.1,
+        "optimizer": (
+            OptimizerConfig(
+                learning_rate=1e-3,
+                beta1=0.9,
+                beta2=0.99,
+                eps=1e-8,
+                weight_decay=0.1,
+            )
+            if with_optimizer
+            else None
         ),
-        "parameters": {key: files},
-        "steps": {key: 3.0},
+        "parameters": {key: files} if with_optimizer else {},
+        "steps": {key: 3.0} if with_optimizer else {},
         "files": {},
         "digest": "",
     }
@@ -1066,6 +1075,96 @@ def _canonical_checkpoint(root: Path) -> CheckpointManifest:
     manifest["digest"] = _manifest_digest(manifest)
     (root / "checkpoint.json").write_text(json.dumps(manifest))
     return manifest
+
+
+def test_weights_only_checkpoint_validation_is_canonical(tmp_path: Path) -> None:
+    root = tmp_path / "checkpoint"
+    manifest = _canonical_checkpoint(root, with_optimizer=False)
+
+    assert validate_checkpoint(root) == manifest
+    with pytest.raises(RuntimeError, match="does not contain optimizer state"):
+        validate_checkpoint(root, require_optimizer=True)
+
+
+def test_weights_only_load_replaces_stale_optimizer_and_recreates_it_lazily(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from art.trainer_rank import _checkpoint as checkpoint_module
+
+    root = tmp_path / "checkpoint"
+    _canonical_checkpoint(root, with_optimizer=False)
+    source = prepare_checkpoint(str(root))
+    assert source.manifest is not None and source.manifest["optimizer"] is None
+
+    trainer = TrainerRank(_runtime())
+    config = cast(Any, source.config)
+    old = torch.nn.Parameter(torch.zeros(1, 2))
+    trainer._checkpoint_slots["student"] = _CheckpointSlot((old,), config)
+    stale = trainer._dynamic_optimizer("student", AdamParams(learning_rate=1e-3))
+    replacement = torch.nn.Parameter(torch.ones(1, 2))
+    key = source.keys[0]
+    monkeypatch.setattr(
+        trainer, "_local_lora_adapter_templates", lambda: {key: replacement}
+    )
+    monkeypatch.setattr(trainer, "_load_checkpoint_slot", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(
+        trainer,
+        "_validate_checkpoint_consistency",
+        lambda *_args: (replacement,),
+    )
+    monkeypatch.setattr(trainer, "_validate_loaded_checkpoint_config", lambda *_: None)
+    monkeypatch.setattr(checkpoint_module, "_slot_snapshot", lambda _trainer: ())
+    monkeypatch.setattr(checkpoint_module, "_commit_slot", lambda *_args: None)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_optimizer_state",
+        lambda *_args: pytest.fail("weights-only load read optimizer state"),
+    )
+
+    checkpoint_module.load_checkpoint(trainer, source, "student")
+
+    slot = trainer._checkpoint_slots["student"]
+    assert slot.params == (replacement,)
+    assert slot.optimizer is None
+    assert stale is not slot.optimizer
+
+    replacement.grad = torch.ones_like(replacement)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+    )
+    result = trainer.optim_step(
+        checkpoints=["student"],
+        params=AdamParams(learning_rate=1e-3, weight_decay=0),
+    )
+
+    assert result["update_successful"] == 1
+    assert slot.optimizer is not None
+    assert slot.optimizer is not stale
+
+
+def test_checkpoint_snapshot_handles_existing_slot_refs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LoRA(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            slot = torch.nn.Linear(1, 1)
+            slot.ref = object()  # type: ignore[attr-defined]
+            self._slot_keys = {slot.ref: "slot_0"}  # type: ignore[attr-defined]
+            self._slot_modules = torch.nn.ModuleDict({"slot_0": slot})
+
+    module = ModuleType("art.megatron.lora")
+    module.LoRA = LoRA  # type: ignore[attr-defined]
+    module.LoRASlotRef = object  # type: ignore[attr-defined]
+    monkeypatch.setitem(__import__("sys").modules, "art.megatron.lora", module)
+    lora = LoRA()
+
+    snapshot = _slot_snapshot(TrainerRank(_runtime(lora)))
+
+    assert len(snapshot) == 1
+    assert snapshot[0][3] == {"slot_0": lora._slot_modules["slot_0"].ref}  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize(
@@ -1684,8 +1783,11 @@ def test_checkpoint_load_failure_is_collective_and_transactional(
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
-def test_real_checkpoint_codec_restores_exact_next_optimizer_step(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "with_optimizer", (False, True), ids=("weights-only", "optimizer")
+)
+def test_real_checkpoint_codec_round_trips_with_optional_optimizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_optimizer: bool
 ) -> None:
     from art.megatron import lora as lora_module
     from art.megatron.lora import LoRA
@@ -1736,9 +1838,10 @@ def test_real_checkpoint_codec_restores_exact_next_optimizer_step(
         return trainer
 
     original = make_trainer()
-    for parameter in original._checkpoint_slots["student"].params:
-        parameter.grad = torch.full_like(parameter, 0.25)
-    original.optim_step(params=adam)
+    if with_optimizer:
+        for parameter in original._checkpoint_slots["student"].params:
+            parameter.grad = torch.full_like(parameter, 0.25)
+        original.optim_step(params=adam)
     output = tmp_path / "exact"
     original.save_checkpoint(str(output), "student")
     original.save_checkpoint(str(output), "student")
@@ -1746,7 +1849,8 @@ def test_real_checkpoint_codec_restores_exact_next_optimizer_step(
     assert not (tmp_path / ".exact.reserved").exists()
     prepared = prepare_checkpoint(str(output))
     assert prepared.manifest is not None
-    assert prepared.manifest["optimizer"] is not None
+    assert validate_checkpoint(output) == prepared.manifest
+    assert (prepared.manifest["optimizer"] is not None) is with_optimizer
 
     restored_lora = LoRA("layer.q_proj", 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     restored = TrainerRank(_runtime(restored_lora))
@@ -1756,6 +1860,9 @@ def test_real_checkpoint_codec_restores_exact_next_optimizer_step(
         lambda params, **_kwargs: tuple(item.grad.float() for item in params),
     )
     checkpoint_module.load_checkpoint(restored, prepared, "student")
+    assert (
+        restored._checkpoint_slots["student"].optimizer is not None
+    ) is with_optimizer
 
     for trainer in (original, restored):
         for parameter in trainer._checkpoint_slots["student"].params:
