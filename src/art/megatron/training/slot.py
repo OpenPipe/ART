@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import math
 from pathlib import Path
-import sys
 import time
 from typing import Any, Literal, cast
 import uuid
@@ -135,11 +134,15 @@ class MegatronTrainingSlot:
         self._runs: dict[str, _ResidentRun] = {}
         self._results: dict[str, tuple[str, Contract]] = {}
         self._sft_tokenizer = SftBatchTokenizer()
+        self._batch_releases: set[asyncio.Task[None]] = set()
+        self._batch_release_failures: list[BaseException] = []
         self._closed = False
 
     @property
     def valid(self) -> bool:
-        return not self._closed and self.trainer.valid
+        return (
+            not self._closed and self.trainer.valid and not self._batch_release_failures
+        )
 
     async def register_run(
         self,
@@ -348,16 +351,7 @@ class MegatronTrainingSlot:
         try:
             raw = await self.trainer.forward(job, prepared.packed.leases)
         finally:
-            primary = sys.exception()
-            try:
-                await self.runtime.release_batch(prepared.packed)
-            except BaseException as cleanup_error:
-                if primary is None:
-                    raise
-                primary.add_note(
-                    "packed-batch release also failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
+            self._release_batch_soon(prepared.packed)
         return ForwardResult(
             operation_id=ref.operation_id,
             packing=prepared.packing,
@@ -409,16 +403,7 @@ class MegatronTrainingSlot:
         try:
             raw = await self.trainer.forward_backward(job, prepared.packed.leases)
         finally:
-            primary = sys.exception()
-            try:
-                await self.runtime.release_batch(prepared.packed)
-            except BaseException as cleanup_error:
-                if primary is None:
-                    raise
-                primary.add_note(
-                    "packed-batch release also failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
+            self._release_batch_soon(prepared.packed)
         return ForwardBackwardResult(
             operation_id=ref.operation_id,
             packing=prepared.packing,
@@ -737,7 +722,50 @@ class MegatronTrainingSlot:
         if self._closed:
             return
         self._closed = True
-        await self.trainer.close()
+        primary: BaseException | None = None
+        try:
+            if self._batch_releases:
+                await asyncio.gather(
+                    *tuple(self._batch_releases), return_exceptions=True
+                )
+                await asyncio.sleep(0)
+            self._raise_batch_release_failures()
+        except BaseException as error:
+            primary = error
+        try:
+            await self.trainer.close()
+        except BaseException as error:
+            if primary is None:
+                primary = error
+            else:
+                primary.add_note(
+                    f"trainer close also failed: {type(error).__name__}: {error}"
+                )
+        if primary is not None:
+            raise primary
+
+    def _release_batch_soon(self, packed: DistributedPackedBatch) -> None:
+        task = asyncio.create_task(
+            self.runtime.release_batch(packed),
+            name=f"release-packed-batch-{packed.packing_generation_id}",
+        )
+        self._batch_releases.add(task)
+        task.add_done_callback(self._batch_release_done)
+
+    def _batch_release_done(self, task: asyncio.Task[None]) -> None:
+        self._batch_releases.discard(task)
+        if task.cancelled():
+            self._batch_release_failures.append(
+                RuntimeError("packed-batch release was cancelled")
+            )
+        elif error := task.exception():
+            self._batch_release_failures.append(error)
+
+    def _raise_batch_release_failures(self) -> None:
+        if self._batch_release_failures:
+            raise BaseExceptionGroup(
+                "packed-batch release failed", self._batch_release_failures
+            )
 
     def _require_run(self, run_id: str) -> _ResidentRun:
         self._require_open()
@@ -759,6 +787,7 @@ class MegatronTrainingSlot:
     def _require_open(self) -> None:
         if self._closed:
             raise RuntimeError("Megatron training slot is closed")
+        self._raise_batch_release_failures()
 
     @staticmethod
     def _fingerprint(ref: Contract, request: Contract, *parts: str) -> str:

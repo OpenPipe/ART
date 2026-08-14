@@ -156,7 +156,22 @@ class LocalMegatronTrainingSlot:
         if self._closed:
             return
         self._closed = True
-        await self.runtime.close()
+        primary: BaseException | None = None
+        try:
+            await self.slot.close()
+        except BaseException as error:
+            primary = error
+        try:
+            await self.runtime.close()
+        except BaseException as error:
+            if primary is None:
+                primary = error
+            else:
+                primary.add_note(
+                    f"runtime close also failed: {type(error).__name__}: {error}"
+                )
+        if primary is not None:
+            raise primary
 
     async def __aenter__(self) -> "LocalMegatronTrainingSlot":
         return self
