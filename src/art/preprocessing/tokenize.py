@@ -490,13 +490,43 @@ def _last_assistant_input_ids_and_labels(
         add_generation_prompt=False,
         **template_kwargs,
     )
-    if not completed_text.startswith(prompt_text):
-        raise ValueError(
-            "Cannot isolate the final assistant response because the completed chat "
-            "does not extend its generation prompt"
+    if completed_text.startswith(prompt_text):
+        target_text = completed_text[len(prompt_text) :]
+    else:
+        history_text = _apply_chat_template_text(
+            tokenizer,
+            messages[:-1],
+            tools=tools,
+            add_generation_prompt=False,
+            **template_kwargs,
         )
+        marker = "__ART_FINAL_ASSISTANT_TARGET__"
+        final_message = messages[-1]
+        has_final_output = any(
+            final_message.get(key)
+            for key in ("content", "reasoning", "reasoning_content", "tool_calls")
+        )
+        marked_text = _apply_chat_template_text(
+            tokenizer,
+            [*messages[:-1], {"role": "assistant", "content": marker}],
+            tools=tools,
+            add_generation_prompt=False,
+            **template_kwargs,
+        )
+        marker_start = marked_text.find(marker)
+        if (
+            not prompt_text.startswith(history_text)
+            or not has_final_output
+            or marker in completed_text
+            or marker_start < 0
+            or completed_text[:marker_start] != marked_text[:marker_start]
+        ):
+            raise ValueError(
+                "Cannot isolate the final assistant response because the completed "
+                "chat does not extend its generation prompt"
+            )
+        target_text = completed_text[marker_start:]
 
-    target_text = completed_text[len(prompt_text) :]
     prompt_ids = token_ids_for_template_part(tokenizer, prompt_text)
     target_ids = token_ids_for_template_part(tokenizer, target_text)
     input_ids = [*prompt_ids, *target_ids]

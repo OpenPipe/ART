@@ -264,6 +264,48 @@ class _BoundaryMergingTokenizer(_LastAssistantTokenizer):
         return token_ids
 
 
+class _DisabledThinkingTokenizer(_LastAssistantTokenizer):
+    disabled_thinking_prefix = "<assistant><|channel>thought\n<channel|>"
+
+    def _render_chat(self, messages, *, add_generation_prompt: bool) -> str:
+        rendered_parts: list[str] = []
+        for message in messages:
+            role = message["role"]
+            content = message.get("content") or ""
+            if role == "assistant":
+                rendered_parts.append(f"<assistant>{content}{self.eos_token}\n")
+            else:
+                rendered_parts.append(f"<{role}>{content}{self.eos_token}\n")
+        if add_generation_prompt:
+            rendered_parts.append(self.disabled_thinking_prefix)
+        return "".join(rendered_parts)
+
+
+class _ToolContinuationTokenizer(_LastAssistantTokenizer):
+    def _render_chat(self, messages, *, add_generation_prompt: bool) -> str:
+        rendered_parts: list[str] = []
+        previous_role = None
+        for message in messages:
+            role = message["role"]
+            content = message.get("content") or ""
+            if role == "assistant":
+                content += "".join(
+                    f"<call:{tool_call['function']['name']}>"
+                    for tool_call in message.get("tool_calls", [])
+                )
+            if role == "assistant" and previous_role == "tool":
+                rendered_parts[-1] = rendered_parts[-1].removesuffix(
+                    f"{self.eos_token}\n"
+                )
+                rendered_parts.append(f"{content}{self.eos_token}\n")
+            else:
+                rendered_parts.append(f"<{role}>{content}{self.eos_token}\n")
+            previous_role = role
+        if add_generation_prompt and previous_role != "tool":
+            rendered_parts.append("<assistant>")
+        return "".join(rendered_parts)
+
+
 class _NonPrefixStableTokenizer(_LastAssistantTokenizer):
     def apply_chat_template(self, *args, **kwargs):
         rendered = super().apply_chat_template(*args, **kwargs)
@@ -450,6 +492,100 @@ def test_tokenize_sft_batch_trains_only_final_assistant_turn() -> None:
     assert input_ids[target_start:] == target_ids
     assert tokenizer.decode(target_ids) == "final answer<eos>\n"
     assert batch.num_trainable_tokens == len(target_ids)
+
+
+def test_tokenize_sft_batch_handles_disabled_thinking_generation_prefix() -> None:
+    tokenizer = _DisabledThinkingTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "earlier answer"},
+            {"role": "user", "content": "second question"},
+            {"role": "assistant", "content": "final answer"},
+        ],
+    )
+
+    batch = tokenize_sft_batch(
+        trajectory_batch=[Trajectory(messages_and_choices=messages)],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        assistant_turns="last",
+    )
+
+    input_ids = batch.trajectory_tensors[0]["input_ids"][0].tolist()
+    labels = batch.trajectory_tensors[0]["labels"][0].tolist()
+    target_ids = [token_id for token_id in labels if token_id != -100]
+    target_start = next(index for index, label in enumerate(labels) if label != -100)
+
+    assert tokenizer.decode(target_ids) == "final answer<eos>\n"
+    assert tokenizer.decode(input_ids[:target_start]).endswith(
+        tokenizer.disabled_thinking_prefix
+    )
+
+
+def test_tokenize_sft_batch_handles_assistant_continuation_after_tool() -> None:
+    tokenizer = _ToolContinuationTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "look it up"},
+            {"role": "assistant", "content": "calling tool"},
+            {"role": "tool", "content": "tool result"},
+            {"role": "assistant", "content": "final answer"},
+        ],
+    )
+
+    batch = tokenize_sft_batch(
+        trajectory_batch=[Trajectory(messages_and_choices=messages)],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        assistant_turns="last",
+    )
+
+    labels = batch.trajectory_tensors[0]["labels"][0].tolist()
+    target_ids = [token_id for token_id in labels if token_id != -100]
+    assert tokenizer.decode(target_ids) == "final answer<eos>\n"
+
+
+def test_tokenize_sft_batch_handles_tool_call_continuation_after_tool() -> None:
+    tokenizer = _ToolContinuationTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "look it up"},
+            {"role": "assistant", "content": "calling tool"},
+            {"role": "tool", "content": "tool result"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "next_tool", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+    )
+
+    batch = tokenize_sft_batch(
+        trajectory_batch=[Trajectory(messages_and_choices=messages)],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        assistant_turns="last",
+    )
+
+    labels = batch.trajectory_tensors[0]["labels"][0].tolist()
+    target_ids = [token_id for token_id in labels if token_id != -100]
+    assert tokenizer.decode(target_ids) == "<call:next_tool><eos>\n"
 
 
 def test_tokenize_sft_batch_trains_final_tool_call_and_turn_end() -> None:
