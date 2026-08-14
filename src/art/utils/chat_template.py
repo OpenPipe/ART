@@ -64,7 +64,8 @@ def _template_requires_structured_tool_arguments(chat_template: object) -> bool:
     if not isinstance(chat_template, str):
         return False
     arguments_access = (
-        r"(?:\b(?:tool_call|tc)\s*\.\s*(?:function\s*\.\s*)?arguments\b"
+        r"(?:(?<![.\w])(?:tool_call|tc)\s*\.\s*"
+        r"(?:function\s*\.\s*)?arguments\b"
         r"|(?<![.\w])arguments\b)"
     )
     if re.search(rf"{arguments_access}\s*\|\s*items\b", chat_template):

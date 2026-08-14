@@ -3062,6 +3062,94 @@ def test_chat_rerender_normalizes_tool_arguments(arguments: object) -> None:
     assert rendered_arguments == [{"id": 3}]
 
 
+def test_structured_tool_arguments_remain_in_sampled_region_without_exact_tokens() -> (
+    None
+):
+    exchange = _chat_exchange([1], [2])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice.pop("token_ids")
+    choice["logprobs"] = None
+    choice["message"] = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": '{"x":1}'},
+            }
+        ],
+    }
+    exchange.response = ChatCompletion.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+
+    class Tokenizer:
+        chat_template = "{% set args = tc.arguments %}{{ args.items() }}"
+
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"turn 0": [1], "lookup": [20], '{"x":1}': [30, 31]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            if messages[-1]["role"] != "assistant":
+                return [1, 10]
+            function = messages[-1]["tool_calls"][0]["function"]
+            assert isinstance(function["arguments"], dict)
+            if function["name"] != "lookup":
+                return [1, 10, 98, 25, 99, 26]
+            return [1, 10, 20, 25, 30, 31, 26]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.tokens == [1, 20, 25, 30, 31, 26]
+    assert tokenized.flags[1:5] == [tr.TokenFlag.SAMPLED] * 4
+    assert all(math.isnan(value) for value in tokenized.logprobs[1:5])
+
+
+def test_reasoning_probe_failure_does_not_override_authoritative_render() -> None:
+    exchange = _chat_exchange([], [])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice.pop("prompt_token_ids")
+    choice.pop("token_ids")
+    choice["logprobs"] = None
+    choice["message"] = {
+        "role": "assistant",
+        "reasoning": "think",
+        "content": "answer",
+    }
+    exchange.response = ChatCompletion.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"turn 0": [1], "think": [20], "answer": [30]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            if messages[-1]["role"] != "assistant":
+                return [1]
+            if not messages[-1].get("reasoning"):
+                raise ValueError("speculative render rejected")
+            return [1, 20, 30]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.tokens == [1, 20, 30]
+    assert tokenized.flags[1:] == [tr.TokenFlag.SAMPLED] * 2
+
+
 @pytest.mark.parametrize("arguments", ("not-json", "[]"))
 def test_chat_rerender_rejects_invalid_tool_arguments(arguments: str) -> None:
     history = tr.ChatCompletionsHistory(

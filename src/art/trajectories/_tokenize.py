@@ -3400,15 +3400,17 @@ def _tokenize_chat_view(
             template = tokenizer_template
     if kwargs.get("preserve_thinking") is True:
         template = chat_template_with_preserved_thinking(template)
-    messages = normalize_tool_call_arguments_for_chat_template(messages, template)
     ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
 
     def render(
         selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> list[int]:
+        render_messages = normalize_tool_call_arguments_for_chat_template(
+            selected_messages, template
+        )
         return _ids(
             resolved_tokenizer.apply_chat_template(
-                selected_messages,
+                render_messages,
                 tools=history.tools,
                 tokenize=True,
                 add_generation_prompt=add_generation_prompt,
@@ -3416,6 +3418,16 @@ def _tokenize_chat_view(
                 **kwargs,
             )
         )
+
+    def probe_render(
+        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    ) -> list[int] | None:
+        try:
+            return render(
+                selected_messages, add_generation_prompt=add_generation_prompt
+            )
+        except Exception:
+            return None
 
     rendered = render(messages, add_generation_prompt=not ends_with_assistant)
     if any(
@@ -3429,21 +3441,24 @@ def _tokenize_chat_view(
         for message in without_reasoning:
             message.pop("reasoning", None)
         if (
-            render(
+            probe_render(
                 without_reasoning,
                 add_generation_prompt=not ends_with_assistant,
             )
             == rendered
         ):
-            messages = deepcopy(messages)
-            for message in messages:
+            aliased_messages = deepcopy(messages)
+            for message in aliased_messages:
                 reasoning = message.pop("reasoning", None)
                 if isinstance(reasoning, str) and reasoning:
                     message.setdefault("reasoning_content", reasoning)
-            rendered = render(
-                messages,
+            aliased_render = probe_render(
+                aliased_messages,
                 add_generation_prompt=not ends_with_assistant,
             )
+            if aliased_render is not None:
+                messages = aliased_messages
+                rendered = aliased_render
     if any(
         message.get("role") == "assistant"
         and isinstance(message.get("refusal"), str)
@@ -3454,14 +3469,14 @@ def _tokenize_chat_view(
         for message in without_refusals:
             message.pop("refusal", None)
         if (
-            render(
+            probe_render(
                 without_refusals,
                 add_generation_prompt=not ends_with_assistant,
             )
             == rendered
         ):
-            messages = deepcopy(messages)
-            for message in messages:
+            merged_messages = deepcopy(messages)
+            for message in merged_messages:
                 refusal = message.pop("refusal", None)
                 if not isinstance(refusal, str) or not refusal:
                     continue
@@ -3479,10 +3494,13 @@ def _tokenize_chat_view(
                     raise ValueError(
                         "Cannot render an assistant refusal with this content shape"
                     )
-            rendered = render(
-                messages,
+            merged_render = probe_render(
+                merged_messages,
                 add_generation_prompt=not ends_with_assistant,
             )
+            if merged_render is not None:
+                messages = merged_messages
+                rendered = merged_render
 
     prompt_cache: dict[int, list[int] | None] = {}
     output_cache: dict[int, tuple[list[int] | None, list[float]]] = {}
@@ -3524,10 +3542,13 @@ def _tokenize_chat_view(
                 continue
             source_prompt = source_prompt_tokens(source)
             if source_prompt and source_matches_context(source):
-                rendered_prompt = render(
+                rendered_prompt = probe_render(
                     messages[:message_index], add_generation_prompt=True
                 )
-                if rendered[: len(rendered_prompt)] == rendered_prompt:
+                if (
+                    rendered_prompt is not None
+                    and rendered[: len(rendered_prompt)] == rendered_prompt
+                ):
                     rendered = [
                         *source_prompt,
                         *rendered[len(rendered_prompt) :],
@@ -3669,14 +3690,16 @@ def _tokenize_chat_view(
         if markers:
             try:
                 marked_text = resolved_tokenizer.apply_chat_template(
-                    marked_messages,
+                    normalize_tool_call_arguments_for_chat_template(
+                        marked_messages, template
+                    ),
                     tools=history.tools,
                     tokenize=False,
                     add_generation_prompt=not ends_with_assistant,
                     **({"chat_template": template} if template is not None else {}),
                     **kwargs,
                 )
-            except (TypeError, NotImplementedError):
+            except Exception:
                 marked_text = None
             if isinstance(marked_text, str):
                 marker_pattern = re.compile(
@@ -3729,7 +3752,7 @@ def _tokenize_chat_view(
                         add_special_tokens=False,
                         return_offsets_mapping=True,
                     )
-                except (TypeError, NotImplementedError):
+                except Exception:
                     encoded = None
                 encoded_data = _string_dict(encoded)
                 raw_offsets = (
@@ -4064,10 +4087,13 @@ def _tokenize_chat_view(
                     generation_start = len(source_prompt)
                     sampled_bounds = (generation_start, len(rendered))
                 elif sampled_message_count == 1:
-                    prompt_render = render(
+                    prompt_render = probe_render(
                         messages[:message_index], add_generation_prompt=True
                     )
-                    if rendered[: len(prompt_render)] != prompt_render:
+                    if (
+                        prompt_render is None
+                        or rendered[: len(prompt_render)] != prompt_render
+                    ):
                         raise ValueError(
                             "Could not locate a sampled history message in the "
                             "rendered history"

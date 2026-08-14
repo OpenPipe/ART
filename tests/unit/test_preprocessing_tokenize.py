@@ -82,6 +82,28 @@ def test_schema_argument_alias_does_not_normalize_tool_arguments() -> None:
     assert normalized is messages
 
 
+@pytest.mark.parametrize(
+    "schema_style",
+    (
+        "{{ schema.tool_call.arguments | items }}",
+        ("{% set structured = schema.tool_call.arguments %}{{ structured.items() }}"),
+    ),
+)
+def test_nested_schema_tool_call_arguments_do_not_trigger_normalization(
+    schema_style: str,
+) -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"arguments": '{"id": 3}'}}],
+        }
+    ]
+
+    normalized = normalize_tool_call_arguments_for_chat_template(messages, schema_style)
+
+    assert normalized is messages
+
+
 class _FakeTokenizer:
     chat_template = ""
     eos_token = "\x00"
@@ -251,6 +273,37 @@ def test_legacy_qwen_template_gains_opt_in_thinking_preservation() -> None:
         "enable_thinking": False,
         "preserve_thinking": True,
     }
+
+
+def test_legacy_qwen_template_renders_prior_reasoning_when_preserved() -> None:
+    import jinja2
+
+    legacy = (
+        "{% set _enable = enable_thinking | default(false) %}"
+        "{% set ns = namespace(last_query_index=2) %}"
+        "{% for message in messages %}"
+        "{%- if loop.index0 > ns.last_query_index %}"
+        "{{ message.reasoning | default('') }}"
+        "{% endif %}{{ message.content }}"
+        "{% endfor %}"
+    )
+    configured = chat_template_with_preserved_thinking(legacy)
+    assert isinstance(configured, str)
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "reasoning": "prior-thought", "content": "first"},
+        {"role": "user", "content": "two"},
+        {"role": "assistant", "reasoning": "current-thought", "content": "second"},
+    ]
+
+    rendered = (
+        jinja2.Environment()
+        .from_string(configured)
+        .render(messages=messages, preserve_thinking=True)
+    )
+
+    assert "prior-thought" in rendered
+    assert "current-thought" in rendered
 
 
 def test_native_or_unrecognized_thinking_templates_are_unchanged() -> None:
