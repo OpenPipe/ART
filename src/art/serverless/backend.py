@@ -668,7 +668,8 @@ class ServerlessBackend:
         )
 
     def supports_async_pipeline_packing(self, model: AnyTrainableModel) -> bool:
-        return self._model_key(model) in self._clients
+        del model
+        return True
 
     async def prepare_pipeline_batch(
         self,
