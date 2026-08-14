@@ -137,6 +137,10 @@ class MegatronTrainingSlot:
         self._sft_tokenizer = SftBatchTokenizer()
         self._closed = False
 
+    @property
+    def valid(self) -> bool:
+        return not self._closed and self.trainer.valid
+
     async def register_run(
         self,
         registration: RunSlotRegistration,
@@ -194,7 +198,12 @@ class MegatronTrainingSlot:
         self._require_open()
         if run_id not in self._runs:
             return
-        await self.trainer.unregister_run(run_id)
+        if self.trainer.valid:
+            try:
+                await self.trainer.unregister_run(run_id)
+            except BaseException:
+                if self.trainer.valid:
+                    raise
         self._runs.pop(run_id)
 
     async def prepare_forward_backward(
