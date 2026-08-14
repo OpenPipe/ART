@@ -4034,6 +4034,9 @@ def _tokenize_chat_view(
                 marked_bounds[message_index] = (len(prefix), len(completed))
                 # The marker-derived per-part offsets describe the old render.
                 marked_part_bounds.pop(message_index, None)
+            else:
+                marked_bounds.pop(message_index, None)
+                marked_part_bounds.pop(message_index, None)
         source_boundary = False
         generation_start: int | None = None
         sampled_bounds: tuple[int, int] | None = None
