@@ -410,10 +410,10 @@ _THROUGHPUT_CONFIGS = {
         num_layers=8,
         packed_sequence_length=32_768,
         prompt_tokens=14_651,
-        completion_tokens=100,
-        rollouts_per_group=14,
+        completion_tokens=70,
+        rollouts_per_group=20,
         groups_per_step=4,
-        initial_model_calls_per_inference_gpu=6,
+        initial_model_calls_per_inference_gpu=5,
         max_num_seqs=64,
         max_num_batched_tokens=131_072,
         enable_prefix_caching=True,
@@ -465,7 +465,7 @@ _B300_THROUGHPUT_FLOORS = {
         (40_300, 38_500, 4_740, 0.90, 5.0),
     ),
     "dsv4": (
-        "14676f59c82498fcd4d20c893239747dfcc26c84217d01a2abbdee29bc40c3d5",
+        "31e579f6e18bac26ac03cbe114a8fc2de6f9095f9efe697b87496893b5d8bbe9",
         (14_800, 14_300, 1_300, 0.94, 6.0),
     ),
     "glm52": (
