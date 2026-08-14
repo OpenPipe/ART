@@ -3393,12 +3393,11 @@ def _tokenize_chat_view(
         kwargs.setdefault("enable_thinking", thinking.get("type") == "enabled")
         if budget := thinking.get("budget_tokens"):
             kwargs.setdefault("thinking_budget", budget)
-    template = (
-        chat_template
-        or history.chat_template
-        or config.chat_template
-        or getattr(resolved_tokenizer, "chat_template", None)
-    )
+    template = chat_template or history.chat_template or config.chat_template
+    if template is None:
+        tokenizer_template = getattr(resolved_tokenizer, "chat_template", None)
+        if isinstance(tokenizer_template, str):
+            template = tokenizer_template
     if kwargs.get("preserve_thinking") is True:
         template = chat_template_with_preserved_thinking(template)
     messages = normalize_tool_call_arguments_for_chat_template(messages, template)

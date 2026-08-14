@@ -63,17 +63,22 @@ def merge_chat_template_kwargs(
 def _template_requires_structured_tool_arguments(chat_template: object) -> bool:
     if not isinstance(chat_template, str):
         return False
-    if re.search(r"\barguments\s*\|\s*items\b", chat_template):
+    arguments_access = (
+        r"(?:\b(?:tool_call|tc)\s*\.\s*(?:function\s*\.\s*)?arguments\b"
+        r"|(?<![.\w])arguments\b)"
+    )
+    if re.search(rf"{arguments_access}\s*\|\s*items\b", chat_template):
         return True
-    if re.search(r"\barguments\s*\.\s*items\s*\(", chat_template):
+    if re.search(rf"{arguments_access}\s*\.\s*items\s*\(", chat_template):
         return True
     aliases = re.findall(
-        r"{%[-+]?\s*set\s+([A-Za-z_]\w*)\s*=\s*[^%]*\barguments\b[^%]*[-+]?%}",
+        r"{%[-+]?\s*set\s+([A-Za-z_]\w*)\s*=\s*([^%]*)[-+]?%}",
         chat_template,
     )
     return any(
-        re.search(rf"\b{re.escape(alias)}\s*\.\s*items\s*\(", chat_template)
-        for alias in aliases
+        re.search(arguments_access, expression)
+        and re.search(rf"\b{re.escape(alias)}\s*\.\s*items\s*\(", chat_template)
+        for alias, expression in aliases
     )
 
 

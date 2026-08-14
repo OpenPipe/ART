@@ -23,8 +23,10 @@ def _trajectory(content: str) -> Trajectory:
     )
 
 
+@pytest.mark.parametrize("base_model", ("Qwen/Qwen3.5-4B", "unsloth/Qwen3-4B"))
 def test_qwen_rollout_server_uses_preserve_thinking_template(
     monkeypatch: pytest.MonkeyPatch,
+    base_model: str,
 ) -> None:
     template = (
         "{% if enable_thinking %}think{% endif %}"
@@ -41,9 +43,7 @@ def test_qwen_rollout_server_uses_preserve_thinking_template(
     )
     config: dict[str, Any] = {}
 
-    _apply_configured_chat_template_server_args(
-        config, {}, base_model="Qwen/Qwen3.5-4B"
-    )
+    _apply_configured_chat_template_server_args(config, {}, base_model=base_model)
 
     configured = config["server_args"]["chat_template"]
     assert "preserve_thinking is defined and preserve_thinking is true" in configured
@@ -98,11 +98,11 @@ def test_qwen_template_load_failure_is_a_warned_fallback(
     )
     monkeypatch.setattr(
         "art.local.backend.AutoTokenizer.from_pretrained",
-        lambda _model: (_ for _ in ()).throw(OSError("offline")),
+        lambda _model: (_ for _ in ()).throw(ValueError("bad tokenizer")),
     )
     config: dict[str, Any] = {}
 
-    with pytest.warns(RuntimeWarning, match="offline"):
+    with pytest.warns(RuntimeWarning, match="bad tokenizer"):
         _apply_configured_chat_template_server_args(
             config, {}, base_model="Qwen/Qwen3.5-4B"
         )

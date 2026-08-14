@@ -23,10 +23,13 @@ pytest.importorskip("transformers")
     (
         "{{ tool_call.arguments | items }}",
         "{% for key, value in tool_call.arguments.items() %}",
+        "{{ arguments | items }}",
+        "{% for key, value in arguments.items() %}",
         (
             "{% set structured = tool_call.arguments %}"
             "{% for key, value in structured.items() %}"
         ),
+        "{% set structured = tc.arguments %}{{ structured.items() }}",
     ),
 )
 def test_structured_tool_argument_templates_are_normalized(template: str) -> None:
@@ -51,12 +54,30 @@ def test_unrelated_items_iteration_does_not_normalize_tool_arguments() -> None:
     ]
     gpt_oss_style = (
         "{% for name, schema in tools.items() %}{{ name }}{{ schema.arguments }}"
-        "{% endfor %}{{ tool_call.arguments }}"
+        "{{ schema.arguments|items }}{% endfor %}{{ tool_call.arguments }}"
     )
 
     normalized = normalize_tool_call_arguments_for_chat_template(
         messages, gpt_oss_style
     )
+
+    assert normalized is messages
+
+
+def test_schema_argument_alias_does_not_normalize_tool_arguments() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "lookup", "arguments": '{"id": 3}'}}],
+        }
+    ]
+    schema_style = (
+        "{% set structured = tool.parameters.arguments %}"
+        "{% for key, value in structured.items() %}{{ key }}{{ value }}{% endfor %}"
+        "{{ tool_call.arguments }}"
+    )
+
+    normalized = normalize_tool_call_arguments_for_chat_template(messages, schema_style)
 
     assert normalized is messages
 

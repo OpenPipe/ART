@@ -1112,6 +1112,31 @@ def test_fallback_upgrades_legacy_qwen_template_when_preservation_is_requested()
     assert "preserve_thinking is defined and preserve_thinking is true" in configured
 
 
+def test_tokenizer_dict_chat_template_fallback_is_not_forwarded() -> None:
+    history = tr.ChatCompletionsHistory(
+        model="test/model",
+        messages=[{"role": "assistant", "content": "answer"}],
+        message_sources=[None],
+    )
+
+    class Tokenizer:
+        chat_template = {"default": "{{ message.content }}"}
+
+        def __call__(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+            del text, add_special_tokens
+            return [11]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            assert "chat_template" not in kwargs
+            return [10, 11] if messages[-1]["role"] == "assistant" else [10]
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.tokens == [10, 11]
+
+
 def test_fallback_uses_template_overrides_and_nan_logprobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

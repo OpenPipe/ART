@@ -528,6 +528,10 @@ def normalize_chat_message(message: Mapping[str, object]) -> dict[str, object]:
 
     data = copy.deepcopy(dict(message))
     data.pop("annotations", None)
+    if data.get("reasoning_content") is not None and not data.get("reasoning"):
+        data["reasoning"] = data.pop("reasoning_content")
+    elif data.get("reasoning_content") == data.get("reasoning"):
+        data.pop("reasoning_content", None)
     if data.get("role") == "assistant" and data.get("content") is None:
         data["content"] = ""
     elif data.get("content") is None:
