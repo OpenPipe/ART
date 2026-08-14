@@ -612,11 +612,14 @@ def chat_completions_histories(
             exact_continuation = lambda branch: _chat_exact_generation_extends(
                 branch, prompt_ids, len(prompt), token_cache
             )
-            continuation = lambda branch: reconcile or (
-                _chat_retains_sampled_reasoning(
-                    branch, prompt_ids, len(prompt), token_cache
+            continuation = lambda branch: (
+                reconcile
+                or (
+                    _chat_retains_sampled_reasoning(
+                        branch, prompt_ids, len(prompt), token_cache
+                    )
+                    and exact_continuation(branch)
                 )
-                and exact_continuation(branch)
             )
             source_continuation = lambda branch: (
                 reconcile

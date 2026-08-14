@@ -246,8 +246,10 @@ def _apply_configured_chat_template_server_args(
         chat_template = _model_support_default_chat_template(
             base_model, internal_config
         )
-    if chat_template is None and base_model is not None and base_model.startswith(
-        ("Qwen/Qwen3-", "Qwen/Qwen3.5-", "OpenPipe/Qwen3-")
+    if (
+        chat_template is None
+        and base_model is not None
+        and base_model.startswith(("Qwen/Qwen3-", "Qwen/Qwen3.5-", "OpenPipe/Qwen3-"))
     ):
         tokenizer = AutoTokenizer.from_pretrained(base_model)
         default = getattr(tokenizer, "chat_template", None)
