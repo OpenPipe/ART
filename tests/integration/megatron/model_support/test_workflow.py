@@ -70,7 +70,7 @@ from .workflow_throughput import (
     _packed_input_fingerprint,
     _phase_evidence,
     _run_throughput_attempts,
-    _same_setting_decision_suffix,
+    _settled_execution_decision_suffix,
     _sized_config,
     _throughput_config_for_hardware,
     acceptance_failures,
@@ -271,6 +271,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         {
             "step": step,
             "data/step_num_groups_trainable": 8,
+            "data/step_num_groups_submitted": 24,
             "data/step_packed_sequences": 1,
             "data/step_nonpadding_logical_tokens": 1_000,
             "train/prefix_tree/logical_tokens": 4_000,
@@ -284,11 +285,13 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             "data/step_num_gradient_steps": 1,
             "pipeline/global_real_microbatches": 1,
             "pipeline/global_dummy_microbatches": 0,
+            "pipeline/packed_sequence_length": 131_072,
             "pipeline_settings/num_rollout_workers": 16,
             "pipeline_settings/min_batch_size": 8,
             "pipeline_settings/max_batch_size": 32,
             "pipeline_settings/queue_maxsize": 48,
             "pipeline_settings/target_groups_per_step": 24,
+            "queue/packing_policy_lag_steps": 1,
             "time/step_train_s": 1.5,
             "time/step_wall_s": 2.0,
             "time/step_collect_batch_s": 0.001068115234375,
@@ -306,7 +309,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             "discarded/step/stale_groups": 0,
             "discarded/step/zero_variance_groups": 0,
         }
-        for step in range(2, 10)
+        for step in range(1, 10)
     ]
     history_path = tmp_path / "history.jsonl"
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -571,7 +574,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         "pipeline_settings/num_rollout_workers"
     ] = 14
     history_path.write_text("".join(json.dumps(row) + "\n" for row in inconsistent))
-    with pytest.raises(RuntimeError, match="two trailing same-setting"):
+    with pytest.raises(RuntimeError, match="two trailing settled execution"):
         collect(isolated_phase)
     history_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
     capture_settings = measured_settings.model_dump(mode="json")
@@ -717,15 +720,22 @@ def test_throughput_measurement_freezes_actual_settings() -> None:
     assert trainer.apply_pipeline_settings == original
 
 
-def test_throughput_measurement_uses_full_same_setting_suffix() -> None:
+def test_throughput_measurement_uses_settled_execution_suffix() -> None:
     measured = PipelineTuneSettings(
         num_rollout_workers=16,
-        min_batch_size=8,
-        max_batch_size=32,
+        min_batch_size=24,
+        max_batch_size=36,
         queue_maxsize=48,
-        target_groups_per_step=24,
+        target_groups_per_step=31,
     )
-    previous = measured.model_copy(update={"num_rollout_workers": 14})
+    previous = measured.model_copy(
+        update={
+            "num_rollout_workers": 14,
+            "min_batch_size": 27,
+            "max_batch_size": 27,
+            "target_groups_per_step": 27,
+        }
+    )
 
     def decision(start_step: int) -> SimpleNamespace:
         return SimpleNamespace(
@@ -737,23 +747,70 @@ def test_throughput_measurement_uses_full_same_setting_suffix() -> None:
             )
         )
 
-    def rows(settings: PipelineTuneSettings, *steps: int) -> dict[int, dict[str, int]]:
-        values = settings.model_dump(mode="json")
+    def row(
+        settings: PipelineTuneSettings,
+        step: int,
+        packed_length: int,
+        *,
+        submitted: int | None = None,
+    ) -> dict[str, int | float]:
         return {
-            step: {f"pipeline_settings/{name}": value for name, value in values.items()}
-            for step in steps
+            **{
+                f"pipeline_settings/{name}": value
+                for name, value in settings.model_dump(mode="json").items()
+            },
+            "queue/packing_policy_lag_steps": 1,
+            "data/step_num_groups_submitted": (
+                settings.target_groups_per_step if submitted is None else submitted
+            ),
+            "data/step_packed_sequences": 1,
+            "data/step_num_gradient_steps": 1,
+            "pipeline/global_real_microbatches": 1,
+            "pipeline/global_dummy_microbatches": 0,
+            "pipeline/packed_sequence_length": packed_length,
+            "time/step_train_s": float(step),
         }
 
     by_step = {
-        **rows(previous, 10, 11),
-        **rows(measured, 12, 13, 14, 15, 16, 17),
+        **{step: row(previous, step, 56_832) for step in range(3, 6)},
+        6: row(measured, 6, 56_832, submitted=27),
+        **{step: row(measured, step, 64_512) for step in range(7, 12)},
     }
-    selected = _same_setting_decision_suffix(
-        [decision(10), decision(12), decision(14), decision(16)],
+    selected = _settled_execution_decision_suffix(
+        [decision(4), decision(6), decision(8), decision(10)],
         by_step,
     )
 
-    assert [item.stats.start_step for item in selected] == [12, 14, 16]
+    assert [item.stats.start_step for item in selected] == [8, 10]
+
+    alternating = dict(by_step)
+    for step, packed_length in zip(range(6, 12), (60_000, 64_000) * 3, strict=True):
+        alternating[step] = row(measured, step, packed_length)
+    assert [
+        item.stats.start_step
+        for item in _settled_execution_decision_suffix(
+            [decision(4), decision(6), decision(8), decision(10)], alternating
+        )
+    ] == [8, 10]
+
+    timing_changed = {
+        step: {**values, "time/step_train_s": 1000.0 - step}
+        for step, values in alternating.items()
+    }
+    assert [
+        item.stats.start_step
+        for item in _settled_execution_decision_suffix(
+            [decision(4), decision(6), decision(8), decision(10)], timing_changed
+        )
+    ] == [8, 10]
+
+    unique = dict(alternating)
+    for step in range(8, 12):
+        unique[step] = row(measured, step, 70_000 + step)
+    with pytest.raises(RuntimeError, match="two trailing settled execution"):
+        _settled_execution_decision_suffix(
+            [decision(4), decision(6), decision(8), decision(10)], unique
+        )
 
 
 def test_throughput_provenance_ignores_local_editable_paths() -> None:

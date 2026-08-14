@@ -47,7 +47,7 @@ _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
 _INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
-_MEASUREMENT_CONTRACT_VERSION = 18
+_MEASUREMENT_CONTRACT_VERSION = 19
 _ISOLATED_WARMUP_STEPS = 1
 _MATCHED_MEASURED_STEPS = 3
 _PIPELINE_SETTING_NAMES = (
@@ -56,6 +56,13 @@ _PIPELINE_SETTING_NAMES = (
     "max_batch_size",
     "queue_maxsize",
     "target_groups_per_step",
+)
+_EXECUTION_SHAPE_NAMES = (
+    "data/step_packed_sequences",
+    "data/step_num_gradient_steps",
+    "pipeline/global_real_microbatches",
+    "pipeline/global_dummy_microbatches",
+    "pipeline/packed_sequence_length",
 )
 _REPO_ROOT = Path(__file__).parents[4]
 _MAIN_RUNTIME_PACKAGES = (
@@ -181,7 +188,14 @@ def _row_pipeline_settings(row: Mapping[str, Any], step: int) -> dict[str, int]:
     }
 
 
-def _same_setting_decision_suffix(
+def _row_execution_shape(row: Mapping[str, Any], step: int) -> tuple[int, ...]:
+    return tuple(
+        _nonnegative_integer(row.get(name), name=f"step {step} {name}")
+        for name in _EXECUTION_SHAPE_NAMES
+    )
+
+
+def _settled_execution_decision_suffix(
     decisions: list[Any],
     by_step: Mapping[int, Mapping[str, Any]],
 ) -> list[Any]:
@@ -192,6 +206,33 @@ def _same_setting_decision_suffix(
         f"autotuner decision window lacks train row: {final.end_step}",
     )
     expected = _row_pipeline_settings(by_step[final.end_step], final.end_step)
+    warmed_shape: dict[int, bool] = {}
+    seen_shapes: set[tuple[int, ...]] = set()
+    for step, row in sorted(by_step.items()):
+        shape = _row_execution_shape(row, step)
+        warmed_shape[step] = shape in seen_shapes
+        seen_shapes.add(shape)
+
+    def is_settled(step: int) -> bool:
+        row = by_step[step]
+        settings = _row_pipeline_settings(row, step)
+        lag = _nonnegative_integer(
+            row.get("queue/packing_policy_lag_steps"),
+            name=f"step {step} packing policy lag",
+        )
+        packing_step = step - lag
+        submitted = _nonnegative_integer(
+            row.get("data/step_num_groups_submitted"),
+            name=f"step {step} submitted groups",
+        )
+        return (
+            settings == expected
+            and packing_step in by_step
+            and _row_pipeline_settings(by_step[packing_step], packing_step) == expected
+            and settings["min_batch_size"] <= submitted <= settings["max_batch_size"]
+            and warmed_shape[step]
+        )
+
     selected: list[Any] = []
     later: Any | None = None
     for decision in reversed(decisions):
@@ -211,16 +252,14 @@ def _same_setting_decision_suffix(
         steps = range(stats.start_step, stats.end_step + 1)
         missing = [step for step in steps if step not in by_step]
         _require(not missing, f"autotuner decision window lacks train rows: {missing}")
-        if not all(
-            _row_pipeline_settings(by_step[step], step) == expected for step in steps
-        ):
+        if not all(is_settled(step) for step in steps):
             break
         selected.append(decision)
         later = stats
     selected.reverse()
     _require(
         len(selected) >= 2,
-        "throughput evidence requires two trailing same-setting autotuner windows",
+        "throughput evidence requires two trailing settled execution windows",
     )
     return selected
 
@@ -1309,7 +1348,7 @@ def _collect_measurements(
         len(by_step) == len(history_rows),
         "throughput history contains duplicate training steps",
     )
-    selected = _same_setting_decision_suffix(decisions, by_step)
+    selected = _settled_execution_decision_suffix(decisions, by_step)
     stats = [decision.stats for decision in selected]
     assert all(window is not None for window in stats)
     first_stats, last_stats = stats[0], stats[-1]
