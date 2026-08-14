@@ -193,6 +193,8 @@ def _compare_iteration(
     depth_reference: list[dict[str, object]] | None,
 ) -> tuple[Diff, Diff]:
     assert outputs is not None and reference is not None
+    _assert_topk_only_oracle(outputs)
+    _assert_topk_only_oracle(reference)
     _assert_same_logits_topk(outputs)
     _assert_same_logits_topk(reference)
     return (
@@ -201,6 +203,7 @@ def _compare_iteration(
             reference,
             tolerance=5e-3,
             topk_tolerance=1e-2,
+            allow_topk_layout_ties=True,
         ),
         Diff()
         if depth_reference is None
@@ -336,6 +339,7 @@ def _compare_outputs(
     *,
     tolerance: float,
     topk_tolerance: float | None = None,
+    allow_topk_layout_ties: bool = False,
 ) -> Diff:
     worst = Diff()
     for actual_output, expected_output in zip(actual, expected, strict=True):
@@ -349,7 +353,11 @@ def _compare_outputs(
             assert isinstance(actual_tensor, torch.Tensor)
             assert isinstance(expected_tensor, torch.Tensor)
             if key == "topk_tokens":
-                _assert_stable_topk_tokens(actual_output, expected_output)
+                _assert_stable_topk_tokens(
+                    actual_output,
+                    expected_output,
+                    allow_topk_only_ties=allow_topk_layout_ties,
+                )
                 continue
             diff = _diff(actual_tensor, expected_tensor)
             limit = (
@@ -402,9 +410,26 @@ def _assert_same_logits_topk(outputs: Sequence[dict[str, object]]) -> None:
                 )
 
 
+def _assert_topk_only_oracle(outputs: Sequence[dict[str, object]]) -> None:
+    topk_only = outputs[2]
+    oracle = outputs[16]
+    for key in ("topk_logprobs", "topk_tokens"):
+        actual = cast(torch.Tensor, topk_only[key])
+        expected = cast(torch.Tensor, oracle[key])
+        if key == "topk_tokens":
+            if not torch.equal(actual, expected):
+                raise AssertionError("top-k-only tokens differ from same-run oracle")
+        elif _diff(actual, expected).mean_abs_pct > 2e-4:
+            raise AssertionError(
+                "top-k-only logprobs differ from same-run oracle by more than 0.0002"
+            )
+
+
 def _assert_stable_topk_tokens(
     actual: dict[str, object],
     expected: dict[str, object],
+    *,
+    allow_topk_only_ties: bool = False,
 ) -> None:
     actual_tokens = cast(torch.Tensor, actual["topk_tokens"])
     expected_tokens = cast(torch.Tensor, expected["topk_tokens"])
@@ -418,6 +443,8 @@ def _assert_stable_topk_tokens(
     if not isinstance(actual_logits, torch.Tensor) or not isinstance(
         expected_logits, torch.Tensor
     ):
+        if allow_topk_only_ties:
+            return
         raise AssertionError("top-k tokens differ for a top-k-only request")
     actual_rows = actual_tokens.reshape(-1, int(actual_tokens.shape[-1]))
     expected_rows = expected_tokens.reshape(-1, int(expected_tokens.shape[-1]))
@@ -727,6 +754,15 @@ def _correctness_requests(slots: Sequence[str] = ()) -> list[ForwardInput]:
                 checkpoint=slots[mask % len(slots)] if slots else Unset,
             )
         )
+    topk_only = requests[2]
+    requests.append(
+        ForwardInput(
+            input_tokens=topk_only.input_tokens.clone(),
+            top_k=3,
+            logits=True,
+            checkpoint=topk_only.checkpoint,
+        )
+    )
     return requests
 
 

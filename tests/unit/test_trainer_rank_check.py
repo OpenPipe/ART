@@ -12,6 +12,9 @@ import torch.multiprocessing as mp
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "dev"))
 _compare_outputs = importlib.import_module("trainer_rank_check")._compare_outputs
+_assert_topk_only_oracle = importlib.import_module(
+    "trainer_rank_check"
+)._assert_topk_only_oracle
 all_ranks_checked = importlib.import_module("trainer_rank_diag").all_ranks_checked
 
 
@@ -53,6 +56,21 @@ def test_topk_comparison_can_use_an_explicit_layout_tolerance() -> None:
     )
     with pytest.raises(AssertionError, match="topk_logprobs mean_abs_pct"):
         _compare_outputs([actual], [expected], tolerance=1e-4)
+
+
+def test_topk_only_same_run_oracle_rejects_corruption() -> None:
+    outputs = [
+        {
+            "topk_logprobs": None,
+            "topk_tokens": None,
+        }
+        for _ in range(17)
+    ]
+    outputs[2] = _topk_output(torch.tensor([[-0.1, -0.2]]), torch.tensor([[1, 3]]))
+    outputs[16] = _topk_output(torch.tensor([[-0.1, -0.2]]), torch.tensor([[1, 2]]))
+
+    with pytest.raises(AssertionError, match="same-run oracle"):
+        _assert_topk_only_oracle(outputs)
 
 
 def test_all_ranks_checked_terminates_on_one_rank_failure(tmp_path: Path) -> None:
