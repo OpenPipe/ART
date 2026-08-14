@@ -273,7 +273,7 @@ def _needs_blackwell_wide_head_tile(
     if device is None or device.type != "cuda":
         return False
     major, _minor = torch.cuda.get_device_capability(device)
-    return major in {10, 11} and _needs_triton_num_stages_2(
+    return major == 10 and _needs_triton_num_stages_2(
         backend=backend,
         head_dim=head_dim,
         head_dim_v=head_dim_v,
