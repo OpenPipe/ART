@@ -374,6 +374,7 @@ _THROUGHPUT_CONFIGS = {
         rollouts_per_group=5,
         groups_per_step=27,
         initial_model_calls_per_inference_gpu=20,
+        max_steps=15,
     ),
     "qwen3_5_dense": ThroughputWorkflowConfig(
         num_layers=8,
@@ -427,7 +428,7 @@ _THROUGHPUT_CONFIGS = {
     ),
     "gpt_oss_moe": ThroughputWorkflowConfig(
         num_layers=4,
-        initial_model_calls_per_inference_gpu=21,
+        initial_model_calls_per_inference_gpu=23,
         max_num_seqs=48,
         max_steps=19,
     ),
@@ -446,7 +447,7 @@ _B300_THROUGHPUT_FLOORS = {
         (40_200, 37_600, 8_600, 0.88, 4.5),
     ),
     "qwen3_moe": (
-        "ba92b6f345eda28ccd0604b4590ac349e1ea5aa33a04228c54be16a93d29b821",
+        "607cf00c63971b4319c53d3977e4994ae74ba6fabefe9628fbdc74145ef4a0bd",
         (49_900, 43_700, 2_050, 0.82, 4.5),
     ),
     "qwen3_5_dense": (
@@ -474,7 +475,7 @@ _B300_THROUGHPUT_FLOORS = {
         (14_880, 14_330, 5_730, 0.91, 12.0),
     ),
     "gpt_oss_moe": (
-        "04d2dce3c3181c7274e2e5bd9d8c721dc265c082d58188c8390f3b7adb50a80a",
+        "00037ae675a0ef0ce1e9c6d82a8e7b84722b8642c6d8adc21b7c3bb597e27fa4",
         (81_700, 76_400, 4_850, 0.88, 2.5),
     ),
 }
