@@ -465,16 +465,17 @@ class MegatronTrainingSlot:
             training_session_id=state.registration.training_session_id,
             expected_learner_version=ref.learner_parent_version,
             learner_version=output_version,
+            generation=TrainerGeneration(
+                training_session_id=state.registration.training_session_id,
+                policy_step=output_version,
+                generation_id=operation_generation_id(ref.operation_id, output_version),
+                adapter_path=get_step_checkpoint_dir(state.output_dir, output_version),
+            ),
             contributing_forward_backward_operation_ids=contributions,
             optimizer=request.optimizer,
         )
         raw = await self.trainer.optim_step(job)
-        generation = TrainerGeneration(
-            training_session_id=state.registration.training_session_id,
-            policy_step=output_version,
-            generation_id=operation_generation_id(ref.operation_id, output_version),
-            adapter_path=get_step_checkpoint_dir(state.output_dir, output_version),
-        )
+        generation = job.generation
         state.generation = generation
         state.registration = state.registration.model_copy(
             update={"learner_version": output_version}
@@ -502,6 +503,12 @@ class MegatronTrainingSlot:
             raise ValueError("load operation has no reserved learner version")
         if request.restore_optimizer and source.optimizer_state_path is None:
             raise ValueError("optimizer-exact load has no optimizer state")
+        generation = TrainerGeneration(
+            training_session_id=state.registration.training_session_id,
+            policy_step=output_version,
+            generation_id=operation_generation_id(ref.operation_id, output_version),
+            adapter_path=get_step_checkpoint_dir(state.output_dir, output_version),
+        )
         job = LoadStateJobSpec(
             operation_id=ref.operation_id,
             run_id=ref.run_id,
@@ -509,6 +516,7 @@ class MegatronTrainingSlot:
             training_session_id=state.registration.training_session_id,
             expected_learner_version=ref.learner_parent_version,
             learner_version=output_version,
+            generation=generation,
             adapter_path=self._require_managed_path(source.adapter_path),
             adapter_step=source.adapter_step,
             optimizer_state_path=(
@@ -522,12 +530,6 @@ class MegatronTrainingSlot:
             restore_optimizer=request.restore_optimizer,
         )
         raw = await self.trainer.load_state(job)
-        generation = TrainerGeneration(
-            training_session_id=state.registration.training_session_id,
-            policy_step=output_version,
-            generation_id=operation_generation_id(ref.operation_id, output_version),
-            adapter_path=get_step_checkpoint_dir(state.output_dir, output_version),
-        )
         state.generation = generation
         state.registration = state.registration.model_copy(
             update={"learner_version": output_version}

@@ -1241,6 +1241,7 @@ class DistributedMegatronService:
                     raise RuntimeError("optimizer command cannot start a cold trainer")
                 if ref.learner_parent_version != self._latest_step:
                     raise RuntimeError("optimizer command learner parent changed")
+                generation = self._training_generation(output_version)
                 job = OptimizerJobSpec(
                     operation_id=ref.operation_id,
                     run_id=ref.run_id,
@@ -1248,13 +1249,13 @@ class DistributedMegatronService:
                     training_session_id=self._training_session_id,
                     expected_learner_version=ref.learner_parent_version,
                     learner_version=output_version,
+                    generation=generation,
                     contributing_forward_backward_operation_ids=(
                         contributing_forward_backward_operation_ids
                     ),
                     optimizer=optimizer,
                 )
             result = await trainer.optim_step(job)
-            generation = self._training_generation(output_version)
             async with self._mutation_lock:
                 if self._latest_step != ref.learner_parent_version:
                     raise RuntimeError("learner advanced while optimizer executed")
@@ -1294,6 +1295,7 @@ class DistributedMegatronService:
                     raise RuntimeError("load command cannot start a cold trainer")
                 if ref.learner_parent_version != self._latest_step:
                     raise RuntimeError("load command learner parent changed")
+                generation = self._training_generation(output_version)
                 job = LoadStateJobSpec(
                     operation_id=ref.operation_id,
                     run_id=ref.run_id,
@@ -1301,6 +1303,7 @@ class DistributedMegatronService:
                     training_session_id=self._training_session_id,
                     expected_learner_version=ref.learner_parent_version,
                     learner_version=output_version,
+                    generation=generation,
                     adapter_path=source.adapter_path,
                     adapter_step=source.adapter_step,
                     optimizer_state_path=(
@@ -1312,7 +1315,6 @@ class DistributedMegatronService:
                     restore_optimizer=restore_optimizer,
                 )
             result = await trainer.load_state(job)
-            generation = self._training_generation(output_version)
             async with self._mutation_lock:
                 if self._latest_step != ref.learner_parent_version:
                     raise RuntimeError("learner advanced while load executed")

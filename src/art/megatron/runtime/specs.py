@@ -349,6 +349,7 @@ class LoadStateJobSpec(_Spec):
     training_session_id: str = Field(min_length=1)
     expected_learner_version: int = Field(ge=0)
     learner_version: int = Field(ge=1)
+    generation: TrainerGeneration
     adapter_path: str = Field(min_length=1)
     adapter_step: int = Field(ge=0)
     optimizer_state_path: str | None = Field(default=None, min_length=1)
@@ -359,6 +360,11 @@ class LoadStateJobSpec(_Spec):
     def _validate_transition(self) -> "LoadStateJobSpec":
         if self.learner_version != self.expected_learner_version + 1:
             raise ValueError("load learner version must advance exactly one step")
+        if (
+            self.generation.training_session_id != self.training_session_id
+            or self.generation.policy_step != self.learner_version
+        ):
+            raise ValueError("load generation does not identify the output learner")
         if self.restore_optimizer != (
             self.optimizer_state_path is not None
             and self.optimizer_generation_id is not None
@@ -399,6 +405,7 @@ class OptimizerJobSpec(_Spec):
     training_session_id: str = Field(min_length=1)
     expected_learner_version: int = Field(ge=0)
     learner_version: int = Field(ge=1)
+    generation: TrainerGeneration
     contributing_forward_backward_operation_ids: tuple[str, ...] = Field(min_length=1)
     optimizer: AdamConfig
 
@@ -406,6 +413,13 @@ class OptimizerJobSpec(_Spec):
     def _validate_transition(self) -> "OptimizerJobSpec":
         if self.learner_version != self.expected_learner_version + 1:
             raise ValueError("optimizer learner version must advance exactly one step")
+        if (
+            self.generation.training_session_id != self.training_session_id
+            or self.generation.policy_step != self.learner_version
+        ):
+            raise ValueError(
+                "optimizer generation does not identify the output learner"
+            )
         if len(set(self.contributing_forward_backward_operation_ids)) != len(
             self.contributing_forward_backward_operation_ids
         ):

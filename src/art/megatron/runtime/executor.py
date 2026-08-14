@@ -7,7 +7,7 @@ from threading import BoundedSemaphore, Event, Lock
 import time
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
@@ -81,7 +81,8 @@ class MegatronTrainJobExecutor:
                 adapter_path=job.output_adapter_path,
             ),
             snapshot_sink=lambda job, adapter_dtypes, adapter_config, save_optimizer: (
-                self._publisher.submit(
+                self._publisher.stage_and_submit(
+                    run_id=job.run_id,
                     generation=job.output.generation,
                     optimizer_state_path=job.output.optimizer_state_path,
                     staging_adapter_path=job.output.staging_adapter_path,
@@ -248,6 +249,7 @@ class MegatronTrainJobExecutor:
                 f"update_successful={result.update_successful}, "
                 f"grad_norm={result.grad_norm}"
             )
+        optimizer_step_s = time.perf_counter() - started
         consumed = self._gradients.consume()
         if consumed != job.contributing_forward_backward_operation_ids:
             raise RuntimeError("optimizer consumed the wrong gradient contributions")
@@ -255,6 +257,17 @@ class MegatronTrainJobExecutor:
         runtime.resident_policy_step = job.learner_version
         runtime.optimizer_state_loaded = True
         self._gradient_parent_version = None
+        if (
+            runtime.adapter_export_dtypes is None
+            or runtime.adapter_export_config is None
+        ):
+            raise RuntimeError("optimizer output has no adapter export layout")
+        snapshot_metrics = self._publisher.stage(
+            run_id=job.run_id,
+            generation=job.generation,
+            adapter_dtypes=runtime.adapter_export_dtypes,
+            adapter_config=runtime.adapter_export_config,
+        )
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -264,7 +277,8 @@ class MegatronTrainJobExecutor:
                 "loss/grad_norm": float(result.grad_norm),
                 "optimizer/update_successful": float(result.update_successful),
                 "optimizer/num_zeros_in_grad": float(result.num_zeros_in_grad or 0),
-                "time/optimizer_step_s": time.perf_counter() - started,
+                "time/optimizer_step_s": optimizer_step_s,
+                **snapshot_metrics,
             },
         }
 
@@ -276,10 +290,23 @@ class MegatronTrainJobExecutor:
 
         execute_megatron_load_state_job(self.runtime, job)
         self._gradient_parent_version = None
+        runtime = self.runtime
+        if (
+            runtime.adapter_export_dtypes is None
+            or runtime.adapter_export_config is None
+        ):
+            raise RuntimeError("loaded state has no adapter export layout")
+        snapshot_metrics = self._publisher.stage(
+            run_id=job.run_id,
+            generation=job.generation,
+            adapter_dtypes=runtime.adapter_export_dtypes,
+            adapter_config=runtime.adapter_export_config,
+        )
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
             "optimizer_restored": job.restore_optimizer,
+            "metrics": snapshot_metrics,
         }
 
     def execute_snapshot(
@@ -308,8 +335,6 @@ class MegatronTrainJobExecutor:
             staging_adapter_path=job.staging_adapter_path,
             existing_adapter=job.existing_adapter,
             publication_targets=job.publication_targets,
-            adapter_dtypes=runtime.adapter_export_dtypes,
-            adapter_config=runtime.adapter_export_config,
             save_optimizer=job.save_optimizer,
             sink=sink,
         )
@@ -643,6 +668,7 @@ class MCoreRunSlotExecutor:
         gradients = state.gradients.prepare_optimizer()
         from art.trainer_rank import AdamParams
 
+        self.runtime.optimizer_snapshot_barrier.wait_before_mutation()
         started = time.perf_counter()
         result = self._slot_trainer.optim_step_reduced(
             job.run_id,
@@ -658,10 +684,25 @@ class MCoreRunSlotExecutor:
         )
         if not result["update_successful"] or not math.isfinite(result["grad_norm"]):
             raise RuntimeError("dynamic LoRA optimizer rejected the update")
+        optimizer_step_s = time.perf_counter() - started
         consumed = state.gradients.consume()
         if consumed != job.contributing_forward_backward_operation_ids:
             raise RuntimeError("optimizer consumed the wrong gradient contributions")
         state.learner_version = job.learner_version
+        from art.megatron.lora import LoRASlotRef
+
+        snapshot_metrics = self._publisher.stage(
+            run_id=job.run_id,
+            generation=job.generation,
+            adapter_dtypes={},
+            adapter_config=state.adapter_config,
+            slot_ref=LoRASlotRef("checkpoint", job.run_id),
+            trainer_rank_optimizer_state=(
+                self._slot_trainer.checkpoint_slot_optimizer_snapshot_sources(
+                    job.run_id
+                )
+            ),
+        )
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -671,7 +712,8 @@ class MCoreRunSlotExecutor:
                 "loss/grad_norm": result["grad_norm"],
                 "optimizer/update_successful": result["update_successful"],
                 "optimizer/num_zeros_in_grad": result["num_zeros_in_grad"],
-                "time/optimizer_step_s": time.perf_counter() - started,
+                "time/optimizer_step_s": optimizer_step_s,
+                **snapshot_metrics,
             },
         }
 
@@ -686,6 +728,7 @@ class MCoreRunSlotExecutor:
         )
         if state.gradients.contribution_ids:
             raise RuntimeError("load_state cannot discard open gradient contributions")
+        self.runtime.optimizer_snapshot_barrier.synchronize()
         from art.megatron.model_support.lora_disk import (
             load_adapter_config,
             load_lora_tensors_for_megatron,
@@ -722,10 +765,25 @@ class MCoreRunSlotExecutor:
         state.gradients = ParameterGradientAccumulator(
             parameters=self._slot_trainer.checkpoint_slot_parameters(job.run_id)
         )
+        from art.megatron.lora import LoRASlotRef
+
+        snapshot_metrics = self._publisher.stage(
+            run_id=job.run_id,
+            generation=job.generation,
+            adapter_dtypes={},
+            adapter_config=state.adapter_config,
+            slot_ref=LoRASlotRef("checkpoint", job.run_id),
+            trainer_rank_optimizer_state=(
+                self._slot_trainer.checkpoint_slot_optimizer_snapshot_sources(
+                    job.run_id
+                )
+            ),
+        )
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
             "optimizer_restored": job.restore_optimizer,
+            "metrics": snapshot_metrics,
         }
 
     def execute_snapshot(
@@ -737,26 +795,14 @@ class MCoreRunSlotExecutor:
         self._validate_parent(state, job.training_session_id, job.learner_version)
         if job.merged_weight_transfer is not None:
             raise ValueError("multi-run slots publish LoRA weights, not merged weights")
-        from art.megatron.lora import LoRASlotRef
-
         metrics = self._publisher.submit(
             generation=job.generation,
             optimizer_state_path=job.optimizer_state_path,
             staging_adapter_path=job.staging_adapter_path,
             existing_adapter=job.existing_adapter,
             publication_targets=job.publication_targets,
-            adapter_dtypes={},
-            adapter_config=state.adapter_config,
             save_optimizer=job.save_optimizer,
             sink=sink,
-            slot_ref=LoRASlotRef("checkpoint", job.run_id),
-            trainer_rank_optimizer_state=(
-                self._slot_trainer.checkpoint_slot_optimizer_snapshot_sources(
-                    job.run_id
-                )
-                if job.save_optimizer
-                else None
-            ),
         )
         return {
             "operation_id": job.operation_id,
@@ -814,6 +860,25 @@ class MCoreRunSlotExecutor:
             raise ValueError("loaded adapter changes immutable target_modules")
 
 
+class _ResolvedGeneration(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    lora: Any | None
+    optimizer: Any
+    prepared_tensors: PreparedSafetensors | None
+
+
+class _CachedGeneration(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    run_id: str
+    generation: TrainerGeneration
+    resolved: Future[_ResolvedGeneration]
+    consumers: list[Future[TrainerRankPublication]] = Field(default_factory=list)
+    retired: bool = False
+    released: bool = False
+
+
 class _GenerationPublisher:
     def __init__(
         self,
@@ -829,29 +894,32 @@ class _GenerationPublisher:
         self.capacity = capacity
         self._slots = BoundedSemaphore(capacity)
         self._lock = Lock()
+        self._resolution_pool = ThreadPoolExecutor(
+            max_workers=capacity, thread_name_prefix="art-snapshot-resolve"
+        )
         self._transport_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="art-publish-transport"
         )
         self._durability_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="art-publish-durable"
         )
+        self._completion_pool = ThreadPoolExecutor(
+            max_workers=capacity, thread_name_prefix="art-publish-complete"
+        )
         self._transport_sender: Any | None = None
         self._lora_layouts: dict[tuple[Any, ...], SafetensorsLayout] = {}
+        self._cache: dict[str, _CachedGeneration] = {}
+        self._latest_by_run: dict[str, str] = {}
         self._failures: list[BaseException] = []
         self._in_flight = 0
 
-    def submit(
+    def stage(
         self,
         *,
+        run_id: str,
         generation: TrainerGeneration,
-        optimizer_state_path: str,
-        staging_adapter_path: str | None,
-        existing_adapter: "OptimizerAdapter | None" = None,
-        publication_targets: tuple[Any, ...],
         adapter_dtypes: dict[str, Any],
         adapter_config: dict[str, Any],
-        save_optimizer: bool,
-        sink: EventSink,
         slot_ref: "LoRASlotRef | None" = None,
         trainer_rank_optimizer_state: "TrainerRankOptimizerState | None" = None,
     ) -> dict[str, float]:
@@ -863,40 +931,23 @@ class _GenerationPublisher:
             stage_vllm_lora_snapshot_from_model,
         )
 
+        self._retire_previous(run_id)
         wait_s, in_flight = self._acquire_slot()
         prepare_started = time.perf_counter()
-        optimizer_handoff: Future[Any] = Future()
-        transport: Future[Future[TrainerRankPublication]] | None = None
         try:
-            lora = None
-            if existing_adapter is None:
-                if staging_adapter_path is None:
-                    raise RuntimeError("new adapter snapshot has no staging path")
-                lora = stage_vllm_lora_snapshot_from_model(
-                    model=self.runtime.model,
-                    adapter_dtypes=adapter_dtypes,
-                    handler=self.runtime.model_support_handler,
-                    adapter_config=adapter_config,
-                    rank=self.runtime.rank,
-                    world_size=self.runtime.world_size,
-                    stager=self.stager,
-                    slot_ref=slot_ref,
-                )
-            lora_launch_s = time.perf_counter() - prepare_started
-            lora_resolve_started = time.perf_counter()
-            lora = None if lora is None else lora.resolve()
-            lora_resolve_s = time.perf_counter() - lora_resolve_started
-            transport = self._enqueue_transport(
-                generation=generation,
-                optimizer_state_path=optimizer_state_path,
-                staging_adapter_path=staging_adapter_path,
-                lora=lora,
-                adapter=(existing_adapter if int(self.runtime.rank) == 0 else None),
-                optimizer=optimizer_handoff,
-                publication_targets=publication_targets,
+            lora = stage_vllm_lora_snapshot_from_model(
+                model=self.runtime.model,
+                adapter_dtypes=adapter_dtypes,
+                handler=self.runtime.model_support_handler,
+                adapter_config=adapter_config,
+                rank=self.runtime.rank,
+                world_size=self.runtime.world_size,
+                stager=self.stager,
+                slot_ref=slot_ref,
             )
+            lora_launch_s = time.perf_counter() - prepare_started
             optimizer_started = time.perf_counter()
-            if save_optimizer and slot_ref is not None:
+            if slot_ref is not None:
                 if trainer_rank_optimizer_state is None:
                     raise RuntimeError("dynamic LoRA snapshot has no optimizer state")
                 optimizer = stage_trainer_rank_optimizer_state_snapshot(
@@ -907,51 +958,124 @@ class _GenerationPublisher:
                     stager=self.stager,
                 )
             else:
-                optimizer = (
-                    stage_optimizer_state_snapshot(
-                        self.runtime,
-                        generation_id=generation.generation_id,
-                        step=generation.policy_step,
-                        stager=self.stager,
-                    )
-                    if save_optimizer
-                    else None
+                optimizer = stage_optimizer_state_snapshot(
+                    self.runtime,
+                    generation_id=generation.generation_id,
+                    step=generation.policy_step,
+                    stager=self.stager,
                 )
-            if optimizer is not None:
-                self.runtime.optimizer_snapshot_barrier.register(optimizer)
-            optimizer_handoff.set_result(optimizer)
+            if lora is not None:
+                self.runtime.optimizer_snapshot_barrier.register(lora)
+            self.runtime.optimizer_snapshot_barrier.register(optimizer)
             optimizer_launch_s = time.perf_counter() - optimizer_started
-            handoff_started = time.perf_counter()
-            persistence = transport.result()
-            transport_handoff_wait_s = time.perf_counter() - handoff_started
+            resolved = self._resolution_pool.submit(
+                self._resolve_generation, lora, optimizer
+            )
+            entry = _CachedGeneration(
+                run_id=run_id,
+                generation=generation,
+                resolved=resolved,
+            )
+            with self._lock:
+                if generation.generation_id in self._cache:
+                    raise RuntimeError(
+                        f"generation snapshot already exists: {generation.generation_id}"
+                    )
+                self._cache[generation.generation_id] = entry
+                self._latest_by_run[run_id] = generation.generation_id
+            resolved.add_done_callback(
+                lambda done, cached=entry: self._snapshot_resolved(cached, done)
+            )
         except BaseException as error:
-            publication_error = error
-            if transport is not None:
-                optimizer_handoff.set_exception(error)
-                publication_error = self._drain_transport(transport, error)
-            self._report_failure(
-                publication_error,
-                sink=sink,
-                generation=generation,
-                remember=False,
-            )
+            self._release_slot()
             raise
-        persistence.add_done_callback(
-            lambda done: self._completed(
-                done,
-                sink=sink,
-                generation=generation,
-            )
-        )
         return {
             "snapshot_pool_wait_s": wait_s,
             "snapshot_pool_in_use": float(in_flight),
             "snapshot_pool_pressure": in_flight / self.capacity,
             "snapshot_lora_launch_s": lora_launch_s,
-            "snapshot_lora_resolve_s": lora_resolve_s,
             "snapshot_optimizer_launch_s": optimizer_launch_s,
-            "snapshot_transport_handoff_wait_s": transport_handoff_wait_s,
             "snapshot_launch_s": time.perf_counter() - prepare_started,
+        }
+
+    def submit(
+        self,
+        *,
+        generation: TrainerGeneration,
+        optimizer_state_path: str,
+        staging_adapter_path: str | None,
+        existing_adapter: "OptimizerAdapter | None" = None,
+        publication_targets: tuple[Any, ...],
+        save_optimizer: bool,
+        sink: EventSink,
+    ) -> dict[str, float]:
+        self.raise_if_failed()
+        with self._lock:
+            entry = self._cache.get(generation.generation_id)
+        if entry is None or entry.generation != generation:
+            raise RuntimeError(
+                f"learner generation is not staged: {generation.generation_id}"
+            )
+        started = time.perf_counter()
+        transport = self._transport_pool.submit(
+            self._transfer_cached_snapshot,
+            entry.resolved,
+            publication_targets,
+        )
+        durability = self._durability_pool.submit(
+            self._persist_cached_snapshot,
+            entry.resolved,
+            generation,
+            optimizer_state_path,
+            staging_adapter_path,
+            existing_adapter if int(self.runtime.rank) == 0 else None,
+            save_optimizer,
+        )
+        persistence = self._completion_pool.submit(
+            self._complete_publication, transport, durability
+        )
+        with self._lock:
+            entry.consumers.append(persistence)
+        persistence.add_done_callback(
+            lambda done: self._completed(
+                done,
+                entry=entry,
+                sink=sink,
+                generation=generation,
+            )
+        )
+        return {
+            "snapshot_attach_s": time.perf_counter() - started,
+        }
+
+    def stage_and_submit(
+        self,
+        *,
+        run_id: str,
+        generation: TrainerGeneration,
+        optimizer_state_path: str,
+        staging_adapter_path: str,
+        publication_targets: tuple[Any, ...],
+        adapter_dtypes: dict[str, Any],
+        adapter_config: dict[str, Any],
+        save_optimizer: bool,
+        sink: EventSink,
+    ) -> dict[str, float]:
+        return {
+            **self.stage(
+                run_id=run_id,
+                generation=generation,
+                adapter_dtypes=adapter_dtypes,
+                adapter_config=adapter_config,
+            ),
+            **self.submit(
+                generation=generation,
+                optimizer_state_path=optimizer_state_path,
+                staging_adapter_path=staging_adapter_path,
+                publication_targets=publication_targets,
+                save_optimizer=save_optimizer,
+                sink=sink,
+            ),
         }
 
     def _acquire_slot(self) -> tuple[float, int]:
@@ -963,108 +1087,118 @@ class _GenerationPublisher:
             self._in_flight += 1
             return wait_s, self._in_flight
 
-    def _enqueue_transport(
-        self,
-        **kwargs: Any,
-    ) -> Future[Future[TrainerRankPublication]]:
-        return self._transport_pool.submit(self._transport_snapshot, **kwargs)
+    def _retire_previous(self, run_id: str) -> None:
+        with self._lock:
+            generation_id = self._latest_by_run.pop(run_id, None)
+            entry = None if generation_id is None else self._cache[generation_id]
+            if entry is not None:
+                entry.retired = True
+        if entry is not None:
+            self._maybe_release(entry)
 
-    @staticmethod
-    def _drain_transport(
-        transport: Future[Future[TrainerRankPublication]],
-        fallback: BaseException,
-    ) -> BaseException:
-        try:
-            transport.result().result()
-        except BaseException as error:
-            return error
-        return fallback
-
-    def _transport_snapshot(
+    def _snapshot_resolved(
         self,
-        *,
-        generation: TrainerGeneration,
-        optimizer_state_path: str,
-        staging_adapter_path: str | None,
-        lora: Any,
-        adapter: "OptimizerAdapter | None",
-        optimizer: Future[Any],
-        publication_targets: tuple[Any, ...],
-    ) -> Future[TrainerRankPublication]:
+        entry: _CachedGeneration,
+        resolved: Future[_ResolvedGeneration],
+    ) -> None:
+        if not resolved.cancelled() and (error := resolved.exception()) is not None:
+            with self._lock:
+                self._failures.append(error)
+                entry.retired = True
+        self._maybe_release(entry)
+
+    def _maybe_release(self, entry: _CachedGeneration) -> None:
+        with self._lock:
+            if (
+                not entry.retired
+                or entry.released
+                or not entry.resolved.done()
+                or any(not consumer.done() for consumer in entry.consumers)
+            ):
+                return
+            entry.released = True
+            self._cache.pop(entry.generation.generation_id, None)
+            if self._latest_by_run.get(entry.run_id) == entry.generation.generation_id:
+                self._latest_by_run.pop(entry.run_id)
+            self._in_flight -= 1
+        self._slots.release()
+
+    def _resolve_generation(self, lora: Any, optimizer: Any) -> _ResolvedGeneration:
+        lora = None if lora is None else lora.resolve()
+        optimizer = optimizer.resolve()
         prepared_tensors = None
         if lora is not None:
             layout_key = tuple(
                 (key, tuple(tensor.shape), str(tensor.dtype))
                 for key, tensor in sorted(lora.tensors.items())
             )
-            layout = self._lora_layouts.get(layout_key)
-            if layout is None:
-                layout = self._lora_layouts[layout_key] = SafetensorsLayout(
-                    lora.tensors
-                )
+            with self._lock:
+                layout = self._lora_layouts.get(layout_key)
+                if layout is None:
+                    layout = self._lora_layouts[layout_key] = SafetensorsLayout(
+                        lora.tensors
+                    )
             prepared_tensors = layout.bind(lora.tensors)
-        failures: list[BaseException] = []
-        if int(self.runtime.rank) == 0 and publication_targets:
-            if lora is None or prepared_tensors is None:
-                raise RuntimeError("rank zero has no LoRA snapshot to transfer")
-            try:
-                self._transfer_lora_snapshot(
-                    lora,
-                    publication_targets,
-                    prepared_tensors=prepared_tensors,
-                )
-            except BaseException as error:
-                failures.append(error)
-        return self._durability_pool.submit(
-            self._persist_snapshot,
-            generation=generation,
-            optimizer_state_path=optimizer_state_path,
-            staging_adapter_path=staging_adapter_path,
+        return _ResolvedGeneration(
             lora=lora,
-            adapter=adapter,
             optimizer=optimizer,
             prepared_tensors=prepared_tensors,
-            failures=failures,
         )
 
-    def _persist_snapshot(
+    def _transfer_cached_snapshot(
         self,
-        *,
+        resolved: Future[_ResolvedGeneration],
+        publication_targets: tuple[Any, ...],
+    ) -> None:
+        if int(self.runtime.rank) != 0 or not publication_targets:
+            return
+        snapshot = resolved.result()
+        if snapshot.lora is None or snapshot.prepared_tensors is None:
+            raise RuntimeError("rank zero has no LoRA snapshot to transfer")
+        self._transfer_lora_snapshot(
+            snapshot.lora,
+            publication_targets,
+            prepared_tensors=snapshot.prepared_tensors,
+        )
+
+    def _persist_cached_snapshot(
+        self,
+        resolved: Future[_ResolvedGeneration],
         generation: TrainerGeneration,
         optimizer_state_path: str,
         staging_adapter_path: str | None,
-        lora: Any,
         adapter: "OptimizerAdapter | None",
-        optimizer: Future[Any],
-        prepared_tensors: PreparedSafetensors | None,
-        failures: list[BaseException],
+        save_optimizer: bool,
     ) -> TrainerRankPublication:
-        record: TrainerRankPublication | None = None
-        try:
-            pending_optimizer = optimizer.result()
-            resolved_optimizer = (
-                None if pending_optimizer is None else pending_optimizer.resolve()
-            )
-            record = self._persist_generation(
-                generation=generation,
-                optimizer_state_path=optimizer_state_path,
-                staging_adapter_path=staging_adapter_path,
-                lora=lora,
-                adapter=adapter,
-                optimizer=resolved_optimizer,
-                prepared_tensors=prepared_tensors,
-            )
-        except BaseException as error:
-            failures.append(error)
+        snapshot = resolved.result()
+        return self._persist_generation(
+            generation=generation,
+            optimizer_state_path=optimizer_state_path,
+            staging_adapter_path=staging_adapter_path,
+            lora=snapshot.lora if adapter is None else None,
+            adapter=adapter,
+            optimizer=snapshot.optimizer if save_optimizer else None,
+            prepared_tensors=snapshot.prepared_tensors if adapter is None else None,
+        )
+
+    @staticmethod
+    def _complete_publication(
+        transport: Future[None],
+        durability: Future[TrainerRankPublication],
+    ) -> TrainerRankPublication:
+        failures: list[BaseException] = []
+        for future in (transport, durability):
+            try:
+                future.result()
+            except BaseException as error:
+                failures.append(error)
         if len(failures) == 1:
             raise failures[0]
         if failures:
             raise BaseExceptionGroup(
                 "adapter persistence and transport failed", failures
             )
-        if record is None:
-            raise RuntimeError("trainer rank produced no publication record")
-        return record
+        return durability.result()
 
     def _transfer_lora_snapshot(
         self,
@@ -1143,13 +1277,14 @@ class _GenerationPublisher:
         self,
         future: Future[TrainerRankPublication],
         *,
+        entry: _CachedGeneration,
         sink: EventSink,
         generation: TrainerGeneration,
     ) -> None:
         try:
             event = TrainerPublicationSucceeded(record=future.result())
         except BaseException as error:
-            self._failed(error, sink=sink, generation=generation)
+            self._failed(error, entry=entry, sink=sink, generation=generation)
             return
         try:
             sink.publication(event)
@@ -1157,21 +1292,29 @@ class _GenerationPublisher:
             with self._lock:
                 self._failures.append(error)
         finally:
-            self._release_slot()
+            self._maybe_release(entry)
 
     def _failed(
         self,
         error: BaseException,
         *,
+        entry: _CachedGeneration,
         sink: EventSink,
         generation: TrainerGeneration,
     ) -> None:
-        self._report_failure(error, sink=sink, generation=generation, remember=True)
+        self._report_failure(
+            error,
+            entry=entry,
+            sink=sink,
+            generation=generation,
+            remember=True,
+        )
 
     def _report_failure(
         self,
         error: BaseException,
         *,
+        entry: _CachedGeneration,
         sink: EventSink,
         generation: TrainerGeneration,
         remember: bool,
@@ -1191,7 +1334,7 @@ class _GenerationPublisher:
             with self._lock:
                 self._failures.append(sink_error)
         finally:
-            self._release_slot()
+            self._maybe_release(entry)
 
     def _release_slot(self) -> None:
         with self._lock:
@@ -1205,8 +1348,18 @@ class _GenerationPublisher:
             raise BaseExceptionGroup("trainer generation publication failed", failures)
 
     def close(self) -> None:
+        with self._lock:
+            entries = tuple(self._cache.values())
+            for entry in entries:
+                entry.retired = True
+        for entry in entries:
+            self._maybe_release(entry)
+        self._resolution_pool.shutdown(wait=True)
         self._transport_pool.shutdown(wait=True)
         self._durability_pool.shutdown(wait=True)
+        self._completion_pool.shutdown(wait=True)
+        for entry in entries:
+            self._maybe_release(entry)
         if self._transport_sender is not None:
             self._transport_sender.close()
             self._transport_sender = None
