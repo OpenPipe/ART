@@ -1082,7 +1082,11 @@ class MonarchTrainerRun:
             self._clear_active(request_id)
 
     async def train(
-        self, job: TrainJobSpec, batch: PackedBatchLeaseSet
+        self,
+        job: TrainJobSpec,
+        batch: PackedBatchLeaseSet,
+        *,
+        on_dispatched: Callable[[], None] | None = None,
     ) -> AsyncIterator[TrainEvent]:
         async for event in self._train(
             job,
@@ -1090,6 +1094,7 @@ class MonarchTrainerRun:
                 job.model_dump_json(), batch.model_dump_json(), port
             ),
             lambda: self._validate_rl(job, batch),
+            on_dispatched=on_dispatched,
         ):
             yield event
 
@@ -1110,9 +1115,18 @@ class MonarchTrainerRun:
         job: TrainerJobSpec,
         start: Callable[[Port[dict[str, Any]]], Awaitable[Any]],
         validate: Callable[[], BaseException | None],
+        *,
+        on_dispatched: Callable[[], None] | None = None,
     ) -> AsyncIterator[TrainEvent]:
+        def signal_dispatched() -> None:
+            nonlocal on_dispatched
+            callback, on_dispatched = on_dispatched, None
+            if callback is not None:
+                callback()
+
         cached = self._jobs.get(job.job_id)
         if cached is not None and cached[0] == job.fingerprint:
+            signal_dispatched()
             for event in cached[1]:
                 yield event
             return
@@ -1121,6 +1135,7 @@ class MonarchTrainerRun:
             cached = self._jobs.get(job.job_id)
             if cached is not None:
                 if cached[0] == job.fingerprint:
+                    signal_dispatched()
                     for event in cached[1]:
                         yield event
                     return
@@ -1172,6 +1187,7 @@ class MonarchTrainerRun:
                 dispatch_started = time.perf_counter()
                 final_progress_received: float | None = None
                 collective = asyncio.ensure_future(start(send_port))
+                signal_dispatched()
                 receive = asyncio.ensure_future(receiver.recv())
                 supervision = asyncio.create_task(self._supervision.wait())
                 self._active_job_id = job.job_id

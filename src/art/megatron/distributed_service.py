@@ -204,6 +204,7 @@ class DistributedMegatronService:
         self._mutation_lock = asyncio.Lock()
         self._serving_lock = asyncio.Lock()
         self._durability_lock = asyncio.Lock()
+        self._pipeline_train_dispatch: asyncio.Event | None = None
         self._managed_service_name: str | None = None
         self._base_url: str | None = None
         self._serving_capabilities: ServingCapabilities | None = None
@@ -239,6 +240,20 @@ class DistributedMegatronService:
     @property
     def openai_server_port(self) -> int:
         return self._model_service_spec().leader_endpoint.port
+
+    def arm_pipeline_train_dispatch(self, event: asyncio.Event) -> None:
+        if self._pipeline_train_dispatch is not None:
+            raise RuntimeError("pipeline trainer dispatch fence is already armed")
+        self._pipeline_train_dispatch = event
+
+    def cancel_pipeline_train_dispatch(self, event: asyncio.Event) -> None:
+        if self._pipeline_train_dispatch is event:
+            self._pipeline_train_dispatch = None
+
+    def _take_pipeline_train_dispatch(self) -> asyncio.Event | None:
+        event = self._pipeline_train_dispatch
+        self._pipeline_train_dispatch = None
+        return event
 
     @property
     def active_learner_step(self) -> int:
@@ -1189,9 +1204,16 @@ class DistributedMegatronService:
                 experimental_config=ExperimentalTrainConfig.model_validate(values),
             )
 
+        dispatch_event = self._take_pipeline_train_dispatch()
         async for metrics in self._run_train_job(
             build_job,
-            lambda trainer, job: trainer.train(job, batch.leases),
+            lambda trainer, job: trainer.train(
+                job,
+                batch.leases,
+                on_dispatched=dispatch_event.set
+                if dispatch_event is not None
+                else None,
+            ),
             lineage_error="learner lineage changed during training",
         ):
             yield metrics

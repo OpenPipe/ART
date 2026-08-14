@@ -1107,10 +1107,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if saw_sentinel:
                 return
 
-    async def _finalize_post_train(self, item: _PostTrainItem) -> None:
-        # Let the training coroutine dispatch a ready next batch before waking
-        # rollout waiters or doing controller-only work.
-        await asyncio.sleep(0)
+    async def _finalize_post_train(
+        self, item: _PostTrainItem, next_train_dispatched: asyncio.Event
+    ) -> None:
+        # Controller-only work must not delay a ready next trainer job.
+        dispatch_wait_started = time.monotonic()
+        await next_train_dispatched.wait()
+        dispatch_wait_s = time.monotonic() - dispatch_wait_started
         async with self.state.policy_updated:
             self.state.policy_updated.notify_all()
 
@@ -1123,6 +1126,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
         started = time.monotonic()
         metrics = dict(item.metrics)
+        metrics["time/step_post_train_dispatch_wait_s"] = dispatch_wait_s
         metrics.update(item.result.metrics)
         attachment_metrics, attachment_owns_vllm_metrics = (
             self._collect_attachment_train_step_metrics()
@@ -1212,6 +1216,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         pending_zero_variance_groups = 0
         pending_dequeued_groups = 0
         post_train_task: asyncio.Task[None] | None = None
+        post_train_dispatch: asyncio.Event | None = None
 
         while True:
             if stop_at_step is not None and current_step >= stop_at_step:
@@ -1225,11 +1230,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             preparation_metrics: dict[str, float] = {}
             packing_policy_step = current_step
             if self._packed_queue is None:
+                if post_train_dispatch is not None:
+                    post_train_dispatch.set()
                 batch, discarded, saw_sentinel = await self._collect_batch(current_step)
             else:
                 packed_queue_depth = self._packed_queue.qsize()
+                if packed_queue_depth == 0 and post_train_dispatch is not None:
+                    post_train_dispatch.set()
                 prepared = await self._packed_queue.get()
                 if prepared is None:
+                    if post_train_dispatch is not None:
+                        post_train_dispatch.set()
                     break
                 batch = prepared.batch
                 discarded = prepared.discarded
@@ -1250,7 +1261,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             ):
                 discard = getattr(self.backend, "discard_pipeline_batch")
                 await discard(batch)
-                prepared.handoff.set()
+                if post_train_dispatch is not None:
+                    post_train_dispatch.set()
+                try:
+                    await self._await_post_train(post_train_task)
+                finally:
+                    prepared.handoff.set()
+                post_train_task = None
+                post_train_dispatch = None
                 discarded += len(batch)
                 self.state.discarded_stale_groups += discarded
                 self._status.note_stale(discarded)
@@ -1284,7 +1302,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
             self.state.next_training_step = expected_step
             if self._packed_queue is not None:
-                prepared.handoff.set()
+                if post_train_task is None:
+                    prepared.handoff.set()
+                else:
+                    post_train_task.add_done_callback(
+                        lambda _task, event=prepared.handoff: event.set()
+                    )
 
             self._status.note_training_start(len(batch))
             train_call_start = time.monotonic()
@@ -1316,6 +1339,15 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 if self.autotune.mode != "off":
                     for group in batch:
                         group._collect_packing_shape = True
+                if post_train_dispatch is not None:
+                    if getattr(
+                        self.backend, "supports_pipeline_train_dispatch_fence", False
+                    ):
+                        train_kwargs["_pipeline_train_dispatch_event"] = (
+                            post_train_dispatch
+                        )
+                    else:
+                        post_train_dispatch.set()
                 result = await self.backend.train(
                     self.model,
                     batch,
@@ -1323,6 +1355,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 )
                 self._backend_training_completed = True
             except Exception:
+                if post_train_dispatch is not None:
+                    post_train_dispatch.set()
                 for group in batch:
                     group._collect_packing_shape = False
                     group._packed_group_shape = None
@@ -1339,10 +1373,16 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     )
 
             self._status.note_training_end()
+            if post_train_dispatch is not None and not post_train_dispatch.is_set():
+                post_train_dispatch.set()
+                raise RuntimeError(
+                    "backend completed without signaling trainer dispatch"
+                )
             post_train_wait_started = time.monotonic()
             await self._await_post_train(post_train_task)
             post_train_wait_s = time.monotonic() - post_train_wait_started
             post_train_task = None
+            post_train_dispatch = None
 
             current_step = int(result.step)
             self.state.policy_version = current_step
@@ -1401,6 +1441,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         **preparation_metrics,
                     }
                 )
+            post_train_dispatch = asyncio.Event()
             post_train_task = asyncio.create_task(
                 self._finalize_post_train(
                     _PostTrainItem(
@@ -1413,7 +1454,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         step_completed_s=step_completed_s,
                         policy_age_metrics=policy_age_metrics,
                         metrics=metrics,
-                    )
+                    ),
+                    post_train_dispatch,
                 ),
                 name=f"post_train_step_{current_step}",
             )
@@ -1424,6 +1466,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if stop_after_batch:
                 break
 
+        if post_train_dispatch is not None:
+            post_train_dispatch.set()
         await self._await_post_train(post_train_task)
         self.state.done = True
         self._accept_prepared_batches = False

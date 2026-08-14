@@ -80,6 +80,8 @@ class _PipelinePreparedBatch(BaseModel):
 
 
 class MegatronBackend(LocalBackend):
+    supports_pipeline_train_dispatch_fence = True
+
     def __init__(
         self,
         *,
@@ -256,20 +258,40 @@ class MegatronBackend(LocalBackend):
                     f"MegatronBackend.train gets {removed_kwarg} from "
                     "art.init_megatron_runtime_config(...)."
                 )
+        dispatch_event = kwargs.pop("_pipeline_train_dispatch_event", None)
+        if dispatch_event is not None and not isinstance(dispatch_event, asyncio.Event):
+            raise TypeError("pipeline train dispatch fence must be an asyncio.Event")
         groups = list(trajectory_groups)
         pipeline_call = bool(
             groups
             and isinstance(groups[0]._prepared_training_batch, _PipelinePreparedBatch)
         )
-        result = await super().train(
-            model,
-            groups,
-            packed_sequence_length=get_megatron_runtime_config().packed_sequence_length,
-            **kwargs,
-        )
         from .distributed_service import DistributedMegatronService
 
-        service = cast(DistributedMegatronService, await self._get_service(model))
+        dispatch_armed = dispatch_event is not None and not dispatch_event.is_set()
+        service: DistributedMegatronService | None = None
+        if dispatch_armed:
+            if not pipeline_call:
+                raise RuntimeError("trainer dispatch fencing requires a prepared batch")
+            assert dispatch_event is not None
+            service = cast(DistributedMegatronService, await self._get_service(model))
+            service.arm_pipeline_train_dispatch(dispatch_event)
+        try:
+            result = await super().train(
+                model,
+                groups,
+                packed_sequence_length=(
+                    get_megatron_runtime_config().packed_sequence_length
+                ),
+                **kwargs,
+            )
+        finally:
+            if dispatch_armed:
+                assert dispatch_event is not None
+                assert service is not None
+                service.cancel_pipeline_train_dispatch(dispatch_event)
+        if service is None:
+            service = cast(DistributedMegatronService, await self._get_service(model))
         final_step = kwargs.get("final_training_step")
         if final_step is not None and result.step >= final_step:
             result.metrics.update(
