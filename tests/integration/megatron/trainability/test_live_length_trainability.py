@@ -768,6 +768,7 @@ async def run_length_trainability_async(
     artifact_dir: Path | None = None,
     allow_unvalidated_arch: bool = False,
     resident_hook: LengthResidentHook | None = None,
+    registration_ready: Awaitable[object] | None = None,
     first_update_learning_rate: float | None = None,
 ) -> LengthTrainabilityReport:
     artifact_dir = artifact_dir or _artifact_dir(base_model)
@@ -858,6 +859,8 @@ async def run_length_trainability_async(
             _internal_config=internal_config,
             report_metrics=[],
         )
+        if registration_ready is not None:
+            await registration_ready
         await model.register(backend)
         registered_step = await model.get_step()
         if resident_hook is not None:

@@ -83,8 +83,6 @@ async def run_resident_functional_session(
             (artifact_dir / "resident_lora_coverage.json").write_text(
                 coverage_report.model_dump_json(indent=2) + "\n", encoding="utf-8"
             )
-            if serving_ready is not None:
-                await serving_ready
             return
         if phase != "first_update" or step != 1:
             raise RuntimeError(f"unexpected resident functional hook {phase}@{step}")
@@ -110,6 +108,7 @@ async def run_resident_functional_session(
             artifact_dir=length_dir,
             allow_unvalidated_arch=allow_unvalidated_arch,
             resident_hook=hook,
+            registration_ready=serving_ready,
             first_update_learning_rate=_PARITY_LEARNING_RATE,
         )
     finally:
