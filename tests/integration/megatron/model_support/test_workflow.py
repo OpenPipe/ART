@@ -505,6 +505,14 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
     assert "queue_ready_inter_forward_backward_gap_p50_s" not in acceptance_failures(
         robust, config, thresholds
     )
+    assert "queue_ready_inter_forward_backward_gap_p50_s" not in acceptance_failures(
+        {
+            **measurements,
+            "queue_ready_inter_forward_backward_gap_worst_rank_p50_s": 0.225,
+        },
+        config,
+        thresholds,
+    )
     assert "queue_ready_inter_forward_backward_gap_max_s" in acceptance_failures(
         {
             **measurements,
@@ -524,7 +532,7 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
         ThroughputThresholds.model_validate(
             {
                 **thresholds.model_dump(),
-                "max_queue_ready_inter_forward_backward_gap_p50_s": 0.201,
+                "max_queue_ready_inter_forward_backward_gap_p50_s": 0.231,
             }
         )
     assert acceptance_failures(

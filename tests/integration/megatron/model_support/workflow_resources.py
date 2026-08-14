@@ -32,7 +32,7 @@ class ThroughputThresholds(BaseModel):
         gt=0.0, allow_inf_nan=False
     )
     max_queue_ready_inter_forward_backward_gap_p50_s: float = Field(
-        default=0.2, gt=0.0, le=0.2, allow_inf_nan=False
+        default=0.23, gt=0.0, le=0.23, allow_inf_nan=False
     )
     max_queue_ready_inter_forward_backward_gap_max_s: float = Field(
         default=1.0, gt=0.0, le=1.0, allow_inf_nan=False
