@@ -108,7 +108,8 @@ _PERFORMANCE_ACCEPTANCE_FAILURES = frozenset(
         "mean_policy_activation_lag_s",
         "max_policy_activation_lag_s",
         "repeated_policy_activation_cadence_s",
-        "queue_ready_inter_forward_backward_gap_mean_s",
+        "queue_ready_inter_forward_backward_gap_p50_s",
+        "queue_ready_inter_forward_backward_gap_max_s",
     }
 )
 _HARD_ACCEPTANCE_FAILURES = frozenset(
@@ -1604,11 +1605,17 @@ def acceptance_failures(
             "queue_ready_inter_forward_backward_gap_worst_rank_count"
         ]
         >= thresholds.min_queue_ready_inter_forward_backward_gap_count,
-        "queue_ready_inter_forward_backward_gap_mean_s": (
-            measurements["queue_ready_inter_forward_backward_gap_worst_rank_mean_s"]
+        "queue_ready_inter_forward_backward_gap_p50_s": (
+            measurements["queue_ready_inter_forward_backward_gap_worst_rank_p50_s"]
             is not None
-            and measurements["queue_ready_inter_forward_backward_gap_worst_rank_mean_s"]
-            <= thresholds.max_queue_ready_inter_forward_backward_gap_mean_s
+            and measurements["queue_ready_inter_forward_backward_gap_worst_rank_p50_s"]
+            <= thresholds.max_queue_ready_inter_forward_backward_gap_p50_s
+        ),
+        "queue_ready_inter_forward_backward_gap_max_s": (
+            measurements["queue_ready_inter_forward_backward_gap_worst_rank_max_s"]
+            is not None
+            and measurements["queue_ready_inter_forward_backward_gap_worst_rank_max_s"]
+            <= thresholds.max_queue_ready_inter_forward_backward_gap_max_s
         ),
     }
     if thresholds.calibration_fingerprint is not None:

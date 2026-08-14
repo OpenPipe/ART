@@ -318,7 +318,14 @@ class _GenerationPublisher:
             optimizer_handoff.set_result(optimizer)
             optimizer_launch_s = time.perf_counter() - optimizer_started
             handoff_started = time.perf_counter()
-            persistence = transport.result()
+            transport.add_done_callback(
+                lambda done: self._transport_ready(
+                    done,
+                    sink=sink,
+                    generation=job.output.generation,
+                    stager=stager,
+                )
+            )
             transport_handoff_wait_s = time.perf_counter() - handoff_started
         except BaseException as error:
             publication_error = error
@@ -333,14 +340,6 @@ class _GenerationPublisher:
                 stager=stager,
             )
             raise
-        persistence.add_done_callback(
-            lambda done: self._completed(
-                done,
-                sink=sink,
-                generation=job.output.generation,
-                stager=stager,
-            )
-        )
         return {
             "snapshot_pool_wait_s": wait_s,
             "snapshot_pool_in_use": float(in_flight),
@@ -351,6 +350,28 @@ class _GenerationPublisher:
             "snapshot_transport_handoff_wait_s": transport_handoff_wait_s,
             "snapshot_launch_s": time.perf_counter() - prepare_started,
         }
+
+    def _transport_ready(
+        self,
+        future: Future[Future[TrainerRankPublication]],
+        *,
+        sink: EventSink,
+        generation: TrainerGeneration,
+        stager: PinnedCpuSnapshotStager,
+    ) -> None:
+        try:
+            persistence = future.result()
+        except BaseException as error:
+            self._failed(error, sink=sink, generation=generation, stager=stager)
+            return
+        persistence.add_done_callback(
+            lambda done: self._completed(
+                done,
+                sink=sink,
+                generation=generation,
+                stager=stager,
+            )
+        )
 
     def _acquire_slot(self) -> tuple[float, int, PinnedCpuSnapshotStager]:
         self.raise_if_failed()
