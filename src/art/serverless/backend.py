@@ -8,6 +8,8 @@ import time
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 import uuid
 
+from pydantic import BaseModel, ConfigDict, Field
+
 from art._backend_training import (
     aggregate_rl_training_metrics,
     build_rl_train_configs,
@@ -35,6 +37,7 @@ from art.training.contracts import (
 )
 from art.trajectories import Trajectory, TrajectoryGroup
 from art.types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
+from art.utils.lifecycle import complete_task
 
 from .. import dev
 from .client import RemoteTrainingClient, RemoteTrainingServiceClient
@@ -66,6 +69,15 @@ class SamplerManager(Protocol):
     async def remove(
         self, model: AnyTrainableModel, publication: SamplerPublication
     ) -> None: ...
+
+
+class _RemotePipelineBatch(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    encoded: EncodedTrainingBatch
+    groups: tuple[Any, ...]
+    selections: tuple[Any, ...]
+    generation_id: str = Field(min_length=1)
 
 
 class ServerlessBackend:
@@ -556,25 +568,24 @@ class ServerlessBackend:
         sequence = client.next_sequence_id
         prepared = groups[0]._prepared_training_batch
         if prepared is not None:
-            local_groups = (
-                prepared.batch.require_local_groups()
-                if isinstance(prepared, EncodedTrainingBatch)
-                else ()
-            )
             if (
-                not isinstance(prepared, EncodedTrainingBatch)
-                or len(local_groups) != len(groups)
+                not isinstance(prepared, _RemotePipelineBatch)
+                or len(prepared.groups) != len(groups)
+                or any(
+                    actual is not expected
+                    for actual, expected in zip(prepared.groups, groups, strict=True)
+                )
                 or any(
                     group._prepared_training_batch is not prepared for group in groups
                 )
-                or any(
-                    actual is not expected
-                    for actual, expected in zip(local_groups, groups, strict=True)
-                )
             ):
                 raise RuntimeError("remote pipeline batch preparation is inconsistent")
+        elif any(group._distributed_lease is not None for group in groups):
+            raise RuntimeError(
+                "distributed trajectory batches require remote pipeline preparation"
+            )
         batch = (
-            prepared.batch
+            prepared.encoded.batch
             if prepared is not None
             else RlTrajectoryBatch.from_groups(
                 groups, default_source_version=client.projected_learner_version
@@ -602,13 +613,23 @@ class ServerlessBackend:
             forward = (
                 await client.forward_backward(request)
                 if prepared is None
-                else await client.forward_backward_prepared(request, prepared)
+                else await client.forward_backward_prepared(request, prepared.encoded)
             )
             submit_s = time.monotonic() - submit_started
-        finally:
+        except BaseException:
             if prepared is not None:
-                for group in groups:
-                    group._prepared_training_batch = None
+                await self._release_remote_pipeline_batch(
+                    prepared, disposition="discarded"
+                )
+            raise
+        else:
+            if prepared is not None:
+                await self._release_remote_pipeline_batch(
+                    prepared, disposition="consumed"
+                )
+        finally:
+            for group in groups:
+                group._prepared_training_batch = None
         optimizer = await client.optim_step(
             OptimStepRequest(
                 run_id=client.run_id,
@@ -681,33 +702,125 @@ class ServerlessBackend:
         del normalize_advantages
         client = await self.training_client(model)
         started = time.monotonic()
-        batch = RlTrajectoryBatch.from_groups(
-            trajectory_groups,
-            default_source_version=client.projected_learner_version,
-        )
-        prepared = await asyncio.to_thread(prepare_training_batch, batch)
+        from art.distributed.rollout import DistributedTrajectorySelection
+
         if any(
             group._prepared_training_batch is not None for group in trajectory_groups
         ):
             raise RuntimeError("trajectory group already owns a prepared batch")
+        selections = tuple(group._distributed_lease for group in trajectory_groups)
+        selected = tuple(
+            selection
+            for selection in selections
+            if isinstance(selection, DistributedTrajectorySelection)
+        )
+        if any(selection is not None for selection in selections) and len(
+            selected
+        ) != len(trajectory_groups):
+            raise RuntimeError("remote batch mixes distributed and controller groups")
+        queue = selected[0].queue if selected else None
+        if queue is not None and any(
+            selection.queue is not queue for selection in selected
+        ):
+            raise RuntimeError("remote batch spans distributed trajectory queues")
+        for group in trajectory_groups:
+            group._distributed_lease = None
+        marked_packed = False
+        generation_id = uuid.uuid4().hex
+        try:
+            materialized = (
+                tuple(
+                    await asyncio.gather(
+                        *(
+                            queue.materialize_selection(selection)
+                            for selection in selected
+                        )
+                    )
+                )
+                if queue is not None
+                else tuple(trajectory_groups)
+            )
+            batch = RlTrajectoryBatch.from_groups(
+                materialized,
+                default_source_version=client.projected_learner_version,
+            )
+            encoded = await asyncio.to_thread(prepare_training_batch, batch)
+            generation_id = encoded.ref.object_id
+            if queue is not None:
+                _, cancelled = await complete_task(
+                    asyncio.create_task(queue.mark_packed(selected, generation_id))
+                )
+                marked_packed = True
+                if cancelled is not None:
+                    raise cancelled
+        except BaseException as primary:
+            if queue is not None:
+                try:
+                    _, cancelled = await complete_task(
+                        asyncio.create_task(
+                            queue.release_selections(
+                                selected,
+                                disposition="discarded",
+                                generation_id=(
+                                    generation_id if marked_packed else None
+                                ),
+                            )
+                        )
+                    )
+                    if cancelled is not None:
+                        raise cancelled
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "remote packing and source cleanup failed",
+                        [primary, cleanup_error],
+                    ) from None
+            raise
+        prepared = _RemotePipelineBatch(
+            encoded=encoded,
+            groups=tuple(trajectory_groups),
+            selections=selected,
+            generation_id=generation_id,
+        )
         for group in trajectory_groups:
             group._prepared_training_batch = prepared
         return {
             "time/step_prepare_remote_batch_s": time.monotonic() - started,
-            "data/step_remote_batch_bytes": float(prepared.ref.byte_count),
+            "data/step_remote_batch_bytes": float(encoded.ref.byte_count),
         }
 
     async def discard_pipeline_batch(
         self, trajectory_groups: list[TrajectoryGroup]
     ) -> None:
         prepared = trajectory_groups[0]._prepared_training_batch
-        if not isinstance(prepared, EncodedTrainingBatch) or any(
+        if not isinstance(prepared, _RemotePipelineBatch) or any(
             group._prepared_training_batch is not prepared
             for group in trajectory_groups
         ):
             raise RuntimeError("remote pipeline batch is not prepared")
         for group in trajectory_groups:
             group._prepared_training_batch = None
+        await self._release_remote_pipeline_batch(prepared, disposition="discarded")
+
+    @staticmethod
+    async def _release_remote_pipeline_batch(
+        prepared: _RemotePipelineBatch,
+        *,
+        disposition: Literal["consumed", "discarded"],
+    ) -> None:
+        if not prepared.selections:
+            return
+        queue = prepared.selections[0].queue
+        _, cancelled = await complete_task(
+            asyncio.create_task(
+                queue.release_selections(
+                    prepared.selections,
+                    disposition=disposition,
+                    generation_id=prepared.generation_id,
+                )
+            )
+        )
+        if cancelled is not None:
+            raise cancelled
 
     async def _train_sft(
         self,
