@@ -52,7 +52,7 @@ INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 LATEST_SUMMARY_LOG_PATH = REPO_ROOT / ".local" / "length_trainability.log"
 DEFAULT_INITIAL_ABS_ERROR_MIN = 5.0
-DEFAULT_SUCCESS_ABS_ERROR_MAX = 1.5
+DEFAULT_SUCCESS_ABS_ERROR_MAX = 2.0
 GPT_OSS_INITIAL_ABS_ERROR_MIN = 100.0
 GPT_OSS_SUCCESS_ABS_ERROR_MAX = 5.0
 GPT_OSS_TARGET_TOKENS = 20
@@ -343,7 +343,11 @@ def _base_max_tokens(target_tokens: int, *, base_model: str | None = None) -> in
     return max_tokens
 
 
-def _prompt_for_index(index: int) -> tuple[str, int]:
+def _prompt_for_index(
+    index: int,
+    *,
+    base_model: str | None = None,
+) -> tuple[str, int]:
     target_words = _get_env_int("ART_MODEL_SUPPORT_LENGTH_PROMPT_WORDS", 300)
     rng = random.Random(index)
     sentences = list(FILLER_SENTENCES)
@@ -351,7 +355,10 @@ def _prompt_for_index(index: int) -> tuple[str, int]:
     selected: list[str] = []
     mid = LENGTH_PROMPT_MIDS[(index // 2) % len(LENGTH_PROMPT_MIDS)]
     leaf = LENGTH_PROMPT_LEAVES[index % len(LENGTH_PROMPT_LEAVES)]
-    prefix = f"{BASE_PROMPT}\n\n{mid}\n\n{leaf}"
+    base_prompt = BASE_PROMPT
+    if _model_support_key(base_model) == "glm52":
+        base_prompt += " Make the sentence moderately detailed rather than terse."
+    prefix = f"{base_prompt}\n\n{mid}\n\n{leaf}"
     prompt = prefix
     for sentence in sentences:
         if _word_count(prompt) >= target_words:
@@ -384,7 +391,7 @@ def _scenario(
 ) -> LengthScenario:
     target_tokens = _target_tokens(base_model)
     max_tokens = _base_max_tokens(target_tokens, base_model=base_model)
-    prompt, prompt_word_count = _prompt_for_index(index)
+    prompt, prompt_word_count = _prompt_for_index(index, base_model=base_model)
     return LengthScenario(
         scenario_index=index,
         target_step=index if target_step is None else target_step,

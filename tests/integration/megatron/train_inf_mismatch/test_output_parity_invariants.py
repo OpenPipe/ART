@@ -320,6 +320,7 @@ def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
 
 
 def test_architecture_specific_real_path_limits() -> None:
+    assert fwd_mean_abs_pct_limit_for_model("meta-llama/Llama-3.2-1B-Instruct") == 5.0
     assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 8.0
     assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-27B") == 15.0
     assert top20_kl_candidate_to_target_limit_for_model("Qwen/Qwen3.5-27B") == 0.01

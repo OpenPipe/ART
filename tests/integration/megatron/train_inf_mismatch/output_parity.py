@@ -50,6 +50,7 @@ BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
     # agreement.
     "gemma4_dense": 15.0,
     "gemma4_moe": 18.0,
+    "llama3_dense": 5.0,
     "qwen3_moe": 8.0,
     "qwen3_5_dense": 15.0,
     "qwen3_5_moe": 10.0,

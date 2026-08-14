@@ -488,10 +488,24 @@ def test_gpt_oss_length_target_accounts_for_harmony_tokens(monkeypatch) -> None:
     assert _target_tokens("openai/gpt-oss-20b") == 24
 
 
+def test_length_trainability_default_success_threshold() -> None:
+    thresholds = _length_trainability_thresholds("zai-org/GLM-5.2")
+
+    assert thresholds.success_abs_error_max == 2
+
+
 def test_length_prompts_form_prefix_tree_by_default() -> None:
     prompts = [_prompt_for_index(index)[0] for index in range(4)]
 
     assert _length_prompt_tree_shape(prompts) == (3, 6)
+
+
+def test_glm52_length_prompt_requests_a_fuller_initial_answer() -> None:
+    default_prompt = _prompt_for_index(0)[0]
+    glm52_prompt = _prompt_for_index(0, base_model="zai-org/GLM-5.2")[0]
+
+    assert "moderately detailed rather than terse" not in default_prompt
+    assert "moderately detailed rather than terse" in glm52_prompt
 
 
 def test_length_trainability_accepts_near_baseline_learning_signal() -> None:
