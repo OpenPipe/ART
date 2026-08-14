@@ -357,7 +357,10 @@ def _prompt_for_index(
     leaf = LENGTH_PROMPT_LEAVES[index % len(LENGTH_PROMPT_LEAVES)]
     base_prompt = BASE_PROMPT
     if _model_support_key(base_model) == "glm52":
-        base_prompt += " Make the sentence moderately detailed rather than terse."
+        base_prompt = base_prompt.replace(
+            "Use one sentence.",
+            "Use two complete sentences with one concrete detail in each.",
+        )
     prefix = f"{base_prompt}\n\n{mid}\n\n{leaf}"
     prompt = prefix
     for sentence in sentences:

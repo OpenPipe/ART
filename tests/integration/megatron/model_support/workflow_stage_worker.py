@@ -329,15 +329,6 @@ def _run_session(
 ) -> None:
     from . import workflow
 
-    # Concurrent standalone stages need distinct single-rank TCP stores.
-    distributed_environment = {
-        "MASTER_ADDR": "127.0.0.1",
-        "MASTER_PORT": str(find_free_tcp_port()),
-        "RANK": "0",
-        "WORLD_SIZE": "1",
-        "LOCAL_RANK": "0",
-        "LOCAL_WORLD_SIZE": "1",
-    }
     architecture = ArchitectureReport.model_validate_json(
         Path(request.architecture_json).read_text(encoding="utf-8")
     )
@@ -346,12 +337,10 @@ def _run_session(
         log_path = Path(item.stage_dir) / "worker.log"
         reset_error: Exception | None = None
         try:
-            environment = (
-                distributed_environment
-                | item.environment
-                | {workflow.WORKFLOW_STAGE_DIR_ENV: item.stage_dir}
-            )
-            with workflow._temporary_env(**environment):
+            with workflow._temporary_env(
+                **item.environment,
+                **{workflow.WORKFLOW_STAGE_DIR_ENV: item.stage_dir},
+            ):
                 with workflow._redirect_output(log_path):
                     result = _STAGE_RUNNERS[item.stage](
                         base_model=request.base_model,

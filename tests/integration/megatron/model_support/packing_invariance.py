@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from typing import Any, cast
+from unittest.mock import patch
 
 from megatron.core import parallel_state as ps
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -23,6 +24,7 @@ from art.megatron.model_support.registry import (
 from art.megatron.model_support.spec import PrefixTreeModelStateContext
 from art.megatron.prefix_tree import parse_prefix_tree_row
 from art.megatron.prefix_tree_state import create_prefix_tree_state
+from art.utils.network import find_free_tcp_port
 
 from ..artifacts import GitRepoState, pinned_git_state
 from .base_megatron_session import (
@@ -699,15 +701,29 @@ def _run_packing_invariance_worker(
     runtime: megatron_train.TrainingRuntime | None = None
     session = active_base_megatron_session()
     reused_runtime = session is not None
-    flex_patch_stack = ExitStack()
-    flex_patch_stack.enter_context(
+    runtime_stack = ExitStack()
+    if not torch.distributed.is_initialized():
+        runtime_stack.enter_context(
+            patch.dict(
+                os.environ,
+                {
+                    "MASTER_ADDR": "127.0.0.1",
+                    "MASTER_PORT": str(find_free_tcp_port()),
+                    "RANK": "0",
+                    "WORLD_SIZE": "1",
+                    "LOCAL_RANK": "0",
+                    "LOCAL_WORLD_SIZE": "1",
+                },
+            )
+        )
+    runtime_stack.enter_context(
         _apply_requested_flex_backend_patch(TEST_DEFAULT_FLEX_BACKEND)
     )
     if precision == "fp32":
-        flex_patch_stack.enter_context(
+        runtime_stack.enter_context(
             _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
         )
-        flex_patch_stack.enter_context(
+        runtime_stack.enter_context(
             _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
         )
     try:
@@ -866,7 +882,7 @@ def _run_packing_invariance_worker(
         torch.cuda.empty_cache()
         _debug_log("run complete; model deleted and cuda cache emptied")
     finally:
-        flex_patch_stack.close()
+        runtime_stack.close()
         if not reused_runtime:
             del runtime
             torch.cuda.empty_cache()

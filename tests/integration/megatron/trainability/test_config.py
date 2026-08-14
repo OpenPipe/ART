@@ -504,8 +504,10 @@ def test_glm52_length_prompt_requests_a_fuller_initial_answer() -> None:
     default_prompt = _prompt_for_index(0)[0]
     glm52_prompt = _prompt_for_index(0, base_model="zai-org/GLM-5.2")[0]
 
-    assert "moderately detailed rather than terse" not in default_prompt
-    assert "moderately detailed rather than terse" in glm52_prompt
+    assert "Use one sentence." in default_prompt
+    assert (
+        "Use two complete sentences with one concrete detail in each." in glm52_prompt
+    )
 
 
 def test_length_trainability_accepts_near_baseline_learning_signal() -> None:
