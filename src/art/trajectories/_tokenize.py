@@ -3899,50 +3899,30 @@ def _tokenize_chat_view(
                             len(prefix),
                         )
                 continue
-            if parts and all(part == "tool_call" for part, _ in parts):
+            if any(part == "tool_call" for part, _ in parts):
                 probe_messages = deepcopy(messages)
-                tool_calls = probe_messages[message_index].get("tool_calls")
-                if isinstance(tool_calls, list):
-                    existing_values: set[str] = set()
-                    for existing_call in tool_calls:
-                        if not isinstance(existing_call, dict):
-                            continue
-                        existing_function = existing_call.get("function")
-                        if isinstance(existing_function, dict):
-                            existing_values.update(
-                                value
-                                for value in existing_function.values()
-                                if isinstance(value, str)
-                            )
-                    for call_index, call in enumerate(tool_calls):
-                        if not isinstance(call, dict):
-                            continue
-                        raw_function = call.get("function")
-                        if not isinstance(raw_function, dict):
-                            continue
-                        function = cast(dict[str, Any], raw_function)
-                        probe_name = (
-                            f"art_trajectory_probe_{id(probe_messages):x}_{call_index}"
+                for part_index, slots in enumerate(
+                    _chat_message_text_slot_groups(probe_messages[message_index])
+                ):
+                    for slot_index, (container, key) in enumerate(slots):
+                        original = str(container[key])
+                        leading = original[: len(original) - len(original.lstrip())]
+                        trailing = original[len(original.rstrip()) :]
+                        marker = (
+                            f"art_trajectory_probe_{id(probe_messages):x}_"
+                            f"{part_index}_{slot_index}"
                         )
-                        probe_arguments = json.dumps({probe_name: True})
-                        while (
-                            probe_name in existing_values
-                            or probe_arguments in existing_values
-                        ):
-                            probe_name += "_"
-                            probe_arguments = json.dumps({probe_name: True})
-                        function["name"] = probe_name
-                        function["arguments"] = probe_arguments
-                    try:
-                        probe = render(
-                            probe_messages,
-                            add_generation_prompt=not ends_with_assistant,
+                        replacement = (
+                            json.dumps({marker: True}) if key == "arguments" else marker
                         )
-                    except Exception:
-                        probe = []
-                    if span := differing_span(probe):
-                        probed_bounds[message_index] = span
-                        continue
+                        container[key] = leading + replacement + trailing
+                probe = probe_render(
+                    probe_messages,
+                    add_generation_prompt=not ends_with_assistant,
+                )
+                if probe is not None and (span := differing_span(probe)):
+                    probed_bounds[message_index] = span
+                    continue
             if len(parts) == 1:
                 try:
                     prefix = render(
@@ -4169,7 +4149,7 @@ def _tokenize_chat_view(
             and full_exact is None
             and message_index in probed_bounds
             and parts
-            and all(part == "tool_call" for part, _ in parts)
+            and any(part == "tool_call" for part, _ in parts)
         ):
             assert source is not None and sampled_bounds is not None
             start, end = sampled_bounds
