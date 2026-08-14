@@ -775,12 +775,24 @@ class ServerlessBackend:
             for group in groups:
                 group._prepared_training_batch = None
 
+        async def publish_sampler() -> tuple[
+            SamplerWeightsResult, dict[str, float] | None
+        ]:
+            sampler_result = await sampler.result()
+            return sampler_result, await self._publish_active_sampler(
+                model, sampler_result
+            )
+
+        publication = asyncio.create_task(
+            publish_sampler(), name=f"remote-sampler-publication-{client.run_id}-{step}"
+        )
+
         async def complete() -> ServerlessTrainResult:
             try:
                 results = await asyncio.gather(
                     forward.result(),
                     optimizer.result(),
-                    sampler.result(),
+                    publication,
                     return_exceptions=True,
                 )
                 failures = [
@@ -788,13 +800,16 @@ class ServerlessBackend:
                 ]
                 if failures:
                     raise BaseExceptionGroup("remote train operations failed", failures)
-                forward_result, optimizer_result, sampler_result = results
+                forward_result, optimizer_result, published = results
                 if not (
                     isinstance(forward_result, ForwardBackwardResult)
                     and isinstance(optimizer_result, OptimStepResult)
-                    and isinstance(sampler_result, SamplerWeightsResult)
+                    and isinstance(published, tuple)
+                    and len(published) == 2
+                    and isinstance(published[0], SamplerWeightsResult)
                 ):
                     raise TypeError("remote train returned an invalid result type")
+                sampler_result, publication_metrics = published
             except BaseException as primary:
                 if release is not None:
                     try:
@@ -809,9 +824,6 @@ class ServerlessBackend:
                 _, cancelled = await complete_task(release)
                 if cancelled is not None:
                     raise cancelled
-            publication_metrics = await self._publish_active_sampler(
-                model, sampler_result
-            )
             _attach_packing_shapes(groups, forward_result.packing.group_shapes)
             metrics = aggregate_rl_training_metrics(
                 training_metrics=[
