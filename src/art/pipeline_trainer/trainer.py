@@ -367,6 +367,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._producer_rollout_errors = 0
         self._packed_queue: asyncio.Queue[_PreparedPipelineItem | None] | None = None
         self._accept_prepared_batches = True
+        self._stop_at_training_step: int | None = None
         self._eval_queue: asyncio.Queue[int] | None = None
         self._rollout_worker_controller = RolloutWorkerController(
             self, self.num_rollout_workers
@@ -403,6 +404,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
         self.state.policy_version = start_step
         self.state.next_training_step = start_step
+        self._stop_at_training_step = (
+            start_step + self.max_steps if self.max_steps is not None else None
+        )
         self.state.scenario_offset = scenario_offset
         self.state.total_scenarios_consumed = int(
             pipeline_state.get("total_scenarios_consumed", scenario_offset) or 0
@@ -1047,6 +1051,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         prepare = getattr(self.backend, "prepare_pipeline_batch")
         while True:
             packing_policy_step = self.state.next_training_step
+            if (
+                self._stop_at_training_step is not None
+                and packing_policy_step >= self._stop_at_training_step
+            ):
+                return
             started = time.monotonic()
             zero_variance_before = self.state.discarded_zero_variance_groups
             batch, discarded, saw_sentinel = await self._collect_batch(
@@ -1114,9 +1123,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return
 
         current_step = self.state.next_training_step
-        stop_at_step = (
-            current_step + self.max_steps if self.max_steps is not None else None
-        )
+        stop_at_step = self._stop_at_training_step
+        if stop_at_step is None and self.max_steps is not None:
+            stop_at_step = current_step + self.max_steps
         if stop_at_step is not None and current_step >= stop_at_step:
             self._persist_state(current_step)
             self.request_stop()

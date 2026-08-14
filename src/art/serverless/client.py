@@ -446,9 +446,16 @@ class RemoteTrainingOperation(Generic[ResultT]):
         return result
 
     async def cancel(self) -> None:
-        await self._service.cancel_operation(
-            self._ref.operation_id, self._cancel_request_id
-        )
+        try:
+            await self._service.cancel_operation(
+                self._ref.operation_id, self._cancel_request_id
+            )
+        except RemoteTrainingHttpError as error:
+            if error.status_code != 409 or (
+                await self._service.get_operation(self._ref.operation_id)
+            ).status not in {"running", "succeeded"}:
+                raise
+            await self.result()
 
 
 class RemoteTrainingClient:
