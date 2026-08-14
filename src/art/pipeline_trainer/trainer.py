@@ -109,6 +109,7 @@ class _PostTrainItem(BaseModel):
     training_policy_step: int = Field(ge=0)
     should_eval_step: bool
     step_seconds: float = Field(ge=0)
+    step_completed_s: float = Field(ge=0)
     policy_age_metrics: dict[str, float]
     metrics: dict[str, float]
 
@@ -693,6 +694,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         value: float,
         *,
         step: int | None,
+        t_s: float | None = None,
         tags: dict[str, str] | None = None,
     ) -> None:
         if not self._attachments:
@@ -701,18 +703,22 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             name=name,
             value=float(value),
             step=step,
-            t_s=time.monotonic(),
+            t_s=time.monotonic() if t_s is None else t_s,
             tags=tags or {},
         )
         for attachment in self._attachments:
             await attachment.on_metric(metric)
 
     async def _emit_pipeline_metrics(
-        self, metrics: Mapping[str, float], *, step: int | None
+        self,
+        metrics: Mapping[str, float],
+        *,
+        step: int | None,
+        t_s: float | None = None,
     ) -> None:
         for name, value in metrics.items():
             if isinstance(value, (int, float)):
-                await self._emit_pipeline_metric(name, float(value), step=step)
+                await self._emit_pipeline_metric(name, float(value), step=step, t_s=t_s)
 
     def _collect_attachment_train_step_metrics(self) -> tuple[dict[str, float], bool]:
         metrics: dict[str, float] = {}
@@ -1154,7 +1160,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         await self._emit_packed_group_observations(
             metrics, batch=item.batch, step=item.current_step
         )
-        await self._emit_pipeline_metrics(metrics, step=item.current_step)
+        await self._emit_pipeline_metrics(
+            metrics, step=item.current_step, t_s=item.step_completed_s
+        )
         phases["autotuner"] = time.monotonic() - started
 
         started = time.monotonic()
@@ -1339,7 +1347,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             current_step = int(result.step)
             self.state.policy_version = current_step
             self.state.next_training_step = current_step
-            step_seconds = time.monotonic() - step_start
+            step_completed_s = time.monotonic()
+            step_seconds = step_completed_s - step_start
             actor_wall_s, actor_idle_s, queue_wait_s = (
                 self._consume_producer_rollout_timings()
             )
@@ -1401,6 +1410,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         training_policy_step=training_policy_step,
                         should_eval_step=should_eval_step,
                         step_seconds=step_seconds,
+                        step_completed_s=step_completed_s,
                         policy_age_metrics=policy_age_metrics,
                         metrics=metrics,
                     )
