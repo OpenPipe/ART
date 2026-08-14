@@ -127,6 +127,7 @@ from art.megatron.training.pipeline_schedule import (
     ScheduleMicrobatch,
     _set_hybridep_token_count,
     _validate_hybridep_token_counts,
+    aggregate_pipeline_schedule_metrics,
     chunk_post_process,
     chunk_pre_process,
     validate_pipeline_topology,
@@ -2963,10 +2964,9 @@ def _finish_megatron_rl_forward_backward_job(
     for state in states:
         diagnostics.extend(state.loss_diagnostics)
     workloads = tuple(state.schedule.training_workload() for state in states)
-    pipeline_metrics: dict[str, float] = {}
-    for state in states:
-        for key, value in state.schedule.telemetry.metrics().items():
-            pipeline_metrics[key] = pipeline_metrics.get(key, 0.0) + value
+    pipeline_metrics = aggregate_pipeline_schedule_metrics(
+        tuple(state.schedule.telemetry for state in states)
+    )
     return MegatronForwardBackwardStepResult(
         reduced_loss=_reduce_loss_sum(
             raw_loss_sum,

@@ -280,6 +280,87 @@ class PipelineScheduleTelemetry:
         return metrics
 
 
+def aggregate_pipeline_schedule_metrics(
+    values: Sequence[PipelineScheduleTelemetry],
+) -> dict[str, float]:
+    if not values:
+        raise ValueError(
+            "pipeline telemetry aggregation requires at least one schedule"
+        )
+    rows = tuple(value.metrics() for value in values)
+    keys = rows[0].keys()
+    if any(row.keys() != keys for row in rows[1:]):
+        raise RuntimeError("pipeline schedules emitted different metric sets")
+    static = {
+        "pipeline/pp_rank",
+        "pipeline/pp_size",
+        "pipeline/vp_size",
+        "pipeline/micro_batch_size",
+        "pipeline/packed_sequence_length",
+        "pipeline/microbatch_group_size_per_vp_stage",
+    }
+    additive = {
+        "pipeline/microbatches_per_dp_rank",
+        "pipeline/real_microbatches_per_dp_rank",
+        "pipeline/dummy_microbatches_per_dp_rank",
+        "pipeline/schedule_wall_s",
+        "pipeline/schedule_gpu_s",
+        "pipeline/p2p_s",
+        "pipeline/p2p_call_host_s",
+        "pipeline/p2p_calls",
+        "pipeline/p2p_wait_host_s",
+        "pipeline/p2p_wait_calls",
+    }
+    dynamic_additive_suffixes = (
+        "/compute_s",
+        "/forward_compute_s",
+        "/backward_compute_s",
+        "/forward_host_s",
+        "/forward_calls",
+        "/schedule_gpu_s",
+        "/p2p_call_host_s",
+        "/p2p_wait_host_s",
+    )
+    out: dict[str, float] = {}
+    for key in keys:
+        observed = tuple(row[key] for row in rows)
+        if key in static:
+            if any(value != observed[0] for value in observed[1:]):
+                raise RuntimeError(f"pipeline schedule changed invariant metric {key}")
+            out[key] = observed[0]
+        elif key == "pipeline/memory_allocated_start_bytes":
+            out[key] = observed[0]
+        elif key.endswith("/peak_memory_bytes"):
+            out[key] = max(observed)
+        elif key in {
+            "pipeline/ideal_bubble_fraction",
+            "pipeline/stage_compute_imbalance_fraction",
+        }:
+            continue
+        elif key in additive or (
+            key.startswith(("pipeline/chunk_", "pipeline/stage_"))
+            and key.endswith(dynamic_additive_suffixes)
+        ):
+            out[key] = sum(observed)
+        else:
+            raise RuntimeError(f"pipeline telemetry has no aggregation rule for {key}")
+    useful = sum(
+        max(1, value.num_microbatches * max(1, value.vp_size)) for value in values
+    )
+    bubbles = sum(max(0, value.pp_size - 1) for value in values)
+    out["pipeline/ideal_bubble_fraction"] = bubbles / (useful + bubbles)
+    stage_compute = [
+        out[f"pipeline/stage_{stage}/forward_compute_s"]
+        + out[f"pipeline/stage_{stage}/backward_compute_s"]
+        for stage in range(values[0].pp_size)
+    ]
+    maximum = max(stage_compute, default=0.0)
+    out["pipeline/stage_compute_imbalance_fraction"] = (
+        (maximum - min(stage_compute)) / maximum if maximum else 0.0
+    )
+    return out
+
+
 def pipeline_bubble_fraction(
     *, pp_size: int, vp_size: int, num_microbatches: int
 ) -> float:
