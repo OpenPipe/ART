@@ -296,13 +296,13 @@ def aggregate_pipeline_schedule_metrics(
         "pipeline/pp_size",
         "pipeline/vp_size",
         "pipeline/micro_batch_size",
-        "pipeline/packed_sequence_length",
         "pipeline/microbatch_group_size_per_vp_stage",
     }
     additive = {
         "pipeline/microbatches_per_dp_rank",
         "pipeline/real_microbatches_per_dp_rank",
         "pipeline/dummy_microbatches_per_dp_rank",
+        "pipeline/packed_sequence_length",
         "pipeline/schedule_wall_s",
         "pipeline/schedule_gpu_s",
         "pipeline/p2p_s",
