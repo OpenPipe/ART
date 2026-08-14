@@ -751,7 +751,9 @@ class MCoreRunSlotExecutor:
             sink=sink,
             slot_ref=LoRASlotRef("checkpoint", job.run_id),
             trainer_rank_optimizer_state=(
-                self._slot_trainer.checkpoint_slot_optimizer_state(job.run_id)
+                self._slot_trainer.checkpoint_slot_optimizer_snapshot_sources(
+                    job.run_id
+                )
                 if job.save_optimizer
                 else None
             ),

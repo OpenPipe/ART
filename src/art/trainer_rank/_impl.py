@@ -695,6 +695,22 @@ class TrainerRank:
         }
         return state
 
+    def checkpoint_slot_optimizer_snapshot_sources(
+        self, name: str
+    ) -> TrainerRankOptimizerState | None:
+        """Return live tensors for immediate side-stream snapshot staging."""
+        if name not in self._checkpoint_slot_params_by_name:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}")
+        dynamic = self._dynamic_optimizers.get(name)
+        if dynamic is None:
+            return None
+        return {
+            "format_version": 1,
+            "layout": self._dynamic_optimizer_layout(name),
+            "master_params": tuple(dynamic.master_params),
+            "optimizer": cast(dict[str, object], dynamic.optimizer.state_dict()),
+        }
+
     def checkpoint_slot_optimizer_layout(self, name: str) -> TrainerRankOptimizerLayout:
         if name not in self._checkpoint_slot_params_by_name:
             raise ValueError(f"Unknown checkpoint slot: {name!r}")

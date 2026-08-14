@@ -131,6 +131,11 @@ class TrainerRank(_impl.TrainerRank):
     ) -> TrainerRankOptimizerState | None:
         return super().checkpoint_slot_optimizer_state(name)
 
+    def checkpoint_slot_optimizer_snapshot_sources(
+        self, name: str
+    ) -> TrainerRankOptimizerState | None:
+        return super().checkpoint_slot_optimizer_snapshot_sources(name)
+
     def checkpoint_slot_optimizer_layout(self, name: str) -> TrainerRankOptimizerLayout:
         return super().checkpoint_slot_optimizer_layout(name)
 
