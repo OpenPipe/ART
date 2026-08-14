@@ -66,7 +66,6 @@ _BLACKWELL_WIDE_HEAD_FLEX_KERNEL_OPTIONS = cast(
         "BACKEND": "TRITON",
         "num_stages": 2,
         "BLOCK_M": 32,
-        "BLOCK_M1": 32,
     },
 )
 _FORCED_FLEX_KERNEL_OPTIONS = cast(
