@@ -1151,13 +1151,13 @@ def test_checkpoint_snapshot_handles_existing_slot_refs(
         def __init__(self) -> None:
             super().__init__()
             slot = torch.nn.Linear(1, 1)
-            slot.ref = object()  # type: ignore[attr-defined]
+            setattr(slot, "ref", object())
             self._slot_keys = {slot.ref: "slot_0"}  # type: ignore[attr-defined]
             self._slot_modules = torch.nn.ModuleDict({"slot_0": slot})
 
     module = ModuleType("art.megatron.lora")
-    module.LoRA = LoRA  # type: ignore[attr-defined]
-    module.LoRASlotRef = object  # type: ignore[attr-defined]
+    setattr(module, "LoRA", LoRA)
+    setattr(module, "LoRASlotRef", object)
     monkeypatch.setitem(__import__("sys").modules, "art.megatron.lora", module)
     lora = LoRA()
 
