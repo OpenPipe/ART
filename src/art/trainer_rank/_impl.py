@@ -1030,7 +1030,9 @@ class TrainerRank:
                 slot.custom_payload, name, custom.kind
             )
             if loaded is not None:
-                _load_custom_state(custom, loaded)
+                record, tensors = loaded
+                _validate_custom_schema(name, custom, record)
+                _load_custom_state(custom, tensors)
             values = _custom_state(custom)
         except BaseException as exc:
             error = exc
@@ -1946,15 +1948,18 @@ class TrainerRank:
         for name in checkpoint_names:
             self._guard_checkpoint_can_step(name)
             slot_params = self._checkpoint_slots[name].params
+            step_flags = self._dynamic_param_step_flags(slot_params)
             slot_grads = self._reduce_dynamic_grads(
                 slot_params, scale_grads=scale_grads
             )
-            selected.append((name, slot_params, slot_grads))
+            selected.append((name, slot_params, slot_grads, step_flags))
 
         all_params = tuple(
-            param for _, slot_params, _ in selected for param in slot_params
+            param for _, slot_params, _, _ in selected for param in slot_params
         )
-        all_grads = tuple(grad for _, _, slot_grads in selected for grad in slot_grads)
+        all_grads = tuple(
+            grad for _, _, slot_grads, _ in selected for grad in slot_grads
+        )
         grad_norm = _distributed_grad_norm(all_params, all_grads)
         if not torch.isfinite(torch.tensor(grad_norm)):
             self.zero_grad()
@@ -1969,10 +1974,12 @@ class TrainerRank:
             if params.grad_clip_norm > 0.0
             else 1.0
         )
-        for name, model_params, grads in selected:
+        for name, model_params, grads, step_flags in selected:
             dynamic = self._dynamic_optimizer(name, params)
-            for master, grad in zip(dynamic.master_params, grads, strict=True):
-                master.grad = grad.mul(clip)
+            for master, grad, should_step in zip(
+                dynamic.master_params, grads, step_flags, strict=True
+            ):
+                master.grad = grad.mul(clip) if should_step else None
             dynamic.optimizer.step()
             dynamic.optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
@@ -1989,6 +1996,28 @@ class TrainerRank:
             "update_successful": 1.0,
             "num_zeros_in_grad": 0.0,
         }
+
+    def _dynamic_param_step_flags(
+        self, params: Sequence[torch.nn.Parameter]
+    ) -> tuple[bool, ...]:
+        custom = [
+            (index, param)
+            for index, param in enumerate(params)
+            if bool(getattr(param, "_art_custom_checkpoint_param", False))
+        ]
+        if not custom:
+            return (True,) * len(params)
+        flags = torch.tensor(
+            [param.grad is not None for _, param in custom],
+            device=self.device,
+            dtype=torch.int32,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(flags, op=dist.ReduceOp.MAX)
+        result = [True] * len(params)
+        for (index, _param), flag in zip(custom, flags.tolist(), strict=True):
+            result[index] = bool(flag)
+        return tuple(result)
 
     def _dynamic_optimizer(
         self,
@@ -3811,6 +3840,74 @@ def _track_custom_object(
     return custom
 
 
+def _custom_layout(
+    name: str,
+    custom: _CustomObject,
+) -> tuple[
+    tuple[tuple[str, ...], ...],
+    tuple[tuple[str, ...], ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
+    if custom.kind == "parameter":
+        parameter = cast(torch.nn.Parameter, custom.value)
+        return ((name,),), (), (), (name,) if parameter.requires_grad else ()
+    if custom.kind == "buffer":
+        return (), ((name,),), (name,), ()
+
+    module = cast(torch.nn.Module, custom.value)
+    parameter_groups: dict[int, list[str]] = {}
+    trainable: list[str] = []
+    for key, parameter in module.named_parameters(remove_duplicate=False):
+        full_key = f"{name}.{key}"
+        aliases = parameter_groups.setdefault(id(parameter), [])
+        if not aliases and parameter.requires_grad:
+            trainable.append(full_key)
+        aliases.append(full_key)
+    buffer_groups: dict[int, list[str]] = {}
+    persistent: list[str] = []
+    for prefix, child in module.named_modules():
+        for key, buffer in child._buffers.items():
+            if buffer is None:
+                continue
+            local_key = f"{prefix}.{key}" if prefix else key
+            full_key = f"{name}.{local_key}"
+            buffer_groups.setdefault(id(buffer), []).append(full_key)
+            if key not in child._non_persistent_buffers_set:
+                persistent.append(full_key)
+
+    def normalize(groups: Mapping[int, Sequence[str]]) -> tuple[tuple[str, ...], ...]:
+        return tuple(sorted(tuple(sorted(group)) for group in groups.values()))
+
+    return (
+        normalize(parameter_groups),
+        normalize(buffer_groups),
+        tuple(sorted(persistent)),
+        tuple(sorted(trainable)),
+    )
+
+
+def _validate_custom_schema(
+    name: str,
+    custom: _CustomObject,
+    record: Mapping[str, object],
+) -> None:
+    actual = (
+        tuple(
+            tuple(group) for group in cast(list[list[str]], record["parameter_aliases"])
+        ),
+        tuple(
+            tuple(group) for group in cast(list[list[str]], record["buffer_aliases"])
+        ),
+        tuple(cast(list[str], record["persistent_buffer_keys"])),
+        tuple(cast(list[str], record["trainable_keys"])),
+    )
+    if actual != _custom_layout(name, custom):
+        raise TrainerRankSlotStateError(
+            f"Custom checkpoint object {name!r} schema differs from its factory"
+        )
+
+
 def _custom_signature(
     name: str,
     custom: _CustomObject,
@@ -3819,36 +3916,7 @@ def _custom_signature(
     state = tuple(
         (key, tuple(value.shape), str(value.dtype)) for key, value in values.items()
     )
-    if custom.kind == "parameter":
-        parameter = cast(torch.nn.Parameter, custom.value)
-        parameters: tuple[object, ...] = ((name, parameter.requires_grad, 0),)
-        buffers: tuple[object, ...] = ()
-    elif custom.kind == "buffer":
-        parameters = ()
-        buffers = ((name, True, 0),)
-    else:
-        module = cast(torch.nn.Module, custom.value)
-        parameter_aliases: dict[int, int] = {}
-        parameters = tuple(
-            (
-                key,
-                parameter.requires_grad,
-                parameter_aliases.setdefault(id(parameter), len(parameter_aliases)),
-            )
-            for key, parameter in module.named_parameters(remove_duplicate=False)
-        )
-        buffer_aliases: dict[int, int] = {}
-        buffers = tuple(
-            (
-                f"{prefix}.{key}" if prefix else key,
-                key not in child._non_persistent_buffers_set,
-                buffer_aliases.setdefault(id(buffer), len(buffer_aliases)),
-            )
-            for prefix, child in module.named_modules()
-            for key, buffer in child._buffers.items()
-            if buffer is not None
-        )
-    return name, custom.kind, state, parameters, buffers
+    return name, custom.kind, state, *_custom_layout(name, custom)
 
 
 def _custom_named_parameters(

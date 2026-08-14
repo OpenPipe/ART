@@ -47,6 +47,9 @@ class CustomTensorRecord(TypedDict):
     kind: Literal["module", "parameter", "buffer"]
     tensor_keys: list[str]
     trainable_keys: list[str]
+    parameter_aliases: list[list[str]]
+    buffer_aliases: list[list[str]]
+    persistent_buffer_keys: list[str]
 
 
 class CheckpointManifest(TypedDict):
@@ -201,6 +204,23 @@ def _manifest_digest(manifest: Mapping[str, object]) -> str:
     return hashlib.blake2b(_manifest_seed(manifest), digest_size=32).hexdigest()
 
 
+def _alias_keys(value: object) -> set[str] | None:
+    if not isinstance(value, list):
+        return None
+    groups = cast(list[object], value)
+    if any(
+        not isinstance(group, list)
+        or not group
+        or not all(isinstance(key, str) and key for key in group)
+        or len(set(group)) != len(group)
+        for group in groups
+    ):
+        return None
+    typed = cast(list[list[str]], groups)
+    keys = {key for group in typed for key in group}
+    return keys if len(keys) == sum(map(len, typed)) else None
+
+
 def _validate_manifest(
     manifest: CheckpointManifest,
     *,
@@ -247,7 +267,18 @@ def _validate_manifest(
         trainable_keys = (
             record.get("trainable_keys", []) if isinstance(record, dict) else []
         )
+        parameter_aliases = (
+            record.get("parameter_aliases") if isinstance(record, dict) else None
+        )
+        buffer_aliases = (
+            record.get("buffer_aliases") if isinstance(record, dict) else None
+        )
+        persistent_buffer_keys = (
+            record.get("persistent_buffer_keys") if isinstance(record, dict) else None
+        )
         kind = record.get("kind") if isinstance(record, dict) else None
+        parameter_keys = _alias_keys(parameter_aliases)
+        buffer_keys = _alias_keys(buffer_aliases)
         if (
             not isinstance(name, str)
             or not name
@@ -261,7 +292,16 @@ def _validate_manifest(
             or not all(isinstance(key, str) for key in trainable_keys)
             or len(set(tensor_keys)) != len(tensor_keys)
             or len(set(trainable_keys)) != len(trainable_keys)
-            or not set(trainable_keys).issubset(tensor_keys)
+            or parameter_keys is None
+            or buffer_keys is None
+            or parameter_keys & buffer_keys
+            or not isinstance(persistent_buffer_keys, list)
+            or not all(isinstance(key, str) for key in persistent_buffer_keys)
+            or len(set(persistent_buffer_keys)) != len(persistent_buffer_keys)
+            or not set(trainable_keys).issubset(parameter_keys)
+            or not set(persistent_buffer_keys).issubset(buffer_keys)
+            or not parameter_keys.issubset(tensor_keys)
+            or not set(persistent_buffer_keys).issubset(tensor_keys)
             or (kind == "buffer" and bool(trainable_keys))
         ):
             raise RuntimeError(
@@ -269,9 +309,24 @@ def _validate_manifest(
             )
         keys = set(tensor_keys)
         if record["kind"] == "module":
-            valid_keys = all(key.startswith(f"{name}.") for key in keys)
+            valid_keys = all(
+                key.startswith(f"{name}.")
+                for key in keys | parameter_keys | buffer_keys
+            )
+        elif record["kind"] == "parameter":
+            valid_keys = (
+                keys == {name}
+                and parameter_keys == {name}
+                and not buffer_keys
+                and not persistent_buffer_keys
+            )
         else:
-            valid_keys = keys == {name}
+            valid_keys = (
+                keys == {name}
+                and buffer_keys == {name}
+                and persistent_buffer_keys == [name]
+                and not parameter_keys
+            )
         if not valid_keys or custom_keys & keys:
             raise RuntimeError("Checkpoint custom tensor keys overlap")
         custom_keys.update(keys)
@@ -506,7 +561,7 @@ def load_custom_tensors(
     source: PreparedCustomPayload | None,
     name: str,
     kind: Literal["module", "parameter", "buffer"],
-) -> dict[str, torch.Tensor] | None:
+) -> tuple[CustomTensorRecord, dict[str, torch.Tensor]] | None:
     if source is None:
         return None
     record = source.records.get(name)
@@ -517,7 +572,7 @@ def load_custom_tensors(
             f"Checkpoint registers {name!r} as {record['kind']}, not {kind}"
         )
     prefix = f"{name}."
-    return {
+    return record, {
         key.removeprefix(prefix) if kind == "module" else "": source.tensors[key]
         for key in record["tensor_keys"]
     }
@@ -575,7 +630,11 @@ def _custom_snapshot(
     name: str,
     snapshot: Path,
 ) -> dict[str, CustomTensorRecord]:
-    from art.trainer_rank._impl import _custom_named_parameters, _custom_state
+    from art.trainer_rank._impl import (
+        _custom_layout,
+        _custom_named_parameters,
+        _custom_state,
+    )
 
     slot = trainer._checkpoint_slots[name]
     records = (
@@ -619,10 +678,16 @@ def _custom_snapshot(
             for key, param in _custom_named_parameters(custom_name, custom)
             if param.requires_grad
         }
+        parameter_aliases, buffer_aliases, persistent_buffer_keys, _ = _custom_layout(
+            custom_name, custom
+        )
         records[custom_name] = {
             "kind": custom.kind,
             "tensor_keys": sorted(flattened),
             "trainable_keys": sorted(trainable),
+            "parameter_aliases": [list(group) for group in parameter_aliases],
+            "buffer_aliases": [list(group) for group in buffer_aliases],
+            "persistent_buffer_keys": list(persistent_buffer_keys),
         }
         tensors.update(
             (key, value.detach().cpu().contiguous().clone())

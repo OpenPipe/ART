@@ -24,6 +24,7 @@ from art.trainer_rank import (
     Unset,
 )
 from art.trainer_rank._checkpoint import (
+    PreparedCustomPayload,
     _file_digest,
     _manifest_digest,
     materialize_lora,
@@ -113,6 +114,12 @@ class _AliasHead(torch.nn.Module):
         super().__init__()
         self.left = torch.nn.Parameter(torch.ones(1))
         self.right = self.left if tied else torch.nn.Parameter(torch.ones(1))
+
+
+class _BufferLayoutHead(torch.nn.Module):
+    def __init__(self, *, persistent: bool) -> None:
+        super().__init__()
+        self.register_buffer("running", torch.ones(1), persistent=persistent)
 
 
 def _runtime(model: torch.nn.Module | None = None) -> Any:
@@ -214,6 +221,31 @@ def _distributed_custom_registration_worker(
         assert "head" not in slot.custom
         assert not slot.params
         dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def _distributed_custom_grad_flags_worker(
+    rank: int,
+    world_size: int,
+    init_method: str,
+) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        trainer, api = _trainer("student")
+        used = api.parameter("used", lambda: torch.tensor(1.0), checkpoint="student")
+        api.parameter("unused", lambda: torch.tensor(2.0), checkpoint="student")
+        if rank == 0:
+            (used * 3).backward()
+        assert trainer._dynamic_param_step_flags(
+            trainer._checkpoint_slots["student"].params
+        ) == (True, False)
     finally:
         dist.destroy_process_group()
 
@@ -560,6 +592,37 @@ def test_selected_optimizer_step_updates_only_its_custom_checkpoint(
     torch.testing.assert_close(b, before_b, atol=0, rtol=0)
 
 
+def test_optimizer_skips_unused_custom_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, rank = _trainer("student")
+    used = rank.parameter("used", lambda: torch.tensor(1.0), checkpoint="student")
+    unused = rank.parameter("unused", lambda: torch.tensor(3.0), checkpoint="student")
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(
+            torch.zeros_like(param, dtype=torch.float32)
+            if param.grad is None
+            else param.grad.float()
+            for param in params
+        ),
+    )
+    (used * 2).backward()
+
+    trainer.optim_step(
+        params=AdamParams(learning_rate=0.1, weight_decay=0.5),
+        checkpoints=["student"],
+    )
+
+    assert not torch.equal(used, torch.tensor(1.0))
+    torch.testing.assert_close(unused, torch.tensor(3.0), atol=0, rtol=0)
+    dynamic = trainer._checkpoint_slots["student"].optimizer
+    assert dynamic is not None
+    assert dynamic.master_params[0] in dynamic.optimizer.state
+    assert dynamic.master_params[1] not in dynamic.optimizer.state
+
+
 def test_parameter_can_be_added_after_checkpoint_optimizer_exists() -> None:
     trainer, rank = _trainer("student")
     slot = trainer._checkpoint_slots["student"]
@@ -626,6 +689,15 @@ def test_distributed_custom_registration_fails_transactionally(
     mp.spawn(
         _distributed_custom_registration_worker,
         args=(2, f"file://{tmp_path / mode}", mode),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_custom_parameter_participation_is_global_across_ranks(tmp_path: Path) -> None:
+    mp.spawn(
+        _distributed_custom_grad_flags_worker,
+        args=(2, f"file://{tmp_path / 'grad-flags'}"),
         nprocs=2,
         join=True,
     )
@@ -729,11 +801,17 @@ def test_custom_tensor_checkpoint_artifacts_and_lora_export_are_separate(
             "kind": "buffer",
             "tensor_keys": ["running_mean"],
             "trainable_keys": [],
+            "parameter_aliases": [],
+            "buffer_aliases": [["running_mean"]],
+            "persistent_buffer_keys": ["running_mean"],
         },
         "temperature": {
             "kind": "parameter",
             "tensor_keys": ["temperature"],
             "trainable_keys": ["temperature"],
+            "parameter_aliases": [["temperature"]],
+            "buffer_aliases": [],
+            "persistent_buffer_keys": [],
         },
         "value_head": {
             "kind": "module",
@@ -746,6 +824,12 @@ def test_custom_tensor_checkpoint_artifacts_and_lora_export_are_separate(
                 "value_head.proj.bias",
                 "value_head.proj.weight",
             ],
+            "parameter_aliases": [
+                ["value_head.proj.bias"],
+                ["value_head.proj.weight"],
+            ],
+            "buffer_aliases": [["value_head.offset"]],
+            "persistent_buffer_keys": ["value_head.offset"],
         },
     }
     assert "custom_tensors.safetensors" in manifest["files"]
@@ -935,6 +1019,62 @@ def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_
             lambda: torch.zeros(2, dtype=torch.float64),
             checkpoint="student",
         )
+
+
+@pytest.mark.parametrize("mismatch", ("trainability", "aliases", "persistence"))
+def test_custom_checkpoint_rejects_factory_schema_mismatch(
+    mismatch: str,
+) -> None:
+    if mismatch == "trainability":
+        record = {
+            "kind": "module",
+            "tensor_keys": ["head.weight"],
+            "trainable_keys": ["head.weight"],
+            "parameter_aliases": [["head.weight"]],
+            "buffer_aliases": [],
+            "persistent_buffer_keys": [],
+        }
+        tensors = {"head.weight": torch.tensor([2.0])}
+
+        def factory() -> _DirectHead:
+            head = _DirectHead()
+            head.weight.requires_grad_(False)
+            return head
+
+    elif mismatch == "aliases":
+        record = {
+            "kind": "module",
+            "tensor_keys": ["head.left", "head.right"],
+            "trainable_keys": ["head.left"],
+            "parameter_aliases": [["head.left", "head.right"]],
+            "buffer_aliases": [],
+            "persistent_buffer_keys": [],
+        }
+        tensors = {"head.left": torch.ones(1), "head.right": torch.ones(1)}
+
+        def factory() -> _AliasHead:
+            return _AliasHead(tied=False)
+
+    else:
+        record = {
+            "kind": "module",
+            "tensor_keys": ["head.running"],
+            "trainable_keys": [],
+            "parameter_aliases": [],
+            "buffer_aliases": [["head.running"]],
+            "persistent_buffer_keys": ["head.running"],
+        }
+        tensors = {"head.running": torch.ones(1)}
+
+        def factory() -> _BufferLayoutHead:
+            return _BufferLayoutHead(persistent=False)
+
+    trainer, api = _trainer("student")
+    trainer._checkpoint_slots["student"].custom_payload = PreparedCustomPayload(
+        {"head": cast(Any, record)}, tensors, {}
+    )
+    with pytest.raises(TrainerRankSlotStateError, match="schema differs"):
+        api.module("head", factory, checkpoint="student")
 
 
 def _real_lora_trainer() -> tuple[TrainerRank, _CustomTensorAPI]:
