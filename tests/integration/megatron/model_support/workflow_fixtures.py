@@ -313,7 +313,7 @@ class _FunctionalPlan(BaseModel):
     config_key: str | None = None
     checkpoint: str = "model.safetensors.index.json"
     vision: tuple[str, str] | None = None
-    auxiliary: tuple[str, str] | None = None
+    auxiliary: tuple[str | None, str] | None = None
 
 
 def _plan(depth: int, prefix: str, **values: Any) -> _FunctionalPlan:
@@ -332,7 +332,7 @@ _FUNCTIONAL_PLANS = {
     "gemma4_dense": _plan(12, "model.language_model.layers", config_key="text_config", vision=("model.vision_tower.encoder.layers", "num_hidden_layers")),
     "gemma4_moe": _plan(12, "model.language_model.layers", config_key="text_config", vision=("model.vision_tower.encoder.layers", "num_hidden_layers")),
     "dsv4": _plan(6, "layers", auxiliary=("mtp", "num_nextn_predict_layers")),
-    "glm52": _plan(10, "model.layers"),
+    "glm52": _plan(10, "model.layers", auxiliary=(None, "num_nextn_predict_layers")),
     "gpt_oss_moe": _plan(4, "model.layers"),
 }
 _FUNCTIONAL_PATTERNS = {
@@ -608,7 +608,10 @@ def _select_functional_weights(
         )
         auxiliary_layer = (
             _layer_index(name, plan.auxiliary[0])
-            if text_layer is None and vision_layer is None and plan.auxiliary
+            if text_layer is None
+            and vision_layer is None
+            and plan.auxiliary
+            and plan.auxiliary[0]
             else None
         )
         text_layers.update(() if text_layer is None else (text_layer,))
@@ -623,12 +626,17 @@ def _select_functional_weights(
             or vision_layer == 0
         ):
             selected[name] = shard
-    expected = set(range(source_depth))
+    auxiliary_prefix, auxiliary_count = plan.auxiliary or (None, None)
+    count = text_config.get(auxiliary_count) if auxiliary_count else 0
+    if type(count) is not int or count < 0:
+        raise RuntimeError(f"{model_key} has invalid {auxiliary_count}")
+    expected = set(
+        range(source_depth + (count if plan.auxiliary and not auxiliary_prefix else 0))
+    )
     if text_layers != expected:
         raise RuntimeError(f"{model_key} canonical text-layer coverage changed")
-    if plan.auxiliary:
-        count = text_config.get(plan.auxiliary[1])
-        if type(count) is not int or auxiliary_layers != set(range(count)):
+    if auxiliary_prefix:
+        if auxiliary_layers != set(range(count)):
             raise RuntimeError(
                 f"{model_key} canonical auxiliary-layer coverage changed"
             )
