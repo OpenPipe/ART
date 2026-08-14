@@ -817,6 +817,7 @@ class MegatronBackend(LocalBackend):
         allow_training_without_logprobs: bool = False,
         plot_tensors: bool = False,
         logprob_calculation_chunk_size: int = 1024,
+        grad_accumulation_sequences: int | None = None,
     ) -> dict[str, float] | None:
         include_moe_routing = self._model_uses_expert_replay(model)
         dev_config = {
@@ -849,16 +850,58 @@ class MegatronBackend(LocalBackend):
             "time/step_packing_rpc_s": distributed.packing_rpc_s,
             "time/step_packed_batch_fanout_s": distributed.packed_batch_fanout_s,
         }
+        from .distributed_service import DistributedMegatronService
+
+        service = cast(
+            DistributedMegatronService,
+            await self._get_service(model),
+        )
+        packing_config = _PackingConfig.from_dev_config(
+            dev_config,
+            include_moe_routing=include_moe_routing,
+            collect_packing_shapes=any(
+                group._collect_packing_shape for group in trajectory_groups
+            ),
+        )
+        try:
+            metrics.update(
+                await service.prepare_cp_lookahead(
+                    distributed,
+                    global_grad_accumulation_sequences=grad_accumulation_sequences,
+                )
+            )
+        except BaseException as primary:
+            cleanup_prepared = _PipelinePreparedBatch(
+                batch=batch,
+                groups=tuple(trajectory_groups),
+                packing_config=packing_config,
+                metrics=metrics,
+            )
+            paths = {
+                group._prepared_log_path
+                for group in trajectory_groups
+                if group._prepared_log_path is not None
+            }
+            try:
+                _, cancelled = await complete_task(
+                    asyncio.create_task(
+                        self._discard_prepared_resources(
+                            cleanup_prepared, trajectory_groups, paths
+                        )
+                    )
+                )
+                if cancelled is not None:
+                    raise cancelled
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "CP lookahead and packed-batch cleanup failed",
+                    [primary, cleanup_error],
+                ) from None
+            raise
         prepared = _PipelinePreparedBatch(
             batch=batch,
             groups=tuple(trajectory_groups),
-            packing_config=_PackingConfig.from_dev_config(
-                dev_config,
-                include_moe_routing=include_moe_routing,
-                collect_packing_shapes=any(
-                    group._collect_packing_shape for group in trajectory_groups
-                ),
-            ),
+            packing_config=packing_config,
             metrics=metrics,
         )
         for group in trajectory_groups:

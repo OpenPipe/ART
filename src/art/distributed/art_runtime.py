@@ -890,9 +890,11 @@ class ArtRuntime:
                 ),
             )
             async with asyncio.timeout(self.topology.cluster.startup_timeout_s):
-                actors, rank_processes = await spawn_monarch_trainer_actors(
-                    proc, runtime_spec, supervision
-                )
+                (
+                    actors,
+                    rank_processes,
+                    cp_lookahead_ports,
+                ) = await spawn_monarch_trainer_actors(proc, runtime_spec, supervision)
         except BaseException as startup_error:
             try:
                 if proc is not None:
@@ -907,7 +909,13 @@ class ArtRuntime:
                 supervision.close()
             raise
         run = MonarchTrainerRun(
-            runtime_spec, run_spec, actors, proc, supervision, rank_processes
+            runtime_spec,
+            run_spec,
+            actors,
+            proc,
+            supervision,
+            rank_processes,
+            cp_lookahead_ports,
         )
         self._trainer_runs.add(run)
         return run

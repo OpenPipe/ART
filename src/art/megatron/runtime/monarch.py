@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import socket
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 import time
 import traceback
 from typing import Any, Callable
@@ -154,6 +154,18 @@ class _TrainerRankReady(BaseModel):
     gpu_id: GpuId
     hostname: str
     process_id: int
+
+
+class _CpLookaheadResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rank: int
+    batch_id: str
+    planned_sequences: int = 0
+    elapsed_s: float = 0.0
+    error_type: str | None = None
+    message: str | None = None
+    traceback_text: str | None = None
 
 
 def _dispatch_trainer_fault(failure: MeshFailure) -> None:
@@ -400,7 +412,77 @@ class MonarchTrainerActor(Actor):
             streaming_config=streaming_weight_offload_config_from_env(),
         )
         self._weight_offload.install()
+        self._cp_preplanner = None
+        self._cp_lookahead_port = None
+        self._cp_lookahead_thread = None
+        if topology.cp > 1:
+            from art.megatron.training.microbatches import CpBatchPreplanner
+
+            self._cp_preplanner = CpBatchPreplanner.from_runtime(
+                self._runtime,
+                device=torch.device("cuda", local_rank),
+            )
+            if self._cp_preplanner is None:
+                raise RuntimeError("CP trainer did not create a batch preplanner")
+            self._cp_lookahead_port, receiver = Channel.open()
+            self._cp_lookahead_thread = Thread(
+                target=self._run_cp_lookahead,
+                args=(receiver,),
+                name=f"art-cp-lookahead-rank-{rank}",
+                daemon=True,
+            )
+            self._cp_lookahead_thread.start()
         self._valid = True
+
+    def _run_cp_lookahead(self, receiver: Any) -> None:
+        while (request := receiver.recv().get()) is not None:
+            batch_json, batch_id, accumulation, reply = request
+            batch = None
+            started = time.perf_counter()
+            try:
+                leases = PackedBatchLeaseSet.model_validate_json(batch_json)
+                if leases.ref.batch_id != batch_id:
+                    raise RuntimeError("CP lookahead request batch ID mismatch")
+                if self._cp_preplanner is None:
+                    raise RuntimeError("CP lookahead preplanner is unavailable")
+                batch = InMemoryPackedBatch.open(
+                    leases.ref, leases.host_refs[self._host_id]
+                )
+                planned = self._cp_preplanner.preplan(
+                    batch.tensors,
+                    global_grad_accumulation_sequences=accumulation,
+                )
+                result = _CpLookaheadResult(
+                    rank=self._runtime.rank,
+                    batch_id=batch_id,
+                    planned_sequences=planned,
+                    elapsed_s=time.perf_counter() - started,
+                )
+            except BaseException as error:
+                result = _CpLookaheadResult(
+                    rank=self._runtime.rank,
+                    batch_id=batch_id,
+                    elapsed_s=time.perf_counter() - started,
+                    error_type=type(error).__name__,
+                    message=str(error),
+                    traceback_text=traceback.format_exc(),
+                )
+            finally:
+                if batch is not None:
+                    batch.close()
+            reply.send(result.model_dump(mode="json"))
+
+    def _stop_cp_lookahead(self) -> None:
+        thread, self._cp_lookahead_thread = self._cp_lookahead_thread, None
+        if thread is None:
+            return
+        port = self._cp_lookahead_port
+        if port is None:
+            raise RuntimeError("CP lookahead thread has no request port")
+        port.send(None)
+        thread.join(timeout=30.0)
+        if thread.is_alive():
+            raise RuntimeError("CP lookahead service did not stop within 30 seconds")
 
     def _publish_compile_cache(self) -> None:
         if self._compile_cache is None or "publish_s" in self._compile_cache_metrics:
@@ -423,6 +505,12 @@ class MonarchTrainerActor(Actor):
             hostname=socket.gethostname(),
             process_id=os.getpid(),
         ).model_dump(mode="json")
+
+    @endpoint
+    def cp_lookahead_port(self) -> dict[str, Any] | None:
+        if self._cp_lookahead_port is None:
+            return None
+        return {"rank": self._runtime.rank, "port": self._cp_lookahead_port}
 
     @endpoint
     def execute(
@@ -542,6 +630,7 @@ class MonarchTrainerActor(Actor):
 
     @endpoint
     def close(self) -> None:
+        self._stop_cp_lookahead()
         self._executor.close()
         import torch
 
@@ -587,6 +676,7 @@ class MonarchTrainerActor(Actor):
     def __cleanup__(self, exc: Exception | None) -> None:
         if exc is not None:
             self._valid = False
+        self._stop_cp_lookahead()
         self._executor.close()
 
 
@@ -594,7 +684,7 @@ async def spawn_monarch_trainer_actors(
     proc_mesh: ProcMesh,
     runtime_spec: TrainerRuntimeSpec,
     supervision: MonarchTrainerSupervision,
-) -> tuple[Any, tuple[_TrainerRankReady, ...]]:
+) -> tuple[Any, tuple[_TrainerRankReady, ...], tuple[Port[Any], ...]]:
     """Configure torch-elastic first, then initialize exactly one actor per rank."""
     spmd: Any = proc_mesh.spawn(
         f"art_torch_elastic_{supervision.token}", _TrainerSPMDActor
@@ -627,7 +717,20 @@ async def spawn_monarch_trainer_actors(
         raise RuntimeError(
             "trainer startup did not return the configured rank placement"
         )
-    return actors, ready
+    port_values = await actors.cp_lookahead_port.call()
+    lookahead_ports = tuple(
+        value["port"]
+        for value in sorted(
+            (value for value in port_values.values() if value is not None),
+            key=lambda value: value["rank"],
+        )
+    )
+    expected_port_count = (
+        len(placements) if runtime_spec.trainer_mesh.topology.cp > 1 else 0
+    )
+    if len(lookahead_ports) != expected_port_count:
+        raise RuntimeError("trainer ranks returned an incomplete CP lookahead service")
+    return actors, ready, lookahead_ports
 
 
 class _PublicationState:
@@ -808,6 +911,7 @@ class MonarchTrainerRun:
         proc_mesh: ProcMesh,
         supervision: MonarchTrainerSupervision,
         rank_processes: tuple[_TrainerRankReady, ...],
+        cp_lookahead_ports: tuple[Port[Any], ...],
     ) -> None:
         if run_spec.runtime_fingerprint != runtime_spec.fingerprint:
             raise ValueError(
@@ -819,9 +923,11 @@ class MonarchTrainerRun:
         self._proc_mesh = proc_mesh
         self._supervision = supervision
         self._rank_processes = rank_processes
+        self._cp_lookahead_ports = cp_lookahead_ports
         self._learner_version = run_spec.initial_learner_version
         self._jobs: dict[str, tuple[str, tuple[TrainEvent, ...]]] = {}
         self._lock = asyncio.Lock()
+        self._cp_lookahead_lock = asyncio.Lock()
         self._active_job_id: str | None = None
         self._active_collective: asyncio.Future[Any] | None = None
         self._active_receive: asyncio.Future[Any] | None = None
@@ -839,6 +945,56 @@ class MonarchTrainerRun:
     @property
     def valid(self) -> bool:
         return self._valid
+
+    async def prepare_cp_lookahead(
+        self,
+        batch: PackedBatchLeaseSet,
+        *,
+        global_grad_accumulation_sequences: int | None,
+    ) -> dict[str, float]:
+        if not self._cp_lookahead_ports:
+            return {}
+        async with self._cp_lookahead_lock:
+            if self._closed or not self._valid:
+                raise RuntimeError("trainer run is not available for CP lookahead")
+            reply, receiver = Channel.open()
+            request = (
+                batch.model_dump_json(),
+                batch.ref.batch_id,
+                global_grad_accumulation_sequences,
+                reply,
+            )
+            started = time.perf_counter()
+            for port in self._cp_lookahead_ports:
+                port.send(request)
+            async with asyncio.timeout(self.run_spec.event_timeout_s):
+                results = []
+                for _ in self._cp_lookahead_ports:
+                    results.append(
+                        _CpLookaheadResult.model_validate(await receiver.recv())
+                    )
+            expected_ranks = set(range(len(self._cp_lookahead_ports)))
+            if {result.rank for result in results} != expected_ranks or any(
+                result.batch_id != batch.ref.batch_id for result in results
+            ):
+                raise RuntimeError("CP lookahead returned mismatched rank or batch IDs")
+            failures = [result for result in results if result.error_type is not None]
+            if failures:
+                details = "\n".join(
+                    f"rank {result.rank}: {result.error_type}: {result.message}\n"
+                    f"{result.traceback_text or ''}"
+                    for result in failures
+                )
+                raise RuntimeError(f"CP lookahead failed:\n{details}")
+            return {
+                "time/step_cp_lookahead_wait_s": time.perf_counter() - started,
+                "time/step_cp_lookahead_rank_max_s": max(
+                    result.elapsed_s for result in results
+                ),
+                "data/step_cp_preplanned_sequences_rank_max": float(
+                    max(result.planned_sequences for result in results)
+                ),
+            }
 
     async def score(
         self,

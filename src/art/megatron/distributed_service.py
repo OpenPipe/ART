@@ -660,6 +660,27 @@ class DistributedMegatronService:
                     await self._reconcile_serving_locked(step, _current)
             return step
 
+    async def prepare_cp_lookahead(
+        self,
+        batch: DistributedPackedBatch,
+        *,
+        global_grad_accumulation_sequences: int | None,
+    ) -> dict[str, float]:
+        mesh = self.runtime.topology.trainer
+        if mesh is None or mesh.topology.cp <= 1:
+            return {}
+        await self._await_trainer_preparation()
+        async with self._mutation_lock:
+            self._require_open()
+            self._raise_publication_failure()
+            trainer = self._trainer
+            if trainer is None or not self._trainer_is_current():
+                raise RuntimeError("CP lookahead requires the current resident trainer")
+        return await trainer.prepare_cp_lookahead(
+            batch.leases,
+            global_grad_accumulation_sequences=(global_grad_accumulation_sequences),
+        )
+
     async def _prepare_for_packing_locked(self) -> tuple[str, int | None]:
         if self._trainer_is_current():
             return self._resolve_current_lora_path(), None

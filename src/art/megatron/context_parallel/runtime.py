@@ -4,6 +4,7 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, replace
 import hashlib
 import json
+from threading import Lock
 from typing import Any, cast
 
 from pydantic import BaseModel
@@ -62,6 +63,7 @@ _RUNTIME_PLAN_CACHE: dict[str, tuple[RankRuntimePlan, ...]] = {}
 _RANK_RUNTIME_PLAN_CACHE: dict[tuple[str, int], RankRuntimePlan] = {}
 _GDN_GLOBAL_DECISION_CACHE: dict[tuple[str, str], Any] = {}
 _GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int, str], Any] = {}
+_PLAN_CACHE_LOCK = Lock()
 
 
 def _json_cache_key(payload: Any) -> str:
@@ -69,9 +71,10 @@ def _json_cache_key(payload: Any) -> str:
 
 
 def _cache_put(cache: dict[Any, Any], key: Any, value: Any) -> None:
-    if key not in cache and len(cache) >= _PLAN_CACHE_MAX_ENTRIES:
-        cache.pop(next(iter(cache)))
-    cache[key] = value
+    with _PLAN_CACHE_LOCK:
+        if key not in cache and len(cache) >= _PLAN_CACHE_MAX_ENTRIES:
+            cache.pop(next(iter(cache)))
+        cache[key] = value
 
 
 def _metadata_tensor_digest(tensor: torch.Tensor) -> str:
@@ -2260,6 +2263,46 @@ def prepare_cp_micro(
         rank_plan=rank_plan,
         pad_multiple=pad_multiple,
     )
+
+
+def preplan_megatron_context_parallel_state(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    original_seq_len: int,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    cp_rank: int,
+    build_gdn_execution_spec: bool = False,
+    gdn_planner_config: Any | None = None,
+) -> str:
+    """Warm one rank's immutable CPU plans without touching CUDA or collectives."""
+    if int(topology.cp) <= 1:
+        raise RuntimeError("context-parallel preplanning requires CP > 1")
+    planning_key, bundle, _group_ids, _parent_ids = _get_or_build_planning_bundle(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
+        build_gdn_execution_spec=build_gdn_execution_spec,
+    )
+    _get_or_build_bundle_rank_plan(
+        planning_key=planning_key,
+        bundle=bundle,
+        original_seq_len=original_seq_len,
+        target_rank=cp_rank,
+        block_size=int(config.block_size),
+    )
+    if build_gdn_execution_spec:
+        _plan_gdn_rank_execution(
+            planning_key=planning_key,
+            bundle=bundle,
+            topology=topology,
+            cp_rank=cp_rank,
+            gdn_planner_config=gdn_planner_config,
+        )
+    return planning_key
 
 
 def prepare_megatron_context_parallel_state(
