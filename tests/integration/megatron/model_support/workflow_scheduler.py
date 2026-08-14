@@ -66,6 +66,7 @@ from .workflow_stage_worker import (
 )
 
 _REDUCED_FIXTURE_GPU_SHARE = 0.125
+_LIGHTWEIGHT_GPU_SHARE_OVERRIDES = {("glm52", "hf_parity"): 1.0}
 _STAGE_DURATION_ESTIMATES_S = {
     "hf_parity": 120.0,
     "lora_coverage": 60.0,
@@ -609,6 +610,10 @@ def _runtime_key(
 def _stage_gpu_share(prepared: PreparedWorkflow, stage_name: str) -> float:
     if stage_name not in _LIGHTWEIGHT_GPU_STAGES:
         return 1.0
+    if override := _LIGHTWEIGHT_GPU_SHARE_OVERRIDES.get(
+        (prepared.report.model_key, stage_name)
+    ):
+        return override
     fixture_path = prepared.fixture.environment(stage_name)[
         "ART_MODEL_SUPPORT_FIXTURE_PATH"
     ]
@@ -647,6 +652,14 @@ def _base_session(
     visible_gpu_count: int,
 ) -> _SharedBaseSession | None:
     if not _ordered_stages(prepared.stages, BASE_MEGATRON_STAGES):
+        return None
+    handler = get_model_support_handler_for_spec(
+        get_model_support_spec(
+            prepared.report.base_model,
+            allow_unvalidated_arch=prepared.allow_unvalidated_arch,
+        )
+    )
+    if handler.is_moe:
         return None
     gpu_counts = {stage_gpu_counts[stage] for stage in BASE_MEGATRON_STAGES}
     fixtures = {
@@ -997,6 +1010,7 @@ def compile_prepared_workflows(
                 reference_id = (
                     f"{prepared.report.model_key}:{CORRECTNESS_REFERENCE_STAGE}"
                 )
+                correctness_affinity = f"{prepared.report.model_key}:correctness"
                 operations.append(
                     WorkflowOperation(
                         id=reference_id,
@@ -1004,7 +1018,10 @@ def compile_prepared_workflows(
                         runtime=_runtime_key(
                             prepared, CORRECTNESS_REFERENCE_STAGE, gpu_count=1
                         ),
-                        resources=WorkflowResourceRequest(gpu_count=1),
+                        resources=WorkflowResourceRequest(
+                            gpu_count=1,
+                            host_affinity=correctness_affinity,
+                        ),
                         estimated_duration_s=_stage_duration_estimate(
                             prepared.report.model_key, CORRECTNESS_REFERENCE_STAGE
                         ),
@@ -1033,6 +1050,11 @@ def compile_prepared_workflows(
                             1.0
                             if shared is not None
                             else _stage_gpu_share(prepared, stage_name)
+                        ),
+                        host_affinity=(
+                            correctness_affinity
+                            if stage_name == "correctness_sensitivity"
+                            else None
                         ),
                     ),
                     dependencies=dependencies,
