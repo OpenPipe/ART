@@ -595,7 +595,9 @@ def test_throughput_measurements_use_runtime_rows_and_activation_timestamps(
             calibration_fingerprint="a" * 64,
         )
     fractional = [dict(row) for row in rows]
-    fractional[0]["data/step_nonpadding_logical_tokens"] = 999.5
+    next(row for row in fractional if row["step"] == 2)[
+        "data/step_nonpadding_logical_tokens"
+    ] = 999.5
     history_path.write_text("".join(json.dumps(row) + "\n" for row in fractional))
     with pytest.raises(RuntimeError, match="must be a nonnegative integer"):
         collect(isolated_phase)
