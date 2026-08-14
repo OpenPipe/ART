@@ -484,6 +484,7 @@ def test_gpt_oss_length_target_accounts_for_harmony_tokens(monkeypatch) -> None:
     assert _target_tokens("google/gemma-4-31B-it") == 22
     assert _target_tokens("openai/gpt-oss-20b") == 20
     assert _target_tokens("Qwen/Qwen3.5-35B-A3B") == 10
+    assert _target_tokens("zai-org/GLM-5.2") == 12
     monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", "24")
     assert _target_tokens("openai/gpt-oss-20b") == 24
 

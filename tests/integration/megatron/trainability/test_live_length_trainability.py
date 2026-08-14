@@ -57,6 +57,7 @@ GPT_OSS_INITIAL_ABS_ERROR_MIN = 100.0
 GPT_OSS_SUCCESS_ABS_ERROR_MAX = 5.0
 GPT_OSS_TARGET_TOKENS = 20
 GEMMA4_TARGET_TOKENS = 22
+GLM52_TARGET_TOKENS = 12
 GEMMA4_LENGTH_LEARNING_RATE = 3e-5
 DEFAULT_LENGTH_MAX_STEPS = 20
 GPT_OSS_MIN_MAX_TOKENS = 512
@@ -246,6 +247,7 @@ def _target_tokens(base_model: str | None = None) -> int:
     default = {
         "gemma4_dense": GEMMA4_TARGET_TOKENS,
         "gemma4_moe": GEMMA4_TARGET_TOKENS,
+        "glm52": GLM52_TARGET_TOKENS,
         "gpt_oss_moe": GPT_OSS_TARGET_TOKENS,
     }.get(model_key, 10)
     return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", default)
