@@ -712,8 +712,11 @@ class MegatronTrainingSlot:
             return snapshot
         records = await snapshot.publication
         state = self._require_run(snapshot.run_id)
-        if state.generation != snapshot.generation:
-            raise RuntimeError("resident learner changed before snapshot durability")
+        if (
+            state.generation.training_session_id
+            != snapshot.generation.training_session_id
+        ):
+            raise RuntimeError("snapshot completed for another training session")
         durable = await asyncio.to_thread(
             commit_trainer_publication,
             snapshot.optimizer_state_path,
