@@ -92,7 +92,9 @@ class _PendingServerlessTrain(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     step: int = Field(ge=1)
-    completion: asyncio.Task[ServerlessTrainResult] = Field(exclude=True)
+    completion: SkipValidation[asyncio.Task[ServerlessTrainResult]] = Field(
+        exclude=True
+    )
 
     async def result(self) -> ServerlessTrainResult:
         return await self.completion
