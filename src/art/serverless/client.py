@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 import hashlib
-from typing import Any, Generic, TypeVar, cast
+from typing import Any, Generic, Protocol, TypeVar, cast
 import uuid
 
 import httpx
@@ -41,6 +41,8 @@ from .contracts import (
     EventPage,
     OperationResultRef,
     OperationView,
+    PrefetchRouteObjectsRequest,
+    ReleaseRouteObjectsRequest,
     RemoteForwardRequest,
     RemoteTrainingBatchRef,
     RunEvent,
@@ -50,13 +52,20 @@ from .contracts import (
     TrainingRunView,
 )
 from .data_plane import (
+    EncodedRlGroup,
+    EncodedRouteObject,
     EncodedTrainingBatch,
+    EncodedTrainingObject,
     decode_operation_result,
     prepare_training_batch,
 )
 
 ResultT = TypeVar("ResultT", bound=OperationResult)
 ResponseT = TypeVar("ResponseT", bound=Contract)
+
+
+class RouteObjectPublisher(Protocol):
+    async def publish(self, run_id: str, value: EncodedRouteObject) -> None: ...
 
 
 class RemoteTrainingError(RuntimeError):
@@ -174,6 +183,26 @@ class RemoteTrainingServiceClient:
                 "X-Art-Training-SHA256": ref.sha256,
                 "X-Art-Training-Byte-Count": str(ref.byte_count),
             },
+        )
+
+    async def prefetch_route_objects(
+        self, run_id: str, request: PrefetchRouteObjectsRequest
+    ) -> None:
+        await self._send(
+            "POST",
+            f"training/runs/{run_id}/routes:prefetch",
+            content=request.model_dump_json(),
+            headers={"Content-Type": "application/json"},
+        )
+
+    async def release_route_objects(
+        self, run_id: str, request: ReleaseRouteObjectsRequest
+    ) -> None:
+        await self._send(
+            "POST",
+            f"training/runs/{run_id}/routes:release",
+            content=request.model_dump_json(),
+            headers={"Content-Type": "application/json"},
         )
 
     async def get_operation(self, operation_id: str) -> OperationView:
@@ -480,6 +509,7 @@ class RemoteTrainingClient:
         service: RemoteTrainingServiceClient,
         run: TrainingRunView,
         *,
+        route_publisher: RouteObjectPublisher | None = None,
         poll_interval_s: float = 0.1,
         close_timeout_s: float = 20.0,
     ) -> None:
@@ -490,6 +520,7 @@ class RemoteTrainingClient:
                 "remote training polling and close timeouts must be positive"
             )
         self._service = service
+        self._route_publisher = route_publisher
         self._run = run
         self._next_sequence_id = run.next_sequence_id
         self._projected_learner_version = run.projected_learner_version
@@ -541,7 +572,7 @@ class RemoteTrainingClient:
                 prepared_batch = await asyncio.to_thread(
                     prepare_training_batch,
                     request.batch,
-                    identity=request.request_id,
+                    identity=f"{request.run_id}:{request.request_id}",
                 )
             wire_request = RemoteForwardRequest.from_command(
                 request, prepared_batch.remote
@@ -583,13 +614,8 @@ class RemoteTrainingClient:
                     f"got {request.sequence_id}"
                 )
             if prepared_batch is not None:
-                await asyncio.gather(
-                    *(
-                        self._service.put_training_data(
-                            request.run_id, value.ref, value.payload
-                        )
-                        for value in prepared_batch.objects
-                    )
+                await self._stage_inputs(
+                    prepared_batch.objects, prepared_batch.route_objects
                 )
             ref = await self._service.submit(kind, wire_request)
             if (
@@ -610,6 +636,58 @@ class RemoteTrainingClient:
             if ref.reserved_output_learner_version is not None:
                 self._projected_learner_version = ref.reserved_output_learner_version
             return operation
+
+    async def stage_rl_group(self, value: EncodedRlGroup) -> None:
+        await self._stage_inputs((value.data,), value.routes)
+
+    async def _stage_inputs(
+        self,
+        data: tuple[EncodedTrainingObject, ...],
+        routes: tuple[EncodedRouteObject, ...],
+    ) -> None:
+        if routes and self._route_publisher is None:
+            raise RuntimeError("binary route objects require a route publisher")
+        route_refs = tuple(value.ref for value in routes)
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                for value in data:
+                    tasks.create_task(
+                        self._service.put_training_data(
+                            self.run_id, value.ref, value.payload
+                        )
+                    )
+                if self._route_publisher is not None:
+                    for value in routes:
+                        tasks.create_task(
+                            self._route_publisher.publish(self.run_id, value)
+                        )
+            if route_refs:
+                await self._service.prefetch_route_objects(
+                    self.run_id, PrefetchRouteObjectsRequest(refs=route_refs)
+                )
+        except BaseException as primary:
+            cleaned = await asyncio.gather(
+                *(
+                    self._service.delete_training_data(self.run_id, value.ref)
+                    for value in data
+                ),
+                *(
+                    (
+                        self._service.release_route_objects(
+                            self.run_id, ReleaseRouteObjectsRequest(refs=route_refs)
+                        ),
+                    )
+                    if route_refs
+                    else ()
+                ),
+                return_exceptions=True,
+            )
+            failures = [value for value in cleaned if isinstance(value, BaseException)]
+            if failures:
+                raise BaseExceptionGroup(
+                    "remote input staging and cleanup failed", [primary, *failures]
+                ) from None
+            raise
 
     async def forward(
         self, request: ForwardRequest

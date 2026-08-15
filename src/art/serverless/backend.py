@@ -49,15 +49,19 @@ from art.types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
 from art.utils.lifecycle import complete_task
 
 from .. import dev
-from .client import RemoteTrainingClient, RemoteTrainingServiceClient
+from .client import (
+    RemoteTrainingClient,
+    RemoteTrainingServiceClient,
+    RouteObjectPublisher,
+)
 from .contracts import (
     AdapterSpec,
     ApplyCheckpointRetentionRequest,
     CheckpointRevision,
     CreateTrainingRunRequest,
+    ReleaseRouteObjectsRequest,
     RemoteRlBatchRef,
     RemoteRlGroupRef,
-    TrainingDataRef,
     TrainingRunSpec,
 )
 from .data_plane import encode_trajectory_group
@@ -100,7 +104,7 @@ class _RemotePipelineBatch(BaseModel):
 class _StagedPipelineGroup(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    data: TrainingDataRef
+    remote: RemoteRlGroupRef
     byte_stream_receive_s: float = Field(ge=0)
     encode_s: float = Field(ge=0)
     upload_s: float = Field(ge=0)
@@ -222,6 +226,7 @@ class ServerlessBackend:
         training_base_url: str,
         inference_base_url: str,
         sampler_manager: SamplerManager,
+        route_object_publisher: RouteObjectPublisher | None = None,
         api_key: str | None = None,
         inference_api_key: str | None = None,
         checkpoint: str | None = None,
@@ -238,6 +243,8 @@ class ServerlessBackend:
             raise ValueError("restore_optimizer requires checkpoint")
         if close_timeout_s <= 0:
             raise ValueError("close_timeout_s must be positive")
+        if enable_expert_replay and route_object_publisher is None:
+            raise ValueError("expert replay requires a binary route object publisher")
         self._service = RemoteTrainingServiceClient(
             api_key=api_key,
             base_url=training_base_url,
@@ -247,6 +254,7 @@ class ServerlessBackend:
         self._checkpoint = checkpoint
         self._restore_optimizer = restore_optimizer
         self._sampler_manager = sampler_manager
+        self._route_object_publisher = route_object_publisher
         self._enable_expert_replay = enable_expert_replay
         self._close_timeout_s = close_timeout_s
         self._clients: dict[tuple[str | None, str, str, str], RemoteTrainingClient] = {}
@@ -297,6 +305,7 @@ class ServerlessBackend:
                     checkpoint=self._checkpoint,
                     restore_optimizer=self._restore_optimizer,
                 ),
+                route_publisher=self._route_object_publisher,
                 close_timeout_s=self._close_timeout_s,
             )
             self._clients[key] = client
@@ -921,9 +930,9 @@ class ServerlessBackend:
         )
         encode_s = time.monotonic() - encode_started
         upload_started = time.monotonic()
-        await self._upload_pipeline_group(client.run_id, encoded.ref, encoded.payload)
+        await client.stage_rl_group(encoded)
         return _StagedPipelineGroup(
-            data=encoded.ref,
+            remote=encoded.remote,
             byte_stream_receive_s=receive_s,
             encode_s=encode_s,
             upload_s=time.monotonic() - upload_started,
@@ -934,11 +943,6 @@ class ServerlessBackend:
         self, queue: DistributedTrajectoryQueue, ref: TrajectoryGroupRef
     ) -> TrajectoryGroupBundle:
         return await queue.receive_bundle(ref)
-
-    async def _upload_pipeline_group(
-        self, run_id: str, ref: TrainingDataRef, payload: bytes
-    ) -> None:
-        await self._service.put_training_data(run_id, ref, payload)
 
     async def discard_pipeline_group(
         self, model: AnyTrainableModel, group: TrajectoryGroup
@@ -952,7 +956,7 @@ class ServerlessBackend:
         if task is None:
             raise RuntimeError("remote pipeline group was not staged")
         staged = await task
-        await self._service.delete_training_data(client.run_id, staged.data)
+        await self._release_staged_group(client.run_id, staged)
 
     async def _discard_all_staged_pipeline_groups(self) -> list[BaseException]:
         entries = tuple(self._staged_pipeline_groups.items())
@@ -977,7 +981,7 @@ class ServerlessBackend:
         failures = [value for value in results if isinstance(value, BaseException)]
         deletes = await asyncio.gather(
             *(
-                self._service.delete_training_data(key[0], value.data)
+                self._release_staged_group(key[0], value)
                 for (key, _), value in zip(entries, results, strict=True)
                 if isinstance(value, _StagedPipelineGroup)
             ),
@@ -985,6 +989,22 @@ class ServerlessBackend:
         )
         failures.extend(value for value in deletes if isinstance(value, BaseException))
         return failures
+
+    async def _release_staged_group(
+        self, run_id: str, value: _StagedPipelineGroup
+    ) -> None:
+        operations = [self._service.delete_training_data(run_id, value.remote.data)]
+        refs = tuple(route.ref for route in value.remote.routes)
+        if refs:
+            operations.append(
+                self._service.release_route_objects(
+                    run_id, ReleaseRouteObjectsRequest(refs=refs)
+                )
+            )
+        results = await asyncio.gather(*operations, return_exceptions=True)
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("staged remote group cleanup failed", failures)
 
     async def prepare_pipeline_batch(
         self,
@@ -1047,9 +1067,8 @@ class ServerlessBackend:
             )
             batch = RemoteRlBatchRef(
                 groups=tuple(
-                    RemoteRlGroupRef(
-                        data=value.data,
-                        annotations=selection.lease.item.annotations,
+                    value.remote.model_copy(
+                        update={"annotations": selection.lease.item.annotations}
                     )
                     for value, selection in zip(staged, selected, strict=True)
                 ),
@@ -1137,7 +1156,11 @@ class ServerlessBackend:
             ),
             "time/step_remote_forward_submit_s": forward_submit_s,
             "data/step_remote_batch_bytes": float(
-                sum(value.data.byte_count for value in staged)
+                sum(
+                    value.remote.data.byte_count
+                    + sum(route.ref.byte_count for route in value.remote.routes)
+                    for value in staged
+                )
             ),
         }
 

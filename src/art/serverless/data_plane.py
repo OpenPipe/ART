@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 from array import array
+from collections.abc import Mapping
 import hashlib
 import sys
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 import uuid
 
 from msgspec import msgpack
 from pydantic import BaseModel, ConfigDict, TypeAdapter
 
+from art.distributed.packing import TrajectoryGroupPayload
 from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.training.contracts import (
     OperationResult,
@@ -16,6 +18,7 @@ from art.training.contracts import (
     SupervisedTrajectoryBatch,
     TrainingBatch,
 )
+from art.trajectories import TrajectoryGroup
 
 from .contracts import (
     RL_GROUP_DATA_FORMAT,
@@ -23,6 +26,9 @@ from .contracts import (
     OperationResultRef,
     RemoteRlBatchRef,
     RemoteRlGroupRef,
+    RemoteRouteObject,
+    RemoteRouteObjectRef,
+    RemoteRouteSlice,
     RemoteSftBatchRef,
     RemoteTrainingBatchRef,
     TrainingDataRef,
@@ -41,21 +47,63 @@ class EncodedTrainingObject(BaseModel):
     payload: bytes
 
 
+class EncodedRouteObject(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    ref: RemoteRouteObjectRef
+    payload: bytes
+
+
+class EncodedRlGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    data: EncodedTrainingObject
+    routes: tuple[EncodedRouteObject, ...]
+    remote: RemoteRlGroupRef
+
+
+class DecodedRlGroup(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    bundle: TrajectoryGroupBundle
+    group: TrajectoryGroup
+
+
 class EncodedTrainingBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     batch: TrainingBatch
     remote: RemoteTrainingBatchRef
     objects: tuple[EncodedTrainingObject, ...]
+    route_objects: tuple[EncodedRouteObject, ...] = ()
 
 
 def encode_trajectory_group(
     bundle: TrajectoryGroupBundle, *, object_id: str | None = None
-) -> EncodedTrainingObject:
-    return _encode_training_object(
-        msgpack.encode(bundle.model_dump(mode="python")),
+) -> EncodedRlGroup:
+    data_id = object_id or _object_id(uuid.uuid4().hex)
+    stripped, route_payload, slices = _extract_routes(bundle.payload())
+    data = _encode_training_object(
+        msgpack.encode(
+            TrajectoryGroupBundle.from_payload(stripped).model_dump(mode="python")
+        ),
         data_format=RL_GROUP_DATA_FORMAT,
-        object_id=object_id,
+        object_id=data_id,
+    )
+    routes: tuple[EncodedRouteObject, ...] = ()
+    remote_routes: tuple[RemoteRouteObject, ...] = ()
+    if route_payload:
+        route_digest = hashlib.sha256(route_payload).hexdigest()
+        route_ref = RemoteRouteObjectRef(
+            object_id=_object_id(f"{data_id}:{route_digest}"),
+            byte_count=len(route_payload),
+        )
+        routes = (EncodedRouteObject(ref=route_ref, payload=route_payload),)
+        remote_routes = (RemoteRouteObject(ref=route_ref, slices=slices),)
+    return EncodedRlGroup(
+        data=data,
+        routes=routes,
+        remote=RemoteRlGroupRef(data=data.ref, routes=remote_routes),
     )
 
 
@@ -63,15 +111,17 @@ def prepare_training_batch(
     batch: TrainingBatch, *, identity: str | None = None
 ) -> EncodedTrainingBatch:
     if isinstance(batch, RlTrajectoryBatch):
-        objects = tuple(
+        groups = tuple(
             encode_trajectory_group(
                 group,
                 object_id=_object_id(f"{identity}:{index}") if identity else None,
             )
             for index, group in enumerate(batch.groups)
         )
+        objects = tuple(group.data for group in groups)
+        route_objects = tuple(route for group in groups for route in group.routes)
         remote: RemoteTrainingBatchRef = RemoteRlBatchRef(
-            groups=tuple(RemoteRlGroupRef(data=value.ref) for value in objects),
+            groups=tuple(group.remote for group in groups),
             min_source_version=batch.min_source_version,
             max_source_version=batch.max_source_version,
         )
@@ -82,15 +132,212 @@ def prepare_training_batch(
             object_id=_object_id(identity) if identity else None,
         )
         objects = (value,)
+        route_objects = ()
         remote = RemoteSftBatchRef(data=value.ref)
-    return EncodedTrainingBatch(batch=batch, remote=remote, objects=objects)
+    return EncodedTrainingBatch(
+        batch=batch,
+        remote=remote,
+        objects=objects,
+        route_objects=route_objects,
+    )
 
 
 def decode_trajectory_group(
-    ref: TrainingDataRef, payload: bytes
-) -> TrajectoryGroupBundle:
-    _validate_training_object(ref, payload, RL_GROUP_DATA_FORMAT)
-    return TrajectoryGroupBundle.model_validate(msgpack.decode(payload))
+    ref: RemoteRlGroupRef,
+    payload: bytes,
+    *,
+    route_payloads: Mapping[str, bytes],
+) -> DecodedRlGroup:
+    _validate_training_object(ref.data, payload, RL_GROUP_DATA_FORMAT)
+    bundle = TrajectoryGroupBundle.model_validate(msgpack.decode(payload))
+    hydrated = _hydrate_routes(bundle.payload(), ref.routes, route_payloads)
+    return DecodedRlGroup(
+        bundle=TrajectoryGroupBundle.from_payload(hydrated),
+        group=hydrated.build(),
+    )
+
+
+def _extract_routes(
+    payload: TrajectoryGroupPayload,
+) -> tuple[TrajectoryGroupPayload, bytes, tuple[RemoteRouteSlice, ...]]:
+    data = bytearray()
+    slices: list[RemoteRouteSlice] = []
+    trajectories = []
+    for trajectory_index, trajectory in enumerate(payload.trajectories):
+        histories = tuple(
+            _strip_route_map(
+                values,
+                trajectory_index=trajectory_index,
+                scope="additional_history",
+                scope_index=index,
+                data=data,
+                slices=slices,
+            )
+            for index, values in enumerate(
+                trajectory.additional_history_choice_routing_metadata
+            )
+        )
+        exchanges = tuple(
+            _strip_route_map(
+                values,
+                trajectory_index=trajectory_index,
+                scope="exchange",
+                scope_index=index,
+                data=data,
+                slices=slices,
+            )
+            for index, values in enumerate(trajectory.exchange_choice_routing_metadata)
+        )
+        trajectories.append(
+            trajectory.model_copy(
+                update={
+                    "choice_routing_metadata": _strip_route_map(
+                        trajectory.choice_routing_metadata,
+                        trajectory_index=trajectory_index,
+                        scope="messages",
+                        scope_index=0,
+                        data=data,
+                        slices=slices,
+                    ),
+                    "additional_history_choice_routing_metadata": histories,
+                    "exchange_choice_routing_metadata": exchanges,
+                }
+            )
+        )
+    return (
+        payload.model_copy(update={"trajectories": tuple(trajectories)}),
+        bytes(data),
+        tuple(slices),
+    )
+
+
+def _strip_route_map(
+    values: dict[int, Any],
+    *,
+    trajectory_index: int,
+    scope: Literal["messages", "additional_history", "exchange"],
+    scope_index: int,
+    data: bytearray,
+    slices: list[RemoteRouteSlice],
+) -> dict[int, Any]:
+    stripped = {}
+    for choice_index, route in values.items():
+        if not route.data:
+            raise RuntimeError("inline routed experts are empty")
+        offset = len(data)
+        data.extend(route.data)
+        slices.append(
+            RemoteRouteSlice(
+                trajectory_index=trajectory_index,
+                scope=scope,
+                scope_index=scope_index,
+                choice_index=choice_index,
+                offset=offset,
+                byte_count=len(route.data),
+            )
+        )
+        stripped[choice_index] = route.model_copy(update={"data": b""})
+    return stripped
+
+
+def _hydrate_routes(
+    payload: TrajectoryGroupPayload,
+    objects: tuple[RemoteRouteObject, ...],
+    route_payloads: Mapping[str, bytes],
+) -> TrajectoryGroupPayload:
+    routed: dict[tuple[int, str, int, int], bytes] = {}
+    for value in objects:
+        try:
+            data = route_payloads[value.ref.object_id]
+        except KeyError:
+            raise RuntimeError(
+                f"route object is unavailable: {value.ref.object_id}"
+            ) from None
+        if len(data) != value.ref.byte_count:
+            raise RuntimeError("route object byte count changed")
+        for item in value.slices:
+            key = (
+                item.trajectory_index,
+                item.scope,
+                item.scope_index,
+                item.choice_index,
+            )
+            routed[key] = data[item.offset : item.offset + item.byte_count]
+
+    trajectories = []
+    for trajectory_index, trajectory in enumerate(payload.trajectories):
+        histories = tuple(
+            _hydrate_route_map(
+                values,
+                trajectory_index=trajectory_index,
+                scope="additional_history",
+                scope_index=index,
+                routed=routed,
+            )
+            for index, values in enumerate(
+                trajectory.additional_history_choice_routing_metadata
+            )
+        )
+        exchanges = tuple(
+            _hydrate_route_map(
+                values,
+                trajectory_index=trajectory_index,
+                scope="exchange",
+                scope_index=index,
+                routed=routed,
+            )
+            for index, values in enumerate(trajectory.exchange_choice_routing_metadata)
+        )
+        trajectories.append(
+            trajectory.model_copy(
+                update={
+                    "choice_routing_metadata": _hydrate_route_map(
+                        trajectory.choice_routing_metadata,
+                        trajectory_index=trajectory_index,
+                        scope="messages",
+                        scope_index=0,
+                        routed=routed,
+                    ),
+                    "additional_history_choice_routing_metadata": histories,
+                    "exchange_choice_routing_metadata": exchanges,
+                }
+            )
+        )
+    if routed:
+        raise RuntimeError("route object contains unbound trajectory slices")
+    return payload.model_copy(update={"trajectories": tuple(trajectories)})
+
+
+def _hydrate_route_map(
+    values: dict[int, Any],
+    *,
+    trajectory_index: int,
+    scope: Literal["messages", "additional_history", "exchange"],
+    scope_index: int,
+    routed: dict[tuple[int, str, int, int], bytes],
+) -> dict[int, Any]:
+    hydrated = {}
+    for choice_index, route in values.items():
+        key = (trajectory_index, scope, scope_index, choice_index)
+        if route.data:
+            if key in routed:
+                raise RuntimeError("inline routed experts also name a route object")
+            hydrated[choice_index] = route
+            continue
+        try:
+            data = routed.pop(key)
+        except KeyError:
+            raise RuntimeError(
+                "routed experts are missing their route object slice"
+            ) from None
+        itemsize = 1 if route.dtype == "uint8" else 2
+        expected = itemsize
+        for extent in route.shape:
+            expected *= extent
+        if len(data) != expected:
+            raise RuntimeError("route object slice does not match routed-expert shape")
+        hydrated[choice_index] = route.model_copy(update={"data": data})
+    return hydrated
 
 
 def decode_sft_batch(ref: TrainingDataRef, payload: bytes) -> SupervisedTrajectoryBatch:
@@ -101,7 +348,7 @@ def decode_sft_batch(ref: TrainingDataRef, payload: bytes) -> SupervisedTrajecto
 def _encode_training_object(
     payload: bytes,
     *,
-    data_format: Literal["art_trajectory_group_msgpack_v1", "art_sft_batch_msgpack_v1"],
+    data_format: Literal["art_trajectory_group_msgpack_v2", "art_sft_batch_msgpack_v1"],
     object_id: str | None,
 ) -> EncodedTrainingObject:
     digest = hashlib.sha256(payload).hexdigest()

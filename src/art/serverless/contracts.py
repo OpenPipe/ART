@@ -5,6 +5,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field, model_validator
 
+from art.distributed.object_store import MOE_ROUTE_OBJECT_FORMAT
 from art.distributed.trajectory_store import TrajectoryGroupAnnotations
 from art.training.contracts import (
     Contract,
@@ -14,7 +15,7 @@ from art.training.contracts import (
     RunCommand,
 )
 
-RL_GROUP_DATA_FORMAT = "art_trajectory_group_msgpack_v1"
+RL_GROUP_DATA_FORMAT = "art_trajectory_group_msgpack_v2"
 SFT_DATA_FORMAT = "art_sft_batch_msgpack_v1"
 OPERATION_RESULT_FORMAT = "art_operation_result_msgpack_v1"
 
@@ -23,17 +24,92 @@ class TrainingDataRef(Contract):
     object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     byte_count: int = Field(ge=1)
-    format: Literal["art_trajectory_group_msgpack_v1", "art_sft_batch_msgpack_v1"]
+    format: Literal["art_trajectory_group_msgpack_v2", "art_sft_batch_msgpack_v1"]
+
+
+class RemoteRouteObjectRef(Contract):
+    object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=1)
+    format: Literal["art_moe_route_bundle_v1"] = MOE_ROUTE_OBJECT_FORMAT
+
+
+class RemoteRouteSlice(Contract):
+    trajectory_index: int = Field(ge=0)
+    scope: Literal["messages", "additional_history", "exchange"]
+    scope_index: int = Field(ge=0)
+    choice_index: int = Field(ge=0)
+    offset: int = Field(ge=0)
+    byte_count: int = Field(ge=1)
+
+
+class RemoteRouteObject(Contract):
+    ref: RemoteRouteObjectRef
+    slices: tuple[RemoteRouteSlice, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_slices(self) -> "RemoteRouteObject":
+        positions = [
+            (
+                value.trajectory_index,
+                value.scope,
+                value.scope_index,
+                value.choice_index,
+            )
+            for value in self.slices
+        ]
+        if len(positions) != len(set(positions)):
+            raise ValueError("route object contains duplicate trajectory positions")
+        if any(
+            value.offset + value.byte_count > self.ref.byte_count
+            for value in self.slices
+        ):
+            raise ValueError("route slice leaves its object bounds")
+        cursor = 0
+        for value in sorted(self.slices, key=lambda item: item.offset):
+            if value.offset != cursor:
+                raise ValueError("route slices must exactly partition their object")
+            cursor += value.byte_count
+        if cursor != self.ref.byte_count:
+            raise ValueError("route slices must exactly partition their object")
+        return self
+
+
+class PrefetchRouteObjectsRequest(Contract):
+    refs: tuple[RemoteRouteObjectRef, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_refs(self) -> "PrefetchRouteObjectsRequest":
+        ids = [ref.object_id for ref in self.refs]
+        if len(ids) != len(set(ids)):
+            raise ValueError("route prefetch contains duplicate objects")
+        return self
+
+
+class ReleaseRouteObjectsRequest(PrefetchRouteObjectsRequest):
+    pass
 
 
 class RemoteRlGroupRef(Contract):
     data: TrainingDataRef
+    routes: tuple[RemoteRouteObject, ...] = ()
     annotations: TrajectoryGroupAnnotations | None = None
 
     @model_validator(mode="after")
     def _validate_format(self) -> "RemoteRlGroupRef":
         if self.data.format != RL_GROUP_DATA_FORMAT:
             raise ValueError("RL group data has the wrong wire format")
+        positions = [
+            (
+                value.trajectory_index,
+                value.scope,
+                value.scope_index,
+                value.choice_index,
+            )
+            for route in self.routes
+            for value in route.slices
+        ]
+        if len(positions) != len(set(positions)):
+            raise ValueError("RL group routes contain duplicate trajectory positions")
         return self
 
 
@@ -115,6 +191,20 @@ def training_data_refs(batch: RemoteTrainingBatchRef) -> tuple[TrainingDataRef, 
     if isinstance(batch, RemoteRlBatchRef):
         return tuple(group.data for group in batch.groups)
     return (batch.data,)
+
+
+def route_object_refs(
+    batch: RemoteTrainingBatchRef,
+) -> tuple[RemoteRouteObjectRef, ...]:
+    if not isinstance(batch, RemoteRlBatchRef):
+        return ()
+    refs: dict[str, RemoteRouteObjectRef] = {}
+    for group in batch.groups:
+        for route in group.routes:
+            prior = refs.setdefault(route.ref.object_id, route.ref)
+            if prior != route.ref:
+                raise ValueError("route object identity changed within a batch")
+    return tuple(refs.values())
 
 
 class AdapterSpec(Contract):

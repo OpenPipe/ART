@@ -14,6 +14,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 VLLM_LORA_OBJECT_FORMAT = "art_vllm_lora_v1"
+MOE_ROUTE_OBJECT_FORMAT = "art_moe_route_bundle_v1"
 
 
 class _ObjectModel(BaseModel):
@@ -435,6 +436,21 @@ def vllm_lora_object_target(
             "generation_id": generation_id,
             "policy_step": str(policy_step),
         },
+    )
+
+
+def moe_route_object_target(
+    store: S3ObjectStoreConfig,
+    *,
+    tenant_id: str,
+    run_id: str,
+    object_id: str,
+) -> BinaryObjectTarget:
+    return BinaryObjectTarget(
+        store=store,
+        object_id=object_id,
+        format=MOE_ROUTE_OBJECT_FORMAT,
+        metadata={"tenant_id": tenant_id, "run_id": run_id},
     )
 
 
