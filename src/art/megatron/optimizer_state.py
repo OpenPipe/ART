@@ -45,6 +45,7 @@ _POINTER_TEMP_RE = re.compile(r"^\.committed\.json\.\d+\.[0-9a-f]{32}\.tmp$")
 _POLICY_TEMP_RE = re.compile(r"^\.policy\.json\.\d+\.[0-9a-f]{32}\.tmp$")
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _POINTER_UNSET = object()
+_STUB_OPTIMIZER_STATE = {"art_stub_optimizer": 1}
 _SCHEDULE_PROVIDER_FIELDS = {
     "batch_p2p_comm",
     "batch_p2p_sync",
@@ -1639,6 +1640,43 @@ def _stage_optimizer_value(value: Any, stager: PinnedCpuSnapshotBuilder) -> Any:
     return copy.deepcopy(value)
 
 
+def _optimizer_state_dict(optimizer: Any) -> Any:
+    children = getattr(optimizer, "chained_optimizers", None)
+    if children is not None:
+        states = [_optimizer_state_dict(child) for child in children]
+        return states[0] if len(states) == 1 else states
+    if getattr(optimizer, "is_stub_optimizer", False):
+        return _STUB_OPTIMIZER_STATE.copy()
+    return optimizer.state_dict()
+
+
+def _is_stub_optimizer_state(state: Any) -> bool:
+    return (
+        isinstance(state, dict)
+        and len(state) == 1
+        and type(state.get("art_stub_optimizer")) is int
+        and state["art_stub_optimizer"] == 1
+    )
+
+
+def _load_optimizer_state_dict(optimizer: Any, state: Any) -> None:
+    children = getattr(optimizer, "chained_optimizers", None)
+    if children is not None:
+        states = [state] if len(children) == 1 else state
+        if not isinstance(states, list) or len(states) != len(children):
+            raise RuntimeError(
+                "Optimizer checkpoint chain layout does not match runtime"
+            )
+        for child, child_state in zip(children, states, strict=True):
+            _load_optimizer_state_dict(child, child_state)
+        return
+    is_stub = getattr(optimizer, "is_stub_optimizer", False)
+    if is_stub != _is_stub_optimizer_state(state):
+        raise RuntimeError("Optimizer checkpoint stub layout does not match runtime")
+    if not is_stub:
+        optimizer.load_state_dict(state)
+
+
 def snapshot_optimizer_state(
     runtime: Any,
     *,
@@ -1674,7 +1712,9 @@ def stage_optimizer_state_snapshot(
             runtime_sha256=runtime_sha256,
             layout_sha256=layouts[runtime.rank],
             topology=current_optimizer_topology(runtime.world_size),
-            state_dict=_stage_optimizer_value(runtime.optimizer.state_dict(), builder),
+            state_dict=_stage_optimizer_value(
+                _optimizer_state_dict(runtime.optimizer), builder
+            ),
         )
     )
 
@@ -1766,7 +1806,7 @@ def _write_optimizer_shard(
     generation_path.mkdir(parents=True, exist_ok=True)
     try:
         with temporary.open("wb") as output:
-            torch.save(runtime.optimizer.state_dict(), output)
+            torch.save(_optimizer_state_dict(runtime.optimizer), output)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, shard_path)
@@ -2007,7 +2047,7 @@ def load_optimizer_state(
             _run_rank_operation(
                 runtime,
                 "optimizer state apply",
-                lambda: runtime.optimizer.load_state_dict(loaded_state),
+                lambda: _load_optimizer_state_dict(runtime.optimizer, loaded_state),
             )
         finally:
             del loaded_state
