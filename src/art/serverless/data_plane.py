@@ -10,6 +10,10 @@ import uuid
 from msgspec import msgpack
 from pydantic import BaseModel, ConfigDict, TypeAdapter
 
+from art.distributed.moe_route_store import (
+    MoeRouteGroupPayload,
+    MoeRouteObjectPayload,
+)
 from art.distributed.packing import TrajectoryGroupPayload
 from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.training.contracts import (
@@ -18,7 +22,6 @@ from art.training.contracts import (
     SupervisedTrajectoryBatch,
     TrainingBatch,
 )
-from art.trajectories import TrajectoryGroup
 
 from .contracts import (
     RL_GROUP_DATA_FORMAT,
@@ -66,7 +69,7 @@ class DecodedRlGroup(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     bundle: TrajectoryGroupBundle
-    group: TrajectoryGroup
+    routes: MoeRouteGroupPayload
 
 
 class EncodedTrainingBatch(BaseModel):
@@ -150,10 +153,17 @@ def decode_trajectory_group(
 ) -> DecodedRlGroup:
     _validate_training_object(ref.data, payload, RL_GROUP_DATA_FORMAT)
     bundle = TrajectoryGroupBundle.model_validate(msgpack.decode(payload))
-    hydrated = _hydrate_routes(bundle.payload(), ref.routes, route_payloads)
     return DecodedRlGroup(
-        bundle=TrajectoryGroupBundle.from_payload(hydrated),
-        group=hydrated.build(),
+        bundle=bundle,
+        routes=MoeRouteGroupPayload(
+            objects=tuple(
+                MoeRouteObjectPayload(
+                    data=_route_payload(value.ref.object_id, route_payloads),
+                    slices=value.slices,
+                )
+                for value in ref.routes
+            )
+        ),
     )
 
 
@@ -240,104 +250,11 @@ def _strip_route_map(
     return stripped
 
 
-def _hydrate_routes(
-    payload: TrajectoryGroupPayload,
-    objects: tuple[RemoteRouteObject, ...],
-    route_payloads: Mapping[str, bytes],
-) -> TrajectoryGroupPayload:
-    routed: dict[tuple[int, str, int, int], bytes] = {}
-    for value in objects:
-        try:
-            data = route_payloads[value.ref.object_id]
-        except KeyError:
-            raise RuntimeError(
-                f"route object is unavailable: {value.ref.object_id}"
-            ) from None
-        if len(data) != value.ref.byte_count:
-            raise RuntimeError("route object byte count changed")
-        for item in value.slices:
-            key = (
-                item.trajectory_index,
-                item.scope,
-                item.scope_index,
-                item.choice_index,
-            )
-            routed[key] = data[item.offset : item.offset + item.byte_count]
-
-    trajectories = []
-    for trajectory_index, trajectory in enumerate(payload.trajectories):
-        histories = tuple(
-            _hydrate_route_map(
-                values,
-                trajectory_index=trajectory_index,
-                scope="additional_history",
-                scope_index=index,
-                routed=routed,
-            )
-            for index, values in enumerate(
-                trajectory.additional_history_choice_routing_metadata
-            )
-        )
-        exchanges = tuple(
-            _hydrate_route_map(
-                values,
-                trajectory_index=trajectory_index,
-                scope="exchange",
-                scope_index=index,
-                routed=routed,
-            )
-            for index, values in enumerate(trajectory.exchange_choice_routing_metadata)
-        )
-        trajectories.append(
-            trajectory.model_copy(
-                update={
-                    "choice_routing_metadata": _hydrate_route_map(
-                        trajectory.choice_routing_metadata,
-                        trajectory_index=trajectory_index,
-                        scope="messages",
-                        scope_index=0,
-                        routed=routed,
-                    ),
-                    "additional_history_choice_routing_metadata": histories,
-                    "exchange_choice_routing_metadata": exchanges,
-                }
-            )
-        )
-    if routed:
-        raise RuntimeError("route object contains unbound trajectory slices")
-    return payload.model_copy(update={"trajectories": tuple(trajectories)})
-
-
-def _hydrate_route_map(
-    values: dict[int, Any],
-    *,
-    trajectory_index: int,
-    scope: Literal["messages", "additional_history", "exchange"],
-    scope_index: int,
-    routed: dict[tuple[int, str, int, int], bytes],
-) -> dict[int, Any]:
-    hydrated = {}
-    for choice_index, route in values.items():
-        key = (trajectory_index, scope, scope_index, choice_index)
-        if route.data:
-            if key in routed:
-                raise RuntimeError("inline routed experts also name a route object")
-            hydrated[choice_index] = route
-            continue
-        try:
-            data = routed.pop(key)
-        except KeyError:
-            raise RuntimeError(
-                "routed experts are missing their route object slice"
-            ) from None
-        itemsize = 1 if route.dtype == "uint8" else 2
-        expected = itemsize
-        for extent in route.shape:
-            expected *= extent
-        if len(data) != expected:
-            raise RuntimeError("route object slice does not match routed-expert shape")
-        hydrated[choice_index] = route.model_copy(update={"data": data})
-    return hydrated
+def _route_payload(object_id: str, payloads: Mapping[str, bytes]) -> bytes:
+    try:
+        return payloads[object_id]
+    except KeyError:
+        raise RuntimeError(f"route object is unavailable: {object_id}") from None
 
 
 def decode_sft_batch(ref: TrainingDataRef, payload: bytes) -> SupervisedTrajectoryBatch:

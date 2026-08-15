@@ -37,6 +37,10 @@ from .host_admission import (
     HostAdmissionRequest,
     inspect_host,
 )
+from .moe_route_store import (
+    MoeRouteGroupPayload,
+    hydrate_trajectory_group_routes,
+)
 from .monarch_runtime import RemoteCallError, RemoteCallResult
 from .nccl_preflight import (
     NcclPreflightSessionRequest,
@@ -54,6 +58,8 @@ from .specs import HostServiceHealth
 from .trajectory_store import (
     TrajectoryCapacityError,
     TrajectoryEnqueueResult,
+    TrajectoryGroupAnnotations,
+    TrajectoryGroupBundle,
     TrajectoryGroupRef,
     TrajectoryLeaseError,
     TrajectoryQueueItem,
@@ -73,6 +79,28 @@ def _require_etcd_health(url: str, timeout_s: float) -> None:
         health = json.load(response).get("health")
     if health not in (True, "true"):
         raise RuntimeError(f"etcd health check failed: {health!r}")
+
+
+def _build_packing_groups(
+    bundles: tuple[TrajectoryGroupBundle, ...],
+    route_groups: tuple[MoeRouteGroupPayload, ...],
+    annotations: tuple[TrajectoryGroupAnnotations | None, ...],
+) -> list[Any]:
+    if route_groups and len(route_groups) != len(bundles):
+        raise ValueError("trajectory bundles and route groups are not aligned")
+    if annotations and len(annotations) != len(bundles):
+        raise ValueError("trajectory bundles and annotations are not aligned")
+    groups = []
+    for index, bundle in enumerate(bundles):
+        payload = bundle.payload()
+        if route_groups:
+            payload = hydrate_trajectory_group_routes(payload, route_groups[index])
+        group = payload.build()
+        annotation = annotations[index] if annotations else None
+        if annotation is not None:
+            annotation.apply(group)
+        groups.append(group)
+    return groups
 
 
 def resilient_endpoint(function: Any) -> Any:
@@ -456,7 +484,10 @@ class ArtHostService(Actor):
         self, request: PackingRequest, batch_id: str, transfer_timeout_s: float
     ) -> PackingResult:
         fetch_started = time.monotonic()
+        trajectory_receive_s = 0.0
+        trajectory_build_s = 0.0
         if request.trajectory_sources:
+            receive_started = time.monotonic()
             groups = list(
                 await asyncio.gather(
                     *(
@@ -465,18 +496,48 @@ class ArtHostService(Actor):
                     )
                 )
             )
+            trajectory_receive_s = time.monotonic() - receive_started
         elif request.trajectory_transfer is None:
-            groups = [payload.build() for payload in request.trajectory_groups]
+            build_started = time.monotonic()
+            groups = await asyncio.to_thread(
+                _build_packing_groups,
+                request.trajectory_groups,
+                request.moe_route_groups,
+                request.trajectory_annotations,
+            )
+            trajectory_build_s = time.monotonic() - build_started
         else:
             if request.trajectory_groups:
                 raise ValueError("packing request has inline and streamed trajectories")
             if request.trajectory_transfer.stream.stream_id != batch_id:
                 raise ValueError("packing request has the wrong trajectory stream")
-            groups = list(
-                await request.trajectory_transfer.receive_groups(
-                    timeout_s=transfer_timeout_s
-                )
+            bundle_receive = request.trajectory_transfer.receive_bundles(
+                timeout_s=transfer_timeout_s
             )
+            receive_started = time.monotonic()
+            if request.moe_route_transfer is None:
+                bundles = await bundle_receive
+                route_groups: tuple[MoeRouteGroupPayload, ...] = ()
+            else:
+                if request.moe_route_transfer.stream.stream_id != (
+                    f"{batch_id}:moe-routes"
+                ):
+                    raise ValueError("packing request has the wrong route stream")
+                bundles, route_groups = await asyncio.gather(
+                    bundle_receive,
+                    request.moe_route_transfer.receive_groups(
+                        timeout_s=transfer_timeout_s
+                    ),
+                )
+            trajectory_receive_s = time.monotonic() - receive_started
+            build_started = time.monotonic()
+            groups = await asyncio.to_thread(
+                _build_packing_groups,
+                bundles,
+                route_groups,
+                request.trajectory_annotations,
+            )
+            trajectory_build_s = time.monotonic() - build_started
         trajectory_fetch_s = time.monotonic() - fetch_started
         if request.collect_packing_shapes:
             for group in groups:
@@ -555,6 +616,8 @@ class ArtHostService(Actor):
                 packed_group_shapes=shapes,
                 generation_id=request.generation_id,
                 trajectory_fetch_s=trajectory_fetch_s,
+                trajectory_receive_s=trajectory_receive_s,
+                trajectory_build_s=trajectory_build_s,
                 packing_core_s=packing_core_s,
                 trajectory_log_wait_s=trajectory_log_wait_s,
             )
@@ -580,6 +643,8 @@ class ArtHostService(Actor):
             non_padding_tokens=non_padding_tokens,
             trajectory_log_path=request.trajectory_log_path,
             trajectory_fetch_s=trajectory_fetch_s,
+            trajectory_receive_s=trajectory_receive_s,
+            trajectory_build_s=trajectory_build_s,
             packing_core_s=packing_core_s,
             trajectory_log_wait_s=trajectory_log_wait_s,
             packed_batch_finalize_s=packed_batch_finalize_s,

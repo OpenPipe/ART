@@ -5,6 +5,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field, model_validator
 
+from art.distributed.moe_route_store import MoeRouteSlice
 from art.distributed.object_store import MOE_ROUTE_OBJECT_FORMAT
 from art.distributed.trajectory_store import TrajectoryGroupAnnotations
 from art.training.contracts import (
@@ -33,13 +34,7 @@ class RemoteRouteObjectRef(Contract):
     format: Literal["art_moe_route_bundle_v1"] = MOE_ROUTE_OBJECT_FORMAT
 
 
-class RemoteRouteSlice(Contract):
-    trajectory_index: int = Field(ge=0)
-    scope: Literal["messages", "additional_history", "exchange"]
-    scope_index: int = Field(ge=0)
-    choice_index: int = Field(ge=0)
-    offset: int = Field(ge=0)
-    byte_count: int = Field(ge=1)
+RemoteRouteSlice = MoeRouteSlice
 
 
 class RemoteRouteObject(Contract):

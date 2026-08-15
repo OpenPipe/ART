@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from collections.abc import Awaitable, Callable
+from contextlib import AsyncExitStack
 import logging
 import time
 from typing import Any, Literal
@@ -91,6 +92,8 @@ class DistributedPackedBatch(BaseModel):
     trajectory_log_path: str | None = None
     packing_rpc_s: float = 0.0
     trajectory_fetch_s: float = 0.0
+    trajectory_receive_s: float = 0.0
+    trajectory_build_s: float = 0.0
     packing_core_s: float = 0.0
     trajectory_log_wait_s: float = 0.0
     packed_batch_finalize_s: float = 0.0
@@ -729,24 +732,44 @@ class ArtRuntime:
         batch_id = uuid.uuid4().hex
         self._live_batches[batch_id] = trainer_hosts
         try:
-            publisher = None
-            wire_request = request
-            if request.trajectory_groups:
-                from .trajectory_store import publish_trajectory_bundles
+            async with AsyncExitStack() as publishers:
+                wire_request = request
+                if request.trajectory_groups:
+                    from .moe_route_store import publish_moe_route_groups
+                    from .trajectory_store import publish_trajectory_bundles
 
-                controller = self._host(self.topology.cluster.controller_host_id)
-                data_plane_host = urlparse(controller.worker_address).hostname
-                if data_plane_host is None:
-                    raise ValueError("controller has no routable address")
-                transfer, publisher = await publish_trajectory_bundles(
-                    request.trajectory_groups,
-                    stream_id=batch_id,
-                    advertise_host=data_plane_host,
-                )
-                wire_request = request.model_copy(
-                    update={"trajectory_groups": (), "trajectory_transfer": transfer}
-                )
-            try:
+                    controller = self._host(self.topology.cluster.controller_host_id)
+                    data_plane_host = urlparse(controller.worker_address).hostname
+                    if data_plane_host is None:
+                        raise ValueError("controller has no routable address")
+                    transfer, publisher = await publish_trajectory_bundles(
+                        request.trajectory_groups,
+                        stream_id=batch_id,
+                        advertise_host=data_plane_host,
+                    )
+                    wire_request = request.model_copy(
+                        update={
+                            "trajectory_groups": (),
+                            "trajectory_transfer": transfer,
+                        }
+                    )
+                    publishers.push_async_callback(publisher.close)
+                    if request.moe_route_groups:
+                        (
+                            route_transfer,
+                            route_publisher,
+                        ) = await publish_moe_route_groups(
+                            request.moe_route_groups,
+                            stream_id=f"{batch_id}:moe-routes",
+                            advertise_host=data_plane_host,
+                        )
+                        wire_request = wire_request.model_copy(
+                            update={
+                                "moe_route_groups": (),
+                                "moe_route_transfer": route_transfer,
+                            }
+                        )
+                        publishers.push_async_callback(route_publisher.close)
                 packing_rpc_started = time.monotonic()
                 result: PackingResult = await MonarchPackingEndpoint(
                     source_service
@@ -756,9 +779,6 @@ class ArtRuntime:
                     transfer_timeout_s=self.topology.cluster.rpc_timeout_s,
                 )
                 packing_rpc_s = time.monotonic() - packing_rpc_started
-            finally:
-                if publisher is not None:
-                    await publisher.close()
             if result.ref is None:
                 self._live_batches.pop(batch_id)
                 return None
@@ -796,6 +816,8 @@ class ArtRuntime:
             trajectory_log_path=result.trajectory_log_path,
             packing_rpc_s=packing_rpc_s,
             trajectory_fetch_s=result.trajectory_fetch_s,
+            trajectory_receive_s=result.trajectory_receive_s,
+            trajectory_build_s=result.trajectory_build_s,
             packing_core_s=result.packing_core_s,
             trajectory_log_wait_s=result.trajectory_log_wait_s,
             packed_batch_finalize_s=result.packed_batch_finalize_s,

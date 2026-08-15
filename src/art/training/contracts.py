@@ -5,7 +5,11 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
-from art.distributed.trajectory_store import TrajectoryGroupBundle
+from art.distributed.moe_route_store import MoeRouteGroupPayload
+from art.distributed.trajectory_store import (
+    TrajectoryGroupAnnotations,
+    TrajectoryGroupBundle,
+)
 from art.pipeline_tuner.config import PackedGroupShape
 from art.trajectories import Trajectory
 
@@ -30,6 +34,10 @@ class RlTrajectoryBatch(Contract):
     max_source_version: int = Field(ge=0)
     _local_groups: tuple[Any, ...] | None = PrivateAttr(default=None)
     _local_packed_batch: Any | None = PrivateAttr(default=None)
+    _local_moe_route_groups: tuple[MoeRouteGroupPayload, ...] = PrivateAttr(default=())
+    _local_group_annotations: tuple[TrajectoryGroupAnnotations | None, ...] = (
+        PrivateAttr(default=())
+    )
 
     @model_validator(mode="after")
     def _validate_source_versions(self) -> "RlTrajectoryBatch":
@@ -71,21 +79,30 @@ class RlTrajectoryBatch(Contract):
     def from_group_bundles(
         cls,
         bundles: Sequence[TrajectoryGroupBundle],
-        groups: Sequence[Any],
         *,
         min_source_version: int,
         max_source_version: int,
+        groups: Sequence[Any] | None = None,
+        moe_route_groups: Sequence[MoeRouteGroupPayload] = (),
+        group_annotations: Sequence[TrajectoryGroupAnnotations | None] = (),
     ) -> "RlTrajectoryBatch":
-        if len(bundles) != len(groups):
+        if groups is not None and len(bundles) != len(groups):
             raise ValueError(
                 "trajectory bundles and materialized groups are not aligned"
             )
+        if moe_route_groups and len(bundles) != len(moe_route_groups):
+            raise ValueError("trajectory bundles and route groups are not aligned")
+        if group_annotations and len(bundles) != len(group_annotations):
+            raise ValueError("trajectory bundles and annotations are not aligned")
         batch = cls(
             groups=tuple(bundles),
             min_source_version=min_source_version,
             max_source_version=max_source_version,
         )
-        object.__setattr__(batch, "_local_groups", tuple(groups))
+        if groups is not None:
+            object.__setattr__(batch, "_local_groups", tuple(groups))
+        object.__setattr__(batch, "_local_moe_route_groups", tuple(moe_route_groups))
+        object.__setattr__(batch, "_local_group_annotations", tuple(group_annotations))
         return batch
 
     def require_local_groups(self) -> tuple[Any, ...]:
@@ -99,6 +116,14 @@ class RlTrajectoryBatch(Contract):
         if self._local_packed_batch is None:
             raise RuntimeError("local Megatron request has no packed batch lease")
         return self._local_packed_batch
+
+    def local_moe_route_groups(self) -> tuple[MoeRouteGroupPayload, ...]:
+        return self._local_moe_route_groups
+
+    def local_group_annotations(
+        self,
+    ) -> tuple[TrajectoryGroupAnnotations | None, ...]:
+        return self._local_group_annotations
 
 
 class SupervisedTrajectoryBatch(Contract):

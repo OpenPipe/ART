@@ -24,9 +24,11 @@ from art.trajectories import (
 )
 
 from .data_plane import PackedBatchRef
+from .moe_route_store import MoeRouteBatchTransfer, MoeRouteGroupPayload
 from .rollout import RolloutModelSpec
 from .trajectory_store import (
     TrajectoryBatchTransfer,
+    TrajectoryGroupAnnotations,
     TrajectoryGroupBundle,
     TrajectoryQueueItem,
 )
@@ -251,6 +253,9 @@ class PackingRequest(BaseModel):
     generation_id: str = Field(min_length=1)
     trajectory_groups: tuple[TrajectoryGroupBundle, ...] = ()
     trajectory_transfer: TrajectoryBatchTransfer | None = None
+    moe_route_groups: tuple[MoeRouteGroupPayload, ...] = ()
+    moe_route_transfer: MoeRouteBatchTransfer | None = None
+    trajectory_annotations: tuple[TrajectoryGroupAnnotations | None, ...] = ()
     trajectory_sources: tuple[TrajectoryQueueItem, ...] = ()
     trajectory_log_path: str | None = None
     advantage_balance: float = 0.0
@@ -275,6 +280,36 @@ class PackingRequest(BaseModel):
         )
         if sum(inputs) != 1:
             raise ValueError("packing requires exactly one trajectory input")
+        route_inputs = bool(self.moe_route_groups), self.moe_route_transfer is not None
+        if sum(route_inputs) > 1:
+            raise ValueError("packing accepts one MoE route input")
+        if self.trajectory_sources and (
+            any(route_inputs) or self.trajectory_annotations
+        ):
+            raise ValueError("queued trajectories own their routes and annotations")
+        if self.moe_route_groups and len(self.moe_route_groups) != len(
+            self.trajectory_groups
+        ):
+            raise ValueError("inline trajectory and route groups are not aligned")
+        group_count = (
+            len(self.trajectory_groups)
+            if self.trajectory_groups
+            else (
+                len(self.trajectory_transfer.groups)
+                if self.trajectory_transfer is not None
+                else len(self.trajectory_sources)
+            )
+        )
+        if (
+            self.moe_route_transfer is not None
+            and len(self.moe_route_transfer.groups) != group_count
+        ):
+            raise ValueError("trajectory and route transfers are not aligned")
+        if (
+            self.trajectory_annotations
+            and len(self.trajectory_annotations) != group_count
+        ):
+            raise ValueError("trajectory groups and annotations are not aligned")
         return self
 
     @classmethod
@@ -330,6 +365,8 @@ class PackingResult(BaseModel):
     non_padding_tokens: int = Field(default=0, ge=0)
     trajectory_log_path: str | None = None
     trajectory_fetch_s: float = Field(default=0.0, ge=0)
+    trajectory_receive_s: float = Field(default=0.0, ge=0)
+    trajectory_build_s: float = Field(default=0.0, ge=0)
     packing_core_s: float = Field(default=0.0, ge=0)
     trajectory_log_wait_s: float = Field(default=0.0, ge=0)
     packed_batch_finalize_s: float = Field(default=0.0, ge=0)
