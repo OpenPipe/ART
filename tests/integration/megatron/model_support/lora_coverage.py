@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-import socket
 from typing import Any
 
 from megatron.core import parallel_state as ps
@@ -11,13 +10,13 @@ from pydantic import BaseModel, Field
 import torch
 from torch.distributed import (
     destroy_process_group,
-    init_process_group,
     is_initialized,
 )
 
 from art.megatron import train as megatron_train
 from art.megatron.lora import LoRA
 
+from .base_megatron_session import initialize_single_rank_process_group
 from .fp32_grouped_gemm import (
     allow_fp32_grouped_gemm_fallback_for_model_support_tests,
 )
@@ -67,12 +66,6 @@ class LoraCoverageReport(BaseModel):
     unexpected_trainable_parameter_names: list[str] = Field(default_factory=list)
 
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 @contextmanager
 def _single_rank_model_parallel() -> Iterator[None]:
     if not torch.cuda.is_available():
@@ -80,12 +73,7 @@ def _single_rank_model_parallel() -> Iterator[None]:
     if is_initialized():
         raise RuntimeError("torch.distributed is already initialized in this process.")
     torch.cuda.set_device(0)
-    init_process_group(
-        backend="nccl",
-        init_method=f"tcp://127.0.0.1:{_find_free_port()}",
-        rank=0,
-        world_size=1,
-    )
+    initialize_single_rank_process_group()
     try:
         ps.initialize_model_parallel(
             tensor_model_parallel_size=1,

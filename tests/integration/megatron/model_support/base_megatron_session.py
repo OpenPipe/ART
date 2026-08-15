@@ -11,6 +11,21 @@ from pydantic import BaseModel, ConfigDict
 import torch
 
 
+def initialize_single_rank_process_group() -> None:
+    if torch.distributed.is_initialized():  # type: ignore[possibly-missing-attribute]
+        if torch.distributed.get_world_size() != 1:  # type: ignore[possibly-missing-attribute]
+            raise RuntimeError(
+                "single-rank validation found a multi-rank process group"
+            )
+        return
+    torch.distributed.init_process_group(  # type: ignore[possibly-missing-attribute]
+        backend="nccl",
+        store=torch.distributed.HashStore(),  # type: ignore[possibly-missing-attribute]
+        rank=0,
+        world_size=1,
+    )
+
+
 class BaseMegatronSessionKey(BaseModel):
     model_config = ConfigDict(frozen=True)
 

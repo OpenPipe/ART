@@ -24,13 +24,13 @@ from art.megatron.model_support.registry import (
 from art.megatron.model_support.spec import PrefixTreeModelStateContext
 from art.megatron.prefix_tree import parse_prefix_tree_row
 from art.megatron.prefix_tree_state import create_prefix_tree_state
-from art.utils.network import find_free_tcp_port
 
 from ..artifacts import GitRepoState, pinned_git_state
 from .base_megatron_session import (
     BaseMegatronResetReport,
     BaseMegatronSessionKey,
     active_base_megatron_session,
+    initialize_single_rank_process_group,
 )
 from .fp32_grouped_gemm import (
     allow_fp32_grouped_gemm_fallback_for_model_support_tests,
@@ -703,12 +703,11 @@ def _run_packing_invariance_worker(
     reused_runtime = session is not None
     runtime_stack = ExitStack()
     if not torch.distributed.is_initialized():
+        initialize_single_rank_process_group()
         runtime_stack.enter_context(
             patch.dict(
                 os.environ,
                 {
-                    "MASTER_ADDR": "127.0.0.1",
-                    "MASTER_PORT": str(find_free_tcp_port()),
                     "RANK": "0",
                     "WORLD_SIZE": "1",
                     "LOCAL_RANK": "0",

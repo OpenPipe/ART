@@ -9,6 +9,7 @@ from art.megatron.model_support.handlers.dsv4 import DSV4_HANDLER
 from ..artifacts import GitRepoState
 from . import hf_parity as hf_parity_module
 from . import hf_parity_worker as hf_parity_worker_module
+from .base_megatron_session import initialize_single_rank_process_group
 from .hf_parity import (
     HF_PARITY_OUTPUT_DIRNAME,
     HF_PARITY_PACKED_TENSORS,
@@ -274,7 +275,7 @@ def test_run_hf_parity_subprocess_does_not_override_recompute(
     assert "ART_MEGATRON_RECOMPUTE_MODULES" not in env
 
 
-def test_run_hf_parity_subprocess_assigns_unique_rendezvous(
+def test_run_hf_parity_subprocess_does_not_allocate_tcp_rendezvous(
     monkeypatch, tmp_path
 ) -> None:
     request = HfParityRunRequest(
@@ -295,13 +296,9 @@ def test_run_hf_parity_subprocess_assigns_unique_rendezvous(
             covered=True,
         ),
     )
-    ports = iter((24101, 24102))
     environments: list[dict[str, str]] = []
-    monkeypatch.setattr(
-        hf_parity_module,
-        "_find_free_rendezvous_port",
-        lambda: next(ports),
-    )
+    monkeypatch.delenv("MASTER_ADDR", raising=False)
+    monkeypatch.delenv("MASTER_PORT", raising=False)
 
     def _fake_run(*args, **kwargs):
         del args
@@ -315,11 +312,10 @@ def test_run_hf_parity_subprocess_assigns_unique_rendezvous(
     )
 
     hf_parity_module.run_hf_parity_subprocess(request, tmp_path)
-    hf_parity_module.run_hf_parity_subprocess(request, tmp_path)
 
-    assert [env["MASTER_PORT"] for env in environments] == ["24101", "24102"]
     for env in environments:
-        assert env["MASTER_ADDR"] == "127.0.0.1"
+        assert "MASTER_ADDR" not in env
+        assert "MASTER_PORT" not in env
         assert env["RANK"] == "0"
         assert env["WORLD_SIZE"] == "1"
         assert env["LOCAL_RANK"] == "0"
@@ -328,8 +324,6 @@ def test_run_hf_parity_subprocess_assigns_unique_rendezvous(
 
 def test_hf_parity_worker_requires_explicit_distributed_env(monkeypatch) -> None:
     distributed_env = {
-        "MASTER_ADDR": "127.0.0.1",
-        "MASTER_PORT": "24101",
         "RANK": "0",
         "WORLD_SIZE": "1",
         "LOCAL_RANK": "0",
@@ -343,6 +337,27 @@ def test_hf_parity_worker_requires_explicit_distributed_env(monkeypatch) -> None
     for name, value in distributed_env.items():
         monkeypatch.setenv(name, value)
     _validate_distributed_process_env()
+
+
+def test_single_rank_process_group_uses_an_in_process_store(monkeypatch) -> None:
+    store = object()
+    init_kwargs: dict[str, object] = {}
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.distributed, "HashStore", lambda: store)
+    monkeypatch.setattr(
+        torch.distributed,
+        "init_process_group",
+        lambda **kwargs: init_kwargs.update(kwargs),
+    )
+
+    initialize_single_rank_process_group()
+
+    assert init_kwargs == {
+        "backend": "nccl",
+        "store": store,
+        "rank": 0,
+        "world_size": 1,
+    }
 
 
 def test_normalize_hf_tensor_map_for_bridge_adds_language_model_prefix() -> None:
