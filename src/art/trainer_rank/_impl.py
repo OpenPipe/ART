@@ -60,6 +60,27 @@ class AdamParams:
     grad_clip_norm: float = 0.1
 
 
+def _build_dynamic_optimizer(
+    params: Sequence[torch.nn.Parameter],
+    config: AdamParams,
+) -> torch.optim.Optimizer:
+    if not params or any(param.device.type != "cuda" for param in params):
+        raise RuntimeError("TrainerRank dynamic optimizers require CUDA parameters")
+
+    from transformer_engine.pytorch.optimizers import FusedAdam
+
+    return FusedAdam(
+        params,
+        lr=config.learning_rate,
+        betas=(config.beta1, config.beta2),
+        eps=config.eps,
+        weight_decay=config.weight_decay,
+        bias_correction=True,
+        adam_w_mode=True,
+        capturable=False,
+    )
+
+
 @dataclass(frozen=True)
 class TopK:
     logprobs: torch.Tensor
@@ -1451,13 +1472,7 @@ class TrainerRank:
                 strict=True,
             )
         )
-        optimizer = torch.optim.AdamW(
-            masters,
-            lr=params.learning_rate,
-            betas=(params.beta1, params.beta2),
-            eps=params.eps,
-            weight_decay=params.weight_decay,
-        )
+        optimizer = _build_dynamic_optimizer(masters, params)
         return _DynamicOptimizer(optimizer, masters)
 
     def _restore_dynamic_optimizer(

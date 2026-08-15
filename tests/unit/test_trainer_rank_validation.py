@@ -25,6 +25,7 @@ from art.trainer_rank import (
     TrainerRankSlotStateError,
     Unset,
 )
+import art.trainer_rank._impl as trainer_rank_impl
 from art.trainer_rank._impl import (
     _anchor_disconnected_outputs,
     _MemoryCheck,
@@ -35,6 +36,22 @@ from art.trainer_rank._impl import (
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
     from art.megatron.train import TrainingRuntime
+
+
+@pytest.fixture(autouse=True)
+def _cpu_dynamic_optimizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    def build(
+        params: Iterable[torch.nn.Parameter], config: AdamParams
+    ) -> torch.optim.Optimizer:
+        return torch.optim.AdamW(
+            params,
+            lr=config.learning_rate,
+            betas=(config.beta1, config.beta2),
+            eps=config.eps,
+            weight_decay=config.weight_decay,
+        )
+
+    monkeypatch.setattr(trainer_rank_impl, "_build_dynamic_optimizer", build)
 
 
 class _Model:
