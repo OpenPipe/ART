@@ -1413,8 +1413,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self.grad_accumulation_sequences
             )
         from art.local.backend import LocalBackend
+        from art.serverless.backend import ServerlessBackend
 
-        if stop_at_step is not None and isinstance(self.backend, LocalBackend):
+        if stop_at_step is not None and isinstance(
+            self.backend, (LocalBackend, ServerlessBackend)
+        ):
             train_kwargs["final_training_step"] = stop_at_step
         if self.kl_penalty_coef > 0.0:
             train_kwargs.update(
@@ -1489,6 +1492,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     async def _discard_collected_group(self, group: TrajectoryGroup) -> None:
         if isinstance(self._output_queue, DistributedTrajectoryQueue):
+            if group._distributed_lease is None:
+                return
             failures: list[BaseException] = []
             discard = getattr(self.backend, "discard_pipeline_group", None)
             if callable(discard):

@@ -44,6 +44,17 @@ def merge_gradient_step_metrics(
     return metrics
 
 
+def should_save_optimizer_state(step: int, config: TrainConfig) -> bool:
+    return (
+        step <= 1
+        or step % config.optimizer_save_interval == 0
+        or (
+            config.final_training_step is not None
+            and step >= config.final_training_step
+        )
+    )
+
+
 def build_rl_train_configs(
     *,
     learning_rate: float,

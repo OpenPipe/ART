@@ -10,7 +10,7 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
 from .. import dev
-from .._backend_training import merge_gradient_step_metrics
+from .._backend_training import merge_gradient_step_metrics, should_save_optimizer_state
 from ..backend import AnyTrainableModel
 from ..distributed.art_runtime import ArtRuntime
 from ..local.backend import LocalBackend, _PackedTrainingBatch
@@ -115,18 +115,6 @@ def _sampler_publication_mode(
         "in_flight_lora"
         if service.rollout_weight_update_mode == "in_flight_lora"
         else "versioned_lora"
-    )
-
-
-def _should_save_optimizer(step: int, config: Any) -> bool:
-    return (
-        config.optimizer_save_interval == 1
-        or step <= 1
-        or step % config.optimizer_save_interval == 0
-        or (
-            config.final_training_step is not None
-            and step >= config.final_training_step
-        )
     )
 
 
@@ -1049,7 +1037,7 @@ class MegatronBackend(LocalBackend):
                 ),
             )
         )
-        if _should_save_optimizer(next_step, config):
+        if should_save_optimizer_state(next_step, config):
             await client.save_state(
                 SaveStateRequest(
                     run_id=client.run_id,

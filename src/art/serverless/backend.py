@@ -15,6 +15,7 @@ from art._backend_training import (
     aggregate_rl_training_metrics,
     build_rl_train_configs,
     merge_gradient_step_metrics,
+    should_save_optimizer_state,
 )
 from art._source_revision import art_source_revision
 from art.adapter_leases import pin_inference_target, pinned_inference_name
@@ -155,6 +156,7 @@ class _ServerlessTrainSettings(BaseModel):
     num_trajectories_learning_rate_multiplier_power: float = 0.0
     save_checkpoint: bool = True
     optimizer_save_interval: int = Field(default=5, ge=1)
+    final_training_step: int | None = Field(default=None, ge=1)
     grad_accumulation_sequences: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
@@ -198,6 +200,7 @@ class _ServerlessTrainSettings(BaseModel):
                 self.num_trajectories_learning_rate_multiplier_power
             ),
             optimizer_save_interval=self.optimizer_save_interval,
+            final_training_step=self.final_training_step,
             grad_accumulation_sequences=self.grad_accumulation_sequences,
         )
         return config, LossConfig(
@@ -668,6 +671,7 @@ class ServerlessBackend:
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         save_checkpoint: bool = True,
         optimizer_save_interval: int = 5,
+        final_training_step: int | None = None,
         grad_accumulation_sequences: int | None = None,
         verbose: bool = False,
     ) -> ServerlessTrainResult:
@@ -698,7 +702,7 @@ class ServerlessBackend:
     ) -> _PendingServerlessTrain:
         if not groups:
             raise ValueError("trajectory_groups must not be empty")
-        _, loss = settings.resolve()
+        config, loss = settings.resolve()
         client = await self.training_client(model)
         prepared = groups[0]._prepared_training_batch
         if prepared is not None:
@@ -768,7 +772,7 @@ class ServerlessBackend:
                     ),
                 )
             )
-            if settings.save_checkpoint:
+            if settings.save_checkpoint or should_save_optimizer_state(step, config):
                 state = await client.save_state(
                     SaveStateRequest(
                         run_id=client.run_id,
