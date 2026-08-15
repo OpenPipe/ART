@@ -1255,24 +1255,18 @@ class ServerlessBackend:
             values[index : index + batch_size]
             for index in range(0, len(values), batch_size)
         ]
-        if isinstance(config.learning_rate, list):
-            rates = [float(value) for value in config.learning_rate]
-            scalar_learning_rate = None
-        else:
-            rates = None
-            scalar_learning_rate = float(config.learning_rate)
+        rates = (
+            [float(value) for value in config.learning_rate]
+            if isinstance(config.learning_rate, list)
+            else [float(config.learning_rate)] * len(raw_batches)
+        )
+        if len(rates) != len(raw_batches):
+            raise ValueError("SFT learning-rate schedule must match batch count")
         tokenizer = SftBatchTokenizer()
         batches: list[tuple[list[Trajectory], float]] = []
         total_dropped = 0
         total_trainable_tokens = 0
-        for raw_batch in raw_batches:
-            if rates is not None and len(batches) >= len(rates):
-                raise ValueError("SFT learning-rate schedule ended before SFT data")
-            if rates is None:
-                assert scalar_learning_rate is not None
-                learning_rate = scalar_learning_rate
-            else:
-                learning_rate = rates[len(batches)]
+        for raw_batch, learning_rate in zip(raw_batches, rates, strict=True):
             tokenized = await asyncio.to_thread(
                 tokenizer.tokenize,
                 model,
@@ -1288,48 +1282,45 @@ class ServerlessBackend:
         if not batches:
             return
         client = await self.training_client(model)
-        forwards: list[TrainingOperation[ForwardBackwardResult]] = []
-        for batch, _learning_rate in batches:
+        pending: dict[str, float] | None = None
+        for batch, learning_rate in batches:
             sequence = client.next_sequence_id
-            forwards.append(
-                await client.forward_backward(
-                    ForwardBackwardRequest(
-                        run_id=client.run_id,
-                        request_id=uuid.uuid4().hex,
-                        sequence_id=sequence,
-                        batch=SupervisedTrajectoryBatch(
-                            trajectories=tuple(batch),
-                            assistant_turns=config.assistant_turns,
-                        ),
-                        loss=LossConfig(name="cross_entropy"),
-                    )
+            forward = await client.forward_backward(
+                ForwardBackwardRequest(
+                    run_id=client.run_id,
+                    request_id=uuid.uuid4().hex,
+                    sequence_id=sequence,
+                    batch=SupervisedTrajectoryBatch(
+                        trajectories=tuple(batch),
+                        assistant_turns=config.assistant_turns,
+                    ),
+                    loss=LossConfig(name="cross_entropy"),
                 )
             )
-        sequence = client.next_sequence_id
-        optimizer = await client.optim_step(
-            OptimStepRequest(
-                run_id=client.run_id,
-                request_id=uuid.uuid4().hex,
-                sequence_id=sequence,
-                optimizer=AdamConfig(learning_rate=batches[0][1]),
+            optimizer = await client.optim_step(
+                OptimStepRequest(
+                    run_id=client.run_id,
+                    request_id=uuid.uuid4().hex,
+                    sequence_id=sequence + 1,
+                    optimizer=AdamConfig(learning_rate=learning_rate),
+                )
             )
-        )
-        forward_results = await asyncio.gather(
-            *(forward.result() for forward in forwards)
-        )
-        optimizer_result = await optimizer.result()
-        pending = {
-            **merge_gradient_step_metrics(
-                _aggregate_sft_forward_metrics(
-                    tuple(result.metrics for result in forward_results)
+            forward_result, optimizer_result = await asyncio.gather(
+                forward.result(), optimizer.result()
+            )
+            if pending is not None:
+                yield pending
+            pending = {
+                **merge_gradient_step_metrics(
+                    forward_result.metrics, optimizer_result.metrics
                 ),
-                optimizer_result.metrics,
-            ),
-            "data/step_num_trajectories": float(len(values)),
-            "data/step_trainable_assistant_tokens": float(total_trainable_tokens),
-            "data/step_num_dropped_trajectories": float(total_dropped),
-            TRAIN_GRADIENT_STEPS_KEY: float(len(forward_results)),
-        }
+                **_packing_outcome_metrics(forward_result.packing),
+                "data/step_num_trajectories": float(len(values)),
+                "data/step_trainable_assistant_tokens": float(total_trainable_tokens),
+                "data/step_num_dropped_trajectories": float(total_dropped),
+                TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
+            }
+        assert pending is not None
         sequence = client.next_sequence_id
         step = client.projected_learner_version
         sampler = await client.save_weights_for_sampler(
@@ -1428,29 +1419,6 @@ def _attach_packing_shapes(
         raise RuntimeError("remote packing shapes do not match trajectory groups")
     for group, shape in zip(groups, shapes, strict=True):
         group._packed_group_shape = shape
-
-
-def _aggregate_sft_forward_metrics(
-    samples: tuple[dict[str, float], ...],
-) -> dict[str, float]:
-    if not samples:
-        raise ValueError("SFT optimizer requires at least one forward/backward result")
-    result = dict(samples[-1])
-    additive = {
-        "time/forward_backward_s",
-        "data/gradient_step_nonpadding_logical_tokens",
-        "data/gradient_step_loss_bearing_tokens",
-        "data/gradient_step_executed_token_equivalents",
-        "data/gradient_step_nominal_schedule_capacity_tokens",
-        "data/gradient_step_dummy_executed_token_equivalents",
-        "data/gradient_step_dummy_schedule_capacity_tokens",
-        "pipeline/gradient_step_real_microbatches",
-        "pipeline/gradient_step_dummy_microbatches",
-    }
-    for key in additive:
-        if any(key in sample for sample in samples):
-            result[key] = sum(sample.get(key, 0.0) for sample in samples)
-    return result
 
 
 def _source_version_range(
