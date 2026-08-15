@@ -100,7 +100,8 @@ class RemoteTrainingServiceClient:
         *,
         api_key: str,
         base_url: str,
-        http_client: httpx.AsyncClient | None = None,
+        control_http_client: httpx.AsyncClient | None = None,
+        transfer_http_client: httpx.AsyncClient | None = None,
         request_timeout_s: float = 30.0,
         max_retries: int = 3,
     ) -> None:
@@ -111,15 +112,29 @@ class RemoteTrainingServiceClient:
         url = httpx.URL(base_url)
         if url.path.rstrip("/").split("/")[-1] != "v1":
             raise ValueError("remote training base_url must end in /v1")
-        self._client = http_client or httpx.AsyncClient(
-            base_url=str(url).rstrip("/") + "/",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=httpx.Timeout(
-                request_timeout_s, connect=min(request_timeout_s, 10)
-            ),
-            limits=httpx.Limits(max_connections=64, max_keepalive_connections=16),
-        )
-        self._owns_client = http_client is None
+        owns_clients = control_http_client is None
+        if owns_clients != (transfer_http_client is None):
+            raise ValueError("remote training HTTP clients must be provided together")
+        if control_http_client is None:
+
+            def client(max_connections: int) -> httpx.AsyncClient:
+                return httpx.AsyncClient(
+                    base_url=str(url).rstrip("/") + "/",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    timeout=httpx.Timeout(
+                        request_timeout_s, connect=min(request_timeout_s, 10)
+                    ),
+                    limits=httpx.Limits(
+                        max_connections=max_connections,
+                        max_keepalive_connections=16,
+                    ),
+                )
+
+            control_http_client, transfer_http_client = client(32), client(64)
+        assert transfer_http_client is not None
+        self._control_client = control_http_client
+        self._transfer_client = transfer_http_client
+        self._owns_clients = owns_clients
         self._max_retries = max_retries
 
     async def create_run(self, request: CreateTrainingRunRequest) -> TrainingRunView:
@@ -168,6 +183,7 @@ class RemoteTrainingServiceClient:
                 "X-Art-Training-SHA256": ref.sha256,
                 "X-Art-Training-Byte-Count": str(ref.byte_count),
             },
+            transfer=True,
         )
         received = TrainingDataRef.model_validate(response.json())
         if received != ref:
@@ -183,6 +199,7 @@ class RemoteTrainingServiceClient:
                 "X-Art-Training-SHA256": ref.sha256,
                 "X-Art-Training-Byte-Count": str(ref.byte_count),
             },
+            transfer=True,
         )
 
     async def prefetch_route_objects(
@@ -193,6 +210,7 @@ class RemoteTrainingServiceClient:
             f"training/runs/{run_id}/routes:prefetch",
             content=request.model_dump_json(),
             headers={"Content-Type": "application/json"},
+            transfer=True,
         )
 
     async def release_route_objects(
@@ -203,6 +221,7 @@ class RemoteTrainingServiceClient:
             f"training/runs/{run_id}/routes:release",
             content=request.model_dump_json(),
             headers={"Content-Type": "application/json"},
+            transfer=True,
         )
 
     async def get_operation(self, operation_id: str) -> OperationView:
@@ -218,6 +237,7 @@ class RemoteTrainingServiceClient:
             f"training/operations/{operation_id}/result",
             content=None,
             headers=None,
+            transfer=True,
         )
         payload = response.content
         if len(payload) != ref.byte_count:
@@ -326,11 +346,13 @@ class RemoteTrainingServiceClient:
         *,
         content: str | bytes | None,
         headers: dict[str, str] | None,
+        transfer: bool = False,
     ) -> httpx.Response:
+        client = self._transfer_client if transfer else self._control_client
         response: httpx.Response | None = None
         for attempt in range(self._max_retries + 1):
             try:
-                response = await self._client.request(
+                response = await client.request(
                     method,
                     path,
                     content=content,
@@ -357,8 +379,10 @@ class RemoteTrainingServiceClient:
         return response
 
     async def close(self) -> None:
-        if self._owns_client:
-            await self._client.aclose()
+        if self._owns_clients:
+            await asyncio.gather(
+                self._control_client.aclose(), self._transfer_client.aclose()
+            )
 
 
 _EVENT_PAGE_LIMIT = 1000
