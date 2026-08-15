@@ -1679,8 +1679,16 @@ class TrainerRank:
         params: AdamParams,
         scale_grads: float = 1.0,
         checkpoints: Sequence[str] | None = None,
+        on_live_graphs: Literal["allow", "error"] = "allow",
     ) -> dict[str, float]:
+        if on_live_graphs not in ("allow", "error"):
+            raise ValueError(
+                "on_live_graphs must be either 'allow' or 'error', got "
+                f"{on_live_graphs!r}"
+            )
         selected_checkpoints = self._selected_dynamic_checkpoints(checkpoints)
+        if on_live_graphs == "error":
+            self._guard_checkpoints_can_step(selected_checkpoints)
         return self._dynamic_optim_step(
             selected_checkpoints,
             params=params,
@@ -1946,7 +1954,6 @@ class TrainerRank:
         )
         selected = []
         for name in checkpoint_names:
-            self._guard_checkpoint_can_step(name)
             slot_params = self._checkpoint_slots[name].params
             step_flags = self._dynamic_param_step_flags(slot_params)
             slot_grads = self._reduce_dynamic_grads(
@@ -2713,14 +2720,39 @@ class TrainerRank:
         )
 
     def _guard_checkpoint_can_step(self, name: str) -> None:
-        ref = self._slot_ref(name)
-        if not self._has_live_slot_graph(ref):
+        if not self._has_live_slot_graph(self._slot_ref(name)):
             return
         raise TrainerRankSlotStateError(
             f"Cannot optim_step checkpoint slot {name!r} while outputs from an "
             "earlier forward using that slot have not been backpropagated. Call "
             "loss.backward() without retaining the graph before optim_step(); if "
             "the forward was abandoned, release all references to its outputs."
+        )
+
+    def _guard_checkpoints_can_step(self, names: Sequence[str]) -> None:
+        local_live = [self._has_live_slot_graph(self._slot_ref(name)) for name in names]
+        if dist.is_available() and dist.is_initialized():
+            live = torch.tensor(
+                local_live,
+                device=self.device,
+                dtype=torch.int32,
+            )
+            dist.all_reduce(live, op=dist.ReduceOp.MAX)
+            live_flags = live.tolist()
+        else:
+            live_flags = local_live
+        blocked = [
+            name for name, is_live in zip(names, live_flags, strict=True) if is_live
+        ]
+        if not blocked:
+            return
+        raise TrainerRankSlotStateError(
+            f"Cannot optim_step checkpoint slots {blocked!r} while outputs from an "
+            "earlier forward using those slots have a live backward graph on at "
+            "least one rank. Call loss.backward() without retaining the graph "
+            "before optim_step(); if the forward was abandoned, release all "
+            "references to its outputs; or pass on_live_graphs='allow' to accept "
+            "responsibility for any retained graphs."
         )
 
     def _estimate_group_request_output_bytes(

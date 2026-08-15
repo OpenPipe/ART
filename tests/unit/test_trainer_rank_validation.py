@@ -422,6 +422,7 @@ def test_cp1_packed_forward_uses_model_attention_metadata(
 
     runtime = _runtime()
     trainer = TrainerRank(runtime)
+    trainer.device = torch.device("meta")
     batch = prefix_tree_pack(
         (torch.tensor([1, 2, 3]), torch.tensor([1, 2, 4])), max_depth=1
     )
@@ -448,6 +449,11 @@ def test_cp1_packed_forward_uses_model_attention_metadata(
     assert captured["model_support_handler"] is runtime.model_support_handler
     assert captured["sliding_windows"] == (16,)
     assert captured["gdn_planner_config"] == "planner-config"
+    assert captured["target_device"] == torch.device("meta")
+    assert prepared.tokens.device == torch.device("meta")
+    assert prepared.position_ids.device == torch.device("meta")
+    assert batch.tokens.device == torch.device("cpu")
+    assert batch.position_ids.device == torch.device("cpu")
     torch.testing.assert_close(
         cast(torch.Tensor, captured["input_pos"]), batch.position_ids
     )
@@ -2389,6 +2395,124 @@ def test_trainer_rank_releases_abandoned_output_graph() -> None:
     gc.collect()
 
     trainer._guard_slot_can_load(ref)
+
+
+def _tracked_param_target(
+    trainer: TrainerRank,
+    ref: "LoRASlotRef",
+    value: torch.Tensor,
+) -> torch.Tensor:
+    [tracked] = trainer._track_slot_graph_outputs(
+        ref,
+        [ForwardOutput(value, None, None, None)],
+    )
+    assert tracked.target_logprobs is not None
+    return tracked.target_logprobs
+
+
+def test_optim_step_allows_unused_live_graph_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, param = _trainer_with_checkpoint(monkeypatch, torch.tensor([2.0]))
+    ref = trainer._slot_ref("student")
+    # This models a trajectory with no sampled tokens: its differentiable forward
+    # output is retained but intentionally contributes no loss or gradients.
+    unused = _tracked_param_target(trainer, ref, param.square())
+    used = _tracked_param_target(trainer, ref, param * 3.0)
+    used.sum().backward()
+    before = param.detach().clone()
+
+    result = trainer.optim_step(params=AdamParams(learning_rate=1e-2, weight_decay=0.0))
+
+    assert result["update_successful"] == 1.0
+    assert not torch.equal(param, before)
+    with pytest.raises(RuntimeError, match="modified by an inplace operation|version"):
+        unused.sum().backward()
+
+
+def test_optim_step_can_error_on_unused_live_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, param = _trainer_with_checkpoint(monkeypatch, torch.tensor([2.0]))
+    ref = trainer._slot_ref("student")
+    unused = _tracked_param_target(trainer, ref, param.square())
+    used = _tracked_param_target(trainer, ref, param * 3.0)
+    used.sum().backward()
+    before = param.detach().clone()
+
+    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+        trainer.optim_step(
+            params=AdamParams(learning_rate=1e-2, weight_decay=0.0),
+            on_live_graphs="error",
+        )
+
+    assert unused.grad_fn is not None
+    torch.testing.assert_close(param, before)
+    assert param.grad is not None
+
+
+def test_optim_step_rejects_invalid_live_graph_policy() -> None:
+    trainer = TrainerRank(_runtime())
+
+    with pytest.raises(ValueError, match="on_live_graphs"):
+        cast(Any, trainer).optim_step(
+            params=AdamParams(learning_rate=1e-3),
+            on_live_graphs="warn",
+        )
+
+
+def _live_graph_error_worker(rank: int, world_size: int, init_method: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
+        init_method=init_method,
+        timeout=timedelta(seconds=30),
+    )
+    retained: torch.Tensor | None = None
+    try:
+        trainer = TrainerRank(_runtime())
+        cast(Any, trainer)._slot_ref = _slot_ref
+        param = torch.nn.Parameter(torch.tensor([2.0]))
+        trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (
+            param,
+        )
+        param.grad = torch.ones_like(param)
+        if rank == 0:
+            retained = _tracked_param_target(
+                trainer,
+                trainer._slot_ref("student"),
+                param.square(),
+            )
+
+        with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+            trainer.optim_step(
+                params=AdamParams(learning_rate=1e-3),
+                on_live_graphs="error",
+            )
+
+        completed = torch.tensor(1)
+        dist.all_reduce(completed)
+        assert completed.item() == world_size
+        assert retained is None or retained.grad_fn is not None
+    finally:
+        dist.destroy_process_group()
+
+
+def test_optim_step_live_graph_error_is_collective(tmp_path: Path) -> None:
+    context = mp.spawn(
+        _live_graph_error_worker,
+        args=(2, f"file://{tmp_path / 'live-graph'}"),
+        nprocs=2,
+        join=False,
+    )
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        if context.join(timeout=1):
+            return
+    for process in context.processes:
+        process.terminate()
+    pytest.fail("collective live-graph policy test hung")
 
 
 def test_dp_rank_forward_preserves_nested_shape_for_inactive_requests() -> None:

@@ -235,6 +235,9 @@ class TrainerRank(_impl.TrainerRank):
 
         Per-input checkpoints override `checkpoint`. `no_grad=None` inherits the
         ambient PyTorch grad mode; `True` disables grads and `False` enables them.
+        Input and target tensors may be on a different device from the trainer;
+        ART moves its packed model inputs and labels internally without mutating
+        the caller-owned `ForwardInput` objects.
         """
         forward = cast(
             Callable[..., Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]],
@@ -307,6 +310,9 @@ class TrainerRank(_impl.TrainerRank):
 
         Per-input checkpoints override `checkpoint`. `no_grad=None` inherits the
         ambient PyTorch grad mode; `True` disables grads and `False` enables them.
+        Input and target tensors may be on a different device from the trainer;
+        ART moves its packed model inputs and labels internally without mutating
+        the caller-owned `ForwardInput` objects.
         """
         forward = cast(
             Callable[..., ForwardOutputs],
@@ -328,11 +334,21 @@ class TrainerRank(_impl.TrainerRank):
         params: AdamParams,
         scale_grads: float = 1.0,
         checkpoints: Sequence[str] | None = None,
+        on_live_graphs: Literal["allow", "error"] = "allow",
     ) -> dict[str, float]:
+        """Step checkpoint slots that have accumulated gradients.
+
+        By default, caller-retained forward graphs do not block the step. ART does
+        not detach or free those graphs, and backward through one after the step is
+        unsafe: it may fail PyTorch's version checks or recompute against updated
+        checkpoint-slot weights. Pass `on_live_graphs="error"` to raise before
+        mutating any selected slot when a live graph remains on any rank.
+        """
         return super().optim_step(
             params=params,
             scale_grads=scale_grads,
             checkpoints=checkpoints,
+            on_live_graphs=on_live_graphs,
         )
 
 

@@ -268,6 +268,49 @@ def test_forward_micro_batches_preserves_nested_vineppo_groups(
     )
 
 
+@pytest.mark.parametrize("api", ("dp_rank_forward", "forward_micro_batches"))
+def test_forward_preserves_caller_owned_nested_input_tensors(
+    api: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_: True)
+    monkeypatch.setattr(
+        rank,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: [
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+        ],
+    )
+    groups = _vineppo_like_inputs()
+    tensors = [
+        (request, request.input_tokens, request.target_tokens)
+        for group in groups
+        for request in group
+    ]
+    snapshots = [
+        (inputs.clone(), None if targets is None else targets.clone())
+        for _request, inputs, targets in tensors
+    ]
+
+    if api == "dp_rank_forward":
+        rank.dp_rank_forward(groups)
+    else:
+        list(rank.forward_micro_batches(groups))
+
+    for (request, inputs, targets), (expected_inputs, expected_targets) in zip(
+        tensors, snapshots, strict=True
+    ):
+        assert request.input_tokens is inputs
+        assert request.target_tokens is targets
+        assert inputs.device.type == "cpu"
+        torch.testing.assert_close(inputs, expected_inputs)
+        if targets is not None and expected_targets is not None:
+            assert targets.device.type == "cpu"
+            torch.testing.assert_close(targets, expected_targets)
+
+
 def test_adaptive_planner_materializes_only_final_large_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
