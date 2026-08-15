@@ -577,7 +577,6 @@ def _throughput_stage_resources(model_key: str) -> WorkflowStageResources:
     return WorkflowStageResources(
         required_world_size=4,
         required_physical_gpus=4,
-        exclusive_host=model_key == "dsv4",
         megatron=MegatronWorkflowResources(
             gpu_ids=[0, 1],
             topology=MegatronWorkflowTopology(
