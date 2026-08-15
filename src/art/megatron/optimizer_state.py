@@ -54,6 +54,14 @@ _SCHEDULE_PROVIDER_FIELDS = {
     "overlap_p2p_comm",
     "variable_seq_lengths",
 }
+# OptimStepRequest mutates these and the optimizer state persists their values.
+_STEP_OPTIMIZER_CONFIG_FIELDS = {
+    "adam_beta1",
+    "adam_beta2",
+    "adam_eps",
+    "lr",
+    "weight_decay",
+}
 
 
 class _OptimizerRecord(BaseModel):
@@ -1463,7 +1471,10 @@ def _model_runtime_sha256(runtime: Any) -> str:
                 ),
             },
             "optimizer": _type_identity(runtime.optimizer),
-            "optimizer_config": _public_fields(runtime.optimizer_config),
+            "optimizer_config": _public_fields(
+                runtime.optimizer_config,
+                exclude=_STEP_OPTIMIZER_CONFIG_FIELDS,
+            ),
             "compile": runtime.transformer_layers_compiled,
             "topology": current_optimizer_topology(runtime.world_size),
             "torch": torch.__version__,
