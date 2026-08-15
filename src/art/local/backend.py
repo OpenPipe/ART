@@ -1819,9 +1819,6 @@ class LocalBackend:
         self._grad_accumulation_sequences_by_service[service_key] = resolved
         return resolved
 
-    # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
-    # have been moved to the Model class (frontend)
-
     async def _train_sft(
         self,
         model: AnyTrainableModel,
