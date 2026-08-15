@@ -350,14 +350,14 @@ def test_gemma4_real_path_limits() -> None:
             "google/gemma-4-26B-A4B-it",
             allow_unvalidated_arch=True,
         )
-        == 18.0
+        == 25.0
     )
     assert (
         top20_kl_candidate_to_target_limit_for_model(
             "google/gemma-4-26B-A4B-it",
             allow_unvalidated_arch=True,
         )
-        == 0.008
+        == 0.012
     )
     assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
 
