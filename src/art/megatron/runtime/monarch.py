@@ -20,7 +20,7 @@ from art.distributed.data_plane import PackedBatchLeaseSet
 from art.distributed.monarch_bootstrap import activate_cuda_device
 from art.distributed.specs import GpuId
 from art.utils.cache_dirs import configure_model_cache_env
-from art.utils.lifecycle import cleanup_after_failure
+from art.utils.lifecycle import cleanup_after_failure, consume_future_exception
 
 from .data_plane import InMemoryPackedBatch, SFTBatchData
 from .publication import (
@@ -1078,7 +1078,7 @@ class MonarchTrainerRun:
             raise
         finally:
             supervision.cancel()
-            supervision.add_done_callback(_consume_future)
+            supervision.add_done_callback(consume_future_exception)
             self._clear_active(request_id)
 
     async def train(
@@ -1172,7 +1172,7 @@ class MonarchTrainerRun:
                 return
 
             publication = asyncio.get_running_loop().create_future()
-            publication.add_done_callback(_consume_future)
+            publication.add_done_callback(consume_future_exception)
             generation_id = job.output_generation_id
             if generation_id in self._publications:
                 raise RuntimeError(
@@ -1327,7 +1327,7 @@ class MonarchTrainerRun:
                             )
                             self._publication_drains.add(drain)
                             drain.add_done_callback(self._publication_drains.discard)
-                            drain.add_done_callback(_consume_future)
+                            drain.add_done_callback(consume_future_exception)
                         yield completed
                         self._learner_version = job.learner_version
                         emit(completed)
@@ -1377,7 +1377,7 @@ class MonarchTrainerRun:
             finally:
                 if supervision is not None:
                     supervision.cancel()
-                    supervision.add_done_callback(_consume_future)
+                    supervision.add_done_callback(consume_future_exception)
                 self._clear_active(job.job_id)
                 # Older jobs cannot be retried after the sequential learner advances.
                 self._jobs = {job.job_id: (job.fingerprint, tuple(events))}
@@ -1497,10 +1497,10 @@ class MonarchTrainerRun:
             raise
         finally:
             supervision.cancel()
-            supervision.add_done_callback(_consume_future)
+            supervision.add_done_callback(consume_future_exception)
             if receive is not None and not receive.done():
                 receive.cancel()
-                receive.add_done_callback(_consume_future)
+                receive.add_done_callback(consume_future_exception)
             state.drain_done = True
             self._retire_publication(state)
 
@@ -1710,7 +1710,7 @@ class MonarchTrainerRun:
             self._valid = False
             self._cancel_active()
             self._close_task = asyncio.create_task(self._close(graceful))
-            self._close_task.add_done_callback(_consume_future)
+            self._close_task.add_done_callback(consume_future_exception)
         await asyncio.shield(self._close_task)
 
     async def _close(self, graceful: bool) -> None:
@@ -1770,7 +1770,7 @@ class MonarchTrainerRun:
             if future is not None and not future.done():
                 future.cancel()
             if future is not None:
-                future.add_done_callback(_consume_future)
+                future.add_done_callback(consume_future_exception)
 
     def _clear_active(self, job_id: str) -> None:
         if self._active_job_id == job_id:
@@ -1791,10 +1791,3 @@ async def _remote_teardown(operation: Awaitable[Any]) -> None:
 def _current_task_is_cancelling() -> bool:
     task = asyncio.current_task()
     return task is not None and bool(task.cancelling())
-
-
-def _consume_future(future: asyncio.Future[Any]) -> None:
-    try:
-        future.exception()
-    except asyncio.CancelledError:
-        pass

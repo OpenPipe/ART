@@ -47,6 +47,13 @@ async def complete_to_thread(
     return await complete_task(asyncio.create_task(asyncio.to_thread(operation)))
 
 
+def consume_future_exception(future: asyncio.Future[Any]) -> None:
+    try:
+        future.exception()
+    except asyncio.CancelledError:
+        pass
+
+
 def process_shutdown_timeout(level: int) -> float:
     multiplier = max(0.1, 1.0 - _PROCESS_SHUTDOWN_LEVEL_STEP * level)
     return PROCESS_SHUTDOWN_TIMEOUT_SECONDS * multiplier

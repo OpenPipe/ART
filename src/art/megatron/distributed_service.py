@@ -30,7 +30,11 @@ from art.serving_capabilities import (
     ServingCapabilities,
     discover_serving_capabilities,
 )
-from art.utils.lifecycle import complete_task, complete_to_thread
+from art.utils.lifecycle import (
+    complete_task,
+    complete_to_thread,
+    consume_future_exception,
+)
 from art.utils.output_dirs import get_step_checkpoint_dir
 from art.vllm_runtime import (
     get_external_vllm_runtime_config,
@@ -117,11 +121,6 @@ async def _post_vllm(
 ) -> httpx.Response:
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         return await client.post(url, headers=_headers(api_key), **kwargs)
-
-
-def _consume_task_result(task: asyncio.Future[Any]) -> None:
-    if not task.cancelled():
-        task.exception()
 
 
 def _retire_completed(
@@ -367,7 +366,7 @@ class DistributedMegatronService:
                 raise RuntimeError(f"learner generation {step} is not materialized")
 
         task = asyncio.create_task(wait())
-        task.add_done_callback(_consume_task_result)
+        task.add_done_callback(consume_future_exception)
         return task
 
     @property
@@ -600,9 +599,9 @@ class DistributedMegatronService:
             return
         self._require_open()
         source_step = asyncio.get_running_loop().create_future()
-        source_step.add_done_callback(_consume_task_result)
+        source_step.add_done_callback(consume_future_exception)
         task = asyncio.create_task(self._prepare_trainer(source_step))
-        task.add_done_callback(_consume_task_result)
+        task.add_done_callback(consume_future_exception)
         self._trainer_preparation_step = source_step
         self._trainer_preparation_task = task
 
@@ -1059,7 +1058,7 @@ class DistributedMegatronService:
             )
 
         task = asyncio.create_task(prepare())
-        task.add_done_callback(_consume_task_result)
+        task.add_done_callback(consume_future_exception)
         self._next_publication_preparation = trainer, generation, task
 
     async def _run_train_job(
@@ -1415,7 +1414,7 @@ class DistributedMegatronService:
             previous = loop.create_future()
             previous.set_result(None)
         serving = loop.create_future()
-        serving.add_done_callback(_consume_task_result)
+        serving.add_done_callback(consume_future_exception)
         self._serving_futures[step] = serving
         serving.add_done_callback(
             lambda done: _retire_completed(self._serving_futures, step, done)
@@ -1445,7 +1444,7 @@ class DistributedMegatronService:
         task = asyncio.create_task(publication)
         self._publication_tasks[step] = task
         self._prepared_adapter_transfers.pop(generation.generation_id, None)
-        task.add_done_callback(_consume_task_result)
+        task.add_done_callback(consume_future_exception)
         task.add_done_callback(
             lambda done: _retire_completed(self._publication_tasks, step, done)
         )
@@ -1465,7 +1464,7 @@ class DistributedMegatronService:
             else None
         )
         if records is not None:
-            records.add_done_callback(_consume_task_result)
+            records.add_done_callback(consume_future_exception)
         try:
             if previous_publication is not None:
                 await asyncio.shield(previous_publication)
@@ -1507,7 +1506,7 @@ class DistributedMegatronService:
             )
         )
         self._durability_tasks.add(durable_task)
-        durable_task.add_done_callback(_consume_task_result)
+        durable_task.add_done_callback(consume_future_exception)
         durable_task.add_done_callback(self._durability_tasks.discard)
         try:
             materialization_started = time.monotonic()
@@ -1839,7 +1838,7 @@ class DistributedMegatronService:
         task = asyncio.create_task(self._recover_failed_replica(failure))
         self._recovery_tasks.add(task)
         task.add_done_callback(self._recovery_tasks.discard)
-        task.add_done_callback(_consume_task_result)
+        task.add_done_callback(consume_future_exception)
 
     async def _recover_failed_replica(self, failure: ReplicaFailure) -> None:
         async with self._train_lock:
@@ -2493,7 +2492,7 @@ class DistributedMegatronService:
         if self._close_task is None:
             self._closed = True
             self._close_task = asyncio.create_task(self._close())
-            self._close_task.add_done_callback(_consume_task_result)
+            self._close_task.add_done_callback(consume_future_exception)
         await asyncio.shield(self._close_task)
 
     async def _close(self) -> None:

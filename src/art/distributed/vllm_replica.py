@@ -241,6 +241,10 @@ class ReplicaManager:
                 raise ValueError(f"{key} conflicts with the replica model revision")
         self._spec = spec
         self._launchers = launchers
+        self._host_launchers = tuple(
+            launchers[host_id]
+            for host_id in dict.fromkeys(member.host_id for member in spec.members)
+        )
         self._template = template
         self._on_failure = on_failure
         self._startup_timeout_s = startup_timeout_s
@@ -372,7 +376,7 @@ class ReplicaManager:
             await asyncio.gather(
                 *(
                     asyncio.wait_for(
-                        self._launchers[host_id].prepare_adapter_receive(
+                        launcher.prepare_adapter_receive(
                             generation_id,
                             template_path,
                             max(1.0, self._rpc_timeout_s - 1.0),
@@ -380,9 +384,7 @@ class ReplicaManager:
                         ),
                         self._rpc_timeout_s,
                     )
-                    for host_id in dict.fromkeys(
-                        member.host_id for member in self._spec.members
-                    )
+                    for launcher in self._host_launchers
                 )
             )
         )
@@ -394,14 +396,12 @@ class ReplicaManager:
             await asyncio.gather(
                 *(
                     asyncio.wait_for(
-                        self._launchers[host_id].wait_adapter_receive(
+                        launcher.wait_adapter_receive(
                             generation_id, self._rpc_timeout_s
                         ),
                         self._rpc_timeout_s,
                     )
-                    for host_id in dict.fromkeys(
-                        member.host_id for member in self._spec.members
-                    )
+                    for launcher in self._host_launchers
                 )
             )
         )
@@ -410,12 +410,10 @@ class ReplicaManager:
         await asyncio.gather(
             *(
                 asyncio.wait_for(
-                    self._launchers[host_id].release_adapter_receive(generation_id),
+                    launcher.release_adapter_receive(generation_id),
                     self._rpc_timeout_s,
                 )
-                for host_id in dict.fromkeys(
-                    member.host_id for member in self._spec.members
-                )
+                for launcher in self._host_launchers
             )
         )
 

@@ -75,11 +75,6 @@ from .vllm_replica import (
 logger = logging.getLogger(__name__)
 
 
-def _consume_task_result(task: asyncio.Future[Any]) -> None:
-    if not task.cancelled():
-        task.exception()
-
-
 class DistributedPackedBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 

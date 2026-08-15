@@ -23,6 +23,12 @@ class _Spec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+def _gpu_identities(gpu_ids: tuple[GpuId, ...]) -> tuple[int | str, ...]:
+    return tuple(
+        gpu_id.casefold() if isinstance(gpu_id, str) else gpu_id for gpu_id in gpu_ids
+    )
+
+
 class HostSpec(_Spec):
     host_id: str = Field(min_length=1)
     node_rank: int = Field(ge=0)
@@ -32,10 +38,7 @@ class HostSpec(_Spec):
 
     @model_validator(mode="after")
     def _validate_gpu_ids(self) -> "HostSpec":
-        identities = tuple(
-            gpu_id.casefold() if isinstance(gpu_id, str) else gpu_id
-            for gpu_id in self.gpu_ids
-        )
+        identities = _gpu_identities(self.gpu_ids)
         if len(set(identities)) != len(identities):
             raise ValueError("gpu_ids must be unique within a host")
         return self
@@ -183,10 +186,7 @@ class ModelServiceMemberSpec(_Spec):
     def _validate_gpu_ids(self) -> "ModelServiceMemberSpec":
         if not self.gpu_ids:
             raise ValueError("model-service members require at least one GPU")
-        identities = tuple(
-            gpu_id.casefold() if isinstance(gpu_id, str) else gpu_id
-            for gpu_id in self.gpu_ids
-        )
+        identities = _gpu_identities(self.gpu_ids)
         if len(set(identities)) != len(identities):
             raise ValueError("member gpu_ids must be unique")
         return self
