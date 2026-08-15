@@ -87,6 +87,10 @@ def packing_metrics(packed: DistributedPackedBatch) -> dict[str, float]:
         "time/step_packing_core_s": packed.packing_core_s,
         "time/step_packing_lock_wait_s": packed.packing_lock_wait_s,
         "time/step_packing_compute_s": packed.packing_compute_s,
+        **{
+            f"time/step_{name}": value
+            for name, value in packed.packing_timings.model_dump().items()
+        },
         "time/step_trajectory_log_wait_s": packed.trajectory_log_wait_s,
         "time/step_packed_batch_finalize_s": packed.packed_batch_finalize_s,
         "time/step_packing_rpc_s": packed.packing_rpc_s,

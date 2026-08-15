@@ -10,9 +10,10 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 import uuid
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from art.megatron.runtime.specs import TrainerRuntimeSpec, TrainingRunSpec
+from art.preprocessing.pack import PackingTimings
 from art.utils.lifecycle import complete_task
 
 from .artifact_preflight import (
@@ -97,6 +98,7 @@ class DistributedPackedBatch(BaseModel):
     packing_core_s: float = 0.0
     packing_lock_wait_s: float = 0.0
     packing_compute_s: float = 0.0
+    packing_timings: PackingTimings = Field(default_factory=PackingTimings)
     trajectory_log_wait_s: float = 0.0
     packed_batch_finalize_s: float = 0.0
     packed_batch_fanout_s: float = 0.0
@@ -823,6 +825,7 @@ class ArtRuntime:
             packing_core_s=result.packing_core_s,
             packing_lock_wait_s=result.packing_lock_wait_s,
             packing_compute_s=result.packing_compute_s,
+            packing_timings=result.packing_timings,
             trajectory_log_wait_s=result.trajectory_log_wait_s,
             packed_batch_finalize_s=result.packed_batch_finalize_s,
             packed_batch_fanout_s=packed_batch_fanout_s,

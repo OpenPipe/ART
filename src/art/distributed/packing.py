@@ -16,6 +16,7 @@ from art.preprocessing.moe_routing import (
     MoeRouteArray,
     moe_route_dtype,
 )
+from art.preprocessing.pack import PackingTimings
 from art.trajectories import (
     MetadataValue,
     PydanticException,
@@ -370,6 +371,7 @@ class PackingResult(BaseModel):
     packing_core_s: float = Field(default=0.0, ge=0)
     packing_lock_wait_s: float = Field(default=0.0, ge=0)
     packing_compute_s: float = Field(default=0.0, ge=0)
+    packing_timings: PackingTimings = Field(default_factory=PackingTimings)
     trajectory_log_wait_s: float = Field(default=0.0, ge=0)
     packed_batch_finalize_s: float = Field(default=0.0, ge=0)
     generation_id: str = Field(min_length=1)

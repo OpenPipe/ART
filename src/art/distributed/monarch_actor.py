@@ -556,6 +556,9 @@ class ArtHostService(Actor):
         packing_started = time.monotonic()
         packing_lock_wait_s = 0.0
         packing_compute_s = 0.0
+        from art.preprocessing.pack import PackingTimings
+
+        packing_timings = PackingTimings()
         try:
             async with self._packing_lock:
                 packing_lock_wait_s = time.monotonic() - packing_started
@@ -584,6 +587,7 @@ class ArtHostService(Actor):
                             request.logprob_calculation_chunk_size
                         ),
                         include_moe_routing=request.include_moe_routing,
+                        packing_timings=packing_timings,
                     )
                 )
                 packing_compute_s = time.monotonic() - packing_compute_started
@@ -626,6 +630,7 @@ class ArtHostService(Actor):
                 packing_core_s=packing_core_s,
                 packing_lock_wait_s=packing_lock_wait_s,
                 packing_compute_s=packing_compute_s,
+                packing_timings=packing_timings,
                 trajectory_log_wait_s=trajectory_log_wait_s,
             )
         trainable_assistant_tokens = int(packed["assistant_mask"].sum().item())
@@ -655,6 +660,7 @@ class ArtHostService(Actor):
             packing_core_s=packing_core_s,
             packing_lock_wait_s=packing_lock_wait_s,
             packing_compute_s=packing_compute_s,
+            packing_timings=packing_timings,
             trajectory_log_wait_s=trajectory_log_wait_s,
             packed_batch_finalize_s=packed_batch_finalize_s,
         )

@@ -85,6 +85,7 @@ from ..pipeline_tuner import (
 )
 from ..preprocessing.pack import (
     PackedTensors,
+    PackingTimings,
     packed_tensors_from_tokenized_results,
     packed_tensors_to_dir,
     plot_packed_tensors,
@@ -1029,7 +1030,9 @@ class LocalBackend:
         packed_sequence_length: int | None,
         logprob_calculation_chunk_size: int,
         include_moe_routing: bool = False,
+        packing_timings: PackingTimings | None = None,
     ) -> PackedTensors | None:
+        started = time.monotonic()
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
@@ -1059,6 +1062,9 @@ class LocalBackend:
             if packed_sequence_length is not None
             else model_max_sequence_length
         )
+        if packing_timings is not None:
+            packing_timings.packing_setup_s = time.monotonic() - started
+        started = time.monotonic()
         tokenized_results = list(
             tokenize_trajectory_groups(
                 tokenizer,
@@ -1074,8 +1080,11 @@ class LocalBackend:
                 _max_sequence_length=training_max_sequence_length,
             )
         )
+        if packing_timings is not None:
+            packing_timings.packing_tokenization_s = time.monotonic() - started
         if not tokenized_results:
             return None
+        started = time.monotonic()
         too_long_for_model = [
             result
             for result in tokenized_results
@@ -1143,6 +1152,8 @@ class LocalBackend:
                 return None
 
         self._record_packed_group_observations(trajectory_groups, tokenized_results)
+        if packing_timings is not None:
+            packing_timings.packing_filter_observe_s = time.monotonic() - started
         packed_tensors = packed_tensors_from_tokenized_results(
             tokenized_results,
             sequence_length,
@@ -1151,6 +1162,7 @@ class LocalBackend:
             advantage_balance=advantage_balance,
             pack_results=self._supports_result_packing,
             include_moe_routing=include_moe_routing,
+            timings=packing_timings,
         )
         if (
             not allow_training_without_logprobs

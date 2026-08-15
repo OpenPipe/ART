@@ -5,6 +5,7 @@ import time
 from typing import Any, Literal, NamedTuple, cast
 
 import numpy as np
+from pydantic import BaseModel, ConfigDict, Field
 import torch
 from typing_extensions import NotRequired, TypedDict, Unpack
 
@@ -26,6 +27,19 @@ from .moe_routing import (
 from .tokenize import TokenizedResult
 
 DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH = 64
+
+
+class PackingTimings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    packing_setup_s: float = Field(default=0.0, ge=0.0)
+    packing_tokenization_s: float = Field(default=0.0, ge=0.0)
+    packing_filter_observe_s: float = Field(default=0.0, ge=0.0)
+    prefix_tree_item_build_s: float = Field(default=0.0, ge=0.0)
+    prefix_tree_plan_s: float = Field(default=0.0, ge=0.0)
+    packing_array_allocation_s: float = Field(default=0.0, ge=0.0)
+    packing_row_materialize_s: float = Field(default=0.0, ge=0.0)
+    packing_tensor_finalize_s: float = Field(default=0.0, ge=0.0)
 
 
 class PrefixTreePackingStats(TypedDict):
@@ -211,6 +225,7 @@ def packed_tensors_from_tokenized_results(
     min_prefix_tree_shared_segment_length: int = (
         DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
     ),
+    timings: PackingTimings | None = None,
 ) -> PackedTensors:
     return prefix_tree_pack(
         tokenized_results=tokenized_results,
@@ -222,6 +237,7 @@ def packed_tensors_from_tokenized_results(
         pack_results=pack_results,
         include_moe_routing=include_moe_routing,
         min_prefix_tree_shared_segment_length=(min_prefix_tree_shared_segment_length),
+        timings=timings,
     )
 
 
@@ -238,12 +254,14 @@ def prefix_tree_pack(
     min_prefix_tree_shared_segment_length: int = (
         DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
     ),
+    timings: PackingTimings | None = None,
 ) -> PackedTensors:
     if min_prefix_tree_shared_segment_length < 0:
         raise ValueError("min_prefix_tree_shared_segment_length must be >= 0")
     items: list[_PrefixTreePackItem] = []
     moe_routing_pack_stats = MoeRoutingPackStats()
 
+    started = time.monotonic()
     for result in tokenized_results:
         if len(result.token_ids) > seq_len and not truncate_long_results:
             if verbosity > 1:
@@ -262,7 +280,10 @@ def prefix_tree_pack(
         if truncate_long_results:
             item = _truncate_prefix_tree_pack_item(item, seq_len)
         items.append(item)
+    if timings is not None:
+        timings.prefix_tree_item_build_s = time.monotonic() - started
 
+    started = time.monotonic()
     planned_rows = _prefix_tree_pack_rows(
         items,
         seq_len=seq_len,
@@ -274,7 +295,10 @@ def prefix_tree_pack(
     random.Random(len(planned_rows)).shuffle(planned_rows)
     rows = [row for row, _ in planned_rows]
     row_plans = [plan for _, plan in planned_rows]
+    if timings is not None:
+        timings.prefix_tree_plan_s = time.monotonic() - started
 
+    started = time.monotonic()
     num_sequences = len(rows)
     tokens_np = np.full((num_sequences, seq_len), pad_token_id, dtype=np.int64)
     group_ids_np = np.full((num_sequences, seq_len), -1, dtype=np.int64)
@@ -301,7 +325,10 @@ def prefix_tree_pack(
             np.moveaxis(padding, 1, 0)[:, None],
             (num_layers, num_sequences, seq_len, topk),
         ).copy()
+    if timings is not None:
+        timings.packing_array_allocation_s = time.monotonic() - started
 
+    started = time.monotonic()
     for index, (row, plan) in enumerate(zip(rows, row_plans, strict=True)):
         row_route_tensor = (
             route_tensor_np[:, index] if route_tensor_np is not None else None
@@ -323,6 +350,9 @@ def prefix_tree_pack(
         )
         pixel_values.append(_packed_row_tensor_list(row, "pixel_values"))
         image_grid_thw.append(_packed_row_tensor_list(row, "image_grid_thw"))
+    if timings is not None:
+        timings.packing_row_materialize_s = time.monotonic() - started
+    started = time.monotonic()
     assistant_mask_tensor = torch.from_numpy(assistant_mask_np)
     weights_tensor = torch.from_numpy(weights_np)
     weights_tensor = torch.where(
@@ -381,6 +411,8 @@ def prefix_tree_pack(
             num_experts=num_experts,
             pack_stats=moe_routing_pack_stats,
         )
+    if timings is not None:
+        timings.packing_tensor_finalize_s = time.monotonic() - started
     return packed_tensors
 
 
