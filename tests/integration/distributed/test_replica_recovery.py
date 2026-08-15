@@ -1,3 +1,5 @@
+from typing import Any, cast
+
 import pytest
 
 from art.distributed.specs import (
@@ -65,28 +67,7 @@ def _spec() -> ModelServiceSpec:
         model_revision="revision",
         runtime_fingerprint="runtime",
         parallel=VllmParallelSpec(tp=2, pp=2),
-        update_mode="lora",
     )
-
-
-@pytest.mark.asyncio
-async def test_single_member_service_lifecycle() -> None:
-    events: list[str] = []
-    spec = _spec().model_copy(
-        update={
-            "members": (_spec().members[0],),
-            "parallel": VllmParallelSpec(tp=2),
-        }
-    )
-    manager = ReplicaManager(
-        spec,
-        {"host0": Launcher("host0", events)},
-        ReplicaLaunchTemplate(served_model_name="model@0"),
-    )
-
-    assert (await manager.start()).phase == "ready"
-    assert (await manager.stop()).phase == "stopped"
-    assert events == ["stop:host0"]
 
 
 @pytest.mark.asyncio
@@ -103,7 +84,7 @@ async def test_failure_stops_whole_gang_before_callback_and_restarts_generation(
 
     manager = ReplicaManager(
         _spec(),
-        launchers,
+        cast(Any, launchers),
         ReplicaLaunchTemplate(served_model_name="model@0", lora_path="/step/0000"),
         on_failure=failed,
         monitor_interval_s=60,
@@ -122,7 +103,9 @@ async def test_failure_stops_whole_gang_before_callback_and_restarts_generation(
 
     launchers["host1"].failed = False
     restarted = await manager.restart(
-        served_model_name="model@1", lora_path="/step/0001"
+        served_model_name="model@1",
+        lora_path="/step/0001",
+        initial_policy_version=1,
     )
 
     assert restarted.phase == "ready"

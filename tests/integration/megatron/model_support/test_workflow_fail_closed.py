@@ -3,17 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import cast
 
-from integration.megatron.model_support import workflow_scheduler
-from integration.megatron.model_support import workflow_stage_worker as worker
-from integration.megatron.model_support.validation_spec import (
+from art.megatron.model_support.spec import ArchitectureReport
+
+from . import workflow_scheduler
+from . import workflow_stage_worker as worker
+from .validation_spec import (
     ValidationReport,
     ValidationStageResult,
 )
-from integration.megatron.model_support.workflow import CORRECTNESS_REFERENCE_STAGE
-from integration.megatron.model_support.workflow_forkserver import (
+from .workflow import CORRECTNESS_REFERENCE_STAGE
+from .workflow_forkserver import (
     WorkflowForkserverPool,
 )
-from integration.megatron.model_support.workflow_runtime import (
+from .workflow_runtime import (
     WorkflowDevice,
     WorkflowOperation,
     WorkflowOperationFailed,
@@ -21,13 +23,11 @@ from integration.megatron.model_support.workflow_runtime import (
     compile_workflow,
     execute_workflow,
 )
-from integration.megatron.model_support.workflow_scheduler import PreparedWorkflow
-from integration.megatron.model_support.workflow_stage_worker import (
+from .workflow_scheduler import PreparedWorkflow
+from .workflow_stage_worker import (
     WorkflowStageWorkerItem,
     WorkflowStageWorkerSession,
 )
-
-from art.megatron.model_support.spec import ArchitectureReport
 
 
 def _runtime(name: str, *, handler: str | None = None) -> WorkflowRuntimeKey:

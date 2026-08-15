@@ -24,3 +24,4 @@ replays/
 !/src/art/wandb/**
 /src/art/wandb/__pycache__/
 scratch/
+/progress_log.md

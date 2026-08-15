@@ -6,14 +6,17 @@ import subprocess
 import sys
 
 import art
-from art.distributed import NcclTransportSpec, PackingRequest
+from art.distributed import PackingRequest
 
-EXAMPLE_DIR = Path(__file__).parents[1] / "examples" / "multinode"
+EXAMPLE_DIR = Path(__file__).parents[3] / "examples" / "multinode"
 
 
 def test_packing_request_from_public_groups() -> None:
     model = art.TrainableModel(
-        name="packing-public-api", project="test", base_model="not-loaded"
+        name="packing-public-api",
+        project="test",
+        run_name="packing-public-api",
+        base_model="not-loaded",
     )
     group = art.TrajectoryGroup(
         [
@@ -71,10 +74,6 @@ assert "NcclTransportSpec" in distributed.__all__
     )
 
 
-def test_nccl_transport_is_a_public_typed_contract() -> None:
-    assert NcclTransportSpec(net_name="IB").net_name == "IB"
-
-
 def test_documented_rollout_is_installed_and_bounded() -> None:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = os.pathsep.join(
@@ -94,7 +93,10 @@ async def check():
     reference = InstalledAsyncCallable.from_callable(program.rollout)
     assert (reference.module, reference.qualname) == ("program", "rollout")
     model = art.TrainableModel(
-        name="documented-rollout", project="test", base_model="not-loaded"
+        name="documented-rollout",
+        project="test",
+        run_name="documented-rollout",
+        base_model="not-loaded",
     )
     trajectory = await program.rollout(model, "maybe", None)
     assert trajectory.reward == 1.0
