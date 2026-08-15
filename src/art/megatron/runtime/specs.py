@@ -71,6 +71,20 @@ class TrainerRuntimeSpec(_Spec):
     def fingerprint(self) -> str:
         return _fingerprint(self)
 
+    @property
+    def compatibility_fingerprint(self) -> str:
+        hybrid_ep = self.hybrid_ep
+        if hybrid_ep is None:
+            return self.fingerprint
+        # The HybridEP rendezvous namespace is process-scoped, not checkpoint state.
+        return _fingerprint(
+            self.model_copy(
+                update={
+                    "hybrid_ep": hybrid_ep.model_copy(update={"run_id": "<runtime>"})
+                }
+            )
+        )
+
 
 class TrainingRunSpec(_Spec):
     run_id: str = Field(min_length=1)
