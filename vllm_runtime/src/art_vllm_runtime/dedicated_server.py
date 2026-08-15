@@ -25,7 +25,7 @@ from art_vllm_runtime.binary_routes import (
 from art_vllm_runtime.fast_metrics import FastMetricsSidecar
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
-ART_SERVING_PROTOCOL_VERSION = 4
+ART_SERVING_PROTOCOL_VERSION = 5
 _runtime_state: dict[str, object] = {}
 _auth_tokens: list[str] = []
 _fast_metrics_port: int | None = None
@@ -114,10 +114,36 @@ class _ResetPrefixCacheRequest(BaseModel):
 class _InFlightLoraUpdateRequest(BaseModel):
     model_name: str = Field(min_length=1)
     lora_path: str = Field(min_length=1)
+    generation_id: str = Field(min_length=1)
     policy_version: int = Field(ge=0)
     lora_slot: str | None = Field(default=None, min_length=1)
     base_model_name: str | None = None
     is_3d_lora_weight: bool = False
+
+
+class _AppliedLoraUpdate(BaseModel):
+    identity: dict[str, object]
+    response: dict[str, object]
+
+
+def _lora_update_identity(body: _InFlightLoraUpdateRequest) -> dict[str, object]:
+    return body.model_dump(mode="python", exclude={"lora_path"})
+
+
+def _applied_lora_updates(models: Any) -> dict[str, _AppliedLoraUpdate]:
+    updates = getattr(models, "_art_applied_lora_updates", None)
+    if updates is None:
+        updates = {}
+        setattr(models, "_art_applied_lora_updates", updates)
+    return updates
+
+
+def _lora_mutation_lock(models: Any, lora_slot: str) -> asyncio.Lock:
+    locks = getattr(models, "_art_lora_mutation_locks", None)
+    if locks is None:
+        locks = {}
+        setattr(models, "_art_lora_mutation_locks", locks)
+    return locks.setdefault(lora_slot, asyncio.Lock())
 
 
 class _UnloadLoraPolicyRequest(BaseModel):
@@ -388,110 +414,135 @@ def _patch_art_runtime_routes() -> None:
             models = raw_request.app.state.openai_serving_models
             engine_client = engine(raw_request)
             coordinator = lora_update_coordinator(models, engine_client)
-            update_seq = await coordinator.begin_update(lora_slot)
-            mutation_started = False
-            try:
-                async with models.lora_resolver_lock[lora_slot]:
-                    load_request = LoadLoRAAdapterRequest(
-                        lora_name=lora_slot,
-                        lora_path=lora_path,
-                        load_inplace=lora_slot in models.lora_requests,
-                        is_3d_lora_weight=body.is_3d_lora_weight,
-                    )
-                    load_error = await models._check_load_lora_adapter_request(
-                        load_request
-                    )
-                    if isinstance(load_error, ErrorResponse):
-                        await coordinator.cancel_update(lora_slot, update_seq)
+            async with _lora_mutation_lock(models, lora_slot):
+                identity = _lora_update_identity(body)
+                applied = _applied_lora_updates(models).get(lora_slot)
+                if applied is not None:
+                    prior_generation = str(applied.identity["generation_id"])
+                    if prior_generation == body.generation_id:
+                        if applied.identity != identity:
+                            return JSONResponse(
+                                content={
+                                    "error": "LoRA generation identity was reused"
+                                },
+                                status_code=HTTPStatus.CONFLICT.value,
+                            )
+                        return JSONResponse(content=applied.response)
+                    if body.policy_version <= int(applied.identity["policy_version"]):
                         return JSONResponse(
-                            content=load_error.model_dump(mode="python"),
-                            status_code=load_error.error.code,
+                            content={"error": "LoRA policy update is not newer"},
+                            status_code=HTTPStatus.CONFLICT.value,
                         )
-                    lora_int_id = (
-                        models.lora_requests[lora_slot].lora_int_id
-                        if lora_slot in models.lora_requests
-                        else models.lora_id_counter.inc(1)
-                    )
-                    lora_request = PolicyLoRARequest(
-                        lora_name=lora_slot,
-                        lora_int_id=lora_int_id,
-                        lora_path=lora_path,
-                        base_model_name=(
-                            body.base_model_name
-                            if body.base_model_name is not None
-                            and models.is_base_model(body.base_model_name)
-                            else None
-                        ),
-                        load_inplace=True,
-                        is_3d_lora_weight=body.is_3d_lora_weight,
-                        policy_version=policy_version,
-                        update_seq=update_seq,
-                    )
-                    mutation_started = True
-                    await engine_client.engine_core.call_utility_async(
-                        "pause_scheduler", "keep", False
-                    )
-                    cache_transition = (
+                update_seq = await coordinator.begin_update(lora_slot)
+                mutation_started = False
+                try:
+                    async with models.lora_resolver_lock[lora_slot]:
+                        load_request = LoadLoRAAdapterRequest(
+                            lora_name=lora_slot,
+                            lora_path=lora_path,
+                            load_inplace=lora_slot in models.lora_requests,
+                            is_3d_lora_weight=body.is_3d_lora_weight,
+                        )
+                        load_error = await models._check_load_lora_adapter_request(
+                            load_request
+                        )
+                        if isinstance(load_error, ErrorResponse):
+                            await coordinator.cancel_update(lora_slot, update_seq)
+                            return JSONResponse(
+                                content=load_error.model_dump(mode="python"),
+                                status_code=load_error.error.code,
+                            )
+                        lora_int_id = (
+                            models.lora_requests[lora_slot].lora_int_id
+                            if lora_slot in models.lora_requests
+                            else models.lora_id_counter.inc(1)
+                        )
+                        lora_request = PolicyLoRARequest(
+                            lora_name=lora_slot,
+                            lora_int_id=lora_int_id,
+                            lora_path=lora_path,
+                            base_model_name=(
+                                body.base_model_name
+                                if body.base_model_name is not None
+                                and models.is_base_model(body.base_model_name)
+                                else None
+                            ),
+                            load_inplace=True,
+                            is_3d_lora_weight=body.is_3d_lora_weight,
+                            policy_version=policy_version,
+                            update_seq=update_seq,
+                        )
+                        mutation_started = True
                         await engine_client.engine_core.call_utility_async(
-                            "art_apply_lora_policy_update",
-                            policy_lora_request_payload(lora_request),
+                            "pause_scheduler", "keep", False
                         )
-                    )
-                    serving_request = PolicyLoRARequest(
-                        **{
-                            **policy_lora_request_payload(lora_request),
-                            "load_inplace": False,
-                        }
-                    )
-                    models.lora_requests[lora_slot] = serving_request
-                    register_lora_alias(
-                        models,
-                        public_model_name=public_model_name,
-                        lora_slot=lora_slot,
-                    )
-                    publish_lora_slot_policy(
-                        models,
-                        lora_slot=lora_slot,
-                        policy_version=policy_version,
-                        update_seq=update_seq,
-                    )
-                    await engine_client.engine_core.call_utility_async(
-                        "resume_scheduler"
-                    )
-                    await coordinator.commit_update(lora_slot, serving_request)
-                    mutation_started = False
-                _runtime_state.update(
-                    loaded_adapter=public_model_name,
-                    policy_version=policy_version,
-                    update_identity=(f"lora:{lora_slot}:{policy_version}:{update_seq}"),
-                )
-            except BaseException:
-                if mutation_started:
-                    try:
-                        await asyncio.shield(
-                            engine_client.engine_core.call_utility_async(
-                                "pause_scheduler", "abort", True
+                        cache_transition = (
+                            await engine_client.engine_core.call_utility_async(
+                                "art_apply_lora_policy_update",
+                                policy_lora_request_payload(lora_request),
                             )
                         )
-                    finally:
-                        await asyncio.shield(
-                            coordinator.fail_update(lora_slot, update_seq)
+                        serving_request = PolicyLoRARequest(
+                            **{
+                                **policy_lora_request_payload(lora_request),
+                                "load_inplace": False,
+                            }
                         )
-                else:
-                    await asyncio.shield(
-                        coordinator.cancel_update(lora_slot, update_seq)
-                    )
-                raise
-            return JSONResponse(
-                content={
-                    "status": "updated",
-                    "model_name": public_model_name,
-                    "lora_slot": lora_slot,
-                    "policy_version": policy_version,
-                    "update_seq": update_seq,
-                    "cache_transition": cache_transition,
-                }
-            )
+                        models.lora_requests[lora_slot] = serving_request
+                        register_lora_alias(
+                            models,
+                            public_model_name=public_model_name,
+                            lora_slot=lora_slot,
+                        )
+                        publish_lora_slot_policy(
+                            models,
+                            lora_slot=lora_slot,
+                            policy_version=policy_version,
+                            update_seq=update_seq,
+                        )
+                        await engine_client.engine_core.call_utility_async(
+                            "resume_scheduler"
+                        )
+                        await coordinator.commit_update(lora_slot, serving_request)
+                        mutation_started = False
+                        response = {
+                            "status": "updated",
+                            "model_name": public_model_name,
+                            "lora_slot": lora_slot,
+                            "generation_id": body.generation_id,
+                            "policy_version": policy_version,
+                            "update_seq": update_seq,
+                            "cache_transition": cache_transition,
+                        }
+                        _applied_lora_updates(models)[lora_slot] = _AppliedLoraUpdate(
+                            identity=identity,
+                            response=response,
+                        )
+                        _runtime_state.update(
+                            loaded_adapter=public_model_name,
+                            policy_version=policy_version,
+                            update_identity=(
+                                f"lora:{lora_slot}:{policy_version}:{update_seq}"
+                            ),
+                        )
+                except BaseException:
+                    if mutation_started:
+                        try:
+                            await asyncio.shield(
+                                engine_client.engine_core.call_utility_async(
+                                    "pause_scheduler", "abort", True
+                                )
+                            )
+                        finally:
+                            await asyncio.shield(
+                                coordinator.fail_update(lora_slot, update_seq)
+                            )
+                    else:
+                        await asyncio.shield(
+                            coordinator.cancel_update(lora_slot, update_seq)
+                        )
+                    raise
+                return JSONResponse(content=response)
 
         @router.post("/art/unload_lora_policy")
         async def unload_lora_policy(
@@ -544,6 +595,7 @@ def _patch_art_runtime_routes() -> None:
                         policy_lora_request_payload(lora_request),
                     )
                     removed_aliases = unregister_lora_slot(models, body.lora_slot)
+                    _applied_lora_updates(models).pop(body.lora_slot, None)
                     await engine_client.engine_core.call_utility_async(
                         "resume_scheduler"
                     )

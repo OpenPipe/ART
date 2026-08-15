@@ -2399,6 +2399,7 @@ class DistributedMegatronService:
                 "model_name": name,
                 "lora_slot": name,
                 "lora_path": path,
+                "generation_id": self._generation_id_for_step(step),
                 "policy_version": step,
             }
             if in_flight

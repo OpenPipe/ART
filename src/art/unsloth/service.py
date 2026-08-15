@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import dataclass, field
 from functools import cached_property
+import hashlib
 import logging
 import os
 import socket
@@ -611,6 +612,9 @@ class UnslothService:
                     "model_name": self._in_flight_lora_slot,
                     "lora_slot": self._in_flight_lora_slot,
                     "lora_path": checkpoint_path,
+                    "generation_id": hashlib.sha256(
+                        f"{self.model_name}\0{step}\0{checkpoint_path}".encode()
+                    ).hexdigest(),
                     "policy_version": step,
                 },
                 **self._runtime_request_kwargs(),
