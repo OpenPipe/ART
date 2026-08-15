@@ -32,6 +32,7 @@ from art.preprocessing.policy_spans import (
     choice_policy_token_spans,
     validate_complete_policy_token_spans,
 )
+from art.preprocessing.vllm_tokens import choice_vllm_token_metadata
 
 from .artifacts import REPO_ROOT
 from .output_parity import (
@@ -654,32 +655,17 @@ def _choice_score_index(
             for item in trajectory.messages_and_choices:
                 if not isinstance(item, Choice):
                     continue
-                metadata = choice_moe_routing_metadata(item)
-                if metadata is None:
-                    if require_routing_metadata:
-                        raise RuntimeError(
-                            "Real-path trajectory choice is missing routes"
-                        )
-                    token_logprobs = (
-                        item.logprobs.content
-                        if item.logprobs is not None
-                        and item.logprobs.content is not None
-                        else []
+                if (
+                    require_routing_metadata
+                    and choice_moe_routing_metadata(item) is None
+                ):
+                    raise RuntimeError("Real-path trajectory choice is missing routes")
+                token_metadata = choice_vllm_token_metadata(item)
+                if token_metadata is None:
+                    raise RuntimeError(
+                        "Real-path trajectory choice is missing exact vLLM token metadata"
                     )
-                    indexed.setdefault(
-                        tuple(_parse_token_id(entry.token) for entry in token_logprobs),
-                        item,
-                    )
-                    continue
-                prompt_ids = [int(value) for value in metadata["prompt_token_ids"]]
-                completion_ids = [
-                    int(value)
-                    for value in (
-                        metadata.get("completion_token_ids")
-                        or metadata.get("token_ids")
-                        or []
-                    )
-                ]
+                prompt_ids, completion_ids = token_metadata
                 indexed.setdefault(tuple(prompt_ids + completion_ids), item)
     return indexed
 
@@ -781,12 +767,7 @@ def _vllm_scores_from_real_choices(
     prompt_by_id = {prompt.prompt_id: prompt for prompt in logical_map.prompts}
     choice_by_prompt_id: dict[int, Choice] = {}
     for prompt in logical_map.prompts:
-        key = (
-            tuple(prompt.token_ids)
-            if require_routing_metadata
-            else tuple(prompt.token_ids[prompt.scored_token_start_index :])
-        )
-        choice = choices_by_tokens.get(key)
+        choice = choices_by_tokens.get(tuple(prompt.token_ids))
         if choice is None:
             raise RuntimeError(
                 "Could not find captured vLLM choice for logical prompt "

@@ -32,11 +32,32 @@ from .output_parity import (
 )
 from .real_path import (
     RealPathConfig,
+    _choice_score_index,
     _collect_real_trajectory_groups,
     _delete_adapter_safetensors_on_pass,
     _real_path_rollout_mode,
     _topk_from_chat_logprob,
 )
+
+
+def test_choice_score_index_disambiguates_equal_completions_by_prompt() -> None:
+    def choice(prompt_id: int) -> Choice:
+        return Choice.model_validate(
+            {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {"role": "assistant", "content": "same"},
+                "prompt_token_ids": [prompt_id],
+                "token_ids": [7],
+            }
+        )
+
+    first, second = choice(1), choice(2)
+    groups = [[SimpleNamespace(messages_and_choices=[first, second])]]
+
+    indexed = _choice_score_index(groups, require_routing_metadata=False)
+
+    assert indexed == {(1, 7): first, (2, 7): second}
 
 
 def _write_workflow_worker_result(
