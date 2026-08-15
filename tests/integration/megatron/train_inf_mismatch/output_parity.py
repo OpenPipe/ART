@@ -43,9 +43,9 @@ BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
     "dsv4": 25.0,
     # Gemma dense's apparent 19.086% result had a completion-path collision;
-    # source matching reduced the same deterministic case to 14.093%. Learned
-    # dense policies reached 13.972%. Eight unique-path learned MoE policies
-    # reached 23.866% MAPE and 0.011330 KL.
+    # a source-matched rerun of that deterministic fixture measured 14.093%.
+    # Learned dense policies reached 13.972%. Eight unique-path learned MoE
+    # policies reached 23.866% MAPE and 0.011330 KL.
     "gemma4_dense": 15.0,
     "gemma4_moe": 25.0,
     "llama3_dense": 5.0,
