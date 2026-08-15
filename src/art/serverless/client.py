@@ -44,6 +44,7 @@ from .contracts import (
     PrefetchRouteObjectsRequest,
     ReleaseRouteObjectsRequest,
     RemoteForwardRequest,
+    RemoteRouteObjectRef,
     RemoteTrainingBatchRef,
     RunEvent,
     SetCheckpointTtlRequest,
@@ -525,6 +526,139 @@ class RemoteTrainingOperation(Generic[ResultT]):
             await self.result()
 
 
+_ROUTE_PREFETCH_INTERVAL_S = 0.5
+_ROUTE_PREFETCH_MAX_REFS = 64
+
+
+class _RoutePrefetchBatcher:
+    def __init__(self, service: RemoteTrainingServiceClient, run_id: str) -> None:
+        self._service = service
+        self._run_id = run_id
+        self._refs: dict[str, RemoteRouteObjectRef] = {}
+        self._futures: dict[str, asyncio.Future[None]] = {}
+        self._pending: dict[str, RemoteRouteObjectRef] = {}
+        self._wake = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+        self._force_flush = False
+        self._closing = False
+        self._closed = False
+        self._error: BaseException | None = None
+
+    def enqueue(
+        self, refs: tuple[RemoteRouteObjectRef, ...]
+    ) -> tuple[asyncio.Future[None], ...]:
+        if self._error is not None:
+            raise self._error
+        if self._closing or self._closed:
+            raise RuntimeError("remote route prefetch batcher is closed")
+        loop = asyncio.get_running_loop()
+        futures = []
+        for ref in refs:
+            existing = self._refs.get(ref.object_id)
+            if existing is not None and existing != ref:
+                raise RuntimeError("remote route object identity changed")
+            if existing is None:
+                self._refs[ref.object_id] = ref
+                self._pending[ref.object_id] = ref
+                self._futures[ref.object_id] = loop.create_future()
+            futures.append(self._futures[ref.object_id])
+        if refs:
+            if self._task is None:
+                self._task = asyncio.create_task(
+                    self._run(), name=f"remote-route-prefetch-{self._run_id}"
+                )
+            if len(self._pending) >= _ROUTE_PREFETCH_MAX_REFS:
+                self._force_flush = True
+            self._wake.set()
+        return tuple(futures)
+
+    async def ensure(self, refs: tuple[RemoteRouteObjectRef, ...]) -> None:
+        futures = self.enqueue(refs)
+        if not futures:
+            return
+        self._force_flush = True
+        self._wake.set()
+        await asyncio.shield(asyncio.gather(*futures))
+        if self._error is not None:
+            raise self._error
+
+    def forget(self, refs: tuple[RemoteRouteObjectRef, ...]) -> None:
+        for ref in refs:
+            future = self._futures.get(ref.object_id)
+            if future is None or not future.done():
+                raise RuntimeError("remote route object was not prefetched")
+            if self._refs.pop(ref.object_id) != ref:
+                raise RuntimeError("remote route object identity changed")
+            self._futures.pop(ref.object_id)
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closing = True
+        self._force_flush = True
+        self._wake.set()
+        if self._task is not None:
+            await self._task
+        self._closed = True
+        if self._error is not None:
+            raise self._error
+
+    async def abort(self) -> None:
+        self._closing = self._closed = True
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._finish_waiters()
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                await self._wake.wait()
+                self._wake.clear()
+                if self._closing and not self._pending:
+                    return
+                if not self._pending:
+                    continue
+                deadline = (
+                    asyncio.get_running_loop().time() + _ROUTE_PREFETCH_INTERVAL_S
+                )
+                while (
+                    not self._force_flush
+                    and not self._closing
+                    and len(self._pending) < _ROUTE_PREFETCH_MAX_REFS
+                ):
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        async with asyncio.timeout(remaining):
+                            await self._wake.wait()
+                    except TimeoutError:
+                        break
+                    self._wake.clear()
+                self._force_flush = False
+                batch = tuple(self._pending.values())
+                self._pending.clear()
+                await self._service.prefetch_route_objects(
+                    self._run_id, PrefetchRouteObjectsRequest(refs=batch)
+                )
+                for ref in batch:
+                    future = self._futures[ref.object_id]
+                    if not future.done():
+                        future.set_result(None)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            self._error = error
+            self._finish_waiters()
+
+    def _finish_waiters(self) -> None:
+        for future in self._futures.values():
+            if not future.done():
+                future.set_result(None)
+
+
 class RemoteTrainingClient:
     """Run-scoped implementation of ART's canonical training command API."""
 
@@ -550,6 +684,7 @@ class RemoteTrainingClient:
         self._projected_learner_version = run.projected_learner_version
         self._poll_interval_s = poll_interval_s
         self._events = _RunEventObserver(service, run.run_id, poll_interval_s)
+        self._route_prefetch = _RoutePrefetchBatcher(service, run.run_id)
         self._close_timeout_s = close_timeout_s
         self._lock = asyncio.Lock()
         self._operations: dict[str, tuple[str, RemoteTrainingOperation[Any]]] = {}
@@ -662,12 +797,42 @@ class RemoteTrainingClient:
             return operation
 
     async def stage_rl_group(self, value: EncodedRlGroup) -> None:
-        await self._stage_inputs((value.data,), value.routes)
+        await self._stage_inputs((value.data,), value.routes, defer_prefetch=True)
+
+    async def ensure_route_objects(
+        self, refs: tuple[RemoteRouteObjectRef, ...]
+    ) -> None:
+        await self._route_prefetch.ensure(refs)
+
+    async def release_route_objects(
+        self, refs: tuple[RemoteRouteObjectRef, ...]
+    ) -> None:
+        if not refs:
+            return
+        failures: list[BaseException] = []
+        try:
+            await self._route_prefetch.ensure(refs)
+        except BaseException as error:
+            failures.append(error)
+        try:
+            await self._service.release_route_objects(
+                self.run_id, ReleaseRouteObjectsRequest(refs=refs)
+            )
+        except BaseException as error:
+            failures.append(error)
+        self._route_prefetch.forget(refs)
+        if failures:
+            raise BaseExceptionGroup("remote route object release failed", failures)
+
+    def forget_route_objects(self, refs: tuple[RemoteRouteObjectRef, ...]) -> None:
+        self._route_prefetch.forget(refs)
 
     async def _stage_inputs(
         self,
         data: tuple[EncodedTrainingObject, ...],
         routes: tuple[EncodedRouteObject, ...],
+        *,
+        defer_prefetch: bool = False,
     ) -> None:
         if routes and self._route_publisher is None:
             raise RuntimeError("binary route objects require a route publisher")
@@ -686,9 +851,9 @@ class RemoteTrainingClient:
                             self._route_publisher.publish(self.run_id, value)
                         )
             if route_refs:
-                await self._service.prefetch_route_objects(
-                    self.run_id, PrefetchRouteObjectsRequest(refs=route_refs)
-                )
+                self._route_prefetch.enqueue(route_refs)
+                if not defer_prefetch:
+                    await self._route_prefetch.ensure(route_refs)
         except BaseException as primary:
             cleaned = await asyncio.gather(
                 *(
@@ -807,10 +972,22 @@ class RemoteTrainingClient:
         async with self._lock:
             if self._closed:
                 return
-            self._run = await self._service.close_run(
-                self.run_id, self._close_request_id
-            )
+            failures: list[BaseException] = []
+            try:
+                await self._route_prefetch.close()
+            except BaseException as error:
+                failures.append(error)
+            try:
+                self._run = await self._service.close_run(
+                    self.run_id, self._close_request_id
+                )
+            except BaseException as error:
+                failures.append(error)
             self._closed = True
+            if failures:
+                raise BaseExceptionGroup(
+                    "remote training client close failed", failures
+                )
 
     async def wait_closed(self, *, timeout_s: float | None = None) -> None:
         if not self._closed:
@@ -834,6 +1011,7 @@ class RemoteTrainingClient:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self._route_prefetch.abort()
         await self._events.close()
 
     async def close_event_observer(self) -> None:

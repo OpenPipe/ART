@@ -60,7 +60,6 @@ from .contracts import (
     ApplyCheckpointRetentionRequest,
     CheckpointRevision,
     CreateTrainingRunRequest,
-    ReleaseRouteObjectsRequest,
     RemoteRlBatchRef,
     RemoteRlGroupRef,
     TrainingRunSpec,
@@ -966,7 +965,7 @@ class ServerlessBackend:
         if task is None:
             raise RuntimeError("remote pipeline group was not staged")
         staged = await task
-        await self._release_staged_group(client.run_id, staged)
+        await self._release_staged_group(client, staged)
 
     async def _discard_all_staged_pipeline_groups(self) -> list[BaseException]:
         entries = tuple(self._staged_pipeline_groups.items())
@@ -991,7 +990,7 @@ class ServerlessBackend:
         failures = [value for value in results if isinstance(value, BaseException)]
         deletes = await asyncio.gather(
             *(
-                self._release_staged_group(key[0], value)
+                self._release_staged_group(self._client_for_run(key[0]), value)
                 for (key, _), value in zip(entries, results, strict=True)
                 if isinstance(value, _StagedPipelineGroup)
             ),
@@ -1001,20 +1000,26 @@ class ServerlessBackend:
         return failures
 
     async def _release_staged_group(
-        self, run_id: str, value: _StagedPipelineGroup
+        self, client: RemoteTrainingClient, value: _StagedPipelineGroup
     ) -> None:
-        operations = [self._service.delete_training_data(run_id, value.remote.data)]
+        operations = [
+            self._service.delete_training_data(client.run_id, value.remote.data)
+        ]
         refs = tuple(route.ref for route in value.remote.routes)
         if refs:
-            operations.append(
-                self._service.release_route_objects(
-                    run_id, ReleaseRouteObjectsRequest(refs=refs)
-                )
-            )
+            operations.append(client.release_route_objects(refs))
         results = await asyncio.gather(*operations, return_exceptions=True)
         failures = [result for result in results if isinstance(result, BaseException)]
         if failures:
             raise BaseExceptionGroup("staged remote group cleanup failed", failures)
+
+    def _client_for_run(self, run_id: str) -> RemoteTrainingClient:
+        clients = tuple(
+            client for client in self._clients.values() if client.run_id == run_id
+        )
+        if len(clients) != 1:
+            raise RuntimeError("remote training run does not own exactly one client")
+        return clients[0]
 
     async def prepare_pipeline_batch(
         self,
@@ -1072,6 +1077,12 @@ class ServerlessBackend:
             stage_wait_started = time.monotonic()
             staged = tuple(await asyncio.gather(*stage_tasks))
             stage_wait_s = time.monotonic() - stage_wait_started
+            route_refs = tuple(
+                route.ref for value in staged for route in value.remote.routes
+            )
+            route_prefetch_started = time.monotonic()
+            await client.ensure_route_objects(route_refs)
+            route_prefetch_wait_s = time.monotonic() - route_prefetch_started
             min_source_version, max_source_version = _source_version_range(
                 trajectory_groups, client.projected_learner_version
             )
@@ -1107,6 +1118,7 @@ class ServerlessBackend:
                     group._collect_packing_shape for group in trajectory_groups
                 ),
             )
+            client.forget_route_objects(route_refs)
             forward_submit_s = time.monotonic() - submit_started
             if forward.ref.learner_parent_version != learner_parent_version:
                 raise RuntimeError(
@@ -1155,6 +1167,7 @@ class ServerlessBackend:
         return {
             "time/step_prepare_remote_batch_s": time.monotonic() - started,
             "time/step_remote_group_stage_wait_s": stage_wait_s,
+            "time/step_remote_route_prefetch_wait_s": route_prefetch_wait_s,
             "time/step_remote_group_receive_max_s": max(
                 value.byte_stream_receive_s for value in staged
             ),
