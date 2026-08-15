@@ -714,6 +714,12 @@ def read_committed_optimizer_pointer(
     return _read_pointer(Path(optimizer_state_path))
 
 
+def read_optimizer_generation_manifest(
+    optimizer_state_path: str, generation: str
+) -> OptimizerGenerationManifest:
+    return _read_manifest(optimizer_generation_path(optimizer_state_path, generation))
+
+
 def read_committed_optimizer_step(optimizer_state_path: str) -> int | None:
     pointer = read_committed_optimizer_pointer(optimizer_state_path)
     return None if pointer is None else pointer.step

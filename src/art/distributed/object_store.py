@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 from threading import Lock
 from typing import Iterable, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -75,6 +77,11 @@ class BinaryObjectRef(_ObjectModel):
     tree_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     files: tuple[BinaryObjectFile, ...] = Field(min_length=1)
     metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class BinaryObjectMaterialization(_ObjectModel):
+    ref: BinaryObjectRef
+    path: str = Field(min_length=1)
 
 
 class S3BinaryObjectStore:
@@ -315,6 +322,89 @@ class S3BinaryObjectStore:
 
     def _manifest_uri(self, target: BinaryObjectTarget) -> str:
         return binary_object_manifest_uri(target)
+
+
+class S3BinaryObjectReceiver:
+    """Materialize verified objects into bounded, explicitly released paths."""
+
+    def __init__(self, config: S3ObjectStoreConfig, receive_root: str | Path) -> None:
+        self.config = config
+        self.receive_root = Path(receive_root).resolve()
+        self.receive_root.mkdir(parents=True, exist_ok=True)
+        self._store = S3BinaryObjectStore(config)
+        self._active: set[Path] = set()
+        self._lock = Lock()
+        self._closed = False
+
+    def materialize(
+        self,
+        manifest_uri: str,
+        *,
+        expected_format: str,
+        expected_metadata: dict[str, str],
+    ) -> BinaryObjectMaterialization:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("binary object receiver is closed")
+        ref = self._store.resolve(manifest_uri)
+        assert ref is not None
+        if ref.format != expected_format:
+            raise RuntimeError("binary object format does not match its consumer")
+        if any(
+            ref.metadata.get(key) != value for key, value in expected_metadata.items()
+        ):
+            raise RuntimeError("binary object metadata does not match its consumer")
+        destination = self.receive_root / f".receive-{uuid4().hex}"
+        self._store.materialize(ref, destination)
+        with self._lock:
+            if self._closed:
+                shutil.rmtree(destination, ignore_errors=True)
+                raise RuntimeError(
+                    "binary object receiver closed during materialization"
+                )
+            self._active.add(destination)
+        return BinaryObjectMaterialization(ref=ref, path=str(destination))
+
+    def release(self, materialization: BinaryObjectMaterialization) -> None:
+        path = self._managed_path(materialization.path)
+        with self._lock:
+            if path not in self._active:
+                raise RuntimeError("binary object materialization is not active")
+            self._active.remove(path)
+        try:
+            shutil.rmtree(path)
+        except BaseException:
+            with self._lock:
+                self._active.add(path)
+            raise
+
+    def delete(self, manifest_uri: str) -> None:
+        ref = self._store.resolve(manifest_uri, missing_ok=True)
+        if ref is not None:
+            self._store.delete(ref)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            active = tuple(self._active)
+            self._active.clear()
+        failures: list[BaseException] = []
+        for path in active:
+            try:
+                shutil.rmtree(path)
+            except BaseException as error:
+                failures.append(error)
+        self._store.close()
+        if failures:
+            raise BaseExceptionGroup("binary object receiver cleanup failed", failures)
+
+    def _managed_path(self, value: str) -> Path:
+        path = Path(value).resolve()
+        if path.parent != self.receive_root or not path.name.startswith(".receive-"):
+            raise RuntimeError("binary object materialization leaves its receive root")
+        return path
 
 
 def binary_object_manifest_uri(target: BinaryObjectTarget) -> str:
