@@ -797,7 +797,6 @@ class MegatronTrainingSlot:
     async def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         primary: BaseException | None = None
         try:
             if self._pending_results:
@@ -824,6 +823,7 @@ class MegatronTrainingSlot:
             self._raise_batch_release_failures()
         except BaseException as error:
             primary = error
+        self._closed = True
         try:
             await self.trainer.close()
         except BaseException as error:

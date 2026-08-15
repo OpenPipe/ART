@@ -147,40 +147,39 @@ class S3BinaryObjectStore:
             return existing
         prefix = self._prefix(target)
         published: list[BinaryObjectFile] = []
-        try:
-            for relative_path, chunks in sorted(files.items()):
-                relative_path = _safe_relative_path(relative_path)
-                byte_count, digest = self._upload(f"{prefix}/{relative_path}", chunks)
-                published.append(
-                    BinaryObjectFile(
-                        relative_path=relative_path,
-                        byte_count=byte_count,
-                        sha256=digest,
-                    )
+        # The prefix is the immutable object identity. A concurrent publisher can
+        # commit the same prefix while this publisher is unwinding, so failed
+        # publishes intentionally leave any partial keys for later lifecycle cleanup.
+        for relative_path, chunks in sorted(files.items()):
+            relative_path = _safe_relative_path(relative_path)
+            byte_count, digest = self._upload(f"{prefix}/{relative_path}", chunks)
+            published.append(
+                BinaryObjectFile(
+                    relative_path=relative_path,
+                    byte_count=byte_count,
+                    sha256=digest,
                 )
-            tree_sha256 = _tree_sha256(published)
-            result = BinaryObjectRef(
-                object_id=target.object_id,
-                format=target.format,
-                manifest_uri=self._manifest_uri(target),
-                byte_count=sum(file.byte_count for file in published),
-                tree_sha256=tree_sha256,
-                files=tuple(published),
-                metadata=target.metadata,
             )
-            body = _manifest_bytes(result)
-            self._client.put_object(
-                Bucket=target.store.bucket,
-                Key=f"{prefix}/_COMMITTED.json",
-                Body=body,
-                ContentType="application/json",
-            )
-            if self._read(f"{prefix}/_COMMITTED.json") != body:
-                raise RuntimeError("object commit manifest changed after publication")
-            return result
-        except BaseException:
-            self._delete_prefix(prefix, target.store.bucket)
-            raise
+        tree_sha256 = _tree_sha256(published)
+        result = BinaryObjectRef(
+            object_id=target.object_id,
+            format=target.format,
+            manifest_uri=self._manifest_uri(target),
+            byte_count=sum(file.byte_count for file in published),
+            tree_sha256=tree_sha256,
+            files=tuple(published),
+            metadata=target.metadata,
+        )
+        body = _manifest_bytes(result)
+        self._client.put_object(
+            Bucket=target.store.bucket,
+            Key=f"{prefix}/_COMMITTED.json",
+            Body=body,
+            ContentType="application/json",
+        )
+        if self._read(f"{prefix}/_COMMITTED.json") != body:
+            raise RuntimeError("object commit manifest changed after publication")
+        return result
 
     def resolve(
         self, manifest_uri: str, *, missing_ok: bool = False
