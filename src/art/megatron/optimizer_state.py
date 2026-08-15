@@ -548,6 +548,62 @@ def _fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
+def _remove_abandoned_adapter_staging(staging: Path) -> None:
+    if staging.is_symlink() or (staging.exists() and not staging.is_dir()):
+        raise RuntimeError(f"Adapter staging path is not a directory: {staging}")
+    if staging.exists():
+        shutil.rmtree(staging)
+        _fsync_directory(staging.parent)
+
+
+@contextmanager
+def adapter_publication_transaction(
+    staging_path: str | Path,
+    *,
+    step: int,
+    training_session_id: str,
+    generation_id: str,
+) -> Iterator[tuple[Path, OptimizerAdapter | None]]:
+    """Serialize one adapter generation and rebuild abandoned staging state."""
+    staging = Path(staging_path).absolute()
+    canonical = canonical_adapter_path(staging, step)
+    if staging.name != generation_id:
+        raise RuntimeError("Adapter staging path identifies another generation")
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = staging.with_name(f".{staging.name}.lock")
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        existing = read_adapter_publication(canonical, step=step)
+        if existing is not None:
+            if (
+                existing.training_session_id,
+                existing.step,
+                existing.generation_id,
+            ) != (training_session_id, step, generation_id):
+                raise RuntimeError("Committed adapter generation changed identity")
+            yield staging, existing
+            return
+        _remove_abandoned_adapter_staging(staging)
+        try:
+            yield staging, None
+            published = read_adapter_publication(canonical, step=step)
+            if published is None or (
+                published.training_session_id,
+                published.step,
+                published.generation_id,
+            ) != (training_session_id, step, generation_id):
+                raise RuntimeError("Adapter transaction did not publish its generation")
+        except BaseException as error:
+            try:
+                _remove_abandoned_adapter_staging(staging)
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "adapter staging cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+
+
 def _write_model_atomic(path: Path, model: BaseModel) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")

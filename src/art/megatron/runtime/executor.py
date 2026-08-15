@@ -1504,6 +1504,7 @@ class _GenerationPublisher:
         prepared_tensors: PreparedSafetensors | None,
     ) -> _RankSnapshotPersistence:
         from art.megatron.optimizer_state import (
+            adapter_publication_transaction,
             publish_adapter_checkpoint,
             write_optimizer_snapshot_shard,
         )
@@ -1514,20 +1515,25 @@ class _GenerationPublisher:
             if lora is not None:
                 if staging_adapter_path is None or adapter is not None:
                     raise RuntimeError("new adapter publication is inconsistent")
-                staging = Path(staging_adapter_path)
-                if staging.exists():
-                    raise RuntimeError(f"Adapter staging generation exists: {staging}")
-                save_vllm_lora_snapshot(
-                    lora,
-                    str(staging),
-                    prepared_tensors=prepared_tensors,
-                )
-                adapter = publish_adapter_checkpoint(
-                    staging,
+                with adapter_publication_transaction(
+                    staging_adapter_path,
                     step=generation.policy_step,
                     training_session_id=generation.training_session_id,
                     generation_id=generation.generation_id,
-                )
+                ) as (staging, existing):
+                    adapter = existing
+                    if adapter is None:
+                        save_vllm_lora_snapshot(
+                            lora,
+                            str(staging),
+                            prepared_tensors=prepared_tensors,
+                        )
+                        adapter = publish_adapter_checkpoint(
+                            staging,
+                            step=generation.policy_step,
+                            training_session_id=generation.training_session_id,
+                            generation_id=generation.generation_id,
+                        )
         shard = (
             write_optimizer_snapshot_shard(
                 optimizer,
