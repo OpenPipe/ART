@@ -163,3 +163,46 @@ def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> Non
     response = TestClient(app).post("/sleep?level=1&mode=wait")
     assert response.status_code == 400
     assert response.json() == {"error": "invalid level=1 mode='wait'"}
+
+
+def test_launch_policy_version_resolves_loaded_slot_alias(monkeypatch) -> None:
+    monkeypatch.setitem(dedicated_server._runtime_state, "loaded_adapter", "policy@5")
+    monkeypatch.setitem(dedicated_server._runtime_state, "policy_version", 5)
+
+    assert (
+        dedicated_server._launch_policy_version_for_slot(
+            lora_slot="policy", public_model_name="policy@6"
+        )
+        == 5
+    )
+
+
+def test_kv_preflight_runs_before_pipeline_route_mutation(monkeypatch) -> None:
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enable_return_routed_experts=False),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=2,
+            distributed_executor_backend="mp",
+            data_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+        ),
+        use_v2_model_runner=False,
+        kv_transfer_config=SimpleNamespace(is_kv_transfer_instance=True),
+    )
+
+    class EngineArgs:
+        def create_engine_config(self):
+            return config
+
+    monkeypatch.setattr(
+        dedicated_server,
+        "_register_model_route_layout",
+        lambda _model_config: None,
+    )
+    dedicated_server._patch_engine_config(EngineArgs, pipeline_route_capture=True)
+
+    with pytest.raises(ValueError, match="KV connectors"):
+        EngineArgs().create_engine_config()
+
+    assert config.model_config.enable_return_routed_experts is False

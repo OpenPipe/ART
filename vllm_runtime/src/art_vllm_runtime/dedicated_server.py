@@ -130,6 +130,27 @@ def _lora_update_identity(body: _InFlightLoraUpdateRequest) -> dict[str, object]
     return body.model_dump(mode="python", exclude={"lora_path"})
 
 
+def _runtime_policy_version() -> int | None:
+    value = _runtime_state.get("policy_version")
+    return None if isinstance(value, bool) or not isinstance(value, int) else value
+
+
+def _launch_policy_version_for_slot(
+    *, lora_slot: str, public_model_name: str
+) -> int | None:
+    loaded = _runtime_state.get("loaded_adapter")
+    if not isinstance(loaded, str):
+        return None
+    loaded_slot = (
+        loaded.rsplit("@", 1)[0]
+        if "@" in loaded and loaded.rsplit("@", 1)[1].isdigit()
+        else loaded
+    )
+    if loaded in {lora_slot, public_model_name} or loaded_slot == lora_slot:
+        return _runtime_policy_version()
+    return None
+
+
 def _applied_lora_updates(models: Any) -> dict[str, _AppliedLoraUpdate]:
     updates = getattr(models, "_art_applied_lora_updates", None)
     if updates is None:
@@ -340,11 +361,19 @@ def _patch_art_runtime_routes() -> None:
                 content={
                     "runtime": "art_vllm",
                     "protocol_version": ART_SERVING_PROTOCOL_VERSION,
-                    "binary_routed_experts": True,
+                    "binary_routed_experts": bool(
+                        _runtime_state.get("binary_routed_experts", False)
+                    ),
                     "fast_metrics": {"url": _fast_metrics_url(raw_request)},
-                    "inplace_lora_load": True,
-                    "in_flight_lora_updates": True,
-                    "policy_token_spans": True,
+                    "inplace_lora_load": bool(
+                        _runtime_state.get("in_flight_lora_updates", False)
+                    ),
+                    "in_flight_lora_updates": bool(
+                        _runtime_state.get("in_flight_lora_updates", False)
+                    ),
+                    "policy_token_spans": bool(
+                        _runtime_state.get("policy_token_spans", False)
+                    ),
                 }
             )
 
@@ -433,6 +462,15 @@ def _patch_art_runtime_routes() -> None:
                             content={"error": "LoRA policy update is not newer"},
                             status_code=HTTPStatus.CONFLICT.value,
                         )
+                elif (
+                    launch_policy_version := _launch_policy_version_for_slot(
+                        lora_slot=lora_slot, public_model_name=public_model_name
+                    )
+                ) is not None and body.policy_version < launch_policy_version:
+                    return JSONResponse(
+                        content={"error": "LoRA policy update regresses launch policy"},
+                        status_code=HTTPStatus.CONFLICT.value,
+                    )
                 update_seq = await coordinator.begin_update(lora_slot)
                 mutation_started = False
                 try:
@@ -641,7 +679,7 @@ def _patch_art_runtime_routes() -> None:
     ) -> None:
         await original_init_app_state(engine_client, state, *args, **kwargs)
         policy_version = _runtime_state.get("initial_policy_version")
-        if policy_version is None:
+        if policy_version is None or _runtime_state.get("loaded_adapter") is None:
             return
         from art_vllm_runtime.policy_spans import declare_initial_lora_policy
 
@@ -711,9 +749,9 @@ def _patch_engine_config(
 
     def create(self: Any, *args: Any, **kwargs: Any) -> Any:
         config = create_engine_config(self, *args, **kwargs)
+        _validate_pipeline_route_config(config)
         config.model_config.enable_return_routed_experts = True
         _register_model_route_layout(config.model_config)
-        _validate_pipeline_route_config(config)
         return config
 
     create.__art_original__ = create_engine_config  # type: ignore[attr-defined]
@@ -805,6 +843,9 @@ def main(argv: list[str] | None = None) -> None:
         update_identity=args.update_identity,
         initial_policy_version=args.initial_policy_version,
         pp_layer_partition=pp_layer_partition,
+        binary_routed_experts=route_capture,
+        in_flight_lora_updates=args.rollout_weights_mode == "lora",
+        policy_token_spans=args.rollout_weights_mode == "lora",
     )
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
