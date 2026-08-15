@@ -700,7 +700,7 @@ async def _direct_vllm_runtime(
     )
     command = runtime.build_vllm_runtime_server_cmd(launch_config)
     log_path = artifact_dir / f"real_path_vllm_{served_model_name}.log"
-    env = os.environ.copy()
+    env = runtime._vllm_runtime_subprocess_env(command)
     env["PYTHONUNBUFFERED"] = "1"
     if forward_trace_dir is not None:
         trace_site = Path(__file__).resolve().parent / "vllm_forward_trace_site"
