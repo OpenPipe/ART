@@ -419,7 +419,7 @@ _THROUGHPUT_CONFIGS = {
         rollouts_per_group=20,
         groups_per_step=4,
         initial_model_calls_per_inference_gpu=5,
-        max_num_seqs=64,
+        max_num_seqs=80,
         max_num_batched_tokens=131_072,
         enable_prefix_caching=True,
     ),

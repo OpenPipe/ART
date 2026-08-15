@@ -1146,7 +1146,8 @@ def test_dsv4_throughput_uses_shorter_packed_sequence() -> None:
         dsv4.completion_tokens,
         dsv4.groups_per_step,
         dsv4.initial_model_calls_per_inference_gpu,
-    ) == (32_768, 14_651, 20, 70, 4, 5)
+        dsv4.max_num_seqs,
+    ) == (32_768, 14_651, 20, 70, 4, 5, 80)
     stage = HANDLER_WORKFLOW_RESOURCES["dsv4"].e2e_throughput
     llama_stage = HANDLER_WORKFLOW_RESOURCES["llama3_dense"].e2e_throughput
     assert stage is not None
