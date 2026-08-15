@@ -29,13 +29,10 @@ from ..model_support.workflow_resources import (
 # prefix route-conflict behavior on the measured path. With the workflow's
 # 16-token completions, Qwen3.5 MoE reruns on 2026-05-25 measured 4.169% and
 # 4.606% mean_abs_pct. Resident first-update policies on 2026-08-13/14 measured
-# 6.120-7.426% MAPE and 0.002258-0.004652 KL. Its 10%/0.005 gates cover that
-# natural learned-policy distribution while remaining tight enough for the
-# prior expert-LoRA defect to fail by a wide margin.
-# Four independently trained Qwen3.5 dense policies measured 7.986-10.887%
-# MAPE and 0.006147-0.007974 KL, with at least 0.960 top1 and 0.957 top20
-# agreement. Its architecture-specific gates cover policy-to-policy variance
-# while preserving those independent agreement checks.
+# 6.120-7.426% MAPE and 0.002258-0.004652 KL. Qwen3.5 dense initially appeared
+# to need a 15%/0.01 gate, but that was an architecture-blind FLA Triton
+# autotune-cache hit. An SM103-native cache made three equivalent Megatron
+# scores repeat exactly and measured 5.421% MAPE / 0.001600 KL against vLLM.
 # DeepSeek-V4-Flash uses FP4 vLLM kernels while Megatron materializes bf16/fp32
 # tensors, and its serving scores vary unusually strongly on an exact rescore.
 # The DSV4 fixture therefore uses 256-token-aligned root and branch blocks: its
@@ -45,22 +42,23 @@ from ..model_support.workflow_resources import (
 BF16_FWD_MEAN_ABS_PCT_LIMIT = 4.0
 BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
     "dsv4": 25.0,
-    # Exact deterministic dense replays reached 19.086% MAPE; vLLM generation
-    # versus its own prompt rescore reached 14.914%, ruling out adapter variance.
-    # Unique-path learned MoE policies reached 23.866% MAPE and 0.011330 KL.
-    "gemma4_dense": 20.0,
+    # Gemma dense's apparent 19.086% result had a completion-path collision;
+    # source matching reduced the same deterministic case to 14.093%. Learned
+    # dense policies reached 13.972%. Eight unique-path learned MoE policies
+    # reached 23.866% MAPE and 0.011330 KL.
+    "gemma4_dense": 15.0,
     "gemma4_moe": 25.0,
     "llama3_dense": 5.0,
     "qwen3_moe": 8.0,
-    "qwen3_5_dense": 15.0,
-    "qwen3_5_moe": 10.0,
+    "qwen3_5_dense": 7.0,
+    "qwen3_5_moe": 8.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT_BY_MODEL_KEY = {
     "dsv4": 0.07,
     "gemma4_dense": 0.008,
     "gemma4_moe": 0.012,
-    "qwen3_5_dense": 0.01,
+    "qwen3_5_dense": 0.003,
     "qwen3_5_moe": 0.005,
     # Real vLLM execution is intentionally not forced deterministic. This stays
     # tight enough to reject numerical defects without flaking on its KL tail.
