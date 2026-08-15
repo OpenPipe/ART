@@ -543,7 +543,10 @@ class ServerlessBackend:
             client = await self.training_client(model)
             page = await self._service.list_checkpoints(client.run_id)
             for checkpoint in page.checkpoints:
-                if checkpoint.learner_version not in keep:
+                if (
+                    checkpoint.learner_version not in keep
+                    and checkpoint.checkpoint_id != page.current_checkpoint_id
+                ):
                     await self._service.delete_checkpoint(
                         client.run_id, checkpoint.checkpoint_id
                     )
@@ -613,6 +616,13 @@ class ServerlessBackend:
             actual_steps = {checkpoint.learner_version for checkpoint in ready}
             if actual_steps != plan.observed_steps:
                 raise RuntimeError("remote checkpoint catalog changed during retention")
+            retain_checkpoint_ids = {
+                checkpoint.checkpoint_id
+                for checkpoint in ready
+                if checkpoint.learner_version in retained
+            }
+            if page.current_checkpoint_id is not None:
+                retain_checkpoint_ids.add(page.current_checkpoint_id)
             await self._service.apply_checkpoint_retention(
                 client.run_id,
                 ApplyCheckpointRetentionRequest(
@@ -623,11 +633,7 @@ class ServerlessBackend:
                         )
                         for checkpoint in ready
                     ),
-                    retain_checkpoint_ids=tuple(
-                        checkpoint.checkpoint_id
-                        for checkpoint in ready
-                        if checkpoint.learner_version in retained
-                    ),
+                    retain_checkpoint_ids=tuple(sorted(retain_checkpoint_ids)),
                     archive_checkpoint_ids=tuple(
                         checkpoint.checkpoint_id
                         for checkpoint in ready

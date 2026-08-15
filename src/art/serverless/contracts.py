@@ -316,6 +316,7 @@ class CheckpointView(Contract):
 
 class CheckpointPage(Contract):
     checkpoints: tuple[CheckpointView, ...]
+    current_checkpoint_id: str | None
 
 
 class CheckpointRevision(Contract):
