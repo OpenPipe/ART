@@ -12,6 +12,7 @@ from pathlib import Path
 import random
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 from typing import Any, AsyncIterator, Iterator, cast
@@ -37,6 +38,7 @@ from art.preprocessing.vllm_tokens import choice_vllm_token_metadata
 from .artifacts import REPO_ROOT
 from .output_parity import (
     TOP_K,
+    LogicalToken,
     LogicalTokenMap,
     PairComparison,
     RolloutMode,
@@ -648,8 +650,8 @@ def _choice_score_index(
     trajectory_groups: list[Any],
     *,
     require_routing_metadata: bool,
-) -> dict[tuple[int, ...], Choice]:
-    indexed: dict[tuple[int, ...], Choice] = {}
+) -> dict[tuple[int, ...], list[Choice]]:
+    indexed: dict[tuple[int, ...], list[Choice]] = {}
     for group in trajectory_groups:
         for trajectory in group:
             for item in trajectory.messages_and_choices:
@@ -666,7 +668,7 @@ def _choice_score_index(
                         "Real-path trajectory choice is missing exact vLLM token metadata"
                     )
                 prompt_ids, completion_ids = token_metadata
-                indexed.setdefault(tuple(prompt_ids + completion_ids), item)
+                indexed.setdefault(tuple(prompt_ids + completion_ids), []).append(item)
     return indexed
 
 
@@ -765,20 +767,62 @@ def _vllm_scores_from_real_choices(
         require_routing_metadata=require_routing_metadata,
     )
     prompt_by_id = {prompt.prompt_id: prompt for prompt in logical_map.prompts}
-    choice_by_prompt_id: dict[int, Choice] = {}
-    for prompt in logical_map.prompts:
-        choice = choices_by_tokens.get(tuple(prompt.token_ids))
-        if choice is None:
+    tokens_by_leaf: dict[tuple[int, int, int], list[LogicalToken]] = {}
+    for token in logical_map.tokens:
+        tokens_by_leaf.setdefault(
+            (token.sample_id, token.family_id, token.completion_id), []
+        ).append(token)
+    choice_by_leaf: dict[tuple[int, int, int], Choice] = {}
+    for leaf, tokens in tokens_by_leaf.items():
+        prompt = prompt_by_id[tokens[0].prompt_id]
+        choices = choices_by_tokens.get(tuple(prompt.token_ids))
+        if not choices:
             raise RuntimeError(
                 "Could not find captured vLLM choice for logical prompt "
                 f"{prompt.prompt_id}"
             )
-        choice_by_prompt_id[prompt.prompt_id] = choice
+        has_source_logprobs = all(token.source_logprob is not None for token in tokens)
+        if not has_source_logprobs and len(choices) != 1:
+            raise RuntimeError(
+                "Duplicate vLLM token paths require packed source logprobs"
+            )
+        matching = choices
+        if has_source_logprobs:
+            matching = []
+            for choice in choices:
+                entries = (
+                    choice.logprobs.content
+                    if choice.logprobs is not None
+                    and choice.logprobs.content is not None
+                    else []
+                )
+                for token in tokens:
+                    index = (
+                        token.vllm_prompt_token_index - prompt.scored_token_start_index
+                    )
+                    if (
+                        index < 0
+                        or index >= len(entries)
+                        or _parse_token_id(entries[index].token) != token.token_id
+                        or struct.pack("!f", float(entries[index].logprob))
+                        != struct.pack("!f", cast(float, token.source_logprob))
+                    ):
+                        break
+                else:
+                    matching.append(choice)
+        if not matching:
+            raise RuntimeError(
+                "No captured vLLM choice matches packed source logprobs for "
+                f"prompt {prompt.prompt_id}"
+            )
+        choice = matching[0]
+        choices.remove(choice)
+        choice_by_leaf[leaf] = choice
     target_logprobs: list[float] = []
     topk: list[TokenTopK] = []
     for token in logical_map.tokens:
         prompt = prompt_by_id[token.prompt_id]
-        choice = choice_by_prompt_id[token.prompt_id]
+        choice = choice_by_leaf[(token.sample_id, token.family_id, token.completion_id)]
         metadata = choice_moe_routing_metadata(choice)
         vllm_prompt_len = prompt.scored_token_start_index
         if (

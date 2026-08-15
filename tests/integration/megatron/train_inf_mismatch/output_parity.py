@@ -172,6 +172,7 @@ class LogicalToken(BaseModel):
     art_packed_token_index: int
     art_logit_index: int
     vllm_prompt_token_index: int
+    source_logprob: float | None = None
 
 
 class LogicalTokenMap(BaseModel):
@@ -580,6 +581,11 @@ def build_logical_token_map(packed_tensors: dict[str, Any]) -> LogicalTokenMap:
                         art_packed_token_index=packed_i,
                         art_logit_index=packed_i - 1,
                         vllm_prompt_token_index=prompt_len + (packed_i - leaf_start),
+                        source_logprob=(
+                            None
+                            if logprobs is None
+                            else float(logprobs[sample_id, packed_i])
+                        ),
                     )
                 )
 

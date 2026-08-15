@@ -18,6 +18,9 @@ from .output_parity import (
     TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
     TOP_K,
     EngineSide,
+    LogicalPrompt,
+    LogicalToken,
+    LogicalTokenMap,
     ScoreBundle,
     TokenTopK,
     TrainInfOutputParityConfig,
@@ -37,6 +40,7 @@ from .real_path import (
     _delete_adapter_safetensors_on_pass,
     _real_path_rollout_mode,
     _topk_from_chat_logprob,
+    _vllm_scores_from_real_choices,
 )
 
 
@@ -57,7 +61,79 @@ def test_choice_score_index_disambiguates_equal_completions_by_prompt() -> None:
 
     indexed = _choice_score_index(groups, require_routing_metadata=False)
 
-    assert indexed == {(1, 7): first, (2, 7): second}
+    assert indexed == {(1, 7): [first], (2, 7): [second]}
+
+
+def test_equal_token_paths_match_packed_source_logprobs() -> None:
+    def choice(score: float) -> Choice:
+        return Choice.model_validate(
+            {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {"role": "assistant", "content": "same"},
+                "prompt_token_ids": [1],
+                "token_ids": [7],
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": "token_id:7",
+                            "logprob": score,
+                            "top_logprobs": [{"token": "token_id:7", "logprob": score}],
+                        }
+                    ]
+                },
+            }
+        )
+
+    first, second = choice(-1.0), choice(-2.0)
+    groups = [[SimpleNamespace(messages_and_choices=[first, second])]]
+    logical_map = LogicalTokenMap(
+        prompts=[
+            LogicalPrompt(
+                prompt_id=0,
+                sample_id=0,
+                family_id=0,
+                completion_id=0,
+                packed_prompt_length=1,
+                scored_token_start_index=1,
+                token_ids=[1, 7],
+            )
+        ],
+        tokens=[
+            LogicalToken(
+                token_id=7,
+                sample_id=0,
+                family_id=0,
+                completion_id=0,
+                prompt_id=0,
+                art_packed_token_index=1,
+                art_logit_index=0,
+                vllm_prompt_token_index=1,
+                source_logprob=-2.0,
+            ),
+            LogicalToken(
+                token_id=7,
+                sample_id=0,
+                family_id=0,
+                completion_id=1,
+                prompt_id=0,
+                art_packed_token_index=2,
+                art_logit_index=1,
+                vllm_prompt_token_index=1,
+                source_logprob=-1.0,
+            ),
+        ],
+    )
+
+    scores = _vllm_scores_from_real_choices(
+        trajectory_groups=groups,
+        logical_map=logical_map,
+        require_routing_metadata=False,
+        weight_state="lora",
+        rollout_mode="native_lora",
+    )
+
+    assert scores.target_logprobs == [-2.0, -1.0]
 
 
 def _write_workflow_worker_result(
