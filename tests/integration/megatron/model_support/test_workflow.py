@@ -1147,7 +1147,7 @@ def test_dsv4_throughput_uses_shorter_packed_sequence() -> None:
         dsv4.groups_per_step,
         dsv4.initial_model_calls_per_inference_gpu,
         dsv4.max_num_seqs,
-    ) == (32_768, 14_651, 20, 78, 4, 6, 80)
+    ) == (32_768, 14_651, 20, 84, 4, 6, 80)
     stage = HANDLER_WORKFLOW_RESOURCES["dsv4"].e2e_throughput
     assert stage is not None
     assert not stage.exclusive_host
