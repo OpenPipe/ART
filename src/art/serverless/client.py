@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 import hashlib
-from typing import Any, Generic, Protocol, TypeVar, cast
+from typing import Any, Callable, Generic, Protocol, TypeVar, cast
 import uuid
 
 import httpx
@@ -63,6 +63,8 @@ from .data_plane import (
 
 ResultT = TypeVar("ResultT", bound=OperationResult)
 ResponseT = TypeVar("ResponseT", bound=Contract)
+_CREATE_RUN_RESOLVE_STATUSES = frozenset({409, 429, 500, 502, 503, 504})
+_MAX_RETAINED_COMPLETED_OPERATIONS = 1024
 
 
 class RouteObjectPublisher(Protocol):
@@ -139,9 +141,27 @@ class RemoteTrainingServiceClient:
         self._max_retries = max_retries
 
     async def create_run(self, request: CreateTrainingRunRequest) -> TrainingRunView:
-        return await self._request(
-            "POST", "training/runs", TrainingRunView, body=request
-        )
+        try:
+            return await self._request(
+                "POST",
+                "training/runs",
+                TrainingRunView,
+                body=request,
+                max_retries=0,
+            )
+        except (httpx.TransportError, RemoteTrainingHttpError) as error:
+            if (
+                isinstance(error, RemoteTrainingHttpError)
+                and error.status_code not in _CREATE_RUN_RESOLVE_STATUSES
+            ):
+                raise
+            try:
+                return await self.resolve_run(request)
+            except BaseException as resolve_error:
+                resolve_error.add_note(
+                    f"create_run failed before run-name resolve: {error!r}"
+                )
+                raise
 
     async def resolve_run(self, request: CreateTrainingRunRequest) -> TrainingRunView:
         return await self._request(
@@ -330,6 +350,7 @@ class RemoteTrainingServiceClient:
         response_type: type[ResponseT],
         *,
         body: Contract | None = None,
+        max_retries: int | None = None,
     ) -> ResponseT:
         content = None if body is None else body.model_dump_json()
         response = await self._send(
@@ -337,6 +358,7 @@ class RemoteTrainingServiceClient:
             path,
             content=content,
             headers=None if body is None else {"Content-Type": "application/json"},
+            max_retries=max_retries,
         )
         return response_type.model_validate(response.json())
 
@@ -348,10 +370,12 @@ class RemoteTrainingServiceClient:
         content: str | bytes | None,
         headers: dict[str, str] | None,
         transfer: bool = False,
+        max_retries: int | None = None,
     ) -> httpx.Response:
         client = self._transfer_client if transfer else self._control_client
         response: httpx.Response | None = None
-        for attempt in range(self._max_retries + 1):
+        retries = self._max_retries if max_retries is None else max_retries
+        for attempt in range(retries + 1):
             try:
                 response = await client.request(
                     method,
@@ -360,12 +384,12 @@ class RemoteTrainingServiceClient:
                     headers=headers,
                 )
             except httpx.TransportError:
-                if attempt == self._max_retries:
+                if attempt == retries:
                     raise
             else:
                 if response.status_code not in {429, 502, 503, 504}:
                     break
-                if attempt == self._max_retries:
+                if attempt == retries:
                     break
             await asyncio.sleep(min(0.1 * 2**attempt, 1.0))
         if response is None:
@@ -472,6 +496,7 @@ class RemoteTrainingOperation(Generic[ResultT]):
         service: RemoteTrainingServiceClient,
         events: _RunEventObserver,
         result_type: type[ResultT],
+        on_completion: Callable[[], None] | None = None,
     ) -> None:
         self._ref = ref
         self._service = service
@@ -479,6 +504,7 @@ class RemoteTrainingOperation(Generic[ResultT]):
         self._result_type = result_type
         self._completion: asyncio.Task[ResultT] | None = None
         self._cancel_request_id = uuid.uuid4().hex
+        self._on_completion = on_completion
 
     @property
     def ref(self) -> OperationRef:
@@ -489,6 +515,9 @@ class RemoteTrainingOperation(Generic[ResultT]):
             self._completion = asyncio.create_task(
                 self._wait(), name=f"remote-training-result-{self._ref.operation_id}"
             )
+            on_completion = self._on_completion
+            if on_completion is not None:
+                self._completion.add_done_callback(lambda _: on_completion())
         return await asyncio.shield(self._completion)
 
     async def _wait(self) -> ResultT:
@@ -789,12 +818,26 @@ class RemoteTrainingClient:
                 self._service,
                 self._events,
                 result_type,
+                on_completion=self._bound_operation_cache,
             )
             self._operations[request.request_id] = (fingerprint, operation)
+            self._bound_operation_cache()
             self._next_sequence_id += 1
             if ref.reserved_output_learner_version is not None:
                 self._projected_learner_version = ref.reserved_output_learner_version
             return operation
+
+    def _bound_operation_cache(self) -> None:
+        overflow = len(self._operations) - _MAX_RETAINED_COMPLETED_OPERATIONS
+        if overflow <= 0:
+            return
+        for request_id, (_fingerprint, operation) in tuple(self._operations.items()):
+            if overflow <= 0:
+                return
+            completion = operation._completion
+            if completion is not None and completion.done():
+                self._operations.pop(request_id, None)
+                overflow -= 1
 
     async def stage_rl_group(self, value: EncodedRlGroup) -> None:
         await self._stage_inputs((value.data,), value.routes, defer_prefetch=True)
@@ -835,7 +878,10 @@ class RemoteTrainingClient:
         defer_prefetch: bool = False,
     ) -> None:
         if routes and self._route_publisher is None:
-            raise RuntimeError("binary route objects require a route publisher")
+            raise RuntimeError(
+                "binary route objects require a route publisher; pass "
+                "route_object_publisher when enabling remote MoE routing replay"
+            )
         route_refs = tuple(value.ref for value in routes)
         try:
             async with asyncio.TaskGroup() as tasks:

@@ -26,6 +26,7 @@ from art.distributed.rollout import (
 )
 from art.distributed.trajectory_store import TrajectoryGroupBundle, TrajectoryGroupRef
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
+from art.preprocessing.sft import SftBatchTokenizer
 from art.serving_capabilities import discover_serving_capabilities
 from art.training.client import TrainingOperation
 from art.training.contracts import (
@@ -72,6 +73,14 @@ if TYPE_CHECKING:
         CheckpointRetentionPlan,
         CheckpointRetentionStrategy,
     )
+
+
+_SERVERLESS_KL_REFERENCE_BLOCKER = (
+    "serverless KL references require a remote checkpoint-to-reference-adapter "
+    "contract. The current training command schema only carries named RL losses "
+    "('cispo'/'ppo') plus scalar KL fields and does not expose a named KL loss or "
+    "reference checkpoint resolver."
+)
 
 
 class SamplerManager(Protocol):
@@ -165,9 +174,7 @@ class _ServerlessTrainSettings(BaseModel):
         if self.kl_ref_adapter_path is not None:
             raise ValueError("remote training does not accept client filesystem paths")
         if self.kl_penalty_reference_step is not None:
-            raise NotImplementedError(
-                "remote KL checkpoint resolution is not implemented"
-            )
+            raise NotImplementedError(_SERVERLESS_KL_REFERENCE_BLOCKER)
         return self
 
     def resolve(self) -> tuple[TrainConfig, LossConfig]:
@@ -245,8 +252,6 @@ class ServerlessBackend:
             raise ValueError("restore_optimizer requires checkpoint")
         if close_timeout_s <= 0:
             raise ValueError("close_timeout_s must be positive")
-        if enable_expert_replay and route_object_publisher is None:
-            raise ValueError("expert replay requires a binary route object publisher")
         self._service = RemoteTrainingServiceClient(
             api_key=api_key,
             base_url=training_base_url,
@@ -1246,56 +1251,85 @@ class ServerlessBackend:
         batch_size = resolve_sft_batch_size(
             batch_size=config.batch_size, default_batch_size=2
         )
-        batches = [
+        raw_batches = [
             values[index : index + batch_size]
             for index in range(0, len(values), batch_size)
         ]
-        rates = (
-            config.learning_rate
-            if isinstance(config.learning_rate, list)
-            else [config.learning_rate] * len(batches)
-        )
-        if len(rates) != len(batches):
-            raise ValueError("SFT learning-rate schedule must match batch count")
+        if isinstance(config.learning_rate, list):
+            rates = [float(value) for value in config.learning_rate]
+            scalar_learning_rate = None
+        else:
+            rates = None
+            scalar_learning_rate = float(config.learning_rate)
+        tokenizer = SftBatchTokenizer()
+        batches: list[tuple[list[Trajectory], float]] = []
+        total_dropped = 0
+        total_trainable_tokens = 0
+        for raw_batch in raw_batches:
+            if rates is not None and len(batches) >= len(rates):
+                raise ValueError("SFT learning-rate schedule ended before SFT data")
+            if rates is None:
+                assert scalar_learning_rate is not None
+                learning_rate = scalar_learning_rate
+            else:
+                learning_rate = rates[len(batches)]
+            tokenized = await asyncio.to_thread(
+                tokenizer.tokenize,
+                model,
+                tuple(raw_batch),
+                assistant_turns=config.assistant_turns,
+                learning_rate=learning_rate,
+            )
+            total_dropped += tokenized.num_dropped_trajectories
+            if tokenized.num_trainable_tokens < 1:
+                continue
+            total_trainable_tokens += tokenized.num_trainable_tokens
+            batches.append((raw_batch, learning_rate))
+        if not batches:
+            return
         client = await self.training_client(model)
-        pending: dict[str, float] | None = None
-        for batch, learning_rate in zip(batches, rates, strict=True):
+        forwards: list[TrainingOperation[ForwardBackwardResult]] = []
+        for batch, _learning_rate in batches:
             sequence = client.next_sequence_id
-            forward = await client.forward_backward(
-                ForwardBackwardRequest(
-                    run_id=client.run_id,
-                    request_id=uuid.uuid4().hex,
-                    sequence_id=sequence,
-                    batch=SupervisedTrajectoryBatch(
-                        trajectories=tuple(batch),
-                        assistant_turns=config.assistant_turns,
-                    ),
-                    loss=LossConfig(name="cross_entropy"),
+            forwards.append(
+                await client.forward_backward(
+                    ForwardBackwardRequest(
+                        run_id=client.run_id,
+                        request_id=uuid.uuid4().hex,
+                        sequence_id=sequence,
+                        batch=SupervisedTrajectoryBatch(
+                            trajectories=tuple(batch),
+                            assistant_turns=config.assistant_turns,
+                        ),
+                        loss=LossConfig(name="cross_entropy"),
+                    )
                 )
             )
-            optimizer = await client.optim_step(
-                OptimStepRequest(
-                    run_id=client.run_id,
-                    request_id=uuid.uuid4().hex,
-                    sequence_id=sequence + 1,
-                    optimizer=AdamConfig(learning_rate=learning_rate),
-                )
+        sequence = client.next_sequence_id
+        optimizer = await client.optim_step(
+            OptimStepRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=sequence,
+                optimizer=AdamConfig(learning_rate=batches[0][1]),
             )
-            forward_result, optimizer_result = await asyncio.gather(
-                forward.result(), optimizer.result()
-            )
-            if pending is not None:
-                yield pending
-            pending = {
-                **merge_gradient_step_metrics(
-                    forward_result.metrics, optimizer_result.metrics
+        )
+        forward_results = await asyncio.gather(
+            *(forward.result() for forward in forwards)
+        )
+        optimizer_result = await optimizer.result()
+        pending = {
+            **merge_gradient_step_metrics(
+                _aggregate_sft_forward_metrics(
+                    tuple(result.metrics for result in forward_results)
                 ),
-                **_packing_outcome_metrics(forward_result.packing),
-                "data/step_num_trajectories": float(len(values)),
-                "data/step_num_dropped_trajectories": 0.0,
-                TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
-            }
-        assert pending is not None
+                optimizer_result.metrics,
+            ),
+            "data/step_num_trajectories": float(len(values)),
+            "data/step_trainable_assistant_tokens": float(total_trainable_tokens),
+            "data/step_num_dropped_trajectories": float(total_dropped),
+            TRAIN_GRADIENT_STEPS_KEY: float(len(forward_results)),
+        }
         sequence = client.next_sequence_id
         step = client.projected_learner_version
         sampler = await client.save_weights_for_sampler(
@@ -1394,6 +1428,29 @@ def _attach_packing_shapes(
         raise RuntimeError("remote packing shapes do not match trajectory groups")
     for group, shape in zip(groups, shapes, strict=True):
         group._packed_group_shape = shape
+
+
+def _aggregate_sft_forward_metrics(
+    samples: tuple[dict[str, float], ...],
+) -> dict[str, float]:
+    if not samples:
+        raise ValueError("SFT optimizer requires at least one forward/backward result")
+    result = dict(samples[-1])
+    additive = {
+        "time/forward_backward_s",
+        "data/gradient_step_nonpadding_logical_tokens",
+        "data/gradient_step_loss_bearing_tokens",
+        "data/gradient_step_executed_token_equivalents",
+        "data/gradient_step_nominal_schedule_capacity_tokens",
+        "data/gradient_step_dummy_executed_token_equivalents",
+        "data/gradient_step_dummy_schedule_capacity_tokens",
+        "pipeline/gradient_step_real_microbatches",
+        "pipeline/gradient_step_dummy_microbatches",
+    }
+    for key in additive:
+        if any(key in sample for sample in samples):
+            result[key] = sum(sample.get(key, 0.0) for sample in samples)
+    return result
 
 
 def _source_version_range(
