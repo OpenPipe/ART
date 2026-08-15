@@ -92,6 +92,7 @@ class _ActorEventSink:
 _SUPERVISION_LOCK = Lock()
 _SUPERVISION_HANDLERS: dict[str, "MonarchTrainerSupervision"] = {}
 _SUPERVISION_MESHES: dict[str, "MonarchTrainerSupervision"] = {}
+_EXPECTED_STOPPED_MESH_FAILURES: dict[str, float] = {}
 _PREVIOUS_FAULT_HOOK: Callable[[MeshFailure], None] | None = None
 
 
@@ -159,6 +160,11 @@ class _TrainerRankReady(BaseModel):
 def _dispatch_trainer_fault(failure: MeshFailure) -> None:
     message = str(failure)
     with _SUPERVISION_LOCK:
+        now = time.monotonic()
+        for mesh_name, deadline in tuple(_EXPECTED_STOPPED_MESH_FAILURES.items()):
+            if deadline <= now:
+                _EXPECTED_STOPPED_MESH_FAILURES.pop(mesh_name)
+        expected_stop = failure.mesh_name in _EXPECTED_STOPPED_MESH_FAILURES
         owner = _SUPERVISION_MESHES.get(failure.mesh_name)
         handlers = (
             (owner,)
@@ -170,12 +176,34 @@ def _dispatch_trainer_fault(failure: MeshFailure) -> None:
             )
         )
         previous = _PREVIOUS_FAULT_HOOK
+        _restore_fault_hook_locked()
+    if expected_stop:
+        return
     if handlers:
         for handler in handlers:
             handler.notify(message)
         return
     if previous is not None:
         previous(failure)
+
+
+def _restore_fault_hook_locked() -> None:
+    global _PREVIOUS_FAULT_HOOK
+    if _SUPERVISION_HANDLERS or _EXPECTED_STOPPED_MESH_FAILURES:
+        return
+    if monarch_actor.unhandled_fault_hook is _dispatch_trainer_fault:
+        assert _PREVIOUS_FAULT_HOOK is not None
+        setattr(monarch_actor, "unhandled_fault_hook", _PREVIOUS_FAULT_HOOK)
+    _PREVIOUS_FAULT_HOOK = None
+
+
+def _expire_expected_stopped_mesh_failures() -> None:
+    with _SUPERVISION_LOCK:
+        now = time.monotonic()
+        for mesh_name, deadline in tuple(_EXPECTED_STOPPED_MESH_FAILURES.items()):
+            if deadline <= now:
+                _EXPECTED_STOPPED_MESH_FAILURES.pop(mesh_name)
+        _restore_fault_hook_locked()
 
 
 class MonarchTrainerSupervision:
@@ -192,7 +220,7 @@ class MonarchTrainerSupervision:
         with _SUPERVISION_LOCK:
             if self.token in _SUPERVISION_HANDLERS:
                 raise RuntimeError(f"trainer run {run_id!r} is already supervised")
-            if not _SUPERVISION_HANDLERS:
+            if monarch_actor.unhandled_fault_hook is not _dispatch_trainer_fault:
                 _PREVIOUS_FAULT_HOOK = monarch_actor.unhandled_fault_hook
                 setattr(
                     monarch_actor,
@@ -223,8 +251,9 @@ class MonarchTrainerSupervision:
     async def wait(self) -> str:
         return await asyncio.shield(self._failure)
 
-    def close(self) -> None:
-        global _PREVIOUS_FAULT_HOOK
+    def close(self, *, suppress_owned_mesh_faults_s: float = 0.0) -> None:
+        if suppress_owned_mesh_faults_s < 0:
+            raise ValueError("mesh-fault suppression duration must be non-negative")
         with _SUPERVISION_LOCK:
             if self._closed:
                 return
@@ -234,15 +263,16 @@ class MonarchTrainerSupervision:
             for mesh_name in self._mesh_names:
                 if _SUPERVISION_MESHES.get(mesh_name) is self:
                     _SUPERVISION_MESHES.pop(mesh_name)
-            if not _SUPERVISION_HANDLERS:
-                if monarch_actor.unhandled_fault_hook is _dispatch_trainer_fault:
-                    assert _PREVIOUS_FAULT_HOOK is not None
-                    setattr(
-                        monarch_actor,
-                        "unhandled_fault_hook",
-                        _PREVIOUS_FAULT_HOOK,
+                if suppress_owned_mesh_faults_s:
+                    _EXPECTED_STOPPED_MESH_FAILURES[mesh_name] = (
+                        time.monotonic() + suppress_owned_mesh_faults_s
                     )
-                _PREVIOUS_FAULT_HOOK = None
+            _restore_fault_hook_locked()
+        if suppress_owned_mesh_faults_s:
+            self._loop.call_later(
+                suppress_owned_mesh_faults_s,
+                _expire_expected_stopped_mesh_failures,
+            )
 
 
 class _TrainerSPMDActor(SPMDActor):
@@ -1464,8 +1494,11 @@ class MonarchTrainerSlot:
             )
 
             def stopped(task: asyncio.Task[None]) -> None:
-                if not task.cancelled() and task.exception() is None:
-                    self._supervision.close()
+                self._supervision.close(
+                    suppress_owned_mesh_faults_s=self._shutdown_timeout_s
+                )
+                if not task.cancelled():
+                    task.exception()
 
             self._stop_task.add_done_callback(stopped)
         await asyncio.wait_for(
@@ -2579,8 +2612,11 @@ class MonarchTrainerRun:
             )
 
             def stopped(task: asyncio.Task[None]) -> None:
-                if not task.cancelled() and task.exception() is None:
-                    self._supervision.close()
+                self._supervision.close(
+                    suppress_owned_mesh_faults_s=self.run_spec.shutdown_timeout_s
+                )
+                if not task.cancelled():
+                    task.exception()
 
             self._stop_task.add_done_callback(stopped)
         await asyncio.wait_for(

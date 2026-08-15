@@ -967,7 +967,9 @@ class ArtRuntime:
                     [startup_error, cleanup_error],
                 ) from None
             finally:
-                supervision.close()
+                supervision.close(
+                    suppress_owned_mesh_faults_s=self.topology.cluster.rpc_timeout_s
+                )
             raise
         return actors, proc, supervision, rank_processes
 
