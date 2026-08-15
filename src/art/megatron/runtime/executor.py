@@ -804,6 +804,7 @@ class MCoreRunSlotExecutor:
                     job.run_id
                 )
             ),
+            snapshot_optimizer=job.restore_optimizer,
         )
         return {
             "operation_id": job.operation_id,
@@ -836,6 +837,7 @@ class MCoreRunSlotExecutor:
                         job.run_id
                     )
                 ),
+                snapshot_optimizer=job.save_optimizer,
             )
         metrics = {
             **stage_metrics,
@@ -911,7 +913,7 @@ class _ResolvedGeneration(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     lora: Any | None
-    optimizer: Any
+    optimizer: Any | None
     prepared_tensors: PreparedSafetensors | None
 
 
@@ -993,6 +995,7 @@ class _GenerationPublisher:
         adapter_config: dict[str, Any],
         slot_ref: "LoRASlotRef | None" = None,
         trainer_rank_optimizer_state: "TrainerRankOptimizerState | None" = None,
+        snapshot_optimizer: bool = True,
     ) -> dict[str, float]:
         from art.megatron.optimizer_state import (
             stage_optimizer_state_snapshot,
@@ -1018,26 +1021,32 @@ class _GenerationPublisher:
             )
             lora_launch_s = time.perf_counter() - prepare_started
             optimizer_started = time.perf_counter()
-            if slot_ref is not None:
-                if trainer_rank_optimizer_state is None:
-                    raise RuntimeError("dynamic LoRA snapshot has no optimizer state")
-                optimizer = stage_trainer_rank_optimizer_state_snapshot(
-                    self.runtime,
-                    trainer_rank_optimizer_state,
-                    generation_id=generation.generation_id,
-                    step=generation.policy_step,
-                    stager=self.stager,
-                )
+            if snapshot_optimizer:
+                if slot_ref is not None:
+                    if trainer_rank_optimizer_state is None:
+                        raise RuntimeError(
+                            "dynamic LoRA snapshot has no optimizer state"
+                        )
+                    optimizer = stage_trainer_rank_optimizer_state_snapshot(
+                        self.runtime,
+                        trainer_rank_optimizer_state,
+                        generation_id=generation.generation_id,
+                        step=generation.policy_step,
+                        stager=self.stager,
+                    )
+                else:
+                    optimizer = stage_optimizer_state_snapshot(
+                        self.runtime,
+                        generation_id=generation.generation_id,
+                        step=generation.policy_step,
+                        stager=self.stager,
+                    )
             else:
-                optimizer = stage_optimizer_state_snapshot(
-                    self.runtime,
-                    generation_id=generation.generation_id,
-                    step=generation.policy_step,
-                    stager=self.stager,
-                )
+                optimizer = None
             if lora is not None:
                 self.runtime.optimizer_snapshot_barrier.register(lora)
-            self.runtime.optimizer_snapshot_barrier.register(optimizer)
+            if optimizer is not None:
+                self.runtime.optimizer_snapshot_barrier.register(optimizer)
             optimizer_launch_s = time.perf_counter() - optimizer_started
             resolved = self._resolution_pool.submit(
                 self._resolve_generation, lora, optimizer
@@ -1141,6 +1150,7 @@ class _GenerationPublisher:
                 generation=generation,
                 adapter_dtypes=adapter_dtypes,
                 adapter_config=adapter_config,
+                snapshot_optimizer=save_optimizer,
             ),
             **self.submit(
                 generation=generation,
@@ -1210,7 +1220,7 @@ class _GenerationPublisher:
 
     def _resolve_generation(self, lora: Any, optimizer: Any) -> _ResolvedGeneration:
         lora = None if lora is None else lora.resolve()
-        optimizer = optimizer.resolve()
+        optimizer = None if optimizer is None else optimizer.resolve()
         prepared_tensors = None
         if lora is not None:
             layout_key = tuple(
@@ -1279,6 +1289,8 @@ class _GenerationPublisher:
         started = time.perf_counter()
         snapshot = resolved.result()
         ready = time.perf_counter()
+        if save_optimizer and snapshot.optimizer is None:
+            raise RuntimeError("optimizer persistence requires an optimizer snapshot")
         result = self._persist_generation(
             generation=generation,
             optimizer_state_path=optimizer_state_path,
