@@ -554,8 +554,11 @@ class ArtHostService(Actor):
 
             log_future = asyncio.get_running_loop().run_in_executor(None, write_log)
         packing_started = time.monotonic()
+        packing_lock_wait_s = 0.0
+        packing_compute_s = 0.0
         try:
             async with self._packing_lock:
+                packing_lock_wait_s = time.monotonic() - packing_started
                 if self._packer is None:
                     from art.megatron.backend import MegatronBackend
 
@@ -565,6 +568,7 @@ class ArtHostService(Actor):
                     )
                 packer = self._packer
                 assert packer is not None
+                packing_compute_started = time.monotonic()
                 packed, cancelled = await complete_to_thread(
                     lambda: packer._get_packed_tensors(
                         request.model.build(),
@@ -582,6 +586,7 @@ class ArtHostService(Actor):
                         include_moe_routing=request.include_moe_routing,
                     )
                 )
+                packing_compute_s = time.monotonic() - packing_compute_started
                 if cancelled is not None:
                     raise cancelled
         except BaseException as error:
@@ -619,6 +624,8 @@ class ArtHostService(Actor):
                 trajectory_receive_s=trajectory_receive_s,
                 trajectory_build_s=trajectory_build_s,
                 packing_core_s=packing_core_s,
+                packing_lock_wait_s=packing_lock_wait_s,
+                packing_compute_s=packing_compute_s,
                 trajectory_log_wait_s=trajectory_log_wait_s,
             )
         trainable_assistant_tokens = int(packed["assistant_mask"].sum().item())
@@ -646,6 +653,8 @@ class ArtHostService(Actor):
             trajectory_receive_s=trajectory_receive_s,
             trajectory_build_s=trajectory_build_s,
             packing_core_s=packing_core_s,
+            packing_lock_wait_s=packing_lock_wait_s,
+            packing_compute_s=packing_compute_s,
             trajectory_log_wait_s=trajectory_log_wait_s,
             packed_batch_finalize_s=packed_batch_finalize_s,
         )

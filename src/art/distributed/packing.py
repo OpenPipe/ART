@@ -368,6 +368,8 @@ class PackingResult(BaseModel):
     trajectory_receive_s: float = Field(default=0.0, ge=0)
     trajectory_build_s: float = Field(default=0.0, ge=0)
     packing_core_s: float = Field(default=0.0, ge=0)
+    packing_lock_wait_s: float = Field(default=0.0, ge=0)
+    packing_compute_s: float = Field(default=0.0, ge=0)
     trajectory_log_wait_s: float = Field(default=0.0, ge=0)
     packed_batch_finalize_s: float = Field(default=0.0, ge=0)
     generation_id: str = Field(min_length=1)

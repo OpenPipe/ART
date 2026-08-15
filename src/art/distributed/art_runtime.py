@@ -95,6 +95,8 @@ class DistributedPackedBatch(BaseModel):
     trajectory_receive_s: float = 0.0
     trajectory_build_s: float = 0.0
     packing_core_s: float = 0.0
+    packing_lock_wait_s: float = 0.0
+    packing_compute_s: float = 0.0
     trajectory_log_wait_s: float = 0.0
     packed_batch_finalize_s: float = 0.0
     packed_batch_fanout_s: float = 0.0
@@ -819,6 +821,8 @@ class ArtRuntime:
             trajectory_receive_s=result.trajectory_receive_s,
             trajectory_build_s=result.trajectory_build_s,
             packing_core_s=result.packing_core_s,
+            packing_lock_wait_s=result.packing_lock_wait_s,
+            packing_compute_s=result.packing_compute_s,
             trajectory_log_wait_s=result.trajectory_log_wait_s,
             packed_batch_finalize_s=result.packed_batch_finalize_s,
             packed_batch_fanout_s=packed_batch_fanout_s,
