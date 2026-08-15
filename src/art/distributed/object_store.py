@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
+from io import BytesIO
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -85,11 +86,18 @@ class BinaryObjectMaterialization(_ObjectModel):
     path: str = Field(min_length=1)
 
 
+class BinaryObjectContents(_ObjectModel):
+    ref: BinaryObjectRef
+    file: BinaryObjectFile
+    data: bytes = Field(min_length=1)
+
+
 class S3BinaryObjectStore:
     """Publish immutable binary trees by committing their manifest last."""
 
     def __init__(self, config: S3ObjectStoreConfig) -> None:
         import boto3
+        from boto3.s3.transfer import TransferConfig
         from botocore.config import Config
 
         self.config = config
@@ -113,6 +121,11 @@ class S3BinaryObjectStore:
         self._parts = ThreadPoolExecutor(
             max_workers=config.multipart_concurrency,
             thread_name_prefix="art-s3-part",
+        )
+        self._transfer = TransferConfig(
+            multipart_threshold=config.multipart_chunk_bytes,
+            multipart_chunksize=config.multipart_chunk_bytes,
+            max_concurrency=config.multipart_concurrency,
         )
         self._lock = Lock()
         self._closed = False
@@ -191,6 +204,9 @@ class S3BinaryObjectStore:
         resolved = self.resolve(ref.manifest_uri)
         if resolved != ref:
             raise RuntimeError("binary object manifest changed before materialization")
+        return self._materialize(ref, destination)
+
+    def _materialize(self, ref: BinaryObjectRef, destination: str | Path) -> Path:
         root = Path(destination)
         root.mkdir(parents=True, exist_ok=False)
         bucket, manifest_key = _parse_s3_uri(ref.manifest_uri)
@@ -200,7 +216,10 @@ class S3BinaryObjectStore:
                 target = root / file.relative_path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 self._client.download_file(
-                    bucket, f"{prefix}/{file.relative_path}", str(target)
+                    bucket,
+                    f"{prefix}/{file.relative_path}",
+                    str(target),
+                    Config=self._transfer,
                 )
                 if (
                     target.stat().st_size != file.byte_count
@@ -215,6 +234,24 @@ class S3BinaryObjectStore:
             shutil.rmtree(root, ignore_errors=True)
             raise
         return root
+
+    def _read_file(self, ref: BinaryObjectRef, file: BinaryObjectFile) -> bytes:
+        bucket, manifest_key = _parse_s3_uri(ref.manifest_uri)
+        prefix = str(PurePosixPath(manifest_key).parent)
+        buffer = BytesIO()
+        self._client.download_fileobj(
+            bucket,
+            f"{prefix}/{file.relative_path}",
+            buffer,
+            Config=self._transfer,
+        )
+        data = buffer.getvalue()
+        if (
+            len(data) != file.byte_count
+            or hashlib.sha256(data).hexdigest() != file.sha256
+        ):
+            raise RuntimeError(f"binary object file changed: {file.relative_path}")
+        return data
 
     def delete(self, ref: BinaryObjectRef) -> None:
         bucket, key = self._require_manifest_uri(ref.manifest_uri)
@@ -347,16 +384,9 @@ class S3BinaryObjectReceiver:
         with self._lock:
             if self._closed:
                 raise RuntimeError("binary object receiver is closed")
-        ref = self._store.resolve(manifest_uri)
-        assert ref is not None
-        if ref.format != expected_format:
-            raise RuntimeError("binary object format does not match its consumer")
-        if any(
-            ref.metadata.get(key) != value for key, value in expected_metadata.items()
-        ):
-            raise RuntimeError("binary object metadata does not match its consumer")
+        ref = self._resolve(manifest_uri, expected_format, expected_metadata)
         destination = self.receive_root / f".receive-{uuid4().hex}"
-        self._store.materialize(ref, destination)
+        self._store._materialize(ref, destination)
         with self._lock:
             if self._closed:
                 shutil.rmtree(destination, ignore_errors=True)
@@ -365,6 +395,30 @@ class S3BinaryObjectReceiver:
                 )
             self._active.add(destination)
         return BinaryObjectMaterialization(ref=ref, path=str(destination))
+
+    def read_file(
+        self,
+        manifest_uri: str,
+        *,
+        expected_format: str,
+        expected_metadata: dict[str, str],
+        relative_path: str,
+    ) -> BinaryObjectContents:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("binary object receiver is closed")
+        ref = self._resolve(manifest_uri, expected_format, expected_metadata)
+        matches = tuple(
+            file for file in ref.files if file.relative_path == relative_path
+        )
+        if len(matches) != 1:
+            raise RuntimeError(
+                "binary object does not contain exactly one requested file"
+            )
+        file = matches[0]
+        return BinaryObjectContents(
+            ref=ref, file=file, data=self._store._read_file(ref, file)
+        )
 
     def release(self, materialization: BinaryObjectMaterialization) -> None:
         path = self._managed_path(materialization.path)
@@ -406,6 +460,22 @@ class S3BinaryObjectReceiver:
         if path.parent != self.receive_root or not path.name.startswith(".receive-"):
             raise RuntimeError("binary object materialization leaves its receive root")
         return path
+
+    def _resolve(
+        self,
+        manifest_uri: str,
+        expected_format: str,
+        expected_metadata: dict[str, str],
+    ) -> BinaryObjectRef:
+        ref = self._store.resolve(manifest_uri)
+        assert ref is not None
+        if ref.format != expected_format:
+            raise RuntimeError("binary object format does not match its consumer")
+        if any(
+            ref.metadata.get(key) != value for key, value in expected_metadata.items()
+        ):
+            raise RuntimeError("binary object metadata does not match its consumer")
+        return ref
 
 
 def binary_object_manifest_uri(target: BinaryObjectTarget) -> str:
