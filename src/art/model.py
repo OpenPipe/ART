@@ -1,4 +1,3 @@
-import asyncio
 from contextlib import contextmanager, nullcontext
 from contextvars import Token
 from datetime import datetime
@@ -31,7 +30,6 @@ from .metrics_taxonomy import (
     SFT_GRADIENT_STEP_KEY,
     SFT_METRIC_PREFIX,
     SFT_WANDB_GRADIENT_STEP_KEY,
-    TRAIN_GRADIENT_STEPS_KEY,
     average_metric_samples,
     build_data_metrics_from_summary,
     summarize_trajectory_groups,

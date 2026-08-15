@@ -397,21 +397,6 @@ def _is_lora_wrapped_linear(module: Any) -> bool:
     )
 
 
-def _apply_lora_to_existing_linear_output(
-    module: Any,
-    x: Any,
-    output: Any,
-) -> Any:
-    if not _is_lora_wrapped_linear(module):
-        return output
-    wrapper = module.punica_wrapper
-    if getattr(wrapper, "no_lora", False):
-        return output
-    if getattr(wrapper, "indices_len", [None])[0] is None:
-        return output
-    return module._apply_lora_to_output(x, output)
-
-
 def _register_dsv4_lora_expand_fp32_output_op() -> None:
     if getattr(_register_dsv4_lora_expand_fp32_output_op, "_registered", False):
         return

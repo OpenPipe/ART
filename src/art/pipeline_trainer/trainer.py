@@ -18,7 +18,6 @@ from typing import (
     AsyncIterator,
     Generic,
     Iterable,
-    Mapping,
     Sequence,
     TypeVar,
     cast,

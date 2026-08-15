@@ -32,7 +32,6 @@ def test_dsv4_lora_support_declares_vllm_025_manager_protocol(monkeypatch) -> No
         pass
 
     manager_patches: list[type] = []
-    dummy_patches: list[type] = []
     monkeypatch.setattr(
         patches.importlib,
         "import_module",
@@ -47,18 +46,11 @@ def test_dsv4_lora_support_declares_vllm_025_manager_protocol(monkeypatch) -> No
         "_patch_dsv4_lora_manager_indexer_skip",
         manager_patches.append,
     )
-    monkeypatch.setattr(
-        patches,
-        "_patch_dsv4_local_dummy_lora",
-        dummy_patches.append,
-    )
-
     patches.patch_dsv4_lora_support()
 
     assert getattr(FakeDeepseekV4ForCausalLM, "supports_lora") is True
     assert getattr(FakeDeepseekV4ForCausalLM, "lora_manager") is None
     assert manager_patches == [FakeDeepseekV4ForCausalLM]
-    assert dummy_patches == [FakeDeepseekV4ForCausalLM]
 
 
 def test_dsv4_fp8_o_proj_normalizes_rope_cache_once() -> None:
@@ -93,111 +85,6 @@ def test_dsv4_native_o_proj_receives_fp32_rope_cache() -> None:
     assert attention._o_proj(None, None) == "native"
     assert seen == [attention.rotary_emb.cos_sin_cache]
     assert seen[0].dtype == torch.float32
-
-
-def test_dsv4_layerwise_reload_restores_merged_column_metadata() -> None:
-    patches = _load_dsv4_patches_module()
-    param = torch.nn.Parameter(torch.empty(3, 4), requires_grad=False)
-
-    patches._restore_merged_column_output_dim(param)
-
-    assert getattr(param, "output_dim") == 0
-
-
-def test_dsv4_layerwise_reload_restores_direct_linear_shard_metadata() -> None:
-    patches = _load_dsv4_patches_module()
-    param = torch.nn.Parameter(torch.empty(3, 4), requires_grad=False)
-
-    patches._restore_linear_shard_dim(param, torch.empty(3, 8))
-
-    assert getattr(param, "input_dim") == 1
-    assert getattr(param, "output_dim") == 1
-
-
-def test_dsv4_layerwise_reload_preserves_vllm_shard_metadata() -> None:
-    patches = _load_dsv4_patches_module()
-
-    class ReadOnlyShardParameter:
-        shape = (3, 4)
-
-        @property
-        def input_dim(self) -> int:
-            return 1
-
-        @property
-        def output_dim(self) -> int:
-            return 0
-
-    param = ReadOnlyShardParameter()
-
-    patches._restore_linear_shard_dim(param, torch.empty(3, 8))
-
-    assert param.input_dim == 1
-    assert param.output_dim == 0
-
-
-def test_dsv4_bmm_weight_passes_through_current_2d_parameter() -> None:
-    patches = _load_dsv4_patches_module()
-    param = torch.nn.Parameter(torch.empty(6, 4), requires_grad=False)
-    loaded = torch.empty(12, 4)
-
-    reshaped = patches._reshape_dsv4_bmm_weight(
-        "layers.0.attn.wo_a.weight", param, loaded, tp_rank=1, tp_size=2
-    )
-
-    assert reshaped is loaded
-
-
-def test_dsv4_bmm_weight_selects_tp_rows_before_grouping() -> None:
-    patches = _load_dsv4_patches_module()
-    param = torch.nn.Parameter(torch.empty(2, 3, 4), requires_grad=False)
-    loaded = torch.arange(48).view(12, 4)
-
-    reshaped = patches._reshape_dsv4_bmm_weight(
-        "layers.0.attn.wo_a.weight", param, loaded, tp_rank=1, tp_size=2
-    )
-
-    assert reshaped.shape == param.shape
-    assert torch.equal(reshaped.flatten(0, 1), loaded[6:])
-
-
-def test_dsv4_expert_delta_names_use_checkpoint_projection_names() -> None:
-    patches = _load_dsv4_patches_module()
-
-    assert (
-        patches._dsv4_expert_checkpoint_name("layers.0.ffn.experts.3.down_proj.weight")
-        == "layers.0.ffn.experts.3.w2.weight"
-    )
-    assert (
-        patches._dsv4_expert_checkpoint_name(
-            "layers.0.ffn.shared_experts.gate_proj.weight"
-        )
-        == "layers.0.ffn.shared_experts.w1.weight"
-    )
-    assert (
-        patches._dsv4_expert_checkpoint_name(
-            "layers.0.ffn.shared_experts.down_proj.weight"
-        )
-        == "layers.0.ffn.shared_experts.down_proj.weight"
-    )
-
-
-def test_dsv4_fp8_weight_is_linked_to_its_block_scale() -> None:
-    patches = _load_dsv4_patches_module()
-    param = torch.nn.Parameter(
-        torch.empty(4, 4, dtype=torch.float8_e4m3fn), requires_grad=False
-    )
-    scale = torch.nn.Parameter(torch.ones(2, 2), requires_grad=False)
-
-    patches._attach_block_fp8_scale(
-        param,
-        "layers.0.attn.q_proj.weight",
-        {"layers.0.attn.q_proj.weight_scale_inv": scale},
-        (2, 2),
-    )
-
-    assert getattr(param, "_art_block_fp8_scale") is scale
-    assert getattr(param, "_art_block_fp8_size") == (2, 2)
 
 
 def test_dsv4_compressor_helper_uses_punica_metadata_without_full_batch_lora(

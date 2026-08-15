@@ -6,12 +6,10 @@ import torch
 
 from art.megatron.lora import (
     LoRA,
-    LoRAPublishPlanner,
     LoraShardMeta,
     LoRASlotRef,
     _block_for_key,
     _dtype_name,
-    _template_expert_ids,
 )
 from art.megatron.lora import (
     _distributed_initialized as _distributed_ready,
@@ -187,99 +185,6 @@ def collect_local_packed_expert_entries(
                 )
             )
     return local_tensors, metadata
-
-
-def _global_packed_expert_metadata(
-    planner: LoRAPublishPlanner,
-    adapter_dtypes: dict[str, torch.dtype],
-    packed_expert_groups: Sequence[ExpertPackedLoraGroup],
-) -> list[PackedExpertShardMeta]:
-    metadata: list[PackedExpertShardMeta] = []
-    for template in planner.templates:
-        if int(template.num_local_experts) <= 1:
-            continue
-        slot_match = _packed_expert_slot(
-            template.adapter_model_prefix,
-            template.suffix,
-            packed_expert_groups,
-        )
-        if slot_match is None:
-            continue
-        group_prefix, slot = slot_match
-        shard_ranks = range(template.shard_world_size) if template.sharded else (0,)
-        ep_world_size = 1
-        if _distributed_ready():
-            from megatron.core import parallel_state as ps
-
-            ep_world_size = ps.get_expert_model_parallel_world_size()
-        for ep_rank in range(ep_world_size):
-            expert_ids = tuple(
-                expert
-                for expert in _template_expert_ids(template, ep_rank)
-                if expert is not None
-            )
-            if not expert_ids:
-                continue
-            expert_start = expert_ids[0]
-            expert_count = len(expert_ids)
-            expert_key = (
-                f"{template.adapter_model_prefix.format(expert=expert_start)}."
-                f"{template.suffix}"
-            )
-            for shard_rank in shard_ranks:
-                owner_rank = planner._expert_owner_rank(ep_rank, shard_rank)
-                per_expert_meta = planner._make_metadata(
-                    template,
-                    key=expert_key,
-                    owner_rank=owner_rank,
-                    shard_rank=shard_rank,
-                    adapter_dtypes=adapter_dtypes,
-                )
-                metadata.append(
-                    PackedExpertShardMeta(
-                        key=f"{group_prefix}.{slot.output_suffix}",
-                        owner_rank=owner_rank,
-                        shape=(expert_count, *per_expert_meta.shape),
-                        dtype_name=per_expert_meta.dtype_name,
-                        manifest=per_expert_meta.manifest,
-                        expert_start=expert_start,
-                        expert_count=expert_count,
-                        pack_layout=slot.pack_layout,
-                    )
-                )
-    return metadata
-
-
-def _global_regular_metadata(
-    planner: LoRAPublishPlanner,
-    adapter_dtypes: dict[str, torch.dtype],
-    packed_expert_groups: Sequence[ExpertPackedLoraGroup],
-) -> list[LoraShardMeta]:
-    if not packed_expert_groups:
-        return planner.global_metadata(adapter_dtypes)
-    if _distributed_ready():
-        from megatron.core import parallel_state as ps
-
-        pp_world_size = ps.get_pipeline_model_parallel_world_size()
-        if pp_world_size != 1:
-            raise RuntimeError(
-                "LoRA publish planner requires pipeline_model_parallel_size=1; "
-                f"got {pp_world_size}. Rank-local modules cannot describe remote "
-                "pipeline stages without exchanging templates."
-            )
-    metadata: list[LoraShardMeta] = []
-    for template in planner.templates:
-        if (
-            _packed_expert_slot(
-                template.adapter_model_prefix,
-                template.suffix,
-                packed_expert_groups,
-            )
-            is not None
-        ):
-            continue
-        metadata.extend(planner._metadata_for_template(template, adapter_dtypes))
-    return metadata
 
 
 def _merge_sharded_tensor(
@@ -678,55 +583,6 @@ def _stage_published_tensors(
             staged[key] = staged_flat.narrow(0, offset, numel).view(tensor.shape)
             offset += numel
     return staged
-
-
-def _save_rank0_vllm_lora(
-    *,
-    metadata: list[LoraShardMeta],
-    tensors_by_owner_key: dict[tuple[int, str], torch.Tensor],
-    packed_expert_metadata: list[PackedExpertShardMeta] | None = None,
-    packed_expert_tensors_by_owner_key: (
-        dict[tuple[int, str], torch.Tensor] | None
-    ) = None,
-    handler: Any,
-    adapter_config: dict[str, Any],
-    output_dir: str,
-) -> None:
-    vllm_tensors, published_config = _rank0_vllm_lora_tensors(
-        metadata=metadata,
-        tensors_by_owner_key=tensors_by_owner_key,
-        packed_expert_metadata=packed_expert_metadata,
-        packed_expert_tensors_by_owner_key=packed_expert_tensors_by_owner_key,
-        handler=handler,
-        adapter_config=adapter_config,
-    )
-    builder = PinnedCpuSnapshotStager().begin()
-    published_tensors = _stage_published_tensors(vllm_tensors, builder)
-    builder.finish(published_tensors).resolve()
-    save_vllm_lora_tensors(output_dir, published_tensors, published_config)
-
-
-def _rank0_vllm_lora_tensors(
-    *,
-    metadata: list[LoraShardMeta],
-    tensors_by_owner_key: dict[tuple[int, str], torch.Tensor],
-    packed_expert_metadata: list[PackedExpertShardMeta] | None = None,
-    packed_expert_tensors_by_owner_key: (
-        dict[tuple[int, str], torch.Tensor] | None
-    ) = None,
-    handler: Any,
-    adapter_config: dict[str, Any],
-) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-    merged_tensors = _rank0_merged_lora_tensors(
-        metadata=metadata,
-        tensors_by_owner_key=tensors_by_owner_key,
-        packed_expert_metadata=packed_expert_metadata,
-        packed_expert_tensors_by_owner_key=packed_expert_tensors_by_owner_key,
-    )
-    return handler.to_vllm_lora_tensors(
-        merged_tensors,
-        adapter_config=dict(adapter_config),
-    )
 
 
 def _rank0_merged_lora_tensors(

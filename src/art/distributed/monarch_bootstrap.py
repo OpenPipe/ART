@@ -393,68 +393,6 @@ def activate_cpu_child_virtualenv() -> None:
     activate_child_virtualenv()
 
 
-async def _deployment_rollout(
-    _model: Any, scenario: int, _config: Any
-) -> tuple[int, str, int]:
-    return scenario, socket.gethostname(), os.getpid()
-
-
-async def deployment_smoke(hosts: Any) -> None:
-    """Admit every host and execute one installed CPU rollout per node."""
-
-    from art.model import TrainableModel
-
-    from .art_runtime import ArtRuntime
-    from .rollout import InstalledAsyncCallable
-    from .specs import ClusterSpec, HostSpec, RuntimeTopology
-
-    host_count = int(hosts.region.slice().sizes[0])
-    host_ids = tuple(f"host{rank}" for rank in range(host_count))
-    runtime = await ArtRuntime.start(
-        hosts,
-        RuntimeTopology(
-            cluster=ClusterSpec(
-                hosts=tuple(
-                    HostSpec(
-                        host_id=host_id,
-                        node_rank=rank,
-                        worker_address=f"attached://{rank}",
-                        cpu_slots=1,
-                    )
-                    for rank, host_id in enumerate(host_ids)
-                ),
-                controller_host_id=host_ids[0],
-            ),
-            rollout_host_ids=host_ids,
-        ),
-    )
-    try:
-        executor = runtime.rollout_executor(
-            InstalledAsyncCallable.from_callable(_deployment_rollout),
-            target_workers=host_count,
-        )
-        executor.set_workers(tuple(range(host_count)))
-        model = TrainableModel(
-            name="bootstrap-smoke",
-            run_name="bootstrap-smoke",
-            project="art",
-            base_model="none",
-        )
-        results = await asyncio.gather(
-            *(
-                executor.run(worker, _deployment_rollout, model, worker, None)
-                for worker in range(host_count)
-            )
-        )
-        if len({hostname for _, hostname, _ in results}) != host_count:
-            raise RuntimeError(
-                f"CPU rollout placement did not cover every host: {results}"
-            )
-        print(f"ART admitted {host_count} host(s); CPU rollouts={results}", flush=True)
-    finally:
-        await runtime.close()
-
-
 def _owns_tcp_listener(pid: int, port: int) -> bool:
     socket_inodes = {
         target[8:-1]

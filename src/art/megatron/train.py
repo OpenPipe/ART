@@ -37,14 +37,12 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_
 from art import dev, types
 from art.loss import (
     AlignedLossInputs,
-    Loss,
     LossInputs,
     LossOffPolicyDiagnosticsAccumulator,
     loss_fn,
     shift_tensor,
 )
 from art.megatron.context_parallel.types import (
-    DispatchedPackedTensors,
     ParallelTopology,
     PreparedMegatronBatch,
     TrainingStepWorkload,
@@ -96,11 +94,9 @@ from art.megatron.training.microbatches import (
     CpBatchLookaheadState,
     PreparedRLMicroInputs,
     PreparedSFTMicroInputs,
-    _causal_attention_state,
     _clone_packed_tensors,
     _clone_sft_tensors,
     _count_sft_trainable_tokens,
-    _count_trainable_tokens,
     _local_trainable_sft_token_count_tensor,
     _local_trainable_token_count_tensor,
     _next_micro_lookahead,
@@ -132,7 +128,6 @@ from art.megatron.training.pipeline_schedule import (
     _set_hybridep_token_count,
     _validate_hybridep_token_counts,
     chunk_post_process,
-    chunk_pre_process,
     validate_pipeline_topology,
 )
 from art.megatron.training.trace import (
@@ -966,40 +961,6 @@ def _experimental_train_config(job: TrainJobSpec) -> dev.TrainConfig:
 
 def _moe_replay_strict(job: TrainJobSpec) -> bool:
     return job.experimental_config.moe_routing_replay_strict
-
-
-def _load_lora_and_optimizer(
-    runtime: TrainingRuntime,
-    *,
-    lora_path: str,
-    optimizer_state_path: str,
-    adapter_step: int,
-) -> dict[str, torch.dtype]:
-    runtime.optimizer_snapshot_barrier.synchronize()
-    persistent_optimizer = runtime.optimizer if runtime.optimizer_persistent else None
-    _load_adapter_into_model(
-        runtime.model,
-        lora_path,
-        runtime.rank,
-        handler=runtime.model_support_handler,
-        optimizer=persistent_optimizer,
-    )
-    if persistent_optimizer is not None:
-        return {}
-
-    runtime.optimizer = _build_optimizer(
-        runtime.model,
-        runtime.optimizer_config,
-    )
-    assert runtime.optimizer is not None
-    _load_optimizer(
-        runtime,
-        optimizer_state_path=optimizer_state_path,
-        adapter_path=lora_path,
-        adapter_step=adapter_step,
-        allow_missing=True,
-    )
-    return {}
 
 
 def _prepare_rl_training_state(

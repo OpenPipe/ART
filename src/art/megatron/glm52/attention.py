@@ -38,13 +38,6 @@ def _latent_rms_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return weight * normalized.to(x.dtype)
 
 
-def _half_split_rope(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> torch.Tensor:
-    first, second = x.chunk(2, dim=-1)
-    return torch.cat((first * cos - second * sin, second * cos + first * sin), dim=-1)
-
-
 def _interleaved_rope(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:

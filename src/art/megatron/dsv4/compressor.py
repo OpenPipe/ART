@@ -17,7 +17,6 @@ from art.megatron.dsv4.rope import (
 from art.megatron.dsv4.utils import rotate_activation
 from art.megatron.prefix_tree import (
     PrefixTreeRow,
-    PrefixTreeSegment,
     parse_prefix_tree,
 )
 

@@ -1227,47 +1227,6 @@ def _score_chain_segment_keys(
     )
 
 
-def _add_local_search_load(
-    rank_loads: list[int],
-    owner: int,
-    segment: GdnSegmentSpec,
-    *,
-    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
-) -> int:
-    rank_loads[owner] += segment.length
-    return segment.length - segment_attention_counts[_segment_key(segment)][owner]
-
-
-def _estimate_local_rank_kernel_work(
-    local_segments_by_rank_depth: tuple[tuple[tuple[GdnSegmentSpec, ...], ...], ...],
-) -> tuple[tuple[int, ...], int, int]:
-    estimate = _estimate_local_runtime_from_lengths(
-        tuple(
-            tuple(
-                tuple(segment.length for segment in segments)
-                for segments in rank_segments
-            )
-            for rank_segments in local_segments_by_rank_depth
-        )
-    )
-    return (
-        estimate.rank_work,
-        max(estimate.rank_bucket_counts, default=0),
-        max(estimate.rank_segment_counts, default=0),
-    )
-
-
-def _estimate_local_rank_kernel_work_from_lengths(
-    local_lengths_by_rank_depth: tuple[tuple[tuple[int, ...], ...], ...],
-) -> tuple[tuple[int, ...], int, int]:
-    estimate = _estimate_local_runtime_from_lengths(local_lengths_by_rank_depth)
-    return (
-        estimate.rank_work,
-        max(estimate.rank_bucket_counts, default=0),
-        max(estimate.rank_segment_counts, default=0),
-    )
-
-
 def _estimate_local_runtime_from_lengths(
     local_lengths_by_rank_depth: tuple[tuple[tuple[int, ...], ...], ...],
 ) -> _GdnLocalRuntimeEstimate:
@@ -1291,36 +1250,6 @@ def _estimate_local_runtime_from_lengths(
         rank_bucket_counts=tuple(rank_bucket_counts),
         rank_segment_counts=tuple(rank_segment_counts),
     )
-
-
-def _estimate_chain_rank_kernel_work(
-    chain_segments_by_depth: tuple[tuple[GdnSegmentSpec, ...], ...],
-    *,
-    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
-    cp_size: int,
-) -> tuple[tuple[int, ...], int]:
-    estimate = _estimate_chain_runtime_from_counts(
-        tuple(
-            tuple(
-                chain_rank_counts_by_key[_segment_key(segment)] for segment in segments
-            )
-            for segments in chain_segments_by_depth
-        ),
-        cp_size=cp_size,
-    )
-    return estimate.rank_work, estimate.bucket_count
-
-
-def _estimate_chain_rank_kernel_work_from_counts(
-    chain_rank_counts_by_depth: tuple[tuple[tuple[int, ...], ...], ...],
-    *,
-    cp_size: int,
-) -> tuple[tuple[int, ...], int]:
-    estimate = _estimate_chain_runtime_from_counts(
-        chain_rank_counts_by_depth,
-        cp_size=cp_size,
-    )
-    return estimate.rank_work, estimate.bucket_count
 
 
 def _estimate_chain_runtime_from_counts(

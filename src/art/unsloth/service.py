@@ -14,7 +14,6 @@ from .. import dev, types
 from ..adapter_leases import in_flight_lora_name
 from ..dev.validate import is_dedicated_mode
 from ..local.checkpoints import get_last_checkpoint_dir
-from ..preprocessing.inputs import TrainInputs
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..serving_capabilities import (

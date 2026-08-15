@@ -33,7 +33,6 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
 
 import httpx
 import numpy as np
-import polars as pl
 from pydantic import BaseModel, ConfigDict
 import torch
 from tqdm import auto as tqdm
@@ -152,61 +151,6 @@ class _TrainStepVllmMetricsCollector:
 
     async def aclose(self) -> None:
         await self._client.aclose()
-
-
-def _prometheus_values(text: str, name: str) -> list[float]:
-    values: list[float] = []
-    for line in text.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        try:
-            sample, raw_value = line.rsplit(None, 1)
-        except ValueError:
-            continue
-        sample_name = sample.split("{", 1)[0]
-        if sample_name != name:
-            continue
-        try:
-            values.append(float(raw_value))
-        except ValueError:
-            continue
-    return values
-
-
-def _prometheus_sum(text: str, name: str) -> float | None:
-    values = _prometheus_values(text, name)
-    if not values:
-        return None
-    return math.fsum(values)
-
-
-def _prometheus_sum_with_label(
-    text: str, name: str, label: str, value: str
-) -> float | None:
-    values: list[float] = []
-    needle = f'{label}="{value}"'
-    for line in text.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        try:
-            sample, raw_value = line.rsplit(None, 1)
-        except ValueError:
-            continue
-        sample_name = sample.split("{", 1)[0]
-        if sample_name != name or needle not in sample:
-            continue
-        try:
-            values.append(float(raw_value))
-        except ValueError:
-            continue
-    return math.fsum(values) if values else None
-
-
-def _prometheus_mean(text: str, name: str) -> float | None:
-    values = _prometheus_values(text, name)
-    if not values:
-        return None
-    return math.fsum(values) / len(values)
 
 
 def _configured_chat_template_value(
@@ -2292,11 +2236,6 @@ class LocalBackend:
 
         # If S3 bucket is provided, pull from S3 first
         if from_s3_bucket is not None:
-            if verbose:
-                print(
-                    f"DEBUG: Fork checkpoint - from_s3_bucket={from_s3_bucket}, not_after_step={not_after_step}"
-                )
-
             # Determine which checkpoint to pull
             if not_after_step is None:
                 # Pull only the latest checkpoint
@@ -2359,12 +2298,6 @@ class LocalBackend:
                 f"No checkpoints found for model {from_model} in project {from_project}"
             )
 
-        if verbose:
-            print(f"DEBUG: Checkpoint base dir: {checkpoint_base_dir}")
-            print(
-                f"DEBUG: Contents: {os.listdir(checkpoint_base_dir) if os.path.exists(checkpoint_base_dir) else 'Does not exist'}"
-            )
-
         # Get all available checkpoint steps
         available_steps = sorted(
             int(d)
@@ -2403,21 +2336,11 @@ class LocalBackend:
             print(
                 f"Copying checkpoint from {source_checkpoint_dir} to {dest_checkpoint_dir}"
             )
-            print(f"DEBUG: Source dir exists: {os.path.exists(source_checkpoint_dir)}")
-            if os.path.exists(source_checkpoint_dir):
-                print(
-                    f"DEBUG: Source dir contents: {os.listdir(source_checkpoint_dir)}"
-                )
-                print(
-                    f"DEBUG: Source dir is empty: {len(os.listdir(source_checkpoint_dir)) == 0}"
-                )
 
         import shutil
 
         # Remove destination if it already exists (empty directory from previous attempts)
         if os.path.exists(dest_checkpoint_dir):
-            if verbose:
-                print("DEBUG: Destination already exists, removing it first")
             shutil.rmtree(dest_checkpoint_dir)
 
         shutil.copytree(source_checkpoint_dir, dest_checkpoint_dir)
