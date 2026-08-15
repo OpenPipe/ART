@@ -25,6 +25,7 @@ pytest.importorskip("transformers")
         "{% for key, value in tool_call.arguments.items() %}",
         "{{ arguments | items }}",
         "{% for key, value in arguments.items() %}",
+        "{% if function['arguments'] is mapping %}",
         (
             "{% set structured = tool_call.arguments %}"
             "{% for key, value in structured.items() %}"
