@@ -551,7 +551,11 @@ class MegatronTrainingSlot:
             learner_parent_version=output_version,
             kind="save_state",
         )
-        adapter, _metrics = await self._snapshot(commit_ref, save_optimizer=True)
+        adapter, _metrics = await self._snapshot(
+            commit_ref,
+            save_optimizer=True,
+            sequence_continuation_of=ref.operation_id,
+        )
         self.trainer.retire_operation(commit_ref.operation_id)
         result = LoadStateResult(
             operation_id=ref.operation_id,
@@ -657,8 +661,13 @@ class MegatronTrainingSlot:
         ref: OperationRef,
         *,
         save_optimizer: bool,
+        sequence_continuation_of: str | None = None,
     ) -> tuple[OptimizerAdapter, dict[str, float]]:
-        snapshot = await self._start_snapshot(ref, save_optimizer=save_optimizer)
+        snapshot = await self._start_snapshot(
+            ref,
+            save_optimizer=save_optimizer,
+            sequence_continuation_of=sequence_continuation_of,
+        )
         return await self._finish_snapshot(snapshot)
 
     async def _start_snapshot(
@@ -666,6 +675,7 @@ class MegatronTrainingSlot:
         ref: OperationRef,
         *,
         save_optimizer: bool,
+        sequence_continuation_of: str | None = None,
     ) -> tuple[OptimizerAdapter, dict[str, float]] | _PendingSnapshot:
         state = self._require_parent(ref)
         generation = state.generation
@@ -713,6 +723,7 @@ class MegatronTrainingSlot:
         raw = await self.trainer.snapshot(
             GenerationSnapshotJobSpec(
                 operation_id=ref.operation_id,
+                sequence_continuation_of=sequence_continuation_of,
                 run_id=ref.run_id,
                 sequence_id=ref.sequence_id,
                 training_session_id=state.registration.training_session_id,

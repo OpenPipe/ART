@@ -1496,6 +1496,7 @@ class MonarchTrainerRun:
         self._learner_version = run_spec.initial_learner_version
         self._jobs: dict[str, tuple[str, tuple[TrainEvent, ...]]] = {}
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._operation_sequence_ids: dict[str, int] = {}
         self._next_operation_sequence = 0
         self._open_forward_backward_ids: list[str] = []
         self._lock = asyncio.Lock()
@@ -1591,6 +1592,7 @@ class MonarchTrainerRun:
             result = next(result for result in results if result["rank"] == 0)
             self._next_operation_sequence += 1
             self._operations[job.operation_id] = (job.fingerprint, result)
+            self._operation_sequence_ids[job.operation_id] = job.sequence_id
             return result
         except BaseException as error:
             await self._invalidate_command(
@@ -1635,6 +1637,7 @@ class MonarchTrainerRun:
             self._open_forward_backward_ids.append(job.operation_id)
             self._next_operation_sequence += 1
             self._operations[job.operation_id] = (job.fingerprint, result)
+            self._operation_sequence_ids[job.operation_id] = job.sequence_id
             return result
         except BaseException as error:
             await self._invalidate_command(error, "F/B operation and cleanup failed")
@@ -1710,6 +1713,7 @@ class MonarchTrainerRun:
                     self._open_forward_backward_ids.append(job.operation_id)
                 self._next_operation_sequence += 1
                 self._operations[job.operation_id] = (job.fingerprint, result)
+                self._operation_sequence_ids[job.operation_id] = job.sequence_id
                 return result
             except BaseException as error:
                 await self._invalidate_command(error, "SFT command and cleanup failed")
@@ -1766,7 +1770,9 @@ class MonarchTrainerRun:
             self._next_operation_sequence += 1
             for operation_id in job.contributing_forward_backward_operation_ids:
                 self._operations.pop(operation_id, None)
+                self._operation_sequence_ids.pop(operation_id, None)
             self._operations[job.operation_id] = (job.fingerprint, result)
+            self._operation_sequence_ids[job.operation_id] = job.sequence_id
             return result
         except BaseException as error:
             await self._invalidate_command(
@@ -1817,6 +1823,7 @@ class MonarchTrainerRun:
                 self._learner_version = job.learner_version
                 self._next_operation_sequence += 1
                 self._operations[job.operation_id] = (job.fingerprint, result)
+                self._operation_sequence_ids[job.operation_id] = job.sequence_id
                 return result
             except BaseException as error:
                 await self._invalidate_command(
@@ -1876,8 +1883,10 @@ class MonarchTrainerRun:
             self._publication_drains.add(drain)
             drain.add_done_callback(self._publication_drains.discard)
             drain.add_done_callback(_consume_future)
-            self._next_operation_sequence += 1
+            if job.sequence_continuation_of is None:
+                self._next_operation_sequence += 1
             self._operations[job.operation_id] = (job.fingerprint, result)
+            self._operation_sequence_ids[job.operation_id] = job.sequence_id
             return result
         except BaseException as error:
             if not publication.done():
@@ -1914,10 +1923,31 @@ class MonarchTrainerRun:
             raise ValueError("operation run_id does not match this training run")
         if job.training_session_id != self.run_spec.training_session_id:
             raise ValueError("operation training_session_id does not match this run")
-        if job.sequence_id != self._next_operation_sequence:
+        continuation = (
+            job.sequence_continuation_of
+            if isinstance(job, GenerationSnapshotJobSpec)
+            else None
+        )
+        expected_sequence = (
+            self._operation_sequence_ids.get(continuation)
+            if continuation is not None
+            else self._next_operation_sequence
+        )
+        if expected_sequence is None:
+            raise RuntimeError(
+                f"snapshot continuation parent is not retained: {continuation}"
+            )
+        if (
+            continuation is not None
+            and expected_sequence != self._next_operation_sequence - 1
+        ):
+            raise RuntimeError(
+                "snapshot must continue the immediately preceding command"
+            )
+        if job.sequence_id != expected_sequence:
             raise RuntimeError(
                 "trainer operation sequence must be gapless: "
-                f"expected={self._next_operation_sequence}, got={job.sequence_id}"
+                f"expected={expected_sequence}, got={job.sequence_id}"
             )
         learner_parent = (
             job.learner_version
@@ -2219,6 +2249,10 @@ class MonarchTrainerRun:
         # without yielding to the task which awaits this publication.
         state.active_waiters += 1
         return self._await_publication(state)
+
+    def retire_operation(self, operation_id: str) -> None:
+        self._operations.pop(operation_id, None)
+        self._operation_sequence_ids.pop(operation_id, None)
 
     async def _await_publication(
         self, state: "_PublicationState"

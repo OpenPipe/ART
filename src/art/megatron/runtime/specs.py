@@ -436,6 +436,7 @@ class GenerationSnapshotJobSpec(_Spec):
     """Stage one immutable learner generation, optionally with optimizer state."""
 
     operation_id: str = Field(min_length=1)
+    sequence_continuation_of: str | None = Field(default=None, min_length=1)
     run_id: str = Field(min_length=1)
     sequence_id: int = Field(ge=0)
     training_session_id: str = Field(min_length=1)
@@ -451,6 +452,8 @@ class GenerationSnapshotJobSpec(_Spec):
 
     @model_validator(mode="after")
     def _validate_snapshot(self) -> "GenerationSnapshotJobSpec":
+        if self.sequence_continuation_of == self.operation_id:
+            raise ValueError("snapshot cannot continue itself")
         if (
             self.generation.training_session_id != self.training_session_id
             or self.generation.policy_step != self.learner_version

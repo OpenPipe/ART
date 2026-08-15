@@ -1342,6 +1342,7 @@ class DistributedMegatronService:
                 ),
                 save_optimizer=True,
                 activate_serving=False,
+                sequence_continuation_of=ref.operation_id,
             )
             durable = await asyncio.shield(launch.completion)
             trainer.retire_operation(commit_operation_id)
@@ -1367,6 +1368,7 @@ class DistributedMegatronService:
         *,
         save_optimizer: bool,
         activate_serving: bool,
+        sequence_continuation_of: str | None = None,
     ) -> GenerationSnapshotLaunch:
         async with self._mutation_lock:
             self._require_open()
@@ -1432,6 +1434,7 @@ class DistributedMegatronService:
 
         job = GenerationSnapshotJobSpec(
             operation_id=ref.operation_id,
+            sequence_continuation_of=sequence_continuation_of,
             run_id=ref.run_id,
             sequence_id=ref.sequence_id,
             training_session_id=self._training_session_id,
