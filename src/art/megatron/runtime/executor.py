@@ -1093,7 +1093,7 @@ class _GenerationPublisher:
         self.raise_if_failed()
         with self._lock:
             entry = self._cache.get(generation.generation_id)
-        if entry is None or entry.generation != generation:
+        if entry is None or entry.retired or entry.generation != generation:
             raise RuntimeError(
                 f"learner generation is not staged: {generation.generation_id}"
             )
@@ -1166,7 +1166,11 @@ class _GenerationPublisher:
     def has_generation(self, generation: TrainerGeneration) -> bool:
         with self._lock:
             entry = self._cache.get(generation.generation_id)
-            return entry is not None and entry.generation == generation
+            return (
+                entry is not None
+                and not entry.retired
+                and entry.generation == generation
+            )
 
     def retire_run(self, run_id: str) -> None:
         self._retire_previous(run_id)
@@ -1174,11 +1178,36 @@ class _GenerationPublisher:
     def _acquire_slot(self) -> tuple[float, int]:
         self.raise_if_failed()
         started = time.perf_counter()
-        self._slots.acquire()
+        if not self._slots.acquire(blocking=False):
+            self._evict_for_capacity()
+            self._slots.acquire()
         wait_s = time.perf_counter() - started
         with self._lock:
             self._in_flight += 1
             return wait_s, self._in_flight
+
+    def _evict_for_capacity(self) -> None:
+        with self._lock:
+            entries = tuple(
+                entry for entry in self._cache.values() if not entry.released
+            )
+            ready = tuple(
+                entry
+                for entry in entries
+                if entry.resolved.done()
+                and all(consumer.done() for consumer in entry.consumers)
+            )
+            if not entries:
+                raise RuntimeError("snapshot pool is full without a cached generation")
+            entry = (ready or entries)[0]
+            entry.retired = True
+            consumers = tuple(entry.consumers)
+        try:
+            entry.resolved.result()
+            for consumer in consumers:
+                consumer.result()
+        finally:
+            self._maybe_release(entry)
 
     def _retire_previous(self, run_id: str) -> None:
         with self._lock:
