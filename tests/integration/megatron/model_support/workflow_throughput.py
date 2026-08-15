@@ -47,9 +47,11 @@ _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
 _INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
-_MEASUREMENT_CONTRACT_VERSION = 19
+_MEASUREMENT_CONTRACT_VERSION = 20
 _ISOLATED_WARMUP_STEPS = 1
 _MATCHED_MEASURED_STEPS = 3
+_PACKING_DRAIN_WINDOWS = 1
+_REQUIRED_SETTLED_WINDOWS = 2
 _PIPELINE_SETTING_NAMES = (
     "num_rollout_workers",
     "min_batch_size",
@@ -259,7 +261,7 @@ def _settled_execution_decision_suffix(
         later = stats
     selected.reverse()
     _require(
-        len(selected) >= 2,
+        len(selected) >= _REQUIRED_SETTLED_WINDOWS,
         "throughput evidence requires two trailing settled execution windows",
     )
     return selected
@@ -1796,13 +1798,14 @@ async def _run_e2e_throughput_async(
         vllm_metric_interval_s=0.25,
     )
     measured_steps = config.max_steps - autotune.warmup_ignore_steps
+    tail_windows = _PACKING_DRAIN_WINDOWS + _REQUIRED_SETTLED_WINDOWS
     if (
-        measured_steps < 2 * autotune.window_steps
+        measured_steps < tail_windows * autotune.window_steps
         or measured_steps % autotune.window_steps
     ):
         raise RuntimeError(
-            "throughput stage must end on a whole autotuner window after at least "
-            f"two measured windows: max_steps={config.max_steps}, "
+            "throughput stage must end on a whole autotuner window after a drain "
+            f"window and two measured windows: max_steps={config.max_steps}, "
             f"warmup={autotune.warmup_ignore_steps}, window={autotune.window_steps}"
         )
     capture_train_calls = _matched_capture_steps(config.max_steps)
@@ -2063,7 +2066,9 @@ async def _run_e2e_throughput_async(
                 release_trajectory_sources,
             )
             try:
-                measurement_start = config.max_steps - 2 * autotune.window_steps + 1
+                measurement_start = (
+                    config.max_steps - tail_windows * autotune.window_steps + 1
+                )
                 with _freeze_pipeline_settings_from_step(trainer, measurement_start):
                     await trainer.train(handle_signals=False)
                 if train_call_count != config.max_steps:

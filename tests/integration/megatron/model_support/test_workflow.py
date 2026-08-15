@@ -1166,7 +1166,9 @@ def test_dsv4_throughput_uses_shorter_packed_sequence() -> None:
 def test_throughput_load_balancing_overrides() -> None:
     qwen3 = _THROUGHPUT_CONFIGS["qwen3_moe"]
     gpt_oss = _THROUGHPUT_CONFIGS["gpt_oss_moe"]
-    assert qwen3.max_steps == 15
+    assert ThroughputWorkflowConfig(num_layers=2).max_steps == 13
+    assert qwen3.max_steps == 17
+    assert gpt_oss.max_steps == 21
     assert gpt_oss.initial_model_calls_per_inference_gpu == 23
 
 
