@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import Field, model_validator
 
+from art.distributed.trajectory_store import TrajectoryGroupAnnotations
 from art.training.contracts import (
     Contract,
     ForwardRequest,
@@ -13,15 +14,57 @@ from art.training.contracts import (
     RunCommand,
 )
 
-TRAINING_DATA_FORMAT = "art_training_batch_msgpack_v1"
+RL_GROUP_DATA_FORMAT = "art_trajectory_group_msgpack_v1"
+SFT_DATA_FORMAT = "art_sft_batch_msgpack_v1"
 OPERATION_RESULT_FORMAT = "art_operation_result_msgpack_v1"
 
 
 class TrainingDataRef(Contract):
     object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     byte_count: int = Field(ge=1)
-    format: Literal["art_training_batch_msgpack_v1"] = TRAINING_DATA_FORMAT
-    batch_kind: Literal["rl", "sft"]
+    format: Literal["art_trajectory_group_msgpack_v1", "art_sft_batch_msgpack_v1"]
+
+
+class RemoteRlGroupRef(Contract):
+    data: TrainingDataRef
+    annotations: TrajectoryGroupAnnotations | None = None
+
+    @model_validator(mode="after")
+    def _validate_format(self) -> "RemoteRlGroupRef":
+        if self.data.format != RL_GROUP_DATA_FORMAT:
+            raise ValueError("RL group data has the wrong wire format")
+        return self
+
+
+class RemoteRlBatchRef(Contract):
+    kind: Literal["rl"] = "rl"
+    groups: tuple[RemoteRlGroupRef, ...] = Field(min_length=1)
+    min_source_version: int = Field(ge=0)
+    max_source_version: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_versions(self) -> "RemoteRlBatchRef":
+        if self.max_source_version < self.min_source_version:
+            raise ValueError("max_source_version must be >= min_source_version")
+        return self
+
+
+class RemoteSftBatchRef(Contract):
+    kind: Literal["sft"] = "sft"
+    data: TrainingDataRef
+
+    @model_validator(mode="after")
+    def _validate_format(self) -> "RemoteSftBatchRef":
+        if self.data.format != SFT_DATA_FORMAT:
+            raise ValueError("SFT data has the wrong wire format")
+        return self
+
+
+RemoteTrainingBatchRef = Annotated[
+    RemoteRlBatchRef | RemoteSftBatchRef,
+    Field(discriminator="kind"),
+]
 
 
 class OperationResultRef(Contract):
@@ -31,15 +74,15 @@ class OperationResultRef(Contract):
 
 
 class RemoteForwardRequest(RunCommand):
-    batch: TrainingDataRef
+    batch: RemoteTrainingBatchRef
     loss: LossConfig
     collect_packing_shapes: bool = False
 
     @classmethod
     def from_command(
-        cls, command: ForwardRequest, batch: TrainingDataRef
+        cls, command: ForwardRequest, batch: RemoteTrainingBatchRef
     ) -> "RemoteForwardRequest":
-        if command.batch.kind != batch.batch_kind:
+        if command.batch.kind != batch.kind:
             raise ValueError("training data kind differs from the forward command")
         return cls(
             run_id=command.run_id,
@@ -54,7 +97,7 @@ class RemoteForwardRequest(RunCommand):
     def _validate_loss(self) -> "RemoteForwardRequest":
         expected = (
             {"cross_entropy"}
-            if self.batch.batch_kind == "sft"
+            if self.batch.kind == "sft"
             else {
                 "cispo",
                 "ppo",
@@ -62,10 +105,16 @@ class RemoteForwardRequest(RunCommand):
         )
         if self.loss.name not in expected:
             raise ValueError(
-                f"{self.batch.batch_kind} batches require one of {sorted(expected)}, "
+                f"{self.batch.kind} batches require one of {sorted(expected)}, "
                 f"got {self.loss.name!r}"
             )
         return self
+
+
+def training_data_refs(batch: RemoteTrainingBatchRef) -> tuple[TrainingDataRef, ...]:
+    if isinstance(batch, RemoteRlBatchRef):
+        return tuple(group.data for group in batch.groups)
+    return (batch.data,)
 
 
 class AdapterSpec(Contract):

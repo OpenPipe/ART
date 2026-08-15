@@ -28,6 +28,7 @@ from .trajectory_store import (
     TrajectoryCapacityError,
     TrajectoryEnqueueResult,
     TrajectoryGroupAnnotations,
+    TrajectoryGroupBundle,
     TrajectoryGroupRef,
     TrajectoryLeaseError,
     TrajectoryQueueItem,
@@ -270,6 +271,8 @@ class RolloutWorkerEndpoint(Protocol):
     async def run(self, invocation: RolloutInvocation) -> RolloutResult: ...
 
     async def materialize(self, ref: TrajectoryGroupRef) -> TrajectoryGroup: ...
+
+    async def bundle(self, ref: TrajectoryGroupRef) -> TrajectoryGroupBundle: ...
 
     async def drop(self, ref: TrajectoryGroupRef) -> None: ...
 
@@ -755,6 +758,9 @@ class DistributedTrajectoryQueue:
         item = selection.lease.item
         return item.apply_annotations(await self._owner(item.ref).materialize(item.ref))
 
+    async def receive_bundle(self, ref: TrajectoryGroupRef) -> TrajectoryGroupBundle:
+        return await self._owner(ref).bundle(ref)
+
     def _summary_group(self, lease: TrajectoryQueueLease) -> TrajectoryGroup:
         item = lease.item
         descriptor = item.ref.descriptor
@@ -1118,6 +1124,9 @@ class InProcessRolloutWorker:
 
     async def materialize(self, ref: TrajectoryGroupRef) -> TrajectoryGroup:
         return self._results.materialize(ref)
+
+    async def bundle(self, ref: TrajectoryGroupRef) -> TrajectoryGroupBundle:
+        return self._results.bundle(ref)
 
     async def drop(self, ref: TrajectoryGroupRef) -> None:
         self._results.drop(ref)

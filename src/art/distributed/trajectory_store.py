@@ -145,32 +145,35 @@ class TrajectoryBatchTransfer(_Contract):
         return self
 
     async def receive_groups(self, *, timeout_s: float) -> tuple[TrajectoryGroup, ...]:
+        bundles = await self.receive_bundles(timeout_s=timeout_s)
+        return await asyncio.to_thread(
+            lambda: tuple(bundle.build() for bundle in bundles)
+        )
+
+    async def receive_bundles(
+        self, *, timeout_s: float
+    ) -> tuple[TrajectoryGroupBundle, ...]:
         payload = await receive_byte_stream(self.stream, timeout_s=timeout_s)
-        return await asyncio.to_thread(self._build_groups, payload)
+        return await asyncio.to_thread(self._build_bundles, payload)
 
-    def _build_groups(self, payload: bytearray) -> tuple[TrajectoryGroup, ...]:
-        from msgspec import msgpack
-
-        from .packing import TrajectoryGroupPayload
-
+    def _build_bundles(self, payload: bytearray) -> tuple[TrajectoryGroupBundle, ...]:
         view = memoryview(payload)
         offset = 0
-        groups = []
+        bundles = []
         try:
             for layout in self.groups:
                 end = offset + layout.header_byte_count
-                header = msgpack.decode(view[offset:end])
+                header = bytes(view[offset:end])
                 offset = end
                 records = []
                 for byte_count in layout.record_byte_counts:
                     end = offset + byte_count
-                    records.append(msgpack.decode(view[offset:end]))
+                    records.append(bytes(view[offset:end]))
                     offset = end
-                header["trajectories"] = tuple(records)
-                groups.append(TrajectoryGroupPayload.model_validate(header).build())
+                bundles.append(TrajectoryGroupBundle(header=header, records=records))
         finally:
             view.release()
-        return tuple(groups)
+        return tuple(bundles)
 
 
 class TrajectoryGroupRef(_Contract):
@@ -225,6 +228,18 @@ class TrajectoryGroupAnnotations(_Contract):
     actor_idle_s: float = Field(default=0.0, ge=0)
     queue_wait_s: float = Field(default=0.0, ge=0)
 
+    def apply(self, group: TrajectoryGroup) -> TrajectoryGroup:
+        group.metadata.update(self.metadata)
+        group.metadata["_art_rollout_wall_s"] = self.rollout_wall_s
+        group.metadata["_art_actor_idle_s"] = self.actor_idle_s
+        group.metadata["_art_queue_wait_s"] = self.queue_wait_s
+        for trajectory in group.trajectories:
+            if trajectory.initial_policy_version is None:
+                trajectory.initial_policy_version = self.initial_policy_version
+            if trajectory.final_policy_version is None:
+                trajectory.final_policy_version = self.final_policy_version
+        return group
+
 
 class TrajectoryQueueItem(_Contract):
     ref: TrajectoryGroupRef
@@ -244,17 +259,7 @@ class TrajectoryQueueItem(_Contract):
         return self.apply_annotations(groups[0])
 
     def apply_annotations(self, group: TrajectoryGroup) -> TrajectoryGroup:
-        annotations = self.annotations
-        group.metadata.update(annotations.metadata)
-        group.metadata["_art_rollout_wall_s"] = annotations.rollout_wall_s
-        group.metadata["_art_actor_idle_s"] = annotations.actor_idle_s
-        group.metadata["_art_queue_wait_s"] = annotations.queue_wait_s
-        for trajectory in group.trajectories:
-            if trajectory.initial_policy_version is None:
-                trajectory.initial_policy_version = annotations.initial_policy_version
-            if trajectory.final_policy_version is None:
-                trajectory.final_policy_version = annotations.final_policy_version
-        return group
+        return self.annotations.apply(group)
 
 
 class TrajectoryQueueResize(_Contract):

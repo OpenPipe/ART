@@ -17,6 +17,7 @@ from .rollout import (
 )
 from .trajectory_store import (
     TrajectoryEnqueueResult,
+    TrajectoryGroupBundle,
     TrajectoryGroupRef,
     TrajectoryQueueItem,
     TrajectoryQueuePacking,
@@ -96,6 +97,19 @@ class MonarchRolloutWorkerEndpoint(RolloutWorkerEndpoint):
         if len(groups) != 1:
             raise RuntimeError("trajectory owner returned the wrong group count")
         return groups[0]
+
+    async def bundle(self, ref: TrajectoryGroupRef) -> TrajectoryGroupBundle:
+        transfer = ref.transfer
+        if transfer is None:
+            raise RuntimeError("remote trajectory has no data-plane transfer")
+        if transfer.stream.stream_id != ref.result_id:
+            raise RuntimeError("trajectory owner returned the wrong result ID")
+        if transfer.stream.byte_count != ref.descriptor.byte_count:
+            raise RuntimeError("trajectory owner returned the wrong byte count")
+        bundles = await transfer.receive_bundles(timeout_s=self.timeout_s)
+        if len(bundles) != 1:
+            raise RuntimeError("trajectory owner returned the wrong group count")
+        return bundles[0]
 
     async def drop(self, ref: TrajectoryGroupRef) -> None:
         await call_remote(self.actor.drop_result, ref)

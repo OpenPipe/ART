@@ -1489,8 +1489,21 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     async def _discard_collected_group(self, group: TrajectoryGroup) -> None:
         if isinstance(self._output_queue, DistributedTrajectoryQueue):
-            await self._output_queue.discard_group(group)
-            group._distributed_lease = None
+            failures: list[BaseException] = []
+            discard = getattr(self.backend, "discard_pipeline_group", None)
+            if callable(discard):
+                try:
+                    await discard(self.model, group)
+                except BaseException as error:
+                    failures.append(error)
+            try:
+                await self._output_queue.discard_group(group)
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                group._distributed_lease = None
+            if failures:
+                raise BaseExceptionGroup("trajectory discard failed", failures)
 
     def _check_all_failed(self, group: TrajectoryGroup) -> None:
         """Raise if all rollouts in a group failed with exceptions."""
@@ -2387,6 +2400,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 actor_idle_s=actor_idle_s,
             )
             if accepted:
+                stage = getattr(self.backend, "stage_pipeline_group", None)
+                if callable(stage):
+                    await stage(self.model, self._output_queue, group)
                 self._status.note_group_enqueued()
             return wait_s
         if not isinstance(group, TrajectoryGroup):

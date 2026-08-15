@@ -67,6 +67,27 @@ class RlTrajectoryBatch(Contract):
         object.__setattr__(batch, "_local_packed_batch", local_packed_batch)
         return batch
 
+    @classmethod
+    def from_group_bundles(
+        cls,
+        bundles: Sequence[TrajectoryGroupBundle],
+        groups: Sequence[Any],
+        *,
+        min_source_version: int,
+        max_source_version: int,
+    ) -> "RlTrajectoryBatch":
+        if len(bundles) != len(groups):
+            raise ValueError(
+                "trajectory bundles and materialized groups are not aligned"
+            )
+        batch = cls(
+            groups=tuple(bundles),
+            min_source_version=min_source_version,
+            max_source_version=max_source_version,
+        )
+        object.__setattr__(batch, "_local_groups", tuple(groups))
+        return batch
+
     def require_local_groups(self) -> tuple[Any, ...]:
         if self._local_groups is None:
             raise RuntimeError(
