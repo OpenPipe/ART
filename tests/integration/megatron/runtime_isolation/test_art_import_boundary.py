@@ -129,6 +129,7 @@ def test_runtime_env_preserves_build_arch_without_initializing_cuda(
         ART_MEGATRON_CACHE_ROOT=str(cache_root),
         CUDA_VISIBLE_DEVICES="",
         TORCH_CUDA_ARCH_LIST="10.3",
+        XDG_CACHE_HOME=str(cache_root),
     )
     for name in (
         "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR",
