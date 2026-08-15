@@ -435,6 +435,30 @@ def publish_adapter_checkpoint(
     return adapter
 
 
+def acknowledge_materialized_adapter(
+    adapter_path: str | Path,
+    *,
+    step: int,
+    training_session_id: str,
+    generation_id: str,
+) -> OptimizerAdapter:
+    """Attach exact learner identity to an already verified adapter tree."""
+    path = Path(adapter_path).absolute()
+    adapter = optimizer_adapter(
+        path,
+        step,
+        training_session_id=training_session_id,
+        generation_id=generation_id,
+    )
+    acknowledgment = path / ADAPTER_PUBLICATION_ACK
+    if acknowledgment.exists():
+        if read_adapter_publication(path, step=step) != adapter:
+            raise RuntimeError("materialized adapter acknowledgement changed identity")
+    else:
+        _write_model_atomic(acknowledgment, adapter)
+    return adapter
+
+
 def read_latest_adapter_pointer(output_dir: str | Path) -> OptimizerAdapter | None:
     pointer = Path(output_dir) / "megatron_runtime" / ADAPTER_LATEST_POINTER
     if not pointer.exists():

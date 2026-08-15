@@ -88,30 +88,12 @@ def export_checkpoint_bundle(
     adapter = read_adapter_publication(adapter_path, step=step)
     if adapter is None or adapter.generation_id != generation_id:
         raise RuntimeError("checkpoint adapter generation is unavailable")
-    return export_checkpoint_bundle_from_adapter(
-        adapter,
-        adapter_source_path=adapter.identity,
-        destination=destination,
-        optimizer_state_path=optimizer_state_path,
-    )
-
-
-def export_checkpoint_bundle_from_adapter(
-    adapter: OptimizerAdapter,
-    *,
-    adapter_source_path: str,
-    destination: str | Path,
-    optimizer_state_path: str | None,
-) -> CheckpointBundleManifest:
-    source_root = Path(adapter_source_path).absolute()
-    if Path(adapter.identity).absolute() != source_root:
-        raise RuntimeError("adapter lease identity differs from its source path")
     target = Path(destination).absolute()
     if target.exists():
         manifest = read_checkpoint_bundle(target, verify_files=True)
         if (
-            manifest.adapter.generation_id != adapter.generation_id
-            or manifest.adapter.step != adapter.step
+            manifest.adapter.generation_id != generation_id
+            or manifest.adapter.step != step
         ):
             raise RuntimeError("checkpoint archive path contains another generation")
         return manifest
@@ -123,12 +105,10 @@ def export_checkpoint_bundle_from_adapter(
             optimizer = None
             if optimizer_state_path is not None:
                 leases.enter_context(
-                    optimizer_generation_lease(
-                        optimizer_state_path, adapter.generation_id
-                    )
+                    optimizer_generation_lease(optimizer_state_path, generation_id)
                 )
                 generation = optimizer_generation_path(
-                    optimizer_state_path, adapter.generation_id
+                    optimizer_state_path, generation_id
                 )
                 optimizer = OptimizerGenerationManifest.model_validate_json(
                     (generation / OPTIMIZER_MANIFEST).read_text("utf-8")
@@ -136,7 +116,7 @@ def export_checkpoint_bundle_from_adapter(
                 if optimizer.adapter != adapter:
                     raise RuntimeError("optimizer generation names another adapter")
             sources: list[tuple[Path, str]] = [
-                (source_root / file.name, f"adapter/{file.name}")
+                (Path(adapter.identity) / file.name, f"adapter/{file.name}")
                 for file in adapter.files
             ]
             if optimizer is not None:
