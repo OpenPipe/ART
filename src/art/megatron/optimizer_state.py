@@ -1711,8 +1711,10 @@ def stage_optimizer_state_snapshot(
 ) -> PendingCpuSnapshot[OptimizerStateSnapshot]:
     if runtime.optimizer is None:
         raise RuntimeError("Cannot snapshot an uninitialized optimizer")
-    records = _all_gather_objects(runtime, _runtime_layout_record(runtime))
-    runtime_sha256, layouts = _validated_runtime_layouts(runtime, records)
+    # Cache eviction makes restaging rank-local. Cross-rank validation belongs
+    # at publication commit, where every rank record is already required.
+    runtime_sha256 = _model_runtime_sha256(runtime)
+    layout_sha256 = _optimizer_layout_sha256(runtime)
     builder = stager.begin()
     return builder.finish(
         OptimizerStateSnapshot(
@@ -1721,7 +1723,7 @@ def stage_optimizer_state_snapshot(
             rank=runtime.rank,
             world_size=runtime.world_size,
             runtime_sha256=runtime_sha256,
-            layout_sha256=layouts[runtime.rank],
+            layout_sha256=layout_sha256,
             topology=current_optimizer_topology(runtime.world_size),
             state_dict=_stage_optimizer_value(
                 _optimizer_state_dict(runtime.optimizer), builder
@@ -1741,14 +1743,7 @@ def stage_trainer_rank_optimizer_state_snapshot(
     layout = state.get("layout")
     if layout is None:
         raise RuntimeError("TrainerRank optimizer state has no topology layout")
-    local = {
-        "rank": runtime.rank,
-        "runtime_sha256": _model_runtime_sha256(runtime),
-        "layout_sha256": _json_sha256(layout),
-    }
-    runtime_sha256, layouts = _validated_runtime_layouts(
-        runtime, _all_gather_objects(runtime, local)
-    )
+    # This path may run on only the rank that evicted a cached generation.
     builder = stager.begin()
     return builder.finish(
         OptimizerStateSnapshot(
@@ -1756,8 +1751,8 @@ def stage_trainer_rank_optimizer_state_snapshot(
             step=step,
             rank=runtime.rank,
             world_size=runtime.world_size,
-            runtime_sha256=runtime_sha256,
-            layout_sha256=layouts[runtime.rank],
+            runtime_sha256=_model_runtime_sha256(runtime),
+            layout_sha256=_json_sha256(layout),
             topology=current_optimizer_topology(runtime.world_size),
             state_dict=_stage_optimizer_value(state, builder),
         )
