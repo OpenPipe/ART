@@ -528,7 +528,8 @@ class PipelineAutotuner:
         )
         if target_changed:
             self._clear_min_batch_trial()
-            self._clear_worker_load_candidate()
+            if self.inference_observer == "direct_vllm":
+                self._clear_worker_load_candidate()
         stale_backlog_active = self._update_stale_backlog_state(stats)
         action = "hold"
         pending_worker_action = "hold"
@@ -570,7 +571,7 @@ class PipelineAutotuner:
             )
             action = "decrease_workers"
             reason = "predicted or actual stale backlog exceeds the freshness target"
-        elif target_changed:
+        elif target_changed and self.inference_observer == "direct_vllm":
             reason = "batch geometry changed; worker load evidence was reset"
         elif (
             state == "inference_over_train_over"
@@ -601,7 +602,8 @@ class PipelineAutotuner:
             or black_box_probe
         ):
             pending_worker_action = "increase_workers"
-            if self._worker_load_change_ready(+1):
+            if black_box_probe or self._worker_load_change_ready(+1):
+                self._clear_worker_load_candidate()
                 updated = updated.model_copy(
                     update={
                         "num_rollout_workers": self._move_workers(
