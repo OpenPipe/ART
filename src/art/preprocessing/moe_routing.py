@@ -451,15 +451,8 @@ def _validate_route_array(array: MoeRouteArray, *, field_name: str) -> None:
         )
     if array.shape[-1] > array.num_experts:
         raise RuntimeError("MoE routing top-k exceeds exact expert count")
-    flat = array.reshape(-1, array.shape[-1])
-    for start in range(0, len(flat), 1 << 20):
-        rows = np.sort(flat[start : start + (1 << 20)], axis=1)
-        if rows.size and int(rows.max()) >= array.num_experts:
-            raise RuntimeError("MoE route expert id is outside the exact model range")
-        if rows.shape[1] > 1 and bool(np.any(rows[:, 1:] == rows[:, :-1])):
-            raise RuntimeError(
-                "MoE route expert ids must be distinct per token and layer"
-            )
+    if array.size and int(array.max()) >= array.num_experts:
+        raise RuntimeError("MoE route expert id is outside the exact model range")
 
 
 def _common_route_shape(*arrays: MoeRouteArray) -> tuple[int, int]:

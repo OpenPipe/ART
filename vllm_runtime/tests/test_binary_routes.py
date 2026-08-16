@@ -48,7 +48,11 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
         text_config = type(
             "TextConfig",
             (),
-            {"num_hidden_layers": 2, "mlp_layer_types": ["dense", "sparse"]},
+            {
+                "num_hidden_layers": 2,
+                "num_experts_per_tok": 2,
+                "mlp_layer_types": ["dense", "sparse"],
+            },
         )()
         model_config = type(
             "ModelConfig",
@@ -98,13 +102,19 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
         np.testing.assert_array_equal(decoded[0][:, :3, :], expected)
         np.testing.assert_array_equal(decoded[0][:, 3:, :], values[:, 3:, :])
 
-    def test_rejects_missing_capture_on_routed_layer(self) -> None:
+    def test_does_not_compute_route_conflicts(self) -> None:
         routes = binary_routes._CapturedRoutes(num_experts=8, padding_layers=(0, 1, 2))
         values = np.zeros((1, 5, 2), dtype=np.uint8)
         values[:, 3, :] = (2, 5)
         routes[0] = values
 
-        with self.assertRaisesRegex(RuntimeError, "must be distinct"):
+        binary_routes.encode_routed_experts_response(b"{}", routes)
+
+    def test_rejects_route_outside_model_range(self) -> None:
+        routes = binary_routes._CapturedRoutes(num_experts=8, padding_layers=())
+        routes[0] = np.asarray([[[0, 8]]], dtype=np.uint8)
+
+        with self.assertRaisesRegex(RuntimeError, "outside the exact model range"):
             binary_routes.encode_routed_experts_response(b"{}", routes)
 
 
