@@ -8,6 +8,7 @@ from ipaddress import ip_address
 import json
 import os
 import socket
+import time
 from typing import Any
 import uuid
 
@@ -444,7 +445,11 @@ def _patch_art_runtime_routes() -> None:
             models = raw_request.app.state.openai_serving_models
             engine_client = engine(raw_request)
             coordinator = lora_update_coordinator(models, engine_client)
+            endpoint_started = mutation_lock_started = time.perf_counter()
             async with _lora_mutation_lock(models, lora_slot):
+                timings = {
+                    "mutation_lock_wait_s": time.perf_counter() - mutation_lock_started
+                }
                 identity = _lora_update_identity(body)
                 applied = _applied_lora_updates(models).get(lora_slot)
                 if applied is not None:
@@ -472,10 +477,13 @@ def _patch_art_runtime_routes() -> None:
                         content={"error": "LoRA policy update regresses launch policy"},
                         status_code=HTTPStatus.CONFLICT.value,
                     )
+                phase_started = time.perf_counter()
                 update_seq = await coordinator.begin_update(lora_slot)
+                timings["admission_drain_s"] = time.perf_counter() - phase_started
                 mutation_started = False
                 try:
                     async with models.lora_resolver_lock[lora_slot]:
+                        phase_started = time.perf_counter()
                         load_request = LoadLoRAAdapterRequest(
                             lora_name=lora_slot,
                             lora_path=lora_path,
@@ -491,6 +499,9 @@ def _patch_art_runtime_routes() -> None:
                                 content=load_error.model_dump(mode="python"),
                                 status_code=load_error.error.code,
                             )
+                        timings["adapter_validation_s"] = (
+                            time.perf_counter() - phase_started
+                        )
                         lora_int_id = (
                             models.lora_requests[lora_slot].lora_int_id
                             if lora_slot in models.lora_requests
@@ -512,15 +523,22 @@ def _patch_art_runtime_routes() -> None:
                             update_seq=update_seq,
                         )
                         mutation_started = True
+                        phase_started = time.perf_counter()
                         await engine_client.engine_core.call_utility_async(
                             "pause_scheduler", "keep", False
                         )
+                        timings["scheduler_pause_s"] = (
+                            time.perf_counter() - phase_started
+                        )
+                        phase_started = time.perf_counter()
                         cache_transition = (
                             await engine_client.engine_core.call_utility_async(
                                 "art_apply_lora_policy_update",
                                 policy_lora_request_payload(lora_request),
                             )
                         )
+                        timings["worker_update_s"] = time.perf_counter() - phase_started
+                        phase_started = time.perf_counter()
                         serving_request = PolicyLoRARequest(
                             **{
                                 **policy_lora_request_payload(lora_request),
@@ -539,11 +557,23 @@ def _patch_art_runtime_routes() -> None:
                             policy_version=policy_version,
                             update_seq=update_seq,
                         )
+                        timings["serving_metadata_s"] = (
+                            time.perf_counter() - phase_started
+                        )
+                        phase_started = time.perf_counter()
                         await engine_client.engine_core.call_utility_async(
                             "resume_scheduler"
                         )
+                        timings["scheduler_resume_s"] = (
+                            time.perf_counter() - phase_started
+                        )
+                        phase_started = time.perf_counter()
                         await coordinator.commit_update(lora_slot, serving_request)
+                        timings["coordinator_commit_s"] = (
+                            time.perf_counter() - phase_started
+                        )
                         mutation_started = False
+                        timings["total_s"] = time.perf_counter() - endpoint_started
                         response = {
                             "status": "updated",
                             "model_name": public_model_name,
@@ -552,6 +582,7 @@ def _patch_art_runtime_routes() -> None:
                             "policy_version": policy_version,
                             "update_seq": update_seq,
                             "cache_transition": cache_transition,
+                            "timings_s": timings,
                         }
                         _applied_lora_updates(models)[lora_slot] = _AppliedLoraUpdate(
                             identity=identity,
