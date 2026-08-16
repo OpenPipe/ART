@@ -643,10 +643,10 @@ class _RoutePrefetchBatcher:
     async def _run(self) -> None:
         try:
             while True:
-                await self._wake.wait()
-                self._wake.clear()
                 if self._closing and not self._pending:
                     return
+                await self._wake.wait()
+                self._wake.clear()
                 if not self._pending:
                     continue
                 deadline = (

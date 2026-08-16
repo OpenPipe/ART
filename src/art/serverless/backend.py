@@ -120,6 +120,16 @@ class _StagedPipelineGroup(BaseModel):
     wall_s: float = Field(ge=0)
 
 
+class _PipelineGroupStage(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    key: tuple[str, str]
+    admitted: SkipValidation[asyncio.Future[bool]] = Field(exclude=True)
+    task: SkipValidation[asyncio.Task[_StagedPipelineGroup | None]] = Field(
+        exclude=True
+    )
+
+
 class _PendingServerlessTrain(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -276,9 +286,7 @@ class ServerlessBackend:
             tuple[tuple[str | None, str, str, str], int], int
         ] = {}
         self._exact_adapter_lock = asyncio.Lock()
-        self._staged_pipeline_groups: dict[
-            tuple[str, str], asyncio.Task[_StagedPipelineGroup]
-        ] = {}
+        self._staged_pipeline_groups: dict[tuple[str, str], _PipelineGroupStage] = {}
         self._closed = False
 
     async def register(self, model: "Model") -> None:
@@ -911,15 +919,49 @@ class ServerlessBackend:
         model: AnyTrainableModel,
         queue: DistributedTrajectoryQueue,
         ref: TrajectoryGroupRef,
-    ) -> None:
+    ) -> _PipelineGroupStage:
         client = await self.training_client(model)
         key = (client.run_id, ref.result_id)
         if key in self._staged_pipeline_groups:
             raise RuntimeError("trajectory group is already staged for remote training")
-        self._staged_pipeline_groups[key] = asyncio.create_task(
-            self._stage_pipeline_group(client, queue, ref),
+        admitted = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(
+            self._stage_admitted_pipeline_group(client, queue, ref, admitted),
             name=f"remote-training-stage-{client.run_id}-{ref.result_id}",
         )
+        stage = _PipelineGroupStage(key=key, admitted=admitted, task=task)
+        self._staged_pipeline_groups[key] = stage
+        return stage
+
+    async def resolve_pipeline_group_stage(
+        self, stage: object, *, accepted: bool
+    ) -> None:
+        if not isinstance(stage, _PipelineGroupStage):
+            raise TypeError("invalid remote pipeline group stage")
+        if self._staged_pipeline_groups.get(stage.key) is not stage:
+            raise RuntimeError("remote pipeline group staging ownership changed")
+        if stage.admitted.done():
+            raise RuntimeError("remote pipeline group stage was resolved twice")
+        stage.admitted.set_result(accepted)
+        if accepted:
+            return
+        self._staged_pipeline_groups.pop(stage.key)
+        result, cancelled = await complete_task(stage.task)
+        if result is not None:
+            raise RuntimeError("rejected pipeline group was staged remotely")
+        if cancelled is not None:
+            raise cancelled
+
+    async def _stage_admitted_pipeline_group(
+        self,
+        client: RemoteTrainingClient,
+        queue: DistributedTrajectoryQueue,
+        ref: TrajectoryGroupRef,
+        admitted: asyncio.Future[bool],
+    ) -> _StagedPipelineGroup | None:
+        if not await admitted:
+            return None
+        return await self._stage_pipeline_group(client, queue, ref)
 
     async def _stage_pipeline_group(
         self,
@@ -966,10 +1008,12 @@ class ServerlessBackend:
             raise RuntimeError("remote pipeline group has no distributed selection")
         client = await self.training_client(model)
         key = (client.run_id, selection.lease.item.ref.result_id)
-        task = self._staged_pipeline_groups.pop(key, None)
-        if task is None:
+        stage = self._staged_pipeline_groups.pop(key, None)
+        if stage is None:
             raise RuntimeError("remote pipeline group was not staged")
-        staged = await task
+        staged = await stage.task
+        if staged is None:
+            raise RuntimeError("selected pipeline group was not admitted")
         await self._release_staged_group(client, staged)
 
     async def _discard_all_staged_pipeline_groups(self) -> list[BaseException]:
@@ -987,10 +1031,13 @@ class ServerlessBackend:
 
     async def _discard_staged_pipeline_entries(
         self,
-        entries: tuple[tuple[tuple[str, str], asyncio.Task[_StagedPipelineGroup]], ...],
+        entries: tuple[tuple[tuple[str, str], _PipelineGroupStage], ...],
     ) -> list[BaseException]:
+        for _, stage in entries:
+            if not stage.admitted.done():
+                stage.admitted.set_result(False)
         results = await asyncio.gather(
-            *(task for _, task in entries), return_exceptions=True
+            *(stage.task for _, stage in entries), return_exceptions=True
         )
         failures = [value for value in results if isinstance(value, BaseException)]
         deletes = await asyncio.gather(
@@ -1075,12 +1122,18 @@ class ServerlessBackend:
         )
         adopted = False
         try:
-            tasks = tuple(self._staged_pipeline_groups.get(key) for key in stage_keys)
-            if any(task is None for task in tasks):
+            stages = tuple(self._staged_pipeline_groups.get(key) for key in stage_keys)
+            if any(stage is None for stage in stages):
                 raise RuntimeError("remote pipeline group staging was not started")
-            stage_tasks = tuple(task for task in tasks if task is not None)
+            owned_stages = tuple(stage for stage in stages if stage is not None)
+            stage_tasks = tuple(stage.task for stage in owned_stages)
             stage_wait_started = time.monotonic()
-            staged = tuple(await asyncio.gather(*stage_tasks))
+            staged_values = await asyncio.gather(
+                *(asyncio.shield(task) for task in stage_tasks)
+            )
+            if any(value is None for value in staged_values):
+                raise RuntimeError("selected pipeline group was not admitted")
+            staged = tuple(value for value in staged_values if value is not None)
             stage_wait_s = time.monotonic() - stage_wait_started
             route_refs = tuple(
                 route.ref for value in staged for route in value.remote.routes
@@ -1108,8 +1161,8 @@ class ServerlessBackend:
             marked_packed = True
             if cancelled is not None:
                 raise cancelled
-            for key, task in zip(stage_keys, stage_tasks, strict=True):
-                if self._staged_pipeline_groups.pop(key, None) is not task:
+            for key, stage in zip(stage_keys, owned_stages, strict=True):
+                if self._staged_pipeline_groups.pop(key, None) is not stage:
                     raise RuntimeError(
                         "remote pipeline group staging ownership changed"
                     )
@@ -1130,28 +1183,53 @@ class ServerlessBackend:
                     "remote service admitted F/B against another learner"
                 )
         except BaseException as primary:
-            cleanup = [forward.cancel()] if forward is not None else []
+            cleanup = (
+                [asyncio.create_task(forward.cancel())] if forward is not None else []
+            )
             cleanup.append(
-                queue.release_selections(
-                    selected,
-                    disposition="discarded",
-                    generation_id=generation_id if marked_packed else None,
+                asyncio.create_task(
+                    queue.release_selections(
+                        selected,
+                        disposition="discarded",
+                        generation_id=generation_id if marked_packed else None,
+                    )
                 )
             )
-            stage_failures: list[BaseException] = []
-            if not adopted:
-                entries = tuple(
-                    (key, task)
-                    for key in stage_keys
-                    if (task := self._staged_pipeline_groups.pop(key, None)) is not None
+
+            async def cleanup_failed_prepare() -> list[BaseException]:
+                stage_failures: list[BaseException] = []
+                try:
+                    if not adopted:
+                        entries = tuple(
+                            (key, stage)
+                            for key in stage_keys
+                            if (stage := self._staged_pipeline_groups.pop(key, None))
+                            is not None
+                        )
+                        stage_failures = await self._discard_staged_pipeline_entries(
+                            entries
+                        )
+                finally:
+                    cleanup_results = await asyncio.gather(
+                        *cleanup, return_exceptions=True
+                    )
+                return [
+                    result
+                    for result in (*stage_failures, *cleanup_results)
+                    if isinstance(result, BaseException) and result is not primary
+                ]
+
+            try:
+                failures, cancelled = await complete_task(
+                    asyncio.create_task(cleanup_failed_prepare())
                 )
-                stage_failures = await self._discard_staged_pipeline_entries(entries)
-            failures = [
-                result
-                for result in await asyncio.gather(*cleanup, return_exceptions=True)
-                if isinstance(result, BaseException)
-            ]
-            failures.extend(error for error in stage_failures if error is not primary)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "remote packing and source cleanup failed",
+                    [primary, cleanup_error],
+                ) from None
+            if cancelled is not None:
+                failures.append(cancelled)
             if failures:
                 raise BaseExceptionGroup(
                     "remote packing and source cleanup failed", [primary, *failures]

@@ -51,6 +51,7 @@ from art.pipeline_tuner import (
     RolloutWorkerController,
 )
 from art.preprocessing.policy_spans import PolicyTokenSpan
+from art.utils.lifecycle import complete_task
 
 from .checkpoint_retention import (
     CHECKPOINT_CREATED_AT_METRIC,
@@ -2396,18 +2397,38 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if isinstance(self._output_queue, DistributedTrajectoryQueue):
             if not isinstance(group, TrajectoryGroupRef):
                 raise RuntimeError("distributed result queue requires a stored group")
-            accepted, wait_s = await self._output_queue.put(
-                group,
-                metadata=metadata,
-                initial_policy_version=initial_policy_version,
-                final_policy_version=final_policy_version,
-                rollout_wall_s=rollout_wall_s,
-                actor_idle_s=actor_idle_s,
-            )
+            stage = getattr(self.backend, "stage_pipeline_group", None)
+            resolve_stage = getattr(self.backend, "resolve_pipeline_group_stage", None)
+            reservation = None
+            if callable(stage):
+                if not callable(resolve_stage):
+                    raise RuntimeError(
+                        "distributed pipeline staging requires atomic admission"
+                    )
+                reservation = await stage(self.model, self._output_queue, group)
+            try:
+                put = asyncio.create_task(
+                    self._output_queue.put(
+                        group,
+                        metadata=metadata,
+                        initial_policy_version=initial_policy_version,
+                        final_policy_version=final_policy_version,
+                        rollout_wall_s=rollout_wall_s,
+                        actor_idle_s=actor_idle_s,
+                    )
+                )
+                (accepted, wait_s), cancelled = await complete_task(put)
+            except BaseException:
+                if reservation is not None:
+                    assert callable(resolve_stage)
+                    await resolve_stage(reservation, accepted=False)
+                raise
+            if reservation is not None:
+                assert callable(resolve_stage)
+                await resolve_stage(reservation, accepted=accepted)
+            if cancelled is not None:
+                raise cancelled
             if accepted:
-                stage = getattr(self.backend, "stage_pipeline_group", None)
-                if callable(stage):
-                    await stage(self.model, self._output_queue, group)
                 self._status.note_group_enqueued()
             return wait_s
         if not isinstance(group, TrajectoryGroup):
