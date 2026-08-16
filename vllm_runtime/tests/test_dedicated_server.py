@@ -1,3 +1,4 @@
+import asyncio
 from http.client import HTTPConnection
 import json
 import os
@@ -175,6 +176,32 @@ def test_launch_policy_version_resolves_loaded_slot_alias(monkeypatch) -> None:
         )
         == 5
     )
+
+
+@pytest.mark.asyncio
+async def test_lora_mutations_are_serialized_across_slots() -> None:
+    models = SimpleNamespace()
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    events: list[str] = []
+
+    async def mutate(slot: str) -> None:
+        async with dedicated_server._lora_mutation_lock(models, slot):
+            events.append(f"{slot}:enter")
+            if slot == "first":
+                first_entered.set()
+                await release_first.wait()
+            events.append(f"{slot}:exit")
+
+    first = asyncio.create_task(mutate("first"))
+    await first_entered.wait()
+    second = asyncio.create_task(mutate("second"))
+    await asyncio.sleep(0)
+    assert events == ["first:enter"]
+
+    release_first.set()
+    await asyncio.gather(first, second)
+    assert events == ["first:enter", "first:exit", "second:enter", "second:exit"]
 
 
 def test_kv_preflight_runs_before_pipeline_route_mutation(monkeypatch) -> None:
