@@ -280,7 +280,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _patch_art_runtime_routes() -> None:
     from fastapi import APIRouter, Depends, FastAPI, Query, Request
-    from fastapi.responses import JSONResponse, Response
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
     from vllm.entrypoints.openai import api_server
     from vllm.entrypoints.openai.chat_completion.api_router import (
         create_chat_completion,
@@ -292,7 +292,7 @@ def _patch_art_runtime_routes() -> None:
 
     from art_vllm_runtime.binary_routes import (
         capture_routed_experts,
-        encode_routed_experts_response,
+        routed_experts_response_chunks,
     )
 
     if getattr(api_server, "_art_runtime_routes_patched", False):
@@ -407,8 +407,15 @@ def _patch_art_runtime_routes() -> None:
                 for key, value in response.headers.items()
                 if key.lower() not in {"content-length", "content-type"}
             }
-            return Response(
-                content=encode_routed_experts_response(response.body, routes),
+            chunks = routed_experts_response_chunks(response.body, routes)
+            headers["content-length"] = str(sum(map(len, chunks)))
+
+            async def body_chunks():
+                for chunk in chunks:
+                    yield chunk
+
+            return StreamingResponse(
+                content=body_chunks(),
                 media_type="application/vnd.art.routed-experts-v2",
                 headers=headers,
             )

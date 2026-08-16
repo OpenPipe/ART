@@ -110,6 +110,21 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
 
         binary_routes.encode_routed_experts_response(b"{}", routes)
 
+    def test_streaming_chunks_preserve_protocol_bytes(self) -> None:
+        routes = binary_routes._CapturedRoutes(num_experts=8, padding_layers=())
+        routes[0] = (
+            np.arange(400_000, dtype=np.uint32).astype(np.uint8).reshape(100_000, 2, 2)
+            % 8
+        )
+
+        chunks = binary_routes.routed_experts_response_chunks(b'{"value":1}', routes)
+
+        self.assertGreater(len(chunks), 4)
+        self.assertEqual(
+            b"".join(chunks),
+            binary_routes.encode_routed_experts_response(b'{"value":1}', routes),
+        )
+
     def test_rejects_route_outside_model_range(self) -> None:
         routes = binary_routes._CapturedRoutes(num_experts=8, padding_layers=())
         routes[0] = np.asarray([[[0, 8]]], dtype=np.uint8)

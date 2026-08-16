@@ -15,6 +15,7 @@ HEADER = struct.Struct("<8sQII")
 ROUTE_HEADER = struct.Struct("<IB3xQQQ")
 PIPELINE_ROUTES_ENV = "ART_VLLM_PIPELINE_ROUTES_PROTOCOL"
 PIPELINE_ROUTES_PROTOCOL = "1"
+RESPONSE_CHUNK_BYTES = 256 * 1024
 _REGISTERED_NUM_EXPERTS: int | None = None
 _REGISTERED_PADDING_LAYERS: tuple[int, ...] | None = None
 
@@ -52,6 +53,21 @@ def encode_routed_experts_response(
     *,
     num_experts: int | None = None,
 ) -> bytes:
+    return b"".join(
+        routed_experts_response_chunks(
+            json_body,
+            routes,
+            num_experts=num_experts,
+        )
+    )
+
+
+def routed_experts_response_chunks(
+    json_body: bytes,
+    routes: dict[int, np.ndarray],
+    *,
+    num_experts: int | None = None,
+) -> tuple[bytes | memoryview, ...]:
     num_experts = int(num_experts or getattr(routes, "num_experts", 0))
     dtype = _route_dtype(num_experts)
     chunks: list[bytes | memoryview] = [
@@ -76,13 +92,13 @@ def encode_routed_experts_response(
         )
         _validate_route_ids(array, num_experts=num_experts)
         array = np.ascontiguousarray(array)
+        chunks.append(ROUTE_HEADER.pack(choice_index, dtype_code, *array.shape))
+        view = memoryview(array).cast("B")
         chunks.extend(
-            (
-                ROUTE_HEADER.pack(choice_index, dtype_code, *array.shape),
-                memoryview(array).cast("B"),
-            )
+            view[offset : offset + RESPONSE_CHUNK_BYTES]
+            for offset in range(0, len(view), RESPONSE_CHUNK_BYTES)
         )
-    return b"".join(chunks)
+    return tuple(chunks)
 
 
 def _route_dtype(num_experts: int) -> np.dtype[Any]:
