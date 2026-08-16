@@ -970,6 +970,66 @@ def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp(tmp_path: Path)
     _assert_tensors_equal(roundtrip, original)
 
 
+def test_gemma4_peft_target_parameter_moe_layout_is_transposed(tmp_path: Path):
+    model_dir = tmp_path / "gemma4-moe"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "text_config": {
+                    "enable_moe_block": True,
+                    "hidden_size": 6,
+                    "moe_intermediate_size": 2,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    prefix = "base_model.model.model.layers.0.moe.experts"
+    peft_gate_up_a = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    peft_gate_up_b = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    peft_down_a = torch.arange(12, 24, dtype=torch.float32).reshape(2, 6)
+    peft_down_b = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    peft_tensors = {
+        f"{prefix}.base_layer.lora_A.weight": peft_gate_up_a,
+        f"{prefix}.base_layer.lora_B.weight": peft_gate_up_b,
+        f"{prefix}.lora_A.weight": peft_down_a,
+        f"{prefix}.lora_B.weight": peft_down_b,
+    }
+    adapter_config = _config(str(model_dir), rank=1, alpha=1)
+
+    normalized, _ = GEMMA4_MOE_HANDLER.to_vllm_lora_tensors(
+        peft_tensors,
+        adapter_config=adapter_config,
+    )
+
+    assert torch.equal(
+        normalized[f"{prefix}.base_layer.lora_A.weight"], peft_gate_up_b.T
+    )
+    assert torch.equal(
+        normalized[f"{prefix}.base_layer.lora_B.weight"], peft_gate_up_a.T
+    )
+    assert torch.equal(normalized[f"{prefix}.lora_A.weight"], peft_down_b.T)
+    assert torch.equal(normalized[f"{prefix}.lora_B.weight"], peft_down_a.T)
+
+    internal = GEMMA4_MOE_HANDLER.from_vllm_lora_tensors(
+        peft_tensors,
+        adapter_config=adapter_config,
+    )
+    art_prefix = "base_model.model.model.layers.0.mlp.experts"
+    for expert in range(2):
+        gate_up_a = internal[f"{art_prefix}.{expert}.gate_up_proj.lora_A.weight"]
+        gate_up_b = internal[f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight"]
+        down_a = internal[f"{art_prefix}.{expert}.down_proj.lora_A.weight"]
+        down_b = internal[f"{art_prefix}.{expert}.down_proj.lora_B.weight"]
+        assert torch.equal(gate_up_a, peft_gate_up_b[:, expert].unsqueeze(0))
+        assert torch.equal(gate_up_b[:4], peft_gate_up_a[expert].unsqueeze(1))
+        assert torch.count_nonzero(gate_up_b[4:]) == 0
+        assert torch.equal(down_a[:, :2], peft_down_b[:, expert].unsqueeze(0))
+        assert torch.count_nonzero(down_a[:, 2:]) == 0
+        assert torch.equal(down_b, peft_down_a[expert].unsqueeze(1))
+
+
 def test_gpt_oss_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
     art_prefix = "base_model.model.model.layers.0"
     original = _gpt_oss_moe_art_tensors(art_prefix)
