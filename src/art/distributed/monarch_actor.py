@@ -13,7 +13,11 @@ from typing import Any, Literal
 from urllib.request import urlopen
 
 # This module is imported only by explicit distributed runtime construction.
-from monarch.actor import Actor, endpoint  # ty: ignore[unresolved-import]
+from monarch.actor import (  # ty: ignore[unresolved-import]
+    Actor,
+    concurrent_endpoint,
+    endpoint,
+)
 
 from art.utils.lifecycle import complete_task, complete_to_thread
 
@@ -103,7 +107,7 @@ def _build_packing_groups(
     return groups
 
 
-def resilient_endpoint(function: Any) -> Any:
+def _resilient(function: Any) -> Any:
     @wraps(function)
     async def wrapped(*args: Any, **kwargs: Any) -> RemoteCallResult:
         try:
@@ -134,7 +138,15 @@ def resilient_endpoint(function: Any) -> Any:
                 )
             )
 
-    return endpoint(wrapped)
+    return wrapped
+
+
+def resilient_endpoint(function: Any) -> Any:
+    return endpoint(_resilient(function))
+
+
+def resilient_concurrent_endpoint(function: Any) -> Any:
+    return concurrent_endpoint(_resilient(function))
 
 
 class AdapterTransferHostService(Actor):
@@ -196,6 +208,8 @@ class ArtHostService(Actor):
         self._trajectory_queues: dict[str, TrajectoryQueueStore] = {}
         self._packer = None
         self._packing_lock = asyncio.Lock()
+        self._packing_tasks: set[asyncio.Task[Any]] = set()
+        self._closing = False
         self._vllm_output_root = vllm_output_root
         self._vllm_launcher = None
         self._nccl_cleanups: dict[str, asyncio.Task[None]] = {}
@@ -301,6 +315,9 @@ class ArtHostService(Actor):
 
     @resilient_endpoint
     async def close(self) -> None:
+        self._closing = True
+        if self._packing_tasks:
+            await asyncio.gather(*tuple(self._packing_tasks))
         probe_ids = tuple(
             {
                 *self._nccl_cleanups,
@@ -479,8 +496,21 @@ class ArtHostService(Actor):
         if self._vllm_launcher is not None:
             await self._vllm_launcher.stop_member(replica_id, member_id, generation)
 
-    @resilient_endpoint
+    @resilient_concurrent_endpoint
     async def pack_batch(
+        self, request: PackingRequest, batch_id: str, transfer_timeout_s: float
+    ) -> PackingResult:
+        if self._closing:
+            raise RuntimeError("ART host service is closing")
+        task = asyncio.current_task()
+        assert task is not None
+        self._packing_tasks.add(task)
+        try:
+            return await self._pack_batch(request, batch_id, transfer_timeout_s)
+        finally:
+            self._packing_tasks.remove(task)
+
+    async def _pack_batch(
         self, request: PackingRequest, batch_id: str, transfer_timeout_s: float
     ) -> PackingResult:
         fetch_started = time.monotonic()
