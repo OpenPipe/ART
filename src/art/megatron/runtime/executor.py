@@ -822,23 +822,26 @@ class MCoreRunSlotExecutor:
         self._validate_parent(state, job.training_session_id, job.learner_version)
         if job.merged_weight_transfer is not None:
             raise ValueError("multi-run slots publish LoRA weights, not merged weights")
-        stage_metrics = {}
-        if not self._publisher.has_generation(job.generation):
-            from art.megatron.lora import LoRASlotRef
+        from art.megatron.lora import LoRASlotRef
 
-            stage_metrics = self._publisher.stage(
-                run_id=job.run_id,
-                generation=job.generation,
-                adapter_dtypes={},
-                adapter_config=state.adapter_config,
-                slot_ref=LoRASlotRef("checkpoint", job.run_id),
-                trainer_rank_optimizer_state=(
-                    self._slot_trainer.checkpoint_slot_optimizer_snapshot_sources(
-                        job.run_id
-                    )
-                ),
-                snapshot_optimizer=job.save_optimizer,
-            )
+        needs_optimizer = job.save_optimizer and not self._publisher.has_generation(
+            job.generation, require_optimizer=True
+        )
+        stage_metrics = self._publisher.ensure_generation(
+            run_id=job.run_id,
+            generation=job.generation,
+            adapter_dtypes={},
+            adapter_config=state.adapter_config,
+            slot_ref=LoRASlotRef("checkpoint", job.run_id),
+            trainer_rank_optimizer_state=(
+                self._slot_trainer.checkpoint_slot_optimizer_snapshot_sources(
+                    job.run_id
+                )
+                if needs_optimizer
+                else None
+            ),
+            snapshot_optimizer=job.save_optimizer,
+        )
         metrics = {
             **stage_metrics,
             **self._publisher.submit(
@@ -923,6 +926,8 @@ class _CachedGeneration(BaseModel):
     run_id: str
     generation: TrainerGeneration
     resolved: Future[_ResolvedGeneration]
+    optimizer_upgrade: Future[Any] | None = None
+    has_optimizer: bool = False
     consumers: list[Future[TrainerRankPublication]] = Field(default_factory=list)
     object_ids: set[str] = Field(default_factory=set)
     retired: bool = False
@@ -1055,6 +1060,7 @@ class _GenerationPublisher:
                 run_id=run_id,
                 generation=generation,
                 resolved=resolved,
+                has_optimizer=optimizer is not None,
             )
             with self._lock:
                 if generation.generation_id in self._cache:
@@ -1076,6 +1082,71 @@ class _GenerationPublisher:
             "snapshot_lora_launch_s": lora_launch_s,
             "snapshot_optimizer_launch_s": optimizer_launch_s,
             "snapshot_launch_s": time.perf_counter() - prepare_started,
+        }
+
+    def ensure_generation(
+        self,
+        *,
+        run_id: str,
+        generation: TrainerGeneration,
+        adapter_dtypes: dict[str, Any],
+        adapter_config: dict[str, Any],
+        slot_ref: "LoRASlotRef | None" = None,
+        trainer_rank_optimizer_state: "TrainerRankOptimizerState | None" = None,
+        snapshot_optimizer: bool,
+    ) -> dict[str, float]:
+        with self._lock:
+            entry = self._cache.get(generation.generation_id)
+            reusable = (
+                entry is not None
+                and not entry.retired
+                and entry.run_id == run_id
+                and entry.generation == generation
+            )
+        if not reusable:
+            return self.stage(
+                run_id=run_id,
+                generation=generation,
+                adapter_dtypes=adapter_dtypes,
+                adapter_config=adapter_config,
+                slot_ref=slot_ref,
+                trainer_rank_optimizer_state=trainer_rank_optimizer_state,
+                snapshot_optimizer=snapshot_optimizer,
+            )
+        assert entry is not None
+        if not snapshot_optimizer or entry.has_optimizer:
+            return {}
+        if trainer_rank_optimizer_state is None:
+            raise RuntimeError("dynamic LoRA snapshot has no optimizer state")
+
+        from art.megatron.optimizer_state import (
+            stage_trainer_rank_optimizer_state_snapshot,
+        )
+
+        started = time.perf_counter()
+        optimizer = stage_trainer_rank_optimizer_state_snapshot(
+            self.runtime,
+            trainer_rank_optimizer_state,
+            generation_id=generation.generation_id,
+            step=generation.policy_step,
+            stager=self.stager,
+        )
+        self.runtime.optimizer_snapshot_barrier.register(optimizer)
+        resolved = self._resolution_pool.submit(optimizer.resolve)
+        with self._lock:
+            if entry.retired or entry.released or entry.optimizer_upgrade is not None:
+                raise RuntimeError(
+                    "generation changed while staging optimizer snapshot"
+                )
+            entry.optimizer_upgrade = resolved
+            entry.has_optimizer = True
+        resolved.add_done_callback(
+            lambda done, cached=entry: self._optimizer_resolved(cached, done)
+        )
+        elapsed = time.perf_counter() - started
+        return {
+            "snapshot_optimizer_launch_s": elapsed,
+            "snapshot_launch_s": elapsed,
         }
 
     def submit(
@@ -1107,7 +1178,7 @@ class _GenerationPublisher:
         )
         durability = self._durability_pool.submit(
             self._persist_cached_snapshot,
-            entry.resolved,
+            entry,
             generation,
             optimizer_state_path,
             staging_adapter_path,
@@ -1163,13 +1234,19 @@ class _GenerationPublisher:
             ),
         }
 
-    def has_generation(self, generation: TrainerGeneration) -> bool:
+    def has_generation(
+        self,
+        generation: TrainerGeneration,
+        *,
+        require_optimizer: bool = False,
+    ) -> bool:
         with self._lock:
             entry = self._cache.get(generation.generation_id)
             return (
                 entry is not None
                 and not entry.retired
                 and entry.generation == generation
+                and (not require_optimizer or entry.has_optimizer)
             )
 
     def retire_run(self, run_id: str) -> None:
@@ -1195,6 +1272,7 @@ class _GenerationPublisher:
                 entry
                 for entry in entries
                 if entry.resolved.done()
+                and (entry.optimizer_upgrade is None or entry.optimizer_upgrade.done())
                 and all(consumer.done() for consumer in entry.consumers)
             )
             if not entries:
@@ -1204,6 +1282,8 @@ class _GenerationPublisher:
             consumers = tuple(entry.consumers)
         try:
             entry.resolved.result()
+            if entry.optimizer_upgrade is not None:
+                entry.optimizer_upgrade.result()
             for consumer in consumers:
                 consumer.result()
         finally:
@@ -1229,12 +1309,27 @@ class _GenerationPublisher:
                 entry.retired = True
         self._maybe_release(entry)
 
+    def _optimizer_resolved(
+        self,
+        entry: _CachedGeneration,
+        resolved: Future[Any],
+    ) -> None:
+        if not resolved.cancelled() and (error := resolved.exception()) is not None:
+            with self._lock:
+                self._failures.append(error)
+                entry.retired = True
+        self._maybe_release(entry)
+
     def _maybe_release(self, entry: _CachedGeneration) -> None:
         with self._lock:
             if (
                 not entry.retired
                 or entry.released
                 or not entry.resolved.done()
+                or (
+                    entry.optimizer_upgrade is not None
+                    and not entry.optimizer_upgrade.done()
+                )
                 or any(not consumer.done() for consumer in entry.consumers)
             ):
                 return
@@ -1308,7 +1403,7 @@ class _GenerationPublisher:
 
     def _persist_cached_snapshot(
         self,
-        resolved: Future[_ResolvedGeneration],
+        entry: _CachedGeneration,
         generation: TrainerGeneration,
         optimizer_state_path: str,
         staging_adapter_path: str | None,
@@ -1316,9 +1411,12 @@ class _GenerationPublisher:
         save_optimizer: bool,
     ) -> _RankSnapshotPersistence:
         started = time.perf_counter()
-        snapshot = resolved.result()
+        snapshot = entry.resolved.result()
+        optimizer = snapshot.optimizer
+        if save_optimizer and optimizer is None and entry.optimizer_upgrade is not None:
+            optimizer = entry.optimizer_upgrade.result()
         ready = time.perf_counter()
-        if save_optimizer and snapshot.optimizer is None:
+        if save_optimizer and optimizer is None:
             raise RuntimeError("optimizer persistence requires an optimizer snapshot")
         result = self._persist_generation(
             generation=generation,
@@ -1330,7 +1428,7 @@ class _GenerationPublisher:
                 else None
             ),
             adapter=adapter,
-            optimizer=snapshot.optimizer if save_optimizer else None,
+            optimizer=optimizer if save_optimizer else None,
             prepared_tensors=(
                 snapshot.prepared_tensors
                 if adapter is None and staging_adapter_path is not None

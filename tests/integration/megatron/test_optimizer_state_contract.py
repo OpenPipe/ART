@@ -6,7 +6,24 @@ import pytest
 
 from art.megatron.distributed_service import DistributedMegatronService
 from art.megatron.migrations import apply_megatron_migrations, optimizer_state_path
-from art.megatron.tensor_snapshot import SnapshotReadBarrier
+from art.megatron.tensor_snapshot import PinnedCpuSnapshotStager, SnapshotReadBarrier
+from art.trainer_rank import TrainerRankOptimizerState
+
+
+class _ResolvedSnapshot:
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def resolve(self) -> object:
+        return self.value
+
+
+class _RecordingBarrier:
+    def __init__(self) -> None:
+        self.snapshots: list[object] = []
+
+    def register(self, snapshot: object) -> None:
+        self.snapshots.append(snapshot)
 
 
 def test_split_optimizer_root_moves_to_unified_path(tmp_path: Path) -> None:
@@ -93,3 +110,64 @@ def test_resident_optimizer_is_reused_across_objectives_in_one_run(
 
     assert runtime.optimizer is old_optimizer
     assert adapter_dtypes == {}
+
+
+def test_lora_only_generation_can_add_optimizer_without_restaging_lora(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.megatron.lora import LoRASlotRef
+    from art.megatron.runtime.executor import _GenerationPublisher
+    from art.megatron.runtime.specs import TrainerGeneration
+
+    lora_stages: list[bool] = []
+    optimizer = object()
+    barrier = _RecordingBarrier()
+    runtime = SimpleNamespace(
+        rank=1,
+        world_size=2,
+        model=object(),
+        model_support_handler=object(),
+        optimizer_snapshot_barrier=barrier,
+    )
+    monkeypatch.setattr(
+        "art.megatron.weights.lora_publish.stage_vllm_lora_snapshot_from_model",
+        lambda **_kwargs: lora_stages.append(True),
+    )
+    monkeypatch.setattr(
+        "art.megatron.optimizer_state.stage_trainer_rank_optimizer_state_snapshot",
+        lambda *_args, **_kwargs: _ResolvedSnapshot(optimizer),
+    )
+    publisher = _GenerationPublisher(
+        runtime, stager=PinnedCpuSnapshotStager(), capacity=1
+    )
+    generation = TrainerGeneration(
+        training_session_id="session",
+        policy_step=1,
+        generation_id="step-00000001-0123456789abcdef0123456789abcdef",
+        adapter_path="/tmp/step-1",
+    )
+    publisher.stage(
+        run_id="run",
+        generation=generation,
+        adapter_dtypes={},
+        adapter_config={},
+        slot_ref=LoRASlotRef("checkpoint", "run"),
+        snapshot_optimizer=False,
+    )
+    publisher.ensure_generation(
+        run_id="run",
+        generation=generation,
+        adapter_dtypes={},
+        adapter_config={},
+        slot_ref=LoRASlotRef("checkpoint", "run"),
+        trainer_rank_optimizer_state=cast(TrainerRankOptimizerState, {}),
+        snapshot_optimizer=True,
+    )
+
+    entry = publisher._cache[generation.generation_id]
+    assert lora_stages == [True]
+    assert len(barrier.snapshots) == 1
+    assert entry.optimizer_upgrade is not None
+    assert entry.optimizer_upgrade.result(timeout=1) is optimizer
+    assert publisher.has_generation(generation, require_optimizer=True)
+    publisher.close()
