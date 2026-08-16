@@ -518,6 +518,7 @@ def test_load_checkpoint_slot_retains_config_and_uses_its_alpha(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
+    trainer._dynamic_optimizer_padding_masks_by_name["student"] = ()
     seen: dict[str, object] = {}
     monkeypatch.setattr(
         trainer,
@@ -539,9 +540,34 @@ def test_load_checkpoint_slot_retains_config_and_uses_its_alpha(
 
     assert seen["alpha"] == 16
     assert trainer._checkpoint_slot_adapter_configs["student"] == config
+    assert "student" not in trainer._dynamic_optimizer_padding_masks_by_name
     trainer.load_checkpoint_slot("student", {}, alpha=7)
     assert seen["alpha"] == 7
     assert "student" not in trainer._checkpoint_slot_adapter_configs
+
+
+def test_dynamic_optimizer_padding_masks_are_cached_per_loaded_slot() -> None:
+    calls = 0
+    runtime = _runtime()
+
+    def canonicalize(
+        state: dict[str, torch.Tensor], _model: object
+    ) -> dict[str, torch.Tensor]:
+        nonlocal calls
+        calls += 1
+        return state
+
+    runtime.model_support_handler.canonicalize_loaded_lora_state = canonicalize
+    trainer = TrainerRank(runtime)
+    trainer._checkpoint_slot_params_by_name["student"] = (
+        torch.nn.Parameter(torch.ones(2)),
+    )
+
+    first = trainer._dynamic_optimizer_padding_masks("student")
+    second = trainer._dynamic_optimizer_padding_masks("student")
+
+    assert first is second
+    assert calls == 1
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")

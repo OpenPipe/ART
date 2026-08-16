@@ -587,6 +587,9 @@ class TrainerRank:
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
         self._dynamic_optimizers: dict[str, _DynamicOptimizer] = {}
+        self._dynamic_optimizer_padding_masks_by_name: dict[
+            str, tuple[torch.Tensor, ...]
+        ] = {}
         self._checkpoint_slot_params_by_name: dict[
             str, tuple[torch.nn.Parameter, ...]
         ] = {}
@@ -676,6 +679,7 @@ class TrainerRank:
             )
         if config is not None:
             self._validate_loaded_checkpoint_slot_config(name, config)
+        self._dynamic_optimizer_padding_masks_by_name.pop(name, None)
         self._checkpoint_slot_params_by_name[name] = slot_params
         self._checkpoint_slot_param_names_by_name[name] = tuple(
             names for names, _param in named_params
@@ -767,6 +771,7 @@ class TrainerRank:
         self._checkpoint_slot_param_names_by_name.pop(name)
         self._checkpoint_slot_adapter_configs.pop(name, None)
         self._dynamic_optimizers.pop(name, None)
+        self._dynamic_optimizer_padding_masks_by_name.pop(name, None)
         return unloaded
 
     def checkpoint_slot_parameters(self, name: str) -> tuple[torch.nn.Parameter, ...]:
@@ -1541,6 +1546,10 @@ class TrainerRank:
                         value.masked_fill_(mask, 0)
 
     def _dynamic_optimizer_padding_masks(self, name: str) -> tuple[torch.Tensor, ...]:
+        if (
+            cached := self._dynamic_optimizer_padding_masks_by_name.get(name)
+        ) is not None:
+            return cached
         params = self._checkpoint_slot_params_by_name[name]
         masks = tuple(torch.zeros_like(param, dtype=torch.bool) for param in params)
         param_indices = {id(param): index for index, param in enumerate(params)}
@@ -1602,6 +1611,7 @@ class TrainerRank:
                 masks[index].copy_(mask)
             else:
                 masks[index][expert].copy_(mask)
+        self._dynamic_optimizer_padding_masks_by_name[name] = masks
         return masks
 
     def _reduce_dynamic_grads(
