@@ -281,6 +281,7 @@ class MegatronTrainJobExecutor:
             generation=job.generation,
             adapter_dtypes=runtime.adapter_export_dtypes,
             adapter_config=runtime.adapter_export_config,
+            snapshot_optimizer=False,
         )
         return {
             "operation_id": job.operation_id,
@@ -315,6 +316,7 @@ class MegatronTrainJobExecutor:
             generation=job.generation,
             adapter_dtypes=runtime.adapter_export_dtypes,
             adapter_config=runtime.adapter_export_config,
+            snapshot_optimizer=job.restore_optimizer,
         )
         return {
             "operation_id": job.operation_id,
@@ -343,14 +345,13 @@ class MegatronTrainJobExecutor:
             not runtime.optimizer_state_loaded or runtime.optimizer is None
         ):
             raise RuntimeError("snapshot requested non-resident optimizer state")
-        stage_metrics = {}
-        if not self._publisher.has_generation(job.generation):
-            stage_metrics = self._publisher.stage(
-                run_id=job.run_id,
-                generation=job.generation,
-                adapter_dtypes=runtime.adapter_export_dtypes,
-                adapter_config=runtime.adapter_export_config,
-            )
+        stage_metrics = self._publisher.ensure_generation(
+            run_id=job.run_id,
+            generation=job.generation,
+            adapter_dtypes=runtime.adapter_export_dtypes,
+            adapter_config=runtime.adapter_export_config,
+            snapshot_optimizer=job.save_optimizer,
+        )
         metrics = {
             **stage_metrics,
             **self._publisher.submit(
@@ -723,11 +724,7 @@ class MCoreRunSlotExecutor:
             adapter_dtypes={},
             adapter_config=state.adapter_config,
             slot_ref=LoRASlotRef("checkpoint", job.run_id),
-            trainer_rank_optimizer_state=(
-                self._slot_trainer.checkpoint_slot_optimizer_snapshot_sources(
-                    job.run_id
-                )
-            ),
+            snapshot_optimizer=False,
         )
         return {
             "operation_id": job.operation_id,
@@ -1116,21 +1113,32 @@ class _GenerationPublisher:
         assert entry is not None
         if not snapshot_optimizer or entry.has_optimizer:
             return {}
-        if trainer_rank_optimizer_state is None:
-            raise RuntimeError("dynamic LoRA snapshot has no optimizer state")
 
         from art.megatron.optimizer_state import (
+            stage_optimizer_state_snapshot,
             stage_trainer_rank_optimizer_state_snapshot,
         )
 
         started = time.perf_counter()
-        optimizer = stage_trainer_rank_optimizer_state_snapshot(
-            self.runtime,
-            trainer_rank_optimizer_state,
-            generation_id=generation.generation_id,
-            step=generation.policy_step,
-            stager=self.stager,
-        )
+        if slot_ref is None:
+            if trainer_rank_optimizer_state is not None:
+                raise RuntimeError("static optimizer upgrade received slot state")
+            optimizer = stage_optimizer_state_snapshot(
+                self.runtime,
+                generation_id=generation.generation_id,
+                step=generation.policy_step,
+                stager=self.stager,
+            )
+        else:
+            if trainer_rank_optimizer_state is None:
+                raise RuntimeError("dynamic LoRA snapshot has no optimizer state")
+            optimizer = stage_trainer_rank_optimizer_state_snapshot(
+                self.runtime,
+                trainer_rank_optimizer_state,
+                generation_id=generation.generation_id,
+                step=generation.policy_step,
+                stager=self.stager,
+            )
         self.runtime.optimizer_snapshot_barrier.register(optimizer)
         resolved = self._resolution_pool.submit(optimizer.resolve)
         with self._lock:

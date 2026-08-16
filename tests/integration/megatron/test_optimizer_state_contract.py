@@ -112,8 +112,10 @@ def test_resident_optimizer_is_reused_across_objectives_in_one_run(
     assert adapter_dtypes == {}
 
 
+@pytest.mark.parametrize("dynamic", [False, True])
 def test_lora_only_generation_can_add_optimizer_without_restaging_lora(
     monkeypatch: pytest.MonkeyPatch,
+    dynamic: bool,
 ) -> None:
     from art.megatron.lora import LoRASlotRef
     from art.megatron.runtime.executor import _GenerationPublisher
@@ -137,6 +139,10 @@ def test_lora_only_generation_can_add_optimizer_without_restaging_lora(
         "art.megatron.optimizer_state.stage_trainer_rank_optimizer_state_snapshot",
         lambda *_args, **_kwargs: _ResolvedSnapshot(optimizer),
     )
+    monkeypatch.setattr(
+        "art.megatron.optimizer_state.stage_optimizer_state_snapshot",
+        lambda *_args, **_kwargs: _ResolvedSnapshot(optimizer),
+    )
     publisher = _GenerationPublisher(
         runtime, stager=PinnedCpuSnapshotStager(), capacity=1
     )
@@ -151,7 +157,7 @@ def test_lora_only_generation_can_add_optimizer_without_restaging_lora(
         generation=generation,
         adapter_dtypes={},
         adapter_config={},
-        slot_ref=LoRASlotRef("checkpoint", "run"),
+        slot_ref=LoRASlotRef("checkpoint", "run") if dynamic else None,
         snapshot_optimizer=False,
     )
     publisher.ensure_generation(
@@ -159,8 +165,10 @@ def test_lora_only_generation_can_add_optimizer_without_restaging_lora(
         generation=generation,
         adapter_dtypes={},
         adapter_config={},
-        slot_ref=LoRASlotRef("checkpoint", "run"),
-        trainer_rank_optimizer_state=cast(TrainerRankOptimizerState, {}),
+        slot_ref=LoRASlotRef("checkpoint", "run") if dynamic else None,
+        trainer_rank_optimizer_state=(
+            cast(TrainerRankOptimizerState, {}) if dynamic else None
+        ),
         snapshot_optimizer=True,
     )
 
