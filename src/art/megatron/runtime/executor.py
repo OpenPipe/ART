@@ -1188,6 +1188,7 @@ class _GenerationPublisher:
             publication_targets,
             adapter_object_target,
             generation,
+            started,
         )
         durability = self._durability_pool.submit(
             self._persist_cached_snapshot,
@@ -1197,9 +1198,10 @@ class _GenerationPublisher:
             staging_adapter_path,
             existing_adapter if int(self.runtime.rank) == 0 else None,
             save_optimizer,
+            started,
         )
         persistence = self._completion_pool.submit(
-            self._complete_publication, transport, durability
+            self._complete_publication, transport, durability, started
         )
         with self._lock:
             entry.consumers.append(persistence)
@@ -1209,6 +1211,7 @@ class _GenerationPublisher:
                 entry=entry,
                 sink=sink,
                 generation=generation,
+                submitted_at=started,
             )
         )
         return {
@@ -1383,10 +1386,13 @@ class _GenerationPublisher:
         publication_targets: tuple[Any, ...],
         object_target: BinaryObjectTarget | None,
         generation: TrainerGeneration,
+        submitted_at: float,
     ) -> _SnapshotTransport:
         started = time.perf_counter()
         if int(self.runtime.rank) != 0:
-            return _SnapshotTransport()
+            return _SnapshotTransport(
+                metrics={"time/snapshot_transport_queue_s": started - submitted_at}
+            )
         snapshot = entry.resolved.result()
         ready = time.perf_counter()
         if snapshot.lora is None or snapshot.prepared_tensors is None:
@@ -1409,6 +1415,7 @@ class _GenerationPublisher:
         return _SnapshotTransport(
             adapter=adapter,
             metrics={
+                "time/snapshot_transport_queue_s": started - submitted_at,
                 "time/snapshot_transport_wait_s": ready - started,
                 "time/snapshot_transport_s": time.perf_counter() - ready,
             },
@@ -1422,6 +1429,7 @@ class _GenerationPublisher:
         staging_adapter_path: str | None,
         adapter: OptimizerAdapter | None,
         save_optimizer: bool,
+        submitted_at: float,
     ) -> _RankSnapshotPersistence:
         started = time.perf_counter()
         snapshot = entry.resolved.result()
@@ -1451,6 +1459,7 @@ class _GenerationPublisher:
         return result.model_copy(
             update={
                 "metrics": {
+                    "time/snapshot_persistence_queue_s": started - submitted_at,
                     "time/snapshot_persistence_wait_s": ready - started,
                     "time/snapshot_persistence_s": time.perf_counter() - ready,
                 }
@@ -1461,7 +1470,9 @@ class _GenerationPublisher:
     def _complete_publication(
         transport: Future[_SnapshotTransport],
         durability: Future[_RankSnapshotPersistence],
+        submitted_at: float,
     ) -> TrainerRankPublication:
+        started = time.perf_counter()
         failures: list[BaseException] = []
         for future in (transport, durability):
             try:
@@ -1484,11 +1495,14 @@ class _GenerationPublisher:
         ):
             raise RuntimeError("nonzero rank unexpectedly published an adapter")
         metrics = {**transferred.metrics, **persisted.metrics}
-        metrics["time/snapshot_publication_s"] = max(
-            metrics.get("time/snapshot_transport_wait_s", 0.0)
-            + metrics.get("time/snapshot_transport_s", 0.0),
-            metrics.get("time/snapshot_persistence_wait_s", 0.0)
-            + metrics.get("time/snapshot_persistence_s", 0.0),
+        completed_at = time.perf_counter()
+        metrics.update(
+            {
+                "time/snapshot_completion_queue_s": started - submitted_at,
+                "time/snapshot_completion_wait_s": completed_at - started,
+                "time/snapshot_rank_ready_s": completed_at - submitted_at,
+                "time/snapshot_publication_s": completed_at - submitted_at,
+            }
         )
         return TrainerRankPublication(
             generation=persisted.generation,
@@ -1670,9 +1684,27 @@ class _GenerationPublisher:
         entry: _CachedGeneration,
         sink: EventSink,
         generation: TrainerGeneration,
+        submitted_at: float,
     ) -> None:
+        callback_started = time.perf_counter()
         try:
-            event = TrainerPublicationSucceeded(record=future.result())
+            record = future.result()
+            callback_delay_s = max(
+                0.0,
+                callback_started
+                - submitted_at
+                - record.metrics["time/snapshot_rank_ready_s"],
+            )
+            event = TrainerPublicationSucceeded(
+                record=record.model_copy(
+                    update={
+                        "metrics": {
+                            **record.metrics,
+                            "time/snapshot_callback_delay_s": callback_delay_s,
+                        }
+                    }
+                )
+            )
         except BaseException as error:
             self._failed(error, entry=entry, sink=sink, generation=generation)
             return
