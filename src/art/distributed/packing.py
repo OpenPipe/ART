@@ -59,6 +59,13 @@ class _ChoiceRoutingPayload(BaseModel):
         num_experts = int(metadata.get(NUM_EXPERTS_KEY, 0))
         if routes.dtype != moe_route_dtype(num_experts):
             raise RuntimeError("routed experts do not match exact expert count")
+        if isinstance(routes, MoeRouteArray):
+            if routes.num_experts != num_experts:
+                raise RuntimeError(
+                    "routed experts disagree with their exact expert count"
+                )
+        else:
+            routes = MoeRouteArray(routes, num_experts=num_experts)
         dtype: Literal["uint8", "uint16"] = (
             "uint8" if routes.dtype == np.dtype(np.uint8) else "uint16"
         )
@@ -75,9 +82,11 @@ class _ChoiceRoutingPayload(BaseModel):
 
     def build(self) -> dict[str, Any]:
         num_experts = int(self.metadata[NUM_EXPERTS_KEY])
+        # Bundle construction validated the exact bytes before transport.
         routes = MoeRouteArray(
             np.frombuffer(self.data, dtype=self.dtype).reshape(self.shape),
             num_experts=num_experts,
+            validate=False,
         )
         return {**self.metadata, ROUTED_EXPERTS_KEY: routes}
 
