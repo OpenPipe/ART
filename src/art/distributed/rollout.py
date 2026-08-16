@@ -499,15 +499,23 @@ class DistributedTrajectoryQueue:
         return bool(groups) or closed, groups[0] if groups else None
 
     async def get_many(
-        self, count: int, *, wait: bool
+        self, count: int, *, wait: bool, held_groups: int = 0
     ) -> tuple[list[TrajectoryGroup], bool]:
-        if count < 1:
-            raise ValueError("trajectory queue get count must be positive")
+        if count < 1 or held_groups < 0:
+            raise ValueError(
+                "trajectory queue counts must be nonnegative with count > 0"
+            )
         self._raise_owner_cleanup_failure()
         async with self._take_lock:
-            minimum_reserved = wait and count <= self.maxsize
+            minimum_size = count + held_groups
+            if wait and minimum_size > self.maxsize:
+                raise TrajectoryCapacityError(
+                    f"minimum acquisition requires {minimum_size} trajectory groups; "
+                    f"queue capacity is {self.maxsize} groups"
+                )
+            minimum_reserved = wait
             if minimum_reserved:
-                self._minimum_take_size = count
+                self._minimum_take_size = minimum_size
                 self._sync_maxsize()
             try:
                 if wait:

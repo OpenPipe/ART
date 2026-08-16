@@ -1451,7 +1451,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             count = (self.min_batch_size if wait else self.max_batch_size) - len(batch)
             if isinstance(self._output_queue, DistributedTrajectoryQueue):
                 items, saw_sentinel = await self._output_queue.get_many(
-                    count, wait=wait
+                    count, wait=wait, held_groups=len(batch)
                 )
                 if not items:
                     break
