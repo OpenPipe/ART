@@ -1155,8 +1155,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 batch, discarded, saw_sentinel = await self._collect_batch(current_step)
             else:
                 packed_queue_depth = self._packed_queue.qsize()
-                prepared = await self._packed_queue.get()
-                if prepared is None:
+                completed, prepared = await self._await_or_stop(
+                    self._packed_queue.get()
+                )
+                if not completed or prepared is None:
                     break
                 if self.state.done:
                     await getattr(self.backend, "discard_pipeline_batch")(
