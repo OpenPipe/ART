@@ -1247,6 +1247,10 @@ class ServerlessBackend:
         )
         for group in trajectory_groups:
             group._prepared_training_batch = prepared
+        trajectory_bytes = sum(value.remote.data.byte_count for value in staged)
+        route_bytes = sum(
+            route.ref.byte_count for value in staged for route in value.remote.routes
+        )
         return {
             "time/step_prepare_remote_batch_s": time.monotonic() - started,
             "time/step_remote_group_stage_wait_s": stage_wait_s,
@@ -1261,12 +1265,10 @@ class ServerlessBackend:
                 value.upload_s for value in staged
             ),
             "time/step_remote_forward_submit_s": forward_submit_s,
-            "data/step_remote_batch_bytes": float(
-                sum(
-                    value.remote.data.byte_count
-                    + sum(route.ref.byte_count for route in value.remote.routes)
-                    for value in staged
-                )
+            "data/step_remote_trajectory_bytes": float(trajectory_bytes),
+            "data/step_remote_route_bytes": float(route_bytes),
+            "data/step_remote_reference_bytes": float(
+                len(batch.model_dump_json().encode())
             ),
         }
 
