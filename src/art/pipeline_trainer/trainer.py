@@ -591,6 +591,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if self.state.done:
             return
         self.state.done = True
+        self._accept_prepared_batches = False
         self._stop_event.set()
 
         async def _notify_policy() -> None:
@@ -1050,7 +1051,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     async def _packing_stage(self) -> None:
         assert self._packed_queue is not None
         prepare = getattr(self.backend, "prepare_pipeline_batch")
-        while True:
+        while not self.state.done:
             packing_policy_step = self.state.next_training_step
             if (
                 self._stop_at_training_step is not None
@@ -1112,7 +1113,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if not self._accept_prepared_batches:
                 await getattr(self.backend, "discard_pipeline_batch")(batch)
                 return
-            await self._packed_queue.put(item)
+            accepted, _ = await self._await_or_stop(self._packed_queue.put(item))
+            if not accepted:
+                await getattr(self.backend, "discard_pipeline_batch")(batch)
+                return
             await item.handoff.wait()
             if not self._accept_prepared_batches:
                 return
@@ -1136,7 +1140,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         pending_zero_variance_groups = 0
         pending_dequeued_groups = 0
 
-        while True:
+        while not self.state.done:
             if stop_at_step is not None and current_step >= stop_at_step:
                 break
             step_start = time.monotonic()
@@ -1153,6 +1157,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 packed_queue_depth = self._packed_queue.qsize()
                 prepared = await self._packed_queue.get()
                 if prepared is None:
+                    break
+                if self.state.done:
+                    await getattr(self.backend, "discard_pipeline_batch")(
+                        prepared.batch
+                    )
+                    prepared.handoff.set()
                     break
                 batch = prepared.batch
                 discarded = prepared.discarded
