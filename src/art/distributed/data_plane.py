@@ -649,7 +649,7 @@ class ByteStreamPublisher(_AuthenticatedStreamPublisher):
         self,
         stream_id: str,
         advertise_host: str,
-        chunks: tuple[bytes, ...],
+        chunks: tuple[bytes | memoryview, ...],
         on_sent: Callable[[], None] | None,
         server_loop: ByteStreamServerLoop | None,
     ) -> None:
@@ -665,7 +665,7 @@ class ByteStreamPublisher(_AuthenticatedStreamPublisher):
     async def create(
         cls,
         stream_id: str,
-        chunks: tuple[bytes, ...],
+        chunks: tuple[bytes | memoryview, ...],
         *,
         advertise_host: str,
         on_sent: Callable[[], None] | None = None,
@@ -903,9 +903,13 @@ def _receive_into_stream(
 async def _write_stream_chunk(
     writer: asyncio.StreamWriter, source: bytes | memoryview
 ) -> None:
-    for offset in range(0, len(source), _STREAM_CHUNK_BYTES):
-        writer.write(source[offset : offset + _STREAM_CHUNK_BYTES])
-        await writer.drain()
+    view = memoryview(source).cast("B")
+    try:
+        for offset in range(0, len(view), _STREAM_CHUNK_BYTES):
+            writer.write(view[offset : offset + _STREAM_CHUNK_BYTES])
+            await writer.drain()
+    finally:
+        view.release()
 
 
 def _flatten_packed_tensors(

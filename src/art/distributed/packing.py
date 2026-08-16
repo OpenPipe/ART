@@ -25,7 +25,11 @@ from art.trajectories import (
 )
 
 from .data_plane import PackedBatchRef
-from .moe_route_store import MoeRouteBatchTransfer, MoeRouteGroupPayload
+from .moe_route_store import (
+    MoeRouteBatchTransfer,
+    MoeRouteBytes,
+    MoeRouteGroupPayload,
+)
 from .rollout import RolloutModelSpec
 from .trajectory_store import (
     TrajectoryBatchTransfer,
@@ -39,12 +43,12 @@ if TYPE_CHECKING:
 
 
 class _ChoiceRoutingPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     metadata: dict[str, Any]
     dtype: Literal["uint8", "uint16"]
     shape: tuple[int, int, int]
-    data: bytes
+    data: MoeRouteBytes
 
     @classmethod
     def from_metadata(cls, metadata: dict[str, Any]) -> "_ChoiceRoutingPayload":

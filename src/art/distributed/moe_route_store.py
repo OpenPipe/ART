@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, model_validator
 
 from .data_plane import (
     ByteStreamPublisher,
@@ -18,6 +18,10 @@ if TYPE_CHECKING:
 
 RouteScope = Literal["messages", "additional_history", "exchange"]
 RouteKey = tuple[int, RouteScope, int, int]
+MoeRouteBytes = Annotated[
+    bytes | memoryview,
+    PlainSerializer(bytes, return_type=bytes),
+]
 
 
 class _Contract(BaseModel):
@@ -34,7 +38,9 @@ class MoeRouteSlice(_Contract):
 
 
 class MoeRouteObjectPayload(_Contract):
-    data: bytes = Field(min_length=1)
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    data: MoeRouteBytes = Field(min_length=1)
     slices: tuple[MoeRouteSlice, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -91,7 +97,7 @@ class MoeRouteBatchTransfer(_Contract):
         return await asyncio.to_thread(self._build_groups, payload)
 
     def _build_groups(self, payload: bytearray) -> tuple[MoeRouteGroupPayload, ...]:
-        view = memoryview(payload)
+        view = memoryview(payload).toreadonly()
         offset = 0
         groups = []
         try:
@@ -101,7 +107,7 @@ class MoeRouteBatchTransfer(_Contract):
                     end = offset + layout.byte_count
                     objects.append(
                         MoeRouteObjectPayload(
-                            data=bytes(view[offset:end]), slices=layout.slices
+                            data=view[offset:end], slices=layout.slices
                         )
                     )
                     offset = end
@@ -150,7 +156,7 @@ async def publish_moe_route_groups(
 def hydrate_trajectory_group_routes(
     payload: TrajectoryGroupPayload, routes: MoeRouteGroupPayload
 ) -> TrajectoryGroupPayload:
-    routed: dict[RouteKey, bytes] = {
+    routed: dict[RouteKey, MoeRouteBytes] = {
         (
             item.trajectory_index,
             item.scope,
@@ -210,7 +216,7 @@ def _hydrate_route_map(
     trajectory_index: int,
     scope: RouteScope,
     scope_index: int,
-    routed: dict[RouteKey, bytes],
+    routed: dict[RouteKey, MoeRouteBytes],
 ) -> dict[int, _ChoiceRoutingPayload]:
     hydrated = {}
     for choice_index, route in values.items():
