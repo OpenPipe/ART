@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from threading import Lock
+import time
 from typing import Any, Generic, NamedTuple, TypeVar
 
+from pydantic import BaseModel, ConfigDict
 import torch
 
 _T = TypeVar("_T")
@@ -11,6 +13,17 @@ _T = TypeVar("_T")
 class _CudaFence(NamedTuple):
     device: int
     event: torch.cuda.Event
+
+
+class SnapshotStageTimings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_contiguous_s: float = 0.0
+    pinned_allocate_s: float = 0.0
+    copy_launch_s: float = 0.0
+    fence_launch_s: float = 0.0
+    tensor_count: int = 0
+    tensor_bytes: int = 0
 
 
 class PendingCpuSnapshot(Generic[_T]):
@@ -36,26 +49,36 @@ class PinnedCpuSnapshotBuilder:
         self._stager = stager
         self._devices: set[int] = set()
         self._sources: list[torch.Tensor] = []
+        self.timings = SnapshotStageTimings()
 
     def stage(self, tensor: torch.Tensor) -> torch.Tensor:
         source = tensor.detach()
+        self.timings.tensor_count += 1
+        self.timings.tensor_bytes += source.numel() * source.element_size()
         if not source.is_cuda:
             return source.to(device="cpu", copy=True)
+        contiguous_started = time.perf_counter()
         source = source.contiguous()
+        self.timings.source_contiguous_s += time.perf_counter() - contiguous_started
         device = source.device.index
         if device is None:
             raise RuntimeError("CUDA snapshot tensor has no device index")
         stream = self._stager.stream(device)
+        allocate_started = time.perf_counter()
         target = torch.empty_like(source, device="cpu", pin_memory=True)
+        self.timings.pinned_allocate_s += time.perf_counter() - allocate_started
+        copy_started = time.perf_counter()
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
             target.copy_(source, non_blocking=True)
             source.record_stream(stream)
+        self.timings.copy_launch_s += time.perf_counter() - copy_started
         self._devices.add(device)
         self._sources.append(source)
         return target
 
     def finish(self, payload: _T) -> PendingCpuSnapshot[_T]:
+        fence_started = time.perf_counter()
         fences: list[_CudaFence] = []
         for device in sorted(self._devices):
             stream = self._stager.stream(device)
@@ -63,6 +86,7 @@ class PinnedCpuSnapshotBuilder:
                 event = torch.cuda.Event(blocking=True)
                 event.record(stream)
             fences.append(_CudaFence(device, event))
+        self.timings.fence_launch_s += time.perf_counter() - fence_started
         return PendingCpuSnapshot(payload, tuple(fences), tuple(self._sources))
 
 

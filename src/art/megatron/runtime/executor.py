@@ -1004,6 +1004,7 @@ class _GenerationPublisher:
             stage_trainer_rank_optimizer_state_snapshot,
         )
         from art.megatron.weights.lora_publish import (
+            LoraSnapshotTimings,
             stage_vllm_lora_snapshot_from_model,
         )
 
@@ -1011,6 +1012,7 @@ class _GenerationPublisher:
         wait_s, in_flight = self._acquire_slot()
         prepare_started = time.perf_counter()
         try:
+            lora_timings = LoraSnapshotTimings()
             lora = stage_vllm_lora_snapshot_from_model(
                 model=self.runtime.model,
                 adapter_dtypes=adapter_dtypes,
@@ -1020,6 +1022,7 @@ class _GenerationPublisher:
                 world_size=self.runtime.world_size,
                 stager=self.stager,
                 slot_ref=slot_ref,
+                timings=lora_timings,
             )
             lora_launch_s = time.perf_counter() - prepare_started
             optimizer_started = time.perf_counter()
@@ -1072,7 +1075,7 @@ class _GenerationPublisher:
         except BaseException as error:
             self._release_slot()
             raise
-        return {
+        metrics = {
             "snapshot_pool_wait_s": wait_s,
             "snapshot_pool_in_use": float(in_flight),
             "snapshot_pool_pressure": in_flight / self.capacity,
@@ -1080,6 +1083,8 @@ class _GenerationPublisher:
             "snapshot_optimizer_launch_s": optimizer_launch_s,
             "snapshot_launch_s": time.perf_counter() - prepare_started,
         }
+        metrics.update(lora_timings.metrics())
+        return metrics
 
     def ensure_generation(
         self,

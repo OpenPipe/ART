@@ -1,7 +1,8 @@
 from collections.abc import Iterable, Sequence
+import time
 from typing import Any, NamedTuple
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 from art.megatron.lora import (
@@ -22,6 +23,7 @@ from art.megatron.tensor_snapshot import (
     PendingCpuSnapshot,
     PinnedCpuSnapshotBuilder,
     PinnedCpuSnapshotStager,
+    SnapshotStageTimings,
 )
 from art.megatron.training.model_chunks import ModelChunks
 from art.utils.safetensors import PreparedSafetensors
@@ -50,6 +52,37 @@ class LoraSnapshot(BaseModel):
 
     tensors: dict[str, torch.Tensor]
     adapter_config: dict[str, Any]
+
+
+class LoraSnapshotTimings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    setup_s: float = 0.0
+    collect_regular_s: float = 0.0
+    collect_packed_s: float = 0.0
+    metadata_regular_s: float = 0.0
+    metadata_packed_s: float = 0.0
+    exchange_regular_s: float = 0.0
+    exchange_packed_s: float = 0.0
+    merge_regular_s: float = 0.0
+    merge_packed_s: float = 0.0
+    published_tensor_stage_s: float = 0.0
+    handler_conversion_s: float = 0.0
+    finish_s: float = 0.0
+    stage: SnapshotStageTimings = Field(default_factory=SnapshotStageTimings)
+
+    def metrics(self) -> dict[str, float]:
+        values = {
+            f"snapshot_lora_{key}": float(value)
+            for key, value in self.model_dump(exclude={"stage"}).items()
+        }
+        values.update(
+            {
+                f"snapshot_lora_stage_{key}": float(value)
+                for key, value in self.stage.model_dump().items()
+            }
+        )
+        return values
 
 
 def iter_lora_modules(model_chunks: ModelChunks) -> Iterable[LoRA]:
@@ -737,13 +770,18 @@ def _rank0_merged_lora_tensors(
     packed_expert_tensors_by_owner_key: (
         dict[tuple[int, str], torch.Tensor] | None
     ) = None,
+    timings: LoraSnapshotTimings | None = None,
 ) -> dict[str, torch.Tensor]:
+    started = time.perf_counter()
     merged_tensors = merge_sharded_adapter_entries(
         _entries_by_key(metadata, tensors_by_owner_key)
     )
+    if timings is not None:
+        timings.merge_regular_s = time.perf_counter() - started
     if packed_expert_metadata:
         if packed_expert_tensors_by_owner_key is None:
             raise RuntimeError("Missing packed expert tensors for LoRA publish")
+        started = time.perf_counter()
         packed_tensors = merge_packed_expert_adapter_entries(
             packed_expert_metadata,
             packed_expert_tensors_by_owner_key,
@@ -752,6 +790,8 @@ def _rank0_merged_lora_tensors(
             if key in merged_tensors:
                 raise RuntimeError(f"Duplicate LoRA tensor after packed publish: {key}")
             merged_tensors[key] = tensor
+        if timings is not None:
+            timings.merge_packed_s = time.perf_counter() - started
     return merged_tensors
 
 
@@ -789,7 +829,11 @@ def _build_merged_lora_tensors_from_model(
     rank: int,
     world_size: int,
     slot_ref: LoRASlotRef | None = None,
+    timings: LoraSnapshotTimings | None = None,
 ) -> dict[str, torch.Tensor] | None:
+    if timings is None:
+        timings = LoraSnapshotTimings()
+    started = time.perf_counter()
     actual_rank, device = _rank_and_device()
     if _distributed_ready():
         actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
@@ -806,6 +850,8 @@ def _build_merged_lora_tensors_from_model(
             )
         rank = 0
     packed_expert_groups = tuple(handler.expert_packed_lora_groups())
+    timings.setup_s = time.perf_counter() - started
+    started = time.perf_counter()
     local_tensors, local_metadata = collect_local_lora_entries(
         model,
         adapter_dtypes,
@@ -813,6 +859,8 @@ def _build_merged_lora_tensors_from_model(
         packed_expert_groups=packed_expert_groups,
         slot_ref=slot_ref,
     )
+    timings.collect_regular_s = time.perf_counter() - started
+    started = time.perf_counter()
     local_packed_tensors, local_packed_metadata = collect_local_packed_expert_entries(
         model,
         adapter_dtypes,
@@ -820,30 +868,41 @@ def _build_merged_lora_tensors_from_model(
         packed_expert_groups=packed_expert_groups,
         slot_ref=slot_ref,
     )
-    all_packed_metadata = _canonical_global_metadata(local_packed_metadata)
+    timings.collect_packed_s = time.perf_counter() - started
+    started = time.perf_counter()
     all_metadata = _canonical_global_metadata(local_metadata)
+    timings.metadata_regular_s = time.perf_counter() - started
+    started = time.perf_counter()
+    all_packed_metadata = _canonical_global_metadata(local_packed_metadata)
+    timings.metadata_packed_s = time.perf_counter() - started
+    started = time.perf_counter()
     exchanged_tensors = _exchange_batched_tensors(
         all_metadata,
         local_tensors=local_tensors,
         rank=rank,
         device=device,
     )
+    timings.exchange_regular_s = time.perf_counter() - started
+    started = time.perf_counter()
     exchanged_packed_tensors = _exchange_batched_tensors(
         all_packed_metadata,
         local_tensors=local_packed_tensors,
         rank=rank,
         device=device,
     )
+    timings.exchange_packed_s = time.perf_counter() - started
 
     if rank != 0:
         return None
 
-    return _rank0_merged_lora_tensors(
+    merged = _rank0_merged_lora_tensors(
         metadata=all_metadata,
         tensors_by_owner_key=exchanged_tensors,
         packed_expert_metadata=all_packed_metadata,
         packed_expert_tensors_by_owner_key=exchanged_packed_tensors,
+        timings=timings,
     )
+    return merged
 
 
 def save_vllm_lora_from_model(
@@ -904,7 +963,10 @@ def stage_vllm_lora_snapshot_from_model(
     world_size: int,
     stager: PinnedCpuSnapshotStager,
     slot_ref: LoRASlotRef | None = None,
+    timings: LoraSnapshotTimings | None = None,
 ) -> PendingCpuSnapshot[LoraSnapshot] | None:
+    if timings is None:
+        timings = LoraSnapshotTimings()
     merged_tensors = _build_merged_lora_tensors_from_model(
         model=model,
         adapter_dtypes=adapter_dtypes,
@@ -912,28 +974,41 @@ def stage_vllm_lora_snapshot_from_model(
         rank=rank,
         world_size=world_size,
         slot_ref=slot_ref,
+        timings=timings,
     )
     if merged_tensors is None:
         return None
     builder = stager.begin()
     if handler.vllm_lora_conversion_is_view_only():
+        started = time.perf_counter()
         merged_tensors = _stage_published_tensors(merged_tensors, builder)
+        timings.published_tensor_stage_s = time.perf_counter() - started
+        started = time.perf_counter()
         vllm_tensors, published_config = handler.to_vllm_lora_tensors(
             merged_tensors,
             adapter_config=dict(adapter_config),
         )
+        timings.handler_conversion_s = time.perf_counter() - started
     else:
+        started = time.perf_counter()
         vllm_tensors, published_config = handler.to_vllm_lora_tensors(
             merged_tensors,
             adapter_config=dict(adapter_config),
         )
+        timings.handler_conversion_s = time.perf_counter() - started
+        started = time.perf_counter()
         vllm_tensors = _stage_published_tensors(vllm_tensors, builder)
-    return builder.finish(
+        timings.published_tensor_stage_s = time.perf_counter() - started
+    started = time.perf_counter()
+    pending = builder.finish(
         LoraSnapshot(
             tensors=vllm_tensors,
             adapter_config=published_config,
         )
     )
+    timings.finish_s = time.perf_counter() - started
+    timings.stage = builder.timings
+    return pending
 
 
 def save_vllm_lora_snapshot(
