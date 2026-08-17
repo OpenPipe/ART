@@ -24,9 +24,9 @@ from . import (
     Trajectory,
     TrajectoryGroup,
     TrajectoryHistory,
+    _StringInterningModel,
 )
 from ._serialization import (
-    _intern_strings,
     _rebind_history_sources,
     serialize_history,
     validate_history,
@@ -60,7 +60,7 @@ def _json_tensor(value: torch.Tensor) -> list[int] | list[float | str]:
     return [int(item) for item in items]
 
 
-class TensorizedHistory(pydantic.BaseModel):
+class TensorizedHistory(_StringInterningModel):
     """One tokenizable history represented by canonical one-dimensional tensors."""
 
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
@@ -105,7 +105,6 @@ class TensorizedHistory(pydantic.BaseModel):
     def validate_tokenwise_lengths(self) -> Self:
         if not (len(self.tokens) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tensorized history fields differ in length")
-        _intern_strings(self)
         return self
 
     def to(self, device: torch.device | str) -> Self:
@@ -155,7 +154,7 @@ class TensorizedTrajectory(TensorizedHistory):
         return self
 
 
-class TensorizedMultiHistoryTrajectory(pydantic.BaseModel):
+class TensorizedMultiHistoryTrajectory(_StringInterningModel):
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
 
     trajectory: Trajectory
@@ -189,7 +188,6 @@ class TensorizedMultiHistoryTrajectory(pydantic.BaseModel):
     def bind_source_trajectory(self) -> Self:
         for history in self.histories:
             _rebind_history_sources(history.history, self.trajectory)
-        _intern_strings(self)
         return self
 
     def to(self, device: torch.device | str) -> Self:
@@ -210,7 +208,7 @@ TensorizedTrajectoryT = TypeVar(
 )
 
 
-class TensorizedTrajectoryGroup(pydantic.BaseModel, Generic[TensorizedTrajectoryT]):
+class TensorizedTrajectoryGroup(_StringInterningModel, Generic[TensorizedTrajectoryT]):
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
 
     trajectory_group: TrajectoryGroup
@@ -249,7 +247,6 @@ class TensorizedTrajectoryGroup(pydantic.BaseModel, Generic[TensorizedTrajectory
             else:
                 for history in tensorized.histories:
                     _rebind_history_sources(history.history, trajectory)
-        _intern_strings(self)
         return self
 
     def to(self, device: torch.device | str) -> Self:

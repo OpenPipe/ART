@@ -33,7 +33,7 @@ def _json_size(value: object) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
 
 
-def test_trajectory_construction_interns_nested_models_keys_and_cycles() -> None:
+def test_explicit_interning_handles_nested_models_keys_and_cycles() -> None:
     class ProviderExtra(pydantic.BaseModel, extra="allow"):
         content: str
 
@@ -66,6 +66,10 @@ def test_trajectory_construction_interns_nested_models_keys_and_cycles() -> None
     )
 
     canonical = next(key for key in trajectory.metadata if key == repeated)
+    assert cycle[0] is not canonical
+
+    trajectory._intern_strings()
+
     assert cycle[0] is canonical
     assert cycle[1] is canonical
     assert cycle[2] is cycle
@@ -79,21 +83,21 @@ def test_trajectory_construction_interns_nested_models_keys_and_cycles() -> None
     assert next(iter(trajectory.metadata["frozenset"])) is canonical
 
 
-def test_validation_finish_grouping_copy_and_pickle_preserve_sharing() -> None:
+def test_only_pickle_boundary_interns_validated_finished_and_grouped_values() -> None:
     repeated = _long()
     trajectory = art.Trajectory.model_validate(
         {"metadata": {"first": _fresh(repeated), "second": _fresh(repeated)}}
     )
-    assert trajectory.metadata["first"] is trajectory.metadata["second"]
+    assert trajectory.metadata["first"] is not trajectory.metadata["second"]
     from_json = art.Trajectory.model_validate_json(
         json.dumps({"metadata": {"first": repeated, "second": repeated}})
     )
-    assert from_json.metadata["first"] is from_json.metadata["second"]
+    assert from_json.metadata["first"] is not from_json.metadata["second"]
 
     trajectory.metadata["third"] = _fresh(repeated)
     assert trajectory.metadata["third"] is not trajectory.metadata["first"]
     trajectory.finish()
-    assert trajectory.metadata["third"] is trajectory.metadata["first"]
+    assert trajectory.metadata["third"] is not trajectory.metadata["first"]
 
     other = art.Trajectory(metadata={"value": _fresh(repeated)})
     group = art.TrajectoryGroup(
@@ -101,17 +105,24 @@ def test_validation_finish_grouping_copy_and_pickle_preserve_sharing() -> None:
         exceptions=[ValueError(_fresh(repeated))],
         metadata={"value": _fresh(repeated)},
     )
+    assert other.metadata["value"] is not trajectory.metadata["first"]
+    assert group.metadata["value"] is not trajectory.metadata["first"]
+    assert group.exceptions[0].message is not trajectory.metadata["first"]
+
+    assert (
+        copy.copy(group).trajectories[0].metadata["first"]
+        is trajectory.metadata["first"]
+    )
+    deep = copy.deepcopy(group)
+    assert (
+        deep.trajectories[0].metadata["first"]
+        is not deep.trajectories[1].metadata["value"]
+    )
+    restored = pickle.loads(pickle.dumps(group))
     canonical = trajectory.metadata["first"]
     assert other.metadata["value"] is canonical
     assert group.metadata["value"] is canonical
     assert group.exceptions[0].message is canonical
-
-    assert copy.copy(group).trajectories[0].metadata["first"] is canonical
-    deep = copy.deepcopy(group)
-    assert (
-        deep.trajectories[0].metadata["first"] is deep.trajectories[1].metadata["value"]
-    )
-    restored = pickle.loads(pickle.dumps(group))
     assert (
         restored.trajectories[0].metadata["first"]
         is restored.trajectories[1].metadata["value"]
@@ -128,7 +139,7 @@ def test_interning_does_not_change_model_equality() -> None:
     assert trajectory == before
 
 
-def test_capture_uses_a_scope_pool_and_no_capture_hides_it() -> None:
+def test_capture_defers_interning_and_no_capture_hides_scope() -> None:
     body = {
         "id": "chatcmpl-1",
         "object": "chat.completion",
@@ -155,7 +166,7 @@ def test_capture_uses_a_scope_pool_and_no_capture_hides_it() -> None:
         state.finish()
         reset(token)
         exchange = trajectory.exchanges.chat_completions[0]
-        assert exchange.request["model"] is exchange.response.model
+        assert exchange.request["model"] is not exchange.response.model
 
         with art.no_capture():
             hidden, hidden_token = begin(
@@ -164,8 +175,11 @@ def test_capture_uses_a_scope_pool_and_no_capture_hides_it() -> None:
             assert hidden is None
             assert hidden_token is None
 
+    pickle.dumps(trajectory)
+    assert exchange.request["model"] is exchange.response.model
 
-def test_nested_scopes_do_not_share_string_pools() -> None:
+
+def test_nested_scopes_do_not_intern_strings() -> None:
     repeated = _long()
     outer = art.Trajectory(metadata={"value": _fresh(repeated)})
     inner = art.Trajectory(metadata={"value": _fresh(repeated)})
@@ -177,7 +191,7 @@ def test_nested_scopes_do_not_share_string_pools() -> None:
         assert outer.metadata["value"] is not inner.metadata["value"]
 
 
-async def test_concurrent_capture_scopes_keep_independent_pools() -> None:
+async def test_concurrent_capture_scopes_do_not_intern_strings() -> None:
     repeated = _long()
     ready = 0
     both_ready = asyncio.Event()
@@ -210,7 +224,7 @@ def test_normal_pydantic_dumps_are_unchanged() -> None:
     assert json.loads(trajectory.model_dump_json()) == expected
 
 
-def test_tokenization_boundaries_intern_manual_mutations(
+def test_tokenization_boundaries_do_not_intern_manual_mutations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repeated = _long()
@@ -219,7 +233,7 @@ def test_tokenization_boundaries_intern_manual_mutations(
 
     def tokenize_trajectory(value: art.Trajectory, **_: object) -> object:
         first, second = value.metadata["items"]
-        assert first is second
+        assert first is not second
         return object()
 
     monkeypatch.setattr(_tokenize, "tokenize_trajectory", tokenize_trajectory)
@@ -230,7 +244,7 @@ def test_tokenization_boundaries_intern_manual_mutations(
 
     def tokenize_group(value: art.TrajectoryGroup, **_: object) -> object:
         first, second = value.metadata["items"]
-        assert first is second
+        assert first is not second
         return object()
 
     monkeypatch.setattr(_tokenize, "tokenize_group", tokenize_group)
@@ -259,7 +273,7 @@ def test_compact_trajectory_round_trip_and_literal_reference_collision() -> None
 
     trajectory.metadata["third"] = _fresh(repeated)
     trajectory.compact_dump()
-    assert trajectory.metadata["third"] is trajectory.metadata["first"]
+    assert trajectory.metadata["third"] is not trajectory.metadata["first"]
 
 
 def test_compact_decode_is_one_level_and_unmatched_references_are_literal() -> None:
@@ -677,18 +691,51 @@ def test_interning_reduces_pickle_and_compact_json_sizes() -> None:
     trajectory.metadata["items"] = [_fresh(repeated) for _ in range(200)]
     items = trajectory.metadata["items"]
     before_memory = sum(sys.getsizeof(item) for item in items)
-    before_pickle = len(pickle.dumps(trajectory))
-    trajectory.finish()
+    before_pickle = len(pickle.dumps(trajectory.model_dump()))
+    pickled = pickle.dumps(trajectory)
     after_memory = sum(
         sys.getsizeof(item) for item in {id(item): item for item in items}.values()
     )
-    after_pickle = len(pickle.dumps(trajectory))
     compact = trajectory.compact_dump()
     plain = {**compact, "strings": {}, "data": trajectory.model_dump(mode="json")}
 
     assert after_memory < before_memory / 100
-    assert after_pickle < before_pickle / 4
+    assert len(pickled) < before_pickle / 4
     assert _json_size(compact) < _json_size(plain) / 4
+
+
+def test_pickle_prepares_nested_graph_once_and_receiver_can_prepare_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.trajectories import _serialization
+
+    repeated = _long()
+    trajectory = art.Trajectory(
+        metadata={"first": _fresh(repeated), "second": _fresh(repeated)}
+    )
+    group = art.TrajectoryGroup([trajectory])
+    calls: list[object] = []
+    intern_strings = _serialization._intern_strings
+
+    def counted(value: object, pool: dict[str, str] | None = None) -> None:
+        calls.append(value)
+        intern_strings(value, pool)
+
+    monkeypatch.setattr(_serialization, "_intern_strings", counted)
+
+    payload = pickle.dumps(group)
+    assert calls == [group]
+    pickle.dumps(group)
+    assert calls == [group]
+
+    restored = pickle.loads(payload)
+    restored.trajectories[0].metadata["third"] = _fresh(repeated)
+    pickle.dumps(restored)
+    assert calls == [group, restored]
+    assert (
+        restored.trajectories[0].metadata["third"]
+        is restored.trajectories[0].metadata["first"]
+    )
 
 
 def test_cloudpickle_preserves_shared_references() -> None:

@@ -74,6 +74,7 @@ from ..types import Messages, MessagesAndChoices, Tools
 from ._serialization import (
     _CompactModel,
     _rebind_history_sources,
+    _StringInterningModel,
     _StringPool,
     serialize_chat_completion,
     serialize_history,
@@ -297,7 +298,7 @@ class PydanticException(pydantic.BaseModel):
     traceback: str
 
 
-class LegacyHistory(pydantic.BaseModel):
+class LegacyHistory(_StringInterningModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
 
@@ -354,7 +355,7 @@ class LegacyHistory(pydantic.BaseModel):
         ).tensorize(device=device)
 
 
-class History(pydantic.BaseModel):
+class History(_StringInterningModel):
     """Mutable, protocol-native view of one tokenizable sequence."""
 
     model_config = pydantic.ConfigDict(extra="forbid")
@@ -552,7 +553,6 @@ class Trajectory(_CompactModel):
             raise ValueError(
                 "A trajectory cannot contain both exchanges and legacy histories"
             )
-        self._intern_strings()
         return self
 
     def _intern_strings(self, pool: _StringPool | None = None) -> None:
@@ -585,7 +585,6 @@ class Trajectory(_CompactModel):
 
     def finish(self) -> Trajectory:
         self.metrics["duration"] = (datetime.now() - self.start_time).total_seconds()
-        self._intern_strings()
         return self
 
     @asynccontextmanager
@@ -774,7 +773,6 @@ class Trajectory(_CompactModel):
     ) -> TokenizedTrajectory | TokenizedMultiHistoryTrajectory:
         from ._tokenize import tokenize_trajectory
 
-        self._intern_strings()
         return tokenize_trajectory(
             self,
             multi_history=multi_history,
@@ -855,11 +853,6 @@ class TrajectoryGroup(_CompactModel):
     logs: list[str] = pydantic.Field(default_factory=list)
     _collect_packing_shape: bool = pydantic.PrivateAttr(default=False)
     _packed_group_shape: Any = pydantic.PrivateAttr(default=None)
-
-    @pydantic.model_validator(mode="after")
-    def _intern_string_graph(self) -> TrajectoryGroup:
-        self._intern_strings()
-        return self
 
     def _intern_strings(self, pool: _StringPool | None = None) -> None:
         _intern_string_graph(self, pool)
@@ -998,7 +991,6 @@ class TrajectoryGroup(_CompactModel):
     ):
         from ._tokenize import tokenize_group
 
-        self._intern_strings()
         return tokenize_group(
             self,
             multi_history=multi_history,
@@ -1064,7 +1056,7 @@ class TrajectoryGroup(_CompactModel):
         ).tensorize(device=device)
 
 
-class TokenizedHistory(pydantic.BaseModel):
+class TokenizedHistory(_StringInterningModel):
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
 
     history: TrajectoryHistory
@@ -1088,7 +1080,6 @@ class TokenizedHistory(pydantic.BaseModel):
     def validate_tokenwise_lengths(self) -> TokenizedHistory:
         if not (len(self.tokens) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tokenized history fields differ in length")
-        _intern_string_graph(self)
         return self
 
     def tensorize(
@@ -1149,7 +1140,7 @@ class TokenizedTrajectory(TokenizedHistory):
         return _load_tensors().tensorize_trajectory(self, device=device)
 
 
-class TokenizedMultiHistoryTrajectory(pydantic.BaseModel):
+class TokenizedMultiHistoryTrajectory(_StringInterningModel):
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
 
     trajectory: Trajectory
@@ -1183,7 +1174,6 @@ class TokenizedMultiHistoryTrajectory(pydantic.BaseModel):
     def _intern_source_graph(self) -> TokenizedMultiHistoryTrajectory:
         for history in self.histories:
             _rebind_history_sources(history.history, self.trajectory)
-        _intern_string_graph(self)
         return self
 
     def compact_dump(self) -> CompactTrajectoryPayload:
@@ -1204,7 +1194,7 @@ TokenizedTrajectoryT = TypeVar(
 )
 
 
-class TokenizedTrajectoryGroup(pydantic.BaseModel, Generic[TokenizedTrajectoryT]):
+class TokenizedTrajectoryGroup(_StringInterningModel, Generic[TokenizedTrajectoryT]):
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
 
     trajectory_group: TrajectoryGroup
@@ -1241,7 +1231,6 @@ class TokenizedTrajectoryGroup(pydantic.BaseModel, Generic[TokenizedTrajectoryT]
             else:
                 for history in tokenized.histories:
                     _rebind_history_sources(history.history, trajectory)
-        _intern_string_graph(self)
         return self
 
     def compact_dump(self) -> CompactTrajectoryPayload:

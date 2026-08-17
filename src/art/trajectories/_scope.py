@@ -10,13 +10,11 @@ from typing import Any
 
 from . import PydanticException, Trajectory, TrajectoryGroup
 from ._compat import exception_model
-from ._serialization import _StringPool
 
 
 @dataclass(frozen=True, slots=True)
 class _TrajectoryScope:
     trajectory: Trajectory
-    strings: _StringPool
 
 
 _scopes: contextvars.ContextVar[tuple[_TrajectoryScope, ...]] = contextvars.ContextVar(
@@ -42,9 +40,7 @@ def enter_trajectory(trajectory: Trajectory) -> Trajectory:
     from ._capture import install
 
     install()
-    strings: _StringPool = {}
-    trajectory._intern_strings(strings)
-    _scopes.set((*_scopes.get(), _TrajectoryScope(trajectory, strings)))
+    _scopes.set((*_scopes.get(), _TrajectoryScope(trajectory)))
     return trajectory
 
 
