@@ -258,6 +258,7 @@ def prepare_training_batch(
     route_encoding: RouteWireEncoding = "prefix_tree",
 ) -> EncodedTrainingBatch:
     if isinstance(batch, RlTrajectoryBatch):
+        annotations = batch.local_group_annotations()
         groups = tuple(
             encode_trajectory_group(
                 group,
@@ -269,7 +270,14 @@ def prepare_training_batch(
         objects = tuple(group.data for group in groups)
         route_objects = tuple(route for group in groups for route in group.routes)
         remote: RemoteTrainingBatchRef = RemoteRlBatchRef(
-            groups=tuple(group.remote for group in groups),
+            groups=tuple(
+                group.remote.model_copy(
+                    update={
+                        "annotations": (annotations[index] if annotations else None)
+                    }
+                )
+                for index, group in enumerate(groups)
+            ),
             min_source_version=batch.min_source_version,
             max_source_version=batch.max_source_version,
         )

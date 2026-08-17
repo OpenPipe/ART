@@ -23,7 +23,7 @@ from art.distributed.rollout import (
     DistributedTrajectoryQueue,
     DistributedTrajectorySelection,
 )
-from art.distributed.trajectory_store import TrajectoryGroupBundle, TrajectoryGroupRef
+from art.distributed.trajectory_store import TrajectoryGroupRef
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.preprocessing.sft import SftBatchTokenizer
 from art.serving_capabilities import discover_serving_capabilities
@@ -926,15 +926,19 @@ class ServerlessBackend:
         queue = selected[0].queue
         if any(selection.queue is not queue for selection in selected):
             raise RuntimeError("remote batch spans distributed trajectory queues")
-        for group in trajectory_groups:
-            group._distributed_lease = None
         min_source_version, max_source_version = _source_version_range(
             trajectory_groups, client.projected_learner_version
         )
+        bundles = tuple(
+            await asyncio.gather(
+                *(
+                    queue.receive_bundle(selection.lease.item.ref)
+                    for selection in selected
+                )
+            )
+        )
         batch = RlTrajectoryBatch.from_group_bundles(
-            tuple(
-                TrajectoryGroupBundle.from_group(group) for group in trajectory_groups
-            ),
+            bundles,
             min_source_version=min_source_version,
             max_source_version=max_source_version,
             groups=trajectory_groups,
@@ -942,6 +946,8 @@ class ServerlessBackend:
                 selection.lease.item.annotations for selection in selected
             ),
         )
+        for group in trajectory_groups:
+            group._distributed_lease = None
         request_id = uuid.uuid4().hex
         generation_id = request_id
         request = ForwardBackwardRequest(
