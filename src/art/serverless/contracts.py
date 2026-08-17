@@ -5,7 +5,11 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field, model_validator
 
-from art.distributed.moe_route_store import MoeRouteSlice
+from art.distributed.moe_route_store import (
+    MoeRouteSlice,
+    validate_moe_route_bindings,
+    validate_moe_route_slices,
+)
 from art.distributed.object_store import MOE_ROUTE_OBJECT_FORMAT
 from art.distributed.trajectory_store import TrajectoryGroupAnnotations
 from art.training.contracts import (
@@ -16,7 +20,7 @@ from art.training.contracts import (
     RunCommand,
 )
 
-RL_GROUP_DATA_FORMAT = "art_trajectory_group_msgpack_v2"
+RL_GROUP_DATA_FORMAT = "art_trajectory_group_msgpack_v3"
 SFT_DATA_FORMAT = "art_sft_batch_msgpack_v1"
 OPERATION_RESULT_FORMAT = "art_operation_result_msgpack_v1"
 
@@ -25,13 +29,13 @@ class TrainingDataRef(Contract):
     object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     byte_count: int = Field(ge=1)
-    format: Literal["art_trajectory_group_msgpack_v2", "art_sft_batch_msgpack_v1"]
+    format: Literal["art_trajectory_group_msgpack_v3", "art_sft_batch_msgpack_v1"]
 
 
 class RemoteRouteObjectRef(Contract):
     object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     byte_count: int = Field(ge=1)
-    format: Literal["art_moe_route_bundle_v1"] = MOE_ROUTE_OBJECT_FORMAT
+    format: Literal["art_moe_route_bundle_v2"] = MOE_ROUTE_OBJECT_FORMAT
 
 
 RemoteRouteSlice = MoeRouteSlice
@@ -49,23 +53,18 @@ class RemoteRouteObject(Contract):
                 value.scope,
                 value.scope_index,
                 value.choice_index,
+                value.segment_index,
             )
             for value in self.slices
         ]
         if len(positions) != len(set(positions)):
-            raise ValueError("route object contains duplicate trajectory positions")
+            raise ValueError("route object contains duplicate trajectory segments")
         if any(
             value.offset + value.byte_count > self.ref.byte_count
             for value in self.slices
         ):
             raise ValueError("route slice leaves its object bounds")
-        cursor = 0
-        for value in sorted(self.slices, key=lambda item: item.offset):
-            if value.offset != cursor:
-                raise ValueError("route slices must exactly partition their object")
-            cursor += value.byte_count
-        if cursor != self.ref.byte_count:
-            raise ValueError("route slices must exactly partition their object")
+        validate_moe_route_slices(self.slices, self.ref.byte_count)
         return self
 
 
@@ -99,12 +98,16 @@ class RemoteRlGroupRef(Contract):
                 value.scope,
                 value.scope_index,
                 value.choice_index,
+                value.segment_index,
             )
             for route in self.routes
             for value in route.slices
         ]
         if len(positions) != len(set(positions)):
-            raise ValueError("RL group routes contain duplicate trajectory positions")
+            raise ValueError("RL group routes contain duplicate trajectory segments")
+        validate_moe_route_bindings(
+            value for route in self.routes for value in route.slices
+        )
         return self
 
 

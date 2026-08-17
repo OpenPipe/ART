@@ -14,6 +14,7 @@ from art.preprocessing.moe_routing import (
     NUM_EXPERTS_KEY,
     ROUTED_EXPERTS_KEY,
     MoeRouteArray,
+    MoeRouteSegments,
     moe_route_dtype,
 )
 from art.preprocessing.pack import PackingTimings
@@ -48,12 +49,26 @@ class _ChoiceRoutingPayload(BaseModel):
     metadata: dict[str, Any]
     dtype: Literal["uint8", "uint16"]
     shape: tuple[int, int, int]
-    data: MoeRouteBytes
+    data: tuple[MoeRouteBytes, ...]
+
+    @model_validator(mode="after")
+    def _validate_data(self) -> "_ChoiceRoutingPayload":
+        if self.data:
+            bytes_per_token = (
+                np.dtype(self.dtype).itemsize * self.shape[1] * self.shape[2]
+            )
+            if any(len(segment) % bytes_per_token for segment in self.data):
+                raise ValueError("routed-expert segment splits a token")
+            if sum(map(len, self.data)) != self.shape[0] * bytes_per_token:
+                raise ValueError("routed-expert segments do not match their shape")
+        return self
 
     @classmethod
     def from_metadata(cls, metadata: dict[str, Any]) -> "_ChoiceRoutingPayload":
         routes = metadata[ROUTED_EXPERTS_KEY]
-        if not isinstance(routes, np.ndarray) or routes.dtype not in {
+        if not isinstance(
+            routes, np.ndarray | MoeRouteSegments
+        ) or routes.dtype not in {
             np.dtype(np.uint8),
             np.dtype(np.uint16),
         }:
@@ -63,7 +78,7 @@ class _ChoiceRoutingPayload(BaseModel):
         num_experts = int(metadata.get(NUM_EXPERTS_KEY, 0))
         if routes.dtype != moe_route_dtype(num_experts):
             raise RuntimeError("routed experts do not match exact expert count")
-        if isinstance(routes, MoeRouteArray):
+        if isinstance(routes, MoeRouteArray | MoeRouteSegments):
             if routes.num_experts != num_experts:
                 raise RuntimeError(
                     "routed experts disagree with their exact expert count"
@@ -73,6 +88,9 @@ class _ChoiceRoutingPayload(BaseModel):
         dtype: Literal["uint8", "uint16"] = (
             "uint8" if routes.dtype == np.dtype(np.uint8) else "uint16"
         )
+        segments = (
+            routes.segments if isinstance(routes, MoeRouteSegments) else (routes,)
+        )
         return cls(
             metadata={
                 key: value
@@ -81,16 +99,26 @@ class _ChoiceRoutingPayload(BaseModel):
             },
             dtype=dtype,
             shape=routes.shape,
-            data=routes.tobytes(),
+            data=tuple(segment.tobytes() for segment in segments),
         )
 
     def build(self) -> dict[str, Any]:
         num_experts = int(self.metadata[NUM_EXPERTS_KEY])
-        # Bundle construction validated the exact bytes before transport.
-        routes = MoeRouteArray(
-            np.frombuffer(self.data, dtype=self.dtype).reshape(self.shape),
-            num_experts=num_experts,
-            validate=False,
+        if not self.data:
+            raise RuntimeError("routed experts are missing their binary segments")
+        bytes_per_token = np.dtype(self.dtype).itemsize * self.shape[1] * self.shape[2]
+        segments = tuple(
+            MoeRouteArray(
+                np.frombuffer(data, dtype=self.dtype).reshape(
+                    len(data) // bytes_per_token, self.shape[1], self.shape[2]
+                ),
+                num_experts=num_experts,
+                validate=False,
+            )
+            for data in self.data
+        )
+        routes = (
+            segments[0] if len(segments) == 1 else MoeRouteSegments(segments=segments)
         )
         return {**self.metadata, ROUTED_EXPERTS_KEY: routes}
 

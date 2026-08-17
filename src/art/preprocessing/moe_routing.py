@@ -80,6 +80,14 @@ class MoeRouteSegments(BaseModel):
         return self.segments[0].num_experts
 
     @property
+    def dtype(self) -> np.dtype[Any]:
+        return self.segments[0].dtype
+
+    @property
+    def ndim(self) -> int:
+        return 3
+
+    @property
     def shape(self) -> tuple[int, int, int]:
         first = self.segments[0]
         return (
@@ -199,7 +207,11 @@ def choice_moe_routing_metadata(choice: Choice) -> dict[str, Any] | None:
     nested = extra.get(ART_MOE_ROUTING_METADATA_KEY)
     if not isinstance(nested, dict):
         return None
-    return nested if isinstance(nested.get(ROUTED_EXPERTS_KEY), np.ndarray) else None
+    return (
+        nested
+        if isinstance(nested.get(ROUTED_EXPERTS_KEY), np.ndarray | MoeRouteSegments)
+        else None
+    )
 
 
 def align_choice_routes_to_tokenized_result(
@@ -346,7 +358,7 @@ def _timed_append_or_overlay_routes(
     token_count: int,
     route_shape: tuple[int, int],
     start: int,
-    routes: MoeRouteArray,
+    routes: MoeRouteArray | MoeRouteSegments,
 ) -> tuple[np.ndarray | None, np.ndarray | None, int]:
     timing_start = _route_alignment_time_ns()
     try:
@@ -373,8 +385,21 @@ def _append_or_overlay_routes(
     token_count: int,
     route_shape: tuple[int, int],
     start: int,
-    routes: MoeRouteArray,
+    routes: MoeRouteArray | MoeRouteSegments,
 ) -> tuple[np.ndarray | None, np.ndarray | None, int]:
+    if isinstance(routes, MoeRouteSegments):
+        for segment_start, segment in routes.iter_slices(0, routes.shape[0]):
+            aligned, route_mask, covered_until = _append_or_overlay_routes(
+                aligned=aligned,
+                route_mask=route_mask,
+                route_segments=route_segments,
+                covered_until=covered_until,
+                token_count=token_count,
+                route_shape=route_shape,
+                start=start + segment_start,
+                routes=segment,
+            )
+        return aligned, route_mask, covered_until
     if routes.shape[0] == 0:
         return aligned, route_mask, covered_until
     if aligned is None and start == covered_until:
@@ -455,7 +480,9 @@ def _validate_route_array(array: MoeRouteArray, *, field_name: str) -> None:
         raise RuntimeError("MoE route expert id is outside the exact model range")
 
 
-def _common_route_shape(*arrays: MoeRouteArray) -> tuple[int, int]:
+def _common_route_shape(
+    *arrays: MoeRouteArray | MoeRouteSegments,
+) -> tuple[int, int]:
     shape: tuple[int, int] | None = None
     for array in arrays:
         if array.shape[0] == 0:
@@ -483,12 +510,12 @@ def _choice_routes(
     prompt_token_ids: list[int],
     completion_token_count: int,
     stats: MoeRoutingAlignmentStats | None = None,
-) -> tuple[MoeRouteArray, MoeRouteArray]:
+) -> tuple[MoeRouteArray | MoeRouteSegments, MoeRouteArray | MoeRouteSegments]:
     routes = metadata.get(ROUTED_EXPERTS_KEY)
-    if not isinstance(routes, np.ndarray):
+    if not isinstance(routes, np.ndarray | MoeRouteSegments):
         raise RuntimeError("Missing binary routed experts")
     num_experts = int(metadata.get(NUM_EXPERTS_KEY, 0))
-    if isinstance(routes, MoeRouteArray):
+    if isinstance(routes, MoeRouteSegments | MoeRouteArray):
         if routes.num_experts != num_experts:
             raise RuntimeError("MoE route array disagrees with its exact expert count")
     else:
@@ -497,17 +524,61 @@ def _choice_routes(
         len(prompt_token_ids) + completion_token_count,
         len(prompt_token_ids) + max(completion_token_count - 1, 0),
     }
-    if len(routes) not in expected_lengths:
+    route_count = int(routes.shape[0])
+    if route_count not in expected_lengths:
         raise RuntimeError(
             "routed_experts length does not match prompt/completion token ids: "
-            f"{len(routes)} not in {sorted(expected_lengths)}"
+            f"{route_count} not in {sorted(expected_lengths)}"
         )
-    prompt_routes = _readonly_route_view(routes[: len(prompt_token_ids)])
-    completion_routes = _readonly_route_view(routes[len(prompt_token_ids) :])
+    prompt_routes = slice_moe_routes(routes, 0, len(prompt_token_ids))
+    completion_routes = slice_moe_routes(routes, len(prompt_token_ids), route_count)
     if stats is not None:
-        stats.prompt_route_bytes += int(prompt_routes.nbytes)
-        stats.completion_route_bytes += int(completion_routes.nbytes)
+        stats.prompt_route_bytes += moe_route_nbytes(prompt_routes)
+        stats.completion_route_bytes += moe_route_nbytes(completion_routes)
     return prompt_routes, completion_routes
+
+
+def slice_moe_routes(
+    routes: MoeRouteArray | MoeRouteSegments, start: int, end: int | None = None
+) -> MoeRouteArray | MoeRouteSegments:
+    end = routes.shape[0] if end is None else end
+    if not 0 <= start <= end <= routes.shape[0]:
+        raise ValueError("MoE route slice is outside its token range")
+    if isinstance(routes, MoeRouteArray):
+        return _readonly_route_view(routes[start:end])
+    segments = tuple(segment for _, segment in routes.iter_slices(start, end))
+    if not segments:
+        first = routes.segments[0]
+        return MoeRouteArray(
+            np.empty((0, first.shape[1], first.shape[2]), dtype=first.dtype),
+            num_experts=routes.num_experts,
+            validate=False,
+        )
+    return segments[0] if len(segments) == 1 else MoeRouteSegments(segments=segments)
+
+
+def join_moe_routes(
+    *routes: MoeRouteArray | MoeRouteSegments,
+) -> MoeRouteArray | MoeRouteSegments:
+    segments = tuple(
+        segment
+        for value in routes
+        for segment in (
+            value.segments if isinstance(value, MoeRouteSegments) else (value,)
+        )
+        if segment.shape[0] > 0
+    )
+    if not segments:
+        raise ValueError("At least one non-empty MoE route segment is required")
+    return segments[0] if len(segments) == 1 else MoeRouteSegments(segments=segments)
+
+
+def moe_route_nbytes(routes: MoeRouteArray | MoeRouteSegments) -> int:
+    return (
+        int(routes.nbytes)
+        if isinstance(routes, MoeRouteArray)
+        else sum(int(segment.nbytes) for segment in routes.segments)
+    )
 
 
 def _readonly_route_view(routes: np.ndarray) -> MoeRouteArray:

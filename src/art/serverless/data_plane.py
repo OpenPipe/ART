@@ -16,6 +16,7 @@ from art.distributed.moe_route_store import (
 )
 from art.distributed.packing import TrajectoryGroupPayload
 from art.distributed.trajectory_store import TrajectoryGroupBundle
+from art.preprocessing.moe_routing import PROMPT_TOKEN_IDS_KEY
 from art.training.contracts import (
     OperationResult,
     RlTrajectoryBatch,
@@ -172,6 +173,7 @@ def _extract_routes(
 ) -> tuple[TrajectoryGroupPayload, bytes, tuple[RemoteRouteSlice, ...]]:
     data = bytearray()
     slices: list[RemoteRouteSlice] = []
+    segments: dict[tuple[str, int, int, memoryview], tuple[int, int]] = {}
     trajectories = []
     for trajectory_index, trajectory in enumerate(payload.trajectories):
         histories = tuple(
@@ -182,6 +184,7 @@ def _extract_routes(
                 scope_index=index,
                 data=data,
                 slices=slices,
+                segments=segments,
             )
             for index, values in enumerate(
                 trajectory.additional_history_choice_routing_metadata
@@ -195,6 +198,7 @@ def _extract_routes(
                 scope_index=index,
                 data=data,
                 slices=slices,
+                segments=segments,
             )
             for index, values in enumerate(trajectory.exchange_choice_routing_metadata)
         )
@@ -208,6 +212,7 @@ def _extract_routes(
                         scope_index=0,
                         data=data,
                         slices=slices,
+                        segments=segments,
                     ),
                     "additional_history_choice_routing_metadata": histories,
                     "exchange_choice_routing_metadata": exchanges,
@@ -229,25 +234,69 @@ def _strip_route_map(
     scope_index: int,
     data: bytearray,
     slices: list[RemoteRouteSlice],
+    segments: dict[tuple[str, int, int, memoryview], tuple[int, int]],
 ) -> dict[int, Any]:
     stripped = {}
     for choice_index, route in values.items():
         if not route.data:
             raise RuntimeError("inline routed experts are empty")
-        offset = len(data)
-        data.extend(route.data)
-        slices.append(
-            RemoteRouteSlice(
-                trajectory_index=trajectory_index,
-                scope=scope,
-                scope_index=scope_index,
-                choice_index=choice_index,
-                offset=offset,
-                byte_count=len(route.data),
+        for segment_index, segment in enumerate(_route_segments(route)):
+            key = (route.dtype, route.shape[1], route.shape[2], segment)
+            physical = segments.get(key)
+            if physical is None:
+                physical = len(data), len(segment)
+                data.extend(segment)
+                segments[key] = physical
+            slices.append(
+                RemoteRouteSlice(
+                    trajectory_index=trajectory_index,
+                    scope=scope,
+                    scope_index=scope_index,
+                    choice_index=choice_index,
+                    segment_index=segment_index,
+                    offset=physical[0],
+                    byte_count=physical[1],
+                )
             )
-        )
-        stripped[choice_index] = route.model_copy(update={"data": b""})
+        stripped[choice_index] = route.model_copy(update={"data": ()})
     return stripped
+
+
+def _route_segments(route: Any) -> tuple[memoryview, ...]:
+    prompt_ids = route.metadata.get(PROMPT_TOKEN_IDS_KEY)
+    if not isinstance(prompt_ids, list):
+        raise RuntimeError("routed experts are missing prompt token ids")
+    bytes_per_token = (
+        (1 if route.dtype == "uint8" else 2) * route.shape[1] * route.shape[2]
+    )
+    prompt_end = len(prompt_ids) * bytes_per_token
+    total = route.shape[0] * bytes_per_token
+    boundaries = (0, prompt_end, total) if 0 < prompt_end < total else (0, total)
+    return tuple(
+        segment
+        for start, end in zip(boundaries, boundaries[1:])
+        for segment in _route_data_range(route.data, start, end)
+    )
+
+
+def _route_data_range(
+    data: tuple[bytes | memoryview, ...], start: int, end: int
+) -> tuple[memoryview, ...]:
+    result = []
+    cursor = 0
+    for raw in data:
+        segment = memoryview(raw).cast("B").toreadonly()
+        segment_end = cursor + len(segment)
+        overlap_start = max(start, cursor)
+        overlap_end = min(end, segment_end)
+        if overlap_start < overlap_end:
+            result.append(segment[overlap_start - cursor : overlap_end - cursor])
+        cursor = segment_end
+        if cursor >= end:
+            break
+    if cursor < end:
+        raise RuntimeError("routed experts do not cover their declared shape")
+    return tuple(result)
 
 
 def _route_payload(object_id: str, payloads: Mapping[str, bytes]) -> bytes:
@@ -265,7 +314,7 @@ def decode_sft_batch(ref: TrainingDataRef, payload: bytes) -> SupervisedTrajecto
 def _encode_training_object(
     payload: bytes,
     *,
-    data_format: Literal["art_trajectory_group_msgpack_v2", "art_sft_batch_msgpack_v1"],
+    data_format: Literal["art_trajectory_group_msgpack_v3", "art_sft_batch_msgpack_v1"],
     object_id: str | None,
 ) -> EncodedTrainingObject:
     digest = hashlib.sha256(payload).hexdigest()

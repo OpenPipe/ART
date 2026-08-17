@@ -15,7 +15,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 VLLM_LORA_OBJECT_FORMAT = "art_vllm_lora_v1"
-MOE_ROUTE_OBJECT_FORMAT = "art_moe_route_bundle_v1"
+MOE_ROUTE_OBJECT_FORMAT = "art_moe_route_bundle_v2"
 _S3_MIN_MULTIPART_PART_BYTES = 5 << 20
 _S3_MAX_MULTIPART_PART_BYTES = 5 << 30
 _S3_MAX_MULTIPART_PARTS = 10_000

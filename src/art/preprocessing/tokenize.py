@@ -42,6 +42,8 @@ from .moe_routing import (
     MoeRoutingAlignmentStats,
     align_choice_routes_to_tokenized_result,
     choice_moe_routing_metadata,
+    join_moe_routes,
+    slice_moe_routes,
 )
 from .policy_spans import (
     choice_policy_token_spans,
@@ -212,9 +214,9 @@ def _choice_with_retained_routing(choice: Choice, start: int) -> Choice:
     assert token_metadata is not None
     prompt_ids, completion_ids = token_metadata
     routes = routing.get("routed_experts")
-    if not isinstance(routes, np.ndarray):
+    if not isinstance(routes, np.ndarray | MoeRouteSegments):
         raise RuntimeError("Missing binary routed experts")
-    completion_route_count = len(routes) - len(prompt_ids)
+    completion_route_count = routes.shape[0] - len(prompt_ids)
     if completion_route_count not in {
         len(completion_ids),
         max(len(completion_ids) - 1, 0),
@@ -230,8 +232,9 @@ def _choice_with_retained_routing(choice: Choice, start: int) -> Choice:
     extra[ART_MOE_ROUTING_METADATA_KEY] = {
         **routing,
         "completion_token_ids": completion_ids[start:],
-        "routed_experts": np.concatenate(
-            (routes[: len(prompt_ids)], routes[len(prompt_ids) + start :])
+        "routed_experts": join_moe_routes(
+            slice_moe_routes(routes, 0, len(prompt_ids)),
+            slice_moe_routes(routes, len(prompt_ids) + start),
         ),
     }
     return retained
@@ -242,24 +245,7 @@ def _slice_moe_routes(
 ) -> MoeRouteArray | MoeRouteSegments | None:
     if routes is None:
         return None
-    if isinstance(routes, MoeRouteSegments):
-        if start <= 0:
-            return routes
-        if start >= routes.shape[0]:
-            return MoeRouteArray(
-                np.empty(
-                    (0, routes.shape[1], routes.shape[2]),
-                    dtype=routes.segments[0].dtype,
-                ),
-                num_experts=routes.num_experts,
-                validate=False,
-            )
-        return MoeRouteSegments(
-            segments=tuple(
-                segment for _, segment in routes.iter_slices(start, routes.shape[0])
-            )
-        )
-    return cast(MoeRouteArray, routes[start:])
+    return slice_moe_routes(routes, start)
 
 
 class _TokenDecoder(Protocol):

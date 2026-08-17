@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, model_validator
@@ -33,6 +33,7 @@ class MoeRouteSlice(_Contract):
     scope: RouteScope
     scope_index: int = Field(ge=0)
     choice_index: int = Field(ge=0)
+    segment_index: int = Field(default=0, ge=0)
     offset: int = Field(ge=0)
     byte_count: int = Field(ge=1)
 
@@ -45,7 +46,7 @@ class MoeRouteObjectPayload(_Contract):
 
     @model_validator(mode="after")
     def _validate_slices(self) -> "MoeRouteObjectPayload":
-        _validate_route_slices(self.slices, len(self.data))
+        validate_moe_route_slices(self.slices, len(self.data))
         return self
 
 
@@ -60,12 +61,16 @@ class MoeRouteGroupPayload(_Contract):
                 item.scope,
                 item.scope_index,
                 item.choice_index,
+                item.segment_index,
             )
             for value in self.objects
             for item in value.slices
         ]
         if len(positions) != len(set(positions)):
-            raise ValueError("route group contains duplicate trajectory positions")
+            raise ValueError("route group contains duplicate trajectory segments")
+        validate_moe_route_bindings(
+            item for value in self.objects for item in value.slices
+        )
         return self
 
 
@@ -75,7 +80,7 @@ class MoeRouteObjectLayout(_Contract):
 
     @model_validator(mode="after")
     def _validate_slices(self) -> "MoeRouteObjectLayout":
-        _validate_route_slices(self.slices, self.byte_count)
+        validate_moe_route_slices(self.slices, self.byte_count)
         return self
 
 
@@ -156,16 +161,18 @@ async def publish_moe_route_groups(
 def hydrate_trajectory_group_routes(
     payload: TrajectoryGroupPayload, routes: MoeRouteGroupPayload
 ) -> TrajectoryGroupPayload:
-    routed: dict[RouteKey, MoeRouteBytes] = {
-        (
-            item.trajectory_index,
-            item.scope,
-            item.scope_index,
-            item.choice_index,
-        ): value.data[item.offset : item.offset + item.byte_count]
-        for value in routes.objects
-        for item in value.slices
-    }
+    routed: dict[RouteKey, dict[int, MoeRouteBytes]] = {}
+    for value in routes.objects:
+        for item in value.slices:
+            key = (
+                item.trajectory_index,
+                item.scope,
+                item.scope_index,
+                item.choice_index,
+            )
+            routed.setdefault(key, {})[item.segment_index] = value.data[
+                item.offset : item.offset + item.byte_count
+            ]
     trajectories = []
     for trajectory_index, trajectory in enumerate(payload.trajectories):
         histories = tuple(
@@ -216,7 +223,7 @@ def _hydrate_route_map(
     trajectory_index: int,
     scope: RouteScope,
     scope_index: int,
-    routed: dict[RouteKey, MoeRouteBytes],
+    routed: dict[RouteKey, dict[int, MoeRouteBytes]],
 ) -> dict[int, _ChoiceRoutingPayload]:
     hydrated = {}
     for choice_index, route in values.items():
@@ -227,7 +234,7 @@ def _hydrate_route_map(
             hydrated[choice_index] = route
             continue
         try:
-            data = routed.pop(key)
+            segments = routed.pop(key)
         except KeyError:
             raise RuntimeError(
                 "routed experts are missing their route object slice"
@@ -236,17 +243,35 @@ def _hydrate_route_map(
         expected = itemsize
         for extent in route.shape:
             expected *= extent
-        if len(data) != expected:
-            raise RuntimeError("route object slice does not match routed-expert shape")
+        data = tuple(segments[index] for index in range(len(segments)))
+        if sum(map(len, data)) != expected:
+            raise RuntimeError("route object slices do not match routed-expert shape")
         hydrated[choice_index] = route.model_copy(update={"data": data})
     return hydrated
 
 
-def _validate_route_slices(slices: tuple[MoeRouteSlice, ...], byte_count: int) -> None:
+def validate_moe_route_slices(
+    slices: tuple[MoeRouteSlice, ...], byte_count: int
+) -> None:
+    ranges = {(value.offset, value.byte_count) for value in slices}
     cursor = 0
-    for value in sorted(slices, key=lambda item: item.offset):
-        if value.offset != cursor:
+    for offset, size in sorted(ranges):
+        if offset != cursor:
             raise ValueError("route slices must exactly partition their object")
-        cursor += value.byte_count
+        cursor += size
     if cursor != byte_count:
         raise ValueError("route slices must exactly partition their object")
+
+
+def validate_moe_route_bindings(slices: Iterable[MoeRouteSlice]) -> None:
+    bindings: dict[RouteKey, set[int]] = {}
+    for item in slices:
+        key = (
+            item.trajectory_index,
+            item.scope,
+            item.scope_index,
+            item.choice_index,
+        )
+        bindings.setdefault(key, set()).add(item.segment_index)
+    if any(indices != set(range(len(indices))) for indices in bindings.values()):
+        raise ValueError("route segment indices must be contiguous from zero")
