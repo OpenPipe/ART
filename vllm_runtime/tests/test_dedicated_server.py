@@ -166,6 +166,31 @@ def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> Non
     assert response.json() == {"error": "invalid level=1 mode='wait'"}
 
 
+@pytest.mark.asyncio
+async def test_lora_update_request_timing_captures_body_boundary() -> None:
+    observed: dict[str, float] = {}
+
+    async def app(scope, receive, _send) -> None:
+        await receive()
+        observed.update(scope["state"])
+
+    middleware = dedicated_server._ArtRequestTimingMiddleware(app)
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    await middleware(
+        {"type": "http", "method": "POST", "path": "/art/in_flight_lora_update"},
+        receive,
+        lambda _message: None,
+    )
+
+    assert (
+        observed[dedicated_server._BODY_RECEIVED_AT]
+        >= observed[dedicated_server._ASGI_STARTED_AT]
+    )
+
+
 def test_launch_policy_version_resolves_loaded_slot_alias(monkeypatch) -> None:
     monkeypatch.setitem(dedicated_server._runtime_state, "loaded_adapter", "policy@5")
     monkeypatch.setitem(dedicated_server._runtime_state, "policy_version", 5)

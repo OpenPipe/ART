@@ -30,6 +30,9 @@ ART_SERVING_PROTOCOL_VERSION = 5
 _runtime_state: dict[str, object] = {}
 _auth_tokens: list[str] = []
 _fast_metrics_port: int | None = None
+_LORA_UPDATE_PATH = "/art/in_flight_lora_update"
+_ASGI_STARTED_AT = "art_lora_update_asgi_started_at"
+_BODY_RECEIVED_AT = "art_lora_update_body_received_at"
 
 
 def _patch_prebound_listener_tcp_nodelay(api_server: Any) -> None:
@@ -101,6 +104,29 @@ class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
             response = JSONResponse(content={"error": "Unauthorized"}, status_code=401)
             return response(scope, receive, send)
         return self.app(scope, receive, send)
+
+
+class _ArtRequestTimingMiddleware:
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = scope.get("path", "").removeprefix(scope.get("root_path", ""))
+        if scope.get("type") != "http" or path != _LORA_UPDATE_PATH:
+            await self.app(scope, receive, send)
+            return
+        state = scope.setdefault("state", {})
+        state[_ASGI_STARTED_AT] = time.perf_counter()
+
+        async def timed_receive() -> Any:
+            message = await receive()
+            if message["type"] == "http.request" and not message.get(
+                "more_body", False
+            ):
+                state[_BODY_RECEIVED_AT] = time.perf_counter()
+            return message
+
+        await self.app(scope, timed_receive, send)
 
 
 class _SetServedModelNameRequest(BaseModel):
@@ -434,6 +460,7 @@ def _patch_art_runtime_routes() -> None:
         async def in_flight_lora_update(
             body: _InFlightLoraUpdateRequest, raw_request: Request
         ) -> JSONResponse:
+            endpoint_started = time.perf_counter()
             from vllm.entrypoints.openai.engine.protocol import ErrorResponse
             from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
 
@@ -452,10 +479,17 @@ def _patch_art_runtime_routes() -> None:
             models = raw_request.app.state.openai_serving_models
             engine_client = engine(raw_request)
             coordinator = lora_update_coordinator(models, engine_client)
-            endpoint_started = mutation_lock_started = time.perf_counter()
+            mutation_lock_started = time.perf_counter()
             async with _lora_mutation_lock(models, lora_slot):
+                state = raw_request.scope["state"]
+                asgi_started = float(state[_ASGI_STARTED_AT])
+                body_received = float(state[_BODY_RECEIVED_AT])
                 timings = {
-                    "mutation_lock_wait_s": time.perf_counter() - mutation_lock_started
+                    "asgi_body_receive_s": body_received - asgi_started,
+                    "body_parse_dispatch_s": endpoint_started - body_received,
+                    "asgi_to_handler_s": endpoint_started - asgi_started,
+                    "handler_setup_s": mutation_lock_started - endpoint_started,
+                    "mutation_lock_wait_s": time.perf_counter() - mutation_lock_started,
                 }
                 identity = _lora_update_identity(body)
                 applied = _applied_lora_updates(models).get(lora_slot)
@@ -949,6 +983,10 @@ def main(argv: list[str] | None = None) -> None:
             *namespace.middleware,
             "art_vllm_runtime.dedicated_server._ArtAuthenticationMiddleware",
         ]
+    namespace.middleware = [
+        *namespace.middleware,
+        "art_vllm_runtime.dedicated_server._ArtRequestTimingMiddleware",
+    ]
     validate_parsed_serve_args(namespace)
     if args.headless:
         from vllm.entrypoints.cli.serve import run_headless
