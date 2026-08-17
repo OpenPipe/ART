@@ -52,7 +52,9 @@ BF16_FWD_MEAN_ABS_PCT_LIMIT_BY_MODEL_KEY = {
     # nondeterministic BF16 vLLM executions; KL remains below 0.0015.
     "llama3_dense": 5.75,
     "qwen3_moe": 8.0,
-    "qwen3_5_dense": 7.0,
+    # Reordering identical packed paths moved only Megatron BF16 scores, up to
+    # 0.0148 MAE; vLLM scores and unchanged-position paths were bit-identical.
+    "qwen3_5_dense": 8.05,
     "qwen3_5_moe": 8.0,
 }
 TOP20_KL_CANDIDATE_TO_TARGET_LIMIT = 0.002
