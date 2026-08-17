@@ -280,7 +280,7 @@ class ServiceClient:
                 "weights_access_token is Tinker auth; use native Remote Training "
                 "credentials"
             )
-        source_run_id, kind, _checkpoint = _parse_checkpoint_path(path)
+        source_run_id, kind, checkpoint = _parse_checkpoint_path(path)
         if kind != "training":
             raise ValueError("training state must use a /weights/ checkpoint path")
         source = await self._service.get_run(source_run_id)
@@ -295,7 +295,7 @@ class ServiceClient:
             spec,
             CreateTrainingRunRequest(
                 spec=spec,
-                checkpoint=path,
+                checkpoint=checkpoint,
                 restore_optimizer=restore_optimizer,
             ),
         )
