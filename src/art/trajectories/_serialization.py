@@ -22,12 +22,13 @@ _STRING_INTERNING_DISABLED = ContextVar(
 
 
 @contextmanager
-def _without_string_interning() -> Iterator[None]:
-    token = _STRING_INTERNING_DISABLED.set(True)
+def _without_string_interning(*, when: bool = True) -> Iterator[None]:
+    token = _STRING_INTERNING_DISABLED.set(True) if when else None
     try:
         yield
     finally:
-        _STRING_INTERNING_DISABLED.reset(token)
+        if token is not None:
+            _STRING_INTERNING_DISABLED.reset(token)
 
 
 def _skip_string_interning() -> bool:
@@ -37,7 +38,8 @@ def _skip_string_interning() -> bool:
 def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
     """Share equal strings inside supported model and built-in container graphs."""
 
-    _intern_value(value, {} if pool is None else pool, {})
+    if not _skip_string_interning():
+        _intern_value(value, {} if pool is None else pool, {})
 
 
 def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> object:

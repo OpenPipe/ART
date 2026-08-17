@@ -74,7 +74,6 @@ from ..types import Messages, MessagesAndChoices, Tools
 from ._serialization import (
     _CompactModel,
     _rebind_history_sources,
-    _skip_string_interning,
     _StringPool,
     serialize_chat_completion,
     serialize_history,
@@ -554,8 +553,7 @@ class Trajectory(_CompactModel):
             raise ValueError(
                 "A trajectory cannot contain both exchanges and legacy histories"
             )
-        if not _skip_string_interning():
-            self._intern_strings()
+        self._intern_strings()
         return self
 
     def _intern_strings(self, pool: _StringPool | None = None) -> None:
@@ -864,8 +862,7 @@ class TrajectoryGroup(_CompactModel):
 
     @pydantic.model_validator(mode="after")
     def _intern_string_graph(self) -> TrajectoryGroup:
-        if not _skip_string_interning():
-            self._intern_strings()
+        self._intern_strings()
         return self
 
     def _intern_strings(self, pool: _StringPool | None = None) -> None:
