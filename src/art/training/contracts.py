@@ -13,6 +13,8 @@ from art.distributed.trajectory_store import (
 from art.pipeline_tuner.config import PackedGroupShape
 from art.trajectories import Trajectory
 
+from .tokenized import TokenizedDatum, TokenizedLossName
+
 COMMAND_CONTRACT_VERSION = "art_training_commands_v1"
 PACKING_CONTRACT_VERSION = "art_prefix_tree_v1"
 
@@ -132,14 +134,26 @@ class SupervisedTrajectoryBatch(Contract):
     assistant_turns: Literal["all", "last"] = "all"
 
 
+class TokenizedTrainingBatch(Contract):
+    kind: Literal["tokenized"] = "tokenized"
+    datums: tuple[TokenizedDatum, ...] = Field(min_length=1)
+    _encoded_payload: bytes | None = PrivateAttr(default=None)
+
+    def encoded_payload(self) -> bytes | None:
+        return self._encoded_payload
+
+    def remember_encoded_payload(self, payload: bytes) -> None:
+        object.__setattr__(self, "_encoded_payload", payload)
+
+
 TrainingBatch = Annotated[
-    RlTrajectoryBatch | SupervisedTrajectoryBatch,
+    RlTrajectoryBatch | SupervisedTrajectoryBatch | TokenizedTrainingBatch,
     Field(discriminator="kind"),
 ]
 
 
 class LossConfig(Contract):
-    name: Literal["cross_entropy", "cispo", "ppo"]
+    name: TokenizedLossName
     normalize_advantages: bool = True
     values: dict[str, float | int | bool | str | None] = Field(default_factory=dict)
 
@@ -151,12 +165,24 @@ class ForwardRequest(RunCommand):
 
     @model_validator(mode="after")
     def _validate_loss(self) -> "ForwardRequest":
-        expected = {"cross_entropy"} if self.batch.kind == "sft" else {"cispo", "ppo"}
+        expected = {
+            "sft": {"cross_entropy"},
+            "rl": {"cispo", "ppo"},
+            "tokenized": {
+                "cross_entropy",
+                "importance_sampling",
+                "ppo",
+                "cispo",
+            },
+        }[self.batch.kind]
         if self.loss.name not in expected:
             raise ValueError(
                 f"{self.batch.kind} batches require one of {sorted(expected)}, "
                 f"got {self.loss.name!r}"
             )
+        if isinstance(self.batch, TokenizedTrainingBatch):
+            for datum in self.batch.datums:
+                datum.validate_for_loss(self.loss.name)
         return self
 
 

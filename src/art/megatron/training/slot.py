@@ -7,7 +7,7 @@ import time
 from typing import Any, Literal, cast
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
 from art.distributed.object_store import (
@@ -50,11 +50,13 @@ from art.training.contracts import (
     ForwardResult,
     LoadStateRequest,
     LoadStateResult,
+    LossConfig,
     LossFnOutput,
     OperationRef,
     OptimStepRequest,
     OptimStepResult,
     PackingOutcome,
+    RlTrajectoryBatch,
     SamplerWeightsResult,
     SaveStateRequest,
     SaveStateResult,
@@ -78,18 +80,25 @@ class PreparedForward(BaseModel):
 
     ref: OperationRef
     packing: PackingOutcome
-    kind: Literal["rl", "sft"]
+    kind: Literal["rl", "sft", "tokenized"]
 
     @property
     def token_cost(self) -> int:
         return self.packing.physical_tokens
 
 
-class PreparedRlForward(PreparedForward):
-    kind: Literal["rl"] = "rl"
+class PreparedPackedForward(PreparedForward):
+    kind: Literal["rl", "tokenized"] = "rl"
     packed: DistributedPackedBatch
     config: RlForwardBackwardConfig
     experimental_config: ExperimentalTrainConfig
+    loss: LossConfig | None = None
+
+    @model_validator(mode="after")
+    def _validate_loss(self) -> "PreparedPackedForward":
+        if (self.kind == "tokenized") != (self.loss is not None):
+            raise ValueError("tokenized prepared batches require their named loss")
+        return self
 
 
 class PreparedSftForward(PreparedForward):
@@ -263,6 +272,32 @@ class MegatronTrainingSlot:
                 tokenization_s=time.perf_counter() - started,
                 packing=sft_packing_outcome(batch),
             )
+        if request.batch.kind == "tokenized":
+            packed = await self.runtime.pack(
+                PackingRequest(
+                    model=state.model,
+                    generation_id=uuid.uuid4().hex,
+                    tokenized_batch=request.batch,
+                    tokenized_loss=request.loss.name,
+                    packed_sequence_length=self.runtime_spec.packed_sequence_length,
+                )
+            )
+            if packed is None:
+                raise ValueError("tokenized batch produced no packed sequence")
+            return PreparedPackedForward(
+                ref=ref,
+                kind="tokenized",
+                packed=packed,
+                packing=packing_outcome(
+                    packed,
+                    target_packed_sequences=self._data_parallel_size(),
+                ),
+                config=RlForwardBackwardConfig(),
+                experimental_config=ExperimentalTrainConfig(),
+                loss=request.loss,
+            )
+        if not isinstance(request.batch, RlTrajectoryBatch):
+            raise TypeError("unknown forward batch")
         config = experimental_train_config(request)
         training_config = forward_backward_config(request)
         if (
@@ -300,7 +335,7 @@ class MegatronTrainingSlot:
         )
         if packed is None:
             raise ValueError("trajectory batch produced no trainable packed sequence")
-        return PreparedRlForward(
+        return PreparedPackedForward(
             ref=ref,
             packed=packed,
             packing=packing_outcome(
@@ -321,7 +356,7 @@ class MegatronTrainingSlot:
         )
 
     async def discard_prepared(self, prepared: PreparedForward) -> None:
-        if isinstance(prepared, PreparedRlForward):
+        if isinstance(prepared, PreparedPackedForward):
             await self.runtime.release_batch(prepared.packed)
 
     async def forward(self, prepared: PreparedForward) -> ForwardResult:
@@ -344,7 +379,7 @@ class MegatronTrainingSlot:
             )
             raw = await self.trainer.sft_forward(job, prepared.batch)
             return self._sft_forward_result(prepared, raw, backward=False)
-        if not isinstance(prepared, PreparedRlForward):
+        if not isinstance(prepared, PreparedPackedForward):
             raise TypeError("unknown prepared forward payload")
         job = ForwardJobSpec(
             operation_id=ref.operation_id,
@@ -357,6 +392,12 @@ class MegatronTrainingSlot:
             batch=prepared.packed.leases.ref,
             config=prepared.config,
             experimental_config=prepared.experimental_config,
+            loss=prepared.loss,
+            tokenized_trainable_token_count=(
+                prepared.packed.loss_bearing_tokens
+                if prepared.kind == "tokenized"
+                else None
+            ),
         )
         try:
             raw = await self.trainer.forward(job, prepared.packed.leases)
@@ -396,7 +437,7 @@ class MegatronTrainingSlot:
                 ForwardBackwardResult,
                 self._sft_forward_result(prepared, raw, backward=True),
             )
-        if not isinstance(prepared, PreparedRlForward):
+        if not isinstance(prepared, PreparedPackedForward):
             raise TypeError("unknown prepared F/B payload")
         job = ForwardBackwardJobSpec(
             operation_id=ref.operation_id,
@@ -409,6 +450,12 @@ class MegatronTrainingSlot:
             batch=prepared.packed.leases.ref,
             config=prepared.config,
             experimental_config=prepared.experimental_config,
+            loss=prepared.loss,
+            tokenized_trainable_token_count=(
+                prepared.packed.loss_bearing_tokens
+                if prepared.kind == "tokenized"
+                else None
+            ),
         )
         try:
             raw = await self.trainer.forward_backward(job, prepared.packed.leases)

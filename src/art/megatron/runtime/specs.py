@@ -13,7 +13,7 @@ from art.distributed.data_plane import PackedBatchRef
 from art.distributed.object_store import BinaryObjectTarget
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
 from art.megatron.optimizer_state import OptimizerAdapter
-from art.training.contracts import AdamConfig
+from art.training.contracts import AdamConfig, LossConfig
 from art.types import TrainConfig, TrainSFTConfig
 
 
@@ -283,7 +283,7 @@ class SFTJobSpec(_TrainerJobSpec):
 
 
 class ForwardBackwardJobSpec(_Spec):
-    """One admitted RL F/B contribution against a fixed learner parent."""
+    """One admitted packed F/B contribution against a fixed learner parent."""
 
     operation_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
@@ -295,6 +295,8 @@ class ForwardBackwardJobSpec(_Spec):
     batch: PackedBatchRef
     config: RlForwardBackwardConfig = RlForwardBackwardConfig()
     experimental_config: ExperimentalTrainConfig = ExperimentalTrainConfig()
+    loss: LossConfig | None = None
+    tokenized_trainable_token_count: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def _validate_source(self) -> "ForwardBackwardJobSpec":
@@ -303,12 +305,22 @@ class ForwardBackwardJobSpec(_Spec):
             or self.source.policy_step != self.expected_learner_version
         ):
             raise ValueError("source generation does not identify the F/B parent")
-        if self.batch.max_source_version > self.expected_learner_version:
+        tokenized = self.batch.training_kind == "tokenized"
+        if tokenized != (self.loss is not None):
+            raise ValueError("tokenized F/B batches require their named loss")
+        if tokenized != (self.tokenized_trainable_token_count is not None):
+            raise ValueError(
+                "tokenized F/B batches require their trainable-token count"
+            )
+        if (
+            not tokenized
+            and self.batch.max_source_version > self.expected_learner_version
+        ):
             raise ValueError(
                 "batch source policy version cannot be newer than the learner"
             )
         stats = self.batch.prefix_tree_packing_stats
-        if stats is None or stats.policy_token_counts is None:
+        if stats is None or (not tokenized and stats.policy_token_counts is None):
             raise ValueError("F/B batch requires exact policy-token provenance")
         return self
 
@@ -326,6 +338,8 @@ class ForwardBackwardJobSpec(_Spec):
 
     @property
     def trainable_token_count(self) -> int:
+        if self.tokenized_trainable_token_count is not None:
+            return self.tokenized_trainable_token_count
         counts = self.batch.prefix_tree_packing_stats
         assert counts is not None and counts.policy_token_counts is not None
         return sum(counts.policy_token_counts.values())

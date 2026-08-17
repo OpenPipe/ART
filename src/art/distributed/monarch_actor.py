@@ -520,7 +520,19 @@ class ArtHostService(Actor):
         fetch_started = time.monotonic()
         trajectory_receive_s = 0.0
         trajectory_build_s = 0.0
-        if request.trajectory_sources:
+        tokenized_batch = request.tokenized_batch
+        groups = []
+        if request.tokenized_transfer is not None:
+            if request.tokenized_transfer.stream.stream_id != batch_id:
+                raise ValueError("packing request has the wrong tokenized stream")
+            receive_started = time.monotonic()
+            tokenized_batch = await request.tokenized_transfer.receive(
+                timeout_s=transfer_timeout_s
+            )
+            trajectory_receive_s = time.monotonic() - receive_started
+        elif tokenized_batch is not None:
+            pass
+        elif request.trajectory_sources:
             receive_started = time.monotonic()
             groups = list(
                 await asyncio.gather(
@@ -596,7 +608,26 @@ class ArtHostService(Actor):
         try:
             async with self._packing_lock:
                 packing_lock_wait_s = time.monotonic() - packing_started
-                if self._packer is None:
+                if tokenized_batch is not None:
+                    from art.preprocessing.pack import (
+                        packed_tensors_from_tokenized_datums,
+                    )
+
+                    assert request.tokenized_loss is not None
+                    tokenized_loss = request.tokenized_loss
+                    packing_compute_started = time.monotonic()
+                    packed, cancelled = await complete_to_thread(
+                        lambda: packed_tensors_from_tokenized_datums(
+                            tokenized_batch.datums,
+                            loss=tokenized_loss,
+                            seq_len=request.packed_sequence_length,
+                            timings=packing_timings,
+                        )
+                    )
+                    packing_compute_s = time.monotonic() - packing_compute_started
+                    if cancelled is not None:
+                        raise cancelled
+                elif self._packer is None:
                     from art.megatron.backend import MegatronBackend
 
                     previous = gc.get_threshold()
@@ -616,30 +647,31 @@ class ArtHostService(Actor):
                         gc.set_threshold(*previous)
                         raise
                     self._packing_gc_threshold = previous
-                packer = self._packer
-                assert packer is not None
-                packing_compute_started = time.monotonic()
-                packed, cancelled = await complete_to_thread(
-                    lambda: packer._get_packed_tensors(
-                        request.model.build(),
-                        groups,
-                        advantage_balance=request.advantage_balance,
-                        allow_training_without_logprobs=(
-                            request.allow_training_without_logprobs
-                        ),
-                        scale_rewards=request.scale_rewards,
-                        plot_tensors=request.plot_tensors,
-                        packed_sequence_length=request.packed_sequence_length,
-                        logprob_calculation_chunk_size=(
-                            request.logprob_calculation_chunk_size
-                        ),
-                        include_moe_routing=request.include_moe_routing,
-                        packing_timings=packing_timings,
+                if tokenized_batch is None:
+                    packer = self._packer
+                    assert packer is not None
+                    packing_compute_started = time.monotonic()
+                    packed, cancelled = await complete_to_thread(
+                        lambda: packer._get_packed_tensors(
+                            request.model.build(),
+                            groups,
+                            advantage_balance=request.advantage_balance,
+                            allow_training_without_logprobs=(
+                                request.allow_training_without_logprobs
+                            ),
+                            scale_rewards=request.scale_rewards,
+                            plot_tensors=request.plot_tensors,
+                            packed_sequence_length=request.packed_sequence_length,
+                            logprob_calculation_chunk_size=(
+                                request.logprob_calculation_chunk_size
+                            ),
+                            include_moe_routing=request.include_moe_routing,
+                            packing_timings=packing_timings,
+                        )
                     )
-                )
-                packing_compute_s = time.monotonic() - packing_compute_started
-                if cancelled is not None:
-                    raise cancelled
+                    packing_compute_s = time.monotonic() - packing_compute_started
+                    if cancelled is not None:
+                        raise cancelled
         except BaseException as error:
             if log_future is not None:
 
@@ -681,7 +713,10 @@ class ArtHostService(Actor):
                 trajectory_log_wait_s=trajectory_log_wait_s,
             )
         trainable_assistant_tokens = int(packed["assistant_mask"].sum().item())
-        loss_bearing_tokens = int(packed["assistant_mask"][:, 1:].sum().item())
+        loss_mask = packed["assistant_mask"]
+        if tokenized_batch is None:
+            loss_mask = loss_mask[:, 1:]
+        loss_bearing_tokens = int(loss_mask.sum().item())
         non_padding_tokens = int((packed["group_ids"] != -1).sum().item())
         finalize_started = time.monotonic()
         ref = self._packed_batches.store.create(

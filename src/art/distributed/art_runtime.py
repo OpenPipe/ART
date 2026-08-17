@@ -23,7 +23,7 @@ from .artifact_preflight import (
     ArtifactProbeSpec,
     ArtifactRootPreflightError,
 )
-from .data_plane import PackedBatchLeaseSet, fanout_packed_batch
+from .data_plane import ByteStreamPublisher, PackedBatchLeaseSet, fanout_packed_batch
 from .host_admission import (
     HostAdmissionReport,
     HostAdmissionRequest,
@@ -57,7 +57,12 @@ from .nccl_preflight import (
     NcclRendezvousRequest,
     NcclRendezvousResult,
 )
-from .packing import PackingRequest, PackingResult
+from .packing import (
+    PackingRequest,
+    PackingResult,
+    TokenizedBatchTransfer,
+    encode_tokenized_batch,
+)
 from .rollout import DistributedRolloutExecutor, InstalledAsyncCallable
 from .specs import (
     ArtRuntimeConfig,
@@ -733,7 +738,7 @@ class ArtRuntime:
         try:
             async with AsyncExitStack() as publishers:
                 wire_request = request
-                if request.trajectory_groups:
+                if request.trajectory_groups or request.tokenized_batch is not None:
                     from .moe_route_store import publish_moe_route_groups
                     from .trajectory_store import publish_trajectory_bundles
 
@@ -741,18 +746,34 @@ class ArtRuntime:
                     data_plane_host = urlparse(controller.worker_address).hostname
                     if data_plane_host is None:
                         raise ValueError("controller has no routable address")
-                    transfer, publisher = await publish_trajectory_bundles(
-                        request.trajectory_groups,
-                        stream_id=batch_id,
-                        advertise_host=data_plane_host,
-                    )
-                    wire_request = request.model_copy(
-                        update={
-                            "trajectory_groups": (),
-                            "trajectory_transfer": transfer,
-                        }
-                    )
-                    publishers.push_async_callback(publisher.close)
+                    if request.tokenized_batch is not None:
+                        publisher = await ByteStreamPublisher.create(
+                            batch_id,
+                            (encode_tokenized_batch(request.tokenized_batch),),
+                            advertise_host=data_plane_host,
+                        )
+                        wire_request = request.model_copy(
+                            update={
+                                "tokenized_batch": None,
+                                "tokenized_transfer": TokenizedBatchTransfer(
+                                    stream=publisher.transfer
+                                ),
+                            }
+                        )
+                        publishers.push_async_callback(publisher.close)
+                    else:
+                        transfer, publisher = await publish_trajectory_bundles(
+                            request.trajectory_groups,
+                            stream_id=batch_id,
+                            advertise_host=data_plane_host,
+                        )
+                        wire_request = request.model_copy(
+                            update={
+                                "trajectory_groups": (),
+                                "trajectory_transfer": transfer,
+                            }
+                        )
+                        publishers.push_async_callback(publisher.close)
                     if request.moe_route_groups:
                         (
                             route_transfer,

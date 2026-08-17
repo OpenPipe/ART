@@ -22,6 +22,7 @@ from art.training.contracts import (
 
 RL_GROUP_DATA_FORMAT = "art_trajectory_group_msgpack_v3"
 SFT_DATA_FORMAT = "art_sft_batch_msgpack_v1"
+TOKENIZED_DATA_FORMAT = "art_tokenized_batch_msgpack_v1"
 OPERATION_RESULT_FORMAT = "art_operation_result_msgpack_v1"
 
 
@@ -29,7 +30,11 @@ class TrainingDataRef(Contract):
     object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     byte_count: int = Field(ge=1)
-    format: Literal["art_trajectory_group_msgpack_v3", "art_sft_batch_msgpack_v1"]
+    format: Literal[
+        "art_trajectory_group_msgpack_v3",
+        "art_sft_batch_msgpack_v1",
+        "art_tokenized_batch_msgpack_v1",
+    ]
 
 
 class RemoteRouteObjectRef(Contract):
@@ -135,8 +140,19 @@ class RemoteSftBatchRef(Contract):
         return self
 
 
+class RemoteTokenizedBatchRef(Contract):
+    kind: Literal["tokenized"] = "tokenized"
+    data: TrainingDataRef
+
+    @model_validator(mode="after")
+    def _validate_format(self) -> "RemoteTokenizedBatchRef":
+        if self.data.format != TOKENIZED_DATA_FORMAT:
+            raise ValueError("tokenized data has the wrong wire format")
+        return self
+
+
 RemoteTrainingBatchRef = Annotated[
-    RemoteRlBatchRef | RemoteSftBatchRef,
+    RemoteRlBatchRef | RemoteSftBatchRef | RemoteTokenizedBatchRef,
     Field(discriminator="kind"),
 ]
 
@@ -169,14 +185,19 @@ class RemoteForwardRequest(RunCommand):
 
     @model_validator(mode="after")
     def _validate_loss(self) -> "RemoteForwardRequest":
-        expected = (
-            {"cross_entropy"}
-            if self.batch.kind == "sft"
-            else {
+        expected = {
+            "sft": {"cross_entropy"},
+            "rl": {
                 "cispo",
                 "ppo",
-            }
-        )
+            },
+            "tokenized": {
+                "cross_entropy",
+                "importance_sampling",
+                "ppo",
+                "cispo",
+            },
+        }[self.batch.kind]
         if self.loss.name not in expected:
             raise ValueError(
                 f"{self.batch.kind} batches require one of {sorted(expected)}, "

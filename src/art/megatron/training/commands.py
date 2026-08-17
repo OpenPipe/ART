@@ -51,7 +51,9 @@ def packing_outcome(
 ) -> PackingOutcome:
     ref = packed.leases.ref
     stats = ref.prefix_tree_packing_stats
-    if stats is None or stats.policy_token_counts is None:
+    if stats is None:
+        raise RuntimeError("packed batch has no prefix-tree packing statistics")
+    if ref.training_kind == "rl" and stats.policy_token_counts is None:
         raise RuntimeError("RL packed batch has no exact policy-token provenance")
     return PackingOutcome(
         packed_sequence_length=ref.sequence_length,
@@ -66,12 +68,16 @@ def packing_outcome(
         non_padding_tokens=packed.non_padding_tokens,
         loss_bearing_tokens=packed.loss_bearing_tokens,
         trainable_assistant_tokens=packed.trainable_assistant_tokens,
-        policy_token_counts=tuple(
-            PolicyTokenCount(
-                policy_version=version,
-                trainable_assistant_tokens=count,
+        policy_token_counts=(
+            None
+            if stats.policy_token_counts is None
+            else tuple(
+                PolicyTokenCount(
+                    policy_version=version,
+                    trainable_assistant_tokens=count,
+                )
+                for version, count in sorted(stats.policy_token_counts.items())
             )
-            for version, count in sorted(stats.policy_token_counts.items())
         ),
         group_shapes=tuple(
             shape for shape in packed.packed_group_shapes if shape is not None

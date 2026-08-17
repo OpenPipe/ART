@@ -8,7 +8,7 @@ import secrets
 import socket
 from threading import Thread
 import time
-from typing import Any, Coroutine, Protocol, TypeVar, cast
+from typing import Any, Coroutine, Literal, Protocol, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -77,6 +77,11 @@ class PrefixTreePackingStatsSpec(_Contract):
         return self
 
 
+class TokenizedOutputMapSpec(_Contract):
+    packed_positions: tuple[tuple[int, ...], ...] = Field(min_length=1)
+    candidate_counts: tuple[int, ...] = Field(min_length=1)
+
+
 class PackedBatchRef(_Contract):
     batch_id: str = Field(min_length=1)
     owner_actor_id: str = Field(min_length=1)
@@ -93,6 +98,8 @@ class PackedBatchRef(_Contract):
     image_grid_thw_present: tuple[bool, ...]
     moe_routing_replay: MoeRoutingReplaySpec | None = None
     prefix_tree_packing_stats: PrefixTreePackingStatsSpec | None = None
+    training_kind: Literal["rl", "tokenized"] = "rl"
+    tokenized_output_map: TokenizedOutputMapSpec | None = None
     group_ids: tuple[str, ...] = ()
     record_ids: tuple[str, ...] = ()
     min_source_version: int = Field(default=0, ge=0)
@@ -153,6 +160,45 @@ class PackedBatchRef(_Contract):
                 or specs["original_logprobs"].shape != core_shape
             ):
                 raise ValueError("original_logprobs dtype or shape is invalid")
+        tokenized_names = {
+            "target_tokens",
+            "loss_weights",
+            "behavior_logprobs",
+            "token_advantages",
+        }
+        if self.training_kind == "tokenized":
+            if self.tokenized_output_map is None or not tokenized_names <= specs.keys():
+                raise ValueError("tokenized packed-batch manifest is incomplete")
+            target_shape = specs["target_tokens"].shape
+            if (
+                len(target_shape) != 3
+                or target_shape[:2] != core_shape
+                or target_shape[2] < 1
+                or specs["target_tokens"].dtype != "int64"
+                or any(
+                    specs[name].dtype != "float32" or specs[name].shape != target_shape
+                    for name in tokenized_names - {"target_tokens"}
+                )
+            ):
+                raise ValueError("tokenized packed tensor dtype or shape is invalid")
+            expected_optional |= tokenized_names
+            output_map = self.tokenized_output_map
+            if (
+                len(output_map.packed_positions) != len(output_map.candidate_counts)
+                or any(
+                    count < 1 or count > target_shape[2]
+                    for count in output_map.candidate_counts
+                )
+                or any(
+                    position < 0
+                    or position >= self.num_sequences * self.sequence_length
+                    for positions in output_map.packed_positions
+                    for position in positions
+                )
+            ):
+                raise ValueError("tokenized output map is invalid")
+        elif self.tokenized_output_map is not None:
+            raise ValueError("RL packed batches cannot carry a tokenized output map")
         replay_names = {"moe_routing_replay/expert_indices"}
         if self.moe_routing_replay is not None:
             if not replay_names <= specs.keys():
@@ -307,6 +353,8 @@ class SharedMemoryPackedBatchStore:
                 image_grid_thw_present=metadata["image_grid_thw_present"],
                 moe_routing_replay=metadata["moe_routing_replay"],
                 prefix_tree_packing_stats=metadata["prefix_tree_packing_stats"],
+                training_kind=metadata["training_kind"],
+                tokenized_output_map=metadata["tokenized_output_map"],
                 group_ids=group_ids,
                 record_ids=record_ids,
                 min_source_version=min_source_version,
@@ -948,6 +996,21 @@ def _flatten_packed_tensors(
         if tuple(original.shape) != shape:
             raise ValueError("original_logprobs must match the core packed shape")
         flat.append(("original_logprobs", original))
+    tokenized_names = (
+        "target_tokens",
+        "loss_weights",
+        "behavior_logprobs",
+        "token_advantages",
+    )
+    tokenized = [name for name in tokenized_names if name in tensors]
+    if tokenized and len(tokenized) != len(tokenized_names):
+        raise ValueError("tokenized packed tensors are incomplete")
+    for name in tokenized:
+        tensor = tensors[name]
+        _validate_tensor(name, tensor, torch)
+        if tensor.ndim != 3 or tuple(tensor.shape[:2]) != shape:
+            raise ValueError("tokenized packed tensors must have shape [B, S, K]")
+        flat.append((name, tensor))
     replay = tensors.get("moe_routing_replay")
     replay_spec = None
     if replay is not None:
@@ -969,6 +1032,12 @@ def _flatten_packed_tensors(
         ),
         "moe_routing_replay": replay_spec,
         "prefix_tree_packing_stats": tensors.get("prefix_tree_packing_stats"),
+        "training_kind": "tokenized" if tokenized else "rl",
+        "tokenized_output_map": (
+            None
+            if (output_map := tensors.get("tokenized_output_map")) is None
+            else output_map.model_dump()
+        ),
     }
 
 
@@ -1076,6 +1145,14 @@ def _unflatten_packed_tensors(flat: dict[str, Any], ref: PackedBatchRef) -> Any:
     )
     if "original_logprobs" in flat:
         tensors["original_logprobs"] = flat["original_logprobs"]
+    for name in (
+        "target_tokens",
+        "loss_weights",
+        "behavior_logprobs",
+        "token_advantages",
+    ):
+        if name in flat:
+            tensors[name] = flat[name]
     if ref.prefix_tree_packing_stats is not None:
         tensors["prefix_tree_packing_stats"] = (
             ref.prefix_tree_packing_stats.model_dump()

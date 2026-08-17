@@ -21,12 +21,14 @@ from art.training.contracts import (
     OperationResult,
     RlTrajectoryBatch,
     SupervisedTrajectoryBatch,
+    TokenizedTrainingBatch,
     TrainingBatch,
 )
 
 from .contracts import (
     RL_GROUP_DATA_FORMAT,
     SFT_DATA_FORMAT,
+    TOKENIZED_DATA_FORMAT,
     OperationResultRef,
     RemoteRlBatchRef,
     RemoteRlGroupRef,
@@ -34,11 +36,13 @@ from .contracts import (
     RemoteRouteObjectRef,
     RemoteRouteSlice,
     RemoteSftBatchRef,
+    RemoteTokenizedBatchRef,
     RemoteTrainingBatchRef,
     TrainingDataRef,
 )
 
 _SFT_BATCH_ADAPTER = TypeAdapter(SupervisedTrajectoryBatch)
+_TOKENIZED_BATCH_ADAPTER = TypeAdapter(TokenizedTrainingBatch)
 _UINT32_ARRAY_EXT = 1
 _FLOAT32_ARRAY_EXT = 2
 ResultT = TypeVar("ResultT", bound=OperationResult)
@@ -129,7 +133,7 @@ def prepare_training_batch(
             min_source_version=batch.min_source_version,
             max_source_version=batch.max_source_version,
         )
-    else:
+    elif isinstance(batch, SupervisedTrajectoryBatch):
         value = _encode_training_object(
             msgpack.encode(batch.model_dump(mode="python")),
             data_format=SFT_DATA_FORMAT,
@@ -138,6 +142,19 @@ def prepare_training_batch(
         objects = (value,)
         route_objects = ()
         remote = RemoteSftBatchRef(data=value.ref)
+    else:
+        payload = batch.encoded_payload() or msgpack.encode(
+            batch.model_dump(mode="python")
+        )
+        batch.remember_encoded_payload(payload)
+        value = _encode_training_object(
+            payload,
+            data_format=TOKENIZED_DATA_FORMAT,
+            object_id=_object_id(identity) if identity else None,
+        )
+        objects = (value,)
+        route_objects = ()
+        remote = RemoteTokenizedBatchRef(data=value.ref)
     return EncodedTrainingBatch(
         batch=batch,
         remote=remote,
@@ -311,10 +328,30 @@ def decode_sft_batch(ref: TrainingDataRef, payload: bytes) -> SupervisedTrajecto
     return _SFT_BATCH_ADAPTER.validate_python(msgpack.decode(payload))
 
 
+def decode_tokenized_batch(
+    ref: TrainingDataRef, payload: bytes
+) -> TokenizedTrainingBatch:
+    _validate_training_object(ref, payload, TOKENIZED_DATA_FORMAT)
+    batch = _TOKENIZED_BATCH_ADAPTER.validate_python(msgpack.decode(payload))
+    batch.remember_encoded_payload(payload)
+    return batch
+
+
+def decode_tokenized_batch(
+    ref: TrainingDataRef, payload: bytes
+) -> TokenizedTrainingBatch:
+    _validate_training_object(ref, payload, TOKENIZED_DATA_FORMAT)
+    return _TOKENIZED_BATCH_ADAPTER.validate_python(msgpack.decode(payload))
+
+
 def _encode_training_object(
     payload: bytes,
     *,
-    data_format: Literal["art_trajectory_group_msgpack_v3", "art_sft_batch_msgpack_v1"],
+    data_format: Literal[
+        "art_trajectory_group_msgpack_v3",
+        "art_sft_batch_msgpack_v1",
+        "art_tokenized_batch_msgpack_v1",
+    ],
     object_id: str | None,
 ) -> EncodedTrainingObject:
     digest = hashlib.sha256(payload).hexdigest()

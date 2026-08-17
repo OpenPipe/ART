@@ -4,9 +4,10 @@ from collections.abc import Iterable
 import secrets
 from typing import TYPE_CHECKING, Any, Literal
 
+from msgspec import msgpack
 import numpy as np
 from openai.types.chat.chat_completion import Choice
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from art.pipeline_tuner.config import PackedGroupShape
 from art.preprocessing.moe_routing import (
@@ -18,6 +19,8 @@ from art.preprocessing.moe_routing import (
     moe_route_dtype,
 )
 from art.preprocessing.pack import PackingTimings
+from art.training.contracts import TokenizedTrainingBatch
+from art.training.tokenized import TokenizedLossName
 from art.trajectories import (
     MetadataValue,
     PydanticException,
@@ -25,7 +28,7 @@ from art.trajectories import (
     TrajectoryGroup,
 )
 
-from .data_plane import PackedBatchRef
+from .data_plane import ByteStreamTransfer, PackedBatchRef, receive_byte_stream
 from .moe_route_store import (
     MoeRouteBatchTransfer,
     MoeRouteBytes,
@@ -41,6 +44,8 @@ from .trajectory_store import (
 
 if TYPE_CHECKING:
     from art.model import TrainableModel
+
+_TOKENIZED_BATCH_ADAPTER = TypeAdapter(TokenizedTrainingBatch)
 
 
 class _ChoiceRoutingPayload(BaseModel):
@@ -286,8 +291,28 @@ class TrajectoryGroupPayload(BaseModel):
         return group
 
 
+class TokenizedBatchTransfer(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stream: ByteStreamTransfer
+
+    async def receive(self, *, timeout_s: float) -> TokenizedTrainingBatch:
+        payload = bytes(await receive_byte_stream(self.stream, timeout_s=timeout_s))
+        batch = _TOKENIZED_BATCH_ADAPTER.validate_python(msgpack.decode(payload))
+        batch.remember_encoded_payload(payload)
+        return batch
+
+
+def encode_tokenized_batch(batch: TokenizedTrainingBatch) -> bytes:
+    payload = batch.encoded_payload()
+    if payload is None:
+        payload = msgpack.encode(batch.model_dump(mode="python"))
+        batch.remember_encoded_payload(payload)
+    return payload
+
+
 class PackingRequest(BaseModel):
-    """Current ART packing inputs; generalized loss programs are intentionally absent."""
+    """Canonical RL or exact-token packing input."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
@@ -295,6 +320,9 @@ class PackingRequest(BaseModel):
     generation_id: str = Field(min_length=1)
     trajectory_groups: tuple[TrajectoryGroupBundle, ...] = ()
     trajectory_transfer: TrajectoryBatchTransfer | None = None
+    tokenized_batch: TokenizedTrainingBatch | None = None
+    tokenized_transfer: TokenizedBatchTransfer | None = None
+    tokenized_loss: TokenizedLossName | None = None
     moe_route_groups: tuple[MoeRouteGroupPayload, ...] = ()
     moe_route_transfer: MoeRouteBatchTransfer | None = None
     trajectory_annotations: tuple[TrajectoryGroupAnnotations | None, ...] = ()
@@ -319,12 +347,26 @@ class PackingRequest(BaseModel):
             bool(self.trajectory_groups),
             self.trajectory_transfer is not None,
             bool(self.trajectory_sources),
+            self.tokenized_batch is not None,
+            self.tokenized_transfer is not None,
         )
         if sum(inputs) != 1:
-            raise ValueError("packing requires exactly one trajectory input")
+            raise ValueError("packing requires exactly one batch input")
+        tokenized = (
+            self.tokenized_batch is not None or self.tokenized_transfer is not None
+        )
+        if tokenized != (self.tokenized_loss is not None):
+            raise ValueError("tokenized packing requires its named loss")
         route_inputs = bool(self.moe_route_groups), self.moe_route_transfer is not None
         if sum(route_inputs) > 1:
             raise ValueError("packing accepts one MoE route input")
+        if tokenized and (
+            any(route_inputs)
+            or self.trajectory_annotations
+            or self.trajectory_log_path is not None
+            or self.include_moe_routing
+        ):
+            raise ValueError("tokenized packing cannot carry trajectory-only inputs")
         if self.trajectory_sources and (
             any(route_inputs) or self.trajectory_annotations
         ):
@@ -334,12 +376,16 @@ class PackingRequest(BaseModel):
         ):
             raise ValueError("inline trajectory and route groups are not aligned")
         group_count = (
-            len(self.trajectory_groups)
-            if self.trajectory_groups
+            0
+            if tokenized
             else (
-                len(self.trajectory_transfer.groups)
-                if self.trajectory_transfer is not None
-                else len(self.trajectory_sources)
+                len(self.trajectory_groups)
+                if self.trajectory_groups
+                else (
+                    len(self.trajectory_transfer.groups)
+                    if self.trajectory_transfer is not None
+                    else len(self.trajectory_sources)
+                )
             )
         )
         if (
