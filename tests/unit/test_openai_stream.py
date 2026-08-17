@@ -209,7 +209,7 @@ def _chunks() -> list[ChatCompletionChunk]:
                 "prompt_tokens": 2,
                 "completion_tokens": 4,
                 "total_tokens": 6,
-            }
+            },
         ),
     ]
 
@@ -219,8 +219,7 @@ def _sse(chunks: list[ChatCompletionChunk]) -> bytes:
     for chunk in chunks:
         if chunk.object == "":
             frames.append(
-                b'data: {"id":"","object":"","created":0,"model":"",'
-                b'"choices":[]}\n\n'
+                b'data: {"id":"","object":"","created":0,"model":"","choices":[]}\n\n'
             )
             continue
         frames.extend(

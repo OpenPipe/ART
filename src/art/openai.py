@@ -260,9 +260,9 @@ def update_chat_completion(
                         )
                     )
                 if tool_call_delta.id:
-                    choice.message.tool_calls[tool_call_delta.index].id += (
-                        tool_call_delta.id
-                    )
+                    choice.message.tool_calls[
+                        tool_call_delta.index
+                    ].id += tool_call_delta.id
                 if tool_call_delta.function:
                     tool_call = choice.message.tool_calls[tool_call_delta.index]
                     assert isinstance(tool_call, ChatCompletionMessageFunctionToolCall)

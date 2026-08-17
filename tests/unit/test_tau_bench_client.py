@@ -470,7 +470,9 @@ async def test_rollout_retries_stream_body_transport_failure(
 
 
 @pytest.mark.asyncio
-async def test_rollout_does_not_capture_stream_attempt_missing_requested_usage() -> None:
+async def test_rollout_does_not_capture_stream_attempt_missing_requested_usage() -> (
+    None
+):
     rollout_module = importlib.import_module("art.tau_bench.rollout")
     rollout_module.openai_clients.clear()
     requests = 0
@@ -495,9 +497,7 @@ async def test_rollout_does_not_capture_stream_attempt_missing_requested_usage()
                 "object": "chat.completion.chunk",
                 "created": 0,
                 "model": "default",
-                "choices": [
-                    {"index": 0, "delta": {}, "finish_reason": "stop"}
-                ],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             },
         ]
         if include_usage:
@@ -558,9 +558,9 @@ async def test_rollout_does_not_capture_stream_attempt_missing_requested_usage()
 
     assert requests == 2
     assert len(trajectory.exchanges.chat_completions) == 1
-    assert trajectory.exchanges.chat_completions[0].response.choices[0].message.content == (
-        "good"
-    )
+    assert trajectory.exchanges.chat_completions[0].response.choices[
+        0
+    ].message.content == ("good")
 
 
 @pytest.mark.asyncio
