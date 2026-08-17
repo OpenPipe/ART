@@ -18,6 +18,10 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
+from art.utils.chat_template import (
+    chat_template_with_preserved_thinking,
+    configure_preserved_thinking_chat_template,
+)
 from art.utils.lifecycle import (
     PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
     cleanup_after_failure,
@@ -225,14 +229,39 @@ def _apply_configured_chat_template_server_args(
     *,
     base_model: str | None = None,
 ) -> None:
+    server_args = dict(config_dict.get("server_args", {}))
+    if server_args.get("chat_template") is not None:
+        if chat_template_content_format := internal_config.get(
+            "chat_template_content_format"
+        ):
+            server_args.setdefault(
+                "chat_template_content_format",
+                chat_template_content_format,
+            )
+        config_dict["server_args"] = server_args
+        return
     chat_template = _configured_chat_template_server_arg(internal_config)
     if chat_template is None and base_model is not None:
         chat_template = _model_support_default_chat_template(
             base_model, internal_config
         )
+    if chat_template is None and _should_probe_preserve_thinking_template(base_model):
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(base_model)
+        except (OSError, ValueError) as error:
+            warnings.warn(
+                f"Could not load {base_model!r} to configure prior-thinking "
+                f"preservation: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            default = getattr(tokenizer, "chat_template", None)
+            preserved = chat_template_with_preserved_thinking(default)
+            if preserved != default:
+                chat_template = cast(str, preserved)
     if chat_template is None:
         return
-    server_args = dict(config_dict.get("server_args", {}))
     server_args.setdefault("chat_template", chat_template)
     if chat_template_content_format := internal_config.get(
         "chat_template_content_format"
@@ -242,6 +271,13 @@ def _apply_configured_chat_template_server_args(
             chat_template_content_format,
         )
     config_dict["server_args"] = server_args
+
+
+def _should_probe_preserve_thinking_template(base_model: str | None) -> bool:
+    if base_model is None:
+        return False
+    model_name = base_model.rstrip("/").rsplit("/", 1)[-1]
+    return model_name.startswith(("Qwen3-", "Qwen3.5-"))
 
 
 def _tokenizer_cache_key(
@@ -257,7 +293,9 @@ def _tokenizer_cache_key(
 def _load_training_tokenizer(base_model: str) -> PreTrainedTokenizerBase:
     return cast(
         PreTrainedTokenizerBase,
-        AutoTokenizer.from_pretrained(base_model),
+        configure_preserved_thinking_chat_template(
+            AutoTokenizer.from_pretrained(base_model)
+        ),
     )
 
 
@@ -1220,7 +1258,9 @@ class LocalBackend:
     ) -> tuple[str, str]:
         config_dict: dict = dict(config or {})
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
-        _apply_configured_chat_template_server_args(config_dict, internal_config)
+        _apply_configured_chat_template_server_args(
+            config_dict, internal_config, base_model=model.base_model
+        )
         if self._model_uses_expert_replay(model):
             engine_args = dict(config_dict.get("engine_args", {}))
             engine_args["enable_return_routed_experts"] = True

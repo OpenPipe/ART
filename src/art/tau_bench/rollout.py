@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 import json
 import os
+import time
 from typing import Any, cast, overload
 
 from openai import AsyncOpenAI, BadRequestError
@@ -74,6 +75,7 @@ async def rollout(
     retrieval_config: str | None = None,
     retrieval_config_kwargs: dict[str, Any] | None = None,
 ) -> Trajectory:
+    started = time.perf_counter()
     client = _get_default_client(client)
     task_id = scenario.task.id
     async with client.environment(
@@ -88,6 +90,7 @@ async def rollout(
         retrieval_config=retrieval_config,
         retrieval_config_kwargs=retrieval_config_kwargs,
     ) as env:
+        environment_startup = time.perf_counter() - started
         chat_completion_kwargs = chat_completion_kwargs or {}
         openai_client, model_name, cost_model = _completion_client_and_model(
             base_url_or_model,
@@ -116,6 +119,7 @@ async def rollout(
                 if max_turns is not None and num_turns >= max_turns:
                     break
                 try:
+                    policy_started = time.perf_counter()
                     chat_completion = await openai_client.chat.completions.create(
                         messages=messages,
                         model=model_name,
@@ -123,6 +127,14 @@ async def rollout(
                         tool_choice="auto",
                         tools=tools,
                         **chat_completion_kwargs,
+                    )
+                    policy_latency = time.perf_counter() - policy_started
+                    trajectory.metrics["latency/policy"] = (
+                        trajectory.metrics.get("latency/policy", 0.0) + policy_latency
+                    )
+                    trajectory.metrics["latency/policy_max"] = max(
+                        trajectory.metrics.get("latency/policy_max", 0.0),
+                        policy_latency,
                     )
                 except BadRequestError as exc:
                     if _is_max_tokens_error(exc):
@@ -134,6 +146,15 @@ async def rollout(
                     chat_completion.usage,
                     assert_costs=assert_costs,
                 )
+                if chat_completion.usage is not None:
+                    trajectory.metrics["tokens/prompt"] = (
+                        trajectory.metrics.get("tokens/prompt", 0.0)
+                        + chat_completion.usage.prompt_tokens
+                    )
+                    trajectory.metrics["tokens/completion"] = (
+                        trajectory.metrics.get("tokens/completion", 0.0)
+                        + chat_completion.usage.completion_tokens
+                    )
                 choice = chat_completion.choices[0]
                 messages.append(
                     cast(
@@ -145,7 +166,13 @@ async def rollout(
                 if tool_calls:
                     for tool_call in tool_calls:
                         action = _tool_call_action(tool_call)
+                        environment_started = time.perf_counter()
                         step = await client.step_environment(env.id, action)
+                        environment_latency = time.perf_counter() - environment_started
+                        trajectory.metrics["latency/environment"] = (
+                            trajectory.metrics.get("latency/environment", 0.0)
+                            + environment_latency
+                        )
                         messages.append(
                             {
                                 "role": "tool",
@@ -156,9 +183,15 @@ async def rollout(
                         trajectory.reward += step.reward
                         terminated = step.terminated
                 else:
+                    environment_started = time.perf_counter()
                     step = await client.step_environment(
                         env.id,
                         choice.message.content or "",
+                    )
+                    environment_latency = time.perf_counter() - environment_started
+                    trajectory.metrics["latency/environment"] = (
+                        trajectory.metrics.get("latency/environment", 0.0)
+                        + environment_latency
                     )
                     if "user_message_cost" in step.info:
                         trajectory.metrics["cost/user"] += step.info[
@@ -182,6 +215,8 @@ async def rollout(
                 ):
                     break
         trajectory.metrics["num_turns"] = num_turns
+        trajectory.metrics["latency/environment_startup"] = environment_startup
+        trajectory.metrics["latency/active"] = time.perf_counter() - started
         return trajectory
 
 

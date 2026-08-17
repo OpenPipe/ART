@@ -648,22 +648,15 @@ class MCoreRunSlotExecutor:
             raise RuntimeError("Megatron run slot is closed")
         if run_id in self._runs:
             raise RuntimeError(f"training run is already resident: {run_id!r}")
-        from art.megatron.model_support.lora_disk import (
-            load_adapter_config,
-            load_lora_tensors_for_megatron,
-        )
+        from art.megatron.model_support.lora_disk import load_adapter_config
         from art.megatron.training.gradient_accumulator import (
             ParameterGradientAccumulator,
         )
+        from art.trainer_rank import MaterializedCheckpoint
 
         adapter_config = load_adapter_config(adapter_path)
-        adapter_model = load_lora_tensors_for_megatron(
-            adapter_path, handler=self.runtime.model_support_handler
-        )
-        self._slot_trainer.load_checkpoint_slot(
-            run_id,
-            adapter_model,
-            adapter_config=adapter_config,
+        self._slot_trainer.load_checkpoint_sync(
+            MaterializedCheckpoint(path=run_id, directory=adapter_path)
         )
         self._runs[run_id] = _ResidentRunState(
             run_id=run_id,
@@ -850,14 +843,12 @@ class MCoreRunSlotExecutor:
         if state.gradients.contribution_ids:
             raise RuntimeError("load_state cannot discard open gradient contributions")
         self.runtime.optimizer_snapshot_barrier.synchronize()
-        from art.megatron.model_support.lora_disk import (
-            load_adapter_config,
-            load_lora_tensors_for_megatron,
-        )
+        from art.megatron.model_support.lora_disk import load_adapter_config
         from art.megatron.optimizer_state import load_trainer_rank_optimizer_state
         from art.megatron.training.gradient_accumulator import (
             ParameterGradientAccumulator,
         )
+        from art.trainer_rank import MaterializedCheckpoint
 
         config = load_adapter_config(job.adapter_path)
         self._validate_adapter_layout(state.adapter_config, config)
@@ -872,15 +863,15 @@ class MCoreRunSlotExecutor:
                 optimizer_generation_id=job.optimizer_generation_id,
                 layout=self._slot_trainer.checkpoint_slot_optimizer_layout(job.run_id),
             )
-        adapter_model = load_lora_tensors_for_megatron(
-            job.adapter_path, handler=self.runtime.model_support_handler
+        self._slot_trainer.load_checkpoint_sync(
+            MaterializedCheckpoint(path=job.run_id, directory=job.adapter_path)
         )
-        self._slot_trainer.load_checkpoint_slot(
-            job.run_id,
-            adapter_model,
-            optimizer_state=optimizer_state,
-            adapter_config=config,
-        )
+        if optimizer_state is None:
+            self._slot_trainer.clear_checkpoint_slot_optimizer(job.run_id)
+        else:
+            self._slot_trainer.restore_checkpoint_slot_optimizer_state(
+                job.run_id, optimizer_state
+            )
         state.learner_version = job.learner_version
         state.adapter_config = config
         state.gradients = ParameterGradientAccumulator(

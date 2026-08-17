@@ -15,10 +15,116 @@ from art.preprocessing.tokenize import (
 )
 from art.trajectories import Trajectory
 from art.types import MessagesAndChoices, TrainSFTConfig
-from art.utils.chat_template import TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR
+from art.utils.chat_template import (
+    TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR,
+    chat_template_with_preserved_thinking,
+    default_chat_template_kwargs_for_template,
+    normalize_tool_call_arguments_for_chat_template,
+)
 
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
+
+
+@pytest.mark.parametrize(
+    "template",
+    (
+        "{{ tool_call.arguments | items }}",
+        "{% for key, value in tool_call.arguments.items() %}",
+        "{{ arguments | items }}",
+        "{% for key, value in arguments.items() %}",
+        (
+            "{% set structured = tool_call.arguments %}"
+            "{% for key, value in structured.items() %}"
+        ),
+        "{% set structured = tc.arguments %}{{ structured.items() }}",
+    ),
+)
+def test_structured_tool_argument_templates_are_normalized(template: str) -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "lookup", "arguments": '{"id": 3}'}}],
+        }
+    ]
+
+    normalized = normalize_tool_call_arguments_for_chat_template(messages, template)
+
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {"id": 3}
+
+
+def test_empty_structured_tool_arguments_are_normalized() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "lookup", "arguments": ""}}],
+        }
+    ]
+
+    normalized = normalize_tool_call_arguments_for_chat_template(
+        messages, "{{ tool_call.arguments | items }}"
+    )
+
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {}
+
+
+def test_unrelated_items_iteration_does_not_normalize_tool_arguments() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "lookup", "arguments": '{"id": 3}'}}],
+        }
+    ]
+    gpt_oss_style = (
+        "{% for name, schema in tools.items() %}{{ name }}{{ schema.arguments }}"
+        "{{ schema.arguments|items }}{% endfor %}{{ tool_call.arguments }}"
+    )
+
+    normalized = normalize_tool_call_arguments_for_chat_template(
+        messages, gpt_oss_style
+    )
+
+    assert normalized is messages
+
+
+def test_schema_argument_alias_does_not_normalize_tool_arguments() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"name": "lookup", "arguments": '{"id": 3}'}}],
+        }
+    ]
+    schema_style = (
+        "{% set structured = tool.parameters.arguments %}"
+        "{% for key, value in structured.items() %}{{ key }}{{ value }}{% endfor %}"
+        "{{ tool_call.arguments }}"
+    )
+
+    normalized = normalize_tool_call_arguments_for_chat_template(messages, schema_style)
+
+    assert normalized is messages
+
+
+@pytest.mark.parametrize(
+    "schema_style",
+    (
+        "{{ schema.tool_call.arguments | items }}",
+        ("{% set structured = schema.tool_call.arguments %}{{ structured.items() }}"),
+    ),
+)
+def test_nested_schema_tool_call_arguments_do_not_trigger_normalization(
+    schema_style: str,
+) -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"arguments": '{"id": 3}'}}],
+        }
+    ]
+
+    normalized = normalize_tool_call_arguments_for_chat_template(messages, schema_style)
+
+    assert normalized is messages
 
 
 class _FakeTokenizer:
@@ -166,6 +272,48 @@ class _BoundaryMergingTokenizer(_LastAssistantTokenizer):
         return token_ids
 
 
+class _DisabledThinkingTokenizer(_LastAssistantTokenizer):
+    disabled_thinking_prefix = "<assistant><|channel>thought\n<channel|>"
+
+    def _render_chat(self, messages, *, add_generation_prompt: bool) -> str:
+        rendered_parts: list[str] = []
+        for message in messages:
+            role = message["role"]
+            content = message.get("content") or ""
+            if role == "assistant":
+                rendered_parts.append(f"<assistant>{content}{self.eos_token}\n")
+            else:
+                rendered_parts.append(f"<{role}>{content}{self.eos_token}\n")
+        if add_generation_prompt:
+            rendered_parts.append(self.disabled_thinking_prefix)
+        return "".join(rendered_parts)
+
+
+class _ToolContinuationTokenizer(_LastAssistantTokenizer):
+    def _render_chat(self, messages, *, add_generation_prompt: bool) -> str:
+        rendered_parts: list[str] = []
+        previous_role = None
+        for message in messages:
+            role = message["role"]
+            content = message.get("content") or ""
+            if role == "assistant":
+                content += "".join(
+                    f"<call:{tool_call['function']['name']}>"
+                    for tool_call in message.get("tool_calls", [])
+                )
+            if role == "assistant" and previous_role == "tool":
+                rendered_parts[-1] = rendered_parts[-1].removesuffix(
+                    f"{self.eos_token}\n"
+                )
+                rendered_parts.append(f"{content}{self.eos_token}\n")
+            else:
+                rendered_parts.append(f"<{role}>{content}{self.eos_token}\n")
+            previous_role = role
+        if add_generation_prompt and previous_role != "tool":
+            rendered_parts.append("<assistant>")
+        return "".join(rendered_parts)
+
+
 class _NonPrefixStableTokenizer(_LastAssistantTokenizer):
     def apply_chat_template(self, *args, **kwargs):
         rendered = super().apply_chat_template(*args, **kwargs)
@@ -233,6 +381,65 @@ def test_gemma4_normalizes_json_tool_arguments_for_mapping_template(handler) -> 
 
     assert getattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR) is True
     assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {"value": "yes"}
+
+
+def test_legacy_qwen_template_gains_opt_in_thinking_preservation() -> None:
+    template = (
+        "{% if enable_thinking %}think{% endif %}"
+        "{%- if loop.index0 > ns.last_query_index %}reasoning{% endif %}"
+    )
+
+    configured = chat_template_with_preserved_thinking(template)
+
+    assert isinstance(configured, str)
+    assert "preserve_thinking is defined and preserve_thinking is true" in configured
+    assert default_chat_template_kwargs_for_template(configured) == {
+        "enable_thinking": False,
+        "preserve_thinking": True,
+    }
+
+
+def test_legacy_qwen_template_renders_prior_reasoning_when_preserved() -> None:
+    import jinja2
+
+    legacy = (
+        "{% set _enable = enable_thinking | default(false) %}"
+        "{% set ns = namespace(last_query_index=2) %}"
+        "{% for message in messages %}"
+        "{%- if loop.index0 > ns.last_query_index %}"
+        "{{ message.reasoning | default('') }}"
+        "{% endif %}{{ message.content }}"
+        "{% endfor %}"
+    )
+    configured = chat_template_with_preserved_thinking(legacy)
+    assert isinstance(configured, str)
+    messages = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "reasoning": "prior-thought", "content": "first"},
+        {"role": "user", "content": "two"},
+        {"role": "assistant", "reasoning": "current-thought", "content": "second"},
+    ]
+
+    rendered = (
+        jinja2.Environment()
+        .from_string(configured)
+        .render(messages=messages, preserve_thinking=True)
+    )
+
+    assert "prior-thought" in rendered
+    assert "current-thought" in rendered
+
+
+def test_native_or_unrecognized_thinking_templates_are_unchanged() -> None:
+    native = (
+        "{% if enable_thinking %}think{% endif %}"
+        "{%- if (preserve_thinking is defined and preserve_thinking is true) or "
+        "(loop.index0 > ns.last_query_index) %}reasoning{% endif %}"
+    )
+    unrelated = "{%- if loop.index0 > ns.last_query_index %}content{% endif %}"
+
+    assert chat_template_with_preserved_thinking(native) == native
+    assert chat_template_with_preserved_thinking(unrelated) == unrelated
 
 
 def test_tokenize_sft_batch_masks_response_tokens_without_unsloth_import() -> None:
@@ -352,6 +559,100 @@ def test_tokenize_sft_batch_trains_only_final_assistant_turn() -> None:
     assert input_ids[target_start:] == target_ids
     assert tokenizer.decode(target_ids) == "final answer<eos>\n"
     assert batch.num_trainable_tokens == len(target_ids)
+
+
+def test_tokenize_sft_batch_handles_disabled_thinking_generation_prefix() -> None:
+    tokenizer = _DisabledThinkingTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "earlier answer"},
+            {"role": "user", "content": "second question"},
+            {"role": "assistant", "content": "final answer"},
+        ],
+    )
+
+    batch = tokenize_sft_batch(
+        trajectory_batch=[Trajectory(messages_and_choices=messages)],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        assistant_turns="last",
+    )
+
+    input_ids = batch.trajectory_tensors[0]["input_ids"][0].tolist()
+    labels = batch.trajectory_tensors[0]["labels"][0].tolist()
+    target_ids = [token_id for token_id in labels if token_id != -100]
+    target_start = next(index for index, label in enumerate(labels) if label != -100)
+
+    assert tokenizer.decode(target_ids) == "final answer<eos>\n"
+    assert tokenizer.decode(input_ids[:target_start]).endswith(
+        tokenizer.disabled_thinking_prefix
+    )
+
+
+def test_tokenize_sft_batch_handles_assistant_continuation_after_tool() -> None:
+    tokenizer = _ToolContinuationTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "look it up"},
+            {"role": "assistant", "content": "calling tool"},
+            {"role": "tool", "content": "tool result"},
+            {"role": "assistant", "content": "final answer"},
+        ],
+    )
+
+    batch = tokenize_sft_batch(
+        trajectory_batch=[Trajectory(messages_and_choices=messages)],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        assistant_turns="last",
+    )
+
+    labels = batch.trajectory_tensors[0]["labels"][0].tolist()
+    target_ids = [token_id for token_id in labels if token_id != -100]
+    assert tokenizer.decode(target_ids) == "final answer<eos>\n"
+
+
+def test_tokenize_sft_batch_handles_tool_call_continuation_after_tool() -> None:
+    tokenizer = _ToolContinuationTokenizer()
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "look it up"},
+            {"role": "assistant", "content": "calling tool"},
+            {"role": "tool", "content": "tool result"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "next_tool", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+    )
+
+    batch = tokenize_sft_batch(
+        trajectory_batch=[Trajectory(messages_and_choices=messages)],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        assistant_turns="last",
+    )
+
+    labels = batch.trajectory_tensors[0]["labels"][0].tolist()
+    target_ids = [token_id for token_id in labels if token_id != -100]
+    assert tokenizer.decode(target_ids) == "<call:next_tool><eos>\n"
 
 
 def test_tokenize_sft_batch_trains_final_tool_call_and_turn_end() -> None:

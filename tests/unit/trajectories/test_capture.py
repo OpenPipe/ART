@@ -22,6 +22,7 @@ import requests
 
 import art
 from art.gather import GatherContext, record_metrics
+import art.trajectories as tr
 from art.trajectories import (
     ChatCompletionsExchange,
     CompletionsExchange,
@@ -31,6 +32,24 @@ from art.trajectories import (
 )
 from art.trajectories._capture.core import _append_exchange, begin, reset
 from art.trajectories._protocols import Endpoint, build_exchange, endpoint_for_url
+
+
+def test_root_trajectory_exports_are_minimal() -> None:
+    expected = {
+        "Trajectory",
+        "TrajectoryGroup",
+        "trajectory",
+        "trajectory_group",
+        "current_trajectory",
+        "no_capture",
+    }
+
+    assert set(art.__all__) & set(art.trajectories.__all__) == expected
+    assert all(hasattr(art, name) for name in expected)
+    assert all(
+        not hasattr(art, name) for name in set(art.trajectories.__all__) - expected
+    )
+
 
 CHAT: dict[str, Any] = {
     "id": "chatcmpl-1",
@@ -1040,7 +1059,7 @@ def test_gather_metrics_sum_legacy_and_exchange_completion_tokens() -> None:
     assert isinstance(message, MessagesExchange)
 
     trajectory = art.Trajectory(
-        exchanges=art.TrajectoryExchanges(
+        exchanges=tr.TrajectoryExchanges(
             chat_completions=[chat],
             completions=[completion],
             responses=[response],
@@ -1079,7 +1098,7 @@ def test_gather_metrics_omit_partial_exchange_usage() -> None:
     assert isinstance(message, MessagesExchange)
     chat.response.usage = None
     trajectory = art.Trajectory(
-        exchanges=art.TrajectoryExchanges(chat_completions=[chat], messages=[message])
+        exchanges=tr.TrajectoryExchanges(chat_completions=[chat], messages=[message])
     )
 
     record_metrics(GatherContext(), trajectory)
@@ -1520,7 +1539,7 @@ def test_trajectory_rejects_mixed_representations() -> None:
     assert isinstance(exchange, ChatCompletionsExchange)
     with pytest.raises(ValueError, match="both exchanges and legacy histories"):
         art.Trajectory(
-            exchanges=art.TrajectoryExchanges(chat_completions=[exchange]),
+            exchanges=tr.TrajectoryExchanges(chat_completions=[exchange]),
             messages_and_choices=[{"role": "user", "content": "hi"}],
         )
 

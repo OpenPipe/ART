@@ -1,37 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, TypedDict, cast, overload
+import asyncio
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Literal, TypeVar, cast, overload
 
 import torch
 import torch.distributed as dist
 
-
-class TrainerRankOptimizerLayout(TypedDict):
-    parallel: tuple[int, int, int, int, int, int, int, int]
-    parameters: tuple[
-        tuple[
-            tuple[str, ...],
-            tuple[int, ...],
-            str,
-            str,
-            bool,
-            int | None,
-            str,
-            tuple[int, ...],
-        ],
-        ...,
-    ]
-
-
-class TrainerRankOptimizerState(TypedDict):
-    format_version: Literal[1]
-    layout: TrainerRankOptimizerLayout
-    master_params: tuple[torch.Tensor, ...]
-    optimizer: dict[str, object]
-
-
-from . import _impl  # noqa: E402
+from . import _impl
+from ._checkpoint import CheckpointManifest, materialize_lora, validate_checkpoint
 
 AdapterSelection = _impl.AdapterSelection
 AdamParams = _impl.AdamParams
@@ -50,11 +27,16 @@ TopK = _impl.TopK
 TopKT = _impl.TopKT
 TrainerRankMemoryError = _impl.TrainerRankMemoryError
 TrainerRankSlotStateError = _impl.TrainerRankSlotStateError
+TrainerRankOptimizerLayout = _impl.TrainerRankOptimizerLayout
+TrainerRankOptimizerState = _impl.TrainerRankOptimizerState
 Unset = _impl.Unset
-_PushedSlot = _impl._PushedSlot
+MaterializedCheckpoint = _impl.MaterializedCheckpoint
+PushedCheckpoint = _impl.PushedCheckpoint
 
 if TYPE_CHECKING:
     from art.megatron.train import TrainingRuntime
+
+ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
 
 
 for _public_type in (
@@ -65,9 +47,9 @@ for _public_type in (
     MicroBatchStats,
     TopK,
     TrainerRankMemoryError,
-    TrainerRankOptimizerLayout,
-    TrainerRankOptimizerState,
     TrainerRankSlotStateError,
+    MaterializedCheckpoint,
+    PushedCheckpoint,
 ):
     _public_type.__module__ = __name__
 del _public_type
@@ -94,76 +76,89 @@ class TrainerRank(_impl.TrainerRank):
     def zero_grad(self) -> None:
         super().zero_grad()
 
-    def set_checkpoint(self, name: str | None) -> None:
-        super().set_checkpoint(name)
-
-    def set_lora(self, name: str | None) -> None:
-        super().set_lora(name)
-
-    def push_checkpoint(self, name: str | None) -> _PushedSlot:
-        return super().push_checkpoint(name)
-
-    def push_lora(self, name: str | None) -> _PushedSlot:
-        return super().push_lora(name)
-
-    def pop_pushed_lora_or_checkpoint(self) -> None:
-        super().pop_pushed_lora_or_checkpoint()
-
-    def load_checkpoint_slot(
+    def module(
         self,
         name: str,
-        adapter_model: Mapping[str, torch.Tensor],
+        factory: Callable[[], ModuleT],
         *,
-        optimizer_state: TrainerRankOptimizerState | None = None,
-        alpha: float | None = None,
-        adapter_config: Mapping[str, object] | None = None,
-    ) -> int:
-        return super().load_checkpoint_slot(
-            name,
-            adapter_model,
-            optimizer_state=optimizer_state,
-            alpha=alpha,
-            adapter_config=adapter_config,
-        )
+        checkpoint: AdapterSelection = Unset,
+    ) -> ModuleT:
+        """Register or retrieve a checkpoint-owned PyTorch module."""
+        return super().module(name, factory, checkpoint=checkpoint)
 
-    def checkpoint_slot_optimizer_state(
-        self, name: str
-    ) -> TrainerRankOptimizerState | None:
-        return super().checkpoint_slot_optimizer_state(name)
+    def parameter(
+        self,
+        name: str,
+        factory: Callable[[], torch.Tensor | torch.nn.Parameter],
+        *,
+        checkpoint: AdapterSelection = Unset,
+    ) -> torch.nn.Parameter:
+        """Register or retrieve a checkpoint-owned trainable tensor."""
+        return super().parameter(name, factory, checkpoint=checkpoint)
 
-    def checkpoint_slot_optimizer_snapshot_sources(
-        self, name: str
-    ) -> TrainerRankOptimizerState | None:
-        return super().checkpoint_slot_optimizer_snapshot_sources(name)
+    def buffer(
+        self,
+        name: str,
+        factory: Callable[[], torch.Tensor],
+        *,
+        checkpoint: AdapterSelection = Unset,
+    ) -> torch.Tensor:
+        """Register or retrieve a checkpoint-owned persistent buffer."""
+        return super().buffer(name, factory, checkpoint=checkpoint)
 
-    def checkpoint_slot_optimizer_layout(self, name: str) -> TrainerRankOptimizerLayout:
-        return super().checkpoint_slot_optimizer_layout(name)
+    def prefetch_checkpoints(
+        self,
+        *checkpoints: str | MaterializedCheckpoint,
+    ) -> asyncio.Task[None]:
+        return super().prefetch_checkpoints(*checkpoints)
 
-    def restore_checkpoint_slot_optimizer_state(
-        self, name: str, state: TrainerRankOptimizerState
+    def load_checkpoint(
+        self, checkpoint: str | MaterializedCheckpoint | None
+    ) -> asyncio.Task[None]:
+        return super().load_checkpoint(checkpoint)
+
+    def push_checkpoint(
+        self, checkpoint: str | MaterializedCheckpoint | None
+    ) -> PushedCheckpoint:
+        return super().push_checkpoint(checkpoint)
+
+    def pop_checkpoint(self) -> None:
+        super().pop_checkpoint()
+
+    def save_checkpoint(
+        self,
+        output_dir: str,
+        checkpoint_path: str | Literal["active"] = "active",
     ) -> None:
-        super().restore_checkpoint_slot_optimizer_state(name, state)
+        super().save_checkpoint(output_dir, checkpoint_path)
 
-    def unload_checkpoint_slot(self, name: str) -> int:
-        return super().unload_checkpoint_slot(name)
-
-    def save_checkpoint_slot_lora(self, name: str, output_dir: str) -> None:
-        """Collectively publish a trained checkpoint slot as a vLLM LoRA."""
-        super().save_checkpoint_slot_lora(name, output_dir)
-
-    def load_lora_slot(
+    def prepare_checkpoint_save(
         self,
-        name: str,
-        adapter_model: Mapping[str, torch.Tensor],
-        *,
-        alpha: float | None = None,
+        output_dir: str,
+        checkpoint_path: str | Literal["active"] = "active",
+    ) -> None:
+        super().prepare_checkpoint_save(output_dir, checkpoint_path)
+
+    def finish_checkpoint_save(self, output_dir: str) -> None:
+        super().finish_checkpoint_save(output_dir)
+
+    def abort_checkpoint_save(self, output_dir: str) -> None:
+        super().abort_checkpoint_save(output_dir)
+
+    def export_lora(
+        self,
+        output_dir: str,
+        checkpoint_path: str | Literal["active"] = "active",
     ) -> int:
-        return super().load_lora_slot(name, adapter_model, alpha=alpha)
+        return super().export_lora(output_dir, checkpoint_path)
 
     @overload
     def forward_micro_batches(
         self,
         inputs: Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Iterator[
         MicroBatch[
             ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT],
@@ -177,6 +172,9 @@ class TrainerRank(_impl.TrainerRank):
         inputs: Iterable[
             Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Iterator[
         MicroBatch[
             Sequence[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
@@ -190,6 +188,9 @@ class TrainerRank(_impl.TrainerRank):
         inputs: Iterable[
             Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Iterator[
         MicroBatch[
             Sequence[Sequence[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]],
@@ -207,6 +208,9 @@ class TrainerRank(_impl.TrainerRank):
                 ]
             ]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Iterator[
         MicroBatch[
             Sequence[
@@ -223,21 +227,33 @@ class TrainerRank(_impl.TrainerRank):
     ]: ...
 
     def forward_micro_batches(
-        self, inputs: Iterable[ForwardInputs]
+        self,
+        inputs: Iterable[ForwardInputs],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        """Forward replicated inputs in adaptive data-parallel microbatches.
+
+        Per-input checkpoints override `checkpoint`. `no_grad=None` inherits the
+        ambient PyTorch grad mode; `True` disables grads and `False` enables them.
+        Input and target tensors may be on a different device from the trainer;
+        ART moves its packed model inputs and labels internally without mutating
+        the caller-owned `ForwardInput` objects.
+        """
         forward = cast(
-            Callable[
-                [Iterable[ForwardInputs]],
-                Iterator[MicroBatch[ForwardInputs, ForwardOutputs]],
-            ],
+            Callable[..., Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]],
             super().forward_micro_batches,
         )
-        return forward(inputs)
+        return forward(inputs, checkpoint=checkpoint, no_grad=no_grad)
 
     @overload
     def dp_rank_forward(
         self,
         inputs: Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]: ...
 
     @overload
@@ -246,6 +262,9 @@ class TrainerRank(_impl.TrainerRank):
         inputs: Iterable[
             Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Sequence[
         Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
     ]: ...
@@ -256,6 +275,9 @@ class TrainerRank(_impl.TrainerRank):
         inputs: Iterable[
             Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Sequence[
         Sequence[Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
     ]: ...
@@ -270,18 +292,35 @@ class TrainerRank(_impl.TrainerRank):
                 ]
             ]
         ],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
     ) -> Sequence[
         Sequence[
             Sequence[Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
         ]
     ]: ...
 
-    def dp_rank_forward(self, inputs: ForwardInputs) -> ForwardOutputs:
+    def dp_rank_forward(
+        self,
+        inputs: ForwardInputs,
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
+    ) -> ForwardOutputs:
+        """Forward inputs already local to this data-parallel rank.
+
+        Per-input checkpoints override `checkpoint`. `no_grad=None` inherits the
+        ambient PyTorch grad mode; `True` disables grads and `False` enables them.
+        Input and target tensors may be on a different device from the trainer;
+        ART moves its packed model inputs and labels internally without mutating
+        the caller-owned `ForwardInput` objects.
+        """
         forward = cast(
-            Callable[[ForwardInputs], ForwardOutputs],
+            Callable[..., ForwardOutputs],
             super().dp_rank_forward,
         )
-        return forward(inputs)
+        return forward(inputs, checkpoint=checkpoint, no_grad=no_grad)
 
     def dp_reduce(
         self,
@@ -297,26 +336,41 @@ class TrainerRank(_impl.TrainerRank):
         params: AdamParams,
         scale_grads: float = 1.0,
         checkpoints: Sequence[str] | None = None,
+        on_live_graphs: Literal["allow", "error"] = "allow",
     ) -> dict[str, float]:
+        """Step checkpoint slots that have accumulated gradients.
+
+        By default, caller-retained forward graphs do not block the step. ART does
+        not detach or free those graphs, and backward through one after the step is
+        unsafe: it may fail PyTorch's version checks or recompute against updated
+        checkpoint-slot weights. Pass `on_live_graphs="error"` to raise before
+        mutating any selected slot when a live graph remains on any rank.
+        """
         return super().optim_step(
             params=params,
             scale_grads=scale_grads,
             checkpoints=checkpoints,
+            on_live_graphs=on_live_graphs,
         )
 
 
 __all__ = [
     "AdapterSelection",
     "AdamParams",
+    "CheckpointManifest",
     "ForwardInput",
     "ForwardOutput",
     "MicroBatch",
     "MicroBatchStats",
+    "MaterializedCheckpoint",
+    "materialize_lora",
     "TopK",
     "TrainerRank",
     "TrainerRankMemoryError",
     "TrainerRankOptimizerLayout",
     "TrainerRankOptimizerState",
+    "PushedCheckpoint",
     "TrainerRankSlotStateError",
     "Unset",
+    "validate_checkpoint",
 ]

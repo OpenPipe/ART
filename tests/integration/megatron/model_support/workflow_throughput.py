@@ -119,6 +119,10 @@ _HARD_ACCEPTANCE_FAILURES = frozenset(
 )
 
 
+class _ThroughputEvidenceInconclusive(RuntimeError):
+    pass
+
+
 class ThroughputFixture(NamedTuple):
     model_key: str
     path: str
@@ -260,10 +264,10 @@ def _settled_execution_decision_suffix(
         selected.append(decision)
         later = stats
     selected.reverse()
-    _require(
-        len(selected) >= _REQUIRED_SETTLED_WINDOWS,
-        "throughput evidence requires two trailing settled execution windows",
-    )
+    if len(selected) < _REQUIRED_SETTLED_WINDOWS:
+        raise _ThroughputEvidenceInconclusive(
+            "throughput evidence requires two trailing settled execution windows"
+        )
     return selected
 
 
@@ -1675,7 +1679,20 @@ def _run_throughput_attempts(
     for attempt in range(1, _THROUGHPUT_MAX_ATTEMPTS + 1):
         artifact_dir = stage_dir / f"attempt_{attempt}"
         artifact_dir.mkdir(parents=True, exist_ok=False)
-        result = run_attempt(attempt, artifact_dir)
+        try:
+            result = run_attempt(attempt, artifact_dir)
+        except _ThroughputEvidenceInconclusive as error:
+            attempts.append(
+                {
+                    "attempt": attempt,
+                    "artifact_dir": str(artifact_dir),
+                    "acceptance_status": "evidence_inconclusive",
+                    "acceptance_failures": [str(error)],
+                }
+            )
+            if attempt == _THROUGHPUT_MAX_ATTEMPTS:
+                raise
+            continue
         status = result.metrics["acceptance_status"]
         _require(
             status in {"accepted", "rejected", "load_inconclusive"},

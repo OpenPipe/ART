@@ -73,6 +73,7 @@ from .workflow_throughput import (
     _settled_execution_decision_suffix,
     _sized_config,
     _throughput_config_for_hardware,
+    _ThroughputEvidenceInconclusive,
     acceptance_failures,
 )
 
@@ -700,6 +701,30 @@ def test_throughput_attempt_error_is_not_retried(tmp_path: Path) -> None:
         _run_throughput_attempts(tmp_path, fail)
     assert (tmp_path / "attempt_1" / "partial.txt").is_file()
     assert not (tmp_path / "attempt_2").exists()
+
+
+def test_inconclusive_throughput_evidence_retries_once(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    def run_attempt(attempt: int, _artifact_dir: Path) -> ValidationStageResult:
+        calls.append(attempt)
+        if attempt == 1:
+            raise _ThroughputEvidenceInconclusive("insufficient settled evidence")
+        classification = _classify_acceptance_failures([])
+        return ValidationStageResult(
+            name="e2e_throughput",
+            passed=True,
+            metrics=classification,
+        )
+
+    result = _run_throughput_attempts(tmp_path, run_attempt)
+    assert calls == [1, 2]
+    assert result.passed
+    assert result.metrics["throughput_attempt_count"] == 2
+    assert result.metrics["throughput_retry_performed"]
+    assert result.metrics["throughput_attempts"][0]["acceptance_status"] == (
+        "evidence_inconclusive"
+    )
 
 
 def test_throughput_measurement_freezes_actual_settings() -> None:

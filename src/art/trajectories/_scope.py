@@ -10,13 +10,13 @@ from typing import Any
 from . import PydanticException, Trajectory, TrajectoryGroup
 from ._compat import exception_model
 
-_trajectories: contextvars.ContextVar[tuple[Trajectory, ...]] = contextvars.ContextVar(
-    "art_trajectories", default=()
+_scopes: contextvars.ContextVar[tuple[Trajectory, ...]] = contextvars.ContextVar(
+    "art_trajectory_scopes", default=()
 )
 
 
 def get_current_trajectory(*, required: bool) -> Trajectory | None:
-    current = _trajectories.get()
+    current = _scopes.get()
     if current:
         return current[-1]
     if required:
@@ -28,7 +28,7 @@ def enter_trajectory(trajectory: Trajectory) -> Trajectory:
     from ._capture import install
 
     install()
-    _trajectories.set((*_trajectories.get(), trajectory))
+    _scopes.set((*_scopes.get(), trajectory))
     return trajectory
 
 
@@ -38,10 +38,10 @@ def exit_trajectory(
     _exc_value: BaseException | None,
     _traceback: TracebackType | None,
 ) -> None:
-    current = _trajectories.get()
+    current = _scopes.get()
     if not current or current[-1] is not trajectory:
         raise RuntimeError("Trajectory contexts must exit in stack order")
-    _trajectories.set(current[:-1])
+    _scopes.set(current[:-1])
     trajectory.finish()
 
 
@@ -49,11 +49,11 @@ def exit_trajectory(
 def no_capture() -> Iterator[None]:
     """Hide enclosing trajectory capture while allowing new nested scopes."""
 
-    token = _trajectories.set(())
+    token = _scopes.set(())
     try:
         yield
     finally:
-        _trajectories.reset(token)
+        _scopes.reset(token)
 
 
 def _require_raw_coroutine(value: object) -> None:

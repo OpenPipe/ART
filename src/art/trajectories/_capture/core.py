@@ -178,7 +178,11 @@ def begin(
     ):
         return None, None
     return (
-        CaptureState(trajectory=trajectory, endpoint=endpoint, request=request),
+        CaptureState(
+            trajectory=trajectory,
+            endpoint=endpoint,
+            request=request,
+        ),
         _adapter_active.set(True),
     )
 

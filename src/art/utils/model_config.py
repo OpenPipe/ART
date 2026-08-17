@@ -54,6 +54,10 @@ def detect_chat_template_parts(
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
         )
 
+    # Gemma 4 format
+    if "<|turn>" in template:
+        return "<|turn>user\n", "<|turn>model\n"
+
     # Gemma format
     if "<start_of_turn>" in template:
         return "<start_of_turn>user\n", "<start_of_turn>model\n"

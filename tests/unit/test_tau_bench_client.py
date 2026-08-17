@@ -20,6 +20,7 @@ from art.tau_bench.client import (
     Task,
     TauBenchClient,
 )
+import art.trajectories as tr
 
 
 def test_client_reuses_connections_by_default(
@@ -302,6 +303,13 @@ async def test_rollout_supports_string_model_args(
 
     assert trajectory.reward == 1.0
     assert trajectory.metrics["cost/user"] == 0.25
+    assert trajectory.metrics["latency/environment_startup"] >= 0
+    assert trajectory.metrics["latency/policy"] >= 0
+    assert trajectory.metrics["latency/policy_max"] >= 0
+    assert trajectory.metrics["latency/environment"] >= 0
+    assert trajectory.metrics["latency/active"] >= 0
+    assert trajectory.metrics["tokens/prompt"] == 10
+    assert trajectory.metrics["tokens/completion"] == 5
     assert client.deleted == ["env-1"]
     assert client.create_kwargs["user_llm"] == "gpt-4.1-2025-04-14"
 
@@ -478,16 +486,16 @@ async def test_rollout_captures_two_turn_tool_exchange_with_exact_tokens() -> No
     assert trajectory.tools is None
     restored = art.Trajectory.model_validate_json(trajectory.model_dump_json())
     tokenized = restored.tokenize()
-    assert tokenized.token_ids == [10, 11, 12, 13, 14]
+    assert tokenized.tokens == [10, 11, 12, 13, 14]
     assert tokenized.logprobs[2] == -0.25
     assert tokenized.logprobs[3] != tokenized.logprobs[3]
     assert tokenized.logprobs[4] == -0.5
     assert tokenized.flags == [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
 
 
