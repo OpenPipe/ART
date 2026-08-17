@@ -373,11 +373,21 @@ class ServerlessBackend:
                 return_exceptions=True,
             )
         finally:
-            await asyncio.gather(
-                *(client.close_event_observer() for client in self._clients.values()),
-                return_exceptions=True,
-            )
-            await self._service.close()
+            for awaitable in (
+                asyncio.gather(
+                    *(
+                        client.close_event_observer()
+                        for client in self._clients.values()
+                    ),
+                    return_exceptions=True,
+                ),
+                self._service.close(),
+            ):
+                try:
+                    async with asyncio.timeout(self._close_timeout_s):
+                        await awaitable
+                except BaseException as error:
+                    failures.append(error)
         if failures:
             raise BaseExceptionGroup("ServerlessBackend shutdown failed", failures)
 
