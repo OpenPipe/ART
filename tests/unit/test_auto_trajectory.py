@@ -209,7 +209,7 @@ async def test_server():
     await runner.cleanup()
 
 
-async def test_auto_trajectory(test_server: None) -> None:
+async def test_trajectory_capture(test_server: None) -> None:
     message: ChatCompletionMessageParam = {"role": "user", "content": "Hi!"}
     tools: list[ChatCompletionToolParam] = [
         {
@@ -279,15 +279,11 @@ async def test_auto_trajectory(test_server: None) -> None:
             stream=True,
         ):
             pass
-        # Add ART support with a couple lines of optional code
-        if trajectory := art.auto_trajectory():  # ty: ignore[deprecated]
-            trajectory.reward = 1.0
+        if current := art.current_trajectory():
+            current.reward = 1.0
         return chat_completion.choices[0].message.content
 
-    # Use the capture_auto_trajectory utility to capture a trajectory automatically
-    trajectory = await art.capture_auto_trajectory(  # ty: ignore[deprecated]
-        say_hi()
-    )
+    trajectory = await art.trajectory(say_hi())
     exchanges = trajectory.exchanges.chat_completions
     assert len(exchanges) == 5
     assert exchanges[0].request["messages"] == [message]
@@ -300,7 +296,7 @@ async def test_auto_trajectory(test_server: None) -> None:
 
 
 @pytest.mark.filterwarnings("ignore::UserWarning:pydantic")
-async def test_litellm_auto_trajectory(test_server: None) -> None:
+async def test_litellm_trajectory_capture(test_server: None) -> None:
     message: ChatCompletionMessageParam = {"role": "user", "content": "Hi!"}
     tools: list[ChatCompletionToolParam] = [
         {
@@ -357,15 +353,11 @@ async def test_litellm_auto_trajectory(test_server: None) -> None:
         )
         async for _ in stream:
             pass
-        # Add ART support with a couple lines of optional code
-        if trajectory := art.auto_trajectory():  # ty: ignore[deprecated]
-            trajectory.reward = 1.0
+        if current := art.current_trajectory():
+            current.reward = 1.0
         return choice.message.content
 
-    # Use the capture_auto_trajectory utility to capture a trajectory automatically
-    trajectory = await art.capture_auto_trajectory(  # ty: ignore[deprecated]
-        say_hi()
-    )
+    trajectory = await art.trajectory(say_hi())
     exchanges = trajectory.exchanges.chat_completions
     assert len(exchanges) == 3
     assert exchanges[0].request["messages"] == [message]

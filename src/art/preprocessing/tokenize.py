@@ -4,10 +4,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from functools import cached_property
 from itertools import takewhile
-import json
 import math
 import random
-import re
 from typing import TYPE_CHECKING, Any, Generator, Literal, Protocol, cast
 
 import numpy as np
@@ -35,6 +33,7 @@ from ..utils.chat_template import (
     TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR,
     default_chat_template_kwargs_for_tokenizer,
     merge_chat_template_kwargs,
+    normalize_tool_call_arguments_for_chat_template,
 )
 from .moe_routing import (
     MoeRouteArray,
@@ -332,41 +331,13 @@ def _normalize_tool_call_arguments_for_chat_template(
     tokenizer: _SFTTokenizer,
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    chat_template = tokenizer.chat_template
-    assert isinstance(chat_template, str)
-    aliases = re.findall(
-        r"{%\s*set\s+([A-Za-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*\.)+arguments\s*%}",
-        chat_template,
+    return normalize_tool_call_arguments_for_chat_template(
+        messages,
+        tokenizer.chat_template,
+        require_mapping=bool(
+            getattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR, False)
+        ),
     )
-    if not getattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR, False) and (
-        "tool_call.arguments|items" not in chat_template
-        and not any(f"{alias}.items()" in chat_template for alias in aliases)
-    ):
-        return messages
-
-    normalized_messages: list[dict[str, Any]] = []
-    for message in messages:
-        tool_calls = message.get("tool_calls")
-        if tool_calls is None:
-            normalized_messages.append(message)
-            continue
-
-        assert isinstance(tool_calls, list)
-        normalized_tool_calls = []
-        for tool_call in tool_calls:
-            assert isinstance(tool_call, dict)
-            function = tool_call["function"]
-            assert isinstance(function, dict)
-            arguments_json = function["arguments"]
-            assert isinstance(arguments_json, str)
-            arguments = json.loads(arguments_json)
-            assert isinstance(arguments, dict)
-            normalized_tool_calls.append(
-                {**tool_call, "function": {**function, "arguments": arguments}}
-            )
-        normalized_messages.append({**message, "tool_calls": normalized_tool_calls})
-
-    return normalized_messages
 
 
 def _messages_for_chat_template(
@@ -531,13 +502,43 @@ def _last_assistant_input_ids_and_labels(
         add_generation_prompt=False,
         **template_kwargs,
     )
-    if not completed_text.startswith(prompt_text):
-        raise ValueError(
-            "Cannot isolate the final assistant response because the completed chat "
-            "does not extend its generation prompt"
+    if completed_text.startswith(prompt_text):
+        target_text = completed_text[len(prompt_text) :]
+    else:
+        history_text = _apply_chat_template_text(
+            tokenizer,
+            messages[:-1],
+            tools=tools,
+            add_generation_prompt=False,
+            **template_kwargs,
         )
+        marker = "__ART_FINAL_ASSISTANT_TARGET__"
+        final_message = messages[-1]
+        has_final_output = any(
+            final_message.get(key)
+            for key in ("content", "reasoning", "reasoning_content", "tool_calls")
+        )
+        marked_text = _apply_chat_template_text(
+            tokenizer,
+            [*messages[:-1], {"role": "assistant", "content": marker}],
+            tools=tools,
+            add_generation_prompt=False,
+            **template_kwargs,
+        )
+        marker_start = marked_text.find(marker)
+        if (
+            not prompt_text.startswith(history_text)
+            or not has_final_output
+            or marker in completed_text
+            or marker_start < 0
+            or completed_text[:marker_start] != marked_text[:marker_start]
+        ):
+            raise ValueError(
+                "Cannot isolate the final assistant response because the completed "
+                "chat does not extend its generation prompt"
+            )
+        target_text = completed_text[marker_start:]
 
-    target_text = completed_text[len(prompt_text) :]
     prompt_ids = token_ids_for_template_part(tokenizer, prompt_text)
     target_ids = token_ids_for_template_part(tokenizer, target_text)
     input_ids = [*prompt_ids, *target_ids]
@@ -787,7 +788,7 @@ def tokenize_trajectory_groups(
                 ):
                     if (
                         _max_sequence_length is not None
-                        and len(exchange_result.token_ids) > _max_sequence_length
+                        and len(exchange_result.tokens) > _max_sequence_length
                     ):
                         preview_seen = set(seen_source_keys)
                         would_train = _first_introduction_mask(
@@ -798,11 +799,9 @@ def tokenize_trajectory_groups(
                                 TokenizedResult(
                                     advantage=advantage,
                                     chat="",
-                                    token_ids=exchange_result.token_ids,
-                                    input_pos=list(
-                                        range(len(exchange_result.token_ids))
-                                    ),
-                                    assistant_mask=[0] * len(exchange_result.token_ids),
+                                    token_ids=exchange_result.tokens,
+                                    input_pos=list(range(len(exchange_result.tokens))),
+                                    assistant_mask=[0] * len(exchange_result.tokens),
                                     logprobs=exchange_result.logprobs,
                                     pixel_values=None,
                                     image_grid_thw=None,
@@ -841,7 +840,7 @@ def tokenize_trajectory_groups(
                             (trace.sources[key], key.index)
                             for key in ordered_source_keys
                         ),
-                        exchange_result.token_ids,
+                        exchange_result.tokens,
                         exchange_result.flags,
                     )
                     if chat_trace is not None:
@@ -857,7 +856,7 @@ def tokenize_trajectory_groups(
                             if any(trainable[start : start + length])
                         ]
                         moe_routes, moe_stats = align_choice_routes_to_tokenized_result(
-                            token_ids=exchange_result.token_ids,
+                            token_ids=exchange_result.tokens,
                             choices=[
                                 chat_trace.choices[index] for index in selected_choices
                             ],
@@ -882,8 +881,8 @@ def tokenize_trajectory_groups(
                         TokenizedResult(
                             advantage=advantage,
                             chat="",
-                            token_ids=exchange_result.token_ids,
-                            input_pos=list(range(len(exchange_result.token_ids))),
+                            token_ids=exchange_result.tokens,
+                            input_pos=list(range(len(exchange_result.tokens))),
                             assistant_mask=[int(value) for value in trainable],
                             logprobs=exchange_result.logprobs,
                             pixel_values=None,

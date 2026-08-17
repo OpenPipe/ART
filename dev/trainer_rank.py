@@ -1,9 +1,10 @@
 from itertools import islice
 import os
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
-from trainer_rank_support import load_random_checkpoint_slots
+from trainer_rank_support import load_random_checkpoints
 from transformers import AutoTokenizer
 import typer
 
@@ -33,17 +34,20 @@ def main(
 
         from art.megatron import train as megatron_train
 
-        tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        tokenizer = cast(
+            Any, AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        )
         inputs: list[ForwardInput[torch.Tensor, None, None, None]] = []
         rows = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
         for row in islice(rows, samples):
             token_ids = tokenizer(
-                str(row["text"]),  # type: ignore[index]
+                str(cast(Any, row)["text"]),
                 add_special_tokens=True,
                 truncation=True,
                 max_length=max_seq_length + 1,
                 return_tensors="pt",
             )["input_ids"].reshape(-1)
+            token_ids = cast(torch.Tensor, token_ids)
             inputs.append(
                 ForwardInput(
                     input_tokens=token_ids[:-1],
@@ -57,13 +61,18 @@ def main(
             print_env=dist.get_rank() == 0,
         )
         rank = TrainerRank(runtime)
-        (slot,) = load_random_checkpoint_slots(runtime, rank, 1, lora_rank=lora_rank)
-        rank.set_checkpoint(slot)
+        (slot,) = load_random_checkpoints(
+            runtime,
+            rank,
+            1,
+            base_model=model,
+            lora_rank=lora_rank,
+        )
 
         for step in range(steps):
             loss_sum = torch.tensor(0.0, device=rank.device)
             token_count = torch.tensor(0.0, device=rank.device)
-            for micro in rank.forward_micro_batches(inputs):
+            for micro in rank.forward_micro_batches(inputs, checkpoint=slot):
                 loss = torch.tensor(0.0, device=rank.device)
                 for output in micro.outputs:
                     assert output.target_logprobs is not None

@@ -25,6 +25,7 @@ from art.preprocessing.tokenize import (
     tokenize_trajectory_groups,
 )
 from art.tinker_native.data import trajectory_groups_to_datums
+import art.trajectories as tr
 from art.trajectories import (
     ChatCompletionsExchange,
     ChatCompletionsHistory,
@@ -210,7 +211,7 @@ def _reasoning_stripped_group() -> art.TrajectoryGroup:
     return art.TrajectoryGroup(
         [
             art.Trajectory(
-                exchanges=art.TrajectoryExchanges(chat_completions=[first, second]),
+                exchanges=tr.TrajectoryExchanges(chat_completions=[first, second]),
                 reward=reward,
             )
             for reward in (1.0, 0.0)
@@ -221,7 +222,7 @@ def _reasoning_stripped_group() -> art.TrajectoryGroup:
 def _group() -> art.TrajectoryGroup:
     trajectories = [
         art.Trajectory(
-            exchanges=art.TrajectoryExchanges(
+            exchanges=tr.TrajectoryExchanges(
                 chat_completions=[
                     _exchange("policy", 2),
                     _exchange("judge", 3),
@@ -238,7 +239,7 @@ def _versioned_group() -> art.TrajectoryGroup:
     return art.TrajectoryGroup(
         trajectories=[
             art.Trajectory(
-                exchanges=art.TrajectoryExchanges(
+                exchanges=tr.TrajectoryExchanges(
                     chat_completions=[
                         _exchange("policy@12", 2),
                         _exchange("judge@4", 3),
@@ -537,7 +538,7 @@ def test_public_training_selector_prefers_exact_model_over_glob_interpretation()
     None
 ):
     trajectory = art.Trajectory(
-        exchanges=art.TrajectoryExchanges(
+        exchanges=tr.TrajectoryExchanges(
             chat_completions=[
                 _exchange("policy*", 2),
                 _exchange("policyx", 3),
@@ -549,7 +550,7 @@ def test_public_training_selector_prefers_exact_model_over_glob_interpretation()
     assert [
         history.model
         for history in histories
-        if not isinstance(history, art.LegacyHistory)
+        if not isinstance(history, tr.LegacyHistory)
     ] == ["policy*"]
     assert [
         history.model
@@ -587,7 +588,7 @@ def test_training_selector_rejects_mixed_protocols() -> None:
         end_time=start + timedelta(seconds=1),
     )
     trajectory = art.Trajectory(
-        exchanges=art.TrajectoryExchanges(
+        exchanges=tr.TrajectoryExchanges(
             chat_completions=[_exchange("policy", 2)],
             completions=[completion],
         )
@@ -605,15 +606,15 @@ def test_training_rejects_sampled_token_without_causal_predecessor(
     group = art.TrajectoryGroup(
         [
             art.Trajectory(
-                exchanges=art.TrajectoryExchanges(completions=[exchange]),
+                exchanges=tr.TrajectoryExchanges(completions=[exchange]),
                 reward=reward,
             )
             for reward in (1.0, 0.0)
         ]
     )
     tokenized = group.trajectories[0].tokenize()
-    assert tokenized.token_ids == output_token_ids
-    assert all(flag & art.TokenFlag.SAMPLED for flag in tokenized.flags)
+    assert tokenized.tokens == output_token_ids
+    assert all(flag & tr.TokenFlag.SAMPLED for flag in tokenized.flags)
 
     weight_writes = 0
     original_setattr = TokenizedResult.__setattr__
@@ -669,7 +670,7 @@ def test_preprocessing_preserves_adjacent_choice_boundaries_for_moe() -> None:
     group = art.TrajectoryGroup(
         trajectories=[
             art.Trajectory(
-                exchanges=art.TrajectoryExchanges(
+                exchanges=tr.TrajectoryExchanges(
                     chat_completions=exchanges,
                 ),
                 reward=reward,
@@ -792,7 +793,7 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
     group = art.TrajectoryGroup(
         trajectories=[
             art.Trajectory(
-                exchanges=art.TrajectoryExchanges(
+                exchanges=tr.TrajectoryExchanges(
                     chat_completions=[first, second],
                 ),
                 reward=reward,
@@ -866,10 +867,10 @@ def test_ambiguous_non_moe_suffix_falls_back_to_sampled_spans() -> None:
             history,
             [1, 11, 2, 11],
             [
-                art.TokenFlag.EXACT,
-                art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-                art.TokenFlag.EXACT,
-                art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+                tr.TokenFlag.EXACT,
+                tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+                tr.TokenFlag.EXACT,
+                tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
             ],
         )
         is None
@@ -900,11 +901,11 @@ def test_chat_choice_trace_anchors_retained_suffix_at_its_prompt_boundary() -> N
         history,
         [1, 8, 9, 7, 8],
         [
-            art.TokenFlag.EXACT,
-            art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-            art.TokenFlag.EXACT,
-            art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-            art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
+            tr.TokenFlag.EXACT,
+            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+            tr.TokenFlag.EXACT,
+            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
         ],
     )
 
@@ -944,9 +945,9 @@ def test_chat_choice_trace_does_bounded_work_for_a_retained_suffix() -> None:
     )
     token_ids = CountingList([1, 7, *([0] * 510)])
     flags = [
-        art.TokenFlag.EXACT,
-        art.TokenFlag.EXACT | art.TokenFlag.SAMPLED,
-        *([art.TokenFlag.EXACT] * 510),
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        *([tr.TokenFlag.EXACT] * 510),
     ]
 
     trace = _chat_choice_trace(history, token_ids, flags)
@@ -981,7 +982,7 @@ def test_preprocessing_rejects_partial_choice_evidence_before_moe_routes() -> No
     group = art.TrajectoryGroup(
         trajectories=[
             art.Trajectory(
-                exchanges=art.TrajectoryExchanges(chat_completions=[first, second]),
+                exchanges=tr.TrajectoryExchanges(chat_completions=[first, second]),
                 reward=reward,
             )
             for reward in (1.0, 0.0)

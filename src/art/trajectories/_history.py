@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 import copy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from fnmatch import fnmatchcase
 import json
@@ -528,6 +528,10 @@ def normalize_chat_message(message: Mapping[str, object]) -> dict[str, object]:
 
     data = copy.deepcopy(dict(message))
     data.pop("annotations", None)
+    if data.get("reasoning_content") is not None and not data.get("reasoning"):
+        data["reasoning"] = data.pop("reasoning_content")
+    elif data.get("reasoning_content") == data.get("reasoning"):
+        data.pop("reasoning_content", None)
     if data.get("role") == "assistant" and data.get("content") is None:
         data["content"] = ""
     elif data.get("content") is None:
@@ -601,7 +605,8 @@ def chat_completions_histories(
                 )
             ]
             prompt_lineage_keys = [
-                _chat_message_key(message, visible_only=True) for message in prompt
+                _chat_message_key(message, visible_only=not reconcile)
+                for message in prompt
             ]
             choices = _ordered_choices(
                 exchange.response.choices, protocol="Chat Completions"
@@ -613,10 +618,13 @@ def chat_completions_histories(
                 branch, prompt_ids, len(prompt), token_cache
             )
             continuation = lambda branch: (
-                _chat_retains_sampled_reasoning(
-                    branch, prompt_ids, len(prompt), token_cache
+                reconcile
+                or (
+                    _chat_retains_sampled_reasoning(
+                        branch, prompt_ids, len(prompt), token_cache
+                    )
+                    and exact_continuation(branch)
                 )
-                and (reconcile or exact_continuation(branch))
             )
             source_continuation = lambda branch: (
                 reconcile
@@ -633,8 +641,8 @@ def chat_completions_histories(
                     for index in range(len(prompt))
                 ],
                 equivalent=lambda left, right: (
-                    _chat_message_key(left, visible_only=True)
-                    == _chat_message_key(right, visible_only=True)
+                    _chat_message_key(left, visible_only=not reconcile)
+                    == _chat_message_key(right, visible_only=not reconcile)
                 ),
                 continuation=source_continuation,
                 prompt_keys=prompt_lineage_keys,
@@ -663,7 +671,7 @@ def chat_completions_histories(
                     )
                 )
             output_lineage_keys = [
-                [_chat_message_key(output[0], visible_only=True)]
+                [_chat_message_key(output[0], visible_only=not reconcile)]
                 for _, output, _ in outputs
             ]
             _extend_branches(
@@ -1231,13 +1239,13 @@ def _responses_split_prompt_source(
         return source
     if reconcile:
         return (
-            replace(source, generation_index=None)
+            source.model_copy(update={"generation_index": None})
             if source.exchange is current_exchange
             else source
         )
     if source.output_index is None and source.request_index is None:
         return None
-    return replace(source, generation_index=None)
+    return source.model_copy(update={"generation_index": None})
 
 
 def responses_history(

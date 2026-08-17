@@ -21,6 +21,11 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.responses import Response
 from pydantic import BaseModel
 
+from ..utils.chat_template import (
+    chat_template_with_preserved_thinking,
+    configure_preserved_thinking_chat_template,
+    normalize_tool_call_arguments_for_chat_template,
+)
 from . import (
     AnthropicMessagesHistory,
     ChatCompletionsExchange,
@@ -44,6 +49,7 @@ from . import (
     Tokenizer,
     Trajectory,
     TrajectoryGroup,
+    TrajectoryHistory,
 )
 from ._history import _model_matches
 from ._protocols import Exchange
@@ -97,7 +103,7 @@ class _HistoryTokenizationTrace:
     sources: dict[_SampledSourceKey, object]
 
     def validate(self, tokenized: TokenizedHistory) -> None:
-        if len(self.source_keys) != len(tokenized.token_ids):
+        if len(self.source_keys) != len(tokenized.tokens):
             raise AssertionError(
                 "Tokenization trace differs in length from tokenized data"
             )
@@ -475,7 +481,18 @@ def _chat_choice_output_tokens(
     values = _chat_logprob_entries(choice)
     message = _dump(choice.message)
     if token_ids == [] and (
-        values or any(message.get(key) for key in ("content", "refusal", "tool_calls"))
+        values
+        or any(
+            message.get(key)
+            for key in (
+                "content",
+                "refusal",
+                "reasoning",
+                "reasoning_content",
+                "tool_calls",
+                "function_call",
+            )
+        )
     ):
         token_ids = None
     pair_ids, pair_logprobs = _pairs(values, field="Chat Completions logprobs")
@@ -971,7 +988,7 @@ def _cached_tokenizer(base_model: str, revision: str | None) -> Tokenizer:
             from ..megatron.dsv4.tokenizer import get_dsv4_tokenizer
 
             tokenizer = get_dsv4_tokenizer(cast("PreTrainedTokenizerBase", tokenizer))
-        return _as_tokenizer(tokenizer)
+        return _as_tokenizer(configure_preserved_thinking_chat_template(tokenizer))
     except Exception as exc:
         raise ValueError(
             f"Could not load tokenizer for {base_model!r}; pass base_model explicitly"
@@ -1379,9 +1396,16 @@ def _template_ids(
         kwargs.setdefault("enable_thinking", thinking.get("type") == "enabled")
         if budget := thinking.get("budget_tokens"):
             kwargs.setdefault("thinking_budget", budget)
-    template = chat_template or request.get("chat_template") or config.chat_template
+    template = (
+        chat_template
+        or request.get("chat_template")
+        or config.chat_template
+        or getattr(tokenizer, "chat_template", None)
+    )
+    if kwargs.get("preserve_thinking") is True:
+        template = chat_template_with_preserved_thinking(template)
     result = tokenizer.apply_chat_template(
-        messages,
+        normalize_tool_call_arguments_for_chat_template(messages, template),
         tools=tools,
         tokenize=True,
         add_generation_prompt=not completed,
@@ -1712,8 +1736,9 @@ def _legacy_tokenize(
     if not token_ids:
         raise ValueError("Trajectory contains no trainable choices")
     return TokenizedHistory(
+        history=history,
         model=model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -1721,6 +1746,7 @@ def _legacy_tokenize(
 
 def _tokenize_exchange_trajectory(
     trajectory: Trajectory,
+    history: History,
     base_model: str | None,
     *,
     model: str | None,
@@ -1983,8 +2009,9 @@ def _tokenize_exchange_trajectory(
         previous_render_state = (exchange, messages_override)
 
     tokenized = TokenizedHistory(
+        history=history,
         model=selected_model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -2885,8 +2912,9 @@ def _tokenize_exact_responses_history(
             )
         )
     tokenized = TokenizedHistory(
+        history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -3125,8 +3153,9 @@ def _tokenize_exact_projected_chat_history(
     if history.model is None:
         raise ValueError("History tokenization requires a model")
     tokenized = TokenizedHistory(
+        history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -3137,7 +3166,9 @@ def _tokenize_exact_projected_chat_history(
 
 def _chat_message_parts(message: Mapping[str, object]) -> list[tuple[str, str]]:
     parts: list[tuple[str, str]] = []
-    reasoning = message.get("reasoning") or message.get("reasoning_content")
+    reasoning = message.get("reasoning")
+    if not isinstance(reasoning, str) or not reasoning:
+        reasoning = message.get("reasoning_content")
     if isinstance(reasoning, str) and reasoning:
         parts.append(("reasoning", reasoning))
     if content := _content_text(message.get("content")):
@@ -3376,14 +3407,23 @@ def _tokenize_chat_view(
         if budget := thinking.get("budget_tokens"):
             kwargs.setdefault("thinking_budget", budget)
     template = chat_template or history.chat_template or config.chat_template
+    if template is None:
+        tokenizer_template = getattr(resolved_tokenizer, "chat_template", None)
+        if isinstance(tokenizer_template, str):
+            template = tokenizer_template
+    if kwargs.get("preserve_thinking") is True:
+        template = chat_template_with_preserved_thinking(template)
     ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
 
     def render(
         selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> list[int]:
+        render_messages = normalize_tool_call_arguments_for_chat_template(
+            selected_messages, template
+        )
         return _ids(
             resolved_tokenizer.apply_chat_template(
-                selected_messages,
+                render_messages,
                 tools=history.tools,
                 tokenize=True,
                 add_generation_prompt=add_generation_prompt,
@@ -3391,6 +3431,16 @@ def _tokenize_chat_view(
                 **kwargs,
             )
         )
+
+    def probe_render(
+        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    ) -> list[int] | None:
+        try:
+            return render(
+                selected_messages, add_generation_prompt=add_generation_prompt
+            )
+        except Exception:
+            return None
 
     rendered = render(messages, add_generation_prompt=not ends_with_assistant)
     if any(
@@ -3404,21 +3454,24 @@ def _tokenize_chat_view(
         for message in without_reasoning:
             message.pop("reasoning", None)
         if (
-            render(
+            probe_render(
                 without_reasoning,
                 add_generation_prompt=not ends_with_assistant,
             )
             == rendered
         ):
-            messages = deepcopy(messages)
-            for message in messages:
+            aliased_messages = deepcopy(messages)
+            for message in aliased_messages:
                 reasoning = message.pop("reasoning", None)
                 if isinstance(reasoning, str) and reasoning:
                     message.setdefault("reasoning_content", reasoning)
-            rendered = render(
-                messages,
+            aliased_render = probe_render(
+                aliased_messages,
                 add_generation_prompt=not ends_with_assistant,
             )
+            if aliased_render is not None:
+                messages = aliased_messages
+                rendered = aliased_render
     if any(
         message.get("role") == "assistant"
         and isinstance(message.get("refusal"), str)
@@ -3429,14 +3482,14 @@ def _tokenize_chat_view(
         for message in without_refusals:
             message.pop("refusal", None)
         if (
-            render(
+            probe_render(
                 without_refusals,
                 add_generation_prompt=not ends_with_assistant,
             )
             == rendered
         ):
-            messages = deepcopy(messages)
-            for message in messages:
+            merged_messages = deepcopy(messages)
+            for message in merged_messages:
                 refusal = message.pop("refusal", None)
                 if not isinstance(refusal, str) or not refusal:
                     continue
@@ -3454,10 +3507,13 @@ def _tokenize_chat_view(
                     raise ValueError(
                         "Cannot render an assistant refusal with this content shape"
                     )
-            rendered = render(
-                messages,
+            merged_render = probe_render(
+                merged_messages,
                 add_generation_prompt=not ends_with_assistant,
             )
+            if merged_render is not None:
+                messages = merged_messages
+                rendered = merged_render
 
     prompt_cache: dict[int, list[int] | None] = {}
     output_cache: dict[int, tuple[list[int] | None, list[float]]] = {}
@@ -3486,7 +3542,9 @@ def _tokenize_chat_view(
             == exchange.request.get("chat_template_kwargs")
         )
 
+    canonical_rendered = rendered
     exact_prefix_length = 0
+    canonical_prefix_length = 0
     if (
         chat_template is None
         and chat_template_kwargs is None
@@ -3499,15 +3557,19 @@ def _tokenize_chat_view(
                 continue
             source_prompt = source_prompt_tokens(source)
             if source_prompt and source_matches_context(source):
-                rendered_prompt = render(
+                rendered_prompt = probe_render(
                     messages[:message_index], add_generation_prompt=True
                 )
-                if rendered[: len(rendered_prompt)] == rendered_prompt:
+                if (
+                    rendered_prompt is not None
+                    and rendered[: len(rendered_prompt)] == rendered_prompt
+                ):
                     rendered = [
                         *source_prompt,
                         *rendered[len(rendered_prompt) :],
                     ]
                     exact_prefix_length = len(source_prompt)
+                    canonical_prefix_length = len(rendered_prompt)
                     break
 
     positions_by_first_token: dict[int, list[int]] = {}
@@ -3571,23 +3633,47 @@ def _tokenize_chat_view(
     ):
         direct_bounds = []
 
+    def canonical_render_to_rendered(probe: Sequence[int]) -> list[int] | None:
+        if not exact_prefix_length:
+            return list(probe)
+        if (
+            len(probe) < canonical_prefix_length
+            or list(probe[:canonical_prefix_length])
+            != canonical_rendered[:canonical_prefix_length]
+        ):
+            return None
+        return [
+            *rendered[:exact_prefix_length],
+            *probe[canonical_prefix_length:],
+        ]
+
+    def canonical_span_to_rendered(start: int, end: int) -> tuple[int, int] | None:
+        if not exact_prefix_length:
+            return start, end
+        if start < canonical_prefix_length:
+            return None
+        delta = exact_prefix_length - canonical_prefix_length
+        return start + delta, end + delta
+
     def differing_span(probe: Sequence[int]) -> tuple[int, int] | None:
+        baseline = canonical_rendered if exact_prefix_length else rendered
         prefix = 0
         while (
-            prefix < len(rendered)
+            prefix < len(baseline)
             and prefix < len(probe)
-            and rendered[prefix] == probe[prefix]
+            and baseline[prefix] == probe[prefix]
         ):
             prefix += 1
         suffix = 0
         while (
-            suffix < len(rendered) - prefix
+            suffix < len(baseline) - prefix
             and suffix < len(probe) - prefix
-            and rendered[-suffix - 1] == probe[-suffix - 1]
+            and baseline[-suffix - 1] == probe[-suffix - 1]
         ):
             suffix += 1
-        end = len(rendered) - suffix
-        return (prefix, end) if prefix < end else None
+        end = len(baseline) - suffix
+        span = canonical_span_to_rendered(prefix, end)
+        return span if span is not None and span[0] < span[1] else None
 
     marked_bounds: dict[int, tuple[int, int]] = {}
     marked_part_bounds: dict[int, list[tuple[int, int]]] = {}
@@ -3644,14 +3730,16 @@ def _tokenize_chat_view(
         if markers:
             try:
                 marked_text = resolved_tokenizer.apply_chat_template(
-                    marked_messages,
+                    normalize_tool_call_arguments_for_chat_template(
+                        marked_messages, template
+                    ),
                     tools=history.tools,
                     tokenize=False,
                     add_generation_prompt=not ends_with_assistant,
                     **({"chat_template": template} if template is not None else {}),
                     **kwargs,
                 )
-            except (TypeError, NotImplementedError):
+            except Exception:
                 marked_text = None
             if isinstance(marked_text, str):
                 marker_pattern = re.compile(
@@ -3704,7 +3792,7 @@ def _tokenize_chat_view(
                         add_special_tokens=False,
                         return_offsets_mapping=True,
                     )
-                except (TypeError, NotImplementedError):
+                except Exception:
                     encoded = None
                 encoded_data = _string_dict(encoded)
                 raw_offsets = (
@@ -3712,11 +3800,20 @@ def _tokenize_chat_view(
                     if encoded_data is not None
                     else None
                 )
+                encoded_ids = _ids(encoded) if encoded is not None else []
                 if (
                     encoded is not None
-                    and _ids(encoded) == rendered
+                    and (
+                        encoded_ids == canonical_rendered
+                        or (
+                            exact_prefix_length
+                            and len(encoded_ids) == len(canonical_rendered)
+                            and encoded_ids[canonical_prefix_length:]
+                            == canonical_rendered[canonical_prefix_length:]
+                        )
+                    )
                     and isinstance(raw_offsets, list)
-                    and len(raw_offsets) == len(rendered)
+                    and len(raw_offsets) == len(encoded_ids)
                 ):
                     offsets: list[tuple[int, int]] = []
                     for value in raw_offsets:
@@ -3727,7 +3824,7 @@ def _tokenize_chat_view(
                         ):
                             break
                         offsets.append((value[0], value[1]))
-                    if len(offsets) == len(rendered):
+                    if len(offsets) == len(encoded_ids):
                         token_bounds: dict[tuple[int, int], tuple[int, int]] = {}
                         token_cursor = 0
                         for key, (char_start, char_end) in sorted(
@@ -3760,10 +3857,19 @@ def _tokenize_chat_view(
                                 if (message_index, part_index) in token_bounds
                             ]
                             if len(bounds) == part_count:
-                                marked_part_bounds[message_index] = bounds
+                                rendered_bounds = [
+                                    canonical_span_to_rendered(*bound)
+                                    for bound in bounds
+                                ]
+                                if any(bound is None for bound in rendered_bounds):
+                                    continue
+                                translated = cast(
+                                    list[tuple[int, int]], rendered_bounds
+                                )
+                                marked_part_bounds[message_index] = translated
                                 marked_bounds[message_index] = (
-                                    bounds[0][0],
-                                    bounds[-1][1],
+                                    translated[0][0],
+                                    translated[-1][1],
                                 )
         for message_index, bounds in list(marked_part_bounds.items()):
             whitespace_parts = [
@@ -3788,6 +3894,11 @@ def _tokenize_chat_view(
                         add_generation_prompt=not ends_with_assistant,
                     )
                 except Exception:
+                    marked_bounds.pop(message_index, None)
+                    marked_part_bounds.pop(message_index, None)
+                    break
+                empty_render = canonical_render_to_rendered(empty_render)
+                if empty_render is None:
                     marked_bounds.pop(message_index, None)
                     marked_part_bounds.pop(message_index, None)
                     break
@@ -3833,59 +3944,43 @@ def _tokenize_chat_view(
                         )
                     except Exception:
                         continue
+                    rendered_prefix = canonical_render_to_rendered(prefix)
+                    rendered_completed = canonical_render_to_rendered(completed)
                     if (
                         completed[: len(prefix)] == prefix
-                        and rendered[: len(completed)] == completed
+                        and rendered_prefix is not None
+                        and rendered_completed is not None
+                        and rendered[: len(rendered_completed)] == rendered_completed
                     ):
                         probed_bounds[message_index] = (
-                            len(prefix),
-                            len(prefix),
+                            len(rendered_prefix),
+                            len(rendered_prefix),
                         )
                 continue
-            if parts and all(part == "tool_call" for part, _ in parts):
+            if any(part == "tool_call" for part, _ in parts):
                 probe_messages = deepcopy(messages)
-                tool_calls = probe_messages[message_index].get("tool_calls")
-                if isinstance(tool_calls, list):
-                    existing_values: set[str] = set()
-                    for existing_call in tool_calls:
-                        if not isinstance(existing_call, dict):
-                            continue
-                        existing_function = existing_call.get("function")
-                        if isinstance(existing_function, dict):
-                            existing_values.update(
-                                value
-                                for value in existing_function.values()
-                                if isinstance(value, str)
-                            )
-                    for call_index, call in enumerate(tool_calls):
-                        if not isinstance(call, dict):
-                            continue
-                        raw_function = call.get("function")
-                        if not isinstance(raw_function, dict):
-                            continue
-                        function = cast(dict[str, Any], raw_function)
-                        probe_name = (
-                            f"art_trajectory_probe_{id(probe_messages):x}_{call_index}"
+                for part_index, slots in enumerate(
+                    _chat_message_text_slot_groups(probe_messages[message_index])
+                ):
+                    for slot_index, (container, key) in enumerate(slots):
+                        original = str(container[key])
+                        leading = original[: len(original) - len(original.lstrip())]
+                        trailing = original[len(original.rstrip()) :]
+                        marker = (
+                            f"art_trajectory_probe_{id(probe_messages):x}_"
+                            f"{part_index}_{slot_index}"
                         )
-                        probe_arguments = json.dumps({probe_name: True})
-                        while (
-                            probe_name in existing_values
-                            or probe_arguments in existing_values
-                        ):
-                            probe_name += "_"
-                            probe_arguments = json.dumps({probe_name: True})
-                        function["name"] = probe_name
-                        function["arguments"] = probe_arguments
-                    try:
-                        probe = render(
-                            probe_messages,
-                            add_generation_prompt=not ends_with_assistant,
+                        replacement = (
+                            json.dumps({marker: True}) if key == "arguments" else marker
                         )
-                    except Exception:
-                        probe = []
-                    if span := differing_span(probe):
-                        probed_bounds[message_index] = span
-                        continue
+                        container[key] = leading + replacement + trailing
+                probe = probe_render(
+                    probe_messages,
+                    add_generation_prompt=not ends_with_assistant,
+                )
+                if probe is not None and (span := differing_span(probe)):
+                    probed_bounds[message_index] = span
+                    continue
             if len(parts) == 1:
                 try:
                     prefix = render(
@@ -3894,9 +3989,13 @@ def _tokenize_chat_view(
                 except Exception:
                     prefix = []
                 local = part_ids(parts[0][1])
-                if rendered == [*prefix, *local]:
+                rendered_prefix = canonical_render_to_rendered(prefix)
+                if rendered_prefix is not None and rendered == [
+                    *rendered_prefix,
+                    *local,
+                ]:
                     probed_bounds[message_index] = (
-                        len(prefix),
+                        len(rendered_prefix),
                         len(rendered),
                     )
                     continue
@@ -3907,13 +4006,16 @@ def _tokenize_chat_view(
                     )
                 except Exception:
                     completed = []
+                rendered_completed = canonical_render_to_rendered(completed)
                 if (
                     completed == [*prefix, *local]
-                    and rendered[: len(completed)] == completed
+                    and rendered_prefix is not None
+                    and rendered_completed is not None
+                    and rendered[: len(rendered_completed)] == rendered_completed
                 ):
                     probed_bounds[message_index] = (
-                        len(prefix),
-                        len(completed),
+                        len(rendered_prefix),
+                        len(rendered_completed),
                     )
                     continue
             probe_messages = deepcopy(messages)
@@ -3960,8 +4062,56 @@ def _tokenize_chat_view(
         complete_sampled_message = (
             sampled
             and source is not None
-            and _source_covers_complete_sampled_message(message, source)
+            and _source_covers_complete_sampled_message(
+                history.messages[message_index], source
+            )
         )
+        if (
+            complete_sampled_message
+            and full_exact is not None
+            and message_index in marked_bounds
+            and isinstance(getattr(source, "exchange", None), ChatCompletionsExchange)
+            and marked_bounds[message_index][1] - marked_bounds[message_index][0]
+            != len(full_exact)
+        ):
+            try:
+                prefix = render(messages[:message_index], add_generation_prompt=True)
+                completed = render(
+                    messages[: message_index + 1], add_generation_prompt=False
+                )
+            except Exception:
+                marked_bounds.pop(message_index, None)
+                marked_part_bounds.pop(message_index, None)
+                prefix = completed = None
+
+            rendered_prefix = (
+                canonical_render_to_rendered(prefix) if prefix is not None else None
+            )
+            rendered_completed = (
+                canonical_render_to_rendered(completed)
+                if completed is not None
+                else None
+            )
+            corrected_bounds = (
+                canonical_span_to_rendered(len(prefix), len(completed))
+                if prefix is not None and completed is not None
+                else None
+            )
+            if (
+                prefix is not None
+                and completed is not None
+                and rendered_prefix is not None
+                and rendered_completed is not None
+                and corrected_bounds is not None
+                and rendered[: len(rendered_prefix)] == rendered_prefix
+                and rendered[: len(rendered_completed)] == rendered_completed
+            ):
+                marked_bounds[message_index] = corrected_bounds
+                # The marker-derived per-part offsets describe the old render.
+                marked_part_bounds.pop(message_index, None)
+            else:
+                marked_bounds.pop(message_index, None)
+                marked_part_bounds.pop(message_index, None)
         source_boundary = False
         generation_start: int | None = None
         sampled_bounds: tuple[int, int] | None = None
@@ -3990,15 +4140,23 @@ def _tokenize_chat_view(
                     generation_start = len(source_prompt)
                     sampled_bounds = (generation_start, len(rendered))
                 elif sampled_message_count == 1:
-                    prompt_render = render(
+                    prompt_render = probe_render(
                         messages[:message_index], add_generation_prompt=True
                     )
-                    if rendered[: len(prompt_render)] != prompt_render:
+                    rendered_prompt = (
+                        canonical_render_to_rendered(prompt_render)
+                        if prompt_render is not None
+                        else None
+                    )
+                    if (
+                        rendered_prompt is None
+                        or rendered[: len(rendered_prompt)] != rendered_prompt
+                    ):
                         raise ValueError(
                             "Could not locate a sampled history message in the "
                             "rendered history"
                         )
-                    generation_start = len(prompt_render)
+                    generation_start = len(rendered_prompt)
                     sampled_bounds = (generation_start, len(rendered))
                 else:
                     raise ValueError(
@@ -4062,14 +4220,14 @@ def _tokenize_chat_view(
         if sampled and not content_bounds_proven:
             raise ValueError(
                 "Could not uniquely locate or prove the sampled content boundary "
-                "with this tokenizer"
+                f"for history message {message_index} with this tokenizer"
             )
         if (
             sampled
             and full_exact is None
             and message_index in probed_bounds
             and parts
-            and all(part == "tool_call" for part, _ in parts)
+            and any(part == "tool_call" for part, _ in parts)
         ):
             assert source is not None and sampled_bounds is not None
             start, end = sampled_bounds
@@ -4311,8 +4469,9 @@ def _tokenize_chat_view(
     if history.model is None:
         raise ValueError("History tokenization requires a model")
     tokenized = TokenizedHistory(
+        history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -4378,8 +4537,9 @@ def _tokenize_completions_token_history(
         if len(selected_logprobs) == span.end - span.start:
             logprobs[span.start : span.end] = selected_logprobs
     tokenized = TokenizedHistory(
+        history=history,
         model=history.model,
-        token_ids=list(history.prompt),
+        tokens=list(history.prompt),
         logprobs=logprobs,
         flags=flags,
     )
@@ -4558,8 +4718,9 @@ def _tokenize_completions_string_history(
         else:
             source_keys.extend([None] * len(ids))
     tokenized = TokenizedHistory(
+        history=history,
         model=history.model,
-        token_ids=token_ids,
+        tokens=token_ids,
         logprobs=logprobs,
         flags=flags,
     )
@@ -4647,7 +4808,7 @@ def _spans_are_exhaustive(length: int, spans: Sequence[object]) -> bool:
     return cursor == length
 
 
-def tokenize_history(
+def _tokenize_history(
     history: History | LegacyHistory,
     *,
     model: str | None,
@@ -4761,6 +4922,7 @@ def tokenize_history(
     history_kwargs = getattr(history, "chat_template_kwargs", None)
     return _tokenize_exchange_trajectory(
         trajectory,
+        history,
         base_model,
         model=model,
         chat_template=(
@@ -4776,14 +4938,55 @@ def tokenize_history(
     )
 
 
+def tokenize_history(
+    history: History | LegacyHistory,
+    *,
+    model: str | None,
+    base_model: str | None,
+    tokenizer: Tokenizer | None,
+    chat_template: str | None,
+    chat_template_kwargs: Mapping[str, object] | None,
+    _trace: _TraceBuilder | None = None,
+    _projection_validated: bool = False,
+) -> TokenizedHistory:
+    tokenized = _tokenize_history(
+        history,
+        model=model,
+        base_model=base_model,
+        tokenizer=tokenizer,
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+        _trace=_trace,
+        _projection_validated=_projection_validated,
+    )
+    # Internal protocol conversion is an implementation detail. The source is
+    # always the public history view the caller asked to tokenize.
+    if not isinstance(
+        history,
+        (
+            LegacyHistory,
+            ChatCompletionsHistory,
+            AnthropicMessagesHistory,
+            ResponsesHistory,
+            CompletionsTokenHistory,
+            CompletionsStringHistory,
+        ),
+    ):
+        raise TypeError(f"Unsupported history type: {type(history).__name__}")
+    tokenized.history = history
+    return tokenized
+
+
 def _materialize_trajectory(
     tokenized: TokenizedHistory, trajectory: Trajectory
 ) -> TokenizedTrajectory:
     return TokenizedTrajectory(
-        **tokenized.model_dump(),
-        reward=trajectory.reward,
-        metrics=dict(trajectory.metrics),
-        metadata=dict(trajectory.metadata),
+        history=tokenized.history,
+        model=tokenized.model,
+        tokens=tokenized.tokens,
+        logprobs=tokenized.logprobs,
+        flags=tokenized.flags,
+        trajectory=trajectory,
     )
 
 
@@ -4831,10 +5034,8 @@ def tokenize_trajectory(
     if not multi_history:
         return _materialize_trajectory(tokenized[0], trajectory)
     return TokenizedMultiHistoryTrajectory(
+        trajectory=trajectory,
         histories=tokenized,
-        reward=trajectory.reward,
-        metrics=dict(trajectory.metrics),
-        metadata=dict(trajectory.metadata),
     )
 
 
@@ -4877,10 +5078,8 @@ def _tokenize_trajectory_with_trace(
         traces.append(trace_builder.trace)
     return (
         TokenizedMultiHistoryTrajectory(
+            trajectory=trajectory,
             histories=tokenized_histories,
-            reward=trajectory.reward,
-            metrics=dict(trajectory.metrics),
-            metadata=dict(trajectory.metadata),
         ),
         traces,
     )
@@ -4915,12 +5114,10 @@ def tokenize_group(
     ]
     if multi_history:
         return TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory](
+            trajectory_group=group,
             trajectories=trajectories,
-            metrics=dict(group.metrics),
-            metadata=dict(group.metadata),
         )
     return TokenizedTrajectoryGroup[TokenizedTrajectory](
+        trajectory_group=group,
         trajectories=trajectories,
-        metrics=dict(group.metrics),
-        metadata=dict(group.metadata),
     )

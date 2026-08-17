@@ -35,7 +35,8 @@ from openai.types.chat.chat_completion_user_message_param import (
 )
 import pytest
 
-from art import LegacyHistory, Trajectory, TrajectoryGroup
+from art import Trajectory, TrajectoryGroup
+from art.trajectories import LegacyHistory
 from art.types import MessageOrChoice
 from art.utils.trajectory_logging import (
     read_trajectory_groups_parquet,

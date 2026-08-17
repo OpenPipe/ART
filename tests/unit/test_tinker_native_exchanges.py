@@ -6,6 +6,7 @@ from openai.types.chat.chat_completion import Choice
 import pytest
 
 import art
+import art.trajectories as tr
 from art.trajectories import ChatCompletionsExchange, ChatCompletionsRequest
 
 pytest.importorskip("tinker")
@@ -67,7 +68,7 @@ def _exchange(
 
 def _trajectory(reward: float, *, logprobs: bool = True) -> art.Trajectory:
     return art.Trajectory(
-        exchanges=art.TrajectoryExchanges(
+        exchanges=tr.TrajectoryExchanges(
             chat_completions=[
                 _exchange([10], [20], logprobs=logprobs),
                 _exchange([10, 20, 11], [21], logprobs=logprobs),

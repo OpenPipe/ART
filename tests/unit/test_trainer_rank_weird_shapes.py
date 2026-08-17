@@ -21,6 +21,7 @@ from art.trainer_rank import (
     Unset,
 )
 from art.trainer_rank._impl import (
+    _CheckpointSlot,
     _flatten,
     _MemoryCheck,
     _MemoryProfile,
@@ -68,7 +69,6 @@ def _target_request(
     logits: bool = False,
     hidden_states: bool = False,
     checkpoint: AdapterSelection = Unset,
-    lora: AdapterSelection = Unset,
 ) -> ForwardInput:
     labels = (
         tokens
@@ -85,7 +85,6 @@ def _target_request(
         logits=logits,
         hidden_states=hidden_states,
         checkpoint=checkpoint,
-        lora=lora,
     )
 
 
@@ -269,6 +268,49 @@ def test_forward_micro_batches_preserves_nested_vineppo_groups(
     )
 
 
+@pytest.mark.parametrize("api", ("dp_rank_forward", "forward_micro_batches"))
+def test_forward_preserves_caller_owned_nested_input_tensors(
+    api: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_: True)
+    monkeypatch.setattr(
+        rank,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: [
+            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+        ],
+    )
+    groups = _vineppo_like_inputs()
+    tensors = [
+        (request, request.input_tokens, request.target_tokens)
+        for group in groups
+        for request in group
+    ]
+    snapshots = [
+        (inputs.clone(), None if targets is None else targets.clone())
+        for _request, inputs, targets in tensors
+    ]
+
+    if api == "dp_rank_forward":
+        rank.dp_rank_forward(groups)
+    else:
+        list(rank.forward_micro_batches(groups))
+
+    for (request, inputs, targets), (expected_inputs, expected_targets) in zip(
+        tensors, snapshots, strict=True
+    ):
+        assert request.input_tokens is inputs
+        assert request.target_tokens is targets
+        assert inputs.device.type == "cpu"
+        torch.testing.assert_close(inputs, expected_inputs)
+        if targets is not None and expected_targets is not None:
+            assert targets.device.type == "cpu"
+            torch.testing.assert_close(targets, expected_targets)
+
+
 def test_adaptive_planner_materializes_only_final_large_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -293,15 +335,15 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
     assert limit is not None
     limit_packed_tokens = limit[0]
 
-    def plan(requests):
+    def plan(requests, **kwargs):
         nonlocal plan_calls
         plan_calls += 1
-        return original_plan(requests)
+        return original_plan(requests, **kwargs)
 
-    def estimate(requests):
+    def estimate(requests, **kwargs):
         nonlocal estimate_calls
         estimate_calls += 1
-        return original_estimate(requests)
+        return original_estimate(requests, **kwargs)
 
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     monkeypatch.setattr(rank, "_estimate_flat_forward", estimate)
@@ -324,10 +366,10 @@ def test_adaptive_planner_globally_falls_back_when_one_rank_cannot_estimate(
     plans = 0
     original = rank._plan_flat_forward
 
-    def plan(requests):
+    def plan(requests, **kwargs):
         nonlocal plans
         plans += 1
-        return original(requests)
+        return original(requests, **kwargs)
 
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     candidate = rank._select_next_micro_batch(
@@ -343,7 +385,11 @@ def test_adaptive_planner_probes_new_heterogeneous_signatures(
 ) -> None:
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(rank, "_resolve_slot_ref", lambda request: request.checkpoint)
+    monkeypatch.setattr(
+        rank,
+        "_resolve_slot_ref",
+        lambda request, **_kwargs: request.checkpoint,
+    )
     inputs = [
         _target_request(_tokens(index), checkpoint=f"S{index % 4}")
         for index in range(16)
@@ -403,10 +449,10 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
     plan_calls = 0
     original_plan = rank._plan_flat_forward
 
-    def plan(requests):
+    def plan(requests, **kwargs):
         nonlocal plan_calls
         plan_calls += 1
-        return original_plan(requests)
+        return original_plan(requests, **kwargs)
 
     def run(plan, **_kwargs):
         if available["packed_tokens"] == first_limit_packed_tokens:
@@ -442,13 +488,15 @@ def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     monkeypatch.setattr(
         TrainerRank,
         "_slot_ref",
-        staticmethod(lambda kind, name: (kind, name)),
+        staticmethod(lambda name: name),
     )
-    rank.set_checkpoint("student")
+    rank._default_slot_ref = rank._slot_ref("student")
+    for name in ("student", "teacher", "critic"):
+        rank._checkpoint_slots.setdefault(name, _CheckpointSlot()).params = ()
     requests = [
         _target_request(_tokens(1, 2, 3), top_k=3),
         _target_request(_tokens(1, 2, 4), checkpoint=None, logits=True),
-        _target_request(_tokens(1, 2, 5), lora="teacher", hidden_states=True),
+        _target_request(_tokens(1, 2, 5), checkpoint="teacher", hidden_states=True),
         _target_request(_tokens(1, 2, 6), checkpoint="critic", target_count=4),
     ]
 
@@ -462,10 +510,10 @@ def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     assert signature == plan.signature
     assert plan.signature.slot_group_count == 4
     assert {group.slot_ref for group in plan.groups} == {
-        ("checkpoint", "student"),
-        ("checkpoint", None),
-        ("lora", "teacher"),
-        ("checkpoint", "critic"),
+        "student",
+        None,
+        "teacher",
+        "critic",
     }
 
 

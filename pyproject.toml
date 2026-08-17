@@ -1,6 +1,6 @@
 [project]
 name = "openpipe-art"
-version = "0.5.18"
+version = "0.5.19"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -37,6 +37,7 @@ distributed-cu130 = [
     "torchmonarch==0.6.0",
     "transformers>=5.2.0,<=5.12.1",
 ]
+tensors = ["torch==2.11.0"]
 
 backend = [
     "peft>=0.14.0",

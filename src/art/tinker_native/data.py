@@ -313,7 +313,7 @@ def _tokenized_trajectory_to_datum(
     if trainable is None:
         trainable = [bool(flag & TokenFlag.SAMPLED) for flag in tokenized.flags]
     if not (
-        len(tokenized.token_ids)
+        len(tokenized.tokens)
         == len(tokenized.logprobs)
         == len(tokenized.flags)
         == len(trainable)
@@ -326,7 +326,7 @@ def _tokenized_trajectory_to_datum(
         raise ValueError("Only sampled tokens can be selected for Tinker training")
     if trainable and trainable[0]:
         raise ValueError("A trainable trajectory cannot start with a sampled token")
-    if len(tokenized.token_ids) < 2 or not any(trainable):
+    if len(tokenized.tokens) < 2 or not any(trainable):
         return None
 
     action_mask = trainable[1:]
@@ -336,8 +336,8 @@ def _tokenized_trajectory_to_datum(
     ):
         raise ValueError("Tinker training requires logprobs for every assistant token")
     return _build_datum(
-        tokenized.token_ids[:-1],
-        tokenized.token_ids[1:],
+        tokenized.tokens[:-1],
+        tokenized.tokens[1:],
         [
             logprob if trainable else 0.0
             for trainable, logprob in zip(
