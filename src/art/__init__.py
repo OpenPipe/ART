@@ -17,6 +17,7 @@ command above and they will appear in the project directory.
 """
 
 import os
+from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
@@ -73,7 +74,6 @@ from .metrics import (
 )
 from .model import Model, TrainableModel
 from .pipeline_tuner import PipelineAutotuneConfig, PipelineRuntimeConfig
-from .serverless import ServerlessBackend
 from .trajectories import (
     Trajectory,
     TrajectoryGroup,
@@ -96,6 +96,19 @@ from .types import (
 )
 from .utils import retry
 from .yield_trajectory import capture_yielded_trajectory, yield_trajectory
+
+if TYPE_CHECKING:
+    from .serverless import ServerlessBackend
+
+
+def __getattr__(name: str) -> object:
+    if name == "ServerlessBackend":
+        from .serverless import ServerlessBackend
+
+        globals()[name] = ServerlessBackend
+        return ServerlessBackend
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "dev",
