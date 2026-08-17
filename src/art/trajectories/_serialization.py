@@ -26,6 +26,12 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         return pool.setdefault(value, value)
     if isinstance(value, (bytes, bytearray, memoryview)) or value is None:
         return value
+    if type(value) in (bool, float, int):
+        return value
+    if isinstance(value, list) and all(
+        item is None or type(item) in (bool, float, int) for item in value
+    ):
+        return value
 
     value_id = id(value)
     if value_id in memo:
