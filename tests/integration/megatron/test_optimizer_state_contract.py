@@ -1,12 +1,12 @@
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from art.megatron.distributed_service import DistributedMegatronService
 from art.megatron.migrations import apply_megatron_migrations, optimizer_state_path
-from art.megatron.tensor_snapshot import PinnedCpuSnapshotStager, SnapshotReadBarrier
+from art.megatron.tensor_snapshot import SnapshotReadBarrier
 from art.trainer_rank import TrainerRankOptimizerState
 
 
@@ -83,6 +83,12 @@ def test_resident_optimizer_is_reused_across_objectives_in_one_run(
         SimpleNamespace(
             optimizer_persistent=True,
             optimizer=old_optimizer,
+            resident_training_session_id="session",
+            resident_policy_step=4,
+            resident_generation_id="generation",
+            optimizer_state_loaded=True,
+            adapter_export_dtypes={},
+            adapter_export_config={},
             model=object(),
             rank=0,
             model_support_handler=object(),
@@ -101,11 +107,16 @@ def test_resident_optimizer_is_reused_across_objectives_in_one_run(
         lambda *_args, **_kwargs: pytest.fail("resident optimizer was reloaded"),
     )
 
-    adapter_dtypes = train._load_lora_and_optimizer(
+    adapter_dtypes = train._prepare_rl_training_state(
         runtime,
-        lora_path=str(tmp_path / "adapter"),
-        optimizer_state_path=str(tmp_path / "optimizer"),
-        adapter_step=4,
+        cast(
+            Any,
+            SimpleNamespace(
+                training_session_id="session",
+                source_policy_step=4,
+                source=SimpleNamespace(generation_id="generation"),
+            ),
+        ),
     )
 
     assert runtime.optimizer is old_optimizer
@@ -143,9 +154,7 @@ def test_lora_only_generation_can_add_optimizer_without_restaging_lora(
         "art.megatron.optimizer_state.stage_optimizer_state_snapshot",
         lambda *_args, **_kwargs: _ResolvedSnapshot(optimizer),
     )
-    publisher = _GenerationPublisher(
-        runtime, stager=PinnedCpuSnapshotStager(), capacity=1
-    )
+    publisher = _GenerationPublisher(runtime, capacity=1)
     generation = TrainerGeneration(
         training_session_id="session",
         policy_step=1,

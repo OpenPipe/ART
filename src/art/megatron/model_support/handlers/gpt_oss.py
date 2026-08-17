@@ -46,7 +46,6 @@ from art.megatron.model_support.spec import (
     ExpertPackedLoraSlot,
     HfWeightSource,
     LayerFamilyInstance,
-    RolloutWeightsMode,
 )
 
 _GPT_OSS_MOE_COMPILE_WORKAROUND_FLAGS = (
@@ -800,16 +799,8 @@ class GptOssMoeHandler(DefaultMoeHandler):
             kind="bridge_materialized",
         )
 
-    def vllm_engine_args(
-        self,
-        *,
-        rollout_weights_mode: RolloutWeightsMode,
-    ) -> dict[str, object]:
-        return {
-            "moe_backend": (
-                "triton_unfused" if rollout_weights_mode == "lora" else "triton"
-            )
-        }
+    def vllm_engine_args(self) -> dict[str, object]:
+        return {"moe_backend": "triton_unfused"}
 
     def vllm_server_args(self) -> dict[str, object]:
         return {"tool_call_parser": "openai"}
@@ -1271,7 +1262,6 @@ def _vllm_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
     if "experts" not in target_modules:
         target_modules.append("experts")
     config["target_modules"] = target_modules
-    config["art_merged_lora_delta_unsupported_target_modules"] = ["experts"]
     return config
 
 

@@ -18,6 +18,9 @@ from .output_parity import (
     TOP20_KL_CANDIDATE_TO_TARGET_LIMIT,
     TOP_K,
     EngineSide,
+    LogicalPrompt,
+    LogicalToken,
+    LogicalTokenMap,
     ScoreBundle,
     TokenTopK,
     TrainInfOutputParityConfig,
@@ -32,12 +35,105 @@ from .output_parity import (
 )
 from .real_path import (
     RealPathConfig,
+    _choice_score_index,
     _collect_real_trajectory_groups,
     _delete_adapter_safetensors_on_pass,
     _real_path_rollout_mode,
-    _real_path_rollout_weights_mode,
     _topk_from_chat_logprob,
+    _vllm_scores_from_real_choices,
 )
+
+
+def test_choice_score_index_disambiguates_equal_completions_by_prompt() -> None:
+    def choice(prompt_id: int) -> Choice:
+        return Choice.model_validate(
+            {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {"role": "assistant", "content": "same"},
+                "prompt_token_ids": [prompt_id],
+                "token_ids": [7],
+            }
+        )
+
+    first, second = choice(1), choice(2)
+    groups = [[SimpleNamespace(messages_and_choices=[first, second])]]
+
+    indexed = _choice_score_index(groups, require_routing_metadata=False)
+
+    assert indexed == {(1, 7): [first], (2, 7): [second]}
+
+
+def test_equal_token_paths_match_packed_source_logprobs() -> None:
+    def choice(score: float) -> Choice:
+        return Choice.model_validate(
+            {
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {"role": "assistant", "content": "same"},
+                "prompt_token_ids": [1],
+                "token_ids": [7],
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": "token_id:7",
+                            "logprob": score,
+                            "top_logprobs": [{"token": "token_id:7", "logprob": score}],
+                        }
+                    ]
+                },
+            }
+        )
+
+    first, second = choice(-1.0), choice(-2.0)
+    groups = [[SimpleNamespace(messages_and_choices=[first, second])]]
+    logical_map = LogicalTokenMap(
+        prompts=[
+            LogicalPrompt(
+                prompt_id=0,
+                sample_id=0,
+                family_id=0,
+                completion_id=0,
+                packed_prompt_length=1,
+                scored_token_start_index=1,
+                token_ids=[1, 7],
+            )
+        ],
+        tokens=[
+            LogicalToken(
+                token_id=7,
+                sample_id=0,
+                family_id=0,
+                completion_id=0,
+                prompt_id=0,
+                art_packed_token_index=1,
+                art_logit_index=0,
+                vllm_prompt_token_index=1,
+                source_logprob=-2.0,
+            ),
+            LogicalToken(
+                token_id=7,
+                sample_id=0,
+                family_id=0,
+                completion_id=1,
+                prompt_id=0,
+                art_packed_token_index=2,
+                art_logit_index=1,
+                vllm_prompt_token_index=1,
+                source_logprob=-1.0,
+            ),
+        ],
+    )
+
+    scores = _vllm_scores_from_real_choices(
+        trajectory_groups=groups,
+        logical_map=logical_map,
+        require_routing_metadata=False,
+        weight_state="lora",
+        rollout_mode="native_lora",
+    )
+
+    assert scores.target_logprobs == [-2.0, -1.0]
 
 
 def _write_workflow_worker_result(
@@ -252,7 +348,7 @@ async def test_real_path_rollouts_use_stable_unique_seeds_concurrently() -> None
     )
     model = SimpleNamespace(
         openai_client=lambda: client,
-        get_inference_name=lambda: "fake",
+        get_inference_name=lambda *, step=None: "fake",
     )
     config = RealPathConfig(
         output_parity=TrainInfOutputParityConfig(seed=41),
@@ -290,18 +386,11 @@ def test_real_path_topk_sorts_vllm_sampled_token_prefix() -> None:
 
 
 def test_real_path_rollout_mode_follows_config() -> None:
-    native_config = TrainInfOutputParityConfig(
+    config = TrainInfOutputParityConfig(
         base_model="Qwen/Qwen3.5-35B-A3B",
     )
-    merged_config = TrainInfOutputParityConfig(
-        base_model="unvalidated/native-disabled",
-        allow_unvalidated_arch=True,
-    )
 
-    assert _real_path_rollout_mode(native_config) == "native_lora"
-    assert _real_path_rollout_weights_mode(native_config) == "lora"
-    assert _real_path_rollout_mode(merged_config) == "merged"
-    assert _real_path_rollout_weights_mode(merged_config) == "merged"
+    assert _real_path_rollout_mode(config) == "native_lora"
 
 
 def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
@@ -328,8 +417,13 @@ def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
 
 
 def test_architecture_specific_real_path_limits() -> None:
+    assert fwd_mean_abs_pct_limit_for_model("meta-llama/Llama-3.2-1B-Instruct") == 5.0
     assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 8.0
-    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 5.0
+    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-27B") == 7.0
+    assert top20_kl_candidate_to_target_limit_for_model("Qwen/Qwen3.5-27B") == 0.003
+    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 8.0
+    assert top20_kl_candidate_to_target_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 0.005
+    assert top20_kl_candidate_to_target_limit_for_model("openai/gpt-oss-20b") == 0.005
     assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
 
 
@@ -339,28 +433,28 @@ def test_gemma4_real_path_limits() -> None:
             "google/gemma-4-31B-it",
             allow_unvalidated_arch=True,
         )
-        == 10.0
+        == 15.0
     )
     assert (
         top20_kl_candidate_to_target_limit_for_model(
             "google/gemma-4-31B-it",
             allow_unvalidated_arch=True,
         )
-        == 0.003
+        == 0.008
     )
     assert (
         fwd_mean_abs_pct_limit_for_model(
             "google/gemma-4-26B-A4B-it",
             allow_unvalidated_arch=True,
         )
-        == 10.0
+        == 25.0
     )
     assert (
         top20_kl_candidate_to_target_limit_for_model(
             "google/gemma-4-26B-A4B-it",
             allow_unvalidated_arch=True,
         )
-        == 0.008
+        == 0.012
     )
     assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
 
@@ -432,14 +526,14 @@ def test_config_from_env_accepts_gdn_prefill_backend_override(
     assert config.engine_args["additional_config"] == {"gdn_prefill_backend": "triton"}
 
 
-def test_default_rollout_modes_follow_model_support_native_lora_status() -> None:
+def test_default_rollout_mode_is_native_lora() -> None:
     assert TrainInfOutputParityConfig(
         base_model="Qwen/Qwen3.5-35B-A3B"
-    ).rollout_modes == ["native_lora", "merged"]
+    ).rollout_modes == ["native_lora"]
     assert TrainInfOutputParityConfig(
         base_model="unvalidated/native-disabled",
         allow_unvalidated_arch=True,
-    ).rollout_modes == ["merged"]
+    ).rollout_modes == ["native_lora"]
 
 
 def test_config_from_env_rollout_modes_override_handler_default(

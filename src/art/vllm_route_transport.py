@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 import struct
-from typing import TYPE_CHECKING
 
 from openai.types.chat import ChatCompletion
-
-if TYPE_CHECKING:
-    import numpy as np
 
 from art.preprocessing.moe_routing import MoeRouteArray
 

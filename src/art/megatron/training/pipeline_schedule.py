@@ -166,6 +166,10 @@ class PipelineScheduleTelemetry:
     _cuda_timers: _DeferredCudaTimers | None = field(default=None, repr=False)
     _metrics_cache: dict[str, float] | None = field(default=None, repr=False)
 
+    def cuda_span(self) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
+        timers = self._cuda_timers
+        return None if timers is None else timers.span("forward-backward")
+
     def metrics(self) -> dict[str, float]:
         if self._metrics_cache is not None:
             return dict(self._metrics_cache)
@@ -515,6 +519,10 @@ class _DeferredCudaTimers:
         schedule = self._spans.get("forward-backward", ())
         if schedule:
             schedule[-1][1].synchronize()
+
+    def span(self, name: str) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
+        spans = self._spans.get(name, ())
+        return (spans[0][0], spans[-1][1]) if spans else None
 
     def total(self, name: str) -> float:
         return (

@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Any, Callable, Literal, Sequence
 
 import torch
@@ -9,7 +10,6 @@ from art.megatron.model_support.spec import (
     HfWeightSource,
     LayerFamilyInstance,
     PrefixTreeModelStateContext,
-    RolloutWeightsMode,
     SharedExpertCompileState,
 )
 
@@ -122,12 +122,7 @@ class DefaultDenseHandler:
         del internal_config
         return tokenizer
 
-    def vllm_engine_args(
-        self,
-        *,
-        rollout_weights_mode: RolloutWeightsMode,
-    ) -> dict[str, object]:
-        del rollout_weights_mode
+    def vllm_engine_args(self) -> dict[str, object]:
         return {}
 
     def vllm_server_args(self) -> dict[str, object]:
@@ -143,6 +138,13 @@ class DefaultDenseHandler:
     ) -> Callable[[Any, int], None] | None:
         del model_chunks
         return None
+
+    def preserve_pipeline_microbatch_activation(
+        self,
+        model_chunks: Sequence[Any],
+    ):
+        del model_chunks
+        return nullcontext()
 
     def build_prefix_tree_model_state(
         self,

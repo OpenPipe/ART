@@ -101,7 +101,7 @@ def test_cp_unsupported_model_uses_non_cp_default_topology(monkeypatch) -> None:
     assert config.engine_args["tensor_parallel_size"] == 2
     assert config.engine_args["enable_expert_parallel"] is True
     assert config.engine_args["kv_cache_dtype"] == "fp8"
-    assert config.engine_args["moe_backend"] == "triton"
+    assert config.engine_args["moe_backend"] == "auto"
     assert config.streaming_weight_offload is True
     assert config.megatron_env == {}
     assert config.external_vllm_server_url == "http://127.0.0.1:8000"

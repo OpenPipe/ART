@@ -9,8 +9,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
-from typing import Any
+from typing import Any, Mapping
 import uuid
 
 from pydantic import BaseModel, Field
@@ -20,10 +21,7 @@ from art.megatron.model_support.registry import (
     get_model_support_handler_for_spec,
     get_model_support_spec,
 )
-from art.megatron.model_support.spec import (
-    ArchitectureReport,
-    NativeVllmLoraStatus,
-)
+from art.megatron.model_support.spec import ArchitectureReport
 
 from ..artifacts import pinned_git_state
 from .validation_spec import (
@@ -41,6 +39,9 @@ WORKFLOW_STAGE_DIR_ENV = "ART_MODEL_SUPPORT_WORKFLOW_STAGE_DIR"
 SKIP_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_SKIP_SENSITIVITY"
 INCLUDE_FLASH_SENSITIVITY_ENV = "ART_MODEL_SUPPORT_INCLUDE_FLASH_SENSITIVITY"
 KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
+CORRECTNESS_ARTIFACT_ROOT_ENV = "ART_MODEL_SUPPORT_CORRECTNESS_ARTIFACT_ROOT"
+CORRECTNESS_PHASE_ENV = "ART_MODEL_SUPPORT_CORRECTNESS_PHASE"
+CORRECTNESS_REFERENCE_STAGE = "correctness_reference"
 WORKFLOW_ARTIFACT_SUITE_NAME = "Megatron model-support validation workflow"
 FLASH_SENSITIVITY_MUTATION = "attn_skip_flash_lse_normalize"
 _HANDLER_INAPPLICABLE_SENSITIVITY_MUTATIONS = {
@@ -55,19 +56,14 @@ MANDATORY_VALIDATION_STAGES = (
     "hf_parity",
     "lora_coverage",
     "train_inf_mismatch",
-    "merged_vllm_serving",
     "correctness_sensitivity",
     "chat_template_rollout",
     "packing_invariance",
     "length_trainability",
     "e2e_throughput",
 )
-NATIVE_VLLM_LORA_STAGE = "native_vllm_lora"
 YES_NO_TRAINABILITY_STAGE = "yes_no_trainability"
-OPTIONAL_VALIDATION_STAGES = (
-    YES_NO_TRAINABILITY_STAGE,
-    NATIVE_VLLM_LORA_STAGE,
-)
+OPTIONAL_VALIDATION_STAGES = (YES_NO_TRAINABILITY_STAGE,)
 ALL_VALIDATION_STAGES = (*MANDATORY_VALIDATION_STAGES, *OPTIONAL_VALIDATION_STAGES)
 ARCHITECTURE_REPRESENTATIVE_MODELS = {
     "llama3_dense": "meta-llama/Llama-3.2-1B-Instruct",
@@ -86,14 +82,12 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
         "hf_parity",
         "lora_coverage",
         "train_inf_mismatch",
-        "merged_vllm_serving",
         "correctness_sensitivity",
         "chat_template_rollout",
         "packing_invariance",
         "length_trainability",
         "e2e_throughput",
         YES_NO_TRAINABILITY_STAGE,
-        NATIVE_VLLM_LORA_STAGE,
     }
 )
 _RUNTIME_CLEANUP_STAGES = frozenset(
@@ -121,15 +115,11 @@ class AllArchitecturesValidationReport(BaseModel):
 
 def build_validation_stage_names(
     *,
-    include_native_vllm_lora: bool = False,
     include_yes_no_trainability: bool = False,
-    native_vllm_lora_status: NativeVllmLoraStatus | None = None,
 ) -> list[str]:
     stages = list(MANDATORY_VALIDATION_STAGES)
     if include_yes_no_trainability:
         stages.append(YES_NO_TRAINABILITY_STAGE)
-    if include_native_vllm_lora or native_vllm_lora_status not in {None, "disabled"}:
-        stages.append(NATIVE_VLLM_LORA_STAGE)
     return stages
 
 
@@ -146,7 +136,6 @@ def detect_dependency_versions() -> dict[str, str]:
 def initialize_validation_report(
     *,
     base_model: str,
-    include_native_vllm_lora: bool = False,
     include_yes_no_trainability: bool = False,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationReport:
@@ -162,9 +151,7 @@ def initialize_validation_report(
         stages=[
             ValidationStageResult(name=stage_name)
             for stage_name in build_validation_stage_names(
-                include_native_vllm_lora=include_native_vllm_lora,
                 include_yes_no_trainability=include_yes_no_trainability,
-                native_vllm_lora_status=spec.native_vllm_lora_status,
             )
         ],
     )
@@ -280,7 +267,13 @@ def _oracle_case_config(
     target_modules: list[str],
     allow_unvalidated_arch: bool,
 ) -> Any:
-    oracle_harness.ARTIFACT_ROOT = _stage_artifact_dir()
+    artifact_root = os.environ.get(CORRECTNESS_ARTIFACT_ROOT_ENV)
+    oracle_harness.ARTIFACT_ROOT = (
+        Path(artifact_root) if artifact_root is not None else _stage_artifact_dir()
+    )
+    num_layers = int(
+        os.environ.get("ART_MODEL_SUPPORT_FUNCTIONAL_NUM_LAYERS", num_layers)
+    )
     return oracle_harness.OracleCaseConfig(
         base_model=base_model,
         model_support_key=model_support_key,
@@ -422,8 +415,11 @@ def _run_stage_in_subprocess(
     base_model: str,
     architecture: ArchitectureReport,
     allow_unvalidated_arch: bool = False,
+    run_dir: Path | None = None,
+    stage_environment: Mapping[str, str] | None = None,
+    visible_gpu_ids: tuple[str, ...] | None = None,
 ) -> ValidationStageResult:
-    run_dir = Path(os.environ[WORKFLOW_RUN_DIR_ENV])
+    run_dir = run_dir or Path(os.environ[WORKFLOW_RUN_DIR_ENV])
     stage_dir = run_dir / stage_name
     stage_dir.mkdir(parents=True, exist_ok=False)
     architecture_json = stage_dir / "architecture.json"
@@ -449,6 +445,10 @@ def _run_stage_in_subprocess(
     if allow_unvalidated_arch:
         cmd.append("--allow-unsupported-arch")
     env = os.environ.copy()
+    if stage_environment is not None:
+        env.update(stage_environment)
+    if visible_gpu_ids is not None:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_gpu_ids)
     env["WANDB_MODE"] = "disabled"
     env[WORKFLOW_STAGE_DIR_ENV] = str(stage_dir)
     existing_pythonpath = env.get("PYTHONPATH")
@@ -519,11 +519,15 @@ def _raise_signal_exit(signum: int, _frame: Any) -> None:
 
 
 def _wait_stage_process(process: subprocess.Popen[Any], *, timeout_s: float) -> int:
-    previous_sigterm = signal.signal(signal.SIGTERM, _raise_signal_exit)
+    owns_signals = threading.current_thread() is threading.main_thread()
+    previous_sigterm = (
+        signal.signal(signal.SIGTERM, _raise_signal_exit) if owns_signals else None
+    )
     try:
         return process.wait(timeout=timeout_s)
     finally:
-        signal.signal(signal.SIGTERM, previous_sigterm)
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -623,7 +627,8 @@ def run_lora_coverage_stage(
     return ValidationStageResult(
         name="lora_coverage",
         passed=not report.missing_wrapped_target_modules
-        and not report.missing_exported_target_modules,
+        and not report.missing_exported_target_modules
+        and not report.unexpected_trainable_parameter_names,
         metrics=report.model_dump(mode="json"),
     )
 
@@ -657,7 +662,15 @@ def run_correctness_sensitivity_stage(
     allow_unvalidated_arch: bool = False,
 ) -> ValidationStageResult:
     stage_dir = _workflow_stage_dir()
-    correctness_log = stage_dir / "correctness.log"
+    phase = os.environ.get(CORRECTNESS_PHASE_ENV, "all")
+    if phase not in {"all", "reference", "variants"}:
+        raise ValueError(f"unsupported correctness phase: {phase}")
+    artifact_root = os.environ.get(CORRECTNESS_ARTIFACT_ROOT_ENV)
+    correctness_log = (
+        Path(artifact_root).parent / "reference.log"
+        if phase == "reference" and artifact_root is not None
+        else stage_dir / "correctness.log"
+    )
     sensitivity_log = stage_dir / "sensitivity.log"
     live_training_log = stage_dir / "live_training.log"
     oracle_harness = _import_integration_module(
@@ -685,9 +698,13 @@ def run_correctness_sensitivity_stage(
     oracle_world_size = oracle_harness.oracle_topology(
         is_moe=handler.is_moe
     ).world_size()
-    required_gpu_count = max(
-        oracle_world_size,
-        *(topology.world_size() for topology in suite_topologies),
+    required_gpu_count = (
+        oracle_world_size
+        if phase == "reference"
+        else max(
+            oracle_world_size,
+            *(topology.world_size() for topology in suite_topologies),
+        )
     )
     if available_gpu_count < required_gpu_count:
         raise RuntimeError(
@@ -714,6 +731,33 @@ def run_correctness_sensitivity_stage(
         target_modules=list(spec.default_target_modules),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
+    if phase == "reference":
+        live_training_log.write_text("", encoding="utf-8")
+        with _temporary_env(**{oracle_harness.ORACLE_OBJECTIVE_ENV: "all"}):
+            with _temporary_env(
+                **{ORACLE_LIVE_TRAINING_LOG_ENV: str(live_training_log)}
+            ):
+                with _redirect_output(correctness_log):
+                    oracle_harness.prepare_suite_references(
+                        case_config=case_config,
+                        use_fp32_lora_reference=correctness_use_fp32_lora_reference,
+                    )
+        return ValidationStageResult(
+            name=CORRECTNESS_REFERENCE_STAGE,
+            passed=True,
+            metrics={
+                "correctness_reference_log_path": str(correctness_log),
+                "live_training_log_path": str(live_training_log),
+                "requested_num_layers": case_config.num_layers,
+                "precision": correctness_precision,
+                "use_fp32_lora_reference": correctness_use_fp32_lora_reference,
+                "is_moe": handler.is_moe,
+                "available_gpu_count": available_gpu_count,
+                "required_gpu_count": required_gpu_count,
+            },
+            artifact_dir=case_artifacts.case_dir,
+        )
     mutations: list[str] = []
     inapplicable_sensitivity_mutations: list[str] = []
     default_excluded_sensitivity_mutations: list[str] = []
@@ -773,6 +817,7 @@ def run_correctness_sensitivity_stage(
                     cp_supported=cp_supported,
                     phase_pass_fns=correctness_phase_pass_fns,
                     use_fp32_lora_reference=correctness_use_fp32_lora_reference,
+                    require_existing_references=phase == "variants",
                     prune_reference_artifacts=skip_sensitivity or not mutations,
                     prune_case_artifacts=skip_sensitivity or not mutations,
                 )
@@ -800,12 +845,16 @@ def run_correctness_sensitivity_stage(
                         mutations=mutations,
                         max_world_size=max_world_size,
                     )
-    case_artifacts = oracle_harness.ensure_case_artifacts(case_config)
     return ValidationStageResult(
         name="correctness_sensitivity",
         passed=True,
         metrics={
             "correctness_log_path": str(correctness_log),
+            "correctness_reference_log_path": (
+                str(Path(artifact_root).parent / "reference.log")
+                if phase == "variants" and artifact_root is not None
+                else None
+            ),
             "sensitivity_log_path": str(sensitivity_log),
             "live_training_log_path": str(live_training_log),
             "requested_num_layers": case_config.num_layers,
@@ -861,70 +910,6 @@ def run_correctness_sensitivity_stage(
         },
         artifact_dir=case_artifacts.case_dir,
     )
-
-
-def run_merged_vllm_serving_stage(
-    *,
-    base_model: str,
-    architecture: ArchitectureReport,
-    allow_unvalidated_arch: bool = False,
-) -> ValidationStageResult:
-    merged_vllm_serving = _import_integration_module(
-        "integration.megatron.lora.merged_vllm_serving"
-    )
-    oracle_harness = _import_integration_module(
-        "integration.megatron.model_support.oracle_harness"
-    )
-    spec = get_model_support_spec(
-        base_model,
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    handler = get_model_support_handler_for_spec(spec)
-    case_config = _oracle_case_config(
-        oracle_harness,
-        base_model=base_model,
-        model_support_key=spec.key,
-        is_moe=handler.is_moe,
-        precision=handler.correctness_precision(),
-        num_layers=max(1, architecture.recommended_min_layers),
-        target_modules=list(spec.default_target_modules),
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    report = merged_vllm_serving.run_merged_vllm_serving(case_config)
-    metrics = report.model_dump(mode="json")
-    warning_lines = _read_vllm_reload_warnings(report.output_dir)
-    metrics["vllm_reload_warning_count"] = len(warning_lines)
-    metrics["vllm_reload_warnings"] = warning_lines
-    metrics["readable_summary"] = _merged_vllm_serving_summary(metrics)
-    return ValidationStageResult(
-        name="merged_vllm_serving",
-        passed=bool(report.model_ids),
-        metrics=metrics,
-        artifact_dir=report.output_dir,
-    )
-
-
-def _read_vllm_reload_warnings(output_dir: str) -> list[str]:
-    log_path = Path(output_dir) / "logs" / "vllm-runtime.log"
-    if not log_path.exists():
-        return []
-    return [
-        line.strip()
-        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        if "Failed to load weights" in line
-    ]
-
-
-def _merged_vllm_serving_summary(metrics: dict[str, Any]) -> list[str]:
-    lines = [
-        f"served_model_name={metrics.get('served_model_name', '')}",
-        f"model_ids={metrics.get('model_ids', [])}",
-        f"completion_text={metrics.get('completion_text', '')!r}",
-        f"vllm_reload_warning_count={metrics.get('vllm_reload_warning_count', 0)}",
-    ]
-    for warning in metrics.get("vllm_reload_warnings", []):
-        lines.append(f"vllm_reload_warning={warning}")
-    return lines
 
 
 def run_chat_template_rollout_stage(
@@ -1002,51 +987,6 @@ def run_length_trainability_stage(
     )
 
 
-def run_native_vllm_lora_stage(
-    *,
-    base_model: str,
-    architecture: ArchitectureReport,
-    allow_unvalidated_arch: bool = False,
-) -> ValidationStageResult:
-    native_vllm_lora = _import_integration_module(
-        "integration.megatron.lora.native_vllm_lora"
-    )
-    oracle_harness = _import_integration_module(
-        "integration.megatron.model_support.oracle_harness"
-    )
-    spec = get_model_support_spec(
-        base_model,
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    handler = get_model_support_handler_for_spec(spec)
-    case_config = _oracle_case_config(
-        oracle_harness,
-        base_model=base_model,
-        model_support_key=spec.key,
-        is_moe=handler.is_moe,
-        precision=handler.correctness_precision(),
-        num_layers=max(1, architecture.recommended_min_layers),
-        target_modules=list(spec.default_target_modules),
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    report = native_vllm_lora.run_native_vllm_lora(case_config)
-    passed = (
-        report.rollout_weights_mode == "lora"
-        and report.step0_served
-        and report.step1_served
-        and report.step0_name in report.model_ids_before
-        and report.step1_name not in report.model_ids_before
-        and report.step0_name in report.model_ids_after
-        and report.step1_name in report.model_ids_after
-    )
-    return ValidationStageResult(
-        name=NATIVE_VLLM_LORA_STAGE,
-        passed=passed,
-        metrics=report.model_dump(mode="json"),
-        artifact_dir=report.output_dir,
-    )
-
-
 def run_packing_invariance_stage(
     *,
     base_model: str,
@@ -1094,7 +1034,6 @@ def run_e2e_throughput_stage(
 def build_validation_report(
     *,
     base_model: str,
-    include_native_vllm_lora: bool = False,
     include_yes_no_trainability: bool = False,
     include_sensitivity: bool | None = None,
     output_json: str | Path | None = None,
@@ -1108,9 +1047,6 @@ def build_validation_report(
     only_stage_run_set = _only_stage_run_set(only_stage)
     report = initialize_validation_report(
         base_model=base_model,
-        include_native_vllm_lora=(
-            include_native_vllm_lora or only_stage == NATIVE_VLLM_LORA_STAGE
-        ),
         include_yes_no_trainability=(
             include_yes_no_trainability or only_stage == YES_NO_TRAINABILITY_STAGE
         ),
@@ -1132,14 +1068,12 @@ def build_validation_report(
         "hf_parity": run_hf_parity_stage,
         "lora_coverage": run_lora_coverage_stage,
         "train_inf_mismatch": run_train_inf_mismatch_stage,
-        "merged_vllm_serving": run_merged_vllm_serving_stage,
         "correctness_sensitivity": run_correctness_sensitivity_stage,
         "chat_template_rollout": run_chat_template_rollout_stage,
         "packing_invariance": run_packing_invariance_stage,
         "length_trainability": run_length_trainability_stage,
         "e2e_throughput": run_e2e_throughput_stage,
         YES_NO_TRAINABILITY_STAGE: run_yes_no_trainability_stage,
-        NATIVE_VLLM_LORA_STAGE: run_native_vllm_lora_stage,
     }
     env = {WORKFLOW_RUN_DIR_ENV: str(run_dir)}
     if include_sensitivity is not None:
@@ -1378,6 +1312,54 @@ def _print_stage_result(stage: ValidationStageResult, *, indent: str = "") -> No
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    if args.only_stage is None and not args.stop_on_failure:
+        from .workflow_scheduler import build_scheduled_validation_reports
+
+        base_models = (
+            validated_architecture_representative_models()
+            if args.all_architectures
+            else [args.base_model]
+        )
+        output_json_by_model: dict[str, Path | None] = {
+            base_model: (
+                _per_architecture_output_json(
+                    args.output_json,
+                    get_model_support_spec(
+                        base_model,
+                        allow_unvalidated_arch=args.allow_unsupported_arch,
+                    ).key,
+                )
+                if args.all_architectures
+                else Path(args.output_json)
+            )
+            for base_model in base_models
+        }
+        reports = build_scheduled_validation_reports(
+            base_models=base_models,
+            include_sensitivity=args.include_sensitivity,
+            include_yes_no_trainability=args.include_yes_no_trainability,
+            output_json_by_model=output_json_by_model,
+            skip_stages=set(args.skip_stage),
+            allow_unvalidated_arch=args.allow_unsupported_arch,
+        )
+        if args.all_architectures:
+            all_report = AllArchitecturesValidationReport(
+                reports=reports,
+                passed=all(report.passed for report in reports),
+                complete=all(report.complete for report in reports),
+            )
+            _write_all_architectures_report(all_report, args.output_json)
+            for report in reports:
+                print(f"base_model={report.base_model}", flush=True)
+                for stage in report.stages:
+                    _print_stage_result(stage, indent="  ")
+            print(f"report_json={args.output_json}", flush=True)
+            return 0 if all_report.passed else 1
+        report = reports[0]
+        for stage in report.stages:
+            _print_stage_result(stage)
+        print(f"report_json={args.output_json}", flush=True)
+        return 0 if report.passed else 1
     if args.all_architectures:
         all_report = build_all_architectures_validation_report(
             include_yes_no_trainability=args.include_yes_no_trainability,

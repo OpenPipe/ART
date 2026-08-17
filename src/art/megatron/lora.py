@@ -36,11 +36,9 @@ from .kernels.cute_grouped_lora_quack import (
     quack_grouped_lora_dual,
 )
 from .lora_config import (
-    DENSE_LORA_RANK,
     LORA_ALPHA,
     MEGATRON_LORA_RANK_ENV,
     MEGATRON_LORA_TARGET_MODULES_ENV,
-    MOE_LORA_RANK,
     default_lora_rank_for_handler,
 )
 

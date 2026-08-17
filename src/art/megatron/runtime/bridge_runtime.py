@@ -204,24 +204,6 @@ def _direct_hf_weight_source(key: str) -> HfWeightSource:
 _HF_EXPERT_RE = re.compile(r"(?P<prefix>(?:^|\.)experts\.)(?P<expert>\d+)(?=\.|$)")
 
 
-def _remap_hf_expert_name(
-    name: str,
-    expert_ids: tuple[int | None, ...],
-) -> str:
-    def replace_expert(match: re.Match[str]) -> str:
-        expert = int(match.group("expert"))
-        if not 0 <= expert < len(expert_ids):
-            raise RuntimeError(
-                f"expert {expert} is outside remapping domain [0, {len(expert_ids)})"
-            )
-        mapped = expert_ids[expert]
-        if mapped is None:
-            raise RuntimeError(f"masked physical expert {expert} has no logical name")
-        return f"{match.group('prefix')}{mapped}"
-
-    return _HF_EXPERT_RE.sub(replace_expert, name)
-
-
 def _logical_hf_param(
     hf_param: Any,
     *,

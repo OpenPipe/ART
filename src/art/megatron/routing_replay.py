@@ -34,6 +34,21 @@ def _active_routing_replay_controller() -> Any | None:
     return _ACTIVE_ROUTING_REPLAY_CONTROLLER
 
 
+@torch.compiler.disable
+def _routing_with_replay_boundary(
+    router_module: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    controller = _active_routing_replay_controller()
+    if controller is not None:
+        controller._prepare_native_target_for_router(
+            router_module._art_routing_replay_router_key,
+            logits=args[0],
+        )
+    return router_module._art_routing_replay_original(*args, **kwargs)
+
+
 def _to_tensor_cpu_contiguous(
     tensor: torch.Tensor, *, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -101,6 +116,77 @@ def _global_layer_prefixes(chunk: Any) -> list[tuple[str, int]]:
         if layer is not None:
             prefixes[module_name] = int(layer.layer_number) - 1
     return sorted(prefixes.items(), key=lambda item: len(item[0]), reverse=True)
+
+
+def prepare_moe_routing_replay_boundaries(
+    model_chunks: list[Any],
+    *,
+    pipeline_model: bool | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Install stable eager router boundaries before model compilation."""
+    if pipeline_model is None:
+        from megatron.core import parallel_state as ps
+
+        pipeline_model = len(model_chunks) > 1 or (
+            ps.model_parallel_is_initialized()
+            and int(ps.get_pipeline_model_parallel_world_size()) > 1
+        )
+    bindings: dict[str, dict[str, Any]] = {}
+    for chunk_index, chunk in enumerate(model_chunks):
+        layer_prefixes = _global_layer_prefixes(chunk)
+        for module_name, module in chunk.named_modules():
+            if ROUTER_NAME_TOKEN not in module_name or not hasattr(module, "routing"):
+                continue
+            router_key = _router_key_for_model_module(
+                module_name=module_name,
+                layer_prefixes=layer_prefixes,
+                fallback_chunk_index=None if pipeline_model else chunk_index,
+            )
+            if router_key in bindings:
+                raise RuntimeError(
+                    "Multiple local model chunks own the same replay router: "
+                    f"router_key='{router_key}'"
+                )
+            config = getattr(module, "config", None)
+            if bool(getattr(config, "moe_router_fusion", False)):
+                raise RuntimeError(
+                    "MoE routing replay requires moe_router_fusion=False because "
+                    "Megatron Core fused routing bypasses RouterReplay: "
+                    f"router_key='{router_key}'"
+                )
+            router_replay = getattr(module, "router_replay", None)
+            if router_replay is None:
+                raise RuntimeError(
+                    "MoE routing replay requires provider.moe_enable_routing_replay=True "
+                    "before model construction: "
+                    f"router_key='{router_key}'"
+                )
+            installed_key = getattr(
+                module, "_art_routing_replay_router_key", router_key
+            )
+            if installed_key != router_key:
+                raise RuntimeError(
+                    "Routing replay boundary key changed after model construction: "
+                    f"{installed_key!r} != {router_key!r}"
+                )
+            if not getattr(module, "_art_routing_replay_target_patched", False):
+                module._art_routing_replay_original = module.routing
+                module._art_routing_replay_router_key = router_key
+                module.routing = types.MethodType(_routing_with_replay_boundary, module)
+                module._art_routing_replay_target_patched = True
+            bindings[router_key] = {
+                "module": module,
+                "router_replay": router_replay,
+                "sequence_parallel": bool(getattr(config, "sequence_parallel", False)),
+                "context_parallel_size": int(
+                    getattr(config, "context_parallel_size", 1)
+                ),
+                "topk": int(getattr(module, "topk")),
+                "chunk_index": chunk_index,
+                "layer_index": _global_layer_from_router_key(router_key),
+                "num_experts": int(getattr(config, "num_moe_experts", 0) or 0),
+            }
+    return bindings
 
 
 def build_router_key_from_trace_name(trace_module_name: str) -> str:
@@ -820,139 +906,23 @@ class MoeRoutingReplayController:
         if self._router_bindings:
             return
         pipeline_model = self.bundle.topology.pp > 1 or len(model_chunks) > 1
-        for chunk_index, chunk in enumerate(model_chunks):
-            self._local_router_keys_by_chunk[chunk_index] = set()
-            layer_prefixes = _global_layer_prefixes(chunk)
-            for module_name, module in chunk.named_modules():
-                if ROUTER_NAME_TOKEN not in module_name or not hasattr(
-                    module, "routing"
-                ):
-                    continue
-                router_key = _router_key_for_model_module(
-                    module_name=module_name,
-                    layer_prefixes=layer_prefixes,
-                    fallback_chunk_index=None if pipeline_model else chunk_index,
+        bindings = prepare_moe_routing_replay_boundaries(
+            model_chunks,
+            pipeline_model=pipeline_model,
+        )
+        self._local_router_keys_by_chunk = {
+            chunk_index: set() for chunk_index in range(len(model_chunks))
+        }
+        for router_key, binding in bindings.items():
+            chunk_index = int(binding["chunk_index"])
+            if self.strict and router_key not in self.bundle.router_keys:
+                raise RuntimeError(
+                    "Router key from model is missing in replay bundle: "
+                    f"router_key='{router_key}'"
                 )
-                if router_key in self._router_bindings:
-                    raise RuntimeError(
-                        "Multiple local model chunks own the same replay router: "
-                        f"router_key='{router_key}'"
-                    )
-                if self.strict and router_key not in self.bundle.router_keys:
-                    raise RuntimeError(
-                        "Router key from model is missing in replay bundle: "
-                        f"router_key='{router_key}'"
-                    )
-                config = getattr(module, "config", None)
-                if bool(getattr(config, "moe_router_fusion", False)):
-                    raise RuntimeError(
-                        "MoE routing replay requires moe_router_fusion=False because "
-                        "Megatron Core fused routing bypasses RouterReplay: "
-                        f"router_key='{router_key}'"
-                    )
-                router_replay = getattr(module, "router_replay", None)
-                if router_replay is None:
-                    raise RuntimeError(
-                        "MoE routing replay requires provider.moe_enable_routing_replay=True "
-                        "before model construction: "
-                        f"router_key='{router_key}'"
-                    )
-                if getattr(router_replay, "_art_routing_replay_patched", False):
-                    raise RuntimeError(
-                        "RouterReplay instance is already patched: "
-                        f"router_key='{router_key}'"
-                    )
-                if getattr(module, "_art_routing_replay_target_patched", False):
-                    raise RuntimeError(
-                        "Router module routing method is already patched: "
-                        f"router_key='{router_key}'"
-                    )
-
-                sequence_parallel = bool(getattr(config, "sequence_parallel", False))
-                context_parallel_size = int(getattr(config, "context_parallel_size", 1))
-                topk = int(getattr(module, "topk"))
-                original_routing = module.routing
-
-                def _prepare_native_target_for_bound_router(
-                    logits: torch.Tensor,
-                    _controller: MoeRoutingReplayController = self,
-                    _router_key: str = router_key,
-                ) -> None:
-                    _controller._prepare_native_target_for_router(
-                        _router_key, logits=logits
-                    )
-
-                prepare_native_target = torch.compiler.disable(
-                    _prepare_native_target_for_bound_router
-                )
-
-                def _hash_routing_with_replay_target(
-                    router_module: Any,
-                    *args: Any,
-                    _original_routing: Any = original_routing,
-                    _prepare_native_target: Any = prepare_native_target,
-                    **kwargs: Any,
-                ) -> Any:
-                    del router_module
-                    _prepare_native_target(args[0])
-                    return _original_routing(*args, **kwargs)
-
-                def _moe_routing_with_replay_target(
-                    router_module: Any,
-                    *args: Any,
-                    _original_routing: Any = original_routing,
-                    _prepare_native_target: Any = prepare_native_target,
-                    **kwargs: Any,
-                ) -> Any:
-                    del router_module
-                    _prepare_native_target(args[0])
-                    return _original_routing(*args, **kwargs)
-
-                def _routing_with_replay_target(
-                    router_module: Any,
-                    *args: Any,
-                    _original_routing: Any = original_routing,
-                    _prepare_native_target: Any = prepare_native_target,
-                    **kwargs: Any,
-                ) -> Any:
-                    del router_module
-                    # Target selection mutates Python replay cursors and Megatron's
-                    # RouterReplay state; keep it out of Dynamo while preserving
-                    # compiled routing compute below.
-                    _prepare_native_target(args[0])
-                    return _original_routing(*args, **kwargs)
-
-                original_routing_name = getattr(
-                    getattr(original_routing, "__func__", None), "__name__", ""
-                )
-                if original_routing_name == "_hash_routing":
-                    routing_wrapper = _hash_routing_with_replay_target
-                elif original_routing_name == "_moe_routing":
-                    routing_wrapper = _moe_routing_with_replay_target
-                else:
-                    routing_wrapper = _routing_with_replay_target
-                # Routing replay mutates Python replay cursors and Megatron's
-                # RouterReplay target state immediately before routing consumes
-                # it. Keep the whole patched routing boundary eager so Dynamo
-                # cannot specialize or reorder around that mutable replay state.
-                module.routing = types.MethodType(
-                    torch.compiler.disable(routing_wrapper),
-                    module,
-                )
-                setattr(module, "_art_routing_replay_target_patched", True)
-                self._router_bindings[router_key] = {
-                    "module": module,
-                    "original_routing": original_routing,
-                    "router_replay": router_replay,
-                    "sequence_parallel": sequence_parallel,
-                    "context_parallel_size": context_parallel_size,
-                    "topk": topk,
-                    "chunk_index": chunk_index,
-                    "layer_index": _global_layer_from_router_key(router_key),
-                    "num_experts": int(getattr(config, "num_moe_experts", 0) or 0),
-                }
-                self._local_router_keys.add(router_key)
-                self._local_router_keys_by_chunk[chunk_index].add(router_key)
+            self._router_bindings[router_key] = binding
+            self._local_router_keys.add(router_key)
+            self._local_router_keys_by_chunk[chunk_index].add(router_key)
         self._runtime_topology = self._runtime_parallel_topology(model_chunks)
         self._validate_runtime_topology()
         self._validate_local_routes()
@@ -969,13 +939,6 @@ class MoeRoutingReplayController:
         global _ACTIVE_ROUTING_REPLAY_CONTROLLER
         if _ACTIVE_ROUTING_REPLAY_CONTROLLER is self:
             _ACTIVE_ROUTING_REPLAY_CONTROLLER = None
-        for binding in self._router_bindings.values():
-            module = binding["module"]
-            original_routing = binding.get("original_routing")
-            if original_routing is not None:
-                module.routing = original_routing
-            if hasattr(module, "_art_routing_replay_target_patched"):
-                delattr(module, "_art_routing_replay_target_patched")
         self._router_bindings.clear()
         self._local_router_keys.clear()
         self._local_router_keys_by_chunk.clear()

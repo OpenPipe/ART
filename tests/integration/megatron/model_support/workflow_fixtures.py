@@ -23,11 +23,22 @@ _CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
 _TOKENIZER_FIXTURE_ROOT = Path("/tmp/art-model-support-workflow/tokenizer-compatible")
 _TOKENIZER_CACHE_ROOT = Path("/tmp/art-model-support-workflow/tokenizer-hf-cache")
 _CANONICAL_CACHE_ROOT = Path("/tmp/art-model-support-workflow/canonical-hf-cache")
+_FUNCTIONAL_FIXTURE_ROOT = Path("/tmp/art-model-support-workflow/functional")
+_FUNCTIONAL_CACHE_ROOT = Path("/tmp/art-model-support-workflow/functional-hf-cache")
 _GEMMA_CANONICAL_WEIGHT_STAGES = frozenset({"hf_parity", "packing_invariance"})
 _PRETRAINED_WEIGHT_STAGES = frozenset({"length_trainability", "yes_no_trainability"})
+_FUNCTIONAL_STAGES = frozenset(
+    {
+        "train_inf_mismatch",
+    }
+)
 _GEMMA_YES_NO_ENV = {
     "ART_MODEL_SUPPORT_YES_NO_ALLOWED_TOKEN_IDS": "4443,951,7463",
     "ART_MODEL_SUPPORT_YES_NO_MAX_TOKENS": "1",
+}
+_RESIDENT_FUNCTIONAL_ENV = {
+    "gemma4_dense": {"ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN": "2560"},
+    "gemma4_moe": {"ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN": "2560"},
 }
 _REDUCED_TRAINABILITY_ENV: dict[str, dict[str, dict[str, str]]] = {
     "gemma4_dense": {"yes_no_trainability": _GEMMA_YES_NO_ENV},
@@ -45,15 +56,8 @@ _REDUCED_TRAINABILITY_ENV: dict[str, dict[str, dict[str, str]]] = {
         },
     },
 }
-_TOKENIZER_COMPATIBLE_STAGES = frozenset(
-    {
-        "train_inf_mismatch",
-        "merged_vllm_serving",
-        "native_vllm_lora",
-    }
-)
-_TRAIN_INF_CANONICAL_WEIGHT_MODELS = frozenset({"dsv4", "gpt_oss_moe"})
 _TOKENIZER_FIXTURE_VERSION = 3
+_FUNCTIONAL_FIXTURE_VERSION = 1
 _REVISIONS = {
     "meta-llama/Llama-3.2-1B-Instruct": "9213176726f574b556790deb65791e0c5aa438b6",
     "Qwen/Qwen3-32B": "9216db5781bf21249d130ec9da846c4624c16137",
@@ -81,6 +85,9 @@ class WorkflowFixture(BaseModel):
     tokenizer_compatible_path: str | None = None
     tokenizer_compatible_hf_home: str | None = None
     tokenizer_compatible_manifest: dict[str, object] | None = None
+    functional_path: str | None = None
+    functional_hf_home: str | None = None
+    functional_manifest: dict[str, object] | None = None
     canonical_path: str | None = None
     canonical_hf_home: str | None = None
 
@@ -88,36 +95,42 @@ class WorkflowFixture(BaseModel):
         reduced_trainability = _REDUCED_TRAINABILITY_ENV.get(self.model_key, {}).get(
             stage_name
         )
+        use_functional = stage_name in _FUNCTIONAL_STAGES
         use_canonical = (
-            (stage_name in _PRETRAINED_WEIGHT_STAGES and reduced_trainability is None)
-            or (
-                self.model_key.startswith("gemma4_")
-                and stage_name in _GEMMA_CANONICAL_WEIGHT_STAGES
-            )
-            or (
-                self.model_key in _TRAIN_INF_CANONICAL_WEIGHT_MODELS
-                and stage_name == "train_inf_mismatch"
-            )
+            stage_name in _PRETRAINED_WEIGHT_STAGES and reduced_trainability is None
+        ) or (
+            self.model_key.startswith("gemma4_")
+            and stage_name in _GEMMA_CANONICAL_WEIGHT_STAGES
         )
-        use_tokenizer_compatible = stage_name in _TOKENIZER_COMPATIBLE_STAGES or (
+        use_tokenizer_compatible = (
             self.model_key.startswith("gemma4_") and reduced_trainability is not None
         )
         path = (
-            self.canonical_path
+            self.functional_path
+            if use_functional
+            else self.canonical_path
             if use_canonical
             else self.tokenizer_compatible_path
             if use_tokenizer_compatible
             else self.path
         )
         hf_home = (
-            self.canonical_hf_home
+            self.functional_hf_home
+            if use_functional
+            else self.canonical_hf_home
             if use_canonical
             else self.tokenizer_compatible_hf_home
             if use_tokenizer_compatible
             else self.hf_home
         )
         if path is None or hf_home is None:
-            contract = "canonical weights" if use_canonical else "canonical vocabulary"
+            contract = (
+                "pretrained production-width functional weights"
+                if use_functional
+                else "canonical weights"
+                if use_canonical
+                else "canonical vocabulary"
+            )
             raise RuntimeError(f"{self.model_key} {stage_name} requires {contract}")
         hub = str(Path(hf_home) / "hub")
         environment = {
@@ -130,8 +143,21 @@ class WorkflowFixture(BaseModel):
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
         }
+        if use_functional:
+            assert self.functional_manifest is not None
+            num_layers = self.functional_manifest.get("num_layers")
+            if type(num_layers) is not int:
+                raise RuntimeError(f"{self.model_key} functional depth is invalid")
+            environment["ART_MODEL_SUPPORT_FUNCTIONAL_NUM_LAYERS"] = str(num_layers)
         if reduced_trainability is not None:
             environment.update(reduced_trainability)
+        return environment
+
+    def resident_functional_environment(self) -> dict[str, str]:
+        environment = self.environment("length_trainability")
+        environment.update(_RESIDENT_FUNCTIONAL_ENV.get(self.model_key, {}))
+        if self.model_key == "glm52":
+            environment.update(self.environment("train_inf_mismatch"))
         return environment
 
 
@@ -280,6 +306,56 @@ _MULTIMODAL_SHAPES = {
 }
 # fmt: on
 
+_FUNCTIONAL_LAYER_FIELDS = ("layer_types", "mlp_layer_types", "indexer_types")
+_WIDTH_TERMS = ("hidden", "intermediate", "head", "expert", "lora_rank", "topk")
+
+
+class _FunctionalPlan(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    depth: int
+    prefix: str
+    config_key: str | None = None
+    checkpoint: str = "model.safetensors.index.json"
+    vision: tuple[str, str] | None = None
+    auxiliary: tuple[str | None, str] | None = None
+
+
+def _plan(depth: int, prefix: str, **values: Any) -> _FunctionalPlan:
+    return _FunctionalPlan(depth=depth, prefix=prefix, **values)
+
+
+# fmt: off
+_QWEN35 = {"layer_types": (("linear_attention",) * 3 + ("full_attention",)) * 2}
+_GEMMA4 = {"layer_types": (("sliding_attention",) * 5 + ("full_attention",)) * 2}
+_FUNCTIONAL_PLANS = {
+    "llama3_dense": _plan(2, "model.layers", checkpoint="model.safetensors"),
+    "qwen3_dense": _plan(2, "model.layers"),
+    "qwen3_moe": _plan(2, "model.layers"),
+    "qwen3_5_dense": _plan(8, "model.language_model.layers", config_key="text_config", vision=("model.visual.blocks", "depth")),
+    "qwen3_5_moe": _plan(8, "model.language_model.layers", config_key="text_config", vision=("model.visual.blocks", "depth")),
+    "gemma4_dense": _plan(12, "model.language_model.layers", config_key="text_config", vision=("model.vision_tower.encoder.layers", "num_hidden_layers")),
+    "gemma4_moe": _plan(12, "model.language_model.layers", config_key="text_config", vision=("model.vision_tower.encoder.layers", "num_hidden_layers")),
+    "dsv4": _plan(6, "layers", auxiliary=("mtp", "num_nextn_predict_layers")),
+    "glm52": _plan(10, "model.layers", auxiliary=(None, "num_nextn_predict_layers")),
+    "gpt_oss_moe": _plan(4, "model.layers"),
+}
+_FUNCTIONAL_PATTERNS = {
+    "qwen3_dense": {"layer_types": ("full_attention",) * 2},
+    "qwen3_5_dense": _QWEN35, "qwen3_5_moe": _QWEN35,
+    "gemma4_dense": _GEMMA4, "gemma4_moe": _GEMMA4,
+    "dsv4": {
+        "layer_types": ("sliding_attention", "sliding_attention", "compressed_sparse_attention", "heavily_compressed_attention", "compressed_sparse_attention", "heavily_compressed_attention"),
+        "mlp_layer_types": ("hash_moe",) * 3 + ("moe",) * 3,
+    },
+    "glm52": {
+        "mlp_layer_types": ("dense",) * 3 + ("sparse",) * 7,
+        "indexer_types": ("full",) * 3 + ("shared",) * 3 + ("full",) + ("shared",) * 3,
+    },
+    "gpt_oss_moe": {"layer_types": ("sliding_attention", "full_attention") * 2},
+}
+# fmt: on
+
 
 def _configure(
     model_key: str,
@@ -360,6 +436,122 @@ def _pack_qwen35_experts(path: Path, config: Any) -> None:
     save_file(tensors, checkpoint, metadata={"format": "pt"})
 
 
+def _json_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _manifest_sha256(manifest: Mapping[str, object]) -> str:
+    return _json_sha256(
+        {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    )
+
+
+def _functional_plan(model_key: str) -> _FunctionalPlan:
+    try:
+        return _FUNCTIONAL_PLANS[model_key]
+    except KeyError:
+        raise RuntimeError(
+            f"no pretrained functional fixture for {model_key}"
+        ) from None
+
+
+def _config_text(config: dict[str, Any], plan: _FunctionalPlan) -> dict[str, Any]:
+    value = config if plan.config_key is None else config.get(plan.config_key)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"functional fixture lacks {plan.config_key} config")
+    return value
+
+
+def _config_shape(config: dict[str, Any], *exclude: str) -> dict[str, object]:
+    values = {key: value for key, value in config.items() if key not in exclude}
+    return {
+        "dimensions": {
+            key: value
+            for key, value in values.items()
+            if type(value) is int and any(term in key for term in _WIDTH_TERMS)
+        },
+        "sha256": _json_sha256(values),
+    }
+
+
+def _functional_config(
+    source: dict[str, Any], *, model_key: str
+) -> tuple[dict[str, Any], dict[str, object]]:
+    plan = _functional_plan(model_key)
+    text = _config_text(source, plan)
+    source_depth = text.get("num_hidden_layers")
+    if type(source_depth) is not int or source_depth < plan.depth:
+        raise RuntimeError(f"{model_key} has invalid production depth")
+    reduced = json.loads(json.dumps(source))
+    reduced_text = _config_text(reduced, plan)
+    reduced_text["num_hidden_layers"] = plan.depth
+    if plan.auxiliary:
+        _, count_field = plan.auxiliary
+        count = text.get(count_field)
+        if type(count) is not int or count < 0:
+            raise RuntimeError(f"{model_key} has invalid {count_field}")
+        reduced_text[count_field] = 0
+    patterns: dict[str, list[object]] = {}
+    for field in _FUNCTIONAL_LAYER_FIELDS:
+        if (values := text.get(field)) is not None:
+            if not isinstance(values, list) or len(values) != source_depth:
+                raise RuntimeError(f"{model_key} production {field} is incomplete")
+            patterns[field] = values[: plan.depth]
+            reduced_text[field] = patterns[field]
+    for field, expected in _FUNCTIONAL_PATTERNS.get(model_key, {}).items():
+        if tuple(patterns.get(field, ())) != expected:
+            raise RuntimeError(f"{model_key} production {field} pattern changed")
+
+    shape_exclusions = (
+        "num_hidden_layers",
+        *_FUNCTIONAL_LAYER_FIELDS,
+        *((plan.auxiliary[1],) if plan.auxiliary else ()),
+    )
+    width = {"text": _config_shape(text, *shape_exclusions)}
+    if width["text"] != _config_shape(reduced_text, *shape_exclusions):
+        raise RuntimeError(f"{model_key} functional fixture changed text width")
+    vision_policy: object = "not_applicable"
+    if plan.vision:
+        _, depth_field = plan.vision
+        vision, reduced_vision = (
+            source.get("vision_config"),
+            reduced.get("vision_config"),
+        )
+        if not isinstance(vision, dict) or not isinstance(reduced_vision, dict):
+            raise RuntimeError(f"{model_key} functional fixture lacks vision config")
+        source_vision_depth = vision.get(depth_field)
+        if type(source_vision_depth) is not int or source_vision_depth < 1:
+            raise RuntimeError(f"{model_key} has invalid production vision depth")
+        width["vision"] = _config_shape(vision, depth_field)
+        reduced_vision[depth_field] = 1
+        if width["vision"] != _config_shape(reduced_vision, depth_field):
+            raise RuntimeError(f"{model_key} functional fixture changed vision width")
+        vision_policy = {
+            "mode": "one_pretrained_production_width_layer",
+            "source_depth": source_vision_depth,
+            "text_path_semantics": "unchanged",
+        }
+    dtype = text.get("dtype") or text.get("torch_dtype")
+    dtype = dtype or source.get("dtype") or source.get("torch_dtype")
+    # fmt: off
+    return reduced, {
+        "source_num_layers": source_depth,
+        "selected_layer_sequence": list(range(plan.depth)),
+        "selected_layer_patterns": patterns,
+        "production_width": width,
+        "config_vocab_size": int(text["vocab_size"]),
+        "configured_dtype": str(dtype) if dtype else None,
+        "inference_quantization": {
+            "quantization_config": text.get("quantization_config") or source.get("quantization_config"),
+            "expert_dtype": text.get("expert_dtype") or source.get("expert_dtype"),
+        },
+        "vision_policy": vision_policy,
+    }
+    # fmt: on
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -368,9 +560,113 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _checkpoint_weight_map(path: Path) -> dict[str, str]:
+    from safetensors import safe_open
+
+    if path.name == "model.safetensors":
+        with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            values: object = dict.fromkeys(checkpoint.keys(), path.name)
+    else:
+        try:
+            values = json.loads(path.read_text())["weight_map"]
+        except (OSError, KeyError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"invalid checkpoint index {path}") from exc
+    if (
+        not isinstance(values, dict)
+        or not values
+        or any(
+            not isinstance(key, str)
+            or not isinstance(shard, str)
+            or Path(shard).name != shard
+            for key, shard in values.items()
+        )
+    ):
+        raise RuntimeError(f"invalid checkpoint weight map {path}")
+    return cast(dict[str, str], values)
+
+
+def _layer_index(name: str, prefix: str) -> int | None:
+    if not name.startswith(f"{prefix}."):
+        return None
+    index, separator, suffix = name[len(prefix) + 1 :].partition(".")
+    if not separator or not index.isdecimal() or not suffix:
+        raise RuntimeError(f"malformed checkpoint layer key {name!r}")
+    return int(index)
+
+
+def _select_functional_weights(
+    weights: Mapping[str, str], config: dict[str, Any], *, model_key: str
+) -> dict[str, str]:
+    plan = _functional_plan(model_key)
+    text_config = _config_text(config, plan)
+    source_depth = int(text_config["num_hidden_layers"])
+    text_layers: set[int] = set()
+    vision_layers: set[int] = set()
+    auxiliary_layers: set[int] = set()
+    selected: dict[str, str] = {}
+    for name, shard in weights.items():
+        text_layer = _layer_index(name, plan.prefix)
+        vision_layer = (
+            _layer_index(name, plan.vision[0])
+            if text_layer is None and plan.vision
+            else None
+        )
+        auxiliary_layer = (
+            _layer_index(name, plan.auxiliary[0])
+            if text_layer is None
+            and vision_layer is None
+            and plan.auxiliary
+            and plan.auxiliary[0]
+            else None
+        )
+        text_layers.update(() if text_layer is None else (text_layer,))
+        vision_layers.update(() if vision_layer is None else (vision_layer,))
+        auxiliary_layers.update(() if auxiliary_layer is None else (auxiliary_layer,))
+        if (
+            text_layer is None
+            and vision_layer is None
+            and auxiliary_layer is None
+            or text_layer is not None
+            and text_layer < plan.depth
+            or vision_layer == 0
+        ):
+            selected[name] = shard
+    auxiliary_prefix, auxiliary_count = plan.auxiliary or (None, None)
+    count = text_config.get(auxiliary_count) if auxiliary_count else 0
+    if type(count) is not int or count < 0:
+        raise RuntimeError(f"{model_key} has invalid {auxiliary_count}")
+    expected = set(
+        range(source_depth + (count if plan.auxiliary and not auxiliary_prefix else 0))
+    )
+    if text_layers != expected:
+        raise RuntimeError(f"{model_key} canonical text-layer coverage changed")
+    if auxiliary_prefix:
+        if auxiliary_layers != set(range(count)):
+            raise RuntimeError(
+                f"{model_key} canonical auxiliary-layer coverage changed"
+            )
+    if plan.vision:
+        vision = config.get("vision_config")
+        if not isinstance(vision, dict):
+            raise RuntimeError(f"{model_key} canonical vision config is missing")
+        if vision_layers != set(range(int(vision[plan.vision[1]]))):
+            raise RuntimeError(f"{model_key} canonical vision-layer coverage changed")
+    if not selected:
+        raise RuntimeError(f"{model_key} functional checkpoint selection is empty")
+    return selected
+
+
 def _fixture_files(path: Path) -> dict[str, str]:
     return {
         file.relative_to(path).as_posix(): _sha256(file)
+        for file in sorted(path.rglob("*"))
+        if file.is_file() and file.name != "fixture_manifest.json"
+    }
+
+
+def _fixture_file_sizes(path: Path) -> dict[str, int]:
+    return {
+        file.relative_to(path).as_posix(): file.stat().st_size
         for file in sorted(path.rglob("*"))
         if file.is_file() and file.name != "fixture_manifest.json"
     }
@@ -430,15 +726,15 @@ def _is_current(
     revision: str,
     tokenizer_compatible: bool,
     parent_manifest_sha256: str | None,
+    version: int | None = None,
 ) -> bool:
     try:
         manifest = json.loads((path / "fixture_manifest.json").read_text())
     except (OSError, json.JSONDecodeError):
         return False
     expected = {
-        "version": (
-            _TOKENIZER_FIXTURE_VERSION if tokenizer_compatible else FIXTURE_VERSION
-        ),
+        "version": version
+        or (_TOKENIZER_FIXTURE_VERSION if tokenizer_compatible else FIXTURE_VERSION),
         "source_model": canonical_model,
         "source_revision": revision,
         "handler": model_key,
@@ -451,8 +747,32 @@ def _is_current(
     return (
         _checkpoint_is_complete(path)
         and all(manifest.get(key) == value for key, value in expected.items())
-        and manifest.get("files") == _fixture_files(path)
+        and (
+            manifest.get("file_sizes") == _fixture_file_sizes(path)
+            if version is not None
+            else manifest.get("files") == _fixture_files(path)
+        )
+        and (
+            "manifest_sha256" not in manifest
+            or manifest["manifest_sha256"] == _manifest_sha256(manifest)
+        )
     )
+
+
+def _publish(staging: Path, output: Path) -> None:
+    previous = output.with_name(f".{output.name}.previous")
+    if previous.exists():
+        shutil.rmtree(previous)
+    if output.exists():
+        os.replace(output, previous)
+    try:
+        os.replace(staging, output)
+    except BaseException:
+        if previous.exists():
+            os.replace(previous, output)
+        raise
+    if previous.exists():
+        shutil.rmtree(previous)
 
 
 def _build(
@@ -463,6 +783,7 @@ def _build(
     output: Path,
     tokenizer_compatible: bool,
     source_fixture: Path | None = None,
+    functional: bool = False,
 ) -> None:
     from safetensors.torch import load_file, save_file
     import torch
@@ -491,6 +812,7 @@ def _build(
         source = AutoConfig.from_pretrained(
             source_model, trust_remote_code=True, **source_kwargs
         )
+        source_config = cast(dict[str, Any], source.to_dict())
         source.save_pretrained(staging / "production_config")
         tokenizer = cast(
             Any,
@@ -507,13 +829,22 @@ def _build(
                 f"{model_key} tokenizer ID {tokenizer_max_id} exceeds canonical "
                 f"vocab_size={source_vocab_size}"
             )
-        config = _configure(
-            model_key,
-            source,
-            source_vocab_size=source_vocab_size,
-            tokenizer_compatible=tokenizer_compatible,
-        )
+        functional_contract: dict[str, object] | None = None
+        if functional:
+            reduced, functional_contract = _functional_config(
+                source_config, model_key=model_key
+            )
+            config = source
+        else:
+            config = _configure(
+                model_key,
+                source,
+                source_vocab_size=source_vocab_size,
+                tokenizer_compatible=tokenizer_compatible,
+            )
         config.save_pretrained(staging)
+        if functional:
+            (staging / "config.json").write_text(json.dumps(reduced, indent=2) + "\n")
         tokenizer.save_pretrained(staging)
         if model_key in _MULTIMODAL:
             AutoProcessor.from_pretrained(
@@ -528,7 +859,16 @@ def _build(
                 **source_kwargs,
             ).save_pretrained(staging)
         parameters = 0
-        if model_key == "dsv4":
+        provenance: dict[str, object] | None = None
+        if functional:
+            provenance = _write_functional_weights(
+                canonical_model=canonical_model,
+                model_key=model_key,
+                revision=revision,
+                config=source_config,
+                output=staging,
+            )
+        elif model_key == "dsv4":
             save_file(
                 {"_art_fixture_dummy": torch.zeros(1)}, staging / "model.safetensors"
             )
@@ -590,25 +930,37 @@ def _build(
             "tokenizer_size": len(tokenizer),
             "tokenizer_max_id": tokenizer_max_id,
         }
+        if functional:
+            if functional_contract is None or provenance is None:
+                raise RuntimeError("functional fixture construction is incomplete")
+            manifest.update(
+                {
+                    "version": _FUNCTIONAL_FIXTURE_VERSION,
+                    "fixture_kind": "functional_pretrained",
+                    "pretrained": True,
+                    "num_layers": _functional_plan(model_key).depth,
+                    "dtype": {
+                        "configured": functional_contract["configured_dtype"],
+                        "checkpoint": provenance["checkpoint_dtypes"],
+                    },
+                    "weight_provenance": provenance,
+                    "contract_sha256": _functional_contract_sha256(model_key),
+                    **functional_contract,
+                }
+            )
         if tokenizer_compatible:
             _validate_tokenizer_compatible_fixture(staging, manifest)
-        manifest["files"] = _fixture_files(staging)
+        if functional and not _checkpoint_is_complete(staging):
+            raise RuntimeError(f"{model_key} functional checkpoint is incomplete")
+        if functional:
+            manifest["file_sizes"] = _fixture_file_sizes(staging)
+            manifest["manifest_sha256"] = _manifest_sha256(manifest)
+        else:
+            manifest["files"] = _fixture_files(staging)
         (staging / "fixture_manifest.json").write_text(
             json.dumps(manifest, indent=2) + "\n"
         )
-        previous = output.with_name(f".{output.name}.previous")
-        if previous.exists():
-            shutil.rmtree(previous)
-        if output.exists():
-            os.replace(output, previous)
-        try:
-            os.replace(staging, output)
-        except BaseException:
-            if previous.exists():
-                os.replace(previous, output)
-            raise
-        if previous.exists():
-            shutil.rmtree(previous)
+        _publish(staging, output)
 
 
 def _cache_alias(
@@ -696,6 +1048,92 @@ def _validate_tokenizer_compatible_fixture(
     manifest["tokenizer_max_id"] = registered_max_id
 
 
+def _functional_contract_sha256(model_key: str) -> str:
+    return _json_sha256(
+        (
+            _FUNCTIONAL_FIXTURE_VERSION,
+            _functional_plan(model_key).model_dump(mode="json"),
+            _FUNCTIONAL_PATTERNS.get(model_key),
+        )
+    )
+
+
+def _write_functional_weights(
+    *,
+    canonical_model: str,
+    model_key: str,
+    revision: str,
+    config: dict[str, Any],
+    output: Path,
+) -> dict[str, object]:
+    from huggingface_hub import hf_hub_download, snapshot_download
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    plan = _functional_plan(model_key)
+    cache = _CANONICAL_CACHE_ROOT / f"v{_CANONICAL_CACHE_VERSION}" / model_key / "hub"
+    checkpoint = Path(
+        hf_hub_download(
+            repo_id=canonical_model,
+            filename=plan.checkpoint,
+            revision=revision,
+            cache_dir=cache,
+        )
+    )
+    weights = _checkpoint_weight_map(checkpoint)
+    selected = _select_functional_weights(weights, config, model_key=model_key)
+    by_shard: dict[str, list[str]] = {}
+    for name, shard in selected.items():
+        by_shard.setdefault(shard, []).append(name)
+    source_root = Path(
+        snapshot_download(
+            repo_id=canonical_model,
+            revision=revision,
+            cache_dir=cache,
+            allow_patterns=[plan.checkpoint, *by_shard],
+        )
+    )
+
+    source_blobs: dict[str, str] = {}
+    dtypes: dict[str, int] = {}
+    total_size = 0
+    for source_name, names in sorted(by_shard.items()):
+        source_path = source_root / source_name
+        blob = source_path.resolve(strict=True).name
+        if len(blob) != 64 or any(c not in "0123456789abcdef" for c in blob):
+            raise RuntimeError(
+                f"canonical shard is not content-addressed: {source_path}"
+            )
+        with safe_open(source_path, framework="pt", device="cpu") as source:
+            tensors = {name: source.get_tensor(name) for name in sorted(names)}
+            for name in names:
+                dtype = str(source.get_slice(name).get_dtype())
+                dtypes[dtype] = dtypes.get(dtype, 0) + 1
+        save_file(tensors, output / source_name, metadata={"format": "pt"})
+        total_size += sum(t.numel() * t.element_size() for t in tensors.values())
+        source_blobs[source_name] = blob
+        del tensors
+    index = {
+        "metadata": {"total_size": total_size},
+        "weight_map": dict(sorted(selected.items())),
+    }
+    (output / "model.safetensors.index.json").write_text(
+        json.dumps(index, indent=2) + "\n"
+    )
+    # fmt: off
+    return {
+        "method": "safetensors_safe_open_get_tensor_v1",
+        "source_checkpoint": checkpoint.name,
+        "source_index_sha256": _sha256(checkpoint) if checkpoint.name.endswith(".json") else None,
+        "source_weight_map_sha256": _json_sha256(weights),
+        "source_shards": source_blobs,
+        "selected_key_count": len(selected),
+        "selected_keys_sha256": _json_sha256(sorted(selected)),
+        "checkpoint_dtypes": dtypes,
+    }
+    # fmt: on
+
+
 def _canonical_snapshot(
     *, canonical_model: str, model_key: str, revision: str
 ) -> tuple[Path, Path]:
@@ -723,6 +1161,7 @@ def _ensure_cached_fixture(
     version: int,
     tokenizer_compatible: bool,
     source_fixture: Path | None = None,
+    functional: bool = False,
 ) -> tuple[Path, dict[str, object], Path]:
     namespace = _fixture_namespace(
         canonical_model=canonical_model,
@@ -741,14 +1180,22 @@ def _ensure_cached_fixture(
     )
     with (model_root / f".{namespace}.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if not _is_current(
+        current = _is_current(
             output,
             canonical_model=canonical_model,
             model_key=model_key,
             revision=revision,
             tokenizer_compatible=tokenizer_compatible,
             parent_manifest_sha256=parent_manifest_sha256,
-        ):
+            version=version if functional else None,
+        )
+        if functional and current:
+            current = json.loads((output / "fixture_manifest.json").read_text()).get(
+                "contract_sha256"
+            ) == _functional_contract_sha256(model_key)
+        if not current:
+            if functional and source_fixture is None:
+                raise RuntimeError("functional fixture requires compact metadata")
             _build(
                 canonical_model=canonical_model,
                 model_key=model_key,
@@ -756,6 +1203,7 @@ def _ensure_cached_fixture(
                 output=output,
                 tokenizer_compatible=tokenizer_compatible,
                 source_fixture=source_fixture,
+                functional=functional,
             )
         manifest = cast(
             dict[str, object],
@@ -806,7 +1254,11 @@ def ensure_workflow_fixture(
     tokenizer_path: Path | None = None
     tokenizer_hf_home: Path | None = None
     tokenizer_manifest: dict[str, object] | None = None
-    if required_stages & _TOKENIZER_COMPATIBLE_STAGES:
+    reduced_trainability_stages = _REDUCED_TRAINABILITY_ENV.get(model_key, {})
+    tokenizer_required = model_key.startswith("gemma4_") and bool(
+        required_stages & reduced_trainability_stages.keys()
+    )
+    if tokenizer_required:
         tokenizer_path, tokenizer_manifest, tokenizer_hf_home = _ensure_cached_fixture(
             canonical_model=base_model,
             model_key=model_key,
@@ -817,23 +1269,31 @@ def ensure_workflow_fixture(
             tokenizer_compatible=True,
             source_fixture=output,
         )
+    functional_path: Path | None = None
+    functional_hf_home: Path | None = None
+    functional_manifest: dict[str, object] | None = None
+    if required_stages & _FUNCTIONAL_STAGES:
+        functional_path, functional_manifest, functional_hf_home = (
+            _ensure_cached_fixture(
+                canonical_model=base_model,
+                model_key=model_key,
+                revision=revision,
+                root=_FUNCTIONAL_FIXTURE_ROOT / f"v{_FUNCTIONAL_FIXTURE_VERSION}",
+                cache_root=_FUNCTIONAL_CACHE_ROOT,
+                version=_FUNCTIONAL_FIXTURE_VERSION,
+                tokenizer_compatible=True,
+                source_fixture=output,
+                functional=True,
+            )
+        )
     canonical_path: Path | None = None
     canonical_hf_home: Path | None = None
-    reduced_trainability_stages = _REDUCED_TRAINABILITY_ENV.get(model_key, {})
-    canonical_required = (
-        any(
-            stage in _PRETRAINED_WEIGHT_STAGES
-            and stage not in reduced_trainability_stages
-            for stage in required_stages
-        )
-        or (
-            model_key.startswith("gemma4_")
-            and bool(required_stages & _GEMMA_CANONICAL_WEIGHT_STAGES)
-        )
-        or (
-            model_key in _TRAIN_INF_CANONICAL_WEIGHT_MODELS
-            and "train_inf_mismatch" in required_stages
-        )
+    canonical_required = any(
+        stage in _PRETRAINED_WEIGHT_STAGES and stage not in reduced_trainability_stages
+        for stage in required_stages
+    ) or (
+        model_key.startswith("gemma4_")
+        and bool(required_stages & _GEMMA_CANONICAL_WEIGHT_STAGES)
     )
     if canonical_required:
         canonical_path, canonical_hf_home = _canonical_snapshot(
@@ -855,6 +1315,11 @@ def ensure_workflow_fixture(
             str(tokenizer_hf_home) if tokenizer_hf_home is not None else None
         ),
         tokenizer_compatible_manifest=tokenizer_manifest,
+        functional_path=(str(functional_path) if functional_path is not None else None),
+        functional_hf_home=(
+            str(functional_hf_home) if functional_hf_home is not None else None
+        ),
+        functional_manifest=functional_manifest,
         canonical_path=str(canonical_path) if canonical_path is not None else None,
         canonical_hf_home=(
             str(canonical_hf_home) if canonical_hf_home is not None else None

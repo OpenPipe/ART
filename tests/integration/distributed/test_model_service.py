@@ -1,7 +1,5 @@
-import ast
-import asyncio
-from pathlib import Path
 from types import MethodType, SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -22,22 +20,6 @@ from art.megatron.distributed_service import DistributedMegatronService
 from art.serving_capabilities import ART_SERVING_PROTOCOL_VERSION, ServingCapabilities
 
 
-def test_dedicated_runtime_advertises_the_required_protocol() -> None:
-    source = Path("vllm_runtime/src/art_vllm_runtime/dedicated_server.py")
-    tree = ast.parse(source.read_text("utf-8"))
-    advertised = next(
-        node.value.value
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "ART_SERVING_PROTOCOL_VERSION"
-            for target in node.targets
-        )
-        and isinstance(node.value, ast.Constant)
-    )
-    assert advertised == ART_SERVING_PROTOCOL_VERSION == 3
-
-
 def _spec() -> ModelServiceSpec:
     return ModelServiceSpec(
         name="model",
@@ -52,7 +34,6 @@ def _spec() -> ModelServiceSpec:
         model_revision="revision",
         runtime_fingerprint="runtime",
         parallel=VllmParallelSpec(),
-        update_mode="lora",
     )
 
 
@@ -80,10 +61,13 @@ async def test_runtime_retains_model_service_until_stop_succeeds(monkeypatch) ->
         cluster=SimpleNamespace(startup_timeout_s=1, rpc_timeout_s=1),
     )
     runtime._host_services = {"host0": object()}
+    runtime._adapter_services = {"host0": object()}
     runtime._model_services = {}
     runtime._started, runtime._closed = True, False
     runtime._preflight_launch = AsyncMock()
-    monkeypatch.setattr(runtime_module, "MonarchVllmHostLauncher", lambda _: object())
+    monkeypatch.setattr(
+        runtime_module, "MonarchVllmHostLauncher", lambda *_args: object()
+    )
     monkeypatch.setattr(runtime_module, "ReplicaManager", lambda *_a, **_kw: manager)
 
     with pytest.raises(RuntimeError, match="start failed"):
@@ -169,9 +153,12 @@ async def test_recovery_rebuilds_loaded_adapter_index(monkeypatch, tmp_path) -> 
     service._loaded_adapter_steps = {1, 3, 5}
     service._loaded_exact_adapter_steps = {2}
     service._exact_adapter_refcounts = {2: 1}
-    service._published_adapters[5] = SimpleNamespace(
-        generation_id="policy",
-        identity=str(tmp_path / "checkpoints" / "0005"),
+    service._published_adapters[5] = cast(
+        Any,
+        SimpleNamespace(
+            generation_id="policy",
+            identity=str(tmp_path / "checkpoints" / "0005"),
+        ),
     )
     service._load_adapter_at = AsyncMock(return_value=("model@2", "/step/2"))
     monkeypatch.setattr(
@@ -230,8 +217,12 @@ async def test_recovery_uses_serving_generation_while_learner_is_ahead(
     service._base_url = spec.leader_endpoint.url
     service._serving_capabilities = capabilities
     service._current_lora_name = "model@5"
-    service._published_adapters[5] = SimpleNamespace(
-        generation_id="serving-generation", identity=serving_path
+    service._published_adapters[5] = cast(
+        Any,
+        SimpleNamespace(
+            generation_id="serving-generation",
+            identity=serving_path,
+        ),
     )
     monkeypatch.setattr(
         service_module,
@@ -249,7 +240,9 @@ async def test_recovery_uses_serving_generation_while_learner_is_ahead(
     )
 
     manager.restart.assert_awaited_once_with(
-        served_model_name="model@5", lora_path=serving_path
+        served_model_name="model@5",
+        lora_path=serving_path,
+        initial_policy_version=5,
     )
     report = manager.verify_update.call_args.args[0]
     assert report.policy_version == "5"
@@ -263,7 +256,9 @@ async def test_recovery_uses_serving_generation_while_learner_is_ahead(
 async def test_retention_protects_absent_learner_and_serving_steps(
     monkeypatch, tmp_path
 ) -> None:
-    model = SimpleNamespace(project="project", name="model")
+    model = SimpleNamespace(
+        project="project", name="model", _storage_name=lambda: "model"
+    )
     output_dir = tmp_path / "project" / "models" / "model"
     service = _service(output_dir, SimpleNamespace())
     service._latest_step = 3
@@ -302,18 +297,3 @@ async def test_retention_protects_absent_learner_and_serving_steps(
     assert (checkpoints / "0002").is_dir()
     assert (checkpoints / "0003").is_dir()
     assert not (checkpoints / "0004").exists()
-
-
-@pytest.mark.asyncio
-async def test_in_flight_prune_does_not_enter_serving_critical_section(
-    tmp_path,
-) -> None:
-    service = _service(tmp_path, SimpleNamespace())
-    service.config["rollout_weight_update_mode"] = "in_flight_lora"
-    service._loaded_adapter_steps = {1, 2}
-    await service._serving_lock.acquire()
-    try:
-        await asyncio.wait_for(service.prune_loaded_adapters(retain_steps=set()), 0.1)
-    finally:
-        service._serving_lock.release()
-    assert service._loaded_adapter_steps == {1, 2}

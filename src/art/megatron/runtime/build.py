@@ -85,6 +85,7 @@ def build_trainer_runtime_spec(
         packed_sequence_length=runtime_config.packed_sequence_length,
         snapshot_pool_capacity=runtime_config.snapshot_pool_capacity,
         compile_enabled=compile_enabled,
+        compile_cache=runtime_config.compile_cache and compile_enabled,
         compile_fingerprint=_digest({**identity, "compile": compile_enabled}),
         optimizer_layout_fingerprint=_digest({"mesh": mesh.model_dump(mode="json")}),
         allow_unvalidated_arch=allow_unvalidated_arch,

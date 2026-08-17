@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -41,11 +41,13 @@ def manager(*, engine_args: dict[str, object] | None = None) -> ReplicaManager:
         model_revision="revision",
         runtime_fingerprint="runtime",
         parallel=VllmParallelSpec(tp=1, pp=2, dp=2, enable_expert_parallel=True),
-        update_mode="lora",
     )
     value = ReplicaManager(
         spec,
-        {"host0": SimpleNamespace(), "host1": SimpleNamespace()},
+        cast(
+            Any,
+            {"host0": SimpleNamespace(), "host1": SimpleNamespace()},
+        ),
         ReplicaLaunchTemplate(
             served_model_name="model@1", engine_args=engine_args or {}
         ),
@@ -70,11 +72,6 @@ def manager(*, engine_args: dict[str, object] | None = None) -> ReplicaManager:
     return value
 
 
-def test_one_service_is_the_deployment_contract() -> None:
-    assert "replicas" not in ModelServiceSpec.model_fields
-    assert "leader" not in ModelServiceMemberSpec.model_fields
-
-
 @pytest.mark.asyncio
 async def test_in_flight_update_is_the_only_acknowledgement_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -89,7 +86,7 @@ async def test_in_flight_update_is_the_only_acknowledgement_call(
         base_model="base",
         config={"rollout_weight_update_mode": "in_flight_lora"},
         output_dir=str(tmp_path),
-        runtime=runtime,
+        runtime=cast(Any, runtime),
         enable_expert_replay=False,
     )
     calls: list[tuple[str, dict[str, Any], dict[str, str] | None]] = []
@@ -159,7 +156,10 @@ def test_conflicting_untyped_revision_is_rejected() -> None:
     with pytest.raises(ValueError, match="revision conflicts"):
         ReplicaManager(
             value.spec,
-            {"host0": SimpleNamespace(), "host1": SimpleNamespace()},
+            cast(
+                Any,
+                {"host0": SimpleNamespace(), "host1": SimpleNamespace()},
+            ),
             ReplicaLaunchTemplate(
                 served_model_name="model@1", engine_args={"revision": "other"}
             ),

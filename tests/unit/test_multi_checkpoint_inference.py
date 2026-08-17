@@ -393,7 +393,7 @@ class TestUnslothServiceMaxLoras:
         service = UnslothService(
             model_name="test-model",
             base_model="meta-llama/Llama-3.1-8B",
-            config={"rollout_weights_mode": "lora"},
+            config={},
             output_dir="/tmp/test",
         )
         service._vllm_port = 8000

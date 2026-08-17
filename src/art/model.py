@@ -1,4 +1,3 @@
-import asyncio
 from contextlib import contextmanager, nullcontext
 from contextvars import Token
 from datetime import datetime
@@ -31,7 +30,6 @@ from .metrics_taxonomy import (
     SFT_GRADIENT_STEP_KEY,
     SFT_METRIC_PREFIX,
     SFT_WANDB_GRADIENT_STEP_KEY,
-    TRAIN_GRADIENT_STEPS_KEY,
     average_metric_samples,
     build_data_metrics_from_summary,
     summarize_trajectory_groups,
@@ -304,6 +302,13 @@ class _OpenAIClientProxy:
             self._policy_span_mode,
             self._suppress_weave_trace,
         )
+
+    async def __aenter__(self) -> "_OpenAIClientProxy":
+        await self._client.__aenter__()
+        return self
+
+    async def __aexit__(self, *args: Any) -> Any:
+        return await self._client.__aexit__(*args)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._client, name)

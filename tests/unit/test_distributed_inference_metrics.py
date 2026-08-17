@@ -10,15 +10,23 @@ import pytest
 
 from art.local import backend as backend_module
 from art.local.backend import LocalBackend
+from art.model import Model
+from art.serving_capabilities import (
+    ART_SERVING_PROTOCOL_VERSION,
+    ServingCapabilities,
+)
 
 
 def _runtime_metrics_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     loggers = ModuleType("vllm.v1.metrics.loggers")
     setattr(loggers, "StatLoggerBase", object)
+    fast_metrics = ModuleType("art_vllm_runtime.fast_metrics")
+    setattr(fast_metrics, "FastMetricsSharedWriter", object)
     for name in ("vllm", "vllm.v1", "vllm.v1.metrics"):
         monkeypatch.setitem(sys.modules, name, ModuleType(name))
     monkeypatch.setitem(sys.modules, loggers.__name__, loggers)
-    path = Path(__file__).parents[1] / "vllm_runtime/src/art_vllm_runtime/metrics.py"
+    monkeypatch.setitem(sys.modules, fast_metrics.__name__, fast_metrics)
+    path = Path(__file__).parents[2] / "vllm_runtime/src/art_vllm_runtime/metrics.py"
     spec = importlib.util.spec_from_file_location("test_art_vllm_metrics", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -74,16 +82,31 @@ async def test_backend_reads_leader_metrics_and_fences_counter_generations(
     payloads = iter(
         [
             {
+                "schema_version": 1,
+                "source": "art_vllm_runtime",
+                "last_update_unix_s": 1.0,
+                "record_count": 1,
+                "engine_count": 1,
                 "process_uuid": "leader-a",
                 "generation": 0,
                 "metrics": _metrics(prompt=100, generation=50, queries=20, hits=10),
             },
             {
+                "schema_version": 1,
+                "source": "art_vllm_runtime",
+                "last_update_unix_s": 2.0,
+                "record_count": 2,
+                "engine_count": 1,
                 "process_uuid": "leader-a",
                 "generation": 0,
                 "metrics": _metrics(prompt=200, generation=100, queries=40, hits=20),
             },
             {
+                "schema_version": 1,
+                "source": "art_vllm_runtime",
+                "last_update_unix_s": 3.0,
+                "record_count": 1,
+                "engine_count": 1,
                 "process_uuid": "leader-b",
                 "generation": 1,
                 "metrics": _metrics(
@@ -91,6 +114,11 @@ async def test_backend_reads_leader_metrics_and_fences_counter_generations(
                 ),
             },
             {
+                "schema_version": 1,
+                "source": "art_vllm_runtime",
+                "last_update_unix_s": 4.0,
+                "record_count": 2,
+                "engine_count": 1,
                 "process_uuid": "leader-b",
                 "generation": 1,
                 "metrics": _metrics(
@@ -131,11 +159,20 @@ async def test_backend_reads_leader_metrics_and_fences_counter_generations(
         backend_module, "time", SimpleNamespace(monotonic=lambda: next(times))
     )
     backend = LocalBackend(path=str(tmp_path))
-    model: Any = SimpleNamespace(
+    model = Model(
         name="test-model",
+        project="test",
         inference_base_url="http://leader.test/v1",
         inference_api_key="secret",
-        _serving_capabilities=SimpleNamespace(require=lambda *_args, **_kwargs: None),
+    )
+    object.__setattr__(
+        model,
+        "_serving_capabilities",
+        ServingCapabilities(
+            runtime="art_vllm",
+            protocol_version=ART_SERVING_PROTOCOL_VERSION,
+            fast_metrics={"url": "http://leader.test/art/metrics"},
+        ),
     )
 
     first = await backend.collect_train_step_vllm_metrics(model)
@@ -151,7 +188,9 @@ async def test_backend_reads_leader_metrics_and_fences_counter_generations(
     assert recovered["vllm/prompt_tok_per_s"] == 10.0
     assert recovered["vllm/completion_tok_per_s"] == 5.0
     assert recovered["vllm/world_size"] == 16.0
-    assert set(backend._vllm_metric_snapshots) == {("test-model", "leader-b", 1)}
+    assert set(backend._vllm_metric_snapshots) == {
+        ("test", "test-model", "leader-b", 1)
+    }
     assert (
         requests
         == [

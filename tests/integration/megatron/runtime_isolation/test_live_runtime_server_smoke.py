@@ -51,23 +51,19 @@ def _find_free_port() -> int:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="No CUDA available")
 @pytest.mark.asyncio
 async def test_external_runtime_server_live_smoke(
-    tmp_path: Path,
     artifact_dir: Path,
 ) -> None:
     _require_live_runtime_smoke_opt_in()
 
     port = _find_free_port()
     served_model_name = f"vllm-runtime-live-{uuid.uuid4().hex[:8]}"
-    renamed_model_name = f"{served_model_name}@renamed"
     log_path = artifact_dir / "runtime.log"
     launch_config = runtime.VllmRuntimeLaunchConfig(
         base_model=os.environ.get("BASE_MODEL", DEFAULT_BASE_MODEL),
         port=port,
         host="127.0.0.1",
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
-        lora_path=str(tmp_path / "placeholder_lora"),
         served_model_name=served_model_name,
-        rollout_weights_mode="merged",
         engine_args={
             "gpu_memory_utilization": _safe_gpu_memory_utilization(),
             "max_model_len": int(
@@ -107,19 +103,6 @@ async def test_external_runtime_server_live_smoke(
                 model_info["id"] for model_info in models_response.json()["data"]
             ]
 
-            rename_response = await client.post(
-                "/art/set_served_model_name",
-                json={"name": renamed_model_name},
-            )
-            rename_response.raise_for_status()
-
-            renamed_models_response = await client.get("/v1/models")
-            renamed_models_response.raise_for_status()
-            renamed_model_ids = [
-                model_info["id"]
-                for model_info in renamed_models_response.json()["data"]
-            ]
-
             sleep_response = await client.post(
                 "/sleep",
                 params={"level": 1, "mode": "wait"},
@@ -138,7 +121,7 @@ async def test_external_runtime_server_live_smoke(
             completion_response = await client.post(
                 "/v1/chat/completions",
                 json={
-                    "model": renamed_model_name,
+                    "model": served_model_name,
                     "messages": [{"role": "user", "content": "Say hello."}],
                     "max_tokens": 8,
                     "logprobs": True,
@@ -154,7 +137,6 @@ async def test_external_runtime_server_live_smoke(
                     "command": command,
                     "base_model": launch_config.base_model,
                     "original_model_ids": original_model_ids,
-                    "renamed_model_ids": renamed_model_ids,
                     "sleeping_before_wake": sleeping_before_wake,
                     "sleeping_after_wake": sleeping_after_wake,
                     "text": completion["choices"][0]["message"]["content"],
@@ -167,7 +149,6 @@ async def test_external_runtime_server_live_smoke(
             encoding="utf-8",
         )
         assert served_model_name in original_model_ids
-        assert renamed_model_name in renamed_model_ids
         assert sleeping_before_wake is True
         assert sleeping_after_wake is False
         assert completion["choices"][0]["logprobs"] is not None

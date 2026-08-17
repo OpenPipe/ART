@@ -329,7 +329,6 @@ class LocalMegatronTrainingClient:
         _validate_publication_mode(
             request,
             update_mode=self._service.rollout_weight_update_mode,
-            weights_mode=self._service.rollout_weights_mode,
         )
 
         async def execute(
@@ -517,20 +516,13 @@ def _validate_publication_mode(
     request: SaveWeightsForSamplerRequest,
     *,
     update_mode: str,
-    weights_mode: str,
 ) -> None:
     requested = request.publication.mode
     if requested == "none":
         return
-    expected = (
-        "merged_weights"
-        if weights_mode == "merged"
-        else "in_flight_lora"
-        if update_mode == "in_flight_lora"
-        else "versioned_lora"
-    )
+    expected = "in_flight_lora" if update_mode == "in_flight_lora" else "versioned_lora"
     if requested != expected:
         raise ValueError(
             f"sampler publication mode {requested!r} conflicts with "
-            f"weights={weights_mode!r}, update={update_mode!r}"
+            f"update mode {update_mode!r}"
         )

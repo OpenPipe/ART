@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import gc
 import math
 from pathlib import Path
 from threading import BoundedSemaphore, Event, Lock
@@ -40,8 +41,13 @@ from .specs import (
     GenerationSnapshotJobSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
+    ResidentLoraInspectionShard,
+    ResidentLoraInspectionSpec,
+    ResidentScoreJobSpec,
+    ResidentScoreShard,
     SftForwardBackwardJobSpec,
     SftForwardJobSpec,
+    SFTJobSpec,
     TrainerGeneration,
     TrainerJobSpec,
     TrainJobSpec,
@@ -60,11 +66,11 @@ class MegatronTrainJobExecutor:
         self.runtime = runtime
         self._publisher = _GenerationPublisher(
             runtime,
-            stager=PinnedCpuSnapshotStager(),
             capacity=int(runtime.snapshot_pool_capacity),
         )
         self._gradients = GradientAccumulator(model_chunks=runtime.model)
         self._gradient_parent_version: int | None = None
+        self._python_gc_stabilized = False
         self._closed = False
 
     def execute(
@@ -77,6 +83,8 @@ class MegatronTrainJobExecutor:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._require_no_open_gradients()
+        timing = self.runtime.inter_forward_backward_timing
+        timing.current_job_start_s = time.monotonic()
         validate_packed_batch(batch)
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_rl_job
@@ -109,11 +117,132 @@ class MegatronTrainJobExecutor:
             ),
             cancelled=cancelled,
         )
-        if job.merged_weight_transfer is not None:
-            started = time.perf_counter()
-            self._sync_merged(job.merged_weight_transfer)
-            metrics["time/merged_weight_publish_s"] = time.perf_counter() - started
+        metrics.update(self._stabilize_python_gc())
+        timing.previous_job_complete_s = time.monotonic()
         return metrics
+
+    def execute_sft(
+        self,
+        job: SFTJobSpec,
+        batches: tuple[SFTBatchData, ...],
+        sink: EventSink,
+        cancelled: Event,
+    ) -> dict[str, float]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        timing = self.runtime.inter_forward_backward_timing
+        timing.current_job_start_s = time.monotonic()
+        self._publisher.raise_if_failed()
+        from art.megatron.train import execute_megatron_sft_job
+
+        metrics = execute_megatron_sft_job(
+            self.runtime,
+            job,
+            batches,
+            progress_sink=lambda step_index, num_steps, metrics: sink.progress(
+                step_index=step_index,
+                num_steps=num_steps,
+                metrics=metrics,
+            ),
+            adapter_ready_sink=lambda: sink.adapter_ready(
+                learner_version=job.learner_version,
+                adapter_path=job.output_adapter_path,
+            ),
+            snapshot_sink=lambda snapshot_job, adapter_dtypes, adapter_config, save_optimizer: (
+                self._publisher.stage_and_submit(
+                    run_id=snapshot_job.run_id,
+                    generation=snapshot_job.output.generation,
+                    optimizer_state_path=snapshot_job.output.optimizer_state_path,
+                    staging_adapter_path=snapshot_job.output.staging_adapter_path,
+                    publication_targets=snapshot_job.publication_targets,
+                    adapter_dtypes=adapter_dtypes,
+                    adapter_config=adapter_config,
+                    save_optimizer=save_optimizer,
+                    sink=sink,
+                )
+            ),
+            cancelled=cancelled,
+        )
+        metrics.update(self._stabilize_python_gc())
+        timing.previous_job_complete_s = time.monotonic()
+        return metrics
+
+    def _stabilize_python_gc(self) -> dict[str, float]:
+        if self._python_gc_stabilized or not self.runtime.transformer_layers_compiled:
+            return {}
+        started = time.perf_counter()
+        collected = gc.collect()
+        gc.freeze()
+        self._python_gc_stabilized = True
+        return {
+            "python_gc_stabilize_s": time.perf_counter() - started,
+            "python_gc_collected_objects": float(collected),
+            "python_gc_frozen_objects": float(gc.get_freeze_count()),
+        }
+
+    def score(
+        self,
+        job: ResidentScoreJobSpec,
+        batch: InMemoryPackedBatch,
+    ) -> ResidentScoreShard:
+        self._validate_resident_score(job.run_id, job.learner)
+        validate_packed_batch(batch)
+        from art.megatron.train import execute_megatron_score_job
+
+        return execute_megatron_score_job(self.runtime, job, batch.tensors)
+
+    def inspect_resident_lora(
+        self,
+        request: ResidentLoraInspectionSpec,
+    ) -> ResidentLoraInspectionShard:
+        self._validate_resident_inspection(request.run_id, request.learner)
+        from art.megatron.train import inspect_resident_lora
+
+        return inspect_resident_lora(self.runtime, request)
+
+    def _validate_diagnostic_runtime(self) -> None:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        self._require_no_open_gradients()
+        self._publisher.raise_if_failed()
+
+    def _validate_resident_score(self, run_id: str, learner: TrainerGeneration) -> None:
+        self._validate_diagnostic_runtime()
+        runtime = self.runtime
+        if (
+            runtime.resident_run_id != run_id
+            or runtime.resident_training_session_id != learner.training_session_id
+            or runtime.resident_policy_step != learner.policy_step
+            or runtime.resident_generation_id != learner.generation_id
+            or not runtime.optimizer_state_loaded
+            or runtime.optimizer is None
+        ):
+            raise RuntimeError("resident trainer state does not match score learner")
+
+    def _validate_resident_inspection(
+        self, run_id: str, learner: TrainerGeneration
+    ) -> None:
+        self._validate_diagnostic_runtime()
+        runtime = self.runtime
+        if runtime.resident_run_id != run_id:
+            raise RuntimeError("resident trainer run does not match inspection")
+        unhydrated = (
+            runtime.resident_training_session_id is None
+            and runtime.resident_policy_step is None
+            and runtime.resident_generation_id is None
+            and not runtime.optimizer_state_loaded
+        )
+        hydrated = (
+            runtime.resident_training_session_id == learner.training_session_id
+            and runtime.resident_policy_step == learner.policy_step
+            and runtime.resident_generation_id == learner.generation_id
+            and runtime.optimizer_state_loaded
+        )
+        if not (unhydrated or hydrated):
+            raise RuntimeError(
+                "resident trainer hydration markers are partial or do not match "
+                "the inspection learner"
+            )
 
     def execute_forward_backward(
         self,
@@ -365,10 +494,6 @@ class MegatronTrainJobExecutor:
                 sink=sink,
             ),
         }
-        if job.merged_weight_transfer is not None:
-            started = time.perf_counter()
-            self._sync_merged(job.merged_weight_transfer)
-            metrics["time/merged_weight_publish_s"] = time.perf_counter() - started
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -379,86 +504,36 @@ class MegatronTrainJobExecutor:
         self._gradients.discard()
         self._gradient_parent_version = None
 
-    def sync_merged_source(
-        self,
-        generation: TrainerGeneration,
-        transfer: Any,
-    ) -> dict[str, float]:
-        if self._closed:
-            raise RuntimeError("Megatron executor is closed")
-        self._require_no_open_gradients()
-        runtime = self.runtime
-        if (
-            runtime.resident_training_session_id != generation.training_session_id
-            or runtime.resident_policy_step != generation.policy_step
-        ):
-            from art.megatron.model_support.lora_disk import load_adapter_config
-            from art.megatron.train import _load_adapter_into_model
-
-            _load_adapter_into_model(
-                runtime.model,
-                generation.adapter_path,
-                runtime.rank,
-                handler=runtime.model_support_handler,
-            )
-            runtime.adapter_export_config = load_adapter_config(generation.adapter_path)
-            runtime.adapter_export_dtypes = {}
-            runtime.resident_training_session_id = None
-            runtime.resident_policy_step = None
-            runtime.optimizer_state_loaded = False
-        started = time.perf_counter()
-        self._sync_merged(transfer)
-        return {"time/merged_weight_publish_s": time.perf_counter() - started}
-
-    def _sync_merged(self, transfer: Any) -> None:
-        from art.megatron.weights.merged_weight_export import (
-            sync_merged_weights_to_vllm,
-        )
-
-        runtime = self.runtime
-        if runtime.adapter_export_config is None:
-            raise RuntimeError("merged publication has no adapter export config")
-        (
-            runtime.merged_weight_transfer_group,
-            runtime.merged_weight_transfer_init_info,
-        ) = sync_merged_weights_to_vllm(
-            bridge=runtime.bridge,
-            model=runtime.model,
-            model_support_handler=runtime.model_support_handler,
-            adapter_model={},
-            adapter_config=runtime.adapter_export_config,
-            rank=runtime.rank,
-            world_size=runtime.world_size,
-            merged_weight_transfer_group=runtime.merged_weight_transfer_group,
-            merged_weight_transfer_init_info=(runtime.merged_weight_transfer_init_info),
-            spec=transfer,
-            pause_generation=True,
-        )
-
     def advance_without_training(
         self,
         *,
-        training_session_id: str,
-        expected_learner_version: int,
-        learner_version: int,
+        source: TrainerGeneration,
+        output: TrainerGeneration,
         optimizer_state_path: str,
         adapter: "OptimizerAdapter | None",
     ) -> dict[str, float]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._require_no_open_gradients()
-        if learner_version != expected_learner_version + 1:
-            raise ValueError("a no-op learner transition must advance exactly one step")
+        if (
+            output.training_session_id != source.training_session_id
+            or output.policy_step != source.policy_step + 1
+        ):
+            raise ValueError(
+                "a no-op transition must preserve session and advance one step"
+            )
         runtime = self.runtime
         if (
-            runtime.resident_training_session_id != training_session_id
-            or runtime.resident_policy_step != expected_learner_version
+            runtime.resident_training_session_id != source.training_session_id
+            or runtime.resident_policy_step != source.policy_step
+            or runtime.resident_generation_id != source.generation_id
             or not runtime.optimizer_state_loaded
             or runtime.optimizer is None
         ):
             raise RuntimeError("resident trainer state does not match no-op transition")
         del optimizer_state_path, adapter
-        runtime.resident_policy_step = learner_version
+        runtime.resident_policy_step = output.policy_step
+        runtime.resident_generation_id = output.generation_id
         return {}
 
     def close(self) -> None:
@@ -483,12 +558,6 @@ class MegatronTrainJobExecutor:
                 failures.append(error)
             finally:
                 self.runtime.moe_routing_replay_controller = None
-        from art.megatron.train import _close_merged_weight_transfer_group
-
-        try:
-            _close_merged_weight_transfer_group(self.runtime)
-        except BaseException as error:
-            failures.append(error)
         try:
             import torch
 
@@ -526,7 +595,6 @@ class MCoreRunSlotExecutor:
         self._slot_trainer = TrainerRank(runtime)
         self._publisher = _GenerationPublisher(
             runtime,
-            stager=PinnedCpuSnapshotStager(),
             capacity=int(runtime.snapshot_pool_capacity),
         )
         self._runs: dict[str, _ResidentRunState] = {}
@@ -817,8 +885,6 @@ class MCoreRunSlotExecutor:
     ) -> dict[str, Any]:
         state = self._require_run(job.run_id)
         self._validate_parent(state, job.training_session_id, job.learner_version)
-        if job.merged_weight_transfer is not None:
-            raise ValueError("multi-run slots publish LoRA weights, not merged weights")
         from art.megatron.lora import LoRASlotRef
 
         needs_optimizer = job.save_optimizer and not self._publisher.has_generation(
@@ -922,6 +988,7 @@ class _CachedGeneration(BaseModel):
 
     run_id: str
     generation: TrainerGeneration
+    stager: PinnedCpuSnapshotStager
     resolved: Future[_ResolvedGeneration]
     optimizer_upgrade: Future[Any] | None = None
     has_optimizer: bool = False
@@ -956,16 +1023,17 @@ class _GenerationPublisher:
         self,
         runtime: Any,
         *,
-        stager: PinnedCpuSnapshotStager,
         capacity: int,
     ) -> None:
         if capacity < 1:
             raise ValueError("snapshot pool capacity must be positive")
         self.runtime = runtime
-        self.stager = stager
         self.capacity = capacity
         self._slots = BoundedSemaphore(capacity)
         self._lock = Lock()
+        self._available_stagers = [
+            PinnedCpuSnapshotStager(reusable=True) for _ in range(capacity)
+        ]
         self._resolution_pool = ThreadPoolExecutor(
             max_workers=capacity, thread_name_prefix="art-snapshot-resolve"
         )
@@ -1009,7 +1077,7 @@ class _GenerationPublisher:
         )
 
         self._retire_previous(run_id)
-        wait_s, in_flight = self._acquire_slot()
+        wait_s, in_flight, stager = self._acquire_slot()
         prepare_started = time.perf_counter()
         try:
             lora_timings = LoraSnapshotTimings()
@@ -1020,7 +1088,7 @@ class _GenerationPublisher:
                 adapter_config=adapter_config,
                 rank=self.runtime.rank,
                 world_size=self.runtime.world_size,
-                stager=self.stager,
+                stager=stager,
                 slot_ref=slot_ref,
                 timings=lora_timings,
             )
@@ -1037,14 +1105,14 @@ class _GenerationPublisher:
                         trainer_rank_optimizer_state,
                         generation_id=generation.generation_id,
                         step=generation.policy_step,
-                        stager=self.stager,
+                        stager=stager,
                     )
                 else:
                     optimizer = stage_optimizer_state_snapshot(
                         self.runtime,
                         generation_id=generation.generation_id,
                         step=generation.policy_step,
-                        stager=self.stager,
+                        stager=stager,
                     )
             else:
                 optimizer = None
@@ -1059,6 +1127,7 @@ class _GenerationPublisher:
             entry = _CachedGeneration(
                 run_id=run_id,
                 generation=generation,
+                stager=stager,
                 resolved=resolved,
                 has_optimizer=optimizer is not None,
             )
@@ -1072,8 +1141,8 @@ class _GenerationPublisher:
             resolved.add_done_callback(
                 lambda done, cached=entry: self._snapshot_resolved(cached, done)
             )
-        except BaseException as error:
-            self._release_slot()
+        except BaseException:
+            self._release_slot(stager)
             raise
         metrics = {
             "snapshot_pool_wait_s": wait_s,
@@ -1132,7 +1201,7 @@ class _GenerationPublisher:
                 self.runtime,
                 generation_id=generation.generation_id,
                 step=generation.policy_step,
-                stager=self.stager,
+                stager=entry.stager,
             )
         else:
             if trainer_rank_optimizer_state is None:
@@ -1142,7 +1211,7 @@ class _GenerationPublisher:
                 trainer_rank_optimizer_state,
                 generation_id=generation.generation_id,
                 step=generation.policy_step,
-                stager=self.stager,
+                stager=entry.stager,
             )
         self.runtime.optimizer_snapshot_barrier.register(optimizer)
         resolved = self._resolution_pool.submit(optimizer.resolve)
@@ -1268,7 +1337,7 @@ class _GenerationPublisher:
     def retire_run(self, run_id: str) -> None:
         self._retire_previous(run_id)
 
-    def _acquire_slot(self) -> tuple[float, int]:
+    def _acquire_slot(self) -> tuple[float, int, PinnedCpuSnapshotStager]:
         self.raise_if_failed()
         started = time.perf_counter()
         if not self._slots.acquire(blocking=False):
@@ -1276,8 +1345,10 @@ class _GenerationPublisher:
             self._slots.acquire()
         wait_s = time.perf_counter() - started
         with self._lock:
+            stager = self._available_stagers.pop()
+            stager.reset()
             self._in_flight += 1
-            return wait_s, self._in_flight
+            return wait_s, self._in_flight, stager
 
     def _evict_for_capacity(self) -> None:
         with self._lock:
@@ -1355,8 +1426,7 @@ class _GenerationPublisher:
                 self._latest_by_run.pop(entry.run_id)
             for object_id in entry.object_ids:
                 self._object_publications.pop(object_id, None)
-            self._in_flight -= 1
-        self._slots.release()
+        self._release_slot(entry.stager)
 
     def _resolve_generation(self, lora: Any, optimizer: Any) -> _ResolvedGeneration:
         lora = None if lora is None else lora.resolve()
@@ -1758,8 +1828,9 @@ class _GenerationPublisher:
         finally:
             self._maybe_release(entry)
 
-    def _release_slot(self) -> None:
+    def _release_slot(self, stager: PinnedCpuSnapshotStager) -> None:
         with self._lock:
+            self._available_stagers.append(stager)
             self._in_flight -= 1
         self._slots.release()
 

@@ -10,7 +10,7 @@ import inspect
 import json
 from pathlib import Path
 import time
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator

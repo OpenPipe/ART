@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import hashlib
 import json
+import math
 from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
@@ -13,9 +14,7 @@ from art.distributed.object_store import BinaryObjectTarget
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
 from art.megatron.optimizer_state import OptimizerAdapter
 from art.training.contracts import AdamConfig
-from art.types import TrainConfig
-
-from .weight_transfer import MergedWeightTransferSpec
+from art.types import TrainConfig, TrainSFTConfig
 
 
 class _Spec(BaseModel):
@@ -47,6 +46,7 @@ class TrainerRuntimeSpec(_Spec):
     trainer_mesh: TrainerMeshSpec
     packed_sequence_length: int = Field(ge=1)
     compile_enabled: bool
+    compile_cache: bool = False
     compile_fingerprint: str = Field(min_length=1)
     optimizer_layout_fingerprint: str = Field(min_length=1)
     allow_unvalidated_arch: bool = False
@@ -61,6 +61,8 @@ class TrainerRuntimeSpec(_Spec):
     def _validate_lora_targets(self) -> "TrainerRuntimeSpec":
         if self.lora_alpha != 32.0:
             raise ValueError("current Megatron LoRA semantics require lora_alpha=32")
+        if self.compile_cache and not self.compile_enabled:
+            raise ValueError("compile_cache requires compile_enabled")
         if not self.lora_target_modules:
             raise ValueError("lora_target_modules must not be empty")
         if len(set(self.lora_target_modules)) != len(self.lora_target_modules):
@@ -117,6 +119,10 @@ class RunSlotRegistration(_Spec):
 
 
 class CurrentTrainConfig(TrainConfig):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class CurrentSFTConfig(TrainSFTConfig):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
@@ -191,7 +197,6 @@ class _TrainerJobSpec(_Spec):
     source: TrainerGeneration
     output: DurableTrainOutput
     publication_targets: tuple[AdapterTransferTarget, ...] = ()
-    merged_weight_transfer: MergedWeightTransferSpec | None = None
 
     @model_validator(mode="after")
     def _validate_versions(self) -> "_TrainerJobSpec":
@@ -259,6 +264,21 @@ class TrainJobSpec(_TrainerJobSpec):
             raise ValueError(
                 "batch source policy version cannot be newer than the learner"
             )
+        return self
+
+
+class SFTJobSpec(_TrainerJobSpec):
+    kind: Literal["sft"] = "sft"
+    batch_id: str = Field(min_length=1)
+    num_batches: int = Field(ge=1)
+    config: CurrentSFTConfig
+    weight_decay: float = Field(default=0.0, ge=0)
+    max_grad_norm: float = Field(default=1.0, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_batch_size(self) -> "SFTJobSpec":
+        if not isinstance(self.config.batch_size, int):
+            raise ValueError("typed SFT jobs require a resolved integer batch size")
         return self
 
 
@@ -461,7 +481,6 @@ class GenerationSnapshotJobSpec(_Spec):
     existing_adapter: OptimizerAdapter | None = None
     publication_targets: tuple[AdapterTransferTarget, ...] = ()
     adapter_object_target: BinaryObjectTarget | None = None
-    merged_weight_transfer: MergedWeightTransferSpec | None = None
     save_optimizer: bool = False
 
     @model_validator(mode="after")
@@ -503,8 +522,6 @@ class GenerationSnapshotJobSpec(_Spec):
                 )
         if object_adapter and self.publication_targets:
             raise ValueError("object and direct adapter transports cannot be combined")
-        if self.publication_targets and self.merged_weight_transfer is not None:
-            raise ValueError("snapshot cannot publish LoRA and merged weights together")
         return self
 
     @property
@@ -512,7 +529,172 @@ class GenerationSnapshotJobSpec(_Spec):
         return _fingerprint(self)
 
 
-TrainerJobSpec: TypeAlias = TrainJobSpec
+class ResidentScoreJobSpec(_Spec):
+    job_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    learner: TrainerGeneration
+    batch: PackedBatchRef
+    global_grad_accumulation_sequences: int = Field(ge=1)
+    top_k: int = Field(default=20, ge=1, le=1024)
+
+    @model_validator(mode="after")
+    def _validate_batch_generation(self) -> "ResidentScoreJobSpec":
+        if not (
+            self.batch.min_source_version
+            == self.batch.max_source_version
+            == self.learner.policy_step
+        ):
+            raise ValueError(
+                "resident score batch must come exclusively from the requested learner"
+            )
+        return self
+
+
+class PackedTokenScore(_Spec):
+    sample_index: int = Field(ge=0)
+    logit_index: int = Field(ge=0)
+    target_token_id: int = Field(ge=0)
+    target_logprob: float
+    top_token_ids: tuple[int, ...]
+    top_logprobs: tuple[float, ...]
+
+    @model_validator(mode="after")
+    def _validate_score(self) -> "PackedTokenScore":
+        if not math.isfinite(self.target_logprob) or any(
+            not math.isfinite(value) for value in self.top_logprobs
+        ):
+            raise ValueError("resident token scores must be finite")
+        if not self.top_token_ids or len(self.top_token_ids) != len(self.top_logprobs):
+            raise ValueError("resident top-k token IDs and logprobs must align")
+        if any(token_id < 0 for token_id in self.top_token_ids):
+            raise ValueError("resident top-k token IDs must be non-negative")
+        if len(set(self.top_token_ids)) != len(self.top_token_ids):
+            raise ValueError("resident top-k token IDs must be unique")
+        if any(
+            left < right
+            for left, right in zip(
+                self.top_logprobs, self.top_logprobs[1:], strict=False
+            )
+        ):
+            raise ValueError("resident top-k logprobs must be descending")
+        return self
+
+
+def _validate_score_records(scores: tuple[PackedTokenScore, ...], top_k: int) -> None:
+    keys = [(score.sample_index, score.logit_index) for score in scores]
+    if keys != sorted(keys) or len(keys) != len(set(keys)):
+        raise ValueError("resident token scores must have unique sorted coordinates")
+    if any(len(score.top_token_ids) != top_k for score in scores):
+        raise ValueError("resident token score width does not match top_k")
+
+
+class ResidentScoreShard(_Spec):
+    rank: int = Field(ge=0)
+    job_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    learner: TrainerGeneration
+    batch_id: str = Field(min_length=1)
+    batch_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    top_k: int = Field(ge=1)
+    expected_score_count: int = Field(ge=1)
+    routing_replay_packed_tokens: int = Field(ge=0)
+    scores: tuple[PackedTokenScore, ...]
+
+    @model_validator(mode="after")
+    def _validate_scores(self) -> "ResidentScoreShard":
+        _validate_score_records(self.scores, self.top_k)
+        if len(self.scores) > self.expected_score_count:
+            raise ValueError("resident score shard exceeds the packed target count")
+        return self
+
+
+class ResidentScoreResult(_Spec):
+    job_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    learner: TrainerGeneration
+    batch_id: str = Field(min_length=1)
+    batch_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    ranks: tuple[int, ...]
+    top_k: int = Field(ge=1)
+    expected_score_count: int = Field(ge=1)
+    routing_replay_packed_tokens: int = Field(ge=0)
+    scores: tuple[PackedTokenScore, ...]
+
+    @model_validator(mode="after")
+    def _validate_result(self) -> "ResidentScoreResult":
+        if not self.ranks or len(self.ranks) != len(set(self.ranks)):
+            raise ValueError("resident score result ranks must be unique and nonempty")
+        _validate_score_records(self.scores, self.top_k)
+        if len(self.scores) != self.expected_score_count:
+            raise ValueError("resident score result does not cover every packed target")
+        return self
+
+
+class ResidentLoraInspectionSpec(_Spec):
+    request_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    learner: TrainerGeneration
+    target_modules: tuple[str, ...]
+
+    @model_validator(mode="after")
+    def _validate_targets(self) -> "ResidentLoraInspectionSpec":
+        if not self.target_modules or len(self.target_modules) != len(
+            set(self.target_modules)
+        ):
+            raise ValueError("resident LoRA target modules must be unique and nonempty")
+        return self
+
+
+class ResidentLoraExport(_Spec):
+    base_name: str = Field(min_length=1)
+    adapter_keys: tuple[str | None, ...]
+
+    @model_validator(mode="after")
+    def _validate_keys(self) -> "ResidentLoraExport":
+        if not self.adapter_keys or len(self.adapter_keys) != len(
+            set(self.adapter_keys)
+        ):
+            raise ValueError("resident LoRA export keys must be unique and nonempty")
+        return self
+
+
+class ResidentLoraRankSummary(_Spec):
+    rank: int = Field(ge=0)
+    module_count: int = Field(ge=0)
+    trainable_parameter_count: int = Field(ge=0)
+    trainable_numel: int = Field(ge=0)
+
+
+class ResidentLoraInspectionShard(_Spec):
+    rank: int = Field(ge=0)
+    request_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    learner: TrainerGeneration
+    target_modules: tuple[str, ...]
+    module_count: int = Field(ge=0)
+    wrapped_adapter_prefixes: tuple[str, ...]
+    exports: tuple[ResidentLoraExport, ...]
+    trainable_lora_parameter_names: tuple[str, ...]
+    unexpected_trainable_parameter_names: tuple[str, ...]
+    trainable_numel: int = Field(ge=0)
+
+
+class ResidentLoraInspectionResult(_Spec):
+    request_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    learner: TrainerGeneration
+    target_modules: tuple[str, ...]
+    rank_summaries: tuple[ResidentLoraRankSummary, ...]
+    wrapped_adapter_prefixes: tuple[str, ...]
+    exports: tuple[ResidentLoraExport, ...]
+    trainable_lora_parameter_names: tuple[str, ...]
+    unexpected_trainable_parameter_names: tuple[str, ...]
+
+
+TrainerJobSpec: TypeAlias = Annotated[
+    TrainJobSpec | SFTJobSpec,
+    Field(discriminator="kind"),
+]
 TRAIN_JOB_ADAPTER = TypeAdapter(TrainerJobSpec)
 
 

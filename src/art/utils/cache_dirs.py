@@ -1,8 +1,19 @@
 from collections.abc import MutableMapping
 import os
 from pathlib import Path
+import re
 
 _DEFAULT_CACHE_ROOT = Path("/tmp/art-cache")
+
+
+def compiler_cache_root(
+    cache_root: str | Path,
+    environ: MutableMapping[str, str] | None = None,
+) -> Path:
+    environ = os.environ if environ is None else environ
+    arch = environ.get("TORCH_CUDA_ARCH_LIST") or environ.get("CUDA_ARCH_LIST")
+    arch_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", arch or "unknown")
+    return Path(cache_root) / "compiled" / arch_tag
 
 
 def _set_path(
@@ -71,23 +82,33 @@ def configure_model_cache_env(
         hub_default,
         previous_default=previous_hf / "hub" if rebase else None,
     )
+    compiled_root = compiler_cache_root(xdg_root, environ)
+    previous_compiled_root = compiler_cache_root(previous_xdg, environ)
     for name, default, previous_default in (
         ("HUGGINGFACE_HUB_CACHE", hub_cache, previous_hf / "hub"),
         ("TRANSFORMERS_CACHE", hub_cache, previous_hub),
         ("TORCH_HOME", xdg_root / "torch", previous_xdg / "torch"),
         (
             "TORCH_EXTENSIONS_DIR",
-            xdg_root / "torch_extensions",
-            previous_xdg / "torch_extensions",
+            compiled_root / "torch_extensions",
+            previous_compiled_root / "torch_extensions",
         ),
         (
             "TORCHINDUCTOR_CACHE_DIR",
-            xdg_root / "torchinductor",
-            previous_xdg / "torchinductor",
+            compiled_root / "torchinductor",
+            previous_compiled_root / "torchinductor",
         ),
         ("TRITON_HOME", xdg_root, previous_xdg),
-        ("TRITON_CACHE_DIR", xdg_root / "triton", previous_xdg / "triton"),
-        ("VLLM_CACHE_ROOT", xdg_root / "vllm", previous_xdg / "vllm"),
+        (
+            "TRITON_CACHE_DIR",
+            compiled_root / "triton",
+            previous_compiled_root / "triton",
+        ),
+        (
+            "VLLM_CACHE_ROOT",
+            compiled_root / "vllm",
+            previous_compiled_root / "vllm",
+        ),
         ("VLLM_CONFIG_ROOT", xdg_root / "vllm_config", previous_xdg / "vllm_config"),
     ):
         _set_path(

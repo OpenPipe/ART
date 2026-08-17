@@ -31,7 +31,6 @@ from .range_ops import (
 )
 from .types import (
     ArtContextParallelState,
-    AttnSlice,
     CpBlockMaskVariant,
     DkvReducePlan,
     ExactMaskMetadata,

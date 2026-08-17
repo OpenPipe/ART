@@ -11,6 +11,7 @@ from art.loss import LossInputs, shift_tensor
 from art.megatron.context_parallel.runtime import (
     context_parallel_rank_model_token_counts,
     prepare_cp_micro,
+    preplan_megatron_context_parallel_state,
 )
 from art.megatron.context_parallel.types import (
     ContextParallelConfig,
@@ -35,6 +36,74 @@ class CpBatchLookaheadState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     pending_prepared_micro: PreparedMegatronBatch | None = None
+
+
+class CpBatchPreplanner(BaseModel):
+    """One trainer rank's immutable CPU planning context."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    topology: ParallelTopology
+    config: ContextParallelConfig
+    cp_rank: int
+    build_gdn_execution_spec: bool
+    gdn_planner_config: Any | None = None
+
+    @classmethod
+    def from_runtime(
+        cls, runtime: Any, *, device: torch.device
+    ) -> "CpBatchPreplanner | None":
+        from art.megatron.train import _infer_parallel_topology
+
+        topology = _infer_parallel_topology(runtime.model)
+        if int(topology.cp) <= 1:
+            return None
+        handler = runtime.model_support_handler
+        return cls(
+            topology=topology,
+            config=_context_parallel_config_for_provider(
+                runtime.provider, device, handler
+            ),
+            cp_rank=int(ps.get_context_parallel_rank()),
+            build_gdn_execution_spec=bool(
+                getattr(handler, "build_gdn_execution_spec", False)
+            ),
+            gdn_planner_config=_gdn_planner_config_for_provider(
+                runtime.provider, handler
+            ),
+        )
+
+    def preplan(
+        self,
+        packed_tensors: PackedTensors,
+        *,
+        global_grad_accumulation_sequences: int | None,
+    ) -> int:
+        num_sequences, sequence_length = map(int, packed_tensors["tokens"].shape)
+        accumulation = resolve_global_grad_accumulation_sequences(
+            global_grad_accumulation_sequences
+        )
+        sample_indices = {
+            0 if index is None else index
+            for step_index in range((num_sequences + accumulation - 1) // accumulation)
+            for index in build_micro_sample_indices(
+                step_index,
+                num_sequences,
+                accumulation,
+            )
+        }
+        for index in sorted(sample_indices):
+            preplan_megatron_context_parallel_state(
+                group_ids=packed_tensors["group_ids"][index : index + 1],
+                parent_ids=packed_tensors["parent_ids"][index : index + 1],
+                original_seq_len=sequence_length,
+                topology=self.topology,
+                config=self.config,
+                cp_rank=self.cp_rank,
+                build_gdn_execution_spec=self.build_gdn_execution_spec,
+                gdn_planner_config=self.gdn_planner_config,
+            )
+        return len(sample_indices)
 
 
 class PreparedRLMicroInputs(BaseModel):

@@ -31,6 +31,13 @@ class ThroughputThresholds(BaseModel):
     max_repeated_policy_activation_interval_s: float = Field(
         gt=0.0, allow_inf_nan=False
     )
+    max_queue_ready_inter_forward_backward_gap_p50_s: float = Field(
+        default=0.23, gt=0.0, le=0.23, allow_inf_nan=False
+    )
+    max_queue_ready_inter_forward_backward_gap_max_s: float = Field(
+        default=1.0, gt=0.0, le=1.0, allow_inf_nan=False
+    )
+    min_queue_ready_inter_forward_backward_gap_count: int = Field(default=3, ge=3)
 
     @model_validator(mode="after")
     def validate_calibration_identity(self) -> "ThroughputThresholds":
@@ -57,11 +64,19 @@ class ThroughputWorkflowConfig(BaseModel):
     max_num_seqs: int = Field(default=64, ge=1)
     max_num_batched_tokens: int = Field(default=65_536, ge=1)
     enable_prefix_caching: bool = False
-    max_steps: int = Field(default=31, ge=11)
+    max_steps: int = Field(default=13, ge=7)
     max_steps_off_policy: int = Field(default=4, ge=0)
-    packed_sequence_length: Literal[131072] = THROUGHPUT_PACKED_SEQUENCE_LENGTH
+    packed_sequence_length: int = Field(
+        default=THROUGHPUT_PACKED_SEQUENCE_LENGTH, ge=1024
+    )
     min_vllm_pressure: float = Field(default=0.5, ge=0.0, allow_inf_nan=False)
     max_trainer_underfeed: float = Field(default=0.08, ge=0.0, allow_inf_nan=False)
+    max_unused_and_dummy_ratio: float = Field(
+        default=0.15, ge=0.0, le=1.0, allow_inf_nan=False
+    )
+    max_queue_ready_wait_s: float = Field(
+        default=0.01, ge=0.0, le=0.2, allow_inf_nan=False
+    )
     random_initialization_version: Literal["deterministic_random_v1"] = (
         THROUGHPUT_RANDOM_INITIALIZATION_VERSION
     )
@@ -147,6 +162,7 @@ class WorkflowStageResources(BaseModel):
     required_physical_gpus: int | None = None
     required_h200_equivalent_gpus: int | None = None
     allow_gpu_overlap: bool = False
+    exclusive_host: bool = False
     requires_external_vllm: bool = False
     megatron: MegatronWorkflowResources | None = None
     vllm: VllmWorkflowResources | None = None
@@ -161,8 +177,6 @@ class HandlerWorkflowResources(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     train_inf_mismatch: WorkflowStageResources | None = None
-    merged_vllm_serving: WorkflowStageResources | None = None
-    native_vllm_lora: WorkflowStageResources | None = None
     yes_no_trainability: WorkflowStageResources | None = None
     length_trainability: WorkflowStageResources | None = None
     e2e_throughput: WorkflowStageResources | None = None
@@ -203,33 +217,6 @@ _DSV4_TP2_EP2 = MegatronWorkflowTopology(
     pp=1,
     sp=True,
 )
-_DSV4_REPRESENTATIVE_NUM_LAYERS = 4
-_DSV4_REPRESENTATIVE_COMPRESS_RATIOS = [0, 0, 4, 128]
-_DSV4_REPRESENTATIVE_LAYER_TYPES = [
-    "sliding_attention",
-    "sliding_attention",
-    "compressed_sparse_attention",
-    "heavily_compressed_attention",
-]
-_DSV4_REPRESENTATIVE_MLP_LAYER_TYPES = ["moe"] * 4
-_DSV4_MEGATRON_ENV = {
-    "ART_DSV4_VALIDATION_NUM_LAYERS": str(_DSV4_REPRESENTATIVE_NUM_LAYERS)
-}
-_DSV4_HF_OVERRIDES = {
-    "num_hidden_layers": _DSV4_REPRESENTATIVE_NUM_LAYERS,
-    "num_hash_layers": 0,
-    # Keep DSV4's required FP8 linear path, but avoid the public checkpoint's
-    # MXFP4 experts, which cannot represent the reduced BF16 trainer fixture.
-    "expert_dtype": "fp8",
-    "compress_ratios": _DSV4_REPRESENTATIVE_COMPRESS_RATIOS,
-    "layer_types": _DSV4_REPRESENTATIVE_LAYER_TYPES,
-    "mlp_layer_types": _DSV4_REPRESENTATIVE_MLP_LAYER_TYPES,
-    "rope_parameters": {
-        "partial_rotary_factor": 0.125,
-        "rope_theta": 10000,
-        "rope_type": "default",
-    },
-}
 _DSV4_COMMON_VLLM_ENGINE_ARGS = {
     "compilation_config": {
         "cudagraph_mode": "NONE",
@@ -242,25 +229,9 @@ _DSV4_COMMON_VLLM_ENGINE_ARGS = {
     "max_model_len": 1024,
     "max_num_batched_tokens": 1032,
 }
-_DSV4_MERGED_VLLM_ENGINE_ARGS = {
+_DSV4_VLLM_ENGINE_ARGS = {
     **_DSV4_COMMON_VLLM_ENGINE_ARGS,
-    "moe_backend": "triton",
-}
-_DSV4_LORA_VLLM_ENGINE_ARGS = {
-    **_DSV4_COMMON_VLLM_ENGINE_ARGS,
-    "moe_backend": "triton",
-}
-_DSV4_REDUCED_VLLM_ENGINE_ARGS = {
-    **_DSV4_MERGED_VLLM_ENGINE_ARGS,
-    # The quick DSV4 vLLM serving gates use a reduced 4-layer validation model and then
-    # sync Megatron weights into vLLM through merged-weight transfer. Loading
-    # the full public checkpoint before that sync is incompatible with the
-    # reduced hf_overrides because vLLM still streams layer-4+ tensors.
-    "load_format": "dummy",
-}
-_DSV4_NATIVE_LORA_VLLM_ENGINE_ARGS = {
-    **_DSV4_LORA_VLLM_ENGINE_ARGS,
-    "load_format": "dummy",
+    "moe_backend": "auto",
 }
 _DSV4_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3, 4, 5, 6, 7],
@@ -278,34 +249,13 @@ _DSV4_FULL_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[4, 5, 6, 7],
     tensor_parallel_size=4,
     enable_expert_parallel=True,
-    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
 )
 _DSV4_FULL_VLLM_EP2 = VllmWorkflowResources(
     gpu_ids=[2, 3],
     tensor_parallel_size=2,
     enable_expert_parallel=True,
-    extra_engine_args=_DSV4_LORA_VLLM_ENGINE_ARGS,
-)
-_DSV4_REDUCED_VLLM_EP4 = VllmWorkflowResources(
-    gpu_ids=[4, 5, 6, 7],
-    tensor_parallel_size=4,
-    enable_expert_parallel=True,
-    hf_overrides=_DSV4_HF_OVERRIDES,
-    extra_engine_args=_DSV4_REDUCED_VLLM_ENGINE_ARGS,
-)
-_DSV4_REDUCED_VLLM_EP2 = VllmWorkflowResources(
-    gpu_ids=[2, 3],
-    tensor_parallel_size=2,
-    enable_expert_parallel=True,
-    hf_overrides=_DSV4_HF_OVERRIDES,
-    extra_engine_args=_DSV4_REDUCED_VLLM_ENGINE_ARGS,
-)
-_DSV4_REDUCED_NATIVE_VLLM_EP4 = VllmWorkflowResources(
-    gpu_ids=[0, 1, 2, 3],
-    tensor_parallel_size=4,
-    enable_expert_parallel=True,
-    hf_overrides=_DSV4_HF_OVERRIDES,
-    extra_engine_args=_DSV4_NATIVE_LORA_VLLM_ENGINE_ARGS,
+    extra_engine_args=_DSV4_VLLM_ENGINE_ARGS,
 )
 _GLM52_REDUCED_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0],
@@ -335,20 +285,6 @@ _GPT_OSS_REDUCED_VLLM = VllmWorkflowResources(
         "max_model_len": 1024,
     },
 )
-_QWEN_MOE_REDUCED_MEGATRON = MegatronWorkflowResources(
-    gpu_ids=[0],
-    topology=MegatronWorkflowTopology(),
-)
-_QWEN_MOE_REDUCED_VLLM = VllmWorkflowResources(
-    gpu_ids=[1],
-    tensor_parallel_size=1,
-    extra_engine_args={
-        "enforce_eager": True,
-        "max_model_len": 1024,
-        "moe_backend": "triton",
-    },
-)
-
 # Explicitly for large models which do not fit in the default topology.
 HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
     "dsv4": HandlerWorkflowResources(
@@ -361,19 +297,6 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             high_vram_megatron=_DSV4_FOUR_GPU_MEGATRON,
             high_vram_vllm=_DSV4_FULL_VLLM_EP2,
             streaming_weight_offload=True,
-        ),
-        merged_vllm_serving=WorkflowStageResources(
-            required_world_size=8,
-            required_h200_equivalent_gpus=8,
-            megatron=_DSV4_FOUR_GPU_MEGATRON,
-            vllm=_DSV4_REDUCED_VLLM_EP4,
-            high_vram_megatron=_DSV4_HIGH_VRAM_MEGATRON,
-            high_vram_vllm=_DSV4_REDUCED_VLLM_EP2,
-            megatron_env=_DSV4_MEGATRON_ENV,
-        ),
-        native_vllm_lora=WorkflowStageResources(
-            required_world_size=4,
-            vllm=_DSV4_REDUCED_NATIVE_VLLM_EP4,
         ),
         yes_no_trainability=WorkflowStageResources(
             required_world_size=8,
@@ -403,15 +326,6 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
             megatron=_GLM52_REDUCED_MEGATRON,
             vllm=_GLM52_REDUCED_VLLM,
         ),
-        merged_vllm_serving=WorkflowStageResources(
-            required_world_size=2,
-            megatron=_GLM52_REDUCED_MEGATRON,
-            vllm=_GLM52_REDUCED_VLLM,
-        ),
-        native_vllm_lora=WorkflowStageResources(
-            required_world_size=2,
-            vllm=_GLM52_REDUCED_VLLM,
-        ),
         yes_no_trainability=WorkflowStageResources(
             required_world_size=2,
             megatron=_GLM52_REDUCED_MEGATRON,
@@ -437,41 +351,18 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
                 tensor_parallel_size=1,
             ),
         ),
-        merged_vllm_serving=WorkflowStageResources(
-            required_world_size=2,
-            megatron=_GPT_OSS_REDUCED_MEGATRON,
-            vllm=_GPT_OSS_REDUCED_VLLM,
-        ),
-        native_vllm_lora=WorkflowStageResources(
-            required_world_size=2,
-            vllm=_GPT_OSS_REDUCED_VLLM,
-        ),
     ),
-    **{
-        handler_key: HandlerWorkflowResources(
-            merged_vllm_serving=WorkflowStageResources(
-                required_world_size=2,
-                megatron=_QWEN_MOE_REDUCED_MEGATRON,
-                vllm=_QWEN_MOE_REDUCED_VLLM,
-            ),
-            native_vllm_lora=WorkflowStageResources(
-                required_world_size=2,
-                vllm=_QWEN_MOE_REDUCED_VLLM,
-            ),
-        )
-        for handler_key in ("qwen3_moe", "qwen3_5_moe")
-    },
 }
 
 _THROUGHPUT_CONFIGS = {
     "llama3_dense": ThroughputWorkflowConfig(
-        num_layers=16,
+        num_layers=24,
         prompt_tokens=3922,
         completion_tokens=256,
         rollouts_per_group=6,
-        groups_per_step=24,
-        initial_model_calls_per_inference_gpu=20,
-        max_steps=35,
+        groups_per_step=23,
+        initial_model_calls_per_inference_gpu=26,
+        enable_prefix_caching=True,
     ),
     "qwen3_dense": ThroughputWorkflowConfig(
         num_layers=8,
@@ -479,7 +370,6 @@ _THROUGHPUT_CONFIGS = {
         rollouts_per_group=8,
         groups_per_step=25,
         initial_model_calls_per_inference_gpu=10,
-        max_steps=35,
     ),
     "qwen3_moe": ThroughputWorkflowConfig(
         num_layers=16,
@@ -488,7 +378,7 @@ _THROUGHPUT_CONFIGS = {
         rollouts_per_group=5,
         groups_per_step=27,
         initial_model_calls_per_inference_gpu=20,
-        max_steps=35,
+        max_steps=17,
     ),
     "qwen3_5_dense": ThroughputWorkflowConfig(
         num_layers=8,
@@ -496,7 +386,6 @@ _THROUGHPUT_CONFIGS = {
         completion_tokens=64,
         groups_per_step=31,
         initial_model_calls_per_inference_gpu=12,
-        max_steps=35,
         enable_prefix_caching=True,
     ),
     "qwen3_5_moe": ThroughputWorkflowConfig(
@@ -506,7 +395,6 @@ _THROUGHPUT_CONFIGS = {
         groups_per_step=17,
         initial_model_calls_per_inference_gpu=12,
         max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
-        max_steps=35,
         enable_prefix_caching=True,
     ),
     "gemma4_dense": ThroughputWorkflowConfig(
@@ -515,7 +403,6 @@ _THROUGHPUT_CONFIGS = {
         rollouts_per_group=7,
         groups_per_step=30,
         initial_model_calls_per_inference_gpu=11,
-        max_steps=35,
     ),
     "gemma4_moe": ThroughputWorkflowConfig(
         num_layers=12,
@@ -523,16 +410,18 @@ _THROUGHPUT_CONFIGS = {
         completion_tokens=128,
         groups_per_step=31,
         initial_model_calls_per_inference_gpu=26,
-        max_steps=35,
     ),
     "dsv4": ThroughputWorkflowConfig(
         num_layers=8,
-        prompt_tokens=12_800,
-        completion_tokens=736,
-        groups_per_step=8,
-        initial_model_calls_per_inference_gpu=20,
-        max_num_seqs=60,
-        max_num_batched_tokens=24_576,
+        packed_sequence_length=32_768,
+        prompt_tokens=14_651,
+        completion_tokens=84,
+        rollouts_per_group=20,
+        groups_per_step=4,
+        initial_model_calls_per_inference_gpu=6,
+        max_num_seqs=80,
+        max_num_batched_tokens=131_072,
+        enable_prefix_caching=True,
     ),
     "glm52": ThroughputWorkflowConfig(
         num_layers=12,
@@ -543,9 +432,9 @@ _THROUGHPUT_CONFIGS = {
     ),
     "gpt_oss_moe": ThroughputWorkflowConfig(
         num_layers=4,
-        initial_model_calls_per_inference_gpu=21,
+        initial_model_calls_per_inference_gpu=23,
         max_num_seqs=48,
-        max_steps=35,
+        max_steps=21,
     ),
 }
 
@@ -554,55 +443,55 @@ _THROUGHPUT_CONFIGS = {
 # values are estimates from the prior H200 workflow and remain fingerprint-free.
 _B300_THROUGHPUT_FLOORS = {
     "llama3_dense": (
-        "4931aacd6e2a08318aaeb6019eaff8c973fd4401c51ca073fca3a44360c88314",
-        (49_500, 47_300, 12_900, 0.90, 4.5),
+        "1c9fb158b4813ba42d4c402acde018502bcfe2f7d238ce8e5ff918869a504628",
+        (38_500, 37_300, 10_500, 0.93, 4.5),
     ),
     "qwen3_dense": (
-        "abf0e339c86a7c574133acda5ff402d69b034432b57f57e9b04afe6b84efd865",
+        "75441cafe440cee717d4533bbf95ef094f8790820db5749af2e3d2af0dfe14c8",
         (40_200, 37_600, 8_600, 0.88, 4.5),
     ),
     "qwen3_moe": (
-        "3a8e41c026bc9b8fbb8a1108f003d1bf646725603d5c6579a207de1fbc90c81e",
+        "cf0397f60ec0942b4d42f08d15e864afa0eb8d1fce30312637db4c156c8b837a",
         (49_900, 43_700, 2_050, 0.82, 4.5),
     ),
     "qwen3_5_dense": (
-        "a7bb96316519ec930152dfbb4108f4ea6482da87413f4daa326b53c73a536f9c",
+        "ac87995bd573a0fc4a0e0129a4fcabcb9e74017ac9a7d24e47cd459a8c23c2aa",
         (64_800, 60_000, 3_750, 0.87, 3.5),
     ),
     "qwen3_5_moe": (
-        "a04c0ea28418ec6d526b0686600e0a4cadaf36d7ff40cb1661e0b3b1679aca20",
+        "b59dace57f01fc101eaf4add2e3a94150a83047436b2faeabc530455e214d00a",
         (32_600, 30_800, 257, 0.89, 5.5),
     ),
     "gemma4_dense": (
-        "05aab57334726fdea25c249eb521d89b02ac92c212451feecad7500677fef58c",
+        "6e74bbd99a89e9f88283386eb21833ef54ffcc2e944b6d008854f55c8f731490",
         (23_100, 22_700, 2_390, 0.93, 7.0),
     ),
     "gemma4_moe": (
-        "2db699a071ccbda911f0fca14b56fe063eb7ac2a7d8da5639391e602d15f94c1",
+        "5f0527d0a0dbbd3f7acaf8b943f015a344c8cb1098b014eca524435fb5f5d97d",
         (40_300, 38_500, 4_740, 0.90, 5.0),
     ),
     "dsv4": (
-        "1d2fd40a2ed4ccad93ebbdece213f935c8c06ed035c51e89dff3c9d1f1b9bcdd",
-        (7_050, 7_020, 1_350, 0.94, 43.0),
+        "5112c1585aaf37fb59e733cef684f9fc99691894adb08d7f04235f0c76d5e96f",
+        (14_800, 14_300, 1_300, 0.94, 6.0),
     ),
     "glm52": (
-        "8f8e4ff249ad4efdcc6a6f75e9d3a92c6ce7b6d5dca89a4a3807c76848e52a07",
+        "7e9bd24f6dfb8b12078807ec72749fac5973b2b1c082a618edc62cc2ccfdf695",
         (14_880, 14_330, 5_730, 0.91, 12.0),
     ),
     "gpt_oss_moe": (
-        "27efd9c6dabef7f8af7604ba9754ee57345ec39f5615b49fdfd550014708cf18",
+        "9a3a428f17c342ebedbf59a47338f3531d84ed97e7cfca6e9552966a101ca1db",
         (81_700, 76_400, 4_850, 0.88, 2.5),
     ),
 }
 _H200_THROUGHPUT_FLOORS = {
-    "llama3_dense": (27_500, 25_900, 6_600, 0.89, 7.0),
+    "llama3_dense": (18_300, 17_200, 4_400, 0.89, 7.0),
     "qwen3_dense": (24_100, 23_100, 5_000, 0.91, 7.0),
     "qwen3_moe": (26_400, 20_900, 930, 0.74, 10.0),
     "qwen3_5_dense": (26_500, 25_600, 1_500, 0.91, 5.5),
     "qwen3_5_moe": (13_600, 12_900, 100, 0.90, 12.0),
     "gemma4_dense": (10_600, 10_400, 1_000, 0.93, 13.0),
     "gemma4_moe": (17_900, 17_300, 2_000, 0.91, 9.5),
-    "dsv4": (3_500, 3_400, 620, 0.94, 80.0),
+    "dsv4": (8_300, 8_000, 700, 0.90, 12.0),
     "glm52": (9_400, 9_000, 3_400, 0.91, 19.5),
     "gpt_oss_moe": (39_900, 37_100, 2_200, 0.88, 4.5),
 }

@@ -105,7 +105,7 @@ def test_service_modules_import_without_vllm(artifact_dir: Path) -> None:
                 "import importlib, json; "
                 "modules = ["
                 "'art.megatron.distributed_service', "
-                "'art.megatron.weights.merged_weight_export'"
+                "'art.megatron.weights.conversion_tasks'"
                 "]; "
                 "loaded = [importlib.import_module(name).__name__ for name in modules]; "
                 "print(json.dumps({'loaded': loaded}))"
@@ -116,14 +116,27 @@ def test_service_modules_import_without_vllm(artifact_dir: Path) -> None:
     payload = _load_json_from_stdout(result.stdout)
     assert payload["loaded"] == [
         "art.megatron.distributed_service",
-        "art.megatron.weights.merged_weight_export",
+        "art.megatron.weights.conversion_tasks",
     ]
 
 
 def test_runtime_env_preserves_build_arch_without_initializing_cuda(
     artifact_dir: Path,
 ) -> None:
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "TORCH_CUDA_ARCH_LIST": "10.3"}
+    cache_root = artifact_dir / "cache"
+    env = dict(os.environ)
+    env.update(
+        ART_MEGATRON_CACHE_ROOT=str(cache_root),
+        CUDA_VISIBLE_DEVICES="",
+        TORCH_CUDA_ARCH_LIST="10.3",
+        XDG_CACHE_HOME=str(cache_root),
+    )
+    for name in (
+        "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR",
+        "TORCHINDUCTOR_CACHE_DIR",
+        "TRITON_CACHE_DIR",
+    ):
+        env.pop(name, None)
     result = _run(
         [
             sys.executable,
@@ -134,7 +147,10 @@ def test_runtime_env_preserves_build_arch_without_initializing_cuda(
                 "configure_megatron_runtime_env; "
                 "configure_megatron_runtime_env(); "
                 "print(json.dumps({'arch': os.environ['TORCH_CUDA_ARCH_LIST'], "
-                "'cuda_initialized': torch.cuda.is_initialized()}))"
+                "'cuda_initialized': torch.cuda.is_initialized(), "
+                "'inductor': os.environ['TORCHINDUCTOR_CACHE_DIR'], "
+                "'triton': os.environ['TRITON_CACHE_DIR'], "
+                "'flash': os.environ['FLASH_ATTENTION_CUTE_DSL_CACHE_DIR']}))"
             ),
         ],
         artifact_dir=artifact_dir,
@@ -143,4 +159,7 @@ def test_runtime_env_preserves_build_arch_without_initializing_cuda(
     assert _load_json_from_stdout(result.stdout) == {
         "arch": "10.3",
         "cuda_initialized": False,
+        "inductor": str(cache_root / "compiled" / "10.3" / "torchinductor"),
+        "triton": str(cache_root / "compiled" / "10.3" / "triton"),
+        "flash": str(cache_root / "compiled" / "10.3" / "flash_attention_cute_dsl"),
     }

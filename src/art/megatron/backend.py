@@ -9,7 +9,7 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .. import dev
+from .. import dev, types
 from .._backend_training import merge_gradient_step_metrics, should_save_optimizer_state
 from ..backend import AnyTrainableModel
 from ..distributed.art_runtime import ArtRuntime
@@ -34,6 +34,7 @@ from ..utils.lifecycle import complete_task
 from ..utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 from ..vllm_runtime import get_external_vllm_runtime_config
 from .migrations import apply_megatron_migrations
+from .runtime.specs import ResidentLoraInspectionResult, ResidentScoreResult
 from .runtime_config import get_megatron_runtime_config
 
 
@@ -114,9 +115,7 @@ def _packing_metrics(packed: Any) -> dict[str, float]:
 
 def _sampler_publication_mode(
     service: Any,
-) -> Literal["versioned_lora", "in_flight_lora", "merged_weights"]:
-    if service.rollout_weights_mode == "merged":
-        return "merged_weights"
+) -> Literal["versioned_lora", "in_flight_lora"]:
     return (
         "in_flight_lora"
         if service.rollout_weight_update_mode == "in_flight_lora"
@@ -125,6 +124,8 @@ def _sampler_publication_mode(
 
 
 class MegatronBackend(LocalBackend):
+    supports_pipeline_train_dispatch_fence = True
+
     def __init__(
         self,
         *,
@@ -303,20 +304,40 @@ class MegatronBackend(LocalBackend):
                     f"MegatronBackend.train gets {removed_kwarg} from "
                     "art.init_megatron_runtime_config(...)."
                 )
+        dispatch_event = kwargs.pop("_pipeline_train_dispatch_event", None)
+        if dispatch_event is not None and not isinstance(dispatch_event, asyncio.Event):
+            raise TypeError("pipeline train dispatch fence must be an asyncio.Event")
         groups = list(trajectory_groups)
         pipeline_call = bool(
             groups
             and isinstance(groups[0]._prepared_training_batch, _PipelinePreparedBatch)
         )
-        result = await super().train(
-            model,
-            groups,
-            packed_sequence_length=get_megatron_runtime_config().packed_sequence_length,
-            **kwargs,
-        )
         from .distributed_service import DistributedMegatronService
 
-        service = cast(DistributedMegatronService, await self._get_service(model))
+        dispatch_armed = dispatch_event is not None and not dispatch_event.is_set()
+        service: DistributedMegatronService | None = None
+        if dispatch_armed:
+            if not pipeline_call:
+                raise RuntimeError("trainer dispatch fencing requires a prepared batch")
+            assert dispatch_event is not None
+            service = cast(DistributedMegatronService, await self._get_service(model))
+            service.arm_pipeline_train_dispatch(dispatch_event)
+        try:
+            result = await super().train(
+                model,
+                groups,
+                packed_sequence_length=(
+                    get_megatron_runtime_config().packed_sequence_length
+                ),
+                **kwargs,
+            )
+        finally:
+            if dispatch_armed:
+                assert dispatch_event is not None
+                assert service is not None
+                service.cancel_pipeline_train_dispatch(dispatch_event)
+        if service is None:
+            service = cast(DistributedMegatronService, await self._get_service(model))
         final_step = kwargs.get("final_training_step")
         if final_step is not None and result.step >= final_step:
             result.metrics.update(
@@ -341,6 +362,129 @@ class MegatronBackend(LocalBackend):
 
         service = cast(DistributedMegatronService, await self._get_service(model))
         return await service.finalize_publication_metrics(await self._get_step(model))
+
+    async def inspect_resident_lora(
+        self,
+        model: AnyTrainableModel,
+        *,
+        expected_learner_version: int,
+    ) -> ResidentLoraInspectionResult:
+        from .distributed_service import DistributedMegatronService
+
+        service = cast(DistributedMegatronService, await self._get_service(model))
+        service.prefetch_trainer()
+        return await service.inspect_resident_lora(
+            expected_learner_version=expected_learner_version
+        )
+
+    async def score_resident(
+        self,
+        model: AnyTrainableModel,
+        trajectory_groups: Iterable[TrajectoryGroup],
+        *,
+        expected_learner_version: int,
+        top_k: int = 20,
+        grad_accumulation_sequences: int | None = None,
+    ) -> ResidentScoreResult:
+        groups = list(trajectory_groups)
+        if not groups or not any(group.trajectories for group in groups):
+            raise ValueError("resident scoring requires at least one trajectory")
+        stale = [
+            (group_index, trajectory_index, initial, final)
+            for group_index, group in enumerate(groups)
+            for trajectory_index, trajectory in enumerate(group.trajectories)
+            for initial, final in (
+                (
+                    trajectory.initial_policy_version,
+                    trajectory.final_policy_version,
+                ),
+            )
+            if initial != expected_learner_version or final != expected_learner_version
+        ]
+        if stale:
+            raise ValueError(
+                "resident score trajectories must have exact initial/final learner "
+                f"provenance {expected_learner_version}; mismatches={stale[:8]}"
+            )
+
+        include_moe_routing = self._model_uses_expert_replay(model)
+        dev_config = {
+            "advantage_balance": 0.0,
+            "allow_training_without_logprobs": False,
+            "scale_rewards": True,
+            "plot_tensors": False,
+            "packed_sequence_length": (
+                get_megatron_runtime_config().packed_sequence_length
+            ),
+            "logprob_calculation_chunk_size": 1024,
+        }
+        batch = await self._prepare_training_batch(
+            model,
+            groups,
+            dev_config,
+            include_moe_routing=include_moe_routing,
+        )
+        if batch is None:
+            raise RuntimeError("resident scoring produced no packed batch")
+
+        try:
+            from ..distributed.art_runtime import DistributedPackedBatch
+            from .distributed_service import DistributedMegatronService
+
+            payload = batch.payload
+            if not isinstance(payload, _DistributedBatchPayload):
+                raise RuntimeError("resident scoring did not use the typed data plane")
+            distributed_batch = cast(DistributedPackedBatch, payload.packed)
+            service = cast(
+                DistributedMegatronService,
+                await self._get_service(model),
+            )
+            accumulation = await service.resolve_global_grad_accumulation_sequences(
+                types.TrainConfig(
+                    grad_accumulation_sequences=grad_accumulation_sequences
+                )
+            )
+            return await service.score_resident_packed(
+                distributed_batch,
+                expected_learner_version=expected_learner_version,
+                global_grad_accumulation_sequences=accumulation,
+                top_k=top_k,
+            )
+        finally:
+            primary = sys.exception()
+            paths = {
+                group._prepared_log_path
+                for group in groups
+                if group._prepared_log_path is not None
+            }
+            try:
+                results = await asyncio.gather(
+                    self._release_distributed_batch(
+                        batch,
+                        disposition="discarded",
+                    ),
+                    *(
+                        asyncio.to_thread(Path(path).unlink, missing_ok=True)
+                        for path in paths
+                    ),
+                    return_exceptions=True,
+                )
+                for group in groups:
+                    group._prepared_log_path = None
+                failures = [
+                    result for result in results if isinstance(result, BaseException)
+                ]
+                if failures:
+                    raise BaseExceptionGroup(
+                        "resident score batch release failed", failures
+                    )
+            except BaseException as cleanup_error:
+                if primary is None:
+                    raise
+                raise BaseExceptionGroup(
+                    "resident score and batch release failed",
+                    [primary, cleanup_error],
+                ) from None
 
     def _supports_concurrent_training_and_inference(
         self, model: AnyTrainableModel
@@ -564,7 +708,11 @@ class MegatronBackend(LocalBackend):
         model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
+        from .distributed_service import DistributedMegatronService
+
+        service = cast(DistributedMegatronService, await self._get_service(model))
         if get_external_vllm_runtime_config(model._internal_config or {}) is not None:
+            service.prefetch_trainer()
             return await super()._prepare_backend_for_training(model, config)
         config_dict = dict(config or {})
         server_args = dict(config_dict.get("server_args", {}))
@@ -573,12 +721,6 @@ class MegatronBackend(LocalBackend):
             port = server_args["port"]
             if isinstance(port, bool) or not isinstance(port, int):
                 raise TypeError("OpenAI server port must be an integer")
-            from .distributed_service import DistributedMegatronService
-
-            service = cast(
-                DistributedMegatronService,
-                await self._get_service(cast(TrainableModel, model)),
-            )
             if (
                 service._managed_service_name is not None
                 and service.openai_server_port != port
@@ -586,11 +728,9 @@ class MegatronBackend(LocalBackend):
                 raise RuntimeError("cannot change a running OpenAI server port")
             await self._configure_owned_api_port(cast(TrainableModel, model), port)
         if "port" not in server_args and not self._owns_runtime:
-            from .distributed_service import DistributedMegatronService
-
-            service = cast(DistributedMegatronService, await self._get_service(model))
             server_args["port"] = service.openai_server_port
         config_dict["server_args"] = server_args
+        service.prefetch_trainer()
         return await super()._prepare_backend_for_training(
             model, cast(dev.OpenAIServerConfig, config_dict)
         )
@@ -884,6 +1024,7 @@ class MegatronBackend(LocalBackend):
         allow_training_without_logprobs: bool = False,
         plot_tensors: bool = False,
         logprob_calculation_chunk_size: int = 1024,
+        grad_accumulation_sequences: int | None = None,
     ) -> dict[str, float] | None:
         include_moe_routing = self._model_uses_expert_replay(model)
         dev_config = {
@@ -909,16 +1050,58 @@ class MegatronBackend(LocalBackend):
             )
         distributed = payload.packed
         metrics = _packing_metrics(distributed)
+        from .distributed_service import DistributedMegatronService
+
+        service = cast(
+            DistributedMegatronService,
+            await self._get_service(model),
+        )
+        packing_config = _PackingConfig.from_dev_config(
+            dev_config,
+            include_moe_routing=include_moe_routing,
+            collect_packing_shapes=any(
+                group._collect_packing_shape for group in trajectory_groups
+            ),
+        )
+        try:
+            metrics.update(
+                await service.prepare_cp_lookahead(
+                    distributed,
+                    global_grad_accumulation_sequences=grad_accumulation_sequences,
+                )
+            )
+        except BaseException as primary:
+            cleanup_prepared = _PipelinePreparedBatch(
+                batch=batch,
+                groups=tuple(trajectory_groups),
+                packing_config=packing_config,
+                metrics=metrics,
+            )
+            paths = {
+                group._prepared_log_path
+                for group in trajectory_groups
+                if group._prepared_log_path is not None
+            }
+            try:
+                _, cancelled = await complete_task(
+                    asyncio.create_task(
+                        self._discard_prepared_resources(
+                            cleanup_prepared, trajectory_groups, paths
+                        )
+                    )
+                )
+                if cancelled is not None:
+                    raise cancelled
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "CP lookahead and packed-batch cleanup failed",
+                    [primary, cleanup_error],
+                ) from None
+            raise
         prepared = _PipelinePreparedBatch(
             batch=batch,
             groups=tuple(trajectory_groups),
-            packing_config=_PackingConfig.from_dev_config(
-                dev_config,
-                include_moe_routing=include_moe_routing,
-                collect_packing_shapes=any(
-                    group._collect_packing_shape for group in trajectory_groups
-                ),
-            ),
+            packing_config=packing_config,
             metrics=metrics,
         )
         for group in trajectory_groups:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import socket
 import subprocess
 import sys
 from typing import Any, Callable
@@ -41,16 +40,8 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 HF_PARITY_ARTIFACT_SUITE_NAME = "Megatron HF parity artifacts"
 
 
-def _find_free_rendezvous_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
-
-
 def _hf_parity_worker_env() -> dict[str, str]:
     return {
-        "MASTER_ADDR": "127.0.0.1",
-        "MASTER_PORT": str(_find_free_rendezvous_port()),
         "RANK": "0",
         "WORLD_SIZE": "1",
         "LOCAL_RANK": "0",

@@ -1,10 +1,8 @@
-import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -151,37 +149,6 @@ def _save_adapter(path: Path, tensors: dict[str, torch.Tensor], config: dict) ->
     path.mkdir(parents=True, exist_ok=True)
     save_file(tensors, path / "adapter_model.safetensors")
     (path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
-
-
-def _old_merge_shard_files_to_vllm(
-    lora_path: Path,
-    *,
-    handler,
-    adapter_config: dict,
-) -> None:
-    entries_by_key: dict[str, list[tuple[dict, torch.Tensor]]] = {}
-    shard_paths = sorted(lora_path.glob("adapter_model-*-of-*.safetensors"))
-    manifest_paths = sorted(lora_path.glob("adapter_manifest-*-of-*.json"))
-    for shard_path in shard_paths:
-        suffix = shard_path.name.removeprefix("adapter_model-").removesuffix(
-            ".safetensors"
-        )
-        manifest = json.loads(
-            (lora_path / f"adapter_manifest-{suffix}.json").read_text()
-        )
-        shard_tensors = load_file(shard_path)
-        assert set(shard_tensors) == set(manifest)
-        for key, tensor in shard_tensors.items():
-            entries_by_key.setdefault(key, []).append((manifest[key], tensor))
-
-    merged = merge_sharded_adapter_entries(entries_by_key)
-    vllm_tensors, adapter_config = handler.to_vllm_lora_tensors(
-        merged,
-        adapter_config=adapter_config,
-    )
-    save_vllm_lora_tensors(lora_path, vllm_tensors, adapter_config)
-    for path in [*shard_paths, *manifest_paths]:
-        path.unlink()
 
 
 def _assert_stock_vllm_loads(
@@ -890,6 +857,25 @@ def test_dsv4_vllm_canonical_moe_roundtrip(tmp_path: Path) -> None:
     assert "model.layers.4.attn.compressor.wgate" in loaded_modules
     assert "model.layers.4.attn.compressor.wkv" in loaded_modules
 
+    packed_art = {
+        key.replace(".ffn.experts", ".mlp.experts"): tensor
+        for key, tensor in vllm_tensors.items()
+        if ".ffn.experts" in key
+    }
+    reexported, _ = DSV4_HANDLER.to_vllm_lora_tensors(
+        packed_art,
+        adapter_config=config,
+    )
+    _assert_tensors_equal(
+        reexported,
+        {key: tensor for key, tensor in vllm_tensors.items() if ".ffn.experts" in key},
+    )
+    assert all(
+        reexported[key].data_ptr()
+        == packed_art[key.replace(".ffn.experts", ".mlp.experts")].data_ptr()
+        for key in reexported
+    )
+
 
 def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp(tmp_path: Path):
     art_prefix = "base_model.model.model.layers.0"
@@ -1244,7 +1230,6 @@ def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(
         handler=QWEN3_5_MOE_HANDLER,
     )
     _assert_tensors_equal(roundtrip, full)
-    final_config = json.loads((adapter_dir / "adapter_config.json").read_text())
     loaded_modules = _assert_stock_vllm_loads(
         adapter_dir,
         expected_modules={"experts"},
@@ -1389,117 +1374,6 @@ def test_lora_publish_planner_maps_expert_owner_ranks(monkeypatch):
         lambda group: column_major[group],
     )
     assert LoRAPublishPlanner._expert_owner_rank(ep_rank=3, shard_rank=1) == 7
-
-
-def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
-    uniform_key = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"
-    componentwise_key = (
-        "base_model.model.model.layers.0.mlp.experts.gate_up_proj.lora_B.weight"
-    )
-    unsharded_key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
-    full_uniform = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-    full_componentwise = torch.tensor(
-        [[0.0], [1.0], [10.0], [11.0], [2.0], [3.0], [12.0], [13.0]]
-    )
-    shard0 = {
-        unsharded_key: torch.arange(4, dtype=torch.float32).reshape(2, 2) + 100,
-        uniform_key: full_uniform[:2],
-        componentwise_key: torch.tensor([[0.0], [1.0], [2.0], [3.0]]),
-    }
-    shard1 = {
-        uniform_key: full_uniform[2:],
-        componentwise_key: torch.tensor([[10.0], [11.0], [12.0], [13.0]]),
-    }
-    unsharded_manifest = {"sharded": False, "shard_world_size": 1, "shard_rank": 0}
-    uniform_manifest = {
-        "sharded": True,
-        "shard_world_size": 2,
-        "export_shard_dim": 0,
-        "export_shard_strategy": "uniform",
-    }
-    componentwise_manifest = {
-        "sharded": True,
-        "shard_world_size": 2,
-        "export_shard_dim": 0,
-        "export_shard_strategy": "componentwise",
-        "component_sizes": [4, 4],
-    }
-    manifest0 = {
-        unsharded_key: unsharded_manifest,
-        uniform_key: {**uniform_manifest, "shard_rank": 0},
-        componentwise_key: {**componentwise_manifest, "shard_rank": 0},
-    }
-    manifest1 = {
-        uniform_key: {**uniform_manifest, "shard_rank": 1},
-        componentwise_key: {**componentwise_manifest, "shard_rank": 1},
-    }
-
-    class IdentityHandler:
-        def to_vllm_lora_tensors(self, tensors, *, adapter_config):
-            return dict(tensors), dict(adapter_config)
-
-    old_dir = tmp_path / "old"
-    current_dir = tmp_path / "current"
-    old_dir.mkdir()
-    save_file(shard0, old_dir / "adapter_model-01-of-02.safetensors")
-    save_file(shard1, old_dir / "adapter_model-02-of-02.safetensors")
-    (old_dir / "adapter_manifest-01-of-02.json").write_text(
-        json.dumps(manifest0, sort_keys=True)
-    )
-    (old_dir / "adapter_manifest-02-of-02.json").write_text(
-        json.dumps(manifest1, sort_keys=True)
-    )
-    adapter_config = _config("Qwen/Qwen3-30B-A3B")
-    handler = IdentityHandler()
-    _old_merge_shard_files_to_vllm(
-        old_dir,
-        handler=handler,
-        adapter_config=adapter_config,
-    )
-
-    metadata = [
-        LoraShardMeta(
-            key=key,
-            owner_rank=0,
-            shape=tuple(tensor.shape),
-            dtype_name=str(tensor.dtype).removeprefix("torch."),
-            manifest=manifest0[key],
-            block="base_model.model.model.layers.0",
-        )
-        for key, tensor in shard0.items()
-    ] + [
-        LoraShardMeta(
-            key=key,
-            owner_rank=1,
-            shape=tuple(tensor.shape),
-            dtype_name=str(tensor.dtype).removeprefix("torch."),
-            manifest=manifest1[key],
-            block="base_model.model.model.layers.0",
-        )
-        for key, tensor in shard1.items()
-    ]
-    lora_publish._save_rank0_vllm_lora(
-        metadata=metadata,
-        tensors_by_owner_key={
-            **{(0, key): tensor for key, tensor in shard0.items()},
-            **{(1, key): tensor for key, tensor in shard1.items()},
-        },
-        handler=handler,
-        adapter_config=adapter_config,
-        output_dir=str(current_dir),
-    )
-
-    old_tensors = load_file(old_dir / "adapter_model.safetensors")
-    current_tensors = load_file(current_dir / "adapter_model.safetensors")
-    _assert_tensors_equal(current_tensors, old_tensors)
-    assert torch.equal(current_tensors[uniform_key], full_uniform)
-    assert torch.equal(current_tensors[componentwise_key], full_componentwise)
-    assert (current_dir / "adapter_model.safetensors").read_bytes() == (
-        old_dir / "adapter_model.safetensors"
-    ).read_bytes()
-    assert json.loads((current_dir / "adapter_config.json").read_text()) == json.loads(
-        (old_dir / "adapter_config.json").read_text()
-    )
 
 
 def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path):

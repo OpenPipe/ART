@@ -719,7 +719,7 @@ def prepare_provider_bundle(
 
 
 def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
-    runtime_env = _ProviderRuntimeEnv.from_environ()
+    _ProviderRuntimeEnv.from_environ()
     provider = cast(GPTModelProvider, provider_bundle.provider)
     _apply_art_training_runtime_finalize_defaults(provider)
     _enforce_art_moe_grouped_gemm_fast_path(provider)

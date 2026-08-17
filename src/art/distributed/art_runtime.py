@@ -77,11 +77,6 @@ from .vllm_replica import (
 logger = logging.getLogger(__name__)
 
 
-def _consume_task_result(task: asyncio.Future[Any]) -> None:
-    if not task.cancelled():
-        task.exception()
-
-
 class DistributedPackedBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -872,13 +867,23 @@ class ArtRuntime:
     async def start_trainer(
         self, runtime_spec: TrainerRuntimeSpec, run_spec: TrainingRunSpec
     ) -> Any:
-        actors, proc, supervision, rank_processes = await self._start_trainer_actors(
-            runtime_spec, owner_id=run_spec.run_id
-        )
+        (
+            actors,
+            proc,
+            supervision,
+            rank_processes,
+            cp_lookahead_ports,
+        ) = await self._start_trainer_actors(runtime_spec, owner_id=run_spec.run_id)
         from art.megatron.runtime.monarch import MonarchTrainerRun
 
         run = MonarchTrainerRun(
-            runtime_spec, run_spec, actors, proc, supervision, rank_processes
+            runtime_spec,
+            run_spec,
+            actors,
+            proc,
+            supervision,
+            rank_processes,
+            cp_lookahead_ports,
         )
         self._trainer_runs.add(run)
         return run
@@ -891,9 +896,13 @@ class ArtRuntime:
         command_timeout_s: float = 300.0,
         shutdown_timeout_s: float = 240.0,
     ) -> Any:
-        actors, proc, supervision, rank_processes = await self._start_trainer_actors(
-            runtime_spec, owner_id=slot_id
-        )
+        (
+            actors,
+            proc,
+            supervision,
+            rank_processes,
+            cp_lookahead_ports,
+        ) = await self._start_trainer_actors(runtime_spec, owner_id=slot_id)
         from art.megatron.runtime.monarch import MonarchTrainerSlot
 
         slot = MonarchTrainerSlot(
@@ -902,6 +911,7 @@ class ArtRuntime:
             proc,
             supervision,
             rank_processes,
+            cp_lookahead_ports,
             command_timeout_s=command_timeout_s,
             shutdown_timeout_s=shutdown_timeout_s,
         )
@@ -913,7 +923,7 @@ class ArtRuntime:
         runtime_spec: TrainerRuntimeSpec,
         *,
         owner_id: str,
-    ) -> tuple[Any, Any, Any, Any]:
+    ) -> tuple[Any, Any, Any, Any, Any]:
         self._require_open()
         if self.topology.trainer is None:
             raise RuntimeError("runtime topology has no trainer mesh")
@@ -960,9 +970,11 @@ class ArtRuntime:
                 ),
             )
             async with asyncio.timeout(self.topology.cluster.startup_timeout_s):
-                actors, rank_processes = await spawn_monarch_trainer_actors(
-                    proc, runtime_spec, supervision
-                )
+                (
+                    actors,
+                    rank_processes,
+                    cp_lookahead_ports,
+                ) = await spawn_monarch_trainer_actors(proc, runtime_spec, supervision)
         except BaseException as startup_error:
             try:
                 if proc is not None:
@@ -978,7 +990,7 @@ class ArtRuntime:
                     suppress_owned_mesh_faults_s=self.topology.cluster.rpc_timeout_s
                 )
             raise
-        return actors, proc, supervision, rank_processes
+        return actors, proc, supervision, rank_processes, cp_lookahead_ports
 
     async def stop_trainer(self, run: Any) -> None:
         await run.close()

@@ -36,7 +36,6 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
 
 import httpx
 import numpy as np
-import polars as pl
 from pydantic import BaseModel, ConfigDict
 import torch
 from tqdm import auto as tqdm
@@ -156,61 +155,6 @@ class _TrainStepVllmMetricsCollector:
 
     async def aclose(self) -> None:
         await self._client.aclose()
-
-
-def _prometheus_values(text: str, name: str) -> list[float]:
-    values: list[float] = []
-    for line in text.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        try:
-            sample, raw_value = line.rsplit(None, 1)
-        except ValueError:
-            continue
-        sample_name = sample.split("{", 1)[0]
-        if sample_name != name:
-            continue
-        try:
-            values.append(float(raw_value))
-        except ValueError:
-            continue
-    return values
-
-
-def _prometheus_sum(text: str, name: str) -> float | None:
-    values = _prometheus_values(text, name)
-    if not values:
-        return None
-    return math.fsum(values)
-
-
-def _prometheus_sum_with_label(
-    text: str, name: str, label: str, value: str
-) -> float | None:
-    values: list[float] = []
-    needle = f'{label}="{value}"'
-    for line in text.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        try:
-            sample, raw_value = line.rsplit(None, 1)
-        except ValueError:
-            continue
-        sample_name = sample.split("{", 1)[0]
-        if sample_name != name or needle not in sample:
-            continue
-        try:
-            values.append(float(raw_value))
-        except ValueError:
-            continue
-    return math.fsum(values) if values else None
-
-
-def _prometheus_mean(text: str, name: str) -> float | None:
-    values = _prometheus_values(text, name)
-    if not values:
-        return None
-    return math.fsum(values) / len(values)
 
 
 def _configured_chat_template_value(
@@ -1752,7 +1696,11 @@ class LocalBackend:
                 }
             )
             # The frontend applies reward scaling and logs the resulting metrics.
-            pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
+            pbar = tqdm.tqdm(
+                total=fallback_gradient_steps,
+                desc="train",
+                disable=not verbose,
+            )
             reported_gradient_steps: int | None = None
             try:
                 async for result in self._stream_prepared_training(
@@ -1786,8 +1734,9 @@ class LocalBackend:
                         **result,
                         TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
                     }
-                    pbar.update(1)
-                    pbar.set_postfix(result)
+                    if verbose:
+                        pbar.update(1)
+                        pbar.set_postfix(result)
             finally:
                 pbar.close()
             if verbose:
@@ -1916,9 +1865,6 @@ class LocalBackend:
         self._grad_accumulation_sequences_by_service[service_key] = resolved
         return resolved
 
-    # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
-    # have been moved to the Model class (frontend)
-
     async def _train_sft(
         self,
         model: AnyTrainableModel,
@@ -2015,19 +1961,20 @@ class LocalBackend:
         # Get the service and train
         service = await self._get_service(model)
 
-        pbar = tqdm.tqdm(total=len(batches), desc="sft train")
+        pbar = tqdm.tqdm(total=len(batches), desc="sft train", disable=not verbose)
         total_trainable_tokens = sum(batch.num_trainable_tokens for batch in batches)
         total_trajectories = len(trajectory_list)
         batch_count = 0
 
         async for result in service.train_sft(batches, service_config, verbose):
-            pbar.update(1)
-            postfix: dict[str, str | int] = {
-                "loss": f"{result.get('loss/train', 0):.4f}"
-            }
-            if total_dropped_trajectories:
-                postfix["dropped"] = total_dropped_trajectories
-            pbar.set_postfix(postfix)
+            if verbose:
+                pbar.update(1)
+                postfix: dict[str, str | int] = {
+                    "loss": f"{result.get('loss/train', 0):.4f}"
+                }
+                if total_dropped_trajectories:
+                    postfix["dropped"] = total_dropped_trajectories
+                pbar.set_postfix(postfix)
             batch_count += 1
             yield {
                 **result,
@@ -2332,11 +2279,6 @@ class LocalBackend:
 
         # If S3 bucket is provided, pull from S3 first
         if from_s3_bucket is not None:
-            if verbose:
-                print(
-                    f"DEBUG: Fork checkpoint - from_s3_bucket={from_s3_bucket}, not_after_step={not_after_step}"
-                )
-
             # Determine which checkpoint to pull
             if not_after_step is None:
                 # Pull only the latest checkpoint
@@ -2399,12 +2341,6 @@ class LocalBackend:
                 f"No checkpoints found for model {from_model} in project {from_project}"
             )
 
-        if verbose:
-            print(f"DEBUG: Checkpoint base dir: {checkpoint_base_dir}")
-            print(
-                f"DEBUG: Contents: {os.listdir(checkpoint_base_dir) if os.path.exists(checkpoint_base_dir) else 'Does not exist'}"
-            )
-
         # Get all available checkpoint steps
         available_steps = sorted(
             int(d)
@@ -2443,21 +2379,11 @@ class LocalBackend:
             print(
                 f"Copying checkpoint from {source_checkpoint_dir} to {dest_checkpoint_dir}"
             )
-            print(f"DEBUG: Source dir exists: {os.path.exists(source_checkpoint_dir)}")
-            if os.path.exists(source_checkpoint_dir):
-                print(
-                    f"DEBUG: Source dir contents: {os.listdir(source_checkpoint_dir)}"
-                )
-                print(
-                    f"DEBUG: Source dir is empty: {len(os.listdir(source_checkpoint_dir)) == 0}"
-                )
 
         import shutil
 
         # Remove destination if it already exists (empty directory from previous attempts)
         if os.path.exists(dest_checkpoint_dir):
-            if verbose:
-                print("DEBUG: Destination already exists, removing it first")
             shutil.rmtree(dest_checkpoint_dir)
 
         shutil.copytree(source_checkpoint_dir, dest_checkpoint_dir)

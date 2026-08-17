@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -39,7 +38,6 @@ def test_build_runtime_server_cmd_uses_runtime_project(
             cuda_visible_devices="1",
             lora_path="/tmp/lora",
             served_model_name="test@0",
-            rollout_weights_mode="merged",
             initial_policy_version=7,
             engine_args={"weight_transfer_config": {"backend": "nccl"}},
             server_args={"tool_call_parser": "hermes"},
@@ -64,7 +62,6 @@ def test_build_runtime_server_cmd_honors_runtime_bin_override(monkeypatch) -> No
             cuda_visible_devices="1",
             lora_path="/tmp/lora",
             served_model_name="test@0",
-            rollout_weights_mode="merged",
         )
     )
     assert command[:2] == ["/opt/art/bin/runtime", "--wrapped"]
@@ -88,13 +85,12 @@ def test_build_runtime_server_cmd_allows_lora_without_initial_adapter(
             host="0.0.0.0",
             cuda_visible_devices="0,1",
             served_model_name="test@0",
-            rollout_weights_mode="lora",
         )
     )
 
     assert command[0] == str(runtime_bin)
     assert not any(arg.startswith("--lora-path=") for arg in command)
-    assert "--rollout-weights-mode=lora" in command
+    assert not any(arg.startswith("--rollout-weights-mode=") for arg in command)
 
 
 def test_external_checkpoint_path_mapping() -> None:
@@ -113,38 +109,6 @@ def test_external_checkpoint_path_mapping() -> None:
     )
 
     assert mapped == "/remote/ws/projects/art/.art/models/model/0001"
-
-
-def test_get_vllm_runtime_nccl_so_path_queries_runtime_python(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.delenv("ART_VLLM_RUNTIME_BIN", raising=False)
-    runtime_root = tmp_path / "custom-runtime"
-    runtime_bin = runtime_root / ".venv" / "bin" / "art-vllm-runtime-server"
-    runtime_python = runtime_root / ".venv" / "bin" / "python"
-    runtime_bin.parent.mkdir(parents=True, exist_ok=True)
-    runtime_bin.write_text("#!/bin/sh\n", encoding="ascii")
-    runtime_python.write_text("#!/bin/sh\n", encoding="ascii")
-    nccl_so_path = tmp_path / "libnccl.so.2"
-    nccl_so_path.write_text("nccl\n", encoding="ascii")
-    seen: dict[str, object] = {}
-
-    def fake_run(command, *, capture_output: bool, text: bool):
-        seen["command"] = command
-        seen["capture_output"] = capture_output
-        seen["text"] = text
-        return SimpleNamespace(returncode=0, stdout=f"{nccl_so_path}\n", stderr="")
-
-    monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
-    monkeypatch.setattr(runtime, "subprocess", SimpleNamespace(run=fake_run))
-
-    assert runtime.get_vllm_runtime_nccl_so_path() == nccl_so_path.resolve()
-    command = seen["command"]
-    assert isinstance(command, list)
-    assert command[0] == str(runtime_python)
-    assert seen["capture_output"] is True
-    assert seen["text"] is True
 
 
 def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_source_runtime(
@@ -173,6 +137,20 @@ def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_source_runtime(
     assert env["FLASHINFER_WORKSPACE_BASE"] == str(
         cache_root / "vllm_runtime" / "flashinfer_workspace"
     )
+
+
+def test_vllm_runtime_subprocess_env_pins_runtime_tools(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime_bin = tmp_path / "vllm_runtime/.venv/bin/art-vllm-runtime-server"
+    runtime_bin.parent.mkdir(parents=True)
+    runtime_bin.touch()
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    env = runtime._vllm_runtime_subprocess_env([str(runtime_bin)])
+
+    assert env["PATH"] == f"{runtime_bin.parent}{os.pathsep}/usr/bin"
 
 
 def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_managed_runtime(

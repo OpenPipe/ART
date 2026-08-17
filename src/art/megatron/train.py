@@ -13,14 +13,19 @@ Public cross-repo API consumed by serverless-training:
 - build_training_runtime
 - execute_megatron_rl_job
 - execute_megatron_sft_forward_backward_job
+- execute_megatron_score_job
+- execute_megatron_sft_job
+- inspect_resident_lora
 """
 
+from contextlib import contextmanager
+import hashlib
 import math
 import os
 import random
 from threading import Event
 import time
-from typing import Any, Callable, Literal, cast
+from typing import Any, Callable, Iterator, Literal, cast
 
 from megatron.core import parallel_state as ps
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -33,19 +38,17 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_
 from art import dev, types
 from art.loss import (
     AlignedLossInputs,
-    Loss,
     LossInputs,
     LossOffPolicyDiagnosticsAccumulator,
     loss_fn,
     shift_tensor,
 )
 from art.megatron.context_parallel.types import (
-    DispatchedPackedTensors,
     ParallelTopology,
     PreparedMegatronBatch,
     TrainingStepWorkload,
 )
-from art.megatron.lora import apply_lora_adapters
+from art.megatron.lora import LoRA, apply_lora_adapters
 from art.megatron.megatron_patches import install_fast_frozen_output_backward
 from art.megatron.model_support.lora_disk import (
     load_adapter_config,
@@ -64,26 +67,32 @@ from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
     MoeRoutingReplayController,
     build_moe_routing_replay_bundle_from_packed_tensors,
+    prepare_moe_routing_replay_boundaries,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.specs import (
     ForwardBackwardJobSpec,
     ForwardJobSpec,
     LoadStateJobSpec,
+    PackedTokenScore,
+    ResidentLoraExport,
+    ResidentLoraInspectionShard,
+    ResidentLoraInspectionSpec,
+    ResidentScoreJobSpec,
+    ResidentScoreShard,
     RlForwardBackwardConfig,
     SftForwardBackwardJobSpec,
     SftForwardJobSpec,
+    SFTJobSpec,
     TrainJobSpec,
 )
-from art.megatron.runtime.weight_transfer import MergedWeightTransferInitInfo
 from art.megatron.selective_lm_head import (
     TokenLossOutput,
+    forward_token_logits,
     forward_token_losses,
 )
 from art.megatron.tensor_snapshot import SnapshotReadBarrier
-from art.megatron.training.compile import (
-    configure_training_compile,
-)
+from art.megatron.training.compile import configure_training_compile
 from art.megatron.training.finalize_grads import (
     finalize_model_grads_extended,
     flush_param_grads_to_main_grads,
@@ -92,11 +101,9 @@ from art.megatron.training.microbatches import (
     CpBatchLookaheadState,
     PreparedRLMicroInputs,
     PreparedSFTMicroInputs,
-    _causal_attention_state,
     _clone_packed_tensors,
     _clone_sft_tensors,
     _count_sft_trainable_tokens,
-    _count_trainable_tokens,
     _local_trainable_sft_token_count_tensor,
     _local_trainable_token_count_tensor,
     _next_micro_lookahead,
@@ -129,7 +136,6 @@ from art.megatron.training.pipeline_schedule import (
     _validate_hybridep_token_counts,
     aggregate_pipeline_schedule_metrics,
     chunk_post_process,
-    chunk_pre_process,
     validate_pipeline_topology,
 )
 from art.megatron.training.trace import (
@@ -141,6 +147,9 @@ from art.preprocessing.pack import PackedTensors
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 _optimizer_stats_printed = False
+_INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gap_rank_"
+_INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
+_INTER_FORWARD_BACKWARD_PHASE_PREFIX = "time/inter_forward_backward_"
 
 __all__ = [
     "DEFAULT_MODEL_IDENTIFIER",
@@ -150,7 +159,20 @@ __all__ = [
     "execute_megatron_sft_forward_job",
     "build_training_runtime",
     "execute_megatron_rl_job",
+    "execute_megatron_score_job",
+    "execute_megatron_sft_job",
+    "inspect_resident_lora",
 ]
+
+
+class _InterForwardBackwardTiming(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    metrics_group: Any | None = None
+    previous_schedule_end_s: float | None = None
+    previous_schedule_cuda_end: torch.cuda.Event | None = None
+    previous_job_complete_s: float | None = None
+    current_job_start_s: float | None = None
 
 
 class TrainingRuntime(BaseModel):
@@ -162,8 +184,10 @@ class TrainingRuntime(BaseModel):
     optimizer: Any | None
     optimizer_config: OptimizerConfig
     optimizer_persistent: bool = True
+    resident_run_id: str | None = None
     resident_training_session_id: str | None = None
     resident_policy_step: int | None = None
+    resident_generation_id: str | None = None
     optimizer_state_loaded: bool = False
     adapter_export_dtypes: dict[str, torch.dtype] | None = None
     adapter_export_config: dict[str, Any] | None = None
@@ -175,8 +199,9 @@ class TrainingRuntime(BaseModel):
     rank: int
     world_size: int
     moe_routing_replay_controller: MoeRoutingReplayController | None = None
-    merged_weight_transfer_group: Any | None = None
-    merged_weight_transfer_init_info: MergedWeightTransferInitInfo | None = None
+    inter_forward_backward_timing: _InterForwardBackwardTiming = Field(
+        default_factory=_InterForwardBackwardTiming
+    )
 
     @field_validator("model")
     @classmethod
@@ -260,6 +285,7 @@ class RLForwardBackwardState(BaseModel):
     micro_count: int = Field(ge=1)
     schedule: MCoreScheduleAdapter[PreparedRLMicroInputs]
     loss_diagnostics: LossOffPolicyDiagnosticsAccumulator
+    inter_schedule_metrics: dict[str, float] = Field(default_factory=dict)
 
 
 class SFTForwardBackwardState(BaseModel):
@@ -503,10 +529,11 @@ def build_training_runtime(
     provider = provider_bundle.provider
     if provider_configure is not None:
         provider_configure(provider)
-    if _moe_routing_replay_requested(
+    replay_requested = _moe_routing_replay_requested(
         replay_bundle_path=moe_routing_replay_path,
         replay_bundle=moe_routing_replay_bundle,
-    ):
+    )
+    if replay_requested:
         _enable_native_moe_routing_replay(provider)
     finalize_provider_bundle(provider_bundle)
     _register_trainable_parameter_mode(
@@ -554,6 +581,8 @@ def build_training_runtime(
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
     provider_bundle.handler.install_preprocess_patch(model)
+    if replay_requested:
+        prepare_moe_routing_replay_boundaries(model)
     transformer_layers_compiled = configure_training_compile(
         model=model,
         provider=provider,
@@ -562,6 +591,11 @@ def build_training_runtime(
 
     optimizer_config = optimizer_config or _default_optimizer_config()
     optimizer = _build_optimizer(model, optimizer_config) if build_optimizer else None
+    metrics_group = (
+        torch.distributed.new_group(backend="gloo")  # ty: ignore[possibly-missing-attribute]
+        if world_size > 1
+        else None
+    )
 
     runtime = TrainingRuntime(
         provider_bundle=provider_bundle,
@@ -573,6 +607,9 @@ def build_training_runtime(
         rank=rank,
         world_size=world_size,
         snapshot_pool_capacity=snapshot_pool_capacity,
+        inter_forward_backward_timing=_InterForwardBackwardTiming(
+            metrics_group=metrics_group
+        ),
     )
     configure_moe_routing_replay(
         runtime,
@@ -589,11 +626,12 @@ def _execute_megatron_rl_forward_backward_steps(
     packed_tensors: PackedTensors,
     *,
     before_step: Callable[[int], None],
-    after_step: Callable[[int, int, RLForwardBackwardState, float, float], None],
+    after_step: Callable[[int, int, RLForwardBackwardState, float, float, float], None],
     cancelled: Event | None = None,
     replay_bundle: MoeRoutingReplayBundle | None = None,
     state_is_resident: bool = False,
-) -> tuple[dict[str, torch.dtype], float, int]:
+) -> tuple[dict[str, torch.dtype], float, int, float]:
+    job_prepare_started = time.perf_counter()
     template = None
     zero_template = None
     ref_logprobs_by_index = None
@@ -667,7 +705,9 @@ def _execute_megatron_rl_forward_backward_steps(
             global_grad_accumulation_sequences=global_grad_accumulation_sequences,
         )
         cp_lookahead_state = CpBatchLookaheadState() if int(topology.cp) > 1 else None
+        job_prepare_s = time.perf_counter() - job_prepare_started
         for step_index in range(num_steps):
+            step_input_prepare_started = time.perf_counter()
             if cancelled is not None and cancelled.is_set():
                 from art.megatron.runtime.trainer_run import TrainingCancelledError
 
@@ -725,6 +765,7 @@ def _execute_megatron_rl_forward_backward_steps(
                 )
                 else None
             )
+            step_input_prepare_s = time.perf_counter() - step_input_prepare_started
             train_step_started = time.perf_counter()
             state = run_megatron_rl_forward_backward_step(
                 model_chunks=runtime.model,
@@ -741,6 +782,7 @@ def _execute_megatron_rl_forward_backward_steps(
                 next_step_first_micro=next_step_first_micro,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
                 hybridep_token_counts=hybridep_token_counts,
+                inter_forward_backward_timing=runtime.inter_forward_backward_timing,
             )
             after_step(
                 step_index,
@@ -748,8 +790,9 @@ def _execute_megatron_rl_forward_backward_steps(
                 state,
                 time.perf_counter() - train_step_started,
                 replay_finalize_s,
+                step_input_prepare_s,
             )
-        return adapter_dtypes, replay_finalize_s, num_steps
+        return adapter_dtypes, replay_finalize_s, num_steps, job_prepare_s
     finally:
         if template is not None:
             del template
@@ -787,6 +830,7 @@ def execute_megatron_rl_job(
     adapter_dtypes = None
     job_succeeded = False
     final_metrics: dict[str, float] = {}
+    inter_job_metrics: dict[str, float] = {}
 
     def finish_step(
         step_index: int,
@@ -794,8 +838,9 @@ def execute_megatron_rl_job(
         state: RLForwardBackwardState,
         forward_backward_s: float,
         replay_finalize_s: float,
+        step_input_prepare_s: float,
     ) -> None:
-        nonlocal final_metrics
+        nonlocal final_metrics, inter_job_metrics
         finish_started = time.perf_counter()
         assert runtime.optimizer is not None
         optimizer_result = run_megatron_optimizer_step(
@@ -805,6 +850,7 @@ def execute_megatron_rl_job(
             model_chunks=runtime.model,
             before_step=runtime.optimizer_snapshot_barrier.wait_before_mutation,
         )
+        result_finalize_started = time.perf_counter()
         step_result = _finish_megatron_rl_step(state, optimizer_result)
         train_step_s = forward_backward_s + time.perf_counter() - finish_started
         print0(
@@ -818,12 +864,33 @@ def execute_megatron_rl_job(
             num_gradient_steps=num_steps,
             train_step_s=train_step_s,
         )
+        if step_index == 0:
+            inter_job_metrics = {
+                name: value
+                for name, value in final_metrics.items()
+                if name.startswith(
+                    (
+                        _INTER_FORWARD_BACKWARD_GAP_PREFIX,
+                        _INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX,
+                        _INTER_FORWARD_BACKWARD_PHASE_PREFIX,
+                    )
+                )
+            }
+        final_metrics.update(inter_job_metrics)
         final_metrics["time/replay_finalize_s"] = replay_finalize_s
+        final_metrics["time/step_input_prepare_s"] = step_input_prepare_s
+        final_metrics["time/step_result_finalize_s"] = (
+            time.perf_counter() - result_finalize_started
+        )
         if runtime.rank == 0:
+            progress_started = time.perf_counter()
             progress_sink(step_index, num_steps, final_metrics)
+            final_metrics["time/step_progress_emit_s"] = (
+                time.perf_counter() - progress_started
+            )
 
     try:
-        adapter_dtypes, replay_finalize_s, _ = (
+        adapter_dtypes, replay_finalize_s, _, job_prepare_s = (
             _execute_megatron_rl_forward_backward_steps(
                 runtime,
                 job,
@@ -855,9 +922,15 @@ def execute_megatron_rl_job(
                 ),
             )
         )
+        final_metrics["time/job_prepare_s"] = job_prepare_s
+        adapter_ready_started = time.perf_counter()
         adapter_ready_sink()
+        final_metrics["time/step_adapter_ready_emit_s"] = (
+            time.perf_counter() - adapter_ready_started
+        )
         runtime.resident_training_session_id = job.training_session_id
         runtime.resident_policy_step = job.step
+        runtime.resident_generation_id = job.output_generation_id
         runtime.optimizer_state_loaded = True
         job_succeeded = True
         return final_metrics
@@ -865,6 +938,132 @@ def execute_megatron_rl_job(
         if not job_succeeded:
             runtime.resident_training_session_id = None
             runtime.resident_policy_step = None
+            runtime.resident_generation_id = None
+            runtime.optimizer_state_loaded = False
+        if adapter_dtypes is not None:
+            del adapter_dtypes
+
+
+def execute_megatron_sft_job(
+    runtime: TrainingRuntime,
+    job: SFTJobSpec,
+    batches: tuple[SFTBatchData, ...],
+    *,
+    progress_sink: Callable[[int, int, dict[str, float]], None],
+    adapter_ready_sink: Callable[[], None],
+    snapshot_sink: Callable[
+        [SFTJobSpec, dict[str, torch.dtype], dict[str, Any], bool], dict[str, float]
+    ]
+    | None = None,
+    cancelled: Event | None = None,
+) -> dict[str, float]:
+    if len(batches) != job.num_batches:
+        raise ValueError("SFT job batch count does not match its payload")
+    adapter_dtypes = None
+    succeeded = False
+    final_metrics: dict[str, float] = {}
+    try:
+        configure_moe_routing_replay(runtime)
+        adapter_dtypes = _prepare_rl_training_state(runtime, job)
+        accumulation = resolve_global_grad_accumulation_sequences(
+            int(job.config.batch_size)
+        )
+        assert runtime.optimizer is not None
+        runtime.optimizer.config.clip_grad = job.max_grad_norm
+        for param_group in runtime.optimizer.param_groups:
+            param_group["weight_decay"] = job.weight_decay
+        topology = _infer_parallel_topology(runtime.model)
+
+        for batch_index, batch in enumerate(batches):
+            if cancelled is not None and cancelled.is_set():
+                from art.megatron.runtime.trainer_run import TrainingCancelledError
+
+                raise TrainingCancelledError("SFT job was cancelled")
+            started = time.perf_counter()
+            trajectory_tensors = list(batch.trajectory_tensors)
+            template = _clone_sft_tensors(trajectory_tensors[0])
+            zero_template = _zero_contribution_sft_inputs(template)
+            sample_offset = batch_index * accumulation
+            scheduled_tensors = [trajectory_tensors[0]] * sample_offset + (
+                trajectory_tensors
+            )
+            hybridep_token_counts = (
+                build_sft_hybridep_token_counts(
+                    trajectory_tensors=scheduled_tensors,
+                    step_index=batch_index,
+                    global_grad_accumulation_sequences=accumulation,
+                    topology=topology,
+                    provider=runtime.provider,
+                    model_support_handler=runtime.model_support_handler,
+                )
+                if ps.get_expert_model_parallel_world_size() > 1
+                else None
+            )
+            _ensure_hybridep_capacity(
+                runtime,
+                packed_sequence_length=max(
+                    int(inputs["input_ids"].numel()) for inputs in trajectory_tensors
+                ),
+                context_parallel_size=topology.cp,
+                required_capacity=max(hybridep_token_counts or (), default=0),
+            )
+            scheduled_indices = build_micro_sample_indices(
+                step_index=batch_index,
+                num_sequences=len(scheduled_tensors),
+                global_grad_accumulation_sequences=accumulation,
+            )
+            micro_indices = [
+                None if index is None else index - sample_offset
+                for index in scheduled_indices
+            ]
+            step_result = run_megatron_sft_step(
+                model_chunks=runtime.model,
+                provider=runtime.provider,
+                model_support_handler=runtime.model_support_handler,
+                optimizer=runtime.optimizer,
+                learning_rate=batch.learning_rate,
+                inputs=select_sft_micro_inputs(
+                    trajectory_tensors, micro_indices, zero_template
+                ),
+                step_index=batch_index,
+                sample_index=micro_indices,
+                moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                hybridep_token_counts=hybridep_token_counts,
+                before_optimizer_step=(
+                    runtime.optimizer_snapshot_barrier.wait_before_mutation
+                ),
+            )
+            elapsed = time.perf_counter() - started
+            final_metrics = {
+                "loss/train": float(step_result.reduced_loss.item()),
+                "loss/learning_rate": batch.learning_rate,
+                "loss/grad_norm": float(step_result.grad_norm),
+                "throughput/train_executed_tok_equiv_per_s": (
+                    batch.num_tokens / elapsed if elapsed else 0.0
+                ),
+                **step_result.pipeline_metrics,
+            }
+            if runtime.rank == 0:
+                progress_sink(batch_index, len(batches), final_metrics)
+            del step_result, template, zero_template
+
+        if snapshot_sink is None or runtime.adapter_export_config is None:
+            raise RuntimeError("typed SFT requires an immutable snapshot publisher")
+        final_metrics.update(
+            snapshot_sink(job, adapter_dtypes, runtime.adapter_export_config, True)
+        )
+        adapter_ready_sink()
+        runtime.resident_training_session_id = job.training_session_id
+        runtime.resident_policy_step = job.learner_version
+        runtime.resident_generation_id = job.output_generation_id
+        runtime.optimizer_state_loaded = True
+        succeeded = True
+        return final_metrics
+    finally:
+        if not succeeded:
+            runtime.resident_training_session_id = None
+            runtime.resident_policy_step = None
+            runtime.resident_generation_id = None
             runtime.optimizer_state_loaded = False
         if adapter_dtypes is not None:
             del adapter_dtypes
@@ -898,6 +1097,7 @@ def execute_megatron_rl_forward_backward_job(
         state: RLForwardBackwardState,
         duration_s: float,
         _replay_finalize_s: float,
+        _step_input_prepare_s: float,
     ) -> None:
         global_token_count = state.token_count.detach().clone()
         torch.distributed.all_reduce(
@@ -909,7 +1109,7 @@ def execute_megatron_rl_forward_backward_job(
         durations.append(duration_s)
         global_token_counts.append(global_token_count)
 
-    _, replay_finalize_s, _ = _execute_megatron_rl_forward_backward_steps(
+    _, replay_finalize_s, _, _ = _execute_megatron_rl_forward_backward_steps(
         runtime,
         job,
         packed_tensors,
@@ -983,6 +1183,7 @@ def execute_megatron_dynamic_lora_forward_backward_job(
         state: RLForwardBackwardState,
         duration_s: float,
         _replay_finalize_s: float,
+        _step_input_prepare_s: float,
     ) -> None:
         global_token_count = state.token_count.detach().clone()
         torch.distributed.all_reduce(
@@ -1001,7 +1202,7 @@ def execute_megatron_dynamic_lora_forward_backward_job(
         global_token_counts.append(global_token_count)
 
     with use_lora_slot(slot_ref):
-        _, replay_finalize_s, _ = _execute_megatron_rl_forward_backward_steps(
+        _, replay_finalize_s, _, _ = _execute_megatron_rl_forward_backward_steps(
             runtime,
             job,
             packed_tensors,
@@ -1478,46 +1679,13 @@ def _moe_replay_strict(
     return job.experimental_config.moe_routing_replay_strict
 
 
-def _load_lora_and_optimizer(
-    runtime: TrainingRuntime,
-    *,
-    lora_path: str,
-    optimizer_state_path: str,
-    adapter_step: int,
-) -> dict[str, torch.dtype]:
-    runtime.optimizer_snapshot_barrier.synchronize()
-    persistent_optimizer = runtime.optimizer if runtime.optimizer_persistent else None
-    _load_adapter_into_model(
-        runtime.model,
-        lora_path,
-        runtime.rank,
-        handler=runtime.model_support_handler,
-        optimizer=persistent_optimizer,
-    )
-    if persistent_optimizer is not None:
-        return {}
-
-    runtime.optimizer = _build_optimizer(
-        runtime.model,
-        runtime.optimizer_config,
-    )
-    assert runtime.optimizer is not None
-    _load_optimizer(
-        runtime,
-        optimizer_state_path=optimizer_state_path,
-        adapter_path=lora_path,
-        adapter_step=adapter_step,
-        allow_missing=True,
-    )
-    return {}
-
-
 def _prepare_rl_training_state(
     runtime: TrainingRuntime,
     job: (
         TrainJobSpec
         | ForwardBackwardJobSpec
         | ForwardJobSpec
+        | SFTJobSpec
         | SftForwardBackwardJobSpec
         | SftForwardJobSpec
     ),
@@ -1526,6 +1694,7 @@ def _prepare_rl_training_state(
         runtime.optimizer_persistent
         and runtime.resident_training_session_id == job.training_session_id
         and runtime.resident_policy_step == job.source_policy_step
+        and runtime.resident_generation_id == job.source.generation_id
         and runtime.optimizer_state_loaded
         and runtime.optimizer is not None
     )
@@ -1541,6 +1710,7 @@ def _prepare_rl_training_state(
     replacing_resident_state = runtime.resident_training_session_id is not None
     runtime.resident_training_session_id = None
     runtime.resident_policy_step = None
+    runtime.resident_generation_id = None
     runtime.optimizer_state_loaded = False
     runtime.adapter_export_config = None
     if replacing_resident_state or not runtime.optimizer_persistent:
@@ -1575,6 +1745,7 @@ def _prepare_rl_training_state(
     runtime.adapter_export_config = load_adapter_config(job.source_adapter_path)
     runtime.resident_training_session_id = job.training_session_id
     runtime.resident_policy_step = job.source_policy_step
+    runtime.resident_generation_id = job.source.generation_id
     runtime.optimizer_state_loaded = True
     return runtime.adapter_export_dtypes
 
@@ -2225,6 +2396,520 @@ def _calculate_megatron_logprob_batch(
             moe_routing_replay_controller.finalize_step()
 
 
+def _update_fingerprint(digest: Any, value: str | bytes) -> None:
+    payload = value.encode() if isinstance(value, str) else value
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+
+
+def _update_tensor_fingerprint(digest: Any, name: str, value: Any) -> None:
+    tensor = torch.as_tensor(value).detach().cpu().contiguous()
+    _update_fingerprint(digest, name)
+    _update_fingerprint(digest, str(tuple(tensor.shape)))
+    _update_fingerprint(digest, str(tensor.dtype))
+    _update_fingerprint(digest, tensor.numpy().tobytes())
+
+
+def _packed_batch_fingerprint(packed_tensors: PackedTensors) -> str:
+    digest = hashlib.sha256()
+    for name in ("tokens", "group_ids", "parent_ids", "input_pos", "assistant_mask"):
+        _update_tensor_fingerprint(digest, name, packed_tensors[name])
+    replay = packed_tensors.get("moe_routing_replay")
+    if replay is not None:
+        _update_tensor_fingerprint(digest, "moe_routing_replay", replay.expert_indices)
+    return digest.hexdigest()
+
+
+@contextmanager
+def _preserve_diagnostic_rng(device: torch.device) -> Iterator[None]:
+    python_state = random.getstate()
+    devices = (
+        [device.index if device.index is not None else torch.cuda.current_device()]
+        if device.type == "cuda"
+        else []
+    )
+    try:
+        with torch.random.fork_rng(devices=devices):
+            yield
+    finally:
+        random.setstate(python_state)
+
+
+@contextmanager
+def _temporary_resident_replay(
+    runtime: TrainingRuntime,
+    packed_tensors: PackedTensors,
+    *,
+    global_grad_accumulation_sequences: int,
+) -> Iterator[tuple[MoeRoutingReplayController | None, int]]:
+    packed_replay = packed_tensors.get("moe_routing_replay")
+    if packed_replay is None:
+        if bool(getattr(runtime.model_support_handler, "is_moe", False)):
+            raise RuntimeError("resident MoE scoring requires packed routing replay")
+        yield None, 0
+        return
+
+    bundle = build_moe_routing_replay_bundle_from_packed_tensors(
+        packed_tensors=packed_tensors,
+        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+    )
+    packed_tokens = int(packed_replay.pack_stats.packed_tokens)
+    previous = runtime.moe_routing_replay_controller
+    if previous is None:
+        configure_moe_routing_replay(runtime, replay_bundle=bundle, strict=True)
+        controller = runtime.moe_routing_replay_controller
+        assert controller is not None
+        try:
+            yield controller, packed_tokens
+        finally:
+            controller.remove_router_patches()
+            runtime.moe_routing_replay_controller = None
+        return
+
+    if getattr(previous, "_active_step_index", None) is not None:
+        raise RuntimeError("resident routing replay is active during score dispatch")
+    previous_bundle = previous.bundle
+    previous_strict = previous.strict
+    previous.update_bundle(bundle=bundle, strict=True)
+    try:
+        yield previous, packed_tokens
+    finally:
+        previous.update_bundle(bundle=previous_bundle, strict=previous_strict)
+
+
+def _vocab_parallel_token_scores(
+    local_logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    top_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if local_logits.ndim != 2 or labels.shape != local_logits.shape[:1]:
+        raise ValueError(
+            "resident score logits/labels do not align: "
+            f"logits={tuple(local_logits.shape)} labels={tuple(labels.shape)}"
+        )
+    local_logits = local_logits.float()
+    tp_size = int(ps.get_tensor_model_parallel_world_size())
+    tp_rank = int(ps.get_tensor_model_parallel_rank())
+    group = ps.get_tensor_model_parallel_group(check_initialized=False)
+
+    local_max = local_logits.max(dim=-1).values
+    global_max = local_max.clone()
+    if tp_size > 1:
+        torch.distributed.all_reduce(
+            global_max,
+            op=torch.distributed.ReduceOp.MAX,  # ty: ignore[possibly-missing-attribute]
+            group=group,
+        )
+    local_exp_sum = torch.exp(local_logits - global_max.unsqueeze(1)).sum(dim=-1)
+    global_exp_sum = local_exp_sum.clone()
+    if tp_size > 1:
+        torch.distributed.all_reduce(
+            global_exp_sum,
+            op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
+            group=group,
+        )
+    log_z = global_max + torch.log(global_exp_sum)
+
+    local_vocab = int(local_logits.shape[1])
+    vocab_start = tp_rank * local_vocab
+    local_labels = labels - vocab_start
+    owns_target = (labels >= 0) & (local_labels >= 0) & (local_labels < local_vocab)
+    rows = torch.arange(labels.numel(), device=labels.device)
+    target_logits = local_logits[
+        rows, local_labels.clamp(0, local_vocab - 1)
+    ].masked_fill(~owns_target, 0.0)
+    if tp_size > 1:
+        torch.distributed.all_reduce(
+            target_logits,
+            op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
+            group=group,
+        )
+
+    local_k = min(top_k, local_vocab)
+    local_values, local_ids = torch.topk(local_logits, k=local_k, dim=-1)
+    local_ids += vocab_start
+    if tp_size > 1:
+        gathered_values = [torch.empty_like(local_values) for _ in range(tp_size)]
+        gathered_ids = [torch.empty_like(local_ids) for _ in range(tp_size)]
+        torch.distributed.all_gather(gathered_values, local_values, group=group)
+        torch.distributed.all_gather(gathered_ids, local_ids, group=group)
+        candidate_values = torch.cat(gathered_values, dim=-1)
+        candidate_ids = torch.cat(gathered_ids, dim=-1)
+    else:
+        candidate_values = local_values
+        candidate_ids = local_ids
+    if int(candidate_values.shape[1]) < top_k:
+        raise ValueError("resident score top_k exceeds the padded vocabulary")
+    top_values, top_offsets = torch.topk(candidate_values, k=top_k, dim=-1)
+    top_ids = candidate_ids.gather(1, top_offsets)
+    return target_logits - log_z, top_values - log_z.unsqueeze(1), top_ids
+
+
+def _local_packed_token_scores(
+    *,
+    local_logits: torch.Tensor,
+    prepared: PreparedRLMicroInputs,
+    sample_index: int | None,
+    top_k: int,
+) -> tuple[PackedTokenScore, ...]:
+    selection = prepared.lm_head_selection
+    labels = selection.select(prepared.model_labels).reshape(-1)
+    token_uids = prepared.local_token_uids
+    if token_uids is None:
+        raise RuntimeError("resident scoring requires packed token UIDs")
+    uid_indices = selection.flat_indices.to(device=token_uids.device)
+    selected_uids = token_uids.reshape(-1).index_select(0, uid_indices)
+    target_logprobs, top_logprobs, top_ids = _vocab_parallel_token_scores(
+        local_logits,
+        labels,
+        top_k=top_k,
+    )
+    if sample_index is None or int(ps.get_tensor_model_parallel_rank()) != 0:
+        return ()
+
+    labels_cpu = labels.detach().cpu()
+    uids_cpu = selected_uids.detach().cpu()
+    target_cpu = target_logprobs.detach().cpu()
+    top_logprobs_cpu = top_logprobs.detach().cpu()
+    top_ids_cpu = top_ids.detach().cpu()
+    scores = []
+    for index in range(int(labels_cpu.numel())):
+        target_token_id = int(labels_cpu[index].item())
+        logit_index = int(uids_cpu[index].item())
+        if target_token_id < 0 or logit_index < 0:
+            continue
+        scores.append(
+            PackedTokenScore(
+                sample_index=sample_index,
+                logit_index=logit_index,
+                target_token_id=target_token_id,
+                target_logprob=float(target_cpu[index].item()),
+                top_token_ids=tuple(
+                    int(value) for value in top_ids_cpu[index].tolist()
+                ),
+                top_logprobs=tuple(
+                    float(value) for value in top_logprobs_cpu[index].tolist()
+                ),
+            )
+        )
+    return tuple(scores)
+
+
+def _forward_prepared_score_micro(
+    *,
+    model_chunks: ModelChunks,
+    model_chunk: MegatronModule,
+    model_support_handler: Any,
+    prepared: PreparedRLMicroInputs,
+    device: torch.device,
+) -> torch.Tensor:
+    forward_kwargs = dict(
+        input_ids=prepared.model_tokens,
+        position_ids=prepared.model_input_pos,
+        attention_mask=_placeholder_attention_mask(device),
+        packed_seq_params=prepared.packed_seq_params,
+        **model_support_handler.get_forward_kwargs(
+            model_chunk,
+            attention_bias=prepared.attention_state,
+        ),
+    )
+    with attach_trace_token_uids(model_chunks, prepared.local_token_uids):
+        if chunk_post_process(model_chunk):
+            return forward_token_logits(
+                model_chunk,
+                selection=prepared.lm_head_selection,
+                forward_kwargs=forward_kwargs,
+            )
+        output = model_chunk(**forward_kwargs, labels=None)
+    if not isinstance(output, torch.Tensor):
+        raise TypeError(
+            f"pipeline model chunk must return a tensor, got {type(output).__name__}"
+        )
+    return output
+
+
+@torch.no_grad()
+def _calculate_megatron_score_batch(
+    *,
+    runtime: TrainingRuntime,
+    inputs: list[PackedTensors],
+    sample_indices: list[int | None],
+    step_index: int,
+    top_k: int,
+    controller: MoeRoutingReplayController | None,
+    hybridep_token_counts: list[int] | None,
+) -> tuple[PackedTokenScore, ...]:
+    if not ps.model_parallel_is_initialized():
+        raise RuntimeError("resident scoring requires initialized model parallelism")
+    if not inputs or len(inputs) != len(sample_indices):
+        raise ValueError("resident score input/sample counts must match and be nonzero")
+    if controller is not None:
+        controller.set_step(step_index=step_index, sample_index=sample_indices)
+
+    model_chunks = runtime.model
+    device = next(model_chunks[0].parameters()).device
+    topology = _infer_parallel_topology(model_chunks)
+    modules = {
+        id(module): module for chunk in model_chunks for module in chunk.modules()
+    }
+    previous_training_modes = {
+        module_id: module.training for module_id, module in modules.items()
+    }
+    for chunk in model_chunks:
+        chunk.eval()
+    forward_succeeded = False
+    try:
+        pending_prepared_micro: PreparedMegatronBatch | None = None
+        prepared_micros: list[PreparedRLMicroInputs] = []
+        for order, micro in enumerate(inputs):
+            prepared, pending_prepared_micro = _prepare_current_rl_micro(
+                micro,
+                device=device,
+                topology=topology,
+                provider=runtime.provider,
+                model_support_handler=runtime.model_support_handler,
+                ref_logprobs=None,
+                trace_token_uids=True,
+                pending_prepared_micro=pending_prepared_micro,
+            )
+            prepared_micros.append(prepared)
+            pending_prepared_micro = _prepare_next_rl_cp_micro(
+                _next_micro_lookahead(inputs, order),
+                device=device,
+                topology=topology,
+                provider=runtime.provider,
+                model_support_handler=runtime.model_support_handler,
+                trace_token_uids=True,
+            )
+        schedule = MCoreScheduleAdapter(
+            model_chunks=model_chunks,
+            prepared_microbatches=prepared_micros,
+            sample_indices=sample_indices,
+            model_inputs=[prepared.model_tokens for prepared in prepared_micros],
+            moe_routing_replay_controller=controller,
+            hybridep_token_counts=hybridep_token_counts,
+            model_activator=runtime.model_support_handler.build_pipeline_microbatch_activator(
+                model_chunks
+            ),
+        )
+
+        def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
+            item = next(data_iterator)
+            output = _forward_prepared_score_micro(
+                model_chunks=model_chunks,
+                model_chunk=model,
+                model_support_handler=runtime.model_support_handler,
+                prepared=item.payload,
+                device=device,
+            )
+
+            def collect(output_tensor: torch.Tensor, **_kwargs: Any) -> dict[str, Any]:
+                return {
+                    "order": item.order,
+                    "scores": _local_packed_token_scores(
+                        local_logits=output_tensor,
+                        prepared=item.payload,
+                        sample_index=item.sample_index,
+                        top_k=top_k,
+                    ),
+                }
+
+            return output, collect
+
+        forward_outputs = schedule.run(
+            forward_step_func,
+            forward_only=True,
+            collect_non_loss_data=True,
+        )
+        if not any(chunk_post_process(chunk) for chunk in model_chunks):
+            forward_succeeded = True
+            return ()
+        outputs = cast(list[dict[str, Any]], forward_outputs)
+        if len(outputs) != len(prepared_micros):
+            raise RuntimeError(
+                "resident score pipeline did not return every microbatch: "
+                f"expected={len(prepared_micros)}, got={len(outputs)}"
+            )
+        outputs.sort(key=lambda output: int(output["order"]))
+        forward_succeeded = True
+        return tuple(
+            score
+            for output in outputs
+            for score in cast(tuple[PackedTokenScore, ...], output["scores"])
+        )
+    finally:
+        for module_id, module in modules.items():
+            module.training = previous_training_modes[module_id]
+        if controller is not None and forward_succeeded:
+            controller.finalize_step()
+
+
+def execute_megatron_score_job(
+    runtime: TrainingRuntime,
+    job: ResidentScoreJobSpec,
+    packed_tensors: PackedTensors,
+) -> ResidentScoreShard:
+    """Score one packed batch against the exact resident learner without mutation."""
+    global_accumulation = resolve_global_grad_accumulation_sequences(
+        job.global_grad_accumulation_sequences
+    )
+    num_sequences, packed_sequence_length = map(int, packed_tensors["tokens"].shape)
+    num_steps = math.ceil(num_sequences / global_accumulation)
+    topology = _infer_parallel_topology(runtime.model)
+    template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
+    zero_template = _zero_contribution_inputs(template)
+    hybridep_token_counts_by_step = (
+        [
+            build_rl_hybridep_token_counts(
+                packed_tensors=packed_tensors,
+                step_index=step_index,
+                num_sequences=num_sequences,
+                global_grad_accumulation_sequences=global_accumulation,
+                topology=topology,
+                provider=runtime.provider,
+                model_support_handler=runtime.model_support_handler,
+            )
+            for step_index in range(num_steps)
+        ]
+        if ps.get_expert_model_parallel_world_size() > 1
+        else None
+    )
+    _ensure_hybridep_capacity(
+        runtime,
+        packed_sequence_length=packed_sequence_length,
+        context_parallel_size=topology.cp,
+        required_capacity=max(
+            (
+                count
+                for step_counts in hybridep_token_counts_by_step or ()
+                for count in step_counts
+            ),
+            default=0,
+        ),
+    )
+    device = next(runtime.model[0].parameters()).device
+    scores: list[PackedTokenScore] = []
+    with (
+        runtime.model_support_handler.preserve_pipeline_microbatch_activation(
+            runtime.model
+        ),
+        _preserve_diagnostic_rng(device),
+        _temporary_resident_replay(
+            runtime,
+            packed_tensors,
+            global_grad_accumulation_sequences=global_accumulation,
+        ) as (controller, replay_tokens),
+    ):
+        for step_index in range(num_steps):
+            micro_indices = build_micro_sample_indices(
+                step_index=step_index,
+                num_sequences=num_sequences,
+                global_grad_accumulation_sequences=global_accumulation,
+            )
+            scores.extend(
+                _calculate_megatron_score_batch(
+                    runtime=runtime,
+                    inputs=select_micro_inputs(
+                        packed_tensors, micro_indices, zero_template
+                    ),
+                    sample_indices=micro_indices,
+                    step_index=step_index,
+                    top_k=job.top_k,
+                    controller=controller,
+                    hybridep_token_counts=(
+                        None
+                        if hybridep_token_counts_by_step is None
+                        else hybridep_token_counts_by_step[step_index]
+                    ),
+                )
+            )
+    scores.sort(key=lambda score: (score.sample_index, score.logit_index))
+    expected_score_count = int(packed_tensors["assistant_mask"][:, 1:].sum().item())
+    if expected_score_count < 1:
+        raise ValueError("resident scoring requires at least one assistant target")
+    return ResidentScoreShard(
+        rank=runtime.rank,
+        job_id=job.job_id,
+        run_id=job.run_id,
+        learner=job.learner,
+        batch_id=job.batch.batch_id,
+        batch_fingerprint=_packed_batch_fingerprint(packed_tensors),
+        top_k=job.top_k,
+        expected_score_count=expected_score_count,
+        routing_replay_packed_tokens=replay_tokens,
+        scores=tuple(scores),
+    )
+
+
+@torch.no_grad()
+def inspect_resident_lora(
+    runtime: TrainingRuntime,
+    request: ResidentLoraInspectionSpec,
+) -> ResidentLoraInspectionShard:
+    """Inspect resident LoRA wrappers and export coverage without changing state."""
+    modules: dict[int, LoRA] = {}
+    prefixes: set[str] = set()
+    lora_parameter_ids: set[int] = set()
+    for chunk in runtime.model:
+        for module in chunk.modules():
+            if not isinstance(module, LoRA) or id(module) in modules:
+                continue
+            modules[id(module)] = module
+            prefixes.add(module.adapter_model_prefix)
+            lora_parameter_ids.update(
+                id(parameter) for parameter in module.parameters()
+            )
+
+    trainable_lora_names: set[str] = set()
+    unexpected_trainable_names: set[str] = set()
+    trainable_numel = 0
+    seen_parameters: set[int] = set()
+    for chunk_index, chunk in enumerate(runtime.model):
+        for name, parameter in chunk.named_parameters():
+            parameter_id = id(parameter)
+            if not parameter.requires_grad or parameter_id in seen_parameters:
+                continue
+            seen_parameters.add(parameter_id)
+            qualified_name = f"chunk_{chunk_index}.{name}"
+            trainable_numel += int(parameter.numel())
+            if parameter_id in lora_parameter_ids:
+                trainable_lora_names.add(qualified_name)
+            else:
+                unexpected_trainable_names.add(qualified_name)
+
+    device = next(runtime.model[0].parameters()).device
+    with _preserve_diagnostic_rng(device):
+        exported = runtime.model_support_handler.build_adapter_weights_by_base(
+            runtime.model
+        )
+    exports = tuple(
+        ResidentLoraExport(
+            base_name=base_name,
+            adapter_keys=tuple(
+                sorted(
+                    {getattr(weight, "adapter_key", None) for weight in weights},
+                    key=lambda value: "" if value is None else value,
+                )
+            ),
+        )
+        for base_name, weights in sorted(exported.items())
+    )
+    return ResidentLoraInspectionShard(
+        rank=runtime.rank,
+        request_id=request.request_id,
+        run_id=request.run_id,
+        learner=request.learner,
+        target_modules=request.target_modules,
+        module_count=len(modules),
+        wrapped_adapter_prefixes=tuple(sorted(prefixes)),
+        exports=exports,
+        trainable_lora_parameter_names=tuple(sorted(trainable_lora_names)),
+        unexpected_trainable_parameter_names=tuple(sorted(unexpected_trainable_names)),
+        trainable_numel=trainable_numel,
+    )
+
+
 def _calculate_megatron_logprobs(
     *,
     model_chunks: ModelChunks,
@@ -2670,6 +3355,109 @@ def _finish_megatron_sft_step(
     )
 
 
+def _run_training_schedule(
+    schedule: MCoreScheduleAdapter[Any],
+    forward_step_func: Callable[..., Any],
+    timing: _InterForwardBackwardTiming | None,
+) -> tuple[list[Any], Callable[[], dict[str, float]]]:
+    started_s = time.monotonic()
+    gap_s = (
+        None
+        if timing is None or timing.previous_schedule_end_s is None
+        else started_s - timing.previous_schedule_end_s
+    )
+    phase_s = (
+        None
+        if timing is None
+        or timing.previous_schedule_end_s is None
+        or timing.previous_job_complete_s is None
+        or timing.current_job_start_s is None
+        or not (
+            timing.previous_schedule_end_s
+            <= timing.previous_job_complete_s
+            <= timing.current_job_start_s
+            <= started_s
+        )
+        else (
+            timing.previous_job_complete_s - timing.previous_schedule_end_s,
+            timing.current_job_start_s - timing.previous_job_complete_s,
+            started_s - timing.current_job_start_s,
+        )
+    )
+    previous_cuda_end = (
+        timing.previous_schedule_cuda_end if timing is not None else None
+    )
+    outputs = schedule.run(forward_step_func, forward_only=False)
+    ended_s = time.monotonic()
+    if timing is None:
+        return outputs, lambda: {}
+    cuda_span = schedule.telemetry.cuda_span()
+    timing.previous_schedule_end_s = ended_s
+    timing.previous_schedule_cuda_end = cuda_span[1] if cuda_span is not None else None
+    if gap_s is None:
+        return outputs, lambda: {}
+    world_size = torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
+    local_timing = torch.tensor(
+        (gap_s, *(phase_s or (math.nan, math.nan, math.nan))), dtype=torch.float64
+    )
+    rank_timings = [torch.empty_like(local_timing) for _ in range(world_size)]
+    work = None
+    if world_size == 1:
+        rank_timings[0].copy_(local_timing)
+    else:
+        if timing.metrics_group is None:
+            raise RuntimeError("Multi-rank schedule timing requires a Gloo group")
+        work = torch.distributed.all_gather(  # ty: ignore[possibly-missing-attribute]
+            rank_timings,
+            local_timing,
+            group=timing.metrics_group,
+            async_op=True,
+        )
+
+    def metrics() -> dict[str, float]:
+        if work is not None:
+            work.wait()
+        values = {
+            f"{_INTER_FORWARD_BACKWARD_GAP_PREFIX}{rank}_s": float(parts[0].item())
+            for rank, parts in enumerate(rank_timings)
+        }
+        phase_names = ("previous_job_tail", "worker_idle", "current_job_prepare")
+        values.update(
+            {
+                f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}{name}_rank_{rank}_s": float(
+                    parts[index].item()
+                )
+                for rank, parts in enumerate(rank_timings)
+                for index, name in enumerate(phase_names, start=1)
+                if not torch.isnan(parts[index])
+            }
+        )
+        if previous_cuda_end is None or cuda_span is None:
+            return values
+        local_gpu_gap = torch.tensor(
+            previous_cuda_end.elapsed_time(cuda_span[0]) / 1e3,
+            dtype=torch.float64,
+        )
+        gpu_gaps = [torch.empty_like(local_gpu_gap) for _ in range(world_size)]
+        if world_size == 1:
+            gpu_gaps[0].copy_(local_gpu_gap)
+        else:
+            torch.distributed.all_gather(  # ty: ignore[possibly-missing-attribute]
+                gpu_gaps,
+                local_gpu_gap,
+                group=timing.metrics_group,
+            )
+        values.update(
+            {
+                f"{_INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX}{rank}_s": float(gap.item())
+                for rank, gap in enumerate(gpu_gaps)
+            }
+        )
+        return values
+
+    return outputs, metrics
+
+
 def run_megatron_sft_step(
     *,
     model_chunks: ModelChunks,
@@ -2721,7 +3509,9 @@ def run_megatron_rl_forward_backward_step(
     next_step_first_micro: PackedTensors | None = None,
     next_step_first_ref_logprobs: torch.Tensor | None = None,
     hybridep_token_counts: list[int] | None = None,
+    inter_forward_backward_timing: _InterForwardBackwardTiming | None = None,
 ) -> RLForwardBackwardState:
+    schedule_prepare_started = time.perf_counter()
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
         raise ValueError("run_training_step requires at least one packed sequence")
@@ -2867,9 +3657,15 @@ def run_megatron_rl_forward_backward_step(
 
         return token_output.token_losses, reduce_loss
 
-    forward_data_store = schedule.run(forward_step_func, forward_only=False)
+    schedule_prepare_s = time.perf_counter() - schedule_prepare_started
+    forward_data_store, collect_inter_schedule_metrics = _run_training_schedule(
+        schedule, forward_step_func, inter_forward_backward_timing
+    )
+    replay_finalize_started = time.perf_counter()
     if moe_routing_replay_controller is not None:
         moe_routing_replay_controller.finalize_step(expect_recompute=True)
+    replay_finalize_s = time.perf_counter() - replay_finalize_started
+    result_collect_started = time.perf_counter()
     pipeline_results = cast(
         list[dict[str, Any]],
         _broadcast_from_pipeline_last(forward_data_store),
@@ -2907,6 +3703,19 @@ def run_megatron_rl_forward_backward_step(
         [prepared.loss_inputs for prepared in prepared_micros],
         device=device,
     )
+    result_collect_s = time.perf_counter() - result_collect_started
+    inter_metrics_started = time.perf_counter()
+    inter_metrics = collect_inter_schedule_metrics()
+    inter_metrics["time/post_schedule_inter_metrics_s"] = (
+        time.perf_counter() - inter_metrics_started
+    )
+    inter_metrics.update(
+        {
+            "time/schedule_prepare_s": schedule_prepare_s,
+            "time/post_schedule_replay_finalize_s": replay_finalize_s,
+            "time/post_schedule_result_collect_s": result_collect_s,
+        }
+    )
     return RLForwardBackwardState(
         raw_loss_sum=raw_loss_sum,
         probs_corr_total=probs_corr_total,
@@ -2918,6 +3727,7 @@ def run_megatron_rl_forward_backward_step(
         micro_count=micro_count,
         schedule=schedule,
         loss_diagnostics=loss_diagnostics,
+        inter_schedule_metrics=inter_metrics,
     )
 
 
@@ -2940,7 +3750,10 @@ def _finish_megatron_rl_forward_backward_step(
         loss_metrics=state.loss_diagnostics.to_metrics(
             group=ps.get_data_parallel_group(with_context_parallel=True),
         ),
-        pipeline_metrics=state.schedule.telemetry.metrics(),
+        pipeline_metrics={
+            **state.schedule.telemetry.metrics(),
+            **state.inter_schedule_metrics,
+        },
     )
 
 
@@ -2967,6 +3780,7 @@ def _finish_megatron_rl_forward_backward_job(
     pipeline_metrics = aggregate_pipeline_schedule_metrics(
         tuple(state.schedule.telemetry for state in states)
     )
+    pipeline_metrics.update(states[0].inter_schedule_metrics)
     return MegatronForwardBackwardStepResult(
         reduced_loss=_reduce_loss_sum(
             raw_loss_sum,
@@ -3034,6 +3848,7 @@ def run_training_step(
     next_step_first_ref_logprobs: torch.Tensor | None = None,
     hybridep_token_counts: list[int] | None = None,
     before_optimizer_step: Callable[[], None] | None = None,
+    inter_forward_backward_timing: _InterForwardBackwardTiming | None = None,
 ) -> TrainStepResult:
     state = run_megatron_rl_forward_backward_step(
         model_chunks=model_chunks,
@@ -3050,6 +3865,7 @@ def run_training_step(
         next_step_first_micro=next_step_first_micro,
         next_step_first_ref_logprobs=next_step_first_ref_logprobs,
         hybridep_token_counts=hybridep_token_counts,
+        inter_forward_backward_timing=inter_forward_backward_timing,
     )
     optimizer_result = run_megatron_optimizer_step(
         optimizer=optimizer,
@@ -3059,18 +3875,3 @@ def run_training_step(
         before_step=before_optimizer_step,
     )
     return _finish_megatron_rl_step(state, optimizer_result)
-
-
-def _close_merged_weight_transfer_group(
-    runtime: TrainingRuntime, *, abort: bool = False
-) -> None:
-    weight_transfer_group = runtime.merged_weight_transfer_group
-    runtime.merged_weight_transfer_group = None
-    runtime.merged_weight_transfer_init_info = None
-    if weight_transfer_group is None:
-        return
-    shutdown = getattr(weight_transfer_group, "abort" if abort else "close", None)
-    if shutdown is None and abort:
-        shutdown = getattr(weight_transfer_group, "close", None)
-    if shutdown is not None:
-        shutdown()

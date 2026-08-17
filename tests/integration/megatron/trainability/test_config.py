@@ -279,7 +279,6 @@ def test_megatron_variants_keep_short_packed_sequence_default(monkeypatch) -> No
         variant, base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"
     )
     assert config["init_args"]["max_seq_length"] == 1024
-    assert config["rollout_weights_mode"] == "lora"
     assert (
         _default_variant_name("Qwen/Qwen3-30B-A3B-Instruct-2507") == "megatron_shared"
     )
@@ -324,7 +323,6 @@ def test_qwen3_5_defaults_to_shared_lora_rollout() -> None:
     config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-35B-A3B")
 
     assert _default_variant_name("Qwen/Qwen3.5-35B-A3B") == "megatron_shared"
-    assert config["rollout_weights_mode"] == "lora"
     assert "trainer_gpu_ids" not in config
     assert "inference_gpu_ids" not in config
 
@@ -351,7 +349,6 @@ def test_yes_no_trainability_rejects_initially_saturated_stable_report() -> None
         output_dir="/tmp/report",
         trainer_gpu_ids=[0, 1],
         inference_gpu_ids=[0, 1],
-        rollout_weights_mode="lora",
         reward_threshold=0.9,
         max_steps=4,
         prompt_count=8,
@@ -386,7 +383,6 @@ def test_yes_no_trainability_requires_gradient_correlation_and_learning() -> Non
         output_dir="/tmp/report",
         trainer_gpu_ids=[0, 1],
         inference_gpu_ids=[2, 3],
-        rollout_weights_mode="lora",
         reward_threshold=0.9,
         max_steps=4,
         prompt_count=8,
@@ -456,6 +452,7 @@ def test_qwen3_5_length_trainability_uses_stable_moe_defaults() -> None:
     assert _length_rollouts_per_prompt("Qwen/Qwen3.5-35B-A3B") == 32
     assert _length_max_steps("Qwen/Qwen3.5-35B-A3B") == 40
     assert _length_max_steps("meta-llama/Llama-3.2-1B-Instruct") == 30
+    assert _length_max_steps("openai/gpt-oss-20b") == 30
     assert _length_rollout_seed("Qwen/Qwen3.5-35B-A3B") == 20261833
     assert _length_rollout_temperature("Qwen/Qwen3.5-35B-A3B") == 0.8
     assert _length_current_step_demand("Qwen/Qwen3.5-35B-A3B") is True
@@ -488,14 +485,31 @@ def test_gpt_oss_length_target_accounts_for_harmony_tokens(monkeypatch) -> None:
     assert _target_tokens("google/gemma-4-31B-it") == 22
     assert _target_tokens("openai/gpt-oss-20b") == 20
     assert _target_tokens("Qwen/Qwen3.5-35B-A3B") == 10
+    assert _target_tokens("zai-org/GLM-5.2") == 12
     monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", "24")
     assert _target_tokens("openai/gpt-oss-20b") == 24
+
+
+def test_length_trainability_default_success_threshold() -> None:
+    thresholds = _length_trainability_thresholds("zai-org/GLM-5.2")
+
+    assert thresholds.success_abs_error_max == 2
 
 
 def test_length_prompts_form_prefix_tree_by_default() -> None:
     prompts = [_prompt_for_index(index)[0] for index in range(4)]
 
     assert _length_prompt_tree_shape(prompts) == (3, 6)
+
+
+def test_glm52_length_prompt_requests_a_fuller_initial_answer() -> None:
+    default_prompt = _prompt_for_index(0)[0]
+    glm52_prompt = _prompt_for_index(0, base_model="zai-org/GLM-5.2")[0]
+
+    assert "Use one sentence." in default_prompt
+    assert (
+        "Use two complete sentences with one concrete detail in each." in glm52_prompt
+    )
 
 
 def test_length_trainability_accepts_near_baseline_learning_signal() -> None:
@@ -508,7 +522,6 @@ def test_length_trainability_accepts_near_baseline_learning_signal() -> None:
         trainer_gpu_ids=[0],
         inference_gpu_ids=[1],
         training_topology={"tp": 1, "cp": 1, "ep": 1, "etp": 1, "dp": 1, "sp": False},
-        rollout_weights_mode="lora",
         rollouts_per_prompt=4,
         normalize_advantages=True,
         summary_log_path="/tmp/length_trainability.log",
@@ -602,7 +615,6 @@ def test_validated_dense_model_uses_dense_shared_topology(
     )
 
     config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-4B")
-    assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_sleep_mode"] is True
     assert "enable_expert_parallel" not in config["engine_args"]
 
@@ -619,7 +631,6 @@ def test_qwen3_5_moe_shared_variant_enables_expert_parallel(monkeypatch) -> None
 
     config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-35B-A3B")
 
-    assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_expert_parallel"] is True
 
 
@@ -633,12 +644,17 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
         "get_device_properties",
         lambda device: SimpleNamespace(total_memory=284 * 1024**3),
     )
+
+    def unexpected_memory_probe(_device_ids) -> float:
+        raise AssertionError("external vLLM must not probe resident inference memory")
+
     monkeypatch.setattr(
         "tests.integration.megatron.trainability.yes_no_trainability."
         "_safe_gpu_memory_utilization",
-        lambda device_ids: 0.5,
+        unexpected_memory_probe,
     )
     monkeypatch.setenv("ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_EXTERNAL_VLLM_HEALTH_TIMEOUT", "1200")
     default_variant = _default_variant_name(
         "deepseek-ai/DeepSeek-V4-Flash",
     )
@@ -663,12 +679,13 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
     assert config["engine_args"]["tensor_parallel_size"] == 2
     assert config["engine_args"]["enable_expert_parallel"] is True
     assert config["engine_args"]["kv_cache_dtype"] == "fp8"
-    assert config["engine_args"].get("moe_backend") == "triton"
+    assert config["engine_args"].get("moe_backend") == "auto"
     assert "megatron_topology" not in config
     assert config["vllm_runtime"] == {
         "mode": "external",
         "server_url": "http://127.0.0.1:8000",
         "api_key": "art-external-vllm",
+        "health_timeout_s": 1200.0,
     }
 
 

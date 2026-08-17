@@ -23,7 +23,6 @@ from art.megatron.model_support.registry import (
     model_supports_context_parallel,
     model_uses_expert_parallel,
 )
-from art.megatron.model_support.spec import RolloutWeightsMode
 
 from ..model_support.oracle_harness import Topology, oracle_topology
 from ..model_support.oracle_worker import provider_topology_env
@@ -38,6 +37,7 @@ _SHARED_GPU_IDS_ENV = "ART_MODEL_SUPPORT_SHARED_GPU_IDS"
 _VARIANT_ENV = "ART_MODEL_SUPPORT_YES_NO_VARIANT"
 _EXTERNAL_VLLM_URL_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL"
 _EXTERNAL_VLLM_API_KEY_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY"
+_EXTERNAL_VLLM_HEALTH_TIMEOUT_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_HEALTH_TIMEOUT"
 _TRAINABILITY_ROOT = (
     Path(__file__).resolve().parents[4] / ".local" / "model_support_validation"
 )
@@ -79,7 +79,6 @@ class YesNoTrainabilityReport(BaseModel):
     output_dir: str
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
-    rollout_weights_mode: str
     reward_threshold: float
     max_steps: int
     prompt_count: int
@@ -171,11 +170,14 @@ def _external_vllm_runtime_config() -> dev.VllmRuntimeArgs | None:
     server_url = os.environ.get(_EXTERNAL_VLLM_URL_ENV)
     if server_url is None or server_url.strip() == "":
         return None
-    return {
+    config: dev.VllmRuntimeArgs = {
         "mode": "external",
         "server_url": server_url,
         "api_key": os.environ.get(_EXTERNAL_VLLM_API_KEY_ENV, "art-external-vllm"),
     }
+    if timeout := os.environ.get(_EXTERNAL_VLLM_HEALTH_TIMEOUT_ENV):
+        config["health_timeout_s"] = float(timeout)
+    return config
 
 
 def _topology_with_env_overrides(topology: Topology) -> Topology:
@@ -440,9 +442,18 @@ def _engine_args_for_yes_no_trainability(
     tensor_parallel_size: int = 1,
     enable_expert_parallel: bool = False,
     enable_sleep_mode: bool | None = None,
+    external_runtime: bool = False,
 ) -> dev.EngineArgs:
     engine_args: dict[str, object] = {
-        "gpu_memory_utilization": _safe_gpu_memory_utilization(inference_gpu_ids),
+        "gpu_memory_utilization": (
+            float(
+                os.environ.get(
+                    "ART_MODEL_SUPPORT_YES_NO_GPU_MEMORY_UTILIZATION", "0.85"
+                )
+            )
+            if external_runtime
+            else _safe_gpu_memory_utilization(inference_gpu_ids)
+        ),
         "max_model_len": _get_env_int(
             "ART_MODEL_SUPPORT_YES_NO_MAX_MODEL_LEN",
             _GPT_OSS_MAX_MODEL_LEN if _is_gpt_oss_model(base_model) else 128,
@@ -648,6 +659,7 @@ def _variant_init_args(variant: _TrainabilityVariant) -> dev.InitArgs:
 def _init_megatron_runtime_config(
     variant: _TrainabilityVariant,
     *,
+    packed_sequence_length: int | None = None,
     streaming_weight_offload: bool = False,
 ) -> None:
     if variant.topology is None:
@@ -662,7 +674,11 @@ def _init_megatron_runtime_config(
             ep=variant.topology.ep,
             etp=variant.topology.etp,
         ),
-        packed_sequence_length=_variant_packed_sequence_length(variant),
+        packed_sequence_length=(
+            _variant_packed_sequence_length(variant)
+            if packed_sequence_length is None
+            else packed_sequence_length
+        ),
         streaming_weight_offload=streaming_weight_offload,
     )
 
@@ -681,17 +697,6 @@ def _variant_max_steps(variant: _TrainabilityVariant, *, base_model: str) -> int
 def _variant_rollouts_per_prompt(variant: _TrainabilityVariant) -> int:
     default = 8 if variant.backend_name == "local" else 4
     return _get_env_int("ART_MODEL_SUPPORT_YES_NO_ROLLOUTS_PER_PROMPT", default)
-
-
-def _rollout_weights_mode(
-    base_model: str,
-    *,
-    allow_unvalidated_arch: bool = False,
-) -> RolloutWeightsMode:
-    return get_model_support_spec(
-        base_model,
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    ).default_rollout_weights_mode
 
 
 def _default_variant_name(
@@ -719,25 +724,19 @@ def _default_variant_name(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    rollout_weights_mode = _rollout_weights_mode(
-        base_model,
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    if rollout_weights_mode == "merged" or not is_moe:
-        return "megatron_dedicated"
-    return "megatron_shared"
+    return "megatron_shared" if is_moe else "megatron_dedicated"
 
 
 def _build_internal_config(
     variant: _TrainabilityVariant,
     *,
     base_model: str,
-    rollout_weights_mode: RolloutWeightsMode | None = None,
     allow_unvalidated_arch: bool = False,
     resource_stage_name: _RESOURCE_STAGE_NAME = "yes_no_trainability",
 ) -> dev.InternalModelConfig:
     shared = variant.placement_mode == "shared"
     inference_gpu_ids = variant.inference_gpu_ids
+    external_runtime = _external_vllm_runtime_config()
     stage_resources = _trainability_stage_resources(
         base_model,
         stage_name=resource_stage_name,
@@ -779,6 +778,7 @@ def _build_internal_config(
             )
         ),
         enable_sleep_mode=True if shared else None,
+        external_runtime=external_runtime is not None,
     )
     if vllm_resources is not None:
         engine_args.update(vllm_resources.engine_args())
@@ -786,16 +786,10 @@ def _build_internal_config(
         engine_args.update(stage_resources.vllm.extra_engine_args)
     engine_args["model"] = base_model
     internal_config = dev.InternalModelConfig(
-        rollout_weights_mode=rollout_weights_mode
-        or _rollout_weights_mode(
-            base_model,
-            allow_unvalidated_arch=allow_unvalidated_arch,
-        ),
         engine_args=engine_args,
         init_args=_variant_init_args(variant),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    external_runtime = _external_vllm_runtime_config()
     if (
         stage_resources is not None
         and stage_resources.requires_external_vllm
@@ -1050,7 +1044,6 @@ async def run_yes_no_trainability_async(
     base_model: str,
     variant_name: _VARIANT_NAME = "megatron_shared",
     artifact_root: Path | None = None,
-    rollout_weights_mode: RolloutWeightsMode | None = None,
     allow_unvalidated_arch: bool = False,
     extra_env: dict[str, str] | None = None,
 ) -> YesNoTrainabilityReport:
@@ -1071,10 +1064,8 @@ async def run_yes_no_trainability_async(
     internal_config = _build_internal_config(
         variant,
         base_model=base_model,
-        rollout_weights_mode=rollout_weights_mode,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    rollout_weights_mode = internal_config["rollout_weights_mode"]
     workflow_resources = handler_workflow_resources_for_base_model(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -1145,7 +1136,6 @@ async def run_yes_no_trainability_async(
             output_dir=str(output_dir),
             trainer_gpu_ids=variant.trainer_gpu_ids,
             inference_gpu_ids=variant.inference_gpu_ids,
-            rollout_weights_mode=rollout_weights_mode,
             reward_threshold=reward_threshold,
             max_steps=max_steps,
             prompt_count=len(prompts),
@@ -1290,14 +1280,11 @@ def yes_no_trainability_passed(report: YesNoTrainabilityReport) -> bool:
 
 def run_megatron_dedicated_yes_no_trainability(
     base_model: str,
-    *,
-    rollout_weights_mode: RolloutWeightsMode | None = None,
 ) -> YesNoTrainabilityReport:
     return asyncio.run(
         run_yes_no_trainability_async(
             base_model=base_model,
             variant_name="megatron_dedicated",
-            rollout_weights_mode=rollout_weights_mode,
         )
     )
 

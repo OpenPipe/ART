@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from functools import wraps
+from functools import partial, wraps
 import gc
 import json
 import os
@@ -110,7 +110,10 @@ def _build_packing_groups(
     return groups
 
 
-def _resilient(function: Any) -> Any:
+def resilient_endpoint(function: Any = None, *, concurrent: bool = False) -> Any:
+    if function is None:
+        return partial(resilient_endpoint, concurrent=concurrent)
+
     @wraps(function)
     async def wrapped(*args: Any, **kwargs: Any) -> RemoteCallResult:
         try:
@@ -141,15 +144,7 @@ def _resilient(function: Any) -> Any:
                 )
             )
 
-    return wrapped
-
-
-def resilient_endpoint(function: Any) -> Any:
-    return endpoint(_resilient(function))
-
-
-def resilient_concurrent_endpoint(function: Any) -> Any:
-    return concurrent_endpoint(_resilient(function))
+    return (concurrent_endpoint if concurrent else endpoint)(wrapped)
 
 
 class AdapterTransferHostService(Actor):
@@ -488,7 +483,7 @@ class ArtHostService(Actor):
             )
         return self._vllm_launcher
 
-    @resilient_endpoint
+    @resilient_endpoint(concurrent=True)
     async def start_vllm_member(self, request: HostMemberLaunchRequest):
         if self._admission_report is None:
             raise RuntimeError("host has not passed ART runtime admission")
@@ -505,7 +500,7 @@ class ArtHostService(Actor):
         if self._vllm_launcher is not None:
             await self._vllm_launcher.stop_member(replica_id, member_id, generation)
 
-    @resilient_concurrent_endpoint
+    @resilient_endpoint(concurrent=True)
     async def pack_batch(
         self, request: PackingRequest, batch_id: str, transfer_timeout_s: float
     ) -> PackingResult:

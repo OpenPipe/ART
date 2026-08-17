@@ -9,7 +9,6 @@ import logging
 import os
 from pathlib import Path
 import shutil
-import socket
 import time
 from typing import Any, Literal, NamedTuple, TypedDict, cast
 import uuid
@@ -30,11 +29,14 @@ from art.serving_capabilities import (
     discover_serving_capabilities,
 )
 from art.training.contracts import AdamConfig, OperationRef
-from art.utils.lifecycle import complete_task, complete_to_thread
+from art.utils.lifecycle import (
+    complete_task,
+    complete_to_thread,
+    consume_future_exception,
+)
 from art.utils.output_dirs import get_step_checkpoint_dir
 from art.vllm_runtime import (
     get_external_vllm_runtime_config,
-    get_vllm_runtime_nccl_so_path,
     map_checkpoint_path_for_vllm,
     normalize_vllm_server_url,
     wait_for_vllm_http_runtime,
@@ -75,12 +77,18 @@ from .runtime.specs import (
     ForwardBackwardJobSpec,
     ForwardJobSpec,
     GenerationSnapshotJobSpec,
+    HybridEpRuntimeSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
+    ResidentLoraInspectionResult,
+    ResidentLoraInspectionSpec,
+    ResidentScoreJobSpec,
+    ResidentScoreResult,
     ResolvedCheckpointState,
     RlForwardBackwardConfig,
     SftForwardBackwardJobSpec,
     SftForwardJobSpec,
+    SFTJobSpec,
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
@@ -91,10 +99,6 @@ from .runtime.specs import (
     TrainingRunSpec,
     TrainJobSpec,
     TrainProgress,
-)
-from .runtime.weight_transfer import (
-    MergedWeightTransferInitInfo,
-    MergedWeightTransferSpec,
 )
 from .runtime_config import get_megatron_runtime_config
 
@@ -116,7 +120,6 @@ class _TrainerJobFields(TypedDict):
     source: TrainerGeneration
     output: DurableTrainOutput
     publication_targets: tuple[Any, ...]
-    merged_weight_transfer: MergedWeightTransferSpec | None
 
 
 async def _post_vllm(
@@ -128,17 +131,6 @@ async def _post_vllm(
 ) -> httpx.Response:
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         return await client.post(url, headers=_headers(api_key), **kwargs)
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("", 0))
-        return int(listener.getsockname()[1])
-
-
-def _consume_task_result(task: asyncio.Future[Any]) -> None:
-    if not task.cancelled():
-        task.exception()
 
 
 def _retire_completed(
@@ -179,18 +171,21 @@ class DistributedMegatronService:
         self._learner_generation: TrainerGeneration | None = None
         self._trainer_resident_generation: TrainerGeneration | None = None
         self._trainer: Any = None
+        self._trainer_preparation_task: asyncio.Task[None] | None = None
+        self._trainer_preparation_step: asyncio.Future[int] | None = None
+        self._trainer_preparation_s = 0.0
         # Nested acquisitions must follow train -> serving -> mutation.
         self._train_lock = asyncio.Lock()
         self._mutation_lock = asyncio.Lock()
         self._serving_lock = asyncio.Lock()
         self._durability_lock = asyncio.Lock()
+        self._pipeline_train_dispatch: asyncio.Event | None = None
         self._managed_service_name: str | None = None
         self._base_url: str | None = None
         self._serving_capabilities: ServingCapabilities | None = None
         self._api_key_value: str | None = None
         self._current_lora_name: str | None = None
         self._vllm_sleeping = False
-        self._merged_transfer_init: MergedWeightTransferInitInfo | None = None
         self._published_adapters: dict[int, OptimizerAdapter] = {}
         self._loaded_adapter_steps: set[int] = set()
         self._loaded_exact_adapter_steps: set[int] = set()
@@ -207,7 +202,7 @@ class DistributedMegatronService:
             tuple[
                 Any,
                 TrainerGeneration,
-                asyncio.Task[tuple[tuple[Any, ...], MergedWeightTransferSpec | None]],
+                asyncio.Task[tuple[Any, ...]],
             ]
             | None
         ) = None
@@ -221,12 +216,22 @@ class DistributedMegatronService:
         self._closed = False
 
     @property
-    def rollout_weights_mode(self) -> Literal["lora", "merged"]:
-        return self.config.get("rollout_weights_mode", "lora")
-
-    @property
     def openai_server_port(self) -> int:
         return self._model_service_spec().leader_endpoint.port
+
+    def arm_pipeline_train_dispatch(self, event: asyncio.Event) -> None:
+        if self._pipeline_train_dispatch is not None:
+            raise RuntimeError("pipeline trainer dispatch fence is already armed")
+        self._pipeline_train_dispatch = event
+
+    def cancel_pipeline_train_dispatch(self, event: asyncio.Event) -> None:
+        if self._pipeline_train_dispatch is event:
+            self._pipeline_train_dispatch = None
+
+    def _take_pipeline_train_dispatch(self) -> asyncio.Event | None:
+        event = self._pipeline_train_dispatch
+        self._pipeline_train_dispatch = None
+        return event
 
     @property
     def active_learner_step(self) -> int:
@@ -344,7 +349,7 @@ class DistributedMegatronService:
                 raise RuntimeError(f"learner generation {step} is not materialized")
 
         task = asyncio.create_task(wait())
-        task.add_done_callback(_consume_task_result)
+        task.add_done_callback(consume_future_exception)
         return task
 
     @property
@@ -378,6 +383,16 @@ class DistributedMegatronService:
             and self._trainer.valid
             and self._trainer.learner_version == self._latest_step
         )
+
+    def _resident_trainer_for_generation(
+        self, generation: TrainerGeneration
+    ) -> Any | None:
+        if (
+            self._trainer_is_current()
+            and self._trainer_resident_generation == generation
+        ):
+            return self._trainer
+        return None
 
     @property
     def _optimizer_state_path(self) -> str:
@@ -484,6 +499,12 @@ class DistributedMegatronService:
             return self._trainer, None
         current, reconcile_step = await self._prepare_for_packing_locked()
         assert self._trainer is None
+        self._trainer = await self._launch_trainer(current, run_id=run_id)
+        self._trainer_resident_generation = None
+        reconcile = None if reconcile_step is None else (reconcile_step, current)
+        return self._trainer, reconcile
+
+    async def _launch_trainer(self, current: str, *, run_id: str | None = None) -> Any:
         runtime_spec = self._runtime_spec()
         run_spec = TrainingRunSpec(
             run_id=run_id or uuid.uuid4().hex,
@@ -494,22 +515,112 @@ class DistributedMegatronService:
             optimizer_state_path=self._optimizer_state_path,
             initial_event_timeout_s=self.runtime.topology.cluster.startup_timeout_s,
         )
-        self._trainer = await self.runtime.start_trainer(runtime_spec, run_spec)
-        self._trainer_resident_generation = None
-        reconcile = None if reconcile_step is None else (reconcile_step, current)
-        return self._trainer, reconcile
+        return await self.runtime.start_trainer(runtime_spec, run_spec)
+
+    def prefetch_trainer(self) -> None:
+        if (
+            self._trainer_is_current()
+            or self._trainer_preparation_task is not None
+            or self._temporal_gpu_sharing
+        ):
+            return
+        self._require_open()
+        source_step = asyncio.get_running_loop().create_future()
+        source_step.add_done_callback(consume_future_exception)
+        task = asyncio.create_task(self._prepare_trainer(source_step))
+        task.add_done_callback(consume_future_exception)
+        self._trainer_preparation_step = source_step
+        self._trainer_preparation_task = task
+
+    async def _prepare_trainer(self, source_step: asyncio.Future[int]) -> None:
+        started = time.perf_counter()
+        trainer: Any = None
+        assigned = False
+        try:
+            async with self._mutation_lock:
+                self._raise_publication_failure()
+                current, reconcile_step = await self._prepare_for_packing_locked()
+                step = self._latest_step
+                source_step.set_result(step)
+            trainer = await self._launch_trainer(current)
+            async with self._mutation_lock:
+                if self._trainer is not None:
+                    raise RuntimeError("trainer appeared during background preparation")
+                self._trainer = trainer
+                trainer = None
+                assigned = True
+                self._trainer_resident_generation = None
+                if self._latest_step != step:
+                    raise RuntimeError("learner changed during trainer preparation")
+            if reconcile_step is not None and self._base_url is not None:
+                async with self._serving_lock:
+                    await self._reconcile_serving_locked(reconcile_step, current)
+        except BaseException as error:
+            if not source_step.done():
+                source_step.set_exception(error)
+            if trainer is not None:
+                try:
+                    _, interrupted = await complete_task(
+                        asyncio.create_task(self.runtime.stop_trainer(trainer))
+                    )
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "trainer preparation and cleanup failed",
+                        [error, cleanup_error],
+                    ) from None
+                if interrupted is not None:
+                    error.add_note("trainer preparation cleanup observed cancellation")
+            elif assigned:
+                await self._cleanup_failed_trainer_transaction(
+                    self._trainer, None, error
+                )
+            raise
+        finally:
+            self._trainer_preparation_s = time.perf_counter() - started
+
+    async def _await_trainer_preparation(self) -> None:
+        task = self._trainer_preparation_task
+        if task is None:
+            return
+        await asyncio.shield(task)
+        if self._trainer_preparation_task is task:
+            self._trainer_preparation_task = None
+            self._trainer_preparation_step = None
 
     async def prepare_for_packing(self) -> int:
+        self._require_open()
+        self._raise_publication_failure()
+        if (source_step := self._trainer_preparation_step) is not None:
+            return await asyncio.shield(source_step)
         async with self._train_lock:
             async with self._mutation_lock:
-                self._require_open()
-                self._raise_publication_failure()
                 _current, reconcile_step = await self._prepare_for_packing_locked()
                 step = self._latest_step
             if reconcile_step is not None:
                 async with self._serving_lock:
                     await self._reconcile_serving_locked(step, _current)
             return step
+
+    async def prepare_cp_lookahead(
+        self,
+        batch: DistributedPackedBatch,
+        *,
+        global_grad_accumulation_sequences: int | None,
+    ) -> dict[str, float]:
+        mesh = self.runtime.topology.trainer
+        if mesh is None or mesh.topology.cp <= 1:
+            return {}
+        await self._await_trainer_preparation()
+        async with self._mutation_lock:
+            self._require_open()
+            self._raise_publication_failure()
+            trainer = self._trainer
+            if trainer is None or not self._trainer_is_current():
+                raise RuntimeError("CP lookahead requires the current resident trainer")
+        return await trainer.prepare_cp_lookahead(
+            batch.leases,
+            global_grad_accumulation_sequences=(global_grad_accumulation_sequences),
+        )
 
     async def _prepare_for_packing_locked(self) -> tuple[str, int | None]:
         if self._trainer_is_current():
@@ -535,12 +646,6 @@ class DistributedMegatronService:
         if self._base_url is None:
             self._serving_step = step
             return
-        if self.rollout_weights_mode == "merged":
-            await self._sync_merged_serving_source_locked(
-                step=step,
-                base_url=self._base_url,
-                api_key=self._api_key(),
-            )
         previous_name = self._current_lora_name
         await self._register_lora_for_step_locked(step, checkpoint)
         invalid_exact = {
@@ -813,14 +918,9 @@ class DistributedMegatronService:
         self,
         trainer: Any,
         generation_id: str,
-        learner_version: int,
-    ) -> tuple[tuple[Any, ...], MergedWeightTransferSpec | None]:
+    ) -> tuple[Any, ...]:
         if self._managed_service_name is None:
-            return (), None
-        if self.rollout_weights_mode == "merged":
-            return (), await self._merged_weight_transfer_spec(
-                self._serving_lora_name(learner_version)
-            )
+            return ()
         manager = self.runtime.model_service(self._managed_service_name)
         trainer_host = trainer.runtime_spec.trainer_mesh.ranks[0].host_id
         inference_hosts = {member.host_id for member in manager.spec.members}
@@ -840,7 +940,7 @@ class DistributedMegatronService:
                 error.add_note("adapter transfer cleanup observed cancellation")
             raise
         self._prepared_adapter_transfers[generation_id] = manager
-        return targets, None
+        return targets
 
     def _training_generation(self, step: int) -> TrainerGeneration:
         return TrainerGeneration(
@@ -852,11 +952,7 @@ class DistributedMegatronService:
 
     async def _take_publication_preparation(
         self, trainer: Any, step: int
-    ) -> tuple[
-        TrainerGeneration,
-        tuple[Any, ...],
-        MergedWeightTransferSpec | None,
-    ]:
+    ) -> tuple[TrainerGeneration, tuple[Any, ...]]:
         prepared, self._next_publication_preparation = (
             self._next_publication_preparation,
             None,
@@ -864,15 +960,14 @@ class DistributedMegatronService:
         if prepared is not None:
             prepared_trainer, generation, task = prepared
             if prepared_trainer is trainer and generation.policy_step == step:
-                targets, merged = await task
-                return generation, targets, merged
+                return generation, await task
             self._next_publication_preparation = prepared
             await self._discard_next_publication_preparation()
         generation = self._training_generation(step)
-        targets, merged = await self._prepare_serving_publication(
-            trainer, generation.generation_id, step
+        targets = await self._prepare_serving_publication(
+            trainer, generation.generation_id
         )
-        return generation, targets, merged
+        return generation, targets
 
     def _prefetch_publication_preparation(self, trainer: Any, step: int) -> None:
         if self._managed_service_name is None:
@@ -882,15 +977,15 @@ class DistributedMegatronService:
         generation = self._training_generation(step)
         previous_serving = self._serving_futures.get(step - 2)
 
-        async def prepare() -> tuple[tuple[Any, ...], MergedWeightTransferSpec | None]:
+        async def prepare() -> tuple[Any, ...]:
             if previous_serving is not None:
                 await asyncio.shield(previous_serving)
             return await self._prepare_serving_publication(
-                trainer, generation.generation_id, generation.policy_step
+                trainer, generation.generation_id
             )
 
         task = asyncio.create_task(prepare())
-        task.add_done_callback(_consume_task_result)
+        task.add_done_callback(consume_future_exception)
         self._next_publication_preparation = trainer, generation, task
 
     async def _run_train_job(
@@ -901,6 +996,9 @@ class DistributedMegatronService:
         lineage_error: str,
         wait_for_serving: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        trainer_prepare_started = time.perf_counter()
+        await self._await_trainer_preparation()
+        trainer_prepare_wait_s = time.perf_counter() - trainer_prepare_started
         lock_started = time.perf_counter()
         async with self._train_lock:
             lock_wait_s = time.perf_counter() - lock_started
@@ -925,7 +1023,6 @@ class DistributedMegatronService:
                 (
                     output_generation,
                     publication_targets,
-                    merged_transfer,
                 ) = await self._take_publication_preparation(trainer, next_step)
                 preparation_wait_s = time.perf_counter() - preparation_started
 
@@ -959,7 +1056,6 @@ class DistributedMegatronService:
                             source=source,
                             output=output,
                             publication_targets=publication_targets,
-                            merged_weight_transfer=merged_transfer,
                         )
                     )
 
@@ -1000,6 +1096,12 @@ class DistributedMegatronService:
             final_metrics.update(
                 {
                     "time/step_service_lock_wait_s": lock_wait_s,
+                    "time/step_service_trainer_prepare_s": (
+                        self._trainer_preparation_s
+                    ),
+                    "time/step_service_trainer_prepare_wait_s": (
+                        trainer_prepare_wait_s
+                    ),
                     "time/step_service_job_setup_s": setup_s,
                     "time/step_service_publication_prepare_wait_s": (
                         preparation_wait_s
@@ -1028,9 +1130,16 @@ class DistributedMegatronService:
                 experimental_config=ExperimentalTrainConfig.model_validate(values),
             )
 
+        dispatch_event = self._take_pipeline_train_dispatch()
         async for metrics in self._run_train_job(
             build_job,
-            lambda trainer, job: trainer.train(job, batch.leases),
+            lambda trainer, job: trainer.train(
+                job,
+                batch.leases,
+                on_dispatched=dispatch_event.set
+                if dispatch_event is not None
+                else None,
+            ),
             lineage_error="learner lineage changed during training",
         ):
             yield metrics
@@ -1422,14 +1531,9 @@ class DistributedMegatronService:
             )
 
         targets: tuple[Any, ...] = ()
-        merged: MergedWeightTransferSpec | None = None
         if activate_serving and existing is None:
-            targets, merged = await self._prepare_serving_publication(
-                trainer, generation.generation_id, generation.policy_step
-            )
-        elif activate_serving and self.rollout_weights_mode == "merged":
-            merged = await self._merged_weight_transfer_spec(
-                self._serving_lora_name(generation.policy_step)
+            targets = await self._prepare_serving_publication(
+                trainer, generation.generation_id
             )
 
         job = GenerationSnapshotJobSpec(
@@ -1448,7 +1552,6 @@ class DistributedMegatronService:
             ),
             existing_adapter=existing,
             publication_targets=targets,
-            merged_weight_transfer=merged,
             save_optimizer=save_optimizer,
         )
         result = await trainer.snapshot(job)
@@ -1457,7 +1560,7 @@ class DistributedMegatronService:
             trainer.wait_for_publication(generation.generation_id)
         )
         self._snapshot_rank_tasks[generation.policy_step] = rank_snapshot
-        rank_snapshot.add_done_callback(_consume_task_result)
+        rank_snapshot.add_done_callback(consume_future_exception)
         if activate_serving:
             self._publication_metrics[generation.policy_step] = metrics
             self._emitted_publication_metrics[generation.policy_step] = set()
@@ -1479,7 +1582,7 @@ class DistributedMegatronService:
                 self._complete_durable_snapshot(generation, rank_snapshot, metrics)
             )
         self._durability_tasks.add(completion)
-        completion.add_done_callback(_consume_task_result)
+        completion.add_done_callback(consume_future_exception)
         completion.add_done_callback(self._durability_tasks.discard)
         return GenerationSnapshotLaunch(metrics=metrics, completion=completion)
 
@@ -1521,6 +1624,172 @@ class DistributedMegatronService:
             )
         return durable
 
+    def _require_resident_score_locked(
+        self,
+        expected_learner_version: int,
+    ) -> tuple[Any, TrainerGeneration]:
+        self._require_open()
+        self._raise_publication_failure()
+        source = self._learner_generation
+        trainer = self._resident_trainer_for_generation(source) if source else None
+        if expected_learner_version != self._latest_step:
+            raise ValueError(
+                "resident diagnostic learner version mismatch: "
+                f"request={expected_learner_version}, current={self._latest_step}"
+            )
+        if (
+            source is None
+            or source.policy_step != expected_learner_version
+            or trainer is None
+        ):
+            raise RuntimeError(
+                "resident scoring requires the exact hydrated warm trainer generation"
+            )
+        return trainer, source
+
+    def _require_resident_inspection_locked(
+        self,
+        expected_learner_version: int,
+    ) -> tuple[Any, TrainerGeneration]:
+        self._require_open()
+        self._raise_publication_failure()
+        source = self._learner_generation
+        trainer = self._trainer
+        if expected_learner_version != self._latest_step:
+            raise ValueError(
+                "resident inspection learner version mismatch: "
+                f"request={expected_learner_version}, current={self._latest_step}"
+            )
+        if (
+            source is None
+            or source.policy_step != expected_learner_version
+            or trainer is None
+            or not self._trainer_is_current()
+            or trainer.run_spec.training_session_id != source.training_session_id
+            or self._trainer_resident_generation not in (None, source)
+        ):
+            raise RuntimeError(
+                "resident inspection requires the exact current warm trainer run"
+            )
+        return trainer, source
+
+    async def score_resident_packed(
+        self,
+        batch: DistributedPackedBatch,
+        *,
+        expected_learner_version: int,
+        global_grad_accumulation_sequences: int,
+        top_k: int = 20,
+    ) -> ResidentScoreResult:
+        await self._await_trainer_preparation()
+        async with self._train_lock:
+            async with self._mutation_lock:
+                trainer, source = self._require_resident_score_locked(
+                    expected_learner_version
+                )
+                job = ResidentScoreJobSpec(
+                    job_id=uuid.uuid4().hex,
+                    run_id=trainer.run_spec.run_id,
+                    learner=source,
+                    batch=batch.leases.ref,
+                    global_grad_accumulation_sequences=(
+                        global_grad_accumulation_sequences
+                    ),
+                    top_k=top_k,
+                )
+
+            try:
+                if self._temporal_gpu_sharing and self._base_url is not None:
+                    serving = self._serving_futures.get(expected_learner_version)
+                    if serving is not None:
+                        await asyncio.shield(serving)
+                    async with self._serving_lock:
+                        await self._sleep_for_training_locked()
+                async with self._trainer_failure_boundary():
+                    result = await trainer.score(job, batch.leases)
+                    async with self._mutation_lock:
+                        current_trainer, current_source = (
+                            self._require_resident_score_locked(
+                                expected_learner_version
+                            )
+                        )
+                        if current_trainer is not trainer or current_source != source:
+                            raise RuntimeError(
+                                "resident learner generation changed during scoring"
+                            )
+                    if result.learner != source:
+                        raise RuntimeError(
+                            "resident score returned a different learner generation"
+                        )
+                    if result.expected_score_count != batch.loss_bearing_tokens:
+                        raise RuntimeError(
+                            "resident score target coverage differs from packed data"
+                        )
+                    return result
+            finally:
+                if self._temporal_gpu_sharing and self._vllm_sleeping:
+                    async with self._serving_lock:
+                        await self._wake_for_serving_locked()
+
+    async def inspect_resident_lora(
+        self,
+        *,
+        expected_learner_version: int,
+    ) -> ResidentLoraInspectionResult:
+        await self._await_trainer_preparation()
+        async with self._train_lock:
+            trainer: Any = None
+            try:
+                if self._temporal_gpu_sharing and self._base_url is not None:
+                    serving = self._serving_futures.get(expected_learner_version)
+                    if serving is not None:
+                        await asyncio.shield(serving)
+                    async with self._serving_lock:
+                        await self._sleep_for_training_locked()
+                async with self._mutation_lock:
+                    trainer, reconcile = await self._ensure_trainer_locked()
+                    source_trainer, source = self._require_resident_inspection_locked(
+                        expected_learner_version
+                    )
+                    if source_trainer is not trainer:
+                        raise RuntimeError(
+                            "resident inspection selected another trainer"
+                        )
+                    request = ResidentLoraInspectionSpec(
+                        request_id=uuid.uuid4().hex,
+                        run_id=trainer.run_spec.run_id,
+                        learner=source,
+                        target_modules=trainer.runtime_spec.lora_target_modules,
+                    )
+                if reconcile is not None:
+                    reconcile_step, checkpoint = reconcile
+                    async with self._serving_lock:
+                        await self._reconcile_serving_locked(reconcile_step, checkpoint)
+                result = await trainer.inspect_resident_lora(request)
+                async with self._mutation_lock:
+                    current_trainer, current_source = (
+                        self._require_resident_inspection_locked(
+                            expected_learner_version
+                        )
+                    )
+                    if current_trainer is not trainer or current_source != source:
+                        raise RuntimeError(
+                            "resident learner generation changed during LoRA inspection"
+                        )
+                if result.learner != source:
+                    raise RuntimeError(
+                        "resident LoRA inspection returned another learner generation"
+                    )
+                return result
+            except BaseException as error:
+                if trainer is not None and not trainer.valid:
+                    await self._cleanup_failed_trainer_transaction(trainer, None, error)
+                raise
+            finally:
+                if self._temporal_gpu_sharing and self._vllm_sleeping:
+                    async with self._serving_lock:
+                        await self._wake_for_serving_locked()
+
     def _schedule_publication(
         self,
         generation: TrainerGeneration,
@@ -1550,7 +1819,7 @@ class DistributedMegatronService:
             previous = loop.create_future()
             previous.set_result(None)
         serving = loop.create_future()
-        serving.add_done_callback(_consume_task_result)
+        serving.add_done_callback(consume_future_exception)
         self._serving_futures[step] = serving
         serving.add_done_callback(
             lambda done: _retire_completed(self._serving_futures, step, done)
@@ -1580,7 +1849,7 @@ class DistributedMegatronService:
         task = asyncio.create_task(publication)
         self._publication_tasks[step] = task
         self._prepared_adapter_transfers.pop(generation.generation_id, None)
-        task.add_done_callback(_consume_task_result)
+        task.add_done_callback(consume_future_exception)
         task.add_done_callback(
             lambda done: _retire_completed(self._publication_tasks, step, done)
         )
@@ -1601,7 +1870,7 @@ class DistributedMegatronService:
             else None
         )
         if records is not None:
-            records.add_done_callback(_consume_task_result)
+            records.add_done_callback(consume_future_exception)
         try:
             if previous_publication is not None:
                 await asyncio.shield(previous_publication)
@@ -1643,32 +1912,11 @@ class DistributedMegatronService:
             )
         )
         self._durability_tasks.add(durable_task)
-        durable_task.add_done_callback(_consume_task_result)
+        durable_task.add_done_callback(consume_future_exception)
         durable_task.add_done_callback(self._durability_tasks.discard)
         try:
             materialization_started = time.monotonic()
-            if self.rollout_weights_mode == "merged":
-                await previous_serving
-                self._raise_publication_failure()
-                activation_started = time.monotonic()
-                async with self._serving_lock:
-                    await self._register_lora_for_step_locked(
-                        generation.policy_step,
-                        generation.adapter_path,
-                        generation_id=generation.generation_id,
-                    )
-                metrics["serving_activation_s"] = time.monotonic() - activation_started
-                if not serving.done():
-                    serving.set_result(None)
-                durable_result, _ = await asyncio.shield(durable_task)
-                adapter = durable_result.adapter
-                checkpoint = generation.adapter_path
-                metrics["adapter_materialization_s"] = (
-                    time.monotonic() - materialization_started
-                )
-                async with self._mutation_lock:
-                    self._published_adapters[generation.policy_step] = adapter
-            elif manager is None:
+            if manager is None:
                 durable_result, _ = await asyncio.shield(durable_task)
                 adapter = durable_result.adapter
                 checkpoint = generation.adapter_path
@@ -1731,29 +1979,28 @@ class DistributedMegatronService:
                 metrics["adapter_transport_capacity_utilization"] = sum(
                     result.used_bytes for result in received
                 ) / sum(result.capacity_bytes for result in received)
-            if self.rollout_weights_mode != "merged":
-                await previous_serving
-                self._raise_publication_failure()
-                activation_started = time.monotonic()
-                async with self._mutation_lock:
-                    self._published_adapters[generation.policy_step] = adapter
-                async with self._serving_lock:
-                    await self._register_lora_for_step_locked(
-                        generation.policy_step,
-                        checkpoint,
+            await previous_serving
+            self._raise_publication_failure()
+            activation_started = time.monotonic()
+            async with self._mutation_lock:
+                self._published_adapters[generation.policy_step] = adapter
+            async with self._serving_lock:
+                await self._register_lora_for_step_locked(
+                    generation.policy_step,
+                    checkpoint,
+                )
+                if (
+                    manager is not None
+                    and self.rollout_weight_update_mode != "in_flight_lora"
+                ):
+                    self._loaded_adapter_transfers[generation.policy_step] = (
+                        manager,
+                        generation.generation_id,
                     )
-                    if (
-                        manager is not None
-                        and self.rollout_weight_update_mode != "in_flight_lora"
-                    ):
-                        self._loaded_adapter_transfers[generation.policy_step] = (
-                            manager,
-                            generation.generation_id,
-                        )
-                        transfer_owned = False
-                metrics["serving_activation_s"] = time.monotonic() - activation_started
-                if manager is None and not serving.done():
-                    serving.set_result(None)
+                    transfer_owned = False
+            metrics["serving_activation_s"] = time.monotonic() - activation_started
+            if manager is None and not serving.done():
+                serving.set_result(None)
             if manager is not None and transfer_owned:
                 interrupted = await self._release_adapter_transfer(
                     manager, generation.generation_id
@@ -1884,10 +2131,6 @@ class DistributedMegatronService:
         api_key = self._api_key(config)
         external = get_external_vllm_runtime_config(self.config)
         if external is not None:
-            if self.rollout_weights_mode != "lora":
-                raise RuntimeError(
-                    "External vLLM runtime requires LoRA rollout weights"
-                )
             base_url = normalize_vllm_server_url(external.server_url)
             headers = _headers(external.api_key)
             await wait_for_vllm_http_runtime(
@@ -1931,9 +2174,7 @@ class DistributedMegatronService:
         template = ReplicaLaunchTemplate(
             served_model_name=self._serving_lora_name(step),
             lora_path=lora_path,
-            initial_policy_version=(
-                step if self.rollout_weights_mode == "lora" else None
-            ),
+            initial_policy_version=step,
             engine_args=self._engine_args(config),
             server_args=self._server_args(config),
         )
@@ -1947,10 +2188,6 @@ class DistributedMegatronService:
                 headers=_headers(api_key),
                 allow_openai_compatible=False,
             )
-            if self.rollout_weights_mode == "merged":
-                await self._sync_merged_serving_source_locked(
-                    step=step, base_url=base_url, api_key=api_key
-                )
             generation_id = self._generation_id_for_step(step)
             update_identity = uuid.uuid4().hex
             manager = self.runtime.model_service(service.name)
@@ -1998,51 +2235,7 @@ class DistributedMegatronService:
         self._api_key_value = api_key
         self._current_lora_name = current_lora_name
         self._serving_step = serving_step
-        if self.rollout_weights_mode == "lora":
-            self._loaded_adapter_steps.add(serving_step)
-
-    async def _sync_merged_serving_source_locked(
-        self,
-        *,
-        step: int,
-        base_url: str,
-        api_key: str | None,
-    ) -> None:
-        if step == 0:
-            return
-        temporal_sharing = self._temporal_gpu_sharing
-        if temporal_sharing:
-            await self._sleep_vllm_at(base_url, api_key)
-            self._vllm_sleeping = True
-        try:
-            async with self._mutation_lock:
-                trainer, _ = await self._ensure_trainer_locked()
-                generation = self._learner_generation
-                if generation is None or generation.policy_step != step:
-                    raise RuntimeError(
-                        "merged serving source is not the active learner"
-                    )
-            transfer = await self._merged_weight_transfer_spec(
-                self._serving_lora_name(step),
-                base_url=base_url,
-                api_key=api_key,
-            )
-            metrics = await trainer.sync_merged(generation, transfer)
-            self._publication_metrics.setdefault(step, {}).update(metrics)
-        except BaseException as error:
-            if temporal_sharing:
-                try:
-                    await self._wake_vllm_at(base_url, api_key)
-                except BaseException as wake_error:
-                    raise BaseExceptionGroup(
-                        "merged sync and vLLM wake failed", [error, wake_error]
-                    ) from None
-                finally:
-                    self._vllm_sleeping = False
-            raise
-        if temporal_sharing:
-            await self._wake_vllm_at(base_url, api_key)
-            self._vllm_sleeping = False
+        self._loaded_adapter_steps.add(serving_step)
 
     def _clear_serving_state(self) -> None:
         self._managed_service_name = None
@@ -2057,7 +2250,6 @@ class DistributedMegatronService:
         self._loaded_exact_adapter_steps.clear()
         self._exact_adapter_refcounts.clear()
         self._vllm_sleeping = False
-        self._merged_transfer_init = None
 
     async def _replica_failed(self, failure: ReplicaFailure) -> None:
         if self._closed or failure.replica_id != self._managed_service_name:
@@ -2065,7 +2257,7 @@ class DistributedMegatronService:
         task = asyncio.create_task(self._recover_failed_replica(failure))
         self._recovery_tasks.add(task)
         task.add_done_callback(self._recovery_tasks.discard)
-        task.add_done_callback(_consume_task_result)
+        task.add_done_callback(consume_future_exception)
 
     async def _recover_failed_replica(self, failure: ReplicaFailure) -> None:
         async with self._train_lock:
@@ -2113,9 +2305,7 @@ class DistributedMegatronService:
             state = await manager.restart(
                 served_model_name=bootstrap_name,
                 lora_path=checkpoint,
-                initial_policy_version=(
-                    serving_step if self.rollout_weights_mode == "lora" else None
-                ),
+                initial_policy_version=serving_step,
             )
             self._vllm_sleeping = False
             capability = await discover_serving_capabilities(
@@ -2125,20 +2315,10 @@ class DistributedMegatronService:
             )
             if capability != self._serving_capabilities:
                 raise RuntimeError("restarted vLLM replica capabilities changed")
-            if self.rollout_weights_mode == "merged":
-                self._merged_transfer_init = None
-                await self._sync_merged_serving_source_locked(
-                    step=serving_step,
-                    base_url=base_url,
-                    api_key=self._api_key(),
-                )
             update_identity = uuid.uuid4().hex
             manager.prepare_update(update_identity=update_identity)
             lora_name = bootstrap_name
-            if (
-                self.rollout_weights_mode == "lora"
-                and current_lora_name != bootstrap_name
-            ):
+            if current_lora_name != bootstrap_name:
                 lora_name, lora_path = await self._load_adapter_at(
                     checkpoint,
                     serving_step,
@@ -2156,32 +2336,24 @@ class DistributedMegatronService:
             )
             if manager.verify_update(report).phase != "ready":
                 raise RuntimeError("restarted vLLM replica rejected current policy")
-            if (
-                self.rollout_weights_mode == "lora"
-                and current_lora_name != bootstrap_name
-            ):
+            if current_lora_name != bootstrap_name:
                 await self._unload_adapter_at(bootstrap_name, base_url)
-            if self.rollout_weights_mode == "lora":
-                for step in exact_steps:
-                    if step == serving_step and self.rollout_weight_update_mode != (
-                        "in_flight_lora"
-                    ):
-                        continue
-                    await self._load_adapter_at(
-                        get_step_checkpoint_dir(self.output_dir, step),
-                        step,
-                        exact=True,
-                        base_url=base_url,
-                        api_key=self._api_key(),
-                        active_step=serving_step,
-                    )
+            for step in exact_steps:
+                if step == serving_step and self.rollout_weight_update_mode != (
+                    "in_flight_lora"
+                ):
+                    continue
+                await self._load_adapter_at(
+                    get_step_checkpoint_dir(self.output_dir, step),
+                    step,
+                    exact=True,
+                    base_url=base_url,
+                    api_key=self._api_key(),
+                    active_step=serving_step,
+                )
             self._current_lora_name = lora_name
-            self._loaded_adapter_steps = (
-                {serving_step} if self.rollout_weights_mode == "lora" else set()
-            )
-            self._loaded_exact_adapter_steps = (
-                set(exact_steps) if self.rollout_weights_mode == "lora" else set()
-            )
+            self._loaded_adapter_steps = {serving_step}
+            self._loaded_exact_adapter_steps = set(exact_steps)
             await self._release_loaded_adapter_transfers()
         except BaseException as error:
             manager.quarantine(f"replica recovery failed: {error}")
@@ -2244,18 +2416,11 @@ class DistributedMegatronService:
         )
         values = dict(self.config.get("engine_args", {}))
         values.update(dict((server or {}).get("engine_args", {})))
-        for key, value in handler.vllm_engine_args(
-            rollout_weights_mode=self.rollout_weights_mode
-        ).items():
+        for key, value in handler.vllm_engine_args().items():
             values.setdefault(key, value)
         values["enable_sleep_mode"] = self._temporal_gpu_sharing
-        if self.rollout_weights_mode == "merged":
-            values["weight_transfer_config"] = {"backend": "nccl"}
-            values.pop("enable_lora", None)
-            values.pop("max_loras", None)
-        else:
-            values["enable_lora"] = True
-            values.setdefault("max_loras", 2)
+        values["enable_lora"] = True
+        values.setdefault("max_loras", 2)
         values.setdefault("generation_config", "vllm")
         for key in ("model", "served_model_name"):
             values.pop(key, None)
@@ -2321,41 +2486,6 @@ class DistributedMegatronService:
         )
         response.raise_for_status()
 
-    async def _merged_weight_transfer_spec(
-        self,
-        served_model_name: str,
-        *,
-        base_url: str | None = None,
-        api_key: str | None = None,
-    ) -> MergedWeightTransferSpec:
-        target_url = base_url or self._base_url
-        if target_url is None:
-            raise RuntimeError("merged serving has not started")
-        target_api_key = api_key if base_url is not None else self._api_key()
-        service = self._model_service_spec()
-        if len(service.members) != 1:
-            raise NotImplementedError("merged updates currently require one vLLM host")
-        if self._merged_transfer_init is None:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(
-                    f"{target_url}/get_world_size",
-                    headers=_headers(target_api_key),
-                )
-            response.raise_for_status()
-            self._merged_transfer_init = MergedWeightTransferInitInfo(
-                master_address="127.0.0.1",
-                master_port=_free_port(),
-                rank_offset=1,
-                world_size=int(response.json()["world_size"]) + 1,
-            )
-        return MergedWeightTransferSpec(
-            init_info=self._merged_transfer_init,
-            vllm_base_url=target_url,
-            served_model_name=served_model_name,
-            api_key=target_api_key,
-            nccl_so_path=str(get_vllm_runtime_nccl_so_path()),
-        )
-
     async def _load_adapter(
         self, checkpoint: str, step: int, *, exact: bool = False
     ) -> tuple[str, str]:
@@ -2415,6 +2545,7 @@ class DistributedMegatronService:
         return str(payload.get("lora_slot", name)), path
 
     async def register_lora_for_step(self, step: int, checkpoint: str) -> None:
+        await self._await_trainer_preparation()
         async with self._train_lock:
             self._require_open()
             policy = await asyncio.to_thread(
@@ -2455,6 +2586,7 @@ class DistributedMegatronService:
         expected_step: int,
         learner_version: int,
     ) -> dict[str, float]:
+        await self._await_trainer_preparation()
         async with self._train_lock:
             metrics = self.drain_publication_metrics()
             async with self._mutation_lock:
@@ -2466,11 +2598,11 @@ class DistributedMegatronService:
                     )
                 if learner_version != expected_step + 1:
                     raise ValueError("a no-op policy transition must advance one step")
-                trainer = self._trainer if self._trainer_is_current() else None
                 previous = self._publication_tasks.get(expected_step)
                 source = self._learner_generation
                 if source is None or source.policy_step != expected_step:
                     raise RuntimeError("no-op transition has no immutable source")
+                trainer = self._resident_trainer_for_generation(source)
             if previous is not None:
                 await asyncio.shield(previous)
             source_adapter = self._published_adapters.get(expected_step)
@@ -2492,8 +2624,8 @@ class DistributedMegatronService:
                 try:
                     snapshot_metrics.update(
                         await trainer.advance_without_training(
-                            expected_learner_version=expected_step,
-                            learner_version=learner_version,
+                            source=source,
+                            output=generation,
                             optimizer_state_path=self._optimizer_state_path,
                             adapter=None,
                         )
@@ -2556,15 +2688,13 @@ class DistributedMegatronService:
         self,
         step: int,
         checkpoint: str,
-        *,
-        generation_id: str | None = None,
     ) -> None:
         if self._base_url is None:
             self._serving_step = step
             self._record_serving_activation(step)
             return
         await self._wake_for_serving_locked()
-        generation_id = generation_id or self._generation_id_for_step(step)
+        generation_id = self._generation_id_for_step(step)
         update_identity = uuid.uuid4().hex
         manager = (
             self.runtime.model_service(self._managed_service_name)
@@ -2578,15 +2708,7 @@ class DistributedMegatronService:
                 else None
             )
             lora_name = self._serving_lora_name(step)
-            if self.rollout_weights_mode == "lora":
-                lora_name, _lora_path = await self._load_adapter(checkpoint, step)
-            else:
-                response = await _post_vllm(
-                    f"{self._base_url}/art/set_served_model_name",
-                    api_key=self._api_key(),
-                    json={"name": lora_name},
-                )
-                response.raise_for_status()
+            lora_name, _lora_path = await self._load_adapter(checkpoint, step)
             if manager is not None and state is not None:
                 report = ReplicaUpdateReport(
                     replica_id=manager.spec.name,
@@ -2612,10 +2734,7 @@ class DistributedMegatronService:
                     "policy publication and serving rollback failed", [error, *cleanup]
                 ) from None
             raise
-        if (
-            self.rollout_weights_mode == "lora"
-            and self.rollout_weight_update_mode != "in_flight_lora"
-        ):
+        if self.rollout_weight_update_mode != "in_flight_lora":
             self._loaded_adapter_steps.add(step)
         self._current_lora_name = lora_name
         self._serving_step = step
@@ -2629,8 +2748,6 @@ class DistributedMegatronService:
 
     async def acquire_exact_adapter(self, step: int, checkpoint: str) -> str:
         self._require_open()
-        if self.rollout_weights_mode != "lora":
-            raise RuntimeError("Exact checkpoint eval requires LoRA rollout serving")
         async with self._mutation_lock:
             published = step in self._published_adapters
             generation = self._learner_generation
@@ -2698,8 +2815,6 @@ class DistributedMegatronService:
                 self._exact_adapter_refcounts[step] = count - 1
 
     async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
-        if self.rollout_weights_mode != "lora":
-            return
         async with self._serving_lock:
             self._require_open()
             for step in sorted(self._loaded_exact_adapter_steps - retain_steps):
@@ -2764,12 +2879,23 @@ class DistributedMegatronService:
         if self._close_task is None:
             self._closed = True
             self._close_task = asyncio.create_task(self._close())
-            self._close_task.add_done_callback(_consume_task_result)
+            self._close_task.add_done_callback(consume_future_exception)
         await asyncio.shield(self._close_task)
 
     async def _close(self) -> None:
+        failures: list[BaseException] = []
+        preparation = self._trainer_preparation_task
+        if preparation is not None:
+            try:
+                _, interrupted = await complete_task(preparation)
+            except BaseException as error:
+                failures.append(error)
+            else:
+                if interrupted is not None:
+                    failures.append(interrupted)
+            self._trainer_preparation_task = None
+            self._trainer_preparation_step = None
         async with self._train_lock:
-            failures: list[BaseException] = []
             publications = tuple(self._publication_tasks.values())
             durability_tasks = tuple(self._durability_tasks)
             recovery_tasks = tuple(self._recovery_tasks)

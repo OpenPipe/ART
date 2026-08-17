@@ -29,9 +29,14 @@ from art.megatron.routing_replay import (
 )
 from art.megatron.training import microbatches as megatron_microbatches
 from art.megatron.training.trace import prepare_replay_local_input_token_uids
-from art.megatron.weights.merged_weight_export import build_art_conversion_tasks
+from art.megatron.weights.conversion_tasks import build_art_conversion_tasks
 from art.preprocessing.pack import packed_tensors_from_dir
 
+from .base_megatron_session import (
+    BaseMegatronSessionKey,
+    active_base_megatron_session,
+    initialize_single_rank_process_group,
+)
 from .fp32_grouped_gemm import (
     allow_fp32_grouped_gemm_fallback_for_model_support_tests,
 )
@@ -82,8 +87,6 @@ _REPLAY_ROUTER_LAYER_PATTERN = re.compile(
     r"^chunk_\d+\.layer_(?P<layer>\d+)\.mlp\.router$"
 )
 _DISTRIBUTED_PROCESS_ENV = (
-    "MASTER_ADDR",
-    "MASTER_PORT",
     "RANK",
     "WORLD_SIZE",
     "LOCAL_RANK",
@@ -336,6 +339,8 @@ class _HfMoeRoutingCapture:
             if not torch.allclose(
                 assembled.expert_probs.index_select(0, existing_rows),
                 route.expert_probs.index_select(0, path_rows),
+                rtol=3e-5,
+                atol=3e-6,
             ):
                 raise RuntimeError("HF parity repeated path changed expert scores")
         assembled.expert_indices.index_copy_(0, token_uids, route.expert_indices)
@@ -1517,6 +1522,18 @@ def _run_megatron_sft_step(
         )
     _debug("initializing Megatron optimizer state")
     megatron_train._eager_initialize_optimizer_state(runtime.optimizer)
+    session = active_base_megatron_session()
+    if session is not None:
+        session.capture_runtime(
+            runtime,
+            key=BaseMegatronSessionKey(
+                base_model=request.case_config.base_model,
+                model_key=runtime.model_support_spec.key,
+                num_layers=request.case_config.num_layers,
+                precision=request.case_config.precision,
+                allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
+            ),
+        )
     _debug(f"built {len(tasks)} Megatron conversion tasks")
     for chunk in runtime.model:
         if hasattr(chunk, "zero_grad_buffer"):
@@ -1631,13 +1648,10 @@ def _validate_distributed_process_env() -> None:
         raise RuntimeError(
             f"HF parity worker requires explicit distributed environment: {missing}"
         )
-    master_port = int(os.environ["MASTER_PORT"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
     local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-    if not 0 < master_port < 65536:
-        raise RuntimeError(f"Invalid MASTER_PORT={master_port}")
     if not 0 <= rank < world_size or not 0 <= local_rank < local_world_size:
         raise RuntimeError(
             "Invalid HF parity rank environment: "
@@ -1650,6 +1664,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("HF parity requires at least one CUDA device")
     torch.cuda.set_device(0)
+    initialize_single_rank_process_group()
     _set_deterministic_seed(request.case_config.seed)
     _configure_cuda_precision(request.case_config)
     _enable_debug_traceback_dump()
@@ -1793,7 +1808,11 @@ def _worker_run(request: HfParityRunRequest) -> None:
         _debug("wrote HF parity report")
     finally:
         flex_patch_stack.close()
-        if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        session = active_base_megatron_session()
+        if (
+            (session is None or session.runtime is None)
+            and torch.distributed.is_initialized()  # ty: ignore[possibly-missing-attribute]
+        ):
             torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]
 
 

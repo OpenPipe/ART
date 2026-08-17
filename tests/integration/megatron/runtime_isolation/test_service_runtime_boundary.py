@@ -21,6 +21,13 @@ def _process_is_running(pid: int) -> bool:
     return state != "Z"
 
 
+def test_vllm_start_releases_the_host_service_mailbox() -> None:
+    from art.distributed.monarch_actor import ArtHostService
+
+    start = ArtHostService.__dict__["start_vllm_member"]
+    assert getattr(start._method, "_monarch_concurrent_endpoint_wrapper", False)
+
+
 @pytest.mark.asyncio
 async def test_publication_wait_is_reserved_before_next_train_can_expire_it() -> None:
     from art.megatron.runtime.monarch import (
@@ -277,7 +284,7 @@ async def test_distributed_service_close_retries_owned_resources(
     service = DistributedMegatronService(
         model_name="model",
         base_model="base",
-        config=cast(Any, {"rollout_weights_mode": "lora"}),
+        config=cast(Any, {}),
         output_dir=str(tmp_path),
         runtime=cast(Any, runtime),
         enable_expert_replay=False,
@@ -583,10 +590,7 @@ async def test_unsloth_shared_start_requires_runtime_sleep_mode(
     service = unsloth_service.UnslothService(
         model_name="test-model",
         base_model="Qwen/Qwen3-0.6B",
-        config={
-            "rollout_weights_mode": "lora",
-            "engine_args": {"enable_sleep_mode": False},
-        },
+        config={"engine_args": {"enable_sleep_mode": False}},
         output_dir=str(tmp_path),
     )
     service.__dict__["_state"] = SimpleNamespace(
@@ -615,7 +619,7 @@ async def test_unsloth_runtime_sleep_and_wake_use_runtime_routes(
     service = unsloth_service.UnslothService(
         model_name="test-model",
         base_model="Qwen/Qwen3-0.6B",
-        config={"rollout_weights_mode": "lora"},
+        config={},
         output_dir=str(tmp_path),
     )
     service._vllm_port = 8123

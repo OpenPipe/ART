@@ -18,7 +18,6 @@ from art.megatron.model_support.registry import (
     UnsupportedModelArchitectureError,
     get_model_support_handler,
     get_model_support_spec,
-    model_requires_merged_rollout,
     model_uses_expert_parallel,
 )
 import art.megatron.provider as provider_module
@@ -157,11 +156,10 @@ def test_model_support_specs_own_moe_metadata() -> None:
     assert model_uses_expert_parallel("deepseek-ai/DeepSeek-V4-Flash") is True
 
 
-def test_dsv4_prefers_validated_native_lora_rollout() -> None:
+def test_dsv4_native_lora_is_validated() -> None:
     spec = get_model_support_spec("deepseek-ai/DeepSeek-V4-Flash")
 
     assert spec.native_vllm_lora_status == "validated"
-    assert model_requires_merged_rollout("deepseek-ai/DeepSeek-V4-Flash") is False
 
 
 def test_dsv4_config_only_bridge_does_not_require_checkpoint_state() -> None:
