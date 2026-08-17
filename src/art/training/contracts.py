@@ -201,6 +201,7 @@ class AdamConfig(Contract):
     beta2: float = Field(default=0.99, ge=0, lt=1)
     eps: float = Field(default=1e-13, gt=0)
     weight_decay: float = Field(default=0.1, ge=0)
+    grad_clip_norm: float = Field(default=0.1, ge=0)
 
 
 class OptimStepRequest(RunCommand):

@@ -410,6 +410,7 @@ class MegatronTrainJobExecutor:
         runtime.optimizer.config.adam_beta2 = job.optimizer.beta2
         runtime.optimizer.config.adam_eps = job.optimizer.eps
         runtime.optimizer.config.weight_decay = job.optimizer.weight_decay
+        runtime.optimizer.config.clip_grad = job.optimizer.grad_clip_norm
         from art.megatron.train import run_megatron_optimizer_step
 
         started = time.perf_counter()
@@ -801,7 +802,7 @@ class MCoreRunSlotExecutor:
                 beta2=job.optimizer.beta2,
                 eps=job.optimizer.eps,
                 weight_decay=job.optimizer.weight_decay,
-                grad_clip_norm=float(self.runtime.optimizer_config.clip_grad or 0.0),
+                grad_clip_norm=job.optimizer.grad_clip_norm,
             ),
             grads=gradients,
         )
