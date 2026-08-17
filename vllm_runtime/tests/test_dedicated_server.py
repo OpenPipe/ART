@@ -203,6 +203,38 @@ def test_launch_policy_version_resolves_loaded_slot_alias(monkeypatch) -> None:
     )
 
 
+def test_lora_only_runtime_advertises_update_capabilities(monkeypatch) -> None:
+    class RuntimeConfigured(Exception):
+        pass
+
+    def stop_after_configuration() -> None:
+        raise RuntimeConfigured
+
+    monkeypatch.setattr(
+        dedicated_server,
+        "_configure_index_shared_pp",
+        lambda _model, _engine_args: None,
+    )
+    monkeypatch.setattr(
+        dedicated_server,
+        "apply_vllm_runtime_patches",
+        stop_after_configuration,
+    )
+
+    with pytest.raises(RuntimeConfigured):
+        dedicated_server.main(
+            [
+                "--model=model",
+                "--port=8000",
+                "--cuda-visible-devices=0",
+                "--served-model-name=policy",
+            ]
+        )
+
+    assert dedicated_server._runtime_state["in_flight_lora_updates"] is True
+    assert dedicated_server._runtime_state["policy_token_spans"] is True
+
+
 @pytest.mark.asyncio
 async def test_lora_mutations_are_serialized_across_slots() -> None:
     models = SimpleNamespace()

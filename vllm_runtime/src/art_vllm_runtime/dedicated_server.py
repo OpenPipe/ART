@@ -893,8 +893,8 @@ def main(argv: list[str] | None = None) -> None:
         initial_policy_version=args.initial_policy_version,
         pp_layer_partition=pp_layer_partition,
         binary_routed_experts=route_capture,
-        in_flight_lora_updates=args.rollout_weights_mode == "lora",
-        policy_token_spans=args.rollout_weights_mode == "lora",
+        in_flight_lora_updates=True,
+        policy_token_spans=True,
     )
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
