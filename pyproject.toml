@@ -25,7 +25,7 @@ plotting = ["matplotlib>=3.10.1", "seaborn>=0.13.2"]
 tensors = ["torch==2.11.0"]
 
 backend = [
-    "peft>=0.14.0",
+    "peft>=0.19.1,<0.20",
     "hf-xet>=1.1.0",
     "bitsandbytes>=0.45.2,!=0.50.0",
     "unsloth==2026.3.3",
@@ -48,6 +48,7 @@ backend = [
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
 ]
 megatron = [
+    "peft>=0.19.1,<0.20",
     "numpy<2",
     "torch==2.11.0",
     "torchvision==0.26.0",
