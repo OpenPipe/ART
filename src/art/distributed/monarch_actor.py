@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from functools import wraps
+import gc
 import json
 import os
 from pathlib import Path
@@ -76,6 +77,8 @@ from .trajectory_store import (
     publish_trajectory_bundles,
 )
 from .vllm_replica import HostMemberLaunchRequest
+
+_PACKING_GC_ALLOCATION_THRESHOLD = 50_000
 
 
 def _require_etcd_health(url: str, timeout_s: float) -> None:
@@ -207,6 +210,7 @@ class ArtHostService(Actor):
         )
         self._trajectory_queues: dict[str, TrajectoryQueueStore] = {}
         self._packer = None
+        self._packing_gc_threshold: tuple[int, int, int] | None = None
         self._packing_lock = asyncio.Lock()
         self._packing_tasks: set[asyncio.Task[Any]] = set()
         self._closing = False
@@ -335,9 +339,14 @@ class ArtHostService(Actor):
         for batch_id in tuple(self._batch_publishers):
             await self._drop_batch(batch_id)
         async with self._packing_lock:
-            if self._packer is not None:
-                await self._packer.close()
-                self._packer = None
+            try:
+                if self._packer is not None:
+                    await self._packer.close()
+                    self._packer = None
+            finally:
+                if self._packing_gc_threshold is not None:
+                    gc.set_threshold(*self._packing_gc_threshold)
+                    self._packing_gc_threshold = None
         if self._vllm_launcher is not None:
             await self._vllm_launcher.close()
             self._vllm_launcher = None
@@ -595,10 +604,23 @@ class ArtHostService(Actor):
                 if self._packer is None:
                     from art.megatron.backend import MegatronBackend
 
-                    self._packer = MegatronBackend(
-                        path=f"/tmp/art-packing-{os.getpid()}",
-                        enable_expert_replay=request.include_moe_routing,
+                    previous = gc.get_threshold()
+                    # Packing creates large acyclic Pydantic graphs; the default
+                    # threshold otherwise triggers full scans on the hot path.
+                    gc.set_threshold(
+                        max(previous[0], _PACKING_GC_ALLOCATION_THRESHOLD),
+                        previous[1],
+                        previous[2],
                     )
+                    try:
+                        self._packer = MegatronBackend(
+                            path=f"/tmp/art-packing-{os.getpid()}",
+                            enable_expert_replay=request.include_moe_routing,
+                        )
+                    except BaseException:
+                        gc.set_threshold(*previous)
+                        raise
+                    self._packing_gc_threshold = previous
                 packer = self._packer
                 assert packer is not None
                 packing_compute_started = time.monotonic()
