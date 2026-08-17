@@ -15,7 +15,11 @@ from ..megatron.prefix_tree_packing import (
 from ..megatron.prefix_tree_packing import (
     prefix_tree_pack_segments as _prefix_tree_pack_segments,
 )
-from ..training.tokenized import TokenizedDatum, TokenizedLossName
+from ..training.tokenized import (
+    MAX_TOKENIZED_PHYSICAL_VALUES,
+    TokenizedDatum,
+    TokenizedLossName,
+)
 from ..types import Verbosity
 from .moe_routing import (
     MoeRouteArray,
@@ -381,6 +385,12 @@ def prefix_tree_pack(
         ),
         default=0,
     )
+    physical_values = num_sequences * seq_len * candidate_capacity
+    if physical_values > MAX_TOKENIZED_PHYSICAL_VALUES:
+        raise ValueError(
+            "packed tokenized work exceeds the configured value limit: "
+            f"{physical_values} > {MAX_TOKENIZED_PHYSICAL_VALUES}"
+        )
     tokenized_shape = (num_sequences, seq_len, candidate_capacity)
     target_tokens_np = (
         np.full(tokenized_shape, -100, dtype=np.int64) if tokenized_items else None

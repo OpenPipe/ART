@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Coroutine, Iterable
 from contextlib import asynccontextmanager
-import hashlib
 import os
 import time
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -54,18 +53,14 @@ from .. import dev
 from .client import (
     RemoteTrainingClient,
     RemoteTrainingServiceClient,
-    RouteObjectPublisher,
 )
 from .contracts import (
     AdapterSpec,
     ApplyCheckpointRetentionRequest,
     CheckpointRevision,
     CreateTrainingRunRequest,
-    RemoteRlBatchRef,
-    RemoteRlGroupRef,
     TrainingRunSpec,
 )
-from .data_plane import encode_trajectory_group
 
 if TYPE_CHECKING:
     from art.model import Model, TrainableModel
@@ -99,7 +94,6 @@ class SamplerManager(Protocol):
 class _RemotePipelineBatch(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
-    batch: RemoteRlBatchRef
     forward: SkipValidation[TrainingOperation[ForwardBackwardResult]] = Field(
         exclude=True
     )
@@ -108,26 +102,6 @@ class _RemotePipelineBatch(BaseModel):
     groups: tuple[Any, ...]
     selections: tuple[Any, ...]
     generation_id: str = Field(min_length=1)
-
-
-class _StagedPipelineGroup(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    remote: RemoteRlGroupRef
-    byte_stream_receive_s: float = Field(ge=0)
-    encode_s: float = Field(ge=0)
-    upload_s: float = Field(ge=0)
-    wall_s: float = Field(ge=0)
-
-
-class _PipelineGroupStage(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
-
-    key: tuple[str, str]
-    admitted: SkipValidation[asyncio.Future[bool]] = Field(exclude=True)
-    task: SkipValidation[asyncio.Task[_StagedPipelineGroup | None]] = Field(
-        exclude=True
-    )
 
 
 class _PendingServerlessTrain(BaseModel):
@@ -245,7 +219,6 @@ class ServerlessBackend:
         training_base_url: str,
         inference_base_url: str,
         sampler_manager: SamplerManager,
-        route_object_publisher: RouteObjectPublisher | None = None,
         api_key: str | None = None,
         inference_api_key: str | None = None,
         checkpoint: str | None = None,
@@ -271,7 +244,6 @@ class ServerlessBackend:
         self._checkpoint = checkpoint
         self._restore_optimizer = restore_optimizer
         self._sampler_manager = sampler_manager
-        self._route_object_publisher = route_object_publisher
         self._enable_expert_replay = enable_expert_replay
         self._close_timeout_s = close_timeout_s
         self._clients: dict[tuple[str | None, str, str, str], RemoteTrainingClient] = {}
@@ -286,7 +258,6 @@ class ServerlessBackend:
             tuple[tuple[str | None, str, str, str], int], int
         ] = {}
         self._exact_adapter_lock = asyncio.Lock()
-        self._staged_pipeline_groups: dict[tuple[str, str], _PipelineGroupStage] = {}
         self._closed = False
 
     async def register(self, model: "Model") -> None:
@@ -320,7 +291,6 @@ class ServerlessBackend:
                     checkpoint=self._checkpoint,
                     restore_optimizer=self._restore_optimizer,
                 ),
-                route_publisher=self._route_object_publisher,
                 close_timeout_s=self._close_timeout_s,
             )
             self._clients[key] = client
@@ -357,7 +327,6 @@ class ServerlessBackend:
         failures: list[BaseException] = []
         try:
             async with asyncio.timeout(self._close_timeout_s):
-                failures.extend(await self._discard_all_staged_pipeline_groups())
                 results = await asyncio.gather(
                     *(client.close() for client in self._clients.values()),
                     return_exceptions=True,
@@ -397,9 +366,6 @@ class ServerlessBackend:
         if not isinstance(model, TrainableModel):
             raise TypeError("ServerlessBackend only supports trainable models")
         client = await self.training_client(model)
-        failures = await self._discard_staged_pipeline_run(client.run_id)
-        if failures:
-            raise BaseExceptionGroup("staged pipeline input cleanup failed", failures)
         await client.close()
         await client.wait_closed()
         await client.close_event_observer()
@@ -924,165 +890,6 @@ class ServerlessBackend:
         del model
         return True
 
-    async def stage_pipeline_group(
-        self,
-        model: AnyTrainableModel,
-        queue: DistributedTrajectoryQueue,
-        ref: TrajectoryGroupRef,
-    ) -> _PipelineGroupStage:
-        client = await self.training_client(model)
-        key = (client.run_id, ref.result_id)
-        if key in self._staged_pipeline_groups:
-            raise RuntimeError("trajectory group is already staged for remote training")
-        admitted = asyncio.get_running_loop().create_future()
-        task = asyncio.create_task(
-            self._stage_admitted_pipeline_group(client, queue, ref, admitted),
-            name=f"remote-training-stage-{client.run_id}-{ref.result_id}",
-        )
-        stage = _PipelineGroupStage(key=key, admitted=admitted, task=task)
-        self._staged_pipeline_groups[key] = stage
-        return stage
-
-    async def resolve_pipeline_group_stage(
-        self, stage: object, *, accepted: bool
-    ) -> None:
-        if not isinstance(stage, _PipelineGroupStage):
-            raise TypeError("invalid remote pipeline group stage")
-        if self._staged_pipeline_groups.get(stage.key) is not stage:
-            raise RuntimeError("remote pipeline group staging ownership changed")
-        if stage.admitted.done():
-            raise RuntimeError("remote pipeline group stage was resolved twice")
-        stage.admitted.set_result(accepted)
-        if accepted:
-            return
-        self._staged_pipeline_groups.pop(stage.key)
-        result, cancelled = await complete_task(stage.task)
-        if result is not None:
-            raise RuntimeError("rejected pipeline group was staged remotely")
-        if cancelled is not None:
-            raise cancelled
-
-    async def _stage_admitted_pipeline_group(
-        self,
-        client: RemoteTrainingClient,
-        queue: DistributedTrajectoryQueue,
-        ref: TrajectoryGroupRef,
-        admitted: asyncio.Future[bool],
-    ) -> _StagedPipelineGroup | None:
-        if not await admitted:
-            return None
-        return await self._stage_pipeline_group(client, queue, ref)
-
-    async def _stage_pipeline_group(
-        self,
-        client: RemoteTrainingClient,
-        queue: DistributedTrajectoryQueue,
-        ref: TrajectoryGroupRef,
-    ) -> _StagedPipelineGroup:
-        started = time.monotonic()
-        receive_started = time.monotonic()
-        bundle = await self._receive_pipeline_group(queue, ref)
-        receive_s = time.monotonic() - receive_started
-        encode_started = time.monotonic()
-        encoded = await asyncio.to_thread(
-            encode_trajectory_group,
-            bundle,
-            object_id=hashlib.sha256(
-                (
-                    f"{client.run_id}:{ref.owner_actor_id}:{ref.result_id}:"
-                    f"{ref.lease_id}"
-                ).encode()
-            ).hexdigest(),
-        )
-        encode_s = time.monotonic() - encode_started
-        upload_started = time.monotonic()
-        await client.stage_rl_group(encoded)
-        return _StagedPipelineGroup(
-            remote=encoded.remote,
-            byte_stream_receive_s=receive_s,
-            encode_s=encode_s,
-            upload_s=time.monotonic() - upload_started,
-            wall_s=time.monotonic() - started,
-        )
-
-    async def _receive_pipeline_group(
-        self, queue: DistributedTrajectoryQueue, ref: TrajectoryGroupRef
-    ) -> TrajectoryGroupBundle:
-        return await queue.receive_bundle(ref)
-
-    async def discard_pipeline_group(
-        self, model: AnyTrainableModel, group: TrajectoryGroup
-    ) -> None:
-        selection = group._distributed_lease
-        if not isinstance(selection, DistributedTrajectorySelection):
-            raise RuntimeError("remote pipeline group has no distributed selection")
-        client = await self.training_client(model)
-        key = (client.run_id, selection.lease.item.ref.result_id)
-        stage = self._staged_pipeline_groups.pop(key, None)
-        if stage is None:
-            raise RuntimeError("remote pipeline group was not staged")
-        staged = await stage.task
-        if staged is None:
-            raise RuntimeError("selected pipeline group was not admitted")
-        await self._release_staged_group(client, staged)
-
-    async def _discard_all_staged_pipeline_groups(self) -> list[BaseException]:
-        entries = tuple(self._staged_pipeline_groups.items())
-        self._staged_pipeline_groups.clear()
-        return await self._discard_staged_pipeline_entries(entries)
-
-    async def _discard_staged_pipeline_run(self, run_id: str) -> list[BaseException]:
-        entries = tuple(
-            (key, self._staged_pipeline_groups.pop(key))
-            for key in tuple(self._staged_pipeline_groups)
-            if key[0] == run_id
-        )
-        return await self._discard_staged_pipeline_entries(entries)
-
-    async def _discard_staged_pipeline_entries(
-        self,
-        entries: tuple[tuple[tuple[str, str], _PipelineGroupStage], ...],
-    ) -> list[BaseException]:
-        for _, stage in entries:
-            if not stage.admitted.done():
-                stage.admitted.set_result(False)
-        results = await asyncio.gather(
-            *(stage.task for _, stage in entries), return_exceptions=True
-        )
-        failures = [value for value in results if isinstance(value, BaseException)]
-        deletes = await asyncio.gather(
-            *(
-                self._release_staged_group(self._client_for_run(key[0]), value)
-                for (key, _), value in zip(entries, results, strict=True)
-                if isinstance(value, _StagedPipelineGroup)
-            ),
-            return_exceptions=True,
-        )
-        failures.extend(value for value in deletes if isinstance(value, BaseException))
-        return failures
-
-    async def _release_staged_group(
-        self, client: RemoteTrainingClient, value: _StagedPipelineGroup
-    ) -> None:
-        operations = [
-            self._service.delete_training_data(client.run_id, value.remote.data)
-        ]
-        refs = tuple(route.ref for route in value.remote.routes)
-        if refs:
-            operations.append(client.release_route_objects(refs))
-        results = await asyncio.gather(*operations, return_exceptions=True)
-        failures = [result for result in results if isinstance(result, BaseException)]
-        if failures:
-            raise BaseExceptionGroup("staged remote group cleanup failed", failures)
-
-    def _client_for_run(self, run_id: str) -> RemoteTrainingClient:
-        clients = tuple(
-            client for client in self._clients.values() if client.run_id == run_id
-        )
-        if len(clients) != 1:
-            raise RuntimeError("remote training run does not own exactly one client")
-        return clients[0]
-
     async def prepare_pipeline_batch(
         self,
         model: AnyTrainableModel,
@@ -1121,82 +928,50 @@ class ServerlessBackend:
             raise RuntimeError("remote batch spans distributed trajectory queues")
         for group in trajectory_groups:
             group._distributed_lease = None
-        marked_packed = False
-        generation_id = uuid.uuid4().hex
-        forward: TrainingOperation[ForwardBackwardResult] | None = None
-        forward_submit_s = 0.0
-        staged: tuple[_StagedPipelineGroup, ...] = ()
-        stage_keys = tuple(
-            (client.run_id, selection.lease.item.ref.result_id)
-            for selection in selected
+        min_source_version, max_source_version = _source_version_range(
+            trajectory_groups, client.projected_learner_version
         )
-        adopted = False
+        batch = RlTrajectoryBatch.from_group_bundles(
+            tuple(
+                TrajectoryGroupBundle.from_group(group) for group in trajectory_groups
+            ),
+            min_source_version=min_source_version,
+            max_source_version=max_source_version,
+            groups=trajectory_groups,
+            group_annotations=tuple(
+                selection.lease.item.annotations for selection in selected
+            ),
+        )
+        request_id = uuid.uuid4().hex
+        generation_id = request_id
+        request = ForwardBackwardRequest(
+            run_id=client.run_id,
+            request_id=request_id,
+            sequence_id=client.next_sequence_id,
+            batch=batch,
+            loss=loss,
+            collect_packing_shapes=any(
+                group._collect_packing_shape for group in trajectory_groups
+            ),
+        )
+        forward: TrainingOperation[ForwardBackwardResult] | None = None
+        marked_packed = False
         try:
-            stages = tuple(self._staged_pipeline_groups.get(key) for key in stage_keys)
-            if any(stage is None for stage in stages):
-                raise RuntimeError("remote pipeline group staging was not started")
-            owned_stages = tuple(stage for stage in stages if stage is not None)
-            stage_tasks = tuple(stage.task for stage in owned_stages)
-            stage_wait_started = time.monotonic()
-            staged_values = await asyncio.gather(
-                *(asyncio.shield(task) for task in stage_tasks)
-            )
-            if any(value is None for value in staged_values):
-                raise RuntimeError("selected pipeline group was not admitted")
-            staged = tuple(value for value in staged_values if value is not None)
-            stage_wait_s = time.monotonic() - stage_wait_started
-            route_refs = tuple(
-                route.ref for value in staged for route in value.remote.routes
-            )
-            route_prefetch_started = time.monotonic()
-            await client.ensure_route_objects(route_refs)
-            route_prefetch_wait_s = time.monotonic() - route_prefetch_started
-            min_source_version, max_source_version = _source_version_range(
-                trajectory_groups, client.projected_learner_version
-            )
-            batch = RemoteRlBatchRef(
-                groups=tuple(
-                    value.remote.model_copy(
-                        update={"annotations": selection.lease.item.annotations}
-                    )
-                    for value, selection in zip(staged, selected, strict=True)
-                ),
-                min_source_version=min_source_version,
-                max_source_version=max_source_version,
-            )
-            generation_id = hashlib.sha256(batch.model_dump_json().encode()).hexdigest()
             _, cancelled = await complete_task(
                 asyncio.create_task(queue.mark_packed(selected, generation_id))
             )
             marked_packed = True
             if cancelled is not None:
                 raise cancelled
-            for key, stage in zip(stage_keys, owned_stages, strict=True):
-                if self._staged_pipeline_groups.pop(key, None) is not stage:
-                    raise RuntimeError(
-                        "remote pipeline group staging ownership changed"
-                    )
-            adopted = True
             submit_started = time.monotonic()
-            forward = await client.forward_backward_refs(
-                request_id=uuid.uuid4().hex,
-                batch=batch,
-                loss=loss,
-                collect_packing_shapes=any(
-                    group._collect_packing_shape for group in trajectory_groups
-                ),
-            )
-            client.forget_route_objects(route_refs)
+            forward = await client.forward_backward(request)
             forward_submit_s = time.monotonic() - submit_started
             if forward.ref.learner_parent_version != learner_parent_version:
                 raise RuntimeError(
                     "remote service admitted F/B against another learner"
                 )
         except BaseException as primary:
-            cleanup = (
-                [asyncio.create_task(forward.cancel())] if forward is not None else []
-            )
-            cleanup.append(
+            cleanup = [
                 asyncio.create_task(
                     queue.release_selections(
                         selected,
@@ -1204,42 +979,14 @@ class ServerlessBackend:
                         generation_id=generation_id if marked_packed else None,
                     )
                 )
-            )
-
-            async def cleanup_failed_prepare() -> list[BaseException]:
-                stage_failures: list[BaseException] = []
-                try:
-                    if not adopted:
-                        entries = tuple(
-                            (key, stage)
-                            for key in stage_keys
-                            if (stage := self._staged_pipeline_groups.pop(key, None))
-                            is not None
-                        )
-                        stage_failures = await self._discard_staged_pipeline_entries(
-                            entries
-                        )
-                finally:
-                    cleanup_results = await asyncio.gather(
-                        *cleanup, return_exceptions=True
-                    )
-                return [
-                    result
-                    for result in (*stage_failures, *cleanup_results)
-                    if isinstance(result, BaseException) and result is not primary
-                ]
-
-            try:
-                failures, cancelled = await complete_task(
-                    asyncio.create_task(cleanup_failed_prepare())
-                )
-            except BaseException as cleanup_error:
-                raise BaseExceptionGroup(
-                    "remote packing and source cleanup failed",
-                    [primary, cleanup_error],
-                ) from None
-            if cancelled is not None:
-                failures.append(cancelled)
+            ]
+            if forward is not None:
+                cleanup.append(asyncio.create_task(forward.cancel()))
+            failures = [
+                value
+                for value in await asyncio.gather(*cleanup, return_exceptions=True)
+                if isinstance(value, BaseException) and value is not primary
+            ]
             if failures:
                 raise BaseExceptionGroup(
                     "remote packing and source cleanup failed", [primary, *failures]
@@ -1247,7 +994,6 @@ class ServerlessBackend:
             raise
         assert forward is not None
         prepared = _RemotePipelineBatch(
-            batch=batch,
             forward=forward,
             loss=loss,
             forward_submit_s=forward_submit_s,
@@ -1257,29 +1003,9 @@ class ServerlessBackend:
         )
         for group in trajectory_groups:
             group._prepared_training_batch = prepared
-        trajectory_bytes = sum(value.remote.data.byte_count for value in staged)
-        route_bytes = sum(
-            route.ref.byte_count for value in staged for route in value.remote.routes
-        )
         return {
             "time/step_prepare_remote_batch_s": time.monotonic() - started,
-            "time/step_remote_group_stage_wait_s": stage_wait_s,
-            "time/step_remote_route_prefetch_wait_s": route_prefetch_wait_s,
-            "time/step_remote_group_receive_max_s": max(
-                value.byte_stream_receive_s for value in staged
-            ),
-            "time/step_remote_group_encode_max_s": max(
-                value.encode_s for value in staged
-            ),
-            "time/step_remote_group_upload_max_s": max(
-                value.upload_s for value in staged
-            ),
             "time/step_remote_forward_submit_s": forward_submit_s,
-            "data/step_remote_trajectory_bytes": float(trajectory_bytes),
-            "data/step_remote_route_bytes": float(route_bytes),
-            "data/step_remote_reference_bytes": float(
-                len(batch.model_dump_json().encode())
-            ),
         }
 
     async def discard_pipeline_batch(

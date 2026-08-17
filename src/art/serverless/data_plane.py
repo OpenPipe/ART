@@ -4,11 +4,11 @@ from array import array
 from collections.abc import Mapping
 import hashlib
 import sys
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, NamedTuple, TypeVar
 import uuid
 
 from msgspec import msgpack
-from pydantic import BaseModel, ConfigDict, TypeAdapter
+from pydantic import BaseModel, ConfigDict, TypeAdapter, model_validator
 
 from art.distributed.moe_route_store import (
     MoeRouteGroupPayload,
@@ -16,7 +16,11 @@ from art.distributed.moe_route_store import (
 )
 from art.distributed.packing import TrajectoryGroupPayload
 from art.distributed.trajectory_store import TrajectoryGroupBundle
-from art.preprocessing.moe_routing import PROMPT_TOKEN_IDS_KEY
+from art.megatron.prefix_tree_packing import prefix_tree_pack_segments
+from art.preprocessing.moe_routing import (
+    COMPLETION_TOKEN_IDS_KEY,
+    PROMPT_TOKEN_IDS_KEY,
+)
 from art.training.contracts import (
     OperationResult,
     RlTrajectoryBatch,
@@ -24,12 +28,14 @@ from art.training.contracts import (
     TokenizedTrainingBatch,
     TrainingBatch,
 )
+from art.training.tokenized import MAX_TOKENIZED_LOGPROB_VALUES
 
 from .contracts import (
     RL_GROUP_DATA_FORMAT,
     SFT_DATA_FORMAT,
     TOKENIZED_DATA_FORMAT,
     OperationResultRef,
+    RemoteForwardRequest,
     RemoteRlBatchRef,
     RemoteRlGroupRef,
     RemoteRouteObject,
@@ -39,13 +45,26 @@ from .contracts import (
     RemoteTokenizedBatchRef,
     RemoteTrainingBatchRef,
     TrainingDataRef,
+    command_route_object_refs,
+    training_data_refs,
 )
 
 _SFT_BATCH_ADAPTER = TypeAdapter(SupervisedTrajectoryBatch)
 _TOKENIZED_BATCH_ADAPTER = TypeAdapter(TokenizedTrainingBatch)
 _UINT32_ARRAY_EXT = 1
 _FLOAT32_ARRAY_EXT = 2
+_LOGPROB_SHAPE_KEY = "__art_shape__"
+_LOGPROB_VALUES_KEY = "__art_values__"
 ResultT = TypeVar("ResultT", bound=OperationResult)
+RouteWireEncoding = Literal["inline", "prefix_tree"]
+
+
+class _RouteEntry(NamedTuple):
+    trajectory_index: int
+    scope: Literal["messages", "additional_history", "exchange"]
+    scope_index: int
+    choice_index: int
+    route: Any
 
 
 class EncodedTrainingObject(BaseModel):
@@ -54,12 +73,27 @@ class EncodedTrainingObject(BaseModel):
     ref: TrainingDataRef
     payload: bytes
 
+    @model_validator(mode="after")
+    def _validate_payload(self) -> "EncodedTrainingObject":
+        _validate_training_object(self.ref, self.payload, self.ref.format)
+        return self
+
 
 class EncodedRouteObject(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     ref: RemoteRouteObjectRef
     payload: bytes
+
+    @model_validator(mode="after")
+    def _validate_payload(self) -> "EncodedRouteObject":
+        if self.ref.transport != "command" or self.ref.sha256 is None:
+            raise ValueError("encoded route bytes require command transport")
+        if len(self.payload) != self.ref.byte_count:
+            raise ValueError("route byte count differs from its reference")
+        if hashlib.sha256(self.payload).hexdigest() != self.ref.sha256:
+            raise ValueError("route payload hash differs from its reference")
+        return self
 
 
 class EncodedRlGroup(BaseModel):
@@ -86,11 +120,47 @@ class EncodedTrainingBatch(BaseModel):
     route_objects: tuple[EncodedRouteObject, ...] = ()
 
 
+class EncodedForwardSubmission(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    request: RemoteForwardRequest
+    objects: tuple[EncodedTrainingObject, ...]
+    route_objects: tuple[EncodedRouteObject, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_objects(self) -> "EncodedForwardSubmission":
+        route_refs = {
+            ref.object_id: ref for ref in command_route_object_refs(self.request.batch)
+        }
+        route_data_ids = set(route_refs)
+        expected_data = {
+            ref.object_id: ref
+            for ref in training_data_refs(self.request.batch)
+            if ref.object_id not in route_data_ids
+        }
+        if {value.ref.object_id: value.ref for value in self.objects} != expected_data:
+            raise ValueError("forward submission data objects do not match request")
+        if {
+            value.ref.object_id: value.ref for value in self.route_objects
+        } != route_refs:
+            raise ValueError("forward submission route objects do not match request")
+        return self
+
+
 def encode_trajectory_group(
-    bundle: TrajectoryGroupBundle, *, object_id: str | None = None
+    bundle: TrajectoryGroupBundle,
+    *,
+    object_id: str | None = None,
+    route_encoding: RouteWireEncoding = "prefix_tree",
 ) -> EncodedRlGroup:
     data_id = object_id or _object_id(uuid.uuid4().hex)
-    stripped, route_payload, slices = _extract_routes(bundle.payload())
+    source = bundle.payload()
+    if route_encoding == "prefix_tree":
+        stripped, route_payload, slices = _extract_routes(source)
+    elif route_encoding == "inline":
+        stripped, route_payload, slices = source, b"", ()
+    else:
+        raise ValueError(f"unsupported route wire encoding: {route_encoding!r}")
     data = _encode_training_object(
         msgpack.encode(
             TrajectoryGroupBundle.from_payload(stripped).model_dump(mode="python")
@@ -105,6 +175,8 @@ def encode_trajectory_group(
         route_ref = RemoteRouteObjectRef(
             object_id=_object_id(f"{data_id}:{route_digest}"),
             byte_count=len(route_payload),
+            transport="command",
+            sha256=route_digest,
         )
         routes = (EncodedRouteObject(ref=route_ref, payload=route_payload),)
         remote_routes = (RemoteRouteObject(ref=route_ref, slices=slices),)
@@ -116,13 +188,17 @@ def encode_trajectory_group(
 
 
 def prepare_training_batch(
-    batch: TrainingBatch, *, identity: str | None = None
+    batch: TrainingBatch,
+    *,
+    identity: str | None = None,
+    route_encoding: RouteWireEncoding = "prefix_tree",
 ) -> EncodedTrainingBatch:
     if isinstance(batch, RlTrajectoryBatch):
         groups = tuple(
             encode_trajectory_group(
                 group,
                 object_id=_object_id(f"{identity}:{index}") if identity else None,
+                route_encoding=route_encoding,
             )
             for index, group in enumerate(batch.groups)
         )
@@ -188,9 +264,7 @@ def decode_trajectory_group(
 def _extract_routes(
     payload: TrajectoryGroupPayload,
 ) -> tuple[TrajectoryGroupPayload, bytes, tuple[RemoteRouteSlice, ...]]:
-    data = bytearray()
-    slices: list[RemoteRouteSlice] = []
-    segments: dict[tuple[str, int, int, memoryview], tuple[int, int]] = {}
+    entries: list[_RouteEntry] = []
     trajectories = []
     for trajectory_index, trajectory in enumerate(payload.trajectories):
         histories = tuple(
@@ -199,9 +273,7 @@ def _extract_routes(
                 trajectory_index=trajectory_index,
                 scope="additional_history",
                 scope_index=index,
-                data=data,
-                slices=slices,
-                segments=segments,
+                entries=entries,
             )
             for index, values in enumerate(
                 trajectory.additional_history_choice_routing_metadata
@@ -213,9 +285,7 @@ def _extract_routes(
                 trajectory_index=trajectory_index,
                 scope="exchange",
                 scope_index=index,
-                data=data,
-                slices=slices,
-                segments=segments,
+                entries=entries,
             )
             for index, values in enumerate(trajectory.exchange_choice_routing_metadata)
         )
@@ -227,9 +297,7 @@ def _extract_routes(
                         trajectory_index=trajectory_index,
                         scope="messages",
                         scope_index=0,
-                        data=data,
-                        slices=slices,
-                        segments=segments,
+                        entries=entries,
                     ),
                     "additional_history_choice_routing_metadata": histories,
                     "exchange_choice_routing_metadata": exchanges,
@@ -238,8 +306,7 @@ def _extract_routes(
         )
     return (
         payload.model_copy(update={"trajectories": tuple(trajectories)}),
-        bytes(data),
-        tuple(slices),
+        *_pack_route_entries(entries),
     )
 
 
@@ -249,51 +316,112 @@ def _strip_route_map(
     trajectory_index: int,
     scope: Literal["messages", "additional_history", "exchange"],
     scope_index: int,
-    data: bytearray,
-    slices: list[RemoteRouteSlice],
-    segments: dict[tuple[str, int, int, memoryview], tuple[int, int]],
+    entries: list[_RouteEntry],
 ) -> dict[int, Any]:
     stripped = {}
     for choice_index, route in values.items():
         if not route.data:
             raise RuntimeError("inline routed experts are empty")
-        for segment_index, segment in enumerate(_route_segments(route)):
-            key = (route.dtype, route.shape[1], route.shape[2], segment)
-            physical = segments.get(key)
-            if physical is None:
-                physical = len(data), len(segment)
-                data.extend(segment)
-                segments[key] = physical
-            slices.append(
-                RemoteRouteSlice(
-                    trajectory_index=trajectory_index,
-                    scope=scope,
-                    scope_index=scope_index,
-                    choice_index=choice_index,
-                    segment_index=segment_index,
-                    offset=physical[0],
-                    byte_count=physical[1],
-                )
+        entries.append(
+            _RouteEntry(
+                trajectory_index,
+                scope,
+                scope_index,
+                choice_index,
+                route,
             )
+        )
         stripped[choice_index] = route.model_copy(update={"data": ()})
     return stripped
 
 
-def _route_segments(route: Any) -> tuple[memoryview, ...]:
-    prompt_ids = route.metadata.get(PROMPT_TOKEN_IDS_KEY)
-    if not isinstance(prompt_ids, list):
-        raise RuntimeError("routed experts are missing prompt token ids")
-    bytes_per_token = (
-        (1 if route.dtype == "uint8" else 2) * route.shape[1] * route.shape[2]
+def _pack_route_entries(
+    entries: list[_RouteEntry],
+) -> tuple[bytes, tuple[RemoteRouteSlice, ...]]:
+    if not entries:
+        return b"", ()
+    token_keys: dict[tuple[int, str, int, int, memoryview], int] = {}
+    rows = []
+    for entry in entries:
+        route = entry.route
+        token_ids = _route_token_ids(route)
+        tokens = _route_token_views(route)
+        rows.append(
+            tuple(
+                token_keys.setdefault(
+                    (token_id, route.dtype, route.shape[1], route.shape[2], token),
+                    len(token_keys),
+                )
+                for token_id, token in zip(token_ids, tokens, strict=True)
+            )
+        )
+    planned = prefix_tree_pack_segments(
+        rows,
+        max_depth=max(map(len, rows)),
+        shareable_lengths=tuple(map(len, rows)),
+        min_shared_segment_length=1,
     )
-    prompt_end = len(prompt_ids) * bytes_per_token
-    total = route.shape[0] * bytes_per_token
-    boundaries = (0, prompt_end, total) if 0 < prompt_end < total else (0, total)
-    return tuple(
-        segment
-        for start, end in zip(boundaries, boundaries[1:])
-        for segment in _route_data_range(route.data, start, end)
+    data = bytearray()
+    slices: list[RemoteRouteSlice] = []
+    segment_indices = [0] * len(entries)
+    for segment in planned:
+        route = entries[segment.sequence_indices[0]].route
+        bytes_per_token = _route_bytes_per_token(route)
+        chunks = _route_data_range(
+            route.data,
+            segment.start * bytes_per_token,
+            segment.end * bytes_per_token,
+        )
+        offset = len(data)
+        for chunk in chunks:
+            data.extend(chunk)
+        byte_count = len(data) - offset
+        for sequence_index in segment.sequence_indices:
+            entry = entries[sequence_index]
+            slices.append(
+                RemoteRouteSlice(
+                    trajectory_index=entry.trajectory_index,
+                    scope=entry.scope,
+                    scope_index=entry.scope_index,
+                    choice_index=entry.choice_index,
+                    segment_index=segment_indices[sequence_index],
+                    offset=offset,
+                    byte_count=byte_count,
+                )
+            )
+            segment_indices[sequence_index] += 1
+    return bytes(data), tuple(slices)
+
+
+def _route_token_ids(route: Any) -> tuple[int, ...]:
+    prompt = route.metadata.get(PROMPT_TOKEN_IDS_KEY)
+    completion = route.metadata.get(COMPLETION_TOKEN_IDS_KEY)
+    if not isinstance(prompt, list) or not isinstance(completion, list):
+        raise RuntimeError("routed experts are missing exact token ids")
+    token_ids = tuple(prompt) + tuple(completion)
+    if len(token_ids) != route.shape[0] or any(
+        isinstance(token, bool) or not isinstance(token, int) or token < 0
+        for token in token_ids
+    ):
+        raise RuntimeError("routed-expert token ids do not match their route shape")
+    return token_ids
+
+
+def _route_bytes_per_token(route: Any) -> int:
+    return (1 if route.dtype == "uint8" else 2) * route.shape[1] * route.shape[2]
+
+
+def _route_token_views(route: Any) -> tuple[memoryview, ...]:
+    bytes_per_token = _route_bytes_per_token(route)
+    tokens = tuple(
+        view[offset : offset + bytes_per_token]
+        for raw in route.data
+        for view in (memoryview(raw).cast("B").toreadonly(),)
+        for offset in range(0, len(view), bytes_per_token)
     )
+    if len(tokens) != route.shape[0]:
+        raise RuntimeError("routed experts do not cover their declared shape")
+    return tokens
 
 
 def _route_data_range(
@@ -337,6 +465,25 @@ def decode_tokenized_batch(
     return batch
 
 
+def encode_forward_submission(
+    request: RemoteForwardRequest,
+    batch: EncodedTrainingBatch,
+) -> bytes:
+    if request.batch != batch.remote:
+        raise ValueError("forward submission request and encoded batch differ")
+    return msgpack.encode(
+        EncodedForwardSubmission(
+            request=request,
+            objects=batch.objects,
+            route_objects=batch.route_objects,
+        ).model_dump(mode="python")
+    )
+
+
+def decode_forward_submission(payload: bytes) -> EncodedForwardSubmission:
+    return EncodedForwardSubmission.model_validate(msgpack.decode(payload))
+
+
 def _encode_training_object(
     payload: bytes,
     *,
@@ -378,8 +525,24 @@ def encode_operation_result(
     result: OperationResult,
 ) -> tuple[OperationResultRef, bytes]:
     value = result.model_dump(mode="python")
+    result_values = 0
     for output in value.get("loss_fn_outputs", ()):
-        output["token_logprobs"] = array("f", output["token_logprobs"])
+        raw = output["token_logprobs"]
+        nested = bool(raw) and isinstance(raw[0], list | tuple)
+        rows = tuple(raw) if nested else (raw,)
+        width = len(rows[0]) if rows else 0
+        if any(len(row) != width for row in rows):
+            raise ValueError("token logprobs must be rectangular")
+        result_values += sum(map(len, rows))
+        output["token_logprobs"] = {
+            _LOGPROB_SHAPE_KEY: ((len(rows), width) if nested else (len(raw),)),
+            _LOGPROB_VALUES_KEY: array("f", (item for row in rows for item in row)),
+        }
+    if result_values > MAX_TOKENIZED_LOGPROB_VALUES:
+        raise ValueError(
+            "operation result exceeds the configured logprob value limit: "
+            f"{result_values} > {MAX_TOKENIZED_LOGPROB_VALUES}"
+        )
     payload = msgpack.encode(value, enc_hook=_encode_ext)
     return (
         OperationResultRef(
@@ -397,7 +560,21 @@ def decode_operation_result(
         raise ValueError("operation result byte count differs from its reference")
     if hashlib.sha256(payload).hexdigest() != ref.object_id:
         raise ValueError("operation result hash differs from its reference")
-    return result_type.model_validate(msgpack.decode(payload, ext_hook=_decode_ext))
+    value = msgpack.decode(payload, ext_hook=_decode_ext)
+    for output in value.get("loss_fn_outputs", ()):
+        packed = output["token_logprobs"]
+        shape = tuple(packed[_LOGPROB_SHAPE_KEY])
+        values = packed[_LOGPROB_VALUES_KEY]
+        if len(shape) == 1:
+            output["token_logprobs"] = tuple(values)
+        elif len(shape) == 2 and len(values) == shape[0] * shape[1]:
+            output["token_logprobs"] = tuple(
+                tuple(values[start : start + shape[1]])
+                for start in range(0, len(values), shape[1])
+            )
+        else:
+            raise ValueError("operation result contains an invalid logprob shape")
+    return result_type.model_validate(value)
 
 
 def _encode_ext(value: object):

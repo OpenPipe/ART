@@ -14,8 +14,10 @@ from art.pipeline_tuner.config import PackedGroupShape
 from art.trajectories import Trajectory
 
 from .tokenized import (
+    MAX_TOKENIZED_LOGPROB_VALUES,
     TokenizedDatum,
     TokenizedLossName,
+    tokenized_result_value_count,
     validate_tokenized_loss_values,
 )
 
@@ -142,6 +144,16 @@ class TokenizedTrainingBatch(Contract):
     kind: Literal["tokenized"] = "tokenized"
     datums: tuple[TokenizedDatum, ...] = Field(min_length=1)
     _encoded_payload: bytes | None = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def _validate_result_size(self) -> "TokenizedTrainingBatch":
+        values = tokenized_result_value_count(self.datums)
+        if values > MAX_TOKENIZED_LOGPROB_VALUES:
+            raise ValueError(
+                "tokenized result exceeds the configured value limit: "
+                f"{values} > {MAX_TOKENIZED_LOGPROB_VALUES}"
+            )
+        return self
 
     def encoded_payload(self) -> bytes | None:
         return self._encoded_payload

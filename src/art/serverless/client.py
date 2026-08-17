@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 import hashlib
-from typing import Any, Callable, Generic, Protocol, TypeVar, cast
+from typing import Any, Callable, Generic, TypeVar, cast
 import uuid
 
 import httpx
@@ -17,7 +17,6 @@ from art.training.contracts import (
     ForwardResult,
     LoadStateRequest,
     LoadStateResult,
-    LossConfig,
     OperationKind,
     OperationRef,
     OperationResult,
@@ -41,23 +40,16 @@ from .contracts import (
     EventPage,
     OperationResultRef,
     OperationView,
-    PrefetchRouteObjectsRequest,
-    ReleaseRouteObjectsRequest,
     RemoteForwardRequest,
-    RemoteRouteObjectRef,
-    RemoteTrainingBatchRef,
     RunEvent,
     SetCheckpointTtlRequest,
     TrainingCapabilities,
-    TrainingDataRef,
     TrainingRunView,
 )
 from .data_plane import (
-    EncodedRlGroup,
-    EncodedRouteObject,
     EncodedTrainingBatch,
-    EncodedTrainingObject,
     decode_operation_result,
+    encode_forward_submission,
     prepare_training_batch,
 )
 
@@ -65,10 +57,6 @@ ResultT = TypeVar("ResultT", bound=OperationResult)
 ResponseT = TypeVar("ResponseT", bound=Contract)
 _CREATE_RUN_RESOLVE_STATUSES = frozenset({409, 429, 500, 502, 503, 504})
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
-
-
-class RouteObjectPublisher(Protocol):
-    async def publish(self, run_id: str, value: EncodedRouteObject) -> None: ...
 
 
 class RemoteTrainingError(RuntimeError):
@@ -191,59 +179,23 @@ class RemoteTrainingServiceClient:
             body=request,
         )
 
-    async def put_training_data(
-        self, run_id: str, ref: TrainingDataRef, payload: bytes
-    ) -> None:
+    async def submit_forward(
+        self,
+        kind: OperationKind,
+        request: RemoteForwardRequest,
+        batch: EncodedTrainingBatch,
+    ) -> OperationRef:
+        if kind not in {"forward", "forward_backward"}:
+            raise ValueError("forward submission requires a forward operation")
+        payload = await asyncio.to_thread(encode_forward_submission, request, batch)
         response = await self._send(
-            "PUT",
-            f"training/runs/{run_id}/data/{ref.object_id}",
+            "POST",
+            f"training/runs/{request.run_id}/{kind}",
             content=payload,
-            headers={
-                "Content-Type": "application/vnd.art.training-data+msgpack",
-                "X-Art-Training-Data-Format": ref.format,
-                "X-Art-Training-SHA256": ref.sha256,
-                "X-Art-Training-Byte-Count": str(ref.byte_count),
-            },
+            headers={"Content-Type": "application/vnd.art.forward+msgpack"},
             transfer=True,
         )
-        received = TrainingDataRef.model_validate(response.json())
-        if received != ref:
-            raise RemoteTrainingError("remote training data identity changed")
-
-    async def delete_training_data(self, run_id: str, ref: TrainingDataRef) -> None:
-        await self._send(
-            "DELETE",
-            f"training/runs/{run_id}/data/{ref.object_id}",
-            content=None,
-            headers={
-                "X-Art-Training-Data-Format": ref.format,
-                "X-Art-Training-SHA256": ref.sha256,
-                "X-Art-Training-Byte-Count": str(ref.byte_count),
-            },
-            transfer=True,
-        )
-
-    async def prefetch_route_objects(
-        self, run_id: str, request: PrefetchRouteObjectsRequest
-    ) -> None:
-        await self._send(
-            "POST",
-            f"training/runs/{run_id}/routes:prefetch",
-            content=request.model_dump_json(),
-            headers={"Content-Type": "application/json"},
-            transfer=True,
-        )
-
-    async def release_route_objects(
-        self, run_id: str, request: ReleaseRouteObjectsRequest
-    ) -> None:
-        await self._send(
-            "POST",
-            f"training/runs/{run_id}/routes:release",
-            content=request.model_dump_json(),
-            headers={"Content-Type": "application/json"},
-            transfer=True,
-        )
+        return OperationRef.model_validate(response.json())
 
     async def get_operation(self, operation_id: str) -> OperationView:
         return await self._request(
@@ -555,139 +507,6 @@ class RemoteTrainingOperation(Generic[ResultT]):
             await self.result()
 
 
-_ROUTE_PREFETCH_INTERVAL_S = 0.5
-_ROUTE_PREFETCH_MAX_REFS = 64
-
-
-class _RoutePrefetchBatcher:
-    def __init__(self, service: RemoteTrainingServiceClient, run_id: str) -> None:
-        self._service = service
-        self._run_id = run_id
-        self._refs: dict[str, RemoteRouteObjectRef] = {}
-        self._futures: dict[str, asyncio.Future[None]] = {}
-        self._pending: dict[str, RemoteRouteObjectRef] = {}
-        self._wake = asyncio.Event()
-        self._task: asyncio.Task[None] | None = None
-        self._force_flush = False
-        self._closing = False
-        self._closed = False
-        self._error: BaseException | None = None
-
-    def enqueue(
-        self, refs: tuple[RemoteRouteObjectRef, ...]
-    ) -> tuple[asyncio.Future[None], ...]:
-        if self._error is not None:
-            raise self._error
-        if self._closing or self._closed:
-            raise RuntimeError("remote route prefetch batcher is closed")
-        loop = asyncio.get_running_loop()
-        futures = []
-        for ref in refs:
-            existing = self._refs.get(ref.object_id)
-            if existing is not None and existing != ref:
-                raise RuntimeError("remote route object identity changed")
-            if existing is None:
-                self._refs[ref.object_id] = ref
-                self._pending[ref.object_id] = ref
-                self._futures[ref.object_id] = loop.create_future()
-            futures.append(self._futures[ref.object_id])
-        if refs:
-            if self._task is None:
-                self._task = asyncio.create_task(
-                    self._run(), name=f"remote-route-prefetch-{self._run_id}"
-                )
-            if len(self._pending) >= _ROUTE_PREFETCH_MAX_REFS:
-                self._force_flush = True
-            self._wake.set()
-        return tuple(futures)
-
-    async def ensure(self, refs: tuple[RemoteRouteObjectRef, ...]) -> None:
-        futures = self.enqueue(refs)
-        if not futures:
-            return
-        self._force_flush = True
-        self._wake.set()
-        await asyncio.shield(asyncio.gather(*futures))
-        if self._error is not None:
-            raise self._error
-
-    def forget(self, refs: tuple[RemoteRouteObjectRef, ...]) -> None:
-        for ref in refs:
-            future = self._futures.get(ref.object_id)
-            if future is None or not future.done():
-                raise RuntimeError("remote route object was not prefetched")
-            if self._refs.pop(ref.object_id) != ref:
-                raise RuntimeError("remote route object identity changed")
-            self._futures.pop(ref.object_id)
-
-    async def close(self) -> None:
-        if self._closed:
-            return
-        self._closing = True
-        self._force_flush = True
-        self._wake.set()
-        if self._task is not None:
-            await self._task
-        self._closed = True
-        if self._error is not None:
-            raise self._error
-
-    async def abort(self) -> None:
-        self._closing = self._closed = True
-        task, self._task = self._task, None
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        self._finish_waiters()
-
-    async def _run(self) -> None:
-        try:
-            while True:
-                if self._closing and not self._pending:
-                    return
-                await self._wake.wait()
-                self._wake.clear()
-                if not self._pending:
-                    continue
-                deadline = (
-                    asyncio.get_running_loop().time() + _ROUTE_PREFETCH_INTERVAL_S
-                )
-                while (
-                    not self._force_flush
-                    and not self._closing
-                    and len(self._pending) < _ROUTE_PREFETCH_MAX_REFS
-                ):
-                    remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        break
-                    try:
-                        async with asyncio.timeout(remaining):
-                            await self._wake.wait()
-                    except TimeoutError:
-                        break
-                    self._wake.clear()
-                self._force_flush = False
-                batch = tuple(self._pending.values())
-                self._pending.clear()
-                await self._service.prefetch_route_objects(
-                    self._run_id, PrefetchRouteObjectsRequest(refs=batch)
-                )
-                for ref in batch:
-                    future = self._futures[ref.object_id]
-                    if not future.done():
-                        future.set_result(None)
-        except asyncio.CancelledError:
-            raise
-        except BaseException as error:
-            self._error = error
-            self._finish_waiters()
-
-    def _finish_waiters(self) -> None:
-        for future in self._futures.values():
-            if not future.done():
-                future.set_result(None)
-
-
 class RemoteTrainingClient:
     """Run-scoped implementation of ART's canonical training command API."""
 
@@ -696,7 +515,6 @@ class RemoteTrainingClient:
         service: RemoteTrainingServiceClient,
         run: TrainingRunView,
         *,
-        route_publisher: RouteObjectPublisher | None = None,
         poll_interval_s: float = 0.1,
         close_timeout_s: float = 20.0,
     ) -> None:
@@ -707,13 +525,11 @@ class RemoteTrainingClient:
                 "remote training polling and close timeouts must be positive"
             )
         self._service = service
-        self._route_publisher = route_publisher
         self._run = run
         self._next_sequence_id = run.next_sequence_id
         self._projected_learner_version = run.projected_learner_version
         self._poll_interval_s = poll_interval_s
         self._events = _RunEventObserver(service, run.run_id, poll_interval_s)
-        self._route_prefetch = _RoutePrefetchBatcher(service, run.run_id)
         self._close_timeout_s = close_timeout_s
         self._lock = asyncio.Lock()
         self._operations: dict[str, tuple[str, RemoteTrainingOperation[Any]]] = {}
@@ -801,11 +617,13 @@ class RemoteTrainingClient:
                     f"expected sequence {self._next_sequence_id}, "
                     f"got {request.sequence_id}"
                 )
-            if prepared_batch is not None:
-                await self._stage_inputs(
-                    prepared_batch.objects, prepared_batch.route_objects
+            ref = (
+                await self._service.submit_forward(
+                    kind, cast(RemoteForwardRequest, wire_request), prepared_batch
                 )
-            ref = await self._service.submit(kind, wire_request)
+                if prepared_batch is not None
+                else await self._service.submit(kind, wire_request)
+            )
             if (
                 ref.run_id != self.run_id
                 or ref.sequence_id != request.sequence_id
@@ -839,91 +657,6 @@ class RemoteTrainingClient:
                 self._operations.pop(request_id, None)
                 overflow -= 1
 
-    async def stage_rl_group(self, value: EncodedRlGroup) -> None:
-        await self._stage_inputs((value.data,), value.routes, defer_prefetch=True)
-
-    async def ensure_route_objects(
-        self, refs: tuple[RemoteRouteObjectRef, ...]
-    ) -> None:
-        await self._route_prefetch.ensure(refs)
-
-    async def release_route_objects(
-        self, refs: tuple[RemoteRouteObjectRef, ...]
-    ) -> None:
-        if not refs:
-            return
-        failures: list[BaseException] = []
-        try:
-            await self._route_prefetch.ensure(refs)
-        except BaseException as error:
-            failures.append(error)
-        try:
-            await self._service.release_route_objects(
-                self.run_id, ReleaseRouteObjectsRequest(refs=refs)
-            )
-        except BaseException as error:
-            failures.append(error)
-        self._route_prefetch.forget(refs)
-        if failures:
-            raise BaseExceptionGroup("remote route object release failed", failures)
-
-    def forget_route_objects(self, refs: tuple[RemoteRouteObjectRef, ...]) -> None:
-        self._route_prefetch.forget(refs)
-
-    async def _stage_inputs(
-        self,
-        data: tuple[EncodedTrainingObject, ...],
-        routes: tuple[EncodedRouteObject, ...],
-        *,
-        defer_prefetch: bool = False,
-    ) -> None:
-        if routes and self._route_publisher is None:
-            raise RuntimeError(
-                "binary route objects require a route publisher; pass "
-                "route_object_publisher when enabling remote MoE routing replay"
-            )
-        route_refs = tuple(value.ref for value in routes)
-        try:
-            async with asyncio.TaskGroup() as tasks:
-                for value in data:
-                    tasks.create_task(
-                        self._service.put_training_data(
-                            self.run_id, value.ref, value.payload
-                        )
-                    )
-                if self._route_publisher is not None:
-                    for value in routes:
-                        tasks.create_task(
-                            self._route_publisher.publish(self.run_id, value)
-                        )
-            if route_refs:
-                self._route_prefetch.enqueue(route_refs)
-                if not defer_prefetch:
-                    await self._route_prefetch.ensure(route_refs)
-        except BaseException as primary:
-            cleaned = await asyncio.gather(
-                *(
-                    self._service.delete_training_data(self.run_id, value.ref)
-                    for value in data
-                ),
-                *(
-                    (
-                        self._service.release_route_objects(
-                            self.run_id, ReleaseRouteObjectsRequest(refs=route_refs)
-                        ),
-                    )
-                    if route_refs
-                    else ()
-                ),
-                return_exceptions=True,
-            )
-            failures = [value for value in cleaned if isinstance(value, BaseException)]
-            if failures:
-                raise BaseExceptionGroup(
-                    "remote input staging and cleanup failed", [primary, *failures]
-                ) from None
-            raise
-
     async def forward(
         self, request: ForwardRequest
     ) -> TrainingOperation[ForwardResult]:
@@ -933,41 +666,6 @@ class RemoteTrainingClient:
         self, request: ForwardBackwardRequest
     ) -> TrainingOperation[ForwardBackwardResult]:
         return await self._submit(
-            request,
-            kind="forward_backward",
-            result_type=ForwardBackwardResult,
-        )
-
-    async def forward_backward_prepared(
-        self,
-        request: ForwardBackwardRequest,
-        encoded_batch: EncodedTrainingBatch,
-    ) -> TrainingOperation[ForwardBackwardResult]:
-        return await self._submit(
-            request,
-            kind="forward_backward",
-            result_type=ForwardBackwardResult,
-            encoded_batch=encoded_batch,
-        )
-
-    async def forward_backward_refs(
-        self,
-        *,
-        request_id: str,
-        batch: RemoteTrainingBatchRef,
-        loss: LossConfig,
-        collect_packing_shapes: bool,
-    ) -> TrainingOperation[ForwardBackwardResult]:
-        request = RemoteForwardRequest(
-            run_id=self.run_id,
-            request_id=request_id,
-            sequence_id=self.next_sequence_id,
-            batch=batch,
-            loss=loss,
-            collect_packing_shapes=collect_packing_shapes,
-        )
-        return await self._admit(
-            request,
             request,
             kind="forward_backward",
             result_type=ForwardBackwardResult,
@@ -1020,10 +718,6 @@ class RemoteTrainingClient:
                 return
             failures: list[BaseException] = []
             try:
-                await self._route_prefetch.close()
-            except BaseException as error:
-                failures.append(error)
-            try:
                 self._run = await self._service.close_run(
                     self.run_id, self._close_request_id
                 )
@@ -1057,7 +751,6 @@ class RemoteTrainingClient:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await self._route_prefetch.abort()
         await self._events.close()
 
     async def close_event_observer(self) -> None:

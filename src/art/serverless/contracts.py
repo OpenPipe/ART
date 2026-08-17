@@ -34,6 +34,7 @@ class TrainingDataRef(Contract):
         "art_trajectory_group_msgpack_v3",
         "art_sft_batch_msgpack_v1",
         "art_tokenized_batch_msgpack_v1",
+        "art_moe_route_bundle_v2",
     ]
 
 
@@ -41,6 +42,24 @@ class RemoteRouteObjectRef(Contract):
     object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     byte_count: int = Field(ge=1)
     format: Literal["art_moe_route_bundle_v2"] = MOE_ROUTE_OBJECT_FORMAT
+    transport: Literal["object_store", "command"] = "object_store"
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_transport(self) -> "RemoteRouteObjectRef":
+        if (self.transport == "command") != (self.sha256 is not None):
+            raise ValueError("command route objects require sha256 exclusively")
+        return self
+
+    def training_data_ref(self) -> TrainingDataRef:
+        if self.transport != "command" or self.sha256 is None:
+            raise ValueError("object-store routes are not training-data objects")
+        return TrainingDataRef(
+            object_id=self.object_id,
+            sha256=self.sha256,
+            byte_count=self.byte_count,
+            format=MOE_ROUTE_OBJECT_FORMAT,
+        )
 
 
 RemoteRouteSlice = MoeRouteSlice
@@ -71,21 +90,6 @@ class RemoteRouteObject(Contract):
             raise ValueError("route slice leaves its object bounds")
         validate_moe_route_slices(self.slices, self.ref.byte_count)
         return self
-
-
-class PrefetchRouteObjectsRequest(Contract):
-    refs: tuple[RemoteRouteObjectRef, ...] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def _validate_refs(self) -> "PrefetchRouteObjectsRequest":
-        ids = [ref.object_id for ref in self.refs]
-        if len(ids) != len(set(ids)):
-            raise ValueError("route prefetch contains duplicate objects")
-        return self
-
-
-class ReleaseRouteObjectsRequest(PrefetchRouteObjectsRequest):
-    pass
 
 
 class RemoteRlGroupRef(Contract):
@@ -208,7 +212,12 @@ class RemoteForwardRequest(RunCommand):
 
 def training_data_refs(batch: RemoteTrainingBatchRef) -> tuple[TrainingDataRef, ...]:
     if isinstance(batch, RemoteRlBatchRef):
-        return tuple(group.data for group in batch.groups)
+        return tuple(group.data for group in batch.groups) + tuple(
+            route.ref.training_data_ref()
+            for group in batch.groups
+            for route in group.routes
+            if route.ref.transport == "command"
+        )
     return (batch.data,)
 
 
@@ -220,6 +229,24 @@ def route_object_refs(
     refs: dict[str, RemoteRouteObjectRef] = {}
     for group in batch.groups:
         for route in group.routes:
+            if route.ref.transport == "command":
+                continue
+            prior = refs.setdefault(route.ref.object_id, route.ref)
+            if prior != route.ref:
+                raise ValueError("route object identity changed within a batch")
+    return tuple(refs.values())
+
+
+def command_route_object_refs(
+    batch: RemoteTrainingBatchRef,
+) -> tuple[RemoteRouteObjectRef, ...]:
+    if not isinstance(batch, RemoteRlBatchRef):
+        return ()
+    refs: dict[str, RemoteRouteObjectRef] = {}
+    for group in batch.groups:
+        for route in group.routes:
+            if route.ref.transport != "command":
+                continue
             prior = refs.setdefault(route.ref.object_id, route.ref)
             if prior != route.ref:
                 raise ValueError("route object identity changed within a batch")

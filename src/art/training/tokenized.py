@@ -12,6 +12,12 @@ TokenizedLossName = Literal[
     "ppo",
     "cispo",
 ]
+MAX_TOKENIZED_LOGPROB_VALUES = 16 << 20
+MAX_TOKENIZED_PHYSICAL_VALUES = 64 << 20
+
+
+def tokenized_result_value_count(datums: tuple["TokenizedDatum", ...]) -> int:
+    return sum(len(datum.input_tokens) * datum.candidate_count for datum in datums)
 
 
 def validate_tokenized_loss_values(
