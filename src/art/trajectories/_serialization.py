@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
 from typing import Any, Literal, cast
 
@@ -13,6 +15,23 @@ from pydantic.main import IncEx
 from ..openai import ART_MOE_ROUTING_METADATA_KEY
 
 type _StringPool = dict[str, str]
+
+_STRING_INTERNING_DISABLED = ContextVar(
+    "art_trajectory_string_interning_disabled", default=False
+)
+
+
+@contextmanager
+def _without_string_interning() -> Iterator[None]:
+    token = _STRING_INTERNING_DISABLED.set(True)
+    try:
+        yield
+    finally:
+        _STRING_INTERNING_DISABLED.reset(token)
+
+
+def _skip_string_interning() -> bool:
+    return _STRING_INTERNING_DISABLED.get()
 
 
 def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
