@@ -9,6 +9,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
+import torch
 
 from art.distributed.object_store import (
     BinaryObjectTarget,
@@ -57,6 +58,45 @@ from .trainer_run import EventSink
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
     from art.trainer_rank import TrainerRankOptimizerState
+
+
+def _command_token_logprobs(
+    batch: InMemoryPackedBatch, outputs: list[Any] | tuple[Any, ...]
+) -> tuple[Any, ...]:
+    if batch.ref.training_kind != "tokenized":
+        return tuple(
+            tuple(float(item) for item in values.flatten().tolist())
+            for values in outputs
+        )
+    output_map = batch.ref.tokenized_output_map
+    if output_map is None:
+        raise RuntimeError("tokenized batch has no output map")
+    target_tokens = batch.tensors.get("target_tokens")
+    if target_tokens is None:
+        raise RuntimeError("tokenized batch has no target tensor")
+    candidate_capacity = int(target_tokens.shape[2])
+    physical = torch.cat(
+        [values.reshape(-1, candidate_capacity) for values in outputs], dim=0
+    )
+    expected_rows = batch.ref.num_sequences * batch.ref.sequence_length
+    if int(physical.shape[0]) != expected_rows:
+        raise RuntimeError(
+            "tokenized command did not return every physical packed row: "
+            f"returned={physical.shape[0]}, expected={expected_rows}"
+        )
+    host = physical.detach().cpu()
+    logical = []
+    for positions, candidates in zip(
+        output_map.packed_positions, output_map.candidate_counts, strict=True
+    ):
+        values = host[list(positions), :candidates]
+        if candidates == 1:
+            logical.append(tuple(float(item) for item in values[:, 0].tolist()))
+        else:
+            logical.append(
+                tuple(tuple(float(item) for item in row) for row in values.tolist())
+            )
+    return tuple(logical)
 
 
 class MegatronTrainJobExecutor:
@@ -276,10 +316,7 @@ class MegatronTrainJobExecutor:
             "operation_id": job.operation_id,
             "metrics": result.metrics(),
             "token_count": int(result.token_count.item()),
-            "token_logprobs": tuple(
-                tuple(float(item) for item in values.flatten().tolist())
-                for values in step.new_logprobs
-            ),
+            "token_logprobs": _command_token_logprobs(batch, step.new_logprobs),
         }
 
     def execute_forward(
@@ -306,10 +343,7 @@ class MegatronTrainJobExecutor:
         )
         return {
             **result,
-            "token_logprobs": tuple(
-                tuple(float(item) for item in values.flatten().tolist())
-                for values in result["token_logprobs"]
-            ),
+            "token_logprobs": _command_token_logprobs(batch, result["token_logprobs"]),
         }
 
     def execute_sft_forward_backward(
@@ -677,10 +711,7 @@ class MCoreRunSlotExecutor:
             "operation_id": job.operation_id,
             "metrics": result.metrics(),
             "token_count": int(result.token_count.item()),
-            "token_logprobs": tuple(
-                tuple(float(item) for item in values.flatten().tolist())
-                for values in step.new_logprobs
-            ),
+            "token_logprobs": _command_token_logprobs(batch, step.new_logprobs),
         }
 
     def execute_forward(
@@ -705,10 +736,7 @@ class MCoreRunSlotExecutor:
         )
         return {
             **result,
-            "token_logprobs": tuple(
-                tuple(float(item) for item in values.flatten().tolist())
-                for values in result["token_logprobs"]
-            ),
+            "token_logprobs": _command_token_logprobs(batch, result["token_logprobs"]),
         }
 
     def execute_sft_forward_backward(

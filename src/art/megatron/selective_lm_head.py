@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import os
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
+from megatron.core import parallel_state as ps
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
 )
@@ -69,6 +70,14 @@ class LmHeadTokenSelection(BaseModel):
     def select_optional(self, tensor: torch.Tensor | None) -> torch.Tensor | None:
         return None if tensor is None else self.select(tensor)
 
+    def select_rows(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tuple(tensor.shape[:2]) != self.full_shape:
+            raise ValueError(
+                "selected row tensor must match the label shape: "
+                f"tensor={tuple(tensor.shape)} labels={self.full_shape}"
+            )
+        return tensor.reshape(-1, *tensor.shape[2:]).index_select(0, self.flat_indices)
+
     def restore(self, tensor: torch.Tensor, *, fill_value: float = 0.0) -> torch.Tensor:
         if tensor.numel() != self.flat_indices.numel():
             raise ValueError(
@@ -80,6 +89,20 @@ class LmHeadTokenSelection(BaseModel):
             0,
             self.flat_indices,
             tensor.reshape(-1),
+        )
+        return restored
+
+    def restore_rows(
+        self, tensor: torch.Tensor, *, fill_value: float = 0.0
+    ) -> torch.Tensor:
+        if int(tensor.shape[0]) != int(self.flat_indices.numel()):
+            raise ValueError(
+                "selected tensor rows do not match LM-head selection: "
+                f"tensor={tensor.shape[0]} selection={self.flat_indices.numel()}"
+            )
+        restored = tensor.new_full((*self.full_shape, *tensor.shape[1:]), fill_value)
+        restored.reshape(-1, *tensor.shape[1:]).index_copy_(
+            0, self.flat_indices, tensor
         )
         return restored
 
@@ -216,6 +239,95 @@ def forward_token_logits(
     raise ValueError(
         "selected logits do not match LM-head selection: "
         f"logits={tuple(logits.shape)} selected_tokens={selected_tokens}"
+    )
+
+
+class _VocabParallelSelectedLogprobs(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: Any,
+        local_logits: torch.Tensor,
+        target_tokens: torch.Tensor,
+        group: Any,
+        vocab_start: int,
+        tp_size: int,
+    ) -> torch.Tensor:
+        if local_logits.ndim != 2 or target_tokens.ndim != 2:
+            raise ValueError("selected logprobs require [N,V] logits and [N,K] targets")
+        if local_logits.shape[0] != target_tokens.shape[0]:
+            raise ValueError("selected logprob logits and targets do not align")
+        logits = local_logits.float()
+        local_max = logits.max(dim=1).values
+        global_max = local_max.clone()
+        if tp_size > 1:
+            torch.distributed.all_reduce(
+                global_max,
+                op=torch.distributed.ReduceOp.MAX,  # ty: ignore[possibly-missing-attribute]
+                group=group,
+            )
+        exp_logits = torch.exp(logits - global_max.unsqueeze(1))
+        exp_sum = exp_logits.sum(dim=1)
+        if tp_size > 1:
+            torch.distributed.all_reduce(exp_sum, group=group)
+        softmax = exp_logits / exp_sum.unsqueeze(1)
+
+        local_targets = target_tokens - vocab_start
+        valid = target_tokens >= 0
+        owns_target = (
+            valid & (local_targets >= 0) & (local_targets < local_logits.shape[1])
+        )
+        target_logits = logits.gather(
+            1, local_targets.clamp(0, local_logits.shape[1] - 1)
+        ).masked_fill(~owns_target, 0.0)
+        owners = owns_target.to(dtype=torch.int32)
+        if tp_size > 1:
+            torch.distributed.all_reduce(target_logits, group=group)
+            torch.distributed.all_reduce(owners, group=group)
+        torch._assert_async(
+            torch.all((~valid) | (owners == 1)),
+            "target token is outside the vocabulary-parallel output",
+        )
+        ctx.save_for_backward(softmax, local_targets, owns_target, valid)
+        ctx.input_dtype = local_logits.dtype
+        return (target_logits - (global_max + exp_sum.log()).unsqueeze(1)).masked_fill(
+            ~valid, 0.0
+        )
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: Any
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        grad_output = cast(torch.Tensor, grad_outputs[0])
+        softmax, local_targets, owns_target, valid = ctx.saved_tensors
+        coefficients = grad_output.float().masked_fill(~valid, 0.0)
+        grad_logits = -softmax * coefficients.sum(dim=1, keepdim=True)
+        grad_logits.scatter_add_(
+            1,
+            local_targets.clamp(0, grad_logits.shape[1] - 1),
+            coefficients.masked_fill(~owns_target, 0.0),
+        )
+        return grad_logits.to(dtype=ctx.input_dtype), None, None, None, None
+
+
+def vocab_parallel_selected_logprobs(
+    local_logits: torch.Tensor,
+    target_tokens: torch.Tensor,
+) -> torch.Tensor:
+    """Return exact selected logprobs with a vocabulary-shard-local backward."""
+    initialized = ps.model_parallel_is_initialized()
+    tp_size = int(ps.get_tensor_model_parallel_world_size()) if initialized else 1
+    tp_rank = int(ps.get_tensor_model_parallel_rank()) if initialized else 0
+    group = (
+        ps.get_tensor_model_parallel_group(check_initialized=False)
+        if initialized and tp_size > 1
+        else None
+    )
+    return _VocabParallelSelectedLogprobs.apply(
+        local_logits,
+        target_tokens,
+        group,
+        tp_rank * int(local_logits.shape[1]),
+        tp_size,
     )
 
 

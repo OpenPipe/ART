@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import math
 from typing import Literal
 
@@ -11,6 +12,48 @@ TokenizedLossName = Literal[
     "ppo",
     "cispo",
 ]
+
+
+def validate_tokenized_loss_values(
+    loss: TokenizedLossName,
+    values: Mapping[str, float | int | bool | str | None],
+) -> None:
+    allowed = (
+        {"clip_low_threshold", "clip_high_threshold"}
+        if loss in {"ppo", "cispo"}
+        else set()
+    )
+    unknown = set(values) - allowed
+    if unknown:
+        raise ValueError(f"unsupported {loss} loss settings: {sorted(unknown)}")
+    for name, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise TypeError(f"{name} must be numeric")
+    if (
+        loss in {"ppo", "cispo"}
+        and tokenized_clip_bounds(loss, values)[0]
+        > tokenized_clip_bounds(loss, values)[1]
+    ):
+        raise ValueError("clip_low_threshold must not exceed clip_high_threshold")
+
+
+def tokenized_clip_bounds(
+    loss: TokenizedLossName,
+    values: Mapping[str, float | int | bool | str | None],
+) -> tuple[float, float]:
+    if loss not in {"ppo", "cispo"}:
+        raise ValueError(f"{loss} has no clipping bounds")
+    defaults = (0.8, 1.2) if loss == "ppo" else (0.0, 4.0)
+    low = values.get("clip_low_threshold", defaults[0])
+    high = values.get("clip_high_threshold", defaults[1])
+    if (
+        isinstance(low, bool)
+        or not isinstance(low, int | float)
+        or isinstance(high, bool)
+        or not isinstance(high, int | float)
+    ):
+        raise TypeError("clip thresholds must be numeric")
+    return float(low), float(high)
 
 
 class TokenizedDatum(BaseModel):

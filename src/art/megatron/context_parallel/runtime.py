@@ -2409,16 +2409,27 @@ def dispatch_megatron_context_parallel_training_tensors(
         tuple[tuple[tuple[int, int], ...], int, str, int | None],
         tuple[torch.Tensor, torch.Tensor],
     ] = {}
-    assistant_mask = shift_tensor(micro["assistant_mask"], False)
-    labels = torch.where(
-        assistant_mask,
-        shift_tensor(micro["tokens"], -100),
-        torch.full_like(micro["tokens"], -100),
+    tokenized = "target_tokens" in micro
+    assistant_mask = (
+        micro["assistant_mask"]
+        if tokenized
+        else shift_tensor(micro["assistant_mask"], False)
+    )
+    labels = (
+        micro["target_tokens"][..., 0]
+        if tokenized
+        else torch.where(
+            assistant_mask,
+            shift_tensor(micro["tokens"], -100),
+            torch.full_like(micro["tokens"], -100),
+        )
     )
     old_logprobs = shift_tensor(micro["logprobs"], float("nan"))
     advantages = shift_tensor(micro["advantages"], 0.0)
     weights = shift_tensor(micro["weights"], 0.0)
-    shifted_group_ids = shift_tensor(micro["group_ids"], 0)
+    shifted_group_ids = (
+        micro["group_ids"] if tokenized else shift_tensor(micro["group_ids"], 0)
+    )
     original_logprobs_source = cast(Any, micro).get("original_logprobs")
     original_logprobs = (
         None
@@ -2475,10 +2486,14 @@ def dispatch_megatron_context_parallel_training_tensors(
         ref_logprobs=maybe_dispatch(ref_logprobs, float("nan")),
         loss_all_reduce_group=cp_group,
         token_uids=None if local_token_uids is None else local_token_uids.contiguous(),
+        target_tokens=maybe_dispatch(micro.get("target_tokens"), -100),
+        loss_weights=maybe_dispatch(micro.get("loss_weights"), 0.0),
+        behavior_logprobs=maybe_dispatch(micro.get("behavior_logprobs"), 0.0),
+        token_advantages=maybe_dispatch(micro.get("token_advantages"), 0.0),
     )
     workload = TrainingMicrobatchWorkload(
         logical_nonpadding_tokens=sum(rank_plan.local_valid_lengths),
-        loss_bearing_tokens=int((local_labels != -100).sum().item()),
+        loss_bearing_tokens=int(tensors.assistant_mask.sum().item()),
         executed_token_equivalents=int(local_labels.numel()),
         nominal_schedule_capacity_tokens=rank_plan.original_seq_len,
     )
@@ -2812,9 +2827,10 @@ def _dispatch_tensor(
     on CUDA. Use the rank plan's Python length metadata to decide whether a pad
     mask is needed.
     """
-    if tensor.ndim != 2:
+    if tensor.ndim not in {2, 3}:
         raise RuntimeError(
-            f"_dispatch_tensor expected a rank-2 tensor, got shape {tuple(tensor.shape)}"
+            "_dispatch_tensor expected a rank-2 or rank-3 tensor, "
+            f"got shape {tuple(tensor.shape)}"
         )
     if int(tensor.shape[0]) != 1:
         raise RuntimeError(
@@ -2837,6 +2853,9 @@ def _dispatch_tensor(
         device=tensor.device,
         dispatch_meta_cache=dispatch_meta_cache,
     )
+    if tensor.ndim == 3:
+        gather_index = gather_index.unsqueeze(-1).expand(-1, -1, tensor.shape[2])
+        valid_mask = valid_mask.unsqueeze(-1)
     output = torch.gather(tensor, dim=1, index=gather_index)
     if int(rank_plan.local_valid_lengths[0]) < max_local_len:
         output = output.masked_fill(~valid_mask, pad_value)

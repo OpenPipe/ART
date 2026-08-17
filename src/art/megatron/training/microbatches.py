@@ -117,6 +117,10 @@ class PreparedRLMicroInputs(BaseModel):
     loss_inputs: LossInputs | DispatchedPackedTensors
     lm_head_selection: LmHeadTokenSelection
     ref_logprobs: torch.Tensor | None = None
+    target_tokens: torch.Tensor | None = None
+    loss_weights: torch.Tensor | None = None
+    behavior_logprobs: torch.Tensor | None = None
+    token_advantages: torch.Tensor | None = None
     local_token_uids: torch.Tensor | None = None
     workload: TrainingMicrobatchWorkload
 
@@ -177,6 +181,11 @@ def _clone_packed_tensors(inputs: PackedTensors) -> PackedTensors:
 def _zero_contribution_inputs(template: PackedTensors) -> PackedTensors:
     dummy = _clone_packed_tensors(template)
     dummy["assistant_mask"].zero_()
+    if "target_tokens" in dummy:
+        dummy["target_tokens"].fill_(-100)
+        dummy["loss_weights"].zero_()
+        dummy["behavior_logprobs"].zero_()
+        dummy["token_advantages"].zero_()
     return dummy
 
 
@@ -429,6 +438,8 @@ def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
 
 
 def _count_trainable_tokens(inputs: LossInputs | DispatchedPackedTensors) -> float:
+    if isinstance(inputs, DispatchedPackedTensors) and inputs.loss_weights is not None:
+        return float((inputs.loss_weights != 0).any(dim=-1).sum().item())
     assistant_mask = inputs.align_inputs().assistant_mask
     return float(assistant_mask.sum().item())
 
@@ -591,12 +602,20 @@ def _prepare_dense_rl_micro(
             model_support_handler,
         ),
     )
-    shifted_labels = shift_tensor(micro["tokens"], -100)
-    shifted_assistant_mask = shift_tensor(micro["assistant_mask"], False)
-    shifted_labels = torch.where(
-        shifted_assistant_mask,
-        shifted_labels,
-        torch.full_like(shifted_labels, -100),
+    tokenized = "target_tokens" in micro
+    shifted_assistant_mask = (
+        micro["assistant_mask"]
+        if tokenized
+        else shift_tensor(micro["assistant_mask"], False)
+    )
+    shifted_labels = (
+        micro["target_tokens"][..., 0]
+        if tokenized
+        else torch.where(
+            shifted_assistant_mask,
+            shift_tensor(micro["tokens"], -100),
+            torch.full_like(micro["tokens"], -100),
+        )
     )
     lm_head_selection = LmHeadTokenSelection.from_labels(
         shifted_labels,
@@ -623,6 +642,10 @@ def _prepare_dense_rl_micro(
         loss_inputs=LossInputs(inputs=micro),
         lm_head_selection=lm_head_selection,
         ref_logprobs=ref_logprobs,
+        target_tokens=micro.get("target_tokens"),
+        loss_weights=micro.get("loss_weights"),
+        behavior_logprobs=micro.get("behavior_logprobs"),
+        token_advantages=micro.get("token_advantages"),
         local_token_uids=packed_sequence_token_uids(micro, device=device),
         workload=workload,
     )
@@ -685,6 +708,10 @@ def _prepared_rl_micro_from_cp_batch(
         ref_logprobs=(
             prepared.tensors.ref_logprobs if ref_logprobs is not None else None
         ),
+        target_tokens=prepared.tensors.target_tokens,
+        loss_weights=prepared.tensors.loss_weights,
+        behavior_logprobs=prepared.tensors.behavior_logprobs,
+        token_advantages=prepared.tensors.token_advantages,
         local_token_uids=prepared.tensors.token_uids,
         workload=prepared.workload,
     )

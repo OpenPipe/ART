@@ -39,7 +39,9 @@ from art import dev, types
 from art.loss import (
     AlignedLossInputs,
     LossInputs,
+    LossOffPolicyDiagnostics,
     LossOffPolicyDiagnosticsAccumulator,
+    compute_probs_corr,
     loss_fn,
     shift_tensor,
 )
@@ -90,6 +92,7 @@ from art.megatron.selective_lm_head import (
     TokenLossOutput,
     forward_token_logits,
     forward_token_losses,
+    vocab_parallel_selected_logprobs,
 )
 from art.megatron.tensor_snapshot import SnapshotReadBarrier
 from art.megatron.training.compile import configure_training_compile
@@ -144,6 +147,9 @@ from art.megatron.training.trace import (
 )
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.preprocessing.pack import PackedTensors
+from art.training.contracts import LossConfig
+from art.training.tokenized import tokenized_clip_bounds
+from art.training.tokenized_loss import tokenized_loss
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 _optimizer_stats_printed = False
@@ -622,7 +628,7 @@ def build_training_runtime(
 
 def _execute_megatron_rl_forward_backward_steps(
     runtime: TrainingRuntime,
-    job: TrainJobSpec | ForwardBackwardJobSpec,
+    job: TrainJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
     packed_tensors: PackedTensors,
     *,
     before_step: Callable[[int], None],
@@ -630,6 +636,7 @@ def _execute_megatron_rl_forward_backward_steps(
     cancelled: Event | None = None,
     replay_bundle: MoeRoutingReplayBundle | None = None,
     state_is_resident: bool = False,
+    forward_only: bool = False,
 ) -> tuple[dict[str, torch.dtype], float, int, float]:
     job_prepare_started = time.perf_counter()
     template = None
@@ -783,6 +790,8 @@ def _execute_megatron_rl_forward_backward_steps(
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
                 hybridep_token_counts=hybridep_token_counts,
                 inter_forward_backward_timing=runtime.inter_forward_backward_timing,
+                loss=job.loss if isinstance(job, ForwardBackwardJobSpec) else None,
+                forward_only=forward_only,
             )
             after_step(
                 step_index,
@@ -1083,6 +1092,7 @@ def execute_megatron_rl_forward_backward_job(
 
     gradient_accumulator.before_forward_backward()
     internal = GradientAccumulator(model_chunks=runtime.model)
+    reduction = "sum" if job.loss is not None else "token_mean"
     states: list[RLForwardBackwardState] = []
     durations: list[float] = []
     global_token_counts: list[torch.Tensor] = []
@@ -1104,7 +1114,11 @@ def execute_megatron_rl_forward_backward_job(
             global_token_count,
             group=ps.get_data_parallel_group(with_context_parallel=True),
         )
-        internal.record(f"{job.operation_id}:{step_index}", global_token_count)
+        internal.record(
+            f"{job.operation_id}:{step_index}",
+            global_token_count,
+            reduction=reduction,
+        )
         states.append(state)
         durations.append(duration_s)
         global_token_counts.append(global_token_count)
@@ -1126,7 +1140,7 @@ def execute_megatron_rl_forward_backward_job(
         global_token_counts,
         torch.zeros_like(global_token_counts[0]),
     )
-    gradient_accumulator.record(job.operation_id, token_count)
+    gradient_accumulator.record(job.operation_id, token_count, reduction=reduction)
     result = _finish_megatron_rl_forward_backward_job(tuple(states))
     runtime.resident_training_session_id = job.training_session_id
     runtime.resident_policy_step = job.expected_learner_version
@@ -1169,6 +1183,7 @@ def execute_megatron_dynamic_lora_forward_backward_job(
     slot_ref = LoRASlotRef("checkpoint", slot_name)
     params = slot_trainer.checkpoint_slot_parameters(slot_name)
     internal = ParameterGradientAccumulator(parameters=params)
+    reduction = "sum" if job.loss is not None else "token_mean"
     states: list[RLForwardBackwardState] = []
     durations: list[float] = []
     global_token_counts: list[torch.Tensor] = []
@@ -1192,10 +1207,15 @@ def execute_megatron_dynamic_lora_forward_backward_job(
         )
         gradients = slot_trainer.reduce_checkpoint_slot_grads(
             slot_name,
-            scale_grads=1.0 / float(global_token_count.item()),
+            scale_grads=(
+                1.0 if reduction == "sum" else 1.0 / float(global_token_count.item())
+            ),
         )
         internal.record(
-            f"{job.operation_id}:{step_index}", global_token_count, gradients
+            f"{job.operation_id}:{step_index}",
+            global_token_count,
+            gradients,
+            reduction=reduction,
         )
         states.append(state)
         durations.append(duration_s)
@@ -1219,7 +1239,9 @@ def execute_megatron_dynamic_lora_forward_backward_job(
         global_token_counts,
         torch.zeros_like(global_token_counts[0]),
     )
-    gradient_accumulator.record(job.operation_id, token_count, gradients)
+    gradient_accumulator.record(
+        job.operation_id, token_count, gradients, reduction=reduction
+    )
     internal.consume()
     slot_trainer.clear_checkpoint_slot_grads(slot_name)
     return MegatronForwardBackwardJobResult(
@@ -1541,9 +1563,46 @@ def execute_megatron_rl_forward_job(
     *,
     cancelled: Event | None = None,
     replay_bundle: MoeRoutingReplayBundle | None = None,
+    state_is_resident: bool = False,
 ) -> dict[str, Any]:
     """Run one packed forward without changing gradients or optimizer state."""
     started = time.perf_counter()
+    if job.loss is not None:
+        states: list[RLForwardBackwardState] = []
+
+        def record_step(
+            _step_index: int,
+            _num_steps: int,
+            state: RLForwardBackwardState,
+            _duration_s: float,
+            _replay_finalize_s: float,
+            _step_input_prepare_s: float,
+        ) -> None:
+            states.append(state)
+
+        _, replay_finalize_s, _, _ = _execute_megatron_rl_forward_backward_steps(
+            runtime,
+            job,
+            packed_tensors,
+            before_step=lambda _step_index: None,
+            after_step=record_step,
+            cancelled=cancelled,
+            replay_bundle=replay_bundle,
+            state_is_resident=state_is_resident,
+            forward_only=True,
+        )
+        result = _finish_megatron_rl_forward_backward_job(tuple(states))
+        return {
+            "operation_id": job.operation_id,
+            "token_logprobs": tuple(result.new_logprobs),
+            "metrics": {
+                "loss/train": float(result.reduced_loss.item()),
+                "time/forward_s": time.perf_counter() - started,
+                "time/replay_finalize_s": replay_finalize_s,
+                **result.loss_metrics,
+                **result.pipeline_metrics,
+            },
+        }
     global_sequences = resolve_global_grad_accumulation_sequences(
         job.config.grad_accumulation_sequences
     )
@@ -1624,6 +1683,7 @@ def execute_megatron_dynamic_lora_forward_job(
             packed_tensors,
             cancelled=cancelled,
             replay_bundle=replay_bundle,
+            state_is_resident=True,
         )
 
 
@@ -2167,14 +2227,29 @@ def _forward_prepared_rl_micro(
         return TokenLossOutput(token_losses=output)
 
 
-def _install_schedule_finalize(model_chunks: ModelChunks) -> None:
+def _finalize_model_grads_without_normalization(
+    model: list[MegatronModule],
+    num_tokens: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> None:
+    del num_tokens
+    finalize_model_grads_extended(model, num_tokens=None, **kwargs)
+
+
+def _install_schedule_finalize(
+    model_chunks: ModelChunks, *, normalize_by_tokens: bool = True
+) -> None:
     seen: set[int] = set()
     for chunk in model_chunks:
         config = _unwrap_model_config([chunk])
         if config is None or id(config) in seen:
             continue
         seen.add(id(config))
-        config.finalize_model_grads_func = finalize_model_grads_extended
+        config.finalize_model_grads_func = (
+            finalize_model_grads_extended
+            if normalize_by_tokens
+            else _finalize_model_grads_without_normalization
+        )
 
 
 def _zero_logprob_graph_contribution(
@@ -2193,7 +2268,10 @@ def _globalize_context_parallel_logprob_batch(
 ) -> list[torch.Tensor]:
     if not (len(local_logprobs) == len(attention_states) == len(sequence_lengths)):
         raise ValueError("Context-parallel logprob/state/length counts differ")
-    rows = local_logprobs[0].new_zeros((len(local_logprobs), max(sequence_lengths)))
+    trailing_shape = tuple(local_logprobs[0].shape[2:])
+    rows = local_logprobs[0].new_zeros(
+        (len(local_logprobs), max(sequence_lengths), *trailing_shape)
+    )
     cp_group = None
     for index, (values, attention_state, seq_len) in enumerate(
         zip(local_logprobs, attention_states, sequence_lengths, strict=True)
@@ -2209,7 +2287,9 @@ def _globalize_context_parallel_logprob_batch(
                 "Context-parallel microbatches use different process groups"
             )
         cp_group = micro_cp_group
-        local_values = values.reshape(-1)
+        if tuple(values.shape[2:]) != trailing_shape:
+            raise ValueError("Context-parallel logprob trailing shapes differ")
+        local_values = values.reshape(-1, *trailing_shape)
         cursor = 0
         for range_ in rank_plan.local_row_ranges:
             if range_ is None:
@@ -2221,10 +2301,10 @@ def _globalize_context_parallel_logprob_batch(
                 cursor : cursor + size
             ]
             cursor += size
-        if cursor != int(local_values.numel()):
+        if cursor != int(local_values.shape[0]):
             raise RuntimeError(
                 "Context-parallel reference-logprob layout did not consume all values: "
-                f"consumed={cursor}, values={local_values.numel()}"
+                f"consumed={cursor}, values={local_values.shape[0]}"
             )
     torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
         rows, group=cp_group
@@ -2233,6 +2313,40 @@ def _globalize_context_parallel_logprob_batch(
         rows[index : index + 1, :length]
         for index, length in enumerate(sequence_lengths)
     ]
+
+
+def _globalize_data_parallel_logprob_batch(
+    *,
+    local_logprobs: list[torch.Tensor],
+    sample_indices: list[int | None],
+    global_grad_accumulation_sequences: int,
+) -> list[torch.Tensor]:
+    if len(local_logprobs) != len(sample_indices):
+        raise ValueError("Data-parallel logprob/sample counts differ")
+    shape = tuple(local_logprobs[0].shape[1:])
+    values = local_logprobs[0].new_zeros((global_grad_accumulation_sequences, *shape))
+    present = torch.zeros(
+        global_grad_accumulation_sequences,
+        device=values.device,
+        dtype=torch.int32,
+    )
+    for sample_index, logprobs in zip(sample_indices, local_logprobs, strict=True):
+        if sample_index is None:
+            continue
+        if tuple(logprobs.shape[1:]) != shape or int(logprobs.shape[0]) != 1:
+            raise RuntimeError("tokenized DP logprob shapes differ")
+        offset = sample_index % global_grad_accumulation_sequences
+        values[offset] = logprobs[0]
+        present[offset] = 1
+    if ps.get_data_parallel_world_size() > 1:
+        group = ps.get_data_parallel_group()
+        torch.distributed.all_reduce(values, group=group)
+        torch.distributed.all_reduce(present, group=group)
+    if bool(torch.any(present > 1).item()):
+        raise RuntimeError("multiple DP ranks returned the same packed sequence")
+    indices = torch.nonzero(present).flatten().cpu().tolist()
+    host = values.cpu()
+    return [host[index : index + 1] for index in indices]
 
 
 @torch.no_grad()
@@ -3359,6 +3473,8 @@ def _run_training_schedule(
     schedule: MCoreScheduleAdapter[Any],
     forward_step_func: Callable[..., Any],
     timing: _InterForwardBackwardTiming | None,
+    *,
+    forward_only: bool = False,
 ) -> tuple[list[Any], Callable[[], dict[str, float]]]:
     started_s = time.monotonic()
     gap_s = (
@@ -3387,7 +3503,11 @@ def _run_training_schedule(
     previous_cuda_end = (
         timing.previous_schedule_cuda_end if timing is not None else None
     )
-    outputs = schedule.run(forward_step_func, forward_only=False)
+    outputs = schedule.run(
+        forward_step_func,
+        forward_only=forward_only,
+        collect_non_loss_data=forward_only,
+    )
     ended_s = time.monotonic()
     if timing is None:
         return outputs, lambda: {}
@@ -3510,7 +3630,11 @@ def run_megatron_rl_forward_backward_step(
     next_step_first_ref_logprobs: torch.Tensor | None = None,
     hybridep_token_counts: list[int] | None = None,
     inter_forward_backward_timing: _InterForwardBackwardTiming | None = None,
+    loss: LossConfig | None = None,
+    forward_only: bool = False,
 ) -> RLForwardBackwardState:
+    if forward_only and loss is None:
+        raise ValueError("forward-only RL schedule requires a tokenized named loss")
     schedule_prepare_started = time.perf_counter()
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
@@ -3550,8 +3674,9 @@ def run_megatron_rl_forward_backward_step(
     if cp_lookahead_state is not None and int(topology.cp) <= 1:
         cp_lookahead_state.pending_prepared_micro = None
 
-    _zero_grad_buffers(model_chunks)
-    _install_schedule_finalize(model_chunks)
+    if not forward_only:
+        _zero_grad_buffers(model_chunks)
+        _install_schedule_finalize(model_chunks, normalize_by_tokens=loss is None)
 
     micro_count = len(micro_inputs)
     prepared_micros: list[PreparedRLMicroInputs] = []
@@ -3606,15 +3731,111 @@ def run_megatron_rl_forward_backward_step(
     def forward_step_func(data_iterator: Any, model: MegatronModule, *_args: Any):
         item = next(data_iterator)
         prepared = item.payload
-        token_output = _forward_prepared_rl_micro(
-            model_chunks=model_chunks,
-            model_chunk=model,
-            model_support_handler=model_support_handler,
-            prepared_micro=prepared,
-            device=device,
-        )
+        if loss is None:
+            token_output = _forward_prepared_rl_micro(
+                model_chunks=model_chunks,
+                model_chunk=model,
+                model_support_handler=model_support_handler,
+                prepared_micro=prepared,
+                device=device,
+            )
+        else:
+            token_output = _forward_prepared_score_micro(
+                model_chunks=model_chunks,
+                model_chunk=model,
+                model_support_handler=model_support_handler,
+                prepared=prepared,
+                device=device,
+            )
 
-        def reduce_loss(output_tensor: torch.Tensor):
+        def reduce_loss(output_tensor: torch.Tensor, **_kwargs: Any):
+            if loss is not None:
+                target_tokens = prepared.target_tokens
+                loss_weights = prepared.loss_weights
+                behavior_logprobs = prepared.behavior_logprobs
+                token_advantages = prepared.token_advantages
+                if any(
+                    value is None
+                    for value in (
+                        target_tokens,
+                        loss_weights,
+                        behavior_logprobs,
+                        token_advantages,
+                    )
+                ):
+                    raise RuntimeError(
+                        "tokenized F/B micro is missing named-loss tensors"
+                    )
+                assert target_tokens is not None
+                assert loss_weights is not None
+                assert behavior_logprobs is not None
+                assert token_advantages is not None
+                selected_targets = prepared.lm_head_selection.select_rows(target_tokens)
+                selected_weights = prepared.lm_head_selection.select_rows(loss_weights)
+                selected_behavior = prepared.lm_head_selection.select_rows(
+                    behavior_logprobs
+                )
+                selected_advantages = prepared.lm_head_selection.select_rows(
+                    token_advantages
+                )
+                selected_logprobs = vocab_parallel_selected_logprobs(
+                    output_tensor, selected_targets
+                )
+                loss_output = tokenized_loss(
+                    loss,
+                    target_logprobs=selected_logprobs,
+                    weights=selected_weights,
+                    sampling_logprobs=selected_behavior,
+                    advantages=selected_advantages,
+                )
+                micro_loss = loss_output.loss_sum
+                if not forward_only and not micro_loss.requires_grad:
+                    raise RuntimeError("tokenized micro loss is detached")
+                ratio = loss_output.probability_ratio
+                active = (
+                    selected_weights != 0
+                    if loss.name == "cross_entropy"
+                    else selected_advantages != 0
+                )
+                diagnostics = None
+                if ratio is not None and loss.name in {"ppo", "cispo"}:
+                    low, high = tokenized_clip_bounds(loss.name, loss.values)
+                    diagnostics = LossOffPolicyDiagnostics.from_tensors(
+                        prob_ratio=ratio,
+                        advantages=selected_advantages,
+                        assistant_mask=active,
+                        weights=torch.ones_like(selected_advantages),
+                        ppo=loss.name == "ppo",
+                        epsilon=1.0 - low,
+                        epsilon_high=high - 1.0,
+                    )
+                values = {
+                    "order": item.order,
+                    "raw_loss_sum": micro_loss.detach(),
+                    "probs_corr": (
+                        compute_probs_corr(
+                            selected_behavior.masked_fill(~active, float("nan")),
+                            selected_logprobs.masked_fill(~active, float("nan")),
+                        ).detach()
+                        if ratio is not None
+                        else micro_loss.detach().new_zeros(())
+                    ),
+                    "kl_policy_ref": None,
+                    "offpolicy_diagnostics": diagnostics,
+                    "new_logprobs": prepared.lm_head_selection.restore_rows(
+                        selected_logprobs.detach()
+                    ),
+                }
+                if forward_only:
+                    return values
+                return (
+                    micro_loss,
+                    _local_trainable_token_count_tensor(
+                        [prepared.loss_inputs], device=device
+                    ),
+                    values,
+                )
+            assert isinstance(token_output, TokenLossOutput)
             new_logprobs = -output_tensor
             compact_loss_inputs = token_output.compact_loss_inputs(prepared.loss_inputs)
             loss_info = loss_fn(
@@ -3655,15 +3876,23 @@ def run_megatron_rl_forward_backward_step(
                 },
             )
 
-        return token_output.token_losses, reduce_loss
+        return (
+            token_output.token_losses
+            if isinstance(token_output, TokenLossOutput)
+            else token_output,
+            reduce_loss,
+        )
 
     schedule_prepare_s = time.perf_counter() - schedule_prepare_started
     forward_data_store, collect_inter_schedule_metrics = _run_training_schedule(
-        schedule, forward_step_func, inter_forward_backward_timing
+        schedule,
+        forward_step_func,
+        inter_forward_backward_timing,
+        forward_only=forward_only,
     )
     replay_finalize_started = time.perf_counter()
     if moe_routing_replay_controller is not None:
-        moe_routing_replay_controller.finalize_step(expect_recompute=True)
+        moe_routing_replay_controller.finalize_step(expect_recompute=not forward_only)
     replay_finalize_s = time.perf_counter() - replay_finalize_started
     result_collect_started = time.perf_counter()
     pipeline_results = cast(
@@ -3716,13 +3945,30 @@ def run_megatron_rl_forward_backward_step(
             "time/post_schedule_result_collect_s": result_collect_s,
         }
     )
+    new_logprobs = [
+        cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results
+    ]
+    if loss is not None and int(topology.cp) > 1:
+        new_logprobs = _globalize_context_parallel_logprob_batch(
+            local_logprobs=new_logprobs,
+            attention_states=[prepared.attention_state for prepared in prepared_micros],
+            sequence_lengths=[int(micro["tokens"].shape[1]) for micro in micro_inputs],
+        )
+    if loss is not None:
+        new_logprobs = _globalize_data_parallel_logprob_batch(
+            local_logprobs=new_logprobs,
+            sample_indices=micro_sample_indices,
+            global_grad_accumulation_sequences=(
+                resolve_global_grad_accumulation_sequences(
+                    config.grad_accumulation_sequences
+                )
+            ),
+        )
     return RLForwardBackwardState(
         raw_loss_sum=raw_loss_sum,
         probs_corr_total=probs_corr_total,
         kl_values=tuple(kl_values),
-        new_logprobs=tuple(
-            cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results
-        ),
+        new_logprobs=tuple(new_logprobs),
         token_count=token_count,
         micro_count=micro_count,
         schedule=schedule,

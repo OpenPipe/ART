@@ -337,13 +337,6 @@ def decode_tokenized_batch(
     return batch
 
 
-def decode_tokenized_batch(
-    ref: TrainingDataRef, payload: bytes
-) -> TokenizedTrainingBatch:
-    _validate_training_object(ref, payload, TOKENIZED_DATA_FORMAT)
-    return _TOKENIZED_BATCH_ADAPTER.validate_python(msgpack.decode(payload))
-
-
 def _encode_training_object(
     payload: bytes,
     *,

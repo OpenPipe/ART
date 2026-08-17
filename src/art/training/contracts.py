@@ -13,7 +13,11 @@ from art.distributed.trajectory_store import (
 from art.pipeline_tuner.config import PackedGroupShape
 from art.trajectories import Trajectory
 
-from .tokenized import TokenizedDatum, TokenizedLossName
+from .tokenized import (
+    TokenizedDatum,
+    TokenizedLossName,
+    validate_tokenized_loss_values,
+)
 
 COMMAND_CONTRACT_VERSION = "art_training_commands_v1"
 PACKING_CONTRACT_VERSION = "art_prefix_tree_v1"
@@ -181,6 +185,7 @@ class ForwardRequest(RunCommand):
                 f"got {self.loss.name!r}"
             )
         if isinstance(self.batch, TokenizedTrainingBatch):
+            validate_tokenized_loss_values(self.loss.name, self.loss.values)
             for datum in self.batch.datums:
                 datum.validate_for_loss(self.loss.name)
         return self
@@ -307,7 +312,7 @@ class PackingOutcome(Contract):
 
 
 class LossFnOutput(Contract):
-    token_logprobs: tuple[float, ...]
+    token_logprobs: tuple[float, ...] | tuple[tuple[float, ...], ...]
     metrics: dict[str, float] = Field(default_factory=dict)
 
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 import torch
 
 from .model_chunks import ModelChunks
+
+GradientReduction = Literal["token_mean", "sum"]
 
 
 class GradientContribution(BaseModel):
@@ -14,10 +16,11 @@ class GradientContribution(BaseModel):
     operation_id: str = Field(min_length=1)
     token_count: torch.Tensor
     gradients: tuple[torch.Tensor, ...] | None = None
+    reduction: GradientReduction = "token_mean"
 
 
 class GradientAccumulator(BaseModel):
-    """Own token-weighted, already-normalized Megatron gradient contributions."""
+    """Own Megatron gradient contributions with one explicit reduction mode."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -48,7 +51,13 @@ class GradientAccumulator(BaseModel):
             update={"gradients": tuple(grad.clone() for grad in self._main_gradients())}
         )
 
-    def record(self, operation_id: str, token_count: torch.Tensor) -> None:
+    def record(
+        self,
+        operation_id: str,
+        token_count: torch.Tensor,
+        *,
+        reduction: GradientReduction = "token_mean",
+    ) -> None:
         if self._sealed is not None:
             raise RuntimeError("cannot add gradients to a sealed accumulator")
         if operation_id in self.contribution_ids:
@@ -57,10 +66,13 @@ class GradientAccumulator(BaseModel):
             raise ValueError("gradient contribution token_count must be scalar")
         if self._contributions and self._contributions[-1].gradients is None:
             raise RuntimeError("resident gradients must be stashed before another F/B")
+        if self._contributions and self._contributions[0].reduction != reduction:
+            raise RuntimeError("one gradient accumulator cannot mix reduction modes")
         self._contributions.append(
             GradientContribution(
                 operation_id=operation_id,
                 token_count=token_count.detach().clone(),
+                reduction=reduction,
             )
         )
 
@@ -85,6 +97,12 @@ class GradientAccumulator(BaseModel):
             return
 
         main_grads = self._main_gradients()
+        if resident.reduction == "sum":
+            for item in self._contributions[:-1]:
+                assert item.gradients is not None
+                for grad, saved in zip(main_grads, item.gradients, strict=True):
+                    grad.add_(saved)
+            return
         total_tokens = sum(
             (item.token_count for item in self._contributions),
             torch.zeros_like(resident.token_count),
@@ -149,10 +167,11 @@ class ParameterGradientContribution(BaseModel):
     operation_id: str = Field(min_length=1)
     token_count: torch.Tensor
     gradients: tuple[torch.Tensor, ...]
+    reduction: GradientReduction = "token_mean"
 
 
 class ParameterGradientAccumulator(BaseModel):
-    """Own token-normalized gradient contributions for dynamic parameters."""
+    """Own dynamic-parameter contributions with one explicit reduction mode."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -183,6 +202,8 @@ class ParameterGradientAccumulator(BaseModel):
         operation_id: str,
         token_count: torch.Tensor,
         gradients: tuple[torch.Tensor, ...],
+        *,
+        reduction: GradientReduction = "token_mean",
     ) -> None:
         if self._sealed is not None:
             raise RuntimeError("cannot add gradients to a sealed accumulator")
@@ -194,11 +215,14 @@ class ParameterGradientAccumulator(BaseModel):
             )
         if tuple(tuple(grad.shape) for grad in gradients) != self._layout:
             raise RuntimeError("gradient contribution layout changed")
+        if self._contributions and self._contributions[0].reduction != reduction:
+            raise RuntimeError("one gradient accumulator cannot mix reduction modes")
         self._contributions.append(
             ParameterGradientContribution(
                 operation_id=operation_id,
                 token_count=token_count.detach().clone(),
                 gradients=gradients,
+                reduction=reduction,
             )
         )
 
@@ -219,6 +243,12 @@ class ParameterGradientAccumulator(BaseModel):
         first = self._contributions[0]
         if len(self._contributions) == 1:
             return first.gradients
+        if first.reduction == "sum":
+            combined = [grad.clone() for grad in first.gradients]
+            for item in self._contributions[1:]:
+                for target, grad in zip(combined, item.gradients, strict=True):
+                    target.add_(grad)
+            return tuple(combined)
         total_tokens = sum(
             (item.token_count for item in self._contributions),
             torch.zeros_like(first.token_count),
