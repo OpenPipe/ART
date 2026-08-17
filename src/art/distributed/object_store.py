@@ -16,6 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 VLLM_LORA_OBJECT_FORMAT = "art_vllm_lora_v1"
 MOE_ROUTE_OBJECT_FORMAT = "art_moe_route_bundle_v1"
+_S3_MIN_MULTIPART_PART_BYTES = 5 << 20
+_S3_MAX_MULTIPART_PART_BYTES = 5 << 30
+_S3_MAX_MULTIPART_PARTS = 10_000
 
 
 class _ObjectModel(BaseModel):
@@ -32,7 +35,11 @@ class S3ObjectStoreConfig(_ObjectModel):
     session_token_env: str | None = None
     addressing_style: Literal["virtual", "path"] = "virtual"
     tls_verify: bool = True
-    multipart_chunk_bytes: int = Field(default=64 << 20, ge=5 << 20)
+    multipart_chunk_bytes: int = Field(
+        default=64 << 20,
+        ge=_S3_MIN_MULTIPART_PART_BYTES,
+        le=_S3_MAX_MULTIPART_PART_BYTES,
+    )
     multipart_concurrency: int = Field(default=8, ge=1)
 
     @field_validator("bucket")
@@ -280,9 +287,14 @@ class S3BinaryObjectStore:
         upload_id = upload["UploadId"]
         futures: list[tuple[int, Future[dict[str, object]]]] = []
         completed: list[dict[str, object]] = []
+        part_bytes = _multipart_part_bytes(
+            total,
+            max_part_bytes=self.config.multipart_chunk_bytes,
+            concurrency=self.config.multipart_concurrency,
+        )
         try:
             for part_number, body in enumerate(
-                _multipart_chunks(chunks, self.config.multipart_chunk_bytes), 1
+                _multipart_chunks(chunks, part_bytes), 1
             ):
                 digest.update(body)
                 futures.append(
@@ -535,6 +547,14 @@ def _safe_relative_path(value: str) -> str:
     if path.is_absolute() or ".." in path.parts or str(path) in {"", "."}:
         raise ValueError("object file path must be safe and relative")
     return str(path)
+
+
+def _multipart_part_bytes(total: int, *, max_part_bytes: int, concurrency: int) -> int:
+    return max(
+        _S3_MIN_MULTIPART_PART_BYTES,
+        min(max_part_bytes, (total + concurrency - 1) // concurrency),
+        (total + _S3_MAX_MULTIPART_PARTS - 1) // _S3_MAX_MULTIPART_PARTS,
+    )
 
 
 def _multipart_chunks(chunks: tuple[memoryview, ...], size: int) -> Iterable[bytes]:
