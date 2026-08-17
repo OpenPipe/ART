@@ -131,6 +131,9 @@ def _qwen35_config(base_model: str, rank: int = 2, alpha: int = 4) -> dict:
     config = _config(base_model, rank=rank, alpha=alpha)
     config.update(
         {
+            "hidden_size": 3,
+            "moe_intermediate_size": 4,
+            "num_experts": 2,
             "num_attention_heads": 2,
             "num_key_value_heads": 1,
             "head_dim": 3,
@@ -775,6 +778,55 @@ def test_qwen35_and_qwen36_vllm_canonical_roundtrip_and_stock_loader(tmp_path: P
         )
         assert "language_model.model.layers.0.mlp.experts" in loaded_modules
         assert "language_model.model.layers.0.mlp.experts.base_layer" in loaded_modules
+
+
+def test_qwen36_peft_target_parameter_moe_layout_is_transposed():
+    prefix = "base_model.model.model.language_model.layers.0.mlp.experts"
+    peft_gate_up_a = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    peft_gate_up_b = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    peft_down_a = torch.arange(12, 24, dtype=torch.float32).reshape(2, 6)
+    peft_down_b = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    peft_tensors = {
+        f"{prefix}.base_layer.lora_A.weight": peft_gate_up_a,
+        f"{prefix}.base_layer.lora_B.weight": peft_gate_up_b,
+        f"{prefix}.lora_A.weight": peft_down_a,
+        f"{prefix}.lora_B.weight": peft_down_b,
+    }
+    adapter_config = _qwen35_config(
+        "Qwen/Qwen3.6-35B-A3B",
+        rank=1,
+        alpha=1,
+    )
+    adapter_config.update({"hidden_size": 6, "moe_intermediate_size": 2})
+
+    normalized, _ = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+        peft_tensors,
+        adapter_config=adapter_config,
+    )
+
+    assert torch.equal(
+        normalized[f"{prefix}.base_layer.lora_A.weight"], peft_gate_up_b.T
+    )
+    assert torch.equal(
+        normalized[f"{prefix}.base_layer.lora_B.weight"], peft_gate_up_a.T
+    )
+    assert torch.equal(normalized[f"{prefix}.lora_A.weight"], peft_down_b.T)
+    assert torch.equal(normalized[f"{prefix}.lora_B.weight"], peft_down_a.T)
+
+    internal = QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
+        peft_tensors,
+        adapter_config=adapter_config,
+    )
+    art_prefix = "base_model.model.model.layers.0.mlp.experts"
+    for expert in range(2):
+        gate_up_a = internal[f"{art_prefix}.{expert}.gate_up_proj.lora_A.weight"]
+        gate_up_b = internal[f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight"]
+        down_a = internal[f"{art_prefix}.{expert}.down_proj.lora_A.weight"]
+        down_b = internal[f"{art_prefix}.{expert}.down_proj.lora_B.weight"]
+        assert torch.equal(gate_up_a, peft_gate_up_b[:, expert].unsqueeze(0))
+        assert torch.equal(gate_up_b, peft_gate_up_a[expert].unsqueeze(1))
+        assert torch.equal(down_a, peft_down_b[:, expert].unsqueeze(0))
+        assert torch.equal(down_b, peft_down_a[expert].unsqueeze(1))
 
 
 def test_qwen35_vllm_config_preserves_shared_expert_targets_when_present():

@@ -651,6 +651,83 @@ def _vllm_moe_config(
     return config
 
 
+def _canonicalize_qwen35_peft_moe_target_parameter_layout(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Transpose PEFT's parameter-LoRA factors into vLLM's 3D MoE layout.
+
+    Qwen3.5 and Qwen3.6 store expert parameters as ``[expert, out, in]``
+    tensors, while PEFT's generic 3D target-parameter wrapper interprets them
+    as ``[expert, in, out]``. The resulting factors already use vLLM's fused
+    expert key names, but every expert delta is transposed. Shape-detect that
+    layout and transpose the factors back before Megatron import or vLLM
+    normalization.
+    """
+    grouped: dict[str, dict[str, str]] = {}
+    for key in tensors:
+        match = _VLLM_MOE_KEY_RE.match(key)
+        if match is None:
+            continue
+        slot = (
+            f"{'base_layer.' if match.group('base_layer') else ''}{match.group('lora')}"
+        )
+        grouped.setdefault(match.group("prefix"), {})[slot] = key
+    if not grouped:
+        return tensors
+
+    base_model = adapter_config.get("base_model_name_or_path")
+    if not isinstance(base_model, str) or not base_model:
+        return tensors
+    num_experts = int(adapter_config.get("num_experts", 0) or 0)
+    hidden = int(adapter_config.get("hidden_size", 0) or 0)
+    intermediate = int(adapter_config.get("moe_intermediate_size", 0) or 0)
+    if num_experts <= 0 or hidden <= 0 or intermediate <= 0:
+        config = _qwen35_text_config(base_model)
+        num_experts = int(getattr(config, "num_experts", 0) or 0)
+        hidden = int(getattr(config, "hidden_size", 0) or 0)
+        intermediate = int(getattr(config, "moe_intermediate_size", 0) or 0)
+    if num_experts <= 0 or hidden <= 0 or intermediate <= 0:
+        return tensors
+
+    transformed = dict(tensors)
+    for slots in grouped.values():
+        required = {
+            "base_layer.lora_A",
+            "base_layer.lora_B",
+            "lora_A",
+            "lora_B",
+        }
+        if set(slots) != required:
+            continue
+        gate_up_a_key = slots["base_layer.lora_A"]
+        gate_up_b_key = slots["base_layer.lora_B"]
+        down_a_key = slots["lora_A"]
+        down_b_key = slots["lora_B"]
+        gate_up_a = tensors[gate_up_a_key]
+        gate_up_b = tensors[gate_up_b_key]
+        down_a = tensors[down_a_key]
+        down_b = tensors[down_b_key]
+        packed_rank = int(gate_up_a.shape[0])
+        peft_shapes = (
+            (packed_rank, 2 * intermediate),
+            (hidden, packed_rank),
+            (packed_rank, hidden),
+            (intermediate, packed_rank),
+        )
+        actual_shapes = tuple(
+            tuple(tensor.shape) for tensor in (gate_up_a, gate_up_b, down_a, down_b)
+        )
+        if actual_shapes != peft_shapes:
+            continue
+        transformed[gate_up_a_key] = gate_up_b.transpose(0, 1).contiguous()
+        transformed[gate_up_b_key] = gate_up_a.transpose(0, 1).contiguous()
+        transformed[down_a_key] = down_b.transpose(0, 1).contiguous()
+        transformed[down_b_key] = down_a.transpose(0, 1).contiguous()
+    return transformed
+
+
 type _ExpertLoraGroups = dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]]
 
 
@@ -705,6 +782,10 @@ def _to_vllm_lora_tensors(
     *,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    tensors = _canonicalize_qwen35_peft_moe_target_parameter_layout(
+        tensors,
+        adapter_config=adapter_config,
+    )
     grouped = _group_expert_lora_tensors(tensors, _ART_MOE_EXPERT_KEY_RE)
     has_shared_experts = _has_shared_expert_lora_tensors(tensors)
     transformed: dict[str, torch.Tensor] = {}
@@ -790,6 +871,10 @@ def _from_vllm_lora_tensors(
     *,
     adapter_config: dict[str, Any],
 ) -> dict[str, torch.Tensor]:
+    tensors = _canonicalize_qwen35_peft_moe_target_parameter_layout(
+        tensors,
+        adapter_config=adapter_config,
+    )
     convert = lambda key, tensor: _from_vllm_lora_tensor(
         key,
         tensor,
