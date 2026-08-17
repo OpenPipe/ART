@@ -36,6 +36,7 @@ from art.megatron.weights.lora_publish import (
     save_vllm_lora_from_model,
 )
 from art.trainer_rank import TrainerRank
+from art.trainer_rank._impl import _AdapterConfig, _CheckpointSlot
 from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
 REPO_ROOT = Path(__file__).parents[4]
@@ -1458,14 +1459,16 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
     )
     trainer._slot_stack = []
     trainer._pending_slot_graphs = {}
-    trainer._dynamic_optimizers = {}
-    trainer._checkpoint_slot_params_by_name = {}
-    trainer._checkpoint_slot_adapter_configs = {}
+    trainer._checkpoint_slots = {}
     config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
-    assert trainer.load_checkpoint_slot("student", adapter, adapter_config=config) == 1
+    assert trainer._load_checkpoint_slot("student", adapter, alpha=2) == 1
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(
+        tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
+        cast(_AdapterConfig, config),
+    )
     output_dir = tmp_path / "checkpoint"
 
-    trainer.save_checkpoint_slot_lora("student", str(output_dir))
+    assert trainer.export_lora(str(output_dir), "student") == 0
 
     _assert_tensors_equal(load_file(output_dir / "adapter_model.safetensors"), adapter)
     assert json.loads((output_dir / "adapter_config.json").read_text()) == {

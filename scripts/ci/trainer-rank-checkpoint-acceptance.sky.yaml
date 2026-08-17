@@ -1,0 +1,54 @@
+name: trainer-rank-checkpoint-acceptance
+
+workdir: .
+
+resources:
+  accelerators: H200:2
+  image_id: docker:docker.io/bradhiltonnw/art-gpu:latest
+
+setup: |
+  uv sync --frozen --extra megatron --group dev
+  uv run --no-sync python -m art.megatron.hybrid_ep_setup
+
+run: |
+  set -euo pipefail
+  result=/tmp/art-checkpoint-acceptance
+  fixture="$(find . -maxdepth 1 -type d -name '.live-checkpoint-fixture.*' -print -quit)"
+  test -n "${fixture}"
+  rm -rf "${result}"
+  mkdir -p "${result}"
+
+  exercise() {
+    ranks="$1"
+    operation="$2"
+    source="$3"
+    output="$4"
+    uv run --no-sync torchrun --standalone --nproc-per-node="${ranks}" \
+      dev/trainer_rank_checkpoint_acceptance.py "${operation}" \
+      --source "${source}" --output "${output}" \
+      --output-json "${output}.json"
+  }
+
+  exercise 1 step-save "${fixture}" "${result}/source-1"
+  exercise 1 step-export "${result}/source-1" "${result}/restore-1-to-1"
+  exercise 2 step-export "${result}/source-1" "${result}/restore-1-to-2"
+  diff -qr "${result}/restore-1-to-1" "${result}/restore-1-to-2"
+
+  exercise 2 step-save "${fixture}" "${result}/source-2"
+  exercise 2 step-export "${result}/source-2" "${result}/restore-2-to-2"
+  exercise 1 step-export "${result}/source-2" "${result}/restore-2-to-1"
+  diff -qr "${result}/restore-2-to-2" "${result}/restore-2-to-1"
+  cat "${result}"/*.json
+
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        schedulerName: binpack-scheduler
+        activeDeadlineSeconds: 3600
+        containers:
+          - name: ray-node
+            imagePullPolicy: Always
+            env:
+              - name: UV_LINK_MODE
+                value: copy

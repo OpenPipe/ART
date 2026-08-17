@@ -5,10 +5,15 @@ import pydantic
 import pytest
 from transformers.tokenization_utils_base import BatchEncoding
 
-from art.megatron.model_support.handlers.gemma4 import (
-    GEMMA4_DENSE_HANDLER,
-    GEMMA4_MOE_HANDLER,
-)
+try:
+    from art.megatron.model_support.handlers.gemma4 import (
+        GEMMA4_DENSE_HANDLER,
+        GEMMA4_MOE_HANDLER,
+    )
+except ModuleNotFoundError as error:
+    if error.name is None or not error.name.startswith("megatron"):
+        raise
+    pytest.skip("Megatron is not installed", allow_module_level=True)
 from art.preprocessing.tokenize import (
     _normalize_tool_call_arguments_for_chat_template,
     tokenize_sft_batch,

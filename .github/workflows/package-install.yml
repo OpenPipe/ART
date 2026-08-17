@@ -42,7 +42,7 @@ jobs:
           cd "$project_dir"
           uv init --name art-base-install-smoke --python 3.12 --bare
           uv add "openpipe-art @ file://${wheel_path}"
-          uv run python -c "import importlib.util; assert importlib.util.find_spec('numpy') is None; assert importlib.util.find_spec('torch') is None; import art; from art.pipeline_trainer import PipelineTrainer; print(art.__name__, PipelineTrainer.__name__)"
+          uv run python -c "import importlib.util; assert importlib.util.find_spec('numpy') is not None; assert importlib.util.find_spec('torch') is None; import art; from art.pipeline_trainer import PipelineTrainer; print(art.__name__, PipelineTrainer.__name__)"
           uv add "weave==0.52.41"
           uv run python -c "from weave.trace.settings import override_settings; import art"
 
@@ -58,7 +58,9 @@ jobs:
           project_dir="$(mktemp -d)"
           cd "$project_dir"
           uv init --name art-install-smoke --python 3.12 --bare
-          uv add "openpipe-art[backend] @ file://${wheel_path}"
+          uv add --index https://download.pytorch.org/whl/cu128 \
+            --index-strategy unsafe-best-match \
+            "openpipe-art[backend] @ file://${wheel_path}"
           uv sync
 
       - name: Smoke test distributed wheel surface
@@ -80,7 +82,9 @@ jobs:
             --index-url https://download.pytorch.org/whl/cpu \
             "torch==2.11.0"
           uv pip install --python .venv/bin/python \
-            "openpipe-art[distributed] @ file://${wheel_path}"
+            "openpipe-art @ file://${wheel_path}" \
+            'aiohttp>=3.13.0' 'msgspec>=0.21.0' 'torchmonarch==0.6.0' \
+            'transformers>=5.2.0,<=5.12.1'
           uv pip install --python .venv/bin/python --no-deps \
             "openpipe-art[distributed,megatron] @ file://${wheel_path}"
 
