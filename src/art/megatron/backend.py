@@ -584,9 +584,10 @@ class MegatronBackend(LocalBackend):
             if client := self._training_clients.get(storage_key):
                 return client
             service = cast(DistributedMegatronService, await self._get_service(model))
+            run_id, learner_version = await service.prepare_command_run()
             client = LocalMegatronTrainingClient(
-                run_id=uuid.uuid4().hex,
-                learner_version=await service.prepare_for_packing(),
+                run_id=run_id,
+                learner_version=learner_version,
                 backend=self,
                 model=model,
                 service=service,

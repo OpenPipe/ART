@@ -433,6 +433,7 @@ class MegatronTrainJobExecutor:
             raise RuntimeError("optimizer consumed the wrong gradient contributions")
         runtime.resident_training_session_id = job.training_session_id
         runtime.resident_policy_step = job.learner_version
+        runtime.resident_generation_id = job.generation.generation_id
         runtime.optimizer_state_loaded = True
         self._gradient_parent_version = None
         if (

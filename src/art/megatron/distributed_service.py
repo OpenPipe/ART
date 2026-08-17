@@ -28,7 +28,7 @@ from art.serving_capabilities import (
     ServingCapabilities,
     discover_serving_capabilities,
 )
-from art.training.contracts import AdamConfig, OperationRef
+from art.training.contracts import AdamConfig, LossConfig, OperationRef
 from art.utils.lifecycle import (
     complete_task,
     complete_to_thread,
@@ -252,6 +252,10 @@ class DistributedMegatronService:
     @property
     def optimizer_state_path(self) -> str:
         return self._optimizer_state_path
+
+    @property
+    def packed_sequence_length(self) -> int:
+        return self._runtime_spec().packed_sequence_length
 
     def drain_publication_metrics(self) -> dict[str, float]:
         metrics = {
@@ -600,6 +604,24 @@ class DistributedMegatronService:
                 async with self._serving_lock:
                     await self._reconcile_serving_locked(step, _current)
             return step
+
+    async def prepare_command_run(self) -> tuple[str, int]:
+        await self._await_trainer_preparation()
+        async with self._train_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                self._raise_publication_failure()
+                current, reconcile_step = await self._prepare_for_packing_locked()
+                step = self._latest_step
+                run_id = (
+                    self._trainer.run_spec.run_id
+                    if self._trainer is not None
+                    else uuid.uuid4().hex
+                )
+            if reconcile_step is not None:
+                async with self._serving_lock:
+                    await self._reconcile_serving_locked(step, current)
+            return run_id, step
 
     async def prepare_cp_lookahead(
         self,
@@ -1150,9 +1172,11 @@ class DistributedMegatronService:
         batch: DistributedPackedBatch,
         config: RlForwardBackwardConfig,
         experimental_config: ExperimentalTrainConfig,
+        *,
+        loss: LossConfig | None = None,
     ) -> dict[str, Any]:
         return await self._forward_command(
-            ref, batch, config, experimental_config, backward=True
+            ref, batch, config, experimental_config, loss=loss, backward=True
         )
 
     async def forward_command(
@@ -1161,9 +1185,11 @@ class DistributedMegatronService:
         batch: DistributedPackedBatch,
         config: RlForwardBackwardConfig,
         experimental_config: ExperimentalTrainConfig,
+        *,
+        loss: LossConfig | None = None,
     ) -> dict[str, Any]:
         return await self._forward_command(
-            ref, batch, config, experimental_config, backward=False
+            ref, batch, config, experimental_config, loss=loss, backward=False
         )
 
     async def _forward_command(
@@ -1173,6 +1199,7 @@ class DistributedMegatronService:
         config: RlForwardBackwardConfig,
         experimental_config: ExperimentalTrainConfig,
         *,
+        loss: LossConfig | None,
         backward: bool,
     ) -> dict[str, Any]:
         async with self._train_lock, self._trainer_failure_boundary():
@@ -1188,6 +1215,11 @@ class DistributedMegatronService:
                 source = self._learner_generation
                 if source is None or ref.learner_parent_version != self._latest_step:
                     raise RuntimeError("F/B command learner parent changed")
+                tokenized = batch.leases.ref.training_kind == "tokenized"
+                if tokenized != (loss is not None):
+                    raise ValueError(
+                        "tokenized forward commands require their named loss"
+                    )
                 job = (ForwardBackwardJobSpec if backward else ForwardJobSpec)(
                     operation_id=ref.operation_id,
                     run_id=ref.run_id,
@@ -1199,6 +1231,10 @@ class DistributedMegatronService:
                     batch=batch.leases.ref,
                     config=config,
                     experimental_config=experimental_config,
+                    loss=loss,
+                    tokenized_trainable_token_count=(
+                        batch.loss_bearing_tokens if tokenized else None
+                    ),
                 )
                 cold = self._trainer_resident_generation != source
                 source_adapter = (

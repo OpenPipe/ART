@@ -4,7 +4,10 @@ import asyncio
 from contextlib import suppress
 import time
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
+import uuid
 
+from art.distributed.packing import PackingRequest
+from art.distributed.rollout import RolloutModelSpec
 from art.preprocessing.sft import SftBatchTokenizer
 from art.training.client import TrainingOperation
 from art.training.contracts import (
@@ -27,7 +30,11 @@ from art.training.contracts import (
 from art.training.sequencing import CommandAdmission, RunCommandLedger
 from art.types import TrainConfig
 
-from ..runtime.specs import ResolvedCheckpointState
+from ..runtime.specs import (
+    ExperimentalTrainConfig,
+    ResolvedCheckpointState,
+    RlForwardBackwardConfig,
+)
 from .commands import (
     checkpoint_ref,
     experimental_train_config,
@@ -101,6 +108,8 @@ class LocalMegatronTrainingClient:
         self._completion_tasks: set[asyncio.Task[Any]] = set()
         self._checkpoints: dict[str, ResolvedCheckpointState] = {}
         self._sft_tokenizer = SftBatchTokenizer()
+        self._batch_releases: set[asyncio.Task[None]] = set()
+        self._batch_release_failures: list[BaseException] = []
         self._tail: asyncio.Task[Any] | None = None
         self._closed = False
 
@@ -125,6 +134,7 @@ class LocalMegatronTrainingClient:
     ) -> TrainingOperation[Any]:
         if self._closed:
             raise RuntimeError("local training client is closed")
+        self._raise_batch_release_failures()
         admission = await self._ledger.admit(request, kind=kind)
         if operation := self._operations.get(admission.ref.operation_id):
             return operation
@@ -237,6 +247,57 @@ class LocalMegatronTrainingClient:
                         ),
                         **raw["metrics"],
                     },
+                )
+            if request.batch.kind == "tokenized":
+                packed = await self._service.runtime.pack(
+                    PackingRequest(
+                        model=RolloutModelSpec.from_model(self._model),
+                        generation_id=uuid.uuid4().hex,
+                        tokenized_batch=request.batch,
+                        tokenized_loss=request.loss.name,
+                        packed_sequence_length=self._service.packed_sequence_length,
+                    )
+                )
+                if packed is None:
+                    raise ValueError("tokenized batch produced no packed sequence")
+                packing = packing_outcome(
+                    packed,
+                    target_packed_sequences=(
+                        await self._service.resolve_global_grad_accumulation_sequences(
+                            TrainConfig()
+                        )
+                    ),
+                )
+                metrics = packing_metrics(packed)
+                try:
+                    raw = await (
+                        self._service.forward_backward_command(
+                            admission.ref,
+                            packed,
+                            RlForwardBackwardConfig(),
+                            ExperimentalTrainConfig(),
+                            loss=request.loss,
+                        )
+                        if backward
+                        else self._service.forward_command(
+                            admission.ref,
+                            packed,
+                            RlForwardBackwardConfig(),
+                            ExperimentalTrainConfig(),
+                            loss=request.loss,
+                        )
+                    )
+                finally:
+                    self._release_batch_soon(packed)
+                result_type = ForwardBackwardResult if backward else ForwardResult
+                return result_type(
+                    operation_id=admission.ref.operation_id,
+                    packing=packing,
+                    loss_fn_outputs=tuple(
+                        LossFnOutput(token_logprobs=values)
+                        for values in raw["token_logprobs"]
+                    ),
+                    metrics={**metrics, **raw["metrics"]},
                 )
             batch = await self._prepare_rl_batch(request)
             payload = batch.payload
@@ -510,6 +571,36 @@ class LocalMegatronTrainingClient:
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
+        if self._batch_releases:
+            await asyncio.gather(*tuple(self._batch_releases), return_exceptions=True)
+            await asyncio.sleep(0)
+        self._raise_batch_release_failures()
+
+    def _release_batch_soon(self, packed: Any) -> None:
+        task = asyncio.create_task(
+            self._service.runtime.release_batch(packed),
+            name=f"release-tokenized-batch-{packed.packing_generation_id}",
+        )
+        self._batch_releases.add(task)
+
+        def completed(done: asyncio.Task[None]) -> None:
+            self._batch_releases.discard(done)
+            if done.cancelled():
+                self._batch_release_failures.append(
+                    RuntimeError("tokenized packed-batch release was cancelled")
+                )
+            elif error := done.exception():
+                self._batch_release_failures.append(error)
+
+        task.add_done_callback(completed)
+
+    def _raise_batch_release_failures(self) -> None:
+        if self._batch_release_failures:
+            failures, self._batch_release_failures = (
+                self._batch_release_failures,
+                [],
+            )
+            raise BaseExceptionGroup("tokenized packed-batch release failed", failures)
 
 
 def _validate_publication_mode(
