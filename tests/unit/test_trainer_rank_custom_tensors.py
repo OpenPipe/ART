@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import copy
 from dataclasses import dataclass
 from datetime import timedelta
@@ -30,9 +30,29 @@ from art.trainer_rank._checkpoint import (
     materialize_lora,
     prepare_checkpoint,
 )
+import art.trainer_rank._impl as trainer_rank_impl
 from art.trainer_rank._impl import _CheckpointSlot
 
 ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
+
+
+def _build_cpu_optimizer(
+    params: Sequence[torch.nn.Parameter], config: AdamParams
+) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(
+        params,
+        lr=config.learning_rate,
+        betas=(config.beta1, config.beta2),
+        eps=config.eps,
+        weight_decay=config.weight_decay,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _cpu_dynamic_optimizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        trainer_rank_impl, "_build_dynamic_optimizer", _build_cpu_optimizer
+    )
 
 
 class _CustomTensorAPI(Protocol):
@@ -170,6 +190,7 @@ def _distributed_custom_registration_worker(
     init_method: str,
     mode: str,
 ) -> None:
+    setattr(trainer_rank_impl, "_build_dynamic_optimizer", _build_cpu_optimizer)
     dist.init_process_group(
         "gloo",
         init_method=init_method,
