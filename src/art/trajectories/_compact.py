@@ -20,8 +20,7 @@ from . import (
     TrajectoryGroup,
     _load_tensors,
 )
-from ._serialization import _intern_strings as _intern_string_graph
-from ._serialization import _rebind_history_sources, _StringPool
+from ._serialization import _rebind_history_sources
 
 _FORMAT = "art.trajectories"
 _VERSION = 1
@@ -64,7 +63,6 @@ def dump(
 
     if _is_dumpable(value):
         kind = _kind(value)
-        _intern(value)
         return _encode(kind, _dump_value(value, kind))
     values = list(cast(Iterable[CompactDumpable], value))
     if not values:
@@ -74,9 +72,6 @@ def dump(
     kinds = [_kind(item) for item in values]
     if len(set(kinds)) != 1:
         raise TypeError("compact_dump() requires a homogeneous iterable")
-    pool: _StringPool = {}
-    for item in values:
-        _intern(item, pool)
     return _encode(
         _plural_kind(kinds[0]),
         [_dump_value(item, kind) for item, kind in zip(values, kinds, strict=True)],
@@ -137,10 +132,7 @@ def validate(
             _validate_value(item, singular, target_model, device=device)
             for item in data
         ]
-        pool: _StringPool = {}
-        for value in values:
-            _finish(value, pool)
-        return cast(_CompactValidated, values)
+        return cast(_CompactValidated, [_finish(value) for value in values])
     return _finish(_validate_value(data, kind, target_model, device=device))
 
 
@@ -551,12 +543,11 @@ def _replace_source_exchanges(
             _replace_source_exchanges(item, registry, encode=encode)
 
 
-def _finish[ValueT](value: ValueT, pool: _StringPool | None = None) -> ValueT:
+def _finish[ValueT](value: ValueT) -> ValueT:
     if isinstance(value, TokenizedHistory):
         _rebind_history_sources(value.history)
     elif _is_tensorized(value) and hasattr(value, "history"):
         _rebind_history_sources(value.history)
-    _intern(value, pool)
     return value
 
 
@@ -581,15 +572,6 @@ def _list(value: object, label: str) -> list[object]:
 
 def _json_key(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
-def _intern(value: object, pool: _StringPool | None = None) -> None:
-    if isinstance(value, Trajectory):
-        value._intern_strings(pool)
-    elif isinstance(value, TrajectoryGroup):
-        value._intern_strings(pool)
-    else:
-        _intern_string_graph(value, pool)
 
 
 def _encode(

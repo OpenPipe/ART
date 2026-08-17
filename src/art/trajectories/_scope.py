@@ -4,22 +4,13 @@ import asyncio
 from collections.abc import Coroutine, Iterable, Iterator
 from contextlib import contextmanager
 import contextvars
-from dataclasses import dataclass
 from types import TracebackType
 from typing import Any
 
 from . import PydanticException, Trajectory, TrajectoryGroup
 from ._compat import exception_model
-from ._serialization import _StringPool
 
-
-@dataclass(frozen=True, slots=True)
-class _TrajectoryScope:
-    trajectory: Trajectory
-    strings: _StringPool
-
-
-_scopes: contextvars.ContextVar[tuple[_TrajectoryScope, ...]] = contextvars.ContextVar(
+_scopes: contextvars.ContextVar[tuple[Trajectory, ...]] = contextvars.ContextVar(
     "art_trajectory_scopes", default=()
 )
 
@@ -27,24 +18,17 @@ _scopes: contextvars.ContextVar[tuple[_TrajectoryScope, ...]] = contextvars.Cont
 def get_current_trajectory(*, required: bool) -> Trajectory | None:
     current = _scopes.get()
     if current:
-        return current[-1].trajectory
+        return current[-1]
     if required:
         raise RuntimeError("No trajectory is active in this context")
     return None
-
-
-def _get_current_scope() -> _TrajectoryScope | None:
-    current = _scopes.get()
-    return current[-1] if current else None
 
 
 def enter_trajectory(trajectory: Trajectory) -> Trajectory:
     from ._capture import install
 
     install()
-    strings: _StringPool = {}
-    trajectory._intern_strings(strings)
-    _scopes.set((*_scopes.get(), _TrajectoryScope(trajectory, strings)))
+    _scopes.set((*_scopes.get(), trajectory))
     return trajectory
 
 
@@ -55,7 +39,7 @@ def exit_trajectory(
     _traceback: TracebackType | None,
 ) -> None:
     current = _scopes.get()
-    if not current or current[-1].trajectory is not trajectory:
+    if not current or current[-1] is not trajectory:
         raise RuntimeError("Trajectory contexts must exit in stack order")
     _scopes.set(current[:-1])
     trajectory.finish()

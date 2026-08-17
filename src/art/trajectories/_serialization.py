@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
+from collections.abc import Callable
 from dataclasses import fields, is_dataclass
 from typing import Any, Literal, cast
 
@@ -16,30 +14,11 @@ from ..openai import ART_MOE_ROUTING_METADATA_KEY
 
 type _StringPool = dict[str, str]
 
-_STRING_INTERNING_DISABLED = ContextVar(
-    "art_trajectory_string_interning_disabled", default=False
-)
-
-
-@contextmanager
-def _without_string_interning(*, when: bool = True) -> Iterator[None]:
-    token = _STRING_INTERNING_DISABLED.set(True) if when else None
-    try:
-        yield
-    finally:
-        if token is not None:
-            _STRING_INTERNING_DISABLED.reset(token)
-
-
-def _skip_string_interning() -> bool:
-    return _STRING_INTERNING_DISABLED.get()
-
 
 def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
     """Share equal strings inside supported model and built-in container graphs."""
 
-    if not _skip_string_interning():
-        _intern_value(value, {} if pool is None else pool, {})
+    _intern_value(value, {} if pool is None else pool, {})
 
 
 def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> object:

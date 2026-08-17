@@ -22,7 +22,6 @@ from art.trajectories import (
     Trajectory,
     TrajectoryGroup,
 )
-from art.trajectories._serialization import _without_string_interning
 
 from .data_plane import PackedBatchRef
 from .rollout import RolloutModelSpec
@@ -173,8 +172,7 @@ class TrajectoryPayload(BaseModel):
             exchange["response"] = response
         exchanges["chat_completions"] = chat_exchanges
         payload["exchanges"] = exchanges
-        with _without_string_interning():
-            return Trajectory.model_validate(payload)
+        return Trajectory.model_validate(payload)
 
 
 def _choice_routing_metadata(items: list[Any]) -> dict[int, _ChoiceRoutingPayload]:
@@ -231,13 +229,12 @@ class TrajectoryGroupPayload(BaseModel):
         )
 
     def build(self) -> TrajectoryGroup:
-        with _without_string_interning():
-            group = TrajectoryGroup(
-                (payload.build() for payload in self.trajectories),
-                metadata=self.metadata,
-                metrics=self.metrics,
-                logs=list(self.logs),
-            )
+        group = TrajectoryGroup(
+            (payload.build() for payload in self.trajectories),
+            metadata=self.metadata,
+            metrics=self.metrics,
+            logs=list(self.logs),
+        )
         group.exceptions = [
             PydanticException.model_validate(payload) for payload in self.exceptions
         ]

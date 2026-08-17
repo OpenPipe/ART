@@ -23,7 +23,6 @@ from art.trajectories import (
     Trajectory,
     TrajectoryGroup,
 )
-from art.trajectories._serialization import _without_string_interning
 
 from .trajectory_store import (
     TrajectoryCapacityError,
@@ -261,8 +260,7 @@ class LocalRolloutExecutor:
         config: Any,
     ) -> Any:
         del worker_id
-        with _without_string_interning(when=self._result_queue is not None):
-            result = await rollout_fn(model, scenario, config)
+        result = await rollout_fn(model, scenario, config)
         if self._result_queue is not None and isinstance(result, TrajectoryGroup):
             return self._owner.store(result)
         return result
@@ -1109,10 +1107,9 @@ class InProcessRolloutWorker:
         builder = MetricsBuilder(cost_context="train")
         token = builder.activate()
         try:
-            with _without_string_interning(when=invocation.store_result):
-                value = await function(
-                    invocation.model.build(), invocation.scenario, invocation.config
-                )
+            value = await function(
+                invocation.model.build(), invocation.scenario, invocation.config
+            )
         finally:
             token.var.reset(token)
         if invocation.store_result and isinstance(value, TrajectoryGroup):

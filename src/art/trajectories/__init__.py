@@ -74,7 +74,6 @@ from ..types import Messages, MessagesAndChoices, Tools
 from ._serialization import (
     _CompactModel,
     _rebind_history_sources,
-    _StringPool,
     serialize_chat_completion,
     serialize_history,
     serialize_messages_and_choices,
@@ -553,11 +552,7 @@ class Trajectory(_CompactModel):
             raise ValueError(
                 "A trajectory cannot contain both exchanges and legacy histories"
             )
-        self._intern_strings()
         return self
-
-    def _intern_strings(self, pool: _StringPool | None = None) -> None:
-        _intern_string_graph(self, pool)
 
     def compact_dump(self) -> CompactTrajectoryPayload:
         """Return the explicit string-table representation of this trajectory."""
@@ -586,7 +581,6 @@ class Trajectory(_CompactModel):
 
     def finish(self) -> Trajectory:
         self.metrics["duration"] = (datetime.now() - self.start_time).total_seconds()
-        self._intern_strings()
         return self
 
     @asynccontextmanager
@@ -775,7 +769,6 @@ class Trajectory(_CompactModel):
     ) -> TokenizedTrajectory | TokenizedMultiHistoryTrajectory:
         from ._tokenize import tokenize_trajectory
 
-        self._intern_strings()
         return tokenize_trajectory(
             self,
             multi_history=multi_history,
@@ -859,14 +852,6 @@ class TrajectoryGroup(_CompactModel):
     _distributed_lease: Any = pydantic.PrivateAttr(default=None)
     _prepared_training_batch: Any = pydantic.PrivateAttr(default=None)
     _prepared_log_path: str | None = pydantic.PrivateAttr(default=None)
-
-    @pydantic.model_validator(mode="after")
-    def _intern_string_graph(self) -> TrajectoryGroup:
-        self._intern_strings()
-        return self
-
-    def _intern_strings(self, pool: _StringPool | None = None) -> None:
-        _intern_string_graph(self, pool)
 
     def compact_dump(self) -> CompactTrajectoryPayload:
         """Return the explicit string-table representation of this group."""
@@ -1002,7 +987,6 @@ class TrajectoryGroup(_CompactModel):
     ):
         from ._tokenize import tokenize_group
 
-        self._intern_strings()
         return tokenize_group(
             self,
             multi_history=multi_history,
@@ -1092,7 +1076,6 @@ class TokenizedHistory(pydantic.BaseModel):
     def validate_tokenwise_lengths(self) -> TokenizedHistory:
         if not (len(self.tokens) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tokenized history fields differ in length")
-        _intern_string_graph(self)
         return self
 
     def tensorize(
@@ -1184,10 +1167,9 @@ class TokenizedMultiHistoryTrajectory(pydantic.BaseModel):
         self.trajectory.metadata = value
 
     @pydantic.model_validator(mode="after")
-    def _intern_source_graph(self) -> TokenizedMultiHistoryTrajectory:
+    def _bind_source_graph(self) -> TokenizedMultiHistoryTrajectory:
         for history in self.histories:
             _rebind_history_sources(history.history, self.trajectory)
-        _intern_string_graph(self)
         return self
 
     def compact_dump(self) -> CompactTrajectoryPayload:
@@ -1231,7 +1213,7 @@ class TokenizedTrajectoryGroup(pydantic.BaseModel, Generic[TokenizedTrajectoryT]
         self.trajectory_group.metadata = value
 
     @pydantic.model_validator(mode="after")
-    def _intern_source_graph(self) -> TokenizedTrajectoryGroup[TokenizedTrajectoryT]:
+    def _bind_source_graph(self) -> TokenizedTrajectoryGroup[TokenizedTrajectoryT]:
         if len(self.trajectories) != len(self.trajectory_group.trajectories):
             raise ValueError("Tokenized group differs in length from its source group")
         for tokenized, trajectory in zip(
@@ -1245,7 +1227,6 @@ class TokenizedTrajectoryGroup(pydantic.BaseModel, Generic[TokenizedTrajectoryT]
             else:
                 for history in tokenized.histories:
                     _rebind_history_sources(history.history, trajectory)
-        _intern_string_graph(self)
         return self
 
     def compact_dump(self) -> CompactTrajectoryPayload:
@@ -1279,6 +1260,13 @@ CompactDumpable: TypeAlias = Union[
     "TensorizedTrajectoryGroup[TensorizedMultiHistoryTrajectory]",
 ]
 _CompactValidated: TypeAlias = Union[CompactDumpable, list[CompactDumpable]]
+
+
+def compact_memory[T](value: T) -> T:
+    """Deduplicate equal strings in a supported object graph in place."""
+
+    _intern_string_graph(value)
+    return value
 
 
 def compact_dump(
@@ -1443,6 +1431,7 @@ __all__ = [
     "CompactDumpable",
     "CompactTrajectoryKind",
     "CompactTrajectoryPayload",
+    "compact_memory",
     "compact_dump",
     "compact_validate",
     "current_trajectory",

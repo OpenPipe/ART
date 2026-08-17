@@ -25,12 +25,7 @@ from . import (
     TrajectoryGroup,
     TrajectoryHistory,
 )
-from ._serialization import (
-    _intern_strings,
-    _rebind_history_sources,
-    serialize_history,
-    validate_history,
-)
+from ._serialization import _rebind_history_sources, serialize_history, validate_history
 
 type Device = torch.device | str | None
 
@@ -105,7 +100,6 @@ class TensorizedHistory(pydantic.BaseModel):
     def validate_tokenwise_lengths(self) -> Self:
         if not (len(self.tokens) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tensorized history fields differ in length")
-        _intern_strings(self)
         return self
 
     def to(self, device: torch.device | str) -> Self:
@@ -189,7 +183,6 @@ class TensorizedMultiHistoryTrajectory(pydantic.BaseModel):
     def bind_source_trajectory(self) -> Self:
         for history in self.histories:
             _rebind_history_sources(history.history, self.trajectory)
-        _intern_strings(self)
         return self
 
     def to(self, device: torch.device | str) -> Self:
@@ -249,7 +242,6 @@ class TensorizedTrajectoryGroup(pydantic.BaseModel, Generic[TensorizedTrajectory
             else:
                 for history in tensorized.histories:
                     _rebind_history_sources(history.history, trajectory)
-        _intern_strings(self)
         return self
 
     def to(self, device: torch.device | str) -> Self:
