@@ -279,6 +279,9 @@ def packed_tensors_from_tokenized_datums(
     """Pack exact tokenized-loss inputs without changing their loss semantics."""
     if not datums:
         raise ValueError("tokenized packing requires at least one datum")
+    routed = [datum.moe_routes is not None for datum in datums]
+    if any(routed) and not all(routed):
+        raise ValueError("tokenized batch must provide MoE routes for every datum")
     sharing_ids: dict[tuple[int, tuple[int, ...]], int] = {}
     items = [
         _tokenized_datum_pack_item(
@@ -296,7 +299,7 @@ def packed_tensors_from_tokenized_datums(
         pad_token_id=pad_token_id,
         truncate_long_results=False,
         pack_results=pack_results,
-        include_moe_routing=False,
+        include_moe_routing=all(routed),
         min_prefix_tree_shared_segment_length=(min_prefix_tree_shared_segment_length),
         timings=timings,
         _items=items,
@@ -810,12 +813,14 @@ def _tokenized_datum_pack_item(
         logprobs=np.full(len(datum.input_tokens), np.nan, dtype=np.float32),
         advantage=1.0,
         weight=1.0,
-        prompt_id=datum_index,
+        prompt_id=(
+            datum_index if datum.packing_group_id is None else datum.packing_group_id
+        ),
         shareable_length=shareable_length,
         pixel_values=None,
         image_grid_thw=None,
-        moe_routes=None,
-        policy_versions=np.full(len(datum.input_tokens), -1, dtype=np.int64),
+        moe_routes=(None if datum.moe_routes is None else datum.moe_routes.build()),
+        policy_versions=datum.policy_versions(),
         datum_index=datum_index,
         target_tokens=targets,
         loss_weights=(coefficient_array if loss == "cross_entropy" else None),

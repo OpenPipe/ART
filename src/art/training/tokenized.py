@@ -4,7 +4,14 @@ from collections.abc import Mapping
 import math
 from typing import Literal
 
+import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from art.preprocessing.moe_routing import (
+    MoeRouteArray,
+    MoeRouteSegments,
+    moe_route_dtype,
+)
 
 TokenizedLossName = Literal[
     "cross_entropy",
@@ -14,6 +21,65 @@ TokenizedLossName = Literal[
 ]
 MAX_TOKENIZED_LOGPROB_VALUES = 16 << 20
 MAX_TOKENIZED_PHYSICAL_VALUES = 64 << 20
+
+
+class TokenizedPolicySpan(BaseModel):
+    """Contiguous causal target positions scored by one policy version."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    start_position: int = Field(ge=0)
+    end_position: int = Field(gt=0)
+    policy_version: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_order(self) -> "TokenizedPolicySpan":
+        if self.end_position <= self.start_position:
+            raise ValueError("policy span end must exceed its start")
+        return self
+
+
+class TokenizedMoeRoutes(BaseModel):
+    """Exact per-input-token MoE routes, optionally split into shared segments."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    num_experts: int = Field(ge=1, le=65_536)
+    dtype: Literal["uint8", "uint16"]
+    shape: tuple[int, int, int]
+    data: tuple[bytes, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_layout(self) -> "TokenizedMoeRoutes":
+        tokens, layers, topk = self.shape
+        if min(tokens, layers, topk) <= 0:
+            raise ValueError("MoE route shape axes must be positive")
+        if topk > self.num_experts:
+            raise ValueError("MoE route topk exceeds num_experts")
+        if np.dtype(self.dtype) != moe_route_dtype(self.num_experts):
+            raise ValueError("MoE route dtype does not match num_experts")
+        bytes_per_token = np.dtype(self.dtype).itemsize * layers * topk
+        if any(not segment or len(segment) % bytes_per_token for segment in self.data):
+            raise ValueError("MoE route segments must contain whole tokens")
+        if sum(map(len, self.data)) != tokens * bytes_per_token:
+            raise ValueError("MoE route segments do not match their declared shape")
+        return self
+
+    def build(self) -> MoeRouteArray | MoeRouteSegments:
+        _, layers, topk = self.shape
+        bytes_per_token = np.dtype(self.dtype).itemsize * layers * topk
+        segments = tuple(
+            MoeRouteArray(
+                np.frombuffer(data, dtype=self.dtype).reshape(
+                    len(data) // bytes_per_token, layers, topk
+                ),
+                num_experts=self.num_experts,
+            )
+            for data in self.data
+        )
+        return (
+            segments[0] if len(segments) == 1 else MoeRouteSegments(segments=segments)
+        )
 
 
 def tokenized_result_value_count(datums: tuple["TokenizedDatum", ...]) -> int:
@@ -72,6 +138,9 @@ class TokenizedDatum(BaseModel):
     weights: tuple[tuple[float, ...], ...] | None = None
     logprobs: tuple[tuple[float, ...], ...] | None = None
     advantages: tuple[tuple[float, ...], ...] | None = None
+    packing_group_id: int | None = Field(default=None, ge=0)
+    policy_spans: tuple[TokenizedPolicySpan, ...] = ()
+    moe_routes: TokenizedMoeRoutes | None = None
 
     @model_validator(mode="after")
     def _validate_tensors(self) -> "TokenizedDatum":
@@ -94,11 +163,28 @@ class TokenizedDatum(BaseModel):
                 raise ValueError(f"{name} must match target_tokens")
             if any(not math.isfinite(value) for row in values for value in row):
                 raise ValueError(f"{name} must contain finite values")
+        cursor = 0
+        for span in self.policy_spans:
+            if span.start_position != cursor:
+                raise ValueError("policy spans must form a contiguous partition")
+            cursor = span.end_position
+        if self.policy_spans and cursor != len(self.input_tokens):
+            raise ValueError("policy spans must cover every causal target position")
+        if self.moe_routes is not None and self.moe_routes.shape[0] != len(
+            self.input_tokens
+        ):
+            raise ValueError("MoE routes must cover every exact input token")
         return self
 
     @property
     def candidate_count(self) -> int:
         return len(self.target_tokens[0])
+
+    def policy_versions(self) -> np.ndarray:
+        versions = np.full(len(self.input_tokens), -1, dtype=np.int64)
+        for span in self.policy_spans:
+            versions[span.start_position : span.end_position] = span.policy_version
+        return versions
 
     def validate_for_loss(self, loss: TokenizedLossName) -> None:
         required = (

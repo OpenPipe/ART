@@ -153,6 +153,9 @@ class TokenizedTrainingBatch(Contract):
                 "tokenized result exceeds the configured value limit: "
                 f"{values} > {MAX_TOKENIZED_LOGPROB_VALUES}"
             )
+        routed = [datum.moe_routes is not None for datum in self.datums]
+        if any(routed) and not all(routed):
+            raise ValueError("tokenized batch must provide MoE routes for every datum")
         return self
 
     def encoded_payload(self) -> bytes | None:

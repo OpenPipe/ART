@@ -22,7 +22,7 @@ from art.training.contracts import (
 
 RL_GROUP_DATA_FORMAT = "art_trajectory_group_msgpack_v3"
 SFT_DATA_FORMAT = "art_sft_batch_msgpack_v1"
-TOKENIZED_DATA_FORMAT = "art_tokenized_batch_msgpack_v1"
+TOKENIZED_DATA_FORMAT = "art_tokenized_batch_msgpack_v2"
 OPERATION_RESULT_FORMAT = "art_operation_result_msgpack_v1"
 
 
@@ -33,7 +33,7 @@ class TrainingDataRef(Contract):
     format: Literal[
         "art_trajectory_group_msgpack_v3",
         "art_sft_batch_msgpack_v1",
-        "art_tokenized_batch_msgpack_v1",
+        "art_tokenized_batch_msgpack_v2",
         "art_moe_route_bundle_v2",
     ]
 

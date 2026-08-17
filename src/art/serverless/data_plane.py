@@ -28,7 +28,7 @@ from art.training.contracts import (
     TokenizedTrainingBatch,
     TrainingBatch,
 )
-from art.training.tokenized import MAX_TOKENIZED_LOGPROB_VALUES
+from art.training.tokenized import MAX_TOKENIZED_LOGPROB_VALUES, TokenizedMoeRoutes
 
 from .contracts import (
     RL_GROUP_DATA_FORMAT,
@@ -65,6 +65,70 @@ class _RouteEntry(NamedTuple):
     scope_index: int
     choice_index: int
     route: Any
+
+
+class _RouteByteSlice(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    segment_index: int
+    offset: int
+    byte_count: int
+
+
+class _TokenizedRouteBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    datum_index: int
+    num_experts: int
+    dtype: Literal["uint8", "uint16"]
+    shape: tuple[int, int, int]
+    slices: tuple[_RouteByteSlice, ...]
+
+
+class _TokenizedRoutePool(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    data: bytes
+    bindings: tuple[_TokenizedRouteBinding, ...]
+
+    @model_validator(mode="after")
+    def _validate_layout(self) -> "_TokenizedRoutePool":
+        if not self.data or not self.bindings:
+            raise ValueError("tokenized route pool cannot be empty")
+        if len({value.datum_index for value in self.bindings}) != len(self.bindings):
+            raise ValueError("tokenized route pool repeats a datum")
+        for binding in self.bindings:
+            if tuple(value.segment_index for value in binding.slices) != tuple(
+                range(len(binding.slices))
+            ):
+                raise ValueError("tokenized route slices must be contiguous")
+            if any(
+                value.byte_count <= 0
+                or value.offset < 0
+                or value.offset + value.byte_count > len(self.data)
+                for value in binding.slices
+            ):
+                raise ValueError("tokenized route slice leaves its pool bounds")
+        return self
+
+
+class _TokenizedWireBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    batch: TokenizedTrainingBatch
+    route_pool: _TokenizedRoutePool | None = None
+
+    @model_validator(mode="after")
+    def _validate_route_source(self) -> "_TokenizedWireBatch":
+        inline = [datum.moe_routes is not None for datum in self.batch.datums]
+        if self.route_pool is None:
+            return self
+        if any(inline):
+            raise ValueError("tokenized routes cannot be inline and pooled")
+        indices = tuple(value.datum_index for value in self.route_pool.bindings)
+        if indices != tuple(range(len(self.batch.datums))):
+            raise ValueError("tokenized route pool must cover every datum in order")
+        return self
 
 
 class EncodedTrainingObject(BaseModel):
@@ -219,10 +283,7 @@ def prepare_training_batch(
         route_objects = ()
         remote = RemoteSftBatchRef(data=value.ref)
     else:
-        payload = batch.encoded_payload() or msgpack.encode(
-            batch.model_dump(mode="python")
-        )
-        batch.remember_encoded_payload(payload)
+        payload = _encode_tokenized_wire_batch(batch, route_encoding=route_encoding)
         value = _encode_training_object(
             payload,
             data_format=TOKENIZED_DATA_FORMAT,
@@ -340,11 +401,32 @@ def _pack_route_entries(
 ) -> tuple[bytes, tuple[RemoteRouteSlice, ...]]:
     if not entries:
         return b"", ()
+    data, route_slices = _pack_route_sequences(
+        tuple((entry.route, _route_token_ids(entry.route)) for entry in entries)
+    )
+    return data, tuple(
+        RemoteRouteSlice(
+            trajectory_index=entry.trajectory_index,
+            scope=entry.scope,
+            scope_index=entry.scope_index,
+            choice_index=entry.choice_index,
+            segment_index=segment_index,
+            offset=offset,
+            byte_count=byte_count,
+        )
+        for entry, slices in zip(entries, route_slices, strict=True)
+        for segment_index, (offset, byte_count) in enumerate(slices)
+    )
+
+
+def _pack_route_sequences(
+    entries: tuple[tuple[Any, tuple[int, ...]], ...],
+) -> tuple[bytes, tuple[tuple[tuple[int, int], ...], ...]]:
+    if not entries:
+        return b"", ()
     token_keys: dict[tuple[int, str, int, int, memoryview], int] = {}
     rows = []
-    for entry in entries:
-        route = entry.route
-        token_ids = _route_token_ids(route)
+    for route, token_ids in entries:
         tokens = _route_token_views(route)
         rows.append(
             tuple(
@@ -362,10 +444,9 @@ def _pack_route_entries(
         min_shared_segment_length=1,
     )
     data = bytearray()
-    slices: list[RemoteRouteSlice] = []
-    segment_indices = [0] * len(entries)
+    slices: list[list[tuple[int, int]]] = [[] for _ in entries]
     for segment in planned:
-        route = entries[segment.sequence_indices[0]].route
+        route = entries[segment.sequence_indices[0]][0]
         bytes_per_token = _route_bytes_per_token(route)
         chunks = _route_data_range(
             route.data,
@@ -377,20 +458,8 @@ def _pack_route_entries(
             data.extend(chunk)
         byte_count = len(data) - offset
         for sequence_index in segment.sequence_indices:
-            entry = entries[sequence_index]
-            slices.append(
-                RemoteRouteSlice(
-                    trajectory_index=entry.trajectory_index,
-                    scope=entry.scope,
-                    scope_index=entry.scope_index,
-                    choice_index=entry.choice_index,
-                    segment_index=segment_indices[sequence_index],
-                    offset=offset,
-                    byte_count=byte_count,
-                )
-            )
-            segment_indices[sequence_index] += 1
-    return bytes(data), tuple(slices)
+            slices[sequence_index].append((offset, byte_count))
+    return bytes(data), tuple(tuple(value) for value in slices)
 
 
 def _route_token_ids(route: Any) -> tuple[int, ...]:
@@ -456,13 +525,92 @@ def decode_sft_batch(ref: TrainingDataRef, payload: bytes) -> SupervisedTrajecto
     return _SFT_BATCH_ADAPTER.validate_python(msgpack.decode(payload))
 
 
+def _encode_tokenized_wire_batch(
+    batch: TokenizedTrainingBatch,
+    *,
+    route_encoding: RouteWireEncoding,
+) -> bytes:
+    if route_encoding not in {"inline", "prefix_tree"}:
+        raise ValueError(f"unsupported route wire encoding: {route_encoding!r}")
+    if route_encoding == "inline" or batch.datums[0].moe_routes is None:
+        wire = _TokenizedWireBatch(batch=batch)
+    elif route_encoding == "prefix_tree":
+        entries = tuple(
+            (datum.moe_routes, datum.input_tokens) for datum in batch.datums
+        )
+        if any(route is None for route, _ in entries):
+            raise ValueError("tokenized routes must be present for every datum")
+        data, slices = _pack_route_sequences(
+            tuple((route, tokens) for route, tokens in entries if route is not None)
+        )
+        stripped = batch.model_copy(
+            update={
+                "datums": tuple(
+                    datum.model_copy(update={"moe_routes": None})
+                    for datum in batch.datums
+                )
+            }
+        )
+        wire = _TokenizedWireBatch(
+            batch=stripped,
+            route_pool=_TokenizedRoutePool(
+                data=data,
+                bindings=tuple(
+                    _TokenizedRouteBinding(
+                        datum_index=index,
+                        num_experts=route.num_experts,
+                        dtype=route.dtype,
+                        shape=route.shape,
+                        slices=tuple(
+                            _RouteByteSlice(
+                                segment_index=segment_index,
+                                offset=offset,
+                                byte_count=byte_count,
+                            )
+                            for segment_index, (offset, byte_count) in enumerate(
+                                datum_slices
+                            )
+                        ),
+                    )
+                    for index, ((route, _), datum_slices) in enumerate(
+                        zip(entries, slices, strict=True)
+                    )
+                    if route is not None
+                ),
+            ),
+        )
+    return msgpack.encode(wire.model_dump(mode="python"))
+
+
 def decode_tokenized_batch(
     ref: TrainingDataRef, payload: bytes
 ) -> TokenizedTrainingBatch:
     _validate_training_object(ref, payload, TOKENIZED_DATA_FORMAT)
-    batch = _TOKENIZED_BATCH_ADAPTER.validate_python(msgpack.decode(payload))
-    batch.remember_encoded_payload(payload)
-    return batch
+    wire = _TokenizedWireBatch.model_validate(msgpack.decode(payload))
+    if wire.route_pool is None:
+        return wire.batch
+    datums = list(wire.batch.datums)
+    for binding in wire.route_pool.bindings:
+        datums[binding.datum_index] = datums[binding.datum_index].model_copy(
+            update={
+                "moe_routes": TokenizedMoeRoutes(
+                    num_experts=binding.num_experts,
+                    dtype=binding.dtype,
+                    shape=binding.shape,
+                    data=tuple(
+                        wire.route_pool.data[
+                            value.offset : value.offset + value.byte_count
+                        ]
+                        for value in binding.slices
+                    ),
+                )
+            }
+        )
+    return _TOKENIZED_BATCH_ADAPTER.validate_python(
+        wire.batch.model_copy(update={"datums": tuple(datums)}).model_dump(
+            mode="python"
+        )
+    )
 
 
 def encode_forward_submission(
@@ -490,7 +638,7 @@ def _encode_training_object(
     data_format: Literal[
         "art_trajectory_group_msgpack_v3",
         "art_sft_batch_msgpack_v1",
-        "art_tokenized_batch_msgpack_v1",
+        "art_tokenized_batch_msgpack_v2",
     ],
     object_id: str | None,
 ) -> EncodedTrainingObject:
