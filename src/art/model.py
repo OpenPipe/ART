@@ -38,12 +38,15 @@ from .preprocessing.policy_spans import (
     attach_policy_token_metadata_to_choice,
     attach_static_policy_token_span_to_choice,
     choice_policy_token_spans,
+    choice_prompt_policy_token_spans,
     validate_complete_policy_token_spans,
+    validate_complete_prompt_policy_token_spans,
 )
 from .preprocessing.vllm_tokens import (
     attach_completion_token_metadata,
     attach_vllm_token_metadata_to_choice,
     choice_completion_tokens,
+    choice_vllm_token_metadata,
 )
 from .serving_capabilities import ServingCapabilities
 from .trajectories import Trajectory, TrajectoryGroup
@@ -136,17 +139,35 @@ def _attach_response_art_metadata(
         )
         if policy_span_mode == "synthesize" and not choice_policy_token_spans(choice):
             completion_tokens = choice_completion_tokens(choice)
+            token_metadata = choice_vllm_token_metadata(choice)
             if completion_tokens is None or completion_tokens <= 0:
                 raise RuntimeError(
                     "Immutable step-LoRA policy tracking requires a positive exact "
                     "per-choice completion token count."
                 )
+            if token_metadata is None:
+                raise RuntimeError(
+                    "Immutable step-LoRA policy tracking requires exact prompt tokens."
+                )
             attach_static_policy_token_span_to_choice(
                 choice=choice,
                 model_name=request_model or "",
+                prompt_tokens=len(token_metadata[0]),
                 completion_tokens=completion_tokens,
             )
         if policy_span_mode != "none":
+            token_metadata = choice_vllm_token_metadata(choice)
+            if token_metadata is None:
+                raise RuntimeError("Policy tracking requires exact prompt token IDs.")
+            prompt_tokens = len(token_metadata[0])
+            if prompt_tokens > 1 and not choice_prompt_policy_token_spans(choice):
+                raise RuntimeError(
+                    "Policy tracking requires prompt policy spans for every causal "
+                    "prompt logprob."
+                )
+            validate_complete_prompt_policy_token_spans(
+                choice, prompt_tokens=prompt_tokens
+            )
             completion_tokens = choice_completion_tokens(choice)
             if completion_tokens is None or completion_tokens <= 0:
                 raise RuntimeError(

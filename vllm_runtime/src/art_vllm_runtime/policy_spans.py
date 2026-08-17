@@ -26,8 +26,12 @@ from vllm.lora.request import LoRARequest
 POLICY_TOKEN_SPANS_FIELD = "policy_token_spans"
 ART_POLICY_TOKEN_SPANS_FIELD = "art_policy_token_spans"
 _PARENT_POLICY_TOKEN_SPANS_FIELD = "_art_policy_token_spans_by_choice"
+PROMPT_POLICY_TOKEN_SPANS_FIELD = "prompt_policy_token_spans"
+ART_PROMPT_POLICY_TOKEN_SPANS_FIELD = "art_prompt_policy_token_spans"
+_PARENT_PROMPT_POLICY_TOKEN_SPANS_FIELD = "_art_prompt_policy_token_spans_by_choice"
 
 _CURRENT_ENGINE_POLICY_SPANS: dict[str, list[dict[str, Any]]] = {}
+_CURRENT_ENGINE_PROMPT_POLICY_SPANS: dict[str, list[dict[str, Any]]] = {}
 _WORKER_LORA_POLICY_BY_ID: dict[int, dict[str, Any]] = {}
 _POLICY_CACHE_SALT_PREFIX = "art_policy_cache_salt="
 _POLICY_CACHE_SALT_MARKER = f"|{_POLICY_CACHE_SALT_PREFIX}"
@@ -38,6 +42,7 @@ _POLICY_EXECUTION_MARKER_FIELD = "_art_policy_execution_marker"
 _POLICY_HISTORY_BASE_FIELD = "_art_policy_history_before_current"
 _POLICY_CACHE_TRANSITIONS_FIELD = "_art_policy_cache_transitions"
 _POLICY_CACHE_TRANSITION_KEY = "art_policy_transition_v1"
+_PROMPT_POLICY_SPANS_COMPLETE_FIELD = "_art_prompt_policy_spans_complete"
 
 
 class _RequestAdmissionLease:
@@ -380,6 +385,7 @@ def _patch_model_runner_output_type() -> None:
         # attrs are not part of that transport contract, so ART span metadata
         # must be a declared field.
         art_policy_token_spans: dict[str, list[dict[str, Any]]] | None = None
+        art_prompt_policy_token_spans: dict[str, list[dict[str, Any]]] | None = None
 
     ModelRunnerOutput.__module__ = outputs_mod.__name__
     ModelRunnerOutput.__qualname__ = "ModelRunnerOutput"
@@ -607,6 +613,7 @@ def _patch_engine_core_output_type() -> None:
         routed_experts: np.ndarray | None = None
         num_nans_in_logits: int = 0
         art_policy_token_spans: list[dict[str, Any]] | None = None
+        art_prompt_policy_token_spans: list[dict[str, Any]] | None = None
 
         @property
         def finished(self) -> bool:
@@ -685,7 +692,10 @@ def _patch_worker_policy_span_capture() -> None:
                     output = original(self, *args, **kwargs)
                     # The input batch is current only after execute_model, and the
                     # next serial worker RPC may replace this adapter before sampling.
-                    context = _policy_context_from_runner(self)
+                    scheduler_output = (
+                        args[0] if args else kwargs.get("scheduler_output")
+                    )
+                    context = _policy_context_from_runner(self, scheduler_output)
                     if getattr(self, "execute_model_state", None) is not None:
                         setattr(self, _EXECUTING_POLICY_CONTEXT_FIELD, context)
                     elif context and hasattr(output, "req_ids"):
@@ -761,22 +771,51 @@ def _patch_scheduler_policy_span_transport() -> None:
         def update_from_output(
             self: Any, scheduler_output: Any, model_runner_output: Any
         ):
+            requests = {
+                req_id: self.requests.get(req_id)
+                for req_id in scheduler_output.num_scheduled_tokens
+            }
             outputs_by_client = original_update(
                 self, scheduler_output, model_runner_output
             )
             spans_by_req = getattr(
                 model_runner_output, ART_POLICY_TOKEN_SPANS_FIELD, None
             )
-            if not spans_by_req:
-                return outputs_by_client
+            prompt_spans_by_req = getattr(
+                model_runner_output, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, None
+            )
+            completed_prompt_spans: dict[str, list[dict[str, Any]]] = {}
+            for req_id, step_spans in (prompt_spans_by_req or {}).items():
+                request = requests.get(req_id)
+                if request is None or getattr(
+                    request, _PROMPT_POLICY_SPANS_COMPLETE_FIELD, False
+                ):
+                    continue
+                accumulated = getattr(
+                    request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, None
+                )
+                if accumulated is None:
+                    accumulated = []
+                    setattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, accumulated)
+                _append_absolute_prompt_spans(accumulated, step_spans)
+                if accumulated[-1]["end_token"] == request.num_prompt_tokens:
+                    completed_prompt_spans[req_id] = [
+                        dict(span) for span in accumulated
+                    ]
+                    delattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD)
+                    setattr(request, _PROMPT_POLICY_SPANS_COMPLETE_FIELD, True)
             for client_outputs in outputs_by_client.values():
                 for output in client_outputs.outputs:
-                    spans = spans_by_req.get(output.request_id)
+                    spans = (spans_by_req or {}).get(output.request_id)
                     if not spans:
-                        continue
-                    output.art_policy_token_spans = _trim_step_spans(
-                        spans, len(output.new_token_ids)
-                    )
+                        pass
+                    else:
+                        output.art_policy_token_spans = _trim_step_spans(
+                            spans, len(output.new_token_ids)
+                        )
+                    prompt_spans = completed_prompt_spans.get(output.request_id)
+                    if prompt_spans:
+                        output.art_prompt_policy_token_spans = prompt_spans
             return outputs_by_client
 
         update_from_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
@@ -788,6 +827,8 @@ def _patch_scheduler_policy_span_transport() -> None:
 
     def _preempt_request(self: Any, request: Any, timestamp: float) -> None:
         original_preempt(self, request, timestamp)
+        if hasattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD):
+            delattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD)
         _rebase_preempted_request_policy_history(request)
 
     _preempt_request.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
@@ -804,9 +845,14 @@ def _patch_output_processor_policy_span_accumulation() -> None:
             self: Any, engine_core_outputs: list[Any], *args: Any, **kwargs: Any
         ):
             global _CURRENT_ENGINE_POLICY_SPANS
+            global _CURRENT_ENGINE_PROMPT_POLICY_SPANS
             previous = _CURRENT_ENGINE_POLICY_SPANS
+            previous_prompt = _CURRENT_ENGINE_PROMPT_POLICY_SPANS
             _CURRENT_ENGINE_POLICY_SPANS = _engine_core_policy_spans_by_request(
-                engine_core_outputs
+                engine_core_outputs, ART_POLICY_TOKEN_SPANS_FIELD
+            )
+            _CURRENT_ENGINE_PROMPT_POLICY_SPANS = _engine_core_policy_spans_by_request(
+                engine_core_outputs, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD
             )
             try:
                 return original_process_outputs(
@@ -814,6 +860,7 @@ def _patch_output_processor_policy_span_accumulation() -> None:
                 )
             finally:
                 _CURRENT_ENGINE_POLICY_SPANS = previous
+                _CURRENT_ENGINE_PROMPT_POLICY_SPANS = previous_prompt
 
         process_outputs.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
         OutputProcessor.process_outputs = process_outputs  # type: ignore[method-assign]
@@ -830,6 +877,13 @@ def _patch_output_processor_policy_span_accumulation() -> None:
     ):
         _append_current_policy_spans(self, len(new_token_ids))
         spans = getattr(self, ART_POLICY_TOKEN_SPANS_FIELD, None)
+        prompt_spans = _CURRENT_ENGINE_PROMPT_POLICY_SPANS.get(self.request_id)
+        if prompt_spans:
+            setattr(
+                self,
+                ART_PROMPT_POLICY_TOKEN_SPANS_FIELD,
+                [dict(span) for span in prompt_spans],
+            )
         parent_req = getattr(self, "parent_req", None)
         if spans and parent_req is not None:
             spans_by_choice = getattr(
@@ -841,6 +895,20 @@ def _patch_output_processor_policy_span_accumulation() -> None:
             spans_by_choice[int(getattr(self, "request_index", 0))] = [
                 dict(span) for span in spans
             ]
+        if prompt_spans and parent_req is not None:
+            prompt_spans_by_choice = getattr(
+                parent_req, _PARENT_PROMPT_POLICY_TOKEN_SPANS_FIELD, None
+            )
+            if prompt_spans_by_choice is None:
+                prompt_spans_by_choice = {}
+                setattr(
+                    parent_req,
+                    _PARENT_PROMPT_POLICY_TOKEN_SPANS_FIELD,
+                    prompt_spans_by_choice,
+                )
+            prompt_spans_by_choice[int(getattr(self, "request_index", 0))] = [
+                dict(span) for span in prompt_spans
+            ]
 
         request_output = original_make(self, new_token_ids, *args, **kwargs)
         if request_output is not None and hasattr(request_output, "outputs"):
@@ -850,6 +918,20 @@ def _patch_output_processor_policy_span_accumulation() -> None:
                 else {int(getattr(self, "request_index", 0)): spans}
             )
             _record_request_output_spans(request_output, spans_by_choice)
+            prompt_spans_by_choice = (
+                getattr(parent_req, _PARENT_PROMPT_POLICY_TOKEN_SPANS_FIELD, {})
+                if parent_req is not None
+                else {
+                    int(getattr(self, "request_index", 0)): getattr(
+                        self, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, None
+                    )
+                }
+            )
+            _record_request_output_spans(
+                request_output,
+                prompt_spans_by_choice,
+                field=ART_PROMPT_POLICY_TOKEN_SPANS_FIELD,
+            )
         return request_output
 
     make_request_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
@@ -891,11 +973,21 @@ def _patch_openai_response_policy_spans() -> None:
             **kwargs,
         )
         if isinstance(response, ChatCompletionResponse):
-            spans_by_choice = _policy_spans_by_choice_from_final_output(final_res)
+            spans_by_choice = _policy_spans_by_choice_from_final_output(
+                final_res, ART_POLICY_TOKEN_SPANS_FIELD
+            )
+            prompt_spans_by_choice = _policy_spans_by_choice_from_final_output(
+                final_res, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD
+            )
             for choice in response.choices:
                 spans = spans_by_choice.get(choice.index)
                 if spans:
                     _set_pydantic_extra(choice, POLICY_TOKEN_SPANS_FIELD, spans)
+                prompt_spans = prompt_spans_by_choice.get(choice.index)
+                if prompt_spans:
+                    _set_pydantic_extra(
+                        choice, PROMPT_POLICY_TOKEN_SPANS_FIELD, prompt_spans
+                    )
             if _resolve_lora_alias(self.models, getattr(request, "model", None)):
                 response.model = request.model
         return response
@@ -1535,7 +1627,9 @@ def _request_has_executed(request: Any) -> bool:
     return bool(computed_tokens or output_tokens or preemptions)
 
 
-def _policy_context_from_runner(runner: Any) -> dict[str, dict[str, Any]]:
+def _policy_context_from_runner(
+    runner: Any, scheduler_output: Any | None
+) -> dict[str, dict[str, Any]]:
     input_batch = getattr(runner, "input_batch", None)
     if input_batch is None:
         state = getattr(runner, "execute_model_state", None)
@@ -1548,7 +1642,21 @@ def _policy_context_from_runner(runner: Any) -> dict[str, dict[str, Any]]:
         lora_request = _lora_request_for_input_batch_req(input_batch, req_id)
         if lora_request is None and lora_state is not None:
             lora_request = getattr(lora_state, "lora_requests", {}).get(req_id)
-        context[req_id] = _policy_metadata_for_lora_request(lora_request)
+        metadata = dict(_policy_metadata_for_lora_request(lora_request))
+        req_index = input_batch.req_id_to_index[req_id]
+        scheduled = (
+            0
+            if scheduler_output is None
+            else int(scheduler_output.num_scheduled_tokens.get(req_id, 0))
+        )
+        computed = int(input_batch.num_computed_tokens_cpu[req_index])
+        prompt_tokens = int(input_batch.num_prompt_tokens[req_index])
+        metadata["prompt_span"] = (
+            min(computed + 1, prompt_tokens),
+            min(computed + scheduled + 1, prompt_tokens),
+        )
+        metadata["prompt_tokens"] = prompt_tokens
+        context[req_id] = metadata
     return context
 
 
@@ -1639,6 +1747,30 @@ def _attach_policy_spans_to_model_output(
         ]
     if spans_by_req:
         setattr(output, ART_POLICY_TOKEN_SPANS_FIELD, spans_by_req)
+    prompt_spans_by_req = {}
+    sampled_req_ids = {
+        req_id
+        for req_id, token_ids in zip(output.req_ids, output.sampled_token_ids or ())
+        if token_ids
+    }
+    for req_id, metadata in context.items():
+        start, end = metadata["prompt_span"]
+        prompt_tokens = int(metadata["prompt_tokens"])
+        if end <= start and req_id in sampled_req_ids and prompt_tokens > 1:
+            start, end = 1, prompt_tokens
+        if end <= start:
+            continue
+        prompt_spans_by_req[req_id] = [
+            {
+                "start_token": start,
+                "end_token": end,
+                "policy_version": metadata["policy_version"],
+                "lora_slot": metadata["lora_slot"],
+                "update_seq": metadata["update_seq"],
+            }
+        ]
+    if prompt_spans_by_req:
+        setattr(output, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, prompt_spans_by_req)
 
 
 def _attach_policy_span_context_to_sample_output(
@@ -1665,6 +1797,7 @@ def _policy_span_context_from_sample_output(output: Any) -> dict[str, dict[str, 
 
 def _engine_core_policy_spans_by_request(
     engine_core_outputs: list[Any],
+    field: str,
 ) -> dict[str, list[dict[str, Any]]]:
     spans_by_request: dict[str, list[dict[str, Any]]] = {}
     for item in engine_core_outputs:
@@ -1672,10 +1805,27 @@ def _engine_core_policy_spans_by_request(
         if outputs is None:
             outputs = (item,)
         for output in outputs:
-            spans = getattr(output, ART_POLICY_TOKEN_SPANS_FIELD, None)
+            spans = getattr(output, field, None)
             if spans:
                 spans_by_request[output.request_id] = spans
     return spans_by_request
+
+
+def _append_absolute_prompt_spans(
+    accumulated: list[dict[str, Any]], step_spans: list[dict[str, Any]]
+) -> None:
+    for span in step_spans:
+        current = dict(span)
+        cursor = int(accumulated[-1]["end_token"]) if accumulated else 1
+        start = int(current["start_token"])
+        if start < cursor:
+            raise RuntimeError("prompt policy token spans overlap")
+        if start > cursor:
+            current["start_token"] = cursor
+        if accumulated and _can_merge_spans(accumulated[-1], current):
+            accumulated[-1]["end_token"] = current["end_token"]
+        else:
+            accumulated.append(current)
 
 
 def _trim_step_spans(
@@ -1732,24 +1882,27 @@ def _can_merge_spans(left: dict[str, Any], right: dict[str, Any]) -> bool:
 def _record_request_output_spans(
     request_output: Any,
     spans_by_choice: Mapping[int, list[dict[str, Any]] | None],
+    *,
+    field: str = ART_POLICY_TOKEN_SPANS_FIELD,
 ) -> None:
     for output in request_output.outputs:
         spans = spans_by_choice.get(int(output.index))
         if not spans:
             continue
         copied = [dict(span) for span in spans]
-        setattr(output, ART_POLICY_TOKEN_SPANS_FIELD, copied)
+        setattr(output, field, copied)
 
 
 def _policy_spans_by_choice_from_final_output(
     final_res: Any,
+    field: str,
 ) -> dict[int, list[dict[str, Any]]]:
     outputs = getattr(final_res, "outputs", None)
     if not outputs:
         return {}
     spans_by_choice: dict[int, list[dict[str, Any]]] = {}
     for output in outputs:
-        spans = getattr(output, ART_POLICY_TOKEN_SPANS_FIELD, None)
+        spans = getattr(output, field, None)
         if spans:
             spans_by_choice[int(output.index)] = [dict(span) for span in spans]
     return spans_by_choice
