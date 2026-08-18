@@ -39,6 +39,16 @@ class GradientAccumulator(BaseModel):
     def contribution_ids(self) -> tuple[str, ...]:
         return tuple(item.operation_id for item in self._contributions)
 
+    def residency_tensors(self) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            tensor
+            for contribution in self._contributions
+            for tensor in (
+                contribution.token_count,
+                *(contribution.gradients or ()),
+            )
+        )
+
     def before_forward_backward(self) -> None:
         if self._sealed is not None:
             raise RuntimeError("cannot add gradients to a sealed accumulator")
@@ -190,6 +200,13 @@ class ParameterGradientAccumulator(BaseModel):
     @property
     def contribution_ids(self) -> tuple[str, ...]:
         return tuple(item.operation_id for item in self._contributions)
+
+    def residency_tensors(self) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            tensor
+            for contribution in self._contributions
+            for tensor in (contribution.token_count, *contribution.gradients)
+        )
 
     def before_forward_backward(self) -> None:
         if self._sealed is not None:
