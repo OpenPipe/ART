@@ -88,7 +88,12 @@ class HostTensorImage:
         targets: tuple[torch.Tensor, ...],
         input_tensor_count: int,
     ) -> None:
-        self._groups = groups
+        if len(groups) != len(targets):
+            raise RuntimeError("tensor residency groups and targets differ")
+        self._groups = tuple(
+            group.model_copy(update={"source": target})
+            for group, target in zip(groups, targets, strict=True)
+        )
         self._targets = targets
         self.input_tensor_count = input_tensor_count
 

@@ -458,7 +458,11 @@ class RunResidencyManager:
         self, state: _ManagedState, reservation: ResidencyReservation
     ) -> HostTensorImage:
         try:
-            mapped, manifest = self._store.load(state.key, state.tensors)
+            with self._lock:
+                mapped = state.l3
+                manifest = state.l3_manifest
+            if mapped is None or manifest is None:
+                raise RuntimeError("L3 residency has no verified mapped image")
             image = mapped.pinned_copy()
             with self._lock:
                 self._commit(
@@ -494,9 +498,7 @@ class RunResidencyManager:
             manifest = self._store.write(state.key, image)
             if manifest.physical_bytes != byte_count:
                 raise RuntimeError("L3 residency physical size changed during commit")
-            mapped, loaded = self._store.load(state.key, state.tensors)
-            if loaded != manifest:
-                raise RuntimeError("L3 residency changed immediately after commit")
+            mapped = self._store.map_committed(state.key, manifest, state.tensors)
             with self._lock:
                 self._commit(
                     reservation,

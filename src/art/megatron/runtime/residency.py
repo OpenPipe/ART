@@ -311,10 +311,18 @@ class ResidencyLedger:
         if capacity is None:
             return 0
         with self._lock:
-            projected = (
-                self._ready_bytes[tier] + self._reserved_bytes[tier] + incoming_bytes
-            )
-        return 0 if projected <= capacity.high_bytes else projected - capacity.low_bytes
+            non_evictable = self._reserved_bytes[tier] + incoming_bytes
+            if non_evictable > capacity.max_bytes:
+                raise RuntimeError(
+                    f"{tier} residency capacity exceeded by in-flight state: "
+                    f"required={non_evictable}, max={capacity.max_bytes}"
+                )
+            projected = self._ready_bytes[tier] + non_evictable
+        return (
+            0
+            if projected <= capacity.high_bytes
+            else projected - max(capacity.low_bytes, non_evictable)
+        )
 
     def eviction_candidates(
         self,

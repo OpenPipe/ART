@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 import hashlib
 import json
 import os
@@ -115,6 +116,10 @@ class NvmeResidencyStore:
                         "L3 residency key changed immutable tensor layout"
                     )
                 self._verify_data(destination, existing)
+                if self._image_sha256(manifest, image) != existing.data_sha256:
+                    raise RuntimeError(
+                        "L3 residency key changed immutable tensor contents"
+                    )
                 return existing
             free = shutil.disk_usage(self.root).free
             required = manifest.physical_bytes + self.config.min_free_bytes
@@ -150,9 +155,29 @@ class NvmeResidencyStore:
         manifest = self._read_manifest(destination)
         if manifest.key != key:
             raise RuntimeError("L3 residency manifest changed identity")
+        self._verify_data(destination, manifest)
+        return self._map_image(destination, manifest, tensors), manifest
+
+    def map_committed(
+        self,
+        key: ResidencyKey,
+        manifest: NvmeResidencyManifest,
+        tensors: tuple[torch.Tensor, ...],
+    ) -> HostTensorImage:
+        destination = self.path(key)
+        if self._read_manifest(destination) != manifest:
+            raise RuntimeError("committed L3 residency manifest changed identity")
+        self._verify_data_size(destination, manifest)
+        return self._map_image(destination, manifest, tensors)
+
+    def _map_image(
+        self,
+        destination: Path,
+        manifest: NvmeResidencyManifest,
+        tensors: tuple[torch.Tensor, ...],
+    ) -> HostTensorImage:
         if len(tensors) != manifest.input_tensor_count:
             raise RuntimeError("L3 residency tensor count changed")
-        self._verify_data(destination, manifest)
         mapped = torch.from_file(
             str(destination / _DATA_FILE),
             shared=False,
@@ -186,13 +211,10 @@ class NvmeResidencyStore:
             _StorageGroup(source=target, views=tuple(views))
             for target, views in zip(targets, grouped, strict=True)
         )
-        return (
-            HostTensorImage(
-                groups=groups,
-                targets=targets,
-                input_tensor_count=manifest.input_tensor_count,
-            ),
-            manifest,
+        return HostTensorImage(
+            groups=groups,
+            targets=targets,
+            input_tensor_count=manifest.input_tensor_count,
         )
 
     def delete(self, key: ResidencyKey) -> int:
@@ -270,22 +292,10 @@ class NvmeResidencyStore:
         image: HostTensorImage,
     ) -> NvmeResidencyManifest:
         digest = hashlib.sha256()
-        cursor = 0
         with (directory / _DATA_FILE).open("wb", buffering=0) as handle:
-            for record, target in zip(
-                manifest.storages, image.storage_bytes(), strict=True
-            ):
-                padding = record.offset - cursor
-                if padding:
-                    zeros = bytes(padding)
-                    handle.write(zeros)
-                    digest.update(zeros)
-                view = memoryview(target.numpy())
-                for start in range(0, len(view), self.config.io_chunk_bytes):
-                    chunk = view[start : start + self.config.io_chunk_bytes]
-                    handle.write(chunk)
-                    digest.update(chunk)
-                cursor = record.offset + record.byte_count
+            for chunk in self._image_chunks(manifest, image):
+                handle.write(chunk)
+                digest.update(chunk)
             handle.flush()
             os.fsync(handle.fileno())
         committed = manifest.model_copy(update={"data_sha256": digest.hexdigest()})
@@ -297,16 +307,42 @@ class NvmeResidencyStore:
         self._fsync_dir(directory)
         return committed
 
+    def _image_sha256(
+        self, manifest: NvmeResidencyManifest, image: HostTensorImage
+    ) -> str:
+        digest = hashlib.sha256()
+        for chunk in self._image_chunks(manifest, image):
+            digest.update(chunk)
+        return digest.hexdigest()
+
+    def _image_chunks(
+        self, manifest: NvmeResidencyManifest, image: HostTensorImage
+    ) -> Iterator[bytes | memoryview]:
+        cursor = 0
+        for record, target in zip(
+            manifest.storages, image.storage_bytes(), strict=True
+        ):
+            if padding := record.offset - cursor:
+                yield bytes(padding)
+            view = memoryview(target.numpy())
+            for start in range(0, len(view), self.config.io_chunk_bytes):
+                yield view[start : start + self.config.io_chunk_bytes]
+            cursor = record.offset + record.byte_count
+
     def _verify_data(self, directory: Path, manifest: NvmeResidencyManifest) -> None:
+        self._verify_data_size(directory, manifest)
         path = directory / _DATA_FILE
-        if path.stat().st_size != manifest.data_bytes:
-            raise RuntimeError("L3 residency data size changed")
         digest = hashlib.sha256()
         with path.open("rb", buffering=0) as handle:
             while chunk := handle.read(self.config.io_chunk_bytes):
                 digest.update(chunk)
         if digest.hexdigest() != manifest.data_sha256:
             raise RuntimeError("L3 residency data checksum changed")
+
+    @staticmethod
+    def _verify_data_size(directory: Path, manifest: NvmeResidencyManifest) -> None:
+        if (directory / _DATA_FILE).stat().st_size != manifest.data_bytes:
+            raise RuntimeError("L3 residency data size changed")
 
     def _read_manifest(self, directory: Path) -> NvmeResidencyManifest:
         try:
