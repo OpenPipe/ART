@@ -157,8 +157,6 @@ class _FunctionalStageSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     stage: str
-    trainer_gpu_count: int
-    inference_gpu_count: int
     trainer_gpu_ids: tuple[int, ...]
     inference_gpu_ids: tuple[int, ...]
     trainer_topology: WorkflowTrainerTopology
@@ -385,6 +383,30 @@ def _trainer_topology(
     return WorkflowTrainerTopology(variant=variant, **(values | updates))
 
 
+def _trainer_environment(
+    topology: WorkflowTrainerTopology,
+    trainer_gpu_ids: tuple[int, ...],
+    inference_gpu_ids: tuple[int, ...],
+) -> dict[str, str]:
+    values = {
+        "TRAINER_GPU_IDS": ",".join(map(str, trainer_gpu_ids)),
+        "INFERENCE_GPU_IDS": ",".join(map(str, inference_gpu_ids)),
+        **{
+            name.upper(): str(getattr(topology, name))
+            for name in ("tp", "cp", "ep", "etp", "dp", "pp")
+        },
+    }
+    return {
+        **{f"ART_TRAIN_INF_MISMATCH_{name}": value for name, value in values.items()},
+        **{
+            f"ART_MODEL_SUPPORT_{name}": value
+            for name, value in (
+                values | {"VPP": str(topology.vpp), "SP": "1" if topology.sp else "0"}
+            ).items()
+        },
+    }
+
+
 def _vllm_topology(
     variant: str, engine_args: dict[str, object], *, gpu_count: int
 ) -> WorkflowVllmTopology:
@@ -478,19 +500,13 @@ def _stage_runtime_topology(
         )
     if stage_name in {"train_inf_mismatch", "length_trainability"}:
         spec = _functional_stage_spec(prepared, stage_name, gpu_count)
-        trainer_gpu_ids = spec.trainer_gpu_ids
-        trainer_topology = spec.trainer_topology
-        if len(trainer_gpu_ids) != spec.trainer_gpu_count:
-            trainer_topology = trainer_topology.model_copy(
-                update={"dp": trainer_topology.dp * len(trainer_gpu_ids)}
-            )
         return WorkflowRuntimeTopology(
-            trainer_variants=(trainer_topology,),
+            trainer_variants=(spec.trainer_topology,),
             vllm_variants=(spec.vllm_topology,),
             role_placements=(
                 WorkflowRolePlacement(
                     variant=stage_name,
-                    trainer_gpu_ids=trainer_gpu_ids,
+                    trainer_gpu_ids=spec.trainer_gpu_ids,
                     vllm_gpu_ids=spec.inference_gpu_ids,
                     vllm_external=spec.vllm_external,
                 ),
@@ -780,8 +796,6 @@ def _functional_stage_spec(
         engine_args["enable_return_routed_experts"] = True
     return _FunctionalStageSpec(
         stage=stage,
-        trainer_gpu_count=trainer_gpu_count,
-        inference_gpu_count=inference_gpu_count,
         trainer_gpu_ids=trainer_gpu_ids,
         inference_gpu_ids=inference_gpu_ids,
         trainer_topology=trainer_topology,
@@ -841,15 +855,6 @@ def _functional_session(
         _functional_stage_spec(prepared, stage, stage_gpu_counts[stage])
         for stage in joint_stages
     )
-    if any(
-        spec.trainer_topology.tp
-        * spec.trainer_topology.cp
-        * spec.trainer_topology.pp
-        * spec.trainer_topology.dp
-        != spec.trainer_gpu_count
-        for spec in specs
-    ):
-        return None
     functional_env = prepared.fixture.resident_functional_environment()
     length_env = os.environ | functional_env
     capacities: dict[str, int | float] = {
@@ -871,11 +876,12 @@ def _functional_session(
     if resource_args is None:
         return None
     mismatch = specs[0]
-    inference_gpu_count = mismatch.inference_gpu_count
-    gpu_count = inference_gpu_count + mismatch.trainer_gpu_count
+    trainer_gpu_count = len(mismatch.trainer_gpu_ids)
+    inference_gpu_count = len(mismatch.inference_gpu_ids)
+    gpu_count = inference_gpu_count + trainer_gpu_count
     if gpu_count > visible_gpu_count:
         return None
-    inference_gpu_ids = tuple(range(mismatch.trainer_gpu_count, gpu_count))
+    inference_gpu_ids = tuple(range(trainer_gpu_count, gpu_count))
     trainer = mismatch.trainer_topology
     return _SharedFunctionalSession(
         worker=ResidentFunctionalSessionSpec(
@@ -899,35 +905,12 @@ def _functional_session(
                     "api_key": "art-functional-vllm",
                 },
             ),
-            trainer_gpu_ids=tuple(range(mismatch.trainer_gpu_count)),
-            trainer_environment={
-                "ART_MODEL_SUPPORT_TRAINER_GPU_IDS": ",".join(
-                    map(str, range(mismatch.trainer_gpu_count))
-                ),
-                "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS": ",".join(
-                    map(str, inference_gpu_ids)
-                ),
-                "ART_MODEL_SUPPORT_TP": str(trainer.tp),
-                "ART_MODEL_SUPPORT_CP": str(trainer.cp),
-                "ART_MODEL_SUPPORT_EP": str(trainer.ep),
-                "ART_MODEL_SUPPORT_ETP": str(trainer.etp),
-                "ART_MODEL_SUPPORT_DP": str(trainer.dp),
-                "ART_MODEL_SUPPORT_PP": str(trainer.pp),
-                "ART_MODEL_SUPPORT_VPP": str(trainer.vpp),
-                "ART_MODEL_SUPPORT_SP": "1" if trainer.sp else "0",
-                "ART_TRAIN_INF_MISMATCH_TRAINER_GPU_IDS": ",".join(
-                    map(str, range(mismatch.trainer_gpu_count))
-                ),
-                "ART_TRAIN_INF_MISMATCH_INFERENCE_GPU_IDS": ",".join(
-                    map(str, inference_gpu_ids)
-                ),
-                "ART_TRAIN_INF_MISMATCH_TP": str(trainer.tp),
-                "ART_TRAIN_INF_MISMATCH_CP": str(trainer.cp),
-                "ART_TRAIN_INF_MISMATCH_EP": str(trainer.ep),
-                "ART_TRAIN_INF_MISMATCH_ETP": str(trainer.etp),
-                "ART_TRAIN_INF_MISMATCH_DP": str(trainer.dp),
-                "ART_TRAIN_INF_MISMATCH_PP": str(trainer.pp),
-            },
+            trainer_gpu_ids=tuple(range(trainer_gpu_count)),
+            trainer_environment=_trainer_environment(
+                trainer,
+                tuple(range(trainer_gpu_count)),
+                inference_gpu_ids,
+            ),
         ),
         topology=WorkflowRuntimeTopology(
             trainer_variants=(
@@ -941,7 +924,7 @@ def _functional_session(
             role_placements=(
                 WorkflowRolePlacement(
                     variant=RESIDENT_FUNCTIONAL_MODE,
-                    trainer_gpu_ids=tuple(range(mismatch.trainer_gpu_count)),
+                    trainer_gpu_ids=tuple(range(trainer_gpu_count)),
                     vllm_gpu_ids=inference_gpu_ids,
                     vllm_external=mismatch.vllm_external,
                 ),
@@ -970,11 +953,6 @@ def compile_prepared_workflows(
             visible_gpu_count=visible_gpu_count,
         )
         for stage_name in prepared.stages:
-            stage_resources = getattr(
-                HANDLER_WORKFLOW_RESOURCES.get(prepared.report.model_key),
-                stage_name,
-                None,
-            )
             shared = (
                 functional_session
                 if functional_session is not None
@@ -1063,9 +1041,6 @@ def compile_prepared_workflows(
                             correctness_affinity
                             if stage_name == "correctness_sensitivity"
                             else None
-                        ),
-                        exclusive_host=bool(
-                            stage_resources and stage_resources.exclusive_host
                         ),
                     ),
                     dependencies=dependencies,
@@ -1181,22 +1156,19 @@ def run_prepared_workflows(
                 )
             )
 
-    def runner(session: WorkflowSession, placement: WorkflowPlacement) -> list[str]:
-        session_dir = (
-            by_model_key[session.runtime.handler].run_dir / ".sessions" / session.id
-        )
+    def runner(session: WorkflowSession, placement: WorkflowPlacement) -> None:
+        owner = by_model_key[session.runtime.handler]
+        session_dir = owner.run_dir / ".sessions" / session.id
         session_dir.mkdir(parents=True, exist_ok=False)
-        prepared = by_model_key[session.runtime.handler]
         architecture_json = session_dir / "architecture.json"
         request_json = session_dir / "request.json"
         session_log = session_dir / "worker.log"
         architecture_json.write_text(
-            prepared.architecture.model_dump_json(indent=2), encoding="utf-8"
+            owner.architecture.model_dump_json(indent=2), encoding="utf-8"
         )
         items = []
         for operation in session.operations:
-            prepared = by_model_key[operation.runtime.handler]
-            stage_dir = prepared.run_dir / operation.stage
+            stage_dir = owner.run_dir / operation.stage
             stage_dir.mkdir(parents=True, exist_ok=False)
             fixture_stage = (
                 None
@@ -1206,11 +1178,11 @@ def run_prepared_workflows(
                 else operation.stage
             )
             environment = (
-                prepared.fixture.resident_functional_environment()
+                owner.fixture.resident_functional_environment()
                 if session.runtime.mode == RESIDENT_FUNCTIONAL_MODE
-                else prepared.fixture.environment(fixture_stage)
+                else owner.fixture.environment(fixture_stage)
             )
-            environment[workflow.WORKFLOW_RUN_DIR_ENV] = str(prepared.run_dir)
+            environment[workflow.WORKFLOW_RUN_DIR_ENV] = str(owner.run_dir)
             environment.update(
                 {
                     "ART_MEGATRON_CACHE_ROOT": os.environ.get(
@@ -1225,16 +1197,16 @@ def run_prepared_workflows(
                 "correctness_sensitivity",
             }:
                 environment[CORRECTNESS_ARTIFACT_ROOT_ENV] = str(
-                    prepared.run_dir / ".correctness" / "artifacts"
+                    owner.run_dir / ".correctness" / "artifacts"
                 )
                 environment[CORRECTNESS_PHASE_ENV] = (
                     "reference"
                     if operation.stage == CORRECTNESS_REFERENCE_STAGE
                     else "variants"
                 )
-            if prepared.include_sensitivity is not None:
+            if owner.include_sensitivity is not None:
                 environment[workflow.SKIP_SENSITIVITY_ENV] = (
-                    "0" if prepared.include_sensitivity else "1"
+                    "0" if owner.include_sensitivity else "1"
                 )
             items.append(
                 WorkflowStageWorkerItem(
@@ -1245,9 +1217,9 @@ def run_prepared_workflows(
                 )
             )
         request = WorkflowStageWorkerSession(
-            base_model=prepared.report.base_model,
+            base_model=owner.report.base_model,
             architecture_json=str(architecture_json),
-            allow_unvalidated_arch=prepared.allow_unvalidated_arch,
+            allow_unvalidated_arch=owner.allow_unvalidated_arch,
             resident_functional=(
                 ResidentFunctionalSessionSpec.model_validate_json(
                     session.runtime.static_options
@@ -1285,7 +1257,7 @@ def run_prepared_workflows(
         execution_host = placement.host or socket.gethostname()
         timeout_s = sum(
             workflow._WORKFLOW_STAGE_TIMEOUT_OVERRIDES_S.get(
-                (operation.stage, prepared.report.base_model),
+                (operation.stage, owner.report.base_model),
                 workflow._WORKFLOW_STAGE_TIMEOUT_S,
             )
             for operation in session.operations
@@ -1301,7 +1273,6 @@ def run_prepared_workflows(
         )
         returncode = fork_result["returncode"]
         worker_wall_s = float(fork_result["child_wall_s"])
-        completed = []
         results: list[tuple[WorkflowOperation, Path, bool, ValidationStageResult]] = []
         for operation, item in zip(session.operations, items, strict=True):
             output_json = Path(item.output_json)
@@ -1343,12 +1314,11 @@ def run_prepared_workflows(
                 if not result.passed:
                     remember_failure(operation, output_json, result)
                     failed_operation_id = failed_operation_id or operation.id
-                completed.append(operation.id)
                 continue
             if operation.stage == "correctness_sensitivity":
                 reference_result = ValidationStageResult.model_validate_json(
                     (
-                        prepared.run_dir
+                        owner.run_dir
                         / CORRECTNESS_REFERENCE_STAGE
                         / "stage_result.json"
                     ).read_text(encoding="utf-8")
@@ -1364,12 +1334,12 @@ def run_prepared_workflows(
                         "correctness_total_compute_s": reference_s + composition_s,
                     }
                 )
-            prepared.record_fixture_metric(result.metrics)
+            owner.record_fixture_metric(result.metrics)
             if operation.stage in workflow._RUNTIME_CLEANUP_STAGES:
                 try:
                     result.metrics.update(
                         workflow._prune_runtime_artifacts(
-                            prepared.run_dir / operation.stage
+                            owner.run_dir / operation.stage
                         )
                     )
                 except Exception as exc:
@@ -1377,14 +1347,12 @@ def run_prepared_workflows(
                     result.metrics["runtime_artifact_cleanup_error"] = (
                         f"{type(exc).__name__}: {exc}"
                     )
-            prepared.record(result)
+            owner.record(result)
             if not result.passed:
                 remember_failure(operation, output_json, result)
                 failed_operation_id = failed_operation_id or operation.id
-            completed.append(operation.id)
         if failed_operation_id is not None:
             raise WorkflowOperationFailed(failed_operation_id)
-        return completed
 
     context = (
         active_forkservers if owns_forkservers else nullcontext(active_forkservers)

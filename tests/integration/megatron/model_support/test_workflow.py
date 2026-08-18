@@ -1175,7 +1175,6 @@ def test_dsv4_throughput_uses_shorter_packed_sequence() -> None:
     ) == (32_768, 14_651, 20, 84, 4, 6, 80)
     stage = HANDLER_WORKFLOW_RESOURCES["dsv4"].e2e_throughput
     assert stage is not None
-    assert not stage.exclusive_host
     assert _groups_per_packed_sequence(stage, dsv4) == 2
     assert _THROUGHPUT_CONFIGS["llama3_dense"].groups_per_step == 23
     assert all(

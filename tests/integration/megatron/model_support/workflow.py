@@ -1031,6 +1031,21 @@ def run_e2e_throughput_stage(
     )
 
 
+def validation_stage_runners():
+    return {
+        "hf_parity": run_hf_parity_stage,
+        "lora_coverage": run_lora_coverage_stage,
+        "train_inf_mismatch": run_train_inf_mismatch_stage,
+        "correctness_sensitivity": run_correctness_sensitivity_stage,
+        CORRECTNESS_REFERENCE_STAGE: run_correctness_sensitivity_stage,
+        "chat_template_rollout": run_chat_template_rollout_stage,
+        "packing_invariance": run_packing_invariance_stage,
+        "length_trainability": run_length_trainability_stage,
+        "e2e_throughput": run_e2e_throughput_stage,
+        YES_NO_TRAINABILITY_STAGE: run_yes_no_trainability_stage,
+    }
+
+
 def build_validation_report(
     *,
     base_model: str,
@@ -1064,17 +1079,7 @@ def build_validation_report(
         output_json=output_json,
         model_key=report.model_key,
     )
-    stage_runners = {
-        "hf_parity": run_hf_parity_stage,
-        "lora_coverage": run_lora_coverage_stage,
-        "train_inf_mismatch": run_train_inf_mismatch_stage,
-        "correctness_sensitivity": run_correctness_sensitivity_stage,
-        "chat_template_rollout": run_chat_template_rollout_stage,
-        "packing_invariance": run_packing_invariance_stage,
-        "length_trainability": run_length_trainability_stage,
-        "e2e_throughput": run_e2e_throughput_stage,
-        YES_NO_TRAINABILITY_STAGE: run_yes_no_trainability_stage,
-    }
+    stage_runners = validation_stage_runners()
     env = {WORKFLOW_RUN_DIR_ENV: str(run_dir)}
     if include_sensitivity is not None:
         env[SKIP_SENSITIVITY_ENV] = "0" if include_sensitivity else "1"

@@ -143,43 +143,6 @@ def test_distinct_host_affinities_balance_and_remain_pinned() -> None:
         pool.release(placement, variant_request)
 
 
-def test_exclusive_host_blocks_other_work_until_release() -> None:
-    pool = _GpuPool(_devices(hosts=2))
-    exclusive = WorkflowResourceRequest(gpu_count=4, exclusive_host=True)
-    exclusive_placement = pool.acquire(exclusive)
-    assert exclusive_placement is not None
-    assert exclusive_placement.host == "host-0"
-
-    ordinary = WorkflowResourceRequest(gpu_count=4)
-    ordinary_placements = []
-    for _ in range(2):
-        placement = pool.acquire(ordinary)
-        assert placement is not None
-        ordinary_placements.append(placement)
-    assert {placement.host for placement in ordinary_placements} == {"host-1"}
-    assert pool.acquire(WorkflowResourceRequest(gpu_count=1)) is None
-    cpu_placement = pool.acquire(WorkflowResourceRequest(gpu_count=0))
-    assert cpu_placement is not None and cpu_placement.host == "host-1"
-
-    pool.release(exclusive_placement, exclusive)
-    placement = pool.acquire(ordinary)
-    assert placement is not None and placement.host == "host-0"
-
-
-def test_exclusive_host_waits_for_active_cpu_or_gpu_work() -> None:
-    pool = _GpuPool(_devices(hosts=2))
-    ordinary = WorkflowResourceRequest(gpu_count=1)
-    placements = []
-    for _ in range(2):
-        placement = pool.acquire(ordinary)
-        assert placement is not None
-        placements.append(placement)
-    assert {placement.host for placement in placements} == {"host-0", "host-1"}
-    assert (
-        pool.acquire(WorkflowResourceRequest(gpu_count=4, exclusive_host=True)) is None
-    )
-
-
 def test_compiled_session_counts_shared_startup_once() -> None:
     runtime = _runtime()
     operations = tuple(
