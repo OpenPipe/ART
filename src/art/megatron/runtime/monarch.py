@@ -1830,7 +1830,8 @@ class MonarchTrainerSlot:
                 if payload["kind"] == "rank_failed":
                     raise RuntimeError(
                         f"trainer rank {payload['rank']} publication failed: "
-                        f"{payload['error_type']}: {payload['message']}"
+                        f"{payload['error_type']}: {payload['message']}\n"
+                        f"{payload['traceback']}"
                     )
                 event = TRAINER_PUBLICATION_EVENT_ADAPTER.validate_python(payload)
                 if isinstance(event, TrainerPublicationFailed):
@@ -3091,7 +3092,8 @@ class MonarchTrainerRun:
                 if payload["kind"] == "rank_failed":
                     raise RuntimeError(
                         f"trainer rank {payload['rank']} failed after training: "
-                        f"{payload['error_type']}: {payload['message']}"
+                        f"{payload['error_type']}: {payload['message']}\n"
+                        f"{payload['traceback']}"
                     )
                 self._record_publication(payload)
         except BaseException as exc:
