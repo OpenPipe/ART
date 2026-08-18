@@ -22,6 +22,7 @@ class _TensorView(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     tensor: torch.Tensor
+    tensor_index: int = Field(ge=0)
     dtype: torch.dtype
     storage_offset: int = Field(ge=0)
     shape: tuple[int, ...]
@@ -79,21 +80,17 @@ class TensorResidencyTransition:
         return self._resolved or all(fence.event.query() for fence in self._fences)
 
 
-class TensorResidencySnapshot:
-    """A lossless pinned L2 image that can replace its live tensor bindings."""
-
+class HostTensorImage:
     def __init__(
         self,
         *,
         groups: tuple[_StorageGroup, ...],
         targets: tuple[torch.Tensor, ...],
-        pending: PendingCpuSnapshot[None],
+        input_tensor_count: int,
     ) -> None:
         self._groups = groups
         self._targets = targets
-        self._pending = pending
-        self._lock = Lock()
-        self._resolved = False
+        self.input_tensor_count = input_tensor_count
 
     @property
     def stats(self) -> TensorResidencyStats:
@@ -102,6 +99,62 @@ class TensorResidencySnapshot:
             tensor_count=sum(len(group.views) for group in self._groups),
             byte_count=sum(target.numel() for target in self._targets),
         )
+
+    def activate(self) -> None:
+        with torch.no_grad():
+            for group, target in zip(self._groups, self._targets, strict=True):
+                storage = target.untyped_storage()
+                for view in group.views:
+                    base_bytes = int(target.storage_offset())
+                    element_size = view.tensor.element_size()
+                    if base_bytes % element_size:
+                        raise RuntimeError("host storage offset is not dtype aligned")
+                    replacement = torch.empty(0, dtype=view.dtype, device="cpu")
+                    replacement.set_(
+                        storage,
+                        base_bytes // element_size + view.storage_offset,
+                        view.shape,
+                        view.stride,
+                    )
+                    view.tensor.data = replacement
+
+    def pinned_copy(self) -> "HostTensorImage":
+        targets = tuple(
+            torch.empty_like(target, device="cpu", pin_memory=True).copy_(target)
+            for target in self._targets
+        )
+        return HostTensorImage(
+            groups=self._groups,
+            targets=targets,
+            input_tensor_count=self.input_tensor_count,
+        )
+
+    def storage_bytes(self) -> tuple[torch.Tensor, ...]:
+        return self._targets
+
+    def groups(self) -> tuple[_StorageGroup, ...]:
+        return self._groups
+
+
+class TensorResidencySnapshot(HostTensorImage):
+    """A lossless pinned L2 image that can replace its live tensor bindings."""
+
+    def __init__(
+        self,
+        *,
+        groups: tuple[_StorageGroup, ...],
+        targets: tuple[torch.Tensor, ...],
+        pending: PendingCpuSnapshot[None],
+        input_tensor_count: int,
+    ) -> None:
+        super().__init__(
+            groups=groups,
+            targets=targets,
+            input_tensor_count=input_tensor_count,
+        )
+        self._pending = pending
+        self._lock = Lock()
+        self._resolved = False
 
     @property
     def pending(self) -> PendingCpuSnapshot[None]:
@@ -122,18 +175,7 @@ class TensorResidencySnapshot:
 
     def activate(self) -> None:
         self.resolve()
-        with torch.no_grad():
-            for group, target in zip(self._groups, self._targets, strict=True):
-                storage = target.untyped_storage()
-                for view in group.views:
-                    replacement = torch.empty(0, dtype=view.dtype, device="cpu")
-                    replacement.set_(
-                        storage,
-                        view.storage_offset,
-                        view.shape,
-                        view.stride,
-                    )
-                    view.tensor.data = replacement
+        super().activate()
 
 
 class TensorResidencyMover:
@@ -153,6 +195,7 @@ class TensorResidencyMover:
         self,
         tensors: Iterable[torch.Tensor],
     ) -> TensorResidencySnapshot:
+        tensors = tuple(tensors)
         groups = self._groups(tensors)
         if not groups or any(group.source.device.type != "cuda" for group in groups):
             raise RuntimeError("L2 snapshots require non-empty GPU residency")
@@ -163,6 +206,7 @@ class TensorResidencyMover:
             groups=groups,
             targets=targets,
             pending=builder.finish(None),
+            input_tensor_count=len(tensors),
         )
 
     def move(
@@ -257,7 +301,7 @@ class TensorResidencyMover:
         grouped: dict[tuple[str, int | None, int, int], list[_TensorView]] = {}
         sources: dict[tuple[str, int | None, int, int], torch.Tensor] = {}
         seen: set[int] = set()
-        for tensor in tensors:
+        for tensor_index, tensor in enumerate(tensors):
             if id(tensor) in seen or tensor.numel() == 0:
                 continue
             seen.add(id(tensor))
@@ -278,6 +322,7 @@ class TensorResidencyMover:
             grouped[key].append(
                 _TensorView(
                     tensor=tensor,
+                    tensor_index=tensor_index,
                     dtype=tensor.dtype,
                     storage_offset=int(tensor.storage_offset()),
                     shape=tuple(tensor.shape),

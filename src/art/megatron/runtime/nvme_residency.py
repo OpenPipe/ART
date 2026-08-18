@@ -1,0 +1,324 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+from threading import Lock
+from typing import Literal
+import uuid
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+import torch
+
+from .residency import ResidencyKey
+from .tensor_residency import HostTensorImage, _StorageGroup, _TensorView
+
+_FORMAT = "art_tensor_residency_v1"
+_DATA_FILE = "state.bin"
+_MANIFEST_FILE = "manifest.json"
+
+
+class NvmeResidencyStoreConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    root: str = Field(min_length=1)
+    alignment_bytes: int = Field(default=4096, ge=1)
+    io_chunk_bytes: int = Field(default=16 << 20, ge=1 << 20)
+    min_free_bytes: int = Field(default=16 << 30, ge=0)
+
+
+class NvmeStorageRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    offset: int = Field(ge=0)
+    byte_count: int = Field(ge=1)
+
+
+class NvmeTensorRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tensor_index: int = Field(ge=0)
+    storage_index: int = Field(ge=0)
+    dtype: str = Field(min_length=1)
+    storage_offset: int = Field(ge=0)
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+
+
+class NvmeResidencyManifest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    format: Literal["art_tensor_residency_v1"] = _FORMAT
+    key: ResidencyKey
+    input_tensor_count: int = Field(ge=1)
+    payload_bytes: int = Field(ge=1)
+    data_bytes: int = Field(ge=1)
+    data_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    layout_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    storages: tuple[NvmeStorageRecord, ...]
+    tensors: tuple[NvmeTensorRecord, ...]
+
+    @model_validator(mode="after")
+    def _validate_layout(self) -> "NvmeResidencyManifest":
+        if not self.storages or not self.tensors:
+            raise ValueError("L3 residency manifest cannot be empty")
+        if sum(item.byte_count for item in self.storages) != self.payload_bytes:
+            raise ValueError("L3 residency payload byte count is inconsistent")
+        cursor = 0
+        for item in self.storages:
+            if item.offset < cursor:
+                raise ValueError("L3 residency storages overlap")
+            cursor = item.offset + item.byte_count
+        if cursor != self.data_bytes:
+            raise ValueError("L3 residency data byte count is inconsistent")
+        indices = {item.tensor_index for item in self.tensors}
+        if max(indices) >= self.input_tensor_count or len(indices) != len(self.tensors):
+            raise ValueError("L3 residency tensor indices are invalid")
+        if any(item.storage_index >= len(self.storages) for item in self.tensors):
+            raise ValueError("L3 residency storage index is invalid")
+        return self
+
+
+class NvmeResidencyStore:
+    """Atomic, content-verified L3 storage for one rank's live tensor images."""
+
+    def __init__(self, config: NvmeResidencyStoreConfig) -> None:
+        self.config = config
+        self.root = Path(config.root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = Lock()
+
+    def write(
+        self,
+        key: ResidencyKey,
+        image: HostTensorImage,
+    ) -> NvmeResidencyManifest:
+        resolve = getattr(image, "resolve", None)
+        if callable(resolve):
+            resolve()
+        manifest = self._manifest(key, image)
+        destination = self.path(key)
+        with self._lock:
+            if destination.exists():
+                existing = self._read_manifest(destination)
+                if (
+                    existing.key != key
+                    or existing.layout_sha256 != manifest.layout_sha256
+                ):
+                    raise RuntimeError(
+                        "L3 residency key changed immutable tensor layout"
+                    )
+                self._verify_data(destination, existing)
+                return existing
+            free = shutil.disk_usage(self.root).free
+            required = manifest.data_bytes + self.config.min_free_bytes
+            if free < required:
+                raise RuntimeError(
+                    f"L3 residency free-space floor exceeded: free={free}, "
+                    f"required={required}"
+                )
+            temporary = self.root / f".{destination.name}.tmp-{uuid.uuid4().hex}"
+            temporary.mkdir()
+            try:
+                committed = self._write_image(temporary, manifest, image)
+                os.rename(temporary, destination)
+                self._fsync_dir(self.root)
+                return committed
+            except BaseException:
+                if temporary.exists():
+                    shutil.rmtree(temporary)
+                raise
+
+    def load(
+        self,
+        key: ResidencyKey,
+        tensors: tuple[torch.Tensor, ...],
+    ) -> tuple[HostTensorImage, NvmeResidencyManifest]:
+        destination = self.path(key)
+        manifest = self._read_manifest(destination)
+        if manifest.key != key:
+            raise RuntimeError("L3 residency manifest changed identity")
+        if len(tensors) != manifest.input_tensor_count:
+            raise RuntimeError("L3 residency tensor count changed")
+        self._verify_data(destination, manifest)
+        mapped = torch.from_file(
+            str(destination / _DATA_FILE),
+            shared=False,
+            size=manifest.data_bytes,
+            dtype=torch.uint8,
+        )
+        targets = tuple(
+            mapped[item.offset : item.offset + item.byte_count]
+            for item in manifest.storages
+        )
+        grouped: list[list[_TensorView]] = [[] for _ in manifest.storages]
+        for item in manifest.tensors:
+            tensor = tensors[item.tensor_index]
+            if (
+                str(tensor.dtype) != item.dtype
+                or tuple(tensor.shape) != item.shape
+                or tuple(tensor.stride()) != item.stride
+            ):
+                raise RuntimeError("L3 residency tensor layout changed")
+            grouped[item.storage_index].append(
+                _TensorView(
+                    tensor=tensor,
+                    tensor_index=item.tensor_index,
+                    dtype=tensor.dtype,
+                    storage_offset=item.storage_offset,
+                    shape=item.shape,
+                    stride=item.stride,
+                )
+            )
+        groups = tuple(
+            _StorageGroup(source=target, views=tuple(views))
+            for target, views in zip(targets, grouped, strict=True)
+        )
+        return (
+            HostTensorImage(
+                groups=groups,
+                targets=targets,
+                input_tensor_count=manifest.input_tensor_count,
+            ),
+            manifest,
+        )
+
+    def delete(self, key: ResidencyKey) -> int:
+        destination = self.path(key)
+        manifest = self._read_manifest(destination)
+        if manifest.key != key:
+            raise RuntimeError("refusing to delete a changed L3 residency identity")
+        reclaimed = sum(
+            item.stat().st_size for item in destination.iterdir() if item.is_file()
+        )
+        for name in (_MANIFEST_FILE, _DATA_FILE):
+            (destination / name).unlink()
+        destination.rmdir()
+        self._fsync_dir(self.root)
+        return reclaimed
+
+    def path(self, key: ResidencyKey) -> Path:
+        digest = hashlib.sha256(key.model_dump_json().encode()).hexdigest()
+        return self.root / digest
+
+    def _manifest(
+        self, key: ResidencyKey, image: HostTensorImage
+    ) -> NvmeResidencyManifest:
+        groups = image.groups()
+        targets = image.storage_bytes()
+        if not groups or len(groups) != len(targets):
+            raise RuntimeError("cannot persist an empty L3 tensor image")
+        offsets: list[int] = []
+        cursor = 0
+        for target in targets:
+            if target.device.type != "cpu" or target.dtype != torch.uint8:
+                raise RuntimeError("L3 tensor images must expose CPU byte storages")
+            cursor = self._aligned(cursor)
+            offsets.append(cursor)
+            cursor += target.numel()
+        tensors = tuple(
+            NvmeTensorRecord(
+                tensor_index=view.tensor_index,
+                storage_index=storage_index,
+                dtype=str(view.dtype),
+                storage_offset=view.storage_offset,
+                shape=view.shape,
+                stride=view.stride,
+            )
+            for storage_index, group in enumerate(groups)
+            for view in group.views
+        )
+        input_count = image.input_tensor_count
+        layout = {
+            "input_tensor_count": input_count,
+            "storages": [
+                {"offset": offset, "byte_count": target.numel()}
+                for offset, target in zip(offsets, targets, strict=True)
+            ],
+            "tensors": [item.model_dump(mode="json") for item in tensors],
+        }
+        return NvmeResidencyManifest(
+            key=key,
+            input_tensor_count=input_count,
+            payload_bytes=sum(target.numel() for target in targets),
+            data_bytes=cursor,
+            data_sha256="0" * 64,
+            layout_sha256=self._digest_json(layout),
+            storages=tuple(
+                NvmeStorageRecord(offset=offset, byte_count=target.numel())
+                for offset, target in zip(offsets, targets, strict=True)
+            ),
+            tensors=tensors,
+        )
+
+    def _write_image(
+        self,
+        directory: Path,
+        manifest: NvmeResidencyManifest,
+        image: HostTensorImage,
+    ) -> NvmeResidencyManifest:
+        digest = hashlib.sha256()
+        cursor = 0
+        with (directory / _DATA_FILE).open("wb", buffering=0) as handle:
+            for record, target in zip(
+                manifest.storages, image.storage_bytes(), strict=True
+            ):
+                padding = record.offset - cursor
+                if padding:
+                    zeros = bytes(padding)
+                    handle.write(zeros)
+                    digest.update(zeros)
+                view = memoryview(target.numpy())
+                for start in range(0, len(view), self.config.io_chunk_bytes):
+                    chunk = view[start : start + self.config.io_chunk_bytes]
+                    handle.write(chunk)
+                    digest.update(chunk)
+                cursor = record.offset + record.byte_count
+            handle.flush()
+            os.fsync(handle.fileno())
+        committed = manifest.model_copy(update={"data_sha256": digest.hexdigest()})
+        payload = committed.model_dump_json().encode()
+        with (directory / _MANIFEST_FILE).open("wb", buffering=0) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        self._fsync_dir(directory)
+        return committed
+
+    def _verify_data(self, directory: Path, manifest: NvmeResidencyManifest) -> None:
+        path = directory / _DATA_FILE
+        if path.stat().st_size != manifest.data_bytes:
+            raise RuntimeError("L3 residency data size changed")
+        digest = hashlib.sha256()
+        with path.open("rb", buffering=0) as handle:
+            while chunk := handle.read(self.config.io_chunk_bytes):
+                digest.update(chunk)
+        if digest.hexdigest() != manifest.data_sha256:
+            raise RuntimeError("L3 residency data checksum changed")
+
+    def _read_manifest(self, directory: Path) -> NvmeResidencyManifest:
+        try:
+            return NvmeResidencyManifest.model_validate_json(
+                (directory / _MANIFEST_FILE).read_bytes()
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("L3 residency image is not committed") from exc
+
+    def _aligned(self, value: int) -> int:
+        alignment = self.config.alignment_bytes
+        return (value + alignment - 1) // alignment * alignment
+
+    @staticmethod
+    def _digest_json(value: object) -> str:
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
