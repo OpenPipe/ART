@@ -28,6 +28,7 @@ TopKT = _impl.TopKT
 TrainerRankMemoryError = _impl.TrainerRankMemoryError
 TrainerRankSlotStateError = _impl.TrainerRankSlotStateError
 TrainerRankOptimizerLayout = _impl.TrainerRankOptimizerLayout
+TrainerRankOptimizerSnapshotSource = _impl.TrainerRankOptimizerSnapshotSource
 TrainerRankOptimizerState = _impl.TrainerRankOptimizerState
 TrainerRankResidencyTensors = _impl.TrainerRankResidencyTensors
 Unset = _impl.Unset
@@ -370,6 +371,7 @@ __all__ = [
     "TrainerRankMemoryError",
     "TrainerRankOptimizerLayout",
     "TrainerRankOptimizerState",
+    "TrainerRankOptimizerSnapshotSource",
     "TrainerRankResidencyTensors",
     "PushedCheckpoint",
     "TrainerRankSlotStateError",

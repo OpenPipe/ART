@@ -275,6 +275,15 @@ class RunResidencyManager:
         byte_count: int,
     ) -> None:
         self._require_open()
+        if self.ledger.has_copy(key, "l4_archive"):
+            current = self.ledger.copy(key, "l4_archive")
+            if (
+                current.immutable_ref,
+                current.digest,
+                current.byte_count,
+            ) != (immutable_ref, digest, byte_count):
+                raise RuntimeError("L4 residency identity changed after commit")
+            return
         reservation = self.ledger.reserve(
             key,
             source=("l3_nvme" if self.ledger.has_copy(key, "l3_nvme") else "l2_cpu"),
@@ -528,9 +537,10 @@ class RunResidencyManager:
             if not (
                 self.ledger.has_copy(key, "l1_gpu")
                 or self.ledger.has_copy(key, "l2_cpu")
-                or self.ledger.has_copy(key, "l4_archive")
             ):
                 raise RuntimeError("cannot evict the only exact residency copy")
+            # L4 is a service checkpoint bundle, not a rank-local tensor image.
+            # It becomes executable only after service-level rematerialization.
             self._store.delete(key)
             self.ledger.drop(key, "l3_nvme")
             state.l3 = None

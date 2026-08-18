@@ -1815,6 +1815,44 @@ def stage_trainer_rank_optimizer_state_snapshot(
     )
 
 
+def trainer_rank_optimizer_snapshot_from_cpu(
+    runtime: Any,
+    state: Any,
+    *,
+    generation_id: str,
+    step: int,
+) -> OptimizerStateSnapshot:
+    """Wrap an immutable residency image without another CPU or GPU copy."""
+    layout = state.get("layout")
+    if layout is None:
+        raise RuntimeError("TrainerRank optimizer state has no topology layout")
+    tensors = tuple(_optimizer_value_tensors(state))
+    if not tensors or any(tensor.device.type != "cpu" for tensor in tensors):
+        raise RuntimeError("resident optimizer snapshot must be entirely CPU resident")
+    return OptimizerStateSnapshot(
+        generation_id=generation_id,
+        step=step,
+        rank=runtime.rank,
+        world_size=runtime.world_size,
+        runtime_sha256=_model_runtime_sha256(runtime),
+        layout_sha256=_json_sha256(layout),
+        topology=current_optimizer_topology(runtime.world_size),
+        state_dict=state,
+    )
+
+
+def _optimizer_value_tensors(value: Any) -> Iterator[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _optimizer_value_tensors(key)
+            yield from _optimizer_value_tensors(item)
+    elif isinstance(value, list | tuple):
+        for item in value:
+            yield from _optimizer_value_tensors(item)
+
+
 def write_optimizer_snapshot_shard(
     snapshot: OptimizerStateSnapshot,
     *,

@@ -890,8 +890,15 @@ class MCoreRunSlotExecutor:
         output_key = parent_key.model_copy(
             update={"generation_id": job.generation.generation_id}
         )
-        tensors = self._slot_trainer.checkpoint_slot_residency_tensors(job.run_id).all
-        self._residency.advance_l1(parent_key, output_key, tensors)
+        residency_tensors = self._slot_trainer.checkpoint_slot_residency_tensors(
+            job.run_id
+        )
+        optimizer_source = (
+            self._slot_trainer.checkpoint_slot_optimizer_residency_source(job.run_id)
+        )
+        if optimizer_source is None:
+            raise RuntimeError("optimizer commit has no immutable optimizer state")
+        l2 = self._residency.advance_l1(parent_key, output_key, residency_tensors.all)
         state.desired_key = output_key
         state.installed_key = output_key
         state.learner_version = job.learner_version
@@ -907,6 +914,14 @@ class MCoreRunSlotExecutor:
             adapter_config=state.adapter_config,
             slot_ref=LoRASlotRef("checkpoint", job.run_id),
             snapshot_optimizer=False,
+        )
+        snapshot_metrics.update(
+            self._publisher.attach_resident_optimizer(
+                generation=job.generation,
+                source=optimizer_source,
+                l2=l2,
+                tensor_offset=len(residency_tensors.weights),
+            )
         )
         return {
             "operation_id": job.operation_id,
@@ -1053,44 +1068,56 @@ class MCoreRunSlotExecutor:
     ) -> dict[str, Any]:
         state = self._require_run(job.run_id)
         self._validate_parent(state, job.training_session_id, job.learner_version)
-        from art.megatron.lora import LoRASlotRef
-
-        needs_optimizer = job.save_optimizer and not self._publisher.has_generation(
-            job.generation, require_optimizer=True
-        )
-        stage_metrics = self._publisher.ensure_generation(
-            run_id=job.run_id,
+        if state.desired_key.generation_id != job.generation.generation_id:
+            raise RuntimeError("snapshot does not identify the selected generation")
+        if not self._publisher.has_generation(
+            job.generation, require_optimizer=job.save_optimizer
+        ):
+            raise RuntimeError(
+                "selected generation has no immutable publication snapshot"
+            )
+        metrics = self._publisher.submit(
             generation=job.generation,
-            adapter_dtypes={},
-            adapter_config=state.adapter_config,
-            slot_ref=LoRASlotRef("checkpoint", job.run_id),
-            trainer_rank_optimizer_state=(
-                self._slot_trainer.checkpoint_slot_optimizer_snapshot_sources(
-                    job.run_id
-                )
-                if needs_optimizer
-                else None
-            ),
-            snapshot_optimizer=job.save_optimizer,
+            optimizer_state_path=job.optimizer_state_path,
+            staging_adapter_path=job.staging_adapter_path,
+            existing_adapter=job.existing_adapter,
+            publication_targets=job.publication_targets,
+            adapter_object_target=job.adapter_object_target,
+            save_optimizer=job.save_optimizer,
+            sink=sink,
         )
-        metrics = {
-            **stage_metrics,
-            **self._publisher.submit(
-                generation=job.generation,
-                optimizer_state_path=job.optimizer_state_path,
-                staging_adapter_path=job.staging_adapter_path,
-                existing_adapter=job.existing_adapter,
-                publication_targets=job.publication_targets,
-                adapter_object_target=job.adapter_object_target,
-                save_optimizer=job.save_optimizer,
-                sink=sink,
-            ),
-        }
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
             "metrics": metrics,
         }
+
+    def record_archive(
+        self,
+        run_id: str,
+        generation_id: str,
+        *,
+        immutable_ref: str,
+        digest: str,
+        byte_count: int,
+    ) -> bool:
+        self._require_run(run_id)
+        keys = tuple(
+            key
+            for key in self._residency.keys(run_id)
+            if key.accumulator_revision == 0 and key.generation_id == generation_id
+        )
+        if not keys:
+            return False
+        if len(keys) != 1:
+            raise RuntimeError("generation has multiple base residency identities")
+        self._residency.record_l4(
+            keys[0],
+            immutable_ref=immutable_ref,
+            digest=digest,
+            byte_count=byte_count,
+        )
+        return True
 
     def discard_run_gradients(self, run_id: str) -> None:
         self._require_run(run_id).gradients.discard()
@@ -1487,6 +1514,58 @@ class _GenerationPublisher:
             "snapshot_optimizer_launch_s": elapsed,
             "snapshot_launch_s": elapsed,
         }
+
+    def attach_resident_optimizer(
+        self,
+        *,
+        generation: TrainerGeneration,
+        source: Any,
+        l2: Future[Any],
+        tensor_offset: int,
+    ) -> dict[str, float]:
+        started = time.perf_counter()
+        with self._lock:
+            entry = self._cache.get(generation.generation_id)
+            if entry is None or entry.retired or entry.generation != generation:
+                raise RuntimeError("optimizer residency has no staged generation")
+            if entry.has_optimizer or entry.optimizer_upgrade is not None:
+                raise RuntimeError("generation already has an optimizer snapshot")
+            resolved = self._resolution_pool.submit(
+                self._resolve_resident_optimizer,
+                l2,
+                source,
+                tensor_offset,
+                generation,
+            )
+            entry.optimizer_upgrade = resolved
+            entry.has_optimizer = True
+        resolved.add_done_callback(
+            lambda done, cached=entry: self._optimizer_resolved(cached, done)
+        )
+        elapsed = time.perf_counter() - started
+        return {
+            "snapshot_optimizer_attach_s": elapsed,
+        }
+
+    def _resolve_resident_optimizer(
+        self,
+        l2: Future[Any],
+        source: Any,
+        tensor_offset: int,
+        generation: TrainerGeneration,
+    ) -> Any:
+        from art.megatron.optimizer_state import (
+            trainer_rank_optimizer_snapshot_from_cpu,
+        )
+
+        tensors = l2.result().tensors()[tensor_offset:]
+        state = source.bind(tensors)
+        return trainer_rank_optimizer_snapshot_from_cpu(
+            self.runtime,
+            state,
+            generation_id=generation.generation_id,
+            step=generation.policy_step,
+        )
 
     def submit(
         self,

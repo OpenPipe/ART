@@ -105,6 +105,33 @@ class TrainerRankOptimizerState(TypedDict):
     optimizer: dict[str, object]
 
 
+class TrainerRankOptimizerSnapshotSource(BaseModel):
+    """Immutable optimizer structure whose tensors can be rebound to an L2 image."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    state: TrainerRankOptimizerState
+    tensors: tuple[torch.Tensor, ...]
+
+    def bind(self, replacements: Sequence[torch.Tensor]) -> TrainerRankOptimizerState:
+        if len(replacements) != len(self.tensors):
+            raise TrainerRankSlotStateError(
+                "Optimizer residency tensor count changed while binding a snapshot."
+            )
+        if any(tensor.device.type != "cpu" for tensor in replacements):
+            raise TrainerRankSlotStateError(
+                "Optimizer snapshot replacements must be CPU resident."
+            )
+        mapping = {
+            id(source): replacement
+            for source, replacement in zip(self.tensors, replacements, strict=True)
+        }
+        return cast(
+            TrainerRankOptimizerState,
+            _replace_nested_tensors(self.state, mapping),
+        )
+
+
 class TrainerRankResidencyTensors(BaseModel):
     """Stable tensor objects that physically constitute one checkpoint slot."""
 
@@ -1473,6 +1500,21 @@ class TrainerRank:
             "master_params": slot.optimizer.master_params,
             "optimizer": cast(dict[str, object], slot.optimizer.optimizer.state_dict()),
         }
+
+    def checkpoint_slot_optimizer_residency_source(
+        self, name: str
+    ) -> TrainerRankOptimizerSnapshotSource | None:
+        state = self.checkpoint_slot_optimizer_snapshot_sources(name)
+        if state is None:
+            return None
+        tensors = self.checkpoint_slot_residency_tensors(name).optimizer
+        return TrainerRankOptimizerSnapshotSource(
+            state=cast(
+                TrainerRankOptimizerState,
+                _copy_nested_state(state),
+            ),
+            tensors=tensors,
+        )
 
     def checkpoint_slot_optimizer_state(
         self, name: str
@@ -4552,6 +4594,55 @@ def _nested_tensors(value: object) -> tuple[torch.Tensor, ...]:
     if isinstance(value, Sequence) and not isinstance(value, str | bytes):
         return tuple(tensor for item in value for tensor in _nested_tensors(item))
     return ()
+
+
+def _copy_nested_state(value: object) -> object:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            _copy_nested_state(key): _copy_nested_state(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_copy_nested_state(item) for item in value]
+    if isinstance(value, tuple):
+        return (
+            type(value)(*(_copy_nested_state(item) for item in value))
+            if hasattr(value, "_fields")
+            else tuple(_copy_nested_state(item) for item in value)
+        )
+    return deepcopy(value)
+
+
+def _replace_nested_tensors(
+    value: object, replacements: Mapping[int, torch.Tensor]
+) -> object:
+    if isinstance(value, torch.Tensor):
+        try:
+            return replacements[id(value)]
+        except KeyError as error:
+            raise TrainerRankSlotStateError(
+                "Optimizer state tensor is absent from the residency image."
+            ) from error
+    if isinstance(value, Mapping):
+        return {
+            _replace_nested_tensors(key, replacements): _replace_nested_tensors(
+                item, replacements
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_nested_tensors(item, replacements) for item in value]
+    if isinstance(value, tuple):
+        return (
+            type(value)(
+                *(_replace_nested_tensors(item, replacements) for item in value)
+            )
+            if hasattr(value, "_fields")
+            else tuple(_replace_nested_tensors(item, replacements) for item in value)
+        )
+    return deepcopy(value)
 
 
 def _unique_tensors(values: Iterable[torch.Tensor]) -> tuple[torch.Tensor, ...]:

@@ -539,6 +539,14 @@ class GenerationSnapshotJobSpec(_Spec):
         return _fingerprint(self)
 
 
+class GenerationArchiveSpec(_Spec):
+    run_id: str = Field(min_length=1)
+    generation_id: str = Field(min_length=1)
+    immutable_ref: str = Field(min_length=1)
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=1)
+
+
 class ResidentScoreJobSpec(_Spec):
     job_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
