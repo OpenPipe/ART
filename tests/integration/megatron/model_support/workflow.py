@@ -62,9 +62,7 @@ MANDATORY_VALIDATION_STAGES = (
     "length_trainability",
     "e2e_throughput",
 )
-YES_NO_TRAINABILITY_STAGE = "yes_no_trainability"
-OPTIONAL_VALIDATION_STAGES = (YES_NO_TRAINABILITY_STAGE,)
-ALL_VALIDATION_STAGES = (*MANDATORY_VALIDATION_STAGES, *OPTIONAL_VALIDATION_STAGES)
+ALL_VALIDATION_STAGES = MANDATORY_VALIDATION_STAGES
 ARCHITECTURE_REPRESENTATIVE_MODELS = {
     "llama3_dense": "meta-llama/Llama-3.2-1B-Instruct",
     "qwen3_moe": "Qwen/Qwen3-30B-A3B",
@@ -87,12 +85,9 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
         "packing_invariance",
         "length_trainability",
         "e2e_throughput",
-        YES_NO_TRAINABILITY_STAGE,
     }
 )
-_RUNTIME_CLEANUP_STAGES = frozenset(
-    {"length_trainability", "e2e_throughput", YES_NO_TRAINABILITY_STAGE}
-)
+_RUNTIME_CLEANUP_STAGES = frozenset({"length_trainability", "e2e_throughput"})
 _RUNTIME_ARTIFACT_DIR_NAMES = frozenset(
     {
         "checkpoints",
@@ -113,14 +108,8 @@ class AllArchitecturesValidationReport(BaseModel):
     reports: list[ValidationReport] = Field(default_factory=list)
 
 
-def build_validation_stage_names(
-    *,
-    include_yes_no_trainability: bool = False,
-) -> list[str]:
-    stages = list(MANDATORY_VALIDATION_STAGES)
-    if include_yes_no_trainability:
-        stages.append(YES_NO_TRAINABILITY_STAGE)
-    return stages
+def build_validation_stage_names() -> list[str]:
+    return list(MANDATORY_VALIDATION_STAGES)
 
 
 def detect_dependency_versions() -> dict[str, str]:
@@ -136,7 +125,6 @@ def detect_dependency_versions() -> dict[str, str]:
 def initialize_validation_report(
     *,
     base_model: str,
-    include_yes_no_trainability: bool = False,
     allow_unvalidated_arch: bool = False,
 ) -> ValidationReport:
     spec = get_model_support_spec(
@@ -150,9 +138,7 @@ def initialize_validation_report(
         dependency_versions=detect_dependency_versions(),
         stages=[
             ValidationStageResult(name=stage_name)
-            for stage_name in build_validation_stage_names(
-                include_yes_no_trainability=include_yes_no_trainability,
-            )
+            for stage_name in build_validation_stage_names()
         ],
     )
 
@@ -933,30 +919,6 @@ def run_chat_template_rollout_stage(
     )
 
 
-def run_yes_no_trainability_stage(
-    *,
-    base_model: str,
-    architecture: ArchitectureReport,
-    allow_unvalidated_arch: bool = False,
-) -> ValidationStageResult:
-    del architecture
-    yes_no_trainability = _import_integration_module(
-        "integration.megatron.trainability.yes_no_trainability"
-    )
-    report = yes_no_trainability.run_yes_no_trainability(
-        base_model=base_model,
-        artifact_root=_stage_artifact_dir(),
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    passed = yes_no_trainability.yes_no_trainability_passed(report)
-    return ValidationStageResult(
-        name=YES_NO_TRAINABILITY_STAGE,
-        passed=passed,
-        metrics=report.model_dump(mode="json"),
-        artifact_dir=report.output_dir,
-    )
-
-
 def run_length_trainability_stage(
     *,
     base_model: str,
@@ -1042,14 +1004,12 @@ def validation_stage_runners():
         "packing_invariance": run_packing_invariance_stage,
         "length_trainability": run_length_trainability_stage,
         "e2e_throughput": run_e2e_throughput_stage,
-        YES_NO_TRAINABILITY_STAGE: run_yes_no_trainability_stage,
     }
 
 
 def build_validation_report(
     *,
     base_model: str,
-    include_yes_no_trainability: bool = False,
     include_sensitivity: bool | None = None,
     output_json: str | Path | None = None,
     skip_stages: set[str] | None = None,
@@ -1062,9 +1022,6 @@ def build_validation_report(
     only_stage_run_set = _only_stage_run_set(only_stage)
     report = initialize_validation_report(
         base_model=base_model,
-        include_yes_no_trainability=(
-            include_yes_no_trainability or only_stage == YES_NO_TRAINABILITY_STAGE
-        ),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     skip_stages = skip_stages or set()
@@ -1238,7 +1195,6 @@ def build_validation_report(
 
 def build_all_architectures_validation_report(
     *,
-    include_yes_no_trainability: bool = False,
     include_sensitivity: bool | None = None,
     output_json: str | Path | None = None,
     skip_stages: set[str] | None = None,
@@ -1256,7 +1212,6 @@ def build_all_architectures_validation_report(
         ).key
         report = build_validation_report(
             base_model=base_model,
-            include_yes_no_trainability=include_yes_no_trainability,
             include_sensitivity=include_sensitivity,
             output_json=(
                 _per_architecture_output_json(output_json, model_key)
@@ -1291,7 +1246,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--allow-unsupported-arch", action="store_true")
     parser.add_argument("--include-sensitivity", action="store_true")
-    parser.add_argument("--include-yes-no-trainability", action="store_true")
     parser.add_argument("--skip-stage", action="append", default=[])
     parser.add_argument("--only-stage", choices=ALL_VALIDATION_STAGES)
     parser.add_argument("--stop-on-failure", action="store_true")
@@ -1342,7 +1296,6 @@ def main(argv: list[str] | None = None) -> int:
         reports = build_scheduled_validation_reports(
             base_models=base_models,
             include_sensitivity=args.include_sensitivity,
-            include_yes_no_trainability=args.include_yes_no_trainability,
             output_json_by_model=output_json_by_model,
             skip_stages=set(args.skip_stage),
             allow_unvalidated_arch=args.allow_unsupported_arch,
@@ -1367,7 +1320,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report.passed else 1
     if args.all_architectures:
         all_report = build_all_architectures_validation_report(
-            include_yes_no_trainability=args.include_yes_no_trainability,
             include_sensitivity=args.include_sensitivity,
             output_json=args.output_json,
             skip_stages=set(args.skip_stage),
@@ -1383,7 +1335,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if all_report.passed else 1
     report = build_validation_report(
         base_model=args.base_model,
-        include_yes_no_trainability=args.include_yes_no_trainability,
         include_sensitivity=args.include_sensitivity,
         output_json=args.output_json,
         skip_stages=set(args.skip_stage),

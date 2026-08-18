@@ -77,7 +77,6 @@ _STAGE_DURATION_ESTIMATES_S = {
     "packing_invariance": 90.0,
     "length_trainability": 360.0,
     "e2e_throughput": 360.0,
-    "yes_no_trainability": 360.0,
 }
 _STAGE_DURATION_ESTIMATE_OVERRIDES_S = {
     # Rounded B300 workflow measurements; DSV4 is a deliberate architecture outlier.
@@ -96,7 +95,6 @@ _LIGHTWEIGHT_GPU_STAGES = frozenset(
 _CPU_STAGES = frozenset({"chat_template_rollout"})
 _DEFAULT_STAGE_GPU_COUNTS = {
     "train_inf_mismatch": 4,
-    "yes_no_trainability": 2,
 }
 _WORKFLOW_HOSTS_ENV = "ART_MODEL_SUPPORT_WORKFLOW_HOSTS"
 _VLLM_CAPACITY_ARGS = (
@@ -197,7 +195,6 @@ def _shared_startup_estimate(mode: str, stage: str) -> float:
 def _initialize_workflow(
     *,
     base_model: str,
-    include_yes_no_trainability: bool,
     output_json: Path | None,
     allow_unvalidated_arch: bool,
 ) -> tuple[ValidationReport, Path]:
@@ -205,7 +202,6 @@ def _initialize_workflow(
 
     report = workflow.initialize_validation_report(
         base_model=base_model,
-        include_yes_no_trainability=include_yes_no_trainability,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     return report, workflow._new_workflow_run_dir(
@@ -217,7 +213,6 @@ def _initialize_workflow(
 def prepare_workflow(
     *,
     base_model: str,
-    include_yes_no_trainability: bool,
     include_sensitivity: bool | None,
     output_json: Path | None,
     skip_stages: set[str],
@@ -228,7 +223,6 @@ def prepare_workflow(
 
     report, run_dir = initialized or _initialize_workflow(
         base_model=base_model,
-        include_yes_no_trainability=include_yes_no_trainability,
         output_json=output_json,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
@@ -553,24 +547,6 @@ def _stage_runtime_topology(
             tp=2,
             ep=trainer.ep > 1,
         )
-    elif stage_name == "yes_no_trainability":
-        support = get_model_support_spec(
-            prepared.report.base_model,
-            allow_unvalidated_arch=prepared.allow_unvalidated_arch,
-        )
-        handler = get_model_support_handler_for_spec(support)
-        if handler.is_moe:
-            trainer = _trainer_topology(stage_name, cp=2, ep=2)
-            trainer_gpu_ids = tuple(range(gpu_count))
-            vllm_gpu_ids = trainer_gpu_ids
-            vllm = WorkflowVllmTopology(
-                variant=stage_name,
-                tp=gpu_count,
-                ep=True,
-            )
-        else:
-            vllm_gpu_ids = (1,)
-            vllm = WorkflowVllmTopology(variant=stage_name)
     return WorkflowRuntimeTopology(
         trainer_variants=(trainer,),
         vllm_variants=(vllm,) if vllm else (),
@@ -1371,7 +1347,6 @@ def run_prepared_workflows(
 def build_scheduled_validation_reports(
     *,
     base_models: list[str],
-    include_yes_no_trainability: bool = False,
     include_sensitivity: bool | None = None,
     output_json_by_model: dict[str, Path | None] | None = None,
     skip_stages: set[str] | None = None,
@@ -1386,7 +1361,6 @@ def build_scheduled_validation_reports(
             base_model,
             _initialize_workflow(
                 base_model=base_model,
-                include_yes_no_trainability=include_yes_no_trainability,
                 output_json=output_json_by_model.get(base_model),
                 allow_unvalidated_arch=allow_unvalidated_arch,
             ),
@@ -1398,7 +1372,6 @@ def build_scheduled_validation_reports(
         base_model, workflow_identity = item
         return prepare_workflow(
             base_model=base_model,
-            include_yes_no_trainability=include_yes_no_trainability,
             include_sensitivity=include_sensitivity,
             output_json=output_json_by_model.get(base_model),
             skip_stages=skip_stages,

@@ -120,17 +120,16 @@ def test_fixture_stage_contracts(tmp_path: Path) -> None:
         ("gemma4_dense", "canonical"): ("hf_parity", "packing_invariance", "length_trainability"),
         ("gemma4_dense", "compact"): ("lora_coverage",),
         ("gemma4_dense", "functional"): ("train_inf_mismatch",),
-        ("gemma4_dense", "tokenizer"): ("yes_no_trainability",),
         ("llama3_dense", "compact"): ("hf_parity",),
         ("llama3_dense", "functional"): ("train_inf_mismatch",),
-        ("llama3_dense", "canonical"): ("length_trainability", "yes_no_trainability"),
+        ("llama3_dense", "canonical"): ("length_trainability",),
         ("qwen3_5_moe", "canonical"): ("length_trainability",),
         ("gpt_oss_moe", "functional"): ("train_inf_mismatch",),
         ("gpt_oss_moe", "canonical"): ("length_trainability",),
         ("glm52", "functional"): ("train_inf_mismatch",),
-        ("glm52", "compact"): ("length_trainability", "yes_no_trainability"),
+        ("glm52", "compact"): ("length_trainability",),
         ("dsv4", "functional"): ("train_inf_mismatch",),
-        ("dsv4", "canonical"): ("length_trainability", "yes_no_trainability"),
+        ("dsv4", "canonical"): ("length_trainability",),
     }
     # fmt: on
     for (model_key, selected), stages in cases.items():
@@ -161,9 +160,6 @@ def test_reduced_trainability_preserves_validated_token_contract(
 ) -> None:
     for model_key, stage, expected in (
         ("glm52", "length_trainability", "154820,38069"),
-        ("glm52", "yes_no_trainability", "9829,902,36569"),
-        ("gemma4_dense", "yes_no_trainability", "4443,951,7463"),
-        ("gemma4_moe", "yes_no_trainability", "4443,951,7463"),
     ):
         key = f"ART_MODEL_SUPPORT_{stage.removesuffix('_trainability').upper()}_ALLOWED_TOKEN_IDS"
         assert _fixture(tmp_path, model_key).environment(stage)[key] == expected
@@ -872,10 +868,6 @@ def _without_stage_duration(stage: ValidationStageResult) -> dict[str, object]:
 
 def test_build_validation_stage_names_has_fixed_order() -> None:
     assert build_validation_stage_names() == list(MANDATORY_VALIDATION_STAGES)
-    assert build_validation_stage_names(include_yes_no_trainability=True) == [
-        *MANDATORY_VALIDATION_STAGES,
-        "yes_no_trainability",
-    ]
 
 
 def test_validated_architecture_representative_models_are_fixed() -> None:
@@ -900,7 +892,6 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
     assert resources is not None
     for stage in (
         resources.train_inf_mismatch,
-        resources.yes_no_trainability,
         resources.length_trainability,
     ):
         assert stage is not None
@@ -926,7 +917,6 @@ def test_dsv4_runtime_stages_use_full_model_resources() -> None:
     ("stage_name", "trainer_gpu_ids", "trainer_ep", "trainer_dp"),
     [
         ("train_inf_mismatch", [0, 1, 2, 3], 4, 2),
-        ("yes_no_trainability", [0, 1, 2, 3], 4, 2),
         ("length_trainability", [0, 1, 2, 3], 4, 2),
     ],
 )
@@ -972,7 +962,6 @@ def test_glm52_reduced_workflow_uses_portable_serving_backends() -> None:
     assert resources is not None
     joint_stages = (
         resources.train_inf_mismatch,
-        resources.yes_no_trainability,
         resources.length_trainability,
     )
     for stage in joint_stages:
@@ -988,7 +977,6 @@ def test_glm52_reduced_workflow_uses_portable_serving_backends() -> None:
         assert engine_args["attention_backend"] == "FLASHMLA_SPARSE"
         assert engine_args["max_model_len"] == 1024
         assert engine_args["moe_backend"] == "triton"
-    assert resources.yes_no_trainability_variant == "megatron_dedicated"
 
 
 @pytest.mark.parametrize("handler_key", sorted(HANDLER_WORKFLOW_RESOURCES))

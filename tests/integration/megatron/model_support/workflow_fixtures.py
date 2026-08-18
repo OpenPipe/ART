@@ -26,34 +26,23 @@ _CANONICAL_CACHE_ROOT = Path("/tmp/art-model-support-workflow/canonical-hf-cache
 _FUNCTIONAL_FIXTURE_ROOT = Path("/tmp/art-model-support-workflow/functional")
 _FUNCTIONAL_CACHE_ROOT = Path("/tmp/art-model-support-workflow/functional-hf-cache")
 _GEMMA_CANONICAL_WEIGHT_STAGES = frozenset({"hf_parity", "packing_invariance"})
-_PRETRAINED_WEIGHT_STAGES = frozenset({"length_trainability", "yes_no_trainability"})
+_PRETRAINED_WEIGHT_STAGES = frozenset({"length_trainability"})
 _FUNCTIONAL_STAGES = frozenset(
     {
         "train_inf_mismatch",
     }
 )
-_GEMMA_YES_NO_ENV = {
-    "ART_MODEL_SUPPORT_YES_NO_ALLOWED_TOKEN_IDS": "4443,951,7463",
-    "ART_MODEL_SUPPORT_YES_NO_MAX_TOKENS": "1",
-}
 _RESIDENT_FUNCTIONAL_ENV = {
     "gemma4_dense": {"ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN": "2560"},
     "gemma4_moe": {"ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN": "2560"},
 }
 _REDUCED_TRAINABILITY_ENV: dict[str, dict[str, dict[str, str]]] = {
-    "gemma4_dense": {"yes_no_trainability": _GEMMA_YES_NO_ENV},
-    "gemma4_moe": {"yes_no_trainability": _GEMMA_YES_NO_ENV},
     "glm52": {
         "length_trainability": {
             "ART_MODEL_SUPPORT_LENGTH_ALLOWED_TOKEN_IDS": "154820,38069",
             "ART_MODEL_SUPPORT_LENGTH_MIN_TOKENS": "2",
             "ART_MODEL_SUPPORT_LENGTH_FREQUENCY_PENALTY": "0.5",
-        },
-        "yes_no_trainability": {
-            "ART_MODEL_SUPPORT_YES_NO_ALLOWED_TOKEN_IDS": "9829,902,36569",
-            "ART_MODEL_SUPPORT_YES_NO_MAX_STEPS": "8",
-            "ART_MODEL_SUPPORT_YES_NO_MAX_TOKENS": "1",
-        },
+        }
     },
 }
 _TOKENIZER_FIXTURE_VERSION = 3
