@@ -44,6 +44,9 @@ class SFTBatchData(BaseModel):
     num_tokens: int
     num_trainable_tokens: int
     num_dropped_trajectories: int = 0
+    _fingerprint_cache: tuple[tuple[tuple[torch.Tensor, int], ...], str] | None = (
+        PrivateAttr(default=None)
+    )
 
     @model_validator(mode="after")
     def _validate_trajectories(self) -> "SFTBatchData":
@@ -98,6 +101,28 @@ class SFTBatchData(BaseModel):
 
     @property
     def fingerprint(self) -> str:
+        tensors = tuple(
+            values[name]
+            for values in self.trajectory_tensors
+            for name in ("input_ids", "attention_mask", "labels")
+        )
+        try:
+            versions = tuple((tensor, int(tensor._version)) for tensor in tensors)
+        except RuntimeError:
+            versions = None
+        cached = self._fingerprint_cache
+        if (
+            cached is not None
+            and versions is not None
+            and len(cached[0]) == len(versions)
+        ):
+            if all(
+                prior is current and prior_version == current_version
+                for (prior, prior_version), (current, current_version) in zip(
+                    cached[0], versions, strict=True
+                )
+            ):
+                return cached[1]
         digest = hashlib.sha256(
             json.dumps(
                 {
@@ -117,8 +142,19 @@ class SFTBatchData(BaseModel):
                 digest.update(name.encode())
                 digest.update(str(tensor.dtype).encode())
                 digest.update(json.dumps(tuple(tensor.shape)).encode())
-                digest.update(tensor.numpy().tobytes())
-        return digest.hexdigest()
+                digest.update(memoryview(tensor.numpy()))
+        result = digest.hexdigest()
+        if versions is not None:
+            assert self.__pydantic_private__ is not None
+            self.__pydantic_private__["_fingerprint_cache"] = (versions, result)
+        return result
+
+    def __getstate__(self) -> dict[Any, Any]:
+        state = super().__getstate__()
+        private = dict(state["__pydantic_private__"] or {})
+        private["_fingerprint_cache"] = None
+        state["__pydantic_private__"] = private
+        return state
 
 
 def validate_packed_batch(batch: InMemoryPackedBatch) -> None:

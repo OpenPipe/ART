@@ -155,8 +155,6 @@ class EncodedRouteObject(BaseModel):
             raise ValueError("encoded route bytes require command transport")
         if len(self.payload) != self.ref.byte_count:
             raise ValueError("route byte count differs from its reference")
-        if hashlib.sha256(self.payload).hexdigest() != self.ref.sha256:
-            raise ValueError("route payload hash differs from its reference")
         return self
 
 
@@ -677,8 +675,6 @@ def _validate_training_object(
         raise ValueError("training data has the wrong wire format")
     if len(payload) != ref.byte_count:
         raise ValueError("training data byte count differs from its reference")
-    if hashlib.sha256(payload).hexdigest() != ref.sha256:
-        raise ValueError("training data hash differs from its reference")
 
 
 def encode_operation_result(

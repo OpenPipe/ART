@@ -154,7 +154,8 @@ def restore_checkpoint_bundle(
     restore_optimizer: bool,
 ) -> RestoredCheckpointBundle:
     bundle = Path(source).absolute()
-    manifest = read_checkpoint_bundle(bundle, verify_files=True)
+    manifest = read_checkpoint_bundle(bundle)
+    bundle_files = {record.path: record for record in manifest.files}
     if restore_optimizer and manifest.optimizer is None:
         raise RuntimeError("checkpoint bundle has no optimizer state")
     output = Path(output_dir).absolute()
@@ -164,10 +165,12 @@ def restore_checkpoint_bundle(
         staging = output / "megatron_runtime" / "staging" / uuid4().hex
         try:
             for record in manifest.adapter.files:
+                relative = f"adapter/{record.name}"
                 _copy_file(
-                    bundle / "adapter" / record.name,
+                    bundle / relative,
                     staging / record.name,
-                    f"adapter/{record.name}",
+                    relative,
+                    expected=bundle_files[relative],
                 )
             adapter = publish_adapter_checkpoint(
                 staging,
@@ -202,6 +205,7 @@ def restore_checkpoint_bundle(
                         bundle / record.path,
                         pending / PurePosixPath(record.path).name,
                         record.path,
+                        expected=record,
                     )
                 restored_manifest = manifest.optimizer.model_copy(
                     update={"adapter": adapter}
@@ -245,7 +249,13 @@ def read_checkpoint_bundle(
     return manifest
 
 
-def _copy_file(source: Path, target: Path, relative: str) -> BundleFile:
+def _copy_file(
+    source: Path,
+    target: Path,
+    relative: str,
+    *,
+    expected: BundleFile | None = None,
+) -> BundleFile:
     if not source.is_file():
         raise RuntimeError(f"checkpoint bundle source is missing: {source}")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -258,7 +268,10 @@ def _copy_file(source: Path, target: Path, relative: str) -> BundleFile:
             size += len(chunk)
         output_file.flush()
         os.fsync(output_file.fileno())
-    return BundleFile(path=relative, size_bytes=size, sha256=digest.hexdigest())
+    result = BundleFile(path=relative, size_bytes=size, sha256=digest.hexdigest())
+    if expected is not None and result != expected:
+        raise RuntimeError(f"checkpoint bundle file changed: {source}")
+    return result
 
 
 def _verify_file(path: Path, expected: BundleFile) -> None:

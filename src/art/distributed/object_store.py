@@ -69,7 +69,6 @@ class BinaryObjectTarget(_ObjectModel):
 class BinaryObjectFile(_ObjectModel):
     relative_path: str
     byte_count: int = Field(ge=1)
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("relative_path")
     @classmethod
@@ -83,7 +82,6 @@ class BinaryObjectRef(_ObjectModel):
     format: str = Field(min_length=1)
     manifest_uri: str = Field(pattern=r"^s3://")
     byte_count: int = Field(ge=1)
-    tree_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     files: tuple[BinaryObjectFile, ...] = Field(min_length=1)
     metadata: dict[str, str] = Field(default_factory=dict)
 
@@ -122,6 +120,8 @@ class S3BinaryObjectStore:
             verify=config.tls_verify,
             config=Config(
                 max_pool_connections=config.multipart_concurrency + 2,
+                request_checksum_calculation="when_supported",
+                response_checksum_validation="when_supported",
                 s3={"addressing_style": config.addressing_style},
             ),
         )
@@ -159,21 +159,18 @@ class S3BinaryObjectStore:
         # publishes intentionally leave any partial keys for later lifecycle cleanup.
         for relative_path, chunks in sorted(files.items()):
             relative_path = _safe_relative_path(relative_path)
-            byte_count, digest = self._upload(f"{prefix}/{relative_path}", chunks)
+            byte_count = self._upload(f"{prefix}/{relative_path}", chunks)
             published.append(
                 BinaryObjectFile(
                     relative_path=relative_path,
                     byte_count=byte_count,
-                    sha256=digest,
                 )
             )
-        tree_sha256 = _tree_sha256(published)
         result = BinaryObjectRef(
             object_id=target.object_id,
             format=target.format,
             manifest_uri=self._manifest_uri(target),
             byte_count=sum(file.byte_count for file in published),
-            tree_sha256=tree_sha256,
             files=tuple(published),
             metadata=target.metadata,
         )
@@ -227,16 +224,11 @@ class S3BinaryObjectStore:
                     str(target),
                     Config=self._transfer,
                 )
-                if (
-                    target.stat().st_size != file.byte_count
-                    or _file_sha256(target) != file.sha256
-                ):
+                if target.stat().st_size != file.byte_count:
                     raise RuntimeError(
-                        f"binary object file changed: {file.relative_path}"
+                        f"binary object file size changed: {file.relative_path}"
                     )
         except BaseException:
-            import shutil
-
             shutil.rmtree(root, ignore_errors=True)
             raise
         return root
@@ -252,11 +244,8 @@ class S3BinaryObjectStore:
             Config=self._transfer,
         )
         data = buffer.getvalue()
-        if (
-            len(data) != file.byte_count
-            or hashlib.sha256(data).hexdigest() != file.sha256
-        ):
-            raise RuntimeError(f"binary object file changed: {file.relative_path}")
+        if len(data) != file.byte_count:
+            raise RuntimeError(f"binary object file size changed: {file.relative_path}")
         return data
 
     def delete(self, ref: BinaryObjectRef) -> None:
@@ -271,16 +260,14 @@ class S3BinaryObjectStore:
         self._parts.shutdown(wait=True)
         self._client.close()
 
-    def _upload(self, key: str, chunks: tuple[memoryview, ...]) -> tuple[int, str]:
+    def _upload(self, key: str, chunks: tuple[memoryview, ...]) -> int:
         total = sum(chunk.nbytes for chunk in chunks)
         if total < 1:
             raise ValueError("binary object files must not be empty")
-        digest = hashlib.sha256()
         if total <= self.config.multipart_chunk_bytes:
             body = b"".join(chunk.tobytes() for chunk in chunks)
-            digest.update(body)
             self._client.put_object(Bucket=self.config.bucket, Key=key, Body=body)
-            return total, digest.hexdigest()
+            return total
         upload = self._client.create_multipart_upload(
             Bucket=self.config.bucket, Key=key
         )
@@ -296,7 +283,6 @@ class S3BinaryObjectStore:
             for part_number, body in enumerate(
                 _multipart_chunks(chunks, part_bytes), 1
             ):
-                digest.update(body)
                 futures.append(
                     (
                         part_number,
@@ -324,7 +310,7 @@ class S3BinaryObjectStore:
                 Bucket=self.config.bucket, Key=key, UploadId=upload_id
             )
             raise
-        return total, digest.hexdigest()
+        return total
 
     def _read(self, key: str, *, bucket: str | None = None) -> bytes:
         response = self._client.get_object(Bucket=bucket or self.config.bucket, Key=key)
@@ -374,7 +360,7 @@ class S3BinaryObjectStore:
 
 
 class S3BinaryObjectReceiver:
-    """Materialize verified objects into bounded, explicitly released paths."""
+    """Materialize committed objects into bounded, explicitly released paths."""
 
     def __init__(self, config: S3ObjectStoreConfig, receive_root: str | Path) -> None:
         self.config = config
@@ -578,16 +564,6 @@ def _complete_part(value: tuple[int, Future[dict[str, object]]]) -> dict[str, ob
     return {"ETag": future.result()["ETag"], "PartNumber": part_number}
 
 
-def _tree_sha256(files: list[BinaryObjectFile]) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            [file.model_dump(mode="json") for file in files],
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
-
-
 def _manifest_bytes(ref: BinaryObjectRef) -> bytes:
     return json.dumps(
         ref.model_dump(mode="json"), separators=(",", ":"), sort_keys=True
@@ -601,11 +577,3 @@ def _parse_s3_uri(value: str) -> tuple[str, str]:
     if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
         raise ValueError(f"invalid S3 object URI: {value!r}")
     return parsed.netloc, parsed.path.strip("/")
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(8 << 20):
-            digest.update(chunk)
-    return digest.hexdigest()
