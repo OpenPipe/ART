@@ -625,15 +625,27 @@ class _PreparedRunLoad(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     operation_id: str
-    key: ResidencyKey
+    weights_key: ResidencyKey
+    optimizer_key: ResidencyKey | None
     checkpoint: Any
     optimizer: Any | None
     adapter_config: dict[str, Any]
 
     @property
-    def tensors(self) -> tuple[torch.Tensor, ...]:
-        optimizer = () if self.optimizer is None else self.optimizer.tensors
-        return (*self.checkpoint.parameters, *optimizer)
+    def weights(self) -> tuple[torch.Tensor, ...]:
+        return tuple(self.checkpoint.parameters)
+
+    @property
+    def optimizer_tensors(self) -> tuple[torch.Tensor, ...]:
+        return () if self.optimizer is None else tuple(self.optimizer.tensors)
+
+
+class GenerationResidency(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    weights: ResidencyKey
+    optimizer: ResidencyKey | None = None
+    accumulator: ResidencyKey | None = None
 
 
 class _ResidentRunState(BaseModel):
@@ -645,11 +657,11 @@ class _ResidentRunState(BaseModel):
     learner_version: int
     adapter_config: dict[str, Any]
     gradients: Any
-    desired_key: ResidencyKey
-    installed_key: ResidencyKey
+    desired: GenerationResidency
+    installed_weights: ResidencyKey
+    installed_optimizer: ResidencyKey | None = None
     initial_generation: TrainerGeneration | None = None
     pending_load: _PreparedRunLoad | None = None
-    accumulator_key: ResidencyKey | None = None
     next_accumulator_revision: int = 1
     registration_complete: bool = False
 
@@ -711,7 +723,7 @@ class MCoreRunSlotExecutor:
         self._slot_trainer.load_checkpoint_sync(
             MaterializedCheckpoint(path=run_id, directory=adapter_path)
         )
-        key = ResidencyKey(
+        weights_key = ResidencyKey(
             tenant_id=tenant_id,
             run_id=run_id,
             generation_id=generation_id,
@@ -727,8 +739,8 @@ class MCoreRunSlotExecutor:
             gradients=ParameterGradientAccumulator(
                 parameters=self._slot_trainer.checkpoint_slot_parameters(run_id)
             ),
-            desired_key=key,
-            installed_key=key,
+            desired=GenerationResidency(weights=weights_key),
+            installed_weights=weights_key,
             initial_generation=TrainerGeneration(
                 training_session_id=training_session_id,
                 policy_step=learner_version,
@@ -745,15 +757,22 @@ class MCoreRunSlotExecutor:
         if generation is None:
             raise RuntimeError("run registration has no immutable initial generation")
         tensors = self._slot_trainer.checkpoint_slot_residency_tensors(run_id)
-        self._residency.register_l1(state.installed_key, tensors.all)
+        self._residency.register_l1(state.installed_weights, tensors.weights)
+        optimizer_key = None
+        if tensors.optimizer:
+            optimizer_key = state.installed_weights.model_copy(
+                update={"representation": "optimizer"}
+            )
+            self._residency.register_l1(optimizer_key, tensors.optimizer)
+            state.installed_optimizer = optimizer_key
+        state.desired = state.desired.model_copy(update={"optimizer": optimizer_key})
         self._publisher.register_existing(
             run_id=run_id,
             generation=generation,
             optimizer_source=(
                 self._slot_trainer.checkpoint_slot_optimizer_residency_source(run_id)
             ),
-            residency_key=state.installed_key,
-            tensor_offset=len(tensors.weights),
+            optimizer_residency_key=optimizer_key,
         )
         state.initial_generation = None
         state.registration_complete = True
@@ -787,7 +806,7 @@ class MCoreRunSlotExecutor:
             execute_megatron_dynamic_lora_forward_backward_job,
         )
 
-        with self._resident(state, include_gradients=True):
+        with self._resident(state, include_accumulator=True):
             result = execute_megatron_dynamic_lora_forward_backward_job(
                 self.runtime,
                 job,
@@ -845,7 +864,7 @@ class MCoreRunSlotExecutor:
             execute_megatron_dynamic_lora_sft_forward_backward_job,
         )
 
-        with self._resident(state, include_gradients=True):
+        with self._resident(state, include_accumulator=True):
             result = execute_megatron_dynamic_lora_sft_forward_backward_job(
                 self.runtime,
                 job,
@@ -886,7 +905,7 @@ class MCoreRunSlotExecutor:
         state.gradients.seal(job.contributing_forward_backward_operation_ids)
         from art.trainer_rank import AdamParams
 
-        with self._resident(state, include_gradients=True):
+        with self._resident(state, include_optimizer=True, include_accumulator=True):
             self.runtime.optimizer_snapshot_barrier.wait_before_mutation()
             gradients = state.gradients.prepare_optimizer()
             started = time.perf_counter()
@@ -908,8 +927,8 @@ class MCoreRunSlotExecutor:
         consumed = state.gradients.consume()
         if consumed != job.contributing_forward_backward_operation_ids:
             raise RuntimeError("optimizer consumed the wrong gradient contributions")
-        parent_key = state.installed_key
-        output_key = parent_key.model_copy(
+        parent_weights = state.installed_weights
+        output_weights = parent_weights.model_copy(
             update={"generation_id": job.generation.generation_id}
         )
         residency_tensors = self._slot_trainer.checkpoint_slot_residency_tensors(
@@ -921,13 +940,30 @@ class MCoreRunSlotExecutor:
         if optimizer_source is None:
             raise RuntimeError("optimizer commit has no immutable optimizer state")
         self._residency.advance_l1(
-            parent_key,
-            output_key,
-            residency_tensors.all,
+            parent_weights,
+            output_weights,
+            residency_tensors.weights,
             retire_source=True,
         )
-        state.desired_key = output_key
-        state.installed_key = output_key
+        output_optimizer = output_weights.model_copy(
+            update={"representation": "optimizer"}
+        )
+        if state.installed_optimizer is None:
+            self._residency.register_l1(output_optimizer, residency_tensors.optimizer)
+        else:
+            self._residency.advance_l1(
+                state.installed_optimizer,
+                output_optimizer,
+                residency_tensors.optimizer,
+                retire_source=True,
+            )
+        state.desired = GenerationResidency(
+            weights=output_weights,
+            optimizer=output_optimizer,
+            accumulator=state.desired.accumulator,
+        )
+        state.installed_weights = output_weights
+        state.installed_optimizer = output_optimizer
         state.learner_version = job.learner_version
         self._retire_accumulator(state)
         from art.megatron.lora import LoRASlotRef
@@ -939,14 +975,13 @@ class MCoreRunSlotExecutor:
             adapter_config=state.adapter_config,
             slot_ref=LoRASlotRef("checkpoint", job.run_id),
             snapshot_optimizer=False,
-            residency_key=output_key,
+            residency_key=output_weights,
         )
         snapshot_metrics.update(
             self._publisher.attach_resident_optimizer(
                 generation=job.generation,
                 source=optimizer_source,
-                residency_key=output_key,
-                tensor_offset=len(residency_tensors.weights),
+                residency_key=output_optimizer,
             )
         )
         return {
@@ -998,22 +1033,27 @@ class MCoreRunSlotExecutor:
         adapter_layout_fingerprint = hashlib.sha256(
             encode_adapter_config(config)
         ).hexdigest()
+        weights_key = ResidencyKey(
+            tenant_id=state.tenant_id,
+            run_id=job.run_id,
+            generation_id=job.generation.generation_id,
+            topology_fingerprint=self.runtime.optimizer_layout_fingerprint,
+            adapter_layout_fingerprint=adapter_layout_fingerprint,
+        )
         prepared = _PreparedRunLoad(
             operation_id=job.operation_id,
-            key=ResidencyKey(
-                tenant_id=state.tenant_id,
-                run_id=job.run_id,
-                generation_id=job.generation.generation_id,
-                topology_fingerprint=self.runtime.optimizer_layout_fingerprint,
-                adapter_layout_fingerprint=adapter_layout_fingerprint,
+            weights_key=weights_key,
+            optimizer_key=(
+                None
+                if optimizer_state is None
+                else weights_key.model_copy(update={"representation": "optimizer"})
             ),
             checkpoint=checkpoint,
             optimizer=optimizer_state,
             adapter_config=config,
         )
-        if not prepared.tensors or any(
-            tensor.device.type != "cpu" for tensor in prepared.tensors
-        ):
+        tensors = (*prepared.weights, *prepared.optimizer_tensors)
+        if not tensors or any(tensor.device.type != "cpu" for tensor in tensors):
             raise RuntimeError(
                 "prepared checkpoint generation is not entirely CPU resident"
             )
@@ -1070,12 +1110,21 @@ class MCoreRunSlotExecutor:
             raise RuntimeError("load_state cannot discard open gradient contributions")
         if (
             prepared.operation_id != job.operation_id
-            or prepared.key.generation_id != job.generation.generation_id
+            or prepared.weights_key.generation_id != job.generation.generation_id
             or (prepared.optimizer is not None) != job.restore_optimizer
         ):
             raise RuntimeError("prepared load does not match its ordered command")
         previous = state.pending_load
-        image = self._residency.register_l2(prepared.key, prepared.tensors)
+        weights_image = self._residency.register_l2(
+            prepared.weights_key, prepared.weights
+        )
+        optimizer_image = (
+            None
+            if prepared.optimizer_key is None
+            else self._residency.register_l2(
+                prepared.optimizer_key, prepared.optimizer_tensors
+            )
+        )
         adapter = read_adapter_publication(
             job.generation.adapter_path,
             step=job.generation.policy_step,
@@ -1084,7 +1133,9 @@ class MCoreRunSlotExecutor:
             adapter.training_session_id != job.generation.training_session_id
             or adapter.generation_id != job.generation.generation_id
         ):
-            self._residency.retire(prepared.key)
+            self._residency.retire(prepared.weights_key)
+            if prepared.optimizer_key is not None:
+                self._residency.retire(prepared.optimizer_key)
             raise RuntimeError("loaded generation has no matching immutable adapter")
         try:
             snapshot_metrics = self._publisher.register_existing(
@@ -1095,15 +1146,25 @@ class MCoreRunSlotExecutor:
                     if prepared.optimizer is None
                     else prepared.optimizer.snapshot_source()
                 ),
-                residency_key=prepared.key,
-                tensor_offset=len(prepared.checkpoint.parameters),
+                optimizer_residency_key=prepared.optimizer_key,
             )
         except BaseException:
-            self._residency.retire(prepared.key)
+            self._residency.retire(prepared.weights_key)
+            if prepared.optimizer_key is not None:
+                self._residency.retire(prepared.optimizer_key)
             raise
         if previous is not None:
-            self._residency.retire_async(previous.key)
-        state.desired_key = prepared.key
+            if previous.weights_key != state.installed_weights:
+                self._residency.retire_async(previous.weights_key)
+            if (
+                previous.optimizer_key is not None
+                and previous.optimizer_key != state.installed_optimizer
+            ):
+                self._residency.retire_async(previous.optimizer_key)
+        state.desired = GenerationResidency(
+            weights=prepared.weights_key,
+            optimizer=prepared.optimizer_key,
+        )
         state.pending_load = prepared
         state.learner_version = job.learner_version
         return {
@@ -1111,7 +1172,14 @@ class MCoreRunSlotExecutor:
             "learner_version": job.learner_version,
             "optimizer_restored": job.restore_optimizer,
             "metrics": {
-                "residency/load_l2_bytes": float(image.stats.byte_count),
+                "residency/load_l2_bytes": float(
+                    weights_image.stats.byte_count
+                    + (
+                        0
+                        if optimizer_image is None
+                        else optimizer_image.stats.byte_count
+                    )
+                ),
                 **snapshot_metrics,
             },
         }
@@ -1123,7 +1191,7 @@ class MCoreRunSlotExecutor:
     ) -> dict[str, Any]:
         state = self._require_run(job.run_id)
         self._validate_parent(state, job.training_session_id, job.learner_version)
-        if state.desired_key.generation_id != job.generation.generation_id:
+        if state.desired.weights.generation_id != job.generation.generation_id:
             raise RuntimeError("snapshot does not identify the selected generation")
         if not self._publisher.has_generation(
             job.generation, require_optimizer=job.save_optimizer
@@ -1241,55 +1309,61 @@ class MCoreRunSlotExecutor:
     ) -> None:
         del operation_id
         tensors = state.gradients.residency_tensors()
-        if state.accumulator_key is not None:
-            self._residency.touch(state.accumulator_key)
+        if state.desired.accumulator is not None:
+            self._residency.touch(state.desired.accumulator)
             return
-        key = state.installed_key.model_copy(
+        key = state.installed_weights.model_copy(
             update={
-                "representation": "gradient",
+                "representation": "accumulator",
                 "accumulator_revision": state.next_accumulator_revision,
             }
         )
         self._residency.register_l1(key, tensors)
-        state.accumulator_key = key
+        state.desired = state.desired.model_copy(update={"accumulator": key})
 
     def _retire_accumulator(self, state: _ResidentRunState) -> None:
-        key = state.accumulator_key
+        key = state.desired.accumulator
         if key is None:
             return
         self._residency.retire_async(key)
-        state.accumulator_key = None
+        state.desired = state.desired.model_copy(update={"accumulator": None})
         state.next_accumulator_revision += 1
 
     @contextmanager
     def _resident(
-        self, state: _ResidentRunState, *, include_gradients: bool = False
+        self,
+        state: _ResidentRunState,
+        *,
+        include_optimizer: bool = False,
+        include_accumulator: bool = False,
     ) -> Iterator[None]:
-        base_key = state.desired_key
+        weights_key = state.desired.weights
         acquired: list[ResidencyKey] = []
         try:
-            self._residency.acquire_l1(base_key)
-            acquired.append(base_key)
-            if state.installed_key != base_key:
+            self._residency.acquire_l1(weights_key)
+            acquired.append(weights_key)
+            if state.installed_weights != weights_key:
                 pending = state.pending_load
-                if pending is None or pending.key != base_key:
-                    raise RuntimeError("desired learner has no prepared L1 install")
-                previous = state.installed_key
+                if pending is None or pending.weights_key != weights_key:
+                    raise RuntimeError("desired weights have no prepared L1 install")
+                previous_weights = state.installed_weights
+                previous_optimizer = state.installed_optimizer
                 try:
                     self._slot_trainer.install_prepared_checkpoint_slot_load_sync(
-                        pending.checkpoint, pending.optimizer
+                        pending.checkpoint
                     )
+                    self._slot_trainer.clear_checkpoint_slot_optimizer(state.run_id)
                 except BaseException:
                     self._residency.release_l1(acquired.pop())
-                    self._residency.acquire_l1(previous)
-                    self._residency.release_l1(previous)
+                    self._residency.acquire_l1(previous_weights)
+                    self._residency.release_l1(previous_weights)
                     raise
                 live = self._slot_trainer.checkpoint_slot_residency_tensors(
                     state.run_id
-                ).all
-                if tuple(map(id, live)) != tuple(map(id, pending.tensors)):
+                )
+                if tuple(map(id, live.weights)) != tuple(map(id, pending.weights)):
                     raise RuntimeError(
-                        "installed checkpoint changed prepared residency tensors"
+                        "installed checkpoint changed prepared weight tensors"
                     )
                 from art.megatron.training.gradient_accumulator import (
                     ParameterGradientAccumulator,
@@ -1301,12 +1375,46 @@ class MCoreRunSlotExecutor:
                     )
                 )
                 state.adapter_config = pending.adapter_config
-                state.installed_key = base_key
-                state.pending_load = None
-                self._residency.retire_async(previous)
+                state.installed_weights = weights_key
+                state.installed_optimizer = None
+                if pending.optimizer is None:
+                    state.pending_load = None
+                self._residency.retire_async(previous_weights)
+                if previous_optimizer is not None:
+                    self._residency.retire_async(previous_optimizer)
+            optimizer_key = state.desired.optimizer if include_optimizer else None
+            if optimizer_key is not None:
+                self._residency.acquire_l1(optimizer_key)
+                acquired.append(optimizer_key)
+                if state.installed_optimizer != optimizer_key:
+                    pending = state.pending_load
+                    if (
+                        pending is None
+                        or pending.optimizer_key != optimizer_key
+                        or pending.optimizer is None
+                    ):
+                        raise RuntimeError(
+                            "desired optimizer has no prepared L1 install"
+                        )
+                    self._slot_trainer.install_prepared_checkpoint_slot_optimizer(
+                        state.run_id, pending.optimizer
+                    )
+                    live_optimizer = (
+                        self._slot_trainer.checkpoint_slot_residency_tensors(
+                            state.run_id
+                        ).optimizer
+                    )
+                    if tuple(map(id, live_optimizer)) != tuple(
+                        map(id, pending.optimizer_tensors)
+                    ):
+                        raise RuntimeError(
+                            "installed optimizer changed prepared residency tensors"
+                        )
+                    state.installed_optimizer = optimizer_key
+                    state.pending_load = None
             for key in (
-                (state.accumulator_key,)
-                if include_gradients and state.accumulator_key is not None
+                (state.desired.accumulator,)
+                if include_accumulator and state.desired.accumulator is not None
                 else ()
             ):
                 self._residency.acquire_l1(key)
@@ -1355,7 +1463,6 @@ class _ResidentOptimizerSource(BaseModel):
 
     key: ResidencyKey
     source: Any
-    tensor_offset: int = Field(ge=0)
 
 
 class _CachedGeneration(BaseModel):
@@ -1549,8 +1656,7 @@ class _GenerationPublisher:
         run_id: str,
         generation: TrainerGeneration,
         optimizer_source: Any | None,
-        residency_key: ResidencyKey,
-        tensor_offset: int,
+        optimizer_residency_key: ResidencyKey | None,
     ) -> dict[str, float]:
         """Register an existing adapter and L2 state without reading mutable GPU state."""
         self.raise_if_failed()
@@ -1566,14 +1672,18 @@ class _GenerationPublisher:
         )
         if self._residency is None:
             raise RuntimeError("resident generation requires a residency manager")
-        self._residency.ensure_l2(residency_key)
+        if (optimizer_source is None) != (optimizer_residency_key is None):
+            raise RuntimeError(
+                "optimizer source and residency key must be provided together"
+            )
+        if optimizer_residency_key is not None:
+            self._residency.ensure_l2(optimizer_residency_key)
         resident_optimizer = (
             None
             if optimizer_source is None
             else _ResidentOptimizerSource(
-                key=residency_key,
+                key=optimizer_residency_key,
                 source=optimizer_source,
-                tensor_offset=tensor_offset,
             )
         )
         entry = _CachedGeneration(
@@ -1686,7 +1796,6 @@ class _GenerationPublisher:
         generation: TrainerGeneration,
         source: Any,
         residency_key: ResidencyKey,
-        tensor_offset: int,
     ) -> dict[str, float]:
         started = time.perf_counter()
         with self._lock:
@@ -1700,7 +1809,6 @@ class _GenerationPublisher:
             entry.resident_optimizer = _ResidentOptimizerSource(
                 key=residency_key,
                 source=source,
-                tensor_offset=tensor_offset,
             )
             entry.has_optimizer = True
         elapsed = time.perf_counter() - started
@@ -2077,7 +2185,7 @@ class _GenerationPublisher:
         )
 
         with self._residency.borrow_l2(resident.key) as image:
-            state = resident.source.bind(image.tensors()[resident.tensor_offset :])
+            state = resident.source.bind(image.tensors())
             yield trainer_rank_optimizer_snapshot_from_cpu(
                 self.runtime,
                 state,

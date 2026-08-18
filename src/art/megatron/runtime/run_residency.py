@@ -75,7 +75,7 @@ class RunResidencyManager:
         self._mover = TensorResidencyMover()
         self._snapshot_barrier = snapshot_barrier
         self._states: dict[ResidencyKey, _ManagedState] = {}
-        self._installed_base: dict[str, ResidencyKey] = {}
+        self._installed_components: dict[tuple[str, str], ResidencyKey] = {}
         self._pool = ThreadPoolExecutor(
             max_workers=config.limits.max_concurrent_transitions,
             thread_name_prefix="art-residency",
@@ -98,8 +98,11 @@ class RunResidencyManager:
         self._require_open()
         if not tensors or any(tensor.device.type != "cuda" for tensor in tensors):
             raise RuntimeError("new L1 residency must be a non-empty CUDA tensor tuple")
-        if key.representation == "learner" and key.run_id in self._installed_base:
-            raise RuntimeError("a run may have only one installed base generation")
+        component = self._exclusive_component(key)
+        if component is not None and component in self._installed_components:
+            raise RuntimeError(
+                f"a run may have only one installed {key.representation} generation"
+            )
         byte_count = self._mover.byte_count(tensors, "cuda")
         managed = _ManagedState(key=key, tensors=tensors)
         with self._admission_locks["l1_gpu"]:
@@ -110,8 +113,8 @@ class RunResidencyManager:
             with self._lock:
                 self._commit(reservation)
                 self._states[key] = managed
-                if key.representation == "learner":
-                    self._installed_base[key.run_id] = key
+                if component is not None:
+                    self._installed_components[component] = key
         return self.ensure_l2(key)
 
     def register_l2(
@@ -149,8 +152,13 @@ class RunResidencyManager:
         retire_source: bool = False,
     ) -> Future[HostTensorImage]:
         self._require_open()
-        if source.representation != "learner" or target.representation != "learner":
-            raise ValueError("only committed base generations may advance in place")
+        if (
+            source.representation not in ("weights", "optimizer")
+            or target.representation != source.representation
+        ):
+            raise ValueError(
+                "only committed weight or optimizer generations may advance in place"
+            )
         if retire_source:
             self.ensure_l2(source).result()
         byte_count = self._mover.byte_count(tensors, "cuda")
@@ -158,15 +166,17 @@ class RunResidencyManager:
         with self._admission_locks["l1_gpu"]:
             self._reclaim_l1(max(byte_count - old_bytes, 0), protected={source, target})
             with self._lock:
-                if self._installed_base.get(source.run_id) != source:
+                component = self._exclusive_component(source)
+                assert component is not None
+                if self._installed_components.get(component) != source:
                     raise RuntimeError(
-                        "residency source is not the installed generation"
+                        f"residency source is not the installed {source.representation}"
                     )
                 if source.run_id != target.run_id:
                     raise ValueError("residency advance cannot change runs")
                 self.ledger.advance(source, target, "l1_gpu", byte_count=byte_count)
                 self._states[target] = _ManagedState(key=target, tensors=tensors)
-                self._installed_base[target.run_id] = target
+                self._installed_components[component] = target
         if retire_source:
             self._retire(source)
         return self.ensure_l2(target)
@@ -252,8 +262,9 @@ class RunResidencyManager:
         self._require_open()
         if self.ledger.has_copy(key, "l1_gpu"):
             return
-        if key.representation == "learner":
-            self._evict_installed_base(key.run_id)
+        component = self._exclusive_component(key)
+        if component is not None:
+            self._evict_installed_component(component)
         with self._lock:
             state = self._state(key)
             if self.ledger.has_copy(key, "l2_cpu") and state.l2 is not None:
@@ -300,8 +311,8 @@ class RunResidencyManager:
                 self._commit(reservation)
                 state.l1_transition = None
                 state.l1_reservation = None
-                if key.representation == "learner":
-                    self._installed_base[key.run_id] = key
+                if component := self._exclusive_component(key):
+                    self._installed_components[component] = key
             if not self.ledger.has_copy(key, "l1_gpu"):
                 raise RuntimeError("requested generation did not become L1 resident")
             self.ledger.pin(key)
@@ -354,8 +365,12 @@ class RunResidencyManager:
                 self._store.delete(key)
             self.ledger.drop_entry(key)
             self._states.pop(key)
-            if self._installed_base.get(key.run_id) == key:
-                self._installed_base.pop(key.run_id)
+            component = self._exclusive_component(key)
+            if (
+                component is not None
+                and self._installed_components.get(component) == key
+            ):
+                self._installed_components.pop(component)
 
     def retire_async(self, key: ResidencyKey) -> Future[None]:
         self._require_open()
@@ -530,8 +545,8 @@ class RunResidencyManager:
                 self._record_failure(error)
             raise
 
-    def _evict_installed_base(self, run_id: str) -> None:
-        current = self._installed_base.get(run_id)
+    def _evict_installed_component(self, component: tuple[str, str]) -> None:
+        current = self._installed_components.get(component)
         if current is not None:
             self.evict_l1(current)
 
@@ -621,8 +636,15 @@ class RunResidencyManager:
             raise RuntimeError("cannot evict a pinned residency state")
         state.l2.activate()
         self.ledger.drop(key, "l1_gpu")
-        if self._installed_base.get(key.run_id) == key:
-            self._installed_base.pop(key.run_id)
+        component = self._exclusive_component(key)
+        if component is not None and self._installed_components.get(component) == key:
+            self._installed_components.pop(component)
+
+    @staticmethod
+    def _exclusive_component(key: ResidencyKey) -> tuple[str, str] | None:
+        if key.representation not in ("weights", "optimizer"):
+            return None
+        return key.run_id, key.representation
 
     def _submit(self, fn: Any, *args: Any) -> Future[Any]:
         future = self._pool.submit(fn, *args)

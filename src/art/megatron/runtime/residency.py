@@ -22,17 +22,17 @@ class ResidencyKey(BaseModel):
     tenant_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     generation_id: str = Field(min_length=1)
-    representation: Literal["learner", "gradient", "sampler"] = "learner"
+    representation: Literal["weights", "optimizer", "accumulator", "sampler"] = (
+        "weights"
+    )
     accumulator_revision: int = Field(default=0, ge=0)
     topology_fingerprint: str = Field(min_length=1)
     adapter_layout_fingerprint: str = Field(min_length=1)
 
     @model_validator(mode="after")
     def _validate_representation(self) -> "ResidencyKey":
-        if (self.representation == "gradient") != (self.accumulator_revision > 0):
-            raise ValueError(
-                "only gradient residency may have a positive accumulator revision"
-            )
+        if (self.representation == "accumulator") != (self.accumulator_revision > 0):
+            raise ValueError("only accumulator residency may have a positive revision")
         return self
 
 
