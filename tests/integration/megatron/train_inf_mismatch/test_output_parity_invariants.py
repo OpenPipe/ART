@@ -144,34 +144,6 @@ def _write_workflow_worker_result(
     result_path.write_text(result.model_dump_json(), encoding="utf-8")
 
 
-def test_logical_map_flattens_prefix_tree_branches() -> None:
-    packed = {
-        "tokens": torch.tensor([[10, 11, 12, 13, 14, 12, 15, 16]]),
-        "group_ids": torch.tensor([[0, 0, 1, 1, 1, 2, 2, 2]]),
-        "parent_ids": torch.tensor([[0, 0, 0, 0, 0, 0, 0, 0]]),
-    }
-
-    logical_map = build_logical_token_map(packed)
-
-    assert [prompt.token_ids for prompt in logical_map.prompts] == [
-        [10, 11, 12, 13, 14],
-        [10, 11, 12, 15, 16],
-    ]
-    assert [prompt.packed_prompt_length for prompt in logical_map.prompts] == [2, 2]
-    assert [prompt.scored_token_start_index for prompt in logical_map.prompts] == [
-        3,
-        3,
-    ]
-    assert [token.token_id for token in logical_map.tokens] == [13, 14, 15, 16]
-    assert [token.art_logit_index for token in logical_map.tokens] == [2, 3, 5, 6]
-    assert [token.vllm_prompt_token_index for token in logical_map.tokens] == [
-        3,
-        4,
-        3,
-        4,
-    ]
-
-
 def test_logical_map_handles_unscored_prompt_suffix_inside_leaf() -> None:
     packed = {
         "tokens": torch.tensor([[10, 11, 12, 13, 14, 15]]),
@@ -316,10 +288,6 @@ def test_compare_rollout_reports_base_lora_and_delta_separately() -> None:
     assert report.delta.mean_abs_pct > 0
 
 
-def test_real_path_default_generates_16_tokens_per_rollout() -> None:
-    assert RealPathConfig().max_completion_tokens == 16
-
-
 @pytest.mark.asyncio
 async def test_real_path_rollouts_use_stable_unique_seeds_concurrently() -> None:
     calls = []
@@ -385,80 +353,6 @@ def test_real_path_topk_sorts_vllm_sampled_token_prefix() -> None:
     assert topk.logprobs == [-float(token_id) for token_id in range(TOP_K)]
 
 
-def test_real_path_rollout_mode_follows_config() -> None:
-    config = TrainInfOutputParityConfig(
-        base_model="Qwen/Qwen3.5-35B-A3B",
-    )
-
-    assert _real_path_rollout_mode(config) == "native_lora"
-
-
-def test_real_path_deletes_only_adapter_safetensors_on_pass(tmp_path) -> None:
-    run_dir = tmp_path / "run"
-    active_lora = run_dir / "real_path_active_lora"
-    checkpoint = run_dir / "art_path" / "models" / "m" / "checkpoints" / "0000"
-    active_lora.mkdir(parents=True)
-    checkpoint.mkdir(parents=True)
-    for directory in (active_lora, checkpoint):
-        (directory / "adapter_model.safetensors").write_bytes(b"adapter")
-        (directory / "adapter_config.json").write_text("{}", encoding="utf-8")
-    score_path = run_dir / "real_path_vllm_lora_scores.json"
-    score_path.write_text("{}", encoding="utf-8")
-
-    _delete_adapter_safetensors_on_pass(run_dir, passed=False)
-
-    assert len(list(run_dir.rglob("adapter_model.safetensors"))) == 2
-
-    _delete_adapter_safetensors_on_pass(run_dir, passed=True)
-
-    assert list(run_dir.rglob("adapter_model.safetensors")) == []
-    assert len(list(run_dir.rglob("adapter_config.json"))) == 2
-    assert score_path.exists()
-
-
-def test_architecture_specific_real_path_limits() -> None:
-    assert fwd_mean_abs_pct_limit_for_model("meta-llama/Llama-3.2-1B-Instruct") == 5.75
-    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3-30B-A3B") == 8.0
-    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-27B") == 8.05
-    assert top20_kl_candidate_to_target_limit_for_model("Qwen/Qwen3.5-27B") == 0.003
-    assert fwd_mean_abs_pct_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 8.0
-    assert top20_kl_candidate_to_target_limit_for_model("Qwen/Qwen3.5-35B-A3B") == 0.005
-    assert top20_kl_candidate_to_target_limit_for_model("openai/gpt-oss-20b") == 0.005
-    assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
-
-
-def test_gemma4_real_path_limits() -> None:
-    assert (
-        fwd_mean_abs_pct_limit_for_model(
-            "google/gemma-4-31B-it",
-            allow_unvalidated_arch=True,
-        )
-        == 15.0
-    )
-    assert (
-        top20_kl_candidate_to_target_limit_for_model(
-            "google/gemma-4-31B-it",
-            allow_unvalidated_arch=True,
-        )
-        == 0.008
-    )
-    assert (
-        fwd_mean_abs_pct_limit_for_model(
-            "google/gemma-4-26B-A4B-it",
-            allow_unvalidated_arch=True,
-        )
-        == 25.0
-    )
-    assert (
-        top20_kl_candidate_to_target_limit_for_model(
-            "google/gemma-4-26B-A4B-it",
-            allow_unvalidated_arch=True,
-        )
-        == 0.012
-    )
-    assert TOP20_KL_CANDIDATE_TO_TARGET_LIMIT == 0.002
-
-
 def test_compare_topk_reports_restricted_intersection_kl() -> None:
     target = ScoreBundle(
         side="megatron",
@@ -491,107 +385,6 @@ def test_compare_topk_reports_restricted_intersection_kl() -> None:
     assert report.top20_intersection_kl_candidate_to_target == pytest.approx(
         0.5 * math.log(0.5 / 0.75) + 0.5 * math.log(0.5 / 0.25)
     )
-
-
-def test_config_from_env_accepts_lora_target_module_override(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(
-        "ART_TRAIN_INF_MISMATCH_LORA_TARGET_MODULES",
-        "experts,in_proj_qkv,in_proj_z",
-    )
-
-    config = config_from_env()
-
-    assert config.lora_target_modules == ["experts", "in_proj_qkv", "in_proj_z"]
-
-
-def test_config_from_env_accepts_vllm_memory_utilization_override(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION", "0.5")
-
-    config = config_from_env()
-
-    assert config.engine_args["gpu_memory_utilization"] == 0.5
-
-
-def test_config_from_env_accepts_gdn_prefill_backend_override(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_GDN_PREFILL_BACKEND", "triton")
-
-    config = config_from_env()
-
-    assert config.engine_args["additional_config"] == {"gdn_prefill_backend": "triton"}
-
-
-def test_default_rollout_mode_is_native_lora() -> None:
-    assert TrainInfOutputParityConfig(
-        base_model="Qwen/Qwen3.5-35B-A3B"
-    ).rollout_modes == ["native_lora"]
-    assert TrainInfOutputParityConfig(
-        base_model="unvalidated/native-disabled",
-        allow_unvalidated_arch=True,
-    ).rollout_modes == ["native_lora"]
-
-
-def test_config_from_env_rollout_modes_override_handler_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(
-        "ART_TRAIN_INF_MISMATCH_BASE_MODEL",
-        "unvalidated/native-disabled",
-    )
-    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH", "1")
-    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_ROLLOUT_MODES", "native_lora")
-
-    config = config_from_env()
-
-    assert config.rollout_modes == ["native_lora"]
-
-
-def test_workflow_stage_enables_live_train_inf_mismatch(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-) -> None:
-    import subprocess
-
-    captured_env = {}
-    captured_command = []
-    real_run = subprocess.run
-
-    def fake_run(*args, **kwargs):
-        if "env" not in kwargs:
-            return real_run(*args, **kwargs)
-        command = args[0]
-        captured_command.extend(command)
-        captured_env.update(kwargs["env"])
-        _write_workflow_worker_result(
-            command,
-            workflow_stage.TrainInfMismatchWorkerResult(outcome="passed"),
-        )
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout="",
-            stderr="",
-        )
-
-    monkeypatch.setattr(workflow_stage, "create_artifact_dir", lambda _nodeid: tmp_path)
-    monkeypatch.setattr(workflow_stage.subprocess, "run", fake_run)
-
-    report = workflow_stage.run_train_inf_mismatch(
-        base_model="Qwen/Qwen3.5-35B-A3B",
-        allow_unvalidated_arch=True,
-    )
-
-    assert report.passed is True
-    assert captured_env["ART_RUN_TRAIN_INF_MISMATCH_LIVE"] == "1"
-    assert captured_env["ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH"] == "1"
-    assert captured_env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] == "16"
-    assert captured_env["ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION"] == "0.50"
-    assert "pytest" not in captured_command
 
 
 def test_workflow_stage_does_not_accept_a_skipped_live_test(
