@@ -108,11 +108,17 @@ class PinnedCpuSnapshotStager:
         self._next_buffer = 0
 
     def target_like(self, source: torch.Tensor) -> torch.Tensor:
+        return self.target_bytes(source.nbytes).view(source.dtype).view(source.shape)
+
+    def target_bytes(self, required: int) -> torch.Tensor:
+        if required < 1:
+            raise ValueError("pinned staging target must be non-empty")
         if self._buffers is None:
-            return torch.empty_like(source, device="cpu", pin_memory=True)
+            return torch.empty(
+                required, dtype=torch.uint8, device="cpu", pin_memory=True
+            )
         index = self._next_buffer
         self._next_buffer += 1
-        required = source.nbytes
         if index == len(self._buffers):
             self._buffers.append(
                 torch.empty(required, dtype=torch.uint8, device="cpu", pin_memory=True)
@@ -121,7 +127,7 @@ class PinnedCpuSnapshotStager:
             self._buffers[index] = torch.empty(
                 required, dtype=torch.uint8, device="cpu", pin_memory=True
             )
-        return self._buffers[index][:required].view(source.dtype).view(source.shape)
+        return self._buffers[index][:required]
 
     def begin(self) -> PinnedCpuSnapshotBuilder:
         return PinnedCpuSnapshotBuilder(self)

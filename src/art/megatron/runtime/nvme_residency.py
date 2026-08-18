@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
 import hashlib
 import json
 import os
@@ -16,7 +15,7 @@ import torch
 from .residency import ResidencyKey
 from .tensor_residency import HostTensorImage, _StorageGroup, _TensorView
 
-_FORMAT = "art_tensor_residency_v1"
+_FORMAT = "art_tensor_residency_v2"
 _DATA_FILE = "state.bin"
 _MANIFEST_FILE = "manifest.json"
 
@@ -51,7 +50,7 @@ class NvmeTensorRecord(BaseModel):
 class NvmeResidencyManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    format: Literal["art_tensor_residency_v1"] = _FORMAT
+    format: Literal["art_tensor_residency_v2"] = _FORMAT
     key: ResidencyKey
     input_tensor_count: int = Field(ge=1)
     payload_bytes: int = Field(ge=1)
@@ -170,6 +169,21 @@ class NvmeResidencyStore:
         self._verify_data_size(destination, manifest)
         return self._map_image(destination, manifest, tensors)
 
+    def read_committed(
+        self,
+        key: ResidencyKey,
+        manifest: NvmeResidencyManifest,
+        tensors: tuple[torch.Tensor, ...],
+        targets: tuple[torch.Tensor, ...],
+    ) -> HostTensorImage:
+        """Read L3 directly into caller-owned CPU transfer or L2 buffers."""
+        destination = self.path(key)
+        if self._read_manifest(destination) != manifest:
+            raise RuntimeError("committed L3 residency manifest changed identity")
+        self._verify_data_size(destination, manifest)
+        self._read_targets(destination, manifest, targets)
+        return self._image_from_targets(manifest, tensors, targets)
+
     def _map_image(
         self,
         destination: Path,
@@ -188,6 +202,21 @@ class NvmeResidencyStore:
             mapped[item.offset : item.offset + item.byte_count]
             for item in manifest.storages
         )
+        return self._image_from_targets(manifest, tensors, targets)
+
+    @staticmethod
+    def _image_from_targets(
+        manifest: NvmeResidencyManifest,
+        tensors: tuple[torch.Tensor, ...],
+        targets: tuple[torch.Tensor, ...],
+    ) -> HostTensorImage:
+        if len(targets) != len(manifest.storages) or any(
+            target.device.type != "cpu"
+            or target.dtype != torch.uint8
+            or target.numel() != record.byte_count
+            for target, record in zip(targets, manifest.storages, strict=True)
+        ):
+            raise RuntimeError("L3 restore targets do not match committed storages")
         grouped: list[list[_TensorView]] = [[] for _ in manifest.storages]
         for item in manifest.tensors:
             tensor = tensors[item.tensor_index]
@@ -293,9 +322,18 @@ class NvmeResidencyStore:
     ) -> NvmeResidencyManifest:
         digest = hashlib.sha256()
         with (directory / _DATA_FILE).open("wb", buffering=0) as handle:
-            for chunk in self._image_chunks(manifest, image):
-                handle.write(chunk)
-                digest.update(chunk)
+            cursor = 0
+            for record, target in zip(
+                manifest.storages, image.storage_bytes(), strict=True
+            ):
+                if padding := record.offset - cursor:
+                    handle.write(bytes(padding))
+                view = memoryview(target.numpy()).cast("B")
+                for start in range(0, len(view), self.config.io_chunk_bytes):
+                    chunk = view[start : start + self.config.io_chunk_bytes]
+                    handle.write(chunk)
+                    digest.update(chunk)
+                cursor = record.offset + record.byte_count
             handle.flush()
             os.fsync(handle.fileno())
         committed = manifest.model_copy(update={"data_sha256": digest.hexdigest()})
@@ -311,33 +349,51 @@ class NvmeResidencyStore:
         self, manifest: NvmeResidencyManifest, image: HostTensorImage
     ) -> str:
         digest = hashlib.sha256()
-        for chunk in self._image_chunks(manifest, image):
-            digest.update(chunk)
+        for target in image.storage_bytes():
+            digest.update(memoryview(target.numpy()).cast("B"))
         return digest.hexdigest()
-
-    def _image_chunks(
-        self, manifest: NvmeResidencyManifest, image: HostTensorImage
-    ) -> Iterator[bytes | memoryview]:
-        cursor = 0
-        for record, target in zip(
-            manifest.storages, image.storage_bytes(), strict=True
-        ):
-            if padding := record.offset - cursor:
-                yield bytes(padding)
-            view = memoryview(target.numpy())
-            for start in range(0, len(view), self.config.io_chunk_bytes):
-                yield view[start : start + self.config.io_chunk_bytes]
-            cursor = record.offset + record.byte_count
 
     def _verify_data(self, directory: Path, manifest: NvmeResidencyManifest) -> None:
         self._verify_data_size(directory, manifest)
-        path = directory / _DATA_FILE
         digest = hashlib.sha256()
-        with path.open("rb", buffering=0) as handle:
-            while chunk := handle.read(self.config.io_chunk_bytes):
-                digest.update(chunk)
+        scratch = bytearray(self.config.io_chunk_bytes)
+        with (directory / _DATA_FILE).open("rb", buffering=0) as handle:
+            for record in manifest.storages:
+                handle.seek(record.offset)
+                remaining = record.byte_count
+                while remaining:
+                    view = memoryview(scratch)[: min(remaining, len(scratch))]
+                    count = handle.readinto(view)
+                    if count != len(view):
+                        raise RuntimeError(
+                            "L3 residency data ended during verification"
+                        )
+                    digest.update(view)
+                    remaining -= count
         if digest.hexdigest() != manifest.data_sha256:
             raise RuntimeError("L3 residency data checksum changed")
+
+    def _read_targets(
+        self,
+        directory: Path,
+        manifest: NvmeResidencyManifest,
+        targets: tuple[torch.Tensor, ...],
+    ) -> None:
+        digest = hashlib.sha256()
+        with (directory / _DATA_FILE).open("rb", buffering=0) as handle:
+            for record, target in zip(manifest.storages, targets, strict=True):
+                handle.seek(record.offset)
+                view = memoryview(target.numpy()).cast("B")
+                cursor = 0
+                while cursor < len(view):
+                    chunk = view[cursor : cursor + self.config.io_chunk_bytes]
+                    count = handle.readinto(chunk)
+                    if count != len(chunk):
+                        raise RuntimeError("L3 residency data ended during restore")
+                    digest.update(chunk)
+                    cursor += count
+        if digest.hexdigest() != manifest.data_sha256:
+            raise RuntimeError("L3 residency data checksum changed during restore")
 
     @staticmethod
     def _verify_data_size(directory: Path, manifest: NvmeResidencyManifest) -> None:

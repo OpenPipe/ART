@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from threading import Lock
+from threading import Condition, Lock
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -50,10 +50,12 @@ class TensorResidencyTransition:
         stats: TensorResidencyStats,
         fences: tuple[_CudaFence, ...],
         sources: tuple[torch.Tensor, ...],
+        staging: "_PinnedStagerLease | None" = None,
     ) -> None:
         self.stats = stats
         self._fences = fences
         self._sources = sources
+        self._staging = staging
         self._lock = Lock()
         self._resolved = False
 
@@ -63,6 +65,9 @@ class TensorResidencyTransition:
                 return
             for fence in self._fences:
                 torch.cuda.current_stream(fence.device).wait_event(fence.event)
+            if self._staging is not None:
+                self._staging.release_after(self._fences)
+                self._staging = None
             self._sources = ()
             self._resolved = True
 
@@ -72,6 +77,9 @@ class TensorResidencyTransition:
                 return
             for fence in self._fences:
                 fence.event.synchronize()
+            if self._staging is not None:
+                self._staging.release()
+                self._staging = None
             self._sources = ()
             self._resolved = True
 
@@ -137,9 +145,9 @@ class HostTensorImage:
             raise RuntimeError("host image does not cover every input tensor")
         return tuple(tensor for tensor in tensors if tensor is not None)
 
-    def pinned_copy(self) -> "HostTensorImage":
+    def copy(self, *, pin_memory: bool = False) -> "HostTensorImage":
         targets = tuple(
-            torch.empty_like(target, device="cpu", pin_memory=True).copy_(target)
+            torch.empty_like(target, device="cpu", pin_memory=pin_memory).copy_(target)
             for target in self._targets
         )
         return HostTensorImage(
@@ -164,6 +172,7 @@ class TensorResidencySnapshot(HostTensorImage):
         groups: tuple[_StorageGroup, ...],
         targets: tuple[torch.Tensor, ...],
         pending: PendingCpuSnapshot[None],
+        staging: "_PinnedStagerLease",
         input_tensor_count: int,
     ) -> None:
         super().__init__(
@@ -172,6 +181,7 @@ class TensorResidencySnapshot(HostTensorImage):
             input_tensor_count=input_tensor_count,
         )
         self._pending = pending
+        self._staging = staging
         self._lock = Lock()
         self._resolved = False
 
@@ -192,16 +202,90 @@ class TensorResidencySnapshot(HostTensorImage):
             self._pending.resolve()
             self._resolved = True
 
+    def materialize_l2(self) -> HostTensorImage:
+        self.resolve()
+        try:
+            return self.copy()
+        finally:
+            self._staging.release()
+
     def activate(self) -> None:
         self.resolve()
         super().activate()
 
 
+class _PinnedStagerLease:
+    def __init__(
+        self,
+        pool: "_ReusablePinnedStagerPool",
+        stager: PinnedCpuSnapshotStager,
+    ) -> None:
+        self._pool = pool
+        self.stager = stager
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._pool.release(self.stager)
+
+    def release_after(self, fences: tuple[_CudaFence, ...]) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._pool.release(self.stager, fences=fences)
+
+
+class _ReusablePinnedStagerPool:
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("pinned staging capacity must be positive")
+        self._available = [
+            PinnedCpuSnapshotStager(reusable=True) for _ in range(capacity)
+        ]
+        self._pending: list[tuple[PinnedCpuSnapshotStager, tuple[_CudaFence, ...]]] = []
+        self._condition = Condition()
+
+    def acquire(self) -> _PinnedStagerLease:
+        with self._condition:
+            while not self._available:
+                self._reclaim()
+                if not self._available:
+                    self._condition.wait(timeout=0.001)
+            stager = self._available.pop()
+            stager.reset()
+            return _PinnedStagerLease(self, stager)
+
+    def release(
+        self,
+        stager: PinnedCpuSnapshotStager,
+        *,
+        fences: tuple[_CudaFence, ...] = (),
+    ) -> None:
+        with self._condition:
+            if fences and not all(fence.event.query() for fence in fences):
+                self._pending.append((stager, fences))
+            else:
+                self._available.append(stager)
+            self._condition.notify()
+
+    def _reclaim(self) -> None:
+        pending: list[tuple[PinnedCpuSnapshotStager, tuple[_CudaFence, ...]]] = []
+        for stager, fences in self._pending:
+            if all(fence.event.query() for fence in fences):
+                self._available.append(stager)
+            else:
+                pending.append((stager, fences))
+        self._pending = pending
+
+
 class TensorResidencyMover:
     """Move aliased tensor storages without changing owning Python objects."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, staging_capacity: int = 2) -> None:
         self._streams: dict[int, torch.cuda.Stream] = {}
+        self._stagers = _ReusablePinnedStagerPool(staging_capacity)
 
     def byte_count(self, tensors: Iterable[torch.Tensor], device_type: str) -> int:
         return sum(
@@ -218,15 +302,20 @@ class TensorResidencyMover:
         groups = self._groups(tensors)
         if not groups or any(group.source.device.type != "cuda" for group in groups):
             raise RuntimeError("L2 snapshots require non-empty GPU residency")
-        stager = PinnedCpuSnapshotStager()
-        builder = stager.begin()
-        targets = tuple(builder.stage(group.source) for group in groups)
-        return TensorResidencySnapshot(
-            groups=groups,
-            targets=targets,
-            pending=builder.finish(None),
-            input_tensor_count=len(tensors),
-        )
+        staging = self._stagers.acquire()
+        try:
+            builder = staging.stager.begin()
+            targets = tuple(builder.stage(group.source) for group in groups)
+            return TensorResidencySnapshot(
+                groups=groups,
+                targets=targets,
+                pending=builder.finish(None),
+                staging=staging,
+                input_tensor_count=len(tensors),
+            )
+        except BaseException:
+            staging.release()
+            raise
 
     def host_image(self, tensors: Iterable[torch.Tensor]) -> HostTensorImage:
         tensors = tuple(tensors)
@@ -234,7 +323,7 @@ class TensorResidencyMover:
         if not groups or any(group.source.device.type != "cpu" for group in groups):
             raise RuntimeError("L2 admission requires non-empty CPU residency")
         targets = tuple(
-            torch.empty_like(group.source, device="cpu", pin_memory=True).copy_(
+            torch.empty_like(group.source, device="cpu", pin_memory=False).copy_(
                 group.source
             )
             for group in groups
@@ -251,6 +340,8 @@ class TensorResidencyMover:
         self,
         tensors: Iterable[torch.Tensor],
         target: torch.device | str,
+        *,
+        staging: "_PinnedStagerLease | None" = None,
     ) -> TensorResidencyTransition:
         target = self._normalized_device(torch.device(target))
         groups = tuple(
@@ -276,40 +367,62 @@ class TensorResidencyMover:
             raise RuntimeError(
                 "one tensor residency move must use exactly one CUDA device"
             )
+        owned_staging = staging
         if target.type == "cuda" and any(
             group.source.device.type == "cpu" and not group.source.is_pinned()
             for group in groups
         ):
-            raise RuntimeError("L2 CPU residency must use pinned memory")
+            if staging is not None:
+                raise RuntimeError("caller staging does not own the CPU sources")
+            owned_staging = self._stagers.acquire()
+            try:
+                groups = tuple(
+                    group.model_copy(
+                        update={
+                            "source": owned_staging.stager.target_like(
+                                group.source
+                            ).copy_(group.source)
+                        }
+                    )
+                    for group in groups
+                )
+            except BaseException:
+                owned_staging.release()
+                raise
         device = cuda_devices.pop()
         stream = self._stream(device)
         sources: list[torch.Tensor] = []
-        with torch.cuda.device(device), torch.cuda.stream(stream), torch.no_grad():
-            if any(group.source.device.type == "cuda" for group in groups):
-                stream.wait_stream(torch.cuda.current_stream(device))
-            for group in groups:
-                destination = torch.empty(
-                    group.source.numel(),
-                    dtype=torch.uint8,
-                    device=target,
-                    pin_memory=target.type == "cpu",
-                )
-                destination.copy_(group.source, non_blocking=True)
-                if group.source.device.type == "cuda":
-                    group.source.record_stream(stream)
-                sources.append(group.source)
-                storage = destination.untyped_storage()
-                for view in group.views:
-                    replacement = torch.empty(0, dtype=view.dtype, device=target)
-                    replacement.set_(
-                        storage,
-                        view.storage_offset,
-                        view.shape,
-                        view.stride,
+        try:
+            with torch.cuda.device(device), torch.cuda.stream(stream), torch.no_grad():
+                if any(group.source.device.type == "cuda" for group in groups):
+                    stream.wait_stream(torch.cuda.current_stream(device))
+                for group in groups:
+                    destination = torch.empty(
+                        group.source.numel(),
+                        dtype=torch.uint8,
+                        device=target,
+                        pin_memory=target.type == "cpu",
                     )
-                    view.tensor.data = replacement
-            event = torch.cuda.Event(blocking=True)
-            event.record(stream)
+                    destination.copy_(group.source, non_blocking=True)
+                    if group.source.device.type == "cuda":
+                        group.source.record_stream(stream)
+                    sources.append(group.source)
+                    storage = destination.untyped_storage()
+                    for view in group.views:
+                        replacement = torch.empty(0, dtype=view.dtype, device=target)
+                        replacement.set_(
+                            storage,
+                            view.storage_offset,
+                            view.shape,
+                            view.stride,
+                        )
+                        view.tensor.data = replacement
+                event = torch.cuda.Event(blocking=True)
+                event.record(stream)
+        except BaseException:
+            if owned_staging is not None:
+                owned_staging.release()
+            raise
         return TensorResidencyTransition(
             stats=TensorResidencyStats(
                 storage_count=len(groups),
@@ -318,7 +431,11 @@ class TensorResidencyMover:
             ),
             fences=(_CudaFence(device=device, event=event),),
             sources=tuple(sources),
+            staging=owned_staging,
         )
+
+    def staging(self) -> "_PinnedStagerLease":
+        return self._stagers.acquire()
 
     def _stream(self, device: int) -> torch.cuda.Stream:
         stream = self._streams.get(device)

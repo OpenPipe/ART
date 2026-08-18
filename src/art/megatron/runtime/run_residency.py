@@ -72,7 +72,9 @@ class RunResidencyManager:
         self.config = config
         self.ledger = ResidencyLedger(config.limits)
         self._store = NvmeResidencyStore(config.nvme)
-        self._mover = TensorResidencyMover()
+        self._mover = TensorResidencyMover(
+            staging_capacity=config.limits.max_concurrent_transitions
+        )
         self._snapshot_barrier = snapshot_barrier
         self._states: dict[ResidencyKey, _ManagedState] = {}
         self._installed_components: dict[tuple[str, str], ResidencyKey] = {}
@@ -160,7 +162,11 @@ class RunResidencyManager:
                 "only committed weight or optimizer generations may advance in place"
             )
         if retire_source:
-            self.ensure_l2(source).result()
+            if not (
+                self.ledger.has_copy(source, "l2_cpu")
+                or self.ledger.has_copy(source, "l3_nvme")
+            ):
+                self.ensure_l2(source).result()
         byte_count = self._mover.byte_count(tensors, "cuda")
         old_bytes = self.ledger.copy(source, "l1_gpu").byte_count
         with self._admission_locks["l1_gpu"]:
@@ -269,8 +275,10 @@ class RunResidencyManager:
             state = self._state(key)
             if self.ledger.has_copy(key, "l2_cpu") and state.l2 is not None:
                 byte_count = state.l2.stats.byte_count
+                source: ResidencyTier = "l2_cpu"
             elif self.ledger.has_copy(key, "l3_nvme") and state.l3_manifest is not None:
                 byte_count = state.l3_manifest.payload_bytes
+                source = "l3_nvme"
             else:
                 raise RuntimeError("state has no local source for L1 materialization")
         with self._admission_locks["l1_gpu"]:
@@ -278,23 +286,46 @@ class RunResidencyManager:
                 if self._state(key).l1_transition is not None:
                     return
             self._reclaim_l1(byte_count, protected={key})
-            l2 = self.ensure_l2(key).result()
-            with self._lock:
-                state = self._state(key)
-                if state.l1_transition is not None:
-                    return
-                l2.activate()
-                reservation = self._reserve(
-                    key,
-                    source="l2_cpu",
-                    target="l1_gpu",
-                    byte_count=byte_count,
+            state = self._state(key)
+            reservation = self._reserve(
+                key,
+                source=source,
+                target="l1_gpu",
+                byte_count=byte_count,
+            )
+            staging = None
+            try:
+                if source == "l2_cpu":
+                    l2 = self.ensure_l2(key).result()
+                    l2.activate()
+                else:
+                    manifest = state.l3_manifest
+                    if manifest is None:
+                        raise RuntimeError("L3 residency lost its committed manifest")
+                    staging = self._mover.staging()
+                    targets = tuple(
+                        staging.stager.target_bytes(record.byte_count)
+                        for record in manifest.storages
+                    )
+                    image = self._store.read_committed(
+                        key, manifest, state.tensors, targets
+                    )
+                    image.activate()
+                transition = self._mover.move(
+                    state.tensors,
+                    self.config.device,
+                    staging=staging,
                 )
-                try:
-                    transition = self._mover.move(state.tensors, self.config.device)
-                except BaseException:
+            except BaseException:
+                if staging is not None:
+                    staging.release()
+                self._cancel(reservation)
+                raise
+            with self._lock:
+                if state.l1_transition is not None:
+                    transition.synchronize()
                     self._cancel(reservation)
-                    raise
+                    return
                 state.l1_reservation = reservation
                 state.l1_transition = transition
 
@@ -325,7 +356,10 @@ class RunResidencyManager:
         self.ledger.touch(key)
 
     def evict_l1(self, key: ResidencyKey) -> None:
-        self.ensure_l2(key).result()
+        if not (
+            self.ledger.has_copy(key, "l2_cpu") or self.ledger.has_copy(key, "l3_nvme")
+        ):
+            self.ensure_l2(key).result()
         with self._lock:
             self._evict_l1_locked(key)
 
@@ -462,11 +496,11 @@ class RunResidencyManager:
         snapshot: TensorResidencySnapshot,
     ) -> HostTensorImage:
         try:
-            snapshot.resolve()
+            image = snapshot.materialize_l2()
             with self._lock:
                 self._commit(reservation)
-                state.l2 = snapshot
-                return snapshot
+                state.l2 = image
+                return image
         except BaseException as error:
             self._abort(reservation, error)
             raise
@@ -489,18 +523,22 @@ class RunResidencyManager:
     ) -> HostTensorImage:
         try:
             with self._lock:
-                mapped = state.l3
                 manifest = state.l3_manifest
-            if mapped is None or manifest is None:
+            if manifest is None:
                 raise RuntimeError("L3 residency has no verified mapped image")
-            image = mapped.pinned_copy()
+            targets = tuple(
+                torch.empty(record.byte_count, dtype=torch.uint8)
+                for record in manifest.storages
+            )
+            image = self._store.read_committed(
+                state.key, manifest, state.tensors, targets
+            )
             with self._lock:
                 self._commit(
                     reservation,
                     immutable_ref=str(self._store.path(state.key)),
                     digest=manifest.data_sha256,
                 )
-                state.l3 = mapped
                 state.l3_manifest = manifest
                 state.l2 = image
                 return image
@@ -558,7 +596,11 @@ class RunResidencyManager:
             "l1_gpu", reclaim, protected=protected, require_other_copy=True
         )
         for candidate in candidates:
-            self.ensure_l2(candidate).result()
+            if not (
+                self.ledger.has_copy(candidate, "l2_cpu")
+                or self.ledger.has_copy(candidate, "l3_nvme")
+            ):
+                self.ensure_l2(candidate).result()
             with self._lock:
                 self._evict_l1_locked(candidate)
 
@@ -630,11 +672,12 @@ class RunResidencyManager:
         state = self._state(key)
         if state.l1_transition is not None:
             raise RuntimeError("cannot evict an active L1 transfer")
-        if state.l2 is None:
-            raise RuntimeError("cannot evict L1 before L2 is ready")
+        host = state.l2 if state.l2 is not None else state.l3
+        if host is None:
+            raise RuntimeError("cannot evict L1 without a lossless host copy")
         if self.ledger.entry(key).pin_count:
             raise RuntimeError("cannot evict a pinned residency state")
-        state.l2.activate()
+        host.activate()
         self.ledger.drop(key, "l1_gpu")
         component = self._exclusive_component(key)
         if component is not None and self._installed_components.get(component) == key:
