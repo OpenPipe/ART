@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from threading import RLock
+from threading import Condition, RLock
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -83,6 +83,8 @@ class RunResidencyManager:
         self._retirements: dict[ResidencyKey, Future[None]] = {}
         self._failures: list[BaseException] = []
         self._lock = RLock()
+        self._transition_slots = Condition(self._lock)
+        self._active_transitions = 0
         self._closing = False
         self._closed = False
 
@@ -96,10 +98,10 @@ class RunResidencyManager:
             raise RuntimeError("a run may have only one installed base generation")
         byte_count = self._mover.byte_count(tensors, "cuda")
         self._reclaim_l1(byte_count, protected={key})
-        reservation = self.ledger.reserve(
+        reservation = self._reserve(
             key, source=None, target="l1_gpu", byte_count=byte_count
         )
-        self.ledger.commit(reservation)
+        self._commit(reservation)
         with self._lock:
             self._states[key] = _ManagedState(key=key, tensors=tensors)
             if key.accumulator_revision == 0:
@@ -115,12 +117,12 @@ class RunResidencyManager:
             raise RuntimeError("new L2 residency must be a non-empty CPU tensor tuple")
         byte_count = self._mover.byte_count(tensors, "cpu")
         self._reclaim("l2_cpu", byte_count, protected={key})
-        reservation = self.ledger.reserve(
+        reservation = self._reserve(
             key, source=None, target="l2_cpu", byte_count=byte_count
         )
         try:
             image = self._mover.host_image(tensors)
-            self.ledger.commit(reservation)
+            self._commit(reservation)
         except BaseException as error:
             self._abort(reservation, error)
             raise
@@ -168,8 +170,25 @@ class RunResidencyManager:
                 return state.l2_future
             if self.ledger.has_copy(key, "l1_gpu"):
                 byte_count = self._mover.byte_count(state.tensors, "cuda")
-                self._reclaim("l2_cpu", byte_count, protected={key})
-                reservation = self.ledger.reserve(
+                source: ResidencyTier = "l1_gpu"
+            elif self.ledger.has_copy(key, "l3_nvme"):
+                if state.l3_manifest is None:
+                    raise RuntimeError("L3 residency has no committed manifest")
+                byte_count = state.l3_manifest.payload_bytes
+                source = "l3_nvme"
+            else:
+                raise RuntimeError("state has no local source for L2 materialization")
+        self._reclaim("l2_cpu", byte_count, protected={key})
+        with self._lock:
+            state = self._state(key)
+            if state.l2 is not None:
+                return _resolved_future(state.l2)
+            if state.l2_future is not None:
+                return state.l2_future
+            if not self.ledger.has_copy(key, source):
+                raise RuntimeError("L2 residency source changed during reclamation")
+            if source == "l1_gpu":
+                reservation = self._reserve(
                     key,
                     source="l1_gpu",
                     target="l2_cpu",
@@ -179,23 +198,19 @@ class RunResidencyManager:
                     snapshot = self._mover.snapshot(state.tensors)
                     self._snapshot_barrier.register(snapshot.pending)
                 except BaseException:
-                    self.ledger.abort(reservation)
+                    self._cancel(reservation)
                     raise
                 future = self._submit(
                     self._finish_l2_snapshot, state, reservation, snapshot
                 )
-            elif self.ledger.has_copy(key, "l3_nvme"):
-                byte_count = self.ledger.copy(key, "l3_nvme").byte_count
-                self._reclaim("l2_cpu", byte_count, protected={key})
-                reservation = self.ledger.reserve(
+            else:
+                reservation = self._reserve(
                     key,
                     source="l3_nvme",
                     target="l2_cpu",
                     byte_count=byte_count,
                 )
                 future = self._submit(self._restore_l2, state, reservation)
-            else:
-                raise RuntimeError("state has no local source for L2 materialization")
             state.l2_future = future
             return future
 
@@ -219,14 +234,14 @@ class RunResidencyManager:
             return
         if key.accumulator_revision == 0:
             self._evict_installed_base(key.run_id)
-        local = tuple(
-            self.ledger.copy(key, tier)
-            for tier in ("l2_cpu", "l3_nvme")
-            if self.ledger.has_copy(key, tier)
-        )
-        if not local:
-            raise RuntimeError("state has no local source for L1 materialization")
-        byte_count = local[0].byte_count
+        with self._lock:
+            state = self._state(key)
+            if self.ledger.has_copy(key, "l2_cpu") and state.l2 is not None:
+                byte_count = state.l2.stats.byte_count
+            elif self.ledger.has_copy(key, "l3_nvme") and state.l3_manifest is not None:
+                byte_count = state.l3_manifest.payload_bytes
+            else:
+                raise RuntimeError("state has no local source for L1 materialization")
         self._reclaim_l1(byte_count, protected={key})
         l2 = self.ensure_l2(key).result()
         with self._lock:
@@ -234,7 +249,7 @@ class RunResidencyManager:
             if state.l1_transition is not None:
                 return
             l2.activate()
-            reservation = self.ledger.reserve(
+            reservation = self._reserve(
                 key,
                 source="l2_cpu",
                 target="l1_gpu",
@@ -243,7 +258,7 @@ class RunResidencyManager:
             try:
                 transition = self._mover.move(state.tensors, self.config.device)
             except BaseException:
-                self.ledger.abort(reservation)
+                self._cancel(reservation)
                 raise
             state.l1_reservation = reservation
             state.l1_transition = transition
@@ -258,7 +273,7 @@ class RunResidencyManager:
             if transition is not None:
                 assert reservation is not None
                 transition.wait_on_current_stream()
-                self.ledger.commit(reservation)
+                self._commit(reservation)
                 state.l1_transition = None
                 state.l1_reservation = None
                 if key.accumulator_revision == 0:
@@ -297,13 +312,13 @@ class RunResidencyManager:
             ) != (immutable_ref, digest, byte_count):
                 raise RuntimeError("L4 residency identity changed after commit")
             return
-        reservation = self.ledger.reserve(
+        reservation = self._reserve(
             key,
             source=("l3_nvme" if self.ledger.has_copy(key, "l3_nvme") else "l2_cpu"),
             target="l4_archive",
             byte_count=byte_count,
         )
-        self.ledger.commit(reservation, immutable_ref=immutable_ref, digest=digest)
+        self._commit(reservation, immutable_ref=immutable_ref, digest=digest)
 
     def l2_image(self, key: ResidencyKey) -> HostTensorImage:
         return self.ensure_l2(key).result()
@@ -373,6 +388,7 @@ class RunResidencyManager:
             if self._closing:
                 raise RuntimeError("run residency manager close is already in progress")
             self._closing = True
+            self._transition_slots.notify_all()
             futures = tuple(self._futures)
         _done, pending = wait(futures, timeout=self.config.shutdown_timeout_s)
         self._pool.shutdown(wait=False, cancel_futures=True)
@@ -385,7 +401,7 @@ class RunResidencyManager:
                     if state.l1_transition is not None:
                         assert state.l1_reservation is not None
                         state.l1_transition.synchronize()
-                        self.ledger.commit(state.l1_reservation)
+                        self._commit(state.l1_reservation)
                         state.l1_transition = None
                         state.l1_reservation = None
                     self._retire(state.key)
@@ -418,7 +434,7 @@ class RunResidencyManager:
         try:
             snapshot.resolve()
             with self._lock:
-                self.ledger.commit(reservation)
+                self._commit(reservation)
                 state.l2 = snapshot
                 return snapshot
         except BaseException as error:
@@ -445,7 +461,7 @@ class RunResidencyManager:
             mapped, manifest = self._store.load(state.key, state.tensors)
             image = mapped.pinned_copy()
             with self._lock:
-                self.ledger.commit(
+                self._commit(
                     reservation,
                     immutable_ref=str(self._store.path(state.key)),
                     digest=manifest.data_sha256,
@@ -466,20 +482,23 @@ class RunResidencyManager:
         reservation: ResidencyReservation | None = None
         try:
             image = l2_future.result()
+            byte_count = self._store.physical_bytes(state.key, image)
             with self._lock:
-                self._reclaim("l3_nvme", image.stats.byte_count, protected={state.key})
-                reservation = self.ledger.reserve(
+                self._reclaim("l3_nvme", byte_count, protected={state.key})
+                reservation = self._reserve(
                     state.key,
                     source="l2_cpu",
                     target="l3_nvme",
-                    byte_count=image.stats.byte_count,
+                    byte_count=byte_count,
                 )
             manifest = self._store.write(state.key, image)
+            if manifest.physical_bytes != byte_count:
+                raise RuntimeError("L3 residency physical size changed during commit")
             mapped, loaded = self._store.load(state.key, state.tensors)
             if loaded != manifest:
                 raise RuntimeError("L3 residency changed immediately after commit")
             with self._lock:
-                self.ledger.commit(
+                self._commit(
                     reservation,
                     immutable_ref=str(self._store.path(state.key)),
                     digest=manifest.data_sha256,
@@ -507,10 +526,9 @@ class RunResidencyManager:
             "l1_gpu", reclaim, protected=protected, require_other_copy=True
         )
         for candidate in candidates:
-            self.ensure_l3(candidate).result()
+            self.ensure_l2(candidate).result()
             with self._lock:
                 self._evict_l1_locked(candidate)
-                self._evict_l2(candidate)
 
     def _reclaim(
         self,
@@ -525,31 +543,16 @@ class RunResidencyManager:
         candidates = self.ledger.eviction_candidates(
             tier,
             reclaim,
-            protected={
-                *protected,
-                *(
-                    key
-                    for key in self._states
-                    if tier == "l2_cpu"
-                    and not (
-                        self.ledger.has_copy(key, "l1_gpu")
-                        or self.ledger.has_copy(key, "l3_nvme")
-                    )
-                ),
-                *(
-                    key
-                    for key in self._states
-                    if tier == "l3_nvme"
-                    and not (
-                        self.ledger.has_copy(key, "l1_gpu")
-                        or self.ledger.has_copy(key, "l2_cpu")
-                    )
-                ),
-            },
-            require_other_copy=True,
+            protected=protected,
+            require_other_copy=tier != "l2_cpu",
         )
         for candidate in candidates:
             if tier == "l2_cpu":
+                if not (
+                    self.ledger.has_copy(candidate, "l1_gpu")
+                    or self.ledger.has_copy(candidate, "l3_nvme")
+                ):
+                    self.ensure_l3(candidate).result()
                 self._evict_l2(candidate)
             elif tier == "l3_nvme":
                 self._evict_l3(candidate)
@@ -622,10 +625,53 @@ class RunResidencyManager:
             if state is not None and state.l2_demotion is future:
                 state.l2_demotion = None
 
+    def _reserve(
+        self,
+        key: ResidencyKey,
+        *,
+        source: ResidencyTier | None,
+        target: ResidencyTier,
+        byte_count: int,
+    ) -> ResidencyReservation:
+        with self._transition_slots:
+            limit = self.config.limits.max_concurrent_transitions
+            while self._active_transitions >= limit:
+                if self._closing or self._closed:
+                    raise RuntimeError("run residency manager is closed")
+                self._transition_slots.wait()
+                self._raise_failures()
+            reservation = self.ledger.reserve(
+                key, source=source, target=target, byte_count=byte_count
+            )
+            self._active_transitions += 1
+            return reservation
+
+    def _commit(
+        self,
+        reservation: ResidencyReservation,
+        *,
+        immutable_ref: str | None = None,
+        digest: str | None = None,
+    ) -> None:
+        with self._transition_slots:
+            self.ledger.commit(reservation, immutable_ref=immutable_ref, digest=digest)
+            self._release_transition_slot()
+
+    def _cancel(self, reservation: ResidencyReservation) -> None:
+        with self._transition_slots:
+            self.ledger.abort(reservation)
+            self._release_transition_slot()
+
+    def _release_transition_slot(self) -> None:
+        if self._active_transitions < 1:
+            raise RuntimeError("residency transition accounting underflow")
+        self._active_transitions -= 1
+        self._transition_slots.notify()
+
     def _abort(self, reservation: ResidencyReservation, error: BaseException) -> None:
         with self._lock:
             try:
-                self.ledger.abort(reservation)
+                self._cancel(reservation)
             finally:
                 self._failures.append(error)
 

@@ -80,6 +80,10 @@ class NvmeResidencyManifest(BaseModel):
             raise ValueError("L3 residency storage index is invalid")
         return self
 
+    @property
+    def physical_bytes(self) -> int:
+        return self.data_bytes + len(self.model_dump_json().encode())
+
 
 class NvmeResidencyStore:
     """Atomic, content-verified L3 storage for one rank's live tensor images."""
@@ -113,7 +117,7 @@ class NvmeResidencyStore:
                 self._verify_data(destination, existing)
                 return existing
             free = shutil.disk_usage(self.root).free
-            required = manifest.data_bytes + self.config.min_free_bytes
+            required = manifest.physical_bytes + self.config.min_free_bytes
             if free < required:
                 raise RuntimeError(
                     f"L3 residency free-space floor exceeded: free={free}, "
@@ -130,6 +134,12 @@ class NvmeResidencyStore:
                 if temporary.exists():
                     shutil.rmtree(temporary)
                 raise
+
+    def physical_bytes(self, key: ResidencyKey, image: HostTensorImage) -> int:
+        resolve = getattr(image, "resolve", None)
+        if callable(resolve):
+            resolve()
+        return self._manifest(key, image).physical_bytes
 
     def load(
         self,
