@@ -14,6 +14,7 @@ from art.types import MegatronRuntimeConfig
 
 from ..runtime.build import build_trainer_runtime_spec
 from ..runtime.local import compile_local_training_topology
+from ..runtime.run_residency import RunResidencyConfig
 from ..runtime_config import init_megatron_runtime_config
 from .slot import MegatronTrainingSlot
 
@@ -45,6 +46,7 @@ class LocalMegatronTrainingSlotConfig(BaseModel):
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     chat_template_tool_schema_format: Literal["default", "vllm_openai"] = "default"
     sampler_store: S3ObjectStoreConfig | None = None
+    run_residency: RunResidencyConfig
 
     @model_validator(mode="after")
     def _validate_lora(self) -> "LocalMegatronTrainingSlotConfig":
@@ -136,6 +138,7 @@ class LocalMegatronTrainingSlot:
                 config=internal_config,
                 enable_expert_replay=config.enable_moe_routing_replay,
                 offload_between_jobs=False,
+                run_residency=config.run_residency,
             )
             trainer = await runtime.start_trainer_slot(
                 runtime_spec,

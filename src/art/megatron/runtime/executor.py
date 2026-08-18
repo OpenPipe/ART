@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 import gc
+import hashlib
 import math
 from pathlib import Path
 from threading import BoundedSemaphore, Event, Lock
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 from pydantic import BaseModel, ConfigDict, Field
 import torch
@@ -36,6 +38,8 @@ from .publication import (
     TrainerPublicationSucceeded,
     TrainerRankPublication,
 )
+from .residency import ResidencyKey
+from .run_residency import RunResidencyManager
 from .specs import (
     ForwardBackwardJobSpec,
     ForwardJobSpec,
@@ -614,11 +618,16 @@ class MegatronTrainJobExecutor:
 class _ResidentRunState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    tenant_id: str
     run_id: str
     training_session_id: str
     learner_version: int
     adapter_config: dict[str, Any]
     gradients: Any
+    base_key: ResidencyKey
+    gradient_keys: dict[str, ResidencyKey] = Field(default_factory=dict)
+    next_accumulator_revision: int = 1
+    registration_complete: bool = False
 
 
 class MCoreRunSlotExecutor:
@@ -633,15 +642,25 @@ class MCoreRunSlotExecutor:
             runtime,
             capacity=int(runtime.snapshot_pool_capacity),
         )
+        if runtime.run_residency_config is None:
+            raise RuntimeError("multi-run Megatron requires explicit residency limits")
+        if runtime.optimizer_layout_fingerprint is None:
+            raise RuntimeError("multi-run Megatron has no topology fingerprint")
+        self._residency = RunResidencyManager(
+            runtime.run_residency_config,
+            snapshot_barrier=runtime.optimizer_snapshot_barrier,
+        )
         self._runs: dict[str, _ResidentRunState] = {}
         self._closed = False
 
     def register_run(
         self,
         *,
+        tenant_id: str,
         run_id: str,
         training_session_id: str,
         learner_version: int,
+        generation_id: str,
         adapter_path: str,
     ) -> None:
         if self._closed:
@@ -655,10 +674,14 @@ class MCoreRunSlotExecutor:
         from art.trainer_rank import MaterializedCheckpoint
 
         adapter_config = load_adapter_config(adapter_path)
+        adapter_layout_fingerprint = hashlib.sha256(
+            encode_adapter_config(adapter_config)
+        ).hexdigest()
         self._slot_trainer.load_checkpoint_sync(
             MaterializedCheckpoint(path=run_id, directory=adapter_path)
         )
         self._runs[run_id] = _ResidentRunState(
+            tenant_id=tenant_id,
             run_id=run_id,
             training_session_id=training_session_id,
             learner_version=learner_version,
@@ -666,17 +689,36 @@ class MCoreRunSlotExecutor:
             gradients=ParameterGradientAccumulator(
                 parameters=self._slot_trainer.checkpoint_slot_parameters(run_id)
             ),
+            base_key=ResidencyKey(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                generation_id=generation_id,
+                topology_fingerprint=self.runtime.optimizer_layout_fingerprint,
+                adapter_layout_fingerprint=adapter_layout_fingerprint,
+            ),
         )
 
+    def complete_run_registration(self, run_id: str) -> None:
+        state = self._require_run(run_id, require_complete=False)
+        if state.registration_complete:
+            return
+        tensors = self._slot_trainer.checkpoint_slot_residency_tensors(run_id).all
+        self._residency.register_l1(state.base_key, tensors)
+        state.registration_complete = True
+
     def optimizer_layout(self, run_id: str) -> Any:
-        self._require_run(run_id)
+        self._require_run(run_id, require_complete=False)
         return self._slot_trainer.checkpoint_slot_optimizer_layout(run_id)
 
     def restore_optimizer_state(
-        self, run_id: str, state: "TrainerRankOptimizerState"
+        self, run_id: str, optimizer_state: "TrainerRankOptimizerState"
     ) -> None:
-        self._require_run(run_id)
-        self._slot_trainer.restore_checkpoint_slot_optimizer_state(run_id, state)
+        run = self._require_run(run_id, require_complete=False)
+        if run.registration_complete:
+            raise RuntimeError("cannot restore optimizer after residency registration")
+        self._slot_trainer.restore_checkpoint_slot_optimizer_state(
+            run_id, optimizer_state
+        )
 
     def execute_forward_backward(
         self,
@@ -693,14 +735,16 @@ class MCoreRunSlotExecutor:
             execute_megatron_dynamic_lora_forward_backward_job,
         )
 
-        result = execute_megatron_dynamic_lora_forward_backward_job(
-            self.runtime,
-            job,
-            batch.tensors,
-            slot_trainer=self._slot_trainer,
-            gradient_accumulator=state.gradients,
-            cancelled=cancelled,
-        )
+        with self._resident(state, include_gradients=True):
+            result = execute_megatron_dynamic_lora_forward_backward_job(
+                self.runtime,
+                job,
+                batch.tensors,
+                slot_trainer=self._slot_trainer,
+                gradient_accumulator=state.gradients,
+                cancelled=cancelled,
+            )
+            self._register_gradient_contribution(state, job.operation_id)
         step = result.result
         return {
             "operation_id": job.operation_id,
@@ -723,12 +767,13 @@ class MCoreRunSlotExecutor:
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_dynamic_lora_forward_job
 
-        result = execute_megatron_dynamic_lora_forward_job(
-            self.runtime,
-            job,
-            batch.tensors,
-            cancelled=cancelled,
-        )
+        with self._resident(state):
+            result = execute_megatron_dynamic_lora_forward_job(
+                self.runtime,
+                job,
+                batch.tensors,
+                cancelled=cancelled,
+            )
         return {
             **result,
             "token_logprobs": _command_token_logprobs(batch, result["token_logprobs"]),
@@ -748,14 +793,17 @@ class MCoreRunSlotExecutor:
             execute_megatron_dynamic_lora_sft_forward_backward_job,
         )
 
-        return execute_megatron_dynamic_lora_sft_forward_backward_job(
-            self.runtime,
-            job,
-            batch,
-            slot_trainer=self._slot_trainer,
-            gradient_accumulator=state.gradients,
-            cancelled=cancelled,
-        )
+        with self._resident(state, include_gradients=True):
+            result = execute_megatron_dynamic_lora_sft_forward_backward_job(
+                self.runtime,
+                job,
+                batch,
+                slot_trainer=self._slot_trainer,
+                gradient_accumulator=state.gradients,
+                cancelled=cancelled,
+            )
+            self._register_gradient_contribution(state, job.operation_id)
+            return result
 
     def execute_sft_forward(
         self,
@@ -770,12 +818,13 @@ class MCoreRunSlotExecutor:
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_dynamic_lora_sft_forward_job
 
-        return execute_megatron_dynamic_lora_sft_forward_job(
-            self.runtime,
-            job,
-            batch,
-            cancelled=cancelled,
-        )
+        with self._resident(state):
+            return execute_megatron_dynamic_lora_sft_forward_job(
+                self.runtime,
+                job,
+                batch,
+                cancelled=cancelled,
+            )
 
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
         state = self._require_run(job.run_id)
@@ -783,30 +832,41 @@ class MCoreRunSlotExecutor:
             state, job.training_session_id, job.expected_learner_version
         )
         state.gradients.seal(job.contributing_forward_backward_operation_ids)
-        gradients = state.gradients.prepare_optimizer()
         from art.trainer_rank import AdamParams
 
-        self.runtime.optimizer_snapshot_barrier.wait_before_mutation()
-        started = time.perf_counter()
-        result = self._slot_trainer.optim_step_reduced(
-            job.run_id,
-            params=AdamParams(
-                learning_rate=job.optimizer.learning_rate,
-                beta1=job.optimizer.beta1,
-                beta2=job.optimizer.beta2,
-                eps=job.optimizer.eps,
-                weight_decay=job.optimizer.weight_decay,
-                grad_clip_norm=job.optimizer.grad_clip_norm,
-            ),
-            grads=gradients,
-        )
+        with self._resident(state, include_gradients=True):
+            self.runtime.optimizer_snapshot_barrier.wait_before_mutation()
+            gradients = state.gradients.prepare_optimizer()
+            started = time.perf_counter()
+            result = self._slot_trainer.optim_step_reduced(
+                job.run_id,
+                params=AdamParams(
+                    learning_rate=job.optimizer.learning_rate,
+                    beta1=job.optimizer.beta1,
+                    beta2=job.optimizer.beta2,
+                    eps=job.optimizer.eps,
+                    weight_decay=job.optimizer.weight_decay,
+                    grad_clip_norm=job.optimizer.grad_clip_norm,
+                ),
+                grads=gradients,
+            )
         if not result["update_successful"] or not math.isfinite(result["grad_norm"]):
             raise RuntimeError("dynamic LoRA optimizer rejected the update")
         optimizer_step_s = time.perf_counter() - started
         consumed = state.gradients.consume()
         if consumed != job.contributing_forward_backward_operation_ids:
             raise RuntimeError("optimizer consumed the wrong gradient contributions")
+        parent_key = state.base_key
+        output_key = parent_key.model_copy(
+            update={"generation_id": job.generation.generation_id}
+        )
+        tensors = self._slot_trainer.checkpoint_slot_residency_tensors(job.run_id).all
+        self._residency.advance_l1(parent_key, output_key, tensors)
+        state.base_key = output_key
         state.learner_version = job.learner_version
+        self._residency.demote_l2_async(parent_key)
+        for operation_id in consumed:
+            self._residency.retire_async(state.gradient_keys.pop(operation_id))
         from art.megatron.lora import LoRASlotRef
 
         snapshot_metrics = self._publisher.stage(
@@ -951,6 +1011,11 @@ class MCoreRunSlotExecutor:
     def unregister_run(self, run_id: str) -> None:
         state = self._require_run(run_id)
         state.gradients.discard()
+        retirements = tuple(
+            self._residency.retire_async(key) for key in self._residency.keys(run_id)
+        )
+        for retirement in retirements:
+            retirement.result()
         self._slot_trainer.unload_checkpoint_slot(run_id)
         self._runs.pop(run_id)
         self._publisher.retire_run(run_id)
@@ -961,15 +1026,50 @@ class MCoreRunSlotExecutor:
         for state in self._runs.values():
             state.gradients.discard()
         self._publisher.close()
+        self._residency.close()
         self._closed = True
 
-    def _require_run(self, run_id: str) -> _ResidentRunState:
+    def _require_run(
+        self, run_id: str, *, require_complete: bool = True
+    ) -> _ResidentRunState:
         if self._closed:
             raise RuntimeError("Megatron run slot is closed")
         try:
-            return self._runs[run_id]
+            state = self._runs[run_id]
         except KeyError as exc:
             raise RuntimeError(f"training run is not resident: {run_id!r}") from exc
+        if require_complete and not state.registration_complete:
+            raise RuntimeError("training run residency registration is incomplete")
+        return state
+
+    def _register_gradient_contribution(
+        self, state: _ResidentRunState, operation_id: str
+    ) -> None:
+        key = state.base_key.model_copy(
+            update={"accumulator_revision": state.next_accumulator_revision}
+        )
+        tensors = state.gradients.contribution_residency_tensors(operation_id)
+        self._residency.register_l1(key, tensors)
+        state.gradient_keys[operation_id] = key
+        state.next_accumulator_revision += 1
+
+    @contextmanager
+    def _resident(
+        self, state: _ResidentRunState, *, include_gradients: bool = False
+    ) -> Iterator[None]:
+        keys = (
+            state.base_key,
+            *(state.gradient_keys.values() if include_gradients else ()),
+        )
+        acquired: list[ResidencyKey] = []
+        try:
+            for key in keys:
+                self._residency.acquire_l1(key)
+                acquired.append(key)
+            yield
+        finally:
+            for key in reversed(acquired):
+                self._residency.release_l1(key)
 
     @staticmethod
     def _validate_parent(

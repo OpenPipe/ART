@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Awaitable
 import hashlib
 import json
 import os
+from pathlib import Path
 import socket
 from threading import Event, Lock, Thread
 import time
@@ -141,6 +142,15 @@ def _build_training_runtime(spec: TrainerRuntimeSpec, *, rank: int) -> Any:
 
     from art.megatron.train import build_training_runtime
 
+    residency = spec.run_residency
+    if residency is not None:
+        residency = residency.model_copy(
+            update={
+                "nvme": residency.nvme.model_copy(
+                    update={"root": str(Path(residency.nvme.root) / f"rank-{rank}")}
+                )
+            }
+        )
     return build_training_runtime(
         model_identifier=spec.model_identifier,
         model_initialization=spec.model_initialization,
@@ -152,6 +162,8 @@ def _build_training_runtime(spec: TrainerRuntimeSpec, *, rank: int) -> Any:
         print_env=rank == 0,
         model_support_key=spec.model_support_key,
         snapshot_pool_capacity=spec.snapshot_pool_capacity,
+        run_residency_config=residency,
+        optimizer_layout_fingerprint=spec.optimizer_layout_fingerprint,
     )
 
 
@@ -808,9 +820,11 @@ class MonarchTrainerActor(Actor):
             raise RuntimeError("trainer actor runtime is invalid")
         registration = RunSlotRegistration.model_validate_json(registration_json)
         self._run_slot_executor.register_run(
+            tenant_id=registration.tenant_id,
             run_id=registration.run_id,
             training_session_id=registration.training_session_id,
             learner_version=registration.learner_version,
+            generation_id=registration.generation_id,
             adapter_path=registration.adapter_path,
         )
         if registration.initial_optimizer_state_path is not None:
@@ -830,6 +844,7 @@ class MonarchTrainerActor(Actor):
             self._run_slot_executor.restore_optimizer_state(
                 registration.run_id, optimizer_state
             )
+        self._run_slot_executor.complete_run_registration(registration.run_id)
         return {"rank": self._runtime.rank, "run_id": registration.run_id}
 
     @endpoint

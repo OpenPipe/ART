@@ -199,6 +199,8 @@ class TrainingRuntime(BaseModel):
     adapter_export_dtypes: dict[str, torch.dtype] | None = None
     adapter_export_config: dict[str, Any] | None = None
     snapshot_pool_capacity: int = Field(default=2, ge=1, le=4)
+    run_residency_config: Any | None = None
+    optimizer_layout_fingerprint: str | None = None
     optimizer_snapshot_barrier: SnapshotReadBarrier = Field(
         default_factory=SnapshotReadBarrier
     )
@@ -500,6 +502,8 @@ def build_training_runtime(
     allow_unvalidated_arch: bool | None = None,
     model_support_key: str | None = None,
     snapshot_pool_capacity: int = 2,
+    run_residency_config: Any | None = None,
+    optimizer_layout_fingerprint: str | None = None,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -617,6 +621,8 @@ def build_training_runtime(
         rank=rank,
         world_size=world_size,
         snapshot_pool_capacity=snapshot_pool_capacity,
+        run_residency_config=run_residency_config,
+        optimizer_layout_fingerprint=optimizer_layout_fingerprint,
         inter_forward_backward_timing=_InterForwardBackwardTiming(
             metrics_group=metrics_group
         ),

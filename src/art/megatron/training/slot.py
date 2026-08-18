@@ -201,6 +201,8 @@ class MegatronTrainingSlot:
         )
         if adapter.training_session_id != registration.training_session_id:
             raise ValueError("adapter belongs to another training session")
+        if adapter.generation_id != registration.generation_id:
+            raise ValueError("adapter generation differs from run registration")
         await self.trainer.register_run(registration)
         self._runs[registration.run_id] = _ResidentRun(
             registration=registration,

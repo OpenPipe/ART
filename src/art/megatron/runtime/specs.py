@@ -16,6 +16,8 @@ from art.megatron.optimizer_state import OptimizerAdapter
 from art.training.contracts import AdamConfig, LossConfig
 from art.types import TrainConfig, TrainSFTConfig
 
+from .run_residency import RunResidencyConfig
+
 
 class _Spec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -56,6 +58,7 @@ class TrainerRuntimeSpec(_Spec):
     random_state: int | None = None
     hybrid_ep: HybridEpRuntimeSpec | None = None
     snapshot_pool_capacity: int = Field(default=2, ge=1, le=4)
+    run_residency: RunResidencyConfig | None = None
 
     @model_validator(mode="after")
     def _validate_lora_targets(self) -> "TrainerRuntimeSpec":
@@ -75,17 +78,12 @@ class TrainerRuntimeSpec(_Spec):
 
     @property
     def compatibility_fingerprint(self) -> str:
-        hybrid_ep = self.hybrid_ep
-        if hybrid_ep is None:
-            return self.fingerprint
-        # The HybridEP rendezvous namespace is process-scoped, not checkpoint state.
-        return _fingerprint(
-            self.model_copy(
-                update={
-                    "hybrid_ep": hybrid_ep.model_copy(update={"run_id": "<runtime>"})
-                }
-            )
-        )
+        value = self.model_dump(mode="json")
+        value["run_residency"] = None
+        if self.hybrid_ep is not None:
+            # The HybridEP rendezvous namespace is process-scoped, not checkpoint state.
+            value["hybrid_ep"]["run_id"] = "<runtime>"
+        return _fingerprint(value)
 
 
 class TrainingRunSpec(_Spec):
@@ -101,9 +99,11 @@ class TrainingRunSpec(_Spec):
 
 
 class RunSlotRegistration(_Spec):
+    tenant_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     training_session_id: str = Field(min_length=1)
     learner_version: int = Field(ge=0)
+    generation_id: str = Field(min_length=1)
     adapter_path: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
     initial_optimizer_state_path: str | None = Field(default=None, min_length=1)
