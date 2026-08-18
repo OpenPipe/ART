@@ -28,6 +28,7 @@ from art.training.contracts import (
     SaveStateResult,
     SaveWeightsForSamplerRequest,
 )
+from art.utils.lifecycle import process_shutdown_timeout
 
 from .contracts import (
     ApplyCheckpointRetentionRequest,
@@ -404,7 +405,7 @@ class _RunEventObserver:
                 raise RemoteTrainingError("remote training event observer is closed")
             return self._terminal.pop(operation_id)
 
-    async def close(self) -> None:
+    async def close(self, *, timeout_s: float | None = None) -> None:
         async with self._condition:
             if self._closed:
                 return
@@ -413,7 +414,14 @@ class _RunEventObserver:
             self._condition.notify_all()
         if task is not None:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            if timeout_s is None:
+                await asyncio.gather(task, return_exceptions=True)
+            else:
+                _, pending = await asyncio.wait((task,), timeout=timeout_s)
+                if pending:
+                    raise TimeoutError(
+                        f"event observer for run {self._run_id} did not stop"
+                    )
 
     async def _observe(self) -> None:
         try:
@@ -516,7 +524,7 @@ class RemoteTrainingClient:
         run: TrainingRunView,
         *,
         poll_interval_s: float = 0.1,
-        close_timeout_s: float = 20.0,
+        close_timeout_s: float = process_shutdown_timeout(2),
     ) -> None:
         if run.status != "open":
             raise ValueError(f"remote training run is {run.status}, not open")
@@ -535,6 +543,7 @@ class RemoteTrainingClient:
         self._operations: dict[str, tuple[str, RemoteTrainingOperation[Any]]] = {}
         self._close_request_id = uuid.uuid4().hex
         self._closed = False
+        self._close_accepted = False
 
     @classmethod
     async def create(
@@ -714,24 +723,17 @@ class RemoteTrainingClient:
 
     async def close(self) -> None:
         async with self._lock:
-            if self._closed:
+            if self._close_accepted:
                 return
-            failures: list[BaseException] = []
-            try:
-                self._run = await self._service.close_run(
-                    self.run_id, self._close_request_id
-                )
-            except BaseException as error:
-                failures.append(error)
             self._closed = True
-            if failures:
-                raise BaseExceptionGroup(
-                    "remote training client close failed", failures
-                )
+            self._run = await self._service.close_run(
+                self.run_id, self._close_request_id
+            )
+            self._close_accepted = True
 
     async def wait_closed(self, *, timeout_s: float | None = None) -> None:
-        if not self._closed:
-            raise RuntimeError("remote training run has not been closed")
+        if not self._close_accepted:
+            raise RuntimeError("remote training run closure has not been accepted")
         async with asyncio.timeout(timeout_s or self._close_timeout_s):
             while True:
                 run = await self._service.get_run(self.run_id)
@@ -743,6 +745,7 @@ class RemoteTrainingClient:
                 await asyncio.sleep(self._poll_interval_s)
 
     async def abort_result_waiters(self) -> None:
+        failures: list[BaseException] = []
         tasks = tuple(
             operation._completion
             for _, operation in self._operations.values()
@@ -750,8 +753,45 @@ class RemoteTrainingClient:
         )
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await self._events.close()
+        cleanup_timeout = self._close_timeout_s * 0.2
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=cleanup_timeout)
+            for task in done:
+                try:
+                    task.exception()
+                except asyncio.CancelledError:
+                    pass
+            if pending:
+                failures.append(
+                    TimeoutError(f"{len(pending)} remote result waiters did not stop")
+                )
+        try:
+            await self._events.close(timeout_s=cleanup_timeout)
+        except BaseException as error:
+            failures.append(error)
+        if failures:
+            raise BaseExceptionGroup(
+                "remote training result waiter cleanup failed", failures
+            )
 
-    async def close_event_observer(self) -> None:
-        await self._events.close()
+    async def close_event_observer(self, *, timeout_s: float | None = None) -> None:
+        await self._events.close(timeout_s=timeout_s)
+
+    async def shutdown(self) -> None:
+        """Request run closure, await settlement, and release client resources."""
+        failures: list[BaseException] = []
+        drain_timeout = self._close_timeout_s * 0.8
+        try:
+            async with asyncio.timeout(drain_timeout):
+                await self.close()
+                await self.wait_closed(timeout_s=drain_timeout)
+        except BaseException as error:
+            failures.append(error)
+        try:
+            await self.close_event_observer(
+                timeout_s=self._close_timeout_s - drain_timeout
+            )
+        except BaseException as error:
+            failures.append(error)
+        if failures:
+            raise BaseExceptionGroup("remote training client shutdown failed", failures)

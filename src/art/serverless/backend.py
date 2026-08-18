@@ -47,7 +47,7 @@ from art.training.contracts import (
 )
 from art.trajectories import Trajectory, TrajectoryGroup
 from art.types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
-from art.utils.lifecycle import complete_task
+from art.utils.lifecycle import complete_task, process_shutdown_timeout
 
 from .. import dev
 from .client import (
@@ -224,7 +224,7 @@ class ServerlessBackend:
         checkpoint: str | None = None,
         restore_optimizer: bool = False,
         enable_expert_replay: bool = True,
-        close_timeout_s: float = 20.0,
+        close_timeout_s: float = process_shutdown_timeout(1),
     ) -> None:
         api_key = api_key or os.environ.get("WANDB_API_KEY")
         if api_key is None:
@@ -328,7 +328,7 @@ class ServerlessBackend:
         try:
             async with asyncio.timeout(self._close_timeout_s):
                 results = await asyncio.gather(
-                    *(client.close() for client in self._clients.values()),
+                    *(client.shutdown() for client in self._clients.values()),
                     return_exceptions=True,
                 )
                 failures.extend(
@@ -337,26 +337,26 @@ class ServerlessBackend:
                 await self._drain_background()
         except BaseException as error:
             failures.append(error)
-            await asyncio.gather(
-                *(client.abort_result_waiters() for client in self._clients.values()),
-                return_exceptions=True,
-            )
+            try:
+                async with asyncio.timeout(self._close_timeout_s * 0.2):
+                    results = await asyncio.gather(
+                        *(
+                            client.abort_result_waiters()
+                            for client in self._clients.values()
+                        ),
+                        return_exceptions=True,
+                    )
+                failures.extend(
+                    result for result in results if isinstance(result, BaseException)
+                )
+            except BaseException as cleanup_error:
+                failures.append(cleanup_error)
         finally:
-            for awaitable in (
-                asyncio.gather(
-                    *(
-                        client.close_event_observer()
-                        for client in self._clients.values()
-                    ),
-                    return_exceptions=True,
-                ),
-                self._service.close(),
-            ):
-                try:
-                    async with asyncio.timeout(self._close_timeout_s):
-                        await awaitable
-                except BaseException as error:
-                    failures.append(error)
+            try:
+                async with asyncio.timeout(self._close_timeout_s):
+                    await self._service.close()
+            except BaseException as error:
+                failures.append(error)
         if failures:
             raise BaseExceptionGroup("ServerlessBackend shutdown failed", failures)
 
@@ -366,9 +366,7 @@ class ServerlessBackend:
         if not isinstance(model, TrainableModel):
             raise TypeError("ServerlessBackend only supports trainable models")
         client = await self.training_client(model)
-        await client.close()
-        await client.wait_closed()
-        await client.close_event_observer()
+        await client.shutdown()
         checkpoints = await self._service.list_checkpoints(client.run_id)
         for checkpoint in checkpoints.checkpoints:
             await self._service.delete_checkpoint(

@@ -66,10 +66,14 @@ _ATTENTION_TARGETS = frozenset(
 _MLP_TARGETS = frozenset({"gate_proj", "up_proj", "down_proj", "experts"})
 
 
+class ManagedTrainingClient(CanonicalTrainingClient, Protocol):
+    async def shutdown(self) -> None: ...
+
+
 class TrainingClientFactory(Protocol):
     def __call__(
         self, service: Any, request: CreateTrainingRunRequest
-    ) -> Awaitable[CanonicalTrainingClient]: ...
+    ) -> Awaitable[ManagedTrainingClient]: ...
 
 
 def _default_target_modules(base_model: str) -> Sequence[str]:
@@ -497,7 +501,7 @@ class TrainingClient:
     def __init__(
         self,
         service: ServiceClient,
-        remote: CanonicalTrainingClient,
+        remote: ManagedTrainingClient,
         spec: TrainingRunSpec,
     ) -> None:
         self._service = service
@@ -809,7 +813,7 @@ class TrainingClient:
         if self._closed:
             return
         self._closed = True
-        await self._remote.close()
+        await self._remote.shutdown()
 
     def _schedule(
         self,
