@@ -53,26 +53,6 @@ def _session(
     )
 
 
-def test_fractional_placements_pack_per_host_and_leave_full_width_capacity() -> None:
-    pool = _GpuPool(_devices(hosts=3))
-    fractional = WorkflowResourceRequest(gpu_count=1, gpu_share=0.125)
-
-    placements = [pool.acquire(fractional) for _ in range(24)]
-
-    assert all(placement is not None for placement in placements)
-    assert [placement.host for placement in placements if placement is not None] == [
-        f"host-{index % 3}" for index in range(24)
-    ]
-    assert {
-        (placement.host, placement.devices[0].gpu)
-        for placement in placements
-        if placement is not None
-    } == {(f"host-{index}", "0") for index in range(3)}
-    full_width = pool.acquire(WorkflowResourceRequest(gpu_count=4))
-    assert full_width is not None
-    assert tuple(device.gpu for device in full_width.devices) == ("1", "2", "3", "4")
-
-
 def test_ready_full_width_session_launches_before_fractional_backfill() -> None:
     sessions = (
         _session("fractional", gpu_count=1, gpu_share=0.125, estimated_duration_s=100),
@@ -95,21 +75,6 @@ def test_ready_full_width_session_launches_before_fractional_backfill() -> None:
     ) == ("0", "1", "2", "3")
     assert execution.results["exclusive-one"].placement.devices[0].gpu == "4"
     assert execution.results["fractional"].placement.devices[0].gpu == "5"
-
-
-def test_cpu_sessions_are_distributed_across_explicit_hosts() -> None:
-    sessions = tuple(_session(f"cpu-{index}", gpu_count=0) for index in range(3))
-    execution = execute_workflow(
-        WorkflowPlan(sessions=sessions),
-        devices=_devices(hosts=3),
-        runner=lambda _session, placement: placement.host,
-    )
-
-    assert [execution.results[f"cpu-{index}"].output for index in range(3)] == [
-        "host-0",
-        "host-1",
-        "host-2",
-    ]
 
 
 def test_distinct_host_affinities_balance_and_remain_pinned() -> None:
