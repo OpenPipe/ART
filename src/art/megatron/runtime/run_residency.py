@@ -54,6 +54,7 @@ class _ManagedState(BaseModel):
     l3_manifest: NvmeResidencyManifest | None = None
     l2_future: Future[HostTensorImage] | None = None
     l3_future: Future[NvmeResidencyManifest] | None = None
+    l2_demotion: Future[None] | None = None
     l1_reservation: ResidencyReservation | None = None
     l1_transition: TensorResidencyTransition | None = None
 
@@ -79,8 +80,10 @@ class RunResidencyManager:
             thread_name_prefix="art-residency",
         )
         self._futures: set[Future[Any]] = set()
+        self._retirements: dict[ResidencyKey, Future[None]] = {}
         self._failures: list[BaseException] = []
         self._lock = RLock()
+        self._closing = False
         self._closed = False
 
     def register_l1(
@@ -112,12 +115,14 @@ class RunResidencyManager:
         self._require_open()
         if source.accumulator_revision or target.accumulator_revision:
             raise ValueError("only committed base generations may advance in place")
+        byte_count = self._mover.byte_count(tensors, "cuda")
+        old_bytes = self.ledger.copy(source, "l1_gpu").byte_count
+        self._reclaim_l1(max(byte_count - old_bytes, 0), protected={source, target})
         with self._lock:
             if self._installed_base.get(source.run_id) != source:
                 raise RuntimeError("residency source is not the installed generation")
             if source.run_id != target.run_id:
                 raise ValueError("residency advance cannot change runs")
-            byte_count = self._mover.byte_count(tensors, "cuda")
             self.ledger.advance(source, target, "l1_gpu", byte_count=byte_count)
             self._states[target] = _ManagedState(key=target, tensors=tensors)
             self._installed_base[target.run_id] = target
@@ -133,6 +138,7 @@ class RunResidencyManager:
                 return state.l2_future
             if self.ledger.has_copy(key, "l1_gpu"):
                 byte_count = self._mover.byte_count(state.tensors, "cuda")
+                self._reclaim("l2_cpu", byte_count, protected={key})
                 reservation = self.ledger.reserve(
                     key,
                     source="l1_gpu",
@@ -150,6 +156,7 @@ class RunResidencyManager:
                 )
             elif self.ledger.has_copy(key, "l3_nvme"):
                 byte_count = self.ledger.copy(key, "l3_nvme").byte_count
+                self._reclaim("l2_cpu", byte_count, protected={key})
                 reservation = self.ledger.reserve(
                     key,
                     source="l3_nvme",
@@ -233,14 +240,7 @@ class RunResidencyManager:
 
     def evict_l2(self, key: ResidencyKey) -> None:
         self.ensure_l3(key).result()
-        with self._lock:
-            state = self._state(key)
-            if not self.ledger.has_copy(key, "l1_gpu"):
-                assert state.l3 is not None
-                state.l3.activate()
-            self.ledger.drop(key, "l2_cpu")
-            state.l2 = None
-            state.l2_future = None
+        self._evict_l2(key)
 
     def record_l4(
         self,
@@ -264,6 +264,9 @@ class RunResidencyManager:
 
     def retire(self, key: ResidencyKey) -> None:
         self._require_open()
+        self._retire(key)
+
+    def _retire(self, key: ResidencyKey) -> None:
         with self._lock:
             state = self._state(key)
             if state.l1_transition is not None:
@@ -278,14 +281,58 @@ class RunResidencyManager:
             if self._installed_base.get(key.run_id) == key:
                 self._installed_base.pop(key.run_id)
 
+    def retire_async(self, key: ResidencyKey) -> Future[None]:
+        self._require_open()
+        with self._lock:
+            if existing := self._retirements.get(key):
+                return existing
+            state = self._state(key)
+            dependencies = tuple(
+                future
+                for future in (
+                    state.l2_future,
+                    state.l3_future,
+                    state.l2_demotion,
+                )
+                if future is not None
+            )
+            future = self._submit(self._retire_after, key, dependencies)
+            self._retirements[key] = future
+        future.add_done_callback(
+            lambda completed: self._retirement_completed(key, completed)
+        )
+        return future
+
+    def demote_l2_async(self, key: ResidencyKey) -> Future[None]:
+        self._require_open()
+        with self._lock:
+            state = self._state(key)
+            if state.l2_demotion is not None:
+                return state.l2_demotion
+            l3 = self.ensure_l3(key)
+            state.l2_demotion = self._submit(self._demote_after, key, l3)
+            state.l2_demotion.add_done_callback(
+                lambda completed: self._demotion_completed(key, completed)
+            )
+            return state.l2_demotion
+
+    def keys(self, run_id: str) -> tuple[ResidencyKey, ...]:
+        with self._lock:
+            return tuple(key for key in self._states if key.run_id == run_id)
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
-            self._closed = True
+            if self._closing:
+                raise RuntimeError("run residency manager close is already in progress")
+            self._closing = True
             futures = tuple(self._futures)
         _done, pending = wait(futures, timeout=self.config.shutdown_timeout_s)
         self._pool.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            self._closed = True
+            self._closing = False
         if pending:
             raise TimeoutError(
                 f"{len(pending)} residency transitions exceeded shutdown timeout"
@@ -307,6 +354,19 @@ class RunResidencyManager:
         except BaseException as error:
             self._abort(reservation, error)
             raise
+
+    def _retire_after(
+        self, key: ResidencyKey, dependencies: tuple[Future[Any], ...]
+    ) -> None:
+        for dependency in dependencies:
+            dependency.result()
+        self._retire(key)
+
+    def _demote_after(
+        self, key: ResidencyKey, dependency: Future[NvmeResidencyManifest]
+    ) -> None:
+        dependency.result()
+        self._evict_l2(key)
 
     def _restore_l2(
         self, state: _ManagedState, reservation: ResidencyReservation
@@ -337,6 +397,7 @@ class RunResidencyManager:
         try:
             image = l2_future.result()
             with self._lock:
+                self._reclaim("l3_nvme", image.stats.byte_count, protected={state.key})
                 reservation = self.ledger.reserve(
                     state.key,
                     source="l2_cpu",
@@ -378,6 +439,80 @@ class RunResidencyManager:
         for candidate in candidates:
             self.evict_l1(candidate)
 
+    def _reclaim(
+        self,
+        tier: ResidencyTier,
+        incoming_bytes: int,
+        *,
+        protected: set[ResidencyKey],
+    ) -> None:
+        reclaim = self.ledger.required_reclaim(tier, incoming_bytes)
+        if reclaim <= 0:
+            return
+        candidates = self.ledger.eviction_candidates(
+            tier,
+            reclaim,
+            protected={
+                *protected,
+                *(
+                    key
+                    for key in self._states
+                    if tier == "l2_cpu"
+                    and not (
+                        self.ledger.has_copy(key, "l1_gpu")
+                        or self.ledger.has_copy(key, "l3_nvme")
+                    )
+                ),
+                *(
+                    key
+                    for key in self._states
+                    if tier == "l3_nvme"
+                    and not (
+                        self.ledger.has_copy(key, "l1_gpu")
+                        or self.ledger.has_copy(key, "l2_cpu")
+                    )
+                ),
+            },
+            require_other_copy=True,
+        )
+        for candidate in candidates:
+            if tier == "l2_cpu":
+                self._evict_l2(candidate)
+            elif tier == "l3_nvme":
+                self._evict_l3(candidate)
+            else:
+                raise ValueError(f"unsupported background residency tier: {tier}")
+
+    def _evict_l2(self, key: ResidencyKey) -> None:
+        with self._lock:
+            state = self._state(key)
+            if not self.ledger.has_copy(key, "l2_cpu"):
+                return
+            if not self.ledger.has_copy(key, "l1_gpu"):
+                if state.l3 is None:
+                    raise RuntimeError("cannot evict L2 before L3 is ready")
+                state.l3.activate()
+            self.ledger.drop(key, "l2_cpu")
+            state.l2 = None
+            state.l2_future = None
+
+    def _evict_l3(self, key: ResidencyKey) -> None:
+        with self._lock:
+            state = self._state(key)
+            if not self.ledger.has_copy(key, "l3_nvme"):
+                return
+            if not (
+                self.ledger.has_copy(key, "l1_gpu")
+                or self.ledger.has_copy(key, "l2_cpu")
+                or self.ledger.has_copy(key, "l4_archive")
+            ):
+                raise RuntimeError("cannot evict the only exact residency copy")
+            self._store.delete(key)
+            self.ledger.drop(key, "l3_nvme")
+            state.l3 = None
+            state.l3_manifest = None
+            state.l3_future = None
+
     def _evict_l1_locked(self, key: ResidencyKey) -> None:
         state = self._state(key)
         if state.l1_transition is not None:
@@ -402,6 +537,17 @@ class RunResidencyManager:
         with self._lock:
             self._futures.discard(future)
 
+    def _retirement_completed(self, key: ResidencyKey, future: Future[None]) -> None:
+        with self._lock:
+            if self._retirements.get(key) is future:
+                self._retirements.pop(key)
+
+    def _demotion_completed(self, key: ResidencyKey, future: Future[None]) -> None:
+        with self._lock:
+            state = self._states.get(key)
+            if state is not None and state.l2_demotion is future:
+                state.l2_demotion = None
+
     def _abort(self, reservation: ResidencyReservation, error: BaseException) -> None:
         with self._lock:
             try:
@@ -420,7 +566,7 @@ class RunResidencyManager:
             raise KeyError(f"unknown residency state: {key}") from exc
 
     def _require_open(self) -> None:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("run residency manager is closed")
         self._raise_failures()
 
