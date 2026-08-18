@@ -475,8 +475,12 @@ def _route_token_ids(route: Any) -> tuple[int, ...]:
     completion = route.metadata.get(COMPLETION_TOKEN_IDS_KEY)
     if not isinstance(prompt, list) or not isinstance(completion, list):
         raise RuntimeError("routed experts are missing exact token ids")
-    token_ids = tuple(prompt) + tuple(completion)
-    if len(token_ids) != route.shape[0] or any(
+    route_count = route.shape[0]
+    completion_count = route_count - len(prompt)
+    if completion_count not in {len(completion), max(len(completion) - 1, 0)}:
+        raise RuntimeError("routed-expert token ids do not match their route shape")
+    token_ids = tuple(prompt) + tuple(completion[:completion_count])
+    if any(
         isinstance(token, bool) or not isinstance(token, int) or token < 0
         for token in token_ids
     ):
