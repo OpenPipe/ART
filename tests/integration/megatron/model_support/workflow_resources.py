@@ -200,15 +200,6 @@ _DSV4_TP2_EP4 = MegatronWorkflowTopology(
     pp=1,
     sp=True,
 )
-_DSV4_TP2_EP2 = MegatronWorkflowTopology(
-    tp=2,
-    ep=2,
-    etp=1,
-    dp=1,
-    cp=1,
-    pp=1,
-    sp=True,
-)
 _DSV4_COMMON_VLLM_ENGINE_ARGS = {
     "compilation_config": {
         "cudagraph_mode": "NONE",
@@ -232,10 +223,6 @@ _DSV4_MEGATRON = MegatronWorkflowResources(
 _DSV4_FOUR_GPU_MEGATRON = MegatronWorkflowResources(
     gpu_ids=[0, 1, 2, 3],
     topology=_DSV4_TP2_EP4,
-)
-_DSV4_HIGH_VRAM_MEGATRON = MegatronWorkflowResources(
-    gpu_ids=[0, 1],
-    topology=_DSV4_TP2_EP2,
 )
 _DSV4_FULL_VLLM_EP4 = VllmWorkflowResources(
     gpu_ids=[4, 5, 6, 7],
@@ -278,19 +265,6 @@ _GLM52_FUNCTIONAL_RESOURCES = WorkflowStageResources(
     required_world_size=2,
     megatron=_GLM52_REDUCED_MEGATRON,
     vllm=_GLM52_REDUCED_VLLM,
-)
-_GPT_OSS_REDUCED_MEGATRON = MegatronWorkflowResources(
-    gpu_ids=[0],
-    topology=MegatronWorkflowTopology(),
-)
-_GPT_OSS_REDUCED_VLLM = VllmWorkflowResources(
-    gpu_ids=[1],
-    tensor_parallel_size=1,
-    extra_engine_args={
-        "enforce_eager": True,
-        "load_format": "dummy",
-        "max_model_len": 1024,
-    },
 )
 # Explicitly for large models which do not fit in the default topology.
 HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
@@ -682,20 +656,3 @@ def resolve_stage_resources_for_current_host(
         stage_resources,
         visible_gpu_count=_current_visible_gpu_count(),
     )
-
-
-def validate_dedicated_test_resources(
-    *,
-    stage_name: str,
-    trainer_gpu_ids: list[int],
-    inference_gpu_ids: list[int],
-    allow_overlap: bool = False,
-) -> None:
-    if not trainer_gpu_ids:
-        raise RuntimeError(f"{stage_name} trainer GPU ids must be non-empty")
-    if not inference_gpu_ids:
-        raise RuntimeError(f"{stage_name} inference GPU ids must be non-empty")
-    if not allow_overlap and set(trainer_gpu_ids) & set(inference_gpu_ids):
-        raise RuntimeError(
-            f"{stage_name} trainer and inference GPU ids must not overlap"
-        )
