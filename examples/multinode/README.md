@@ -2,9 +2,8 @@
 
 `program.py` is a bounded CPU example using only public ART APIs. Its top-level
 controller receives a typed launch context and admits the attached hosts, then
-its top-level rollout returns one
-synthetic Yes/No/Maybe `Trajectory` per host for each answer. It never loads a
-model or starts Megatron or vLLM.
+its top-level rollout returns one synthetic Yes/No/Maybe `Trajectory` per host
+for each answer. It never loads a model or starts Megatron or vLLM.
 
 Run the same controller on one local Monarch worker from the project root:
 
@@ -29,10 +28,12 @@ than pickled closures.
 
 Edit the accelerator and setup commands for your infrastructure. The example
 assumes `uvx` is installed in the image and installs ART's `distributed` extra
-from the synchronized source checkout. GPU training also needs the `megatron`
-extra and the locked `vllm_runtime` project; release wheels instead carry the
-managed vLLM runtime bundle. Use `sky launch` after changing setup, and reuse an
-unchanged cluster without rerunning setup with:
+from the synchronized source checkout. For GPU training, use
+`INSTALL_MULTINODE=true bash scripts/setup.sh`; it selects the CUDA-matched root
+and vLLM profiles and prepares the pinned user-space transport stack. Release
+wheels carry the managed vLLM runtime bundle but still require a pre-provisioned
+host transport stack. Use `sky launch` after changing setup, and reuse an unchanged
+cluster without rerunning setup with:
 
 ```fish
 sky exec art-multinode examples/multinode/skypilot.yaml

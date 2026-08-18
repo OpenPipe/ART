@@ -120,7 +120,8 @@ def _load_nixl() -> tuple[Any, Any, Any]:
             module.nixl_thread_sync_t,
         )
     raise RuntimeError(
-        "NIXL Python bindings are unavailable; run scripts/setup_multinode.sh"
+        "NIXL Python bindings are unavailable; provision ART's pinned NIXL/UCX "
+        "stack before starting the service"
     )
 
 

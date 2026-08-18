@@ -129,7 +129,7 @@ two-node smoke that runs all three bounded rollouts on each host without
 reserving training GPUs or provisioning the managed vLLM runtime.
 
 For source-based GPU training, replace its resources and setup with the desired
-topology and both locked environments:
+topology and run the CUDA-detecting cluster setup:
 
 ```yaml
 resources:
@@ -137,8 +137,7 @@ resources:
 
 setup: |
   set -euo pipefail
-  uvx uv@0.11.7 sync --frozen --no-dev --extra distributed --extra megatron
-  uvx uv@0.11.7 sync --project vllm_runtime --frozen --no-dev
+  INSTALL_MULTINODE=true bash scripts/setup.sh
 
 run: |
   set -euo pipefail
@@ -148,9 +147,19 @@ run: |
 ```
 
 `set -euo pipefail` is required because SkyPilot runs multiline setup under
-Bash without enabling fail-fast behavior. A source-based GPU run needs the root
-and `vllm_runtime` locked projects at the same revision on every node. The CPU
-example only syncs the root `distributed` extra.
+Bash without enabling fail-fast behavior. `scripts/setup.sh` pins uv, detects
+CUDA 12 versus CUDA 13, selects the matching distributed, Megatron, and vLLM
+profiles, installs the pinned NIXL/UCX/etcd user-space stack, builds HybridEP,
+and validates the resulting environments. The image or cluster bootstrap must
+already provide the NVIDIA driver, open kernel modules, MOFED/RDMA devices, and
+the ordinary native build tools validated by `scripts/setup_multinode.sh`. The
+CPU example only syncs the root `distributed` extra.
+
+Setup is cluster provisioning, not service startup. `art-monarch`, trainer
+actors, and managed vLLM processes never invoke these shell scripts. Source
+checkouts launch the already-built `vllm_runtime/.venv`; release wheels may
+materialize their bundled, locked vLLM environment into a content-addressed
+cache on first use.
 
 Any GPU workload spanning hosts must set one explicit NCCL network contract in
 its `ClusterSpec`, for example
@@ -162,13 +171,19 @@ environments and requires each rank to report that exact selected module. It
 never retries with Socket. Deployment qualification remains responsible for
 all-GPU bandwidth, GPU Direct RDMA, HCA, and GID validation.
 
+Cross-host HybridEP also requires one reachable etcd endpoint in
+`NixlTransportSpec.metadata_store`. Setup installs the pinned etcd binary but
+does not daemonize it; the deployment owns that service and its data directory.
+ART health-checks the endpoint from every host before allocating trainer GPUs
+and fails closed if it is absent.
+
 If `ART_VLLM_RUNTIME_BIN` is set, it must point directly to a standard
 `.venv/bin/art-vllm-runtime-server` executable. ART derives the matching Python,
 runtime root, environment, and working directory from that path so the preflight
 cannot certify a different runtime. Arbitrary command wrappers fail closed.
 
-For a published release wheel, use a separate setup rather than synchronizing
-the source runtime:
+For a published release wheel, install the profile matching the host CUDA
+toolkit rather than synchronizing the source runtime. For CUDA 12:
 
 ```yaml
 setup: |
@@ -177,6 +192,13 @@ setup: |
   uv pip install --python .venv/bin/python \
     "openpipe-art[distributed,megatron]==VERSION"
 ```
+
+For CUDA 13, use
+`openpipe-art[distributed-cu130,megatron-cu130]==VERSION`. The Python extras do
+not install or configure host drivers, MOFED, UCX/NIXL, etcd, or a multi-node
+HybridEP extension. A release-wheel deployment must therefore use an image
+prepared with the same cluster setup or currently retain a source checkout for
+that provisioning step.
 
 Release wheels use a content-addressed managed runtime bundle. Only wheels
 built with `scripts/build_package.py` contain that bundle; a generic `uv build`

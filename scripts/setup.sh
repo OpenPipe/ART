@@ -1,5 +1,9 @@
 #!/bin/bash
-set -eo pipefail
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd -- "${script_dir}/.." && pwd)"
+cd "${repo_root}"
 
 # Load environment variables from .env file if it exists
 if [ -f .env ]; then
@@ -8,7 +12,7 @@ if [ -f .env ]; then
         # Skip comments and empty lines
         [[ $line =~ ^#.*$ ]] && continue
         [[ -z $line ]] && continue
-        
+
         key="${line%%=*}"
         current_value="${!key-}"
         if [ -z "${!key+x}" ] ||
@@ -22,18 +26,19 @@ if [ -f .env ]; then
 fi
 
 if ! command -v sudo >/dev/null 2>&1; then
-    sudo_path="/usr/local/bin/sudo"
-    if [ ! -w /usr/local/bin ]; then
-        sudo_path="$HOME/.local/bin/sudo"
-        mkdir -p "$HOME/.local/bin"
-        export PATH="$HOME/.local/bin:$PATH"
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "setup requires root or passwordless sudo" >&2
+        exit 1
     fi
-
+    sudo_path=/usr/local/bin/sudo
     cat <<'EOF' > "$sudo_path"
 #!/bin/sh
+if [ "${1:-}" = "-n" ]; then
+    shift
+fi
 exec "$@"
 EOF
-    chmod +x "$sudo_path"
+    chmod +x /usr/local/bin/sudo
 fi
 
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/conda/bin:$PATH"
@@ -48,13 +53,25 @@ if [ "$install_multinode" != "true" ] && [ "$install_multinode" != "false" ]; th
     exit 1
 fi
 if [ "${#need_pkgs[@]}" -gt 0 ]; then
-    apt-get update
-    apt-get install -y "${need_pkgs[@]}"
+    if [ "$(id -u)" -eq 0 ]; then
+        apt-get update
+        apt-get install -y "${need_pkgs[@]}"
+    elif sudo -n true >/dev/null 2>&1; then
+        sudo -n apt-get update
+        sudo -n apt-get install -y "${need_pkgs[@]}"
+    else
+        echo "setup requires passwordless sudo to install: ${need_pkgs[*]}" >&2
+        exit 1
+    fi
 fi
 
 # Configure git user name and email
-git config --global user.name "${GIT_USER_NAME}"
-git config --global user.email "${GIT_USER_EMAIL}"
+if [ -n "${GIT_USER_NAME:-}" ]; then
+    git config --global user.name "${GIT_USER_NAME}"
+fi
+if [ -n "${GIT_USER_EMAIL:-}" ]; then
+    git config --global user.email "${GIT_USER_EMAIL}"
+fi
 git config --global --add safe.directory "$(pwd)"
 
 if [ "${GIT_RESET_CLEAN:-false}" = "true" ]; then
@@ -87,13 +104,13 @@ if [ "$install_multinode" = "true" ]; then
         echo "INSTALL_EXTRAS is incompatible with the Megatron environment" >&2
         exit 1
     fi
-    scripts/setup_multinode.sh
+    "${repo_root}/scripts/setup_multinode.sh"
     export HYBRID_EP_MULTINODE=1
     export USE_NIXL=1
     export NIXL_HOME=/usr/local/art-multinode/nixl
     export UCX_HOME=/usr/local/art-multinode/ucx
     export LD_LIBRARY_PATH="$NIXL_HOME/lib/x86_64-linux-gnu:$UCX_HOME/lib:${LD_LIBRARY_PATH:-}"
-    /bin/bash src/art/megatron/setup.sh
+    /bin/bash "${repo_root}/src/art/megatron/setup.sh"
 else
     sync_extras=(--extra "$backend_extra")
     if [ "${INSTALL_EXTRAS:-false}" = "true" ]; then

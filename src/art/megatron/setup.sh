@@ -178,7 +178,7 @@ uv_bin="uv"
 if [ -x "${HOME}/.local/bin/uv" ]; then
     uv_bin="${HOME}/.local/bin/uv"
 fi
-"${uv_bin}" sync --extra "${distributed_extra}" --extra "${megatron_extra}" --no-sources-package transformer-engine --frozen --active --inexact
+"${uv_bin}" sync --extra "${distributed_extra}" --extra "${megatron_extra}" --no-sources-package transformer-engine --frozen --inexact
 
 runtime_library_path=""
 for library_dir in \
@@ -219,7 +219,7 @@ print(f"[art-megatron-setup] device={torch.cuda.get_device_name()} capability={t
 print(f"[art-megatron-setup] transformer-engine fp8 block scaling={check_fp8_block_scaling_support()[0]}")
 PY
 
-"${uv_bin}" run --active --frozen --no-sync python -m art.megatron.hybrid_ep_setup
+"${uv_bin}" run --frozen --no-sync python -m art.megatron.hybrid_ep_setup
 if [ "${INSTALL_VLLM_RUNTIME:-true}" = "true" ]; then
     CUDA_HOME="${real_cuda_home}" bash vllm_runtime/setup.sh
 fi
