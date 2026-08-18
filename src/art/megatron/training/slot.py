@@ -696,7 +696,9 @@ class MegatronTrainingSlot:
             return _resolved_future(cast(SamplerWeightsResult, cached))
         if pending := self._pending_result(ref.operation_id, fingerprint):
             return cast(asyncio.Future[SamplerWeightsResult], pending)
-        snapshot = await self._start_snapshot(ref, save_optimizer=False)
+        snapshot = await self._start_snapshot(
+            ref, save_optimizer=False, publish_sampler=True
+        )
 
         async def complete() -> SamplerWeightsResult:
             adapter, metrics = await self._finish_snapshot(snapshot)
@@ -739,7 +741,9 @@ class MegatronTrainingSlot:
             return cast(asyncio.Future[SaveStateResult], pending)
         state = self._require_run(ref.run_id)
         optimizer_state_path = state.registration.optimizer_state_path
-        snapshot = await self._start_snapshot(ref, save_optimizer=True)
+        snapshot = await self._start_snapshot(
+            ref, save_optimizer=True, publish_sampler=False
+        )
 
         async def complete() -> SaveStateResult:
             adapter, metrics = await self._finish_snapshot(snapshot)
@@ -788,11 +792,13 @@ class MegatronTrainingSlot:
         ref: OperationRef,
         *,
         save_optimizer: bool,
+        publish_sampler: bool,
         sequence_continuation_of: str | None = None,
     ) -> tuple[OptimizerAdapter, dict[str, float]]:
         snapshot = await self._start_snapshot(
             ref,
             save_optimizer=save_optimizer,
+            publish_sampler=publish_sampler,
             sequence_continuation_of=sequence_continuation_of,
         )
         return await self._finish_snapshot(snapshot)
@@ -802,13 +808,14 @@ class MegatronTrainingSlot:
         ref: OperationRef,
         *,
         save_optimizer: bool,
+        publish_sampler: bool,
         sequence_continuation_of: str | None = None,
     ) -> tuple[OptimizerAdapter, dict[str, float]] | _PendingSnapshot:
         state = self._require_parent(ref)
         generation = state.generation
         object_target = (
             self._sampler_object_target(ref.run_id, generation)
-            if self.sampler_store is not None
+            if publish_sampler and self.sampler_store is not None
             else None
         )
         existing = read_adapter_publication(
