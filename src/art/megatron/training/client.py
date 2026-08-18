@@ -409,6 +409,8 @@ class LocalMegatronTrainingClient:
                     ResolvedCheckpointState(
                         adapter_path=adapter.identity,
                         adapter_step=adapter.step,
+                        adapter_training_session_id=adapter.training_session_id,
+                        adapter_generation_id=adapter.generation_id,
                     ),
                 )
                 return SamplerWeightsResult(
@@ -451,6 +453,10 @@ class LocalMegatronTrainingClient:
                     ResolvedCheckpointState(
                         adapter_path=durable.adapter.identity,
                         adapter_step=durable.adapter.step,
+                        adapter_training_session_id=(
+                            durable.adapter.training_session_id
+                        ),
+                        adapter_generation_id=durable.adapter.generation_id,
                         optimizer_state_path=self._service.optimizer_state_path,
                         optimizer_generation_id=durable.adapter.generation_id,
                     ),
@@ -519,6 +525,8 @@ class LocalMegatronTrainingClient:
                 ResolvedCheckpointState(
                     adapter_path=generation.adapter_path,
                     adapter_step=generation.policy_step,
+                    adapter_training_session_id=adapter.training_session_id,
+                    adapter_generation_id=adapter.generation_id,
                     optimizer_state_path=self._service.optimizer_state_path,
                     optimizer_generation_id=generation.generation_id,
                 ),

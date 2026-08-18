@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import hashlib
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
@@ -23,6 +24,15 @@ from .tokenized import (
 
 COMMAND_CONTRACT_VERSION = "art_training_commands_v1"
 PACKING_CONTRACT_VERSION = "art_prefix_tree_v1"
+
+
+def operation_generation_id(operation_id: str, learner_version: int) -> str:
+    if not operation_id or learner_version < 1:
+        raise ValueError("learner transition identity is invalid")
+    return (
+        f"step-{learner_version:08d}-"
+        f"{hashlib.sha256(operation_id.encode()).hexdigest()[:32]}"
+    )
 
 
 class Contract(BaseModel):

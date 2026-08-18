@@ -39,7 +39,6 @@ from art.megatron.runtime.specs import (
     SftForwardJobSpec,
     TrainerGeneration,
     TrainerRuntimeSpec,
-    operation_generation_id,
 )
 from art.preprocessing.sft import SftBatchTokenizer
 from art.training.contracts import (
@@ -61,6 +60,7 @@ from art.training.contracts import (
     SaveStateRequest,
     SaveStateResult,
     SaveWeightsForSamplerRequest,
+    operation_generation_id,
 )
 from art.utils.output_dirs import get_step_checkpoint_dir
 
@@ -106,6 +106,15 @@ class PreparedSftForward(PreparedForward):
     batch: SFTBatchData
     global_grad_accumulation_sequences: int = Field(ge=1)
     tokenization_s: float = Field(ge=0)
+
+
+class PreparedLoadState(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    ref: OperationRef
+    request: LoadStateRequest
+    source: ResolvedCheckpointState
+    job: LoadStateJobSpec
 
 
 class _ResidentRun(BaseModel):
@@ -193,15 +202,15 @@ class MegatronTrainingSlot:
             return
         adapter = read_adapter_publication(
             registration.adapter_path,
-            step=registration.learner_version,
+            step=registration.adapter_step,
         ) or optimizer_adapter(
             registration.adapter_path,
-            registration.learner_version,
-            training_session_id=registration.training_session_id,
+            registration.adapter_step,
+            training_session_id=registration.adapter_training_session_id,
         )
-        if adapter.training_session_id != registration.training_session_id:
+        if adapter.training_session_id != registration.adapter_training_session_id:
             raise ValueError("adapter belongs to another training session")
-        if adapter.generation_id != registration.generation_id:
+        if adapter.generation_id != registration.adapter_generation_id:
             raise ValueError("adapter generation differs from run registration")
         await self.trainer.register_run(registration)
         self._runs[registration.run_id] = _ResidentRun(
@@ -211,7 +220,7 @@ class MegatronTrainingSlot:
             generation=TrainerGeneration(
                 training_session_id=registration.training_session_id,
                 policy_step=registration.learner_version,
-                generation_id=adapter.generation_id,
+                generation_id=registration.generation_id,
                 adapter_path=adapter.identity,
             ),
         )
@@ -547,15 +556,15 @@ class MegatronTrainingSlot:
         self._results[ref.operation_id] = (fingerprint, result)
         return _resolved_future(result)
 
-    async def load_state(
+    async def prepare_load_state(
         self,
         ref: OperationRef,
         request: LoadStateRequest,
         source: ResolvedCheckpointState,
-    ) -> LoadStateResult:
+    ) -> PreparedLoadState:
         fingerprint = self._fingerprint(ref, request, source.model_dump_json())
-        if cached := self._cached_result(ref.operation_id, fingerprint):
-            return cast(LoadStateResult, cached)
+        if self._cached_result(ref.operation_id, fingerprint) is not None:
+            raise RuntimeError("completed load_state cannot be prepared again")
         state = self._require_parent(ref)
         output_version = ref.reserved_output_learner_version
         if output_version is None:
@@ -566,7 +575,7 @@ class MegatronTrainingSlot:
             training_session_id=state.registration.training_session_id,
             policy_step=output_version,
             generation_id=operation_generation_id(ref.operation_id, output_version),
-            adapter_path=get_step_checkpoint_dir(state.output_dir, output_version),
+            adapter_path=self._require_managed_path(source.adapter_path),
         )
         job = LoadStateJobSpec(
             operation_id=ref.operation_id,
@@ -588,37 +597,57 @@ class MegatronTrainingSlot:
             ),
             restore_optimizer=request.restore_optimizer,
         )
+        await self.trainer.prepare_load_state(job)
+        return PreparedLoadState(ref=ref, request=request, source=source, job=job)
+
+    async def load_state(self, prepared: PreparedLoadState) -> LoadStateResult:
+        ref = prepared.ref
+        request = prepared.request
+        source = prepared.source
+        job = prepared.job
+        fingerprint = self._fingerprint(ref, request, source.model_dump_json())
+        if cached := self._cached_result(ref.operation_id, fingerprint):
+            return cast(LoadStateResult, cached)
+        state = self._require_parent(ref)
         raw = await self.trainer.load_state(job)
+        generation = job.generation
         state.generation = generation
         state.registration = state.registration.model_copy(
-            update={"learner_version": output_version}
+            update={
+                "learner_version": job.learner_version,
+                "generation_id": generation.generation_id,
+                "adapter_path": source.adapter_path,
+                "adapter_step": source.adapter_step,
+                "adapter_training_session_id": source.adapter_training_session_id,
+                "adapter_generation_id": source.adapter_generation_id,
+            }
         )
-        commit_ref = OperationRef(
-            run_id=ref.run_id,
-            operation_id=f"{ref.operation_id}:load-commit",
-            sequence_id=ref.sequence_id,
-            learner_parent_version=output_version,
-            kind="save_state",
+        adapter = read_adapter_publication(
+            source.adapter_path, step=source.adapter_step
         )
-        adapter, _metrics = await self._snapshot(
-            commit_ref,
-            save_optimizer=True,
-            sequence_continuation_of=ref.operation_id,
-        )
-        self.trainer.retire_operation(commit_ref.operation_id)
+        if adapter is None:
+            raise RuntimeError("loaded checkpoint has no immutable adapter publication")
+        if (
+            adapter.training_session_id != source.adapter_training_session_id
+            or adapter.generation_id != source.adapter_generation_id
+        ):
+            raise RuntimeError("loaded adapter changed checkpoint identity")
         result = LoadStateResult(
             operation_id=ref.operation_id,
             checkpoint=checkpoint_ref(
-                ref.run_id, output_version, generation.generation_id
+                ref.run_id, job.learner_version, generation.generation_id
             ),
             lora=adapter.identity,
-            training_session_id=adapter.training_session_id,
-            generation_id=adapter.generation_id,
+            training_session_id=state.registration.training_session_id,
+            generation_id=generation.generation_id,
             lora_bytes=sum(file.size_bytes for file in adapter.files),
             optimizer_restored=bool(raw["optimizer_restored"]),
         )
         self._results[ref.operation_id] = (fingerprint, result)
         return result
+
+    async def discard_prepared_load_state(self, operation_id: str) -> None:
+        await self.trainer.discard_prepared_load_state(operation_id)
 
     async def save_weights_for_sampler(
         self,

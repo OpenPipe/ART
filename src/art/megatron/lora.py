@@ -612,23 +612,34 @@ class LoRA(torch.nn.Module):
         alpha: float = LORA_ALPHA,
         requires_grad: bool,
     ) -> bool:
+        slot = self.prepare_lora_slot(
+            ref,
+            adapter_model,
+            alpha=alpha,
+            requires_grad=requires_grad,
+        )
+        if slot is None:
+            return False
+        self.install_lora_slot(slot)
+        return True
+
+    def prepare_lora_slot(
+        self,
+        ref: LoRASlotRef,
+        adapter_model: dict[str, torch.Tensor],
+        *,
+        alpha: float = LORA_ALPHA,
+        requires_grad: bool,
+    ) -> LoRASlot | None:
+        """Build a detached slot whose exact tensors can move through residency."""
         if ref.name is None:
             raise ValueError("base-model slot refs do not own LoRA tensors")
         weights = self._adapter_weights(adapter_model, require=False)
         if weights is None:
-            return False
+            return None
         a_t = self._localized_weight(weights[0], into=self.A_T)
         b_t = self._localized_weight(weights[1], into=self.B_T)
-        slot_key = self._slot_keys.get(ref)
-        if slot_key is None:
-            slot_key = f"slot_{len(self._slot_keys)}"
-            self._slot_keys[ref] = slot_key
-        elif self._has_live_slot_grads(ref):
-            raise RuntimeError(
-                f"Cannot overwrite live LoRA slot {ref.kind}:{ref.name} for "
-                f"{self.adapter_model_prefix}; clear grads/backward graph first."
-            )
-        self._slot_modules[slot_key] = LoRASlot(
+        return LoRASlot(
             ref=ref,
             a_t=a_t,
             b_t=b_t,
@@ -637,7 +648,20 @@ class LoRA(torch.nn.Module):
             b_template=self.B_T,
             requires_grad=requires_grad,
         )
-        return True
+
+    def install_lora_slot(self, slot: LoRASlot) -> None:
+        """Atomically bind a detached slot without copying its tensors."""
+        ref = slot.ref
+        slot_key = self._slot_keys.get(ref)
+        if slot_key is not None and self._has_live_slot_grads(ref):
+            raise RuntimeError(
+                f"Cannot overwrite live LoRA slot {ref.kind}:{ref.name} for "
+                f"{self.adapter_model_prefix}; clear grads/backward graph first."
+            )
+        if slot_key is None:
+            slot_key = f"slot_{len(self._slot_keys)}"
+            self._slot_keys[ref] = slot_key
+        self._slot_modules[slot_key] = slot
 
     def lora_slot_params(self, ref: LoRASlotRef) -> list[torch.nn.Parameter]:
         slot = self._slot(ref)

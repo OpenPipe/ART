@@ -63,6 +63,7 @@ if TYPE_CHECKING:
         CustomOptimizerState,
         LocalOptimizerState,
         PreparedCheckpoint,
+        PreparedCheckpointSlotInstall,
         PreparedCheckpointSlotLoad,
         PreparedCustomPayload,
         _FinalizedSave,
@@ -115,6 +116,26 @@ class TrainerRankResidencyTensors(BaseModel):
     @property
     def all(self) -> tuple[torch.Tensor, ...]:
         return (*self.weights, *self.optimizer)
+
+
+class PreparedTrainerRankOptimizerState(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    layout: TrainerRankOptimizerLayout
+    master_params: tuple[torch.nn.Parameter, ...]
+    state: tuple[dict[str, object], ...]
+    param_group: dict[str, object]
+    padding_masks: tuple[torch.Tensor, ...]
+
+    @property
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        return _unique_tensors(
+            (
+                *self.master_params,
+                *_nested_tensors(self.state),
+                *self.padding_masks,
+            )
+        )
 
 
 def _build_dynamic_optimizer(
@@ -1365,22 +1386,22 @@ class TrainerRank:
         checkpoint: MaterializedCheckpoint,
         *,
         device: torch.device | str = "cpu",
-    ) -> "PreparedCheckpointSlotLoad":
+    ) -> "PreparedCheckpointSlotInstall":
         """Read and localize a checkpoint without mutating resident slots."""
         if self._slot_stack:
             raise RuntimeError("Cannot prepare a checkpoint while one is pushed")
         from . import _checkpoint
 
         source = _checkpoint.prepare_checkpoint(checkpoint.directory)
-        return _checkpoint.prepare_checkpoint_slot_load(
+        prepared = _checkpoint.prepare_checkpoint_slot_load(
             self, source, checkpoint.path, device=device
         )
+        return _checkpoint.stage_checkpoint_slot_load(self, prepared)
 
     def install_prepared_checkpoint_slot_load_sync(
         self,
-        prepared: "PreparedCheckpointSlotLoad",
-        *,
-        restore_checkpoint_optimizer: bool = False,
+        prepared: "PreparedCheckpointSlotInstall",
+        optimizer: PreparedTrainerRankOptimizerState | None = None,
     ) -> None:
         """Atomically bind prepared tensors at the serialized slot barrier."""
         if self._slot_stack:
@@ -1393,11 +1414,7 @@ class TrainerRank:
                 predecessor.exception()
         from . import _checkpoint
 
-        _checkpoint.install_checkpoint_slot_load(
-            self,
-            prepared,
-            restore_checkpoint_optimizer=restore_checkpoint_optimizer,
-        )
+        _checkpoint.install_staged_checkpoint_slot(self, prepared, optimizer)
 
     def checkpoint_slot_parameters(self, name: str) -> tuple[torch.nn.Parameter, ...]:
         try:
@@ -1503,6 +1520,120 @@ class TrainerRank:
                 )
             )
         return TrainerRankResidencyTensors(weights=weights, optimizer=optimizer)
+
+    def prepare_checkpoint_slot_optimizer_for_residency(
+        self,
+        name: str,
+        checkpoint: "PreparedCheckpointSlotInstall",
+        state: TrainerRankOptimizerState,
+    ) -> PreparedTrainerRankOptimizerState:
+        """Build exact CPU optimizer objects that can be promoted without copies."""
+        if state.get("format_version") != 1:
+            raise TrainerRankSlotStateError(
+                f"Unsupported optimizer state format for checkpoint slot {name!r}."
+            )
+        layout = state.get("layout")
+        if layout != self._dynamic_optimizer_layout(name):
+            raise TrainerRankSlotStateError(
+                f"Optimizer state for checkpoint slot {name!r} was saved for a "
+                "different topology or parameter layout."
+            )
+        sources = state.get("master_params")
+        optimizer_state = state.get("optimizer")
+        if not isinstance(sources, Sequence) or not isinstance(
+            optimizer_state, Mapping
+        ):
+            raise TrainerRankSlotStateError(
+                f"Optimizer state for checkpoint slot {name!r} is incomplete."
+            )
+        if len(sources) != len(checkpoint.parameters) or any(
+            tuple(source.shape) != tuple(parameter.shape)
+            for source, parameter in zip(sources, checkpoint.parameters, strict=True)
+        ):
+            raise TrainerRankSlotStateError(
+                f"Optimizer master layout does not match checkpoint slot {name!r}."
+            )
+        groups = optimizer_state.get("param_groups")
+        states = optimizer_state.get("state")
+        if (
+            not isinstance(groups, Sequence)
+            or len(groups) != 1
+            or not isinstance(groups[0], Mapping)
+            or not isinstance(states, Mapping)
+        ):
+            raise TrainerRankSlotStateError(
+                "TrainerRank residency requires one complete optimizer parameter group."
+            )
+        param_group = dict(groups[0])
+        indices = param_group.get("params")
+        actual_indices = list(indices) if isinstance(indices, Sequence) else None
+        if actual_indices != list(range(len(sources))):
+            raise TrainerRankSlotStateError(
+                "Optimizer parameter indices do not match checkpoint master order."
+            )
+        masters = tuple(
+            torch.nn.Parameter(source.detach(), requires_grad=True)
+            for source in sources
+        )
+        prepared_state = tuple(
+            dict(cast(Mapping[str, object], states.get(index, {})))
+            for index in range(len(masters))
+        )
+        tensors = (*masters, *_nested_tensors(prepared_state))
+        if any(tensor.device.type != "cpu" for tensor in tensors):
+            raise TrainerRankSlotStateError(
+                "Prepared optimizer residency must be entirely CPU resident."
+            )
+        return PreparedTrainerRankOptimizerState(
+            layout=layout,
+            master_params=masters,
+            state=prepared_state,
+            param_group={
+                key: value for key, value in param_group.items() if key != "params"
+            },
+            padding_masks=self._prepared_optimizer_padding_masks(checkpoint),
+        )
+
+    def install_prepared_checkpoint_slot_optimizer(
+        self,
+        name: str,
+        state: PreparedTrainerRankOptimizerState,
+    ) -> None:
+        """Bind already-promoted optimizer tensors without another H2D copy."""
+        if state.layout != self._dynamic_optimizer_layout(name):
+            raise TrainerRankSlotStateError(
+                f"Prepared optimizer layout differs from checkpoint slot {name!r}."
+            )
+        if any(tensor.device.type != "cuda" for tensor in state.tensors):
+            raise TrainerRankSlotStateError(
+                "Prepared optimizer tensors must be L1 resident before installation."
+            )
+        group = state.param_group
+        betas = group.get("betas", (0.9, 0.999))
+        if not isinstance(betas, Sequence) or len(betas) != 2:
+            raise TrainerRankSlotStateError("Prepared optimizer betas are invalid.")
+        optimizer = _build_dynamic_optimizer(
+            state.master_params,
+            AdamParams(
+                learning_rate=float(cast(Any, group.get("lr", 0.0))),
+                beta1=float(cast(Any, betas[0])),
+                beta2=float(cast(Any, betas[1])),
+                eps=float(cast(Any, group.get("eps", 1e-8))),
+                weight_decay=float(cast(Any, group.get("weight_decay", 0.0))),
+            ),
+        )
+        optimizer.param_groups[0].update(group)
+        optimizer.state.update(
+            {
+                master: values
+                for master, values in zip(state.master_params, state.state, strict=True)
+                if values
+            }
+        )
+        slot = self._checkpoint_slots[name]
+        slot.optimizer = _DynamicOptimizer(optimizer, state.master_params)
+        slot.optimizer_padding_masks = state.padding_masks
+        self._zero_dynamic_optimizer_padding(name, slot.optimizer)
 
     def restore_checkpoint_slot_optimizer_state(
         self, name: str, state: TrainerRankOptimizerState
@@ -2501,6 +2632,56 @@ class TrainerRank:
                 for value in dynamic.optimizer.state.get(param, {}).values():
                     if isinstance(value, torch.Tensor) and value.shape == param.shape:
                         value.masked_fill_(mask, 0)
+
+    def _prepared_optimizer_padding_masks(
+        self, checkpoint: "PreparedCheckpointSlotInstall"
+    ) -> tuple[torch.Tensor, ...]:
+        params = checkpoint.parameters
+        masks = tuple(torch.zeros_like(param, dtype=torch.bool) for param in params)
+        indices = {id(param): index for index, param in enumerate(params)}
+        exported: dict[str, torch.Tensor] = {}
+        owners: dict[str, tuple[int, int | None]] = {}
+        mapped: set[int] = set()
+        for module, slot in checkpoint.sites:
+            for suffix, param in (("lora_A", slot.A_T), ("lora_B", slot.B_T)):
+                index = indices[id(param)]
+                mapped.add(index)
+                keys = module._expected_weight_keys(suffix)
+                if int(param.ndim) == 3:
+                    if len(keys) != int(param.shape[0]):
+                        raise TrainerRankSlotStateError(
+                            "Cannot map prepared optimizer padding: expert layout "
+                            "does not match the staged adapter."
+                        )
+                    for expert, key in enumerate(keys):
+                        exported[str(key)] = torch.ones_like(param[expert].T)
+                        owners[str(key)] = (index, expert)
+                elif len(keys) == 1:
+                    key = str(keys[0])
+                    exported[key] = torch.ones_like(param.T)
+                    owners[key] = (index, None)
+                else:
+                    raise TrainerRankSlotStateError(
+                        "Cannot map prepared optimizer padding to adapter keys."
+                    )
+        if mapped != set(range(len(params))):
+            raise TrainerRankSlotStateError(
+                "Prepared optimizer parameters do not cover every staged LoRA site."
+            )
+        canonical = self.runtime.model_support_handler.canonicalize_loaded_lora_state(
+            exported, self.runtime.model
+        )
+        for key, value in canonical.items():
+            owner = owners.get(key)
+            if owner is None or not isinstance(value, torch.Tensor):
+                continue
+            index, expert = owner
+            mask = value.T == 0
+            if expert is None:
+                masks[index].copy_(mask)
+            else:
+                masks[index][expert].copy_(mask)
+        return masks
 
     def _dynamic_optimizer_padding_masks(self, name: str) -> tuple[torch.Tensor, ...]:
         slot = self._checkpoint_slots[name]

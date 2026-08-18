@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 import gc
 import hashlib
@@ -62,6 +62,11 @@ from .trainer_run import EventSink
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
     from art.trainer_rank import TrainerRankOptimizerState
+
+
+def _consume_future(future: Future[Any]) -> None:
+    if not future.cancelled():
+        future.exception()
 
 
 def _command_token_logprobs(
@@ -615,6 +620,21 @@ class MegatronTrainJobExecutor:
             raise RuntimeError("operation cannot discard open gradient contributions")
 
 
+class _PreparedRunLoad(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    operation_id: str
+    key: ResidencyKey
+    checkpoint: Any
+    optimizer: Any | None
+    adapter_config: dict[str, Any]
+
+    @property
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        optimizer = () if self.optimizer is None else self.optimizer.tensors
+        return (*self.checkpoint.parameters, *optimizer)
+
+
 class _ResidentRunState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -624,7 +644,9 @@ class _ResidentRunState(BaseModel):
     learner_version: int
     adapter_config: dict[str, Any]
     gradients: Any
-    base_key: ResidencyKey
+    desired_key: ResidencyKey
+    installed_key: ResidencyKey
+    pending_load: _PreparedRunLoad | None = None
     gradient_keys: dict[str, ResidencyKey] = Field(default_factory=dict)
     next_accumulator_revision: int = 1
     registration_complete: bool = False
@@ -650,6 +672,12 @@ class MCoreRunSlotExecutor:
             runtime.run_residency_config,
             snapshot_barrier=runtime.optimizer_snapshot_barrier,
         )
+        self._load_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="art-load-prepare"
+        )
+        self._load_preparations: dict[
+            str, tuple[str, str, Future[_PreparedRunLoad]]
+        ] = {}
         self._runs: dict[str, _ResidentRunState] = {}
         self._closed = False
 
@@ -680,6 +708,13 @@ class MCoreRunSlotExecutor:
         self._slot_trainer.load_checkpoint_sync(
             MaterializedCheckpoint(path=run_id, directory=adapter_path)
         )
+        key = ResidencyKey(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            generation_id=generation_id,
+            topology_fingerprint=self.runtime.optimizer_layout_fingerprint,
+            adapter_layout_fingerprint=adapter_layout_fingerprint,
+        )
         self._runs[run_id] = _ResidentRunState(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -689,13 +724,8 @@ class MCoreRunSlotExecutor:
             gradients=ParameterGradientAccumulator(
                 parameters=self._slot_trainer.checkpoint_slot_parameters(run_id)
             ),
-            base_key=ResidencyKey(
-                tenant_id=tenant_id,
-                run_id=run_id,
-                generation_id=generation_id,
-                topology_fingerprint=self.runtime.optimizer_layout_fingerprint,
-                adapter_layout_fingerprint=adapter_layout_fingerprint,
-            ),
+            desired_key=key,
+            installed_key=key,
         )
 
     def complete_run_registration(self, run_id: str) -> None:
@@ -703,7 +733,7 @@ class MCoreRunSlotExecutor:
         if state.registration_complete:
             return
         tensors = self._slot_trainer.checkpoint_slot_residency_tensors(run_id).all
-        self._residency.register_l1(state.base_key, tensors)
+        self._residency.register_l1(state.installed_key, tensors)
         state.registration_complete = True
 
     def optimizer_layout(self, run_id: str) -> Any:
@@ -856,13 +886,14 @@ class MCoreRunSlotExecutor:
         consumed = state.gradients.consume()
         if consumed != job.contributing_forward_backward_operation_ids:
             raise RuntimeError("optimizer consumed the wrong gradient contributions")
-        parent_key = state.base_key
+        parent_key = state.installed_key
         output_key = parent_key.model_copy(
             update={"generation_id": job.generation.generation_id}
         )
         tensors = self._slot_trainer.checkpoint_slot_residency_tensors(job.run_id).all
         self._residency.advance_l1(parent_key, output_key, tensors)
-        state.base_key = output_key
+        state.desired_key = output_key
+        state.installed_key = output_key
         state.learner_version = job.learner_version
         self._residency.demote_l2_async(parent_key)
         for operation_id in consumed:
@@ -895,27 +926,22 @@ class MCoreRunSlotExecutor:
         self._require_run(run_id)
         return self._slot_trainer.checkpoint_slot_optimizer_state(run_id)
 
-    def execute_load_state(self, job: LoadStateJobSpec) -> dict[str, Any]:
+    def prepare_load_state(self, job: LoadStateJobSpec) -> _PreparedRunLoad:
         state = self._require_run(job.run_id)
-        self._validate_parent(
-            state, job.training_session_id, job.expected_learner_version
-        )
-        if state.gradients.contribution_ids:
-            raise RuntimeError("load_state cannot discard open gradient contributions")
-        self.runtime.optimizer_snapshot_barrier.synchronize()
         from art.megatron.model_support.lora_disk import load_adapter_config
         from art.megatron.optimizer_state import load_trainer_rank_optimizer_state
-        from art.megatron.training.gradient_accumulator import (
-            ParameterGradientAccumulator,
-        )
         from art.trainer_rank import MaterializedCheckpoint
 
         config = load_adapter_config(job.adapter_path)
         self._validate_adapter_layout(state.adapter_config, config)
+        checkpoint = self._slot_trainer.prepare_checkpoint_slot_load_sync(
+            MaterializedCheckpoint(path=job.run_id, directory=job.adapter_path),
+            device="cpu",
+        )
         optimizer_state = None
         if job.optimizer_state_path is not None:
             assert job.optimizer_generation_id is not None
-            optimizer_state = load_trainer_rank_optimizer_state(
+            loaded = load_trainer_rank_optimizer_state(
                 self.runtime,
                 optimizer_state_path=job.optimizer_state_path,
                 adapter_path=job.adapter_path,
@@ -923,40 +949,101 @@ class MCoreRunSlotExecutor:
                 optimizer_generation_id=job.optimizer_generation_id,
                 layout=self._slot_trainer.checkpoint_slot_optimizer_layout(job.run_id),
             )
-        self._slot_trainer.load_checkpoint_sync(
-            MaterializedCheckpoint(path=job.run_id, directory=job.adapter_path)
-        )
-        if optimizer_state is None:
-            self._slot_trainer.clear_checkpoint_slot_optimizer(job.run_id)
-        else:
-            self._slot_trainer.restore_checkpoint_slot_optimizer_state(
-                job.run_id, optimizer_state
-            )
-        state.learner_version = job.learner_version
-        state.adapter_config = config
-        state.gradients = ParameterGradientAccumulator(
-            parameters=self._slot_trainer.checkpoint_slot_parameters(job.run_id)
-        )
-        from art.megatron.lora import LoRASlotRef
-
-        snapshot_metrics = self._publisher.stage(
-            run_id=job.run_id,
-            generation=job.generation,
-            adapter_dtypes={},
-            adapter_config=state.adapter_config,
-            slot_ref=LoRASlotRef("checkpoint", job.run_id),
-            trainer_rank_optimizer_state=(
-                self._slot_trainer.checkpoint_slot_optimizer_snapshot_sources(
-                    job.run_id
+            optimizer_state = (
+                self._slot_trainer.prepare_checkpoint_slot_optimizer_for_residency(
+                    job.run_id, checkpoint, loaded
                 )
+            )
+        adapter_layout_fingerprint = hashlib.sha256(
+            encode_adapter_config(config)
+        ).hexdigest()
+        prepared = _PreparedRunLoad(
+            operation_id=job.operation_id,
+            key=ResidencyKey(
+                tenant_id=state.tenant_id,
+                run_id=job.run_id,
+                generation_id=job.generation.generation_id,
+                topology_fingerprint=self.runtime.optimizer_layout_fingerprint,
+                adapter_layout_fingerprint=adapter_layout_fingerprint,
             ),
-            snapshot_optimizer=job.restore_optimizer,
+            checkpoint=checkpoint,
+            optimizer=optimizer_state,
+            adapter_config=config,
         )
+        if not prepared.tensors or any(
+            tensor.device.type != "cpu" for tensor in prepared.tensors
+        ):
+            raise RuntimeError(
+                "prepared checkpoint generation is not entirely CPU resident"
+            )
+        return prepared
+
+    def start_prepare_load_state(self, job: LoadStateJobSpec) -> None:
+        existing = self._load_preparations.get(job.operation_id)
+        if existing is not None:
+            if existing[:2] != (job.run_id, job.fingerprint):
+                raise RuntimeError(
+                    "operation_id was reused for another load preparation"
+                )
+            return
+        self._load_preparations[job.operation_id] = (
+            job.run_id,
+            job.fingerprint,
+            self._load_pool.submit(self.prepare_load_state, job),
+        )
+
+    def load_state_prepared(self, job: LoadStateJobSpec) -> bool:
+        try:
+            run_id, fingerprint, future = self._load_preparations[job.operation_id]
+        except KeyError as error:
+            raise RuntimeError("load preparation was not started") from error
+        if (run_id, fingerprint) != (job.run_id, job.fingerprint):
+            raise RuntimeError("load preparation identity changed")
+        if future.done():
+            future.result()
+            return True
+        return False
+
+    def finish_prepared_load_state(self, job: LoadStateJobSpec) -> dict[str, Any]:
+        if not self.load_state_prepared(job):
+            raise RuntimeError("load preparation is not complete")
+        _run_id, _fingerprint, future = self._load_preparations.pop(job.operation_id)
+        return self.commit_load_state(job, future.result())
+
+    def discard_prepared_load_state(self, operation_id: str) -> None:
+        preparation = self._load_preparations.pop(operation_id, None)
+        if preparation is None:
+            return
+        future = preparation[2]
+        if not future.cancel():
+            future.add_done_callback(_consume_future)
+
+    def commit_load_state(
+        self, job: LoadStateJobSpec, prepared: _PreparedRunLoad
+    ) -> dict[str, Any]:
+        state = self._require_run(job.run_id)
+        self._validate_parent(
+            state, job.training_session_id, job.expected_learner_version
+        )
+        if state.gradients.contribution_ids:
+            raise RuntimeError("load_state cannot discard open gradient contributions")
+        if (
+            prepared.operation_id != job.operation_id
+            or prepared.key.generation_id != job.generation.generation_id
+            or (prepared.optimizer is not None) != job.restore_optimizer
+        ):
+            raise RuntimeError("prepared load does not match its ordered command")
+        if state.pending_load is not None:
+            self._residency.retire(state.pending_load.key)
+        image = self._residency.register_l2(prepared.key, prepared.tensors)
+        state.desired_key = prepared.key
+        state.pending_load = prepared
+        state.learner_version = job.learner_version
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
             "optimizer_restored": job.restore_optimizer,
-            "metrics": snapshot_metrics,
+            "metrics": {"residency/load_l2_bytes": float(image.stats.byte_count)},
         }
 
     def execute_snapshot(
@@ -1010,6 +1097,11 @@ class MCoreRunSlotExecutor:
 
     def unregister_run(self, run_id: str) -> None:
         state = self._require_run(run_id)
+        for operation_id, (prepared_run_id, _fingerprint, _future) in tuple(
+            self._load_preparations.items()
+        ):
+            if prepared_run_id == run_id:
+                self.discard_prepared_load_state(operation_id)
         state.gradients.discard()
         retirements = tuple(
             self._residency.retire_async(key) for key in self._residency.keys(run_id)
@@ -1025,9 +1117,20 @@ class MCoreRunSlotExecutor:
             return
         for state in self._runs.values():
             state.gradients.discard()
+        futures = tuple(value[2] for value in self._load_preparations.values())
+        for future in futures:
+            future.cancel()
+        _done, pending = wait(
+            futures, timeout=self._residency.config.shutdown_timeout_s
+        )
+        self._load_pool.shutdown(wait=False, cancel_futures=True)
         self._publisher.close()
         self._residency.close()
         self._closed = True
+        if pending:
+            raise TimeoutError(
+                f"{len(pending)} load preparations exceeded shutdown timeout"
+            )
 
     def _require_run(
         self, run_id: str, *, require_complete: bool = True
@@ -1045,7 +1148,7 @@ class MCoreRunSlotExecutor:
     def _register_gradient_contribution(
         self, state: _ResidentRunState, operation_id: str
     ) -> None:
-        key = state.base_key.model_copy(
+        key = state.installed_key.model_copy(
             update={"accumulator_revision": state.next_accumulator_revision}
         )
         tensors = state.gradients.contribution_residency_tensors(operation_id)
@@ -1057,13 +1160,46 @@ class MCoreRunSlotExecutor:
     def _resident(
         self, state: _ResidentRunState, *, include_gradients: bool = False
     ) -> Iterator[None]:
-        keys = (
-            state.base_key,
-            *(state.gradient_keys.values() if include_gradients else ()),
-        )
+        base_key = state.desired_key
         acquired: list[ResidencyKey] = []
         try:
-            for key in keys:
+            self._residency.acquire_l1(base_key)
+            acquired.append(base_key)
+            if state.installed_key != base_key:
+                pending = state.pending_load
+                if pending is None or pending.key != base_key:
+                    raise RuntimeError("desired learner has no prepared L1 install")
+                previous = state.installed_key
+                try:
+                    self._slot_trainer.install_prepared_checkpoint_slot_load_sync(
+                        pending.checkpoint, pending.optimizer
+                    )
+                except BaseException:
+                    self._residency.release_l1(acquired.pop())
+                    self._residency.acquire_l1(previous)
+                    self._residency.release_l1(previous)
+                    raise
+                live = self._slot_trainer.checkpoint_slot_residency_tensors(
+                    state.run_id
+                ).all
+                if tuple(map(id, live)) != tuple(map(id, pending.tensors)):
+                    raise RuntimeError(
+                        "installed checkpoint changed prepared residency tensors"
+                    )
+                from art.megatron.training.gradient_accumulator import (
+                    ParameterGradientAccumulator,
+                )
+
+                state.gradients = ParameterGradientAccumulator(
+                    parameters=self._slot_trainer.checkpoint_slot_parameters(
+                        state.run_id
+                    )
+                )
+                state.adapter_config = pending.adapter_config
+                state.installed_key = base_key
+                state.pending_load = None
+                self._residency.retire_async(previous)
+            for key in state.gradient_keys.values() if include_gradients else ():
                 self._residency.acquire_l1(key)
                 acquired.append(key)
             yield

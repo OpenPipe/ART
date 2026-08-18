@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import struct
 import threading
-from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
 import uuid
 
 from pydantic import BaseModel, ConfigDict
@@ -89,6 +89,24 @@ class PreparedCheckpointSlotLoad(BaseModel):
     config: dict[str, object]
     adapter: dict[str, torch.Tensor]
     expected_keys: frozenset[str]
+
+
+class PreparedCheckpointSlotInstall(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    name: str
+    source: PreparedCheckpoint
+    config: dict[str, object]
+    sites: tuple[tuple[Any, Any], ...]
+    expected_keys: frozenset[str]
+
+    @property
+    def parameters(self) -> tuple[torch.nn.Parameter, ...]:
+        return tuple(
+            parameter
+            for _module, slot in self.sites
+            for parameter in (slot.A_T, slot.B_T)
+        )
 
 
 @dataclass(frozen=True)
@@ -1691,6 +1709,121 @@ def prepare_checkpoint_slot_load(
         adapter=prepared_adapter,
         expected_keys=frozenset(expected),
     )
+
+
+def stage_checkpoint_slot_load(
+    trainer: TrainerRank,
+    prepared: PreparedCheckpointSlotLoad,
+) -> PreparedCheckpointSlotInstall:
+    """Build detached CPU/GPU slot modules without mutating the live model."""
+    group = _ensure_group(trainer)
+    from art.megatron.lora import LoRA
+
+    ref = trainer._slot_ref(prepared.name)
+    config = cast("_AdapterConfig", prepared.config)
+
+    def stage() -> tuple[tuple[Any, Any], ...]:
+        sites = []
+        for chunk in trainer.runtime.model:
+            for module in chunk.modules():
+                if not isinstance(module, LoRA):
+                    continue
+                slot = module.prepare_lora_slot(
+                    ref,
+                    prepared.adapter,
+                    alpha=float(config["lora_alpha"]),
+                    requires_grad=True,
+                )
+                if slot is not None:
+                    sites.append((module, slot))
+        if not sites:
+            raise trainer._slot_state_error(
+                f"Checkpoint {prepared.name!r} loaded no adapter sites"
+            )
+        return tuple(sites)
+
+    sites = _phase(stage, "stage detached checkpoint adapter", group)
+    covered = {
+        str(key)
+        for module, _slot in sites
+        for suffix in ("lora_A", "lora_B")
+        for key in module._expected_weight_keys(suffix)
+    }
+    distributed_coverage = {
+        key for keys in _gather(tuple(covered), group) for key in keys
+    }
+    if distributed_coverage != set(prepared.expected_keys):
+        raise trainer._slot_state_error(
+            "Detached checkpoint tensor coverage differs from runtime"
+        )
+    return PreparedCheckpointSlotInstall(
+        name=prepared.name,
+        source=prepared.source,
+        config=prepared.config,
+        sites=sites,
+        expected_keys=prepared.expected_keys,
+    )
+
+
+def install_staged_checkpoint_slot(
+    trainer: TrainerRank,
+    prepared: PreparedCheckpointSlotInstall,
+    optimizer: Any | None = None,
+) -> None:
+    """Bind detached slot objects at the serialized L1 run-switch barrier."""
+    group = _ensure_group(trainer)
+    name = prepared.name
+    _phase(
+        lambda: trainer._guard_slot_can_load(trainer._slot_ref(name)),
+        "validate checkpoint target",
+        group,
+    )
+    from art.megatron.lora import LoRA
+    from art.trainer_rank._impl import _CheckpointSlot
+
+    snapshot = _slot_snapshot(trainer)
+    previous = trainer._checkpoint_slots.get(name)
+    staged = {id(module): slot for module, slot in prepared.sites}
+    try:
+
+        def install() -> None:
+            ref = trainer._slot_ref(name)
+            for chunk in trainer.runtime.model:
+                for module in chunk.modules():
+                    if not isinstance(module, LoRA):
+                        continue
+                    slot = staged.get(id(module))
+                    if slot is None:
+                        module.unload_lora_slot(ref)
+                    else:
+                        module.install_lora_slot(slot)
+            target = _CheckpointSlot(
+                prepared.parameters,
+                cast("_AdapterConfig", prepared.config),
+                custom_payload=prepared.source.custom,
+            )
+            target.revision = 0 if previous is None else previous.revision + 1
+            trainer._checkpoint_slots[name] = target
+
+        _phase(install, "install staged checkpoint", group)
+        _phase(
+            lambda: trainer._validate_loaded_checkpoint_config(
+                name, cast("_AdapterConfig", prepared.config)
+            ),
+            "validate loaded checkpoint config",
+            group,
+        )
+        if optimizer is not None:
+            _phase(
+                lambda: trainer.install_prepared_checkpoint_slot_optimizer(
+                    name, optimizer
+                ),
+                "install prepared checkpoint optimizer",
+                group,
+            )
+    except BaseException:
+        _rollback_load(trainer, snapshot, "", name, previous, group)
+        raise
 
 
 def install_checkpoint_slot_load(

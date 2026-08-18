@@ -105,6 +105,9 @@ class RunSlotRegistration(_Spec):
     learner_version: int = Field(ge=0)
     generation_id: str = Field(min_length=1)
     adapter_path: str = Field(min_length=1)
+    adapter_step: int = Field(ge=0)
+    adapter_training_session_id: str = Field(min_length=1)
+    adapter_generation_id: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
     initial_optimizer_state_path: str | None = Field(default=None, min_length=1)
     initial_optimizer_generation_id: str | None = Field(default=None, min_length=1)
@@ -171,15 +174,6 @@ class TrainerGeneration(_Spec):
         if int(self.generation_id.split("-", 2)[1]) != self.policy_step:
             raise ValueError("generation ID and policy step must match")
         return self
-
-
-def operation_generation_id(operation_id: str, learner_version: int) -> str:
-    if not operation_id or learner_version < 1:
-        raise ValueError("learner transition identity is invalid")
-    return (
-        f"step-{learner_version:08d}-"
-        f"{hashlib.sha256(operation_id.encode()).hexdigest()[:32]}"
-    )
 
 
 class DurableTrainOutput(_Spec):
@@ -433,6 +427,8 @@ class LoadStateJobSpec(_Spec):
 class ResolvedCheckpointState(_Spec):
     adapter_path: str = Field(min_length=1)
     adapter_step: int = Field(ge=0)
+    adapter_training_session_id: str = Field(min_length=1)
+    adapter_generation_id: str = Field(min_length=1)
     optimizer_state_path: str | None = Field(default=None, min_length=1)
     optimizer_generation_id: str | None = Field(default=None, min_length=1)
 

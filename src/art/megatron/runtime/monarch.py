@@ -837,7 +837,7 @@ class MonarchTrainerActor(Actor):
                 self._runtime,
                 optimizer_state_path=registration.initial_optimizer_state_path,
                 adapter_path=registration.adapter_path,
-                adapter_step=registration.learner_version,
+                adapter_step=registration.adapter_step,
                 optimizer_generation_id=registration.initial_optimizer_generation_id,
                 layout=self._run_slot_executor.optimizer_layout(registration.run_id),
             )
@@ -999,16 +999,52 @@ class MonarchTrainerActor(Actor):
             raise
 
     @endpoint
+    def start_prepare_run_slot_load_state(self, job_json: str) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = LoadStateJobSpec.model_validate_json(job_json)
+            self._run_slot_executor.start_prepare_load_state(job)
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.learner_version,
+            }
+        except BaseException:
+            self._valid = False
+            raise
+
+    @endpoint
+    def poll_prepare_run_slot_load_state(self, job_json: str) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = LoadStateJobSpec.model_validate_json(job_json)
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": job.operation_id,
+                "learner_version": job.learner_version,
+                "ready": self._run_slot_executor.load_state_prepared(job),
+            }
+        except BaseException:
+            self._valid = False
+            raise
+
+    @endpoint
     def execute_run_slot_load_state(self, job_json: str) -> dict[str, Any]:
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             job = LoadStateJobSpec.model_validate_json(job_json)
-            result = self._run_slot_executor.execute_load_state(job)
+            result = self._run_slot_executor.finish_prepared_load_state(job)
             return {"rank": self._runtime.rank, **result}
         except BaseException:
             self._valid = False
             raise
+
+    @endpoint
+    def discard_run_slot_load_state(self, operation_id: str) -> None:
+        self._run_slot_executor.discard_prepared_load_state(operation_id)
 
     @endpoint
     def execute_run_slot_snapshot(
@@ -1560,6 +1596,56 @@ class MonarchTrainerSlot:
             except BaseException as error:
                 await self._invalidate(error, "optimizer operation and cleanup failed")
                 raise
+
+    async def prepare_load_state(self, job: LoadStateJobSpec) -> None:
+        self._require_open()
+        payload = job.model_dump_json()
+        try:
+            started = list(
+                (
+                    await asyncio.wait_for(
+                        self._actors.start_prepare_run_slot_load_state.call(payload),
+                        timeout=self._command_timeout_s,
+                    )
+                ).values()
+            )
+            self._validate_command_results(
+                started,
+                operation_id=job.operation_id,
+                learner_version=job.learner_version,
+            )
+            deadline = asyncio.get_running_loop().time() + self._command_timeout_s
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("load preparation exceeded command timeout")
+                polled = list(
+                    (
+                        await asyncio.wait_for(
+                            self._actors.poll_prepare_run_slot_load_state.call(payload),
+                            timeout=remaining,
+                        )
+                    ).values()
+                )
+                self._validate_command_results(
+                    polled,
+                    operation_id=job.operation_id,
+                    learner_version=job.learner_version,
+                )
+                if all(bool(result["ready"]) for result in polled):
+                    return
+                await asyncio.sleep(min(0.01, remaining))
+        except BaseException as error:
+            await self._invalidate(error, "load preparation and cleanup failed")
+            raise
+
+    async def discard_prepared_load_state(self, operation_id: str) -> None:
+        if not self.valid:
+            return
+        await asyncio.wait_for(
+            self._actors.discard_run_slot_load_state.call(operation_id),
+            timeout=self._command_timeout_s,
+        )
 
     async def load_state(self, job: LoadStateJobSpec) -> dict[str, Any]:
         async with self._lock:
