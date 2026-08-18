@@ -662,10 +662,6 @@ class MCoreRunSlotExecutor:
 
         self.runtime = runtime
         self._slot_trainer = TrainerRank(runtime)
-        self._publisher = _GenerationPublisher(
-            runtime,
-            capacity=int(runtime.snapshot_pool_capacity),
-        )
         if runtime.run_residency_config is None:
             raise RuntimeError("multi-run Megatron requires explicit residency limits")
         if runtime.optimizer_layout_fingerprint is None:
@@ -673,6 +669,11 @@ class MCoreRunSlotExecutor:
         self._residency = RunResidencyManager(
             runtime.run_residency_config,
             snapshot_barrier=runtime.optimizer_snapshot_barrier,
+        )
+        self._publisher = _GenerationPublisher(
+            runtime,
+            capacity=int(runtime.snapshot_pool_capacity),
+            residency=self._residency,
         )
         self._load_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="art-load-prepare"
@@ -744,14 +745,14 @@ class MCoreRunSlotExecutor:
         if generation is None:
             raise RuntimeError("run registration has no immutable initial generation")
         tensors = self._slot_trainer.checkpoint_slot_residency_tensors(run_id)
-        l2 = self._residency.register_l1(state.installed_key, tensors.all)
+        self._residency.register_l1(state.installed_key, tensors.all)
         self._publisher.register_existing(
             run_id=run_id,
             generation=generation,
             optimizer_source=(
                 self._slot_trainer.checkpoint_slot_optimizer_residency_source(run_id)
             ),
-            l2=l2,
+            residency_key=state.installed_key,
             tensor_offset=len(tensors.weights),
         )
         state.initial_generation = None
@@ -919,7 +920,7 @@ class MCoreRunSlotExecutor:
         )
         if optimizer_source is None:
             raise RuntimeError("optimizer commit has no immutable optimizer state")
-        l2 = self._residency.advance_l1(
+        self._residency.advance_l1(
             parent_key,
             output_key,
             residency_tensors.all,
@@ -939,12 +940,13 @@ class MCoreRunSlotExecutor:
             adapter_config=state.adapter_config,
             slot_ref=LoRASlotRef("checkpoint", job.run_id),
             snapshot_optimizer=False,
+            residency_key=output_key,
         )
         snapshot_metrics.update(
             self._publisher.attach_resident_optimizer(
                 generation=job.generation,
                 source=optimizer_source,
-                l2=l2,
+                residency_key=output_key,
                 tensor_offset=len(residency_tensors.weights),
             )
         )
@@ -1094,7 +1096,7 @@ class MCoreRunSlotExecutor:
                     if prepared.optimizer is None
                     else prepared.optimizer.snapshot_source()
                 ),
-                l2=self._residency.ensure_l2(prepared.key),
+                residency_key=prepared.key,
                 tensor_offset=len(prepared.checkpoint.parameters),
             )
         except BaseException:
@@ -1159,7 +1161,7 @@ class MCoreRunSlotExecutor:
         keys = tuple(
             key
             for key in self._residency.keys(run_id)
-            if key.accumulator_revision == 0 and key.generation_id == generation_id
+            if key.representation == "learner" and key.generation_id == generation_id
         )
         if not keys:
             return False
@@ -1178,26 +1180,48 @@ class MCoreRunSlotExecutor:
 
     def unregister_run(self, run_id: str) -> None:
         state = self._require_run(run_id)
+        failures: list[BaseException] = []
         for operation_id, (prepared_run_id, _fingerprint, _future) in tuple(
             self._load_preparations.items()
         ):
             if prepared_run_id == run_id:
-                self.discard_prepared_load_state(operation_id)
-        state.gradients.discard()
-        retirements = tuple(
-            self._residency.retire_async(key) for key in self._residency.keys(run_id)
-        )
-        for retirement in retirements:
-            retirement.result()
-        self._slot_trainer.unload_checkpoint_slot(run_id)
-        self._runs.pop(run_id)
-        self._publisher.retire_run(run_id)
+                try:
+                    self.discard_prepared_load_state(operation_id)
+                except BaseException as error:
+                    failures.append(error)
+        try:
+            state.gradients.discard()
+        except BaseException as error:
+            failures.append(error)
+        try:
+            self._publisher.retire_run(run_id)
+        except BaseException as error:
+            failures.append(error)
+        for key in self._residency.keys(run_id):
+            try:
+                self._residency.retire_async(key).result()
+            except BaseException as error:
+                failures.append(error)
+        try:
+            self._slot_trainer.unload_checkpoint_slot(run_id)
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            self._runs.pop(run_id)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Megatron run unload failed", failures)
 
     def close(self) -> None:
         if self._closed:
             return
+        failures: list[BaseException] = []
         for state in self._runs.values():
-            state.gradients.discard()
+            try:
+                state.gradients.discard()
+            except BaseException as error:
+                failures.append(error)
         futures = tuple(value[2] for value in self._load_preparations.values())
         for future in futures:
             future.cancel()
@@ -1205,13 +1229,25 @@ class MCoreRunSlotExecutor:
             futures, timeout=self._residency.config.shutdown_timeout_s
         )
         self._load_pool.shutdown(wait=False, cancel_futures=True)
-        self._publisher.close()
-        self._residency.close()
+        try:
+            self._publisher.close()
+        except BaseException as error:
+            failures.append(error)
+        try:
+            self._residency.close()
+        except BaseException as error:
+            failures.append(error)
         self._closed = True
         if pending:
-            raise TimeoutError(
-                f"{len(pending)} load preparations exceeded shutdown timeout"
+            failures.append(
+                TimeoutError(
+                    f"{len(pending)} load preparations exceeded shutdown timeout"
+                )
             )
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("Megatron run slot close failed", failures)
 
     def _require_run(
         self, run_id: str, *, require_complete: bool = True
@@ -1230,7 +1266,10 @@ class MCoreRunSlotExecutor:
         self, state: _ResidentRunState, operation_id: str
     ) -> None:
         key = state.installed_key.model_copy(
-            update={"accumulator_revision": state.next_accumulator_revision}
+            update={
+                "representation": "gradient",
+                "accumulator_revision": state.next_accumulator_revision,
+            }
         )
         tensors = state.gradients.contribution_residency_tensors(operation_id)
         self._residency.register_l1(key, tensors)
@@ -1319,6 +1358,15 @@ class _ResolvedGeneration(BaseModel):
     lora: Any | None
     optimizer: Any | None
     prepared_tensors: PreparedSafetensors | None
+    lora_residency_key: ResidencyKey | None = None
+
+
+class _ResidentOptimizerSource(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    key: ResidencyKey
+    source: Any
+    tensor_offset: int = Field(ge=0)
 
 
 class _CachedGeneration(BaseModel):
@@ -1329,9 +1377,12 @@ class _CachedGeneration(BaseModel):
     stager: PinnedCpuSnapshotStager | None
     resolved: Future[_ResolvedGeneration]
     optimizer_upgrade: Future[Any] | None = None
+    resident_optimizer: _ResidentOptimizerSource | None = None
     has_optimizer: bool = False
+    release_stager_on_resolve: bool = False
     consumers: list[Future[TrainerRankPublication]] = Field(default_factory=list)
     object_ids: set[str] = Field(default_factory=set)
+    residency_retirement: Future[None] | None = None
     retired: bool = False
     released: bool = False
 
@@ -1362,11 +1413,13 @@ class _GenerationPublisher:
         runtime: Any,
         *,
         capacity: int,
+        residency: RunResidencyManager | None = None,
     ) -> None:
         if capacity < 1:
             raise ValueError("snapshot pool capacity must be positive")
         self.runtime = runtime
         self.capacity = capacity
+        self._residency = residency
         self._slots = BoundedSemaphore(capacity)
         self._lock = Lock()
         self._available_stagers = [
@@ -1391,6 +1444,7 @@ class _GenerationPublisher:
         self._lora_layouts: dict[tuple[Any, ...], SafetensorsLayout] = {}
         self._cache: dict[str, _CachedGeneration] = {}
         self._latest_by_run: dict[str, str] = {}
+        self._residency_retirements: set[Future[None]] = set()
         self._failures: list[BaseException] = []
         self._in_flight = 0
 
@@ -1404,6 +1458,7 @@ class _GenerationPublisher:
         slot_ref: "LoRASlotRef | None" = None,
         trainer_rank_optimizer_state: "TrainerRankOptimizerState | None" = None,
         snapshot_optimizer: bool = True,
+        residency_key: ResidencyKey | None = None,
     ) -> dict[str, float]:
         from art.megatron.optimizer_state import (
             stage_optimizer_state_snapshot,
@@ -1459,8 +1514,13 @@ class _GenerationPublisher:
             if optimizer is not None:
                 self.runtime.optimizer_snapshot_barrier.register(optimizer)
             optimizer_launch_s = time.perf_counter() - optimizer_started
+            lora_residency_key = (
+                None
+                if residency_key is None
+                else residency_key.model_copy(update={"representation": "sampler"})
+            )
             resolved = self._resolution_pool.submit(
-                self._resolve_generation, lora, optimizer
+                self._resolve_generation, lora, optimizer, lora_residency_key
             )
             entry = _CachedGeneration(
                 run_id=run_id,
@@ -1468,6 +1528,7 @@ class _GenerationPublisher:
                 stager=stager,
                 resolved=resolved,
                 has_optimizer=optimizer is not None,
+                release_stager_on_resolve=lora_residency_key is not None,
             )
             with self._lock:
                 if generation.generation_id in self._cache:
@@ -1499,7 +1560,7 @@ class _GenerationPublisher:
         run_id: str,
         generation: TrainerGeneration,
         optimizer_source: Any | None,
-        l2: Future[Any],
+        residency_key: ResidencyKey,
         tensor_offset: int,
     ) -> dict[str, float]:
         """Register an existing adapter and L2 state without reading mutable GPU state."""
@@ -1514,15 +1575,16 @@ class _GenerationPublisher:
         resolved.set_result(
             _ResolvedGeneration(lora=None, optimizer=None, prepared_tensors=None)
         )
-        optimizer = (
+        if self._residency is None:
+            raise RuntimeError("resident generation requires a residency manager")
+        self._residency.ensure_l2(residency_key)
+        resident_optimizer = (
             None
             if optimizer_source is None
-            else self._resolution_pool.submit(
-                self._resolve_resident_optimizer,
-                l2,
-                optimizer_source,
-                tensor_offset,
-                generation,
+            else _ResidentOptimizerSource(
+                key=residency_key,
+                source=optimizer_source,
+                tensor_offset=tensor_offset,
             )
         )
         entry = _CachedGeneration(
@@ -1530,8 +1592,8 @@ class _GenerationPublisher:
             generation=generation,
             stager=None,
             resolved=resolved,
-            optimizer_upgrade=optimizer,
-            has_optimizer=optimizer is not None,
+            resident_optimizer=resident_optimizer,
+            has_optimizer=resident_optimizer is not None,
         )
         with self._lock:
             if generation.generation_id in self._cache:
@@ -1546,10 +1608,6 @@ class _GenerationPublisher:
             self._latest_by_run[run_id] = generation.generation_id
         if previous is not None:
             self._maybe_release(previous)
-        if optimizer is not None:
-            optimizer.add_done_callback(
-                lambda done, cached=entry: self._optimizer_resolved(cached, done)
-            )
         return {
             "snapshot_optimizer_attach_s": time.perf_counter() - started,
         }
@@ -1638,7 +1696,7 @@ class _GenerationPublisher:
         *,
         generation: TrainerGeneration,
         source: Any,
-        l2: Future[Any],
+        residency_key: ResidencyKey,
         tensor_offset: int,
     ) -> dict[str, float]:
         started = time.perf_counter()
@@ -1648,42 +1706,18 @@ class _GenerationPublisher:
                 raise RuntimeError("optimizer residency has no staged generation")
             if entry.has_optimizer or entry.optimizer_upgrade is not None:
                 raise RuntimeError("generation already has an optimizer snapshot")
-            resolved = self._resolution_pool.submit(
-                self._resolve_resident_optimizer,
-                l2,
-                source,
-                tensor_offset,
-                generation,
+            if self._residency is None:
+                raise RuntimeError("resident optimizer requires a residency manager")
+            entry.resident_optimizer = _ResidentOptimizerSource(
+                key=residency_key,
+                source=source,
+                tensor_offset=tensor_offset,
             )
-            entry.optimizer_upgrade = resolved
             entry.has_optimizer = True
-        resolved.add_done_callback(
-            lambda done, cached=entry: self._optimizer_resolved(cached, done)
-        )
         elapsed = time.perf_counter() - started
         return {
             "snapshot_optimizer_attach_s": elapsed,
         }
-
-    def _resolve_resident_optimizer(
-        self,
-        l2: Future[Any],
-        source: Any,
-        tensor_offset: int,
-        generation: TrainerGeneration,
-    ) -> Any:
-        from art.megatron.optimizer_state import (
-            trainer_rank_optimizer_snapshot_from_cpu,
-        )
-
-        tensors = l2.result().tensors()[tensor_offset:]
-        state = source.bind(tensors)
-        return trainer_rank_optimizer_snapshot_from_cpu(
-            self.runtime,
-            state,
-            generation_id=generation.generation_id,
-            step=generation.policy_step,
-        )
 
     def submit(
         self,
@@ -1790,7 +1824,34 @@ class _GenerationPublisher:
             )
 
     def retire_run(self, run_id: str) -> None:
-        self._retire_previous(run_id)
+        with self._lock:
+            entries = tuple(
+                entry for entry in self._cache.values() if entry.run_id == run_id
+            )
+            self._latest_by_run.pop(run_id, None)
+            for entry in entries:
+                entry.retired = True
+        failures: list[BaseException] = []
+        for entry in entries:
+            try:
+                entry.resolved.result()
+                if entry.optimizer_upgrade is not None:
+                    entry.optimizer_upgrade.result()
+                for consumer in tuple(entry.consumers):
+                    consumer.result()
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                self._maybe_release(entry)
+                if entry.residency_retirement is not None:
+                    try:
+                        entry.residency_retirement.result()
+                    except BaseException as error:
+                        failures.append(error)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("generation retirement failed", failures)
 
     def _acquire_slot(self) -> tuple[float, int, PinnedCpuSnapshotStager]:
         self.raise_if_failed()
@@ -1822,18 +1883,24 @@ class _GenerationPublisher:
             if not entries:
                 raise RuntimeError("snapshot pool is full without a cached generation")
             entry = (ready or entries)[0]
-            entry.retired = True
             consumers = tuple(entry.consumers)
+            preserve = entry.release_stager_on_resolve
+            if not preserve:
+                entry.retired = True
         try:
             entry.resolved.result()
-            if entry.optimizer_upgrade is not None:
+            if not preserve and entry.optimizer_upgrade is not None:
                 entry.optimizer_upgrade.result()
-            for consumer in consumers:
-                consumer.result()
+            if not preserve:
+                for consumer in consumers:
+                    consumer.result()
         finally:
-            self._maybe_release(entry)
+            if preserve:
+                self._release_entry_stager(entry)
+            else:
+                self._maybe_release(entry)
 
-    def _retire_previous(self, run_id: str) -> None:
+    def _retire_previous(self, run_id: str) -> _CachedGeneration | None:
         with self._lock:
             generation_id = self._latest_by_run.pop(run_id, None)
             entry = None if generation_id is None else self._cache[generation_id]
@@ -1841,6 +1908,7 @@ class _GenerationPublisher:
                 entry.retired = True
         if entry is not None:
             self._maybe_release(entry)
+        return entry
 
     def _snapshot_resolved(
         self,
@@ -1851,6 +1919,8 @@ class _GenerationPublisher:
             with self._lock:
                 self._failures.append(error)
                 entry.retired = True
+        if entry.release_stager_on_resolve:
+            self._release_entry_stager(entry)
         self._maybe_release(entry)
 
     def _optimizer_resolved(
@@ -1865,6 +1935,8 @@ class _GenerationPublisher:
         self._maybe_release(entry)
 
     def _maybe_release(self, entry: _CachedGeneration) -> None:
+        retirement: Future[None] | None = None
+        retirement_started = False
         with self._lock:
             if (
                 not entry.retired
@@ -1883,30 +1955,135 @@ class _GenerationPublisher:
                 self._latest_by_run.pop(entry.run_id)
             for object_id in entry.object_ids:
                 self._object_publications.pop(object_id, None)
-        if entry.stager is not None:
-            self._release_slot(entry.stager)
+            if not entry.resolved.cancelled() and entry.resolved.exception() is None:
+                lora_key = entry.resolved.result().lora_residency_key
+                if lora_key is not None:
+                    if self._residency is None:
+                        raise RuntimeError(
+                            "resident LoRA source has no residency manager"
+                        )
+                    try:
+                        retirement = self._residency.retire_async(lora_key)
+                        retirement_started = True
+                    except BaseException as error:
+                        retirement = Future()
+                        retirement.set_exception(error)
+                        self._failures.append(error)
+                    entry.residency_retirement = retirement
+                    if retirement_started:
+                        self._residency_retirements.add(retirement)
+        self._release_entry_stager(entry)
+        if retirement is not None and retirement_started:
+            retirement.add_done_callback(self._residency_retired)
 
-    def _resolve_generation(self, lora: Any, optimizer: Any) -> _ResolvedGeneration:
+    def _release_entry_stager(self, entry: _CachedGeneration) -> None:
+        with self._lock:
+            stager = entry.stager
+            entry.stager = None
+        if stager is not None:
+            self._release_slot(stager)
+
+    def _resolve_generation(
+        self,
+        lora: Any,
+        optimizer: Any,
+        lora_residency_key: ResidencyKey | None = None,
+    ) -> _ResolvedGeneration:
         lora = None if lora is None else lora.resolve()
         optimizer = None if optimizer is None else optimizer.resolve()
         prepared_tensors = None
         if lora is not None:
-            layout_key = tuple(
-                (key, tuple(tensor.shape), str(tensor.dtype))
-                for key, tensor in sorted(lora.tensors.items())
-            )
-            with self._lock:
-                layout = self._lora_layouts.get(layout_key)
-                if layout is None:
-                    layout = self._lora_layouts[layout_key] = SafetensorsLayout(
-                        lora.tensors
-                    )
-            prepared_tensors = layout.bind(lora.tensors)
+            if lora_residency_key is None:
+                prepared_tensors = self._prepare_lora_tensors(lora)
+            else:
+                if self._residency is None:
+                    raise RuntimeError("LoRA residency requires a residency manager")
+                self._residency.register_l2(
+                    lora_residency_key,
+                    tuple(lora.tensors[key] for key in sorted(lora.tensors)),
+                )
         return _ResolvedGeneration(
             lora=lora,
             optimizer=optimizer,
             prepared_tensors=prepared_tensors,
+            lora_residency_key=lora_residency_key if lora is not None else None,
         )
+
+    def _prepare_lora_tensors(self, lora: Any) -> PreparedSafetensors:
+        layout_key = tuple(
+            (key, tuple(tensor.shape), str(tensor.dtype))
+            for key, tensor in sorted(lora.tensors.items())
+        )
+        with self._lock:
+            layout = self._lora_layouts.get(layout_key)
+            if layout is None:
+                layout = self._lora_layouts[layout_key] = SafetensorsLayout(
+                    lora.tensors
+                )
+        return layout.bind(lora.tensors)
+
+    @contextmanager
+    def _lora_snapshot(
+        self,
+        entry: _CachedGeneration,
+        existing_adapter: OptimizerAdapter | None,
+    ) -> Iterator[tuple[Any, PreparedSafetensors]]:
+        snapshot = entry.resolved.result()
+        if snapshot.lora is None:
+            if existing_adapter is None:
+                raise RuntimeError("rank zero has no LoRA snapshot to publish")
+            yield self._load_existing_adapter(existing_adapter)
+            return
+        if snapshot.lora_residency_key is None:
+            if snapshot.prepared_tensors is None:
+                raise RuntimeError("LoRA snapshot has no serialized tensor layout")
+            yield snapshot.lora, snapshot.prepared_tensors
+            return
+        if self._residency is None:
+            raise RuntimeError("resident LoRA snapshot has no residency manager")
+        with self._residency.borrow_l2(snapshot.lora_residency_key) as image:
+            keys = tuple(sorted(snapshot.lora.tensors))
+            tensors = image.tensors()
+            if len(keys) != len(tensors):
+                raise RuntimeError("resident LoRA tensor identity changed")
+            lora = snapshot.lora.model_copy(
+                update={"tensors": dict(zip(keys, tensors, strict=True))}
+            )
+            yield lora, self._prepare_lora_tensors(lora)
+
+    @contextmanager
+    def _optimizer_snapshot(
+        self,
+        entry: _CachedGeneration,
+        generation: TrainerGeneration,
+        *,
+        required: bool,
+    ) -> Iterator[Any | None]:
+        if not required:
+            yield None
+            return
+        snapshot = entry.resolved.result()
+        if snapshot.optimizer is not None:
+            yield snapshot.optimizer
+            return
+        if entry.optimizer_upgrade is not None:
+            yield entry.optimizer_upgrade.result()
+            return
+        resident = entry.resident_optimizer
+        if resident is None or self._residency is None:
+            raise RuntimeError("optimizer persistence requires an optimizer snapshot")
+        from art.megatron.optimizer_state import (
+            trainer_rank_optimizer_snapshot_from_cpu,
+        )
+
+        with self._residency.borrow_l2(resident.key) as image:
+            state = resident.source.bind(image.tensors()[resident.tensor_offset :])
+            yield trainer_rank_optimizer_snapshot_from_cpu(
+                self.runtime,
+                state,
+                generation_id=generation.generation_id,
+                step=generation.policy_step,
+            )
 
     def _transfer_cached_snapshot(
         self,
@@ -1926,29 +2103,24 @@ class _GenerationPublisher:
             return _SnapshotTransport(
                 metrics={"time/snapshot_transport_queue_s": started - submitted_at}
             )
-        snapshot = entry.resolved.result()
+        entry.resolved.result()
         ready = time.perf_counter()
-        lora = snapshot.lora
-        prepared_tensors = snapshot.prepared_tensors
-        if lora is None or prepared_tensors is None:
-            if existing_adapter is None:
-                raise RuntimeError("rank zero has no LoRA snapshot to transfer")
-            lora, prepared_tensors = self._load_existing_adapter(existing_adapter)
         adapter = None
-        if object_target is not None:
-            adapter = self._publish_lora_object_once(
-                entry,
-                object_target,
-                generation,
-                lora,
-                prepared_tensors,
-            )
-        elif publication_targets:
-            self._transfer_lora_snapshot(
-                lora,
-                publication_targets,
-                prepared_tensors=prepared_tensors,
-            )
+        with self._lora_snapshot(entry, existing_adapter) as (lora, prepared_tensors):
+            if object_target is not None:
+                adapter = self._publish_lora_object_once(
+                    entry,
+                    object_target,
+                    generation,
+                    lora,
+                    prepared_tensors,
+                )
+            elif publication_targets:
+                self._transfer_lora_snapshot(
+                    lora,
+                    publication_targets,
+                    prepared_tensors=prepared_tensors,
+                )
         return _SnapshotTransport(
             adapter=adapter,
             metrics={
@@ -1991,30 +2163,33 @@ class _GenerationPublisher:
         submitted_at: float,
     ) -> _RankSnapshotPersistence:
         started = time.perf_counter()
-        snapshot = entry.resolved.result()
-        optimizer = snapshot.optimizer
-        if save_optimizer and optimizer is None and entry.optimizer_upgrade is not None:
-            optimizer = entry.optimizer_upgrade.result()
+        entry.resolved.result()
         ready = time.perf_counter()
-        if save_optimizer and optimizer is None:
-            raise RuntimeError("optimizer persistence requires an optimizer snapshot")
-        result = self._persist_generation(
-            generation=generation,
-            optimizer_state_path=optimizer_state_path,
-            staging_adapter_path=staging_adapter_path,
-            lora=(
-                snapshot.lora
-                if adapter is None and staging_adapter_path is not None
-                else None
-            ),
-            adapter=adapter,
-            optimizer=optimizer if save_optimizer else None,
-            prepared_tensors=(
-                snapshot.prepared_tensors
-                if adapter is None and staging_adapter_path is not None
-                else None
-            ),
-        )
+        with self._optimizer_snapshot(
+            entry, generation, required=save_optimizer
+        ) as optimizer:
+            needs_lora = adapter is None and staging_adapter_path is not None
+            if needs_lora and int(self.runtime.rank) == 0:
+                with self._lora_snapshot(entry, None) as (lora, prepared_tensors):
+                    result = self._persist_generation(
+                        generation=generation,
+                        optimizer_state_path=optimizer_state_path,
+                        staging_adapter_path=staging_adapter_path,
+                        lora=lora,
+                        adapter=None,
+                        optimizer=optimizer,
+                        prepared_tensors=prepared_tensors,
+                    )
+            else:
+                result = self._persist_generation(
+                    generation=generation,
+                    optimizer_state_path=optimizer_state_path,
+                    staging_adapter_path=staging_adapter_path,
+                    lora=None,
+                    adapter=adapter,
+                    optimizer=optimizer,
+                    prepared_tensors=None,
+                )
         return result.model_copy(
             update={
                 "metrics": {
@@ -2323,6 +2498,12 @@ class _GenerationPublisher:
             self._in_flight -= 1
         self._slots.release()
 
+    def _residency_retired(self, future: Future[None]) -> None:
+        with self._lock:
+            self._residency_retirements.discard(future)
+            if not future.cancelled() and (error := future.exception()) is not None:
+                self._failures.append(error)
+
     def raise_if_failed(self) -> None:
         with self._lock:
             failures = tuple(self._failures)
@@ -2330,6 +2511,7 @@ class _GenerationPublisher:
             raise BaseExceptionGroup("trainer generation publication failed", failures)
 
     def close(self) -> None:
+        failures: list[BaseException] = []
         with self._lock:
             entries = tuple(self._cache.values())
             for entry in entries:
@@ -2342,14 +2524,45 @@ class _GenerationPublisher:
         self._completion_pool.shutdown(wait=True)
         for entry in entries:
             self._maybe_release(entry)
+        with self._lock:
+            retirements = tuple(self._residency_retirements)
+        _done, pending = wait(
+            retirements,
+            timeout=(
+                None
+                if self._residency is None
+                else self._residency.config.shutdown_timeout_s
+            ),
+        )
+        if pending:
+            failures.append(
+                TimeoutError(
+                    f"{len(pending)} sampler residency retirements exceeded shutdown timeout"
+                )
+            )
         if self._transport_sender is not None:
-            self._transport_sender.close()
+            try:
+                self._transport_sender.close()
+            except BaseException as error:
+                failures.append(error)
             self._transport_sender = None
         if self._object_store is not None:
-            self._object_store.close()
+            try:
+                self._object_store.close()
+            except BaseException as error:
+                failures.append(error)
             self._object_store = None
         with self._lock:
             in_flight = self._in_flight
         if in_flight:
-            raise RuntimeError(f"publication close retained {in_flight} snapshots")
-        self.raise_if_failed()
+            failures.append(
+                RuntimeError(f"publication close retained {in_flight} snapshots")
+            )
+        try:
+            self.raise_if_failed()
+        except BaseException as error:
+            failures.append(error)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("generation publisher close failed", failures)

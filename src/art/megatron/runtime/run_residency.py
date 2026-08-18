@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from threading import Condition, RLock
-from typing import Any
+from contextlib import contextmanager
+from threading import Condition, Lock, RLock
+from typing import Any, Iterator
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch
@@ -83,6 +84,9 @@ class RunResidencyManager:
         self._retirements: dict[ResidencyKey, Future[None]] = {}
         self._failures: list[BaseException] = []
         self._lock = RLock()
+        self._admission_locks = {
+            tier: Lock() for tier in ("l1_gpu", "l2_cpu", "l3_nvme")
+        }
         self._transition_slots = Condition(self._lock)
         self._active_transitions = 0
         self._closing = False
@@ -94,18 +98,20 @@ class RunResidencyManager:
         self._require_open()
         if not tensors or any(tensor.device.type != "cuda" for tensor in tensors):
             raise RuntimeError("new L1 residency must be a non-empty CUDA tensor tuple")
-        if key.accumulator_revision == 0 and key.run_id in self._installed_base:
+        if key.representation == "learner" and key.run_id in self._installed_base:
             raise RuntimeError("a run may have only one installed base generation")
         byte_count = self._mover.byte_count(tensors, "cuda")
-        self._reclaim_l1(byte_count, protected={key})
-        reservation = self._reserve(
-            key, source=None, target="l1_gpu", byte_count=byte_count
-        )
-        self._commit(reservation)
-        with self._lock:
-            self._states[key] = _ManagedState(key=key, tensors=tensors)
-            if key.accumulator_revision == 0:
-                self._installed_base[key.run_id] = key
+        managed = _ManagedState(key=key, tensors=tensors)
+        with self._admission_locks["l1_gpu"]:
+            self._reclaim_l1(byte_count, protected={key})
+            reservation = self._reserve(
+                key, source=None, target="l1_gpu", byte_count=byte_count
+            )
+            with self._lock:
+                self._commit(reservation)
+                self._states[key] = managed
+                if key.representation == "learner":
+                    self._installed_base[key.run_id] = key
         return self.ensure_l2(key)
 
     def register_l2(
@@ -116,20 +122,22 @@ class RunResidencyManager:
         if not tensors or any(tensor.device.type != "cpu" for tensor in tensors):
             raise RuntimeError("new L2 residency must be a non-empty CPU tensor tuple")
         byte_count = self._mover.byte_count(tensors, "cpu")
-        self._reclaim("l2_cpu", byte_count, protected={key})
-        reservation = self._reserve(
-            key, source=None, target="l2_cpu", byte_count=byte_count
-        )
+        with self._admission_locks["l2_cpu"]:
+            self._reclaim("l2_cpu", byte_count, protected={key})
+            reservation = self._reserve(
+                key, source=None, target="l2_cpu", byte_count=byte_count
+            )
         try:
             image = self._mover.host_image(tensors)
-            self._commit(reservation)
+            managed = _ManagedState(key=key, tensors=tensors, l2=image)
+            with self._lock:
+                if key in self._states:
+                    raise RuntimeError("residency key is already registered")
+                self._commit(reservation)
+                self._states[key] = managed
         except BaseException as error:
             self._abort(reservation, error)
             raise
-        with self._lock:
-            if key in self._states:
-                raise RuntimeError("residency key is already registered")
-            self._states[key] = _ManagedState(key=key, tensors=tensors, l2=image)
         return image
 
     def advance_l1(
@@ -141,21 +149,24 @@ class RunResidencyManager:
         retire_source: bool = False,
     ) -> Future[HostTensorImage]:
         self._require_open()
-        if source.accumulator_revision or target.accumulator_revision:
+        if source.representation != "learner" or target.representation != "learner":
             raise ValueError("only committed base generations may advance in place")
         if retire_source:
             self.ensure_l2(source).result()
         byte_count = self._mover.byte_count(tensors, "cuda")
         old_bytes = self.ledger.copy(source, "l1_gpu").byte_count
-        self._reclaim_l1(max(byte_count - old_bytes, 0), protected={source, target})
-        with self._lock:
-            if self._installed_base.get(source.run_id) != source:
-                raise RuntimeError("residency source is not the installed generation")
-            if source.run_id != target.run_id:
-                raise ValueError("residency advance cannot change runs")
-            self.ledger.advance(source, target, "l1_gpu", byte_count=byte_count)
-            self._states[target] = _ManagedState(key=target, tensors=tensors)
-            self._installed_base[target.run_id] = target
+        with self._admission_locks["l1_gpu"]:
+            self._reclaim_l1(max(byte_count - old_bytes, 0), protected={source, target})
+            with self._lock:
+                if self._installed_base.get(source.run_id) != source:
+                    raise RuntimeError(
+                        "residency source is not the installed generation"
+                    )
+                if source.run_id != target.run_id:
+                    raise ValueError("residency advance cannot change runs")
+                self.ledger.advance(source, target, "l1_gpu", byte_count=byte_count)
+                self._states[target] = _ManagedState(key=target, tensors=tensors)
+                self._installed_base[target.run_id] = target
         if retire_source:
             self._retire(source)
         return self.ensure_l2(target)
@@ -168,51 +179,60 @@ class RunResidencyManager:
                 return _resolved_future(state.l2)
             if state.l2_future is not None:
                 return state.l2_future
-            if self.ledger.has_copy(key, "l1_gpu"):
-                byte_count = self._mover.byte_count(state.tensors, "cuda")
-                source: ResidencyTier = "l1_gpu"
-            elif self.ledger.has_copy(key, "l3_nvme"):
-                if state.l3_manifest is None:
-                    raise RuntimeError("L3 residency has no committed manifest")
-                byte_count = state.l3_manifest.payload_bytes
-                source = "l3_nvme"
-            else:
-                raise RuntimeError("state has no local source for L2 materialization")
-        self._reclaim("l2_cpu", byte_count, protected={key})
-        with self._lock:
-            state = self._state(key)
-            if state.l2 is not None:
-                return _resolved_future(state.l2)
-            if state.l2_future is not None:
-                return state.l2_future
-            if not self.ledger.has_copy(key, source):
-                raise RuntimeError("L2 residency source changed during reclamation")
-            if source == "l1_gpu":
-                reservation = self._reserve(
-                    key,
-                    source="l1_gpu",
-                    target="l2_cpu",
-                    byte_count=byte_count,
-                )
-                try:
-                    snapshot = self._mover.snapshot(state.tensors)
-                    self._snapshot_barrier.register(snapshot.pending)
-                except BaseException:
-                    self._cancel(reservation)
-                    raise
-                future = self._submit(
-                    self._finish_l2_snapshot, state, reservation, snapshot
-                )
-            else:
-                reservation = self._reserve(
-                    key,
-                    source="l3_nvme",
-                    target="l2_cpu",
-                    byte_count=byte_count,
-                )
-                future = self._submit(self._restore_l2, state, reservation)
-            state.l2_future = future
-            return future
+        with self._admission_locks["l2_cpu"]:
+            with self._lock:
+                state = self._state(key)
+                if state.l2 is not None:
+                    return _resolved_future(state.l2)
+                if state.l2_future is not None:
+                    return state.l2_future
+                if self.ledger.has_copy(key, "l1_gpu"):
+                    byte_count = self._mover.byte_count(state.tensors, "cuda")
+                    source: ResidencyTier = "l1_gpu"
+                elif self.ledger.has_copy(key, "l3_nvme"):
+                    if state.l3_manifest is None:
+                        raise RuntimeError("L3 residency has no committed manifest")
+                    byte_count = state.l3_manifest.payload_bytes
+                    source = "l3_nvme"
+                else:
+                    raise RuntimeError(
+                        "state has no local source for L2 materialization"
+                    )
+            self._reclaim("l2_cpu", byte_count, protected={key})
+            with self._lock:
+                state = self._state(key)
+                if state.l2 is not None:
+                    return _resolved_future(state.l2)
+                if state.l2_future is not None:
+                    return state.l2_future
+                if not self.ledger.has_copy(key, source):
+                    raise RuntimeError("L2 residency source changed during reclamation")
+                if source == "l1_gpu":
+                    reservation = self._reserve(
+                        key,
+                        source="l1_gpu",
+                        target="l2_cpu",
+                        byte_count=byte_count,
+                    )
+                    try:
+                        snapshot = self._mover.snapshot(state.tensors)
+                        self._snapshot_barrier.register(snapshot.pending)
+                    except BaseException:
+                        self._cancel(reservation)
+                        raise
+                    future = self._submit(
+                        self._finish_l2_snapshot, state, reservation, snapshot
+                    )
+                else:
+                    reservation = self._reserve(
+                        key,
+                        source="l3_nvme",
+                        target="l2_cpu",
+                        byte_count=byte_count,
+                    )
+                    future = self._submit(self._restore_l2, state, reservation)
+                state.l2_future = future
+                return future
 
     def ensure_l3(self, key: ResidencyKey) -> Future[NvmeResidencyManifest]:
         self._require_open()
@@ -232,7 +252,7 @@ class RunResidencyManager:
         self._require_open()
         if self.ledger.has_copy(key, "l1_gpu"):
             return
-        if key.accumulator_revision == 0:
+        if key.representation == "learner":
             self._evict_installed_base(key.run_id)
         with self._lock:
             state = self._state(key)
@@ -242,26 +262,30 @@ class RunResidencyManager:
                 byte_count = state.l3_manifest.payload_bytes
             else:
                 raise RuntimeError("state has no local source for L1 materialization")
-        self._reclaim_l1(byte_count, protected={key})
-        l2 = self.ensure_l2(key).result()
-        with self._lock:
-            state = self._state(key)
-            if state.l1_transition is not None:
-                return
-            l2.activate()
-            reservation = self._reserve(
-                key,
-                source="l2_cpu",
-                target="l1_gpu",
-                byte_count=byte_count,
-            )
-            try:
-                transition = self._mover.move(state.tensors, self.config.device)
-            except BaseException:
-                self._cancel(reservation)
-                raise
-            state.l1_reservation = reservation
-            state.l1_transition = transition
+        with self._admission_locks["l1_gpu"]:
+            with self._lock:
+                if self._state(key).l1_transition is not None:
+                    return
+            self._reclaim_l1(byte_count, protected={key})
+            l2 = self.ensure_l2(key).result()
+            with self._lock:
+                state = self._state(key)
+                if state.l1_transition is not None:
+                    return
+                l2.activate()
+                reservation = self._reserve(
+                    key,
+                    source="l2_cpu",
+                    target="l1_gpu",
+                    byte_count=byte_count,
+                )
+                try:
+                    transition = self._mover.move(state.tensors, self.config.device)
+                except BaseException:
+                    self._cancel(reservation)
+                    raise
+                state.l1_reservation = reservation
+                state.l1_transition = transition
 
     def acquire_l1(self, key: ResidencyKey) -> None:
         """Fence the current compute stream and pin the selected L1 generation."""
@@ -276,7 +300,7 @@ class RunResidencyManager:
                 self._commit(reservation)
                 state.l1_transition = None
                 state.l1_reservation = None
-                if key.accumulator_revision == 0:
+                if key.representation == "learner":
                     self._installed_base[key.run_id] = key
             if not self.ledger.has_copy(key, "l1_gpu"):
                 raise RuntimeError("requested generation did not become L1 resident")
@@ -292,7 +316,8 @@ class RunResidencyManager:
 
     def evict_l2(self, key: ResidencyKey) -> None:
         self.ensure_l3(key).result()
-        self._evict_l2(key)
+        if not self._evict_l2(key) and self.ledger.has_copy(key, "l2_cpu"):
+            raise RuntimeError("cannot evict pinned L2 residency")
 
     def record_l4(
         self,
@@ -322,6 +347,18 @@ class RunResidencyManager:
 
     def l2_image(self, key: ResidencyKey) -> HostTensorImage:
         return self.ensure_l2(key).result()
+
+    @contextmanager
+    def borrow_l2(self, key: ResidencyKey) -> Iterator[HostTensorImage]:
+        """Pin one generation while a host-side consumer reads its L2 image."""
+        self._require_open()
+        with self._lock:
+            self._state(key)
+            self.ledger.pin(key)
+        try:
+            yield self.ensure_l2(key).result()
+        finally:
+            self.ledger.unpin(key)
 
     def retire(self, key: ResidencyKey) -> None:
         self._require_open()
@@ -487,7 +524,7 @@ class RunResidencyManager:
         try:
             image = l2_future.result()
             byte_count = self._store.physical_bytes(state.key, image)
-            with self._lock:
+            with self._admission_locks["l3_nvme"]:
                 self._reclaim("l3_nvme", byte_count, protected={state.key})
                 reservation = self._reserve(
                     state.key,
@@ -539,33 +576,33 @@ class RunResidencyManager:
         *,
         protected: set[ResidencyKey],
     ) -> None:
-        reclaim = self.ledger.required_reclaim(tier, incoming_bytes)
-        if reclaim <= 0:
-            return
-        candidates = self.ledger.eviction_candidates(
-            tier,
-            reclaim,
-            protected=protected,
-            require_other_copy=tier != "l2_cpu",
-        )
-        for candidate in candidates:
-            if tier == "l2_cpu":
-                if not (
-                    self.ledger.has_copy(candidate, "l1_gpu")
-                    or self.ledger.has_copy(candidate, "l3_nvme")
-                ):
-                    self.ensure_l3(candidate).result()
-                self._evict_l2(candidate)
-            elif tier == "l3_nvme":
-                self._evict_l3(candidate)
-            else:
-                raise ValueError(f"unsupported background residency tier: {tier}")
+        while (reclaim := self.ledger.required_reclaim(tier, incoming_bytes)) > 0:
+            candidates = self.ledger.eviction_candidates(
+                tier,
+                reclaim,
+                protected=protected,
+                require_other_copy=tier != "l2_cpu",
+            )
+            for candidate in candidates:
+                if tier == "l2_cpu":
+                    if not (
+                        self.ledger.has_copy(candidate, "l1_gpu")
+                        or self.ledger.has_copy(candidate, "l3_nvme")
+                    ):
+                        self.ensure_l3(candidate).result()
+                    self._evict_l2(candidate)
+                elif tier == "l3_nvme":
+                    self._evict_l3(candidate)
+                else:
+                    raise ValueError(f"unsupported background residency tier: {tier}")
 
-    def _evict_l2(self, key: ResidencyKey) -> None:
+    def _evict_l2(self, key: ResidencyKey) -> bool:
         with self._lock:
             state = self._state(key)
             if not self.ledger.has_copy(key, "l2_cpu"):
-                return
+                return False
+            if self.ledger.entry(key).pin_count:
+                return False
             if not self.ledger.has_copy(key, "l1_gpu"):
                 if state.l3 is None:
                     raise RuntimeError("cannot evict L2 before L3 is ready")
@@ -573,12 +610,15 @@ class RunResidencyManager:
             self.ledger.drop(key, "l2_cpu")
             state.l2 = None
             state.l2_future = None
+            return True
 
-    def _evict_l3(self, key: ResidencyKey) -> None:
+    def _evict_l3(self, key: ResidencyKey) -> bool:
         with self._lock:
             state = self._state(key)
             if not self.ledger.has_copy(key, "l3_nvme"):
-                return
+                return False
+            if self.ledger.entry(key).pin_count:
+                return False
             if not (
                 self.ledger.has_copy(key, "l1_gpu")
                 or self.ledger.has_copy(key, "l2_cpu")
@@ -591,6 +631,7 @@ class RunResidencyManager:
             state.l3 = None
             state.l3_manifest = None
             state.l3_future = None
+            return True
 
     def _evict_l1_locked(self, key: ResidencyKey) -> None:
         state = self._state(key)
