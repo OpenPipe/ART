@@ -503,7 +503,11 @@ class MonarchTrainerActor(Actor):
         from .executor import MCoreRunSlotExecutor, MegatronTrainJobExecutor
 
         self._executor = MegatronTrainJobExecutor(self._runtime)
-        self._run_slot_executor = MCoreRunSlotExecutor(self._runtime)
+        self._run_slot_executor = (
+            MCoreRunSlotExecutor(self._runtime)
+            if self._runtime.run_residency_config is not None
+            else None
+        )
         self._weight_offload = WeightOffloadManager.from_config(
             model=self._runtime.model,
             rank=self._runtime.rank,
@@ -534,6 +538,11 @@ class MonarchTrainerActor(Actor):
             )
             self._cp_lookahead_thread.start()
         self._valid = True
+
+    def _require_run_slot_executor(self) -> Any:
+        if self._run_slot_executor is None:
+            raise RuntimeError("trainer actor is not configured for multi-run slots")
+        return self._run_slot_executor
 
     def _run_cp_lookahead(self, receiver: Any) -> None:
         while (request := receiver.recv().get()) is not None:
@@ -820,7 +829,8 @@ class MonarchTrainerActor(Actor):
         if not self._valid:
             raise RuntimeError("trainer actor runtime is invalid")
         registration = RunSlotRegistration.model_validate_json(registration_json)
-        self._run_slot_executor.register_run(
+        executor = self._require_run_slot_executor()
+        executor.register_run(
             tenant_id=registration.tenant_id,
             run_id=registration.run_id,
             training_session_id=registration.training_session_id,
@@ -840,19 +850,17 @@ class MonarchTrainerActor(Actor):
                 adapter_path=registration.adapter_path,
                 adapter_step=registration.adapter_step,
                 optimizer_generation_id=registration.initial_optimizer_generation_id,
-                layout=self._run_slot_executor.optimizer_layout(registration.run_id),
+                layout=executor.optimizer_layout(registration.run_id),
             )
-            self._run_slot_executor.restore_optimizer_state(
-                registration.run_id, optimizer_state
-            )
-        self._run_slot_executor.complete_run_registration(registration.run_id)
+            executor.restore_optimizer_state(registration.run_id, optimizer_state)
+        executor.complete_run_registration(registration.run_id)
         return {"rank": self._runtime.rank, "run_id": registration.run_id}
 
     @endpoint
     def unregister_run_slot(self, run_id: str) -> dict[str, Any]:
         if not self._valid:
             raise RuntimeError("trainer actor runtime is invalid")
-        self._run_slot_executor.unregister_run(run_id)
+        self._require_run_slot_executor().unregister_run(run_id)
         return {"rank": self._runtime.rank, "run_id": run_id}
 
     @endpoint
@@ -871,7 +879,7 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
-            result = self._run_slot_executor.execute_forward_backward(
+            result = self._require_run_slot_executor().execute_forward_backward(
                 job, batch, Event()
             )
             coordinator = self._runtime.rank == 0
@@ -906,7 +914,9 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
-            result = self._run_slot_executor.execute_forward(job, batch, Event())
+            result = self._require_run_slot_executor().execute_forward(
+                job, batch, Event()
+            )
             coordinator = self._runtime.rank == 0
             return {
                 "rank": self._runtime.rank,
@@ -935,7 +945,7 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
-            result = self._run_slot_executor.execute_sft_forward_backward(
+            result = self._require_run_slot_executor().execute_sft_forward_backward(
                 job, batch, Event()
             )
             coordinator = self._runtime.rank == 0
@@ -964,7 +974,9 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
-            result = self._run_slot_executor.execute_sft_forward(job, batch, Event())
+            result = self._require_run_slot_executor().execute_sft_forward(
+                job, batch, Event()
+            )
             coordinator = self._runtime.rank == 0
             return {
                 "rank": self._runtime.rank,
@@ -984,7 +996,7 @@ class MonarchTrainerActor(Actor):
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             job = OptimizerJobSpec.model_validate_json(job_json)
-            result = self._run_slot_executor.execute_optimizer(job)
+            result = self._require_run_slot_executor().execute_optimizer(job)
             coordinator = self._runtime.rank == 0
             return {
                 "rank": self._runtime.rank,
@@ -1005,7 +1017,7 @@ class MonarchTrainerActor(Actor):
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             job = LoadStateJobSpec.model_validate_json(job_json)
-            self._run_slot_executor.start_prepare_load_state(job)
+            self._require_run_slot_executor().start_prepare_load_state(job)
             return {
                 "rank": self._runtime.rank,
                 "operation_id": job.operation_id,
@@ -1025,7 +1037,7 @@ class MonarchTrainerActor(Actor):
                 "rank": self._runtime.rank,
                 "operation_id": job.operation_id,
                 "learner_version": job.learner_version,
-                "ready": self._run_slot_executor.load_state_prepared(job),
+                "ready": self._require_run_slot_executor().load_state_prepared(job),
             }
         except BaseException:
             self._valid = False
@@ -1037,7 +1049,7 @@ class MonarchTrainerActor(Actor):
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             job = LoadStateJobSpec.model_validate_json(job_json)
-            result = self._run_slot_executor.finish_prepared_load_state(job)
+            result = self._require_run_slot_executor().finish_prepared_load_state(job)
             return {"rank": self._runtime.rank, **result}
         except BaseException:
             self._valid = False
@@ -1045,7 +1057,7 @@ class MonarchTrainerActor(Actor):
 
     @endpoint
     def discard_run_slot_load_state(self, operation_id: str) -> None:
-        self._run_slot_executor.discard_prepared_load_state(operation_id)
+        self._require_run_slot_executor().discard_prepared_load_state(operation_id)
 
     @endpoint
     def execute_run_slot_snapshot(
@@ -1058,7 +1070,7 @@ class MonarchTrainerActor(Actor):
                 raise RuntimeError("trainer actor runtime is invalid")
             job = GenerationSnapshotJobSpec.model_validate_json(job_json)
             coordinator = self._runtime.rank == 0
-            result = self._run_slot_executor.execute_snapshot(
+            result = self._require_run_slot_executor().execute_snapshot(
                 job,
                 _ActorEventSink(event_port, coordinator=coordinator),
             )
@@ -1091,7 +1103,7 @@ class MonarchTrainerActor(Actor):
                 "rank": self._runtime.rank,
                 "run_id": archive.run_id,
                 "generation_id": archive.generation_id,
-                "recorded": self._run_slot_executor.record_archive(
+                "recorded": self._require_run_slot_executor().record_archive(
                     archive.run_id,
                     archive.generation_id,
                     immutable_ref=archive.immutable_ref,
@@ -1215,7 +1227,8 @@ class MonarchTrainerActor(Actor):
             self._executor.discard_open_gradients()
             self._weight_offload.after_job()
             self._command_job_open = False
-        self._run_slot_executor.close()
+        if self._run_slot_executor is not None:
+            self._run_slot_executor.close()
         self._stop_cp_lookahead()
         self._executor.close()
         import torch
@@ -1266,7 +1279,8 @@ class MonarchTrainerActor(Actor):
             self._executor.discard_open_gradients()
             self._weight_offload.after_job()
             self._command_job_open = False
-        self._run_slot_executor.close()
+        if self._run_slot_executor is not None:
+            self._run_slot_executor.close()
         self._stop_cp_lookahead()
         self._executor.close()
 
