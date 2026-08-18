@@ -67,11 +67,11 @@ else
     echo "Skipping git reset/clean (GIT_RESET_CLEAN is not true). Preserving synced working tree."
 fi
 
-# Install astral-uv (standalone version)
-# Always prefer the standalone uv over system/conda installations.
-if command -v uv >/dev/null 2>&1; then
-    echo "Using $(uv --version)"
-elif ! curl -LsSf https://astral.sh/uv/install.sh | sh; then
+readonly uv_version=0.11.7
+if ! uv --version 2>/dev/null | grep -q "^uv ${uv_version} "; then
+    curl -LsSf "https://astral.sh/uv/${uv_version}/install.sh" | sh
+fi
+if ! uv --version; then
     echo "Failed to install uv." >&2
     exit 1
 fi
