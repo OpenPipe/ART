@@ -647,6 +647,7 @@ class _ResidentRunState(BaseModel):
     gradients: Any
     desired_key: ResidencyKey
     installed_key: ResidencyKey
+    initial_generation: TrainerGeneration | None = None
     pending_load: _PreparedRunLoad | None = None
     gradient_keys: dict[str, ResidencyKey] = Field(default_factory=dict)
     next_accumulator_revision: int = 1
@@ -727,14 +728,33 @@ class MCoreRunSlotExecutor:
             ),
             desired_key=key,
             installed_key=key,
+            initial_generation=TrainerGeneration(
+                training_session_id=training_session_id,
+                policy_step=learner_version,
+                generation_id=generation_id,
+                adapter_path=adapter_path,
+            ),
         )
 
     def complete_run_registration(self, run_id: str) -> None:
         state = self._require_run(run_id, require_complete=False)
         if state.registration_complete:
             return
-        tensors = self._slot_trainer.checkpoint_slot_residency_tensors(run_id).all
-        self._residency.register_l1(state.installed_key, tensors)
+        generation = state.initial_generation
+        if generation is None:
+            raise RuntimeError("run registration has no immutable initial generation")
+        tensors = self._slot_trainer.checkpoint_slot_residency_tensors(run_id)
+        l2 = self._residency.register_l1(state.installed_key, tensors.all)
+        self._publisher.register_existing(
+            run_id=run_id,
+            generation=generation,
+            optimizer_source=(
+                self._slot_trainer.checkpoint_slot_optimizer_residency_source(run_id)
+            ),
+            l2=l2,
+            tensor_offset=len(tensors.weights),
+        )
+        state.initial_generation = None
         state.registration_complete = True
 
     def optimizer_layout(self, run_id: str) -> Any:
@@ -1482,7 +1502,7 @@ class _GenerationPublisher:
         l2: Future[Any],
         tensor_offset: int,
     ) -> dict[str, float]:
-        """Register a loaded L2 generation without reading mutable GPU state."""
+        """Register an existing adapter and L2 state without reading mutable GPU state."""
         self.raise_if_failed()
         started = time.perf_counter()
         with self._lock:
