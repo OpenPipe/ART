@@ -189,7 +189,7 @@ def _ordered_choices(choices: Sequence[_IndexedT], *, protocol: str) -> list[_In
 
 def _is_prefix(prefix: Sequence[object], value: Sequence[object]) -> bool:
     return len(prefix) <= len(value) and all(
-        left == right for left, right in zip(prefix, value[: len(prefix)], strict=True)
+        left == right for left, right in zip(prefix, value)
     )
 
 
@@ -310,6 +310,18 @@ def _extend_branches(
     branches.extend(created)
 
 
+def _token_prefix_lengths(tokens: Sequence[int]) -> list[int]:
+    prefix_lengths = [0] * len(tokens)
+    matched = 0
+    for index in range(1, len(tokens)):
+        while matched and tokens[index] != tokens[matched]:
+            matched = prefix_lengths[matched - 1]
+        if tokens[index] == tokens[matched]:
+            matched += 1
+            prefix_lengths[index] = matched
+    return prefix_lengths
+
+
 def _contains_tokens(tokens: Sequence[int], sampled: Sequence[int]) -> bool:
     if not sampled:
         return True
@@ -318,14 +330,7 @@ def _contains_tokens(tokens: Sequence[int], sampled: Sequence[int]) -> bool:
 
     # Knuth-Morris-Pratt keeps reconciliation linear for long sampled outputs.
     # Comparing every slice blocks the event loop on long multi-turn histories.
-    prefix_lengths = [0] * len(sampled)
-    matched = 0
-    for index in range(1, len(sampled)):
-        while matched and sampled[index] != sampled[matched]:
-            matched = prefix_lengths[matched - 1]
-        if sampled[index] == sampled[matched]:
-            matched += 1
-            prefix_lengths[index] = matched
+    prefix_lengths = _token_prefix_lengths(sampled)
 
     matched = 0
     for token in tokens:
@@ -351,7 +356,21 @@ def _retains_output_suffix(
     ):
         return False
     continuation = later_prompt[len(prompt) :]
-    return any(_is_prefix(output[start:], continuation) for start in range(len(output)))
+    if not output or not continuation:
+        return False
+
+    prefix_lengths = _token_prefix_lengths(continuation)
+    matched = 0
+    for index, token in enumerate(output):
+        while matched and token != continuation[matched]:
+            matched = prefix_lengths[matched - 1]
+        if token == continuation[matched]:
+            matched += 1
+            if matched == len(continuation):
+                if index + 1 == len(output):
+                    return True
+                matched = prefix_lengths[matched - 1]
+    return matched > 0
 
 
 def _chat_generation_tokens(

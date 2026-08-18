@@ -315,6 +315,31 @@ def test_contains_tokens(tokens: list[int], sampled: list[int], expected: bool) 
     assert history_module._contains_tokens(tokens, sampled) is expected
 
 
+@pytest.mark.parametrize(
+    ("prompt", "output", "later_prompt", "expected"),
+    [
+        ([0], [], [0, 1], False),
+        ([0], [1], [0], False),
+        ([0], [7, 1, 2], [0, 1, 2], True),
+        ([0], [1, 1, 1, 2], [0, 1, 1, 2], True),
+        ([0], [1, 2, 3], [0, 1, 2], False),
+        ([0], [9, 1], [0, 1, 2], True),
+        ([0], [1], [9, 1], False),
+    ],
+)
+def test_retains_output_suffix(
+    prompt: list[int],
+    output: list[int],
+    later_prompt: list[int],
+    expected: bool,
+) -> None:
+    history_module = importlib.import_module("art.trajectories._history")
+
+    assert (
+        history_module._retains_output_suffix(prompt, output, later_prompt) is expected
+    )
+
+
 def test_contains_tokens_scales_linearly() -> None:
     history_module = importlib.import_module("art.trajectories._history")
 
@@ -341,6 +366,15 @@ def test_contains_tokens_scales_linearly() -> None:
 
     assert history_module._contains_tokens(cast(Any, tokens), cast(Any, sampled))
     assert tokens.accesses + sampled.accesses < 10 * (len(tokens) + len(sampled))
+
+    output = CountingTokens([1] * 10_000 + [2])
+    later_prompt = CountingTokens([0, *([1] * 1_000), 2])
+    assert history_module._retains_output_suffix(
+        [0], cast(Any, output), cast(Any, later_prompt)
+    )
+    assert output.accesses + later_prompt.accesses < 10 * (
+        len(output) + len(later_prompt)
+    )
 
 
 def test_divergent_chat_projection_parses_each_exact_generation_once(
