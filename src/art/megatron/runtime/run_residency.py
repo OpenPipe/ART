@@ -135,10 +135,14 @@ class RunResidencyManager:
         source: ResidencyKey,
         target: ResidencyKey,
         tensors: tuple[torch.Tensor, ...],
+        *,
+        retire_source: bool = False,
     ) -> Future[HostTensorImage]:
         self._require_open()
         if source.accumulator_revision or target.accumulator_revision:
             raise ValueError("only committed base generations may advance in place")
+        if retire_source:
+            self.ensure_l2(source).result()
         byte_count = self._mover.byte_count(tensors, "cuda")
         old_bytes = self.ledger.copy(source, "l1_gpu").byte_count
         self._reclaim_l1(max(byte_count - old_bytes, 0), protected={source, target})
@@ -150,6 +154,8 @@ class RunResidencyManager:
             self.ledger.advance(source, target, "l1_gpu", byte_count=byte_count)
             self._states[target] = _ManagedState(key=target, tensors=tensors)
             self._installed_base[target.run_id] = target
+        if retire_source:
+            self._retire(source)
         return self.ensure_l2(target)
 
     def ensure_l2(self, key: ResidencyKey) -> Future[HostTensorImage]:
@@ -211,11 +217,18 @@ class RunResidencyManager:
         self._require_open()
         if self.ledger.has_copy(key, "l1_gpu"):
             return
-        l2 = self.ensure_l2(key).result()
         if key.accumulator_revision == 0:
             self._evict_installed_base(key.run_id)
-        byte_count = l2.stats.byte_count
+        local = tuple(
+            self.ledger.copy(key, tier)
+            for tier in ("l2_cpu", "l3_nvme")
+            if self.ledger.has_copy(key, tier)
+        )
+        if not local:
+            raise RuntimeError("state has no local source for L1 materialization")
+        byte_count = local[0].byte_count
         self._reclaim_l1(byte_count, protected={key})
+        l2 = self.ensure_l2(key).result()
         with self._lock:
             state = self._state(key)
             if state.l1_transition is not None:
@@ -363,14 +376,38 @@ class RunResidencyManager:
             futures = tuple(self._futures)
         _done, pending = wait(futures, timeout=self.config.shutdown_timeout_s)
         self._pool.shutdown(wait=False, cancel_futures=True)
+        failures: list[BaseException] = []
+        if not pending:
+            with self._lock:
+                states = tuple(self._states.values())
+            for state in states:
+                try:
+                    if state.l1_transition is not None:
+                        assert state.l1_reservation is not None
+                        state.l1_transition.synchronize()
+                        self.ledger.commit(state.l1_reservation)
+                        state.l1_transition = None
+                        state.l1_reservation = None
+                    self._retire(state.key)
+                except BaseException as error:
+                    failures.append(error)
+        try:
+            self._raise_failures()
+        except BaseException as error:
+            failures.append(error)
         with self._lock:
             self._closed = True
             self._closing = False
         if pending:
-            raise TimeoutError(
-                f"{len(pending)} residency transitions exceeded shutdown timeout"
+            failures.append(
+                TimeoutError(
+                    f"{len(pending)} residency transitions exceeded shutdown timeout"
+                )
             )
-        self._raise_failures()
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("run residency shutdown failed", failures)
 
     def _finish_l2_snapshot(
         self,
@@ -470,7 +507,10 @@ class RunResidencyManager:
             "l1_gpu", reclaim, protected=protected, require_other_copy=True
         )
         for candidate in candidates:
-            self.evict_l1(candidate)
+            self.ensure_l3(candidate).result()
+            with self._lock:
+                self._evict_l1_locked(candidate)
+                self._evict_l2(candidate)
 
     def _reclaim(
         self,

@@ -898,11 +898,15 @@ class MCoreRunSlotExecutor:
         )
         if optimizer_source is None:
             raise RuntimeError("optimizer commit has no immutable optimizer state")
-        l2 = self._residency.advance_l1(parent_key, output_key, residency_tensors.all)
+        l2 = self._residency.advance_l1(
+            parent_key,
+            output_key,
+            residency_tensors.all,
+            retire_source=True,
+        )
         state.desired_key = output_key
         state.installed_key = output_key
         state.learner_version = job.learner_version
-        self._residency.demote_l2_async(parent_key)
         for operation_id in consumed:
             self._residency.retire_async(state.gradient_keys.pop(operation_id))
         from art.megatron.lora import LoRASlotRef
