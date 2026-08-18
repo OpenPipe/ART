@@ -1,34 +1,18 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Mapping
 import json
-import logging
 import os
 import time
 from typing import Any, cast, overload
 
 import httpx
-from openai import (
-    APIConnectionError,
-    APIError,
-    APITimeoutError,
-    AsyncOpenAI,
-    AsyncStream,
-    BadRequestError,
-    DefaultAsyncHttpxClient,
-)
+from openai import AsyncOpenAI, BadRequestError, DefaultAsyncHttpxClient
 from openai.types.chat import ChatCompletionMessageParam
-from openai.types.chat.chat_completion import ChatCompletion
-from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from openai.types.completion_usage import CompletionUsage
 
 from art.costs import get_model_pricing, tokens_to_cost
 from art.model import Model
-from art.openai import (
-    IncompleteChatCompletionStreamError,
-    consume_chat_completion_stream,
-)
 from art.trajectories import Trajectory
 
 from .client import Scenario, TauBenchClient, _get_default_client
@@ -37,7 +21,8 @@ openai_clients: dict[tuple[str, str], AsyncOpenAI] = {}
 CONTEXT_TOKEN_LIMIT = 32_768
 DEFAULT_MAX_COMPLETION_TOKENS = 4096
 _POLICY_CONNECTION_LIMIT = 2048
-_STREAM_RETRY_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+_POLICY_MAX_RETRIES = 1
+_POLICY_HTTP_TIMEOUT = httpx.Timeout(connect=30, read=10 * 60, write=30, pool=30)
 
 
 @overload
@@ -117,29 +102,6 @@ async def rollout(
             model=model,
             base_model=base_model,
         )
-        policy_completion_kwargs = dict(chat_completion_kwargs)
-        stream_policy = bool(
-            policy_completion_kwargs.setdefault(
-                "stream", isinstance(base_url_or_model, str)
-            )
-        )
-        if stream_policy:
-            stream_options = dict(
-                cast(
-                    Mapping[str, Any],
-                    policy_completion_kwargs.get("stream_options") or {},
-                )
-            )
-            stream_options["include_usage"] = True
-            policy_completion_kwargs["stream_options"] = stream_options
-            extra_headers = dict(
-                cast(
-                    Mapping[str, str],
-                    policy_completion_kwargs.get("extra_headers") or {},
-                )
-            )
-            extra_headers.setdefault("X-ART-Stream-Progress", "sse-comments-v1")
-            policy_completion_kwargs["extra_headers"] = extra_headers
         messages: list[ChatCompletionMessageParam] = [
             {"role": "system", "content": env.info["policy"]},
             {"role": "user", "content": env.observation.removeprefix("user: ")},
@@ -162,14 +124,13 @@ async def rollout(
                     break
                 try:
                     policy_started = time.perf_counter()
-                    chat_completion = await _create_policy_completion(
-                        openai_client,
+                    chat_completion = await openai_client.chat.completions.create(
                         messages=messages,
                         model=model_name,
-                        stream_policy=stream_policy,
+                        stream=False,
                         tool_choice="auto",
                         tools=tools,
-                        **policy_completion_kwargs,
+                        **chat_completion_kwargs,
                     )
                     policy_latency = time.perf_counter() - policy_started
                     trajectory.metrics["latency/policy"] = (
@@ -179,7 +140,7 @@ async def rollout(
                         trajectory.metrics.get("latency/policy_max", 0.0),
                         policy_latency,
                     )
-                except (BadRequestError, APIError) as exc:
+                except BadRequestError as exc:
                     if _is_max_tokens_error(exc):
                         break
                     raise
@@ -263,58 +224,6 @@ async def rollout(
         return trajectory
 
 
-async def _create_policy_completion(
-    openai_client: AsyncOpenAI,
-    *,
-    stream_policy: bool,
-    **kwargs: Any,
-) -> ChatCompletion:
-    attempts = max(1, int(getattr(openai_client, "max_retries", 2)) + 1)
-    for attempt in range(attempts):
-        completion = await openai_client.chat.completions.create(**kwargs)
-        if not stream_policy:
-            return cast(ChatCompletion, completion)
-        try:
-            return await consume_chat_completion_stream(
-                cast(AsyncStream[ChatCompletionChunk], completion),
-                require_usage=True,
-            )
-        except Exception as error:
-            if attempt == attempts - 1 or not _retryable_stream_error(error):
-                raise
-            delay = 0.25 * (2**attempt)
-            logging.warning(
-                "Retrying streamed policy completion after %s",
-                type(error).__name__,
-            )
-            await asyncio.sleep(delay)
-    raise AssertionError("unreachable")
-
-
-def _retryable_stream_error(error: Exception) -> bool:
-    if isinstance(
-        error,
-        (
-            IncompleteChatCompletionStreamError,
-            APIConnectionError,
-            APITimeoutError,
-            httpx.TransportError,
-            json.JSONDecodeError,
-        ),
-    ):
-        return True
-    if not isinstance(error, APIError):
-        return False
-    body = getattr(error, "body", None)
-    code = body.get("code") if isinstance(body, Mapping) else None
-    if not isinstance(code, (int, str)):
-        return False
-    try:
-        return int(code) in _STREAM_RETRY_STATUS_CODES
-    except (TypeError, ValueError):
-        return False
-
-
 def _completion_client_and_model(
     base_url_or_model: str | Model,
     *,
@@ -336,11 +245,13 @@ def _completion_client_and_model(
         openai_clients[key] = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url_or_model,
+            max_retries=_POLICY_MAX_RETRIES,
             http_client=DefaultAsyncHttpxClient(
+                timeout=_POLICY_HTTP_TIMEOUT,
                 limits=httpx.Limits(
                     max_connections=_POLICY_CONNECTION_LIMIT,
                     max_keepalive_connections=_POLICY_CONNECTION_LIMIT,
-                )
+                ),
             ),
         )
     return openai_clients[key], model, base_model
@@ -378,7 +289,7 @@ def _record_tinker_costs(
     )
 
 
-def _is_max_tokens_error(exc: APIError) -> bool:
+def _is_max_tokens_error(exc: BadRequestError) -> bool:
     message = getattr(exc, "message", str(exc))
     return "max_tokens" in message or "max_completion_tokens" in message
 

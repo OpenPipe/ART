@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 import importlib
 import json
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
-from openai import APIError, AsyncOpenAI
-from openai.types.chat import ChatCompletion, ChatCompletionChunk
+from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletion
 import pytest
 
 import art
@@ -251,92 +250,9 @@ class FakeTauBenchClient(TauBenchClient):
         return DeleteEnvironmentResponse(id=env_id, deleted=True)
 
 
-class FakeStream:
-    def __init__(self, chunks: list[ChatCompletionChunk]) -> None:
-        self._chunks = iter(chunks)
-
-    def __aiter__(self) -> AsyncIterator[ChatCompletionChunk]:
-        return self
-
-    async def __anext__(self) -> ChatCompletionChunk:
-        try:
-            return next(self._chunks)
-        except StopIteration:
-            raise StopAsyncIteration from None
-
-    async def close(self) -> None:
-        pass
-
-
-class FailedStream:
-    def __aiter__(self) -> AsyncIterator[ChatCompletionChunk]:
-        return self
-
-    async def __anext__(self) -> ChatCompletionChunk:
-        raise httpx.ReadError(
-            "connection reset",
-            request=httpx.Request("POST", "http://model.test/v1/chat/completions"),
-        )
-
-    async def close(self) -> None:
-        pass
-
-
-class MaxTokensErrorStream:
-    def __aiter__(self) -> AsyncIterator[ChatCompletionChunk]:
-        return self
-
-    async def __anext__(self) -> ChatCompletionChunk:
-        raise APIError(
-            message="max_tokens is too large for this model",
-            request=httpx.Request("POST", "http://model.test/v1/chat/completions"),
-            body={"code": 400},
-        )
-
-    async def close(self) -> None:
-        pass
-
-
 class FakeCompletions:
     async def create(self, **kwargs: Any) -> Any:
         self.kwargs = kwargs
-        if kwargs.get("stream"):
-            return FakeStream(
-                [
-                    ChatCompletionChunk.model_validate(
-                        {
-                            "id": "chat-1",
-                            "object": "chat.completion.chunk",
-                            "created": 0,
-                            "model": "default",
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "finish_reason": "stop",
-                                    "delta": {
-                                        "role": "assistant",
-                                        "content": "hello",
-                                    },
-                                }
-                            ],
-                        }
-                    ),
-                    ChatCompletionChunk.model_validate(
-                        {
-                            "id": "chat-1",
-                            "object": "chat.completion.chunk",
-                            "created": 0,
-                            "model": "default",
-                            "choices": [],
-                            "usage": {
-                                "prompt_tokens": 10,
-                                "completion_tokens": 5,
-                                "total_tokens": 15,
-                            },
-                        }
-                    ),
-                ]
-            )
         return ChatCompletion.model_validate(
             {
                 "id": "chat-1",
@@ -363,36 +279,6 @@ class FakeAsyncOpenAI:
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
         self.chat = SimpleNamespace(completions=FakeCompletions())
-
-
-class RetryStreamCompletions(FakeCompletions):
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def create(self, **kwargs: Any) -> Any:
-        self.calls += 1
-        if self.calls == 1:
-            return FailedStream()
-        return await super().create(**kwargs)
-
-
-class RetryStreamAsyncOpenAI:
-    max_retries = 1
-
-    def __init__(self, **kwargs: Any) -> None:
-        self.chat = SimpleNamespace(completions=RetryStreamCompletions())
-
-
-class MaxTokensStreamCompletions:
-    async def create(self, **kwargs: Any) -> Any:
-        return MaxTokensErrorStream()
-
-
-class MaxTokensStreamAsyncOpenAI:
-    max_retries = 0
-
-    def __init__(self, **kwargs: Any) -> None:
-        self.chat = SimpleNamespace(completions=MaxTokensStreamCompletions())
 
 
 @pytest.mark.asyncio
@@ -434,133 +320,17 @@ async def test_rollout_supports_string_model_args(
     policy_client: Any = rollout_module.openai_clients[
         ("http://model.test/v1", "model-key")
     ]
-    completions = policy_client.chat.completions
-    assert completions.kwargs["stream"] is True
-    assert completions.kwargs["stream_options"] == {"include_usage": True}
-    assert completions.kwargs["extra_headers"] == {
-        "X-ART-Stream-Progress": "sse-comments-v1"
-    }
-    limits = policy_client.kwargs["http_client"].limits
-    assert limits.max_connections == 2048
-    assert limits.max_keepalive_connections == 2048
-
-
-@pytest.mark.asyncio
-async def test_rollout_retries_stream_body_transport_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    rollout_module = importlib.import_module("art.tau_bench.rollout")
-    rollout_module.openai_clients.clear()
-    monkeypatch.setattr(rollout_module, "AsyncOpenAI", RetryStreamAsyncOpenAI)
-
-    trajectory = await rollout_module.rollout(
-        Scenario(domain="banking_knowledge", task=Task(id="task_001")),
-        "http://model.test/v1",
-        "model-key",
-        "default",
-        client=FakeTauBenchClient(),
-        max_turns=1,
+    assert policy_client.chat.completions.kwargs["stream"] is False
+    assert policy_client.kwargs["max_retries"] == 1
+    http_client = policy_client.kwargs["http_client"]
+    assert http_client.timeout == httpx.Timeout(
+        connect=30,
+        read=10 * 60,
+        write=30,
+        pool=30,
     )
-
-    completions: Any = rollout_module.openai_clients[
-        ("http://model.test/v1", "model-key")
-    ].chat.completions
-    assert completions.calls == 2
-    assert trajectory.reward == 1.0
-
-
-@pytest.mark.asyncio
-async def test_rollout_does_not_capture_stream_attempt_missing_requested_usage() -> (
-    None
-):
-    rollout_module = importlib.import_module("art.tau_bench.rollout")
-    rollout_module.openai_clients.clear()
-    requests = 0
-
-    def stream_body(content: str, *, include_usage: bool) -> bytes:
-        chunks = [
-            {
-                "id": "completion",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "default",
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": content},
-                        "finish_reason": None,
-                    }
-                ],
-            },
-            {
-                "id": "completion",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "default",
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            },
-        ]
-        if include_usage:
-            chunks.append(
-                {
-                    "id": "completion",
-                    "object": "chat.completion.chunk",
-                    "created": 0,
-                    "model": "default",
-                    "choices": [],
-                    "usage": {
-                        "prompt_tokens": 2,
-                        "completion_tokens": 1,
-                        "total_tokens": 3,
-                    },
-                }
-            )
-        return b"".join(
-            [
-                *(f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks),
-                b"data: [DONE]\n\n",
-            ]
-        )
-
-    async def handler(_request: httpx.Request) -> httpx.Response:
-        nonlocal requests
-        requests += 1
-        return httpx.Response(
-            200,
-            content=stream_body(
-                "bad" if requests == 1 else "good",
-                include_usage=requests > 1,
-            ),
-            headers={"Content-Type": "text/event-stream"},
-        )
-
-    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    openai_client = AsyncOpenAI(
-        api_key="model-key",
-        base_url="http://model.test/v1",
-        http_client=http_client,
-        max_retries=1,
-    )
-    rollout_module.openai_clients[("http://model.test/v1", "model-key")] = openai_client
-    try:
-        trajectory = await rollout_module.rollout(
-            Scenario(domain="banking_knowledge", task=Task(id="task_001")),
-            "http://model.test/v1",
-            "model-key",
-            "default",
-            client=FakeTauBenchClient(),
-            max_turns=1,
-        )
-    finally:
-        await openai_client.close()
-        await http_client.aclose()
-        rollout_module.openai_clients.clear()
-
-    assert requests == 2
-    assert len(trajectory.exchanges.chat_completions) == 1
-    assert trajectory.exchanges.chat_completions[0].response.choices[
-        0
-    ].message.content == ("good")
+    assert http_client.limits.max_connections == 2048
+    assert http_client.limits.max_keepalive_connections == 2048
 
 
 @pytest.mark.asyncio
@@ -714,7 +484,6 @@ async def test_rollout_captures_two_turn_tool_exchange_with_exact_tokens() -> No
             "default",
             client=ToolTauBenchClient(),
             max_turns=2,
-            chat_completion_kwargs={"stream": False},
         )
     finally:
         await openai_client.close()
@@ -802,35 +571,6 @@ async def test_rollout_stops_on_max_tokens_bad_request(
         "default",
         client=client,
         max_turns=10,
-        chat_completion_kwargs={"stream": False},
-    )
-
-    assert trajectory.metrics["num_turns"] == 0
-    assert client.steps == 0
-    assert client.deleted == ["env-1"]
-
-
-@pytest.mark.asyncio
-async def test_rollout_stops_on_in_band_max_tokens_stream_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    rollout_module = importlib.import_module("art.tau_bench.rollout")
-    rollout_module.openai_clients.clear()
-    monkeypatch.setattr(rollout_module, "AsyncOpenAI", MaxTokensStreamAsyncOpenAI)
-    monkeypatch.setattr(
-        rollout_module,
-        "DefaultAsyncHttpxClient",
-        lambda **kwargs: SimpleNamespace(**kwargs),
-    )
-    client = CountingTauBenchClient()
-
-    trajectory = await rollout_module.rollout(
-        Scenario(domain="banking_knowledge", task=Task(id="task_001")),
-        "http://model.test/v1",
-        "model-key",
-        "default",
-        client=client,
-        max_turns=10,
     )
 
     assert trajectory.metrics["num_turns"] == 0
@@ -884,7 +624,6 @@ async def test_rollout_stops_before_next_turn_exceeds_context(
         "default",
         client=client,
         max_turns=10,
-        chat_completion_kwargs={"stream": False},
     )
 
     assert trajectory.metrics["num_turns"] == 1
