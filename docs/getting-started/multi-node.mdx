@@ -10,10 +10,12 @@ process does not launch another SkyPilot cluster from inside its allocation.
 
 ## Controller program
 
-The bootstrap accepts an import path to a top-level async function. SkyPilot
-runs the bootstrap on every node, but only rank 0 imports its module and invokes
-the controller. `examples/multinode/program.py` is a complete CPU-runnable
-Yes/No/Maybe smoke:
+The bootstrap accepts a source script or import path to a top-level async
+function. A script reference such as `train.py:main` adds the script's directory
+to every ART-owned worker's Python path, so source synchronized by SkyPilot does
+not need to be packaged first. SkyPilot runs the bootstrap on every node, but
+only rank 0 imports the module and invokes the controller.
+`examples/multinode/program.py` is a complete CPU-runnable Yes/No/Maybe smoke:
 
 ```python
 import asyncio
@@ -81,7 +83,10 @@ async def main(hosts: Any) -> None:
         )
         executor.set_workers(workers)
         model = art.TrainableModel(
-            name="multinode-smoke", project="art", base_model="not-loaded"
+            name="multinode-smoke",
+            project="art",
+            base_model="not-loaded",
+            run_name="multinode-smoke",
         )
         trajectories = []
         for answer in REWARDS:
@@ -148,7 +153,7 @@ run: |
   set -euo pipefail
   export NCCL_NET=IB
   exec .venv/bin/art-monarch skypilot \
-    --program your_package.train:main
+    --program train.py:main
 ```
 
 `set -euo pipefail` is required because SkyPilot runs multiline setup under
@@ -227,8 +232,8 @@ For a local process that explicitly wants the same Monarch service APIs, ART
 can own one loopback worker directly:
 
 ```fish
-env PYTHONPATH=(pwd)/examples/multinode .venv/bin/art-monarch local \
-  --program program:main \
+.venv/bin/art-monarch local \
+  --program examples/multinode/program.py:main \
   --port 0 \
   --startup-timeout 90
 ```
@@ -254,7 +259,7 @@ command:
   --host gpu-a=10.0.0.10 \
   --host gpu-b=10.0.0.11 \
   --python /shared/project/.venv/bin/python \
-  --program your_package.train:main
+  --program /shared/project/train.py:main
 ```
 
 Each value is `SSH_TARGET=WORKER_HOST`. Omit `=WORKER_HOST` when the SSH target
@@ -265,7 +270,7 @@ or `--ssh-arg=-F` affect only launch and stop commands; they do not tunnel
 Monarch traffic. SSH mode uses only worker port `N`, not SkyPilot's lifecycle
 port `N + 1`.
 
-The selected Python executable and user code must exist at the same paths on
+The selected Python executable and source script must exist at the same paths on
 every host. ART uses non-interactive SSH, verifies that each launch-specific
 worker PID owns its listener, and monitors each foreground SSH process for the
 controller lifetime. A pre-existing listener is a hard error rather than a

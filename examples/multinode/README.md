@@ -8,8 +8,8 @@ model or starts Megatron or vLLM.
 Run the same controller on one local Monarch worker from the project root:
 
 ```fish
-env PYTHONPATH=(pwd)/examples/multinode .venv/bin/art-monarch local \
-  --program program:main \
+.venv/bin/art-monarch local \
+  --program examples/multinode/program.py:main \
   --port 0 \
   --startup-timeout 90
 ```
