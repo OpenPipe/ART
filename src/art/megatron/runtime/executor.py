@@ -27,6 +27,7 @@ from art.megatron.optimizer_state import (
     OptimizerAdapter,
     OptimizerShard,
     OptimizerTopology,
+    read_adapter_publication,
 )
 from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
@@ -1052,9 +1053,35 @@ class MCoreRunSlotExecutor:
             or (prepared.optimizer is not None) != job.restore_optimizer
         ):
             raise RuntimeError("prepared load does not match its ordered command")
-        if state.pending_load is not None:
-            self._residency.retire(state.pending_load.key)
+        previous = state.pending_load
         image = self._residency.register_l2(prepared.key, prepared.tensors)
+        adapter = read_adapter_publication(
+            job.generation.adapter_path,
+            step=job.generation.policy_step,
+        )
+        if adapter is None or (
+            adapter.training_session_id != job.generation.training_session_id
+            or adapter.generation_id != job.generation.generation_id
+        ):
+            self._residency.retire(prepared.key)
+            raise RuntimeError("loaded generation has no matching immutable adapter")
+        try:
+            snapshot_metrics = self._publisher.register_existing(
+                run_id=job.run_id,
+                generation=job.generation,
+                optimizer_source=(
+                    None
+                    if prepared.optimizer is None
+                    else prepared.optimizer.snapshot_source()
+                ),
+                l2=self._residency.ensure_l2(prepared.key),
+                tensor_offset=len(prepared.checkpoint.parameters),
+            )
+        except BaseException:
+            self._residency.retire(prepared.key)
+            raise
+        if previous is not None:
+            self._residency.retire_async(previous.key)
         state.desired_key = prepared.key
         state.pending_load = prepared
         state.learner_version = job.learner_version
@@ -1062,7 +1089,10 @@ class MCoreRunSlotExecutor:
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
             "optimizer_restored": job.restore_optimizer,
-            "metrics": {"residency/load_l2_bytes": float(image.stats.byte_count)},
+            "metrics": {
+                "residency/load_l2_bytes": float(image.stats.byte_count),
+                **snapshot_metrics,
+            },
         }
 
     def execute_snapshot(
@@ -1276,7 +1306,7 @@ class _CachedGeneration(BaseModel):
 
     run_id: str
     generation: TrainerGeneration
-    stager: PinnedCpuSnapshotStager
+    stager: PinnedCpuSnapshotStager | None
     resolved: Future[_ResolvedGeneration]
     optimizer_upgrade: Future[Any] | None = None
     has_optimizer: bool = False
@@ -1443,6 +1473,67 @@ class _GenerationPublisher:
         metrics.update(lora_timings.metrics())
         return metrics
 
+    def register_existing(
+        self,
+        *,
+        run_id: str,
+        generation: TrainerGeneration,
+        optimizer_source: Any | None,
+        l2: Future[Any],
+        tensor_offset: int,
+    ) -> dict[str, float]:
+        """Register a loaded L2 generation without reading mutable GPU state."""
+        self.raise_if_failed()
+        started = time.perf_counter()
+        with self._lock:
+            if generation.generation_id in self._cache:
+                raise RuntimeError(
+                    f"generation snapshot already exists: {generation.generation_id}"
+                )
+        resolved: Future[_ResolvedGeneration] = Future()
+        resolved.set_result(
+            _ResolvedGeneration(lora=None, optimizer=None, prepared_tensors=None)
+        )
+        optimizer = (
+            None
+            if optimizer_source is None
+            else self._resolution_pool.submit(
+                self._resolve_resident_optimizer,
+                l2,
+                optimizer_source,
+                tensor_offset,
+                generation,
+            )
+        )
+        entry = _CachedGeneration(
+            run_id=run_id,
+            generation=generation,
+            stager=None,
+            resolved=resolved,
+            optimizer_upgrade=optimizer,
+            has_optimizer=optimizer is not None,
+        )
+        with self._lock:
+            if generation.generation_id in self._cache:
+                raise RuntimeError(
+                    f"generation snapshot already exists: {generation.generation_id}"
+                )
+            previous_id = self._latest_by_run.get(run_id)
+            previous = None if previous_id is None else self._cache[previous_id]
+            if previous is not None:
+                previous.retired = True
+            self._cache[generation.generation_id] = entry
+            self._latest_by_run[run_id] = generation.generation_id
+        if previous is not None:
+            self._maybe_release(previous)
+        if optimizer is not None:
+            optimizer.add_done_callback(
+                lambda done, cached=entry: self._optimizer_resolved(cached, done)
+            )
+        return {
+            "snapshot_optimizer_attach_s": time.perf_counter() - started,
+        }
+
     def ensure_generation(
         self,
         *,
@@ -1475,6 +1566,9 @@ class _GenerationPublisher:
         assert entry is not None
         if not snapshot_optimizer or entry.has_optimizer:
             return {}
+        stager = entry.stager
+        if stager is None:
+            raise RuntimeError("loaded generation has no optimizer state to publish")
 
         from art.megatron.optimizer_state import (
             stage_optimizer_state_snapshot,
@@ -1489,7 +1583,7 @@ class _GenerationPublisher:
                 self.runtime,
                 generation_id=generation.generation_id,
                 step=generation.policy_step,
-                stager=entry.stager,
+                stager=stager,
             )
         else:
             if trainer_rank_optimizer_state is None:
@@ -1499,7 +1593,7 @@ class _GenerationPublisher:
                 trainer_rank_optimizer_state,
                 generation_id=generation.generation_id,
                 step=generation.policy_step,
-                stager=entry.stager,
+                stager=stager,
             )
         self.runtime.optimizer_snapshot_barrier.register(optimizer)
         resolved = self._resolution_pool.submit(optimizer.resolve)
@@ -1596,6 +1690,7 @@ class _GenerationPublisher:
             entry,
             publication_targets,
             adapter_object_target,
+            existing_adapter if int(self.runtime.rank) == 0 else None,
             generation,
             started,
         )
@@ -1766,7 +1861,8 @@ class _GenerationPublisher:
                 self._latest_by_run.pop(entry.run_id)
             for object_id in entry.object_ids:
                 self._object_publications.pop(object_id, None)
-        self._release_slot(entry.stager)
+        if entry.stager is not None:
+            self._release_slot(entry.stager)
 
     def _resolve_generation(self, lora: Any, optimizer: Any) -> _ResolvedGeneration:
         lora = None if lora is None else lora.resolve()
@@ -1795,6 +1891,7 @@ class _GenerationPublisher:
         entry: _CachedGeneration,
         publication_targets: tuple[Any, ...],
         object_target: BinaryObjectTarget | None,
+        existing_adapter: OptimizerAdapter | None,
         generation: TrainerGeneration,
         submitted_at: float,
     ) -> _SnapshotTransport:
@@ -1803,24 +1900,32 @@ class _GenerationPublisher:
             return _SnapshotTransport(
                 metrics={"time/snapshot_transport_queue_s": started - submitted_at}
             )
+        if not publication_targets and object_target is None:
+            return _SnapshotTransport(
+                metrics={"time/snapshot_transport_queue_s": started - submitted_at}
+            )
         snapshot = entry.resolved.result()
         ready = time.perf_counter()
-        if snapshot.lora is None or snapshot.prepared_tensors is None:
-            raise RuntimeError("rank zero has no LoRA snapshot to transfer")
+        lora = snapshot.lora
+        prepared_tensors = snapshot.prepared_tensors
+        if lora is None or prepared_tensors is None:
+            if existing_adapter is None:
+                raise RuntimeError("rank zero has no LoRA snapshot to transfer")
+            lora, prepared_tensors = self._load_existing_adapter(existing_adapter)
         adapter = None
         if object_target is not None:
             adapter = self._publish_lora_object_once(
                 entry,
                 object_target,
                 generation,
-                snapshot.lora,
-                snapshot.prepared_tensors,
+                lora,
+                prepared_tensors,
             )
         elif publication_targets:
             self._transfer_lora_snapshot(
-                snapshot.lora,
+                lora,
                 publication_targets,
-                prepared_tensors=snapshot.prepared_tensors,
+                prepared_tensors=prepared_tensors,
             )
         return _SnapshotTransport(
             adapter=adapter,
@@ -1829,6 +1934,28 @@ class _GenerationPublisher:
                 "time/snapshot_transport_wait_s": ready - started,
                 "time/snapshot_transport_s": time.perf_counter() - ready,
             },
+        )
+
+    @staticmethod
+    def _load_existing_adapter(
+        adapter: OptimizerAdapter,
+    ) -> tuple[Any, PreparedSafetensors]:
+        from art.megatron.model_support.lora_disk import (
+            ART_LORA_FORMAT_CONFIG_KEY,
+            ART_LORA_FORMAT_VLLM,
+            load_adapter_config,
+            load_vllm_lora_tensors,
+        )
+        from art.megatron.weights.lora_publish import LoraSnapshot
+
+        if read_adapter_publication(adapter.identity, step=adapter.step) != adapter:
+            raise RuntimeError("existing adapter publication changed before transport")
+        config = load_adapter_config(adapter.identity)
+        if config.get(ART_LORA_FORMAT_CONFIG_KEY) != ART_LORA_FORMAT_VLLM:
+            raise RuntimeError("existing adapter is not in vLLM format")
+        tensors = load_vllm_lora_tensors(adapter.identity)
+        return LoraSnapshot(tensors=tensors, adapter_config=config), (
+            SafetensorsLayout(tensors).bind(tensors)
         )
 
     def _persist_cached_snapshot(

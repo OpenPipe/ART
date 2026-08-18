@@ -164,6 +164,32 @@ class PreparedTrainerRankOptimizerState(BaseModel):
             )
         )
 
+    def snapshot_source(self) -> TrainerRankOptimizerSnapshotSource:
+        optimizer = {
+            "state": {
+                index: values for index, values in enumerate(self.state) if values
+            },
+            "param_groups": [
+                {
+                    **self.param_group,
+                    "params": list(range(len(self.master_params))),
+                }
+            ],
+        }
+        state = cast(
+            TrainerRankOptimizerState,
+            {
+                "format_version": 1,
+                "layout": self.layout,
+                "master_params": self.master_params,
+                "optimizer": optimizer,
+            },
+        )
+        return TrainerRankOptimizerSnapshotSource(
+            state=cast(TrainerRankOptimizerState, _copy_nested_state(state)),
+            tensors=self.tensors,
+        )
+
 
 def _build_dynamic_optimizer(
     params: Sequence[torch.nn.Parameter],

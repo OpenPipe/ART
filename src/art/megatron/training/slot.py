@@ -19,6 +19,7 @@ from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
 from art.megatron.optimizer_state import (
     OptimizerAdapter,
+    clone_adapter_generation,
     optimizer_adapter,
     read_adapter_publication,
     read_committed_optimizer_pointer,
@@ -116,6 +117,7 @@ class PreparedLoadState(BaseModel):
     request: LoadStateRequest
     source: ResolvedCheckpointState
     job: LoadStateJobSpec
+    adapter: OptimizerAdapter
 
 
 class _ResidentRun(BaseModel):
@@ -576,7 +578,7 @@ class MegatronTrainingSlot:
             training_session_id=state.registration.training_session_id,
             policy_step=output_version,
             generation_id=operation_generation_id(ref.operation_id, output_version),
-            adapter_path=self._require_managed_path(source.adapter_path),
+            adapter_path=get_step_checkpoint_dir(state.output_dir, output_version),
         )
         job = LoadStateJobSpec(
             operation_id=ref.operation_id,
@@ -599,7 +601,37 @@ class MegatronTrainingSlot:
             restore_optimizer=request.restore_optimizer,
         )
         await self.trainer.prepare_load_state(job)
-        return PreparedLoadState(ref=ref, request=request, source=source, job=job)
+        try:
+            adapter = await asyncio.to_thread(
+                clone_adapter_generation,
+                job.adapter_path,
+                source_step=job.adapter_step,
+                staging_path=(
+                    Path(state.output_dir)
+                    / "megatron_runtime"
+                    / "staging"
+                    / generation.generation_id
+                ),
+                step=generation.policy_step,
+                training_session_id=generation.training_session_id,
+                generation_id=generation.generation_id,
+            )
+        except BaseException as error:
+            try:
+                await self.trainer.discard_prepared_load_state(job.operation_id)
+            except BaseException as cleanup:
+                error.add_note(
+                    "prepared load cleanup also failed: "
+                    f"{type(cleanup).__name__}: {cleanup}"
+                )
+            raise
+        return PreparedLoadState(
+            ref=ref,
+            request=request,
+            source=source,
+            job=job,
+            adapter=adapter,
+        )
 
     async def load_state(self, prepared: PreparedLoadState) -> LoadStateResult:
         ref = prepared.ref
@@ -617,20 +649,16 @@ class MegatronTrainingSlot:
             update={
                 "learner_version": job.learner_version,
                 "generation_id": generation.generation_id,
-                "adapter_path": source.adapter_path,
-                "adapter_step": source.adapter_step,
-                "adapter_training_session_id": source.adapter_training_session_id,
-                "adapter_generation_id": source.adapter_generation_id,
+                "adapter_path": prepared.adapter.identity,
+                "adapter_step": prepared.adapter.step,
+                "adapter_training_session_id": prepared.adapter.training_session_id,
+                "adapter_generation_id": prepared.adapter.generation_id,
             }
         )
-        adapter = read_adapter_publication(
-            source.adapter_path, step=source.adapter_step
-        )
-        if adapter is None:
-            raise RuntimeError("loaded checkpoint has no immutable adapter publication")
+        adapter = prepared.adapter
         if (
-            adapter.training_session_id != source.adapter_training_session_id
-            or adapter.generation_id != source.adapter_generation_id
+            adapter.training_session_id != generation.training_session_id
+            or adapter.generation_id != generation.generation_id
         ):
             raise RuntimeError("loaded adapter changed checkpoint identity")
         result = LoadStateResult(
