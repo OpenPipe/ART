@@ -22,6 +22,7 @@ class ResidencyKey(BaseModel):
     tenant_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     generation_id: str = Field(min_length=1)
+    accumulator_revision: int = Field(default=0, ge=0)
     topology_fingerprint: str = Field(min_length=1)
     adapter_layout_fingerprint: str = Field(min_length=1)
 
@@ -210,6 +211,74 @@ class ResidencyLedger:
                 self._copies.pop(key)
                 self._last_access.pop(key, None)
                 self._pins.pop(key, None)
+
+    def advance(
+        self,
+        source: ResidencyKey,
+        target: ResidencyKey,
+        tier: ResidencyTier,
+        *,
+        byte_count: int,
+    ) -> ResidencyCopy:
+        """Transfer one physical copy to a new immutable state identity."""
+        if source == target or byte_count < 1:
+            raise ValueError("residency advance requires a new key and positive bytes")
+        with self._lock:
+            source_copies = self._copies.get(source)
+            if source_copies is None or tier not in source_copies:
+                raise RuntimeError(f"residency source is not ready: {tier}")
+            if target in self._copies or any(
+                item.key == target for item in self._reservations.values()
+            ):
+                raise RuntimeError("residency target identity already exists")
+            old = source_copies[tier]
+            capacity = self.limits.capacity(tier)
+            if capacity is not None:
+                projected = self._ready_bytes[tier] - old.byte_count + byte_count
+                if projected > capacity.max_bytes:
+                    raise RuntimeError(
+                        f"{tier} residency capacity exceeded: "
+                        f"projected={projected}, max={capacity.max_bytes}"
+                    )
+                self._ready_bytes[tier] = projected
+            source_copies.pop(tier)
+            pins = self._pins.pop(source, 0)
+            if not source_copies:
+                self._copies.pop(source)
+                self._last_access.pop(source, None)
+            now = time.monotonic()
+            copy = ResidencyCopy(tier=tier, byte_count=byte_count, ready_at=now)
+            self._copies[target] = {tier: copy}
+            self._last_access[target] = now
+            if pins:
+                self._pins[target] = pins
+            return copy
+
+    def drop_entry(self, key: ResidencyKey) -> None:
+        with self._lock:
+            if self._pins.get(key, 0):
+                raise RuntimeError("cannot drop a pinned residency entry")
+            if any(item.key == key for item in self._reservations.values()):
+                raise RuntimeError("cannot drop residency with an active transition")
+            copies = self._copies.pop(key, None)
+            if copies is None:
+                raise KeyError(key)
+            for tier, copy in copies.items():
+                if self.limits.capacity(tier) is not None:
+                    self._ready_bytes[tier] -= copy.byte_count
+            self._last_access.pop(key, None)
+            self._pins.pop(key, None)
+
+    def has_copy(self, key: ResidencyKey, tier: ResidencyTier) -> bool:
+        with self._lock:
+            return tier in self._copies.get(key, {})
+
+    def copy(self, key: ResidencyKey, tier: ResidencyTier) -> ResidencyCopy:
+        with self._lock:
+            try:
+                return self._copies[key][tier]
+            except KeyError as exc:
+                raise KeyError((key, tier)) from exc
 
     def pin(self, key: ResidencyKey) -> None:
         with self._lock:
