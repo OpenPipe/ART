@@ -1153,6 +1153,63 @@ def test_checkpoint_export_requires_retained_adapter_config() -> None:
         trainer.export_lora("/unused", "student")
 
 
+def test_prepared_lora_export_lifecycle_without_megatron(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = object()
+    captures: list[object] = []
+    saved: list[tuple[str, object]] = []
+    module = ModuleType("art.megatron.weights.lora_publish")
+
+    def capture(**_kwargs: object) -> tuple[object, dict[str, float]]:
+        captures.append(snapshot)
+        return snapshot, {"d2h": 1.0}
+
+    setattr(module, "_capture_lora_publish_snapshot_from_model", capture)
+    setattr(
+        module,
+        "_save_lora_publish_snapshot",
+        lambda output, value: saved.append((output, value)) or {"serialize": 2.0},
+    )
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    trainer = TrainerRank(_runtime())
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(
+        config={
+            "base_model_name_or_path": "test",
+            "r": 1,
+            "lora_alpha": 1,
+            "target_modules": [],
+        },
+        revision=7,
+    )
+
+    revision, timings = trainer._prepare_lora_export(
+        "publish", "student", owner_id="owner"
+    )
+    assert revision == 7
+    assert timings["d2h"] == 1.0
+    assert timings["slot_validation"] >= 0
+    with pytest.raises(RuntimeError, match="already prepared"):
+        trainer._prepare_lora_export("publish", "student", owner_id="other")
+    trainer._abort_lora_export("publish", owner_id="other")
+    assert captures == [snapshot]
+    assert trainer._finish_lora_export("publish", "/output", owner_id="owner") == {
+        "serialize": 2.0
+    }
+    assert saved == [("/output", snapshot)]
+    with pytest.raises(ValueError, match="Unknown prepared LoRA export"):
+        trainer._finish_lora_export("publish", "/output", owner_id="owner")
+
+    trainer._prepare_lora_export("aborted", "student", owner_id="owner")
+    trainer._abort_lora_export("aborted", owner_id="owner")
+    with pytest.raises(ValueError, match="Unknown prepared LoRA export"):
+        trainer._finish_lora_export("aborted", "/output", owner_id="owner")
+
+    assert trainer.export_lora("/legacy", "student") == 7
+    assert saved[-1] == ("/legacy", snapshot)
+    assert not trainer._prepared_lora_exports
+
+
 def test_checkpoint_save_rejects_accumulated_gradients() -> None:
     trainer = TrainerRank(_runtime())
     parameter = torch.nn.Parameter(torch.ones(2))

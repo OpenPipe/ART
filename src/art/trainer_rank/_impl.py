@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
     from art.megatron.prefix_tree_state import PrefixTreeAttentionState
     from art.megatron.train import TrainingRuntime
+    from art.megatron.weights.lora_publish import _LoraPublishSnapshot
     from art.trainer_rank._checkpoint import (
         CustomOptimizerState,
         LocalOptimizerState,
@@ -813,6 +814,7 @@ class TrainerRank:
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
+        self._prepared_lora_exports: dict[str, tuple[str, _LoraPublishSnapshot]] = {}
         self._checkpoint_prefetches: dict[str, asyncio.Task[PreparedCheckpoint]] = {}
         self._checkpoint_mutation_tail: asyncio.Task[None] | None = None
         self._checkpoint_process_group: dist.ProcessGroup | None = None
@@ -1279,6 +1281,36 @@ class TrainerRank:
         return _checkpoint.export_lora(
             self, output_dir, self._resolve_checkpoint_name(checkpoint_path)
         )
+
+    def _prepare_lora_export(
+        self,
+        export_id: str,
+        checkpoint_path: str | Literal["active"] = "active",
+        *,
+        owner_id: str,
+    ) -> tuple[int, dict[str, float]]:
+        from . import _checkpoint
+
+        return _checkpoint.prepare_lora_export(
+            self,
+            export_id,
+            self._resolve_checkpoint_name(checkpoint_path),
+            owner_id=owner_id,
+        )
+
+    def _finish_lora_export(
+        self, export_id: str, output_dir: str, *, owner_id: str
+    ) -> dict[str, float]:
+        from . import _checkpoint
+
+        return _checkpoint.finish_lora_export(
+            self, export_id, output_dir, owner_id=owner_id
+        )
+
+    def _abort_lora_export(self, export_id: str, *, owner_id: str) -> None:
+        from . import _checkpoint
+
+        _checkpoint.abort_lora_export(self, export_id, owner_id=owner_id)
 
     @staticmethod
     def _checkpoint_source_key(path: str) -> str:

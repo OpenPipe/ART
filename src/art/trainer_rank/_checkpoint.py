@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import struct
 import threading
+import time
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 import uuid
 
@@ -21,6 +22,7 @@ import torch.distributed as dist
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRA, LoraShardMeta, LoRASlotRef
+    from art.megatron.weights.lora_publish import _LoraPublishSnapshot
     from art.trainer_rank._impl import (
         TrainerRank,
         _AdapterConfig,
@@ -1724,8 +1726,24 @@ def load_checkpoint(
         raise
 
 
-def export_lora(trainer: TrainerRank, output_dir: str, checkpoint_name: str) -> int:
+def prepare_lora_export(
+    trainer: TrainerRank,
+    export_id: str,
+    checkpoint_name: str,
+    *,
+    owner_id: str,
+) -> tuple[int, dict[str, float]]:
+    started = time.monotonic()
     group = _ensure_group(trainer)
+    snapshots: dict[str, tuple[str, _LoraPublishSnapshot]] = getattr(
+        trainer, "_prepared_lora_exports", {}
+    )
+    duplicate = (
+        RuntimeError(f"LoRA export {export_id!r} is already prepared")
+        if export_id in snapshots
+        else None
+    )
+    raise_distributed(duplicate, "validate LoRA export ID", group)
     slot = None
     error: BaseException | None = None
     try:
@@ -1745,24 +1763,77 @@ def export_lora(trainer: TrainerRank, output_dir: str, checkpoint_name: str) -> 
         raise trainer._slot_state_error(
             f"Checkpoint {checkpoint_name!r} differs across ranks"
         )
-    from art.megatron.weights.lora_publish import save_vllm_lora_from_model
+    slot_validation = time.monotonic() - started
+    from art.megatron.weights.lora_publish import (
+        _capture_lora_publish_snapshot_from_model,
+    )
 
+    snapshot = None
+    capture_timings: dict[str, float] = {}
     error = None
     try:
-        save_vllm_lora_from_model(
+        snapshot, capture_timings = _capture_lora_publish_snapshot_from_model(
             model=trainer.runtime.model,
             adapter_dtypes={},
             handler=trainer.runtime.model_support_handler,
             adapter_config=dict(slot.config),
-            output_dir=output_dir,
             rank=trainer.runtime.rank,
             world_size=trainer.runtime.world_size,
             slot_ref=trainer._slot_ref(checkpoint_name),
+            failure_group=group,
         )
     except BaseException as exc:
         error = exc
+    raise_distributed(error, "prepare LoRA export", group)
+    if snapshot is not None:
+        snapshots[export_id] = (owner_id, snapshot)
+        trainer._prepared_lora_exports = snapshots
+    return slot.revision, {"slot_validation": slot_validation, **capture_timings}
+
+
+def finish_lora_export(
+    trainer: TrainerRank, export_id: str, output_dir: str, *, owner_id: str
+) -> dict[str, float]:
+    from art.megatron.weights.lora_publish import _save_lora_publish_snapshot
+
+    snapshots: dict[str, tuple[str, _LoraPublishSnapshot]] = getattr(
+        trainer, "_prepared_lora_exports", {}
+    )
+    try:
+        owner, snapshot = snapshots[export_id]
+    except KeyError:
+        raise ValueError(f"Unknown prepared LoRA export: {export_id!r}") from None
+    if owner != owner_id:
+        raise ValueError(f"LoRA export {export_id!r} belongs to another owner")
+    snapshots.pop(export_id)
+    return _save_lora_publish_snapshot(output_dir, snapshot)
+
+
+def abort_lora_export(trainer: TrainerRank, export_id: str, *, owner_id: str) -> None:
+    snapshots: dict[str, tuple[str, _LoraPublishSnapshot]] = getattr(
+        trainer, "_prepared_lora_exports", {}
+    )
+    if (prepared := snapshots.get(export_id)) is not None and prepared[0] == owner_id:
+        snapshots.pop(export_id)
+
+
+def export_lora(trainer: TrainerRank, output_dir: str, checkpoint_name: str) -> int:
+    group = _ensure_group(trainer)
+    export_id = uuid.uuid4().hex
+    owner_id = uuid.uuid4().hex
+    revision, _timings = prepare_lora_export(
+        trainer, export_id, checkpoint_name, owner_id=owner_id
+    )
+    error: BaseException | None = None
+    try:
+        if trainer.runtime.rank == 0:
+            finish_lora_export(trainer, export_id, output_dir, owner_id=owner_id)
+    except BaseException as exc:
+        error = exc
+    finally:
+        abort_lora_export(trainer, export_id, owner_id=owner_id)
     raise_distributed(error, "export LoRA", group)
-    return slot.revision
+    return revision
 
 
 def _ensure_groups(
