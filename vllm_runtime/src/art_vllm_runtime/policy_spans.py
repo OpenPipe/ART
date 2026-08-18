@@ -43,6 +43,7 @@ _POLICY_HISTORY_BASE_FIELD = "_art_policy_history_before_current"
 _POLICY_CACHE_TRANSITIONS_FIELD = "_art_policy_cache_transitions"
 _POLICY_CACHE_TRANSITION_KEY = "art_policy_transition_v1"
 _PROMPT_POLICY_SPANS_COMPLETE_FIELD = "_art_prompt_policy_spans_complete"
+_CACHED_PROMPT_POLICY_SPAN_FIELD = "_art_cached_prompt_policy_span"
 
 
 class _RequestAdmissionLease:
@@ -1753,8 +1754,10 @@ def _attach_policy_spans_to_model_output(
     for req_id, metadata in context.items():
         start, end = metadata["prompt_span"]
         prompt_tokens = int(metadata["prompt_tokens"])
+        cached_prompt = False
         if end <= start and req_id in sampled_req_ids and prompt_tokens > 1:
             start, end = 1, prompt_tokens
+            cached_prompt = True
         if end <= start:
             continue
         prompt_spans_by_req[req_id] = [
@@ -1764,6 +1767,7 @@ def _attach_policy_spans_to_model_output(
                 "policy_version": metadata["policy_version"],
                 "lora_slot": metadata["lora_slot"],
                 "update_seq": metadata["update_seq"],
+                _CACHED_PROMPT_POLICY_SPAN_FIELD: cached_prompt,
             }
         ]
     if prompt_spans_by_req:
@@ -1813,6 +1817,9 @@ def _append_absolute_prompt_spans(
 ) -> None:
     for span in step_spans:
         current = dict(span)
+        cached_prompt = bool(current.pop(_CACHED_PROMPT_POLICY_SPAN_FIELD, False))
+        if cached_prompt and accumulated:
+            continue
         cursor = int(accumulated[-1]["end_token"]) if accumulated else 1
         start = int(current["start_token"])
         if start < cursor:
