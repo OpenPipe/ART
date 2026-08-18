@@ -2201,40 +2201,42 @@ def load_trainer_rank_optimizer_state(
     optimizer_generation_id: str,
     layout: Any,
 ) -> Any:
-    """Collectively load one topology-strict dynamic LoRA optimizer shard."""
-    local = {
-        "rank": runtime.rank,
-        "runtime_sha256": _model_runtime_sha256(runtime),
-        "layout_sha256": _json_sha256(layout),
-    }
-    runtime_sha256, layouts = _validated_runtime_layouts(
-        runtime, _all_gather_objects(runtime, local)
-    )
+    """Load one topology-strict shard without entering the GPU process group."""
+    runtime_sha256 = _model_runtime_sha256(runtime)
+    layout_sha256 = _json_sha256(layout)
     with optimizer_generation_lease(
         optimizer_state_path, optimizer_generation_id
     ) as pointer:
         adapter = _loaded_adapter(adapter_path, adapter_step)
-        pinned = pin_optimizer_generation(
+        _, manifest, shards = _validate_generation(
+            optimizer_state_path, pointer, runtime.world_size, runtime.rank
+        )
+        if manifest.runtime_sha256 != runtime_sha256:
+            raise RuntimeError(
+                "Optimizer checkpoint model-runtime mismatch: "
+                f"saved={manifest.runtime_sha256}, current={runtime_sha256}"
+            )
+        if pointer.adapter != adapter:
+            raise RuntimeError(
+                "Optimizer checkpoint adapter mismatch: "
+                f"saved={pointer.adapter.model_dump()}, current={adapter.model_dump()}"
+            )
+        _validate_adapter_publication(pointer.adapter, verify_files=True)
+        saved_layout = shards[runtime.rank].layout_sha256
+        if saved_layout != layout_sha256:
+            raise RuntimeError(
+                "Optimizer parameter ownership/layout mismatch: "
+                f"rank={runtime.rank}, saved={saved_layout}, current={layout_sha256}"
+            )
+
+        shard = resolve_optimizer_shard(
             optimizer_state_path,
+            rank=runtime.rank,
             world_size=runtime.world_size,
-            runtime_sha256=runtime_sha256,
-            layout_sha256_by_rank=layouts,
-            adapter=adapter,
             pointer=pointer,
         )
-        assert pinned is not None
-
-        def load_shard() -> Any:
-            shard = resolve_optimizer_shard(
-                optimizer_state_path,
-                rank=runtime.rank,
-                world_size=runtime.world_size,
-                pointer=pinned,
-            )
-            assert shard is not None
-            return torch.load(shard, map_location="cpu", weights_only=True)
-
-        return _run_rank_operation(runtime, "dynamic optimizer shard load", load_shard)
+        assert shard is not None
+        return torch.load(shard, map_location="cpu", weights_only=True)
 
 
 def _allow_unpaired_resume() -> bool:
