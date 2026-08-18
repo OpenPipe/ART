@@ -85,7 +85,14 @@ class TrainerRuntimeSpec(_Spec):
             else self.hybrid_ep.model_copy(update={"run_id": "<runtime>"})
         )
         return _fingerprint(
-            self.model_copy(update={"run_residency": None, "hybrid_ep": hybrid_ep})
+            self.model_copy(
+                update={
+                    # TrainerRank materializes each run's exact adapter shape.
+                    "lora_rank": 1,
+                    "run_residency": None,
+                    "hybrid_ep": hybrid_ep,
+                }
+            )
         )
 
 
