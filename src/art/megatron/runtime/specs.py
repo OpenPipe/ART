@@ -78,12 +78,15 @@ class TrainerRuntimeSpec(_Spec):
 
     @property
     def compatibility_fingerprint(self) -> str:
-        value = self.model_dump(mode="json")
-        value["run_residency"] = None
-        if self.hybrid_ep is not None:
-            # The HybridEP rendezvous namespace is process-scoped, not checkpoint state.
-            value["hybrid_ep"]["run_id"] = "<runtime>"
-        return _fingerprint(value)
+        # Residency policy and HybridEP rendezvous identity are process-local.
+        hybrid_ep = (
+            None
+            if self.hybrid_ep is None
+            else self.hybrid_ep.model_copy(update={"run_id": "<runtime>"})
+        )
+        return _fingerprint(
+            self.model_copy(update={"run_residency": None, "hybrid_ep": hybrid_ep})
+        )
 
 
 class TrainingRunSpec(_Spec):
