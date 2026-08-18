@@ -784,7 +784,6 @@ def _patch_scheduler_policy_span_transport() -> None:
             prompt_spans_by_req = getattr(
                 model_runner_output, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, None
             )
-            completed_prompt_spans: dict[str, list[dict[str, Any]]] = {}
             for req_id, step_spans in (prompt_spans_by_req or {}).items():
                 request = requests.get(req_id)
                 if request is None or getattr(
@@ -798,14 +797,10 @@ def _patch_scheduler_policy_span_transport() -> None:
                     accumulated = []
                     setattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, accumulated)
                 _append_absolute_prompt_spans(accumulated, step_spans)
-                if accumulated[-1]["end_token"] == request.num_prompt_tokens:
-                    completed_prompt_spans[req_id] = [
-                        dict(span) for span in accumulated
-                    ]
-                    delattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD)
-                    setattr(request, _PROMPT_POLICY_SPANS_COMPLETE_FIELD, True)
+            outputs_by_request = {}
             for client_outputs in outputs_by_client.values():
                 for output in client_outputs.outputs:
+                    outputs_by_request[output.request_id] = output
                     spans = (spans_by_req or {}).get(output.request_id)
                     if not spans:
                         pass
@@ -813,9 +808,11 @@ def _patch_scheduler_policy_span_transport() -> None:
                         output.art_policy_token_spans = _trim_step_spans(
                             spans, len(output.new_token_ids)
                         )
-                    prompt_spans = completed_prompt_spans.get(output.request_id)
-                    if prompt_spans:
-                        output.art_prompt_policy_token_spans = prompt_spans
+            for req_id, request in requests.items():
+                if request is not None:
+                    _flush_complete_prompt_spans(
+                        request, outputs_by_request.get(req_id)
+                    )
             return outputs_by_client
 
         update_from_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
@@ -1826,6 +1823,17 @@ def _append_absolute_prompt_spans(
             accumulated[-1]["end_token"] = current["end_token"]
         else:
             accumulated.append(current)
+
+
+def _flush_complete_prompt_spans(request: Any, output: Any | None) -> None:
+    if output is None or getattr(request, _PROMPT_POLICY_SPANS_COMPLETE_FIELD, False):
+        return
+    accumulated = getattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, None)
+    if not accumulated or accumulated[-1]["end_token"] != request.num_prompt_tokens:
+        return
+    output.art_prompt_policy_token_spans = [dict(span) for span in accumulated]
+    delattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD)
+    setattr(request, _PROMPT_POLICY_SPANS_COMPLETE_FIELD, True)
 
 
 def _trim_step_spans(
