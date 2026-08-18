@@ -16,6 +16,7 @@ import threading
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 import uuid
 
+from pydantic import BaseModel, ConfigDict
 import torch
 import torch.distributed as dist
 
@@ -78,6 +79,16 @@ class PreparedCustomPayload:
     records: dict[str, CustomTensorRecord]
     tensors: dict[str, torch.Tensor]
     optimizer: dict[str, torch.Tensor]
+
+
+class PreparedCheckpointSlotLoad(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    name: str
+    source: PreparedCheckpoint
+    config: dict[str, object]
+    adapter: dict[str, torch.Tensor]
+    expected_keys: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -1623,9 +1634,13 @@ def _rollback_load(
     _phase(rollback, "roll back checkpoint load", group)
 
 
-def load_checkpoint(
-    trainer: TrainerRank, source: PreparedCheckpoint, name: str
-) -> None:
+def prepare_checkpoint_slot_load(
+    trainer: TrainerRank,
+    source: PreparedCheckpoint,
+    name: str,
+    *,
+    device: torch.device | str | None = None,
+) -> PreparedCheckpointSlotLoad:
     group = _ensure_group(trainer)
     if any(value != source.digest for value in _gather(source.digest, group)):
         raise trainer._slot_state_error(
@@ -1648,11 +1663,6 @@ def load_checkpoint(
         "validate checkpoint base model",
         group,
     )
-    _phase(
-        lambda: trainer._guard_slot_can_load(trainer._slot_ref(name)),
-        "validate checkpoint target",
-        group,
-    )
     local_keys = trainer._local_lora_adapter_templates()
     adapter = _phase(
         lambda: _load_adapter(trainer, source, local_keys),
@@ -1661,7 +1671,10 @@ def load_checkpoint(
     )
     prepared_adapter = _phase(
         lambda: trainer._prepare_adapter_model(
-            name, adapter, canonicalized=source.manifest is not None
+            name,
+            adapter,
+            canonicalized=source.manifest is not None,
+            device=device,
         ),
         "localize checkpoint adapter",
         group,
@@ -1671,6 +1684,30 @@ def load_checkpoint(
         raise trainer._slot_state_error(
             "Checkpoint tensor coverage differs from runtime"
         )
+    return PreparedCheckpointSlotLoad(
+        name=name,
+        source=source,
+        config=dict(config),
+        adapter=prepared_adapter,
+        expected_keys=frozenset(expected),
+    )
+
+
+def install_checkpoint_slot_load(
+    trainer: TrainerRank,
+    prepared: PreparedCheckpointSlotLoad,
+    *,
+    restore_checkpoint_optimizer: bool,
+) -> None:
+    group = _ensure_group(trainer)
+    name = prepared.name
+    source = prepared.source
+    config = cast("_AdapterConfig", prepared.config)
+    _phase(
+        lambda: trainer._guard_slot_can_load(trainer._slot_ref(name)),
+        "validate checkpoint target",
+        group,
+    )
     temporary = f"__art_loading_{uuid.uuid4().hex}"
     snapshot = _slot_snapshot(trainer)
     previous = trainer._checkpoint_slots.get(name)
@@ -1678,7 +1715,7 @@ def load_checkpoint(
         loaded = _phase(
             lambda: trainer._load_checkpoint_slot(
                 temporary,
-                prepared_adapter,
+                prepared.adapter,
                 alpha=float(config["lora_alpha"]),
                 _prepared=True,
             ),
@@ -1687,7 +1724,7 @@ def load_checkpoint(
         )
         params = _phase(
             lambda: trainer._validate_checkpoint_consistency(
-                temporary, loaded, expected
+                temporary, loaded, set(prepared.expected_keys)
             ),
             "validate staged checkpoint",
             group,
@@ -1702,7 +1739,11 @@ def load_checkpoint(
             "validate loaded checkpoint config",
             group,
         )
-        if source.manifest is not None and source.manifest["optimizer"] is not None:
+        if (
+            restore_checkpoint_optimizer
+            and source.manifest is not None
+            and source.manifest["optimizer"] is not None
+        ):
             optimizer_state = _phase(
                 lambda: _optimizer_state(trainer, source, temporary),
                 "read checkpoint optimizer",
@@ -1726,6 +1767,13 @@ def load_checkpoint(
     except BaseException:
         _rollback_load(trainer, snapshot, temporary, name, previous, group)
         raise
+
+
+def load_checkpoint(
+    trainer: TrainerRank, source: PreparedCheckpoint, name: str
+) -> None:
+    prepared = prepare_checkpoint_slot_load(trainer, source, name)
+    install_checkpoint_slot_load(trainer, prepared, restore_checkpoint_optimizer=True)
 
 
 def export_lora(trainer: TrainerRank, output_dir: str, checkpoint_name: str) -> int:

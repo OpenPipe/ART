@@ -63,6 +63,7 @@ if TYPE_CHECKING:
         CustomOptimizerState,
         LocalOptimizerState,
         PreparedCheckpoint,
+        PreparedCheckpointSlotLoad,
         PreparedCustomPayload,
         _FinalizedSave,
         _PreparedSave,
@@ -1359,6 +1360,45 @@ class TrainerRank:
         source = _checkpoint.prepare_checkpoint(checkpoint.directory)
         _checkpoint.load_checkpoint(self, source, checkpoint.path)
 
+    def prepare_checkpoint_slot_load_sync(
+        self,
+        checkpoint: MaterializedCheckpoint,
+        *,
+        device: torch.device | str = "cpu",
+    ) -> "PreparedCheckpointSlotLoad":
+        """Read and localize a checkpoint without mutating resident slots."""
+        if self._slot_stack:
+            raise RuntimeError("Cannot prepare a checkpoint while one is pushed")
+        from . import _checkpoint
+
+        source = _checkpoint.prepare_checkpoint(checkpoint.directory)
+        return _checkpoint.prepare_checkpoint_slot_load(
+            self, source, checkpoint.path, device=device
+        )
+
+    def install_prepared_checkpoint_slot_load_sync(
+        self,
+        prepared: "PreparedCheckpointSlotLoad",
+        *,
+        restore_checkpoint_optimizer: bool = False,
+    ) -> None:
+        """Atomically bind prepared tensors at the serialized slot barrier."""
+        if self._slot_stack:
+            raise RuntimeError("Cannot install a checkpoint while one is pushed")
+        predecessor = self._checkpoint_mutation_tail
+        if predecessor is not None:
+            if not predecessor.done():
+                raise RuntimeError("A checkpoint mutation is running asynchronously")
+            if not predecessor.cancelled():
+                predecessor.exception()
+        from . import _checkpoint
+
+        _checkpoint.install_checkpoint_slot_load(
+            self,
+            prepared,
+            restore_checkpoint_optimizer=restore_checkpoint_optimizer,
+        )
+
     def checkpoint_slot_parameters(self, name: str) -> tuple[torch.nn.Parameter, ...]:
         try:
             return self._checkpoint_slots[name].params
@@ -1964,6 +2004,7 @@ class TrainerRank:
         adapter_model: Mapping[str, torch.Tensor],
         *,
         canonicalized: bool = False,
+        device: torch.device | str | None = None,
     ) -> dict[str, torch.Tensor]:
         templates = self._local_lora_adapter_templates()
         keys = set(adapter_model)
@@ -1997,7 +2038,7 @@ class TrainerRank:
             )
         return {
             key: tensor.to(
-                device=templates[key].device,
+                device=templates[key].device if device is None else device,
                 dtype=templates[key].dtype,
                 non_blocking=True,
             )
