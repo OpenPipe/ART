@@ -184,6 +184,7 @@ class _InterForwardBackwardTiming(BaseModel):
 class TrainingRuntime(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    model_identifier: str
     provider_bundle: ProviderBundle
     provider: Any
     model: ModelChunks
@@ -507,9 +508,11 @@ def build_training_runtime(
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
     install_fast_frozen_output_backward()
+    model_identifier = model_identifier or os.environ.get(
+        "MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER
+    )
     provider_bundle = prepare_provider_bundle(
-        model_identifier
-        or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
+        model_identifier,
         torch_dtype=provider_torch_dtype,
         load_weights=model_initialization == "pretrained",
         allow_unvalidated_arch=(
@@ -604,6 +607,7 @@ def build_training_runtime(
     )
 
     runtime = TrainingRuntime(
+        model_identifier=model_identifier,
         provider_bundle=provider_bundle,
         provider=provider,
         model=model,
