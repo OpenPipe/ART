@@ -106,6 +106,30 @@ class RunResidencyManager:
                 self._installed_base[key.run_id] = key
         return self.ensure_l2(key)
 
+    def register_l2(
+        self, key: ResidencyKey, tensors: tuple[torch.Tensor, ...]
+    ) -> HostTensorImage:
+        """Admit an off-GPU generation without making it compute resident."""
+        self._require_open()
+        if not tensors or any(tensor.device.type != "cpu" for tensor in tensors):
+            raise RuntimeError("new L2 residency must be a non-empty CPU tensor tuple")
+        byte_count = self._mover.byte_count(tensors, "cpu")
+        self._reclaim("l2_cpu", byte_count, protected={key})
+        reservation = self.ledger.reserve(
+            key, source=None, target="l2_cpu", byte_count=byte_count
+        )
+        try:
+            image = self._mover.host_image(tensors)
+            self.ledger.commit(reservation)
+        except BaseException as error:
+            self._abort(reservation, error)
+            raise
+        with self._lock:
+            if key in self._states:
+                raise RuntimeError("residency key is already registered")
+            self._states[key] = _ManagedState(key=key, tensors=tensors, l2=image)
+        return image
+
     def advance_l1(
         self,
         source: ResidencyKey,

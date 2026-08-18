@@ -102,21 +102,35 @@ class HostTensorImage:
 
     def activate(self) -> None:
         with torch.no_grad():
-            for group, target in zip(self._groups, self._targets, strict=True):
-                storage = target.untyped_storage()
-                for view in group.views:
-                    base_bytes = int(target.storage_offset())
-                    element_size = view.tensor.element_size()
-                    if base_bytes % element_size:
-                        raise RuntimeError("host storage offset is not dtype aligned")
-                    replacement = torch.empty(0, dtype=view.dtype, device="cpu")
-                    replacement.set_(
-                        storage,
-                        base_bytes // element_size + view.storage_offset,
-                        view.shape,
-                        view.stride,
-                    )
-                    view.tensor.data = replacement
+            for view, replacement in self.tensor_views():
+                view.tensor.data = replacement
+
+    def tensor_views(self) -> tuple[tuple[_TensorView, torch.Tensor], ...]:
+        replacements: list[tuple[_TensorView, torch.Tensor]] = []
+        for group, target in zip(self._groups, self._targets, strict=True):
+            storage = target.untyped_storage()
+            for view in group.views:
+                base_bytes = int(target.storage_offset())
+                element_size = view.tensor.element_size()
+                if base_bytes % element_size:
+                    raise RuntimeError("host storage offset is not dtype aligned")
+                replacement = torch.empty(0, dtype=view.dtype, device="cpu")
+                replacement.set_(
+                    storage,
+                    base_bytes // element_size + view.storage_offset,
+                    view.shape,
+                    view.stride,
+                )
+                replacements.append((view, replacement))
+        return tuple(replacements)
+
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        tensors: list[torch.Tensor | None] = [None] * self.input_tensor_count
+        for view, replacement in self.tensor_views():
+            tensors[view.tensor_index] = replacement
+        if any(tensor is None for tensor in tensors):
+            raise RuntimeError("host image does not cover every input tensor")
+        return tuple(tensor for tensor in tensors if tensor is not None)
 
     def pinned_copy(self) -> "HostTensorImage":
         targets = tuple(
@@ -208,6 +222,25 @@ class TensorResidencyMover:
             pending=builder.finish(None),
             input_tensor_count=len(tensors),
         )
+
+    def host_image(self, tensors: Iterable[torch.Tensor]) -> HostTensorImage:
+        tensors = tuple(tensors)
+        groups = self._groups(tensors)
+        if not groups or any(group.source.device.type != "cpu" for group in groups):
+            raise RuntimeError("L2 admission requires non-empty CPU residency")
+        targets = tuple(
+            torch.empty_like(group.source, device="cpu", pin_memory=True).copy_(
+                group.source
+            )
+            for group in groups
+        )
+        image = HostTensorImage(
+            groups=groups,
+            targets=targets,
+            input_tensor_count=len(tensors),
+        )
+        image.activate()
+        return image
 
     def move(
         self,
