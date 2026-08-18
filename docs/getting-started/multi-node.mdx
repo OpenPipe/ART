@@ -146,8 +146,8 @@ resources:
 
 setup: |
   set -euo pipefail
-  uv sync --frozen --no-dev --extra distributed --extra megatron
-  uv sync --project vllm_runtime --frozen --no-dev
+  uvx uv@0.11.7 sync --frozen --no-dev --extra distributed --extra megatron
+  uvx uv@0.11.7 sync --project vllm_runtime --frozen --no-dev
 
 run: |
   set -euo pipefail

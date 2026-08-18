@@ -137,8 +137,7 @@ def build_runtime_fingerprint(
         "art_build_sha256": _art_build_sha256(),
         "python": f"{platform.python_implementation()}-{platform.python_version()}-"
         f"{sys.implementation.cache_tag}",
-        "platform": f"{platform.system()}-{platform.release()}-{platform.machine()}-"
-        f"{libc[0]}-{libc[1]}",
+        "platform": f"{platform.system()}-{platform.machine()}-{libc[0]}-{libc[1]}",
         "packages": tuple((name, metadata.version(name)) for name in package_names),
         "environment": _runtime_environment(os.environ),
     }

@@ -13,7 +13,7 @@ envs:
 
 setup: |
   set -euo pipefail
-  uv sync --frozen --no-dev --extra distributed
+  uvx uv@0.11.7 sync --frozen --no-dev --extra distributed
 
 run: |
   set -euo pipefail
