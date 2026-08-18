@@ -311,10 +311,31 @@ def _extend_branches(
 
 
 def _contains_tokens(tokens: Sequence[int], sampled: Sequence[int]) -> bool:
-    return any(
-        list(tokens[start : start + len(sampled)]) == list(sampled)
-        for start in range(len(tokens) - len(sampled) + 1)
-    )
+    if not sampled:
+        return True
+    if len(sampled) > len(tokens):
+        return False
+
+    # Knuth-Morris-Pratt keeps reconciliation linear for long sampled outputs.
+    # Comparing every slice blocks the event loop on long multi-turn histories.
+    prefix_lengths = [0] * len(sampled)
+    matched = 0
+    for index in range(1, len(sampled)):
+        while matched and sampled[index] != sampled[matched]:
+            matched = prefix_lengths[matched - 1]
+        if sampled[index] == sampled[matched]:
+            matched += 1
+            prefix_lengths[index] = matched
+
+    matched = 0
+    for token in tokens:
+        while matched and token != sampled[matched]:
+            matched = prefix_lengths[matched - 1]
+        if token == sampled[matched]:
+            matched += 1
+            if matched == len(sampled):
+                return True
+    return False
 
 
 def _retains_output_suffix(

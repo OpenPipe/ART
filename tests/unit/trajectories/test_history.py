@@ -299,6 +299,50 @@ def test_chat_projection_scales_with_captured_messages() -> None:
     assert normalized[2] < normalized[1] * 2, measurements
 
 
+@pytest.mark.parametrize(
+    ("tokens", "sampled", "expected"),
+    [
+        ([1, 2, 3], [], True),
+        ([1, 2], [1, 2, 3], False),
+        ([1, 2, 3, 4], [2, 3], True),
+        ([1, 1, 1, 2], [1, 1, 2], True),
+        ([1, 1, 1, 2], [1, 2, 2], False),
+    ],
+)
+def test_contains_tokens(tokens: list[int], sampled: list[int], expected: bool) -> None:
+    history_module = importlib.import_module("art.trajectories._history")
+
+    assert history_module._contains_tokens(tokens, sampled) is expected
+
+
+def test_contains_tokens_scales_linearly() -> None:
+    history_module = importlib.import_module("art.trajectories._history")
+
+    class CountingTokens:
+        def __init__(self, values: list[int]) -> None:
+            self.values = values
+            self.accesses = 0
+
+        def __len__(self) -> int:
+            return len(self.values)
+
+        def __getitem__(self, index: int | slice) -> int | list[int]:
+            value = self.values[index]
+            self.accesses += len(value) if isinstance(value, list) else 1
+            return value
+
+        def __iter__(self):
+            for value in self.values:
+                self.accesses += 1
+                yield value
+
+    tokens = CountingTokens([1] * 10_000 + [2])
+    sampled = CountingTokens([1] * 1_000 + [2])
+
+    assert history_module._contains_tokens(cast(Any, tokens), cast(Any, sampled))
+    assert tokens.accesses + sampled.accesses < 10 * (len(tokens) + len(sampled))
+
+
 def test_divergent_chat_projection_parses_each_exact_generation_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
