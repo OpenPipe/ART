@@ -2,7 +2,6 @@ import os
 from typing import Any
 import warnings
 
-from peft.tuners.lora.config import LoraConfig
 import torch
 
 from art.dev.get_model_config import default_target_modules
@@ -27,6 +26,7 @@ def create_identity_lora(
 
     from accelerate import init_empty_weights
     from peft import get_peft_model
+    from peft.tuners.lora.config import LoraConfig
     from transformers import AutoConfig, AutoModelForCausalLM
 
     from .model_support import get_model_support_handler
