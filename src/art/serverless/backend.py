@@ -226,9 +226,11 @@ class ServerlessBackend:
         enable_expert_replay: bool = True,
         close_timeout_s: float = process_shutdown_timeout(1),
     ) -> None:
-        api_key = api_key or os.environ.get("WANDB_API_KEY")
+        api_key = api_key or os.environ.get("REMOTE_TRAINING_API_KEY")
         if api_key is None:
-            raise ValueError("ServerlessBackend requires api_key or WANDB_API_KEY")
+            raise ValueError(
+                "ServerlessBackend requires api_key or REMOTE_TRAINING_API_KEY"
+            )
         if not inference_base_url:
             raise ValueError("ServerlessBackend requires an inference_base_url")
         if restore_optimizer and checkpoint is None:
