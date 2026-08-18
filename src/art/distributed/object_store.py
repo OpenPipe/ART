@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+from bisect import bisect_right
 from concurrent.futures import Future, ThreadPoolExecutor
 import hashlib
-from io import BytesIO
+from io import BytesIO, RawIOBase
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
 from threading import Lock
-from typing import Iterable, Literal
+from typing import Any, Iterable, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -248,6 +249,43 @@ class S3BinaryObjectStore:
             raise RuntimeError(f"binary object file size changed: {file.relative_path}")
         return data
 
+    def read_file_into(
+        self,
+        ref: BinaryObjectRef,
+        relative_path: str,
+        target: memoryview,
+    ) -> BinaryObjectFile:
+        """Download one object directly into caller-owned host staging."""
+        resolved = self.resolve(ref.manifest_uri)
+        if resolved != ref:
+            raise RuntimeError("binary object manifest changed before download")
+        return self._read_file_into(ref, relative_path, target)
+
+    def _read_file_into(
+        self,
+        ref: BinaryObjectRef,
+        relative_path: str,
+        target: memoryview,
+    ) -> BinaryObjectFile:
+        relative_path = _safe_relative_path(relative_path)
+        matches = tuple(
+            file for file in ref.files if file.relative_path == relative_path
+        )
+        if len(matches) != 1:
+            raise RuntimeError("binary object file name must match exactly one file")
+        file = matches[0]
+        writer = _MemoryviewWriter(target, expected_bytes=file.byte_count)
+        bucket, manifest_key = _parse_s3_uri(ref.manifest_uri)
+        prefix = str(PurePosixPath(manifest_key).parent)
+        self._client.download_fileobj(
+            bucket,
+            f"{prefix}/{file.relative_path}",
+            writer,
+            Config=self._transfer,
+        )
+        writer.verify_complete()
+        return file
+
     def delete(self, ref: BinaryObjectRef) -> None:
         bucket, key = self._require_manifest_uri(ref.manifest_uri)
         self._delete_prefix(str(PurePosixPath(key).parent), bucket)
@@ -265,8 +303,11 @@ class S3BinaryObjectStore:
         if total < 1:
             raise ValueError("binary object files must not be empty")
         if total <= self.config.multipart_chunk_bytes:
-            body = b"".join(chunk.tobytes() for chunk in chunks)
-            self._client.put_object(Bucket=self.config.bucket, Key=key, Body=body)
+            self._client.put_object(
+                Bucket=self.config.bucket,
+                Key=key,
+                Body=_ChunkRangeReader(chunks),
+            )
             return total
         upload = self._client.create_multipart_upload(
             Bucket=self.config.bucket, Key=key
@@ -280,8 +321,8 @@ class S3BinaryObjectStore:
             concurrency=self.config.multipart_concurrency,
         )
         try:
-            for part_number, body in enumerate(
-                _multipart_chunks(chunks, part_bytes), 1
+            for part_number, (offset, byte_count) in enumerate(
+                _multipart_ranges(total, part_bytes), 1
             ):
                 futures.append(
                     (
@@ -292,7 +333,11 @@ class S3BinaryObjectStore:
                             Key=key,
                             UploadId=upload_id,
                             PartNumber=part_number,
-                            Body=body,
+                            Body=_ChunkRangeReader(
+                                chunks,
+                                offset=offset,
+                                byte_count=byte_count,
+                            ),
                         ),
                     )
                 )
@@ -416,6 +461,21 @@ class S3BinaryObjectReceiver:
         return BinaryObjectContents(
             ref=ref, file=file, data=self._store._read_file(ref, file)
         )
+
+    def read_file_into(
+        self,
+        manifest_uri: str,
+        *,
+        expected_format: str,
+        expected_metadata: dict[str, str],
+        relative_path: str,
+        target: memoryview,
+    ) -> BinaryObjectFile:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("binary object receiver is closed")
+        ref = self._resolve(manifest_uri, expected_format, expected_metadata)
+        return self._store._read_file_into(ref, relative_path, target)
 
     def release(self, materialization: BinaryObjectMaterialization) -> None:
         path = self._managed_path(materialization.path)
@@ -543,20 +603,138 @@ def _multipart_part_bytes(total: int, *, max_part_bytes: int, concurrency: int) 
     )
 
 
-def _multipart_chunks(chunks: tuple[memoryview, ...], size: int) -> Iterable[bytes]:
-    buffer = bytearray()
-    for chunk in chunks:
-        view = chunk.cast("B")
-        offset = 0
-        while offset < view.nbytes:
-            count = min(size - len(buffer), view.nbytes - offset)
-            buffer.extend(view[offset : offset + count])
-            offset += count
-            if len(buffer) == size:
-                yield bytes(buffer)
-                buffer.clear()
-    if buffer:
-        yield bytes(buffer)
+def _multipart_ranges(total: int, size: int) -> Iterable[tuple[int, int]]:
+    for offset in range(0, total, size):
+        yield offset, min(size, total - offset)
+
+
+class _ChunkRangeReader(RawIOBase):
+    """Seekable stream over immutable tensor-backed buffers without coalescing."""
+
+    def __init__(
+        self,
+        chunks: tuple[memoryview, ...],
+        *,
+        offset: int = 0,
+        byte_count: int | None = None,
+    ) -> None:
+        self._chunks = tuple(chunk.cast("B") for chunk in chunks if chunk.nbytes)
+        self._offsets: list[int] = [0]
+        for chunk in self._chunks:
+            self._offsets.append(self._offsets[-1] + chunk.nbytes)
+        total = self._offsets[-1]
+        byte_count = total - offset if byte_count is None else byte_count
+        if offset < 0 or byte_count < 0 or offset + byte_count > total:
+            raise ValueError("chunk reader range leaves its source buffers")
+        self._start = offset
+        self._length = byte_count
+        self._position = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            position = offset
+        elif whence == 1:
+            position = self._position + offset
+        elif whence == 2:
+            position = self._length + offset
+        else:
+            raise ValueError(f"unsupported seek mode {whence}")
+        if position < 0 or position > self._length:
+            raise ValueError("chunk reader seek leaves its range")
+        self._position = position
+        return position
+
+    def read(self, size: int = -1) -> bytes:
+        remaining = self._length - self._position
+        size = remaining if size is None or size < 0 else min(size, remaining)
+        if size == 0:
+            return b""
+        absolute = self._start + self._position
+        pending = size
+        output: list[memoryview] = []
+        first = max(0, bisect_right(self._offsets, absolute) - 1)
+        for index in range(first, len(self._chunks)):
+            chunk = self._chunks[index]
+            start, end = self._offsets[index], self._offsets[index + 1]
+            if absolute >= end:
+                continue
+            local = max(absolute - start, 0)
+            count = min(end - start - local, pending)
+            output.append(chunk[local : local + count])
+            absolute += count
+            pending -= count
+            if pending == 0:
+                break
+        if pending:
+            raise RuntimeError("chunk reader did not cover its declared range")
+        self._position += size
+        return b"".join(output)
+
+
+class _MemoryviewWriter(RawIOBase):
+    """Seekable S3 download target over a caller-owned writable buffer."""
+
+    def __init__(self, target: memoryview, *, expected_bytes: int) -> None:
+        self._target = target.cast("B")
+        if self._target.readonly or self._target.nbytes != expected_bytes:
+            raise ValueError("download target must be writable and exactly sized")
+        self._position = 0
+        self._intervals: list[tuple[int, int]] = []
+        self._lock = Lock()
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        with self._lock:
+            return self._position
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        with self._lock:
+            if whence == 0:
+                position = offset
+            elif whence == 1:
+                position = self._position + offset
+            elif whence == 2:
+                position = self._target.nbytes + offset
+            else:
+                raise ValueError(f"unsupported seek mode {whence}")
+            if position < 0 or position > self._target.nbytes:
+                raise ValueError("download target seek leaves its buffer")
+            self._position = position
+            return position
+
+    def write(self, value: Any) -> int:
+        source = memoryview(value).cast("B")
+        with self._lock:
+            end = self._position + source.nbytes
+            if end > self._target.nbytes:
+                raise RuntimeError("binary object download exceeded its target")
+            self._target[self._position : end] = source
+            self._intervals.append((self._position, end))
+            self._position = end
+        return source.nbytes
+
+    def verify_complete(self) -> None:
+        cursor = 0
+        for start, end in sorted(self._intervals):
+            if start > cursor:
+                raise RuntimeError("binary object download left an unwritten range")
+            cursor = max(cursor, end)
+        if cursor != self._target.nbytes:
+            raise RuntimeError("binary object download was incomplete")
 
 
 def _complete_part(value: tuple[int, Future[dict[str, object]]]) -> dict[str, object]:

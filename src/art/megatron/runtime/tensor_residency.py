@@ -164,7 +164,7 @@ class HostTensorImage:
 
 
 class TensorResidencySnapshot(HostTensorImage):
-    """A lossless pinned L2 image that can replace its live tensor bindings."""
+    """A lossless pageable L2 image that can replace its live tensor bindings."""
 
     def __init__(
         self,
