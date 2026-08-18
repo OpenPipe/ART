@@ -281,6 +281,12 @@ class RunResidencyManager:
                 source = "l3_nvme"
             else:
                 raise RuntimeError("state has no local source for L1 materialization")
+        capacity = self.config.limits.l1_gpu.max_bytes
+        if byte_count > capacity:
+            raise RuntimeError(
+                "one residency component exceeds the L1 budget: "
+                f"component={byte_count}, max={capacity}"
+            )
         with self._admission_locks["l1_gpu"]:
             with self._lock:
                 if self._state(key).l1_transition is not None:
@@ -347,6 +353,27 @@ class RunResidencyManager:
             if not self.ledger.has_copy(key, "l1_gpu"):
                 raise RuntimeError("requested generation did not become L1 resident")
             self.ledger.pin(key)
+
+    def prefetch_l1(self, key: ResidencyKey) -> None:
+        """Materialize an evictable L1 copy without synchronizing the compute thread."""
+        self.prepare_l1(key)
+        with self._lock:
+            transition = self._state(key).l1_transition
+        if transition is None:
+            return
+        transition.synchronize()
+        with self._lock:
+            state = self._state(key)
+            if state.l1_transition is not transition:
+                return
+            reservation = state.l1_reservation
+            if reservation is None:
+                raise RuntimeError("L1 transfer has no residency reservation")
+            self._commit(reservation)
+            state.l1_transition = None
+            state.l1_reservation = None
+            if component := self._exclusive_component(key):
+                self._installed_components[component] = key
 
     def release_l1(self, key: ResidencyKey) -> None:
         self.ledger.unpin(key)

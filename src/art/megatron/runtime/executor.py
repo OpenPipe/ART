@@ -39,7 +39,7 @@ from .publication import (
     TrainerPublicationSucceeded,
     TrainerRankPublication,
 )
-from .residency import ResidencyKey
+from .residency import ResidencyCapacityUnavailable, ResidencyKey
 from .run_residency import RunResidencyManager
 from .specs import (
     ForwardBackwardJobSpec,
@@ -791,6 +791,35 @@ class MCoreRunSlotExecutor:
             run_id, optimizer_state
         )
 
+    def prepare_residency(self, run_id: str, command_kind: str) -> bool:
+        """Launch component transfers before the serialized GPU command turn."""
+        state = self._require_run(run_id)
+        if command_kind in {"forward", "forward_backward"}:
+            keys = (state.desired.weights,)
+            if (
+                command_kind == "forward_backward"
+                and state.desired.accumulator is not None
+            ):
+                keys += (state.desired.accumulator,)
+        elif command_kind == "optim_step":
+            keys = tuple(
+                key
+                for key in (
+                    state.desired.weights,
+                    state.desired.optimizer,
+                    state.desired.accumulator,
+                )
+                if key is not None
+            )
+        else:
+            raise ValueError(f"unsupported residency prefetch command {command_kind!r}")
+        try:
+            for key in keys:
+                self._residency.prefetch_l1(key)
+        except ResidencyCapacityUnavailable:
+            return False
+        return True
+
     def execute_forward_backward(
         self,
         job: ForwardBackwardJobSpec,
@@ -806,13 +835,14 @@ class MCoreRunSlotExecutor:
             execute_megatron_dynamic_lora_forward_backward_job,
         )
 
-        with self._resident(state, include_accumulator=True):
+        with self._resident(state):
             result = execute_megatron_dynamic_lora_forward_backward_job(
                 self.runtime,
                 job,
                 batch.tensors,
                 slot_trainer=self._slot_trainer,
                 gradient_accumulator=state.gradients,
+                accumulator_residency=self._accumulator_resident(state),
                 cancelled=cancelled,
             )
             self._register_gradient_contribution(state, job.operation_id)
@@ -864,13 +894,14 @@ class MCoreRunSlotExecutor:
             execute_megatron_dynamic_lora_sft_forward_backward_job,
         )
 
-        with self._resident(state, include_accumulator=True):
+        with self._resident(state):
             result = execute_megatron_dynamic_lora_sft_forward_backward_job(
                 self.runtime,
                 job,
                 batch,
                 slot_trainer=self._slot_trainer,
                 gradient_accumulator=state.gradients,
+                accumulator_residency=self._accumulator_resident(state),
                 cancelled=cancelled,
             )
             self._register_gradient_contribution(state, job.operation_id)
@@ -1328,6 +1359,18 @@ class MCoreRunSlotExecutor:
         self._residency.retire_async(key)
         state.desired = state.desired.model_copy(update={"accumulator": None})
         state.next_accumulator_revision += 1
+
+    @contextmanager
+    def _accumulator_resident(self, state: _ResidentRunState) -> Iterator[None]:
+        key = state.desired.accumulator
+        if key is None:
+            yield
+            return
+        self._residency.acquire_l1(key)
+        try:
+            yield
+        finally:
+            self._residency.release_l1(key)
 
     @contextmanager
     def _resident(

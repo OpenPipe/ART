@@ -372,6 +372,14 @@ class MegatronTrainingSlot:
         if isinstance(prepared, PreparedPackedForward):
             await self.runtime.release_batch(prepared.packed)
 
+    async def prepare_residency(
+        self,
+        run_id: str,
+        command_kind: Literal["forward", "forward_backward", "optim_step"],
+    ) -> dict[str, float]:
+        self._require_run(run_id)
+        return await self.trainer.prepare_residency(run_id, command_kind)
+
     async def forward(self, prepared: PreparedForward) -> ForwardResult:
         ref = prepared.ref
         state = self._require_parent(ref)

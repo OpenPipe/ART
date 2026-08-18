@@ -18,7 +18,7 @@ Public cross-repo API consumed by serverless-training:
 - inspect_resident_lora
 """
 
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 import hashlib
 import math
 import os
@@ -1171,6 +1171,7 @@ def execute_megatron_dynamic_lora_forward_backward_job(
     *,
     slot_trainer: Any,
     gradient_accumulator: Any,
+    accumulator_residency: AbstractContextManager[None],
     cancelled: Event | None = None,
     replay_bundle: MoeRoutingReplayBundle | None = None,
 ) -> MegatronForwardBackwardJobResult:
@@ -1249,9 +1250,10 @@ def execute_megatron_dynamic_lora_forward_backward_job(
         global_token_counts,
         torch.zeros_like(global_token_counts[0]),
     )
-    gradient_accumulator.record(
-        job.operation_id, token_count, gradients, reduction=reduction
-    )
+    with accumulator_residency:
+        gradient_accumulator.record(
+            job.operation_id, token_count, gradients, reduction=reduction
+        )
     internal.consume()
     slot_trainer.clear_checkpoint_slot_grads(slot_name)
     return MegatronForwardBackwardJobResult(
@@ -1489,6 +1491,7 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
     *,
     slot_trainer: Any,
     gradient_accumulator: Any,
+    accumulator_residency: AbstractContextManager[None],
     cancelled: Event | None = None,
 ) -> dict[str, Any]:
     from art.megatron.lora import LoRASlotRef, use_lora_slot
@@ -1516,7 +1519,8 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
             job.run_id,
             scale_grads=1.0 / float(token_count.item()),
         )
-        gradient_accumulator.record(job.operation_id, token_count, gradients)
+        with accumulator_residency:
+            gradient_accumulator.record(job.operation_id, token_count, gradients)
         return _sft_command_result(
             job=job,
             batch=batch,

@@ -16,6 +16,10 @@ RESIDENCY_TIERS: tuple[ResidencyTier, ...] = (
 )
 
 
+class ResidencyCapacityUnavailable(RuntimeError):
+    """A legal transfer cannot be admitted until current residency changes."""
+
+
 class ResidencyKey(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -146,7 +150,7 @@ class ResidencyLedger:
                 self._ready_bytes[target] + self._reserved_bytes[target] + byte_count
             )
             if projected > capacity.max_bytes:
-                raise RuntimeError(
+                raise ResidencyCapacityUnavailable(
                     f"{target} residency capacity exceeded: "
                     f"projected={projected}, max={capacity.max_bytes}"
                 )
@@ -311,7 +315,7 @@ class ResidencyLedger:
         with self._lock:
             non_evictable = self._reserved_bytes[tier] + incoming_bytes
             if non_evictable > capacity.max_bytes:
-                raise RuntimeError(
+                raise ResidencyCapacityUnavailable(
                     f"{tier} residency capacity exceeded by in-flight state: "
                     f"required={non_evictable}, max={capacity.max_bytes}"
                 )
@@ -353,7 +357,7 @@ class ResidencyLedger:
                 reclaimed += self._copies[key][tier].byte_count
                 if reclaimed >= reclaim_bytes:
                     return tuple(selected)
-        raise RuntimeError(
+        raise ResidencyCapacityUnavailable(
             f"insufficient evictable {tier} residency: "
             f"required={reclaim_bytes}, available={reclaimed}"
         )

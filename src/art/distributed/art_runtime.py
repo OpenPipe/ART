@@ -894,6 +894,7 @@ class ArtRuntime:
             supervision,
             rank_processes,
             cp_lookahead_ports,
+            _residency_prefetch_ports,
         ) = await self._start_trainer_actors(runtime_spec, owner_id=run_spec.run_id)
         from art.megatron.runtime.monarch import MonarchTrainerRun
 
@@ -923,6 +924,7 @@ class ArtRuntime:
             supervision,
             rank_processes,
             cp_lookahead_ports,
+            residency_prefetch_ports,
         ) = await self._start_trainer_actors(runtime_spec, owner_id=slot_id)
         from art.megatron.runtime.monarch import MonarchTrainerSlot
 
@@ -933,6 +935,7 @@ class ArtRuntime:
             supervision,
             rank_processes,
             cp_lookahead_ports,
+            residency_prefetch_ports,
             command_timeout_s=command_timeout_s,
             shutdown_timeout_s=shutdown_timeout_s,
         )
@@ -944,7 +947,7 @@ class ArtRuntime:
         runtime_spec: TrainerRuntimeSpec,
         *,
         owner_id: str,
-    ) -> tuple[Any, Any, Any, Any, Any]:
+    ) -> tuple[Any, Any, Any, Any, Any, Any]:
         self._require_open()
         if self.topology.trainer is None:
             raise RuntimeError("runtime topology has no trainer mesh")
@@ -995,6 +998,7 @@ class ArtRuntime:
                     actors,
                     rank_processes,
                     cp_lookahead_ports,
+                    residency_prefetch_ports,
                 ) = await spawn_monarch_trainer_actors(proc, runtime_spec, supervision)
         except BaseException as startup_error:
             try:
@@ -1011,7 +1015,14 @@ class ArtRuntime:
                     suppress_owned_mesh_faults_s=self.topology.cluster.rpc_timeout_s
                 )
             raise
-        return actors, proc, supervision, rank_processes, cp_lookahead_ports
+        return (
+            actors,
+            proc,
+            supervision,
+            rank_processes,
+            cp_lookahead_ports,
+            residency_prefetch_ports,
+        )
 
     async def stop_trainer(self, run: Any) -> None:
         await run.close()
