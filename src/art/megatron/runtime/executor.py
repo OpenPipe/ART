@@ -2010,16 +2010,27 @@ class _GenerationPublisher:
         )
 
     def _prepare_lora_tensors(self, lora: Any) -> PreparedSafetensors:
-        layout_key = tuple(
-            (key, tuple(tensor.shape), str(tensor.dtype))
-            for key, tensor in sorted(lora.tensors.items())
-        )
-        with self._lock:
-            layout = self._lora_layouts.get(layout_key)
-            if layout is None:
-                layout = self._lora_layouts[layout_key] = SafetensorsLayout(
-                    lora.tensors
+        storages: dict[tuple[int, int], int] = {}
+        layout_key = []
+        for key, tensor in sorted(lora.tensors.items()):
+            storage = tensor.untyped_storage()
+            identity = storage.data_ptr(), storage.nbytes()
+            storage_index = storages.setdefault(identity, len(storages))
+            layout_key.append(
+                (
+                    key,
+                    tuple(tensor.shape),
+                    str(tensor.dtype),
+                    storage_index,
+                    storage.nbytes(),
+                    tensor.data_ptr() - storage.data_ptr(),
                 )
+            )
+        cache_key = tuple(layout_key)
+        with self._lock:
+            layout = self._lora_layouts.get(cache_key)
+            if layout is None:
+                layout = self._lora_layouts[cache_key] = SafetensorsLayout(lora.tensors)
         return layout.bind(lora.tensors)
 
     @contextmanager
