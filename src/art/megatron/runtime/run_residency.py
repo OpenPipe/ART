@@ -319,32 +319,6 @@ class RunResidencyManager:
         if not self._evict_l2(key) and self.ledger.has_copy(key, "l2_cpu"):
             raise RuntimeError("cannot evict pinned L2 residency")
 
-    def record_l4(
-        self,
-        key: ResidencyKey,
-        *,
-        immutable_ref: str,
-        digest: str,
-        byte_count: int,
-    ) -> None:
-        self._require_open()
-        if self.ledger.has_copy(key, "l4_archive"):
-            current = self.ledger.copy(key, "l4_archive")
-            if (
-                current.immutable_ref,
-                current.digest,
-                current.byte_count,
-            ) != (immutable_ref, digest, byte_count):
-                raise RuntimeError("L4 residency identity changed after commit")
-            return
-        reservation = self._reserve(
-            key,
-            source=("l3_nvme" if self.ledger.has_copy(key, "l3_nvme") else "l2_cpu"),
-            target="l4_archive",
-            byte_count=byte_count,
-        )
-        self._commit(reservation, immutable_ref=immutable_ref, digest=digest)
-
     def l2_image(self, key: ResidencyKey) -> HostTensorImage:
         return self.ensure_l2(key).result()
 

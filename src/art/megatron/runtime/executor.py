@@ -1148,33 +1148,6 @@ class MCoreRunSlotExecutor:
             "metrics": metrics,
         }
 
-    def record_archive(
-        self,
-        run_id: str,
-        generation_id: str,
-        *,
-        immutable_ref: str,
-        digest: str,
-        byte_count: int,
-    ) -> bool:
-        self._require_run(run_id)
-        keys = tuple(
-            key
-            for key in self._residency.keys(run_id)
-            if key.representation == "learner" and key.generation_id == generation_id
-        )
-        if not keys:
-            return False
-        if len(keys) != 1:
-            raise RuntimeError("generation has multiple base residency identities")
-        self._residency.record_l4(
-            keys[0],
-            immutable_ref=immutable_ref,
-            digest=digest,
-            byte_count=byte_count,
-        )
-        return True
-
     def discard_run_gradients(self, run_id: str) -> None:
         self._require_run(run_id).gradients.discard()
 

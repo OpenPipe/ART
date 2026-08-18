@@ -36,7 +36,6 @@ from .specs import (
     AdapterReady,
     ForwardBackwardJobSpec,
     ForwardJobSpec,
-    GenerationArchiveSpec,
     GenerationSnapshotJobSpec,
     HybridEpRuntimeSpec,
     LoadStateJobSpec,
@@ -1094,28 +1093,6 @@ class MonarchTrainerActor(Actor):
             raise
 
     @endpoint
-    def record_run_slot_archive(self, archive_json: str) -> dict[str, Any]:
-        try:
-            if not self._valid:
-                raise RuntimeError("trainer actor runtime is invalid")
-            archive = GenerationArchiveSpec.model_validate_json(archive_json)
-            return {
-                "rank": self._runtime.rank,
-                "run_id": archive.run_id,
-                "generation_id": archive.generation_id,
-                "recorded": self._require_run_slot_executor().record_archive(
-                    archive.run_id,
-                    archive.generation_id,
-                    immutable_ref=archive.immutable_ref,
-                    digest=archive.digest,
-                    byte_count=archive.byte_count,
-                ),
-            }
-        except BaseException:
-            self._valid = False
-            raise
-
-    @endpoint
     def execute_snapshot(
         self,
         job_json: str,
@@ -1751,31 +1728,6 @@ class MonarchTrainerSlot:
                 return result
             except BaseException as error:
                 await self._invalidate(error, "snapshot operation and cleanup failed")
-                raise
-
-    async def record_archive(self, archive: GenerationArchiveSpec) -> bool:
-        async with self._control_lock:
-            self._require_open()
-            try:
-                values = await asyncio.wait_for(
-                    self._actors.record_run_slot_archive.call(
-                        archive.model_dump_json()
-                    ),
-                    timeout=self._command_timeout_s,
-                )
-                results = list(values.values())
-                if (
-                    {result["rank"] for result in results}
-                    != set(range(len(self._rank_processes)))
-                    or {result["run_id"] for result in results} != {archive.run_id}
-                    or {result["generation_id"] for result in results}
-                    != {archive.generation_id}
-                    or len({result["recorded"] for result in results}) != 1
-                ):
-                    raise RuntimeError("trainer ranks disagree on L4 residency")
-                return bool(results[0]["recorded"])
-            except BaseException as error:
-                await self._invalidate(error, "archive record and cleanup failed")
                 raise
 
     def wait_for_publication(

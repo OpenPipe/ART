@@ -30,7 +30,6 @@ from art.megatron.runtime.specs import (
     ExperimentalTrainConfig,
     ForwardBackwardJobSpec,
     ForwardJobSpec,
-    GenerationArchiveSpec,
     GenerationSnapshotJobSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
@@ -765,26 +764,6 @@ class MegatronTrainingSlot:
         return cast(
             asyncio.Future[SaveStateResult],
             self._start_pending_result(ref.operation_id, fingerprint, complete()),
-        )
-
-    async def record_archive(
-        self,
-        *,
-        run_id: str,
-        generation_id: str,
-        immutable_ref: str,
-        digest: str,
-        byte_count: int,
-    ) -> bool:
-        self._require_run(run_id)
-        return await self.trainer.record_archive(
-            GenerationArchiveSpec(
-                run_id=run_id,
-                generation_id=generation_id,
-                immutable_ref=immutable_ref,
-                digest=digest,
-                byte_count=byte_count,
-            )
         )
 
     async def _snapshot(

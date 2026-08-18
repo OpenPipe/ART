@@ -8,8 +8,8 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-ResidencyTier = Literal["l1_gpu", "l2_cpu", "l3_nvme", "l4_archive"]
-LOCAL_RESIDENCY_TIERS: tuple[ResidencyTier, ...] = (
+ResidencyTier = Literal["l1_gpu", "l2_cpu", "l3_nvme"]
+RESIDENCY_TIERS: tuple[ResidencyTier, ...] = (
     "l1_gpu",
     "l2_cpu",
     "l3_nvme",
@@ -66,8 +66,8 @@ class ResidencyLimits(BaseModel):
     l3_nvme: TierCapacity
     max_concurrent_transitions: int = Field(default=2, ge=1)
 
-    def capacity(self, tier: ResidencyTier) -> TierCapacity | None:
-        return None if tier == "l4_archive" else getattr(self, tier)
+    def capacity(self, tier: ResidencyTier) -> TierCapacity:
+        return getattr(self, tier)
 
 
 class ResidencyCopy(BaseModel):
@@ -116,8 +116,8 @@ class ResidencyLedger:
         self._last_access: dict[ResidencyKey, float] = {}
         self._pins: dict[ResidencyKey, int] = {}
         self._reservations: dict[str, ResidencyReservation] = {}
-        self._ready_bytes = {tier: 0 for tier in LOCAL_RESIDENCY_TIERS}
-        self._reserved_bytes = {tier: 0 for tier in LOCAL_RESIDENCY_TIERS}
+        self._ready_bytes = {tier: 0 for tier in RESIDENCY_TIERS}
+        self._reserved_bytes = {tier: 0 for tier in RESIDENCY_TIERS}
         self._lock = Lock()
 
     def reserve(
@@ -142,18 +142,15 @@ class ResidencyLedger:
             if len(self._reservations) >= self.limits.max_concurrent_transitions:
                 raise RuntimeError("residency transition capacity is exhausted")
             capacity = self.limits.capacity(target)
-            if capacity is not None:
-                projected = (
-                    self._ready_bytes[target]
-                    + self._reserved_bytes[target]
-                    + byte_count
+            projected = (
+                self._ready_bytes[target] + self._reserved_bytes[target] + byte_count
+            )
+            if projected > capacity.max_bytes:
+                raise RuntimeError(
+                    f"{target} residency capacity exceeded: "
+                    f"projected={projected}, max={capacity.max_bytes}"
                 )
-                if projected > capacity.max_bytes:
-                    raise RuntimeError(
-                        f"{target} residency capacity exceeded: "
-                        f"projected={projected}, max={capacity.max_bytes}"
-                    )
-                self._reserved_bytes[target] += byte_count
+            self._reserved_bytes[target] += byte_count
             reservation = ResidencyReservation(
                 reservation_id=uuid.uuid4().hex,
                 key=key,
@@ -183,10 +180,8 @@ class ResidencyLedger:
                 ready_at=now,
             )
             self._copies.setdefault(current.key, {})[current.target] = copy
-            capacity = self.limits.capacity(current.target)
-            if capacity is not None:
-                self._reserved_bytes[current.target] -= current.byte_count
-                self._ready_bytes[current.target] += current.byte_count
+            self._reserved_bytes[current.target] -= current.byte_count
+            self._ready_bytes[current.target] += current.byte_count
             self._reservations.pop(current.reservation_id)
             self._last_access[current.key] = now
             return copy
@@ -194,8 +189,7 @@ class ResidencyLedger:
     def abort(self, reservation: ResidencyReservation) -> None:
         with self._lock:
             current = self._require_reservation(reservation)
-            if self.limits.capacity(current.target) is not None:
-                self._reserved_bytes[current.target] -= current.byte_count
+            self._reserved_bytes[current.target] -= current.byte_count
             self._reservations.pop(current.reservation_id)
 
     def drop(
@@ -214,8 +208,7 @@ class ResidencyLedger:
             if not deleting_entry and len(copies) == 1:
                 raise RuntimeError("cannot drop the only ready residency copy")
             copy = copies.pop(tier)
-            if self.limits.capacity(tier) is not None:
-                self._ready_bytes[tier] -= copy.byte_count
+            self._ready_bytes[tier] -= copy.byte_count
             if not copies:
                 self._copies.pop(key)
                 self._last_access.pop(key, None)
@@ -242,14 +235,13 @@ class ResidencyLedger:
                 raise RuntimeError("residency target identity already exists")
             old = source_copies[tier]
             capacity = self.limits.capacity(tier)
-            if capacity is not None:
-                projected = self._ready_bytes[tier] - old.byte_count + byte_count
-                if projected > capacity.max_bytes:
-                    raise RuntimeError(
-                        f"{tier} residency capacity exceeded: "
-                        f"projected={projected}, max={capacity.max_bytes}"
-                    )
-                self._ready_bytes[tier] = projected
+            projected = self._ready_bytes[tier] - old.byte_count + byte_count
+            if projected > capacity.max_bytes:
+                raise RuntimeError(
+                    f"{tier} residency capacity exceeded: "
+                    f"projected={projected}, max={capacity.max_bytes}"
+                )
+            self._ready_bytes[tier] = projected
             source_copies.pop(tier)
             pins = self._pins.pop(source, 0)
             if not source_copies:
@@ -273,8 +265,7 @@ class ResidencyLedger:
             if copies is None:
                 raise KeyError(key)
             for tier, copy in copies.items():
-                if self.limits.capacity(tier) is not None:
-                    self._ready_bytes[tier] -= copy.byte_count
+                self._ready_bytes[tier] -= copy.byte_count
             self._last_access.pop(key, None)
             self._pins.pop(key, None)
 
@@ -317,8 +308,6 @@ class ResidencyLedger:
         if incoming_bytes < 0:
             raise ValueError("incoming_bytes must be non-negative")
         capacity = self.limits.capacity(tier)
-        if capacity is None:
-            return 0
         with self._lock:
             non_evictable = self._reserved_bytes[tier] + incoming_bytes
             if non_evictable > capacity.max_bytes:
@@ -389,8 +378,8 @@ class ResidencyLedger:
     def usage(self) -> ResidencyUsage:
         with self._lock:
             return ResidencyUsage(
-                ready_bytes={**self._ready_bytes, "l4_archive": 0},
-                reserved_bytes={**self._reserved_bytes, "l4_archive": 0},
+                ready_bytes=dict(self._ready_bytes),
+                reserved_bytes=dict(self._reserved_bytes),
             )
 
     def _require_reservation(
