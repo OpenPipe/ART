@@ -135,6 +135,10 @@ class ServiceClient:
         self._project_id = project_id
         self._clients: list[TrainingClient] = []
         self._sampling_targets: dict[str, SamplingTarget] = {}
+        self._submission_lock = threading.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._admissions_closed = False
+        self._close_future: Future[None] | None = None
         self._closed = False
 
     def create_lora_training_client(
@@ -382,47 +386,48 @@ class ServiceClient:
         return None
 
     def close(self) -> None:
-        if self._closed:
+        future = self._start_close()
+        if future is None:
             self._runtime.stop()
             return
         deadline = time.monotonic() + process_shutdown_timeout(1)
-        future = self._runtime.submit_future(self._close())
         try:
             future.result(timeout=max(0.0, deadline - time.monotonic()))
-        finally:
+        except BaseException:
             future.cancel()
-            self._closed = True
-            self._runtime.stop(max(0.0, deadline - time.monotonic()))
+            raise
+        self._runtime.stop(max(0.0, deadline - time.monotonic()))
 
     async def close_async(self) -> None:
-        if self._closed:
+        future = self._start_close()
+        if future is None:
             await asyncio.to_thread(self._runtime.stop)
             return
         deadline = time.monotonic() + process_shutdown_timeout(1)
-        future = self._runtime.submit_future(self._close())
         try:
             async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
                 await asyncio.wrap_future(future)
-        finally:
+        except BaseException:
             future.cancel()
-            self._closed = True
-            await asyncio.to_thread(
-                self._runtime.stop, max(0.0, deadline - time.monotonic())
-            )
+            raise
+        await asyncio.to_thread(
+            self._runtime.stop, max(0.0, deadline - time.monotonic())
+        )
 
     async def _close(self) -> None:
-        failures = await asyncio.gather(
-            *(client._close_remote() for client in self._clients),
-            return_exceptions=True,
-        )
-        try:
+        async with self._lifecycle_lock:
+            if self._closed:
+                return
+            failures = await asyncio.gather(
+                *(client._close_remote() for client in self._clients),
+                return_exceptions=True,
+            )
+            errors = [error for error in failures if isinstance(error, BaseException)]
+            if errors:
+                raise BaseExceptionGroup("Tinker compatibility close failed", errors)
             await self._service.close()
-        except BaseException as error:
-            failures.append(error)
-        self._closed = True
-        errors = [error for error in failures if isinstance(error, BaseException)]
-        if errors:
-            raise BaseExceptionGroup("Tinker compatibility close failed", errors)
+            with self._submission_lock:
+                self._closed = True
 
     def _remember_sampling_target(
         self, path: str, result: SamplerWeightsResult, base_model: str
@@ -442,10 +447,12 @@ class ServiceClient:
     async def _create_training_client(
         self, spec: TrainingRunSpec, request: CreateTrainingRunRequest
     ) -> TrainingClient:
-        remote = await self._training_client_factory(self._service, request)
-        client = TrainingClient(self, remote, spec)
-        self._clients.append(client)
-        return client
+        async with self._lifecycle_lock:
+            self._ensure_open()
+            remote = await self._training_client_factory(self._service, request)
+            client = TrainingClient(self, remote, spec)
+            self._clients.append(client)
+            return client
 
     async def _validate_capabilities(self, rank: int) -> None:
         capabilities: TrainingCapabilities = await self._service.capabilities()
@@ -502,8 +509,18 @@ class ServiceClient:
         return selected
 
     def _ensure_open(self) -> None:
-        if self._closed:
-            raise RuntimeError("ServiceClient is closed")
+        with self._submission_lock:
+            if self._admissions_closed:
+                raise RuntimeError("ServiceClient is closed")
+
+    def _start_close(self) -> Future[None] | None:
+        with self._submission_lock:
+            if self._closed:
+                return None
+            self._admissions_closed = True
+            if self._close_future is None or self._close_future.done():
+                self._close_future = self._runtime.submit_future(self._close())
+            return self._close_future
 
     def __enter__(self) -> ServiceClient:
         return self
