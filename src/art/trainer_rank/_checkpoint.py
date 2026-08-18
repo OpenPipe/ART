@@ -1584,18 +1584,22 @@ def _validate_base_model(
             "Checkpoint manifest and adapter config name different base models"
         )
     runtime_model = getattr(trainer.runtime, "model_identifier", None)
-    if runtime_model is not None and runtime_model != configured:
-        raise trainer._slot_state_error(
-            f"Checkpoint base model {configured!r} differs from runtime model "
-            f"{runtime_model!r}"
+    if runtime_model is not None:
+        if runtime_model != configured:
+            raise trainer._slot_state_error(
+                f"Checkpoint base model {configured!r} differs from runtime model "
+                f"{runtime_model!r}"
+            )
+    else:
+        supported = tuple(
+            getattr(
+                getattr(trainer.runtime, "model_support_spec", None), "model_names", ()
+            )
         )
-    supported = tuple(
-        getattr(getattr(trainer.runtime, "model_support_spec", None), "model_names", ())
-    )
-    if supported and configured not in supported:
-        raise trainer._slot_state_error(
-            f"Checkpoint base model {configured!r} is incompatible with this runtime"
-        )
+        if supported and configured not in supported:
+            raise trainer._slot_state_error(
+                f"Checkpoint base model {configured!r} is incompatible with this runtime"
+            )
 
 
 def _rollback_load(

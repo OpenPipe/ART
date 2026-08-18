@@ -44,6 +44,7 @@ from art.trainer_rank._checkpoint import (
     _merge_component,
     _PreparedSave,
     _slot_snapshot,
+    _validate_base_model,
     _validate_save_state,
     abort_checkpoint_save,
     finish_checkpoint_save,
@@ -103,6 +104,65 @@ def test_public_types_have_canonical_module_paths() -> None:
         TrainerRankSlotStateError,
     ):
         assert public_type.__module__ == "art.trainer_rank"
+
+
+def test_checkpoint_base_model_accepts_exact_runtime_identifier() -> None:
+    runtime = SimpleNamespace(
+        model_identifier="/fixtures/model",
+        model_support_spec=SimpleNamespace(model_names=("Qwen/Qwen3.5-35B-A3B",)),
+    )
+    trainer = cast(
+        TrainerRank,
+        SimpleNamespace(
+            runtime=runtime,
+            _slot_state_error=TrainerRankSlotStateError,
+        ),
+    )
+
+    _validate_base_model(
+        trainer,
+        cast(PreparedCheckpoint, SimpleNamespace(manifest=None)),
+        {"base_model_name_or_path": "/fixtures/model"},
+    )
+
+
+def test_checkpoint_base_model_rejects_runtime_identifier_mismatch() -> None:
+    trainer = cast(
+        TrainerRank,
+        SimpleNamespace(
+            runtime=SimpleNamespace(model_identifier="/fixtures/runtime-model"),
+            _slot_state_error=TrainerRankSlotStateError,
+        ),
+    )
+
+    with pytest.raises(TrainerRankSlotStateError, match="differs from runtime model"):
+        _validate_base_model(
+            trainer,
+            cast(PreparedCheckpoint, SimpleNamespace(manifest=None)),
+            {"base_model_name_or_path": "/fixtures/checkpoint-model"},
+        )
+
+
+def test_checkpoint_base_model_uses_handler_alias_without_runtime_identifier() -> None:
+    trainer = cast(
+        TrainerRank,
+        SimpleNamespace(
+            runtime=SimpleNamespace(
+                model_identifier=None,
+                model_support_spec=SimpleNamespace(model_names=("supported/model",)),
+            ),
+            _slot_state_error=TrainerRankSlotStateError,
+        ),
+    )
+
+    with pytest.raises(
+        TrainerRankSlotStateError, match="incompatible with this runtime"
+    ):
+        _validate_base_model(
+            trainer,
+            cast(PreparedCheckpoint, SimpleNamespace(manifest=None)),
+            {"base_model_name_or_path": "unsupported/model"},
+        )
 
 
 class _FakeLoRASite(torch.nn.Module):
