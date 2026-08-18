@@ -13,17 +13,13 @@ import uuid
 import tinker
 from tinker import APIFuture
 
-from art._source_revision import art_source_revision
 from art.serverless.client import RemoteTrainingClient, RemoteTrainingServiceClient
 from art.serverless.contracts import (
     CreateTrainingRunRequest,
-    TrainingCapabilities,
     TrainingRunSpec,
 )
 from art.training.client import TrainingClient as CanonicalTrainingClient
 from art.training.contracts import (
-    COMMAND_CONTRACT_VERSION,
-    PACKING_CONTRACT_VERSION,
     AdamConfig,
     ForwardBackwardRequest,
     ForwardRequest,
@@ -202,14 +198,11 @@ class ServiceClient:
             train_attn=train_attn,
             train_unembed=train_unembed,
         )
-        await self._validate_capabilities(rank)
         spec = TrainingRunSpec(
             run_name=self._run_name_factory(),
             base_model=base_model,
             adapter={"rank": rank, "target_modules": targets},
             seed=seed if seed is not None else secrets.randbelow(2**31),
-            packing_contract_version=PACKING_CONTRACT_VERSION,
-            art_version=art_source_revision(),
             metadata=self._metadata(user_metadata),
         )
         return await self._create_training_client(
@@ -294,7 +287,6 @@ class ServiceClient:
         if kind != "training":
             raise ValueError("training state must use a /weights/ checkpoint path")
         source = await self._service.get_run(source_run_id)
-        await self._validate_capabilities(source.spec.adapter.rank)
         spec = source.spec.model_copy(
             update={
                 "run_name": self._run_name_factory(),
@@ -453,25 +445,6 @@ class ServiceClient:
             client = TrainingClient(self, remote, spec)
             self._clients.append(client)
             return client
-
-    async def _validate_capabilities(self, rank: int) -> None:
-        capabilities: TrainingCapabilities = await self._service.capabilities()
-        if capabilities.command_contract_version != COMMAND_CONTRACT_VERSION:
-            raise RuntimeError("Remote Training command contract is incompatible")
-        if PACKING_CONTRACT_VERSION not in capabilities.packing_contract_versions:
-            raise RuntimeError("Remote Training packing contract is incompatible")
-        missing = {"cross_entropy", "importance_sampling", "ppo", "cispo"} - set(
-            capabilities.supported_losses
-        )
-        if missing:
-            raise RuntimeError(f"Remote Training is missing losses: {sorted(missing)}")
-        if "bfloat16" not in capabilities.supported_dtypes:
-            raise RuntimeError("Remote Training does not support bfloat16")
-        if rank > capabilities.max_lora_rank:
-            raise ValueError(
-                f"LoRA rank {rank} exceeds Remote Training maximum "
-                f"{capabilities.max_lora_rank}"
-            )
 
     def _resolve_targets(
         self,

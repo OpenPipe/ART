@@ -265,8 +265,6 @@ class TrainingRunSpec(Contract):
     adapter: AdapterSpec
     seed: int = 0
     dtype: Literal["bfloat16"] = "bfloat16"
-    packing_contract_version: str = Field(min_length=1)
-    art_version: str = Field(min_length=1)
     metadata: dict[str, str] = Field(default_factory=dict)
 
 
@@ -339,14 +337,6 @@ class EventPage(Contract):
 
 class CloseRunRequest(Contract):
     request_id: str = Field(min_length=1)
-
-
-class TrainingCapabilities(Contract):
-    command_contract_version: str
-    packing_contract_versions: tuple[str, ...]
-    supported_losses: tuple[str, ...]
-    supported_dtypes: tuple[str, ...]
-    max_lora_rank: int = Field(ge=1)
 
 
 class CheckpointView(Contract):

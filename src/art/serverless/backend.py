@@ -16,7 +16,6 @@ from art._backend_training import (
     merge_gradient_step_metrics,
     should_save_optimizer_state,
 )
-from art._source_revision import art_source_revision
 from art.adapter_leases import pin_inference_target, pinned_inference_name
 from art.backend import AnyModel, AnyTrainableModel
 from art.distributed.rollout import (
@@ -29,8 +28,6 @@ from art.preprocessing.sft import SftBatchTokenizer
 from art.serving_capabilities import discover_serving_capabilities
 from art.training.client import TrainingOperation
 from art.training.contracts import (
-    COMMAND_CONTRACT_VERSION,
-    PACKING_CONTRACT_VERSION,
     AdamConfig,
     ForwardBackwardRequest,
     ForwardBackwardResult,
@@ -273,7 +270,6 @@ class ServerlessBackend:
                 raise RuntimeError("ServerlessBackend is closed")
             if key in self._clients:
                 raise RuntimeError("model is already registered")
-            await self._check_capabilities(model)
             client = await RemoteTrainingClient.create(
                 self._service,
                 CreateTrainingRunRequest(
@@ -282,8 +278,6 @@ class ServerlessBackend:
                         base_model=model.base_model,
                         adapter=_adapter_spec(model),
                         seed=int((model.lora_config or {}).get("random_state", 3407)),
-                        packing_contract_version=PACKING_CONTRACT_VERSION,
-                        art_version=art_source_revision(),
                         metadata={
                             "project": model.project,
                             "model_alias": model.name,
@@ -306,21 +300,6 @@ class ServerlessBackend:
             raise RuntimeError(
                 "model is not registered with ServerlessBackend"
             ) from error
-
-    async def _check_capabilities(self, model: AnyTrainableModel) -> None:
-        capabilities = await self._service.capabilities()
-        if capabilities.command_contract_version != COMMAND_CONTRACT_VERSION:
-            raise RuntimeError("remote command contract version does not match ART")
-        if PACKING_CONTRACT_VERSION not in capabilities.packing_contract_versions:
-            raise RuntimeError("remote service does not support ART's packing contract")
-        if "bfloat16" not in capabilities.supported_dtypes:
-            raise RuntimeError("remote service does not support bfloat16 training")
-        if not {"cross_entropy", "cispo", "ppo"}.issubset(
-            capabilities.supported_losses
-        ):
-            raise RuntimeError("remote service does not support ART's named losses")
-        if _adapter_spec(model).rank > capabilities.max_lora_rank:
-            raise RuntimeError("requested LoRA rank exceeds remote service capacity")
 
     async def close(self) -> None:
         if self._closed:

@@ -44,7 +44,6 @@ from .contracts import (
     RemoteForwardRequest,
     RunEvent,
     SetCheckpointTtlRequest,
-    TrainingCapabilities,
     TrainingRunView,
 )
 from .data_plane import (
@@ -242,9 +241,6 @@ class RemoteTrainingServiceClient:
             TrainingRunView,
             body=CloseRunRequest(request_id=request_id),
         )
-
-    async def capabilities(self) -> TrainingCapabilities:
-        return await self._request("GET", "training/capabilities", TrainingCapabilities)
 
     async def list_checkpoints(self, run_id: str) -> CheckpointPage:
         return await self._request(
