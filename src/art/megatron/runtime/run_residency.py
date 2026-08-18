@@ -73,7 +73,7 @@ class RunResidencyManager:
         self._mover = TensorResidencyMover()
         self._snapshot_barrier = snapshot_barrier
         self._states: dict[ResidencyKey, _ManagedState] = {}
-        self._installed: dict[str, ResidencyKey] = {}
+        self._installed_base: dict[str, ResidencyKey] = {}
         self._pool = ThreadPoolExecutor(
             max_workers=config.limits.max_concurrent_transitions,
             thread_name_prefix="art-residency",
@@ -89,16 +89,18 @@ class RunResidencyManager:
         self._require_open()
         if not tensors or any(tensor.device.type != "cuda" for tensor in tensors):
             raise RuntimeError("new L1 residency must be a non-empty CUDA tensor tuple")
-        if key.run_id in self._installed:
-            raise RuntimeError("a run may have only one installed L1 generation")
+        if key.accumulator_revision == 0 and key.run_id in self._installed_base:
+            raise RuntimeError("a run may have only one installed base generation")
         byte_count = self._mover.byte_count(tensors, "cuda")
+        self._reclaim_l1(byte_count, protected={key})
         reservation = self.ledger.reserve(
             key, source=None, target="l1_gpu", byte_count=byte_count
         )
         self.ledger.commit(reservation)
         with self._lock:
             self._states[key] = _ManagedState(key=key, tensors=tensors)
-            self._installed[key.run_id] = key
+            if key.accumulator_revision == 0:
+                self._installed_base[key.run_id] = key
         return self.ensure_l2(key)
 
     def advance_l1(
@@ -108,15 +110,17 @@ class RunResidencyManager:
         tensors: tuple[torch.Tensor, ...],
     ) -> Future[HostTensorImage]:
         self._require_open()
+        if source.accumulator_revision or target.accumulator_revision:
+            raise ValueError("only committed base generations may advance in place")
         with self._lock:
-            if self._installed.get(source.run_id) != source:
+            if self._installed_base.get(source.run_id) != source:
                 raise RuntimeError("residency source is not the installed generation")
             if source.run_id != target.run_id:
                 raise ValueError("residency advance cannot change runs")
             byte_count = self._mover.byte_count(tensors, "cuda")
             self.ledger.advance(source, target, "l1_gpu", byte_count=byte_count)
             self._states[target] = _ManagedState(key=target, tensors=tensors)
-            self._installed[target.run_id] = target
+            self._installed_base[target.run_id] = target
         return self.ensure_l2(target)
 
     def ensure_l2(self, key: ResidencyKey) -> Future[HostTensorImage]:
@@ -174,10 +178,11 @@ class RunResidencyManager:
     def prepare_l1(self, key: ResidencyKey) -> None:
         """Launch L2/L3 -> L1 transfer; compute later waits on its CUDA event."""
         self._require_open()
-        if self._installed.get(key.run_id) == key:
+        if self.ledger.has_copy(key, "l1_gpu"):
             return
         l2 = self.ensure_l2(key).result()
-        self._evict_installed_run(key.run_id)
+        if key.accumulator_revision == 0:
+            self._evict_installed_base(key.run_id)
         byte_count = l2.stats.byte_count
         self._reclaim_l1(byte_count, protected={key})
         with self._lock:
@@ -212,8 +217,9 @@ class RunResidencyManager:
                 self.ledger.commit(reservation)
                 state.l1_transition = None
                 state.l1_reservation = None
-                self._installed[key.run_id] = key
-            if self._installed.get(key.run_id) != key:
+                if key.accumulator_revision == 0:
+                    self._installed_base[key.run_id] = key
+            if not self.ledger.has_copy(key, "l1_gpu"):
                 raise RuntimeError("requested generation did not become L1 resident")
             self.ledger.pin(key)
 
@@ -269,8 +275,8 @@ class RunResidencyManager:
                 self._store.delete(key)
             self.ledger.drop_entry(key)
             self._states.pop(key)
-            if self._installed.get(key.run_id) == key:
-                self._installed.pop(key.run_id)
+            if self._installed_base.get(key.run_id) == key:
+                self._installed_base.pop(key.run_id)
 
     def close(self) -> None:
         with self._lock:
@@ -357,8 +363,8 @@ class RunResidencyManager:
                 self._record_failure(error)
             raise
 
-    def _evict_installed_run(self, run_id: str) -> None:
-        current = self._installed.get(run_id)
+    def _evict_installed_base(self, run_id: str) -> None:
+        current = self._installed_base.get(run_id)
         if current is not None:
             self.evict_l1(current)
 
@@ -382,8 +388,8 @@ class RunResidencyManager:
             raise RuntimeError("cannot evict a pinned residency state")
         state.l2.activate()
         self.ledger.drop(key, "l1_gpu")
-        if self._installed.get(key.run_id) == key:
-            self._installed.pop(key.run_id)
+        if self._installed_base.get(key.run_id) == key:
+            self._installed_base.pop(key.run_id)
 
     def _submit(self, fn: Any, *args: Any) -> Future[Any]:
         future = self._pool.submit(fn, *args)
