@@ -309,6 +309,10 @@ class RunResidencyManager:
     def release_l1(self, key: ResidencyKey) -> None:
         self.ledger.unpin(key)
 
+    def touch(self, key: ResidencyKey) -> None:
+        self._require_open()
+        self.ledger.touch(key)
+
     def evict_l1(self, key: ResidencyKey) -> None:
         self.ensure_l2(key).result()
         with self._lock:

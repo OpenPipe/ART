@@ -649,7 +649,7 @@ class _ResidentRunState(BaseModel):
     installed_key: ResidencyKey
     initial_generation: TrainerGeneration | None = None
     pending_load: _PreparedRunLoad | None = None
-    gradient_keys: dict[str, ResidencyKey] = Field(default_factory=dict)
+    accumulator_key: ResidencyKey | None = None
     next_accumulator_revision: int = 1
     registration_complete: bool = False
 
@@ -929,8 +929,7 @@ class MCoreRunSlotExecutor:
         state.desired_key = output_key
         state.installed_key = output_key
         state.learner_version = job.learner_version
-        for operation_id in consumed:
-            self._residency.retire_async(state.gradient_keys.pop(operation_id))
+        self._retire_accumulator(state)
         from art.megatron.lora import LoRASlotRef
 
         snapshot_metrics = self._publisher.stage(
@@ -1149,7 +1148,9 @@ class MCoreRunSlotExecutor:
         }
 
     def discard_run_gradients(self, run_id: str) -> None:
-        self._require_run(run_id).gradients.discard()
+        state = self._require_run(run_id)
+        state.gradients.discard()
+        self._retire_accumulator(state)
 
     def unregister_run(self, run_id: str) -> None:
         state = self._require_run(run_id)
@@ -1238,15 +1239,26 @@ class MCoreRunSlotExecutor:
     def _register_gradient_contribution(
         self, state: _ResidentRunState, operation_id: str
     ) -> None:
+        del operation_id
+        tensors = state.gradients.residency_tensors()
+        if state.accumulator_key is not None:
+            self._residency.touch(state.accumulator_key)
+            return
         key = state.installed_key.model_copy(
             update={
                 "representation": "gradient",
                 "accumulator_revision": state.next_accumulator_revision,
             }
         )
-        tensors = state.gradients.contribution_residency_tensors(operation_id)
         self._residency.register_l1(key, tensors)
-        state.gradient_keys[operation_id] = key
+        state.accumulator_key = key
+
+    def _retire_accumulator(self, state: _ResidentRunState) -> None:
+        key = state.accumulator_key
+        if key is None:
+            return
+        self._residency.retire_async(key)
+        state.accumulator_key = None
         state.next_accumulator_revision += 1
 
     @contextmanager
@@ -1292,7 +1304,11 @@ class MCoreRunSlotExecutor:
                 state.installed_key = base_key
                 state.pending_load = None
                 self._residency.retire_async(previous)
-            for key in state.gradient_keys.values() if include_gradients else ():
+            for key in (
+                (state.accumulator_key,)
+                if include_gradients and state.accumulator_key is not None
+                else ()
+            ):
                 self._residency.acquire_l1(key)
                 acquired.append(key)
             yield
