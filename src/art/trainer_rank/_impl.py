@@ -35,6 +35,7 @@ from typing import (
 )
 import weakref
 
+from pydantic import BaseModel, ConfigDict
 import torch
 from torch.autograd.function import FunctionCtx
 import torch.distributed as dist
@@ -100,6 +101,19 @@ class TrainerRankOptimizerState(TypedDict):
     layout: TrainerRankOptimizerLayout
     master_params: tuple[torch.Tensor, ...]
     optimizer: dict[str, object]
+
+
+class TrainerRankResidencyTensors(BaseModel):
+    """Stable tensor objects that physically constitute one checkpoint slot."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    weights: tuple[torch.Tensor, ...]
+    optimizer: tuple[torch.Tensor, ...]
+
+    @property
+    def all(self) -> tuple[torch.Tensor, ...]:
+        return (*self.weights, *self.optimizer)
 
 
 def _build_dynamic_optimizer(
@@ -1420,6 +1434,35 @@ class TrainerRank:
     def checkpoint_slot_optimizer_layout(self, name: str) -> TrainerRankOptimizerLayout:
         self.checkpoint_slot_parameters(name)
         return self._dynamic_optimizer_layout(name)
+
+    def checkpoint_slot_residency_tensors(
+        self, name: str
+    ) -> TrainerRankResidencyTensors:
+        """Return every movable tensor while preserving its owning Python object."""
+        slot = self._checkpoint_slots.get(name)
+        if slot is None:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}")
+        weights = _unique_tensors(
+            (
+                *slot.params,
+                *(
+                    tensor
+                    for custom in slot.custom.values()
+                    for tensor in _custom_residency_tensors(custom)
+                ),
+            )
+        )
+        dynamic = slot.optimizer
+        optimizer = ()
+        if dynamic is not None:
+            optimizer = _unique_tensors(
+                (
+                    *dynamic.master_params,
+                    *_nested_tensors(dynamic.optimizer.state),
+                    *(slot.optimizer_padding_masks or ()),
+                )
+            )
+        return TrainerRankResidencyTensors(weights=weights, optimizer=optimizer)
 
     def restore_checkpoint_slot_optimizer_state(
         self, name: str, state: TrainerRankOptimizerState
@@ -4266,6 +4309,37 @@ def _custom_state(custom: _CustomObject) -> dict[str, torch.Tensor]:
     if custom.kind == "module":
         return dict(cast(torch.nn.Module, custom.value).state_dict())
     return {"": cast(torch.Tensor, custom.value)}
+
+
+def _custom_residency_tensors(custom: _CustomObject) -> tuple[torch.Tensor, ...]:
+    if custom.kind == "module":
+        module = cast(torch.nn.Module, custom.value)
+        return (*module.parameters(), *module.buffers())
+    return (cast(torch.Tensor, custom.value),)
+
+
+def _nested_tensors(value: object) -> tuple[torch.Tensor, ...]:
+    if isinstance(value, torch.Tensor):
+        return (value,)
+    if isinstance(value, Mapping):
+        return tuple(
+            tensor
+            for key, item in value.items()
+            for tensor in (*_nested_tensors(key), *_nested_tensors(item))
+        )
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return tuple(tensor for item in value for tensor in _nested_tensors(item))
+    return ()
+
+
+def _unique_tensors(values: Iterable[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+    seen: set[int] = set()
+    result: list[torch.Tensor] = []
+    for tensor in values:
+        if id(tensor) not in seen:
+            seen.add(id(tensor))
+            result.append(tensor)
+    return tuple(result)
 
 
 def _load_custom_state(

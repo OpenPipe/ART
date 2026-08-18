@@ -29,6 +29,7 @@ TrainerRankMemoryError = _impl.TrainerRankMemoryError
 TrainerRankSlotStateError = _impl.TrainerRankSlotStateError
 TrainerRankOptimizerLayout = _impl.TrainerRankOptimizerLayout
 TrainerRankOptimizerState = _impl.TrainerRankOptimizerState
+TrainerRankResidencyTensors = _impl.TrainerRankResidencyTensors
 Unset = _impl.Unset
 MaterializedCheckpoint = _impl.MaterializedCheckpoint
 PushedCheckpoint = _impl.PushedCheckpoint
@@ -369,6 +370,7 @@ __all__ = [
     "TrainerRankMemoryError",
     "TrainerRankOptimizerLayout",
     "TrainerRankOptimizerState",
+    "TrainerRankResidencyTensors",
     "PushedCheckpoint",
     "TrainerRankSlotStateError",
     "Unset",
