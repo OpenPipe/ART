@@ -596,12 +596,22 @@ async def run_explicit_controller(
     startup_timeout_s: float | None = None,
     owned_workers: Sequence[_WorkerSession] = (),
 ) -> Any:
+    from .launch import ArtLaunchContext
+
     hosts = await attach_controller(
         spec.worker_addresses,
         startup_timeout_s=startup_timeout_s,
         owned_workers=owned_workers,
     )
-    program_task = asyncio.ensure_future(program.resolve()(hosts))
+    program_task = asyncio.ensure_future(
+        program.resolve()(
+            ArtLaunchContext(
+                host_mesh=hosts,
+                worker_addresses=spec.worker_addresses,
+                controller_rank=spec.controller_rank,
+            )
+        )
+    )
     try:
         while not program_task.done():
             exited = [worker for worker in owned_workers if not worker.is_alive()]

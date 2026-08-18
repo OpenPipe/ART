@@ -3,13 +3,11 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
-from typing import Any
 
 import art
 from art.distributed import (
+    ArtLaunchContext,
     ArtRuntime,
-    ClusterSpec,
-    HostSpec,
     InstalledAsyncCallable,
     compile_topology,
 )
@@ -35,23 +33,13 @@ async def rollout(
     )
 
 
-async def main(hosts: Any) -> None:
-    host_count = int(hosts.region.slice().sizes[0])
-    host_ids = tuple(f"host{rank}" for rank in range(host_count))
+async def main(launch: ArtLaunchContext) -> None:
+    host_count = launch.host_count
     runtime = await ArtRuntime.start(
-        hosts,
+        launch.host_mesh,
         compile_topology(
-            cluster=ClusterSpec(
-                hosts=tuple(
-                    HostSpec(
-                        host_id=host_id,
-                        node_rank=rank,
-                        worker_address=f"attached://{rank}",
-                        cpu_slots=1,
-                    )
-                    for rank, host_id in enumerate(host_ids)
-                ),
-                controller_host_id=host_ids[0],
+            cluster=launch.homogeneous_cluster(
+                cpu_slots=1,
                 startup_timeout_s=90,
                 rpc_timeout_s=30,
             )

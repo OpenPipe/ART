@@ -21,13 +21,11 @@ only rank 0 imports the module and invokes the controller.
 import asyncio
 import os
 import socket
-from typing import Any
 
 import art
 from art.distributed import (
+    ArtLaunchContext,
     ArtRuntime,
-    ClusterSpec,
-    HostSpec,
     InstalledAsyncCallable,
     compile_topology,
 )
@@ -53,23 +51,13 @@ async def rollout(
     )
 
 
-async def main(hosts: Any) -> None:
-    host_count = int(hosts.region.slice().sizes[0])
-    host_ids = tuple(f"host{rank}" for rank in range(host_count))
+async def main(launch: ArtLaunchContext) -> None:
+    host_count = launch.host_count
     runtime = await ArtRuntime.start(
-        hosts,
+        launch.host_mesh,
         compile_topology(
-            cluster=ClusterSpec(
-                hosts=tuple(
-                    HostSpec(
-                        host_id=host_id,
-                        node_rank=rank,
-                        worker_address=f"attached://{rank}",
-                        cpu_slots=1,
-                    )
-                    for rank, host_id in enumerate(host_ids)
-                ),
-                controller_host_id=host_ids[0],
+            cluster=launch.homogeneous_cluster(
+                cpu_slots=1,
                 startup_timeout_s=90,
                 rpc_timeout_s=30,
             )
@@ -115,12 +103,15 @@ async def main(hosts: Any) -> None:
         await runtime.close()
 ```
 
-The controller runs once, while the top-level `rollout` runs in one process on
-each host. Both must be installed or synchronized at the same import paths on
-every node; ART sends verified import references and never ships opaque
-closures. The dummy `TrainableModel` is serialized for the rollout contract but
-never loaded, so this validates the package, host admission, process placement,
-public trajectory types, and cleanup without a GPU or inference server.
+The controller receives an `ArtLaunchContext` once, while the top-level
+`rollout` runs in one process on each host. The context owns the attached host
+mesh and builds a homogeneous typed cluster without exposing provider
+environment variables. Both functions must be installed or synchronized at the
+same import paths on every node; ART sends verified import references and never
+ships opaque closures. The dummy `TrainableModel` is serialized for the rollout
+contract but never loaded, so this validates the package, host admission,
+process placement, public trajectory types, and cleanup without a GPU or
+inference server.
 
 The distributed service APIs are opt-in. Existing single-node programs continue
 to construct and use `LocalBackend` exactly as before:

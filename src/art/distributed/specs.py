@@ -139,6 +139,24 @@ class ClusterSpec(_Spec):
             raise ValueError("controller_host_id must identify a configured host")
         return self
 
+    @property
+    def host_ids(self) -> tuple[str, ...]:
+        return tuple(host.host_id for host in self.hosts)
+
+    def gpu_placements(
+        self, host_ids: Sequence[str] | None = None
+    ) -> tuple[GpuPlacement, ...]:
+        selected = set(self.host_ids if host_ids is None else host_ids)
+        unknown = selected.difference(self.host_ids)
+        if unknown:
+            raise ValueError(f"unknown GPU placement hosts: {sorted(unknown)}")
+        return tuple(
+            GpuPlacement(host_id=host.host_id, gpu_id=gpu_id)
+            for host in self.hosts
+            if host.host_id in selected
+            for gpu_id in host.gpu_ids
+        )
+
 
 class GpuPlacement(_Spec):
     host_id: str = Field(min_length=1)
