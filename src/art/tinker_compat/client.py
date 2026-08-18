@@ -527,6 +527,8 @@ class TrainingClient:
         self._submission_lock = threading.Lock()
         self._admission_tail: Future[None] = Future()
         self._admission_tail.set_result(None)
+        self._close_lock = asyncio.Lock()
+        self._admissions_closed = False
         self._closed = False
 
     def forward(
@@ -817,6 +819,7 @@ class TrainingClient:
     def close(self) -> None:
         if self._closed:
             return
+        self._begin_close()
         self._runtime.submit(self._close_remote()).result(
             timeout=process_shutdown_timeout(2)
         )
@@ -824,14 +827,21 @@ class TrainingClient:
     async def close_async(self) -> None:
         if self._closed:
             return
+        self._begin_close()
         async with asyncio.timeout(process_shutdown_timeout(2)):
             await self._runtime.submit(self._close_remote())
 
     async def _close_remote(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        await self._remote.shutdown()
+        self._begin_close()
+        async with self._close_lock:
+            if self._closed:
+                return
+            await self._remote.shutdown()
+            self._closed = True
+
+    def _begin_close(self) -> None:
+        with self._submission_lock:
+            self._admissions_closed = True
 
     def _schedule(
         self,
@@ -840,7 +850,7 @@ class TrainingClient:
         convert: Callable[[Any], T],
     ) -> APIFuture[T]:
         with self._submission_lock:
-            if self._closed:
+            if self._admissions_closed:
                 raise RuntimeError("TrainingClient is closed")
             predecessor = self._admission_tail
             admitted: Future[None] = Future()
