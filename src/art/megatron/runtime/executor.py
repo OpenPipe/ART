@@ -1808,7 +1808,9 @@ class _GenerationPublisher:
     def _evict_for_capacity(self) -> None:
         with self._lock:
             entries = tuple(
-                entry for entry in self._cache.values() if not entry.released
+                entry
+                for entry in self._cache.values()
+                if entry.stager is not None and not entry.released
             )
             ready = tuple(
                 entry
