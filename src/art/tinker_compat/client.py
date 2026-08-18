@@ -6,6 +6,7 @@ from concurrent.futures import Future
 import os
 import secrets
 import threading
+import time
 from typing import Any, Literal, Protocol, TypeVar
 import uuid
 
@@ -36,6 +37,7 @@ from art.training.contracts import (
     SaveStateResult,
     SaveWeightsForSamplerRequest,
 )
+from art.utils.lifecycle import process_shutdown_timeout
 
 from ._runtime import AsyncRuntime
 from .data import to_tinker_forward_output, to_tokenized_batch, validate_loss
@@ -381,19 +383,32 @@ class ServiceClient:
 
     def close(self) -> None:
         if self._closed:
-            return
-        try:
-            self._runtime.submit(self._close()).result()
-        finally:
             self._runtime.stop()
+            return
+        deadline = time.monotonic() + process_shutdown_timeout(1)
+        future = self._runtime.submit_future(self._close())
+        try:
+            future.result(timeout=max(0.0, deadline - time.monotonic()))
+        finally:
+            future.cancel()
+            self._closed = True
+            self._runtime.stop(max(0.0, deadline - time.monotonic()))
 
     async def close_async(self) -> None:
         if self._closed:
+            await asyncio.to_thread(self._runtime.stop)
             return
+        deadline = time.monotonic() + process_shutdown_timeout(1)
+        future = self._runtime.submit_future(self._close())
         try:
-            await self._runtime.submit(self._close())
+            async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+                await asyncio.wrap_future(future)
         finally:
-            self._runtime.stop()
+            future.cancel()
+            self._closed = True
+            await asyncio.to_thread(
+                self._runtime.stop, max(0.0, deadline - time.monotonic())
+            )
 
     async def _close(self) -> None:
         failures = await asyncio.gather(
@@ -802,12 +817,15 @@ class TrainingClient:
     def close(self) -> None:
         if self._closed:
             return
-        self._runtime.submit(self._close_remote()).result()
+        self._runtime.submit(self._close_remote()).result(
+            timeout=process_shutdown_timeout(2)
+        )
 
     async def close_async(self) -> None:
         if self._closed:
             return
-        await self._runtime.submit(self._close_remote())
+        async with asyncio.timeout(process_shutdown_timeout(2)):
+            await self._runtime.submit(self._close_remote())
 
     async def _close_remote(self) -> None:
         if self._closed:

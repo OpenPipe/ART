@@ -8,6 +8,8 @@ from typing import Any, TypeVar
 
 from tinker import APIFuture
 
+from art.utils.lifecycle import process_shutdown_timeout
+
 T = TypeVar("T")
 
 
@@ -47,12 +49,17 @@ class AsyncRuntime:
             raise RuntimeError("Tinker compatibility client is closed")
         return asyncio.run_coroutine_threadsafe(coroutine, self._loop)
 
-    def stop(self) -> None:
-        if self._closed:
+    def stop(self, timeout_s: float = process_shutdown_timeout(2)) -> None:
+        if timeout_s < 0:
+            raise ValueError("runtime stop timeout cannot be negative")
+        if self._closed and not self._thread.is_alive():
             return
-        self._closed = True
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join()
+        if not self._closed:
+            self._closed = True
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout_s)
+        if self._thread.is_alive():
+            raise RuntimeError("Tinker compatibility runtime did not stop in time")
 
     def _run(self) -> None:
         self._loop = asyncio.new_event_loop()
