@@ -20,6 +20,8 @@ from art.megatron.optimizer_state import (
     canonical_adapter_path,
     commit_optimizer_generation,
     optimizer_generation_nbytes,
+    optimizer_generation_path,
+    optimizer_pending_generation_path,
     read_committed_optimizer_pointer,
 )
 
@@ -138,10 +140,11 @@ class SnapshotWritePlan(_PublicationModel):
 
 
 class SnapshotWriteTargets(_PublicationModel):
-    format_version: Literal[1] = 1
+    format_version: Literal[2] = 2
     local_adapter_staging_path: str | None = Field(default=None, min_length=1)
     local_adapter_target: OptimizerAdapter | None = None
     optimizer_state_path: str | None = Field(default=None, min_length=1)
+    writes_optimizer: bool
     adapter_object_target: BinaryObjectTarget | None = None
 
     @model_validator(mode="after")
@@ -154,6 +157,8 @@ class SnapshotWriteTargets(_PublicationModel):
         for value in (self.local_adapter_staging_path, self.optimizer_state_path):
             if value is not None and not Path(value).is_absolute():
                 raise ValueError("snapshot write target paths must be absolute")
+        if self.writes_optimizer and self.optimizer_state_path is None:
+            raise ValueError("optimizer writes require an exact state path")
         return self
 
 
@@ -204,6 +209,38 @@ class SnapshotWriteReservationPlan(_PublicationModel):
     @property
     def digest(self) -> str:
         return snapshot_write_reservation_plan_digest(self)
+
+    @property
+    def local_write_bytes(self) -> int:
+        return (
+            self.snapshot.adapter_bytes
+            if self.targets.local_adapter_staging_path is not None
+            else 0
+        ) + (self.snapshot.optimizer_bytes if self.targets.writes_optimizer else 0)
+
+    @property
+    def local_write_paths(self) -> tuple[str, ...]:
+        paths: list[str] = []
+        if staging := self.targets.local_adapter_staging_path:
+            local = self.targets.local_adapter_target
+            assert local is not None
+            paths.extend((staging, local.identity))
+        if self.targets.writes_optimizer:
+            assert self.targets.optimizer_state_path is not None
+            paths.extend(
+                str(path)
+                for path in (
+                    optimizer_pending_generation_path(
+                        self.targets.optimizer_state_path,
+                        self.snapshot.generation.generation_id,
+                    ),
+                    optimizer_generation_path(
+                        self.targets.optimizer_state_path,
+                        self.snapshot.generation.generation_id,
+                    ),
+                )
+            )
+        return tuple(paths)
 
 
 class SnapshotWriteGrant(_PublicationModel):
@@ -285,6 +322,7 @@ def build_snapshot_write_reservation_plan(
     *,
     local_adapter_staging_path: str | None = None,
     optimizer_state_path: str | None = None,
+    writes_optimizer: bool,
     adapter_object_target: BinaryObjectTarget | None = None,
 ) -> SnapshotWriteReservationPlan:
     return SnapshotWriteReservationPlan(
@@ -293,6 +331,7 @@ def build_snapshot_write_reservation_plan(
             local_adapter_staging_path=local_adapter_staging_path,
             local_adapter_target=snapshot.ranks[0].adapter,
             optimizer_state_path=optimizer_state_path,
+            writes_optimizer=writes_optimizer,
             adapter_object_target=adapter_object_target,
         ),
     )

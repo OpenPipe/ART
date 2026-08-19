@@ -90,6 +90,7 @@ def _reservation_plan(tmp_path: Path) -> SnapshotWriteReservationPlan:
         snapshot,
         local_adapter_staging_path=str(staging),
         optimizer_state_path=str(tmp_path / "optimizer_states"),
+        writes_optimizer=True,
         adapter_object_target=target,
     )
 
@@ -103,6 +104,30 @@ def test_reservation_plan_round_trips_every_authorized_target(tmp_path: Path) ->
     assert restored.targets.local_adapter_target == plan.snapshot.ranks[0].adapter
     assert restored.targets.optimizer_state_path == str(tmp_path / "optimizer_states")
     assert restored.targets.adapter_object_target is not None
+    assert restored.local_write_bytes == (
+        plan.snapshot.adapter_bytes + plan.snapshot.optimizer_bytes
+    )
+    assert restored.local_write_paths == (
+        str(
+            tmp_path
+            / "megatron_runtime"
+            / "staging"
+            / plan.snapshot.generation.generation_id
+        ),
+        plan.snapshot.ranks[0].adapter.identity,
+        str(
+            tmp_path
+            / "optimizer_states"
+            / "generations"
+            / f".pending-{plan.snapshot.generation.generation_id}"
+        ),
+        str(
+            tmp_path
+            / "optimizer_states"
+            / "generations"
+            / plan.snapshot.generation.generation_id
+        ),
+    )
 
     prepared = PreparedSave(
         operation_id="save",
@@ -163,11 +188,14 @@ def test_existing_snapshot_retains_exact_physical_sources(tmp_path: Path) -> Non
     plan = _reservation_plan(tmp_path)
     optimizer = str(tmp_path / "optimizer")
     existing = build_snapshot_write_reservation_plan(
-        plan.snapshot, optimizer_state_path=optimizer
+        plan.snapshot, optimizer_state_path=optimizer, writes_optimizer=False
     )
 
     assert existing.targets == SnapshotWriteTargets(
         local_adapter_target=plan.snapshot.ranks[0].adapter,
         optimizer_state_path=optimizer,
+        writes_optimizer=False,
     )
+    assert existing.local_write_bytes == 0
+    assert existing.local_write_paths == ()
     assert existing.digest != plan.digest

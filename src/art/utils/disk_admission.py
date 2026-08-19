@@ -331,6 +331,35 @@ class DiskAdmission:
             self._prune_closed(manifest)
         return tuple(reaped)
 
+    def settle_committed_reservations(
+        self, catalog_claim_is_committed: Callable[[DiskCatalogClaim], bool]
+    ) -> tuple[str, ...]:
+        """Close dead reservations whose exact catalog write was committed."""
+        settled: list[str] = []
+        now = _now()
+        with self._manifest() as manifest:
+            for value in tuple(manifest.reservations.values()):
+                if (
+                    value.state != "active"
+                    or value.catalog_claim is None
+                    or self._owner_is_live(value)
+                    or not catalog_claim_is_committed(value.catalog_claim)
+                    or _paths_have_open_files(value.owned_paths)
+                ):
+                    continue
+                self._lease_path(value).unlink(missing_ok=True)
+                manifest.reservations[value.reservation_id] = value.model_copy(
+                    update={
+                        "remaining_bytes": 0,
+                        "state": "completed",
+                        "updated_at": now,
+                        "closed_at": now,
+                    }
+                )
+                settled.append(value.reservation_id)
+            self._prune_closed(manifest)
+        return tuple(settled)
+
     def _set_remaining(self, reservation_id: str, remaining_bytes: int) -> None:
         self._require_owner_process()
         with self._manifest() as manifest:

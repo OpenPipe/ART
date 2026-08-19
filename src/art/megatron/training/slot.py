@@ -1101,6 +1101,7 @@ class MegatronTrainingSlot:
                 optimizer_state_path=(
                     optimizer_state_path if persist_optimizer else None
                 ),
+                writes_optimizer=persist_optimizer,
                 adapter_object_target=object_target,
             ),
             publication=self.trainer.wait_for_publication(ref.operation_id),
@@ -1143,7 +1144,9 @@ class MegatronTrainingSlot:
             ),
             plan=plan,
             reservation_plan=build_snapshot_write_reservation_plan(
-                plan, optimizer_state_path=optimizer_state_path
+                plan,
+                optimizer_state_path=optimizer_state_path,
+                writes_optimizer=False,
             ),
         )
 
