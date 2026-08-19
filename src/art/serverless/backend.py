@@ -750,7 +750,7 @@ class ServerlessBackend:
                     ),
                 )
             )
-            if settings.save_checkpoint or should_save_optimizer_state(step, config):
+            if should_save_optimizer_state(step, config):
                 state = await client.save_state(
                     SaveStateRequest(
                         run_id=client.run_id,

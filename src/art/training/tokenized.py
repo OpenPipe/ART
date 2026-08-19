@@ -201,6 +201,8 @@ class TokenizedDatum(BaseModel):
             )
         if loss != "cross_entropy" and self.candidate_count != 1:
             raise ValueError(f"{loss} requires one target token per input position")
+        if loss != "cross_entropy" and not self.policy_spans:
+            raise ValueError(f"{loss} requires complete policy spans")
         coefficients = self.weights if loss == "cross_entropy" else self.advantages
         assert coefficients is not None
         if not any(value != 0.0 for row in coefficients for value in row):
