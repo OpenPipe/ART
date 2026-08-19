@@ -41,7 +41,7 @@ class S3ObjectStoreConfig(_ObjectModel):
         ge=_S3_MIN_MULTIPART_PART_BYTES,
         le=_S3_MAX_MULTIPART_PART_BYTES,
     )
-    multipart_concurrency: int = Field(default=8, ge=1)
+    multipart_concurrency: int = Field(default=16, ge=1)
 
     @field_validator("bucket")
     @classmethod
