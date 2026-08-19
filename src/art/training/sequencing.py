@@ -26,6 +26,11 @@ class CommandAdmission(Contract):
     contributing_forward_backward_operation_ids: tuple[str, ...] = ()
 
 
+class CommandAdmissionPolicy(Contract):
+    max_command_depth: int = Field(default=128, ge=1)
+    max_gradient_contributions: int = Field(default=64, ge=1)
+
+
 class _AdmissionRecord(Contract):
     request_fingerprint: str = Field(min_length=1)
     admission: CommandAdmission
@@ -34,16 +39,24 @@ class _AdmissionRecord(Contract):
 class RunCommandLedger:
     """Atomically admit one gapless, idempotent run-local command stream."""
 
-    def __init__(self, run_id: str, *, learner_version: int) -> None:
+    def __init__(
+        self,
+        run_id: str,
+        *,
+        learner_version: int,
+        admission_policy: CommandAdmissionPolicy | None = None,
+    ) -> None:
         if not run_id:
             raise ValueError("run_id must not be empty")
         if learner_version < 0:
             raise ValueError("learner_version must be non-negative")
         self.run_id = run_id
+        self._admission_policy = admission_policy or CommandAdmissionPolicy()
         self._next_sequence_id = 0
         self._projected_learner_version = learner_version
         self._open_forward_backward_ids: list[str] = []
         self._records: dict[str, _AdmissionRecord] = {}
+        self._nonterminal_request_ids: set[str] = set()
         self._lock = asyncio.Lock()
 
     @property
@@ -72,6 +85,30 @@ class RunCommandLedger:
         if admission.ref.operation_id in self._open_forward_backward_ids:
             raise RuntimeError("cannot retire an open F/B command")
         self._records.pop(request_id)
+        self._nonterminal_request_ids.discard(request_id)
+
+    def mark_terminal(
+        self,
+        request_id: str,
+        admission: CommandAdmission,
+        *,
+        error: BaseException | None,
+    ) -> None:
+        record = self._records.get(request_id)
+        if record is None:
+            return
+        if record.admission != admission:
+            raise RuntimeError("command terminal state does not match its admission")
+        self._nonterminal_request_ids.discard(request_id)
+        if isinstance(error, asyncio.CancelledError):
+            if admission.ref.operation_id in self._open_forward_backward_ids:
+                self._open_forward_backward_ids.remove(admission.ref.operation_id)
+        elif error is not None and admission.ref.kind in {
+            "forward_backward",
+            "optim_step",
+            "load_state",
+        }:
+            self._open_forward_backward_ids.clear()
 
     def _admit(
         self,
@@ -93,6 +130,11 @@ class RunCommandLedger:
             ):
                 raise RuntimeError("request_id was reused for a different command")
             return prior.admission
+        if (
+            len(self._nonterminal_request_ids)
+            >= self._admission_policy.max_command_depth
+        ):
+            raise RuntimeError("training run command depth limit reached")
         if request.sequence_id != self._next_sequence_id:
             raise RuntimeError(
                 "command sequence must be gapless: "
@@ -103,22 +145,23 @@ class RunCommandLedger:
             f"{self.run_id}\0{request.request_id}".encode()
         ).hexdigest()
         parent = self._projected_learner_version
+        open_ids = list(self._open_forward_backward_ids)
         contributions: tuple[str, ...] = ()
         reserved: int | None = None
         if kind == "forward_backward":
-            self._open_forward_backward_ids.append(operation_id)
+            if len(open_ids) >= self._admission_policy.max_gradient_contributions:
+                raise RuntimeError("training run gradient contribution limit reached")
+            open_ids.append(operation_id)
         elif kind == "optim_step":
-            if not self._open_forward_backward_ids:
+            if not open_ids:
                 raise RuntimeError("optimizer requires an open F/B contribution")
-            contributions = tuple(self._open_forward_backward_ids)
-            self._open_forward_backward_ids.clear()
+            contributions = tuple(open_ids)
+            open_ids = []
             reserved = parent + 1
-            self._projected_learner_version = reserved
         elif kind == "load_state":
-            if self._open_forward_backward_ids:
+            if open_ids:
                 raise RuntimeError("load_state cannot discard open gradients")
             reserved = parent + 1
-            self._projected_learner_version = reserved
 
         admission = CommandAdmission(
             ref=OperationRef(
@@ -131,9 +174,14 @@ class RunCommandLedger:
             ),
             contributing_forward_backward_operation_ids=contributions,
         )
-        self._records[request.request_id] = _AdmissionRecord(
+        record = _AdmissionRecord(
             request_fingerprint=request_fingerprint, admission=admission
         )
+
+        self._open_forward_backward_ids = open_ids
+        self._projected_learner_version = parent if reserved is None else reserved
+        self._records[request.request_id] = record
+        self._nonterminal_request_ids.add(request.request_id)
         self._next_sequence_id += 1
         return admission
 

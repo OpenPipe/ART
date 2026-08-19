@@ -28,7 +28,11 @@ from art.training.contracts import (
     SaveStateResult,
     SaveWeightsForSamplerRequest,
 )
-from art.training.sequencing import CommandAdmission, RunCommandLedger
+from art.training.sequencing import (
+    CommandAdmission,
+    CommandAdmissionPolicy,
+    RunCommandLedger,
+)
 from art.types import TrainConfig
 
 from ..runtime.specs import (
@@ -127,8 +131,13 @@ class LocalMegatronTrainingClient:
         backend: MegatronBackend,
         model: TrainableModel,
         service: DistributedMegatronService,
+        admission_policy: CommandAdmissionPolicy | None = None,
     ) -> None:
-        self._ledger = RunCommandLedger(run_id, learner_version=learner_version)
+        self._ledger = RunCommandLedger(
+            run_id,
+            learner_version=learner_version,
+            admission_policy=admission_policy,
+        )
         self._backend = backend
         self._model = model
         self._service = service
@@ -673,6 +682,15 @@ class LocalMegatronTrainingClient:
 
     def _bound_operation_cache(self, operation: LocalTrainingOperation[Any]) -> None:
         operation_id = operation.ref.operation_id
+        if operation._ordered.done() and operation._result.done():
+            error = (
+                asyncio.CancelledError()
+                if operation._result.cancelled()
+                else operation._result.exception()
+            )
+            self._ledger.mark_terminal(
+                operation._request_id, operation._admission, error=error
+            )
         if (
             self._operations.get(operation_id) is operation
             and operation_id not in self._completed_operations
