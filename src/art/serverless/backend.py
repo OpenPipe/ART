@@ -658,31 +658,39 @@ class ServerlessBackend:
     ) -> tuple[tuple[str | None, str, str, str], int]:
         return self._model_key(model), step
 
-    def _reserve_sampler_publication(
+    async def _reserve_sampler_publication(
         self, model: AnyTrainableModel, step: int
     ) -> _PendingSamplerPublication:
-        key = self._sampler_key(model, step)
-        if key in self._sampler_results or key in self._pending_sampler_publications:
-            raise RuntimeError(f"sampler weights for learner step {step} already exist")
-        model_key = key[0]
-        predecessor = self._sampler_publication_tails.get(model_key)
-        if predecessor is not None and step <= predecessor[0]:
-            raise RuntimeError(
-                "sampler learner versions must increase monotonically: "
-                f"previous={predecessor[0]}, next={step}"
+        async with self._exact_adapter_lock:
+            key = self._sampler_key(model, step)
+            if (
+                key in self._sampler_results
+                or key in self._pending_sampler_publications
+            ):
+                raise RuntimeError(
+                    f"sampler weights for learner step {step} already exist"
+                )
+            model_key = key[0]
+            predecessor = self._sampler_publication_tails.get(model_key)
+            if predecessor is not None and step <= predecessor[0]:
+                raise RuntimeError(
+                    "sampler learner versions must increase monotonically: "
+                    f"previous={predecessor[0]}, next={step}"
+                )
+            loop = asyncio.get_running_loop()
+            materialized: asyncio.Future[SamplerWeightsResult] = loop.create_future()
+            materialized.add_done_callback(consume_future_exception)
+            activation_settled: asyncio.Future[None] = loop.create_future()
+            pending = _PendingSamplerPublication(
+                materialized=materialized,
+                predecessor_settled=(
+                    predecessor[1] if predecessor is not None else None
+                ),
+                activation_settled=activation_settled,
             )
-        loop = asyncio.get_running_loop()
-        materialized: asyncio.Future[SamplerWeightsResult] = loop.create_future()
-        materialized.add_done_callback(consume_future_exception)
-        activation_settled: asyncio.Future[None] = loop.create_future()
-        pending = _PendingSamplerPublication(
-            materialized=materialized,
-            predecessor_settled=(predecessor[1] if predecessor is not None else None),
-            activation_settled=activation_settled,
-        )
-        self._pending_sampler_publications[key] = pending
-        self._sampler_publication_tails[model_key] = (step, activation_settled)
-        return pending
+            self._pending_sampler_publications[key] = pending
+            self._sampler_publication_tails[model_key] = (step, activation_settled)
+            return pending
 
     def _resolve_sampler_result(
         self,
@@ -1092,7 +1100,7 @@ class ServerlessBackend:
             step = optimizer.ref.reserved_output_learner_version
             if step is None:
                 raise RuntimeError("optimizer did not reserve a learner version")
-            sampler_ready = self._reserve_sampler_publication(model, step)
+            sampler_ready = await self._reserve_sampler_publication(model, step)
             sampler = await client.save_weights_for_sampler(
                 SaveWeightsForSamplerRequest(
                     run_id=client.run_id,

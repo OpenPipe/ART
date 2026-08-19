@@ -745,6 +745,23 @@ async def test_active_sampler_publications_follow_learner_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sampler_reservation_serializes_with_retention() -> None:
+    backend, model, _, _ = _backend()
+
+    async with backend._exact_adapter_lock:
+        reservation = asyncio.create_task(
+            backend._reserve_sampler_publication(model, 4)
+        )
+        await asyncio.sleep(0)
+        assert not reservation.done()
+
+    pending = await reservation
+    assert backend._pending_sampler_steps(model) == {4}
+    backend._fail_sampler_result(model, 4, pending, asyncio.CancelledError())
+    backend._clear_sampler_state()
+
+
+@pytest.mark.asyncio
 async def test_exact_eval_waits_for_its_pending_sampler_then_publishes_version() -> (
     None
 ):
