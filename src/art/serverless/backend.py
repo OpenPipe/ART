@@ -73,6 +73,7 @@ _SERVERLESS_KL_REFERENCE_BLOCKER = (
     "('cispo'/'ppo') plus scalar KL fields and does not expose a named KL loss or "
     "reference checkpoint resolver."
 )
+_EXACT_ADAPTER_REMOVE_ATTEMPTS = 2
 
 
 class SamplerManager(Protocol):
@@ -116,6 +117,8 @@ class _PendingServerlessTrain(BaseModel):
 class _ExactAdapterLeaseState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    model: SkipValidation[Any] = Field(exclude=True)
+    publication: SamplerPublication
     lock: SkipValidation[asyncio.Lock] = Field(
         default_factory=asyncio.Lock, exclude=True
     )
@@ -268,6 +271,8 @@ class ServerlessBackend:
             tuple[tuple[str | None, str, str, str], int], _ExactAdapterLeaseState
         ] = {}
         self._exact_adapter_lock = asyncio.Lock()
+        self._close_lock = asyncio.Lock()
+        self._closing = False
         self._closed = False
 
     async def register(self, model: "Model") -> None:
@@ -277,7 +282,7 @@ class ServerlessBackend:
             raise TypeError("ServerlessBackend only supports trainable models")
         key = self._model_key(model)
         async with self._register_lock:
-            if self._closed:
+            if self._closing or self._closed:
                 raise RuntimeError("ServerlessBackend is closed")
             if key in self._clients:
                 raise RuntimeError("model is already registered")
@@ -313,44 +318,72 @@ class ServerlessBackend:
             ) from error
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        failures: list[BaseException] = []
-        try:
-            async with asyncio.timeout(self._close_timeout_s):
-                results = await asyncio.gather(
-                    *(client.shutdown() for client in self._clients.values()),
-                    return_exceptions=True,
-                )
-                failures.extend(
-                    result for result in results if isinstance(result, BaseException)
-                )
-                await self._drain_background()
-        except BaseException as error:
-            failures.append(error)
+        async with self._close_lock:
+            if self._closed:
+                return
+            async with self._register_lock:
+                async with self._exact_adapter_lock:
+                    active = sorted(
+                        f"{state.publication.model_alias}={state.leases}"
+                        for state in self._exact_adapter_states.values()
+                        if state.leases
+                    )
+                    if active:
+                        raise RuntimeError(
+                            "cannot close ServerlessBackend with active exact adapter "
+                            f"leases: {', '.join(active)}"
+                        )
+                    self._closing = True
+
+            deadline = asyncio.get_running_loop().time() + self._close_timeout_s
+            failures: list[BaseException] = []
             try:
-                async with asyncio.timeout(self._close_timeout_s * 0.2):
+                async with asyncio.timeout_at(deadline):
                     results = await asyncio.gather(
-                        *(
-                            client.abort_result_waiters()
-                            for client in self._clients.values()
-                        ),
+                        *(client.shutdown() for client in self._clients.values()),
                         return_exceptions=True,
                     )
-                failures.extend(
-                    result for result in results if isinstance(result, BaseException)
-                )
-            except BaseException as cleanup_error:
-                failures.append(cleanup_error)
-        finally:
-            try:
-                async with asyncio.timeout(self._close_timeout_s):
-                    await self._service.close()
+                    failures.extend(
+                        result
+                        for result in results
+                        if isinstance(result, BaseException)
+                    )
+                    await self._drain_background()
             except BaseException as error:
                 failures.append(error)
-        if failures:
-            raise BaseExceptionGroup("ServerlessBackend shutdown failed", failures)
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        results = await asyncio.gather(
+                            *(
+                                client.abort_result_waiters()
+                                for client in self._clients.values()
+                            ),
+                            return_exceptions=True,
+                        )
+                    failures.extend(
+                        result
+                        for result in results
+                        if isinstance(result, BaseException)
+                    )
+                except BaseException as cleanup_error:
+                    failures.append(cleanup_error)
+
+            adapters_drained = False
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await self._drain_exact_adapters()
+                adapters_drained = True
+            except BaseException as error:
+                failures.append(error)
+            if adapters_drained:
+                try:
+                    async with asyncio.timeout_at(deadline):
+                        await self._service.close()
+                except BaseException as error:
+                    failures.append(error)
+            if failures:
+                raise BaseExceptionGroup("ServerlessBackend shutdown failed", failures)
+            self._closed = True
 
     async def delete(self, model: "Model") -> None:
         from art.model import TrainableModel
@@ -402,7 +435,7 @@ class ServerlessBackend:
             ):
                 yield
         finally:
-            await self._release_exact_adapter(model, key, publication, state)
+            await self._release_exact_adapter(key, state)
 
     async def _acquire_exact_adapter(
         self,
@@ -411,23 +444,25 @@ class ServerlessBackend:
         publication: SamplerPublication,
     ) -> _ExactAdapterLeaseState:
         async with self._exact_adapter_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("ServerlessBackend is closed")
             weights = self._sampler_results.get(key)
             if weights is None:
                 raise RuntimeError(
                     f"exact sampler weights for learner step {key[1]} are unavailable"
                 )
             state = self._exact_adapter_states.setdefault(
-                key, _ExactAdapterLeaseState()
+                key, _ExactAdapterLeaseState(model=model, publication=publication)
             )
             state.leases += 1
         try:
             async with state.lock:
                 if state.remove_failed:
-                    await self._sampler_manager.remove(model, publication)
-                    state.published = False
-                    state.remove_failed = False
+                    await self._remove_exact_adapter(state)
                 if not state.published:
-                    await self._sampler_manager.publish(model, weights, publication)
+                    await self._sampler_manager.publish(
+                        state.model, weights, state.publication
+                    )
                     state.published = True
         except BaseException:
             await self._drop_exact_adapter_reservation(key, state)
@@ -436,9 +471,7 @@ class ServerlessBackend:
 
     async def _release_exact_adapter(
         self,
-        model: AnyTrainableModel,
         key: tuple[tuple[str | None, str, str, str], int],
-        publication: SamplerPublication,
         state: _ExactAdapterLeaseState,
     ) -> None:
         async with state.lock:
@@ -450,15 +483,58 @@ class ServerlessBackend:
                     state.leases -= 1
                     return
             try:
-                await self._sampler_manager.remove(model, publication)
-            except BaseException:
+                await self._remove_exact_adapter(state)
+            finally:
+                await self._drop_exact_adapter_reservation(key, state)
+
+    async def _remove_exact_adapter(self, state: _ExactAdapterLeaseState) -> None:
+        for attempt in range(_EXACT_ADAPTER_REMOVE_ATTEMPTS):
+            try:
+                await self._sampler_manager.remove(state.model, state.publication)
+            except BaseException as error:
                 state.remove_failed = True
-                raise
+                if attempt + 1 == _EXACT_ADAPTER_REMOVE_ATTEMPTS or not isinstance(
+                    error, Exception
+                ):
+                    raise
             else:
                 state.published = False
                 state.remove_failed = False
-            finally:
-                await self._drop_exact_adapter_reservation(key, state)
+                return
+
+    async def _drain_exact_adapters(self) -> None:
+        async with self._exact_adapter_lock:
+            states = tuple(self._exact_adapter_states.items())
+        results = await asyncio.gather(
+            *(self._drain_exact_adapter(key, state) for key, state in states),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("exact adapter removal failed", failures)
+
+    async def _drain_exact_adapter(
+        self,
+        key: tuple[tuple[str | None, str, str, str], int],
+        state: _ExactAdapterLeaseState,
+    ) -> None:
+        async with state.lock:
+            async with self._exact_adapter_lock:
+                if (
+                    self._exact_adapter_states.get(key) is not state
+                    or state.leases
+                    or not state.published
+                ):
+                    raise RuntimeError("exact adapter cleanup state is inconsistent")
+            await self._remove_exact_adapter(state)
+            async with self._exact_adapter_lock:
+                if (
+                    self._exact_adapter_states.get(key) is not state
+                    or state.leases
+                    or state.published
+                ):
+                    raise RuntimeError("exact adapter cleanup state is inconsistent")
+                del self._exact_adapter_states[key]
 
     async def _drop_exact_adapter_reservation(
         self,
