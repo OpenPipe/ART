@@ -104,6 +104,15 @@ class ResidencyReservation(BaseModel):
     created_at: float = Field(ge=0.0)
 
 
+class ResidencyDemand(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    key: ResidencyKey
+    source: ResidencyTier | None
+    target: ResidencyTier
+    byte_count: int = Field(ge=1)
+
+
 class ResidencyUsage(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -134,37 +143,76 @@ class ResidencyLedger:
     ) -> ResidencyReservation:
         if byte_count < 1:
             raise ValueError("residency reservation byte_count must be positive")
+        return self.reserve_many(
+            (
+                ResidencyDemand(
+                    key=key,
+                    source=source,
+                    target=target,
+                    byte_count=byte_count,
+                ),
+            )
+        )[0]
+
+    def reserve_many(
+        self, demands: Iterable[ResidencyDemand]
+    ) -> tuple[ResidencyReservation, ...]:
+        """Atomically reserve every destination in one demanded transfer set."""
+        demands = tuple(demands)
+        if not demands:
+            return ()
+        targets = tuple((demand.key, demand.target) for demand in demands)
+        if len(set(targets)) != len(targets):
+            raise ValueError("residency demand destinations must be unique")
         with self._lock:
-            copies = self._copies.get(key, {})
-            if source is not None and source not in copies:
-                raise RuntimeError(f"residency source is not ready: {source}")
-            if target in copies or any(
-                item.key == key and item.target == target
-                for item in self._reservations.values()
-            ):
-                raise RuntimeError(f"residency target already exists: {target}")
-            if len(self._reservations) >= self.limits.max_concurrent_transitions:
-                raise RuntimeError("residency transition capacity is exhausted")
-            capacity = self.limits.capacity(target)
-            projected = (
-                self._ready_bytes[target] + self._reserved_bytes[target] + byte_count
-            )
-            if projected > capacity.max_bytes:
-                raise ResidencyCapacityUnavailable(
-                    f"{target} residency capacity exceeded: "
-                    f"projected={projected}, max={capacity.max_bytes}"
+            existing_targets = {
+                (item.key, item.target) for item in self._reservations.values()
+            }
+            projected = {
+                tier: self._ready_bytes[tier] + self._reserved_bytes[tier]
+                for tier in RESIDENCY_TIERS
+            }
+            for demand in demands:
+                copies = self._copies.get(demand.key, {})
+                if demand.source is not None and demand.source not in copies:
+                    raise RuntimeError(
+                        f"residency source is not ready: {demand.source}"
+                    )
+                if (
+                    demand.target in copies
+                    or (
+                        demand.key,
+                        demand.target,
+                    )
+                    in existing_targets
+                ):
+                    raise RuntimeError(
+                        f"residency target already exists: {demand.target}"
+                    )
+                projected[demand.target] += demand.byte_count
+            for tier, byte_count in projected.items():
+                capacity = self.limits.capacity(tier)
+                if byte_count > capacity.max_bytes:
+                    raise ResidencyCapacityUnavailable(
+                        f"{tier} residency capacity exceeded: "
+                        f"projected={byte_count}, max={capacity.max_bytes}"
+                    )
+            now = time.monotonic()
+            reservations = tuple(
+                ResidencyReservation(
+                    reservation_id=uuid.uuid4().hex,
+                    key=demand.key,
+                    source=demand.source,
+                    target=demand.target,
+                    byte_count=demand.byte_count,
+                    created_at=now,
                 )
-            self._reserved_bytes[target] += byte_count
-            reservation = ResidencyReservation(
-                reservation_id=uuid.uuid4().hex,
-                key=key,
-                source=source,
-                target=target,
-                byte_count=byte_count,
-                created_at=time.monotonic(),
+                for demand in demands
             )
-            self._reservations[reservation.reservation_id] = reservation
-            return reservation
+            for reservation in reservations:
+                self._reserved_bytes[reservation.target] += reservation.byte_count
+                self._reservations[reservation.reservation_id] = reservation
+            return reservations
 
     def commit(
         self,
@@ -196,6 +244,45 @@ class ResidencyLedger:
             self._reserved_bytes[current.target] -= current.byte_count
             self._reservations.pop(current.reservation_id)
 
+    def commit_many(
+        self, reservations: Iterable[ResidencyReservation]
+    ) -> tuple[ResidencyCopy, ...]:
+        reservations = tuple(reservations)
+        if not reservations:
+            return ()
+        with self._lock:
+            current = tuple(self._require_reservation(item) for item in reservations)
+            if len({item.reservation_id for item in current}) != len(current):
+                raise ValueError("residency reservations must be unique")
+            now = time.monotonic()
+            copies = tuple(
+                ResidencyCopy(
+                    tier=item.target,
+                    byte_count=item.byte_count,
+                    ready_at=now,
+                )
+                for item in current
+            )
+            for item, copy in zip(current, copies, strict=True):
+                self._copies.setdefault(item.key, {})[item.target] = copy
+                self._reserved_bytes[item.target] -= item.byte_count
+                self._ready_bytes[item.target] += item.byte_count
+                self._reservations.pop(item.reservation_id)
+                self._last_access[item.key] = now
+            return copies
+
+    def abort_many(self, reservations: Iterable[ResidencyReservation]) -> None:
+        reservations = tuple(reservations)
+        if not reservations:
+            return
+        with self._lock:
+            current = tuple(self._require_reservation(item) for item in reservations)
+            if len({item.reservation_id for item in current}) != len(current):
+                raise ValueError("residency reservations must be unique")
+            for item in current:
+                self._reserved_bytes[item.target] -= item.byte_count
+                self._reservations.pop(item.reservation_id)
+
     def drop(
         self,
         key: ResidencyKey,
@@ -206,6 +293,11 @@ class ResidencyLedger:
         with self._lock:
             if self._pin_count(key, tier):
                 raise RuntimeError(f"cannot drop a pinned {tier} residency copy")
+            if any(
+                item.key == key and item.source == tier
+                for item in self._reservations.values()
+            ):
+                raise RuntimeError(f"cannot drop an in-transition {tier} source")
             copies = self._copies.get(key)
             if copies is None or tier not in copies:
                 raise RuntimeError(f"residency copy is not ready: {tier}")
@@ -288,26 +380,44 @@ class ResidencyLedger:
                 raise KeyError((key, tier)) from exc
 
     def pin(self, key: ResidencyKey, tier: ResidencyTier) -> None:
+        self.pin_many(((key, tier),))
+
+    def pin_many(self, copies: Iterable[tuple[ResidencyKey, ResidencyTier]]) -> None:
+        copies = tuple(copies)
+        if len(set(copies)) != len(copies):
+            raise ValueError("residency copies to pin must be unique")
         with self._lock:
-            if tier not in self._copies.get(key, {}):
-                raise RuntimeError(f"cannot pin a missing {tier} residency copy")
-            pins = self._pins.setdefault(key, {})
-            pins[tier] = pins.get(tier, 0) + 1
-            self._last_access[key] = time.monotonic()
+            for key, tier in copies:
+                if tier not in self._copies.get(key, {}):
+                    raise RuntimeError(f"cannot pin a missing {tier} residency copy")
+            now = time.monotonic()
+            for key, tier in copies:
+                pins = self._pins.setdefault(key, {})
+                pins[tier] = pins.get(tier, 0) + 1
+                self._last_access[key] = now
 
     def unpin(self, key: ResidencyKey, tier: ResidencyTier) -> None:
+        self.unpin_many(((key, tier),))
+
+    def unpin_many(self, copies: Iterable[tuple[ResidencyKey, ResidencyTier]]) -> None:
+        copies = tuple(copies)
+        if len(set(copies)) != len(copies):
+            raise ValueError("residency copies to unpin must be unique")
         with self._lock:
-            pins = self._pins.get(key, {})
-            count = pins.get(tier, 0)
-            if count < 1:
-                raise RuntimeError(f"{tier} residency copy is not pinned")
-            if count == 1:
-                pins.pop(tier)
-                if not pins:
-                    self._pins.pop(key)
-            else:
-                pins[tier] = count - 1
-            self._last_access[key] = time.monotonic()
+            for key, tier in copies:
+                if self._pin_count(key, tier) < 1:
+                    raise RuntimeError(f"{tier} residency copy is not pinned")
+            now = time.monotonic()
+            for key, tier in copies:
+                pins = self._pins[key]
+                count = pins[tier]
+                if count == 1:
+                    pins.pop(tier)
+                    if not pins:
+                        self._pins.pop(key)
+                else:
+                    pins[tier] = count - 1
+                self._last_access[key] = now
 
     def touch(self, key: ResidencyKey) -> None:
         with self._lock:
@@ -369,6 +479,70 @@ class ResidencyLedger:
             f"required={reclaim_bytes}, available={reclaimed}"
         )
 
+    def admission_evictions(
+        self,
+        tier: ResidencyTier,
+        incoming_bytes: int,
+        demanded_bytes: int,
+        *,
+        protected: Iterable[ResidencyKey] = (),
+        require_other_copy: bool = True,
+    ) -> tuple[ResidencyKey, ...]:
+        """Plan mandatory capacity reclaim plus best-effort watermark reclaim."""
+        if incoming_bytes < 0 or demanded_bytes < 0:
+            raise ValueError("residency admission bytes must be non-negative")
+        capacity = self.limits.capacity(tier)
+        if demanded_bytes > capacity.max_bytes:
+            raise ResidencyCapacityUnavailable(
+                f"{tier} demanded working set exceeds capacity: "
+                f"demanded={demanded_bytes}, max={capacity.max_bytes}"
+            )
+        protected_set = set(protected)
+        with self._lock:
+            projected = (
+                self._ready_bytes[tier] + self._reserved_bytes[tier] + incoming_bytes
+            )
+            mandatory = max(projected - capacity.max_bytes, 0)
+            protected_reserved = sum(
+                item.byte_count
+                for item in self._reservations.values()
+                if item.target == tier and item.key in protected_set
+            )
+            unrelated_reserved = self._reserved_bytes[tier] - protected_reserved
+            preferred = mandatory
+            if projected > capacity.high_bytes:
+                retained_floor = max(
+                    capacity.low_bytes, demanded_bytes + unrelated_reserved
+                )
+                preferred = max(mandatory, projected - retained_floor)
+            if preferred <= 0:
+                return ()
+            candidates = sorted(
+                (
+                    key
+                    for key, copies in self._copies.items()
+                    if tier in copies
+                    and not self._pin_count(key, tier)
+                    and key not in protected_set
+                    and (not require_other_copy or len(copies) > 1)
+                    and not any(item.key == key for item in self._reservations.values())
+                ),
+                key=lambda key: (self._last_access[key], key.run_id, key.generation_id),
+            )
+            reclaimed = 0
+            selected: list[ResidencyKey] = []
+            for key in candidates:
+                selected.append(key)
+                reclaimed += self._copies[key][tier].byte_count
+                if reclaimed >= preferred:
+                    return tuple(selected)
+            if reclaimed >= mandatory:
+                return tuple(selected)
+        raise ResidencyCapacityUnavailable(
+            f"insufficient evictable {tier} residency for demanded working set: "
+            f"required={mandatory}, available={reclaimed}"
+        )
+
     def entry(self, key: ResidencyKey) -> ResidencyEntry:
         with self._lock:
             copies = self._copies.get(key)
@@ -393,6 +567,23 @@ class ResidencyLedger:
             return ResidencyUsage(
                 ready_bytes=dict(self._ready_bytes),
                 reserved_bytes=dict(self._reserved_bytes),
+            )
+
+    def has_reservation(self, key: ResidencyKey) -> bool:
+        with self._lock:
+            return any(item.key == key for item in self._reservations.values())
+
+    def accounted_bytes(self, tier: ResidencyTier, keys: Iterable[ResidencyKey]) -> int:
+        keys = set(keys)
+        with self._lock:
+            return sum(
+                copies[tier].byte_count
+                for key, copies in self._copies.items()
+                if key in keys and tier in copies
+            ) + sum(
+                item.byte_count
+                for item in self._reservations.values()
+                if item.key in keys and item.target == tier
             )
 
     def _require_reservation(
