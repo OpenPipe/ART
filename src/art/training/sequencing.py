@@ -90,6 +90,10 @@ class RunCommandLedger:
         self._nonterminal_request_ids.discard(request_id)
         self._discarded_forward_backward_ids.discard(admission.ref.operation_id)
 
+    def fail(self, error: BaseException) -> None:
+        self._failure = self._failure or error
+        self._discard_forward_backward_operations()
+
     def cancel_pending_forward_backward(
         self, request_id: str, admission: CommandAdmission
     ) -> None:
@@ -104,6 +108,9 @@ class RunCommandLedger:
 
     def can_retire_forward_backward(self, operation_id: str) -> bool:
         return operation_id in self._discarded_forward_backward_ids
+
+    def is_open_forward_backward(self, operation_id: str) -> bool:
+        return operation_id in self._open_forward_backward_ids
 
     def close(self) -> None:
         self._discard_forward_backward_operations()

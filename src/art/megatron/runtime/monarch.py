@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict
 from art.distributed.data_plane import PackedBatchLeaseSet
 from art.distributed.monarch_bootstrap import activate_cuda_device
 from art.distributed.specs import GpuId
+from art.training.contracts import OperationRef
 from art.utils.cache_dirs import configure_model_cache_env
 from art.utils.lifecycle import cleanup_after_failure, consume_future_exception
 
@@ -2347,6 +2348,7 @@ class MonarchTrainerRun:
         self._jobs: dict[str, tuple[str, tuple[TrainEvent, ...]]] = {}
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
         self._operation_sequence_ids: dict[str, int] = {}
+        self._cancelled_operations: dict[str, OperationRef] = {}
         self._next_operation_sequence = 0
         self._open_forward_backward_ids: list[str] = []
         self._lock = asyncio.Lock()
@@ -2360,6 +2362,50 @@ class MonarchTrainerRun:
         self._close_task: asyncio.Task[None] | None = None
         self._closed = False
         self._valid = True
+
+    async def consume_cancelled_operation(self, ref: OperationRef) -> None:
+        prior = self._cancelled_operations.get(ref.operation_id)
+        if prior is not None:
+            if prior != ref:
+                raise RuntimeError(
+                    "cancelled operation_id was reused for a different command"
+                )
+            return
+        async with self._lock:
+            prior = self._cancelled_operations.get(ref.operation_id)
+            if prior is not None:
+                if prior != ref:
+                    raise RuntimeError(
+                        "cancelled operation_id was reused for a different command"
+                    )
+                return
+            if ref.operation_id in self._operation_sequence_ids:
+                raise RuntimeError("executed operation cannot be consumed as cancelled")
+            if self._closed or not self._valid:
+                raise RuntimeError("trainer runtime is invalid")
+            if self._jobs:
+                raise RuntimeError(
+                    "fused train jobs cannot be mixed with command operations"
+                )
+            if ref.run_id != self.run_spec.run_id:
+                raise ValueError("operation run_id does not match this training run")
+            if ref.sequence_id != self._next_operation_sequence:
+                raise RuntimeError(
+                    "trainer cancelled operation sequence must be gapless: "
+                    f"expected={self._next_operation_sequence}, "
+                    f"got={ref.sequence_id}"
+                )
+            if ref.learner_parent_version != self._learner_version:
+                raise ValueError(
+                    "cancelled operation learner parent mismatch: "
+                    f"operation={ref.learner_parent_version}, "
+                    f"runtime={self._learner_version}"
+                )
+            if ref.reserved_output_learner_version is not None:
+                raise RuntimeError("learner-transition command cannot be cancelled")
+            self._cancelled_operations[ref.operation_id] = ref
+            self._operation_sequence_ids[ref.operation_id] = ref.sequence_id
+            self._next_operation_sequence += 1
 
     @property
     def learner_version(self) -> int:
@@ -3314,6 +3360,7 @@ class MonarchTrainerRun:
     def retire_operation(self, operation_id: str) -> None:
         self._operations.pop(operation_id, None)
         self._operation_sequence_ids.pop(operation_id, None)
+        self._cancelled_operations.pop(operation_id, None)
 
     async def _await_publication(
         self, state: "_PublicationState"

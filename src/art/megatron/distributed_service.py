@@ -627,6 +627,22 @@ class DistributedMegatronService:
         if self._trainer is not None:
             self._trainer.retire_operation(operation_id)
 
+    async def consume_cancelled_command(self, ref: OperationRef) -> None:
+        async with self._train_lock, self._trainer_failure_boundary():
+            async with self._mutation_lock:
+                self._require_open()
+                self._raise_publication_failure()
+                trainer, reconcile = await self._ensure_trainer_locked(
+                    run_id=ref.run_id
+                )
+                if ref.learner_parent_version != self._latest_step:
+                    raise RuntimeError("cancelled command learner parent changed")
+            if reconcile is not None:
+                step, checkpoint = reconcile
+                async with self._serving_lock:
+                    await self._reconcile_serving_locked(step, checkpoint)
+            await trainer.consume_cancelled_operation(ref)
+
     async def prepare_cp_lookahead(
         self,
         batch: DistributedPackedBatch,
