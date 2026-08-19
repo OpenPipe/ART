@@ -642,24 +642,57 @@ def test_tokenized_compact_round_trip_all_protocol_source_shapes() -> None:
             )
 
 
-def test_explicit_memory_compaction_reduces_pickle_and_compact_json_sizes() -> None:
+def test_pickle_boundary_reduces_pickle_and_compact_json_sizes() -> None:
     trajectory = art.Trajectory()
     repeated = _long() * 4
     trajectory.metadata["items"] = [_fresh(repeated) for _ in range(200)]
     items = trajectory.metadata["items"]
     before_memory = sum(sys.getsizeof(item) for item in items)
-    before_pickle = len(pickle.dumps(trajectory))
-    tr.compact_memory(trajectory)
+    before_pickle = len(pickle.dumps(trajectory.model_dump()))
+    pickled = pickle.dumps(trajectory)
     after_memory = sum(
         sys.getsizeof(item) for item in {id(item): item for item in items}.values()
     )
-    after_pickle = len(pickle.dumps(trajectory))
     compact = trajectory.compact_dump()
     plain = {**compact, "strings": {}, "data": trajectory.model_dump(mode="json")}
 
     assert after_memory < before_memory / 100
-    assert after_pickle < before_pickle / 4
+    assert len(pickled) < before_pickle / 4
     assert _json_size(compact) < _json_size(plain) / 4
+
+
+def test_pickle_prepares_nested_graph_once_and_receiver_can_prepare_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.trajectories import _serialization
+
+    repeated = _long()
+    trajectory = art.Trajectory(
+        metadata={"first": _fresh(repeated), "second": _fresh(repeated)}
+    )
+    group = art.TrajectoryGroup([trajectory])
+    calls: list[object] = []
+    intern_strings = _serialization._intern_strings
+
+    def counted(value: object, pool: dict[str, str] | None = None) -> None:
+        calls.append(value)
+        intern_strings(value, pool)
+
+    monkeypatch.setattr(_serialization, "_intern_strings", counted)
+
+    payload = pickle.dumps(group)
+    assert calls == [group]
+    pickle.dumps(group)
+    assert calls == [group]
+
+    restored = pickle.loads(payload)
+    restored.trajectories[0].metadata["third"] = _fresh(repeated)
+    pickle.dumps(restored)
+    assert calls == [group, restored]
+    assert (
+        restored.trajectories[0].metadata["third"]
+        is restored.trajectories[0].metadata["first"]
+    )
 
 
 def test_cloudpickle_preserves_shared_references() -> None:

@@ -24,6 +24,7 @@ from . import (
     Trajectory,
     TrajectoryGroup,
     TrajectoryHistory,
+    _StringInterningModel,
 )
 from ._serialization import _rebind_history_sources, serialize_history, validate_history
 
@@ -55,7 +56,7 @@ def _json_tensor(value: torch.Tensor) -> list[int] | list[float | str]:
     return [int(item) for item in items]
 
 
-class TensorizedHistory(pydantic.BaseModel):
+class TensorizedHistory(_StringInterningModel):
     """One tokenizable history represented by canonical one-dimensional tensors."""
 
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
@@ -149,7 +150,7 @@ class TensorizedTrajectory(TensorizedHistory):
         return self
 
 
-class TensorizedMultiHistoryTrajectory(pydantic.BaseModel):
+class TensorizedMultiHistoryTrajectory(_StringInterningModel):
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
 
     trajectory: Trajectory
@@ -203,7 +204,7 @@ TensorizedTrajectoryT = TypeVar(
 )
 
 
-class TensorizedTrajectoryGroup(pydantic.BaseModel, Generic[TensorizedTrajectoryT]):
+class TensorizedTrajectoryGroup(_StringInterningModel, Generic[TensorizedTrajectoryT]):
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
 
     trajectory_group: TrajectoryGroup

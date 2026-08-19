@@ -74,6 +74,7 @@ from ..types import Messages, MessagesAndChoices, Tools
 from ._serialization import (
     _CompactModel,
     _rebind_history_sources,
+    _StringInterningModel,
     serialize_chat_completion,
     serialize_history,
     serialize_messages_and_choices,
@@ -296,7 +297,7 @@ class PydanticException(pydantic.BaseModel):
     traceback: str
 
 
-class LegacyHistory(pydantic.BaseModel):
+class LegacyHistory(_StringInterningModel):
     messages_and_choices: MessagesAndChoices
     tools: Tools | None = None
 
@@ -353,7 +354,7 @@ class LegacyHistory(pydantic.BaseModel):
         ).tensorize(device=device)
 
 
-class History(pydantic.BaseModel):
+class History(_StringInterningModel):
     """Mutable, protocol-native view of one tokenizable sequence."""
 
     model_config = pydantic.ConfigDict(extra="forbid")
@@ -1052,7 +1053,7 @@ class TrajectoryGroup(_CompactModel):
         ).tensorize(device=device)
 
 
-class TokenizedHistory(pydantic.BaseModel):
+class TokenizedHistory(_StringInterningModel):
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
 
     history: TrajectoryHistory
@@ -1136,7 +1137,7 @@ class TokenizedTrajectory(TokenizedHistory):
         return _load_tensors().tensorize_trajectory(self, device=device)
 
 
-class TokenizedMultiHistoryTrajectory(pydantic.BaseModel):
+class TokenizedMultiHistoryTrajectory(_StringInterningModel):
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
 
     trajectory: Trajectory
@@ -1190,7 +1191,7 @@ TokenizedTrajectoryT = TypeVar(
 )
 
 
-class TokenizedTrajectoryGroup(pydantic.BaseModel, Generic[TokenizedTrajectoryT]):
+class TokenizedTrajectoryGroup(_StringInterningModel, Generic[TokenizedTrajectoryT]):
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
 
     trajectory_group: TrajectoryGroup

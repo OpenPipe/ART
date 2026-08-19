@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import fields, is_dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, SupportsIndex, cast
 
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
@@ -13,6 +13,20 @@ from pydantic.main import IncEx
 from ..openai import ART_MOE_ROUTING_METADATA_KEY
 
 type _StringPool = dict[str, str]
+
+
+class _StringInterningModel(BaseModel):
+    """Intern strings once, immediately before this graph is pickled."""
+
+    __slots__ = ("_art_pickle_strings_interned",)
+
+    def __reduce_ex__(self, protocol: SupportsIndex, /) -> str | tuple[Any, ...]:
+        if not getattr(self, "_art_pickle_strings_interned", False):
+            _intern_strings(self)
+        return super().__reduce_ex__(protocol)
+
+    def _mark_pickle_strings_interned(self) -> None:
+        object.__setattr__(self, "_art_pickle_strings_interned", True)
 
 
 def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
@@ -45,6 +59,8 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         if extra is not None and id(extra) not in memo:
             memo[id(extra)] = extra
             _intern_mapping(cast(dict[object, object], extra), pool, memo)
+        if isinstance(value, _StringInterningModel):
+            value._mark_pickle_strings_interned()
         return value
     if is_dataclass(value) and type(value).__module__.startswith("art.trajectories"):
         memo[value_id] = value
@@ -263,7 +279,7 @@ def _rebind_history_sources(history: object, trajectory: object | None = None) -
     visit(history)
 
 
-class _CompactModel(BaseModel):
+class _CompactModel(_StringInterningModel):
     """Pydantic model whose default dump omits fields equal to their defaults."""
 
     def model_dump(
