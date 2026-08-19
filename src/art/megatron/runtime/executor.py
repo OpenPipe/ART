@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 import gc
 import hashlib
@@ -2004,9 +2004,9 @@ class _GenerationPublisher:
     def _acquire_slot(self) -> tuple[float, int, PinnedCpuSnapshotStager]:
         self.raise_if_failed()
         started = time.perf_counter()
-        if not self._slots.acquire(blocking=False):
+        while not self._slots.acquire(blocking=False):
             self._evict_for_capacity()
-            self._slots.acquire()
+            self.raise_if_failed()
         wait_s = time.perf_counter() - started
         with self._lock:
             stager = self._available_stagers.pop()
@@ -2021,20 +2021,36 @@ class _GenerationPublisher:
                 for entry in self._cache.values()
                 if entry.stager is not None and not entry.released
             )
-            ready = tuple(
-                entry
-                for entry in entries
-                if entry.resolved.done()
-                and (entry.optimizer_upgrade is None or entry.optimizer_upgrade.done())
-                and all(consumer.done() for consumer in entry.consumers)
-            )
             if not entries:
                 raise RuntimeError("snapshot pool is full without a cached generation")
-            entry = (ready or entries)[0]
-            consumers = tuple(entry.consumers)
-            preserve = entry.release_stager_on_resolve
-            if not preserve:
-                entry.retired = True
+            entry = next(
+                (
+                    entry
+                    for entry in entries
+                    if all(future.done() for future in self._stager_dependencies(entry))
+                ),
+                None,
+            )
+            if entry is None:
+                pending = tuple(
+                    {
+                        future
+                        for candidate in entries
+                        for future in self._stager_dependencies(candidate)
+                        if not future.done()
+                    }
+                )
+            else:
+                pending = ()
+                consumers = tuple(entry.consumers)
+                preserve = entry.release_stager_on_resolve
+                if not preserve:
+                    entry.retired = True
+        if entry is None:
+            if not pending:
+                raise RuntimeError("snapshot pool has no releasable dependency")
+            wait(pending, return_when=FIRST_COMPLETED)
+            return
         try:
             entry.resolved.result()
             if not preserve and entry.optimizer_upgrade is not None:
@@ -2047,6 +2063,15 @@ class _GenerationPublisher:
                 self._release_entry_stager(entry)
             else:
                 self._maybe_release(entry)
+
+    @staticmethod
+    def _stager_dependencies(entry: _CachedGeneration) -> tuple[Future[Any], ...]:
+        if entry.release_stager_on_resolve:
+            return (entry.resolved,)
+        optimizer = (
+            () if entry.optimizer_upgrade is None else (entry.optimizer_upgrade,)
+        )
+        return entry.resolved, *optimizer, *entry.consumers
 
     def _retire_previous(self, run_id: str) -> _CachedGeneration | None:
         with self._lock:
