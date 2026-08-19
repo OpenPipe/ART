@@ -148,6 +148,7 @@ QWEN3_5_DENSE_SPEC = ModelSupportSpec(
     handler_key=_QWEN3_5_DENSE_HANDLER_KEY,
     model_names=(
         "Qwen/Qwen3.5-4B",
+        "Qwen/Qwen3.5-9B",
         "Qwen/Qwen3.5-27B",
         "Qwen/Qwen3.6-27B",
     ),
