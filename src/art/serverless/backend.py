@@ -24,7 +24,6 @@ from art.distributed.rollout import (
 )
 from art.distributed.trajectory_store import TrajectoryGroupRef
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
-from art.preprocessing.sft import SftBatchTokenizer
 from art.serving_capabilities import discover_serving_capabilities
 from art.training.client import TrainingOperation
 from art.training.contracts import (
@@ -1657,28 +1656,9 @@ class ServerlessBackend:
         )
         if len(rates) != len(raw_batches):
             raise ValueError("SFT learning-rate schedule must match batch count")
-        tokenizer = SftBatchTokenizer()
-        batches: list[tuple[list[Trajectory], float]] = []
-        total_dropped = 0
-        total_trainable_tokens = 0
-        for raw_batch, learning_rate in zip(raw_batches, rates, strict=True):
-            tokenized = await asyncio.to_thread(
-                tokenizer.tokenize,
-                model,
-                tuple(raw_batch),
-                assistant_turns=config.assistant_turns,
-                learning_rate=learning_rate,
-            )
-            total_dropped += tokenized.num_dropped_trajectories
-            if tokenized.num_trainable_tokens < 1:
-                continue
-            total_trainable_tokens += tokenized.num_trainable_tokens
-            batches.append((raw_batch, learning_rate))
-        if not batches:
-            return
         client = await self.training_client(model)
-        pending: dict[str, float] | None = None
-        for batch, learning_rate in batches:
+        rows: list[dict[str, float]] = []
+        for batch, learning_rate in zip(raw_batches, rates, strict=True):
             sequence = client.next_sequence_id
             forward = await client.forward_backward(
                 ForwardBackwardRequest(
@@ -1692,6 +1672,9 @@ class ServerlessBackend:
                     loss=LossConfig(name="cross_entropy"),
                 )
             )
+            forward_result = await forward.result()
+            if not forward_result.produced_gradient:
+                continue
             optimizer = await client.optim_step(
                 OptimStepRequest(
                     run_id=client.run_id,
@@ -1700,22 +1683,20 @@ class ServerlessBackend:
                     optimizer=AdamConfig(learning_rate=learning_rate),
                 )
             )
-            forward_result, optimizer_result = await asyncio.gather(
-                forward.result(), optimizer.result()
+            optimizer_result = await optimizer.result()
+            rows.append(
+                {
+                    **merge_gradient_step_metrics(
+                        forward_result.metrics, optimizer_result.metrics
+                    ),
+                    **_packing_outcome_metrics(forward_result.packing),
+                    "data/step_num_trajectories": float(len(batch)),
+                }
             )
-            if pending is not None:
-                yield pending
-            pending = {
-                **merge_gradient_step_metrics(
-                    forward_result.metrics, optimizer_result.metrics
-                ),
-                **_packing_outcome_metrics(forward_result.packing),
-                "data/step_num_trajectories": float(len(values)),
-                "data/step_trainable_assistant_tokens": float(total_trainable_tokens),
-                "data/step_num_dropped_trajectories": float(total_dropped),
-                TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
-            }
-        assert pending is not None
+        if not rows:
+            return
+        for row in rows:
+            row[TRAIN_GRADIENT_STEPS_KEY] = float(len(rows))
         sequence = client.next_sequence_id
         step = client.projected_learner_version
         sampler, sampler_ready = await self._start_sampler_publication(
@@ -1737,11 +1718,10 @@ class ServerlessBackend:
             state.result(),
             self._complete_sampler_publication(model, step, sampler, sampler_ready),
         )
-        yield {
-            **pending,
-            **state_result.metrics,
-            **publication_metrics,
-        }
+        rows[-1].update(state_result.metrics)
+        rows[-1].update(publication_metrics)
+        for row in rows:
+            yield row
 
     async def finalize_training_session(
         self, model: AnyTrainableModel

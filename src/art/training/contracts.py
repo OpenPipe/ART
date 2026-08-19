@@ -343,11 +343,11 @@ class PolicyTokenCount(Contract):
 
 class PackingOutcome(Contract):
     packed_sequence_length: int = Field(ge=1)
-    packed_sequences: int = Field(ge=1)
+    packed_sequences: int = Field(ge=0)
     target_packed_sequences: int = Field(ge=1)
     nominal_capacity_tokens: int = Field(ge=1)
-    physical_tokens: int = Field(ge=1)
-    non_padding_tokens: int = Field(ge=1)
+    physical_tokens: int = Field(ge=0)
+    non_padding_tokens: int = Field(ge=0)
     loss_bearing_tokens: int = Field(ge=0)
     trainable_assistant_tokens: int = Field(ge=0)
     policy_token_counts: tuple[PolicyTokenCount, ...] | None
@@ -357,6 +357,16 @@ class PackingOutcome(Contract):
     def _validate_counts(self) -> "PackingOutcome":
         if self.non_padding_tokens > self.physical_tokens:
             raise ValueError("non_padding_tokens cannot exceed physical_tokens")
+        if (self.packed_sequences == 0) != (self.physical_tokens == 0):
+            raise ValueError("zero packed sequences and physical tokens must agree")
+        if self.physical_tokens == 0 and any(
+            (
+                self.non_padding_tokens,
+                self.loss_bearing_tokens,
+                self.trainable_assistant_tokens,
+            )
+        ):
+            raise ValueError("a zero-work packing outcome cannot contain tokens")
         counts = self.policy_token_counts
         if counts is not None:
             versions = [count.policy_version for count in counts]
@@ -472,7 +482,15 @@ class ForwardResult(OperationResult):
 
 
 class ForwardBackwardResult(ForwardResult):
-    pass
+    produced_gradient: bool = True
+
+    @model_validator(mode="after")
+    def _validate_gradient(self) -> "ForwardBackwardResult":
+        if self.produced_gradient != (self.packing.loss_bearing_tokens > 0):
+            raise ValueError("produced_gradient must match loss-bearing tokens")
+        if not self.produced_gradient and self.loss_fn_outputs:
+            raise ValueError("a zero-gradient forward cannot return loss outputs")
+        return self
 
 
 class OptimStepResult(OperationResult):

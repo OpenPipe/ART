@@ -121,6 +121,12 @@ class PreparedSftForward(PreparedForward):
     tokenization_s: float = Field(ge=0)
 
 
+class PreparedEmptySftForward(PreparedForward):
+    kind: Literal["sft"] = "sft"
+    tokenization_s: float = Field(ge=0)
+    num_dropped_trajectories: int = Field(ge=0)
+
+
 class PreparedLoadState(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -301,7 +307,23 @@ class MegatronTrainingSlot:
                 assistant_turns=request.batch.assistant_turns,
             )
             if tokenized.num_trainable_tokens < 1:
-                raise ValueError("supervised batch produced no trainable tokens")
+                return PreparedEmptySftForward(
+                    ref=ref,
+                    tokenization_s=time.perf_counter() - started,
+                    num_dropped_trajectories=tokenized.num_dropped_trajectories,
+                    packing=PackingOutcome(
+                        packed_sequence_length=1,
+                        packed_sequences=0,
+                        target_packed_sequences=self._data_parallel_size(),
+                        nominal_capacity_tokens=self._data_parallel_size(),
+                        physical_tokens=0,
+                        non_padding_tokens=0,
+                        loss_bearing_tokens=0,
+                        trainable_assistant_tokens=0,
+                        policy_token_counts=None,
+                        group_shapes=(),
+                    ),
+                )
             batch = sft_batch_data(tokenized)
             topology = self.runtime_spec.trainer_mesh.topology
             data_parallel_size = len(self.runtime_spec.trainer_mesh.ranks) // (
@@ -419,6 +441,8 @@ class MegatronTrainingSlot:
     async def forward(self, prepared: PreparedForward) -> ForwardResult:
         ref = prepared.ref
         state = self._require_parent(ref)
+        if isinstance(prepared, PreparedEmptySftForward):
+            return self._empty_sft_forward_result(prepared, backward=False)
         if isinstance(prepared, PreparedSftForward):
             job = SftForwardJobSpec(
                 operation_id=ref.operation_id,
@@ -474,6 +498,11 @@ class MegatronTrainingSlot:
     ) -> ForwardBackwardResult:
         ref = prepared.ref
         state = self._require_parent(ref)
+        if isinstance(prepared, PreparedEmptySftForward):
+            return cast(
+                ForwardBackwardResult,
+                self._empty_sft_forward_result(prepared, backward=True),
+            )
         if isinstance(prepared, PreparedSftForward):
             job = SftForwardBackwardJobSpec(
                 operation_id=ref.operation_id,
@@ -549,6 +578,26 @@ class MegatronTrainingSlot:
                 **raw["metrics"],
             },
         )
+
+    @staticmethod
+    def _empty_sft_forward_result(
+        prepared: PreparedEmptySftForward, *, backward: bool
+    ) -> ForwardResult:
+        result = ForwardBackwardResult if backward else ForwardResult
+        values: dict[str, Any] = {
+            "operation_id": prepared.ref.operation_id,
+            "packing": prepared.packing,
+            "loss_fn_outputs": (),
+            "metrics": {
+                "time/step_tokenize_trajectory_groups_s": prepared.tokenization_s,
+                "data/step_num_dropped_trajectories": float(
+                    prepared.num_dropped_trajectories
+                ),
+            },
+        }
+        if backward:
+            values["produced_gradient"] = False
+        return result.model_validate(values)
 
     async def optim_step(
         self,
