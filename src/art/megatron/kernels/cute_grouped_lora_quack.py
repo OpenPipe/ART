@@ -254,6 +254,51 @@ def _validate_dual_inputs(
     return counts
 
 
+def _validate_shared_outer_inputs(
+    x: torch.Tensor,
+    a_t: torch.Tensor,
+    b_t: torch.Tensor,
+    tokens_per_expert: list[int] | torch.Tensor,
+) -> torch.Tensor:
+    counts = _tokens_per_expert_to_tensor(tokens_per_expert)
+    if x.ndim != 2:
+        raise ValueError(f"x must be 2D, got shape {tuple(x.shape)}")
+    shared_a = a_t.ndim == 2 and b_t.ndim == 3
+    shared_b = a_t.ndim == 3 and b_t.ndim == 2
+    if not (shared_a or shared_b):
+        raise ValueError(
+            "Shared-outer grouped LoRA requires exactly one shared factor: "
+            "a_t [in, rank] with b_t [experts, rank, out], or "
+            "a_t [experts, in, rank] with b_t [rank, out]; "
+            f"got a_t={tuple(a_t.shape)} b_t={tuple(b_t.shape)}"
+        )
+    rank = a_t.shape[-1]
+    _validate_rank(rank)
+    b_rank = b_t.shape[1] if shared_a else b_t.shape[0]
+    if b_rank != rank:
+        raise ValueError(f"Expected b_t rank dim {rank}, got shape {tuple(b_t.shape)}")
+    experts = b_t.shape[0] if shared_a else a_t.shape[0]
+    in_features = a_t.shape[0] if shared_a else a_t.shape[1]
+    if in_features != x.shape[1]:
+        raise ValueError(
+            f"a_t input dim must match x.shape[1], got {in_features} and {x.shape[1]}"
+        )
+    if counts.numel() != experts:
+        raise ValueError(
+            "tokens_per_expert length must match number of experts, "
+            f"got {counts.numel()} and {experts}"
+        )
+    if x.device.type != "cuda" or a_t.device != x.device or b_t.device != x.device:
+        raise ValueError("x, a_t, and b_t must be CUDA tensors on the same device")
+    if x.dtype not in {torch.float16, torch.bfloat16}:
+        raise ValueError(f"Unsupported dtype {x.dtype}; expected fp16 or bf16")
+    if a_t.dtype != x.dtype or b_t.dtype != x.dtype:
+        raise ValueError(
+            f"Dtype mismatch: x={x.dtype}, a_t={a_t.dtype}, b_t={b_t.dtype}"
+        )
+    return counts
+
+
 def _effective_rank(rank: int) -> int:
     if rank < _PADDED_LOW_RANK_TARGET:
         return _PADDED_LOW_RANK_TARGET
@@ -274,6 +319,20 @@ def _pad_b_t(b_t: torch.Tensor, effective_rank: int) -> torch.Tensor:
         return b_t.contiguous()
     pad = b_t.new_zeros(b_t.shape[0], pad_rank, b_t.shape[2])
     return torch.cat((b_t, pad), dim=1).contiguous()
+
+
+def _pad_shared_a_t(a_t: torch.Tensor, effective_rank: int) -> torch.Tensor:
+    pad_rank = effective_rank - a_t.shape[1]
+    if pad_rank <= 0:
+        return a_t.contiguous()
+    return torch.cat((a_t, a_t.new_zeros(a_t.shape[0], pad_rank)), dim=1)
+
+
+def _pad_shared_b_t(b_t: torch.Tensor, effective_rank: int) -> torch.Tensor:
+    pad_rank = effective_rank - b_t.shape[0]
+    if pad_rank <= 0:
+        return b_t.contiguous()
+    return torch.cat((b_t, b_t.new_zeros(pad_rank, b_t.shape[1])), dim=0)
 
 
 def _proj_tile_n(rank: int) -> int:
@@ -304,6 +363,15 @@ def _grad_b_tile_m(rank: int) -> int:
     if override is not None:
         return override
     return 64 if rank <= 64 else 128
+
+
+def _dense_gemm(
+    a: torch.Tensor, b: torch.Tensor, *, alpha: float = 1.0
+) -> torch.Tensor:
+    out = torch.mm(a, b)
+    if alpha != 1.0:
+        out.mul_(alpha)
+    return out
 
 
 def _varlen_quack_gemm(
@@ -546,6 +614,122 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         )
 
 
+class _QuackGroupedLoraSharedOuterFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        a_t: torch.Tensor,
+        b_t: torch.Tensor,
+        counts: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        expert_offsets = _build_expert_offsets(counts, device=x.device)
+        shared_a = a_t.ndim == 2
+        actual_rank = a_t.shape[-1]
+        effective_rank = _effective_rank(actual_rank)
+
+        if shared_a:
+            a_t_eff = _pad_shared_a_t(a_t, effective_rank)
+            b_t_eff = _pad_b_t(b_t, effective_rank)
+            tmp = _dense_gemm(x, a_t_eff)
+            out = _varlen_quack_gemm(
+                tmp,
+                b_t_eff.permute(0, 2, 1).contiguous(),
+                out_features=b_t.shape[-1],
+                expert_offsets=expert_offsets,
+                tile_m=64,
+                tile_n=_matmul_tile_n(b_t.shape[-1]),
+                alpha=scale,
+            )
+        else:
+            a_t_eff = _pad_a_t(a_t, effective_rank)
+            b_t_eff = _pad_shared_b_t(b_t, effective_rank)
+            tmp = _varlen_quack_gemm(
+                x.contiguous(),
+                a_t_eff.permute(0, 2, 1).contiguous(),
+                out_features=effective_rank,
+                expert_offsets=expert_offsets,
+                tile_m=64,
+                tile_n=_proj_tile_n(effective_rank),
+            )
+            out = _dense_gemm(tmp, b_t_eff, alpha=scale)
+
+        ctx.save_for_backward(x, a_t_eff, b_t_eff, tmp, expert_offsets)
+        ctx.actual_rank = actual_rank
+        ctx.effective_rank = effective_rank
+        ctx.scale = scale
+        ctx.shared_a = shared_a
+        return out
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: Any):
+        if len(grad_outputs) != 1:
+            raise RuntimeError(
+                f"Expected exactly one gradient output, got {len(grad_outputs)}"
+            )
+        x, a_t_eff, b_t_eff, tmp, expert_offsets = ctx.saved_tensors
+        actual_rank = ctx.actual_rank
+        effective_rank = ctx.effective_rank
+        scale = ctx.scale
+        shared_a = ctx.shared_a
+        grad_out = cast(torch.Tensor, grad_outputs[0])
+        assert grad_out.stride(-1) == 1, (
+            "QuACK shared-outer grouped LoRA backward requires grad_out stride(-1) == 1"
+        )
+
+        if shared_a:
+            grad_tmp = _varlen_quack_gemm(
+                grad_out,
+                b_t_eff.contiguous(),
+                out_features=effective_rank,
+                expert_offsets=expert_offsets,
+                tile_m=64,
+                tile_n=_proj_tile_n(effective_rank),
+                alpha=scale,
+            )
+            grad_x = _dense_gemm(grad_tmp, a_t_eff.transpose(0, 1))
+            grad_a_eff = _dense_gemm(x.transpose(0, 1), grad_tmp)
+            grad_b_eff = _varlen_quack_gemm_k(
+                tmp.transpose(0, 1),
+                grad_out.transpose(0, 1),
+                batch_count=b_t_eff.shape[0],
+                out_shape_m=effective_rank,
+                out_shape_n=b_t_eff.shape[-1],
+                expert_offsets=expert_offsets,
+                tile_m=_grad_b_tile_m(effective_rank),
+                tile_n=_matmul_tile_n(b_t_eff.shape[-1]),
+                alpha=scale,
+            )
+            grad_a = grad_a_eff[:, :actual_rank].contiguous()
+            grad_b = grad_b_eff[:, :actual_rank, :].contiguous()
+        else:
+            grad_tmp = _dense_gemm(grad_out, b_t_eff.transpose(0, 1), alpha=scale)
+            grad_x = _varlen_quack_gemm(
+                grad_tmp,
+                a_t_eff.contiguous(),
+                out_features=x.shape[-1],
+                expert_offsets=expert_offsets,
+                tile_m=64,
+                tile_n=_matmul_tile_n(x.shape[-1]),
+            )
+            grad_a_eff = _varlen_quack_gemm_k(
+                x.transpose(0, 1),
+                grad_tmp.transpose(0, 1),
+                batch_count=a_t_eff.shape[0],
+                out_shape_m=a_t_eff.shape[1],
+                out_shape_n=effective_rank,
+                expert_offsets=expert_offsets,
+                tile_m=_grad_a_tile_m(effective_rank),
+                tile_n=_proj_tile_n(effective_rank),
+            )
+            grad_b_eff = _dense_gemm(tmp.transpose(0, 1), grad_out, alpha=scale)
+            grad_a = grad_a_eff[:, :, :actual_rank].contiguous()
+            grad_b = grad_b_eff[:actual_rank, :].contiguous()
+
+        return grad_x, grad_a, grad_b, None, None
+
+
 class _QuackGroupedLoraDualFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -760,6 +944,28 @@ def quack_grouped_lora(
     """
     counts_tensor = _validate_inputs(x, a_t, b_t, counts)
     return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor, scale, None)
+
+
+@torch.compiler.disable
+def quack_grouped_lora_shared_outer(
+    x: torch.Tensor,
+    a_t: torch.Tensor,
+    b_t: torch.Tensor,
+    counts: list[int] | torch.Tensor,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    """Run grouped LoRA with one factor shared across all experts.
+
+    FC1 accepts shared `a_t [in, rank]` and expert `b_t [experts, rank, out]`.
+    FC2 accepts expert `a_t [experts, in, rank]` and shared `b_t [rank, out]`.
+    The shared side uses dense GEMMs in forward and backward; the expert side
+    uses QuACK varlen GEMMs without expanding the shared factor over experts.
+
+    `counts` must be ordered by local expert and sum to `x.shape[0]`. The sum is
+    intentionally not checked here because doing so can synchronize the hot path.
+    """
+    counts_tensor = _validate_shared_outer_inputs(x, a_t, b_t, counts)
+    return _QuackGroupedLoraSharedOuterFn.apply(x, a_t, b_t, counts_tensor, scale)
 
 
 @torch.compiler.disable
