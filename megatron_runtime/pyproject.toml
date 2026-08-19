@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "aiohttp>=3.13.0",
+    "apache-tvm-ffi==0.1.11",
     "anthropic>=0.77.0",
     "flash-attn-4==4.0.0b5",
     "flashinfer-cubin==0.6.8.post1",
