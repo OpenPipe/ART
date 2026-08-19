@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import math
-from typing import Literal
+from typing import Annotated, Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, model_validator
 
 from art.preprocessing.moe_routing import (
     MoeRouteArray,
@@ -21,6 +21,10 @@ TokenizedLossName = Literal[
 ]
 MAX_TOKENIZED_LOGPROB_VALUES = 16 << 20
 MAX_TOKENIZED_PHYSICAL_VALUES = 64 << 20
+TokenizedMoeRouteBytes = Annotated[
+    bytes | memoryview,
+    PlainSerializer(bytes, return_type=bytes, when_used="json"),
+]
 
 
 class TokenizedPolicySpan(BaseModel):
@@ -42,12 +46,12 @@ class TokenizedPolicySpan(BaseModel):
 class TokenizedMoeRoutes(BaseModel):
     """Exact per-input-token MoE routes, optionally split into shared segments."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     num_experts: int = Field(ge=1, le=65_536)
     dtype: Literal["uint8", "uint16"]
     shape: tuple[int, int, int]
-    data: tuple[bytes, ...] = Field(min_length=1)
+    data: tuple[TokenizedMoeRouteBytes, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _validate_layout(self) -> "TokenizedMoeRoutes":
@@ -58,6 +62,17 @@ class TokenizedMoeRoutes(BaseModel):
             raise ValueError("MoE route topk exceeds num_experts")
         if np.dtype(self.dtype) != moe_route_dtype(self.num_experts):
             raise ValueError("MoE route dtype does not match num_experts")
+        if any(
+            isinstance(segment, memoryview)
+            and (
+                not segment.readonly
+                or not segment.c_contiguous
+                or segment.ndim != 1
+                or segment.format != "B"
+            )
+            for segment in self.data
+        ):
+            raise ValueError("MoE route memoryviews must be readonly contiguous bytes")
         bytes_per_token = np.dtype(self.dtype).itemsize * layers * topk
         if any(not segment or len(segment) % bytes_per_token for segment in self.data):
             raise ValueError("MoE route segments must contain whole tokens")

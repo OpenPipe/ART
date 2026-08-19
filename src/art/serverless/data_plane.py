@@ -713,6 +713,7 @@ def decode_tokenized_batch(
     if wire.route_pool is None:
         return wire.batch
     datums = list(wire.batch.datums)
+    route_pool = memoryview(wire.route_pool.data).toreadonly()
     for binding in wire.route_pool.bindings:
         datums[binding.datum_index] = datums[binding.datum_index].model_copy(
             update={
@@ -721,9 +722,7 @@ def decode_tokenized_batch(
                     dtype=binding.dtype,
                     shape=binding.shape,
                     data=tuple(
-                        wire.route_pool.data[
-                            value.offset : value.offset + value.byte_count
-                        ]
+                        route_pool[value.offset : value.offset + value.byte_count]
                         for value in binding.slices
                     ),
                 )
