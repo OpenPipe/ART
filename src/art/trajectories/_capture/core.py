@@ -16,7 +16,7 @@ from .. import (
     Trajectory,
 )
 from .._protocols import Endpoint, Exchange, build_exchange, endpoint_for_url
-from .._scope import get_current_trajectory
+from .._scope import _get_current_scope
 
 logger = logging.getLogger(__name__)
 _adapter_active: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -166,11 +166,11 @@ def begin(
     url: str,
     body: object,
 ) -> tuple[CaptureState | None, contextvars.Token[bool] | None]:
-    trajectory = get_current_trajectory(required=False)
+    scope = _get_current_scope()
     endpoint = endpoint_for_url(url)
     request = _json_body(body)
     if (
-        trajectory is None
+        scope is None
         or method.upper() != "POST"
         or endpoint is None
         or request is None
@@ -179,7 +179,7 @@ def begin(
         return None, None
     return (
         CaptureState(
-            trajectory=trajectory,
+            trajectory=scope.trajectory,
             endpoint=endpoint,
             request=request,
         ),

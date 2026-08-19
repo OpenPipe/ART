@@ -1389,7 +1389,9 @@ def test_streaming_messages_reject_malformed_token_metadata(
 def test_streaming_chat_choices_are_accumulated_by_index() -> None:
     now = datetime.now()
 
-    def chunk(index: int, content: str) -> dict[str, Any]:
+    def chunk(
+        index: int, content: str, finish_reason: str | None = None
+    ) -> dict[str, Any]:
         return {
             "id": "chatcmpl-1",
             "object": "chat.completion.chunk",
@@ -1399,7 +1401,7 @@ def test_streaming_chat_choices_are_accumulated_by_index() -> None:
                 {
                     "index": index,
                     "delta": {"role": "assistant", "content": content},
-                    "finish_reason": None,
+                    "finish_reason": finish_reason,
                     "logprobs": None,
                 }
             ],
@@ -1412,8 +1414,8 @@ def test_streaming_chat_choices_are_accumulated_by_index() -> None:
             [
                 (None, chunk(1, "b")),
                 (None, chunk(0, "a")),
-                (None, chunk(1, "d")),
-                (None, chunk(0, "c")),
+                (None, chunk(1, "d", "stop")),
+                (None, chunk(0, "c", "stop")),
                 (None, "[DONE]"),
             ]
         ),
@@ -1432,7 +1434,7 @@ def test_streaming_chat_choices_are_accumulated_by_index() -> None:
 def test_streaming_chat_preserves_reasoning_fields() -> None:
     now = datetime.now()
 
-    def chunk(**delta: str) -> dict[str, Any]:
+    def chunk(finish_reason: str | None = None, **delta: str) -> dict[str, Any]:
         return {
             "id": "chatcmpl-1",
             "object": "chat.completion.chunk",
@@ -1442,7 +1444,7 @@ def test_streaming_chat_preserves_reasoning_fields() -> None:
                 {
                     "index": 0,
                     "delta": {"role": "assistant", **delta},
-                    "finish_reason": None,
+                    "finish_reason": finish_reason,
                     "logprobs": None,
                 }
             ],
@@ -1454,7 +1456,14 @@ def test_streaming_chat_preserves_reasoning_fields() -> None:
         _sse(
             [
                 (None, chunk(reasoning="r1", reasoning_content="c1")),
-                (None, chunk(reasoning="r2", reasoning_content="c2")),
+                (
+                    None,
+                    chunk(
+                        "stop",
+                        reasoning="r2",
+                        reasoning_content="c2",
+                    ),
+                ),
                 (None, "[DONE]"),
             ]
         ),

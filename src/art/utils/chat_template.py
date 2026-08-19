@@ -65,13 +65,15 @@ def _template_requires_structured_tool_arguments(chat_template: object) -> bool:
     if not isinstance(chat_template, str):
         return False
     arguments_access = (
-        r"(?:(?<![.\w])(?:tool_call|tc)\s*\.\s*"
-        r"(?:function\s*\.\s*)?arguments\b"
+        r"(?:(?<![.\w])(?:tool_call|tc|function)\s*(?:\.\s*"
+        r"(?:function\s*\.\s*)?arguments\b|\[\s*['\"]arguments['\"]\s*\])"
         r"|(?<![.\w])arguments\b)"
     )
     if re.search(rf"{arguments_access}\s*\|\s*items\b", chat_template):
         return True
     if re.search(rf"{arguments_access}\s*\.\s*items\s*\(", chat_template):
+        return True
+    if re.search(rf"{arguments_access}\s+is\s+mapping\b", chat_template):
         return True
     aliases = re.findall(
         r"{%[-+]?\s*set\s+([A-Za-z_]\w*)\s*=\s*([^%]*)[-+]?%}",
