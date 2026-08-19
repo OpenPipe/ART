@@ -93,6 +93,17 @@ def _pipeline_tasks() -> set[asyncio.Task]:
     }
 
 
+async def _wait_for_owned_tasks(trainer: PipelineTrainer) -> None:
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while trainer._shutdown_owned_tasks:
+        _, pending = await asyncio.wait(
+            tuple(trainer._shutdown_owned_tasks),
+            timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+        )
+        assert not pending
+        await asyncio.sleep(0)
+
+
 @pytest.mark.asyncio
 async def test_clean_stop_finalizes_owner_without_failure_mode(tmp_path: Path) -> None:
     backend = _Backend()
@@ -197,6 +208,128 @@ async def test_stubborn_stage_is_cancelled_and_joined(
 
 
 @pytest.mark.asyncio
+async def test_cancellation_suppressing_stage_is_retained_without_blocking_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(trainer_module, "_PIPELINE_SHUTDOWN_TIMEOUT_SECONDS", 0.08)
+    trainer = _trainer(tmp_path, _Backend())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    data_released = asyncio.Event()
+    leases_released = asyncio.Event()
+    attachment_modes: list[bool] = []
+
+    async def suppress_cancellation() -> None:
+        started.set()
+        try:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+        finally:
+            finished.set()
+
+    async def release_data() -> None:
+        data_released.set()
+
+    async def release_leases() -> None:
+        leases_released.set()
+
+    async def stop_attachments(*, training_failed: bool = False) -> None:
+        attachment_modes.append(training_failed)
+
+    trainer._discard_pending_prepared_batches = release_data  # type: ignore[method-assign]
+    trainer._release_all_scheduled_eval_leases = release_leases  # type: ignore[method-assign]
+    trainer._stop_attachments = stop_attachments  # type: ignore[method-assign]
+    _replace_stages(trainer, suppress_cancellation)
+    operation = asyncio.create_task(trainer.train(handle_signals=False))
+    await started.wait()
+    trainer.request_stop()
+
+    [error] = await asyncio.wait_for(
+        asyncio.gather(operation, return_exceptions=True), timeout=1.0
+    )
+    assert isinstance(error, BaseException)
+    leaves = trainer_module.unique_exception_leaves((error,))
+    assert any(
+        str(failure)
+        == "1 live task(s) remain in pipeline stages after the pipeline shutdown deadline."
+        for failure in leaves
+    )
+    assert data_released.is_set() and leases_released.is_set()
+    assert attachment_modes == [True]
+    assert trainer._shutdown_owned_tasks
+
+    release.set()
+    await asyncio.wait_for(finished.wait(), timeout=1.0)
+    await _wait_for_owned_tasks(trainer)
+    assert not _pipeline_tasks()
+
+
+@pytest.mark.asyncio
+async def test_stuck_prepared_discard_does_not_starve_queue_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(trainer_module, "_PIPELINE_SHUTDOWN_TIMEOUT_SECONDS", 0.08)
+    close_attempted = asyncio.Event()
+    discard_started = asyncio.Event()
+    discard_release = asyncio.Event()
+    discard_finished = asyncio.Event()
+
+    class Queue:
+        async def finish(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            close_attempted.set()
+
+    monkeypatch.setattr(trainer_module, "DistributedTrajectoryQueue", Queue)
+    trainer = _trainer(tmp_path, _Backend())
+    queue = Queue()
+
+    async def stuck_discard() -> None:
+        discard_started.set()
+        try:
+            while not discard_release.is_set():
+                try:
+                    await discard_release.wait()
+                except asyncio.CancelledError:
+                    continue
+        finally:
+            discard_finished.set()
+
+    async def training_stage() -> None:
+        trainer._output_queue = queue  # type: ignore[assignment]
+        trainer.request_stop()
+
+    trainer._discard_pending_prepared_batches = stuck_discard  # type: ignore[method-assign]
+    _replace_stages(trainer, training_stage)
+
+    [error] = await asyncio.wait_for(
+        asyncio.gather(trainer.train(handle_signals=False), return_exceptions=True),
+        timeout=1.0,
+    )
+    assert isinstance(error, BaseException)
+    leaves = trainer_module.unique_exception_leaves((error,))
+    assert any(
+        str(failure)
+        == "1 live task(s) remain in mandatory pipeline release tasks after the "
+        "pipeline shutdown deadline."
+        for failure in leaves
+    )
+    assert discard_started.is_set()
+    assert close_attempted.is_set()
+    assert trainer._shutdown_owned_tasks
+
+    discard_release.set()
+    await asyncio.wait_for(discard_finished.wait(), timeout=1.0)
+    await _wait_for_owned_tasks(trainer)
+    assert not _pipeline_tasks()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_cancellation_is_primary_and_joins_optional_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -235,7 +368,7 @@ async def test_cleanup_cancellation_is_primary_and_joins_optional_work(
         attachment_modes.append(training_failed)
 
     trainer._shutdown_pipeline = observed_shutdown  # type: ignore[method-assign]
-    trainer._release_pipeline_resources = release_data  # type: ignore[method-assign]
+    trainer._discard_pending_prepared_batches = release_data  # type: ignore[method-assign]
     trainer._stop_attachments = stop_attachments  # type: ignore[method-assign]
     _replace_stages(trainer, training_stage)
     operation = asyncio.create_task(trainer.train(handle_signals=False))
@@ -302,7 +435,7 @@ async def test_mandatory_releases_run_while_backend_owner_exhausts_optional_drai
     async def stop_attachments(*, training_failed: bool = False) -> None:
         attachment_modes.append(training_failed)
 
-    trainer._release_pipeline_resources = release_data  # type: ignore[method-assign]
+    trainer._discard_pending_prepared_batches = release_data  # type: ignore[method-assign]
     trainer._release_all_scheduled_eval_leases = release_leases  # type: ignore[method-assign]
     trainer._stop_attachments = stop_attachments  # type: ignore[method-assign]
     _replace_stages(trainer, training_stage)

@@ -70,6 +70,7 @@ _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 _QUEUE_WAIT_TIME_KEY = "_art_queue_wait_s"
 _PIPELINE_SHUTDOWN_TIMEOUT_SECONDS = process_shutdown_timeout(1)
 _PIPELINE_STAGE_GRACE_FRACTION = 0.25
+_PIPELINE_STAGE_CANCEL_FRACTION = 0.5
 _PIPELINE_OPTIONAL_DRAIN_FRACTION = 0.75
 _SCORE_FRESHNESS_TAU_STEPS = 8.0
 # Rollout critical batch size from the best current GRPO/RLVR evidence. This is
@@ -374,6 +375,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._post_train_tasks: set[asyncio.Task[None]] = set()
         self._terminal_task_failures: list[BaseException] = []
         self._shutdown_wake_tasks: set[asyncio.Task[Any]] = set()
+        self._shutdown_owned_tasks: set[asyncio.Task[Any]] = set()
         self._shutdown_started_at: float | None = None
         self._shutdown_deadline: float | None = None
         self._shutdown_failed_event = asyncio.Event()
@@ -694,8 +696,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         await settle_tasks(
                             stages,
                             cancel=True,
-                            deadline=self._begin_shutdown(),
+                            deadline=self._shutdown_phase_deadline(
+                                _PIPELINE_STAGE_CANCEL_FRACTION
+                            ),
                             description="pipeline stages",
+                            ownership=self._shutdown_owned_tasks,
                         )
                     )
                     stages.clear()
@@ -718,8 +723,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         await settle_tasks(
                             stages,
                             cancel=True,
-                            deadline=self._begin_shutdown(),
+                            deadline=self._shutdown_phase_deadline(
+                                _PIPELINE_STAGE_CANCEL_FRACTION
+                            ),
                             description="pipeline stages",
+                            ownership=self._shutdown_owned_tasks,
                         )
                     )
                     stages.clear()
@@ -731,8 +739,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 *await settle_tasks(
                     stages,
                     cancel=True,
-                    deadline=self._begin_shutdown(),
+                    deadline=self._shutdown_phase_deadline(
+                        _PIPELINE_STAGE_CANCEL_FRACTION
+                    ),
                     description="pipeline stages",
+                    ownership=self._shutdown_owned_tasks,
                 ),
             ]
             error = self._group_pipeline_failures(
@@ -742,7 +753,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise error from None
         finally:
             stop_wait.cancel()
-            await asyncio.gather(stop_wait, return_exceptions=True)
+            await settle_tasks(
+                (stop_wait,),
+                cancel=True,
+                deadline=self._shutdown_phase_deadline(_PIPELINE_STAGE_CANCEL_FRACTION),
+                description="pipeline stop watcher",
+                ownership=self._shutdown_owned_tasks,
+            )
         return unique_exception_leaves(failures)
 
     async def _shutdown_pipeline(
@@ -761,8 +778,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             await settle_tasks(
                 self._shutdown_wake_tasks,
                 cancel=True,
-                deadline=deadline,
+                deadline=optional_deadline,
                 description="pipeline wake tasks",
+                ownership=self._shutdown_owned_tasks,
             )
         )
         self._shutdown_wake_tasks.clear()
@@ -779,25 +797,22 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                 finally:
-                    for task in (failure_wait, optional_wait):
-                        task.cancel()
-                    await asyncio.gather(
-                        failure_wait, optional_wait, return_exceptions=True
+                    await settle_tasks(
+                        (failure_wait, optional_wait),
+                        cancel=True,
+                        deadline=deadline,
+                        description="attachment stop watchers",
+                        ownership=self._shutdown_owned_tasks,
                     )
             await self._stop_attachments(
                 training_failed=self._shutdown_failed_event.is_set()
             )
 
-        mandatory.extend(
-            (
-                asyncio.create_task(
-                    self._release_pipeline_resources(),
-                    name="pipeline_data_release",
-                ),
-                asyncio.create_task(
-                    self._release_all_scheduled_eval_leases(),
-                    name="pipeline_eval_lease_release",
-                ),
+        mandatory.extend(self._release_pipeline_resources())
+        mandatory.append(
+            asyncio.create_task(
+                self._release_all_scheduled_eval_leases(),
+                name="pipeline_eval_lease_release",
             )
         )
         if attachments_started:
@@ -822,6 +837,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     cancel=self._shutdown_failed_event.is_set(),
                     deadline=optional_deadline,
                     description="post-training tasks",
+                    ownership=self._shutdown_owned_tasks,
                     interrupt_events=(self._optional_abort_event, cleanup_cancelled),
                 )
             )
@@ -834,6 +850,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     (backend_owner,),
                     deadline=optional_deadline,
                     description="backend publication owner",
+                    ownership=self._shutdown_owned_tasks,
                     interrupt_events=(cleanup_cancelled,),
                 )
                 failures.extend(owner_failures)
@@ -848,6 +865,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 cancel=self._shutdown_failed_event.is_set(),
                 deadline=optional_deadline,
                 description="publication metric/readiness tasks",
+                ownership=self._shutdown_owned_tasks,
                 interrupt_events=(self._optional_abort_event, cleanup_cancelled),
             )
             failures.extend(readiness_failures)
@@ -864,6 +882,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 mandatory,
                 deadline=deadline,
                 description="mandatory pipeline release tasks",
+                ownership=self._shutdown_owned_tasks,
             )
         )
         if failures:
@@ -875,22 +894,20 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 failures.append(error)
         return unique_exception_leaves(failures)
 
-    async def _release_pipeline_resources(self) -> None:
-        failures: list[BaseException] = []
-        try:
-            await self._discard_pending_prepared_batches()
-        except BaseException as error:
-            failures.append(error)
+    def _release_pipeline_resources(self) -> list[asyncio.Task[Any]]:
+        releases = [
+            asyncio.create_task(
+                self._discard_pending_prepared_batches(),
+                name="pipeline_prepared_batch_release",
+            )
+        ]
         if isinstance(self._output_queue, DistributedTrajectoryQueue):
-            try:
-                await self._output_queue.close()
-            except BaseException as error:
-                failures.append(error)
-        error = self._group_pipeline_failures(
-            None, failures, message="Pipeline data release failed."
-        )
-        if error is not None:
-            raise error
+            releases.append(
+                asyncio.create_task(
+                    self._output_queue.close(), name="pipeline_queue_close"
+                )
+            )
+        return releases
 
     def _shutdown_operation_done(self, task: asyncio.Task[Any]) -> None:
         if not task.cancelled() and task.exception() is not None:
