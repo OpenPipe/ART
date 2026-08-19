@@ -1388,17 +1388,21 @@ class MCoreRunSlotExecutor:
     ) -> None:
         del operation_id
         tensors = state.gradients.residency_tensors()
-        if state.desired.accumulator is not None:
-            self._residency.touch(state.desired.accumulator)
-            return
+        previous = state.desired.accumulator
         key = state.installed_weights.model_copy(
             update={
                 "representation": "accumulator",
                 "accumulator_revision": state.next_accumulator_revision,
             }
         )
-        self._residency.register_l1(key, tensors)
+        if previous is None:
+            self._residency.register_l1(key, tensors)
+        else:
+            self._residency.advance_l1(previous, key, tensors)
         state.desired = state.desired.model_copy(update={"accumulator": key})
+        state.next_accumulator_revision += 1
+        if previous is not None:
+            self._residency.retire_async(previous)
 
     def _retire_accumulator(self, state: _ResidentRunState) -> None:
         key = state.desired.accumulator
@@ -1406,7 +1410,6 @@ class MCoreRunSlotExecutor:
             return
         self._residency.retire_async(key)
         state.desired = state.desired.model_copy(update={"accumulator": None})
-        state.next_accumulator_revision += 1
 
     @contextmanager
     def _accumulator_resident(self, state: _ResidentRunState) -> Iterator[None]:
