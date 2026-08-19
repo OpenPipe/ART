@@ -623,6 +623,10 @@ class DistributedMegatronService:
                     await self._reconcile_serving_locked(step, current)
             return run_id, step
 
+    def retire_command_operation(self, operation_id: str) -> None:
+        if self._trainer is not None:
+            self._trainer.retire_operation(operation_id)
+
     async def prepare_cp_lookahead(
         self,
         batch: DistributedPackedBatch,

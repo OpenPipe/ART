@@ -63,6 +63,16 @@ class RunCommandLedger:
         async with self._lock:
             return self._admit(request, kind=kind)
 
+    def retire(self, request_id: str, admission: CommandAdmission) -> None:
+        record = self._records.get(request_id)
+        if record is None:
+            return
+        if record.admission != admission:
+            raise RuntimeError("command retirement does not match its admission")
+        if admission.ref.operation_id in self._open_forward_backward_ids:
+            raise RuntimeError("cannot retire an open F/B command")
+        self._records.pop(request_id)
+
     def _admit(
         self,
         request: RunCommand,

@@ -51,6 +51,7 @@ if TYPE_CHECKING:
     from art.model import TrainableModel
 
 ResultT = TypeVar("ResultT", bound=Contract)
+_MAX_RETAINED_COMPLETED_OPERATIONS = 1024
 
 
 def _consume_future(future: asyncio.Future[Any]) -> None:
@@ -65,10 +66,12 @@ class _DeferredResult(NamedTuple, Generic[ResultT]):
 class LocalTrainingOperation(Generic[ResultT]):
     def __init__(
         self,
+        request_id: str,
         admission: CommandAdmission,
         ordered: asyncio.Task[None],
         result: asyncio.Future[ResultT],
     ) -> None:
+        self._request_id = request_id
         self._admission = admission
         self._ordered = ordered
         self._result = result
@@ -104,7 +107,6 @@ class LocalMegatronTrainingClient:
         self._model = model
         self._service = service
         self._operations: dict[str, LocalTrainingOperation[Any]] = {}
-        self._retired_operation_ids: set[str] = set()
         self._completion_tasks: set[asyncio.Task[Any]] = set()
         self._checkpoints: dict[str, ResolvedCheckpointState] = {}
         self._sft_tokenizer = SftBatchTokenizer()
@@ -138,8 +140,6 @@ class LocalMegatronTrainingClient:
         admission = await self._ledger.admit(request, kind=kind)
         if operation := self._operations.get(admission.ref.operation_id):
             return operation
-        if admission.ref.operation_id in self._retired_operation_ids:
-            raise RuntimeError("completed F/B result is no longer retained")
         predecessor = self._tail
 
         result = asyncio.get_running_loop().create_future()
@@ -178,9 +178,14 @@ class LocalMegatronTrainingClient:
             run(), name=f"megatron-{kind}-{request.sequence_id}"
         )
         ordered.add_done_callback(_consume_future)
-        operation = LocalTrainingOperation(admission, ordered, result)
+        operation = LocalTrainingOperation(
+            request.request_id, admission, ordered, result
+        )
         self._operations[admission.ref.operation_id] = operation
+        ordered.add_done_callback(lambda _: self._bound_operation_cache())
+        result.add_done_callback(lambda _: self._bound_operation_cache())
         self._tail = ordered
+        self._bound_operation_cache()
         return operation
 
     async def forward(
@@ -375,8 +380,8 @@ class LocalMegatronTrainingClient:
                 metrics=raw["metrics"],
             )
             for operation_id in admission.contributing_forward_backward_operation_ids:
-                if self._operations.pop(operation_id, None) is not None:
-                    self._retired_operation_ids.add(operation_id)
+                if operation := self._operations.get(operation_id):
+                    self._retire_operation(operation)
             return result
 
         return cast(
@@ -612,6 +617,27 @@ class LocalMegatronTrainingClient:
                 [],
             )
             raise BaseExceptionGroup("tokenized packed-batch release failed", failures)
+
+    def _bound_operation_cache(self) -> None:
+        completed = [
+            operation
+            for operation in self._operations.values()
+            if operation._ordered.done()
+            and operation._result.done()
+            and operation.ref.kind != "forward_backward"
+        ]
+        for operation in completed[:-_MAX_RETAINED_COMPLETED_OPERATIONS]:
+            self._retire_operation(operation)
+
+    def _retire_operation(self, operation: LocalTrainingOperation[Any]) -> None:
+        operation_id = operation.ref.operation_id
+        if self._operations.get(operation_id) is not operation:
+            return
+        if not operation._ordered.done() or not operation._result.done():
+            raise RuntimeError("cannot retire an incomplete local training operation")
+        self._ledger.retire(operation._request_id, operation._admission)
+        self._service.retire_command_operation(operation_id)
+        self._operations.pop(operation_id)
 
 
 def _validate_publication_mode(
