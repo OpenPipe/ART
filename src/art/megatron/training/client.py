@@ -54,6 +54,8 @@ if TYPE_CHECKING:
 ResultT = TypeVar("ResultT", bound=Contract)
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
 _MAX_RETAINED_COMPLETED_RESULT_BYTES = 512 << 20
+_DEFERRED_RESULT_KINDS = frozenset({"save_sampler", "save_state"})
+_SEQUENCE_POISONING_KINDS = frozenset({"forward_backward", "optim_step", "load_state"})
 
 
 def _consume_future(future: asyncio.Future[Any]) -> None:
@@ -63,6 +65,28 @@ def _consume_future(future: asyncio.Future[Any]) -> None:
 
 class _DeferredResult(NamedTuple, Generic[ResultT]):
     completion: asyncio.Task[ResultT]
+
+
+class _SequenceReleaseGate:
+    def __init__(self) -> None:
+        self._future: asyncio.Future[BaseException | None] = (
+            asyncio.get_running_loop().create_future()
+        )
+
+    @property
+    def done(self) -> bool:
+        return self._future.done()
+
+    async def wait(self) -> BaseException | None:
+        return await asyncio.shield(self._future)
+
+    def release(self) -> None:
+        if not self._future.done():
+            self._future.set_result(None)
+
+    def poison(self, error: BaseException) -> None:
+        if not self._future.done():
+            self._future.set_result(error)
 
 
 class LocalTrainingOperation(Generic[ResultT]):
@@ -117,7 +141,7 @@ class LocalMegatronTrainingClient:
         self._sft_tokenizer = SftBatchTokenizer()
         self._batch_releases: set[asyncio.Task[None]] = set()
         self._batch_release_failures: list[BaseException] = []
-        self._tail: asyncio.Task[Any] | None = None
+        self._sequence_tail: _SequenceReleaseGate | None = None
         self._closed = False
 
     @property
@@ -145,7 +169,8 @@ class LocalMegatronTrainingClient:
         admission = await self._ledger.admit(request, kind=kind)
         if operation := self._operations.get(admission.ref.operation_id):
             return operation
-        predecessor = self._tail
+        predecessor = self._sequence_tail
+        sequence_release = _SequenceReleaseGate()
 
         result = asyncio.get_running_loop().create_future()
         result.add_done_callback(_consume_future)
@@ -163,33 +188,56 @@ class LocalMegatronTrainingClient:
         async def run() -> None:
             try:
                 if predecessor is not None:
-                    await asyncio.shield(predecessor)
+                    predecessor_failure = await predecessor.wait()
+                    if predecessor_failure is not None:
+                        if not result.done():
+                            result.set_exception(predecessor_failure)
+                        sequence_release.poison(predecessor_failure)
+                        return
                 value = await execute(admission)
+                if isinstance(value, _DeferredResult):
+                    if kind not in _DEFERRED_RESULT_KINDS:
+                        value.completion.cancel()
+                        value.completion.add_done_callback(_consume_future)
+                        raise RuntimeError(f"{kind} cannot return a deferred result")
+                    completion = asyncio.create_task(
+                        settle(value.completion),
+                        name=f"megatron-{kind}-result-{request.sequence_id}",
+                    )
+                    self._completion_tasks.add(completion)
+                    completion.add_done_callback(self._completion_tasks.discard)
+                elif not result.done():
+                    result.set_result(value)
             except BaseException as error:
                 if not result.done():
                     result.set_exception(error)
+                if kind in _SEQUENCE_POISONING_KINDS:
+                    sequence_release.poison(error)
+                else:
+                    sequence_release.release()
                 raise
-            if isinstance(value, _DeferredResult):
-                completion = asyncio.create_task(
-                    settle(value.completion),
-                    name=f"megatron-{kind}-result-{request.sequence_id}",
-                )
-                self._completion_tasks.add(completion)
-                completion.add_done_callback(self._completion_tasks.discard)
-            elif not result.done():
-                result.set_result(value)
+            sequence_release.release()
 
         ordered = asyncio.create_task(
             run(), name=f"megatron-{kind}-{request.sequence_id}"
         )
-        ordered.add_done_callback(_consume_future)
+
+        def ordered_done(task: asyncio.Task[None]) -> None:
+            _consume_future(task)
+            if task.cancelled() and not sequence_release.done:
+                if kind in _SEQUENCE_POISONING_KINDS:
+                    sequence_release.poison(asyncio.CancelledError())
+                else:
+                    sequence_release.release()
+
+        ordered.add_done_callback(ordered_done)
         operation = LocalTrainingOperation(
             request.request_id, admission, ordered, result
         )
         self._operations[admission.ref.operation_id] = operation
         ordered.add_done_callback(lambda _: self._bound_operation_cache(operation))
         result.add_done_callback(lambda _: self._bound_operation_cache(operation))
-        self._tail = ordered
+        self._sequence_tail = sequence_release
         self._bound_operation_cache(operation)
         return operation
 

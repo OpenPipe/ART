@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from art.distributed.trajectory_store import TrajectoryGroupBundle
@@ -210,6 +211,52 @@ class _Service:
         )
 
 
+class _FailingService(_Service):
+    def __init__(self, failure_kind: str) -> None:
+        super().__init__()
+        self.failure_kind = failure_kind
+        self.failure = RuntimeError(f"{failure_kind} failed")
+        self.failure_consumed = False
+        self.failure_started = asyncio.Event()
+        self.failure_release = asyncio.Event()
+
+    async def _fail(self) -> None:
+        self.failure_consumed = True
+        self.failure_started.set()
+        await self.failure_release.wait()
+        raise self.failure
+
+    async def forward_backward_command(self, ref, _batch, _config, _experimental):
+        if self.failure_kind == "forward_backward" and not self.failure_consumed:
+            self.calls.append(f"fb:{ref.sequence_id}")
+            await self._fail()
+        return await super().forward_backward_command(
+            ref, _batch, _config, _experimental
+        )
+
+    async def forward_command(self, ref, _batch, _config, _experimental):
+        if self.failure_kind == "forward" and not self.failure_consumed:
+            self.calls.append(f"forward:{ref.sequence_id}")
+            await self._fail()
+        return await super().forward_command(ref, _batch, _config, _experimental)
+
+    async def optimizer_command(self, ref, _optimizer, contributions):
+        if self.failure_kind == "optim_step" and not self.failure_consumed:
+            self.calls.append(f"optim:{ref.sequence_id}:{len(contributions)}")
+            await self._fail()
+        return await super().optimizer_command(ref, _optimizer, contributions)
+
+    async def load_state_command(self, ref, source, *, restore_optimizer):
+        if self.failure_kind == "load_state" and not self.failure_consumed:
+            self.calls.append(
+                f"load:{ref.sequence_id}:{source.adapter_step}:{restore_optimizer}"
+            )
+            await self._fail()
+        return await super().load_state_command(
+            ref, source, restore_optimizer=restore_optimizer
+        )
+
+
 class _Client(LocalMegatronTrainingClient):
     async def _prepare_rl_batch(self, request):
         request.batch.require_local_groups()
@@ -375,6 +422,190 @@ def test_local_forward_and_load_use_the_same_ordered_stream() -> None:
         assert service.retired_operation_ids == []
         assert client.projected_learner_version == 5
         await client.close()
+
+    asyncio.run(run())
+
+
+def test_failed_local_forward_releases_concurrently_submitted_successor() -> None:
+    async def run() -> None:
+        service = _FailingService("forward")
+        client = _Client(
+            run_id="run",
+            learner_version=3,
+            backend=_Backend(),
+            model=object(),
+            service=service,
+        )
+        failed = await client.forward(
+            ForwardRequest(
+                run_id="run",
+                request_id="failed-forward",
+                sequence_id=0,
+                batch=_batch(),
+                loss=LossConfig(name="cispo"),
+            )
+        )
+        successor = await client.forward(
+            ForwardRequest(
+                run_id="run",
+                request_id="successor-forward",
+                sequence_id=1,
+                batch=_batch(),
+                loss=LossConfig(name="cispo"),
+            )
+        )
+        await asyncio.wait_for(service.failure_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert service.calls == ["forward:0"]
+
+        service.failure_release.set()
+        with pytest.raises(RuntimeError, match="forward failed"):
+            await failed.result()
+        assert (await asyncio.wait_for(successor.result(), timeout=1)).operation_id
+        assert service.calls == ["forward:0", "forward:1"]
+        assert client.next_sequence_id == 2
+        await client.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "failure_kind", ["forward_backward", "optim_step", "load_state"]
+)
+def test_failed_local_mutation_poisons_concurrently_submitted_successor(
+    failure_kind: str,
+) -> None:
+    async def run() -> None:
+        service = _FailingService(failure_kind)
+        client = _Client(
+            run_id="run",
+            learner_version=3,
+            backend=_Backend(),
+            model=object(),
+            service=service,
+        )
+        if failure_kind == "forward_backward":
+            failed = await client.forward_backward(
+                ForwardBackwardRequest(
+                    run_id="run",
+                    request_id="failed-fb",
+                    sequence_id=0,
+                    batch=_batch(),
+                    loss=LossConfig(name="cispo"),
+                )
+            )
+        elif failure_kind == "optim_step":
+            contribution = await client.forward_backward(
+                ForwardBackwardRequest(
+                    run_id="run",
+                    request_id="fb",
+                    sequence_id=0,
+                    batch=_batch(),
+                    loss=LossConfig(name="cispo"),
+                )
+            )
+            await contribution.result()
+            failed = await client.optim_step(
+                OptimStepRequest(
+                    run_id="run",
+                    request_id="failed-optim",
+                    sequence_id=1,
+                    optimizer=AdamConfig(learning_rate=1e-3),
+                )
+            )
+        else:
+            client._remember_checkpoint(
+                "source",
+                ResolvedCheckpointState(
+                    adapter_path="/tmp/adapter",
+                    adapter_step=3,
+                    adapter_training_session_id="session",
+                    adapter_generation_id="generation-3",
+                    optimizer_state_path="/tmp/optimizer",
+                    optimizer_generation_id="generation-3",
+                ),
+            )
+            failed = await client.load_state(
+                LoadStateRequest(
+                    run_id="run",
+                    request_id="failed-load",
+                    sequence_id=0,
+                    checkpoint="source",
+                )
+            )
+
+        successor_sequence = client.next_sequence_id
+        successor = await client.forward(
+            ForwardRequest(
+                run_id="run",
+                request_id="blocked-forward",
+                sequence_id=successor_sequence,
+                batch=_batch(),
+                loss=LossConfig(name="cispo"),
+            )
+        )
+        await asyncio.wait_for(service.failure_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert f"forward:{successor_sequence}" not in service.calls
+
+        service.failure_release.set()
+        with pytest.raises(
+            RuntimeError, match=f"{failure_kind} failed"
+        ) as failed_error:
+            await failed.result()
+        with pytest.raises(
+            RuntimeError, match=f"{failure_kind} failed"
+        ) as successor_error:
+            await asyncio.wait_for(successor.result(), timeout=1)
+        assert failed_error.value is service.failure
+        assert successor_error.value is service.failure
+        assert f"forward:{successor_sequence}" not in service.calls
+        assert client.next_sequence_id == successor_sequence + 1
+        await client.close()
+
+    asyncio.run(run())
+
+
+def test_cancelled_local_mutation_poison_is_consumed_and_close_is_bounded() -> None:
+    async def run() -> None:
+        service = _FailingService("forward_backward")
+        client = _Client(
+            run_id="run",
+            learner_version=3,
+            backend=_Backend(),
+            model=object(),
+            service=service,
+        )
+        failed = await client.forward_backward(
+            ForwardBackwardRequest(
+                run_id="run",
+                request_id="cancelled-fb",
+                sequence_id=0,
+                batch=_batch(),
+                loss=LossConfig(name="cispo"),
+            )
+        )
+        successor = await client.forward(
+            ForwardRequest(
+                run_id="run",
+                request_id="blocked-forward",
+                sequence_id=1,
+                batch=_batch(),
+                loss=LossConfig(name="cispo"),
+            )
+        )
+        await asyncio.wait_for(service.failure_started.wait(), timeout=1)
+        await failed.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(successor.result(), timeout=1)
+        assert service.calls == ["fb:0"]
+        assert client._sequence_tail is not None
+        assert isinstance(
+            client._sequence_tail._future.result(), asyncio.CancelledError
+        )
+        assert client._sequence_tail._future.exception() is None
+        await asyncio.wait_for(client.close(), timeout=1)
 
     asyncio.run(run())
 
