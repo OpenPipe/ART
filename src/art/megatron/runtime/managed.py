@@ -440,7 +440,7 @@ def ensure_megatron_runtime(
         if not (bundle / "manifest.json").is_file():
             source_python = _source_runtime_python()
             python = (
-                _write_runtime_launcher(source_python.parent.parent)
+                _write_runtime_launcher(source_python.parents[2])
                 if source_python.is_file()
                 else Path(sys.executable)
             )

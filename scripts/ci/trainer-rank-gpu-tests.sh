@@ -3,7 +3,9 @@ set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES=0,1
 export PYTHONUNBUFFERED=1
-runtime_python="megatron_runtime/.venv/bin/python"
+runtime_python="$(
+  .venv/bin/python -c 'from art.megatron.runtime.managed import ensure_megatron_runtime; print(ensure_megatron_runtime(art_build_sha256="trainer-rank-ci").python)'
+)"
 test -x "${runtime_python}"
 
 "${runtime_python}" -m pytest --tb=short \

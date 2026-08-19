@@ -5,10 +5,6 @@ import pydantic
 import pytest
 from transformers.tokenization_utils_base import BatchEncoding
 
-from art.megatron.model_support.handlers.gemma4 import (
-    GEMMA4_DENSE_HANDLER,
-    GEMMA4_MOE_HANDLER,
-)
 from art.preprocessing.tokenize import (
     _normalize_tool_call_arguments_for_chat_template,
     tokenize_sft_batch,
@@ -356,8 +352,14 @@ def test_glm_chat_template_normalizes_aliased_tool_call_arguments() -> None:
     assert messages[0]["tool_calls"][0]["function"]["arguments"] == ('{"value": "yes"}')
 
 
-@pytest.mark.parametrize("handler", [GEMMA4_DENSE_HANDLER, GEMMA4_MOE_HANDLER])
-def test_gemma4_normalizes_json_tool_arguments_for_mapping_template(handler) -> None:
+@pytest.mark.parametrize("handler_name", ["GEMMA4_DENSE_HANDLER", "GEMMA4_MOE_HANDLER"])
+def test_gemma4_normalizes_json_tool_arguments_for_mapping_template(
+    handler_name: str,
+) -> None:
+    pytest.importorskip("megatron")
+    from art.megatron.model_support.handlers import gemma4
+
+    handler = getattr(gemma4, handler_name)
     tokenizer = _FakeTokenizer()
     tokenizer.chat_template = (
         "{% set function = tool_call['function'] %}"

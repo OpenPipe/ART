@@ -215,6 +215,7 @@ jobs:
           megatron_runtime/.venv/bin/python -c "import megatron.core.packed_seq_params"
           megatron_runtime/.venv/bin/python -m pytest --nbval --current-env --tb=short \
             tests/unit/test_megatron_reference_logprobs.py \
+            tests/unit/test_preprocessing_tokenize.py::test_gemma4_normalizes_json_tool_arguments_for_mapping_template \
             tests/unit/test_moe_routing_replay.py \
             tests/unit/test_moe_routing_real_path.py \
             tests/unit/test_pipeline_trainer_local_backend.py \
