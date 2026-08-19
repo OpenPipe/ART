@@ -13,7 +13,11 @@ import pytest
 from art import Trajectory, TrajectoryGroup
 from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.pipeline_tuner.config import PackedGroupShape, PackingLeafShape
-from art.serverless.client import RemoteTrainingClient, RemoteTrainingServiceClient
+from art.serverless.client import (
+    RemoteTrainingClient,
+    RemoteTrainingError,
+    RemoteTrainingServiceClient,
+)
 from art.serverless.contracts import (
     MAX_OPERATION_RESULT_BYTES,
     AdapterSpec,
@@ -327,6 +331,67 @@ async def test_operation_result_streams_into_exact_receive_buffer():
     assert isinstance(received, bytearray)
     assert received == payload
     assert stream.reads > 1
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_operation_result_receive_budget_serializes_allocations():
+    payload = b"12345678"
+    release = asyncio.Event()
+    first_started = asyncio.Event()
+    calls = 0
+
+    class BlockedResult(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            await release.wait()
+            yield payload
+
+    async def handle(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        first_started.set()
+        return httpx.Response(200, stream=BlockedResult())
+
+    http = httpx.AsyncClient(
+        base_url="http://test/v1/", transport=httpx.MockTransport(handle)
+    )
+    service = RemoteTrainingServiceClient(
+        api_key="test",
+        base_url="http://test/v1",
+        control_http_client=http,
+        transfer_http_client=http,
+        max_result_bytes_in_flight=len(payload),
+    )
+    ref = OperationResultRef(object_id="0" * 64, byte_count=len(payload))
+    first = asyncio.create_task(service.get_operation_result("first", ref))
+    await first_started.wait()
+    second = asyncio.create_task(service.get_operation_result("second", ref))
+    await asyncio.sleep(0)
+    assert calls == 1
+    release.set()
+    assert await asyncio.gather(first, second) == [payload, payload]
+    assert calls == 2
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_operation_result_rejects_content_length_before_allocation():
+    async def handle(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Length": "9"}, content=b"1234")
+
+    http = httpx.AsyncClient(
+        base_url="http://test/v1/", transport=httpx.MockTransport(handle)
+    )
+    service = RemoteTrainingServiceClient(
+        api_key="test",
+        base_url="http://test/v1",
+        control_http_client=http,
+        transfer_http_client=http,
+    )
+    with pytest.raises(RemoteTrainingError, match="Content-Length changed"):
+        await service.get_operation_result(
+            "operation", OperationResultRef(object_id="0" * 64, byte_count=4)
+        )
     await http.aclose()
 
 

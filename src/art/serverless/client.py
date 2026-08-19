@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterable, Mapping
+from contextlib import asynccontextmanager
 import hashlib
 from typing import Any, Callable, Generic, TypeVar, cast
 import uuid
@@ -31,6 +32,7 @@ from art.training.contracts import (
 from art.utils.lifecycle import process_shutdown_timeout
 
 from .contracts import (
+    MAX_OPERATION_RESULT_BYTES,
     ApplyCheckpointRetentionRequest,
     CancelOperationRequest,
     CheckpointPage,
@@ -59,6 +61,31 @@ ResultT = TypeVar("ResultT", bound=OperationResult)
 ResponseT = TypeVar("ResponseT", bound=Contract)
 _CREATE_RUN_RESOLVE_STATUSES = frozenset({409, 429, 500, 502, 503, 504})
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
+
+
+class _ByteBudget:
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("byte budget must be positive")
+        self._capacity = capacity
+        self._used = 0
+        self._condition = asyncio.Condition()
+
+    @asynccontextmanager
+    async def reserve(self, byte_count: int):
+        if not 0 < byte_count <= self._capacity:
+            raise RemoteTrainingError("remote result exceeds the client receive budget")
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: self._used + byte_count <= self._capacity
+            )
+            self._used += byte_count
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._used -= byte_count
+                self._condition.notify_all()
 
 
 def _sha256(payload: bytes) -> str:
@@ -105,6 +132,7 @@ class RemoteTrainingServiceClient:
         transfer_http_client: httpx.AsyncClient | None = None,
         request_timeout_s: float = 30.0,
         max_retries: int = 3,
+        max_result_bytes_in_flight: int = MAX_OPERATION_RESULT_BYTES,
     ) -> None:
         if not api_key:
             raise ValueError("remote training api_key must not be empty")
@@ -137,6 +165,7 @@ class RemoteTrainingServiceClient:
         self._transfer_client = transfer_http_client
         self._owns_clients = owns_clients
         self._max_retries = max_retries
+        self._result_budget = _ByteBudget(max_result_bytes_in_flight)
 
     async def create_run(self, request: CreateTrainingRunRequest) -> TrainingRunView:
         try:
@@ -217,28 +246,37 @@ class RemoteTrainingServiceClient:
     async def get_operation_result(
         self, operation_id: str, ref: OperationResultRef
     ) -> bytearray:
-        response = await self._send(
-            "GET",
-            f"training/operations/{operation_id}/result",
-            content=None,
-            headers=None,
-            transfer=True,
-            stream=True,
-        )
-        payload = bytearray(ref.byte_count)
-        offset = 0
-        try:
-            async for chunk in response.aiter_bytes():
-                end = offset + len(chunk)
-                if end > len(payload):
-                    raise RemoteTrainingError("remote operation result grew in transit")
-                payload[offset:end] = chunk
-                offset = end
-        finally:
-            await response.aclose()
-        if offset != ref.byte_count:
-            raise RemoteTrainingError("remote operation result byte count changed")
-        return payload
+        async with self._result_budget.reserve(ref.byte_count):
+            response = await self._send(
+                "GET",
+                f"training/operations/{operation_id}/result",
+                content=None,
+                headers=None,
+                transfer=True,
+                stream=True,
+            )
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None and content_length != str(ref.byte_count):
+                await response.aclose()
+                raise RemoteTrainingError(
+                    "remote operation result Content-Length changed"
+                )
+            payload = bytearray(ref.byte_count)
+            offset = 0
+            try:
+                async for chunk in response.aiter_bytes():
+                    end = offset + len(chunk)
+                    if end > len(payload):
+                        raise RemoteTrainingError(
+                            "remote operation result grew in transit"
+                        )
+                    payload[offset:end] = chunk
+                    offset = end
+            finally:
+                await response.aclose()
+            if offset != ref.byte_count:
+                raise RemoteTrainingError("remote operation result byte count changed")
+            return payload
 
     async def get_events(self, run_id: str, *, after: int) -> EventPage:
         return await self._request(
