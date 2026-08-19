@@ -62,6 +62,7 @@ _STEP_OPTIMIZER_CONFIG_FIELDS = {
     "lr",
     "weight_decay",
 }
+OptimizerShardSerialization = Literal["torch_pickle_v1", "art_safetensors_v1"]
 
 
 class _OptimizerRecord(BaseModel):
@@ -111,6 +112,7 @@ class OptimizerShard(_OptimizerRecord):
     rank: int = Field(ge=0)
     size_bytes: int = Field(gt=0)
     layout_sha256: str = Field(pattern=_SHA256_PATTERN)
+    serialization: OptimizerShardSerialization = "torch_pickle_v1"
 
 
 class _PairedOptimizerRecord(_OptimizerRecord):
@@ -190,12 +192,17 @@ class OptimizerStateSnapshot(_OptimizerRecord):
         return self
 
 
-def optimizer_shard_name(rank: int, world_size: int) -> str:
+def optimizer_shard_name(
+    rank: int,
+    world_size: int,
+    serialization: OptimizerShardSerialization = "torch_pickle_v1",
+) -> str:
     if world_size <= 0 or rank < 0 or rank >= world_size:
         raise ValueError(
             f"Invalid optimizer shard rank {rank} for world size {world_size}"
         )
-    return f"{rank + 1:02d}-of-{world_size:02d}.pt"
+    suffix = "pt" if serialization == "torch_pickle_v1" else "safetensors"
+    return f"{rank + 1:02d}-of-{world_size:02d}.{suffix}"
 
 
 def current_optimizer_topology(world_size: int) -> OptimizerTopology:
@@ -340,8 +347,14 @@ def _optimizer_model_lock_path(optimizer_state_path: str | Path) -> Path:
     return model_root / OPTIMIZER_MODEL_LOCK
 
 
-def optimizer_shard_path(generation_path: Path, *, rank: int, world_size: int) -> Path:
-    return generation_path / optimizer_shard_name(rank, world_size)
+def optimizer_shard_path(
+    generation_path: Path,
+    *,
+    rank: int,
+    world_size: int,
+    serialization: OptimizerShardSerialization = "torch_pickle_v1",
+) -> Path:
+    return generation_path / optimizer_shard_name(rank, world_size, serialization)
 
 
 def _adapter_checkpoint_files(path: str | Path) -> tuple[Path, tuple[Path, ...]]:
@@ -926,7 +939,9 @@ def _validate_generation_files(
 ) -> tuple[OptimizerShard, ...]:
     ordered = _ordered_manifest_shards(manifest)
     names = tuple(
-        optimizer_shard_name(shard.rank, manifest.topology.world_size)
+        optimizer_shard_name(
+            shard.rank, manifest.topology.world_size, shard.serialization
+        )
         for shard in ordered
     )
     expected_entries = tuple(sorted((OPTIMIZER_MANIFEST, *names)))
@@ -941,7 +956,9 @@ def _validate_generation_files(
             f"expected={expected_entries}, actual={actual_entries}"
         )
     for shard in ordered:
-        name = optimizer_shard_name(shard.rank, manifest.topology.world_size)
+        name = optimizer_shard_name(
+            shard.rank, manifest.topology.world_size, shard.serialization
+        )
         actual_size = (generation_path / name).stat().st_size
         if actual_size != shard.size_bytes:
             raise RuntimeError(
@@ -1472,7 +1489,10 @@ def resolve_optimizer_shard(
     generation_path, _, ordered = _validate_generation(
         optimizer_state_path, pointer, world_size, rank
     )
-    return generation_path / optimizer_shard_name(ordered[rank].rank, world_size)
+    shard = ordered[rank]
+    return generation_path / optimizer_shard_name(
+        shard.rank, world_size, shard.serialization
+    )
 
 
 def _type_identity(value: object) -> str:
@@ -1896,25 +1916,22 @@ def write_optimizer_snapshot_shard(
     pending = optimizer_pending_generation_path(
         optimizer_state_path, snapshot.generation_id
     )
+    from art.megatron.optimizer_archive import prepare_optimizer_archive
+
+    prepared = prepare_optimizer_archive(snapshot.state_dict)
     shard_path = optimizer_shard_path(
         pending,
         rank=snapshot.rank,
         world_size=snapshot.world_size,
+        serialization="art_safetensors_v1",
     )
-    temporary = shard_path.with_name(f".{shard_path.name}.{os.getpid()}.tmp")
     pending.mkdir(parents=True, exist_ok=True)
-    try:
-        with temporary.open("wb") as output:
-            torch.save(snapshot.state_dict, output)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, shard_path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    prepared.write(shard_path)
     return OptimizerShard(
         rank=snapshot.rank,
-        size_bytes=shard_path.stat().st_size,
+        size_bytes=prepared.nbytes,
         layout_sha256=snapshot.layout_sha256,
+        serialization="art_safetensors_v1",
     )
 
 
@@ -2233,7 +2250,14 @@ def load_trainer_rank_optimizer_state(
             pointer=pointer,
         )
         assert shard is not None
-        return torch.load(shard, map_location="cpu", weights_only=True)
+        saved_shard = shards[runtime.rank]
+        if saved_shard.serialization != "art_safetensors_v1":
+            raise RuntimeError(
+                "TrainerRank optimizer checkpoints require art_safetensors_v1 shards"
+            )
+        from art.megatron.optimizer_archive import load_optimizer_archive
+
+        return load_optimizer_archive(shard)
 
 
 def _allow_unpaired_resume() -> bool:

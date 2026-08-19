@@ -20,6 +20,7 @@ from .optimizer_state import (
     optimizer_generation_lease,
     optimizer_generation_path,
     optimizer_pending_generation_path,
+    optimizer_shard_name,
     publish_adapter_checkpoint,
     read_adapter_publication,
     read_committed_optimizer_pointer,
@@ -60,8 +61,13 @@ class CheckpointBundleManifest(_BundleRecord):
         expected: set[str] = {f"adapter/{file.name}" for file in self.adapter.files}
         if self.optimizer is not None:
             expected.update(
-                f"optimizer/{rank + 1:02d}-of-{self.optimizer.topology.world_size:02d}.pt"
-                for rank in range(self.optimizer.topology.world_size)
+                "optimizer/"
+                + optimizer_shard_name(
+                    shard.rank,
+                    self.optimizer.topology.world_size,
+                    shard.serialization,
+                )
+                for shard in self.optimizer.shards
             )
         actual = {file.path for file in self.files}
         if actual != expected or len(actual) != len(self.files):
@@ -122,11 +128,17 @@ def export_checkpoint_bundle(
             if optimizer is not None:
                 sources.extend(
                     (
-                        generation
-                        / f"{rank + 1:02d}-of-{optimizer.topology.world_size:02d}.pt",
-                        f"optimizer/{rank + 1:02d}-of-{optimizer.topology.world_size:02d}.pt",
+                        generation / name,
+                        f"optimizer/{name}",
                     )
-                    for rank in range(optimizer.topology.world_size)
+                    for shard in optimizer.shards
+                    for name in (
+                        optimizer_shard_name(
+                            shard.rank,
+                            optimizer.topology.world_size,
+                            shard.serialization,
+                        ),
+                    )
                 )
             files = tuple(
                 _copy_file(source, staging / relative, relative)
