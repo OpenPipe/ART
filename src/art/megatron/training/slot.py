@@ -597,6 +597,9 @@ class MegatronTrainingSlot:
         result = OptimStepResult(
             operation_id=ref.operation_id,
             contributing_forward_backward_operation_ids=contributions,
+            checkpoint=checkpoint_ref(
+                ref.run_id, output_version, generation.generation_id
+            ),
             metrics=raw["metrics"],
         )
         self._results[ref.operation_id] = (fingerprint, result)

@@ -157,6 +157,11 @@ class _Client:
                 contributing_forward_backward_operation_ids=(
                     self.operations[-2].ref.operation_id,
                 ),
+                checkpoint=CheckpointRef(
+                    run_id=self.run_id,
+                    learner_version=self.projected_learner_version,
+                    checkpoint_id=operation.ref.operation_id,
+                ),
                 metrics={"time/optimizer_step_s": 0.1},
             )
         )

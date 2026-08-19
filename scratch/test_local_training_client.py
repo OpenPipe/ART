@@ -311,6 +311,12 @@ def test_local_client_executes_one_ordered_command_stream() -> None:
         assert optimizer_result.contributing_forward_backward_operation_ids == (
             forward.ref.operation_id,
         )
+        assert optimizer_result.checkpoint.run_id == "run"
+        assert optimizer_result.checkpoint.learner_version == 4
+        assert (
+            optimizer_result.checkpoint.checkpoint_id
+            == service.generation.generation_id
+        )
         assert service.retired_operation_ids == [forward.ref.operation_id]
         sampler = await client.save_weights_for_sampler(
             SaveWeightsForSamplerRequest(

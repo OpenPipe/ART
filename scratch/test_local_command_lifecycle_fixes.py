@@ -35,7 +35,11 @@ class _Service:
         return None
 
     async def optimizer_command(self, _ref, _optimizer, contributions):
-        return {"metrics": {}}, SimpleNamespace(contributions=contributions)
+        return {"metrics": {}}, SimpleNamespace(
+            contributions=contributions,
+            policy_step=_ref.reserved_output_learner_version,
+            generation_id=f"generation-{_ref.operation_id}",
+        )
 
     def retire_command_operation(self, operation_id: str) -> None:
         if self.fail_retirement:
