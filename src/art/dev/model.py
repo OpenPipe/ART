@@ -222,6 +222,7 @@ class InitArgs(TypedDict, total=False):
 class LoRAConfig(TypedDict, total=False):
     rank: int
     target_modules: list[str]
+    moe_parameterization: Literal["per_expert", "shared_outer"]
     alpha: int
     dropout: float
     bias: str

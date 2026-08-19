@@ -1364,6 +1364,7 @@ def _adapter_spec(model: AnyTrainableModel) -> AdapterSpec:
                 model.base_model, allow_unvalidated_arch=allow_unvalidated
             )
         ),
+        moe_parameterization=configured.get("moe_parameterization", "per_expert"),
     )
 
 

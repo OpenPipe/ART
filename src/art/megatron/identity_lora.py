@@ -1,5 +1,5 @@
 import os
-from typing import Any
+from typing import Any, Literal
 import warnings
 
 import torch
@@ -17,11 +17,16 @@ def create_identity_lora(
     rank: int | None = None,
     target_modules: list[str] | None = None,
     lora_alpha: int = LORA_ALPHA,
+    moe_parameterization: Literal["per_expert", "shared_outer"] = "per_expert",
     random_state: int | None = None,
     allow_unvalidated_arch: bool = False,
     handler: ModelSupportHandler | None = None,
 ) -> None:
     """Create an identity LoRA adapter for a Megatron model."""
+    if moe_parameterization not in {"per_expert", "shared_outer"}:
+        raise ValueError(
+            f"unsupported MoE LoRA parameterization {moe_parameterization!r}"
+        )
     from unittest.mock import patch
 
     from accelerate import init_empty_weights
@@ -97,6 +102,7 @@ def create_identity_lora(
         target_modules=target_modules,
         bias="none",
     ).to_dict()
+    final_config["moe_parameterization"] = moe_parameterization
     normalize_lora_checkpoint_to_vllm(
         lora_path,
         handler=handler,

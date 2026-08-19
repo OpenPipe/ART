@@ -168,6 +168,11 @@ def _build_training_runtime(spec: TrainerRuntimeSpec, *, rank: int) -> Any:
         snapshot_pool_capacity=spec.snapshot_pool_capacity,
         run_residency_config=residency,
         optimizer_layout_fingerprint=spec.optimizer_layout_fingerprint,
+        provider_configure=lambda provider: setattr(
+            provider,
+            "_art_lora_moe_parameterization",
+            spec.lora_moe_parameterization,
+        ),
     )
 
 
@@ -470,6 +475,9 @@ class MonarchTrainerActor(Actor):
                 "ART_MEGATRON_LORA_RANK": str(runtime_spec.lora_rank),
                 "ART_MEGATRON_LORA_TARGET_MODULES": json.dumps(
                     runtime_spec.lora_target_modules
+                ),
+                "ART_MEGATRON_LORA_MOE_PARAMETERIZATION": (
+                    runtime_spec.lora_moe_parameterization
                 ),
                 "ART_DISABLE_MEGATRON_COMPILE": (
                     "0" if runtime_spec.compile_enabled else "1"

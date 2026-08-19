@@ -32,6 +32,7 @@ class LocalMegatronTrainingSlotConfig(BaseModel):
     lora_rank: int | None = Field(default=None, ge=1)
     lora_alpha: float = Field(default=32.0, gt=0)
     lora_target_modules: tuple[str, ...] = ()
+    lora_moe_parameterization: Literal["per_expert", "shared_outer"] = "per_expert"
     dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     model_initialization: Literal["pretrained", "random"] = "pretrained"
     random_state: int | None = None
@@ -89,7 +90,10 @@ class LocalMegatronTrainingSlot:
             init_args["revision"] = config.model_revision
         if config.random_state is not None:
             init_args["random_state"] = config.random_state
-        lora_config: dev.LoRAConfig = {"alpha": int(config.lora_alpha)}
+        lora_config: dev.LoRAConfig = {
+            "alpha": int(config.lora_alpha),
+            "moe_parameterization": config.lora_moe_parameterization,
+        }
         if config.lora_rank is not None:
             lora_config["rank"] = config.lora_rank
         if config.lora_target_modules:

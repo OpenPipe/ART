@@ -44,6 +44,7 @@ class TrainerRuntimeSpec(_Spec):
     lora_rank: int = Field(ge=1)
     lora_alpha: float = Field(default=32.0, gt=0)
     lora_target_modules: tuple[str, ...]
+    lora_moe_parameterization: Literal["per_expert", "shared_outer"] = "per_expert"
     dtype: Literal["bfloat16", "float16", "float32"]
     trainer_mesh: TrainerMeshSpec
     packed_sequence_length: int = Field(ge=1)
@@ -87,8 +88,9 @@ class TrainerRuntimeSpec(_Spec):
         return _fingerprint(
             self.model_copy(
                 update={
-                    # TrainerRank materializes each run's exact adapter shape.
+                    # TrainerRank materializes each run's exact adapter slot shape.
                     "lora_rank": 1,
+                    "lora_moe_parameterization": "per_expert",
                     "run_residency": None,
                     "hybrid_ep": hybrid_ep,
                 }

@@ -82,6 +82,7 @@ def build_trainer_runtime_spec(
         lora_rank=int(lora.get("rank") or default_lora_rank_for_handler(handler)),
         lora_alpha=float(lora.get("alpha", LORA_ALPHA)),
         lora_target_modules=tuple(targets),
+        lora_moe_parameterization=lora.get("moe_parameterization", "per_expert"),
         dtype=trainer_dtype(config),
         trainer_mesh=mesh,
         packed_sequence_length=runtime_config.packed_sequence_length,

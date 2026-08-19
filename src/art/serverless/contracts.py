@@ -258,6 +258,7 @@ class AdapterSpec(Contract):
     rank: int = Field(ge=1, le=32)
     alpha: Literal[32] = 32
     target_modules: tuple[str, ...] = Field(min_length=1)
+    moe_parameterization: Literal["per_expert", "shared_outer"] = "per_expert"
 
 
 class TrainingRunSpec(Contract):
