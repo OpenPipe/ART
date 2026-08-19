@@ -594,6 +594,35 @@ def _remove_abandoned_adapter_staging(staging: Path) -> None:
         _fsync_directory(staging.parent)
 
 
+def discard_uncommitted_adapter_staging(
+    staging_path: str | Path,
+    *,
+    step: int,
+    training_session_id: str,
+    generation_id: str,
+) -> bool:
+    """Remove only one fenced staging generation; preserve an exact commit."""
+    staging = Path(staging_path).absolute()
+    canonical = canonical_adapter_path(staging, step)
+    if staging.name != generation_id:
+        raise RuntimeError("Adapter staging path identifies another generation")
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = staging.with_name(f".{staging.name}.lock")
+    with lock_path.open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        existing = read_adapter_publication(canonical, step=step)
+        if existing is not None:
+            if (
+                existing.training_session_id,
+                existing.generation_id,
+            ) != (training_session_id, generation_id):
+                raise RuntimeError("Committed adapter generation changed identity")
+            return False
+        existed = staging.exists()
+        _remove_abandoned_adapter_staging(staging)
+        return existed
+
+
 @contextmanager
 def adapter_publication_transaction(
     staging_path: str | Path,
@@ -1147,6 +1176,28 @@ def commit_optimizer_generation(
             policy_path.unlink()
             _fsync_directory(path)
     return committed
+
+
+def discard_uncommitted_optimizer_generation(
+    optimizer_state_path: str, generation: str
+) -> bool:
+    """Remove one fenced pending generation without touching a committed one."""
+    path = Path(optimizer_state_path)
+    pending = optimizer_pending_generation_path(optimizer_state_path, generation)
+    committed = optimizer_generation_path(optimizer_state_path, generation)
+    trash: Path | None = None
+    with _writer_lease(path):
+        if committed.exists():
+            return False
+        if not pending.exists():
+            return False
+        if pending.is_symlink() or not pending.is_dir():
+            raise RuntimeError(f"Optimizer pending path is not a directory: {pending}")
+        trash = pending.with_name(f".trash-{pending.name}-{uuid4().hex}")
+        os.replace(pending, trash)
+        _fsync_directory(pending.parent)
+    shutil.rmtree(trash)
+    return True
 
 
 def _prune_optimizer_generations_locked(

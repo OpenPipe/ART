@@ -1054,7 +1054,11 @@ class MegatronTrainingSlot:
                     optimizer_state_path, pointer.generation
                 )
                 return self._existing_snapshot(
-                    ref, generation, pointer.adapter, manifest=manifest
+                    ref,
+                    generation,
+                    pointer.adapter,
+                    manifest=manifest,
+                    optimizer_state_path=optimizer_state_path,
                 )
             existing = pointer.adapter
             persist_optimizer = False
@@ -1110,7 +1114,10 @@ class MegatronTrainingSlot:
         adapter: OptimizerAdapter,
         *,
         manifest: OptimizerGenerationManifest | None = None,
+        optimizer_state_path: str | None = None,
     ) -> _ExistingSnapshot:
+        if (manifest is None) != (optimizer_state_path is None):
+            raise ValueError("optimizer manifest and physical source must be paired")
         shards = (
             {} if manifest is None else {shard.rank: shard for shard in manifest.shards}
         )
@@ -1135,7 +1142,9 @@ class MegatronTrainingSlot:
                 None if manifest is None else optimizer_generation_nbytes(manifest)
             ),
             plan=plan,
-            reservation_plan=build_snapshot_write_reservation_plan(plan),
+            reservation_plan=build_snapshot_write_reservation_plan(
+                plan, optimizer_state_path=optimizer_state_path
+            ),
         )
 
     def _sampler_object_target(

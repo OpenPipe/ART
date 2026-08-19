@@ -159,9 +159,15 @@ def test_reservation_plan_rejects_target_identity_changes(tmp_path: Path) -> Non
         )
 
 
-def test_existing_snapshot_has_no_operation_owned_targets(tmp_path: Path) -> None:
+def test_existing_snapshot_retains_exact_physical_sources(tmp_path: Path) -> None:
     plan = _reservation_plan(tmp_path)
-    existing = build_snapshot_write_reservation_plan(plan.snapshot)
+    optimizer = str(tmp_path / "optimizer")
+    existing = build_snapshot_write_reservation_plan(
+        plan.snapshot, optimizer_state_path=optimizer
+    )
 
-    assert existing.targets == SnapshotWriteTargets()
+    assert existing.targets == SnapshotWriteTargets(
+        local_adapter_target=plan.snapshot.ranks[0].adapter,
+        optimizer_state_path=optimizer,
+    )
     assert existing.digest != plan.digest

@@ -146,12 +146,11 @@ class SnapshotWriteTargets(_PublicationModel):
 
     @model_validator(mode="after")
     def _validate_local_target(self) -> "SnapshotWriteTargets":
-        if (self.local_adapter_staging_path is None) != (
-            self.local_adapter_target is None
+        if (
+            self.local_adapter_staging_path is not None
+            and self.local_adapter_target is None
         ):
-            raise ValueError(
-                "local adapter staging and target must be present together"
-            )
+            raise ValueError("adapter staging requires an exact committed target")
         for value in (self.local_adapter_staging_path, self.optimizer_state_path):
             if value is not None and not Path(value).is_absolute():
                 raise ValueError("snapshot write target paths must be absolute")
@@ -168,18 +167,21 @@ class SnapshotWriteReservationPlan(_PublicationModel):
         rank_zero = self.snapshot.ranks[0]
         staging = self.targets.local_adapter_staging_path
         local = self.targets.local_adapter_target
-        if staging is not None and local is not None:
+        if local is not None:
+            if local != rank_zero.adapter:
+                raise ValueError("local adapter target differs from its snapshot plan")
+        if staging is not None:
+            assert local is not None
             if Path(staging).name != generation.generation_id:
                 raise ValueError("adapter staging target identifies another generation")
-            if local != rank_zero.adapter or local.identity != str(
+            if local.identity != str(
                 canonical_adapter_path(staging, generation.policy_step)
             ):
                 raise ValueError("local adapter target differs from its snapshot plan")
-        if (
-            self.targets.optimizer_state_path is not None
-            and self.snapshot.optimizer_manifest is None
+        if (self.targets.optimizer_state_path is None) != (
+            self.snapshot.optimizer_manifest is None
         ):
-            raise ValueError("optimizer target has no exact optimizer manifest")
+            raise ValueError("optimizer manifest and physical source must be paired")
         object_target = self.targets.adapter_object_target
         if object_target is not None:
             transport = rank_zero.transport_adapter
@@ -289,11 +291,7 @@ def build_snapshot_write_reservation_plan(
         snapshot=snapshot,
         targets=SnapshotWriteTargets(
             local_adapter_staging_path=local_adapter_staging_path,
-            local_adapter_target=(
-                snapshot.ranks[0].adapter
-                if local_adapter_staging_path is not None
-                else None
-            ),
+            local_adapter_target=snapshot.ranks[0].adapter,
             optimizer_state_path=optimizer_state_path,
             adapter_object_target=adapter_object_target,
         ),

@@ -326,6 +326,29 @@ class S3BinaryObjectStore:
         bucket, key = self._require_manifest_uri(ref.manifest_uri)
         self._delete_prefix(str(PurePosixPath(key).parent), bucket)
 
+    def discard_uncommitted(
+        self, target: BinaryObjectTarget, files: tuple[BinaryObjectFile, ...]
+    ) -> None:
+        """Delete only exact fenced payload keys when no commit manifest exists."""
+        self._require_target(target)
+        if self.resolve(self._manifest_uri(target), missing_ok=True) is not None:
+            raise RuntimeError("cannot discard a committed binary object")
+        prefix = self._prefix(target)
+        keys = tuple(_binary_object_file_key(prefix, file) for file in files)
+        if len(keys) != len(set(keys)):
+            raise ValueError("binary object cleanup contains duplicate payload keys")
+        for key in keys:
+            self._abort_uploads(key)
+        if keys:
+            result = self._client.delete_objects(
+                Bucket=target.store.bucket,
+                Delete={"Objects": [{"Key": key} for key in keys], "Quiet": True},
+            )
+            if errors := result.get("Errors"):
+                raise RuntimeError(f"binary object cleanup failed: {errors}")
+        if self.resolve(self._manifest_uri(target), missing_ok=True) is not None:
+            raise RuntimeError("binary object committed during fenced cleanup")
+
     def close(self) -> None:
         with self._lock:
             if self._closed:
@@ -403,6 +426,37 @@ class S3BinaryObjectStore:
             )
             raise
         return total
+
+    def _abort_uploads(self, key: str) -> None:
+        key_marker = None
+        upload_marker = None
+        while True:
+            markers = (
+                {}
+                if key_marker is None
+                else {
+                    "KeyMarker": key_marker,
+                    "UploadIdMarker": upload_marker,
+                }
+            )
+            values = self._client.list_multipart_uploads(
+                Bucket=self.config.bucket,
+                Prefix=key,
+                **markers,
+            )
+            for upload in values.get("Uploads", ()):
+                if upload.get("Key") == key:
+                    self._client.abort_multipart_upload(
+                        Bucket=self.config.bucket,
+                        Key=key,
+                        UploadId=upload["UploadId"],
+                    )
+            if not values.get("IsTruncated"):
+                return
+            key_marker = values.get("NextKeyMarker")
+            upload_marker = values.get("NextUploadIdMarker")
+            if not key_marker or not upload_marker:
+                raise RuntimeError("multipart cleanup pagination lost its cursor")
 
     def _read(self, key: str, *, bucket: str | None = None) -> bytes:
         response = self._client.get_object(Bucket=bucket or self.config.bucket, Key=key)
