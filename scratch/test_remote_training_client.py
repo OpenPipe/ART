@@ -24,6 +24,7 @@ from art.serverless.contracts import (
     CreateTrainingRunRequest,
     OperationResultRef,
     TrainingRunSpec,
+    remote_request_fingerprint,
 )
 from art.serverless.data_plane import (
     FORWARD_SUBMISSION_PREFIX_BYTES,
@@ -117,7 +118,9 @@ class FakeService:
             )
             result_ref, payload = encode_operation_result(result)
             self.operation_results[ref["operation_id"]] = payload
-            self.operations[ref["operation_id"]] = self._operation(ref, result_ref, now)
+            self.operations[ref["operation_id"]] = self._operation(
+                ref, result_ref, now, submission.request
+            )
             self.events.append(self._event(ref, result_ref, now))
             return httpx.Response(200, json=ref)
         if path == "/v1/training/runs/run/optim_step":
@@ -128,7 +131,9 @@ class FakeService:
                     _operation_id("run", "forward"),
                 ),
             )
-            self.operations[ref["operation_id"]] = self._operation(ref, result, now)
+            self.operations[ref["operation_id"]] = self._operation(
+                ref, result, now, OptimStepRequest.model_validate(body)
+            )
             self.events.append(self._event(ref, result, now))
             return httpx.Response(200, json=ref)
         if path == "/v1/training/runs/run/events":
@@ -173,9 +178,11 @@ class FakeService:
         }
 
     @staticmethod
-    def _operation(ref, result, now):
+    def _operation(ref, result, now, request):
         return {
             "ref": ref,
+            "request_id": request.request_id,
+            "request_fingerprint": remote_request_fingerprint(request),
             "status": "succeeded",
             "result": result.model_dump(mode="json"),
             "error": None,

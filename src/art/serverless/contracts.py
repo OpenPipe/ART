@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+import json
 from typing import Annotated, Any, Literal
 
 from pydantic import Field, model_validator
@@ -348,6 +350,8 @@ class TrainingRunView(Contract):
 
 class OperationView(Contract):
     ref: OperationRef
+    request_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+    request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     status: OperationStatus
     contributing_forward_backward_operation_ids: tuple[str, ...] = ()
     result: OperationResultRef | dict[str, Any] | None = None
@@ -355,6 +359,16 @@ class OperationView(Contract):
     event_cursor: int = Field(ge=1)
     created_at: datetime
     updated_at: datetime
+
+
+def remote_request_fingerprint(request: RunCommand) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            request.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
 
 class CancelOperationRequest(Contract):

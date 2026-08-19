@@ -53,6 +53,7 @@ from .contracts import (
     RunEvent,
     SetCheckpointTtlRequest,
     TrainingRunView,
+    remote_request_fingerprint,
 )
 from .data_plane import (
     FORWARD_SUBMISSION_MEDIA_TYPE,
@@ -672,6 +673,27 @@ class _RunEventObserver:
                     future.set_exception(error)
 
 
+def _terminal_event(view: OperationView) -> RunEvent | None:
+    event = {
+        "succeeded": "operation_succeeded",
+        "failed": "operation_failed",
+        "cancelled": "operation_cancelled",
+    }.get(view.status)
+    if event is None:
+        return None
+    payload = view.result if view.status == "succeeded" else view.error
+    if isinstance(payload, Contract):
+        payload = payload.model_dump(mode="json")
+    return RunEvent(
+        cursor=view.event_cursor,
+        run_id=view.ref.run_id,
+        operation_id=view.ref.operation_id,
+        event=event,
+        payload=payload or {},
+        created_at=view.updated_at,
+    )
+
+
 class RemoteTrainingOperation(Generic[ResultT]):
     def __init__(
         self,
@@ -835,11 +857,7 @@ class RemoteTrainingClient:
         result_type: type[ResultT],
         submission: EncodedForwardSubmission | None = None,
     ) -> TrainingOperation[ResultT]:
-        fingerprint = (
-            await asyncio.to_thread(_sha256, submission.preamble)
-            if submission is not None
-            else _sha256(wire_request.model_dump_json().encode())
-        )
+        fingerprint = remote_request_fingerprint(wire_request)
         async with self._lock:
             if self._closed:
                 raise RuntimeError("remote training client is closed")
@@ -849,6 +867,13 @@ class RemoteTrainingClient:
                 if existing[0] != fingerprint:
                     raise ValueError("request_id was reused with different content")
                 return cast(TrainingOperation[ResultT], existing[1])
+            if request.sequence_id < self._next_sequence_id:
+                return await self._resolve_replay(
+                    request,
+                    kind=kind,
+                    fingerprint=fingerprint,
+                    result_type=result_type,
+                )
             if request.sequence_id != self._next_sequence_id:
                 raise ValueError(
                     f"expected sequence {self._next_sequence_id}, "
@@ -904,6 +929,57 @@ class RemoteTrainingClient:
             if ref.reserved_output_learner_version is not None:
                 self._projected_learner_version = ref.reserved_output_learner_version
             return operation
+
+    async def _resolve_replay(
+        self,
+        request: RunCommand,
+        *,
+        kind: OperationKind,
+        fingerprint: str,
+        result_type: type[ResultT],
+    ) -> TrainingOperation[ResultT]:
+        operation_id = _operation_id(request.run_id, request.request_id)
+        view = await self._service.get_operation(operation_id)
+        self._validate_replay(view, request, kind, fingerprint)
+        event = _terminal_event(view)
+        if event is None:
+            terminal = self._events.reserve(operation_id)
+            view = await self._service.get_operation(operation_id)
+            self._validate_replay(view, request, kind, fingerprint)
+            event = _terminal_event(view)
+            if event is not None and not terminal.done():
+                terminal.set_result(event)
+            self._events.claim(operation_id, terminal)
+        else:
+            terminal = asyncio.get_running_loop().create_future()
+            terminal.set_result(event)
+        operation = RemoteTrainingOperation(
+            view.ref,
+            self._service,
+            terminal,
+            result_type,
+            on_completion=self._bound_operation_cache,
+        )
+        self._operations[request.request_id] = (fingerprint, operation)
+        self._bound_operation_cache()
+        return operation
+
+    def _validate_replay(
+        self,
+        view: OperationView,
+        request: RunCommand,
+        kind: OperationKind,
+        fingerprint: str,
+    ) -> None:
+        if (
+            view.ref.operation_id != _operation_id(request.run_id, request.request_id)
+            or view.ref.run_id != self.run_id
+            or view.ref.sequence_id != request.sequence_id
+            or view.ref.kind != kind
+            or view.request_id != request.request_id
+            or view.request_fingerprint != fingerprint
+        ):
+            raise ValueError("replayed request differs from the persisted operation")
 
     def _bound_operation_cache(self) -> None:
         overflow = len(self._operations) - _MAX_RETAINED_COMPLETED_OPERATIONS
