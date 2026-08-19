@@ -179,12 +179,12 @@ class S3BinaryObjectStore:
                 raise RuntimeError("committed object identity differs from its target")
             return existing
         prefix = self._prefix(target)
-        # The prefix is the immutable object identity. A concurrent publisher can
-        # commit the same prefix while this publisher is unwinding, so failed
-        # publishes intentionally leave any partial keys for later lifecycle cleanup.
+        # Content-addressed payload keys cannot overwrite another writer's bytes.
+        # Failed writes remain invisible until the conditional manifest commit and
+        # are reclaimed later by the lifecycle owner after writer fencing.
         for file in planned:
             written = self._upload(
-                f"{prefix}/{file.relative_path}", files[file.relative_path]
+                _binary_object_file_key(prefix, file), files[file.relative_path]
             )
             if written != file.byte_count:
                 raise RuntimeError("binary object upload changed its planned size")
@@ -197,12 +197,27 @@ class S3BinaryObjectStore:
             metadata=target.metadata,
         )
         body = _manifest_bytes(result)
-        self._client.put_object(
-            Bucket=target.store.bucket,
-            Key=f"{prefix}/_COMMITTED.json",
-            Body=body,
-            ContentType="application/json",
-        )
+        try:
+            self._client.put_object(
+                Bucket=target.store.bucket,
+                Key=f"{prefix}/_COMMITTED.json",
+                Body=body,
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+        except Exception as error:
+            if not _is_precondition_failed(error):
+                raise
+            committed = self.resolve(self._manifest_uri(target))
+            if committed is None:
+                raise RuntimeError(
+                    "conditional object commit lost its winner"
+                ) from error
+            if committed != result:
+                raise RuntimeError(
+                    "another publisher committed different object content"
+                ) from error
+            return committed
         if self._read(f"{prefix}/_COMMITTED.json") != body:
             raise RuntimeError("object commit manifest changed after publication")
         return result
@@ -242,7 +257,7 @@ class S3BinaryObjectStore:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 self._client.download_file(
                     bucket,
-                    f"{prefix}/{file.relative_path}",
+                    _binary_object_file_key(prefix, file),
                     str(target),
                     Config=self._transfer,
                 )
@@ -261,7 +276,7 @@ class S3BinaryObjectStore:
         buffer = BytesIO()
         self._client.download_fileobj(
             bucket,
-            f"{prefix}/{file.relative_path}",
+            _binary_object_file_key(prefix, file),
             buffer,
             Config=self._transfer,
         )
@@ -300,7 +315,7 @@ class S3BinaryObjectStore:
         prefix = str(PurePosixPath(manifest_key).parent)
         self._client.download_fileobj(
             bucket,
-            f"{prefix}/{file.relative_path}",
+            _binary_object_file_key(prefix, file),
             writer,
             Config=self._transfer,
         )
@@ -796,6 +811,18 @@ def _complete_part(
     part_number: int, future: Future[dict[str, object]]
 ) -> dict[str, object]:
     return {"ETag": future.result()["ETag"], "PartNumber": part_number}
+
+
+def _binary_object_file_key(prefix: str, file: BinaryObjectFile) -> str:
+    return f"{prefix}/files/{file.sha256}"
+
+
+def _is_precondition_failed(error: Exception) -> bool:
+    from botocore.exceptions import ClientError
+
+    return isinstance(error, ClientError) and error.response.get("Error", {}).get(
+        "Code"
+    ) in {"PreconditionFailed", "412"}
 
 
 def _manifest_bytes(ref: BinaryObjectRef) -> bytes:
