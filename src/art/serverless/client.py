@@ -70,6 +70,7 @@ class _ByteBudget:
         self._capacity = capacity
         self._used = 0
         self._condition = asyncio.Condition()
+        self._closed = False
 
     @asynccontextmanager
     async def reserve(self, byte_count: int):
@@ -77,8 +78,10 @@ class _ByteBudget:
             raise RemoteTrainingError("remote result exceeds the client receive budget")
         async with self._condition:
             await self._condition.wait_for(
-                lambda: self._used + byte_count <= self._capacity
+                lambda: self._closed or self._used + byte_count <= self._capacity
             )
+            if self._closed:
+                raise RemoteTrainingError("remote result receive budget is closed")
             self._used += byte_count
         try:
             yield
@@ -86,6 +89,11 @@ class _ByteBudget:
             async with self._condition:
                 self._used -= byte_count
                 self._condition.notify_all()
+
+    async def close(self) -> None:
+        async with self._condition:
+            self._closed = True
+            self._condition.notify_all()
 
 
 def _sha256(payload: bytes) -> str:
@@ -423,6 +431,7 @@ class RemoteTrainingServiceClient:
         return response
 
     async def close(self) -> None:
+        await self._result_budget.close()
         if self._owns_clients:
             await asyncio.gather(
                 self._control_client.aclose(), self._transfer_client.aclose()

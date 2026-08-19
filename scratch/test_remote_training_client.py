@@ -395,6 +395,44 @@ async def test_operation_result_rejects_content_length_before_allocation():
     await http.aclose()
 
 
+@pytest.mark.asyncio
+async def test_operation_result_receive_budget_close_wakes_waiters():
+    payload = b"1234"
+    release = asyncio.Event()
+    first_started = asyncio.Event()
+
+    class BlockedResult(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            first_started.set()
+            await release.wait()
+            yield payload
+
+    async def handle(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=BlockedResult())
+
+    http = httpx.AsyncClient(
+        base_url="http://test/v1/", transport=httpx.MockTransport(handle)
+    )
+    service = RemoteTrainingServiceClient(
+        api_key="test",
+        base_url="http://test/v1",
+        control_http_client=http,
+        transfer_http_client=http,
+        max_result_bytes_in_flight=len(payload),
+    )
+    ref = OperationResultRef(object_id="0" * 64, byte_count=len(payload))
+    first = asyncio.create_task(service.get_operation_result("first", ref))
+    await first_started.wait()
+    waiting = asyncio.create_task(service.get_operation_result("waiting", ref))
+    await asyncio.sleep(0)
+    await service.close()
+    with pytest.raises(RemoteTrainingError, match="budget is closed"):
+        await waiting
+    release.set()
+    assert await first == payload
+    await http.aclose()
+
+
 def test_tokenized_request_rejects_oversized_logprob_result(monkeypatch):
     monkeypatch.setattr("art.training.contracts.MAX_TOKENIZED_LOGPROB_VALUES", 3)
     with pytest.raises(ValueError, match="configured value limit"):
