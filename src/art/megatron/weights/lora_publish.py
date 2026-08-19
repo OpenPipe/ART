@@ -899,10 +899,12 @@ def save_vllm_lora_snapshot(
     output_dir: str,
     *,
     prepared_tensors: PreparedSafetensors | None = None,
+    model_identity: FileIdentity | None = None,
 ) -> dict[str, FileIdentity]:
     return save_vllm_lora_tensors(
         output_dir,
         snapshot.tensors,
         snapshot.adapter_config,
         prepared_tensors=prepared_tensors,
+        model_identity=model_identity,
     )

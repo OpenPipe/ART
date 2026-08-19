@@ -15,7 +15,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 import torch
 
-from art.utils.safetensors import PreparedSafetensors, save_prepared_safetensors
+from art.utils.safetensors import (
+    FileIdentity,
+    PreparedSafetensors,
+    save_prepared_safetensors,
+)
 
 
 class _TransportRecord(BaseModel):
@@ -58,6 +62,7 @@ class AdapterReceiveResult(_TransportRecord):
 class AdapterTransferNotification(_TransportRecord):
     generation_id: str = Field(min_length=1)
     used_bytes: int = Field(gt=0)
+    model_identity: FileIdentity
     adapter_config: dict[str, Any]
     sender_staging_s: float = Field(ge=0)
     sender_registration_s: float = Field(ge=0)
@@ -319,6 +324,7 @@ class AdapterSnapshotReceiver:
                     (pending.slot.block.narrow(0, 0, notification.used_bytes),)
                 ),
                 path / "adapter_model.safetensors",
+                identity=notification.model_identity,
             )
             with (path / "adapter_config.json").open("w", encoding="utf-8") as output:
                 json.dump(notification.adapter_config, output, indent=2, sort_keys=True)
@@ -516,6 +522,8 @@ class NixlAdapterSender:
         payload: PreparedSafetensors,
         adapter_config: dict[str, Any],
         targets: tuple[AdapterTransferTarget, ...],
+        *,
+        model_identity: FileIdentity,
     ) -> None:
         if not targets:
             return
@@ -523,6 +531,8 @@ class NixlAdapterSender:
         if any(target.generation_id != first.generation_id for target in targets[1:]):
             raise RuntimeError("Adapter transfer targets disagree")
         used_bytes = payload.nbytes
+        if model_identity.size_bytes != used_bytes:
+            raise RuntimeError("Adapter payload identity size does not match payload")
         if any(used_bytes > target.capacity_bytes for target in targets):
             raise RuntimeError("Adapter payload exceeds prepared receive capacity")
         agent = self._require_agent()
@@ -534,6 +544,7 @@ class NixlAdapterSender:
             AdapterTransferNotification(
                 generation_id=first.generation_id,
                 used_bytes=used_bytes,
+                model_identity=model_identity,
                 adapter_config=adapter_config,
                 sender_staging_s=time.monotonic() - staging_started,
                 sender_registration_s=sender_registration_s,
@@ -630,6 +641,7 @@ class AdapterSnapshotSender:
         targets: tuple[AdapterTransferTarget, ...],
         *,
         prepared_tensors: PreparedSafetensors,
+        model_identity: FileIdentity,
     ) -> None:
         transports = {target.transport for target in targets}
         if not targets:
@@ -643,9 +655,15 @@ class AdapterSnapshotSender:
                 prepared_tensors,
                 {**snapshot.adapter_config, "art_lora_format": "vllm"},
                 targets,
+                model_identity=model_identity,
             )
             return
-        self._send_local(snapshot, targets, prepared_tensors=prepared_tensors)
+        self._send_local(
+            snapshot,
+            targets,
+            prepared_tensors=prepared_tensors,
+            model_identity=model_identity,
+        )
 
     @staticmethod
     def _send_local(
@@ -653,6 +671,7 @@ class AdapterSnapshotSender:
         targets: tuple[AdapterTransferTarget, ...],
         *,
         prepared_tensors: PreparedSafetensors,
+        model_identity: FileIdentity,
     ) -> None:
         from art.megatron.weights.lora_publish import save_vllm_lora_snapshot
 
@@ -666,10 +685,12 @@ class AdapterSnapshotSender:
                 snapshot,
                 target.path,
                 prepared_tensors=prepared_tensors,
+                model_identity=model_identity,
             )
             notification = AdapterTransferNotification(
                 generation_id=target.generation_id,
                 used_bytes=prepared_tensors.nbytes,
+                model_identity=model_identity,
                 adapter_config=snapshot_config,
                 sender_staging_s=time.monotonic() - started,
                 sender_registration_s=0.0,

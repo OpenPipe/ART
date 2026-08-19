@@ -2562,6 +2562,7 @@ class _GenerationPublisher:
                 payload.lora,
                 prepared.publication_targets,
                 prepared_tensors=payload.tensors,
+                model_identity=payload.model_identity,
             )
         return _SnapshotTransport(
             adapter=adapter,
@@ -2669,6 +2670,7 @@ class _GenerationPublisher:
         targets: tuple[Any, ...],
         *,
         prepared_tensors: PreparedSafetensors,
+        model_identity: FileIdentity,
     ) -> None:
         from art.distributed.adapter_transport import AdapterSnapshotSender
 
@@ -2679,6 +2681,7 @@ class _GenerationPublisher:
                 lora,
                 targets,
                 prepared_tensors=prepared_tensors,
+                model_identity=model_identity,
             )
 
     def _publish_lora_object_once(

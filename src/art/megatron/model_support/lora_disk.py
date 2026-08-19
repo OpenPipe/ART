@@ -90,12 +90,14 @@ def save_vllm_lora_tensors(
     adapter_config: dict[str, Any],
     *,
     prepared_tensors: PreparedSafetensors | None = None,
+    model_identity: FileIdentity | None = None,
 ) -> dict[str, FileIdentity]:
     base_dir = Path(lora_path)
     base_dir.mkdir(parents=True, exist_ok=True)
     model = save_prepared_safetensors(
         prepared_tensors or prepare_safetensors(tensors),
         base_dir / "adapter_model.safetensors",
+        identity=model_identity,
     )
     config = save_adapter_config(
         base_dir,
