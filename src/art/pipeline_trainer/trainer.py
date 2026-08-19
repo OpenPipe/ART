@@ -50,7 +50,11 @@ from art.pipeline_tuner import (
     RolloutWorkerController,
 )
 from art.preprocessing.policy_spans import PolicyTokenSpan
-from art.utils.lifecycle import complete_task
+from art.utils.lifecycle import (
+    complete_task,
+    consume_future_exception,
+    process_shutdown_timeout,
+)
 
 from .checkpoint_retention import (
     CHECKPOINT_CREATED_AT_METRIC,
@@ -68,6 +72,7 @@ PIPELINE_STATE_KEY = "_pipeline_trainer"
 _ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
 _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 _QUEUE_WAIT_TIME_KEY = "_art_queue_wait_s"
+_PIPELINE_SHUTDOWN_TIMEOUT_SECONDS = process_shutdown_timeout(1)
 _SCORE_FRESHNESS_TAU_STEPS = 8.0
 # Rollout critical batch size from the best current GRPO/RLVR evidence. This is
 # grounded in reported experiments, not a well-validated universal constant.
@@ -556,54 +561,81 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     except (ValueError, RuntimeError):
                         pass
             cleanup_failures: list[BaseException] = []
+            shutdown_deadline = loop.time() + _PIPELINE_SHUTDOWN_TIMEOUT_SECONDS
+
+            def record_cleanup_failure(error: BaseException | None) -> None:
+                if error is not None and all(
+                    error is not failure for failure in cleanup_failures
+                ):
+                    cleanup_failures.append(error)
+
+            async def run_cleanup(operation: Awaitable[Any], description: str) -> bool:
+                try:
+                    error = await self._run_shutdown_operation(
+                        operation,
+                        deadline=shutdown_deadline,
+                        description=description,
+                    )
+                except BaseException as exc:
+                    error = exc
+                record_cleanup_failure(error)
+                return error is None
+
             self._accept_prepared_batches = False
+            await run_cleanup(
+                self._discard_pending_prepared_batches(),
+                "discarding pending prepared batches",
+            )
             try:
-                await self._discard_pending_prepared_batches()
+                for error in await self._settle_shutdown_tasks(
+                    self._post_train_tasks,
+                    cancel=training_failed,
+                    deadline=shutdown_deadline,
+                    description="post-training tasks",
+                ):
+                    record_cleanup_failure(error)
             except BaseException as exc:
-                cleanup_failures.append(exc)
-            if self._post_train_tasks:
-                results = await asyncio.gather(
-                    *tuple(self._post_train_tasks), return_exceptions=True
-                )
+                record_cleanup_failure(exc)
+            finally:
                 self._post_train_tasks.clear()
-                cleanup_failures.extend(
-                    result for result in results if isinstance(result, BaseException)
-                )
+            cancel_readiness = training_failed
             if not training_failed:
-                try:
-                    await self._finalize_backend_training()
-                except BaseException as exc:
-                    cleanup_failures.append(exc)
-            if self._publication_metric_tasks:
-                await asyncio.gather(
-                    *tuple(self._publication_metric_tasks), return_exceptions=True
+                cancel_readiness = not await run_cleanup(
+                    self._finalize_backend_training(),
+                    "finalizing backend training",
                 )
-            if self._publication_metric_failure is not None:
-                cleanup_failures.append(self._publication_metric_failure)
-            if isinstance(self._output_queue, DistributedTrajectoryQueue):
-                try:
-                    await self._output_queue.close()
-                except BaseException as exc:
-                    cleanup_failures.append(exc)
             try:
-                await self._stop_attachments(training_failed=training_failed)
+                for error in await self._settle_shutdown_tasks(
+                    self._publication_metric_tasks | self._checkpoint_log_tasks,
+                    cancel=cancel_readiness,
+                    deadline=shutdown_deadline,
+                    description="publication metric/readiness tasks",
+                ):
+                    record_cleanup_failure(error)
             except BaseException as exc:
-                cleanup_failures.append(exc)
+                record_cleanup_failure(exc)
+            finally:
+                self._publication_metric_tasks.clear()
+                self._checkpoint_log_tasks.clear()
+            if isinstance(self._output_queue, DistributedTrajectoryQueue):
+                await run_cleanup(
+                    self._output_queue.close(), "closing the trajectory queue"
+                )
+            await run_cleanup(
+                self._stop_attachments(training_failed=training_failed),
+                "stopping pipeline attachments",
+            )
             for cleanup in (self._status.flush, self._status.close):
                 try:
                     cleanup()
                 except BaseException as exc:
-                    cleanup_failures.append(exc)
-            try:
-                await self._release_all_scheduled_eval_leases()
-            except BaseException as exc:
-                cleanup_failures.append(exc)
-            if self._checkpoint_log_tasks:
-                await asyncio.gather(
-                    *tuple(self._checkpoint_log_tasks), return_exceptions=True
-                )
-            if self._checkpoint_log_failure is not None:
-                cleanup_failures.append(self._checkpoint_log_failure)
+                    record_cleanup_failure(exc)
+            await run_cleanup(
+                self._release_all_scheduled_eval_leases(),
+                "releasing scheduled eval leases",
+            )
+            record_cleanup_failure(self._publication_metric_failure)
+            record_cleanup_failure(self._checkpoint_log_failure)
             if cleanup_failures:
                 if primary_failure is not None:
                     raise BaseExceptionGroup(
@@ -615,6 +647,67 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 raise BaseExceptionGroup(
                     "Pipeline cleanup failed.", cleanup_failures
                 ) from None
+
+    @staticmethod
+    async def _run_shutdown_operation(
+        operation: Awaitable[Any], *, deadline: float, description: str
+    ) -> BaseException | None:
+        task = asyncio.ensure_future(operation)
+        try:
+            done, _ = await asyncio.wait(
+                (task,),
+                timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+            )
+        except BaseException:
+            task.cancel()
+            task.add_done_callback(consume_future_exception)
+            raise
+        if task not in done:
+            task.cancel()
+            task.add_done_callback(consume_future_exception)
+            return TimeoutError(f"Pipeline shutdown timed out while {description}.")
+        if task.cancelled():
+            return asyncio.CancelledError(
+                f"Pipeline cleanup was cancelled while {description}."
+            )
+        return task.exception()
+
+    @staticmethod
+    async def _settle_shutdown_tasks(
+        tasks: set[asyncio.Task[None]],
+        *,
+        cancel: bool,
+        deadline: float,
+        description: str,
+    ) -> list[BaseException]:
+        tracked = tuple(tasks)
+        if cancel:
+            for task in tracked:
+                task.cancel()
+        if not tracked:
+            return []
+        done, pending = await asyncio.wait(
+            tracked,
+            timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+        )
+        failures = [
+            error
+            for task in tracked
+            if task in done
+            and not task.cancelled()
+            and (error := task.exception()) is not None
+        ]
+        if pending:
+            for task in pending:
+                task.cancel()
+                task.add_done_callback(consume_future_exception)
+            failures.append(
+                TimeoutError(
+                    f"{len(pending)} {description} did not stop before the pipeline "
+                    "shutdown deadline."
+                )
+            )
+        return failures
 
     def request_stop(self) -> None:
         """Request a clean shutdown of the pipeline stages."""
@@ -2475,13 +2568,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     async def _log_publication_metrics_when_ready(
         self, step: int, ready: Awaitable[dict[str, float]]
     ) -> None:
-        try:
-            metrics = await ready
-        except asyncio.CancelledError:
-            raise
-        except BaseException:
-            # The backend owns and surfaces publication failures at its next boundary.
-            return
+        metrics = await ready
         if not metrics:
             return
         await self._emit_pipeline_metrics(metrics, step=step)
