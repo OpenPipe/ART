@@ -316,7 +316,7 @@ class MegatronTrainingSlot:
                 batch=batch,
                 global_grad_accumulation_sequences=grad_sequences,
                 tokenization_s=time.perf_counter() - started,
-                packing=sft_packing_outcome(batch),
+                packing=sft_packing_outcome(batch, physical_sequences=grad_sequences),
             )
         if request.batch.kind == "tokenized":
             packed = await self.runtime.pack(

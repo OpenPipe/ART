@@ -457,7 +457,9 @@ class LocalMegatronTrainingClient:
                 result_type = ForwardBackwardResult if backward else ForwardResult
                 return result_type(
                     operation_id=admission.ref.operation_id,
-                    packing=sft_packing_outcome(batch),
+                    packing=sft_packing_outcome(
+                        batch, physical_sequences=grad_sequences
+                    ),
                     loss_fn_outputs=tuple(
                         LossFnOutput(token_logprobs=values)
                         for values in raw["token_logprobs"]
@@ -710,6 +712,7 @@ class LocalMegatronTrainingClient:
                         optimizer_state_path=self._service.optimizer_state_path,
                         optimizer_generation_id=durable.adapter.generation_id,
                     ),
+                    overwrite=request.overwrite,
                 )
                 return SaveStateResult(
                     operation_id=admission.ref.operation_id,
@@ -810,12 +813,20 @@ class LocalMegatronTrainingClient:
         )
 
     def _remember_checkpoint(
-        self, checkpoint_id: str, checkpoint: ResolvedCheckpointState
+        self,
+        checkpoint_id: str,
+        checkpoint: ResolvedCheckpointState,
+        *,
+        overwrite: bool = False,
     ) -> None:
         existing = self._checkpoints.get(checkpoint_id)
-        if existing is not None and (
-            existing.adapter_path != checkpoint.adapter_path
-            or existing.adapter_step != checkpoint.adapter_step
+        if (
+            existing is not None
+            and (
+                existing.adapter_path != checkpoint.adapter_path
+                or existing.adapter_step != checkpoint.adapter_step
+            )
+            and not overwrite
         ):
             raise RuntimeError(
                 f"checkpoint name {checkpoint_id!r} identifies different learners"

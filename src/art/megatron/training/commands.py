@@ -115,16 +115,19 @@ def sft_batch_data(batch: SFTBatch) -> SFTBatchData:
     )
 
 
-def sft_packing_outcome(batch: SFTBatchData) -> PackingOutcome:
+def sft_packing_outcome(
+    batch: SFTBatchData, *, physical_sequences: int
+) -> PackingOutcome:
     max_length = max(
         int(tensors["input_ids"].numel()) for tensors in batch.trajectory_tensors
     )
+    physical_tokens = max_length * physical_sequences
     return PackingOutcome(
         packed_sequence_length=max_length,
-        packed_sequences=batch.num_trajectories,
-        target_packed_sequences=batch.num_trajectories,
-        nominal_capacity_tokens=batch.num_tokens,
-        physical_tokens=batch.num_tokens,
+        packed_sequences=physical_sequences,
+        target_packed_sequences=physical_sequences,
+        nominal_capacity_tokens=physical_tokens,
+        physical_tokens=physical_tokens,
         non_padding_tokens=batch.num_tokens,
         loss_bearing_tokens=batch.num_trainable_tokens,
         trainable_assistant_tokens=batch.num_trainable_tokens,
