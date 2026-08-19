@@ -1377,7 +1377,7 @@ class TrainerRank:
             raise TypeError(
                 "adapter_config['base_model_name_or_path'] must be a string"
             )
-        if base_model.startswith(("Qwen/Qwen3.5-", "Qwen/Qwen3.6-")):
+        if base_model.startswith(("Qwen/Qwen3.5-", "Qwen/Qwen3.6-", "Qwen/Qwen3.8-")):
             dimensions = {
                 "num_attention_heads": getattr(
                     self.runtime.provider, "num_attention_heads", None
