@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import mmap
 import tracemalloc
 
 import numpy as np
@@ -224,10 +225,30 @@ def test_tokenized_routes_reject_readonly_view_of_mutable_owner() -> None:
     segment = memoryview(owner).toreadonly()
     assert segment.readonly and segment.c_contiguous and segment.format == "B"
 
-    with pytest.raises(ValueError, match="immutable backing"):
+    with pytest.raises(ValueError, match="bytes backing"):
         TokenizedMoeRoutes(
             num_experts=16,
             dtype="uint8",
             shape=(1, 4, 2),
             data=(segment,),
         )
+
+
+def test_tokenized_routes_reject_hashable_file_backing(tmp_path) -> None:
+    path = tmp_path / "routes.bin"
+    path.write_bytes(bytes(8))
+    with path.open("rb") as stream:
+        owner = mmap.mmap(stream.fileno(), 8, access=mmap.ACCESS_READ)
+        segment = memoryview(owner)
+        try:
+            assert hash(segment) == hash(bytes(segment))
+            with pytest.raises(ValueError, match="bytes backing"):
+                TokenizedMoeRoutes(
+                    num_experts=16,
+                    dtype="uint8",
+                    shape=(1, 4, 2),
+                    data=(segment,),
+                )
+        finally:
+            segment.release()
+            owner.close()
