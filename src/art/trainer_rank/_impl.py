@@ -234,6 +234,7 @@ class _AdapterConfig(TypedDict):
     r: int
     lora_alpha: float
     target_modules: str | list[str]
+    moe_parameterization: NotRequired[Literal["per_expert", "shared_outer"]]
     num_attention_heads: NotRequired[int]
     num_key_value_heads: NotRequired[int]
     head_dim: NotRequired[int]
@@ -1830,6 +1831,7 @@ class TrainerRank:
         rank = config["r"]
         config_alpha_value = config["lora_alpha"]
         target_modules = config["target_modules"]
+        moe_parameterization = config.get("moe_parameterization", "per_expert")
         if not isinstance(base_model, str):
             raise TypeError(
                 "adapter_config['base_model_name_or_path'] must be a string"
@@ -1861,6 +1863,11 @@ class TrainerRank:
             raise TypeError(
                 "adapter_config['target_modules'] must be a string or list of strings"
             )
+        if moe_parameterization not in ("per_expert", "shared_outer"):
+            raise ValueError(
+                "adapter_config['moe_parameterization'] must be 'per_expert' or "
+                f"'shared_outer', got {moe_parameterization!r}"
+            )
         if rank < 1:
             raise ValueError("adapter_config['r'] must be >= 1")
         config_alpha = float(config_alpha_value)
@@ -1876,19 +1883,32 @@ class TrainerRank:
         from art.megatron.lora import LoRA
 
         ref = self._slot_ref(name)
-        slots = [
-            slot
+        sites = [
+            (module, slot)
             for chunk in self.runtime.model
             for module in chunk.modules()
             if isinstance(module, LoRA)
             if (slot := module._slot(ref)) is not None
         ]
+        slots = [slot for _module, slot in sites]
         expected = (int(config["r"]), float(config["lora_alpha"]))
         actual = {(slot.rank, slot.alpha) for slot in slots}
         if actual != {expected}:
             raise ValueError(
                 f"Adapter config for checkpoint slot {name!r} declares "
                 f"rank/alpha={expected}, loaded weights use {sorted(actual)}"
+            )
+        expected_parameterization = config.get("moe_parameterization", "per_expert")
+        actual_parameterizations = {
+            slot.parameterization for module, slot in sites if module.is_expert
+        }
+        if actual_parameterizations and actual_parameterizations != {
+            expected_parameterization
+        }:
+            raise ValueError(
+                f"Adapter config for checkpoint slot {name!r} declares MoE "
+                f"parameterization={expected_parameterization!r}, loaded weights use "
+                f"{sorted(actual_parameterizations)}"
             )
 
     @overload
@@ -2248,7 +2268,9 @@ class TrainerRank:
         templates: dict[str, torch.Tensor] = {}
         for chunk in self.runtime.model:
             for module in chunk.modules():
-                expected_weight_keys = getattr(module, "_expected_weight_keys", None)
+                expected_weight_keys = getattr(
+                    module, "_expected_weight_keys_for_param", None
+                )
                 if not callable(expected_weight_keys):
                     continue
                 for suffix, parameter_name in (
@@ -2258,9 +2280,28 @@ class TrainerRank:
                     parameter = getattr(module, parameter_name, None)
                     if not isinstance(parameter, torch.Tensor):
                         continue
-                    templates.update(
-                        (str(key), parameter) for key in expected_weight_keys(suffix)
+                    parameterizations = (
+                        ("per_expert", "shared_outer")
+                        if getattr(module, "shared_factor", None) is not None
+                        else (getattr(parameter, "lora_moe_parameterization", None),)
                     )
+                    for parameterization in parameterizations:
+                        key_parameter = parameter
+                        if parameterization != getattr(
+                            parameter, "lora_moe_parameterization", None
+                        ):
+                            key_parameter = torch.nn.Parameter(
+                                parameter.new_empty(0), requires_grad=False
+                            )
+                            setattr(
+                                key_parameter,
+                                "lora_moe_parameterization",
+                                parameterization,
+                            )
+                        templates.update(
+                            (str(key), parameter)
+                            for key in expected_weight_keys(suffix, key_parameter)
+                        )
         return templates
 
     def _iter_slot_parameters(self, ref: "LoRASlotRef") -> Iterator[torch.nn.Parameter]:
@@ -2271,12 +2312,15 @@ class TrainerRank:
     def _local_parameter_key_groups(self, name: str) -> tuple[tuple[str, ...], ...]:
         ref = self._slot_ref(name)
         return tuple(
-            tuple(str(key) for key in expected(str(suffix).removesuffix(".weight")))
+            tuple(
+                str(key) for key in expected(str(suffix).removesuffix(".weight"), param)
+            )
             for chunk in self.runtime.model
             for module in chunk.modules()
             if (lora_params := getattr(module, "_lora_params", None)) is not None
-            if (expected := getattr(module, "_expected_weight_keys", None)) is not None
-            for suffix, _param in lora_params(ref)
+            if (expected := getattr(module, "_expected_weight_keys_for_param", None))
+            is not None
+            for suffix, param in lora_params(ref)
         )
 
     def _validate_checkpoint_consistency(

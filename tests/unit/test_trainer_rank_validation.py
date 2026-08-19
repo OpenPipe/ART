@@ -178,7 +178,9 @@ class _FakeLoRASite(torch.nn.Module):
         self.A_T = torch.nn.Parameter(torch.zeros(4, 2, device=device, dtype=dtype))
         self.B_T = torch.nn.Parameter(torch.zeros(2, 5, device=device, dtype=dtype))
 
-    def _expected_weight_keys(self, suffix: str) -> list[str]:
+    def _expected_weight_keys_for_param(
+        self, suffix: str, _parameter: torch.nn.Parameter
+    ) -> list[str]:
         return [f"{self.prefix}.{suffix}.weight"]
 
 

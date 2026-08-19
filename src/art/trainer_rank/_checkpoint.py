@@ -1547,7 +1547,7 @@ def _optimizer_state(
                 suffix = suffix.removesuffix(".weight")
                 keys = [
                     key
-                    for key in module._expected_weight_keys(suffix)
+                    for key in module._expected_weight_keys_for_param(suffix, parameter)
                     if isinstance(key, str)
                 ]
                 records = [source.manifest["parameters"][key] for key in keys]
@@ -1571,7 +1571,13 @@ def _optimizer_state(
                 key: loaded[record[index]][key]
                 for key, record in zip(keys, records, strict=True)
             }
-            full = module._adapter_weight(tensors, suffix=suffix)
+            full = module._adapter_weight(
+                tensors,
+                suffix=suffix,
+                moe_parameterization=getattr(
+                    parameter, "lora_moe_parameterization", None
+                ),
+            )
             components[component].append(_localized(module, full, parameter))
         key_steps = {source.manifest["steps"][key] for key in keys}
         if len(key_steps) != 1:
@@ -1745,9 +1751,9 @@ def stage_checkpoint_slot_load(
     sites = _phase(stage, "stage detached checkpoint adapter", group)
     covered = {
         str(key)
-        for module, _slot in sites
-        for suffix in ("lora_A", "lora_B")
-        for key in module._expected_weight_keys(suffix)
+        for module, slot in sites
+        for suffix, parameter in (("lora_A", slot.A_T), ("lora_B", slot.B_T))
+        for key in module._expected_weight_keys_for_param(suffix, parameter)
     }
     distributed_coverage = {
         key for keys in _gather(tuple(covered), group) for key in keys
