@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from bisect import bisect_right
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import suppress
 import hashlib
 from io import BytesIO, RawIOBase
 import json
@@ -323,7 +324,7 @@ class S3BinaryObjectStore:
             Bucket=self.config.bucket, Key=key
         )
         upload_id = upload["UploadId"]
-        futures: list[tuple[int, Future[dict[str, object]]]] = []
+        futures: dict[Future[dict[str, object]], int] = {}
         completed: list[dict[str, object]] = []
         part_bytes = _multipart_part_bytes(
             total,
@@ -334,26 +335,30 @@ class S3BinaryObjectStore:
             for part_number, (offset, byte_count) in enumerate(
                 _multipart_ranges(total, part_bytes), 1
             ):
-                futures.append(
-                    (
-                        part_number,
-                        self._parts.submit(
-                            self._client.upload_part,
-                            Bucket=self.config.bucket,
-                            Key=key,
-                            UploadId=upload_id,
-                            PartNumber=part_number,
-                            Body=_ChunkRangeReader(
-                                chunks,
-                                offset=offset,
-                                byte_count=byte_count,
-                            ),
-                        ),
-                    )
+                future = self._parts.submit(
+                    self._client.upload_part,
+                    Bucket=self.config.bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                    PartNumber=part_number,
+                    Body=_ChunkRangeReader(
+                        chunks,
+                        offset=offset,
+                        byte_count=byte_count,
+                    ),
                 )
+                futures[future] = part_number
                 if len(futures) >= self.config.multipart_concurrency:
-                    completed.append(_complete_part(futures.pop(0)))
-            completed.extend(_complete_part(value) for value in futures)
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    completed.extend(
+                        _complete_part(futures.pop(future), future) for future in done
+                    )
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                completed.extend(
+                    _complete_part(futures.pop(future), future) for future in done
+                )
+            completed.sort(key=lambda value: int(value["PartNumber"]))
             self._client.complete_multipart_upload(
                 Bucket=self.config.bucket,
                 Key=key,
@@ -361,6 +366,13 @@ class S3BinaryObjectStore:
                 MultipartUpload={"Parts": completed},
             )
         except BaseException:
+            pending = tuple(futures)
+            for future in pending:
+                future.cancel()
+            wait(pending)
+            for future in pending:
+                with suppress(BaseException):
+                    future.result()
             self._client.abort_multipart_upload(
                 Bucket=self.config.bucket, Key=key, UploadId=upload_id
             )
@@ -747,8 +759,9 @@ class _MemoryviewWriter(RawIOBase):
             raise RuntimeError("binary object download was incomplete")
 
 
-def _complete_part(value: tuple[int, Future[dict[str, object]]]) -> dict[str, object]:
-    part_number, future = value
+def _complete_part(
+    part_number: int, future: Future[dict[str, object]]
+) -> dict[str, object]:
     return {"ETag": future.result()["ETag"], "PartNumber": part_number}
 
 
