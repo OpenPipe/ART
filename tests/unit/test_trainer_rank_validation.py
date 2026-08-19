@@ -978,7 +978,13 @@ def test_checkpoint_slot_adapter_config_is_validated_and_copied() -> None:
         trainer._validate_checkpoint_adapter_config("student", {"r": 8}, alpha=None)
 
 
-def test_qwen35_checkpoint_adapter_config_captures_attention_dimensions() -> None:
+@pytest.mark.parametrize(
+    "base_model",
+    ("Qwen/Qwen3.5-4B", "Qwen/Qwen3.6-27B", "Qwen/Qwen3.8-27B"),
+)
+def test_qwen35_checkpoint_adapter_config_captures_attention_dimensions(
+    base_model: str,
+) -> None:
     runtime = _runtime()
     runtime.provider.num_attention_heads = 16
     runtime.provider.num_query_groups = 4
@@ -988,7 +994,7 @@ def test_qwen35_checkpoint_adapter_config_captures_attention_dimensions() -> Non
     retained = trainer._validate_checkpoint_adapter_config(
         "student",
         {
-            "base_model_name_or_path": "Qwen/Qwen3.5-4B",
+            "base_model_name_or_path": base_model,
             "r": 8,
             "lora_alpha": 16,
             "target_modules": ["q_proj"],

@@ -161,6 +161,7 @@ QWEN3_5_DENSE_SPEC = ModelSupportSpec(
         "Qwen/Qwen3.5-4B",
         "Qwen/Qwen3.5-27B",
         "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.8-27B",
     ),
     default_target_modules=_QWEN3_5_DENSE_TARGET_MODULES,
     native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
