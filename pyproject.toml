@@ -17,6 +17,7 @@ dependencies = [
     "polars>=1.26.0",
     "tblib>=3.0.0",
     "nest-asyncio>=1.6.0",
+    "numpy<2",
     "setproctitle>=1.3.6",
 ]
 
@@ -29,6 +30,7 @@ distributed = [
     "torch==2.11.0 ; sys_platform == 'darwin'",
     "torchmonarch==0.6.0",
     "transformers>=5.2.0,<=5.12.1",
+    "uv>=0.11.7",
 ]
 distributed-cu130 = [
     "aiohttp>=3.13.0",
@@ -36,6 +38,7 @@ distributed-cu130 = [
     "torch==2.11.0+cu130 ; sys_platform == 'linux'",
     "torchmonarch==0.6.0",
     "transformers>=5.2.0,<=5.12.1",
+    "uv>=0.11.7",
 ]
 tensors = ["torch==2.11.0"]
 
@@ -62,6 +65,7 @@ backend = [
     "gql>=4.0.0",
     "nvidia-cudnn-frontend<1.21 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
+    "uv>=0.11.7",
 ]
 backend-cu130 = [
     "peft>=0.14.0",
@@ -86,68 +90,30 @@ backend-cu130 = [
     "nvidia-cudnn-frontend<1.21 ; sys_platform == 'linux'",
     "nvidia-nccl-cu13==2.28.9 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
+    "uv>=0.11.7",
 ]
 megatron = [
     "aiohttp>=3.13.0",
     "msgspec>=0.21.0",
     "numpy<2",
+    "nixl-cu12==1.3.2 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "peft>=0.14.0",
     "torch==2.11.0+cu128 ; sys_platform == 'linux' or sys_platform == 'win32'",
     "torch==2.11.0 ; sys_platform == 'darwin'",
-    "torchvision==0.26.0+cu128 ; sys_platform == 'linux' or sys_platform == 'win32'",
-    "torchvision==0.26.0 ; sys_platform == 'darwin'",
-    "flash-attn-4==4.0.0b5",
-    "flashinfer-cubin==0.6.8.post1",
-    "flashinfer-python==0.6.8.post1",
-    "ninja>=1.11.1",
-    "quack-kernels==0.3.9",
-    "apex",
-    "transformer-engine==2.11.0",
-    "transformer-engine-cu12==2.11.0",
-    "transformer-engine-torch==2.11.0",
-    "megatron-core==0.17.0",
-    "pybind11>=2.13.6",
-    "setuptools>=78.1.0",
-    "megatron-bridge==0.4.0rc0",
     "torchmonarch==0.6.0",
-    "nvidia-cuda-cccl-cu12==12.9.27 ; sys_platform == 'linux'",
-    "tilelang==0.1.10 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "causal-conv1d==1.6.1 ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
-    "mamba-ssm==2.3.1 ; sys_platform == 'linux' and platform_machine == 'x86_64' and python_full_version < '3.12'",
-    "nvidia-ml-py==13.580.82",
-    "nvidia-modelopt>=0.42.0a0 ; sys_platform != 'darwin'",
-    "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
     "transformers==5.12.1",
-    "scipy>=1.17.0",
-    "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
+    "uv>=0.11.7",
 ]
 megatron-cu130 = [
     "aiohttp>=3.13.0",
     "msgspec>=0.21.0",
     "numpy<2",
+    "nixl-cu13==1.3.2 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "peft>=0.14.0",
     "torch==2.11.0+cu130 ; sys_platform == 'linux'",
-    "torchvision==0.26.0+cu130 ; sys_platform == 'linux'",
-    "flash-attn-4==4.0.0b5",
-    "flashinfer-cubin==0.6.8.post1",
-    "flashinfer-python==0.6.8.post1",
-    "ninja>=1.11.1",
-    "quack-kernels==0.3.9",
-    "apex",
-    "transformer-engine==2.14.1",
-    "transformer-engine-cu13==2.14.1",
-    "transformer-engine-torch==2.14.1",
-    "megatron-core==0.17.0",
-    "pybind11>=2.13.6",
-    "setuptools>=78.1.0",
-    "megatron-bridge==0.4.0rc0",
     "torchmonarch==0.6.0",
-    "tilelang==0.1.10 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "nvidia-ml-py==13.580.82",
-    "nvidia-nccl-cu13==2.28.9 ; sys_platform == 'linux'",
-    "nvidia-modelopt>=0.42.0a0 ; sys_platform != 'darwin'",
-    "nvidia-resiliency-ext<0.5 ; sys_platform == 'linux'",
     "transformers==5.12.1",
-    "scipy>=1.17.0",
-    "ml-dtypes>=0.5.0 ; python_full_version < '3.13'",
+    "uv>=0.11.7",
 ]
 
 langgraph = [
@@ -165,8 +131,7 @@ tinker = [
     "protobuf>=6.31.1",
     "tinker-cookbook>=0.5.2,<0.6",
     "tinker>=0.23.4,<0.24",
-    "torch==2.11.0+cu128 ; sys_platform == 'linux' or sys_platform == 'win32'",
-    "torch==2.11.0 ; sys_platform == 'darwin'",
+    "torch==2.11.0",
     "transformers>=5.2.0,<=5.5.3",
     "uvicorn>=0.35.0",
     "datrie>=0.8.3",
@@ -305,80 +270,9 @@ conflicts = [
 ]
 override-dependencies = [
     "click==8.2.0",
-    "flashinfer-python==0.6.8.post1",
-    "megatron-core==0.17.0",
     "numpy<2",
     "nvidia-cublas==13.2.2.2 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5",
-    "quack-kernels==0.3.9",
-]
-exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d", "mamba-ssm"]
-no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-cu13", "transformer-engine-torch", "megatron-bridge", "nv-grouped-gemm"]
-
-[tool.uv.extra-build-dependencies]
-apex = ["torch>=2.11.0"]
-megatron-core = ["pybind11", "setuptools"]
-nv-grouped-gemm = ["torch>=2.11.0"]
-transformer-engine-torch = ["torch>=2.11.0"]
-
-[tool.uv.extra-build-variables]
-apex = { APEX_CPP_EXT = "1", APEX_PARALLEL_BUILD = "16", NVCC_APPEND_FLAGS = "--threads 4" }
-transformer-engine-torch = { NVTE_NO_LOCAL_VERSION = "1" }
-
-[[tool.uv.dependency-metadata]]
-name = "apex"
-version = "0.1"
-requires-dist = ["packaging"]
-
-# Keep Bridge's runtime deps explicit here and let ART's megatron extra own the
-# Transformers pin validated by model-support handlers in this branch.
-[[tool.uv.dependency-metadata]]
-name = "megatron-bridge"
-version = "0.5.0+e1a207ac"
-requires-dist = [
-    "accelerate",
-    "comet-ml",
-    "datasets",
-    "diffusers",
-    "einops",
-    "flash-linear-attention",
-    "flashinfer-cubin",
-    "flashinfer-python",
-    "hydra-core",
-    "imageio",
-    "imageio-ffmpeg",
-    "megatron-core",
-    "mistral-common",
-    "mlflow",
-    "nvidia-resiliency-ext",
-    "omegaconf",
-    "open-clip-torch",
-    "peft",
-    "pyyaml",
-    "qwen-vl-utils",
-    "regex",
-    "rich",
-    "six",
-    "tensorboard",
-    "timm",
-    "torch",
-    "tqdm",
-    "transformers",
-    "typing-extensions",
-    "wandb",
-]
-
-[[tool.uv.dependency-metadata]]
-name = "transformer-engine-torch"
-version = "2.11.0"
-requires-dist = [
-    "einops",
-    "onnx",
-    "onnxscript",
-    "packaging",
-    "pydantic",
-    "torch",
-    "transformer-engine-cu12",
 ]
 
 [tool.ty.src]
@@ -438,6 +332,7 @@ allowed-unresolved-imports = [
     "fla.**",
     "megatron.**",
     "monarch.**",
+    "msgspec.**",
     "quack.**",
     "safetensors.**",
     "scipy.**",
@@ -469,22 +364,11 @@ torch = [
     { index = "pytorch-cu128", extra = "distributed", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { index = "pytorch-cu128", extra = "backend", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { index = "pytorch-cu128", extra = "megatron", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-    { index = "pytorch-cu128", extra = "tinker", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
     { index = "pytorch-cu130", extra = "distributed-cu130", marker = "sys_platform == 'linux'" },
     { index = "pytorch-cu130", extra = "backend-cu130", marker = "sys_platform == 'linux'" },
     { index = "pytorch-cu130", extra = "megatron-cu130", marker = "sys_platform == 'linux'" },
 ]
-torchvision = [
-    { index = "pytorch-cu128", extra = "megatron", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-    { index = "pytorch-cu130", extra = "megatron-cu130", marker = "sys_platform == 'linux'" },
-]
-apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
-flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
-megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" }
 panza = { git = "https://github.com/corbt/panza.git" }
-transformer-engine-torch = [
-    { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "v2.11", subdirectory = "transformer_engine/pytorch", extra = "megatron" },
-]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

@@ -404,6 +404,9 @@ def activate_trainer_child_virtualenv() -> None:
     threads = os.environ.get("MKL_NUM_THREADS", os.environ.get("OMP_NUM_THREADS", "1"))
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(name, threads)
+    executable_env = Path(sys.executable).parent.parent
+    if (executable_env / "pyvenv.cfg").is_file():
+        os.environ["ART_VIRTUAL_ENV"] = str(executable_env)
     activate_child_virtualenv()
 
 

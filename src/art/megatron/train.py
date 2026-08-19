@@ -55,6 +55,7 @@ from art.megatron.model_support.lora_disk import (
 )
 from art.megatron.optimizer_state import (
     ALLOW_UNPAIRED_MEGATRON_RESUME_ENV,
+    _model_runtime_sha256,
     load_optimizer_state,
 )
 from art.megatron.provider import (
@@ -172,6 +173,7 @@ class TrainingRuntime(BaseModel):
     model: ModelChunks
     optimizer: Any | None
     optimizer_config: OptimizerConfig
+    optimizer_runtime_sha256: str | None = None
     optimizer_persistent: bool = True
     resident_run_id: str | None = None
     resident_training_session_id: str | None = None
@@ -538,6 +540,7 @@ def build_training_runtime(
             metrics_group=metrics_group
         ),
     )
+    _model_runtime_sha256(runtime)
     configure_moe_routing_replay(
         runtime,
         replay_bundle_path=moe_routing_replay_path,

@@ -25,6 +25,13 @@ class _NcclRuntimeRequest(BaseModel):
     runtime_kind: Literal["trainer", "vllm"]
     master_addr: str = Field(min_length=1)
     timeout_s: float = Field(gt=0)
+    runtime_python: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_runtime_python(self) -> _NcclRuntimeRequest:
+        if (self.runtime_kind == "trainer") != (self.runtime_python is not None):
+            raise ValueError("trainer NCCL probes require their managed runtime Python")
+        return self
 
 
 class NcclPreflightSessionRequest(BaseModel):
@@ -285,7 +292,8 @@ def _runtime_launch(
     request: _NcclRuntimeRequest, script: str
 ) -> tuple[tuple[str, ...], dict[str, str]]:
     if request.runtime_kind == "trainer":
-        return (_art_python(), "-c", script), os.environ.copy()
+        assert request.runtime_python is not None
+        return (request.runtime_python, "-c", script), os.environ.copy()
     return (
         _art_python(),
         "-c",

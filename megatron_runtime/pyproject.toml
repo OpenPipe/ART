@@ -1,0 +1,183 @@
+[project]
+name = "art-megatron-runtime"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "aiohttp>=3.13.0",
+    "anthropic>=0.77.0",
+    "flash-attn-4==4.0.0b5",
+    "flashinfer-cubin==0.6.8.post1",
+    "flashinfer-python==0.6.8.post1",
+    "litellm>=1.71.1,<=1.82.0",
+    "megatron-bridge==0.4.0rc0",
+    "megatron-core==0.17.0",
+    "ml-dtypes>=0.5.0",
+    "msgspec>=0.21.0",
+    "nest-asyncio>=1.6.0",
+    "ninja>=1.11.1",
+    "numpy<2",
+    "nvidia-cutlass-dsl==4.5.2",
+    "nvidia-ml-py==13.580.82",
+    "nvidia-modelopt>=0.42.0a0",
+    "nvidia-resiliency-ext<0.5",
+    "openai>=2.14.0",
+    "peft>=0.14.0",
+    "polars>=1.26.0",
+    "pydantic>=2.12",
+    "pybind11>=2.13.6",
+    "python-dotenv>=1.0.0",
+    "quack-kernels==0.3.9",
+    "requests>=2.32.0",
+    "scipy>=1.17.0,<1.18",
+    "setproctitle>=1.3.6",
+    "setuptools>=78.1.0",
+    "tblib>=3.0.0",
+    "tilelang==0.1.10",
+    "torchmonarch==0.6.0",
+    "transformers==5.12.1",
+    "typer>=0.15.2",
+    "typing-extensions>=4.13",
+    "uv>=0.11.7",
+    "weave>=0.52.41",
+]
+
+[project.optional-dependencies]
+cuda12 = [
+    "apex",
+    "nixl-cu12==1.3.2",
+    "nvidia-cuda-cccl-cu12==12.9.27",
+    "torch==2.11.0+cu128",
+    "torchvision==0.26.0+cu128",
+    "transformer-engine==2.11.0",
+    "transformer-engine-cu12==2.11.0",
+    "transformer-engine-torch==2.11.0",
+]
+cuda13 = [
+    "nixl-cu13==1.3.2",
+    "nvidia-nccl-cu13==2.28.9",
+    "torch==2.11.0+cu130",
+    "torchvision==0.26.0+cu130",
+    "transformer-engine==2.14.1",
+    "transformer-engine-cu13==2.14.1",
+    "transformer-engine-torch==2.14.1",
+]
+
+[dependency-groups]
+test = [
+    "nbval>=0.11.0",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.1.0",
+]
+
+[tool.uv]
+required-version = ">=0.11.7"
+conflicts = [[{ extra = "cuda12" }, { extra = "cuda13" }]]
+override-dependencies = [
+    "click==8.2.0",
+    "flashinfer-python==0.6.8.post1",
+    "megatron-core==0.17.0",
+    "numpy<2",
+    "nvidia-cublas==13.2.2.2 ; sys_platform == 'linux'",
+    "nvidia-resiliency-ext<0.5",
+    "quack-kernels==0.3.9",
+]
+exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d", "mamba-ssm"]
+no-build-isolation-package = [
+    "apex",
+    "megatron-bridge",
+    "nv-grouped-gemm",
+    "transformer-engine",
+    "transformer-engine-cu12",
+    "transformer-engine-cu13",
+    "transformer-engine-torch",
+]
+
+[tool.uv.extra-build-dependencies]
+apex = ["torch>=2.11.0"]
+megatron-core = ["pybind11", "setuptools"]
+nv-grouped-gemm = ["torch>=2.11.0"]
+transformer-engine-torch = ["torch>=2.11.0"]
+
+[tool.uv.extra-build-variables]
+apex = { APEX_CPP_EXT = "1", APEX_CUDA_EXT = "1", APEX_FAST_LAYER_NORM = "1", APEX_PARALLEL_BUILD = "16", NVCC_APPEND_FLAGS = "--threads 4" }
+transformer-engine-torch = { NVTE_NO_LOCAL_VERSION = "1" }
+
+[[tool.uv.dependency-metadata]]
+name = "apex"
+version = "0.1"
+requires-dist = ["packaging"]
+
+[[tool.uv.dependency-metadata]]
+name = "megatron-bridge"
+version = "0.5.0+e1a207ac"
+requires-dist = [
+    "accelerate",
+    "comet-ml",
+    "datasets",
+    "diffusers",
+    "einops",
+    "flash-linear-attention",
+    "flashinfer-cubin",
+    "flashinfer-python",
+    "hydra-core",
+    "imageio",
+    "imageio-ffmpeg",
+    "megatron-core",
+    "mistral-common",
+    "mlflow",
+    "nvidia-resiliency-ext",
+    "omegaconf",
+    "open-clip-torch",
+    "peft",
+    "pyyaml",
+    "qwen-vl-utils",
+    "regex",
+    "rich",
+    "six",
+    "tensorboard",
+    "timm",
+    "torch",
+    "tqdm",
+    "transformers",
+    "typing-extensions",
+    "wandb",
+]
+
+[[tool.uv.dependency-metadata]]
+name = "transformer-engine-torch"
+version = "2.11.0"
+requires-dist = [
+    "einops",
+    "onnx",
+    "onnxscript",
+    "packaging",
+    "pydantic",
+    "torch",
+    "transformer-engine-cu12",
+]
+
+[tool.uv.sources]
+apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
+flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
+megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" }
+torch = [
+    { index = "pytorch-cu128", extra = "cuda12" },
+    { index = "pytorch-cu130", extra = "cuda13" },
+]
+torchvision = [
+    { index = "pytorch-cu128", extra = "cuda12" },
+    { index = "pytorch-cu130", extra = "cuda13" },
+]
+transformer-engine-torch = [
+    { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "v2.11", subdirectory = "transformer_engine/pytorch", extra = "cuda12" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -58,13 +59,24 @@ _SLOT_SIZE = _SLOT_HEADER.size + _PAYLOAD.size
 _STATE_SIZE = _CONTROL.size + 2 * _SLOT_SIZE
 
 
+def _memfd_create(name: str) -> int:
+    function = ctypes.CDLL(None, use_errno=True).memfd_create
+    function.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    function.restype = ctypes.c_int
+    fd = function(name.encode(), 1)  # MFD_CLOEXEC
+    if fd < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return fd
+
+
 def _slot_offset(sequence: int) -> int:
     return _CONTROL.size + (sequence & 1) * _SLOT_SIZE
 
 
 class FastMetricsSharedWriter:
     def __init__(self) -> None:
-        self.fd = os.memfd_create("art-fast-metrics", os.MFD_CLOEXEC)
+        self.fd = _memfd_create("art-fast-metrics")
         os.ftruncate(self.fd, _STATE_SIZE)
         self._mapping = mmap.mmap(self.fd, _STATE_SIZE)
         self._sequence = 0

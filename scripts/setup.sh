@@ -104,12 +104,6 @@ if [ "$install_multinode" = "true" ]; then
         echo "INSTALL_EXTRAS is incompatible with the Megatron environment" >&2
         exit 1
     fi
-    "${repo_root}/scripts/setup_multinode.sh"
-    export HYBRID_EP_MULTINODE=1
-    export USE_NIXL=1
-    export NIXL_HOME=/usr/local/art-multinode/nixl
-    export UCX_HOME=/usr/local/art-multinode/ucx
-    export LD_LIBRARY_PATH="$NIXL_HOME/lib/x86_64-linux-gnu:$UCX_HOME/lib:${LD_LIBRARY_PATH:-}"
     /bin/bash "${repo_root}/src/art/megatron/setup.sh"
 else
     sync_extras=(--extra "$backend_extra")

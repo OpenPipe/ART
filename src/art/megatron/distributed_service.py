@@ -377,7 +377,6 @@ class DistributedMegatronService:
     def _temporal_gpu_sharing(self) -> bool:
         return (
             get_external_vllm_runtime_config(self.config) is None
-            and self._managed_service_name is not None
             and self._model_service_spec().temporal_gpu_sharing
         )
 
@@ -521,7 +520,7 @@ class DistributedMegatronService:
         hybrid_ep = _hybrid_ep_runtime_spec(
             mesh,
             run_id=self.runtime.runtime_id,
-            transport=self.runtime.topology.cluster.nixl_transport,
+            transport=self.runtime.nixl_transport,
         )
         identity = {
             "art": _art_source_revision(),

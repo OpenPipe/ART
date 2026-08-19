@@ -1,0 +1,10 @@
+{
+  "nixl-de8115ca.tar.gz": {
+    "sha256": "a9d88772935e91181733f00df0a7e93b6be5f1d29300e5c06cfc6b4ad2f6dbdb",
+    "url": "https://github.com/ai-dynamo/nixl/archive/de8115ca97d3f8fb63a4988e9b4d4a038b2e0f72.tar.gz"
+  },
+  "ucx-1.21.0.tar.gz": {
+    "sha256": "2374d2fcf3186fbfd5e27633ab153aabaeb6b4f503a88563d2aca67cf51ed2c1",
+    "url": "https://github.com/openucx/ucx/releases/download/v1.21.0/ucx-1.21.0.tar.gz"
+  }
+}

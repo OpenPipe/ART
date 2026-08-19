@@ -42,7 +42,7 @@ jobs:
           cd "$project_dir"
           uv init --name art-base-install-smoke --python 3.12 --bare
           uv add "openpipe-art @ file://${wheel_path}"
-          uv run python -c "import importlib.util; assert importlib.util.find_spec('numpy') is None; assert importlib.util.find_spec('torch') is None; import art; from art.pipeline_trainer import PipelineTrainer; print(art.__name__, PipelineTrainer.__name__)"
+          uv run python -c "import importlib.util; assert importlib.util.find_spec('numpy') is not None; assert importlib.util.find_spec('torch') is None; import art; from art import ServerlessBackend; from art.pipeline_trainer import PipelineTrainer; print(art.__name__, ServerlessBackend.__name__, PipelineTrainer.__name__)"
           uv add "weave==0.52.41"
           uv run python -c "from weave.trace.settings import override_settings; import art"
 
@@ -61,7 +61,44 @@ jobs:
           uv add "openpipe-art[backend] @ file://${wheel_path}"
           uv sync
 
-      - name: Smoke test distributed wheel surface
+      - name: Resolve published Megatron profiles
+        run: |
+          wheel_path="$(python - <<'PY'
+          from pathlib import Path
+
+          print(next(Path("dist").glob("openpipe_art-*.whl")).resolve())
+          PY
+          )"
+
+          for profile in megatron megatron-cu130; do
+            case "$profile" in
+              megatron) index=cu128 ;;
+              megatron-cu130) index=cu130 ;;
+            esac
+            project_dir="$(mktemp -d)"
+            cd "$project_dir"
+            uv init --name "art-${profile}-resolve" --python 3.12 --bare
+            uv add --no-sync \
+              --index-strategy unsafe-best-match \
+              --extra-index-url "https://download.pytorch.org/whl/${index}" \
+              "openpipe-art[${profile}] @ file://${wheel_path}"
+          done
+
+      - name: Resolve published Tinker profile
+        run: |
+          wheel_path="$(python - <<'PY'
+          from pathlib import Path
+
+          print(next(Path("dist").glob("openpipe_art-*.whl")).resolve())
+          PY
+          )"
+
+          project_dir="$(mktemp -d)"
+          cd "$project_dir"
+          uv init --name art-tinker-resolve --python 3.12 --bare
+          uv add --no-sync "openpipe-art[tinker] @ file://${wheel_path}"
+
+      - name: Smoke test distributed wheel surface on CPU
         env:
           ART_VLLM_RUNTIME_CACHE_DIR: ${{ runner.temp }}/art-vllm-runtime-cache
         run: |
@@ -77,17 +114,22 @@ jobs:
           uv init --name art-distributed-install-smoke --python 3.12 --bare
           uv venv --python 3.12
           uv pip install --python .venv/bin/python \
+            "openpipe-art @ file://${wheel_path}"
+          uv pip install --python .venv/bin/python \
             --index-url https://download.pytorch.org/whl/cpu \
             "torch==2.11.0"
           uv pip install --python .venv/bin/python \
-            "openpipe-art[distributed] @ file://${wheel_path}"
-          uv pip install --python .venv/bin/python --no-deps \
-            "openpipe-art[distributed,megatron] @ file://${wheel_path}"
+            "msgspec>=0.21.0" \
+            "torchmonarch==0.6.0" \
+            "transformers==5.12.1"
 
           .venv/bin/python - <<'PY'
           import sys
           from importlib.metadata import metadata
           from pathlib import Path
+          import subprocess
+          import tempfile
+          import venv
 
           import art
           import art.distributed as distributed
@@ -122,6 +164,31 @@ jobs:
           assert {"distributed", "megatron"} <= set(
               metadata("openpipe-art").get_all("Provides-Extra") or ()
           )
+          bundle = Path(art.__file__).with_name("_megatron_runtime")
+          assert (bundle / "manifest.json").is_file()
+          assert (bundle / "uv.lock").is_file()
+
+          from art.megatron.runtime.managed import _copy_art
+
+          with tempfile.TemporaryDirectory() as temp_dir:
+              managed = Path(temp_dir) / "managed"
+              venv.EnvBuilder(with_pip=False).create(managed)
+              managed_python = managed / "bin" / "python"
+              _copy_art(managed_python)
+              managed_site = Path(
+                  subprocess.check_output(
+                      [
+                          str(managed_python),
+                          "-c",
+                          "import sysconfig; print(sysconfig.get_paths()['purelib'])",
+                      ],
+                      text=True,
+                  ).strip()
+              )
+              copied_bundle = managed_site / "art" / "_megatron_runtime"
+              assert (copied_bundle / "manifest.json").is_file()
+              assert (copied_bundle / "nixl-de8115ca.tar.gz").is_file()
+              assert not (managed_site / "art" / "_vllm_runtime").exists()
           PY
 
           PYTHONPATH="$GITHUB_WORKSPACE/examples/multinode" timeout 150s \

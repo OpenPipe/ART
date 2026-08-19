@@ -33,6 +33,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to uv.lock",
     )
     parser.add_argument(
+        "--megatron-uv-lock",
+        type=Path,
+        default=Path("megatron_runtime/uv.lock"),
+        help="Path to the managed Megatron runtime lock file",
+    )
+    parser.add_argument(
         "--base-image",
         default="pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel",
         help="Base image reference used for CI runtime/build cache compatibility",
@@ -53,18 +59,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=16,
         help="Fingerprint length (hex chars)",
     )
-    parser.add_argument(
-        "--ci-apex-parallel-build",
-        type=int,
-        default=8,
-        help="CI override for APEX_PARALLEL_BUILD used by cache build and restore.",
-    )
-    parser.add_argument(
-        "--ci-apex-nvcc-threads",
-        type=int,
-        default=1,
-        help="CI override for NVCC_APPEND_FLAGS=--threads <n> used by cache build and restore.",
-    )
     return parser
 
 
@@ -76,14 +70,17 @@ def main() -> int:
         raise SystemExit(f"pyproject file not found: {args.pyproject}")
     if not args.uv_lock.exists():
         raise SystemExit(f"uv lock file not found: {args.uv_lock}")
+    if not args.megatron_uv_lock.exists():
+        raise SystemExit(f"Megatron uv lock file not found: {args.megatron_uv_lock}")
 
     payload: dict[str, Any] = {
         "inputs": {
             "pyproject_sha256": _sha256_file(args.pyproject),
             "uv_lock_sha256": _sha256_file(args.uv_lock),
+            "megatron_uv_lock_sha256": _sha256_file(args.megatron_uv_lock),
         },
         "ci_context": {
-            "fingerprint_schema_version": 10,
+            "fingerprint_schema_version": 11,
             "cache_kind": "full_uv_cache",
             "cache_scope": "prek_split_extras_group_dev",
             "cache_target": "uv_cache",
@@ -98,8 +95,6 @@ def main() -> int:
             "base_image": args.base_image,
             "python_mm": args.python_mm,
             "torch_cuda_arch_list": args.torch_cuda_arch_list,
-            "ci_apex_parallel_build": args.ci_apex_parallel_build,
-            "ci_apex_nvcc_threads": args.ci_apex_nvcc_threads,
         }
     )
     canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)

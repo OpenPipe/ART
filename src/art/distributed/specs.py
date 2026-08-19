@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Sequence
 from ipaddress import ip_address
 from typing import Annotated, Literal, TypeAlias
 
@@ -92,22 +93,18 @@ class EndpointSpec(_Spec):
 
 
 class NixlTransportSpec(_Spec):
-    metadata_store: EndpointSpec
-    nixl_home: str = Field(default="/usr/local/art-multinode/nixl", min_length=1)
-    ucx_home: str = Field(default="/usr/local/art-multinode/ucx", min_length=1)
-    nixl_plugin_dir: str = Field(
-        default="/usr/local/art-multinode/nixl-ucx/lib/plugins", min_length=1
-    )
-    ucx_module_dir: str = Field(
-        default="/usr/local/art-multinode/ucx/lib/ucx", min_length=1
-    )
+    metadata_store: EndpointSpec | None = None
+    nixl_home: str | None = Field(default=None, min_length=1)
+    ucx_home: str | None = Field(default=None, min_length=1)
+    nixl_plugin_dir: str | None = Field(default=None, min_length=1)
+    ucx_module_dir: str | None = Field(default=None, min_length=1)
     ucx_net_devices: str = Field(default="all", min_length=1)
     ucx_tls: str = Field(default="rc,rc_gda,cuda_copy", min_length=1)
     enable_cuda_fabric: bool = False
 
     @model_validator(mode="after")
     def _validate_metadata_store(self) -> "NixlTransportSpec":
-        if not self.metadata_store.is_routable:
+        if self.metadata_store is not None and not self.metadata_store.is_routable:
             raise ValueError("NIXL metadata store must be routable across hosts")
         return self
 
