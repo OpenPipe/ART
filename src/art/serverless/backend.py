@@ -113,6 +113,17 @@ class _PendingServerlessTrain(BaseModel):
         return await self.completion
 
 
+class _ExactAdapterLeaseState(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    lock: SkipValidation[asyncio.Lock] = Field(
+        default_factory=asyncio.Lock, exclude=True
+    )
+    leases: int = Field(default=0, ge=0)
+    published: bool = False
+    remove_failed: bool = False
+
+
 class _ServerlessTrainSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
@@ -253,8 +264,8 @@ class ServerlessBackend:
         self._sampler_results: dict[
             tuple[tuple[str | None, str, str, str], int], SamplerWeightsResult
         ] = {}
-        self._exact_adapter_leases: dict[
-            tuple[tuple[str | None, str, str, str], int], int
+        self._exact_adapter_states: dict[
+            tuple[tuple[str | None, str, str, str], int], _ExactAdapterLeaseState
         ] = {}
         self._exact_adapter_lock = asyncio.Lock()
         self._closed = False
@@ -384,29 +395,82 @@ class ServerlessBackend:
         publication = SamplerPublication(
             mode="versioned_lora", model_alias=inference_name
         )
-        async with self._exact_adapter_lock:
-            weights = self._sampler_results.get(key)
-            if weights is None:
-                raise RuntimeError(
-                    f"exact sampler weights for learner step {step} are unavailable"
-                )
-            leases = self._exact_adapter_leases.get(key, 0)
-            if leases == 0:
-                await self._sampler_manager.publish(model, weights, publication)
-            self._exact_adapter_leases[key] = leases + 1
+        state = await self._acquire_exact_adapter(model, key, publication)
         try:
             async with pin_inference_target(
                 model.name, step=step, inference_name=inference_name
             ):
                 yield
         finally:
-            async with self._exact_adapter_lock:
-                leases = self._exact_adapter_leases[key]
-                if leases == 1:
-                    del self._exact_adapter_leases[key]
+            await self._release_exact_adapter(model, key, publication, state)
+
+    async def _acquire_exact_adapter(
+        self,
+        model: AnyTrainableModel,
+        key: tuple[tuple[str | None, str, str, str], int],
+        publication: SamplerPublication,
+    ) -> _ExactAdapterLeaseState:
+        async with self._exact_adapter_lock:
+            weights = self._sampler_results.get(key)
+            if weights is None:
+                raise RuntimeError(
+                    f"exact sampler weights for learner step {key[1]} are unavailable"
+                )
+            state = self._exact_adapter_states.setdefault(
+                key, _ExactAdapterLeaseState()
+            )
+            state.leases += 1
+        try:
+            async with state.lock:
+                if state.remove_failed:
                     await self._sampler_manager.remove(model, publication)
-                else:
-                    self._exact_adapter_leases[key] = leases - 1
+                    state.published = False
+                    state.remove_failed = False
+                if not state.published:
+                    await self._sampler_manager.publish(model, weights, publication)
+                    state.published = True
+        except BaseException:
+            await self._drop_exact_adapter_reservation(key, state)
+            raise
+        return state
+
+    async def _release_exact_adapter(
+        self,
+        model: AnyTrainableModel,
+        key: tuple[tuple[str | None, str, str, str], int],
+        publication: SamplerPublication,
+        state: _ExactAdapterLeaseState,
+    ) -> None:
+        async with state.lock:
+            async with self._exact_adapter_lock:
+                if self._exact_adapter_states.get(key) is not state or not state.leases:
+                    raise RuntimeError("exact adapter lease state is inconsistent")
+                remove = state.leases == 1
+                if not remove:
+                    state.leases -= 1
+                    return
+            try:
+                await self._sampler_manager.remove(model, publication)
+            except BaseException:
+                state.remove_failed = True
+                raise
+            else:
+                state.published = False
+                state.remove_failed = False
+            finally:
+                await self._drop_exact_adapter_reservation(key, state)
+
+    async def _drop_exact_adapter_reservation(
+        self,
+        key: tuple[tuple[str | None, str, str, str], int],
+        state: _ExactAdapterLeaseState,
+    ) -> None:
+        async with self._exact_adapter_lock:
+            if self._exact_adapter_states.get(key) is not state or not state.leases:
+                raise RuntimeError("exact adapter lease state is inconsistent")
+            state.leases -= 1
+            if not state.leases and not state.published:
+                del self._exact_adapter_states[key]
 
     async def _prepare_backend_for_training(
         self,
@@ -538,8 +602,10 @@ class ServerlessBackend:
         model_key = self._model_key(model)
         leased = [
             step
-            for (key, step), leases in self._exact_adapter_leases.items()
-            if key == model_key and step not in retain_steps and leases > 0
+            for (key, step), state in self._exact_adapter_states.items()
+            if key == model_key
+            and step not in retain_steps
+            and (state.leases or state.published)
         ]
         if leased:
             raise RuntimeError(
