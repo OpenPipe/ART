@@ -81,6 +81,14 @@ class TokenizedMoeRoutes(BaseModel):
             raise ValueError("MoE route segments must contain whole tokens")
         if sum(map(len, self.data)) != tokens * bytes_per_token:
             raise ValueError("MoE route segments do not match their declared shape")
+        object.__setattr__(
+            self,
+            "data",
+            tuple(
+                memoryview(segment) if isinstance(segment, memoryview) else segment
+                for segment in self.data
+            ),
+        )
         return self
 
     def build(self) -> MoeRouteArray | MoeRouteSegments:

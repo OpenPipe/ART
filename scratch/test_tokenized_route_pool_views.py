@@ -252,3 +252,21 @@ def test_tokenized_routes_reject_hashable_file_backing(tmp_path) -> None:
         finally:
             segment.release()
             owner.close()
+
+
+def test_tokenized_routes_own_memoryview_lifetime() -> None:
+    owner = bytes(8)
+    caller_view = memoryview(owner)
+    routes = TokenizedMoeRoutes(
+        num_experts=16,
+        dtype="uint8",
+        shape=(1, 4, 2),
+        data=(caller_view,),
+    )
+
+    assert routes.data[0] is not caller_view
+    assert isinstance(routes.data[0], memoryview)
+    assert routes.data[0].obj is owner
+    caller_view.release()
+
+    np.testing.assert_array_equal(routes.build(), np.zeros((1, 4, 2), dtype=np.uint8))
