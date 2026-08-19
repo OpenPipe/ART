@@ -171,7 +171,7 @@ class MoeRouteObjectBatchTransfer(_Contract):
     ) -> tuple[MoeRouteGroupPayload, ...]:
         objects = {value.object_id: value for group in self.groups for value in group}
 
-        async def receive(value: MoeRouteStoredObject) -> bytes:
+        async def receive(value: MoeRouteStoredObject) -> memoryview:
             async with slots:
                 return await asyncio.to_thread(self._receive, receiver, value)
 
@@ -199,27 +199,32 @@ class MoeRouteObjectBatchTransfer(_Contract):
 
     def _receive(
         self, receiver: S3BinaryObjectReceiver, value: MoeRouteStoredObject
-    ) -> bytes:
+    ) -> memoryview:
         target = moe_route_object_target(
             self.store,
             tenant_id=self.tenant_id,
             run_id=self.run_id,
             object_id=value.object_id,
         )
-        contents = receiver.read_file(
-            binary_object_manifest_uri(target),
-            expected_format=value.format,
-            expected_metadata={"tenant_id": self.tenant_id, "run_id": self.run_id},
-            relative_path="routes.bin",
-        )
-        if (
-            contents.ref.object_id != value.object_id
-            or contents.ref.byte_count != value.byte_count
-            or contents.file.byte_count != value.byte_count
-            or len(contents.ref.files) != 1
-        ):
+        payload = bytearray(value.byte_count)
+        writable = memoryview(payload)
+        try:
+            file = receiver.read_single_file_into(
+                binary_object_manifest_uri(target),
+                expected_format=value.format,
+                expected_metadata={
+                    "tenant_id": self.tenant_id,
+                    "run_id": self.run_id,
+                },
+                expected_object_id=value.object_id,
+                relative_path="routes.bin",
+                target=writable,
+            )
+        finally:
+            writable.release()
+        if file.byte_count != value.byte_count:
             raise RuntimeError("stored route object changed immutable identity")
-        return contents.data
+        return memoryview(payload).toreadonly()
 
 
 async def publish_moe_route_groups(

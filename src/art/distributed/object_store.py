@@ -499,6 +499,29 @@ class S3BinaryObjectReceiver:
         ref = self._resolve(manifest_uri, expected_format, expected_metadata)
         return self._store._read_file_into(ref, relative_path, target)
 
+    def read_single_file_into(
+        self,
+        manifest_uri: str,
+        *,
+        expected_format: str,
+        expected_metadata: dict[str, str],
+        expected_object_id: str,
+        relative_path: str,
+        target: memoryview,
+    ) -> BinaryObjectFile:
+        """Download an exact one-file object into caller-owned host memory."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("binary object receiver is closed")
+        ref = self._resolve(manifest_uri, expected_format, expected_metadata)
+        if (
+            ref.object_id != expected_object_id
+            or ref.byte_count != target.nbytes
+            or len(ref.files) != 1
+        ):
+            raise RuntimeError("binary object changed its single-file identity")
+        return self._store._read_file_into(ref, relative_path, target)
+
     def release(self, materialization: BinaryObjectMaterialization) -> None:
         path = self._managed_path(materialization.path)
         with self._lock:
