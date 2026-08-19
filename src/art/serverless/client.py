@@ -66,6 +66,7 @@ from .data_plane import (
 ResultT = TypeVar("ResultT", bound=OperationResult)
 ResponseT = TypeVar("ResponseT", bound=Contract)
 _CREATE_RUN_RESOLVE_STATUSES = frozenset({409, 429, 500, 502, 503, 504})
+_TRANSIENT_HTTP_STATUSES = frozenset({429, 502, 503, 504})
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
 
 
@@ -134,6 +135,20 @@ class RemoteTrainingOperationCancelled(RemoteTrainingError):
     pass
 
 
+def _is_transient_failure(error: BaseException) -> bool:
+    return isinstance(
+        error,
+        (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError),
+    ) or (
+        isinstance(error, RemoteTrainingHttpError)
+        and error.status_code in _TRANSIENT_HTTP_STATUSES
+    )
+
+
+def _retry_delay(attempt: int) -> float:
+    return min(0.1 * 2 ** min(attempt, 4), 1.0)
+
+
 class RemoteTrainingServiceClient:
     """Typed HTTP transport for the Remote Training operation API."""
 
@@ -180,6 +195,7 @@ class RemoteTrainingServiceClient:
         self._owns_clients = owns_clients
         self._max_retries = max_retries
         self._result_budget = _ByteBudget(max_result_bytes_in_flight)
+        self._closed = False
 
     async def create_run(self, request: CreateTrainingRunRequest) -> TrainingRunView:
         try:
@@ -192,6 +208,9 @@ class RemoteTrainingServiceClient:
             )
         except (httpx.TransportError, RemoteTrainingHttpError) as error:
             if (
+                isinstance(error, httpx.TransportError)
+                and not _is_transient_failure(error)
+            ) or (
                 isinstance(error, RemoteTrainingHttpError)
                 and error.status_code not in _CREATE_RUN_RESOLVE_STATUSES
             ):
@@ -261,36 +280,54 @@ class RemoteTrainingServiceClient:
         self, operation_id: str, ref: OperationResultRef
     ) -> bytearray:
         async with self._result_budget.reserve(ref.byte_count):
-            response = await self._send(
-                "GET",
-                f"training/operations/{operation_id}/result",
-                content=None,
-                headers=None,
-                transfer=True,
-                stream=True,
-            )
+            failure_count = 0
+            while True:
+                if self._closed:
+                    raise RemoteTrainingError(
+                        "remote training service client is closed"
+                    )
+                try:
+                    return await self._download_operation_result(operation_id, ref)
+                except BaseException as error:
+                    if not _is_transient_failure(error):
+                        raise
+                if self._closed:
+                    raise RemoteTrainingError(
+                        "remote training service client is closed"
+                    )
+                await asyncio.sleep(_retry_delay(failure_count))
+                failure_count = min(failure_count + 1, 4)
+
+    async def _download_operation_result(
+        self, operation_id: str, ref: OperationResultRef
+    ) -> bytearray:
+        response = await self._send(
+            "GET",
+            f"training/operations/{operation_id}/result",
+            content=None,
+            headers=None,
+            transfer=True,
+            stream=True,
+        )
+        try:
             content_length = response.headers.get("Content-Length")
             if content_length is not None and content_length != str(ref.byte_count):
-                await response.aclose()
                 raise RemoteTrainingError(
                     "remote operation result Content-Length changed"
                 )
             payload = bytearray(ref.byte_count)
             offset = 0
-            try:
-                async for chunk in response.aiter_bytes():
-                    end = offset + len(chunk)
-                    if end > len(payload):
-                        raise RemoteTrainingError(
-                            "remote operation result grew in transit"
-                        )
-                    payload[offset:end] = chunk
-                    offset = end
-            finally:
-                await response.aclose()
-            if offset != ref.byte_count:
-                raise RemoteTrainingError("remote operation result byte count changed")
-            return payload
+            async for chunk in response.aiter_bytes():
+                end = offset + len(chunk)
+                if end > len(payload):
+                    raise RemoteTrainingError("remote operation result grew in transit")
+                payload[offset:end] = chunk
+                offset = end
+        finally:
+            await response.aclose()
+        if offset != ref.byte_count:
+            raise RemoteTrainingError("remote operation result byte count changed")
+        return payload
 
     async def get_events(self, run_id: str, *, after: int) -> EventPage:
         return await self._request(
@@ -462,25 +499,34 @@ class RemoteTrainingServiceClient:
                     ),
                     stream=stream,
                 )
-            except httpx.TransportError:
-                if attempt == retries:
+            except httpx.TransportError as error:
+                if attempt == retries or not _is_transient_failure(error):
                     raise
             else:
-                if response.status_code not in {429, 502, 503, 504}:
+                if response.status_code not in _TRANSIENT_HTTP_STATUSES:
                     break
                 if attempt == retries:
                     break
                 await response.aclose()
-            await asyncio.sleep(min(0.1 * 2**attempt, 1.0))
+            await asyncio.sleep(_retry_delay(attempt))
         if response is None:
             raise RuntimeError("remote training request produced no response")
         if response.is_error:
             if stream:
-                await response.aread()
-            try:
-                value = response.json()
-            except ValueError:
-                value = response.text
+                try:
+                    await response.aread()
+                except httpx.TransportError:
+                    value: object = response.reason_phrase
+                else:
+                    try:
+                        value = response.json()
+                    except ValueError:
+                        value = response.text
+            else:
+                try:
+                    value = response.json()
+                except ValueError:
+                    value = response.text
             detail = value.get("detail", value) if isinstance(value, dict) else value
             if stream:
                 await response.aclose()
@@ -488,6 +534,7 @@ class RemoteTrainingServiceClient:
         return response
 
     async def close(self) -> None:
+        self._closed = True
         await self._result_budget.close()
         if self._owns_clients:
             await asyncio.gather(
@@ -578,10 +625,30 @@ class _RunEventObserver:
 
     async def _observe(self) -> None:
         try:
+            failure_count = 0
             while True:
-                page = await self._service.get_events(self._run_id, after=self._cursor)
-                if page.next_cursor < self._cursor:
-                    raise RemoteTrainingError("remote event cursor moved backwards")
+                try:
+                    page = await self._service.get_events(
+                        self._run_id, after=self._cursor
+                    )
+                except BaseException as error:
+                    if not _is_transient_failure(error):
+                        raise
+                    await asyncio.sleep(_retry_delay(failure_count))
+                    failure_count = min(failure_count + 1, 4)
+                    continue
+                failure_count = 0
+                page_cursor = self._cursor
+                for event in page.events:
+                    if event.run_id != self._run_id:
+                        raise RemoteTrainingError("remote event run identity changed")
+                    if event.cursor <= page_cursor:
+                        raise RemoteTrainingError(
+                            "remote event cursor is not increasing"
+                        )
+                    page_cursor = event.cursor
+                if page.next_cursor != page_cursor:
+                    raise RemoteTrainingError("remote event page cursor changed")
                 self._cursor = page.next_cursor
                 for event in page.events:
                     if event.event not in _TERMINAL_EVENTS:
