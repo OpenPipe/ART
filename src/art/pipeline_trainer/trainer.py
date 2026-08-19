@@ -11,7 +11,6 @@ import math
 import os
 from pathlib import Path
 import signal
-import sys
 import time
 from typing import (
     Any,
@@ -50,11 +49,7 @@ from art.pipeline_tuner import (
     RolloutWorkerController,
 )
 from art.preprocessing.policy_spans import PolicyTokenSpan
-from art.utils.lifecycle import (
-    complete_task,
-    consume_future_exception,
-    process_shutdown_timeout,
-)
+from art.utils.lifecycle import complete_task, process_shutdown_timeout
 
 from .checkpoint_retention import (
     CHECKPOINT_CREATED_AT_METRIC,
@@ -64,6 +59,7 @@ from .checkpoint_retention import (
     CheckpointRetentionStrategy,
     plan_checkpoint_retention,
 )
+from .lifecycle import settle_tasks, unique_exception_leaves
 from .state import PipelineState
 from .status import StatusReporter
 from .types import ConfigT, EvalFn, RolloutFn, ScenarioT, SingleRolloutFn  # noqa: F401
@@ -73,6 +69,8 @@ _ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
 _ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 _QUEUE_WAIT_TIME_KEY = "_art_queue_wait_s"
 _PIPELINE_SHUTDOWN_TIMEOUT_SECONDS = process_shutdown_timeout(1)
+_PIPELINE_STAGE_GRACE_FRACTION = 0.25
+_PIPELINE_OPTIONAL_DRAIN_FRACTION = 0.75
 _SCORE_FRESHNESS_TAU_STEPS = 8.0
 # Rollout critical batch size from the best current GRPO/RLVR evidence. This is
 # grounded in reported experiments, not a well-validated universal constant.
@@ -89,6 +87,10 @@ class _ResizableAsyncQueue(asyncio.Queue[T]):
         if grew:
             for _ in range(min(maxsize - self.qsize(), len(internals._putters))):
                 internals._wakeup_next(internals._putters)
+
+
+class _PipelineStageShutdownTimeout(TimeoutError):
+    pass
 
 
 class _PreparedPipelineItem(BaseModel):
@@ -368,10 +370,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._scheduled_eval_steps: set[int] = set()
         self._scheduled_eval_leases: dict[int, AsyncExitStack] = {}
         self._checkpoint_log_tasks: set[asyncio.Task[None]] = set()
-        self._checkpoint_log_failure: BaseException | None = None
         self._publication_metric_tasks: set[asyncio.Task[None]] = set()
-        self._publication_metric_failure: BaseException | None = None
         self._post_train_tasks: set[asyncio.Task[None]] = set()
+        self._terminal_task_failures: list[BaseException] = []
+        self._shutdown_wake_tasks: set[asyncio.Task[Any]] = set()
+        self._shutdown_started_at: float | None = None
+        self._shutdown_deadline: float | None = None
+        self._shutdown_failed_event = asyncio.Event()
+        self._optional_abort_event = asyncio.Event()
 
         self.state = PipelineState()
         self._stop_event = asyncio.Event()
@@ -399,7 +405,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if self.autotune.mode != "off":
             self._attachments.append(PipelineAutotunerAttachment(self.autotune))
         self._pipeline_tuner_profile: str | None = None
-        self._backend_training_completed = False
+        self._backend_training_started = False
         self._status = StatusReporter(
             get_scenario_offset=lambda: self.state.scenario_offset,
             log_interval_seconds=log_interval_seconds,
@@ -411,7 +417,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     async def train(self, *, handle_signals: bool = True) -> None:
         """Run the training pipeline over the configured scenario iterator."""
-        self._backend_training_completed = False
+        self._backend_training_started = False
+        self._shutdown_started_at = None
+        self._shutdown_deadline = None
+        self._shutdown_failed_event = asyncio.Event()
+        self._optional_abort_event = asyncio.Event()
+        self._terminal_task_failures.clear()
+        self._shutdown_wake_tasks.clear()
         start_step = await self.model.get_step()
         pipeline_state = self._read_pipeline_state() if self.resume else {}
         scenario_offset = int(pipeline_state.get("scenario_offset", 0) or 0)
@@ -452,55 +464,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             self.state.scenario_offset = skipped
             self.state.total_scenarios_consumed = skipped
 
-        try:
-            await self._start_attachments()
-        except BaseException as primary:
-            try:
-                await self._stop_attachments(training_failed=True)
-            except BaseException as cleanup:
-                raise BaseExceptionGroup(
-                    "Pipeline attachment startup and cleanup failed.",
-                    [primary, cleanup],
-                ) from None
-            raise
-
-        queue_maxsize = (
-            self.queue_maxsize
-            if self.queue_maxsize is not None
-            else max(1, self._freshness_queue_window() * self.target_groups_per_step)
-        )
-        result_queue_factory = getattr(
-            self._rollout_executor, "create_result_queue", None
-        )
-        local_data_plane = isinstance(self._rollout_executor, LocalRolloutExecutor)
-        supports_preparation = callable(
-            getattr(self.backend, "prepare_pipeline_batch", None)
-        )
-        packing_support = getattr(self.backend, "supports_async_pipeline_packing", None)
-        if supports_preparation and callable(packing_support):
-            supports_preparation = bool(packing_support(self.model))
-        if callable(result_queue_factory) and (
-            supports_preparation or not local_data_plane
-        ):
-            self._output_queue = result_queue_factory(queue_maxsize)
-            await self._output_queue.start()
-        else:
-            self._output_queue = _ResizableAsyncQueue(maxsize=queue_maxsize)
-        if (
-            isinstance(self._output_queue, DistributedTrajectoryQueue)
-            and supports_preparation
-        ):
-            self._packed_queue = asyncio.Queue(maxsize=1)
-        self._eval_queue = asyncio.Queue()
-
         loop = asyncio.get_running_loop()
         stop_requested = False
         installed_handlers: list[tuple[str, signal.Signals]] = []
         original_handlers: dict[signal.Signals, object] = {}
+        train_task = asyncio.current_task()
 
         def _request_stop(sig: signal.Signals) -> None:
             nonlocal stop_requested
             if stop_requested:
+                if train_task is not None:
+                    train_task.cancel()
                 return
             stop_requested = True
             print(f"Shutdown requested ({sig.name}); finishing current work...")
@@ -509,13 +483,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         def _sync_signal_handler(signum: int, _frame: object | None) -> None:
             _request_stop(signal.Signals(signum))
 
-        training_failed = False
+        primary_failure: BaseException | None = None
+        failures: list[BaseException] = []
+        attachments_started = False
         try:
-            if self.eval_fn is not None and self.eval_at_start:
-                await self._schedule_eval_step(start_step)
-                self._persist_state(start_step)
-
-            self._status.start(initial_step=start_step)
             if handle_signals:
                 for sig in (signal.SIGINT, signal.SIGTERM):
                     original_handlers[sig] = signal.getsignal(sig)
@@ -529,212 +500,454 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         except (ValueError, RuntimeError):
                             continue
 
-            try:
-                async with asyncio.TaskGroup() as tg:
-                    tg.create_task(self._rollout_stage(), name="rollout_stage")
-                    if self._packed_queue is not None:
-                        tg.create_task(self._packing_stage(), name="packing_stage")
-                    tg.create_task(self._training_stage(), name="training_stage")
-                    tg.create_task(self._eval_stage(), name="eval_stage")
-                    tg.create_task(self._status_loop(), name="status_loop")
-            except* Exception as eg:
-                training_failed = True
-                self.request_stop()
-                for exc in eg.exceptions:
-                    if not isinstance(exc, asyncio.CancelledError):
-                        print(f"Pipeline stage failed: {exc}")
-                raise
+            attachments_started = True
+            await self._start_attachments()
+            queue_maxsize = (
+                self.queue_maxsize
+                if self.queue_maxsize is not None
+                else max(
+                    1, self._freshness_queue_window() * self.target_groups_per_step
+                )
+            )
+            result_queue_factory = getattr(
+                self._rollout_executor, "create_result_queue", None
+            )
+            local_data_plane = isinstance(self._rollout_executor, LocalRolloutExecutor)
+            supports_preparation = callable(
+                getattr(self.backend, "prepare_pipeline_batch", None)
+            )
+            packing_support = getattr(
+                self.backend, "supports_async_pipeline_packing", None
+            )
+            if supports_preparation and callable(packing_support):
+                supports_preparation = bool(packing_support(self.model))
+            if callable(result_queue_factory) and (
+                supports_preparation or not local_data_plane
+            ):
+                self._output_queue = result_queue_factory(queue_maxsize)
+                await self._output_queue.start()
+            else:
+                self._output_queue = _ResizableAsyncQueue(maxsize=queue_maxsize)
+            if (
+                isinstance(self._output_queue, DistributedTrajectoryQueue)
+                and supports_preparation
+            ):
+                self._packed_queue = asyncio.Queue(maxsize=1)
+            self._eval_queue = asyncio.Queue()
+
+            if self.eval_fn is not None and self.eval_at_start:
+                await self._schedule_eval_step(start_step)
+                self._persist_state(start_step)
+
+            self._status.start(initial_step=start_step)
+            stage_failures = unique_exception_leaves(await self._run_pipeline_stages())
+            terminal_failures = unique_exception_leaves(self._terminal_task_failures)
+            stage_errors = [
+                error
+                for error in stage_failures
+                if not isinstance(error, _PipelineStageShutdownTimeout)
+            ]
+            if stage_errors:
+                primary_failure = stage_errors[0]
+                failures.extend(stage_errors[1:])
+                failures.extend(terminal_failures)
+                failures.extend(
+                    error
+                    for error in stage_failures
+                    if isinstance(error, _PipelineStageShutdownTimeout)
+                )
+            elif terminal_failures:
+                primary_failure = terminal_failures[0]
+                failures.extend(terminal_failures[1:])
+                failures.extend(stage_failures)
+            elif stage_failures:
+                primary_failure = stage_failures[0]
+                failures.extend(stage_failures[1:])
+        except BaseException as error:
+            primary_failure = error
         finally:
-            primary_failure = sys.exception()
-            training_failed = training_failed or primary_failure is not None
-            if handle_signals:
-                for mode, sig in installed_handlers:
-                    if mode == "loop":
-                        try:
-                            loop.remove_signal_handler(sig)
-                        except (NotImplementedError, RuntimeError):
-                            pass
+            self._begin_shutdown()
+            self.request_stop()
+            terminal_failures = unique_exception_leaves(self._terminal_task_failures)
+            if primary_failure is None and terminal_failures:
+                primary_failure = terminal_failures[0]
+                failures.extend(terminal_failures[1:])
+            elif primary_failure is not None:
+                failures.extend(terminal_failures)
+            if primary_failure is not None:
+                self._mark_shutdown_failed()
+
+            cleanup_cancelled = asyncio.Event()
+            cleanup_task = asyncio.create_task(
+                self._shutdown_pipeline(
+                    cleanup_cancelled=cleanup_cancelled,
+                    attachments_started=attachments_started,
+                ),
+                name="pipeline_shutdown",
+            )
+            cancellation: asyncio.CancelledError | None = None
+            try:
+                while not cleanup_task.done():
                     try:
-                        previous = original_handlers.get(sig)
-                        if previous is not None:
-                            signal.signal(sig, cast(signal.Handlers, previous))
-                    except (ValueError, RuntimeError):
-                        pass
-            cleanup_failures: list[BaseException] = []
-            shutdown_deadline = loop.time() + _PIPELINE_SHUTDOWN_TIMEOUT_SECONDS
-
-            def record_cleanup_failure(error: BaseException | None) -> None:
-                if error is not None and all(
-                    error is not failure for failure in cleanup_failures
-                ):
-                    cleanup_failures.append(error)
-
-            async def run_cleanup(operation: Awaitable[Any], description: str) -> bool:
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError as error:
+                        cancellation = cancellation or error
+                        cleanup_cancelled.set()
+                        self._mark_shutdown_failed()
+                        self.request_stop()
+                    except BaseException:
+                        break
                 try:
-                    error = await self._run_shutdown_operation(
-                        operation,
-                        deadline=shutdown_deadline,
-                        description=description,
-                    )
-                except BaseException as exc:
-                    error = exc
-                record_cleanup_failure(error)
-                return error is None
-
-            self._accept_prepared_batches = False
-            await run_cleanup(
-                self._discard_pending_prepared_batches(),
-                "discarding pending prepared batches",
-            )
-            try:
-                for error in await self._settle_shutdown_tasks(
-                    self._post_train_tasks,
-                    cancel=training_failed,
-                    deadline=shutdown_deadline,
-                    description="post-training tasks",
-                ):
-                    record_cleanup_failure(error)
-            except BaseException as exc:
-                record_cleanup_failure(exc)
-            finally:
-                self._post_train_tasks.clear()
-            cancel_readiness = training_failed
-            if not training_failed:
-                cancel_readiness = not await run_cleanup(
-                    self._finalize_backend_training(),
-                    "finalizing backend training",
+                    failures.extend(cleanup_task.result())
+                except BaseException as error:
+                    failures.append(error)
+                if cancellation is not None:
+                    if primary_failure is not None:
+                        failures.insert(0, primary_failure)
+                    primary_failure = cancellation
+                terminal_failures = unique_exception_leaves(
+                    self._terminal_task_failures
                 )
-            try:
-                for error in await self._settle_shutdown_tasks(
-                    self._publication_metric_tasks | self._checkpoint_log_tasks,
-                    cancel=cancel_readiness,
-                    deadline=shutdown_deadline,
-                    description="publication metric/readiness tasks",
-                ):
-                    record_cleanup_failure(error)
-            except BaseException as exc:
-                record_cleanup_failure(exc)
+                if primary_failure is None and terminal_failures:
+                    primary_failure = terminal_failures[0]
+                    failures.extend(terminal_failures[1:])
+                else:
+                    failures.extend(terminal_failures)
             finally:
-                self._publication_metric_tasks.clear()
-                self._checkpoint_log_tasks.clear()
-            if isinstance(self._output_queue, DistributedTrajectoryQueue):
-                await run_cleanup(
-                    self._output_queue.close(), "closing the trajectory queue"
-                )
-            await run_cleanup(
-                self._stop_attachments(training_failed=training_failed),
-                "stopping pipeline attachments",
-            )
-            for cleanup in (self._status.flush, self._status.close):
-                try:
-                    cleanup()
-                except BaseException as exc:
-                    record_cleanup_failure(exc)
-            await run_cleanup(
-                self._release_all_scheduled_eval_leases(),
-                "releasing scheduled eval leases",
-            )
-            record_cleanup_failure(self._publication_metric_failure)
-            record_cleanup_failure(self._checkpoint_log_failure)
-            if cleanup_failures:
-                if primary_failure is not None:
-                    raise BaseExceptionGroup(
-                        "Pipeline training and cleanup failed.",
-                        [primary_failure, *cleanup_failures],
-                    ) from None
-                if len(cleanup_failures) == 1:
-                    raise cleanup_failures[0]
-                raise BaseExceptionGroup(
-                    "Pipeline cleanup failed.", cleanup_failures
-                ) from None
+                if handle_signals:
+                    for mode, sig in installed_handlers:
+                        if mode == "loop":
+                            try:
+                                loop.remove_signal_handler(sig)
+                            except (NotImplementedError, RuntimeError):
+                                pass
+                        try:
+                            previous = original_handlers.get(sig)
+                            if previous is not None:
+                                signal.signal(sig, cast(signal.Handlers, previous))
+                        except (ValueError, RuntimeError):
+                            pass
 
-    @staticmethod
-    async def _run_shutdown_operation(
-        operation: Awaitable[Any], *, deadline: float, description: str
-    ) -> BaseException | None:
-        task = asyncio.ensure_future(operation)
-        try:
-            done, _ = await asyncio.wait(
-                (task,),
-                timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
-            )
-        except BaseException:
-            task.cancel()
-            task.add_done_callback(consume_future_exception)
-            raise
-        if task not in done:
-            task.cancel()
-            task.add_done_callback(consume_future_exception)
-            return TimeoutError(f"Pipeline shutdown timed out while {description}.")
-        if task.cancelled():
-            return asyncio.CancelledError(
-                f"Pipeline cleanup was cancelled while {description}."
-            )
-        return task.exception()
-
-    @staticmethod
-    async def _settle_shutdown_tasks(
-        tasks: set[asyncio.Task[None]],
-        *,
-        cancel: bool,
-        deadline: float,
-        description: str,
-    ) -> list[BaseException]:
-        tracked = tuple(tasks)
-        if cancel:
-            for task in tracked:
-                task.cancel()
-        if not tracked:
-            return []
-        done, pending = await asyncio.wait(
-            tracked,
-            timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+        terminal_error = self._group_pipeline_failures(
+            primary_failure, failures, message="Pipeline training failed."
         )
-        failures = [
-            error
-            for task in tracked
-            if task in done
-            and not task.cancelled()
-            and (error := task.exception()) is not None
-        ]
-        if pending:
-            for task in pending:
-                task.cancel()
-                task.add_done_callback(consume_future_exception)
-            failures.append(
-                TimeoutError(
-                    f"{len(pending)} {description} did not stop before the pipeline "
-                    "shutdown deadline."
+        if terminal_error is not None:
+            raise terminal_error from None
+
+    def _begin_shutdown(self) -> float:
+        loop = asyncio.get_running_loop()
+        if self._shutdown_deadline is None:
+            self._shutdown_started_at = loop.time()
+            self._shutdown_deadline = (
+                self._shutdown_started_at + _PIPELINE_SHUTDOWN_TIMEOUT_SECONDS
+            )
+        return self._shutdown_deadline
+
+    def _shutdown_phase_deadline(self, fraction: float) -> float:
+        deadline = self._begin_shutdown()
+        assert self._shutdown_started_at is not None
+        return (
+            self._shutdown_started_at
+            + (deadline - self._shutdown_started_at) * fraction
+        )
+
+    def _mark_shutdown_failed(self) -> None:
+        self._shutdown_failed_event.set()
+        self._optional_abort_event.set()
+
+    async def _run_pipeline_stages(self) -> list[BaseException]:
+        stages = {
+            asyncio.create_task(self._rollout_stage(), name="rollout_stage"),
+            asyncio.create_task(self._training_stage(), name="training_stage"),
+            asyncio.create_task(self._eval_stage(), name="eval_stage"),
+            asyncio.create_task(self._status_loop(), name="status_loop"),
+        }
+        if self._packed_queue is not None:
+            stages.add(asyncio.create_task(self._packing_stage(), name="packing_stage"))
+        stop_wait = asyncio.create_task(self._stop_event.wait(), name="pipeline_stop")
+        failures: list[BaseException] = []
+        try:
+            while stages:
+                timeout = None
+                if self._stop_event.is_set():
+                    timeout = max(
+                        0.0,
+                        self._shutdown_phase_deadline(_PIPELINE_STAGE_GRACE_FRACTION)
+                        - asyncio.get_running_loop().time(),
+                    )
+                waiters = (
+                    (*stages, stop_wait) if not stop_wait.done() else tuple(stages)
+                )
+                done, _ = await asyncio.wait(
+                    waiters,
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    failures.append(
+                        _PipelineStageShutdownTimeout(
+                            f"{len(stages)} pipeline stages did not stop cooperatively "
+                            "before the stage shutdown cutoff."
+                        )
+                    )
+                    failures.extend(
+                        await settle_tasks(
+                            stages,
+                            cancel=True,
+                            deadline=self._begin_shutdown(),
+                            description="pipeline stages",
+                        )
+                    )
+                    stages.clear()
+                    break
+                if stop_wait in done:
+                    self._begin_shutdown()
+                    done.remove(stop_wait)
+                completed = stages.intersection(done)
+                stages.difference_update(completed)
+                stage_errors = unique_exception_leaves(
+                    task.exception() for task in completed if not task.cancelled()
+                )
+                if stage_errors:
+                    for error in stage_errors:
+                        print(f"Pipeline stage failed: {error}")
+                    failures.extend(stage_errors)
+                    self._mark_shutdown_failed()
+                    self.request_stop()
+                    failures.extend(
+                        await settle_tasks(
+                            stages,
+                            cancel=True,
+                            deadline=self._begin_shutdown(),
+                            description="pipeline stages",
+                        )
+                    )
+                    stages.clear()
+        except BaseException as primary:
+            self._mark_shutdown_failed()
+            self.request_stop()
+            cleanup = [
+                *failures,
+                *await settle_tasks(
+                    stages,
+                    cancel=True,
+                    deadline=self._begin_shutdown(),
+                    description="pipeline stages",
+                ),
+            ]
+            error = self._group_pipeline_failures(
+                primary, cleanup, message="Pipeline stage supervision failed."
+            )
+            assert error is not None
+            raise error from None
+        finally:
+            stop_wait.cancel()
+            await asyncio.gather(stop_wait, return_exceptions=True)
+        return unique_exception_leaves(failures)
+
+    async def _shutdown_pipeline(
+        self, *, cleanup_cancelled: asyncio.Event, attachments_started: bool
+    ) -> list[BaseException]:
+        deadline = self._begin_shutdown()
+        optional_deadline = self._shutdown_phase_deadline(
+            _PIPELINE_OPTIONAL_DRAIN_FRACTION
+        )
+        optional_done = asyncio.Event()
+        failures: list[BaseException] = []
+        mandatory: list[asyncio.Task[Any]] = []
+        backend_owner: asyncio.Task[None] | None = None
+
+        failures.extend(
+            await settle_tasks(
+                self._shutdown_wake_tasks,
+                cancel=True,
+                deadline=deadline,
+                description="pipeline wake tasks",
+            )
+        )
+        self._shutdown_wake_tasks.clear()
+        if failures:
+            self._mark_shutdown_failed()
+
+        async def stop_attachments() -> None:
+            if not self._shutdown_failed_event.is_set():
+                failure_wait = asyncio.create_task(self._shutdown_failed_event.wait())
+                optional_wait = asyncio.create_task(optional_done.wait())
+                try:
+                    await asyncio.wait(
+                        (failure_wait, optional_wait),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for task in (failure_wait, optional_wait):
+                        task.cancel()
+                    await asyncio.gather(
+                        failure_wait, optional_wait, return_exceptions=True
+                    )
+            await self._stop_attachments(
+                training_failed=self._shutdown_failed_event.is_set()
+            )
+
+        mandatory.extend(
+            (
+                asyncio.create_task(
+                    self._release_pipeline_resources(),
+                    name="pipeline_data_release",
+                ),
+                asyncio.create_task(
+                    self._release_all_scheduled_eval_leases(),
+                    name="pipeline_eval_lease_release",
+                ),
+            )
+        )
+        if attachments_started:
+            mandatory.append(
+                asyncio.create_task(stop_attachments(), name="pipeline_attachment_stop")
+            )
+        for task in mandatory:
+            task.add_done_callback(self._shutdown_operation_done)
+
+        if self._backend_training_started:
+            backend_owner = asyncio.create_task(
+                self._finalize_backend_training(),
+                name="pipeline_backend_publication_owner",
+            )
+            backend_owner.add_done_callback(self._shutdown_operation_done)
+
+        try:
+            post_train = tuple(self._post_train_tasks)
+            failures.extend(
+                await settle_tasks(
+                    post_train,
+                    cancel=self._shutdown_failed_event.is_set(),
+                    deadline=optional_deadline,
+                    description="post-training tasks",
+                    interrupt_events=(self._optional_abort_event, cleanup_cancelled),
                 )
             )
-        return failures
+            self._post_train_tasks.clear()
+            if failures:
+                self._mark_shutdown_failed()
+
+            if backend_owner is not None:
+                owner_failures = await settle_tasks(
+                    (backend_owner,),
+                    deadline=optional_deadline,
+                    description="backend publication owner",
+                    interrupt_events=(cleanup_cancelled,),
+                )
+                failures.extend(owner_failures)
+                if owner_failures:
+                    self._mark_shutdown_failed()
+
+            readiness = tuple(
+                self._publication_metric_tasks | self._checkpoint_log_tasks
+            )
+            readiness_failures = await settle_tasks(
+                readiness,
+                cancel=self._shutdown_failed_event.is_set(),
+                deadline=optional_deadline,
+                description="publication metric/readiness tasks",
+                interrupt_events=(self._optional_abort_event, cleanup_cancelled),
+            )
+            failures.extend(readiness_failures)
+            self._publication_metric_tasks.clear()
+            self._checkpoint_log_tasks.clear()
+            if readiness_failures:
+                self._mark_shutdown_failed()
+            failures.extend(self._terminal_task_failures)
+        finally:
+            optional_done.set()
+
+        failures.extend(
+            await settle_tasks(
+                mandatory,
+                deadline=deadline,
+                description="mandatory pipeline release tasks",
+            )
+        )
+        if failures:
+            self._mark_shutdown_failed()
+        for cleanup in (self._status.flush, self._status.close):
+            try:
+                cleanup()
+            except BaseException as error:
+                failures.append(error)
+        return unique_exception_leaves(failures)
+
+    async def _release_pipeline_resources(self) -> None:
+        failures: list[BaseException] = []
+        try:
+            await self._discard_pending_prepared_batches()
+        except BaseException as error:
+            failures.append(error)
+        if isinstance(self._output_queue, DistributedTrajectoryQueue):
+            try:
+                await self._output_queue.close()
+            except BaseException as error:
+                failures.append(error)
+        error = self._group_pipeline_failures(
+            None, failures, message="Pipeline data release failed."
+        )
+        if error is not None:
+            raise error
+
+    def _shutdown_operation_done(self, task: asyncio.Task[Any]) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            self._mark_shutdown_failed()
+
+    @staticmethod
+    def _group_pipeline_failures(
+        primary: BaseException | None,
+        failures: Iterable[BaseException],
+        *,
+        message: str,
+    ) -> BaseException | None:
+        leaves = unique_exception_leaves((primary, *failures))
+        if not leaves:
+            return None
+        if len(leaves) == 1:
+            return leaves[0]
+        return BaseExceptionGroup(message, leaves)
 
     def request_stop(self) -> None:
         """Request a clean shutdown of the pipeline stages."""
-        if self.state.done:
-            return
         self.state.done = True
         self._accept_prepared_batches = False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._stop_event.set()
+            return
+        self._begin_shutdown()
+        if self._stop_event.is_set():
+            return
         self._stop_event.set()
 
         async def _notify_policy() -> None:
             async with self.state.policy_updated:
                 self.state.policy_updated.notify_all()
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        loop.create_task(_notify_policy())
+        self._shutdown_wake_tasks.add(
+            loop.create_task(_notify_policy(), name="pipeline_policy_wake")
+        )
         if self._output_queue is None:
             return
         if isinstance(self._output_queue, DistributedTrajectoryQueue):
-            loop.create_task(self._output_queue.finish())
+            self._shutdown_wake_tasks.add(
+                loop.create_task(
+                    self._output_queue.finish(), name="pipeline_queue_finish"
+                )
+            )
             return
         try:
             self._output_queue.put_nowait(None)
         except asyncio.QueueFull:
-            loop.create_task(self._output_queue.put(None))
+            self._shutdown_wake_tasks.add(
+                loop.create_task(
+                    self._output_queue.put(None), name="pipeline_queue_wake"
+                )
+            )
 
     async def _await_or_stop(self, awaitable: Awaitable[T]) -> tuple[bool, T | None]:
         operation = asyncio.ensure_future(awaitable)
@@ -752,7 +965,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _finalize_backend_training(self) -> None:
-        if not self._backend_training_completed:
+        if not self._backend_training_started:
             return
         finalize = getattr(self.backend, "finalize_training_session", None)
         if finalize is not None:
@@ -1257,6 +1470,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
         phases: dict[str, float] = {}
         started = time.monotonic()
+        self._require_backend_publication_owner(item.result)
         self._schedule_publication_metrics(item.result)
         await self._log_checkpoint_saved(item.result)
         await self._prune_model_adapters(item.current_step)
@@ -1487,6 +1701,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     else:
                         post_train_dispatch.set()
                 if staged_remote_train:
+                    self._backend_training_started = True
                     pending = await start_pipeline_train(
                         self.model, batch, **train_kwargs
                     )
@@ -1506,12 +1721,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         self.state.policy_updated.notify_all()
                     if self._packed_queue is not None:
                         prepared.handoff.set()
+                    self._backend_training_started = True
                     result = await self.backend.train(
                         self.model,
                         batch,
                         **train_kwargs,
                     )
-                self._backend_training_completed = True
             except Exception:
                 if post_train_dispatch is not None:
                     post_train_dispatch.set()
@@ -2550,9 +2765,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if task.cancelled():
             return
         error = task.exception()
-        if error is not None and self._checkpoint_log_failure is None:
-            self._checkpoint_log_failure = error
-            self.request_stop()
+        if error is not None:
+            self._record_terminal_task_failure(error)
 
     def _schedule_publication_metrics(self, result: Any) -> None:
         ready = getattr(result, "publication_metrics_ready", None)
@@ -2564,6 +2778,16 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         )
         self._publication_metric_tasks.add(task)
         task.add_done_callback(self._publication_metrics_done)
+
+    def _require_backend_publication_owner(self, result: Any) -> None:
+        if (
+            getattr(result, "checkpoint_ready", None) is not None
+            or getattr(result, "publication_metrics_ready", None) is not None
+        ) and not callable(getattr(self.backend, "finalize_training_session", None)):
+            raise RuntimeError(
+                "backend returned asynchronous publication readiness without a "
+                "finalize_training_session owner"
+            )
 
     async def _log_publication_metrics_when_ready(
         self, step: int, ready: Awaitable[dict[str, float]]
@@ -2584,9 +2808,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if task.cancelled():
             return
         error = task.exception()
-        if error is not None and self._publication_metric_failure is None:
-            self._publication_metric_failure = error
-            self.request_stop()
+        if error is not None:
+            self._record_terminal_task_failure(error)
+
+    def _record_terminal_task_failure(self, error: BaseException) -> None:
+        self._terminal_task_failures.append(error)
+        self._mark_shutdown_failed()
+        self.request_stop()
 
     async def _log_checkpoint_eval_completed(self, step: int) -> None:
         self._log_checkpoint_history(
