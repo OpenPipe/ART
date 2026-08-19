@@ -872,6 +872,16 @@ class MegatronTrainingSlot:
             ),
         )
 
+    async def discard_prepared_save(self, operation_id: str) -> None:
+        operation = self._prepared_saves.pop(operation_id, None)
+        if operation is None:
+            return
+        if operation_id in self._pending_results:
+            self._prepared_saves[operation_id] = operation
+            raise RuntimeError("cannot discard an authorized snapshot write")
+        if isinstance(operation.snapshot, _PendingSnapshot):
+            await self.trainer.discard_prepared_snapshot(operation_id)
+
     async def _start_snapshot(
         self,
         ref: OperationRef,

@@ -577,6 +577,9 @@ class MegatronTrainJobExecutor:
             grant=grant,
         )
 
+    def discard_prepared_snapshot(self, operation_id: str) -> None:
+        self._publisher.discard(operation_id)
+
     def discard_open_gradients(self) -> None:
         self._gradients.discard()
         self._gradient_parent_version = None
@@ -1287,6 +1290,9 @@ class MCoreRunSlotExecutor:
             plan=plan,
             grant=grant,
         )
+
+    def discard_prepared_snapshot(self, operation_id: str) -> None:
+        self._publisher.discard(operation_id)
 
     def discard_run_gradients(self, run_id: str) -> None:
         state = self._require_run(run_id)
@@ -2149,6 +2155,34 @@ class _GenerationPublisher:
             self._authorization_failed(prepared, error)
             raise
         return {"snapshot_authorize_s": time.perf_counter() - started}
+
+    def discard(self, operation_id: str) -> None:
+        with self._lock:
+            prepared = self._prepared.get(operation_id)
+            if prepared is None:
+                return
+            if prepared.authorized:
+                raise RuntimeError("cannot discard an authorized snapshot write")
+            self._prepared.pop(operation_id)
+            self._prepared_order.remove(operation_id)
+        error = RuntimeError("snapshot write authorization was rejected")
+        try:
+            prepared.contexts.close()
+        except BaseException as cleanup_error:
+            error.add_note(
+                "snapshot context cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        self._report_failure(
+            error,
+            entry=prepared.entry,
+            sink=prepared.sink,
+            generation=prepared.plan.generation,
+            remember=False,
+        )
+        if not prepared.completion.done():
+            prepared.completion.set_exception(error)
+        self._retire_prepared(prepared)
 
     def stage_and_submit(self, **_kwargs: Any) -> dict[str, float]:
         raise RuntimeError(

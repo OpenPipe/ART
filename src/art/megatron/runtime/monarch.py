@@ -1234,6 +1234,13 @@ class MonarchTrainerActor(Actor):
             raise
 
     @endpoint
+    def discard_run_slot_snapshot(self, operation_id: str) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        self._require_run_slot_executor().discard_prepared_snapshot(operation_id)
+        return {"rank": self._runtime.rank, "operation_id": operation_id}
+
+    @endpoint
     def execute_snapshot(
         self,
         job_json: str,
@@ -1972,6 +1979,31 @@ class MonarchTrainerSlot:
             raise RuntimeError("trainer ranks returned an invalid authorization")
         authorization.set()
         return next(result for result in results if result["rank"] == 0)["metrics"]
+
+    async def discard_prepared_snapshot(self, operation_id: str) -> None:
+        async with self._control_lock:
+            authorization = self._publication_authorizations.get(operation_id)
+            publication = self._publications.get(operation_id)
+            if authorization is None or publication is None:
+                return
+            if authorization.is_set():
+                raise RuntimeError("cannot discard an authorized snapshot write")
+            values = await asyncio.wait_for(
+                self._actors.discard_run_slot_snapshot.call(operation_id),
+                timeout=self._command_timeout_s,
+            )
+            results = list(values.values())
+            if {result["rank"] for result in results} != set(
+                range(len(self._rank_processes))
+            ) or {result["operation_id"] for result in results} != {operation_id}:
+                raise RuntimeError("trainer ranks discarded another snapshot")
+            authorization.set()
+            outcome = (await asyncio.gather(publication, return_exceptions=True))[0]
+            if not isinstance(outcome, BaseException):
+                raise RuntimeError("discarded snapshot unexpectedly published")
+            self._publications.pop(operation_id, None)
+            self._publication_authorizations.pop(operation_id, None)
+            self._operations.pop(operation_id, None)
 
     def wait_for_publication(
         self, operation_id: str
