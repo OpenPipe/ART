@@ -36,6 +36,9 @@ from .tokenized import (
 
 COMMAND_CONTRACT_VERSION = "art_training_commands_v1"
 PACKING_CONTRACT_VERSION = "art_prefix_tree_v1"
+MAX_CONTROL_IDENTIFIER_LENGTH = 255
+MAX_CHECKPOINT_REFERENCE_LENGTH = 2048
+MAX_MODEL_ALIAS_LENGTH = 255
 
 
 def operation_generation_id(operation_id: str, learner_version: int) -> str:
@@ -52,8 +55,8 @@ class Contract(BaseModel):
 
 
 class RunCommand(Contract):
-    run_id: str = Field(min_length=1)
-    request_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+    request_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
     sequence_id: int = Field(ge=0)
 
 
@@ -261,7 +264,9 @@ class OptimStepRequest(RunCommand):
 
 class SamplerPublication(Contract):
     mode: Literal["none", "versioned_lora", "in_flight_lora", "merged_weights"]
-    model_alias: str | None = None
+    model_alias: str | None = Field(
+        default=None, min_length=1, max_length=MAX_MODEL_ALIAS_LENGTH
+    )
 
     @model_validator(mode="after")
     def _validate_alias(self) -> "SamplerPublication":
@@ -273,19 +278,19 @@ class SamplerPublication(Contract):
 
 
 class SaveWeightsForSamplerRequest(RunCommand):
-    checkpoint_name: str = Field(min_length=1)
+    checkpoint_name: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
     ttl_seconds: int | None = Field(default=None, ge=1)
     publication: SamplerPublication
 
 
 class SaveStateRequest(RunCommand):
-    checkpoint_name: str = Field(min_length=1)
+    checkpoint_name: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
     ttl_seconds: int | None = Field(default=None, ge=1)
     overwrite: bool = False
 
 
 class LoadStateRequest(RunCommand):
-    checkpoint: str = Field(min_length=1)
+    checkpoint: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
     restore_optimizer: bool = False
 
 

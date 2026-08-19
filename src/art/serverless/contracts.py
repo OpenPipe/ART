@@ -13,6 +13,8 @@ from art.distributed.moe_route_store import (
 from art.distributed.object_store import MOE_ROUTE_OBJECT_FORMAT
 from art.distributed.trajectory_store import TrajectoryGroupAnnotations
 from art.training.contracts import (
+    MAX_CHECKPOINT_REFERENCE_LENGTH,
+    MAX_CONTROL_IDENTIFIER_LENGTH,
     Contract,
     ForwardRequest,
     LossConfig,
@@ -25,6 +27,22 @@ SFT_DATA_FORMAT = "art_sft_batch_msgpack_v1"
 TOKENIZED_DATA_FORMAT = "art_tokenized_batch_msgpack_v2"
 OPERATION_RESULT_FORMAT = "art_operation_result_msgpack_v1"
 MAX_OPERATION_RESULT_BYTES = 512 << 20
+MAX_BASE_MODEL_LENGTH = 512
+MAX_TARGET_MODULE_COUNT = 256
+MAX_TARGET_MODULE_LENGTH = 255
+MAX_RUN_METADATA_ITEMS = 64
+MAX_RUN_METADATA_KEY_LENGTH = 128
+MAX_RUN_METADATA_VALUE_LENGTH = 4096
+MAX_CHECKPOINT_RETENTION_ITEMS = 512
+
+TargetModule = Annotated[str, Field(min_length=1, max_length=MAX_TARGET_MODULE_LENGTH)]
+RunMetadataKey = Annotated[
+    str, Field(min_length=1, max_length=MAX_RUN_METADATA_KEY_LENGTH)
+]
+RunMetadataValue = Annotated[str, Field(max_length=MAX_RUN_METADATA_VALUE_LENGTH)]
+ControlIdentifier = Annotated[
+    str, Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+]
 
 
 class TrainingDataRef(Contract):
@@ -257,22 +275,28 @@ def command_route_object_refs(
 class AdapterSpec(Contract):
     rank: int = Field(ge=1, le=32)
     alpha: Literal[32] = 32
-    target_modules: tuple[str, ...] = Field(min_length=1)
+    target_modules: tuple[TargetModule, ...] = Field(
+        min_length=1, max_length=MAX_TARGET_MODULE_COUNT
+    )
     moe_parameterization: Literal["per_expert", "shared_outer"] = "per_expert"
 
 
 class TrainingRunSpec(Contract):
     run_name: str = Field(min_length=1, max_length=255)
-    base_model: str = Field(min_length=1)
+    base_model: str = Field(min_length=1, max_length=MAX_BASE_MODEL_LENGTH)
     adapter: AdapterSpec
     seed: int = 0
     dtype: Literal["bfloat16"] = "bfloat16"
-    metadata: dict[str, str] = Field(default_factory=dict)
+    metadata: dict[RunMetadataKey, RunMetadataValue] = Field(
+        default_factory=dict, max_length=MAX_RUN_METADATA_ITEMS
+    )
 
 
 class CreateTrainingRunRequest(Contract):
     spec: TrainingRunSpec
-    checkpoint: str | None = None
+    checkpoint: str | None = Field(
+        default=None, min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH
+    )
     restore_optimizer: bool = False
 
     @model_validator(mode="after")
@@ -320,7 +344,7 @@ class OperationView(Contract):
 
 
 class CancelOperationRequest(Contract):
-    request_id: str = Field(min_length=1)
+    request_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
 
 
 class RunEvent(Contract):
@@ -338,7 +362,7 @@ class EventPage(Contract):
 
 
 class CloseRunRequest(Contract):
-    request_id: str = Field(min_length=1)
+    request_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
 
 
 class CheckpointView(Contract):
@@ -363,14 +387,20 @@ class CheckpointPage(Contract):
 
 
 class CheckpointRevision(Contract):
-    checkpoint_id: str
+    checkpoint_id: ControlIdentifier
     revision: int = Field(ge=1)
 
 
 class ApplyCheckpointRetentionRequest(Contract):
-    observed: tuple[CheckpointRevision, ...]
-    retain_checkpoint_ids: tuple[str, ...] = ()
-    archive_checkpoint_ids: tuple[str, ...] = ()
+    observed: tuple[CheckpointRevision, ...] = Field(
+        max_length=MAX_CHECKPOINT_RETENTION_ITEMS
+    )
+    retain_checkpoint_ids: tuple[ControlIdentifier, ...] = Field(
+        default=(), max_length=MAX_CHECKPOINT_RETENTION_ITEMS
+    )
+    archive_checkpoint_ids: tuple[ControlIdentifier, ...] = Field(
+        default=(), max_length=MAX_CHECKPOINT_RETENTION_ITEMS
+    )
 
     @model_validator(mode="after")
     def _validate_ids(self) -> "ApplyCheckpointRetentionRequest":
