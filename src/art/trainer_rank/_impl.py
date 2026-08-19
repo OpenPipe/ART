@@ -46,6 +46,7 @@ from art.megatron.prefix_tree_packing import (
     estimate_prefix_tree_packed_tokens,
     prefix_tree_pack,
 )
+from art.trainer_rank._telemetry import phase as _telemetry_phase
 
 if TYPE_CHECKING:
     from megatron.core.models.gpt.gpt_model import GPTModel
@@ -1573,9 +1574,13 @@ class TrainerRank:
         self._validate_replicated_top_level_count(len(items))
         start = 0
         while start < len(items):
-            candidate = self._select_next_micro_batch(
-                items, start, checkpoint=checkpoint
-            )
+            with _telemetry_phase(
+                "plan",
+                {"global_start": start, "global_remaining": len(items) - start},
+            ):
+                candidate = self._select_next_micro_batch(
+                    items, start, checkpoint=checkpoint
+                )
             flat_outputs = iter(
                 self._run_flat_plan_with_memory_tracking(
                     candidate.plan,
@@ -1589,23 +1594,29 @@ class TrainerRank:
                     self._last_global_micro_batch_size or 0,
                     candidate.stats_global_count,
                 )
-            yield MicroBatch(
-                inputs=candidate.inputs,
-                outputs=outputs,
-                indices=candidate.indices,
-                stats=MicroBatchStats(
-                    global_start=start,
-                    global_stop=stop,
-                    global_count=candidate.stats_global_count,
-                    local_count=len(candidate.inputs),
-                    packed_tokens=candidate.plan.packed_tokens,
-                    logical_tokens=candidate.plan.logical_tokens,
-                    estimated_required_bytes=candidate.check.estimated_required_bytes,
-                    available_bytes=candidate.check.available_bytes,
-                    rejected_candidates=candidate.rejected_candidates,
-                    cold_start=candidate.cold_start,
-                ),
-            )
+            with _telemetry_phase(
+                # This interval is controlled by the caller and normally contains
+                # loss construction and backward for the yielded microbatch.
+                "caller",
+                self._telemetry_signature(candidate.plan),
+            ):
+                yield MicroBatch(
+                    inputs=candidate.inputs,
+                    outputs=outputs,
+                    indices=candidate.indices,
+                    stats=MicroBatchStats(
+                        global_start=start,
+                        global_stop=stop,
+                        global_count=candidate.stats_global_count,
+                        local_count=len(candidate.inputs),
+                        packed_tokens=candidate.plan.packed_tokens,
+                        logical_tokens=candidate.plan.logical_tokens,
+                        estimated_required_bytes=candidate.check.estimated_required_bytes,
+                        available_bytes=candidate.check.available_bytes,
+                        rejected_candidates=candidate.rejected_candidates,
+                        cold_start=candidate.cold_start,
+                    ),
+                )
             start = stop
 
     @overload
@@ -1721,11 +1732,15 @@ class TrainerRank:
         selected_checkpoints = self._selected_dynamic_checkpoints(checkpoints)
         if on_live_graphs == "error":
             self._guard_checkpoints_can_step(selected_checkpoints)
-        return self._dynamic_optim_step(
-            selected_checkpoints,
-            params=params,
-            scale_grads=scale_grads,
-        )
+        with _telemetry_phase(
+            "optim",
+            {"checkpoint_count": len(selected_checkpoints)},
+        ):
+            return self._dynamic_optim_step(
+                selected_checkpoints,
+                params=params,
+                scale_grads=scale_grads,
+            )
 
     def _load_checkpoint_slot(
         self,
@@ -2600,7 +2615,12 @@ class TrainerRank:
         else:
             baseline = 0
         try:
-            outputs = self._execute_flat_plan(plan)
+            with _telemetry_phase(
+                "forward",
+                self._telemetry_signature(plan),
+                synchronized=torch.cuda.is_available() and self.device.type == "cuda",
+            ):
+                outputs = self._execute_flat_plan(plan)
         except torch.cuda.OutOfMemoryError as exc:
             check = self._memory_check(plan)
             self._raise_memory_error(
@@ -2615,6 +2635,25 @@ class TrainerRank:
             peak = int(torch.cuda.max_memory_allocated(self.device))
             self._update_memory_profile(plan, max(0, peak - baseline))
         return outputs
+
+    @staticmethod
+    def _telemetry_signature(plan: _FlatForwardPlan) -> dict[str, object]:
+        return {
+            "topology": plan.signature.topology,
+            "shared_prefix_max_depth": plan.signature.shared_prefix_max_depth,
+            "slot_group_count": plan.signature.slot_group_count,
+            "request_mix": plan.signature.request_mix,
+            "grad_enabled": plan.signature.grad_enabled,
+            "request_count": plan.request_count,
+            "packed_tokens": plan.packed_tokens,
+            "logical_tokens": plan.logical_tokens,
+            "group_packed_tokens": tuple(
+                int(group.packed.tokens.numel()) for group in plan.groups
+            ),
+            "group_segment_counts": tuple(
+                len(group.packed.segments) for group in plan.groups
+            ),
+        }
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
         outputs = [
