@@ -820,18 +820,15 @@ class LocalMegatronTrainingClient:
         overwrite: bool = False,
     ) -> None:
         existing = self._checkpoints.get(checkpoint_id)
-        if (
-            existing is not None
-            and (
-                existing.adapter_path != checkpoint.adapter_path
-                or existing.adapter_step != checkpoint.adapter_step
-            )
-            and not overwrite
-        ):
+        same_learner = existing is not None and (
+            existing.adapter_path == checkpoint.adapter_path
+            and existing.adapter_step == checkpoint.adapter_step
+        )
+        if existing is not None and not same_learner and not overwrite:
             raise RuntimeError(
                 f"checkpoint name {checkpoint_id!r} identifies different learners"
             )
-        if existing is not None and checkpoint.optimizer_state_path is None:
+        if same_learner and checkpoint.optimizer_state_path is None:
             return
         self._checkpoints[checkpoint_id] = checkpoint
 
