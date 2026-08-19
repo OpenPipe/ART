@@ -23,6 +23,10 @@ from art.training.contracts import (
 from art.training.sequencing import CommandAdmissionPolicy
 
 
+async def _consume_cancelled_command(_ref: Any) -> None:
+    return None
+
+
 def _client(
     policy: CommandAdmissionPolicy | None = None,
     service: Any | None = None,
@@ -33,7 +37,10 @@ def _client(
         backend=SimpleNamespace(),
         model=SimpleNamespace(),
         service=service
-        or SimpleNamespace(retire_command_operation=lambda _operation_id: None),
+        or SimpleNamespace(
+            retire_command_operation=lambda _operation_id: None,
+            consume_cancelled_command=_consume_cancelled_command,
+        ),
         admission_policy=policy,
     )
 
@@ -97,7 +104,7 @@ async def test_default_128_command_boundary_is_atomic_and_releases_cancelled() -
     client = _client()
     release = asyncio.Event()
 
-    async def blocked(_admission):
+    async def blocked(_admission, _own_task):
         await release.wait()
 
     first_request = _forward_backward("fb", 0)
@@ -139,7 +146,7 @@ async def test_default_64_gradient_boundary_and_terminal_release_match_remote() 
     client = _client()
     release = asyncio.Event()
 
-    async def blocked(_admission):
+    async def blocked(_admission, _own_task):
         await release.wait()
 
     requests = tuple(_forward_backward(f"fb-{index}", index) for index in range(65))
@@ -207,7 +214,7 @@ async def test_configured_depth_releases_failure_without_losing_retry() -> None:
     failure = RuntimeError("expected failure")
     executions = 0
 
-    async def fail(_admission):
+    async def fail(_admission, _own_task):
         nonlocal executions
         executions += 1
         raise failure
@@ -225,7 +232,7 @@ async def test_configured_depth_releases_failure_without_losing_retry() -> None:
 
     release = asyncio.Event()
 
-    async def blocked(_admission):
+    async def blocked(_admission, _own_task):
         await release.wait()
 
     successor = await _submit(client, _save("successor", 1), "save_sampler", blocked)
@@ -274,19 +281,29 @@ async def test_repeated_pending_fb_cancellation_is_bounded_and_preserves_prior(
 ) -> None:
     monkeypatch.setattr(client_module, "_MAX_RETAINED_COMPLETED_OPERATIONS", 2)
     retired: list[str] = []
-    client = _client(service=SimpleNamespace(retire_command_operation=retired.append))
+    consumed: list[int] = []
+
+    async def consume(ref):
+        consumed.append(ref.sequence_id)
+
+    client = _client(
+        service=SimpleNamespace(
+            retire_command_operation=retired.append,
+            consume_cancelled_command=consume,
+        )
+    )
     prior = await _submit(
         client,
         _forward_backward("prior", 0),
         "forward_backward",
-        lambda _admission: asyncio.sleep(0, result="prior"),
+        lambda _admission, _own_task: asyncio.sleep(0, result="prior"),
     )
     assert await prior.result() == "prior"
 
     blocker_started = asyncio.Event()
     blocker_release = asyncio.Event()
 
-    async def block(_admission):
+    async def block(_admission, _own_task):
         blocker_started.set()
         await blocker_release.wait()
         return "released"
@@ -295,7 +312,7 @@ async def test_repeated_pending_fb_cancellation_is_bounded_and_preserves_prior(
     await blocker_started.wait()
     pending_executions = 0
 
-    async def must_not_execute(_admission):
+    async def must_not_execute(_admission, _own_task):
         nonlocal pending_executions
         pending_executions += 1
 
@@ -315,12 +332,13 @@ async def test_repeated_pending_fb_cancellation_is_bounded_and_preserves_prior(
     assert pending_executions == 0
     assert client._ledger._nonterminal_request_ids == {"blocker"}
     assert client._ledger._open_forward_backward_ids == [prior.ref.operation_id]
-    assert len(client._completed_operations) == 2
-    assert retired == [operation.ref.operation_id for operation in cancelled[:-2]]
+    assert tuple(client._completed_operations) == (prior.ref.operation_id,)
+    assert retired == []
+    assert consumed == []
 
     optimizer_started = asyncio.Event()
 
-    async def capture(admission):
+    async def capture(admission, _own_task):
         optimizer_started.set()
         return admission
 
@@ -343,6 +361,12 @@ async def test_repeated_pending_fb_cancellation_is_bounded_and_preserves_prior(
     blocker_release.set()
     assert await blocker.result() == "released"
     assert await optimizer.result() == optimizer._admission
+    assert consumed == list(range(2, 12))
+    assert retired == [
+        prior.ref.operation_id,
+        blocker.ref.operation_id,
+        *(operation.ref.operation_id for operation in cancelled[:-1]),
+    ]
     await client.close()
     assert client._operations == {}
     assert client._ledger._records == {}

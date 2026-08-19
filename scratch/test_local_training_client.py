@@ -132,6 +132,9 @@ class _Service:
     def retire_command_operation(self, operation_id: str) -> None:
         self.retired_operation_ids.append(operation_id)
 
+    async def consume_cancelled_command(self, ref) -> None:
+        self.calls.append(f"cancelled:{ref.sequence_id}")
+
     async def forward_backward_command(self, ref, _batch, _config, _experimental):
         self.calls.append(f"fb:{ref.sequence_id}")
         return {"token_logprobs": ((-1.0, -2.0),), "metrics": {"fb": 1.0}}
@@ -595,10 +598,13 @@ def test_running_local_mutation_cancellation_matches_remote() -> None:
             )
         )
         await asyncio.wait_for(service.failure_started.wait(), timeout=1)
-        with pytest.raises(RuntimeError, match="running F/B command"):
-            await failed.cancel()
+        cancellation = asyncio.create_task(failed.cancel())
+        await asyncio.sleep(0)
+        assert not cancellation.done()
 
         service.failure_release.set()
+        with pytest.raises(RuntimeError, match="forward_backward failed"):
+            await cancellation
         with pytest.raises(RuntimeError, match="forward_backward failed"):
             await failed.result()
         with pytest.raises(RuntimeError, match="forward_backward failed"):
@@ -612,7 +618,7 @@ def test_running_local_mutation_cancellation_matches_remote() -> None:
     asyncio.run(run())
 
 
-def test_cancelled_deferred_save_cancels_owned_snapshot_completion() -> None:
+def test_running_deferred_save_cancellation_awaits_terminal_result() -> None:
     async def run() -> None:
         service = _Service()
         client = _Client(
@@ -631,13 +637,16 @@ def test_cancelled_deferred_save_cancels_owned_snapshot_completion() -> None:
             )
         )
         await operation._ordered
-        await operation.cancel()
+        cancellation = asyncio.create_task(operation.cancel())
+        await asyncio.sleep(0)
 
-        with pytest.raises(asyncio.CancelledError):
-            await operation.result()
         assert len(service.snapshot_completions) == 1
-        assert service.snapshot_completions[0].cancelled()
-        assert client._ledger._nonterminal_request_ids == set()
+        assert not service.snapshot_completions[0].done()
+        assert not cancellation.done()
+        service.completion_gate.set()
+        await cancellation
+        assert (await operation.result()).operation_id == operation.ref.operation_id
+        assert not service.snapshot_completions[0].cancelled()
         await client.close()
 
     asyncio.run(run())
@@ -667,11 +676,21 @@ def test_close_cancels_ten_deferred_snapshot_completions() -> None:
         await asyncio.gather(*(operation._ordered for operation in operations))
         assert len(service.snapshot_completions) == 10
         assert all(not task.done() for task in service.snapshot_completions)
+        assert all(
+            raw in operation._state.owned_tasks
+            for operation, raw in zip(
+                operations, service.snapshot_completions, strict=True
+            )
+        )
 
         await asyncio.wait_for(client.close(), timeout=1)
         assert all(task.cancelled() for task in service.snapshot_completions)
         assert all(operation._result.cancelled() for operation in operations)
         assert not any(not task.done() for task in client._completion_tasks)
+        assert all(
+            all(task.done() for task in operation._state.owned_tasks)
+            for operation in operations
+        )
         assert client._operations == {}
         assert client._ledger._records == {}
         assert service.retired_operation_ids == [
