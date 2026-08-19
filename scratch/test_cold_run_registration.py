@@ -8,7 +8,12 @@ import torch
 
 from art.megatron import optimizer_state as optimizer_state_module
 from art.megatron.model_support import lora_disk
-from art.megatron.runtime.executor import MCoreRunSlotExecutor, _GenerationPublisher
+from art.megatron.runtime.executor import (
+    GenerationResidency,
+    MCoreRunSlotExecutor,
+    _GenerationPublisher,
+    _PreparedRunLoad,
+)
 from art.megatron.runtime.residency import ResidencyCapacityUnavailable
 from art.megatron.training import gradient_accumulator as accumulator_module
 from art.trainer_rank import TrainerRank
@@ -148,6 +153,8 @@ class _Residency:
         self.components: dict[Any, tuple[torch.Tensor, ...]] = {}
         self.admissions: list[tuple[tuple[Any, tuple[torch.Tensor, ...]], ...]] = []
         self.acquisitions: list[tuple[Any, ...]] = []
+        self.retirements: list[Any] = []
+        self.retirement_errors: dict[str, BaseException] = {}
         self.acquire_error: BaseException | None = None
         self.admission_error: BaseException | None = None
 
@@ -168,13 +175,23 @@ class _Residency:
     def release_l1_working_set(self, _keys: Any) -> None:
         return None
 
+    def acquire_l1(self, key: Any) -> None:
+        self.acquire_l1_working_set((key,))
+
+    def release_l1(self, key: Any) -> None:
+        self.release_l1_working_set((key,))
+
     def retire(self, key: Any) -> None:
         self.components.pop(key, None)
 
     def retire_async(self, key: Any) -> Future[None]:
-        self.retire(key)
+        self.retirements.append(key)
         future: Future[None] = Future()
-        future.set_result(None)
+        if error := self.retirement_errors.get(key.representation):
+            future.set_exception(error)
+        else:
+            self.retire(key)
+            future.set_result(None)
         return future
 
     def keys(self, run_id: str) -> tuple[Any, ...]:
@@ -212,6 +229,9 @@ class _Publisher:
 class _Accumulator:
     def __init__(self, *, parameters: tuple[torch.Tensor, ...]) -> None:
         self.parameters = parameters
+
+    def discard(self) -> None:
+        return None
 
 
 def _executor(
@@ -446,42 +466,7 @@ def test_fresh_initial_optimizer_snapshots_from_l2_before_l1_install(
     publisher.close()
 
 
-@pytest.mark.parametrize("failure", ["identity", "accumulator"])
-def test_cold_first_install_rolls_back_post_install_failure(
-    monkeypatch: pytest.MonkeyPatch, failure: str
-) -> None:
-    executor, slot, _residency, _publisher = _executor(monkeypatch)
-    _register(executor)
-    state = executor._runs["run"]
-
-    if failure == "identity":
-        monkeypatch.setattr(
-            slot,
-            "checkpoint_slot_residency_tensors",
-            lambda _name: SimpleNamespace(weights=(torch.zeros(1),), optimizer=()),
-        )
-        expected = "changed prepared weight tensors"
-    else:
-        monkeypatch.setattr(
-            accumulator_module,
-            "ParameterGradientAccumulator",
-            lambda **_kwargs: (_ for _ in ()).throw(
-                RuntimeError("forced accumulator failure")
-            ),
-        )
-        expected = "forced accumulator failure"
-
-    with pytest.raises(RuntimeError, match=expected):
-        with executor._resident(state):
-            pass
-
-    assert slot.weight_installs == slot.unload_calls == 1
-    assert slot.installed_checkpoint is None
-    assert not state.checkpoint_slot_installed
-    assert state.installed_weights is state.gradients is None
-
-
-def test_unregister_retries_failed_cold_install_rollback(
+def test_cold_first_install_setup_failure_precedes_slot_mutation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     executor, slot, _residency, _publisher = _executor(monkeypatch)
@@ -494,21 +479,142 @@ def test_unregister_retries_failed_cold_install_rollback(
             RuntimeError("forced accumulator failure")
         ),
     )
-    slot.unload_error = RuntimeError("forced rollback failure")
 
-    with pytest.raises(BaseExceptionGroup, match="install and rollback failed"):
+    with pytest.raises(RuntimeError, match="forced accumulator failure"):
         with executor._resident(state):
             pass
 
+    assert slot.weight_installs == slot.unload_calls == 0
+    assert slot.installed_checkpoint is None
+    assert not state.checkpoint_slot_installed
+    assert state.installed_weights is state.gradients is None
+
+
+def test_existing_install_setup_failure_keeps_previous_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, slot, residency, _publisher = _executor(monkeypatch)
+    _register(executor)
+    state = executor._runs["run"]
+    with executor._resident(state):
+        pass
+    previous_key = state.installed_weights
+    previous_checkpoint = slot.installed_checkpoint
+    previous_gradients = state.gradients
+    assert previous_key is not None and previous_checkpoint is not None
+
+    replacement = slot.prepare_checkpoint_slot_load_sync(
+        SimpleNamespace(path="run"), device="cpu"
+    )
+    replacement_key = previous_key.model_copy(
+        update={"generation_id": "replacement-generation"}
+    )
+    prepared = _PreparedRunLoad(
+        operation_id="load:replacement-generation",
+        weights_key=replacement_key,
+        optimizer_key=None,
+        checkpoint=replacement,
+        optimizer=None,
+        adapter_config=state.adapter_config,
+    )
+    residency.register_l2_working_set(((replacement_key, prepared.weights),))
+    state.desired = GenerationResidency(weights=replacement_key)
+    state.pending_load = prepared
+
+    def fail_before_install(**_kwargs: Any) -> None:
+        assert slot.installed_checkpoint is previous_checkpoint
+        assert slot.weight_installs == 1
+        raise RuntimeError("forced replacement setup failure")
+
+    monkeypatch.setattr(
+        accumulator_module,
+        "ParameterGradientAccumulator",
+        fail_before_install,
+    )
+
+    with pytest.raises(RuntimeError, match="forced replacement setup failure"):
+        with executor._resident(state):
+            pass
+
+    assert slot.weight_installs == 1
+    assert slot.installed_checkpoint is previous_checkpoint
     assert state.checkpoint_slot_installed
-    assert state.installed_weights is None
-    assert slot.installed_checkpoint is not None
+    assert state.installed_weights == previous_key
+    assert state.gradients is previous_gradients
+    assert state.pending_load is prepared
+    assert residency.acquisitions[-1] == (previous_key,)
+
+
+def test_unregister_retries_repeated_checkpoint_unload_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, slot, residency, _publisher = _executor(monkeypatch)
+    _register(executor)
+    executor.complete_run_registration("run")
+    state = executor._runs["run"]
+    with executor._resident(state):
+        pass
+    resident_keys = set(residency.components)
+    slot.unload_error = RuntimeError("forced unload failure")
+
+    for _attempt in range(2):
+        with pytest.raises(RuntimeError, match="forced unload failure"):
+            executor.unregister_run("run")
+        assert executor._runs["run"] is state
+        assert state.unregistering and state.checkpoint_slot_installed
+        assert slot.installed_checkpoint is not None
+        assert set(residency.components) == resident_keys
+        assert residency.retirements == []
+        with pytest.raises(RuntimeError, match="being unregistered"):
+            executor.prepare_residency("run", "forward")
+
     slot.unload_error = None
 
     executor.unregister_run("run")
 
-    assert slot.unload_calls == 2
+    assert slot.unload_calls == 3
     assert slot.installed_checkpoint is None
+    assert set(residency.retirements) == resident_keys
+    assert residency.components == {}
+    assert "run" not in executor._runs
+
+
+def test_unregister_retries_residency_retirement_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, slot, residency, _publisher = _executor(monkeypatch)
+    _register(executor)
+    executor.complete_run_registration("run")
+    state = executor._runs["run"]
+    with executor._resident(state):
+        pass
+    residency.retirement_errors["weights"] = RuntimeError(
+        "forced residency retirement failure"
+    )
+    retire = residency.retire_async
+
+    def retire_after_unload(key: Any) -> Future[None]:
+        assert slot.installed_checkpoint is None
+        return retire(key)
+
+    monkeypatch.setattr(residency, "retire_async", retire_after_unload)
+
+    with pytest.raises(RuntimeError, match="forced residency retirement failure"):
+        executor.unregister_run("run")
+
+    assert executor._runs["run"] is state
+    assert state.unregistering and not state.checkpoint_slot_installed
+    assert state.installed_weights is state.installed_optimizer is None
+    assert slot.unload_calls == 1 and slot.installed_checkpoint is None
+    assert tuple(key.representation for key in residency.keys("run")) == ("weights",)
+    with pytest.raises(RuntimeError, match="being unregistered"):
+        executor.prepare_residency("run", "forward")
+
+    residency.retirement_errors.clear()
+    executor.unregister_run("run")
+
+    assert slot.unload_calls == 1
+    assert residency.components == {}
     assert "run" not in executor._runs
 
 

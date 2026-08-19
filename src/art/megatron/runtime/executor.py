@@ -699,6 +699,7 @@ class _ResidentRunState(BaseModel):
     pending_load: _PreparedRunLoad | None = None
     next_accumulator_revision: int = 1
     registration_complete: bool = False
+    unregistering: bool = False
 
 
 class MCoreRunSlotExecutor:
@@ -1363,7 +1364,10 @@ class MCoreRunSlotExecutor:
         self._retire_accumulator(state)
 
     def unregister_run(self, run_id: str) -> None:
-        state = self._require_run(run_id, require_complete=False)
+        state = self._require_run(
+            run_id, require_complete=False, allow_unregistering=True
+        )
+        state.unregistering = True
         failures: list[BaseException] = []
         for operation_id, (prepared_run_id, _fingerprint, _future) in tuple(
             self._load_preparations.items()
@@ -1378,23 +1382,39 @@ class MCoreRunSlotExecutor:
                 state.gradients.discard()
             except BaseException as error:
                 failures.append(error)
+            else:
+                state.gradients = None
         try:
             self._publisher.retire_run(run_id)
         except BaseException as error:
             failures.append(error)
-        for key in self._residency.keys(run_id):
+        if state.checkpoint_slot_installed or state.installed_weights is not None:
             try:
-                self._residency.retire_async(key).result()
+                self._slot_trainer.unload_checkpoint_slot(run_id)
             except BaseException as error:
                 failures.append(error)
-        try:
-            if state.checkpoint_slot_installed or state.installed_weights is not None:
-                self._slot_trainer.unload_checkpoint_slot(run_id)
+            else:
                 state.checkpoint_slot_installed = False
-        except BaseException as error:
-            failures.append(error)
-        finally:
+                state.installed_weights = None
+                state.installed_optimizer = None
+                state.gradients = None
+        if not state.checkpoint_slot_installed and state.installed_weights is None:
+            for key in self._residency.keys(run_id):
+                try:
+                    self._residency.retire_async(key).result()
+                except BaseException as error:
+                    failures.append(error)
+        cleanup_pending = (
+            state.checkpoint_slot_installed
+            or state.installed_weights is not None
+            or bool(self._residency.keys(run_id))
+        )
+        if not cleanup_pending:
             self._runs.pop(run_id, None)
+        elif not failures:
+            failures.append(
+                RuntimeError("Megatron run cleanup left resident resources")
+            )
         if len(failures) == 1:
             raise failures[0]
         if failures:
@@ -1438,7 +1458,11 @@ class MCoreRunSlotExecutor:
             raise BaseExceptionGroup("Megatron run slot close failed", failures)
 
     def _require_run(
-        self, run_id: str, *, require_complete: bool = True
+        self,
+        run_id: str,
+        *,
+        require_complete: bool = True,
+        allow_unregistering: bool = False,
     ) -> _ResidentRunState:
         if self._closed:
             raise RuntimeError("Megatron run slot is closed")
@@ -1446,6 +1470,8 @@ class MCoreRunSlotExecutor:
             state = self._runs[run_id]
         except KeyError as exc:
             raise RuntimeError(f"training run is not resident: {run_id!r}") from exc
+        if state.unregistering and not allow_unregistering:
+            raise RuntimeError("training run is being unregistered")
         if require_complete and not state.registration_complete:
             raise RuntimeError("training run residency registration is incomplete")
         return state
@@ -1520,49 +1546,24 @@ class MCoreRunSlotExecutor:
                     raise RuntimeError("desired weights have no prepared L1 install")
                 previous_weights = state.installed_weights
                 previous_optimizer = state.installed_optimizer
+                from art.megatron.training.gradient_accumulator import (
+                    ParameterGradientAccumulator,
+                )
+
                 try:
+                    # TrainerRank binds these exact parameters or rolls back the slot.
+                    gradients = ParameterGradientAccumulator(parameters=pending.weights)
                     self._slot_trainer.install_prepared_checkpoint_slot_load_sync(
                         pending.checkpoint
                     )
-                    state.checkpoint_slot_installed = True
-                    if previous_optimizer is not None:
-                        self._slot_trainer.clear_checkpoint_slot_optimizer(state.run_id)
-                    live = self._slot_trainer.checkpoint_slot_residency_tensors(
-                        state.run_id
-                    )
-                    if tuple(map(id, live.weights)) != tuple(map(id, pending.weights)):
-                        raise RuntimeError(
-                            "installed checkpoint changed prepared weight tensors"
-                        )
-                    from art.megatron.training.gradient_accumulator import (
-                        ParameterGradientAccumulator,
-                    )
-
-                    gradients = ParameterGradientAccumulator(
-                        parameters=self._slot_trainer.checkpoint_slot_parameters(
-                            state.run_id
-                        )
-                    )
-                except BaseException as error:
-                    cleanup_error = None
-                    if previous_weights is None and state.checkpoint_slot_installed:
-                        try:
-                            self._slot_trainer.unload_checkpoint_slot(state.run_id)
-                        except BaseException as caught:
-                            cleanup_error = caught
-                        else:
-                            state.checkpoint_slot_installed = False
+                except BaseException:
                     self._residency.release_l1_working_set(working_set)
                     acquired = False
                     if previous_weights is not None:
                         self._residency.acquire_l1(previous_weights)
                         self._residency.release_l1(previous_weights)
-                    if cleanup_error is not None:
-                        raise BaseExceptionGroup(
-                            "checkpoint install and rollback failed",
-                            [error, cleanup_error],
-                        ) from error
                     raise
+                state.checkpoint_slot_installed = True
                 state.gradients = gradients
                 state.adapter_config = pending.adapter_config
                 state.installed_weights = weights_key
