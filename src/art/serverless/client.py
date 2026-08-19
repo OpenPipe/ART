@@ -404,38 +404,41 @@ class _RunEventObserver:
         self._run_id = run_id
         self._poll_interval_s = poll_interval_s
         self._cursor = 0
-        self._terminal: dict[str, RunEvent] = {}
-        self._condition = asyncio.Condition()
+        self._pending: dict[str, asyncio.Future[RunEvent]] = {}
         self._task: asyncio.Task[None] | None = None
         self._error: BaseException | None = None
         self._closed = False
 
-    async def wait(self, operation_id: str) -> RunEvent:
-        async with self._condition:
+    def register(self, operation_id: str) -> asyncio.Future[RunEvent]:
+        if operation_id in self._pending:
+            raise RuntimeError("remote operation was registered twice")
+        future = asyncio.get_running_loop().create_future()
+        future.add_done_callback(_consume_event_future)
+        if self._error is not None:
+            future.set_exception(self._error)
+        elif self._closed:
+            future.set_exception(
+                RemoteTrainingError("remote training event observer is closed")
+            )
+        else:
+            self._pending[operation_id] = future
             if self._task is None:
                 self._task = asyncio.create_task(
                     self._observe(), name=f"remote-training-events-{self._run_id}"
                 )
-            await self._condition.wait_for(
-                lambda: (
-                    operation_id in self._terminal
-                    or self._error is not None
-                    or self._closed
-                )
-            )
-            if self._error is not None:
-                raise self._error
-            if self._closed:
-                raise RemoteTrainingError("remote training event observer is closed")
-            return self._terminal.pop(operation_id)
+        return future
 
     async def close(self, *, timeout_s: float | None = None) -> None:
-        async with self._condition:
-            if self._closed:
-                return
-            self._closed = True
-            task, self._task = self._task, None
-            self._condition.notify_all()
+        if self._closed:
+            return
+        self._closed = True
+        task, self._task = self._task, None
+        pending, self._pending = tuple(self._pending.values()), {}
+        for future in pending:
+            if not future.done():
+                future.set_exception(
+                    RemoteTrainingError("remote training event observer is closed")
+                )
         if task is not None:
             task.cancel()
             if timeout_s is None:
@@ -451,26 +454,29 @@ class _RunEventObserver:
         try:
             while True:
                 page = await self._service.get_events(self._run_id, after=self._cursor)
-                async with self._condition:
-                    if page.next_cursor < self._cursor:
-                        raise RemoteTrainingError("remote event cursor moved backwards")
-                    self._cursor = page.next_cursor
-                    for event in page.events:
-                        if event.event in _TERMINAL_EVENTS:
-                            if event.operation_id is None:
-                                raise RemoteTrainingError(
-                                    "terminal operation event has no operation_id"
-                                )
-                            self._terminal[event.operation_id] = event
-                    self._condition.notify_all()
+                if page.next_cursor < self._cursor:
+                    raise RemoteTrainingError("remote event cursor moved backwards")
+                self._cursor = page.next_cursor
+                for event in page.events:
+                    if event.event not in _TERMINAL_EVENTS:
+                        continue
+                    if event.operation_id is None:
+                        raise RemoteTrainingError(
+                            "terminal operation event has no operation_id"
+                        )
+                    future = self._pending.pop(event.operation_id, None)
+                    if future is not None and not future.done():
+                        future.set_result(event)
                 if len(page.events) < _EVENT_PAGE_LIMIT:
                     await asyncio.sleep(self._poll_interval_s)
         except asyncio.CancelledError:
             raise
         except BaseException as error:
-            async with self._condition:
-                self._error = error
-                self._condition.notify_all()
+            self._error = error
+            pending, self._pending = tuple(self._pending.values()), {}
+            for future in pending:
+                if not future.done():
+                    future.set_exception(error)
 
 
 class RemoteTrainingOperation(Generic[ResultT]):
@@ -484,11 +490,12 @@ class RemoteTrainingOperation(Generic[ResultT]):
     ) -> None:
         self._ref = ref
         self._service = service
-        self._events = events
         self._result_type = result_type
         self._completion: asyncio.Task[ResultT] | None = None
+        self._terminal = events.register(ref.operation_id)
         self._cancel_request_id = uuid.uuid4().hex
-        self._on_completion = on_completion
+        if on_completion is not None:
+            self._terminal.add_done_callback(lambda _: on_completion())
 
     @property
     def ref(self) -> OperationRef:
@@ -499,13 +506,10 @@ class RemoteTrainingOperation(Generic[ResultT]):
             self._completion = asyncio.create_task(
                 self._wait(), name=f"remote-training-result-{self._ref.operation_id}"
             )
-            on_completion = self._on_completion
-            if on_completion is not None:
-                self._completion.add_done_callback(lambda _: on_completion())
         return await asyncio.shield(self._completion)
 
     async def _wait(self) -> ResultT:
-        event = await self._events.wait(self._ref.operation_id)
+        event = await asyncio.shield(self._terminal)
         if event.event == "operation_failed":
             raise RemoteTrainingOperationError(self._ref.operation_id, event.payload)
         if event.event == "operation_cancelled":
@@ -691,8 +695,7 @@ class RemoteTrainingClient:
         for request_id, (_fingerprint, operation) in tuple(self._operations.items()):
             if overflow <= 0:
                 return
-            completion = operation._completion
-            if completion is not None and completion.done():
+            if operation._terminal.done():
                 self._operations.pop(request_id, None)
                 overflow -= 1
 
@@ -825,3 +828,10 @@ class RemoteTrainingClient:
             failures.append(error)
         if failures:
             raise BaseExceptionGroup("remote training client shutdown failed", failures)
+
+
+def _consume_event_future(future: asyncio.Future[RunEvent]) -> None:
+    try:
+        future.exception()
+    except asyncio.CancelledError:
+        pass
