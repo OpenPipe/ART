@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import heapq
 import time
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
 import uuid
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
 
 ResultT = TypeVar("ResultT", bound=Contract)
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
+_MAX_RETAINED_COMPLETED_RESULT_BYTES = 512 << 20
 
 
 def _consume_future(future: asyncio.Future[Any]) -> None:
@@ -107,6 +109,9 @@ class LocalMegatronTrainingClient:
         self._model = model
         self._service = service
         self._operations: dict[str, LocalTrainingOperation[Any]] = {}
+        self._completed_operations: dict[str, int] = {}
+        self._completed_operation_order: list[tuple[int, str]] = []
+        self._completed_result_bytes = 0
         self._completion_tasks: set[asyncio.Task[Any]] = set()
         self._checkpoints: dict[str, ResolvedCheckpointState] = {}
         self._sft_tokenizer = SftBatchTokenizer()
@@ -182,10 +187,10 @@ class LocalMegatronTrainingClient:
             request.request_id, admission, ordered, result
         )
         self._operations[admission.ref.operation_id] = operation
-        ordered.add_done_callback(lambda _: self._bound_operation_cache())
-        result.add_done_callback(lambda _: self._bound_operation_cache())
+        ordered.add_done_callback(lambda _: self._bound_operation_cache(operation))
+        result.add_done_callback(lambda _: self._bound_operation_cache(operation))
         self._tail = ordered
-        self._bound_operation_cache()
+        self._bound_operation_cache(operation)
         return operation
 
     async def forward(
@@ -618,16 +623,31 @@ class LocalMegatronTrainingClient:
             )
             raise BaseExceptionGroup("tokenized packed-batch release failed", failures)
 
-    def _bound_operation_cache(self) -> None:
-        completed = [
-            operation
-            for operation in self._operations.values()
-            if operation._ordered.done()
+    def _bound_operation_cache(self, operation: LocalTrainingOperation[Any]) -> None:
+        operation_id = operation.ref.operation_id
+        if (
+            self._operations.get(operation_id) is operation
+            and operation_id not in self._completed_operations
+            and operation._ordered.done()
             and operation._result.done()
             and operation.ref.kind != "forward_backward"
-        ]
-        for operation in completed[:-_MAX_RETAINED_COMPLETED_OPERATIONS]:
-            self._retire_operation(operation)
+        ):
+            result_bytes = _completed_result_bytes(operation)
+            self._completed_operations[operation_id] = result_bytes
+            self._completed_result_bytes += result_bytes
+            heapq.heappush(
+                self._completed_operation_order,
+                (operation.ref.sequence_id, operation_id),
+            )
+        while self._completed_operations and (
+            len(self._completed_operations) > _MAX_RETAINED_COMPLETED_OPERATIONS
+            or self._completed_result_bytes > _MAX_RETAINED_COMPLETED_RESULT_BYTES
+        ):
+            while True:
+                _, expired = heapq.heappop(self._completed_operation_order)
+                if expired in self._completed_operations:
+                    break
+            self._retire_operation(self._operations[expired])
 
     def _retire_operation(self, operation: LocalTrainingOperation[Any]) -> None:
         operation_id = operation.ref.operation_id
@@ -638,6 +658,19 @@ class LocalMegatronTrainingClient:
         self._ledger.retire(operation._request_id, operation._admission)
         self._service.retire_command_operation(operation_id)
         self._operations.pop(operation_id)
+        self._completed_result_bytes -= self._completed_operations.pop(operation_id, 0)
+
+
+def _completed_result_bytes(operation: LocalTrainingOperation[Any]) -> int:
+    if operation._result.cancelled():
+        return 0
+    try:
+        result = operation._result.result()
+    except BaseException:
+        return 0
+    if not isinstance(result, ForwardResult):
+        return 0
+    return sum(len(output.token_logprobs.data) for output in result.loss_fn_outputs)
 
 
 def _validate_publication_mode(
