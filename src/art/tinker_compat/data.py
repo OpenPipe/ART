@@ -15,7 +15,8 @@ from art.training.tokenized import TokenizedDatum, TokenizedLossName
 
 from .errors import UnsupportedCapabilityError
 
-SUPPORTED_LOSSES = frozenset({"cross_entropy", "importance_sampling", "ppo", "cispo"})
+SUPPORTED_LOSSES = frozenset({"cross_entropy"})
+_POLICY_SPAN_LOSSES = frozenset({"importance_sampling", "ppo", "cispo"})
 
 
 def validate_loss(loss_fn: object) -> TokenizedLossName:
@@ -25,6 +26,11 @@ def validate_loss(loss_fn: object) -> TokenizedLossName:
         )
     if loss_fn == "dro":
         raise UnsupportedCapabilityError("DRO is not supported by Remote Training")
+    if isinstance(loss_fn, str) and loss_fn in _POLICY_SPAN_LOSSES:
+        raise UnsupportedCapabilityError(
+            f"{loss_fn} is not supported by the Tinker compatibility profile because "
+            "Tinker Datum cannot provide the complete ART policy spans it requires"
+        )
     if loss_fn not in SUPPORTED_LOSSES:
         raise ValueError(
             f"unsupported loss {loss_fn!r}; expected one of {sorted(SUPPORTED_LOSSES)}"
@@ -47,7 +53,12 @@ def model_input_tokens(model_input: tinker.ModelInput) -> tuple[int, ...]:
 
 
 def to_tokenized_datum(datum: tinker.Datum, loss_fn: object) -> TokenizedDatum:
-    loss = validate_loss(loss_fn)
+    return _convert_datum(datum, validate_loss(loss_fn))[0]
+
+
+def _convert_datum(
+    datum: tinker.Datum, loss: TokenizedLossName
+) -> tuple[TokenizedDatum, tuple[int, ...]]:
     expected = (
         {"target_tokens", "weights"}
         if loss == "cross_entropy"
@@ -58,7 +69,9 @@ def to_tokenized_datum(datum: tinker.Datum, loss_fn: object) -> TokenizedDatum:
         raise ValueError(
             f"{loss} requires exactly {sorted(expected)}, got {sorted(found)}"
         )
-    target_tokens, _ = _matrix(datum.loss_fn_inputs["target_tokens"], integer=True)
+    target_tokens, target_shape = _matrix(
+        datum.loss_fn_inputs["target_tokens"], integer=True
+    )
     values: dict[str, object] = {
         "input_tokens": model_input_tokens(datum.model_input),
         "target_tokens": target_tokens,
@@ -66,7 +79,7 @@ def to_tokenized_datum(datum: tinker.Datum, loss_fn: object) -> TokenizedDatum:
     for name in ("weights", "logprobs", "advantages"):
         if name in datum.loss_fn_inputs:
             values[name] = _matrix(datum.loss_fn_inputs[name], integer=False)[0]
-    return TokenizedDatum.model_validate(values)
+    return TokenizedDatum.model_validate(values), target_shape
 
 
 def to_tokenized_batch(
@@ -75,12 +88,11 @@ def to_tokenized_batch(
     loss = validate_loss(loss_fn)
     if not data:
         raise ValueError("No data provided")
-    converted = tuple(to_tokenized_datum(datum, loss) for datum in data)
-    shapes = tuple(
-        _matrix(datum.loss_fn_inputs["target_tokens"], integer=True)[1]
-        for datum in data
+    converted = tuple(_convert_datum(datum, loss) for datum in data)
+    return (
+        TokenizedTrainingBatch(datums=tuple(item[0] for item in converted)),
+        tuple(item[1] for item in converted),
     )
-    return TokenizedTrainingBatch(datums=converted), shapes
 
 
 def to_tinker_forward_output(
