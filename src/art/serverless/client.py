@@ -212,16 +212,27 @@ class RemoteTrainingServiceClient:
 
     async def get_operation_result(
         self, operation_id: str, ref: OperationResultRef
-    ) -> bytes:
+    ) -> bytearray:
         response = await self._send(
             "GET",
             f"training/operations/{operation_id}/result",
             content=None,
             headers=None,
             transfer=True,
+            stream=True,
         )
-        payload = response.content
-        if len(payload) != ref.byte_count:
+        payload = bytearray(ref.byte_count)
+        offset = 0
+        try:
+            async for chunk in response.aiter_bytes():
+                end = offset + len(chunk)
+                if end > len(payload):
+                    raise RemoteTrainingError("remote operation result grew in transit")
+                payload[offset:end] = chunk
+                offset = end
+        finally:
+            await response.aclose()
+        if offset != ref.byte_count:
             raise RemoteTrainingError("remote operation result byte count changed")
         return payload
 
@@ -327,6 +338,7 @@ class RemoteTrainingServiceClient:
         content: str | bytes | AsyncIterable[bytes] | None,
         headers: dict[str, str] | None,
         transfer: bool = False,
+        stream: bool = False,
         max_retries: int | None = None,
     ) -> httpx.Response:
         client = self._transfer_client if transfer else self._control_client
@@ -334,11 +346,14 @@ class RemoteTrainingServiceClient:
         retries = self._max_retries if max_retries is None else max_retries
         for attempt in range(retries + 1):
             try:
-                response = await client.request(
-                    method,
-                    path,
-                    content=content,
-                    headers=headers,
+                response = await client.send(
+                    client.build_request(
+                        method,
+                        path,
+                        content=content,
+                        headers=headers,
+                    ),
+                    stream=stream,
                 )
             except httpx.TransportError:
                 if attempt == retries:
@@ -348,15 +363,20 @@ class RemoteTrainingServiceClient:
                     break
                 if attempt == retries:
                     break
+                await response.aclose()
             await asyncio.sleep(min(0.1 * 2**attempt, 1.0))
         if response is None:
             raise RuntimeError("remote training request produced no response")
         if response.is_error:
+            if stream:
+                await response.aread()
             try:
                 value = response.json()
             except ValueError:
                 value = response.text
             detail = value.get("detail", value) if isinstance(value, dict) else value
+            if stream:
+                await response.aclose()
             raise RemoteTrainingHttpError(response.status_code, detail)
         return response
 

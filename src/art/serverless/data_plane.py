@@ -789,7 +789,7 @@ def encode_operation_result(
 
 
 def decode_operation_result(
-    ref: OperationResultRef, payload: bytes, result_type: type[ResultT]
+    ref: OperationResultRef, payload: bytes | bytearray, result_type: type[ResultT]
 ) -> ResultT:
     if len(payload) != ref.byte_count:
         raise ValueError("operation result byte count differs from its reference")

@@ -24,6 +24,7 @@ RL_GROUP_DATA_FORMAT = "art_trajectory_group_msgpack_v3"
 SFT_DATA_FORMAT = "art_sft_batch_msgpack_v1"
 TOKENIZED_DATA_FORMAT = "art_tokenized_batch_msgpack_v2"
 OPERATION_RESULT_FORMAT = "art_operation_result_msgpack_v1"
+MAX_OPERATION_RESULT_BYTES = 512 << 20
 
 
 class TrainingDataRef(Contract):
@@ -163,7 +164,7 @@ RemoteTrainingBatchRef = Annotated[
 
 class OperationResultRef(Contract):
     object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    byte_count: int = Field(ge=1)
+    byte_count: int = Field(ge=1, le=MAX_OPERATION_RESULT_BYTES)
     format: Literal["art_operation_result_msgpack_v1"] = OPERATION_RESULT_FORMAT
 
 
