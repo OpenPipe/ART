@@ -22,6 +22,7 @@ from art.distributed.trajectory_store import (
     TrajectoryQueueItem,
     TrajectoryQueueLease,
 )
+from art.pipeline_trainer.checkpoint_retention import CheckpointRetentionPlan
 from art.pipeline_trainer.trainer import PipelineTrainer
 from art.serverless.backend import ServerlessBackend
 from art.serverless.data_plane import (
@@ -267,6 +268,28 @@ class _Service:
         self.close_calls += 1
 
 
+class _RetentionService(_Service):
+    def __init__(self, *checkpoints: Any) -> None:
+        super().__init__()
+        self.checkpoints = checkpoints
+        self.apply_started = asyncio.Event()
+        self.apply_gate = asyncio.Event()
+        self.retention_request = None
+
+    async def iter_checkpoint_pages(self, run_id):
+        assert run_id == "run"
+        yield SimpleNamespace(
+            checkpoints=self.checkpoints,
+            current_checkpoint_id=None,
+        )
+
+    async def apply_checkpoint_retention(self, run_id, request) -> None:
+        assert run_id == "run"
+        self.retention_request = request
+        self.apply_started.set()
+        await self.apply_gate.wait()
+
+
 class _DiscardBackend:
     def __init__(self) -> None:
         self.called = False
@@ -448,6 +471,38 @@ def _forward_result(operation_id: str) -> ForwardBackwardResult:
             "pipeline/gradient_step_real_microbatches": 1.0,
             "pipeline/gradient_step_dummy_microbatches": 0.0,
         },
+    )
+
+
+def _sampler_result(step: int) -> SamplerWeightsResult:
+    return SamplerWeightsResult(
+        operation_id=f"save-{step}",
+        checkpoint=CheckpointRef(
+            run_id="run",
+            learner_version=step,
+            checkpoint_id=f"step-{step}",
+        ),
+        lora="lora",
+        training_session_id="session",
+        generation_id=f"generation-{step}",
+        lora_bytes=1,
+    )
+
+
+async def _materialize_sampler_result(
+    backend: ServerlessBackend, model: TrainableModel, step: int
+) -> None:
+    pending = await backend._reserve_sampler_publication(model, step)
+    await backend._resolve_sampler_result(model, step, pending, _sampler_result(step))
+    await backend._finish_sampler_publication(model, step, pending)
+
+
+def _checkpoint(step: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        learner_version=step,
+        checkpoint_id=f"step-{step}",
+        revision=1,
+        state="ready",
     )
 
 
@@ -667,7 +722,7 @@ async def test_train_and_next_optimizer_do_not_wait_for_sampler_publication() ->
         await asyncio.sleep(0)
     assert not first_ready.done()
     with pytest.raises(RuntimeError, match="pending or active exact adapter"):
-        backend._validate_sampler_retention(model, set())
+        await backend._validate_sampler_retention(model, set())
 
     client.complete_sampler(1)
     sampler.active_gate.set()
@@ -690,6 +745,38 @@ async def test_train_and_next_optimizer_do_not_wait_for_sampler_publication() ->
         "publication/sampler": 1.0,
         "publication/sampler_step": 5.0,
     }
+    await backend._drain_background()
+
+
+@pytest.mark.asyncio
+async def test_public_train_waits_for_sampler_checkpoint_and_active_alias() -> None:
+    backend, model, client, sampler = _backend()
+    client.gate_sampler = True
+    sampler.active_gate = asyncio.Event()
+
+    training = asyncio.create_task(
+        backend.train(model, [_full_group()], **_train_kwargs())
+    )
+    async with asyncio.timeout(1):
+        while len(client.operations) < 3:
+            await asyncio.sleep(0)
+    client.operations[0].result_future.set_result(
+        _forward_result(client.operations[0].ref.operation_id)
+    )
+    await asyncio.sleep(0)
+    assert not training.done()
+
+    client.complete_sampler()
+    await asyncio.wait_for(sampler.active_started.wait(), timeout=1)
+    assert not training.done()
+    sampler.active_gate.set()
+
+    result = await asyncio.wait_for(training, timeout=1)
+    assert result.checkpoint_id == "step-4"
+    assert result.checkpoint_ready is None
+    assert result.publication_metrics_ready is None
+    assert result.metrics["publication/materialization"] == 1.0
+    assert result.metrics["publication/sampler_step"] == 4.0
     await backend._drain_background()
 
 
@@ -745,20 +832,81 @@ async def test_active_sampler_publications_follow_learner_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sampler_reservation_serializes_with_retention() -> None:
-    backend, model, _, _ = _backend()
+async def test_retention_apply_does_not_block_or_forget_new_publication() -> None:
+    backend, model, client, _ = _backend()
+    service = _RetentionService(_checkpoint(3))
+    backend._service = service
+    await _materialize_sampler_result(backend, model, 3)
 
-    async with backend._exact_adapter_lock:
-        reservation = asyncio.create_task(
-            backend._reserve_sampler_publication(model, 4)
+    retention = asyncio.create_task(
+        backend._apply_checkpoint_retention(
+            model, CheckpointRetentionPlan(observed_steps={3})
         )
-        await asyncio.sleep(0)
-        assert not reservation.done()
+    )
+    await asyncio.wait_for(service.apply_started.wait(), timeout=1)
 
-    pending = await reservation
-    assert backend._pending_sampler_steps(model) == {4}
-    backend._fail_sampler_result(model, 4, pending, asyncio.CancelledError())
-    backend._clear_sampler_state()
+    pending = await asyncio.wait_for(
+        backend.start_pipeline_train(model, [_full_group()], **_train_kwargs()),
+        timeout=1,
+    )
+    client.operations[0].result_future.set_result(
+        _forward_result(client.operations[0].ref.operation_id)
+    )
+    result = await asyncio.wait_for(pending.result(), timeout=1)
+    assert result.checkpoint_ready is not None
+    await asyncio.wait_for(result.checkpoint_ready, timeout=1)
+
+    service.apply_gate.set()
+    await asyncio.wait_for(retention, timeout=1)
+    assert backend._sampler_key(model, 3) not in backend._sampler_results
+    assert backend._sampler_key(model, 4) in backend._sampler_results
+    await backend._drain_background()
+
+
+@pytest.mark.asyncio
+async def test_pending_materialization_is_atomic_with_retention_reservation() -> None:
+    backend, model, client, _ = _backend()
+    client.gate_sampler = True
+    service = _RetentionService(_checkpoint(4))
+    backend._service = service
+    pending = await backend.start_pipeline_train(
+        model, [_full_group()], **_train_kwargs()
+    )
+    client.operations[0].result_future.set_result(
+        _forward_result(client.operations[0].ref.operation_id)
+    )
+    result = await asyncio.wait_for(pending.result(), timeout=1)
+
+    reserve_started = asyncio.Event()
+    reserve_gate = asyncio.Event()
+    reserve = backend._reserve_sampler_forgetting
+
+    async def gated_reserve(*args, **kwargs):
+        reserve_started.set()
+        await reserve_gate.wait()
+        return await reserve(*args, **kwargs)
+
+    backend._reserve_sampler_forgetting = gated_reserve
+    retention = asyncio.create_task(
+        backend._apply_checkpoint_retention(
+            model, CheckpointRetentionPlan(observed_steps={4})
+        )
+    )
+    await asyncio.wait_for(reserve_started.wait(), timeout=1)
+    async with backend._sampler_state_lock:
+        reserve_gate.set()
+        await asyncio.sleep(0)
+        client.complete_sampler()
+        await asyncio.sleep(0)
+
+    await asyncio.wait_for(service.apply_started.wait(), timeout=1)
+    assert service.retention_request.retain_checkpoint_ids == ("step-4",)
+    assert result.checkpoint_ready is not None
+    await asyncio.wait_for(result.checkpoint_ready, timeout=1)
+    service.apply_gate.set()
+    await asyncio.wait_for(retention, timeout=1)
+    assert backend._sampler_key(model, 4) in backend._sampler_results
+    await backend._drain_background()
 
 
 @pytest.mark.asyncio
@@ -788,7 +936,7 @@ async def test_exact_eval_waits_for_its_pending_sampler_then_publishes_version()
     await asyncio.sleep(0)
     assert not entered.is_set()
     with pytest.raises(RuntimeError, match="pending or active exact adapter"):
-        backend._forget_sampler_results(model, set())
+        await backend._forget_sampler_results(model, set())
 
     client.complete_sampler()
     await asyncio.wait_for(sampler.active_started.wait(), timeout=1)
