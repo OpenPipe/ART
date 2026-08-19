@@ -126,6 +126,18 @@ class ServerlessTrainResult(TrainResult):
         step: The training step after this training call completed.
         metrics: Aggregated training metrics (loss, gradient norms, etc.).
         checkpoint_id: Opaque remote checkpoint identity for the committed learner.
+            None until asynchronous sampler materialization completes.
+        checkpoint_ready: Completion signal for asynchronous sampler materialization
+            and active-alias publication.
+        publication_metrics_ready: Step-scoped publication metrics. This resolves
+            with checkpoint_ready but remains separate so metrics cannot be attached
+            to whichever later training step happens to observe publication.
     """
 
     checkpoint_id: str | None = None
+    checkpoint_ready: Awaitable[None] | None = field(
+        default=None, repr=False, compare=False
+    )
+    publication_metrics_ready: Awaitable[dict[str, float]] | None = field(
+        default=None, repr=False, compare=False
+    )

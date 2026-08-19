@@ -44,7 +44,11 @@ from art.training.contracts import (
 )
 from art.trajectories import Trajectory, TrajectoryGroup
 from art.types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
-from art.utils.lifecycle import complete_task, process_shutdown_timeout
+from art.utils.lifecycle import (
+    complete_task,
+    consume_future_exception,
+    process_shutdown_timeout,
+)
 
 from .. import dev
 from .client import (
@@ -113,6 +117,18 @@ class _PendingServerlessTrain(BaseModel):
 
     async def result(self) -> ServerlessTrainResult:
         return await self.completion
+
+
+class _PendingSamplerPublication(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    materialized: SkipValidation[asyncio.Future[SamplerWeightsResult]] = Field(
+        exclude=True
+    )
+    predecessor_settled: SkipValidation[asyncio.Future[None] | None] = Field(
+        exclude=True
+    )
+    activation_settled: SkipValidation[asyncio.Future[None]] = Field(exclude=True)
 
 
 class _ExactAdapterLeaseState(BaseModel):
@@ -268,6 +284,13 @@ class ServerlessBackend:
         self._sampler_results: dict[
             tuple[tuple[str | None, str, str, str], int], SamplerWeightsResult
         ] = {}
+        self._pending_sampler_publications: dict[
+            tuple[tuple[str | None, str, str, str], int],
+            _PendingSamplerPublication,
+        ] = {}
+        self._sampler_publication_tails: dict[
+            tuple[str | None, str, str, str], tuple[int, asyncio.Future[None]]
+        ] = {}
         self._exact_adapter_states: dict[
             tuple[tuple[str | None, str, str, str], int], _ExactAdapterLeaseState
         ] = {}
@@ -368,6 +391,20 @@ class ServerlessBackend:
                     )
                 except BaseException as cleanup_error:
                     failures.append(cleanup_error)
+            if failures and self._background:
+                tasks = tuple(self._background)
+                for task in tasks:
+                    task.cancel()
+                _, pending = await asyncio.wait(
+                    tasks,
+                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+                )
+                if pending:
+                    failures.append(
+                        TimeoutError(
+                            f"{len(pending)} remote background operations did not stop"
+                        )
+                    )
 
             adapters_drained = False
             try:
@@ -382,6 +419,7 @@ class ServerlessBackend:
                         await self._service.close()
                 except BaseException as error:
                     failures.append(error)
+            self._clear_sampler_state()
             if failures:
                 raise BaseExceptionGroup("ServerlessBackend shutdown failed", failures)
             self._closed = True
@@ -393,12 +431,19 @@ class ServerlessBackend:
             raise TypeError("ServerlessBackend only supports trainable models")
         client = await self.training_client(model)
         await client.shutdown()
+        tail = self._sampler_publication_tails.get(self._model_key(model))
+        if tail is not None:
+            async with asyncio.timeout(self._close_timeout_s):
+                await asyncio.shield(tail[1])
+            self._raise_background_failures()
         async for page in self._service.iter_checkpoint_pages(client.run_id):
             for checkpoint in page.checkpoints:
                 await self._service.delete_checkpoint(
                     client.run_id, checkpoint.checkpoint_id
                 )
-        self._clients.pop(self._model_key(model))
+        model_key = self._model_key(model)
+        self._clear_sampler_state(model_key)
+        self._clients.pop(model_key)
 
     def logs_sft_metrics_remotely(self) -> bool:
         return False
@@ -448,7 +493,8 @@ class ServerlessBackend:
             if self._closing or self._closed:
                 raise RuntimeError("ServerlessBackend is closed")
             weights = self._sampler_results.get(key)
-            if weights is None:
+            pending = self._pending_sampler_publications.get(key)
+            if weights is None and pending is None:
                 raise RuntimeError(
                     f"exact sampler weights for learner step {key[1]} are unavailable"
                 )
@@ -457,6 +503,9 @@ class ServerlessBackend:
             )
             state.leases += 1
         try:
+            if weights is None:
+                assert pending is not None
+                weights = await asyncio.shield(pending.materialized)
             async with state.lock:
                 if state.remove_failed:
                     await self._remove_exact_adapter(state)
@@ -609,6 +658,137 @@ class ServerlessBackend:
     ) -> tuple[tuple[str | None, str, str, str], int]:
         return self._model_key(model), step
 
+    def _reserve_sampler_publication(
+        self, model: AnyTrainableModel, step: int
+    ) -> _PendingSamplerPublication:
+        key = self._sampler_key(model, step)
+        if key in self._sampler_results or key in self._pending_sampler_publications:
+            raise RuntimeError(f"sampler weights for learner step {step} already exist")
+        model_key = key[0]
+        predecessor = self._sampler_publication_tails.get(model_key)
+        if predecessor is not None and step <= predecessor[0]:
+            raise RuntimeError(
+                "sampler learner versions must increase monotonically: "
+                f"previous={predecessor[0]}, next={step}"
+            )
+        loop = asyncio.get_running_loop()
+        materialized: asyncio.Future[SamplerWeightsResult] = loop.create_future()
+        materialized.add_done_callback(consume_future_exception)
+        activation_settled: asyncio.Future[None] = loop.create_future()
+        pending = _PendingSamplerPublication(
+            materialized=materialized,
+            predecessor_settled=(predecessor[1] if predecessor is not None else None),
+            activation_settled=activation_settled,
+        )
+        self._pending_sampler_publications[key] = pending
+        self._sampler_publication_tails[model_key] = (step, activation_settled)
+        return pending
+
+    def _resolve_sampler_result(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+        pending: _PendingSamplerPublication,
+        result: SamplerWeightsResult,
+    ) -> None:
+        key = self._sampler_key(model, step)
+        if (
+            self._pending_sampler_publications.get(key) is not pending
+            or pending.materialized.done()
+        ):
+            raise RuntimeError("pending sampler materialization state is inconsistent")
+        if result.checkpoint.learner_version != step:
+            raise RuntimeError(
+                "sampler materialized an unexpected learner version: "
+                f"expected={step}, got={result.checkpoint.learner_version}"
+            )
+        self._sampler_results[key] = result
+        pending.materialized.set_result(result)
+
+    def _finish_sampler_publication(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+        pending: _PendingSamplerPublication,
+    ) -> None:
+        key = self._sampler_key(model, step)
+        if (
+            self._pending_sampler_publications.get(key) is not pending
+            or not pending.materialized.done()
+        ):
+            raise RuntimeError("pending sampler publication state is inconsistent")
+        del self._pending_sampler_publications[key]
+        pending.activation_settled.set_result(None)
+
+    def _fail_sampler_result(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+        pending: _PendingSamplerPublication,
+        error: BaseException,
+    ) -> None:
+        key = self._sampler_key(model, step)
+        if self._pending_sampler_publications.get(key) is pending:
+            del self._pending_sampler_publications[key]
+        if not pending.materialized.done():
+            if isinstance(error, asyncio.CancelledError):
+                pending.materialized.cancel()
+            else:
+                pending.materialized.set_exception(error)
+        if not pending.activation_settled.done():
+            pending.activation_settled.set_result(None)
+
+    async def _complete_sampler_publication(
+        self,
+        model: AnyTrainableModel,
+        step: int,
+        operation: TrainingOperation[SamplerWeightsResult],
+        pending: _PendingSamplerPublication,
+    ) -> dict[str, float]:
+        try:
+            result = await operation.result()
+            self._resolve_sampler_result(model, step, pending, result)
+            if pending.predecessor_settled is not None:
+                await asyncio.shield(pending.predecessor_settled)
+            metrics = dict(result.publication_metrics)
+            active_metrics = await self._sampler_manager.publish(
+                model,
+                result,
+                SamplerPublication(mode="in_flight_lora", model_alias=model.name),
+            )
+            if active_metrics:
+                metrics.update(active_metrics)
+            self._finish_sampler_publication(model, step, pending)
+            return metrics
+        except BaseException as error:
+            self._fail_sampler_result(model, step, pending, error)
+            raise
+
+    def _sampler_checkpoint_readiness(
+        self,
+        result: ServerlessTrainResult,
+        pending: _PendingSamplerPublication,
+        publication: asyncio.Task[dict[str, float]],
+    ) -> asyncio.Task[None]:
+        async def wait() -> None:
+            weights = await asyncio.shield(pending.materialized)
+            result.checkpoint_id = weights.checkpoint.checkpoint_id
+            await asyncio.shield(publication)
+
+        task = asyncio.create_task(
+            wait(), name=f"remote-checkpoint-ready-{result.step}"
+        )
+        task.add_done_callback(consume_future_exception)
+        return task
+
+    @staticmethod
+    def _sampler_publication_metrics_readiness(
+        publication: asyncio.Task[dict[str, float]],
+    ) -> asyncio.Future[dict[str, float]]:
+        ready = asyncio.shield(publication)
+        ready.add_done_callback(consume_future_exception)
+        return ready
+
     def _remember_sampler_result(
         self, model: AnyTrainableModel, result: SamplerWeightsResult
     ) -> None:
@@ -647,6 +827,7 @@ class ServerlessBackend:
     ) -> None:
         keep = set(steps_to_keep)
         async with self._exact_adapter_lock:
+            keep.update(self._pending_sampler_steps(model))
             self._validate_sampler_retention(model, keep)
             client = await self.training_client(model)
             async for page in self._service.iter_checkpoint_pages(client.run_id):
@@ -677,17 +858,29 @@ class ServerlessBackend:
         self, model: AnyTrainableModel, retain_steps: set[int]
     ) -> None:
         model_key = self._model_key(model)
-        leased = [
+        protected = [
             step
             for (key, step), state in self._exact_adapter_states.items()
             if key == model_key
             and step not in retain_steps
             and (state.leases or state.published)
         ]
-        if leased:
+        protected.extend(
+            step
+            for key, step in self._pending_sampler_publications
+            if key == model_key and step not in retain_steps
+        )
+        if protected:
             raise RuntimeError(
-                f"checkpoint retention selected active exact adapter steps {leased}"
+                "checkpoint retention selected pending or active exact adapter steps "
+                f"{sorted(set(protected))}"
             )
+
+    def _pending_sampler_steps(self, model: AnyTrainableModel) -> set[int]:
+        model_key = self._model_key(model)
+        return {
+            step for key, step in self._pending_sampler_publications if key == model_key
+        }
 
     async def _list_checkpoint_infos(self, model: AnyTrainableModel):
         from art.pipeline_trainer.checkpoint_retention import CheckpointInfo
@@ -738,6 +931,7 @@ class ServerlessBackend:
             if actual_steps != plan.observed_steps:
                 raise RuntimeError("remote checkpoint catalog changed during retention")
             retained = set(plan.retain_steps)
+            retained.update(self._pending_sampler_steps(model))
             retained.update(
                 checkpoint.learner_version
                 for checkpoint in ready
@@ -881,7 +1075,10 @@ class ServerlessBackend:
             forward = prepared.forward
             forward_submit_s = prepared.forward_submit_s
 
-        optimizer = None
+        optimizer: TrainingOperation[OptimStepResult] | None = None
+        sampler: TrainingOperation[SamplerWeightsResult] | None = None
+        sampler_ready: _PendingSamplerPublication | None = None
+        step: int | None = None
         try:
             sequence = client.next_sequence_id
             optimizer = await client.optim_step(
@@ -895,6 +1092,7 @@ class ServerlessBackend:
             step = optimizer.ref.reserved_output_learner_version
             if step is None:
                 raise RuntimeError("optimizer did not reserve a learner version")
+            sampler_ready = self._reserve_sampler_publication(model, step)
             sampler = await client.save_weights_for_sampler(
                 SaveWeightsForSamplerRequest(
                     run_id=client.run_id,
@@ -917,6 +1115,9 @@ class ServerlessBackend:
                 )
                 self._track(state.result(), f"remote-state-{step}")
         except BaseException as primary:
+            if sampler_ready is not None:
+                assert step is not None
+                self._fail_sampler_result(model, step, sampler_ready, primary)
             cleanup: list[Coroutine[Any, Any, None]] = []
             if optimizer is None:
                 cleanup.append(forward.cancel())
@@ -939,64 +1140,40 @@ class ServerlessBackend:
                     "remote train admission and cleanup failed", [primary, *failures]
                 ) from None
             raise
+        assert sampler is not None and sampler_ready is not None
+        assert step is not None
+        publication = asyncio.create_task(
+            self._complete_sampler_publication(model, step, sampler, sampler_ready),
+            name=f"remote-sampler-publication-{client.run_id}-{step}",
+        )
+        self._track_task(publication)
         release: asyncio.Task[None] | None = None
         if prepared is not None:
             release = asyncio.create_task(
                 self._release_remote_pipeline_batch(prepared, disposition="consumed"),
                 name=f"remote-pipeline-release-{client.run_id}-{step}",
             )
+            self._track_task(release)
             for group in groups:
                 group._prepared_training_batch = None
 
-        async def publish_sampler() -> tuple[
-            SamplerWeightsResult, dict[str, float] | None
-        ]:
-            sampler_result = await sampler.result()
-            return sampler_result, await self._publish_active_sampler(
-                model, sampler_result
-            )
-
-        publication = asyncio.create_task(
-            publish_sampler(), name=f"remote-sampler-publication-{client.run_id}-{step}"
-        )
-
         async def complete() -> ServerlessTrainResult:
-            try:
-                results = await asyncio.gather(
-                    forward.result(),
-                    optimizer.result(),
-                    publication,
-                    return_exceptions=True,
-                )
-                failures = [
-                    result for result in results if isinstance(result, BaseException)
-                ]
-                if failures:
-                    raise BaseExceptionGroup("remote train operations failed", failures)
-                forward_result, optimizer_result, published = results
-                if not (
-                    isinstance(forward_result, ForwardBackwardResult)
-                    and isinstance(optimizer_result, OptimStepResult)
-                    and isinstance(published, tuple)
-                    and len(published) == 2
-                    and isinstance(published[0], SamplerWeightsResult)
-                ):
-                    raise TypeError("remote train returned an invalid result type")
-                sampler_result, publication_metrics = published
-            except BaseException as primary:
-                if release is not None:
-                    try:
-                        await complete_task(release)
-                    except BaseException as cleanup:
-                        raise BaseExceptionGroup(
-                            "remote train and trajectory release failed",
-                            [primary, cleanup],
-                        ) from None
-                raise
-            if release is not None:
-                _, cancelled = await complete_task(release)
-                if cancelled is not None:
-                    raise cancelled
+            results = await asyncio.gather(
+                forward.result(),
+                optimizer.result(),
+                return_exceptions=True,
+            )
+            failures = [
+                result for result in results if isinstance(result, BaseException)
+            ]
+            if failures:
+                raise BaseExceptionGroup("remote train operations failed", failures)
+            forward_result, optimizer_result = results
+            if not (
+                isinstance(forward_result, ForwardBackwardResult)
+                and isinstance(optimizer_result, OptimStepResult)
+            ):
+                raise TypeError("remote train returned an invalid result type")
             _attach_packing_shapes(groups, forward_result.packing.group_shapes)
             metrics = aggregate_rl_training_metrics(
                 training_metrics=[
@@ -1004,8 +1181,6 @@ class ServerlessBackend:
                         **merge_gradient_step_metrics(
                             forward_result.metrics, optimizer_result.metrics
                         ),
-                        **sampler_result.publication_metrics,
-                        **(publication_metrics or {}),
                         **_packing_outcome_metrics(forward_result.packing),
                         "time/step_remote_forward_submit_s": forward_submit_s,
                     }
@@ -1018,15 +1193,21 @@ class ServerlessBackend:
                 raise RuntimeError(
                     "remote RL packing omitted exact policy token counts"
                 )
-            return ServerlessTrainResult(
+            result = ServerlessTrainResult(
                 step=step,
                 metrics=metrics,
                 packed_policy_token_counts=tuple(
                     (value.policy_version, value.trainable_assistant_tokens)
                     for value in policy_counts
                 ),
-                checkpoint_id=sampler_result.checkpoint.checkpoint_id,
             )
+            result.checkpoint_ready = self._sampler_checkpoint_readiness(
+                result, sampler_ready, publication
+            )
+            result.publication_metrics_ready = (
+                self._sampler_publication_metrics_readiness(publication)
+            )
+            return result
 
         return _PendingServerlessTrain(
             step=step,
@@ -1324,8 +1505,46 @@ class ServerlessBackend:
             **(publication_metrics or {}),
         }
 
+    async def finalize_training_session(
+        self, model: AnyTrainableModel
+    ) -> dict[str, float]:
+        del model
+        async with asyncio.timeout(self._close_timeout_s):
+            await self._drain_background()
+        return {}
+
+    def _clear_sampler_state(
+        self, model_key: tuple[str | None, str, str, str] | None = None
+    ) -> None:
+        pending_keys = tuple(
+            key
+            for key in self._pending_sampler_publications
+            if model_key is None or key[0] == model_key
+        )
+        for key in pending_keys:
+            pending = self._pending_sampler_publications.pop(key)
+            if not pending.materialized.done():
+                pending.materialized.cancel()
+            if not pending.activation_settled.done():
+                pending.activation_settled.set_result(None)
+        result_keys = tuple(
+            key
+            for key in self._sampler_results
+            if model_key is None or key[0] == model_key
+        )
+        for key in result_keys:
+            del self._sampler_results[key]
+        if model_key is None:
+            self._sampler_publication_tails.clear()
+            self._published_initial_models.clear()
+        else:
+            self._sampler_publication_tails.pop(model_key, None)
+            self._published_initial_models.discard(model_key)
+
     def _track(self, awaitable: Coroutine[Any, Any, Any], name: str) -> None:
-        task = asyncio.create_task(awaitable, name=name)
+        self._track_task(asyncio.create_task(awaitable, name=name))
+
+    def _track_task(self, task: asyncio.Task[Any]) -> None:
         self._background.add(task)
 
         def completed(value: asyncio.Task[Any]) -> None:

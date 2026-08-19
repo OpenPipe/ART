@@ -364,6 +364,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._scheduled_eval_leases: dict[int, AsyncExitStack] = {}
         self._checkpoint_log_tasks: set[asyncio.Task[None]] = set()
         self._checkpoint_log_failure: BaseException | None = None
+        self._publication_metric_tasks: set[asyncio.Task[None]] = set()
+        self._publication_metric_failure: BaseException | None = None
         self._post_train_tasks: set[asyncio.Task[None]] = set()
 
         self.state = PipelineState()
@@ -572,6 +574,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     await self._finalize_backend_training()
                 except BaseException as exc:
                     cleanup_failures.append(exc)
+            if self._publication_metric_tasks:
+                await asyncio.gather(
+                    *tuple(self._publication_metric_tasks), return_exceptions=True
+                )
+            if self._publication_metric_failure is not None:
+                cleanup_failures.append(self._publication_metric_failure)
             if isinstance(self._output_queue, DistributedTrajectoryQueue):
                 try:
                     await self._output_queue.close()
@@ -1156,6 +1164,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
         phases: dict[str, float] = {}
         started = time.monotonic()
+        self._schedule_publication_metrics(item.result)
         await self._log_checkpoint_saved(item.result)
         await self._prune_model_adapters(item.current_step)
         await self._run_checkpoint_retention(item.current_step)
@@ -2399,7 +2408,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         ready = getattr(result, "checkpoint_ready", None)
         if ready is not None:
             task = asyncio.create_task(
-                self._log_checkpoint_when_ready(step, path, ready)
+                self._log_checkpoint_when_ready(result, path, ready)
             )
             self._checkpoint_log_tasks.add(task)
             task.add_done_callback(self._checkpoint_log_done)
@@ -2411,9 +2420,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         )
 
     async def _log_checkpoint_when_ready(
-        self, step: int, path: Path, ready: Awaitable[None]
+        self, result: Any, path: Path, ready: Awaitable[None]
     ) -> None:
         await ready
+        step = int(result.step)
+        if hasattr(result, "checkpoint_id"):
+            if not getattr(result, "checkpoint_id", None):
+                raise RuntimeError(
+                    f"remote checkpoint {step} became ready without an identity"
+                )
+            self._record_checkpoint_saved(step, None, remote=True)
+            return
         if not path.is_dir():
             raise RuntimeError(
                 f"checkpoint {step} materialized without directory {path}"
@@ -2442,6 +2459,46 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         error = task.exception()
         if error is not None and self._checkpoint_log_failure is None:
             self._checkpoint_log_failure = error
+            self.request_stop()
+
+    def _schedule_publication_metrics(self, result: Any) -> None:
+        ready = getattr(result, "publication_metrics_ready", None)
+        if ready is None:
+            return
+        task = asyncio.create_task(
+            self._log_publication_metrics_when_ready(int(result.step), ready),
+            name=f"publication_metrics_step_{int(result.step)}",
+        )
+        self._publication_metric_tasks.add(task)
+        task.add_done_callback(self._publication_metrics_done)
+
+    async def _log_publication_metrics_when_ready(
+        self, step: int, ready: Awaitable[dict[str, float]]
+    ) -> None:
+        try:
+            metrics = await ready
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            # The backend owns and surfaces publication failures at its next boundary.
+            return
+        if not metrics:
+            return
+        await self._emit_pipeline_metrics(metrics, step=step)
+        await self.model.log(
+            trajectories=None,
+            split="train",
+            step=step,
+            metrics=dict(metrics),
+        )
+
+    def _publication_metrics_done(self, task: asyncio.Task[None]) -> None:
+        self._publication_metric_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None and self._publication_metric_failure is None:
+            self._publication_metric_failure = error
             self.request_stop()
 
     async def _log_checkpoint_eval_completed(self, step: int) -> None:
