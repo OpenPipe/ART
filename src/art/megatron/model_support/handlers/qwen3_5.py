@@ -36,6 +36,10 @@ _ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
     r"(?P<module>gate_up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
 )
+_ART_MOE_SHARED_KEY_RE = re.compile(
+    r"^(?P<prefix>.*\.mlp\.experts)\.shared\."
+    r"(?P<module>gate_up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
+)
 _VLLM_MOE_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\."
     r"(?:(?P<base_layer>base_layer)\.)?(?P<lora>lora_[AB])\.weight$"
@@ -671,6 +675,98 @@ def _group_expert_lora_tensors(
     return grouped
 
 
+def _expand_shared_outer_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    shared = {
+        (match.group("prefix"), match.group("module"), match.group("lora")): tensor
+        for key, tensor in tensors.items()
+        if (match := _ART_MOE_SHARED_KEY_RE.match(key)) is not None
+    }
+    if not shared:
+        return tensors
+    if adapter_config.get("moe_parameterization") != "shared_outer":
+        raise RuntimeError("compact shared-outer LoRA requires matching adapter config")
+    grouped = _group_expert_lora_tensors(tensors, _ART_MOE_EXPERT_KEY_RE)
+    expanded = {
+        key: tensor
+        for key, tensor in tensors.items()
+        if _ART_MOE_SHARED_KEY_RE.match(key) is None
+    }
+    for (prefix, module, lora_name), tensor in shared.items():
+        experts = grouped.get(prefix)
+        if not experts:
+            if (module, lora_name) == ("gate_up_proj", "lora_A"):
+                peer_key = f"{prefix}.base_layer.lora_B.weight"
+                output_key = f"{prefix}.base_layer.lora_A.weight"
+                peer = tensors.get(peer_key)
+                rank = tensor.shape[0]
+                if peer is None or peer.shape[1] % rank:
+                    raise RuntimeError(
+                        f"shared-outer LoRA cannot infer experts from {peer_key}"
+                    )
+                expanded[output_key] = torch.cat(
+                    [tensor] * (peer.shape[1] // rank), dim=0
+                ).contiguous()
+                continue
+            if (module, lora_name) == ("down_proj", "lora_B"):
+                peer_key = f"{prefix}.lora_A.weight"
+                output_key = f"{prefix}.lora_B.weight"
+                peer = tensors.get(peer_key)
+                rank = tensor.shape[1]
+                if peer is None or peer.shape[0] % rank:
+                    raise RuntimeError(
+                        f"shared-outer LoRA cannot infer experts from {peer_key}"
+                    )
+                expanded[output_key] = _pack_vllm_3d_lora_b(
+                    [tensor] * (peer.shape[0] // rank)
+                )
+                continue
+            raise RuntimeError(
+                f"unsupported compact shared-outer factor {prefix}.{module}.{lora_name}"
+            )
+        for expert in experts:
+            key = _expert_lora_key(prefix, expert, module, lora_name)
+            if key in expanded:
+                raise RuntimeError(f"mixed compact and expanded shared LoRA key: {key}")
+            expanded[key] = tensor
+    return expanded
+
+
+def _compact_shared_outer_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    if adapter_config.get("moe_parameterization") != "shared_outer":
+        return tensors
+    grouped = _group_expert_lora_tensors(tensors, _ART_MOE_EXPERT_KEY_RE)
+    compact = dict(tensors)
+    for prefix, experts in grouped.items():
+        for module, lora_name in (
+            ("gate_up_proj", "lora_A"),
+            ("down_proj", "lora_B"),
+        ):
+            keys = [
+                _expert_lora_key(prefix, expert, module, lora_name)
+                for expert in sorted(experts)
+            ]
+            values = [tensors[key] for key in keys]
+            if any(not torch.equal(values[0], value) for value in values[1:]):
+                raise RuntimeError(
+                    f"shared-outer LoRA factor differs across experts for "
+                    f"{prefix}.{module}.{lora_name}"
+                )
+            for key in keys:
+                compact.pop(key)
+            compact[f"{prefix}.shared.{module}.{lora_name}.weight"] = values[
+                0
+            ].contiguous()
+    return compact
+
+
 def _expert_lora_key(prefix: str, expert: int, module: str, lora_name: str) -> str:
     return f"{prefix}.{expert}.{module}.{lora_name}.weight"
 
@@ -706,6 +802,10 @@ def _to_vllm_lora_tensors(
     *,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    tensors = _expand_shared_outer_lora_tensors(
+        tensors,
+        adapter_config=adapter_config,
+    )
     grouped = _group_expert_lora_tensors(tensors, _ART_MOE_EXPERT_KEY_RE)
     has_shared_experts = _has_shared_expert_lora_tensors(tensors)
     transformed: dict[str, torch.Tensor] = {}
@@ -847,7 +947,10 @@ def _from_vllm_lora_tensors(
             convert=convert,
             reject_fused_moe=True,
         )
-        return transformed
+        return _compact_shared_outer_lora_tensors(
+            transformed,
+            adapter_config=adapter_config,
+        )
 
     grouped: dict[str, dict[str, torch.Tensor]] = {}
     for key, tensor in tensors.items():
@@ -930,7 +1033,10 @@ def _from_vllm_lora_tensors(
         used_keys=used_keys,
         convert=convert,
     )
-    return transformed
+    return _compact_shared_outer_lora_tensors(
+        transformed,
+        adapter_config=adapter_config,
+    )
 
 
 def _ensure_bridge_qwen35_adapter_name_map() -> None:

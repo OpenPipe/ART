@@ -2714,7 +2714,7 @@ class TrainerRank:
             for suffix, param in (("lora_A", slot.A_T), ("lora_B", slot.B_T)):
                 index = indices[id(param)]
                 mapped.add(index)
-                keys = module._expected_weight_keys(suffix)
+                keys = module._expected_weight_keys_for_param(suffix, param)
                 if int(param.ndim) == 3:
                     if len(keys) != int(param.shape[0]):
                         raise TrainerRankSlotStateError(
@@ -2766,7 +2766,7 @@ class TrainerRank:
         for chunk in self.runtime.model:
             for module in chunk.modules():
                 lora_params = getattr(module, "_lora_params", None)
-                expected_keys = getattr(module, "_expected_weight_keys", None)
+                expected_keys = getattr(module, "_expected_weight_keys_for_param", None)
                 if not callable(lora_params) or not callable(expected_keys):
                     continue
                 for suffix, param in lora_params(ref):
@@ -2774,7 +2774,7 @@ class TrainerRank:
                     if index is None:
                         continue
                     mapped_indices.add(index)
-                    keys = expected_keys(str(suffix).removesuffix(".weight"))
+                    keys = expected_keys(str(suffix).removesuffix(".weight"), param)
                     if int(param.ndim) == 3:
                         if len(keys) != int(param.shape[0]):
                             raise TrainerRankSlotStateError(

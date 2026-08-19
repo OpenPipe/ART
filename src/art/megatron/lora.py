@@ -34,6 +34,7 @@ from .expert_parallel import get_expert_parallel_layout
 from .kernels.cute_grouped_lora_quack import (
     quack_grouped_lora,
     quack_grouped_lora_dual,
+    quack_grouped_lora_shared_outer,
 )
 from .lora_config import (
     LORA_ALPHA,
@@ -48,6 +49,8 @@ ShardDomain = Literal["tp", "expert_tp"]
 GradSyncDomain = Literal["tp_default", "expert_tp"]
 GradSyncOp = Literal["none", "sum", "avg"]
 LoraSlotKind = Literal["checkpoint", "lora"]
+LoraFactor = Literal["A", "B"]
+MoeLoraParameterization = Literal["per_expert", "shared_outer"]
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 TP_DEFAULT_GRAD_SYNC_DOMAIN: GradSyncDomain = "tp_default"
@@ -324,6 +327,18 @@ def _configured_lora_target_modules(provider: Any, spec: Any) -> list[str]:
     return [str(target_module) for target_module in target_modules]
 
 
+def _configured_lora_moe_parameterization(
+    provider: Any,
+) -> MoeLoraParameterization:
+    parameterization = getattr(provider, "_art_lora_moe_parameterization", None)
+    if parameterization not in ("per_expert", "shared_outer"):
+        raise ValueError(
+            "provider._art_lora_moe_parameterization must be explicitly set to "
+            f"'per_expert' or 'shared_outer', got {parameterization!r}"
+        )
+    return cast(MoeLoraParameterization, parameterization)
+
+
 def _compile_disabled_collective(function: _F) -> _F:
     return cast(
         _F,
@@ -437,6 +452,8 @@ def _copy_lora_param_metadata(
         "partition_stride",
         "lora_tp_shard_strategy",
         "lora_tp_component_sizes",
+        "lora_is_expert",
+        "lora_moe_parameterization",
     ):
         if hasattr(source, name):
             setattr(target, name, getattr(source, name))
@@ -451,17 +468,27 @@ class LoRASlot(torch.nn.Module):
         a_t: torch.Tensor,
         b_t: torch.Tensor,
         alpha: float,
+        parameterization: MoeLoraParameterization,
         a_template: torch.nn.Parameter,
         b_template: torch.nn.Parameter,
+        a_allreduce: bool,
+        b_allreduce: bool,
         requires_grad: bool,
     ) -> None:
         super().__init__()
         self.ref = ref
         self.alpha = float(alpha)
+        self.parameterization = parameterization
         self.A_T = torch.nn.Parameter(a_t.detach().clone(), requires_grad=requires_grad)
         self.B_T = torch.nn.Parameter(b_t.detach().clone(), requires_grad=requires_grad)
         _copy_lora_param_metadata(a_template, self.A_T)
         _copy_lora_param_metadata(b_template, self.B_T)
+        setattr(self.A_T, "lora_is_expert", self.A_T.ndim == 3)
+        setattr(self.B_T, "lora_is_expert", self.B_T.ndim == 3)
+        setattr(self.A_T, "lora_moe_parameterization", parameterization)
+        setattr(self.B_T, "lora_moe_parameterization", parameterization)
+        setattr(self.A_T, "allreduce", a_allreduce)
+        setattr(self.B_T, "allreduce", b_allreduce)
 
     @property
     def rank(self) -> int:
@@ -486,6 +513,8 @@ class LoRA(torch.nn.Module):
         a_parallel_spec: LoRAParallelSpec = LoRAParallelSpec(),
         b_parallel_spec: LoRAParallelSpec = LoRAParallelSpec(),
         allreduce: bool = True,
+        moe_parameterization: MoeLoraParameterization = "per_expert",
+        shared_factor: LoraFactor | None = None,
     ) -> None:
         super().__init__()
         is_expert = "{expert}" in adapter_model_prefix
@@ -494,19 +523,42 @@ class LoRA(torch.nn.Module):
                 "num_local_experts must be positive and requires an '{expert}' "
                 "adapter_model_prefix when greater than one"
             )
+        if moe_parameterization not in ("per_expert", "shared_outer"):
+            raise ValueError(
+                f"Unsupported MoE LoRA parameterization {moe_parameterization!r}"
+            )
+        if shared_factor not in (None, "A", "B"):
+            raise ValueError(f"Unsupported shared LoRA factor {shared_factor!r}")
+        if shared_factor is not None and not is_expert:
+            raise ValueError(
+                "shared_factor requires an '{expert}' adapter_model_prefix"
+            )
+        if moe_parameterization == "shared_outer" and shared_factor is None:
+            raise ValueError("shared_outer MoE LoRA requires shared_factor='A' or 'B'")
         self.adapter_model_prefix = adapter_model_prefix
+        self.moe_parameterization: MoeLoraParameterization = moe_parameterization
+        self.shared_factor: LoraFactor | None = shared_factor
         self.alpha = float(alpha)
         self.in_features = int(in_features)
         self.out_features = int(out_features)
+        self._num_local_experts = int(num_local_experts)
         self.scale = alpha / rank
         self._slot_modules = torch.nn.ModuleDict()
         self._slot_keys: dict[LoRASlotRef, str] = {}
+        a_is_expert = is_expert and (
+            moe_parameterization == "per_expert" or shared_factor != "A"
+        )
+        b_is_expert = is_expert and (
+            moe_parameterization == "per_expert" or shared_factor != "B"
+        )
         a_shape = (
-            (num_local_experts, in_features, rank) if is_expert else (in_features, rank)
+            (num_local_experts, in_features, rank)
+            if a_is_expert
+            else (in_features, rank)
         )
         b_shape = (
             (num_local_experts, rank, out_features)
-            if is_expert
+            if b_is_expert
             else (rank, out_features)
         )
         self.A_T = torch.nn.Parameter(torch.zeros(a_shape, dtype=dtype, device=device))
@@ -514,13 +566,21 @@ class LoRA(torch.nn.Module):
         _set_lora_parallel_metadata(
             self.A_T,
             parallel_spec=a_parallel_spec,
-            allreduce=allreduce,
+            allreduce=not a_is_expert
+            if moe_parameterization == "shared_outer"
+            else allreduce,
         )
         _set_lora_parallel_metadata(
             self.B_T,
             parallel_spec=b_parallel_spec,
-            allreduce=allreduce,
+            allreduce=not b_is_expert
+            if moe_parameterization == "shared_outer"
+            else allreduce,
         )
+        setattr(self.A_T, "lora_is_expert", a_is_expert)
+        setattr(self.B_T, "lora_is_expert", b_is_expert)
+        setattr(self.A_T, "lora_moe_parameterization", moe_parameterization)
+        setattr(self.B_T, "lora_moe_parameterization", moe_parameterization)
         self._expert_offset = ps.get_expert_model_parallel_rank() * num_local_experts
         self._expert_ids: tuple[int | None, ...] = tuple(
             range(self._expert_offset, self._expert_offset + num_local_experts)
@@ -530,7 +590,7 @@ class LoRA(torch.nn.Module):
 
     @property
     def num_local_experts(self) -> int:
-        return self.A_T.shape[0] if self.is_expert else 1
+        return self._num_local_experts
 
     @property
     def is_expert(self) -> bool:
@@ -539,6 +599,9 @@ class LoRA(torch.nn.Module):
     @property
     def expert_ids(self) -> tuple[int | None, ...]:
         return self._expert_ids
+
+    def _is_expert_parameter(self, param: torch.nn.Parameter) -> bool:
+        return self.is_expert and bool(getattr(param, "lora_is_expert", False))
 
     def bind_expert_layout(
         self,
@@ -553,8 +616,10 @@ class LoRA(torch.nn.Module):
         self._expert_layout = physical_to_logical
         for local_expert, logical_expert in enumerate(expert_ids):
             if logical_expert is None:
-                self.A_T.data[local_expert].zero_()
-                self.B_T.data[local_expert].zero_()
+                if self._is_expert_parameter(self.A_T):
+                    self.A_T.data[local_expert].zero_()
+                if self._is_expert_parameter(self.B_T):
+                    self.B_T.data[local_expert].zero_()
 
     def _broadcast_if_replicated(self, param: torch.nn.Parameter) -> None:
         if not param.lora_tp_replicated:  # ty: ignore[unresolved-attribute]
@@ -583,7 +648,7 @@ class LoRA(torch.nn.Module):
 
     def reset_lora_parameters(self) -> None:
         """Initialize LoRA weights (A=Kaiming, B=zeros) like PEFT defaults."""
-        if self.is_expert:
+        if self._is_expert_parameter(self.A_T):
             for expert, logical_expert in enumerate(self.expert_ids):
                 if logical_expert is None:
                     torch.nn.init.zeros_(self.A_T[expert])
@@ -595,14 +660,63 @@ class LoRA(torch.nn.Module):
         self._broadcast_if_replicated(self.A_T)
         self._broadcast_if_replicated(self.B_T)
 
-    def _expected_weight_keys(self, suffix: str) -> list[str]:
-        if self.is_expert:
+    @staticmethod
+    def _factor_for_suffix(suffix: str) -> LoraFactor:
+        if suffix == "lora_A":
+            return "A"
+        if suffix == "lora_B":
+            return "B"
+        raise ValueError(f"Unsupported LoRA weight suffix {suffix!r}")
+
+    def _factor_is_expert(
+        self,
+        factor: LoraFactor,
+        moe_parameterization: MoeLoraParameterization,
+    ) -> bool:
+        return self.is_expert and (
+            moe_parameterization == "per_expert" or factor != self.shared_factor
+        )
+
+    def _expected_weight_keys(
+        self,
+        suffix: str,
+        moe_parameterization: MoeLoraParameterization | None = None,
+    ) -> list[str]:
+        parameterization = moe_parameterization or self.moe_parameterization
+        if self._factor_is_expert(self._factor_for_suffix(suffix), parameterization):
             return [
                 f"{self.adapter_model_prefix.format(expert=expert)}.{suffix}.weight"
                 for expert in self.expert_ids
                 if expert is not None
             ]
-        return [f"{self.adapter_model_prefix}.{suffix}.weight"]
+        prefix = self.adapter_model_prefix
+        if self.is_expert:
+            prefix = prefix.replace("{expert}", "shared")
+        return [f"{prefix}.{suffix}.weight"]
+
+    def _adapter_model_prefix_for_param(self, param: torch.nn.Parameter) -> str:
+        if self.is_expert and not self._is_expert_parameter(param):
+            return self.adapter_model_prefix.replace("{expert}", "shared")
+        return self.adapter_model_prefix
+
+    def _expected_weight_keys_for_param(
+        self,
+        suffix: str,
+        param: torch.nn.Parameter,
+    ) -> list[str]:
+        parameterization = getattr(
+            param,
+            "lora_moe_parameterization",
+            self.moe_parameterization,
+        )
+        if parameterization not in ("per_expert", "shared_outer"):
+            raise ValueError(
+                f"Unsupported active LoRA parameterization {parameterization!r}"
+            )
+        return self._expected_weight_keys(
+            suffix,
+            cast(MoeLoraParameterization, parameterization),
+        )
 
     def load_lora_slot(
         self,
@@ -634,18 +748,32 @@ class LoRA(torch.nn.Module):
         """Build a detached slot whose exact tensors can move through residency."""
         if ref.name is None:
             raise ValueError("base-model slot refs do not own LoRA tensors")
-        weights = self._adapter_weights(adapter_model, require=False)
+        weights = self._adapter_weights(
+            adapter_model,
+            require=False,
+            moe_parameterization=None,
+        )
         if weights is None:
             return None
         a_t = self._localized_weight(weights[0], into=self.A_T)
         b_t = self._localized_weight(weights[1], into=self.B_T)
+        parameterization = weights[2]
+        self._validate_parameterized_shapes(a_t, b_t, parameterization)
+        dynamic_parameterization = self.is_expert and self.shared_factor is not None
         return LoRASlot(
             ref=ref,
             a_t=a_t,
             b_t=b_t,
             alpha=alpha,
+            parameterization=parameterization,
             a_template=self.A_T,
             b_template=self.B_T,
+            a_allreduce=not (a_t.ndim == 3)
+            if dynamic_parameterization
+            else bool(self.A_T.allreduce),  # ty: ignore[unresolved-attribute]
+            b_allreduce=not (b_t.ndim == 3)
+            if dynamic_parameterization
+            else bool(self.B_T.allreduce),  # ty: ignore[unresolved-attribute]
             requires_grad=requires_grad,
         )
 
@@ -695,7 +823,11 @@ class LoRA(torch.nn.Module):
         )
 
     def load_lora(self, adapter_model: dict[str, torch.Tensor]) -> None:
-        weights = self._adapter_weights(adapter_model, require=False)
+        weights = self._adapter_weights(
+            adapter_model,
+            require=False,
+            moe_parameterization=self.moe_parameterization,
+        )
         if weights is None:
             self.reset_lora_parameters()
             return
@@ -707,26 +839,95 @@ class LoRA(torch.nn.Module):
         adapter_model: dict[str, torch.Tensor],
         *,
         require: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        all_keys = [
-            key
-            for suffix in ("lora_A", "lora_B")
-            for key in self._expected_weight_keys(suffix)
-        ]
-        if not all_keys:
-            return torch.zeros_like(self.A_T), torch.zeros_like(self.B_T)
-        missing = [key for key in all_keys if key not in adapter_model]
-        if len(missing) == len(all_keys) and not require:
-            return None
-        if missing:
-            state = "Missing" if require else "Incomplete"
-            raise KeyError(
-                f"{state} LoRA adapter keys for {self.adapter_model_prefix}: "
-                f"{sorted(missing)}"
-            )
+        moe_parameterization: MoeLoraParameterization | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, MoeLoraParameterization] | None:
+        supported: tuple[MoeLoraParameterization, ...] = ("per_expert",)
+        if self.shared_factor is not None:
+            supported += ("shared_outer",)
+        keys_by_parameterization: dict[MoeLoraParameterization, list[str]] = {
+            parameterization: [
+                key
+                for suffix in ("lora_A", "lora_B")
+                for key in self._expected_weight_keys(suffix, parameterization)
+            ]
+            for parameterization in supported
+        }
+        selected: MoeLoraParameterization
+        if moe_parameterization is None:
+            known_keys = {
+                key for keys in keys_by_parameterization.values() for key in keys
+            }
+            present = known_keys.intersection(adapter_model)
+            if not present:
+                if not keys_by_parameterization["per_expert"]:
+                    selected = "per_expert"
+                elif require:
+                    raise KeyError(
+                        f"Missing LoRA adapter keys for {self.adapter_model_prefix}: "
+                        f"{sorted(known_keys)}"
+                    )
+                else:
+                    return None
+            else:
+                complete: list[MoeLoraParameterization] = [
+                    parameterization
+                    for parameterization, keys in keys_by_parameterization.items()
+                    if keys and set(keys) == present
+                ]
+                if len(complete) != 1:
+                    raise KeyError(
+                        f"Incomplete or mixed LoRA parameterization for "
+                        f"{self.adapter_model_prefix}; exact supported keys are "
+                        f"{keys_by_parameterization}"
+                    )
+                selected = complete[0]
+        else:
+            if moe_parameterization not in supported:
+                raise ValueError(
+                    f"{self.adapter_model_prefix} does not support "
+                    f"{moe_parameterization!r} LoRA"
+                )
+            selected = moe_parameterization
+            all_keys = keys_by_parameterization[selected]
+            unexpected = {
+                key
+                for parameterization, keys in keys_by_parameterization.items()
+                if parameterization != selected
+                for key in keys
+                if key not in all_keys and key in adapter_model
+            }
+            if unexpected:
+                raise KeyError(
+                    f"Mixed LoRA parameterization for {self.adapter_model_prefix}: "
+                    f"{sorted(unexpected)}"
+                )
+            if not all_keys:
+                return (
+                    self._zero_adapter_weight("lora_A", selected),
+                    self._zero_adapter_weight("lora_B", selected),
+                    selected,
+                )
+            missing = [key for key in all_keys if key not in adapter_model]
+            if len(missing) == len(all_keys) and not require:
+                return None
+            if missing:
+                state = "Missing" if require else "Incomplete"
+                raise KeyError(
+                    f"{state} LoRA adapter keys for {self.adapter_model_prefix}: "
+                    f"{sorted(missing)}"
+                )
         return (
-            self._adapter_weight(adapter_model, suffix="lora_A"),
-            self._adapter_weight(adapter_model, suffix="lora_B"),
+            self._adapter_weight(
+                adapter_model,
+                suffix="lora_A",
+                moe_parameterization=selected,
+            ),
+            self._adapter_weight(
+                adapter_model,
+                suffix="lora_B",
+                moe_parameterization=selected,
+            ),
+            selected,
         )
 
     def _adapter_weight(
@@ -734,10 +935,17 @@ class LoRA(torch.nn.Module):
         adapter_model: dict[str, torch.Tensor],
         *,
         suffix: str,
+        moe_parameterization: MoeLoraParameterization | None = None,
     ) -> torch.Tensor:
-        keys = self._expected_weight_keys(suffix)
-        if self.is_expert:
-            loaded = [adapter_model[key].T for key in keys]
+        parameterization = moe_parameterization or self.moe_parameterization
+        factor = self._factor_for_suffix(suffix)
+        keys = self._expected_weight_keys(suffix, parameterization)
+        if self._factor_is_expert(factor, parameterization):
+            if not keys:
+                return self._zero_adapter_weight(suffix, parameterization)
+            loaded = [
+                self._transpose_adapter_weight(adapter_model[key], key) for key in keys
+            ]
             first = loaded[0]
             real_weights = iter(loaded)
             return torch.stack(
@@ -746,7 +954,62 @@ class LoRA(torch.nn.Module):
                     for expert in self.expert_ids
                 ]
             )
-        return adapter_model[keys[0]].T
+        key = keys[0]
+        return self._transpose_adapter_weight(adapter_model[key], key)
+
+    @staticmethod
+    def _transpose_adapter_weight(weight: torch.Tensor, key: str) -> torch.Tensor:
+        if weight.ndim != 2:
+            raise ValueError(
+                f"LoRA adapter weight {key!r} must be 2D, got {tuple(weight.shape)}"
+            )
+        return weight.T
+
+    def _zero_adapter_weight(
+        self,
+        suffix: str,
+        moe_parameterization: MoeLoraParameterization,
+    ) -> torch.Tensor:
+        factor = self._factor_for_suffix(suffix)
+        template = self.A_T if factor == "A" else self.B_T
+        rank = int(self.A_T.shape[-1])
+        shape = list(self._factor_shape(factor, moe_parameterization, rank))
+        if template.lora_tp_sharded:  # ty: ignore[unresolved-attribute]
+            axis = _normalize_axis(template.lora_tp_shard_dim, len(shape))  # ty: ignore[unresolved-attribute]
+            shape[axis] *= _get_shard_world_size(template.lora_shard_domain)  # ty: ignore[unresolved-attribute]
+        return template.new_zeros(shape)
+
+    def _factor_shape(
+        self,
+        factor: LoraFactor,
+        moe_parameterization: MoeLoraParameterization,
+        rank: int,
+    ) -> tuple[int, ...]:
+        shape = (self.in_features, rank) if factor == "A" else (rank, self.out_features)
+        if self._factor_is_expert(factor, moe_parameterization):
+            return (self.num_local_experts, *shape)
+        return shape
+
+    def _validate_parameterized_shapes(
+        self,
+        a_t: torch.Tensor,
+        b_t: torch.Tensor,
+        moe_parameterization: MoeLoraParameterization,
+    ) -> None:
+        if a_t.ndim < 2:
+            raise ValueError(
+                f"{self.adapter_model_prefix}: LoRA A must be at least 2D, "
+                f"got {tuple(a_t.shape)}"
+            )
+        rank = int(a_t.shape[-1])
+        expected_a = self._factor_shape("A", moe_parameterization, rank)
+        expected_b = self._factor_shape("B", moe_parameterization, rank)
+        if tuple(a_t.shape) != expected_a or tuple(b_t.shape) != expected_b:
+            raise ValueError(
+                f"{self.adapter_model_prefix}: invalid {moe_parameterization} LoRA "
+                f"shapes A={tuple(a_t.shape)} B={tuple(b_t.shape)}; expected "
+                f"A={expected_a} B={expected_b}"
+            )
 
     def _localized_weight(
         self, weight: torch.Tensor, *, into: torch.nn.Parameter
@@ -806,10 +1069,10 @@ class LoRA(torch.nn.Module):
         Determine if the given LoRA param should be exported in the sharded LoRA state dict
         (drop replicated ranks/params).
         """
-        if self.is_expert:
+        if self._is_expert_parameter(param):
             if ps.get_expert_data_parallel_rank() != 0:
                 return False
-        else:  # self is a non-MoE layer
+        else:
             # dp x cp rank 0 participates
             if ps.get_data_parallel_rank(with_context_parallel=True) != 0:
                 return False
@@ -867,14 +1130,15 @@ class LoRA(torch.nn.Module):
         for key, param in self._lora_params(ref):
             if not self._should_export_parameter(param):
                 continue
-            if self.is_expert:
+            if self._is_expert_parameter(param):
                 for local_expert, logical_expert in enumerate(self.expert_ids):
                     if logical_expert is None:
                         continue
                     full_key = f"{self.adapter_model_prefix.format(expert=logical_expert)}.{key}"
                     export_items.append((full_key, param, local_expert))
             else:
-                export_items.append((f"{self.adapter_model_prefix}.{key}", param, None))
+                prefix = self._adapter_model_prefix_for_param(param)
+                export_items.append((f"{prefix}.{key}", param, None))
         return export_items
 
     def sharded_lora_manifest(
@@ -893,9 +1157,11 @@ class LoRA(torch.nn.Module):
             state[key] = param.data[expert].T if expert is not None else param.data.T
         return state
 
-    def sharded_lora_grad_dict(self) -> dict[str, torch.Tensor]:
+    def sharded_lora_grad_dict(
+        self, ref: LoRASlotRef | None = None
+    ) -> dict[str, torch.Tensor]:
         grads: dict[str, torch.Tensor] = {}
-        for key, param, expert in self._export_items():
+        for key, param, expert in self._export_items(ref):
             if not hasattr(param, "main_grad"):
                 raise RuntimeError(
                     f"LoRA param missing main_grad attribute for key '{key}'"
@@ -936,6 +1202,14 @@ class LoRA(torch.nn.Module):
                 bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
             if x.shape[0] == 0:
                 return x.new_zeros((*x.shape[:-1], self.out_features))
+            if a_t.ndim == 2 or b_t.ndim == 2:
+                return quack_grouped_lora_shared_outer(
+                    x,
+                    a_t,
+                    b_t,
+                    bsz,
+                    scale=scale,
+                )
             return quack_grouped_lora(x, a_t, b_t, bsz, scale=scale)
         out = (x @ a_t) @ b_t
         return out if scale == 1.0 else out * scale
@@ -998,13 +1272,19 @@ class LoRAPublishPlanner:
                         )
                     templates.append(
                         _LoraPublishTemplate(
-                            adapter_model_prefix=module.adapter_model_prefix,
+                            adapter_model_prefix=module._adapter_model_prefix_for_param(
+                                param
+                            ),
                             suffix=suffix,
                             shape=_exported_param_shape(module, param),
                             dtype_name=_dtype_name(param.dtype),
                             num_local_experts=module.num_local_experts,
-                            expert_layout=module._expert_layout,
-                            is_expert=module.is_expert,
+                            expert_layout=(
+                                module._expert_layout
+                                if module._is_expert_parameter(param)
+                                else ()
+                            ),
+                            is_expert=module._is_expert_parameter(param),
                             shard_domain=shard_domain,
                             sharded=sharded,
                             shard_world_size=(
@@ -1037,15 +1317,18 @@ class LoRAPublishPlanner:
     ) -> list[LoraShardMeta]:
         shard_ranks = range(template.shard_world_size) if template.sharded else (0,)
         if not template.is_expert:
-            tp_ranks = (
-                _process_group_ranks(ps.get_tensor_model_parallel_group())
-                if _distributed_initialized()
-                else (0,)
-            )
+            shard_group_ranks = (0,)
+            if _distributed_initialized():
+                group = (
+                    ps.get_tensor_model_parallel_group()
+                    if template.shard_domain == "tp"
+                    else ps.get_expert_tensor_parallel_group(check_initialized=False)
+                )
+                shard_group_ranks = _process_group_ranks(group)
             owners = [
                 (
                     f"{template.adapter_model_prefix}.{template.suffix}",
-                    tp_ranks[shard_rank],
+                    shard_group_ranks[shard_rank],
                     shard_rank,
                 )
                 for shard_rank in shard_ranks
@@ -1151,7 +1434,7 @@ class LoRAPublishPlanner:
 
 
 def _exported_param_shape(module: LoRA, param: torch.nn.Parameter) -> tuple[int, ...]:
-    if module.is_expert:
+    if module._is_expert_parameter(param):
         return tuple(int(dim) for dim in param[0].T.shape)
     return tuple(int(dim) for dim in param.T.shape)
 
@@ -1198,6 +1481,14 @@ def _expert_grouped_lora_dual_forward(
         )
     gate_a_t, gate_b_t, gate_scale = gate
     up_a_t, up_b_t, up_scale = up
+    if any(factor.ndim == 2 for factor in (gate_a_t, gate_b_t, up_a_t, up_b_t)):
+        return torch.cat(
+            [
+                module.gate_lora(x, tokens_per_expert=counts),
+                module.up_lora(x, tokens_per_expert=counts),
+            ],
+            dim=-1,
+        )
     return quack_grouped_lora_dual(
         x,
         gate_a_t,
@@ -1222,6 +1513,8 @@ def _parallel_lora(
     grad_sync_domain: GradSyncDomain = TP_DEFAULT_GRAD_SYNC_DOMAIN,
     allreduce: bool = True,
     num_local_experts: int = 1,
+    moe_parameterization: MoeLoraParameterization = "per_expert",
+    shared_factor: LoraFactor | None = None,
     lora_cls: type[LoRA] = LoRA,
 ) -> LoRA:
     weight = getattr(linear, "weight0", None)
@@ -1252,6 +1545,8 @@ def _parallel_lora(
         dtype=weight.dtype,
         device=weight.device,
         num_local_experts=num_local_experts,
+        moe_parameterization=moe_parameterization,
+        shared_factor=shared_factor,
         a_parallel_spec=a_parallel_spec,
         b_parallel_spec=b_parallel_spec,
         allreduce=allreduce,
@@ -1268,6 +1563,8 @@ def _parallel_lora_pair(
     layout: Literal["column", "row"],
     suffixes: tuple[str, str],
     num_local_experts: int = 1,
+    moe_parameterization: MoeLoraParameterization = "per_expert",
+    shared_factor: LoraFactor | None = None,
     lora_cls: type[LoRA] = LoRA,
 ) -> tuple[LoRA, LoRA]:
     expert_parallel = "{expert}" in adapter_model_prefix
@@ -1289,6 +1586,8 @@ def _parallel_lora_pair(
                 ),
                 allreduce=not expert_parallel,
                 num_local_experts=num_local_experts,
+                moe_parameterization=moe_parameterization,
+                shared_factor=shared_factor,
                 lora_cls=lora_cls,
             )
             for suffix in suffixes
@@ -1652,6 +1951,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         alpha: float,
         num_local_experts: int,
         fused_gate_up: bool = False,
+        moe_parameterization: MoeLoraParameterization = "per_expert",
     ) -> None:
         super().__init__()
         self.linear_fc1 = linear_fc1
@@ -1669,6 +1969,8 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
                 grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
                 allreduce=False,
                 num_local_experts=num_local_experts,
+                moe_parameterization=moe_parameterization,
+                shared_factor="A",
             )
             gate_out_features = self.out_features // 2
             expert_tp_world_size = _get_shard_world_size("expert_tp")
@@ -1690,6 +1992,8 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
                 layout="column",
                 suffixes=("gate_proj", "up_proj"),
                 num_local_experts=num_local_experts,
+                moe_parameterization=moe_parameterization,
+                shared_factor="A",
             )
 
     def forward(
@@ -1723,6 +2027,7 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         num_local_experts: int,
+        moe_parameterization: MoeLoraParameterization = "per_expert",
     ) -> None:
         super().__init__()
         self.linear_fc2 = linear_fc2
@@ -1738,6 +2043,8 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
             grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
             allreduce=False,
             num_local_experts=num_local_experts,
+            moe_parameterization=moe_parameterization,
+            shared_factor="B",
         )
 
     def forward(
@@ -1953,6 +2260,7 @@ def wrap_grouped_moe_experts(
     rank: int,
     alpha: int,
     fused_gate_up: bool = False,
+    moe_parameterization: MoeLoraParameterization = "per_expert",
 ) -> None:
     expert_loras: list[LoRA] = []
     wrap_fc1 = (
@@ -1973,6 +2281,7 @@ def wrap_grouped_moe_experts(
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
             fused_gate_up=fused_gate_up,
+            moe_parameterization=moe_parameterization,
         )
         setattr(experts, "linear_fc1", linear_fc1_lora)
         expert_loras.extend(
@@ -1995,6 +2304,7 @@ def wrap_grouped_moe_experts(
             rank=rank,
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
+            moe_parameterization=moe_parameterization,
         )
         setattr(experts, "linear_fc2", linear_fc2_lora)
         expert_loras.append(linear_fc2_lora.lora)
@@ -2047,6 +2357,7 @@ def wrap_grouped_moe_experts_3d(
     target_modules: set[str],
     rank: int,
     alpha: int,
+    moe_parameterization: MoeLoraParameterization = "per_expert",
 ) -> None:
     wrap_grouped_moe_experts(
         experts,
@@ -2055,6 +2366,7 @@ def wrap_grouped_moe_experts_3d(
         rank=rank,
         alpha=alpha,
         fused_gate_up=True,
+        moe_parameterization=moe_parameterization,
     )
 
 
@@ -2109,6 +2421,9 @@ def apply_lora_adapters(
     spec = provider._art_model_support_spec
     target_modules = _configured_lora_target_modules(provider, spec)
     rank = _configured_lora_rank(provider, handler)
+    provider._art_lora_moe_parameterization = _configured_lora_moe_parameterization(
+        provider
+    )
     handler.apply_lora_adapters(
         model,
         provider,

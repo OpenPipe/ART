@@ -139,12 +139,14 @@ def collect_local_lora_entries(
     local_tensors: dict[str, torch.Tensor] = {}
     local_manifest: dict[str, dict[str, Any]] = {}
     for module in iter_lora_modules(model_chunks):
-        if _uses_packed_expert_publish(module, packed_expert_groups, slot_ref):
-            continue
-        for key, value in module.sharded_lora_state_dict(slot_ref).items():
+        packed = _uses_packed_expert_publish(module, packed_expert_groups, slot_ref)
+        for key, param, expert in module._export_items(slot_ref):
+            if packed and module._is_expert_parameter(param):
+                continue
+            value = param.data[expert].T if expert is not None else param.data.T
             target_dtype = adapter_dtypes[key] if key in adapter_dtypes else value.dtype
             local_tensors[key] = value.to(target_dtype).contiguous()
-        local_manifest.update(module.sharded_lora_manifest(slot_ref))
+            local_manifest[key] = module._manifest_for_param(param)
 
     if set(local_tensors) != set(local_manifest):
         raise RuntimeError(
@@ -185,6 +187,8 @@ def collect_local_packed_expert_entries(
         expert_start = expert_ids[0]
         expert_count = len(expert_ids)
         for suffix, param in module._lora_params(slot_ref):
+            if not module._is_expert_parameter(param):
+                continue
             slot_match = _packed_expert_slot(
                 module.adapter_model_prefix,
                 suffix,
