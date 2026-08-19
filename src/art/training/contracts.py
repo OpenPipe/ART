@@ -477,7 +477,6 @@ class ForwardBackwardResult(ForwardResult):
 
 class OptimStepResult(OperationResult):
     contributing_forward_backward_operation_ids: tuple[str, ...] = Field(min_length=1)
-    checkpoint: CheckpointRef
     metrics: dict[str, float] = Field(default_factory=dict)
 
 

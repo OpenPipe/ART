@@ -41,11 +41,7 @@ class _Service:
         return {
             "metrics": {},
             "contributing_forward_backward_operation_ids": contributions,
-        }, SimpleNamespace(
-            operation_id=ref.operation_id,
-            policy_step=ref.reserved_output_learner_version,
-            generation_id=f"generation-{ref.operation_id}",
-        )
+        }, SimpleNamespace(operation_id=ref.operation_id)
 
 
 def _client(service: _Service) -> LocalMegatronTrainingClient:

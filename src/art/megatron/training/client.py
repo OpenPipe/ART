@@ -589,7 +589,7 @@ class LocalMegatronTrainingClient:
             admission: CommandAdmission,
             _own_task: Callable[[asyncio.Task[Any]], asyncio.Task[Any]],
         ) -> OptimStepResult:
-            raw, generation = await self._service.optimizer_command(
+            raw, _generation = await self._service.optimizer_command(
                 admission.ref,
                 request.optimizer,
                 admission.contributing_forward_backward_operation_ids,
@@ -598,11 +598,6 @@ class LocalMegatronTrainingClient:
                 operation_id=admission.ref.operation_id,
                 contributing_forward_backward_operation_ids=(
                     admission.contributing_forward_backward_operation_ids
-                ),
-                checkpoint=checkpoint_ref(
-                    self.run_id,
-                    generation.policy_step,
-                    generation.generation_id,
                 ),
                 metrics=raw["metrics"],
             )

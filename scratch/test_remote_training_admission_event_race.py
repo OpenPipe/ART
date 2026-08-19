@@ -21,7 +21,6 @@ from art.serverless.contracts import (
 )
 from art.training.contracts import (
     AdamConfig,
-    CheckpointRef,
     OperationKind,
     OperationRef,
     OptimStepRequest,
@@ -60,11 +59,6 @@ class _OrderedService(RemoteTrainingServiceClient):
                 operation_id=operation_id,
                 contributing_forward_backward_operation_ids=(
                     f"forward-{request.sequence_id}",
-                ),
-                checkpoint=CheckpointRef(
-                    run_id=request.run_id,
-                    learner_version=request.sequence_id + 1,
-                    checkpoint_id=operation_id,
                 ),
             )
             self.events.append(

@@ -36,7 +36,6 @@ from art.serverless.data_plane import (
 )
 from art.training.contracts import (
     AdamConfig,
-    CheckpointRef,
     ForwardBackwardRequest,
     ForwardBackwardResult,
     LossConfig,
@@ -127,11 +126,6 @@ class FakeService:
                 operation_id=ref["operation_id"],
                 contributing_forward_backward_operation_ids=(
                     _operation_id("run", "forward"),
-                ),
-                checkpoint=CheckpointRef(
-                    run_id="run",
-                    learner_version=1,
-                    checkpoint_id=ref["operation_id"],
                 ),
             )
             self.operations[ref["operation_id"]] = self._operation(ref, result, now)

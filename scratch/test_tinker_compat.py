@@ -145,7 +145,6 @@ class FakeRemoteTrainingClient:
             OptimStepResult(
                 operation_id=f"operation-{request.sequence_id}",
                 contributing_forward_backward_operation_ids=("fb-1",),
-                checkpoint=_checkpoint(self.run_id, f"operation-{request.sequence_id}"),
                 metrics={"learning_rate": request.optimizer.learning_rate},
             ),
         )
