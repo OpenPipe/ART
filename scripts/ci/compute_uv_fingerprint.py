@@ -33,6 +33,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to uv.lock",
     )
     parser.add_argument(
+        "--megatron-pyproject",
+        type=Path,
+        default=Path("megatron_runtime/pyproject.toml"),
+        help="Path to the managed Megatron runtime pyproject.toml",
+    )
+    parser.add_argument(
         "--megatron-uv-lock",
         type=Path,
         default=Path("megatron_runtime/uv.lock"),
@@ -70,6 +76,10 @@ def main() -> int:
         raise SystemExit(f"pyproject file not found: {args.pyproject}")
     if not args.uv_lock.exists():
         raise SystemExit(f"uv lock file not found: {args.uv_lock}")
+    if not args.megatron_pyproject.exists():
+        raise SystemExit(
+            f"Megatron pyproject file not found: {args.megatron_pyproject}"
+        )
     if not args.megatron_uv_lock.exists():
         raise SystemExit(f"Megatron uv lock file not found: {args.megatron_uv_lock}")
 
@@ -77,10 +87,11 @@ def main() -> int:
         "inputs": {
             "pyproject_sha256": _sha256_file(args.pyproject),
             "uv_lock_sha256": _sha256_file(args.uv_lock),
+            "megatron_pyproject_sha256": _sha256_file(args.megatron_pyproject),
             "megatron_uv_lock_sha256": _sha256_file(args.megatron_uv_lock),
         },
         "ci_context": {
-            "fingerprint_schema_version": 11,
+            "fingerprint_schema_version": 12,
             "cache_kind": "full_uv_cache",
             "cache_scope": "prek_split_extras_group_dev",
             "cache_target": "uv_cache",

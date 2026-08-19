@@ -35,6 +35,8 @@ jobs:
           fp="$(python3 scripts/ci/compute_uv_fingerprint.py \
             --pyproject pyproject.toml \
             --uv-lock uv.lock \
+            --megatron-pyproject megatron_runtime/pyproject.toml \
+            --megatron-uv-lock megatron_runtime/uv.lock \
             --base-image "${CI_BASE_IMAGE}" \
             --python-mm "${CI_PYTHON_MM}" \
             --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}")"

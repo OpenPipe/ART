@@ -156,6 +156,7 @@ compute_fingerprint() {
   python3 "${REPO_ROOT}/scripts/ci/compute_uv_fingerprint.py" \
     --pyproject "${REPO_ROOT}/pyproject.toml" \
     --uv-lock "${REPO_ROOT}/uv.lock" \
+    --megatron-pyproject "${REPO_ROOT}/megatron_runtime/pyproject.toml" \
     --megatron-uv-lock "${REPO_ROOT}/megatron_runtime/uv.lock" \
     --base-image "${BASE_IMAGE}" \
     --python-mm "${PYTHON_MM}" \
