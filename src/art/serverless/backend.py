@@ -1632,6 +1632,7 @@ class ServerlessBackend:
         train_kwargs: dict[str, Any],
         learner_parent_version: int,
     ) -> _RemotePipelineCommandContext:
+        self._raise_background_failures()
         if normalize_advantages != train_kwargs.get("normalize_advantages", True):
             raise ValueError("pipeline reward normalization configuration changed")
         settings = _ServerlessTrainSettings.model_validate(train_kwargs)

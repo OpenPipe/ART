@@ -1165,6 +1165,7 @@ class MegatronBackend(LocalBackend):
         train_kwargs: dict[str, Any],
         learner_parent_version: int,
     ) -> _MegatronPipelineCommandContext | None:
+        self._raise_pipeline_operation_failures()
         if normalize_advantages != train_kwargs.get("normalize_advantages", True):
             raise ValueError("pipeline reward normalization configuration changed")
         if train_kwargs.get("loss_fn", "cispo") not in {"cispo", "ppo"}:
@@ -1515,6 +1516,15 @@ class MegatronBackend(LocalBackend):
                 self._pipeline_operation_failures.append(error)
 
         task.add_done_callback(completed)
+
+    def _raise_pipeline_operation_failures(self) -> None:
+        if not self._pipeline_operation_failures:
+            return
+        failures, self._pipeline_operation_failures = (
+            self._pipeline_operation_failures,
+            [],
+        )
+        raise BaseExceptionGroup("Megatron pipeline operations failed", failures)
 
     async def prune_model_adapters(
         self,
