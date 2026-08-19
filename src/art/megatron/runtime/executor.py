@@ -2833,6 +2833,9 @@ class _GenerationPublisher:
             elif self._object_store.config != target.store:
                 raise RuntimeError("generation publisher cannot mix object stores")
             store = self._object_store
+        planned_files = {file.name: file for file in planned.files}
+        if any(file.sha256 is None for file in planned_files.values()):
+            raise RuntimeError("adapter object plan has no exact file identity")
         ref = store.publish(
             target,
             {
@@ -2842,14 +2845,20 @@ class _GenerationPublisher:
                 ),
                 "adapter_config.json": (memoryview(payload.config),),
             },
+            file_sha256={
+                name: cast(str, file.sha256) for name, file in planned_files.items()
+            },
         )
         files = {file.relative_path: file for file in ref.files}
         expected_files = ("adapter_config.json", "adapter_model.safetensors")
         if set(files) != set(expected_files):
             raise RuntimeError("adapter object manifest has unexpected files")
         if ref.manifest_uri != planned.identity or tuple(
-            files[name].byte_count for name in expected_files
-        ) != tuple(file.size_bytes for file in planned.files):
+            (files[name].byte_count, files[name].sha256) for name in expected_files
+        ) != tuple(
+            (planned_files[name].size_bytes, planned_files[name].sha256)
+            for name in expected_files
+        ):
             raise RuntimeError("adapter object publication differs from its plan")
         return planned
 

@@ -74,6 +74,7 @@ class BinaryObjectTarget(_ObjectModel):
 class BinaryObjectFile(_ObjectModel):
     relative_path: str
     byte_count: int = Field(ge=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("relative_path")
     @classmethod
@@ -153,37 +154,46 @@ class S3BinaryObjectStore:
         self,
         target: BinaryObjectTarget,
         files: dict[str, tuple[memoryview, ...]],
+        *,
+        file_sha256: dict[str, str],
     ) -> BinaryObjectRef:
         self._require_target(target)
+        if set(files) != set(file_sha256):
+            raise ValueError("binary object digests must cover every file exactly")
+        planned = tuple(
+            BinaryObjectFile(
+                relative_path=_safe_relative_path(relative_path),
+                byte_count=sum(chunk.nbytes for chunk in chunks),
+                sha256=file_sha256[relative_path],
+            )
+            for relative_path, chunks in sorted(files.items())
+        )
         existing = self.resolve(self._manifest_uri(target), missing_ok=True)
         if existing is not None:
             if (
                 existing.object_id != target.object_id
                 or existing.format != target.format
                 or existing.metadata != target.metadata
+                or existing.files != planned
             ):
                 raise RuntimeError("committed object identity differs from its target")
             return existing
         prefix = self._prefix(target)
-        published: list[BinaryObjectFile] = []
         # The prefix is the immutable object identity. A concurrent publisher can
         # commit the same prefix while this publisher is unwinding, so failed
         # publishes intentionally leave any partial keys for later lifecycle cleanup.
-        for relative_path, chunks in sorted(files.items()):
-            relative_path = _safe_relative_path(relative_path)
-            byte_count = self._upload(f"{prefix}/{relative_path}", chunks)
-            published.append(
-                BinaryObjectFile(
-                    relative_path=relative_path,
-                    byte_count=byte_count,
-                )
+        for file in planned:
+            written = self._upload(
+                f"{prefix}/{file.relative_path}", files[file.relative_path]
             )
+            if written != file.byte_count:
+                raise RuntimeError("binary object upload changed its planned size")
         result = BinaryObjectRef(
             object_id=target.object_id,
             format=target.format,
             manifest_uri=self._manifest_uri(target),
-            byte_count=sum(file.byte_count for file in published),
-            files=tuple(published),
+            byte_count=sum(file.byte_count for file in planned),
+            files=planned,
             metadata=target.metadata,
         )
         body = _manifest_bytes(result)
