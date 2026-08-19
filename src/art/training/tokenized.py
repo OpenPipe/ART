@@ -73,6 +73,14 @@ class TokenizedMoeRoutes(BaseModel):
             for segment in self.data
         ):
             raise ValueError("MoE route memoryviews must be readonly contiguous bytes")
+        for segment in self.data:
+            if isinstance(segment, memoryview):
+                try:
+                    hash(segment)
+                except TypeError:
+                    raise ValueError(
+                        "MoE route memoryviews must have immutable backing"
+                    ) from None
         bytes_per_token = np.dtype(self.dtype).itemsize * layers * topk
         if any(not segment or len(segment) % bytes_per_token for segment in self.data):
             raise ValueError("MoE route segments must contain whole tokens")

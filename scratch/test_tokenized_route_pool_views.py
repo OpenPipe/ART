@@ -88,6 +88,7 @@ def test_route_pool_round_trip_shares_views_and_matches_canonical_packing() -> N
         and segment.format == "B"
         for segment in segments
     )
+    assert all(hash(segment) == hash(bytes(segment)) for segment in segments)
     assert len({id(segment.obj) for segment in segments}) == 1
     restored_routes = tuple(datum.moe_routes for datum in restored.datums)
     assert all(routes is not None for routes in restored_routes)
@@ -210,6 +211,20 @@ def test_tokenized_routes_reject_non_readonly_contiguous_byte_views(
     segment: memoryview,
 ) -> None:
     with pytest.raises(ValueError, match="readonly contiguous bytes"):
+        TokenizedMoeRoutes(
+            num_experts=16,
+            dtype="uint8",
+            shape=(1, 4, 2),
+            data=(segment,),
+        )
+
+
+def test_tokenized_routes_reject_readonly_view_of_mutable_owner() -> None:
+    owner = bytearray(8)
+    segment = memoryview(owner).toreadonly()
+    assert segment.readonly and segment.c_contiguous and segment.format == "B"
+
+    with pytest.raises(ValueError, match="immutable backing"):
         TokenizedMoeRoutes(
             num_experts=16,
             dtype="uint8",

@@ -694,6 +694,7 @@ class _ResidentRunState(BaseModel):
     desired: GenerationResidency
     installed_weights: ResidencyKey | None
     installed_optimizer: ResidencyKey | None = None
+    checkpoint_slot_installed: bool = False
     initial_generation: TrainerGeneration | None = None
     pending_load: _PreparedRunLoad | None = None
     next_accumulator_revision: int = 1
@@ -1387,8 +1388,9 @@ class MCoreRunSlotExecutor:
             except BaseException as error:
                 failures.append(error)
         try:
-            if state.installed_weights is not None:
+            if state.checkpoint_slot_installed or state.installed_weights is not None:
                 self._slot_trainer.unload_checkpoint_slot(run_id)
+                state.checkpoint_slot_installed = False
         except BaseException as error:
             failures.append(error)
         finally:
@@ -1522,31 +1524,46 @@ class MCoreRunSlotExecutor:
                     self._slot_trainer.install_prepared_checkpoint_slot_load_sync(
                         pending.checkpoint
                     )
+                    state.checkpoint_slot_installed = True
                     if previous_optimizer is not None:
                         self._slot_trainer.clear_checkpoint_slot_optimizer(state.run_id)
-                except BaseException:
+                    live = self._slot_trainer.checkpoint_slot_residency_tensors(
+                        state.run_id
+                    )
+                    if tuple(map(id, live.weights)) != tuple(map(id, pending.weights)):
+                        raise RuntimeError(
+                            "installed checkpoint changed prepared weight tensors"
+                        )
+                    from art.megatron.training.gradient_accumulator import (
+                        ParameterGradientAccumulator,
+                    )
+
+                    gradients = ParameterGradientAccumulator(
+                        parameters=self._slot_trainer.checkpoint_slot_parameters(
+                            state.run_id
+                        )
+                    )
+                except BaseException as error:
+                    cleanup_error = None
+                    if previous_weights is None and state.checkpoint_slot_installed:
+                        try:
+                            self._slot_trainer.unload_checkpoint_slot(state.run_id)
+                        except BaseException as caught:
+                            cleanup_error = caught
+                        else:
+                            state.checkpoint_slot_installed = False
                     self._residency.release_l1_working_set(working_set)
                     acquired = False
                     if previous_weights is not None:
                         self._residency.acquire_l1(previous_weights)
                         self._residency.release_l1(previous_weights)
+                    if cleanup_error is not None:
+                        raise BaseExceptionGroup(
+                            "checkpoint install and rollback failed",
+                            [error, cleanup_error],
+                        ) from error
                     raise
-                live = self._slot_trainer.checkpoint_slot_residency_tensors(
-                    state.run_id
-                )
-                if tuple(map(id, live.weights)) != tuple(map(id, pending.weights)):
-                    raise RuntimeError(
-                        "installed checkpoint changed prepared weight tensors"
-                    )
-                from art.megatron.training.gradient_accumulator import (
-                    ParameterGradientAccumulator,
-                )
-
-                state.gradients = ParameterGradientAccumulator(
-                    parameters=self._slot_trainer.checkpoint_slot_parameters(
-                        state.run_id
-                    )
-                )
+                state.gradients = gradients
                 state.adapter_config = pending.adapter_config
                 state.installed_weights = weights_key
                 state.installed_optimizer = None

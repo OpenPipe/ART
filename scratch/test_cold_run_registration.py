@@ -38,6 +38,7 @@ class _SlotTrainer:
         self.optimizer_steps = 0
         self.clear_calls = 0
         self.unload_calls = 0
+        self.unload_error: BaseException | None = None
         self.checkpoint: Any | None = None
         self.optimizer: _PreparedOptimizer | None = None
         self.installed_checkpoint: Any | None = None
@@ -135,6 +136,10 @@ class _SlotTrainer:
     def unload_checkpoint_slot(self, name: str) -> None:
         assert name == "run"
         self.unload_calls += 1
+        if self.unload_error is not None:
+            raise self.unload_error
+        self.installed_checkpoint = None
+        self.installed_optimizer = None
 
 
 class _Residency:
@@ -439,6 +444,72 @@ def test_fresh_initial_optimizer_snapshots_from_l2_before_l1_install(
     assert state.installed_weights is state.installed_optimizer is None
     publisher.retire_run("run")
     publisher.close()
+
+
+@pytest.mark.parametrize("failure", ["identity", "accumulator"])
+def test_cold_first_install_rolls_back_post_install_failure(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    executor, slot, _residency, _publisher = _executor(monkeypatch)
+    _register(executor)
+    state = executor._runs["run"]
+
+    if failure == "identity":
+        monkeypatch.setattr(
+            slot,
+            "checkpoint_slot_residency_tensors",
+            lambda _name: SimpleNamespace(weights=(torch.zeros(1),), optimizer=()),
+        )
+        expected = "changed prepared weight tensors"
+    else:
+        monkeypatch.setattr(
+            accumulator_module,
+            "ParameterGradientAccumulator",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("forced accumulator failure")
+            ),
+        )
+        expected = "forced accumulator failure"
+
+    with pytest.raises(RuntimeError, match=expected):
+        with executor._resident(state):
+            pass
+
+    assert slot.weight_installs == slot.unload_calls == 1
+    assert slot.installed_checkpoint is None
+    assert not state.checkpoint_slot_installed
+    assert state.installed_weights is state.gradients is None
+
+
+def test_unregister_retries_failed_cold_install_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, slot, _residency, _publisher = _executor(monkeypatch)
+    _register(executor)
+    state = executor._runs["run"]
+    monkeypatch.setattr(
+        accumulator_module,
+        "ParameterGradientAccumulator",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("forced accumulator failure")
+        ),
+    )
+    slot.unload_error = RuntimeError("forced rollback failure")
+
+    with pytest.raises(BaseExceptionGroup, match="install and rollback failed"):
+        with executor._resident(state):
+            pass
+
+    assert state.checkpoint_slot_installed
+    assert state.installed_weights is None
+    assert slot.installed_checkpoint is not None
+    slot.unload_error = None
+
+    executor.unregister_run("run")
+
+    assert slot.unload_calls == 2
+    assert slot.installed_checkpoint is None
+    assert "run" not in executor._runs
 
 
 @pytest.mark.parametrize(
