@@ -177,6 +177,15 @@ class _PreparedSaveOperation(BaseModel):
     snapshot: _ExistingSnapshot | _PendingSnapshot
 
 
+class _SnapshotSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: str
+    generation: TrainerGeneration
+    output_dir: str
+    optimizer_state_path: str
+
+
 class MegatronTrainingSlot:
     """Canonical pack-and-command facade for one persistent Megatron mesh."""
 
@@ -199,6 +208,7 @@ class MegatronTrainingSlot:
         self._runs: dict[str, _ResidentRun] = {}
         self._results: dict[str, tuple[str, Contract]] = {}
         self._pending_results: dict[str, tuple[str, asyncio.Future[Contract]]] = {}
+        self._recovery_heads: dict[str, asyncio.Task[SaveStateResult]] = {}
         self._prepared_saves: dict[str, _PreparedSaveOperation] = {}
         self._sft_tokenizer = SftBatchTokenizer()
         self._batch_releases: set[asyncio.Task[None]] = set()
@@ -813,6 +823,14 @@ class MegatronTrainingSlot:
         ref: OperationRef,
         request: SaveWeightsForSamplerRequest | SaveStateRequest,
     ) -> PreparedSave:
+        return await self._prepare_save(ref, request, self._snapshot_source(ref))
+
+    async def _prepare_save(
+        self,
+        ref: OperationRef,
+        request: SaveWeightsForSamplerRequest | SaveStateRequest,
+        source: _SnapshotSource,
+    ) -> PreparedSave:
         fingerprint = self._fingerprint(ref, request)
         expected_kind = (
             "sampler_weights"
@@ -835,6 +853,7 @@ class MegatronTrainingSlot:
             raise RuntimeError("authorized save has no retained exact write plan")
         snapshot = await self._start_snapshot(
             ref,
+            source=source,
             save_optimizer=expected_kind == "state",
             publish_sampler=expected_kind == "sampler_weights",
         )
@@ -855,6 +874,64 @@ class MegatronTrainingSlot:
             snapshot=snapshot,
         )
         return prepared
+
+    def start_recovery_head(
+        self,
+        run_id: str,
+        *,
+        learner_version: int,
+        sequence_id: int,
+    ) -> asyncio.Future[SaveStateResult]:
+        state = self._require_run(run_id)
+        generation = state.generation
+        if (
+            learner_version != state.registration.learner_version
+            or learner_version != generation.policy_step
+        ):
+            raise RuntimeError("recovery head is not the resident learner generation")
+        operation_id = f"art-recovery-{generation.generation_id}"
+        existing = self._recovery_heads.get(operation_id)
+        if existing is not None:
+            return existing
+        request = SaveStateRequest(
+            run_id=run_id,
+            request_id=operation_id,
+            sequence_id=sequence_id,
+            checkpoint_name=f"recovery-step-{learner_version}",
+        )
+        ref = OperationRef(
+            run_id=run_id,
+            operation_id=operation_id,
+            sequence_id=sequence_id,
+            learner_parent_version=learner_version,
+            kind="save_state",
+        )
+        source = self._snapshot_source(ref)
+
+        async def complete() -> SaveStateResult:
+            prepared = await self._prepare_save(ref, request, source)
+            result = await asyncio.shield(
+                self.authorize_save(prepared, SnapshotWriteGrant.local(prepared.plan))
+            )
+            if not isinstance(result, SaveStateResult):
+                raise TypeError("recovery snapshot did not produce optimizer state")
+            return result
+
+        task = asyncio.create_task(
+            complete(), name=f"megatron-recovery-{generation.generation_id}"
+        )
+        self._recovery_heads[operation_id] = task
+
+        def completed(done: asyncio.Task[SaveStateResult]) -> None:
+            if (
+                self._recovery_heads.get(operation_id) is done
+                and not done.cancelled()
+                and done.exception() is None
+            ):
+                self._recovery_heads.pop(operation_id)
+
+        task.add_done_callback(completed)
+        return task
 
     def authorize_save(
         self,
@@ -941,12 +1018,12 @@ class MegatronTrainingSlot:
         self,
         ref: OperationRef,
         *,
+        source: _SnapshotSource,
         save_optimizer: bool,
         publish_sampler: bool,
         sequence_continuation_of: str | None = None,
     ) -> _ExistingSnapshot | _PendingSnapshot:
-        state = self._require_parent(ref)
-        generation = state.generation
+        generation = source.generation
         object_target = (
             self._sampler_object_target(ref.run_id, generation)
             if publish_sampler and self.sampler_store is not None
@@ -957,7 +1034,7 @@ class MegatronTrainingSlot:
         )
         if not save_optimizer and existing is not None and object_target is None:
             return self._existing_snapshot(ref, generation, existing)
-        optimizer_state_path = state.registration.optimizer_state_path
+        optimizer_state_path = source.optimizer_state_path
         pointer = read_committed_optimizer_pointer(optimizer_state_path)
         persist_optimizer = save_optimizer
         if (
@@ -986,7 +1063,7 @@ class MegatronTrainingSlot:
             if existing is not None
             or (object_target is not None and not save_optimizer)
             else str(
-                Path(state.output_dir)
+                Path(source.output_dir)
                 / "megatron_runtime"
                 / "staging"
                 / generation.generation_id
@@ -999,7 +1076,7 @@ class MegatronTrainingSlot:
                 sequence_continuation_of=sequence_continuation_of,
                 run_id=ref.run_id,
                 sequence_id=ref.sequence_id,
-                training_session_id=state.registration.training_session_id,
+                training_session_id=generation.training_session_id,
                 learner_version=ref.learner_parent_version,
                 generation=generation,
                 optimizer_state_path=optimizer_state_path,
@@ -1010,7 +1087,7 @@ class MegatronTrainingSlot:
             )
         )
         return _PendingSnapshot(
-            run_id=ref.run_id,
+            run_id=source.run_id,
             generation=generation,
             optimizer_state_path=optimizer_state_path,
             plan=plan,
@@ -1126,6 +1203,21 @@ class MegatronTrainingSlot:
             return
         primary: BaseException | None = None
         try:
+            if self._recovery_heads:
+                outcomes = await asyncio.gather(
+                    *tuple(self._recovery_heads.values()), return_exceptions=True
+                )
+                failures = [
+                    outcome
+                    for outcome in outcomes
+                    if isinstance(outcome, BaseException)
+                ]
+                if len(failures) == 1:
+                    raise failures[0]
+                if failures:
+                    raise BaseExceptionGroup(
+                        "recovery snapshot completion failed", failures
+                    )
             if self._pending_results:
                 outcomes = await asyncio.gather(
                     *(pending[1] for pending in self._pending_results.values()),
@@ -1244,6 +1336,15 @@ class MegatronTrainingSlot:
 
         task.add_done_callback(completed)
         return task
+
+    def _snapshot_source(self, ref: OperationRef) -> _SnapshotSource:
+        state = self._require_parent(ref)
+        return _SnapshotSource(
+            run_id=ref.run_id,
+            generation=state.generation,
+            output_dir=state.output_dir,
+            optimizer_state_path=state.registration.optimizer_state_path,
+        )
 
     def _require_managed_path(self, path: str) -> str:
         resolved = Path(path).resolve()
