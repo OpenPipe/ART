@@ -12,6 +12,12 @@ import uuid
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch
 
+from art.utils.disk_admission import (
+    DiskAdmission,
+    DiskAdmissionConfig,
+    DiskReservationLease,
+)
+
 from .residency import ResidencyKey
 from .tensor_residency import HostTensorImage, _StorageGroup, _TensorView
 
@@ -26,7 +32,7 @@ class NvmeResidencyStoreConfig(BaseModel):
     root: str = Field(min_length=1)
     alignment_bytes: int = Field(default=4096, ge=1)
     io_chunk_bytes: int = Field(default=16 << 20, ge=1 << 20)
-    min_free_bytes: int = Field(default=16 << 30, ge=0)
+    disk_admission: DiskAdmissionConfig | None = None
 
 
 class NvmeStorageRecord(BaseModel):
@@ -91,6 +97,11 @@ class NvmeResidencyStore:
     def __init__(self, config: NvmeResidencyStoreConfig) -> None:
         self.config = config
         self.root = Path(config.root).resolve()
+        if config.disk_admission is None:
+            raise ValueError("L3 residency requires shared disk admission")
+        self._disk_admission = DiskAdmission(config.disk_admission)
+        if not self.root.is_relative_to(self._disk_admission.mount):
+            raise ValueError("L3 residency root leaves shared disk admission")
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = Lock()
 
@@ -120,23 +131,37 @@ class NvmeResidencyStore:
                         "L3 residency key changed immutable tensor contents"
                     )
                 return existing
-            free = shutil.disk_usage(self.root).free
-            required = manifest.physical_bytes + self.config.min_free_bytes
-            if free < required:
-                raise RuntimeError(
-                    f"L3 residency free-space floor exceeded: free={free}, "
-                    f"required={required}"
-                )
             temporary = self.root / f".{destination.name}.tmp-{uuid.uuid4().hex}"
-            temporary.mkdir()
+            reservation = self._disk_admission.reserve(
+                incoming_peak_bytes=manifest.physical_bytes,
+                purpose="rank_l3_residency",
+                owned_paths=(temporary,),
+                run_id=key.run_id,
+            )
             try:
-                committed = self._write_image(temporary, manifest, image)
+                temporary.mkdir()
+                committed = self._write_image(
+                    temporary, manifest, image, reservation=reservation
+                )
                 os.rename(temporary, destination)
                 self._fsync_dir(self.root)
+                reservation.complete()
                 return committed
-            except BaseException:
-                if temporary.exists():
-                    shutil.rmtree(temporary)
+            except BaseException as error:
+                failures = [error]
+                try:
+                    if temporary.exists():
+                        shutil.rmtree(temporary)
+                except BaseException as cleanup:
+                    failures.append(cleanup)
+                try:
+                    reservation.cancel()
+                except BaseException as cleanup:
+                    failures.append(cleanup)
+                if len(failures) > 1:
+                    raise BaseExceptionGroup(
+                        "L3 residency write cleanup failed", failures
+                    ) from None
                 raise
 
     def physical_bytes(self, key: ResidencyKey, image: HostTensorImage) -> int:
@@ -319,6 +344,8 @@ class NvmeResidencyStore:
         directory: Path,
         manifest: NvmeResidencyManifest,
         image: HostTensorImage,
+        *,
+        reservation: DiskReservationLease,
     ) -> NvmeResidencyManifest:
         digest = hashlib.sha256()
         with (directory / _DATA_FILE).open("wb", buffering=0) as handle:
@@ -328,12 +355,17 @@ class NvmeResidencyStore:
             ):
                 if padding := record.offset - cursor:
                     handle.write(bytes(padding))
+                    cursor += padding
+                    reservation.record_written(cursor)
                 view = memoryview(target.numpy()).cast("B")
                 for start in range(0, len(view), self.config.io_chunk_bytes):
                     chunk = view[start : start + self.config.io_chunk_bytes]
                     handle.write(chunk)
                     digest.update(chunk)
-                cursor = record.offset + record.byte_count
+                    cursor += len(chunk)
+                    reservation.record_written(cursor)
+                if cursor != record.offset + record.byte_count:
+                    raise RuntimeError("L3 residency write changed physical layout")
             handle.flush()
             os.fsync(handle.fileno())
         committed = manifest.model_copy(update={"data_sha256": digest.hexdigest()})
@@ -342,6 +374,7 @@ class NvmeResidencyStore:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        reservation.record_written(manifest.data_bytes + len(payload))
         self._fsync_dir(directory)
         return committed
 
