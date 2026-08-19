@@ -58,7 +58,7 @@ class MegatronRuntimeConfig(pydantic.BaseModel):
 
     topology: MegatronTopologyConfig
     packed_sequence_length: int = pydantic.Field(ge=1)
-    snapshot_pool_capacity: int = pydantic.Field(default=2, ge=1, le=4)
+    snapshot_pool_capacity: int = pydantic.Field(default=2, ge=2, le=4)
     compile_cache: bool = False
     # The default 2 resident layers / 4 slots is the tested recommendation.
     # Set ART_MEGATRON_STREAMING_WEIGHT_OFFLOAD_{NUM_LAYERS,NUM_SLOTS,RESIDENT_LAYERS}

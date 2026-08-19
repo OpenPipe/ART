@@ -58,7 +58,7 @@ class TrainerRuntimeSpec(_Spec):
     offload_between_jobs: bool = False
     random_state: int | None = None
     hybrid_ep: HybridEpRuntimeSpec | None = None
-    snapshot_pool_capacity: int = Field(default=2, ge=1, le=4)
+    snapshot_pool_capacity: int = Field(default=2, ge=2, le=4)
     run_residency: RunResidencyConfig | None = None
 
     @model_validator(mode="after")
