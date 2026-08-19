@@ -848,8 +848,7 @@ class MCoreRunSlotExecutor:
         else:
             raise ValueError(f"unsupported residency prefetch command {command_kind!r}")
         try:
-            for key in keys:
-                self._residency.prefetch_l1(key)
+            self._residency.prefetch_l1_working_set(keys)
         except ResidencyCapacityUnavailable:
             return False
         return True
@@ -1433,10 +1432,17 @@ class MCoreRunSlotExecutor:
         include_accumulator: bool = False,
     ) -> Iterator[None]:
         weights_key = state.desired.weights
-        acquired: list[ResidencyKey] = []
+        optimizer_key = state.desired.optimizer if include_optimizer else None
+        accumulator_key = state.desired.accumulator if include_accumulator else None
+        working_set = tuple(
+            key
+            for key in (weights_key, optimizer_key, accumulator_key)
+            if key is not None
+        )
+        acquired = False
         try:
-            self._residency.acquire_l1(weights_key)
-            acquired.append(weights_key)
+            self._residency.acquire_l1_working_set(working_set)
+            acquired = True
             if state.installed_weights != weights_key:
                 pending = state.pending_load
                 if pending is None or pending.weights_key != weights_key:
@@ -1449,7 +1455,8 @@ class MCoreRunSlotExecutor:
                     )
                     self._slot_trainer.clear_checkpoint_slot_optimizer(state.run_id)
                 except BaseException:
-                    self._residency.release_l1(acquired.pop())
+                    self._residency.release_l1_working_set(working_set)
+                    acquired = False
                     self._residency.acquire_l1(previous_weights)
                     self._residency.release_l1(previous_weights)
                     raise
@@ -1477,10 +1484,7 @@ class MCoreRunSlotExecutor:
                 self._residency.retire_async(previous_weights)
                 if previous_optimizer is not None:
                     self._residency.retire_async(previous_optimizer)
-            optimizer_key = state.desired.optimizer if include_optimizer else None
             if optimizer_key is not None:
-                self._residency.acquire_l1(optimizer_key)
-                acquired.append(optimizer_key)
                 if state.installed_optimizer != optimizer_key:
                     pending = state.pending_load
                     if (
@@ -1507,17 +1511,10 @@ class MCoreRunSlotExecutor:
                         )
                     state.installed_optimizer = optimizer_key
                     state.pending_load = None
-            for key in (
-                (state.desired.accumulator,)
-                if include_accumulator and state.desired.accumulator is not None
-                else ()
-            ):
-                self._residency.acquire_l1(key)
-                acquired.append(key)
             yield
         finally:
-            for key in reversed(acquired):
-                self._residency.release_l1(key)
+            if acquired:
+                self._residency.release_l1_working_set(working_set)
 
     @staticmethod
     def _validate_parent(
@@ -1574,6 +1571,7 @@ class _CachedGeneration(BaseModel):
     consumers: list[Future[TrainerRankPublication]] = Field(default_factory=list)
     object_ids: set[str] = Field(default_factory=set)
     residency_retirement: Future[None] | None = None
+    admission_order: int = Field(default=0, ge=0)
     retired: bool = False
     released: bool = False
 
@@ -1670,6 +1668,7 @@ class _GenerationPublisher:
         self._prepared_order: deque[str] = deque()
         self._residency_retirements: set[Future[None]] = set()
         self._failures: list[BaseException] = []
+        self._next_admission_order = 0
         self._in_flight = 0
 
     def stage(
@@ -1693,8 +1692,7 @@ class _GenerationPublisher:
             stage_vllm_lora_snapshot_from_model,
         )
 
-        self._retire_previous(run_id)
-        wait_s, in_flight, stager = self._acquire_slot()
+        wait_s, in_flight, stager = self._acquire_slot(protected_run_id=run_id)
         prepare_started = time.perf_counter()
         try:
             lora_timings = LoraSnapshotTimings()
@@ -1754,13 +1752,7 @@ class _GenerationPublisher:
                 has_optimizer=optimizer is not None,
                 release_stager_on_resolve=lora_residency_key is not None,
             )
-            with self._lock:
-                if generation.generation_id in self._cache:
-                    raise RuntimeError(
-                        f"generation snapshot already exists: {generation.generation_id}"
-                    )
-                self._cache[generation.generation_id] = entry
-                self._latest_by_run[run_id] = generation.generation_id
+            self._cache_staging(entry)
             resolved.add_done_callback(
                 lambda done, cached=entry: self._snapshot_resolved(cached, done)
             )
@@ -1822,19 +1814,8 @@ class _GenerationPublisher:
             resident_optimizer=resident_optimizer,
             has_optimizer=resident_optimizer is not None,
         )
-        with self._lock:
-            if generation.generation_id in self._cache:
-                raise RuntimeError(
-                    f"generation snapshot already exists: {generation.generation_id}"
-                )
-            previous_id = self._latest_by_run.get(run_id)
-            previous = None if previous_id is None else self._cache[previous_id]
-            if previous is not None:
-                previous.retired = True
-            self._cache[generation.generation_id] = entry
-            self._latest_by_run[run_id] = generation.generation_id
-        if previous is not None:
-            self._maybe_release(previous)
+        self._cache_staging(entry)
+        self._activate_generation(entry)
         return {
             "snapshot_optimizer_attach_s": time.perf_counter() - started,
         }
@@ -2237,11 +2218,13 @@ class _GenerationPublisher:
         if failures:
             raise BaseExceptionGroup("generation retirement failed", failures)
 
-    def _acquire_slot(self) -> tuple[float, int, PinnedCpuSnapshotStager]:
+    def _acquire_slot(
+        self, *, protected_run_id: str | None = None
+    ) -> tuple[float, int, PinnedCpuSnapshotStager]:
         self.raise_if_failed()
         started = time.perf_counter()
         while not self._slots.acquire(blocking=False):
-            self._evict_for_capacity()
+            self._evict_for_capacity(protected_run_id=protected_run_id)
             self.raise_if_failed()
         wait_s = time.perf_counter() - started
         with self._lock:
@@ -2250,7 +2233,7 @@ class _GenerationPublisher:
             self._in_flight += 1
             return wait_s, self._in_flight, stager
 
-    def _evict_for_capacity(self) -> None:
+    def _evict_for_capacity(self, *, protected_run_id: str | None = None) -> None:
         with self._lock:
             entries = tuple(
                 entry
@@ -2259,10 +2242,19 @@ class _GenerationPublisher:
             )
             if not entries:
                 raise RuntimeError("snapshot pool is full without a cached generation")
+            candidates = tuple(
+                entry
+                for entry in entries
+                if entry.retired or entry.run_id != protected_run_id
+            )
+            if not candidates:
+                raise ResidencyCapacityUnavailable(
+                    "snapshot pool capacity is occupied by the run being replaced"
+                )
             entry = next(
                 (
                     entry
-                    for entry in entries
+                    for entry in candidates
                     if all(future.done() for future in self._stager_dependencies(entry))
                 ),
                 None,
@@ -2271,7 +2263,7 @@ class _GenerationPublisher:
                 pending = tuple(
                     {
                         future
-                        for candidate in entries
+                        for candidate in candidates
                         for future in self._stager_dependencies(candidate)
                         if not future.done()
                     }
@@ -2309,25 +2301,54 @@ class _GenerationPublisher:
         )
         return entry.resolved, *optimizer, *entry.consumers
 
-    def _retire_previous(self, run_id: str) -> _CachedGeneration | None:
+    def _cache_staging(self, entry: _CachedGeneration) -> None:
         with self._lock:
-            generation_id = self._latest_by_run.pop(run_id, None)
-            entry = None if generation_id is None else self._cache[generation_id]
-            if entry is not None:
-                entry.retired = True
-        if entry is not None:
-            self._maybe_release(entry)
-        return entry
+            generation_id = entry.generation.generation_id
+            if generation_id in self._cache:
+                raise RuntimeError(
+                    f"generation snapshot already exists: {generation_id}"
+                )
+            self._next_admission_order += 1
+            entry.admission_order = self._next_admission_order
+            self._cache[generation_id] = entry
+
+    def _activate_generation(self, entry: _CachedGeneration) -> None:
+        with self._lock:
+            if entry.retired or entry.released:
+                return
+            latest_id = self._latest_by_run.get(entry.run_id)
+            latest = None if latest_id is None else self._cache.get(latest_id)
+            if latest is not None and latest.admission_order > entry.admission_order:
+                predecessors = (entry,)
+            else:
+                self._latest_by_run[entry.run_id] = entry.generation.generation_id
+                predecessors = tuple(
+                    candidate
+                    for candidate in self._cache.values()
+                    if candidate is not entry
+                    and candidate.run_id == entry.run_id
+                    and candidate.admission_order < entry.admission_order
+                    and not candidate.retired
+                )
+            for predecessor in predecessors:
+                predecessor.retired = True
+        for predecessor in predecessors:
+            self._maybe_release(predecessor)
 
     def _snapshot_resolved(
         self,
         entry: _CachedGeneration,
         resolved: Future[_ResolvedGeneration],
     ) -> None:
-        if not resolved.cancelled() and (error := resolved.exception()) is not None:
+        if resolved.cancelled():
+            with self._lock:
+                entry.retired = True
+        elif (error := resolved.exception()) is not None:
             with self._lock:
                 self._failures.append(error)
                 entry.retired = True
+        else:
+            self._activate_generation(entry)
         if entry.release_stager_on_resolve:
             self._release_entry_stager(entry)
         self._maybe_release(entry)

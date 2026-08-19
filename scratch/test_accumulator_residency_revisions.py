@@ -24,6 +24,7 @@ class _ResidencyProbe:
         self.snapshots: dict[ResidencyKey, tuple[torch.Tensor, ...]] = {}
         self.tensor_ids: tuple[int, ...] | None = None
         self.acquired: list[ResidencyKey] = []
+        self.working_sets: list[tuple[ResidencyKey, ...]] = []
 
     def register_l1(self, key, tensors):
         assert self.current is None
@@ -36,12 +37,21 @@ class _ResidencyProbe:
             assert self.current is not None and self.current[0] == key
         self.acquired.append(key)
 
+    def acquire_l1_working_set(self, keys):
+        self.working_sets.append(tuple(keys))
+        for key in keys:
+            self.acquire_l1(key)
+
     def wait_before_mutation(self, key):
         assert self.current is not None and self.current[0] == key
         self.calls.append(("wait", key.accumulator_revision, None))
 
     def release_l1(self, key):
         assert self.acquired.pop() == key
+
+    def release_l1_working_set(self, keys):
+        for key in reversed(tuple(keys)):
+            self.release_l1(key)
 
     def touch(self, key):
         assert self.current is not None and self.current[0] == key
@@ -114,6 +124,7 @@ def test_each_contribution_creates_a_recoverable_accumulator_revision() -> None:
     with executor._resident(state, include_accumulator=True):
         assert residency.acquired == [weights, current]
     assert residency.acquired == []
+    assert residency.working_sets == [(weights, current)]
     executor._retire_accumulator(state)
     assert state.desired.accumulator is None
     assert state.next_accumulator_revision == 3
