@@ -690,9 +690,9 @@ class _ResidentRunState(BaseModel):
     training_session_id: str
     learner_version: int
     adapter_config: dict[str, Any]
-    gradients: Any
+    gradients: Any | None
     desired: GenerationResidency
-    installed_weights: ResidencyKey
+    installed_weights: ResidencyKey | None
     installed_optimizer: ResidencyKey | None = None
     initial_generation: TrainerGeneration | None = None
     pending_load: _PreparedRunLoad | None = None
@@ -739,24 +739,49 @@ class MCoreRunSlotExecutor:
         learner_version: int,
         generation_id: str,
         adapter_path: str,
+        adapter_step: int,
+        initial_optimizer_state_path: str | None = None,
+        initial_optimizer_generation_id: str | None = None,
     ) -> None:
         if self._closed:
             raise RuntimeError("Megatron run slot is closed")
         if run_id in self._runs:
             raise RuntimeError(f"training run is already resident: {run_id!r}")
         from art.megatron.model_support.lora_disk import load_adapter_config
-        from art.megatron.training.gradient_accumulator import (
-            ParameterGradientAccumulator,
-        )
+        from art.megatron.optimizer_state import load_trainer_rank_optimizer_state
         from art.trainer_rank import MaterializedCheckpoint
 
+        if (initial_optimizer_state_path is None) != (
+            initial_optimizer_generation_id is None
+        ):
+            raise ValueError("initial optimizer path and generation must be paired")
         adapter_config = load_adapter_config(adapter_path)
         adapter_layout_fingerprint = hashlib.sha256(
             encode_adapter_config(adapter_config)
         ).hexdigest()
-        self._slot_trainer.load_checkpoint_sync(
-            MaterializedCheckpoint(path=run_id, directory=adapter_path)
+        checkpoint = self._slot_trainer.prepare_checkpoint_slot_load_sync(
+            MaterializedCheckpoint(path=run_id, directory=adapter_path),
+            device="cpu",
         )
+        if initial_optimizer_state_path is not None:
+            assert initial_optimizer_generation_id is not None
+            loaded_optimizer = load_trainer_rank_optimizer_state(
+                self.runtime,
+                optimizer_state_path=initial_optimizer_state_path,
+                adapter_path=adapter_path,
+                adapter_step=adapter_step,
+                optimizer_generation_id=initial_optimizer_generation_id,
+                layout=self.optimizer_layout(checkpoint),
+            )
+            optimizer = (
+                self._slot_trainer.prepare_checkpoint_slot_optimizer_for_residency(
+                    run_id, checkpoint, loaded_optimizer
+                )
+            )
+        else:
+            optimizer = self._slot_trainer.prepare_fresh_checkpoint_slot_optimizer_for_residency(
+                checkpoint
+            )
         weights_key = ResidencyKey(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -764,66 +789,98 @@ class MCoreRunSlotExecutor:
             topology_fingerprint=self.runtime.optimizer_layout_fingerprint,
             adapter_layout_fingerprint=adapter_layout_fingerprint,
         )
-        self._runs[run_id] = _ResidentRunState(
+        optimizer_key = weights_key.model_copy(update={"representation": "optimizer"})
+        prepared = _PreparedRunLoad(
+            operation_id=f"register:{generation_id}",
+            weights_key=weights_key,
+            optimizer_key=optimizer_key,
+            checkpoint=checkpoint,
+            optimizer=optimizer,
+            adapter_config=adapter_config,
+        )
+        tensors = (*prepared.weights, *prepared.optimizer_tensors)
+        if (
+            not prepared.weights
+            or not prepared.optimizer_tensors
+            or any(tensor.device.type != "cpu" for tensor in tensors)
+        ):
+            raise RuntimeError(
+                "prepared initial working set is not entirely CPU resident"
+            )
+        state = _ResidentRunState(
             tenant_id=tenant_id,
             run_id=run_id,
             training_session_id=training_session_id,
             learner_version=learner_version,
             adapter_config=adapter_config,
-            gradients=ParameterGradientAccumulator(
-                parameters=self._slot_trainer.checkpoint_slot_parameters(run_id)
-            ),
-            desired=GenerationResidency(weights=weights_key),
-            installed_weights=weights_key,
+            gradients=None,
+            desired=GenerationResidency(weights=weights_key, optimizer=optimizer_key),
+            installed_weights=None,
             initial_generation=TrainerGeneration(
                 training_session_id=training_session_id,
                 policy_step=learner_version,
                 generation_id=generation_id,
                 adapter_path=adapter_path,
             ),
+            pending_load=prepared,
         )
+        self._residency.register_l2_working_set(
+            (
+                (weights_key, prepared.weights),
+                (optimizer_key, prepared.optimizer_tensors),
+            )
+        )
+        try:
+            self._runs[run_id] = state
+        except BaseException as error:
+            failures: list[BaseException] = [error]
+            for key in (weights_key, optimizer_key):
+                try:
+                    self._residency.retire(key)
+                except BaseException as cleanup_error:
+                    failures.append(cleanup_error)
+            if len(failures) > 1:
+                raise BaseExceptionGroup(
+                    "run admission and cleanup failed", failures
+                ) from error
+            raise
 
     def complete_run_registration(self, run_id: str) -> None:
         state = self._require_run(run_id, require_complete=False)
         if state.registration_complete:
             return
-        generation = state.initial_generation
-        if generation is None:
-            raise RuntimeError("run registration has no immutable initial generation")
-        tensors = self._slot_trainer.checkpoint_slot_residency_tensors(run_id)
-        self._residency.register_l1(state.installed_weights, tensors.weights)
-        optimizer_key = None
-        if tensors.optimizer:
-            optimizer_key = state.installed_weights.model_copy(
-                update={"representation": "optimizer"}
+        try:
+            generation = state.initial_generation
+            if generation is None:
+                raise RuntimeError(
+                    "run registration has no immutable initial generation"
+                )
+            pending = state.pending_load
+            if (
+                pending is None
+                or pending.optimizer is None
+                or pending.optimizer_key is None
+            ):
+                raise RuntimeError("run registration has no prepared L2 working set")
+            self._publisher.register_existing(
+                run_id=run_id,
+                generation=generation,
+                optimizer_source=pending.optimizer.snapshot_source(),
+                optimizer_residency_key=pending.optimizer_key,
             )
-            self._residency.register_l1(optimizer_key, tensors.optimizer)
-            state.installed_optimizer = optimizer_key
-        state.desired = state.desired.model_copy(update={"optimizer": optimizer_key})
-        self._publisher.register_existing(
-            run_id=run_id,
-            generation=generation,
-            optimizer_source=(
-                self._slot_trainer.checkpoint_slot_optimizer_residency_source(run_id)
-            ),
-            optimizer_residency_key=optimizer_key,
-        )
+        except BaseException as error:
+            try:
+                self.unregister_run(run_id)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "run registration and cleanup failed", [error, cleanup_error]
+                ) from error
+            raise
         state.initial_generation = None
         state.registration_complete = True
 
-    def optimizer_layout(self, run_id: str) -> Any:
-        self._require_run(run_id, require_complete=False)
-        return self._slot_trainer.checkpoint_slot_optimizer_layout(run_id)
-
-    def restore_optimizer_state(
-        self, run_id: str, optimizer_state: "TrainerRankOptimizerState"
-    ) -> None:
-        run = self._require_run(run_id, require_complete=False)
-        if run.registration_complete:
-            raise RuntimeError("cannot restore optimizer after residency registration")
-        self._slot_trainer.restore_checkpoint_slot_optimizer_state(
-            run_id, optimizer_state
-        )
+    def optimizer_layout(self, checkpoint: Any) -> Any:
+        return self._slot_trainer.prepared_checkpoint_slot_optimizer_layout(checkpoint)
 
     def prepare_residency(self, run_id: str, command_kind: str) -> bool:
         """Launch component transfers before the serialized GPU command turn."""
@@ -869,12 +926,13 @@ class MCoreRunSlotExecutor:
         )
 
         with self._resident(state):
+            gradients = self._require_gradients(state)
             result = execute_megatron_dynamic_lora_forward_backward_job(
                 self.runtime,
                 job,
                 batch.tensors,
                 slot_trainer=self._slot_trainer,
-                gradient_accumulator=state.gradients,
+                gradient_accumulator=gradients,
                 accumulator_residency=self._accumulator_resident(state),
                 cancelled=cancelled,
             )
@@ -928,12 +986,13 @@ class MCoreRunSlotExecutor:
         )
 
         with self._resident(state):
+            gradients = self._require_gradients(state)
             result = execute_megatron_dynamic_lora_sft_forward_backward_job(
                 self.runtime,
                 job,
                 batch,
                 slot_trainer=self._slot_trainer,
-                gradient_accumulator=state.gradients,
+                gradient_accumulator=gradients,
                 accumulator_residency=self._accumulator_resident(state),
                 cancelled=cancelled,
             )
@@ -966,7 +1025,8 @@ class MCoreRunSlotExecutor:
         self._validate_parent(
             state, job.training_session_id, job.expected_learner_version
         )
-        state.gradients.seal(job.contributing_forward_backward_operation_ids)
+        gradients = self._require_gradients(state)
+        gradients.seal(job.contributing_forward_backward_operation_ids)
         from art.trainer_rank import AdamParams
 
         with self._resident(
@@ -974,7 +1034,7 @@ class MCoreRunSlotExecutor:
         ) as working_set:
             self._residency.wait_before_mutation_working_set(working_set)
             self.runtime.optimizer_snapshot_barrier.wait_before_mutation(key=job.run_id)
-            gradients = state.gradients.prepare_optimizer()
+            reduced_gradients = gradients.prepare_optimizer()
             started = time.perf_counter()
             result = self._slot_trainer.optim_step_reduced(
                 job.run_id,
@@ -986,15 +1046,17 @@ class MCoreRunSlotExecutor:
                     weight_decay=job.optimizer.weight_decay,
                     grad_clip_norm=job.optimizer.grad_clip_norm,
                 ),
-                grads=gradients,
+                grads=reduced_gradients,
             )
         if not result["update_successful"] or not math.isfinite(result["grad_norm"]):
             raise RuntimeError("dynamic LoRA optimizer rejected the update")
         optimizer_step_s = time.perf_counter() - started
-        consumed = state.gradients.consume()
+        consumed = gradients.consume()
         if consumed != job.contributing_forward_backward_operation_ids:
             raise RuntimeError("optimizer consumed the wrong gradient contributions")
         parent_weights = state.installed_weights
+        if parent_weights is None:
+            raise RuntimeError("optimizer has no installed weight generation")
         output_weights = parent_weights.model_copy(
             update={"generation_id": job.generation.generation_id}
         )
@@ -1090,7 +1152,7 @@ class MCoreRunSlotExecutor:
                 adapter_path=job.adapter_path,
                 adapter_step=job.adapter_step,
                 optimizer_generation_id=job.optimizer_generation_id,
-                layout=self._slot_trainer.checkpoint_slot_optimizer_layout(job.run_id),
+                layout=self.optimizer_layout(checkpoint),
             )
             optimizer_state = (
                 self._slot_trainer.prepare_checkpoint_slot_optimizer_for_residency(
@@ -1173,7 +1235,7 @@ class MCoreRunSlotExecutor:
         self._validate_parent(
             state, job.training_session_id, job.expected_learner_version
         )
-        if state.gradients.contribution_ids:
+        if state.gradients is not None and state.gradients.contribution_ids:
             raise RuntimeError("load_state cannot discard open gradient contributions")
         if (
             prepared.operation_id != job.operation_id
@@ -1295,11 +1357,12 @@ class MCoreRunSlotExecutor:
 
     def discard_run_gradients(self, run_id: str) -> None:
         state = self._require_run(run_id)
-        state.gradients.discard()
+        if state.gradients is not None:
+            state.gradients.discard()
         self._retire_accumulator(state)
 
     def unregister_run(self, run_id: str) -> None:
-        state = self._require_run(run_id)
+        state = self._require_run(run_id, require_complete=False)
         failures: list[BaseException] = []
         for operation_id, (prepared_run_id, _fingerprint, _future) in tuple(
             self._load_preparations.items()
@@ -1309,10 +1372,11 @@ class MCoreRunSlotExecutor:
                     self.discard_prepared_load_state(operation_id)
                 except BaseException as error:
                     failures.append(error)
-        try:
-            state.gradients.discard()
-        except BaseException as error:
-            failures.append(error)
+        if state.gradients is not None:
+            try:
+                state.gradients.discard()
+            except BaseException as error:
+                failures.append(error)
         try:
             self._publisher.retire_run(run_id)
         except BaseException as error:
@@ -1323,11 +1387,12 @@ class MCoreRunSlotExecutor:
             except BaseException as error:
                 failures.append(error)
         try:
-            self._slot_trainer.unload_checkpoint_slot(run_id)
+            if state.installed_weights is not None:
+                self._slot_trainer.unload_checkpoint_slot(run_id)
         except BaseException as error:
             failures.append(error)
         finally:
-            self._runs.pop(run_id)
+            self._runs.pop(run_id, None)
         if len(failures) == 1:
             raise failures[0]
         if failures:
@@ -1338,10 +1403,11 @@ class MCoreRunSlotExecutor:
             return
         failures: list[BaseException] = []
         for state in self._runs.values():
-            try:
-                state.gradients.discard()
-            except BaseException as error:
-                failures.append(error)
+            if state.gradients is not None:
+                try:
+                    state.gradients.discard()
+                except BaseException as error:
+                    failures.append(error)
         futures = tuple(value[2] for value in self._load_preparations.values())
         for future in futures:
             future.cancel()
@@ -1386,9 +1452,12 @@ class MCoreRunSlotExecutor:
         self, state: _ResidentRunState, operation_id: str
     ) -> None:
         del operation_id
-        tensors = state.gradients.residency_tensors()
+        tensors = self._require_gradients(state).residency_tensors()
         previous = state.desired.accumulator
-        key = state.installed_weights.model_copy(
+        installed_weights = state.installed_weights
+        if installed_weights is None:
+            raise RuntimeError("gradient contribution has no installed weights")
+        key = installed_weights.model_copy(
             update={
                 "representation": "accumulator",
                 "accumulator_revision": state.next_accumulator_revision,
@@ -1453,12 +1522,14 @@ class MCoreRunSlotExecutor:
                     self._slot_trainer.install_prepared_checkpoint_slot_load_sync(
                         pending.checkpoint
                     )
-                    self._slot_trainer.clear_checkpoint_slot_optimizer(state.run_id)
+                    if previous_optimizer is not None:
+                        self._slot_trainer.clear_checkpoint_slot_optimizer(state.run_id)
                 except BaseException:
                     self._residency.release_l1_working_set(working_set)
                     acquired = False
-                    self._residency.acquire_l1(previous_weights)
-                    self._residency.release_l1(previous_weights)
+                    if previous_weights is not None:
+                        self._residency.acquire_l1(previous_weights)
+                        self._residency.release_l1(previous_weights)
                     raise
                 live = self._slot_trainer.checkpoint_slot_residency_tensors(
                     state.run_id
@@ -1481,7 +1552,8 @@ class MCoreRunSlotExecutor:
                 state.installed_optimizer = None
                 if pending.optimizer is None:
                     state.pending_load = None
-                self._residency.retire_async(previous_weights)
+                if previous_weights is not None:
+                    self._residency.retire_async(previous_weights)
                 if previous_optimizer is not None:
                     self._residency.retire_async(previous_optimizer)
             if optimizer_key is not None:
@@ -1515,6 +1587,12 @@ class MCoreRunSlotExecutor:
         finally:
             if acquired:
                 self._residency.release_l1_working_set(working_set)
+
+    @staticmethod
+    def _require_gradients(state: _ResidentRunState) -> Any:
+        if state.gradients is None:
+            raise RuntimeError("run weights have not been installed")
+        return state.gradients
 
     @staticmethod
     def _validate_parent(

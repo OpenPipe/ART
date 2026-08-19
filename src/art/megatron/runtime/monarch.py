@@ -965,22 +965,12 @@ class MonarchTrainerActor(Actor):
             learner_version=registration.learner_version,
             generation_id=registration.generation_id,
             adapter_path=registration.adapter_path,
+            adapter_step=registration.adapter_step,
+            initial_optimizer_state_path=registration.initial_optimizer_state_path,
+            initial_optimizer_generation_id=(
+                registration.initial_optimizer_generation_id
+            ),
         )
-        if registration.initial_optimizer_state_path is not None:
-            assert registration.initial_optimizer_generation_id is not None
-            from art.megatron.optimizer_state import (
-                load_trainer_rank_optimizer_state,
-            )
-
-            optimizer_state = load_trainer_rank_optimizer_state(
-                self._runtime,
-                optimizer_state_path=registration.initial_optimizer_state_path,
-                adapter_path=registration.adapter_path,
-                adapter_step=registration.adapter_step,
-                optimizer_generation_id=registration.initial_optimizer_generation_id,
-                layout=executor.optimizer_layout(registration.run_id),
-            )
-            executor.restore_optimizer_state(registration.run_id, optimizer_state)
         executor.complete_run_registration(registration.run_id)
         return {"rank": self._runtime.rank, "run_id": registration.run_id}
 

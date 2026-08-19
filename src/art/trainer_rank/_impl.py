@@ -1561,6 +1561,11 @@ class TrainerRank:
         self.checkpoint_slot_parameters(name)
         return self._dynamic_optimizer_layout(name)
 
+    def prepared_checkpoint_slot_optimizer_layout(
+        self, checkpoint: "PreparedCheckpointSlotInstall"
+    ) -> TrainerRankOptimizerLayout:
+        return self._prepared_dynamic_optimizer_layout(checkpoint)
+
     def checkpoint_slot_residency_tensors(
         self, name: str
     ) -> TrainerRankResidencyTensors:
@@ -1602,7 +1607,7 @@ class TrainerRank:
                 f"Unsupported optimizer state format for checkpoint slot {name!r}."
             )
         layout = state.get("layout")
-        if layout != self._dynamic_optimizer_layout(name):
+        if layout != self.prepared_checkpoint_slot_optimizer_layout(checkpoint):
             raise TrainerRankSlotStateError(
                 f"Optimizer state for checkpoint slot {name!r} was saved for a "
                 "different topology or parameter layout."
