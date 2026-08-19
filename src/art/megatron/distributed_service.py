@@ -2898,10 +2898,53 @@ class DistributedMegatronService:
             await self._mutation_lock.acquire()
         try:
             self._require_open()
-            protected = frozenset((self._latest_step, self._serving_step))
-            yield protected
+            protected = {
+                self._latest_step,
+                self._serving_step,
+                self._durable_step,
+                self._durable_optimizer_step,
+                *(
+                    step
+                    for step, count in self._exact_adapter_refcounts.items()
+                    if count
+                ),
+                *(
+                    step
+                    for step, task in self._publication_tasks.items()
+                    if not task.done()
+                ),
+                *(
+                    step
+                    for step, task in self._snapshot_rank_tasks.items()
+                    if not task.done()
+                ),
+                *(
+                    step
+                    for step, future in self._serving_futures.items()
+                    if not future.done()
+                ),
+            }
+            if self._learner_generation is not None:
+                protected.add(self._learner_generation.policy_step)
+            if self._next_publication_preparation is not None:
+                protected.add(self._next_publication_preparation[1].policy_step)
+            yield frozenset(protected)
         finally:
             self._mutation_lock.release()
+
+    def prune_checkpoint_metadata_locked(self, *, retain_steps: set[int]) -> None:
+        required = {
+            self._latest_step,
+            self._serving_step,
+            *(step for step, count in self._exact_adapter_refcounts.items() if count),
+        }
+        if not required <= retain_steps:
+            raise RuntimeError("checkpoint retention omitted an active generation")
+        self._published_adapters = {
+            step: adapter
+            for step, adapter in self._published_adapters.items()
+            if step in retain_steps
+        }
 
     async def _unload_adapter(self, name: str) -> None:
         if self._base_url is None:

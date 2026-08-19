@@ -7,6 +7,8 @@ from typing import Any
 import pytest
 
 from art.distributed.trajectory_store import TrajectoryGroupBundle
+from art.megatron.distributed_service import DistributedMegatronService
+from art.megatron.runtime.specs import ResolvedCheckpointState
 import art.megatron.training.client as client_module
 from art.megatron.training.client import (
     LocalMegatronTrainingClient,
@@ -52,6 +54,37 @@ def _client(service: _Service) -> LocalMegatronTrainingClient:
         model=SimpleNamespace(),
         service=service,
     )
+
+
+def _checkpoint(step: int) -> ResolvedCheckpointState:
+    return ResolvedCheckpointState(
+        adapter_path=f"/checkpoint/{step}",
+        adapter_step=step,
+        adapter_training_session_id="session",
+        adapter_generation_id=f"generation-{step}",
+    )
+
+
+def test_physical_retention_prunes_checkpoint_and_publication_indexes() -> None:
+    client = _client(_Service())
+    client._checkpoints = {
+        "latest": _checkpoint(3),
+        "retained-alias": _checkpoint(1),
+        "deleted-alias": _checkpoint(2),
+    }
+    client.prune_checkpoints(retain_steps={1, 3})
+    assert tuple(client._checkpoints) == ("latest", "retained-alias")
+
+    service = object.__new__(DistributedMegatronService)
+    service._latest_step = 3
+    service._serving_step = 3
+    service._exact_adapter_refcounts = {1: 1}
+    service._published_adapters = {1: object(), 2: object(), 3: object()}
+    service.prune_checkpoint_metadata_locked(retain_steps={1, 3})
+    assert set(service._published_adapters) == {1, 3}
+
+    with pytest.raises(RuntimeError, match="omitted an active generation"):
+        service.prune_checkpoint_metadata_locked(retain_steps={3})
 
 
 def _save(request_id: str, sequence_id: int) -> SaveWeightsForSamplerRequest:

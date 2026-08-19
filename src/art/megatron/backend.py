@@ -1490,12 +1490,17 @@ class MegatronBackend(LocalBackend):
         output_dir = get_model_dir(model=model, art_path=self._path)
         async with service.checkpoint_retention_lease() as active_steps:
 
-            def delete_retained() -> None:
+            def delete_retained() -> set[int]:
                 retained = set(steps_to_keep) | set(active_steps)
                 with optimizer_retention_lease(output_dir, retained) as protected:
                     delete_checkpoints(output_dir, sorted(protected))
+                    return set(protected)
 
-            await asyncio.to_thread(delete_retained)
+            retained = await asyncio.to_thread(delete_retained)
+            service.prune_checkpoint_metadata_locked(retain_steps=retained)
+            client = self._training_clients.get(self._model_storage_key(model))
+            if client is not None:
+                client.prune_checkpoints(retain_steps=retained)
 
     async def _advance_skipped_step(
         self,

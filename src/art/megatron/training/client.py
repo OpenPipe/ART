@@ -832,6 +832,13 @@ class LocalMegatronTrainingClient:
             return
         self._checkpoints[checkpoint_id] = checkpoint
 
+    def prune_checkpoints(self, *, retain_steps: set[int]) -> None:
+        self._checkpoints = {
+            name: checkpoint
+            for name, checkpoint in self._checkpoints.items()
+            if checkpoint.adapter_step in retain_steps
+        }
+
     async def _prepare_rl_batch(self, request: ForwardRequest | ForwardBackwardRequest):
         if request.batch.kind != "rl":
             raise ValueError("Megatron RL F/B requires an RL trajectory batch")
