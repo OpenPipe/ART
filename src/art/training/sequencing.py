@@ -55,8 +55,10 @@ class RunCommandLedger:
         self._next_sequence_id = 0
         self._projected_learner_version = learner_version
         self._open_forward_backward_ids: list[str] = []
+        self._discarded_forward_backward_ids: set[str] = set()
         self._records: dict[str, _AdmissionRecord] = {}
         self._nonterminal_request_ids: set[str] = set()
+        self._failure: BaseException | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -86,6 +88,26 @@ class RunCommandLedger:
             raise RuntimeError("cannot retire an open F/B command")
         self._records.pop(request_id)
         self._nonterminal_request_ids.discard(request_id)
+        self._discarded_forward_backward_ids.discard(admission.ref.operation_id)
+
+    def cancel_pending_forward_backward(
+        self, request_id: str, admission: CommandAdmission
+    ) -> None:
+        record = self._records.get(request_id)
+        if record is None or record.admission != admission:
+            raise RuntimeError("F/B cancellation does not match its admission")
+        operation_id = admission.ref.operation_id
+        if operation_id not in self._open_forward_backward_ids:
+            raise RuntimeError("sealed F/B contribution cannot be cancelled")
+        self._open_forward_backward_ids.remove(operation_id)
+        self._discarded_forward_backward_ids.add(operation_id)
+
+    def can_retire_forward_backward(self, operation_id: str) -> bool:
+        return operation_id in self._discarded_forward_backward_ids
+
+    def close(self) -> None:
+        self._discard_forward_backward_operations()
+        self._failure = None
 
     def mark_terminal(
         self,
@@ -93,6 +115,7 @@ class RunCommandLedger:
         admission: CommandAdmission,
         *,
         error: BaseException | None,
+        execution_started: bool,
     ) -> None:
         record = self._records.get(request_id)
         if record is None:
@@ -100,15 +123,22 @@ class RunCommandLedger:
         if record.admission != admission:
             raise RuntimeError("command terminal state does not match its admission")
         self._nonterminal_request_ids.discard(request_id)
-        if isinstance(error, asyncio.CancelledError):
-            if admission.ref.operation_id in self._open_forward_backward_ids:
-                self._open_forward_backward_ids.remove(admission.ref.operation_id)
-        elif error is not None and admission.ref.kind in {
-            "forward_backward",
-            "optim_step",
-            "load_state",
-        }:
-            self._open_forward_backward_ids.clear()
+        if error is None:
+            return
+        pending_forward_backward_cancellation = (
+            admission.ref.kind == "forward_backward"
+            and isinstance(error, asyncio.CancelledError)
+            and not execution_started
+        )
+        if pending_forward_backward_cancellation:
+            operation_id = admission.ref.operation_id
+            if operation_id in self._open_forward_backward_ids:
+                self._open_forward_backward_ids.remove(operation_id)
+            self._discarded_forward_backward_ids.add(operation_id)
+            return
+        if admission.ref.kind in {"forward_backward", "optim_step", "load_state"}:
+            self._failure = self._failure or error
+            self._discard_forward_backward_operations()
 
     def _admit(
         self,
@@ -130,6 +160,10 @@ class RunCommandLedger:
             ):
                 raise RuntimeError("request_id was reused for a different command")
             return prior.admission
+        if self._failure is not None:
+            raise RuntimeError(
+                "training run command stream has failed"
+            ) from self._failure
         if (
             len(self._nonterminal_request_ids)
             >= self._admission_policy.max_command_depth
@@ -184,6 +218,14 @@ class RunCommandLedger:
         self._nonterminal_request_ids.add(request.request_id)
         self._next_sequence_id += 1
         return admission
+
+    def _discard_forward_backward_operations(self) -> None:
+        self._open_forward_backward_ids.clear()
+        self._discarded_forward_backward_ids.update(
+            record.admission.ref.operation_id
+            for record in self._records.values()
+            if record.admission.ref.kind == "forward_backward"
+        )
 
     @staticmethod
     def _validate_request_kind(request: RunCommand, kind: OperationKind) -> None:

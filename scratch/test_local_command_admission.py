@@ -8,6 +8,7 @@ from pydantic import ValidationError
 import pytest
 
 from art.distributed.trajectory_store import TrajectoryGroupBundle
+import art.megatron.training.client as client_module
 from art.megatron.training.client import LocalMegatronTrainingClient
 from art.training.contracts import (
     AdamConfig,
@@ -24,13 +25,15 @@ from art.training.sequencing import CommandAdmissionPolicy
 
 def _client(
     policy: CommandAdmissionPolicy | None = None,
+    service: Any | None = None,
 ) -> LocalMegatronTrainingClient:
     return LocalMegatronTrainingClient(
         run_id="run",
         learner_version=0,
         backend=SimpleNamespace(),
         model=SimpleNamespace(),
-        service=SimpleNamespace(retire_command_operation=lambda _operation_id: None),
+        service=service
+        or SimpleNamespace(retire_command_operation=lambda _operation_id: None),
         admission_policy=policy,
     )
 
@@ -239,4 +242,107 @@ async def test_configured_depth_releases_failure_without_losing_retry() -> None:
     await asyncio.sleep(0)
     assert mutating._ledger._nonterminal_request_ids == set()
     assert mutating._ledger._open_forward_backward_ids == []
+    for _ in range(10):
+        assert (
+            await _submit(
+                mutating,
+                _forward_backward("failed-fb", 0),
+                "forward_backward",
+                fail,
+            )
+            is failed_forward_backward
+        )
+    before = _admission_state(mutating)
+    with pytest.raises(RuntimeError, match="command stream has failed"):
+        await _submit(
+            mutating,
+            _forward_backward("must-not-admit", 1),
+            "forward_backward",
+            fail,
+        )
+    assert executions == 2
+    assert _admission_state(mutating) == before
     await mutating.close()
+    assert mutating._operations == {}
+    assert mutating._ledger._records == {}
+    assert mutating._ledger._failure is None
+
+
+@pytest.mark.asyncio
+async def test_repeated_pending_fb_cancellation_is_bounded_and_preserves_prior(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(client_module, "_MAX_RETAINED_COMPLETED_OPERATIONS", 2)
+    retired: list[str] = []
+    client = _client(service=SimpleNamespace(retire_command_operation=retired.append))
+    prior = await _submit(
+        client,
+        _forward_backward("prior", 0),
+        "forward_backward",
+        lambda _admission: asyncio.sleep(0, result="prior"),
+    )
+    assert await prior.result() == "prior"
+
+    blocker_started = asyncio.Event()
+    blocker_release = asyncio.Event()
+
+    async def block(_admission):
+        blocker_started.set()
+        await blocker_release.wait()
+        return "released"
+
+    blocker = await _submit(client, _save("blocker", 1), "save_sampler", block)
+    await blocker_started.wait()
+    pending_executions = 0
+
+    async def must_not_execute(_admission):
+        nonlocal pending_executions
+        pending_executions += 1
+
+    cancelled = []
+    for sequence_id in range(2, 12):
+        request = _forward_backward(f"cancel-{sequence_id}", sequence_id)
+        operation = await _submit(client, request, "forward_backward", must_not_execute)
+        await operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation.result()
+        assert (
+            await _submit(client, request, "forward_backward", must_not_execute)
+            is operation
+        )
+        cancelled.append(operation)
+
+    assert pending_executions == 0
+    assert client._ledger._nonterminal_request_ids == {"blocker"}
+    assert client._ledger._open_forward_backward_ids == [prior.ref.operation_id]
+    assert len(client._completed_operations) == 2
+    assert retired == [operation.ref.operation_id for operation in cancelled[:-2]]
+
+    optimizer_started = asyncio.Event()
+
+    async def capture(admission):
+        optimizer_started.set()
+        return admission
+
+    optimizer = await _submit(
+        client,
+        OptimStepRequest(
+            run_id="run",
+            request_id="optimizer",
+            sequence_id=12,
+            optimizer=AdamConfig(learning_rate=1e-4),
+        ),
+        "optim_step",
+        capture,
+    )
+    assert optimizer._admission.contributing_forward_backward_operation_ids == (
+        prior.ref.operation_id,
+    )
+    await asyncio.sleep(0)
+    assert not optimizer_started.is_set()
+    blocker_release.set()
+    assert await blocker.result() == "released"
+    assert await optimizer.result() == optimizer._admission
+    await client.close()
+    assert client._operations == {}
+    assert client._ledger._records == {}

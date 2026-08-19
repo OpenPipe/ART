@@ -110,6 +110,7 @@ class _Service:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.retired_operation_ids: list[str] = []
+        self.snapshot_completions: list[asyncio.Task] = []
         self.completion_gate = asyncio.Event()
         self.generation = TrainerGeneration(
             training_session_id="session",
@@ -175,10 +176,9 @@ class _Service:
                 optimizer_bytes=1 if save_optimizer else None,
             )
 
-        return GenerationSnapshotLaunch(
-            metrics={},
-            completion=asyncio.create_task(complete()),
-        )
+        completion = asyncio.create_task(complete())
+        self.snapshot_completions.append(completion)
+        return GenerationSnapshotLaunch(metrics={}, completion=completion)
 
     async def load_state_command(self, ref, source, *, restore_optimizer):
         self.calls.append(
@@ -566,7 +566,7 @@ def test_failed_local_mutation_poisons_concurrently_submitted_successor(
     asyncio.run(run())
 
 
-def test_cancelled_local_mutation_poison_is_consumed_and_close_is_bounded() -> None:
+def test_running_local_mutation_cancellation_matches_remote() -> None:
     async def run() -> None:
         service = _FailingService("forward_backward")
         client = _Client(
@@ -595,17 +595,88 @@ def test_cancelled_local_mutation_poison_is_consumed_and_close_is_bounded() -> N
             )
         )
         await asyncio.wait_for(service.failure_started.wait(), timeout=1)
-        await failed.cancel()
+        with pytest.raises(RuntimeError, match="running F/B command"):
+            await failed.cancel()
 
-        with pytest.raises(asyncio.CancelledError):
+        service.failure_release.set()
+        with pytest.raises(RuntimeError, match="forward_backward failed"):
+            await failed.result()
+        with pytest.raises(RuntimeError, match="forward_backward failed"):
             await asyncio.wait_for(successor.result(), timeout=1)
         assert service.calls == ["fb:0"]
         assert client._sequence_tail is not None
-        assert isinstance(
-            client._sequence_tail._future.result(), asyncio.CancelledError
-        )
+        assert isinstance(client._sequence_tail._future.result(), RuntimeError)
         assert client._sequence_tail._future.exception() is None
         await asyncio.wait_for(client.close(), timeout=1)
+
+    asyncio.run(run())
+
+
+def test_cancelled_deferred_save_cancels_owned_snapshot_completion() -> None:
+    async def run() -> None:
+        service = _Service()
+        client = _Client(
+            run_id="run",
+            learner_version=3,
+            backend=_Backend(),
+            model=object(),
+            service=service,
+        )
+        operation = await client.save_state(
+            SaveStateRequest(
+                run_id="run",
+                request_id="state",
+                sequence_id=0,
+                checkpoint_name="state",
+            )
+        )
+        await operation._ordered
+        await operation.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await operation.result()
+        assert len(service.snapshot_completions) == 1
+        assert service.snapshot_completions[0].cancelled()
+        assert client._ledger._nonterminal_request_ids == set()
+        await client.close()
+
+    asyncio.run(run())
+
+
+def test_close_cancels_ten_deferred_snapshot_completions() -> None:
+    async def run() -> None:
+        service = _Service()
+        client = _Client(
+            run_id="run",
+            learner_version=3,
+            backend=_Backend(),
+            model=object(),
+            service=service,
+        )
+        operations = [
+            await client.save_state(
+                SaveStateRequest(
+                    run_id="run",
+                    request_id=f"state-{sequence_id}",
+                    sequence_id=sequence_id,
+                    checkpoint_name=f"state-{sequence_id}",
+                )
+            )
+            for sequence_id in range(10)
+        ]
+        await asyncio.gather(*(operation._ordered for operation in operations))
+        assert len(service.snapshot_completions) == 10
+        assert all(not task.done() for task in service.snapshot_completions)
+
+        await asyncio.wait_for(client.close(), timeout=1)
+        assert all(task.cancelled() for task in service.snapshot_completions)
+        assert all(operation._result.cancelled() for operation in operations)
+        assert not any(not task.done() for task in client._completion_tasks)
+        assert client._operations == {}
+        assert client._ledger._records == {}
+        assert service.retired_operation_ids == [
+            operation.ref.operation_id for operation in operations
+        ]
 
     asyncio.run(run())
 

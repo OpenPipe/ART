@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
+from collections.abc import Callable
 import heapq
 import time
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
@@ -34,6 +34,7 @@ from art.training.sequencing import (
     RunCommandLedger,
 )
 from art.types import TrainConfig
+from art.utils.lifecycle import process_shutdown_timeout
 
 from ..runtime.specs import (
     ExperimentalTrainConfig,
@@ -56,8 +57,10 @@ if TYPE_CHECKING:
     from art.model import TrainableModel
 
 ResultT = TypeVar("ResultT", bound=Contract)
+OwnedT = TypeVar("OwnedT")
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
 _MAX_RETAINED_COMPLETED_RESULT_BYTES = 512 << 20
+_TASK_DRAIN_TIMEOUT_S = process_shutdown_timeout(2)
 _DEFERRED_RESULT_KINDS = frozenset({"save_sampler", "save_state"})
 _SEQUENCE_POISONING_KINDS = frozenset({"forward_backward", "optim_step", "load_state"})
 
@@ -67,13 +70,41 @@ def _consume_future(future: asyncio.Future[Any]) -> None:
         future.exception()
 
 
+async def _cancel_and_drain(
+    tasks: tuple[asyncio.Task[Any], ...], *, context: str
+) -> None:
+    pending = tuple(dict.fromkeys(task for task in tasks if not task.done()))
+    for task in pending:
+        task.cancel()
+    await _drain_tasks(pending, context=context)
+
+
+async def _drain_tasks(tasks: tuple[asyncio.Task[Any], ...], *, context: str) -> None:
+    pending = tuple(dict.fromkeys(task for task in tasks if not task.done()))
+    if pending:
+        done, remaining = await asyncio.wait(pending, timeout=_TASK_DRAIN_TIMEOUT_S)
+        for task in done:
+            _consume_future(task)
+        if remaining:
+            raise TimeoutError(f"{len(remaining)} {context} tasks did not stop")
+
+
+async def _await_owned_task(task: asyncio.Task[OwnedT], *, context: str) -> OwnedT:
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.cancel()
+        await _drain_tasks((task,), context=context)
+        return task.result()
+
+
 class _DeferredResult(NamedTuple, Generic[ResultT]):
     completion: asyncio.Task[ResultT]
 
 
 class _SequenceReleaseGate:
     def __init__(self) -> None:
-        self._future: asyncio.Future[BaseException | None] = (
+        self._future: asyncio.Future[BaseException | _SequenceReleaseGate | None] = (
             asyncio.get_running_loop().create_future()
         )
 
@@ -82,7 +113,12 @@ class _SequenceReleaseGate:
         return self._future.done()
 
     async def wait(self) -> BaseException | None:
-        return await asyncio.shield(self._future)
+        gate = self
+        while True:
+            outcome = await asyncio.shield(gate._future)
+            if not isinstance(outcome, _SequenceReleaseGate):
+                return outcome
+            gate = outcome
 
     def release(self) -> None:
         if not self._future.done():
@@ -92,6 +128,34 @@ class _SequenceReleaseGate:
         if not self._future.done():
             self._future.set_result(error)
 
+    def relay(self, predecessor: _SequenceReleaseGate | None) -> None:
+        if self._future.done():
+            return
+        while predecessor is not None and predecessor._future.done():
+            outcome = predecessor._future.result()
+            if isinstance(outcome, _SequenceReleaseGate):
+                predecessor = outcome
+                continue
+            self._future.set_result(outcome)
+            return
+        self._future.set_result(predecessor)
+
+
+class _OperationState:
+    def __init__(self) -> None:
+        self.execution_started = False
+        self.cancel_prepared = False
+        self.terminal_recorded = False
+        self.deferred_completion: asyncio.Task[Any] | None = None
+        self.settlement: asyncio.Task[Any] | None = None
+
+    def deferred_tasks(self) -> tuple[asyncio.Task[Any], ...]:
+        return tuple(
+            task
+            for task in (self.deferred_completion, self.settlement)
+            if task is not None
+        )
+
 
 class LocalTrainingOperation(Generic[ResultT]):
     def __init__(
@@ -100,11 +164,15 @@ class LocalTrainingOperation(Generic[ResultT]):
         admission: CommandAdmission,
         ordered: asyncio.Task[None],
         result: asyncio.Future[ResultT],
+        state: _OperationState,
+        prepare_cancel: Callable[[], None],
     ) -> None:
         self._request_id = request_id
         self._admission = admission
         self._ordered = ordered
         self._result = result
+        self._state = state
+        self._prepare_cancel = prepare_cancel
 
     @property
     def ref(self):
@@ -114,10 +182,27 @@ class LocalTrainingOperation(Generic[ResultT]):
         return await asyncio.shield(self._result)
 
     async def cancel(self) -> None:
-        self._ordered.cancel()
-        self._result.cancel()
-        with suppress(asyncio.CancelledError):
-            await self._ordered
+        if not self._ordered.done():
+            if not self._state.cancel_prepared:
+                self._prepare_cancel()
+                self._state.cancel_prepared = True
+            await _cancel_and_drain((self._ordered,), context="training operation")
+        if completion := self._state.deferred_completion:
+            await _cancel_and_drain(
+                (completion,), context="deferred training completion"
+            )
+        if settlement := self._state.settlement:
+            await _drain_tasks((settlement,), context="deferred training result")
+        if not self._result.done():
+            self._result.cancel()
+        await asyncio.sleep(0)
+
+    def _admission_done(self) -> bool:
+        return (
+            self._ordered.done()
+            and self._result.done()
+            and all(task.done() for task in self._state.deferred_tasks())
+        )
 
 
 class LocalMegatronTrainingClient:
@@ -152,6 +237,7 @@ class LocalMegatronTrainingClient:
         self._batch_release_failures: list[BaseException] = []
         self._sequence_tail: _SequenceReleaseGate | None = None
         self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     @property
     def projected_learner_version(self) -> int:
@@ -176,23 +262,33 @@ class LocalMegatronTrainingClient:
             raise RuntimeError("local training client is closed")
         self._raise_batch_release_failures()
         admission = await self._ledger.admit(request, kind=kind)
-        if operation := self._operations.get(admission.ref.operation_id):
-            return operation
+        if existing := self._operations.get(admission.ref.operation_id):
+            return existing
         predecessor = self._sequence_tail
         sequence_release = _SequenceReleaseGate()
+        state = _OperationState()
 
         result = asyncio.get_running_loop().create_future()
         result.add_done_callback(_consume_future)
+        operation: LocalTrainingOperation[Any]
 
-        async def settle(completion: asyncio.Task[Any]) -> None:
-            try:
-                value = await asyncio.shield(completion)
-            except BaseException as error:
-                if not result.done():
+        def completion_done(task: asyncio.Task[Any]) -> None:
+            self._completion_tasks.discard(task)
+            _consume_future(task)
+            self._bound_operation_cache(operation)
+
+        def settlement_done(task: asyncio.Task[Any]) -> None:
+            if not result.done():
+                if task.cancelled():
+                    result.cancel()
+                elif error := task.exception():
                     result.set_exception(error)
-            else:
-                if not result.done():
-                    result.set_result(value)
+                else:
+                    result.set_result(task.result())
+            completion_done(task)
+
+        async def settle(completion: asyncio.Task[Any]) -> Any:
+            return await completion
 
         async def run() -> None:
             try:
@@ -203,24 +299,34 @@ class LocalMegatronTrainingClient:
                             result.set_exception(predecessor_failure)
                         sequence_release.poison(predecessor_failure)
                         return
+                state.execution_started = True
                 value = await execute(admission)
                 if isinstance(value, _DeferredResult):
                     if kind not in _DEFERRED_RESULT_KINDS:
-                        value.completion.cancel()
-                        value.completion.add_done_callback(_consume_future)
+                        await _cancel_and_drain(
+                            (value.completion,), context=f"invalid {kind} completion"
+                        )
                         raise RuntimeError(f"{kind} cannot return a deferred result")
-                    completion = asyncio.create_task(
+                    state.deferred_completion = value.completion
+                    self._completion_tasks.add(value.completion)
+                    value.completion.add_done_callback(completion_done)
+                    state.settlement = asyncio.create_task(
                         settle(value.completion),
                         name=f"megatron-{kind}-result-{request.sequence_id}",
                     )
-                    self._completion_tasks.add(completion)
-                    completion.add_done_callback(self._completion_tasks.discard)
+                    self._completion_tasks.add(state.settlement)
+                    state.settlement.add_done_callback(settlement_done)
                 elif not result.done():
                     result.set_result(value)
             except BaseException as error:
                 if not result.done():
-                    result.set_exception(error)
-                if kind in _SEQUENCE_POISONING_KINDS:
+                    if isinstance(error, asyncio.CancelledError):
+                        result.cancel()
+                    else:
+                        result.set_exception(error)
+                if not state.execution_started:
+                    sequence_release.relay(predecessor)
+                elif kind in _SEQUENCE_POISONING_KINDS:
                     sequence_release.poison(error)
                 else:
                     sequence_release.release()
@@ -234,17 +340,34 @@ class LocalMegatronTrainingClient:
         def ordered_done(task: asyncio.Task[None]) -> None:
             _consume_future(task)
             if task.cancelled() and not sequence_release.done:
-                if kind in _SEQUENCE_POISONING_KINDS:
+                if not state.execution_started:
+                    sequence_release.relay(predecessor)
+                elif kind in _SEQUENCE_POISONING_KINDS:
                     sequence_release.poison(asyncio.CancelledError())
                 else:
                     sequence_release.release()
+            self._bound_operation_cache(operation)
+
+        def prepare_cancel() -> None:
+            if kind == "forward_backward":
+                if state.execution_started:
+                    raise RuntimeError("running F/B command cannot be cancelled")
+                self._ledger.cancel_pending_forward_backward(
+                    request.request_id, admission
+                )
+            elif kind in {"optim_step", "load_state"}:
+                raise RuntimeError("learner-transition command cannot be cancelled")
 
         ordered.add_done_callback(ordered_done)
         operation = LocalTrainingOperation(
-            request.request_id, admission, ordered, result
+            request.request_id,
+            admission,
+            ordered,
+            result,
+            state,
+            prepare_cancel,
         )
         self._operations[admission.ref.operation_id] = operation
-        ordered.add_done_callback(lambda _: self._bound_operation_cache(operation))
         result.add_done_callback(lambda _: self._bound_operation_cache(operation))
         self._sequence_tail = sequence_release
         self._bound_operation_cache(operation)
@@ -469,7 +592,9 @@ class LocalMegatronTrainingClient:
             )
 
             async def complete() -> SamplerWeightsResult:
-                durable = await launch.completion
+                durable = await _await_owned_task(
+                    launch.completion, context="sampler snapshot completion"
+                )
                 adapter = durable.transport_adapter or durable.adapter
                 self._remember_checkpoint(
                     request.checkpoint_name,
@@ -514,7 +639,9 @@ class LocalMegatronTrainingClient:
             )
 
             async def complete() -> SaveStateResult:
-                durable = await launch.completion
+                durable = await _await_owned_task(
+                    launch.completion, context="state snapshot completion"
+                )
                 if durable.optimizer_bytes is None:
                     raise RuntimeError("save_state completed without optimizer bytes")
                 self._remember_checkpoint(
@@ -638,21 +765,71 @@ class LocalMegatronTrainingClient:
         return request.batch.require_local_packed_batch()
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        pending = tuple(
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(
+                self._close(), name=f"close-megatron-training-client-{self.run_id}"
+            )
+        task = self._close_task
+        try:
+            await asyncio.shield(task)
+        except BaseException:
+            if task.done() and self._close_task is task:
+                self._close_task = None
+            raise
+
+    async def _close(self) -> None:
+        ordered = tuple(
             operation._ordered
             for operation in self._operations.values()
             if not operation._ordered.done()
-        ) + tuple(self._completion_tasks)
-        for task in pending:
+        )
+        owned_completions = tuple(
+            operation._state.deferred_completion
+            for operation in self._operations.values()
+            if operation._state.deferred_completion is not None
+            and not operation._state.deferred_completion.done()
+        )
+        for task in ordered + owned_completions:
             task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_tasks(
+            ordered
+            + owned_completions
+            + tuple(task for task in self._completion_tasks if not task.done()),
+            context="local training client",
+        )
+        for operation in self._operations.values():
+            if (
+                operation._ordered.done()
+                and all(task.done() for task in operation._state.deferred_tasks())
+                and not operation._result.done()
+            ):
+                operation._result.cancel()
+        await asyncio.sleep(0)
+
+        failures: list[BaseException] = []
         if self._batch_releases:
             await asyncio.gather(*tuple(self._batch_releases), return_exceptions=True)
             await asyncio.sleep(0)
-        self._raise_batch_release_failures()
+        try:
+            self._raise_batch_release_failures()
+        except BaseException as error:
+            failures.append(error)
+
+        self._ledger.close()
+        for operation in tuple(self._operations.values()):
+            self._bound_operation_cache(operation)
+        for operation in tuple(self._operations.values()):
+            try:
+                self._retire_operation(operation)
+            except BaseException as error:
+                failures.append(error)
+        self._ledger.close()
+        self._completion_tasks.clear()
+        self._completed_operation_order.clear()
+        self._sequence_tail = None
+        if failures:
+            raise BaseExceptionGroup("local training client close failed", failures)
 
     def _release_batch_soon(self, packed: Any) -> None:
         task = asyncio.create_task(
@@ -681,23 +858,33 @@ class LocalMegatronTrainingClient:
             raise BaseExceptionGroup("tokenized packed-batch release failed", failures)
 
     def _bound_operation_cache(self, operation: LocalTrainingOperation[Any]) -> None:
-        operation_id = operation.ref.operation_id
-        if operation._ordered.done() and operation._result.done():
+        if operation._admission_done() and not operation._state.terminal_recorded:
             error = (
                 asyncio.CancelledError()
                 if operation._result.cancelled()
                 else operation._result.exception()
             )
             self._ledger.mark_terminal(
-                operation._request_id, operation._admission, error=error
+                operation._request_id,
+                operation._admission,
+                error=error,
+                execution_started=operation._state.execution_started,
             )
-        if (
-            self._operations.get(operation_id) is operation
-            and operation_id not in self._completed_operations
-            and operation._ordered.done()
-            and operation._result.done()
-            and operation.ref.kind != "forward_backward"
-        ):
+            operation._state.terminal_recorded = True
+        self._cache_terminal_operations()
+
+    def _cache_terminal_operations(self) -> None:
+        for operation in tuple(self._operations.values()):
+            operation_id = operation.ref.operation_id
+            if (
+                operation_id in self._completed_operations
+                or not operation._admission_done()
+                or (
+                    operation.ref.kind == "forward_backward"
+                    and not self._ledger.can_retire_forward_backward(operation_id)
+                )
+            ):
+                continue
             result_bytes = _completed_result_bytes(operation)
             self._completed_operations[operation_id] = result_bytes
             self._completed_result_bytes += result_bytes
@@ -719,10 +906,10 @@ class LocalMegatronTrainingClient:
         operation_id = operation.ref.operation_id
         if self._operations.get(operation_id) is not operation:
             return
-        if not operation._ordered.done() or not operation._result.done():
+        if not operation._admission_done():
             raise RuntimeError("cannot retire an incomplete local training operation")
-        self._ledger.retire(operation._request_id, operation._admission)
         self._service.retire_command_operation(operation_id)
+        self._ledger.retire(operation._request_id, operation._admission)
         self._operations.pop(operation_id)
         self._completed_result_bytes -= self._completed_operations.pop(operation_id, 0)
 
