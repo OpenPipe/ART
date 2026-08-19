@@ -3,8 +3,10 @@ set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES=0,1
 export PYTHONUNBUFFERED=1
+runtime_python="megatron_runtime/.venv/bin/python"
+test -x "${runtime_python}"
 
-uv run --no-sync pytest --tb=short \
+"${runtime_python}" -m pytest --tb=short \
   tests/unit/test_trainer_rank_custom_tensors.py \
   tests/integration/megatron/cp_attn/test_attention_packed_vs_flattened.py \
   'tests/integration/megatron/gdn_shared_prefix/test_gdn_cp_packed_correctness.py::test_gdn_cp_packed_sibling_order_matches_cp1_oracle[2]' \
@@ -17,7 +19,7 @@ uv run --no-sync pytest --tb=short \
   'tests/integration/megatron/lora/test_dynamic_lora_slots.py::test_trainer_rank_tp_head_backward_matches_unsharded_oracle[2]'
 
 ART_MEGATRON_CONTEXT_PARALLEL_SIZE=2 \
-  uv run --no-sync torchrun --standalone --nproc-per-node=2 \
+  "${runtime_python}" -m torch.distributed.run --standalone --nproc-per-node=2 \
     dev/trainer_rank_check.py \
     --model Qwen/Qwen3-0.6B \
     --layers 1 \

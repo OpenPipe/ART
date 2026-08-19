@@ -99,7 +99,7 @@ nv-grouped-gemm = ["torch>=2.11.0"]
 transformer-engine-torch = ["torch>=2.11.0"]
 
 [tool.uv.extra-build-variables]
-apex = { APEX_CPP_EXT = "1", APEX_CUDA_EXT = "1", APEX_FAST_LAYER_NORM = "1", APEX_PARALLEL_BUILD = "16", NVCC_APPEND_FLAGS = "--threads 4" }
+apex = { APEX_CPP_EXT = "1", APEX_CUDA_EXT = "1", APEX_FAST_LAYER_NORM = "1", APEX_PARALLEL_BUILD = "8", NVCC_APPEND_FLAGS = "--threads 1" }
 transformer-engine-torch = { NVTE_NO_LOCAL_VERSION = "1" }
 
 [[tool.uv.dependency-metadata]]
