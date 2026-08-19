@@ -81,21 +81,21 @@ class AdamParams:
     grad_clip_norm: float = 0.1
 
 
+TrainerRankOptimizerParameterLayout = tuple[
+    tuple[str, ...],
+    tuple[int, ...],
+    str,
+    str,
+    bool,
+    int | None,
+    str,
+    tuple[int, ...],
+]
+
+
 class TrainerRankOptimizerLayout(TypedDict):
     parallel: tuple[int, int, int, int, int, int, int, int]
-    parameters: tuple[
-        tuple[
-            tuple[str, ...],
-            tuple[int, ...],
-            str,
-            str,
-            bool,
-            int | None,
-            str,
-            tuple[int, ...],
-        ],
-        ...,
-    ]
+    parameters: tuple[TrainerRankOptimizerParameterLayout, ...]
 
 
 class TrainerRankOptimizerState(TypedDict):
@@ -1663,6 +1663,46 @@ class TrainerRank:
             padding_masks=self._prepared_optimizer_padding_masks(checkpoint),
         )
 
+    def prepare_fresh_checkpoint_slot_optimizer_for_residency(
+        self,
+        checkpoint: "PreparedCheckpointSlotInstall",
+    ) -> PreparedTrainerRankOptimizerState:
+        """Materialize a complete fresh optimizer without touching CUDA."""
+        parameters = checkpoint.parameters
+        if not parameters or any(param.device.type != "cpu" for param in parameters):
+            raise TrainerRankSlotStateError(
+                "Fresh optimizer preparation requires non-empty CPU checkpoint "
+                "parameters."
+            )
+        layout = self._prepared_dynamic_optimizer_layout(checkpoint)
+        padding_masks = self._prepared_optimizer_padding_masks(checkpoint)
+        masters = tuple(
+            torch.nn.Parameter(param.detach().to(torch.float32).clone())
+            for param in parameters
+        )
+        state: tuple[dict[str, object], ...] = tuple(
+            {
+                "step": torch.zeros((), dtype=torch.float32),
+                "exp_avg": torch.zeros_like(master),
+                "exp_avg_sq": torch.zeros_like(master),
+            }
+            for master in masters
+        )
+        defaults = AdamParams(learning_rate=0.0)
+        return PreparedTrainerRankOptimizerState(
+            layout=layout,
+            master_params=masters,
+            state=state,
+            param_group={
+                "lr": defaults.learning_rate,
+                "bias_correction": True,
+                "betas": (defaults.beta1, defaults.beta2),
+                "eps": defaults.eps,
+                "weight_decay": defaults.weight_decay,
+            },
+            padding_masks=padding_masks,
+        )
+
     def install_prepared_checkpoint_slot_optimizer(
         self,
         name: str,
@@ -1691,12 +1731,37 @@ class TrainerRank:
                 weight_decay=float(cast(Any, group.get("weight_decay", 0.0))),
             ),
         )
-        optimizer.param_groups[0].update(group)
+        self._bind_prepared_checkpoint_slot_optimizer(name, state, optimizer)
+
+    def _bind_prepared_checkpoint_slot_optimizer(
+        self,
+        name: str,
+        state: PreparedTrainerRankOptimizerState,
+        optimizer: torch.optim.Optimizer,
+    ) -> None:
+        if len(optimizer.param_groups) != 1:
+            raise TrainerRankSlotStateError(
+                "Prepared optimizer binding requires exactly one parameter group."
+            )
+        group_params = optimizer.param_groups[0].get("params")
+        if (
+            not isinstance(group_params, Sequence)
+            or len(group_params) != len(state.master_params)
+            or any(
+                actual is not expected
+                for actual, expected in zip(
+                    group_params, state.master_params, strict=True
+                )
+            )
+        ):
+            raise TrainerRankSlotStateError(
+                "Prepared optimizer parameter group does not own its master parameters."
+            )
+        optimizer.param_groups[0].update(state.param_group)
         optimizer.state.update(
             {
                 master: values
                 for master, values in zip(state.master_params, state.state, strict=True)
-                if values
             }
         )
         slot = self._checkpoint_slots[name]
@@ -2934,22 +2999,53 @@ class TrainerRank:
                 "Topology-strict remote optimizer snapshots do not support custom "
                 f"checkpoint tensors in slot {name!r}."
             )
-        parameters = tuple(
-            (
-                names_by_id[id(param)],
-                tuple(param.shape),
-                str(param.dtype),
-                str(getattr(param, "lora_shard_domain", "tp")),
-                bool(getattr(param, "lora_tp_sharded", False)),
-                getattr(param, "lora_tp_shard_dim", None),
-                str(getattr(param, "lora_tp_shard_strategy", "uniform")),
-                tuple(getattr(param, "lora_tp_component_sizes", ())),
-            )
-            for param in params
-        )
         return {
             "parallel": _parallel_optimizer_coordinates(),
-            "parameters": parameters,
+            "parameters": _optimizer_parameter_layout(params, names_by_id),
+        }
+
+    def _prepared_dynamic_optimizer_layout(
+        self, checkpoint: "PreparedCheckpointSlotInstall"
+    ) -> TrainerRankOptimizerLayout:
+        staged = {id(module): (module, slot) for module, slot in checkpoint.sites}
+        if len(staged) != len(checkpoint.sites):
+            raise TrainerRankSlotStateError(
+                "Prepared optimizer sites must refer to unique LoRA modules."
+            )
+        names: dict[int, list[str]] = {}
+        for chunk_index, chunk in enumerate(self.runtime.model):
+            for module in chunk.modules():
+                pair = staged.pop(id(module), None)
+                if pair is None:
+                    continue
+                staged_module, slot = pair
+                for suffix, param in (
+                    ("lora_A.weight", slot.A_T),
+                    ("lora_B.weight", slot.B_T),
+                ):
+                    names.setdefault(id(param), []).append(
+                        f"chunk.{chunk_index}."
+                        f"{staged_module.adapter_model_prefix}.{suffix}"
+                    )
+        parameters = checkpoint.parameters
+        parameter_ids = tuple(id(param) for param in parameters)
+        if (
+            staged
+            or len(set(parameter_ids)) != len(parameter_ids)
+            or set(parameter_ids) != set(names)
+        ):
+            raise TrainerRankSlotStateError(
+                "Prepared optimizer parameters do not exactly match staged LoRA sites."
+            )
+        return {
+            "parallel": _parallel_optimizer_coordinates(),
+            "parameters": _optimizer_parameter_layout(
+                parameters,
+                {
+                    param_id: tuple(sorted(set(param_names)))
+                    for param_id, param_names in names.items()
+                },
+            ),
         }
 
     def _select_next_micro_batch(
@@ -4723,6 +4819,25 @@ def _unique_tensors(values: Iterable[torch.Tensor]) -> tuple[torch.Tensor, ...]:
             seen.add(id(tensor))
             result.append(tensor)
     return tuple(result)
+
+
+def _optimizer_parameter_layout(
+    parameters: Sequence[torch.nn.Parameter],
+    names_by_id: Mapping[int, tuple[str, ...]],
+) -> tuple[TrainerRankOptimizerParameterLayout, ...]:
+    return tuple(
+        (
+            names_by_id[id(param)],
+            tuple(param.shape),
+            str(param.dtype),
+            str(getattr(param, "lora_shard_domain", "tp")),
+            bool(getattr(param, "lora_tp_sharded", False)),
+            getattr(param, "lora_tp_shard_dim", None),
+            str(getattr(param, "lora_tp_shard_strategy", "uniform")),
+            tuple(getattr(param, "lora_tp_component_sizes", ())),
+        )
+        for param in parameters
+    )
 
 
 def _load_custom_state(
