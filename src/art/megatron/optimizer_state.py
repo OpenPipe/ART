@@ -11,11 +11,16 @@ from pathlib import Path
 import re
 import shutil
 import time
-from typing import Any, AsyncIterator, Callable, Iterator, Literal, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterator, Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch
+
+from art.utils.safetensors import FileIdentity
+
+if TYPE_CHECKING:
+    from art.megatron.optimizer_archive import PreparedOptimizerArchive
 
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
@@ -1942,13 +1947,14 @@ def write_optimizer_snapshot_shard(
     snapshot: OptimizerStateSnapshot,
     *,
     optimizer_state_path: str,
+    prepared: PreparedOptimizerArchive,
+    identity: FileIdentity,
 ) -> OptimizerShard:
     pending = optimizer_pending_generation_path(
         optimizer_state_path, snapshot.generation_id
     )
-    from art.megatron.optimizer_archive import prepare_optimizer_archive
-
-    prepared = prepare_optimizer_archive(snapshot.state_dict)
+    if prepared.nbytes != identity.size_bytes:
+        raise RuntimeError("optimizer archive size changed after planning")
     shard_path = optimizer_shard_path(
         pending,
         rank=snapshot.rank,
@@ -1956,7 +1962,9 @@ def write_optimizer_snapshot_shard(
         serialization="art_safetensors_v1",
     )
     pending.mkdir(parents=True, exist_ok=True)
-    identity = prepared.write(shard_path)
+    written = prepared.write(shard_path, identity=identity)
+    if written != identity:
+        raise RuntimeError("optimizer archive identity changed after planning")
     return OptimizerShard(
         rank=snapshot.rank,
         size_bytes=identity.size_bytes,

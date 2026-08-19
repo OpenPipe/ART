@@ -19,6 +19,7 @@ from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
 from art.megatron.optimizer_state import (
     OptimizerAdapter,
+    OptimizerGenerationManifest,
     link_adapter_generation,
     optimizer_adapter,
     optimizer_generation_nbytes,
@@ -27,7 +28,14 @@ from art.megatron.optimizer_state import (
     read_optimizer_generation_manifest,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
-from art.megatron.runtime.publication import commit_trainer_publication
+from art.megatron.runtime.publication import (
+    PreparedSave,
+    SnapshotRankWritePlan,
+    SnapshotWriteGrant,
+    SnapshotWritePlan,
+    build_snapshot_write_plan,
+    commit_trainer_publication,
+)
 from art.megatron.runtime.specs import (
     ExperimentalTrainConfig,
     ForwardBackwardJobSpec,
@@ -136,9 +144,27 @@ class _PendingSnapshot(BaseModel):
     run_id: str
     generation: TrainerGeneration
     optimizer_state_path: str
-    metrics: dict[str, Any]
+    plan: SnapshotWritePlan
     publication: Any
     started: float
+
+
+class _ExistingSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    adapter: OptimizerAdapter
+    optimizer_bytes: int | None
+    plan: SnapshotWritePlan
+
+
+class _PreparedSaveOperation(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    fingerprint: str
+    prepared: PreparedSave
+    ref: OperationRef
+    request: SaveWeightsForSamplerRequest | SaveStateRequest
+    snapshot: _ExistingSnapshot | _PendingSnapshot
 
 
 class MegatronTrainingSlot:
@@ -163,6 +189,7 @@ class MegatronTrainingSlot:
         self._runs: dict[str, _ResidentRun] = {}
         self._results: dict[str, tuple[str, Contract]] = {}
         self._pending_results: dict[str, tuple[str, asyncio.Future[Contract]]] = {}
+        self._prepared_saves: dict[str, _PreparedSaveOperation] = {}
         self._sft_tokenizer = SftBatchTokenizer()
         self._batch_releases: set[asyncio.Task[None]] = set()
         self._batch_release_failures: list[BaseException] = []
@@ -703,34 +730,10 @@ class MegatronTrainingSlot:
         ref: OperationRef,
         request: SaveWeightsForSamplerRequest,
     ) -> asyncio.Future[SamplerWeightsResult]:
-        fingerprint = self._fingerprint(ref, request)
-        if cached := self._cached_result(ref.operation_id, fingerprint):
-            return _resolved_future(cast(SamplerWeightsResult, cached))
-        if pending := self._pending_result(ref.operation_id, fingerprint):
-            return cast(asyncio.Future[SamplerWeightsResult], pending)
-        snapshot = await self._start_snapshot(
-            ref, save_optimizer=False, publish_sampler=True
-        )
-
-        async def complete() -> SamplerWeightsResult:
-            adapter, metrics, _ = await self._finish_snapshot(snapshot)
-            result = SamplerWeightsResult(
-                operation_id=ref.operation_id,
-                checkpoint=checkpoint_ref(
-                    ref.run_id, adapter.step, request.checkpoint_name
-                ),
-                lora=adapter.identity,
-                training_session_id=adapter.training_session_id,
-                generation_id=adapter.generation_id,
-                lora_bytes=sum(file.size_bytes for file in adapter.files),
-                publication_metrics=metrics,
-            )
-            self._results[ref.operation_id] = (fingerprint, result)
-            return result
-
+        prepared = await self.prepare_save(ref, request)
         return cast(
             asyncio.Future[SamplerWeightsResult],
-            self._start_pending_result(ref.operation_id, fingerprint, complete()),
+            self.authorize_save(prepared, SnapshotWriteGrant.local(prepared.plan)),
         )
 
     async def save_state(
@@ -746,57 +749,128 @@ class MegatronTrainingSlot:
         ref: OperationRef,
         request: SaveStateRequest,
     ) -> asyncio.Future[SaveStateResult]:
-        fingerprint = self._fingerprint(ref, request)
-        if cached := self._cached_result(ref.operation_id, fingerprint):
-            return _resolved_future(cast(SaveStateResult, cached))
-        if pending := self._pending_result(ref.operation_id, fingerprint):
-            return cast(asyncio.Future[SaveStateResult], pending)
-        state = self._require_run(ref.run_id)
-        optimizer_state_path = state.registration.optimizer_state_path
-        snapshot = await self._start_snapshot(
-            ref, save_optimizer=True, publish_sampler=False
+        prepared = await self.prepare_save(ref, request)
+        return cast(
+            asyncio.Future[SaveStateResult],
+            self.authorize_save(prepared, SnapshotWriteGrant.local(prepared.plan)),
         )
 
-        async def complete() -> SaveStateResult:
-            adapter, metrics, optimizer_bytes = await self._finish_snapshot(snapshot)
-            if optimizer_bytes is None:
-                raise RuntimeError("save_state completed without optimizer bytes")
-            result = SaveStateResult(
-                operation_id=ref.operation_id,
-                checkpoint=checkpoint_ref(
-                    ref.run_id, adapter.step, request.checkpoint_name
-                ),
-                lora=adapter.identity,
-                training_session_id=adapter.training_session_id,
-                generation_id=adapter.generation_id,
-                lora_bytes=sum(file.size_bytes for file in adapter.files),
-                optimizer_state=optimizer_state_path,
-                optimizer_bytes=optimizer_bytes,
-                metrics=metrics,
+    async def prepare_save(
+        self,
+        ref: OperationRef,
+        request: SaveWeightsForSamplerRequest | SaveStateRequest,
+    ) -> PreparedSave:
+        fingerprint = self._fingerprint(ref, request)
+        expected_kind = (
+            "sampler_weights"
+            if isinstance(request, SaveWeightsForSamplerRequest)
+            else "state"
+        )
+        expected_ref_kind = (
+            "save_sampler" if expected_kind == "sampler_weights" else "save_state"
+        )
+        if ref.kind != expected_ref_kind:
+            raise ValueError("save request does not match its operation kind")
+        existing = self._prepared_saves.get(ref.operation_id)
+        if existing is not None:
+            if existing.fingerprint != fingerprint:
+                raise RuntimeError("operation_id was reused for a different command")
+            return existing.prepared
+        if self._cached_result(ref.operation_id, fingerprint) is not None:
+            raise RuntimeError("completed save has no retained exact write plan")
+        if self._pending_result(ref.operation_id, fingerprint) is not None:
+            raise RuntimeError("authorized save has no retained exact write plan")
+        snapshot = await self._start_snapshot(
+            ref,
+            save_optimizer=expected_kind == "state",
+            publish_sampler=expected_kind == "sampler_weights",
+        )
+        prepared = PreparedSave(
+            operation_id=ref.operation_id,
+            kind=expected_kind,
+            generation=snapshot.plan.generation,
+            plan=snapshot.plan,
+            plan_digest=snapshot.plan.digest,
+        )
+        self._prepared_saves[ref.operation_id] = _PreparedSaveOperation(
+            fingerprint=fingerprint,
+            prepared=prepared,
+            ref=ref,
+            request=request,
+            snapshot=snapshot,
+        )
+        return prepared
+
+    def authorize_save(
+        self,
+        prepared: PreparedSave,
+        grant: SnapshotWriteGrant,
+    ) -> asyncio.Future[SamplerWeightsResult | SaveStateResult]:
+        operation = self._prepared_saves.get(prepared.operation_id)
+        if operation is None or operation.prepared != prepared:
+            raise RuntimeError("save is not prepared with this exact write plan")
+        grant.validate_plan(prepared.plan)
+        if cached := self._cached_result(prepared.operation_id, operation.fingerprint):
+            return _resolved_future(
+                cast(SamplerWeightsResult | SaveStateResult, cached)
             )
-            self._results[ref.operation_id] = (fingerprint, result)
+        if pending := self._pending_result(
+            prepared.operation_id, operation.fingerprint
+        ):
+            return cast(asyncio.Future[SamplerWeightsResult | SaveStateResult], pending)
+
+        async def complete() -> SamplerWeightsResult | SaveStateResult:
+            authorization_metrics: dict[str, float] = {}
+            if isinstance(operation.snapshot, _PendingSnapshot):
+                authorization_metrics = await self.trainer.authorize_snapshot(
+                    prepared.plan, grant
+                )
+            adapter, metrics, optimizer_bytes = await self._finish_snapshot(
+                operation.snapshot,
+                grant=grant,
+                authorization_metrics=authorization_metrics,
+            )
+            request = operation.request
+            if isinstance(request, SaveWeightsForSamplerRequest):
+                result: SamplerWeightsResult | SaveStateResult = SamplerWeightsResult(
+                    operation_id=prepared.operation_id,
+                    checkpoint=checkpoint_ref(
+                        operation.ref.run_id, adapter.step, request.checkpoint_name
+                    ),
+                    lora=adapter.identity,
+                    training_session_id=adapter.training_session_id,
+                    generation_id=adapter.generation_id,
+                    lora_bytes=sum(file.size_bytes for file in adapter.files),
+                    publication_metrics=metrics,
+                )
+            else:
+                if optimizer_bytes is None:
+                    raise RuntimeError("save_state completed without optimizer bytes")
+                optimizer_state_path = self._require_run(
+                    operation.ref.run_id
+                ).registration.optimizer_state_path
+                result = SaveStateResult(
+                    operation_id=prepared.operation_id,
+                    checkpoint=checkpoint_ref(
+                        operation.ref.run_id, adapter.step, request.checkpoint_name
+                    ),
+                    lora=adapter.identity,
+                    training_session_id=adapter.training_session_id,
+                    generation_id=adapter.generation_id,
+                    lora_bytes=sum(file.size_bytes for file in adapter.files),
+                    optimizer_state=optimizer_state_path,
+                    optimizer_bytes=optimizer_bytes,
+                    metrics=metrics,
+                )
+            self._results[prepared.operation_id] = (operation.fingerprint, result)
             return result
 
         return cast(
-            asyncio.Future[SaveStateResult],
-            self._start_pending_result(ref.operation_id, fingerprint, complete()),
+            asyncio.Future[SamplerWeightsResult | SaveStateResult],
+            self._start_pending_result(
+                prepared.operation_id, operation.fingerprint, complete()
+            ),
         )
-
-    async def _snapshot(
-        self,
-        ref: OperationRef,
-        *,
-        save_optimizer: bool,
-        publish_sampler: bool,
-        sequence_continuation_of: str | None = None,
-    ) -> tuple[OptimizerAdapter, dict[str, float], int | None]:
-        snapshot = await self._start_snapshot(
-            ref,
-            save_optimizer=save_optimizer,
-            publish_sampler=publish_sampler,
-            sequence_continuation_of=sequence_continuation_of,
-        )
-        return await self._finish_snapshot(snapshot)
 
     async def _start_snapshot(
         self,
@@ -805,7 +879,7 @@ class MegatronTrainingSlot:
         save_optimizer: bool,
         publish_sampler: bool,
         sequence_continuation_of: str | None = None,
-    ) -> tuple[OptimizerAdapter, dict[str, float], int | None] | _PendingSnapshot:
+    ) -> _ExistingSnapshot | _PendingSnapshot:
         state = self._require_parent(ref)
         generation = state.generation
         object_target = (
@@ -817,7 +891,7 @@ class MegatronTrainingSlot:
             generation.adapter_path, step=generation.policy_step
         )
         if not save_optimizer and existing is not None and object_target is None:
-            return existing, {}, None
+            return self._existing_snapshot(ref, generation, existing)
         optimizer_state_path = state.registration.optimizer_state_path
         pointer = read_committed_optimizer_pointer(optimizer_state_path)
         persist_optimizer = save_optimizer
@@ -837,7 +911,9 @@ class MegatronTrainingSlot:
                 manifest = read_optimizer_generation_manifest(
                     optimizer_state_path, pointer.generation
                 )
-                return pointer.adapter, {}, optimizer_generation_nbytes(manifest)
+                return self._existing_snapshot(
+                    ref, generation, pointer.adapter, manifest=manifest
+                )
             existing = pointer.adapter
             persist_optimizer = False
         staging = (
@@ -852,7 +928,7 @@ class MegatronTrainingSlot:
             )
         )
         started = time.perf_counter()
-        raw = await self.trainer.snapshot(
+        plan = await self.trainer.prepare_snapshot(
             GenerationSnapshotJobSpec(
                 operation_id=ref.operation_id,
                 sequence_continuation_of=sequence_continuation_of,
@@ -872,9 +948,43 @@ class MegatronTrainingSlot:
             run_id=ref.run_id,
             generation=generation,
             optimizer_state_path=optimizer_state_path,
-            metrics=raw["metrics"],
+            plan=plan,
             publication=self.trainer.wait_for_publication(ref.operation_id),
             started=started,
+        )
+
+    def _existing_snapshot(
+        self,
+        ref: OperationRef,
+        generation: TrainerGeneration,
+        adapter: OptimizerAdapter,
+        *,
+        manifest: OptimizerGenerationManifest | None = None,
+    ) -> _ExistingSnapshot:
+        shards = (
+            {} if manifest is None else {shard.rank: shard for shard in manifest.shards}
+        )
+        ranks = tuple(
+            SnapshotRankWritePlan(
+                rank=rank,
+                generation=generation,
+                adapter=adapter if rank == 0 else None,
+                optimizer_shard=shards.get(rank),
+                runtime_sha256=None if manifest is None else manifest.runtime_sha256,
+                topology=None if manifest is None else manifest.topology,
+                saves_optimizer=manifest is not None,
+            )
+            for rank in range(len(self.runtime_spec.trainer_mesh.ranks))
+        )
+        plan = build_snapshot_write_plan(
+            operation_id=ref.operation_id, generation=generation, ranks=ranks
+        )
+        return _ExistingSnapshot(
+            adapter=adapter,
+            optimizer_bytes=(
+                None if manifest is None else optimizer_generation_nbytes(manifest)
+            ),
+            plan=plan,
         )
 
     def _sampler_object_target(
@@ -891,11 +1001,14 @@ class MegatronTrainingSlot:
 
     async def _finish_snapshot(
         self,
-        snapshot: tuple[OptimizerAdapter, dict[str, float], int | None]
-        | _PendingSnapshot,
+        snapshot: _ExistingSnapshot | _PendingSnapshot,
+        *,
+        grant: SnapshotWriteGrant,
+        authorization_metrics: dict[str, float],
     ) -> tuple[OptimizerAdapter, dict[str, float], int | None]:
-        if isinstance(snapshot, tuple):
-            return snapshot
+        grant.validate_plan(snapshot.plan)
+        if isinstance(snapshot, _ExistingSnapshot):
+            return snapshot.adapter, authorization_metrics, snapshot.optimizer_bytes
         records = await snapshot.publication
         state = self._require_run(snapshot.run_id)
         if (
@@ -908,6 +1021,8 @@ class MegatronTrainingSlot:
             snapshot.optimizer_state_path,
             snapshot.generation,
             records,
+            plan=snapshot.plan,
+            grant=grant,
         )
         if state.generation.policy_step < snapshot.generation.policy_step:
             raise RuntimeError("resident learner regressed behind completed snapshot")
@@ -918,7 +1033,7 @@ class MegatronTrainingSlot:
         return (
             durable.transport_adapter or durable.adapter,
             {
-                **snapshot.metrics,
+                **authorization_metrics,
                 **rank_metrics,
                 "time/snapshot_durable_s": time.perf_counter() - snapshot.started,
             },
@@ -929,6 +1044,7 @@ class MegatronTrainingSlot:
         if operation_id in self._pending_results:
             raise RuntimeError("cannot retire an incomplete training operation")
         self.trainer.retire_operation(operation_id)
+        self._prepared_saves.pop(operation_id, None)
         self._results.pop(operation_id, None)
 
     async def close(self) -> None:
@@ -970,6 +1086,7 @@ class MegatronTrainingSlot:
                 primary.add_note(
                     f"trainer close also failed: {type(error).__name__}: {error}"
                 )
+        self._prepared_saves.clear()
         if primary is not None:
             raise primary
 

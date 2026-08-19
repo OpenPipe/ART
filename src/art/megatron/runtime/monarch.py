@@ -26,10 +26,14 @@ from art.utils.lifecycle import cleanup_after_failure, consume_future_exception
 from .data_plane import InMemoryPackedBatch, SFTBatchData
 from .publication import (
     TRAINER_PUBLICATION_EVENT_ADAPTER,
+    SnapshotRankWritePlan,
+    SnapshotWriteGrant,
+    SnapshotWritePlan,
     TrainerPublicationEvent,
     TrainerPublicationFailed,
     TrainerPublicationSucceeded,
     TrainerRankPublication,
+    build_snapshot_write_plan,
 )
 from .specs import (
     TRAIN_EVENT_ADAPTER,
@@ -1194,6 +1198,7 @@ class MonarchTrainerActor(Actor):
                 "rank": self._runtime.rank,
                 "operation_id": job.operation_id,
                 "learner_version": job.learner_version,
+                "rank_write_plan": result["rank_write_plan"],
                 "metrics": result["metrics"] if coordinator else {},
             }
         except BaseException as error:
@@ -1207,6 +1212,25 @@ class MonarchTrainerActor(Actor):
                     "traceback": traceback.format_exc(),
                 }
             )
+            raise
+
+    @endpoint
+    def authorize_run_slot_snapshot(
+        self, plan_json: str, grant_json: str
+    ) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            plan = SnapshotWritePlan.model_validate_json(plan_json)
+            grant = SnapshotWriteGrant.model_validate_json(grant_json)
+            metrics = self._require_run_slot_executor().authorize_snapshot(plan, grant)
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": plan.operation_id,
+                "metrics": metrics,
+            }
+        except BaseException:
+            self._valid = False
             raise
 
     @endpoint
@@ -1231,6 +1255,7 @@ class MonarchTrainerActor(Actor):
                 "rank": self._runtime.rank,
                 "operation_id": job.operation_id,
                 "learner_version": job.learner_version,
+                "rank_write_plan": result["rank_write_plan"],
                 "metrics": result["metrics"] if coordinator else {},
             }
         except BaseException as error:
@@ -1244,6 +1269,23 @@ class MonarchTrainerActor(Actor):
                     "traceback": traceback.format_exc(),
                 }
             )
+            raise
+
+    @endpoint
+    def authorize_snapshot(self, plan_json: str, grant_json: str) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            plan = SnapshotWritePlan.model_validate_json(plan_json)
+            grant = SnapshotWriteGrant.model_validate_json(grant_json)
+            metrics = self._executor.authorize_snapshot(plan, grant)
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": plan.operation_id,
+                "metrics": metrics,
+            }
+        except BaseException:
+            self._valid = False
             raise
 
     @endpoint
@@ -1455,6 +1497,7 @@ async def spawn_monarch_trainer_actors(
 class _PublicationState:
     __slots__ = (
         "active_waiters",
+        "authorized",
         "drain_done",
         "future",
         "generation_id",
@@ -1471,6 +1514,7 @@ class _PublicationState:
     ) -> None:
         self.generation_id = generation_id
         self.future = future
+        self.authorized = asyncio.Event()
         self.records: dict[int, TrainerRankPublication] = {}
         self.train_done = False
         self.drain_done = True
@@ -1514,6 +1558,7 @@ class MonarchTrainerSlot:
         self._publications: dict[
             str, asyncio.Task[tuple[TrainerRankPublication, ...]]
         ] = {}
+        self._publication_authorizations: dict[str, asyncio.Event] = {}
         self._registrations: dict[str, str] = {}
         self._removed_runs: set[str] = set()
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -1834,12 +1879,14 @@ class MonarchTrainerSlot:
                 await self._invalidate(error, "load operation and cleanup failed")
                 raise
 
-    async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
+    async def prepare_snapshot(
+        self, job: GenerationSnapshotJobSpec
+    ) -> SnapshotWritePlan:
         async with self._control_lock:
             self._require_open()
             cached = self._cached_operation(job.operation_id, job.fingerprint)
             if cached is not None:
-                return cached
+                return SnapshotWritePlan.model_validate(cached["write_plan"])
             operation_id = job.operation_id
             if operation_id in self._publications:
                 raise RuntimeError(f"publication already exists: {operation_id}")
@@ -1857,18 +1904,74 @@ class MonarchTrainerSlot:
                     operation_id=job.operation_id,
                     learner_version=job.learner_version,
                 )
+                rank_plans = tuple(
+                    SnapshotRankWritePlan.model_validate(result["rank_write_plan"])
+                    for result in results
+                )
+                plan = build_snapshot_write_plan(
+                    operation_id=job.operation_id,
+                    generation=job.generation,
+                    ranks=rank_plans,
+                )
+                authorization = asyncio.Event()
                 publication = asyncio.create_task(
-                    self._collect_publication(receiver, job.generation),
+                    self._collect_publication(
+                        receiver, job.generation, authorization=authorization
+                    ),
                     name=f"megatron-slot-publish-{operation_id}",
                 )
                 publication.add_done_callback(consume_future_exception)
                 self._publications[operation_id] = publication
+                self._publication_authorizations[operation_id] = authorization
                 result = next(result for result in results if result["rank"] == 0)
-                self._operations[job.operation_id] = (job.fingerprint, result)
-                return result
+                self._operations[job.operation_id] = (
+                    job.fingerprint,
+                    {**result, "write_plan": plan.model_dump(mode="json")},
+                )
+                return plan
             except BaseException as error:
                 await self._invalidate(error, "snapshot operation and cleanup failed")
                 raise
+
+    async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
+        plan = await self.prepare_snapshot(job)
+        metrics = await self.authorize_snapshot(plan, SnapshotWriteGrant.local(plan))
+        result = self._cached_operation(job.operation_id, job.fingerprint)
+        if result is None:
+            raise RuntimeError("authorized snapshot lost its prepared operation")
+        return {**result, "metrics": {**result["metrics"], **metrics}}
+
+    async def authorize_snapshot(
+        self, plan: SnapshotWritePlan, grant: SnapshotWriteGrant
+    ) -> dict[str, float]:
+        grant.validate_plan(plan)
+        prepared = self._operations.get(plan.operation_id)
+        if (
+            prepared is None
+            or SnapshotWritePlan.model_validate(prepared[1]["write_plan"]) != plan
+        ):
+            raise RuntimeError("snapshot authorization differs from its prepared plan")
+        authorization = self._publication_authorizations.get(plan.operation_id)
+        if authorization is None:
+            raise RuntimeError(
+                f"trainer has no prepared publication {plan.operation_id}"
+            )
+        if authorization.is_set():
+            return {}
+        values = await asyncio.wait_for(
+            self._actors.authorize_run_slot_snapshot.call(
+                plan.model_dump_json(), grant.model_dump_json()
+            ),
+            timeout=self._command_timeout_s,
+        )
+        results = list(values.values())
+        expected_ranks = set(range(len(self._rank_processes)))
+        if {result["rank"] for result in results} != expected_ranks or {
+            result["operation_id"] for result in results
+        } != {plan.operation_id}:
+            raise RuntimeError("trainer ranks returned an invalid authorization")
+        authorization.set()
+        return next(result for result in results if result["rank"] == 0)["metrics"]
 
     def wait_for_publication(
         self, operation_id: str
@@ -1885,6 +1988,7 @@ class MonarchTrainerSlot:
             if not publication.done():
                 raise RuntimeError("cannot retire an active trainer publication")
             self._publications.pop(operation_id)
+            self._publication_authorizations.pop(operation_id, None)
         self._operations.pop(operation_id, None)
 
     async def prepare_cp_lookahead(
@@ -1930,8 +2034,11 @@ class MonarchTrainerSlot:
         self,
         receiver: Any,
         generation: TrainerGeneration,
+        *,
+        authorization: asyncio.Event,
     ) -> tuple[TrainerRankPublication, ...]:
         records: dict[int, TrainerRankPublication] = {}
+        await authorization.wait()
         supervision = asyncio.create_task(self._supervision.wait())
         receive: asyncio.Future[Any] | None = None
         try:
@@ -1978,6 +2085,8 @@ class MonarchTrainerSlot:
             return
         self._closed = True
         self._valid = False
+        for authorization in self._publication_authorizations.values():
+            authorization.set()
         primary: BaseException | None = None
         try:
             async with asyncio.timeout(self._shutdown_timeout_s * 0.8):
@@ -2547,18 +2656,29 @@ class MonarchTrainerRun:
                     self._active_job_id = None
                     self._active_collective = None
 
-    async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
+    async def prepare_snapshot(
+        self, job: GenerationSnapshotJobSpec
+    ) -> SnapshotWritePlan:
         cached = self._operations.get(job.operation_id)
         if cached is not None and cached[0] == job.fingerprint:
-            return cached[1]
+            return SnapshotWritePlan.model_validate(cached[1]["write_plan"])
         async with self._lock:
             cached = self._operations.get(job.operation_id)
             if cached is not None:
                 if cached[0] != job.fingerprint:
                     raise RuntimeError("operation_id was reused for another snapshot")
-                return cached[1]
+                return SnapshotWritePlan.model_validate(cached[1]["write_plan"])
             self._validate_operation(job)
-            return await self._run_snapshot(job)
+            result = await self._run_snapshot(job)
+            return SnapshotWritePlan.model_validate(result["write_plan"])
+
+    async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
+        plan = await self.prepare_snapshot(job)
+        metrics = await self.authorize_snapshot(plan, SnapshotWriteGrant.local(plan))
+        result = self._operations.get(job.operation_id)
+        if result is None or result[0] != job.fingerprint:
+            raise RuntimeError("authorized snapshot lost its prepared operation")
+        return {**result[1], "metrics": {**result[1]["metrics"], **metrics}}
 
     async def _run_snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
         generation_id = job.generation.generation_id
@@ -2588,6 +2708,15 @@ class MonarchTrainerRun:
                 operation_id=job.operation_id,
                 learner_version=job.learner_version,
             )
+            rank_plans = tuple(
+                SnapshotRankWritePlan.model_validate(result["rank_write_plan"])
+                for result in results
+            )
+            plan = build_snapshot_write_plan(
+                operation_id=job.operation_id,
+                generation=job.generation,
+                ranks=rank_plans,
+            )
             result = next(result for result in results if result["rank"] == 0)
             state.train_done = True
             state.drain_done = False
@@ -2597,6 +2726,7 @@ class MonarchTrainerRun:
             drain.add_done_callback(consume_future_exception)
             if job.sequence_continuation_of is None:
                 self._next_operation_sequence += 1
+            result = {**result, "write_plan": plan.model_dump(mode="json")}
             self._operations[job.operation_id] = (job.fingerprint, result)
             self._operation_sequence_ids[job.operation_id] = job.sequence_id
             return result
@@ -2612,6 +2742,37 @@ class MonarchTrainerRun:
                 self._active_job_id = None
                 self._active_collective = None
             self._retire_publication(state)
+
+    async def authorize_snapshot(
+        self, plan: SnapshotWritePlan, grant: SnapshotWriteGrant
+    ) -> dict[str, float]:
+        grant.validate_plan(plan)
+        prepared = self._operations.get(plan.operation_id)
+        if (
+            prepared is None
+            or SnapshotWritePlan.model_validate(prepared[1]["write_plan"]) != plan
+        ):
+            raise RuntimeError("snapshot authorization differs from its prepared plan")
+        state = self._publications.get(plan.generation.generation_id)
+        if state is None:
+            raise RuntimeError(
+                f"trainer has no prepared publication {plan.operation_id}"
+            )
+        if state.authorized.is_set():
+            return {}
+        values = await asyncio.wait_for(
+            self._actors.authorize_snapshot.call(
+                plan.model_dump_json(), grant.model_dump_json()
+            ),
+            timeout=self._command_timeout_s(),
+        )
+        results = list(values.values())
+        if {result["rank"] for result in results} != set(
+            range(len(self._rank_processes))
+        ) or {result["operation_id"] for result in results} != {plan.operation_id}:
+            raise RuntimeError("trainer ranks returned an invalid authorization")
+        state.authorized.set()
+        return next(result for result in results if result["rank"] == 0)["metrics"]
 
     def _validate_operation(
         self,
@@ -3191,6 +3352,7 @@ class MonarchTrainerRun:
         self, receiver: Any, state: "_PublicationState"
     ) -> None:
         publication = state.future
+        await state.authorized.wait()
         supervision = asyncio.create_task(self._supervision.wait())
         receive: asyncio.Future[Any] | None = None
         try:
@@ -3449,6 +3611,8 @@ class MonarchTrainerRun:
         primary: BaseException | None = None
         if graceful:
             publications = tuple(self._publications.values())
+            for publication in publications:
+                publication.authorized.set()
             try:
                 async with asyncio.timeout(self.run_spec.shutdown_timeout_s / 2):
                     await asyncio.gather(

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import gc
 import hashlib
 import math
@@ -10,12 +11,13 @@ from threading import BoundedSemaphore, Event, Lock
 import time
 from typing import TYPE_CHECKING, Any, Iterator, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 import torch
 
 from art.distributed.object_store import (
     BinaryObjectTarget,
     S3BinaryObjectStore,
+    binary_object_manifest_uri,
 )
 from art.megatron.model_support.lora_disk import (
     ART_LORA_FORMAT_CONFIG_KEY,
@@ -27,15 +29,25 @@ from art.megatron.optimizer_state import (
     OptimizerAdapter,
     OptimizerShard,
     OptimizerTopology,
+    canonical_adapter_path,
     read_adapter_publication,
 )
 from art.training.contracts import TokenLogprobs
-from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
+from art.utils.safetensors import (
+    FileIdentity,
+    PreparedSafetensors,
+    SafetensorsLayout,
+    prepared_safetensors_identity,
+    save_prepared_safetensors,
+)
 
 from ..tensor_snapshot import PinnedCpuSnapshotStager
 from ..training.gradient_accumulator import GradientAccumulator
 from .data_plane import InMemoryPackedBatch, SFTBatchData, validate_packed_batch
 from .publication import (
+    SnapshotRankWritePlan,
+    SnapshotWriteGrant,
+    SnapshotWritePlan,
     TrainerPublicationFailed,
     TrainerPublicationSucceeded,
     TrainerRankPublication,
@@ -534,24 +546,36 @@ class MegatronTrainJobExecutor:
             adapter_config=runtime.adapter_export_config,
             snapshot_optimizer=job.save_optimizer,
         )
+        rank_plan, prepare_metrics = self._publisher.prepare(
+            operation_id=job.operation_id,
+            generation=job.generation,
+            optimizer_state_path=job.optimizer_state_path,
+            staging_adapter_path=job.staging_adapter_path,
+            existing_adapter=job.existing_adapter,
+            publication_targets=job.publication_targets,
+            adapter_object_target=job.adapter_object_target,
+            save_optimizer=job.save_optimizer,
+            sink=sink,
+        )
         metrics = {
             **stage_metrics,
-            **self._publisher.submit(
-                generation=job.generation,
-                optimizer_state_path=job.optimizer_state_path,
-                staging_adapter_path=job.staging_adapter_path,
-                existing_adapter=job.existing_adapter,
-                publication_targets=job.publication_targets,
-                adapter_object_target=job.adapter_object_target,
-                save_optimizer=job.save_optimizer,
-                sink=sink,
-            ),
+            **prepare_metrics,
         }
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
+            "rank_write_plan": rank_plan.model_dump(mode="json"),
             "metrics": metrics,
         }
+
+    def authorize_snapshot(
+        self, plan: SnapshotWritePlan, grant: SnapshotWriteGrant
+    ) -> dict[str, float]:
+        return self._publisher.authorize(
+            operation_id=plan.operation_id,
+            plan=plan,
+            grant=grant,
+        )
 
     def discard_open_gradients(self) -> None:
         self._gradients.discard()
@@ -1237,7 +1261,8 @@ class MCoreRunSlotExecutor:
             raise RuntimeError(
                 "selected generation has no immutable publication snapshot"
             )
-        metrics = self._publisher.submit(
+        rank_plan, metrics = self._publisher.prepare(
+            operation_id=job.operation_id,
             generation=job.generation,
             optimizer_state_path=job.optimizer_state_path,
             staging_adapter_path=job.staging_adapter_path,
@@ -1250,8 +1275,18 @@ class MCoreRunSlotExecutor:
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
+            "rank_write_plan": rank_plan.model_dump(mode="json"),
             "metrics": metrics,
         }
+
+    def authorize_snapshot(
+        self, plan: SnapshotWritePlan, grant: SnapshotWriteGrant
+    ) -> dict[str, float]:
+        return self._publisher.authorize(
+            operation_id=plan.operation_id,
+            plan=plan,
+            grant=grant,
+        )
 
     def discard_run_gradients(self, run_id: str) -> None:
         state = self._require_run(run_id)
@@ -1554,6 +1589,37 @@ class _RankSnapshotPersistence(BaseModel):
     metrics: dict[str, float] = Field(default_factory=dict)
 
 
+class _PreparedAdapterPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    lora: Any
+    tensors: PreparedSafetensors
+    config: bytes
+    model_identity: FileIdentity
+    config_identity: FileIdentity
+
+
+class _PreparedRankSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    operation_id: str
+    entry: _CachedGeneration
+    plan: SnapshotRankWritePlan
+    adapter: _PreparedAdapterPayload | None
+    optimizer: Any | None
+    optimizer_archive: Any | None
+    optimizer_identity: FileIdentity | None
+    optimizer_state_path: str
+    staging_adapter_path: str | None
+    publication_targets: tuple[Any, ...]
+    adapter_object_target: BinaryObjectTarget | None
+    contexts: Any
+    completion: Future[TrainerRankPublication]
+    sink: SkipValidation[EventSink]
+    prepared_at: float
+    authorized: bool = False
+
+
 class _GenerationPublisher:
     def __init__(
         self,
@@ -1591,6 +1657,8 @@ class _GenerationPublisher:
         self._lora_layouts: dict[tuple[Any, ...], SafetensorsLayout] = {}
         self._cache: dict[str, _CachedGeneration] = {}
         self._latest_by_run: dict[str, str] = {}
+        self._prepared: dict[str, _PreparedRankSnapshot] = {}
+        self._prepared_order: deque[str] = deque()
         self._residency_retirements: set[Future[None]] = set()
         self._failures: list[BaseException] = []
         self._in_flight = 0
@@ -1867,9 +1935,10 @@ class _GenerationPublisher:
             "snapshot_optimizer_attach_s": elapsed,
         }
 
-    def submit(
+    def prepare(
         self,
         *,
+        operation_id: str,
         generation: TrainerGeneration,
         optimizer_state_path: str,
         staging_adapter_path: str | None,
@@ -1878,83 +1947,213 @@ class _GenerationPublisher:
         adapter_object_target: BinaryObjectTarget | None,
         save_optimizer: bool,
         sink: EventSink,
-    ) -> dict[str, float]:
+    ) -> tuple[SnapshotRankWritePlan, dict[str, float]]:
         self.raise_if_failed()
         with self._lock:
             entry = self._cache.get(generation.generation_id)
+            cached = self._prepared.get(operation_id)
+        if cached is not None:
+            if cached.plan.generation != generation:
+                raise RuntimeError(
+                    "snapshot operation was reused for another generation"
+                )
+            return cached.plan, {}
         if entry is None or entry.retired or entry.generation != generation:
             raise RuntimeError(
                 f"learner generation is not staged: {generation.generation_id}"
             )
         started = time.perf_counter()
-        transport = self._transport_pool.submit(
-            self._transfer_cached_snapshot,
-            entry,
-            publication_targets,
-            adapter_object_target,
-            existing_adapter if int(self.runtime.rank) == 0 else None,
-            generation,
-            started,
-        )
-        durability = self._durability_pool.submit(
-            self._persist_cached_snapshot,
-            entry,
-            generation,
-            optimizer_state_path,
-            staging_adapter_path,
-            existing_adapter if int(self.runtime.rank) == 0 else None,
-            save_optimizer,
-            started,
-        )
-        persistence = self._completion_pool.submit(
-            self._complete_publication, transport, durability, started
-        )
-        with self._lock:
-            entry.consumers.append(persistence)
-        persistence.add_done_callback(
-            lambda done: self._completed(
-                done,
-                entry=entry,
-                sink=sink,
-                generation=generation,
-                submitted_at=started,
+        contexts = ExitStack()
+        try:
+            rank = int(self.runtime.rank)
+            adapter = existing_adapter if rank == 0 else None
+            transport_adapter = None
+            adapter_payload = None
+            needs_adapter_payload = rank == 0 and (
+                (adapter is None and staging_adapter_path is not None)
+                or bool(publication_targets)
+                or adapter_object_target is not None
             )
-        )
-        return {
-            "snapshot_attach_s": time.perf_counter() - started,
-        }
+            if needs_adapter_payload:
+                lora, tensors = contexts.enter_context(
+                    self._lora_snapshot(entry, adapter)
+                )
+                config = encode_adapter_config(
+                    {
+                        **lora.adapter_config,
+                        ART_LORA_FORMAT_CONFIG_KEY: ART_LORA_FORMAT_VLLM,
+                    }
+                )
+                model_identity = prepared_safetensors_identity(tensors)
+                config_identity = FileIdentity(
+                    size_bytes=len(config),
+                    sha256=hashlib.sha256(config).hexdigest(),
+                )
+                files = (
+                    CheckpointFile(
+                        name="adapter_config.json", **config_identity.model_dump()
+                    ),
+                    CheckpointFile(
+                        name="adapter_model.safetensors",
+                        **model_identity.model_dump(),
+                    ),
+                )
+                adapter_payload = _PreparedAdapterPayload(
+                    lora=lora,
+                    tensors=tensors,
+                    config=config,
+                    model_identity=model_identity,
+                    config_identity=config_identity,
+                )
+                if adapter is None and staging_adapter_path is not None:
+                    adapter = OptimizerAdapter(
+                        identity=str(
+                            canonical_adapter_path(
+                                staging_adapter_path, generation.policy_step
+                            )
+                        ),
+                        training_session_id=generation.training_session_id,
+                        step=generation.policy_step,
+                        generation_id=generation.generation_id,
+                        files=files,
+                    )
+                if adapter_object_target is not None:
+                    transport_adapter = OptimizerAdapter(
+                        identity=binary_object_manifest_uri(adapter_object_target),
+                        training_session_id=generation.training_session_id,
+                        step=generation.policy_step,
+                        generation_id=generation.generation_id,
+                        files=files,
+                    )
+            if rank == 0 and adapter is None and transport_adapter is None:
+                raise RuntimeError("rank-zero snapshot has no planned adapter output")
 
-    def stage_and_submit(
-        self,
-        *,
-        run_id: str,
-        generation: TrainerGeneration,
-        optimizer_state_path: str,
-        staging_adapter_path: str,
-        publication_targets: tuple[Any, ...],
-        adapter_dtypes: dict[str, Any],
-        adapter_config: dict[str, Any],
-        save_optimizer: bool,
-        sink: EventSink,
-    ) -> dict[str, float]:
-        return {
-            **self.stage(
-                run_id=run_id,
+            optimizer = contexts.enter_context(
+                self._optimizer_snapshot(entry, generation, required=save_optimizer)
+            )
+            optimizer_archive = None
+            optimizer_identity = None
+            shard = None
+            runtime_sha256 = None
+            topology = None
+            if optimizer is not None:
+                from art.megatron.optimizer_archive import prepare_optimizer_archive
+
+                optimizer_archive = prepare_optimizer_archive(optimizer.state_dict)
+                optimizer_identity = optimizer_archive.identity()
+                shard = OptimizerShard(
+                    rank=optimizer.rank,
+                    size_bytes=optimizer_identity.size_bytes,
+                    layout_sha256=optimizer.layout_sha256,
+                    sha256=optimizer_identity.sha256,
+                    serialization="art_safetensors_v1",
+                )
+                runtime_sha256 = optimizer.runtime_sha256
+                topology = optimizer.topology
+            rank_plan = SnapshotRankWritePlan(
+                rank=rank,
                 generation=generation,
-                adapter_dtypes=adapter_dtypes,
-                adapter_config=adapter_config,
-                snapshot_optimizer=save_optimizer,
-            ),
-            **self.submit(
-                generation=generation,
+                adapter=adapter,
+                transport_adapter=transport_adapter,
+                optimizer_shard=shard,
+                runtime_sha256=runtime_sha256,
+                topology=topology,
+                saves_optimizer=save_optimizer,
+            )
+            completion: Future[TrainerRankPublication] = Future()
+            completion.add_done_callback(_consume_future)
+            prepared = _PreparedRankSnapshot(
+                operation_id=operation_id,
+                entry=entry,
+                plan=rank_plan,
+                adapter=adapter_payload,
+                optimizer=optimizer,
+                optimizer_archive=optimizer_archive,
+                optimizer_identity=optimizer_identity,
                 optimizer_state_path=optimizer_state_path,
                 staging_adapter_path=staging_adapter_path,
                 publication_targets=publication_targets,
-                adapter_object_target=None,
-                save_optimizer=save_optimizer,
+                adapter_object_target=adapter_object_target,
+                contexts=contexts,
+                completion=completion,
                 sink=sink,
-            ),
-        }
+                prepared_at=started,
+            )
+            with self._lock:
+                if operation_id in self._prepared:
+                    raise RuntimeError(
+                        f"snapshot operation already prepared: {operation_id}"
+                    )
+                self._prepared[operation_id] = prepared
+                self._prepared_order.append(operation_id)
+                entry.consumers.append(completion)
+        except BaseException:
+            contexts.close()
+            raise
+        return rank_plan, {"snapshot_prepare_s": time.perf_counter() - started}
+
+    def authorize(
+        self,
+        *,
+        operation_id: str,
+        plan: SnapshotWritePlan,
+        grant: SnapshotWriteGrant,
+    ) -> dict[str, float]:
+        self.raise_if_failed()
+        grant.validate_plan(plan)
+        rank = int(self.runtime.rank)
+        try:
+            rank_plan = plan.ranks[rank]
+        except IndexError as error:
+            raise RuntimeError(
+                "snapshot write plan does not cover this rank"
+            ) from error
+        with self._lock:
+            prepared = self._prepared.get(operation_id)
+            if prepared is None:
+                raise RuntimeError(
+                    f"snapshot operation is not prepared: {operation_id}"
+                )
+            if prepared.authorized:
+                if prepared.plan != rank_plan:
+                    raise RuntimeError("authorized snapshot plan changed")
+                return {}
+            if not self._prepared_order or self._prepared_order[0] != operation_id:
+                raise RuntimeError(
+                    "snapshot authorization would overtake an earlier save"
+                )
+            if prepared.plan != rank_plan:
+                raise RuntimeError("rank snapshot differs from the authorized plan")
+            prepared.authorized = True
+            self._prepared_order.popleft()
+        started = time.perf_counter()
+        try:
+            transport = self._transport_pool.submit(
+                self._transfer_prepared_snapshot, prepared, started
+            )
+            durability = self._durability_pool.submit(
+                self._persist_prepared_snapshot, prepared, started
+            )
+            publication = self._completion_pool.submit(
+                self._complete_publication,
+                transport,
+                durability,
+                started,
+                prepared.plan,
+                grant,
+            )
+            publication.add_done_callback(
+                lambda done: self._authorized_completed(done, prepared=prepared)
+            )
+        except BaseException as error:
+            self._authorization_failed(prepared, error)
+            raise
+        return {"snapshot_authorize_s": time.perf_counter() - started}
+
+    def stage_and_submit(self, **_kwargs: Any) -> dict[str, float]:
+        raise RuntimeError(
+            "fused snapshot publication was removed; use prepare/authorize"
+        )
 
     def has_generation(
         self,
@@ -2269,42 +2468,40 @@ class _GenerationPublisher:
                 step=generation.policy_step,
             )
 
-    def _transfer_cached_snapshot(
-        self,
-        entry: _CachedGeneration,
-        publication_targets: tuple[Any, ...],
-        object_target: BinaryObjectTarget | None,
-        existing_adapter: OptimizerAdapter | None,
-        generation: TrainerGeneration,
-        submitted_at: float,
+    def _transfer_prepared_snapshot(
+        self, prepared: _PreparedRankSnapshot, submitted_at: float
     ) -> _SnapshotTransport:
         started = time.perf_counter()
         if int(self.runtime.rank) != 0:
             return _SnapshotTransport(
                 metrics={"time/snapshot_transport_queue_s": started - submitted_at}
             )
-        if not publication_targets and object_target is None:
+        if not prepared.publication_targets and prepared.adapter_object_target is None:
             return _SnapshotTransport(
                 metrics={"time/snapshot_transport_queue_s": started - submitted_at}
             )
-        entry.resolved.result()
         ready = time.perf_counter()
+        payload = prepared.adapter
+        if payload is None:
+            raise RuntimeError("authorized adapter transport has no prepared payload")
         adapter = None
-        with self._lora_snapshot(entry, existing_adapter) as (lora, prepared_tensors):
-            if object_target is not None:
-                adapter = self._publish_lora_object_once(
-                    entry,
-                    object_target,
-                    generation,
-                    lora,
-                    prepared_tensors,
-                )
-            elif publication_targets:
-                self._transfer_lora_snapshot(
-                    lora,
-                    publication_targets,
-                    prepared_tensors=prepared_tensors,
-                )
+        if prepared.adapter_object_target is not None:
+            planned = prepared.plan.transport_adapter
+            if planned is None:
+                raise RuntimeError("authorized object transport has no adapter plan")
+            adapter = self._publish_lora_object_once(
+                prepared.entry,
+                prepared.adapter_object_target,
+                prepared.plan.generation,
+                payload,
+                planned,
+            )
+        elif prepared.publication_targets:
+            self._transfer_lora_snapshot(
+                payload.lora,
+                prepared.publication_targets,
+                prepared_tensors=payload.tensors,
+            )
         return _SnapshotTransport(
             adapter=adapter,
             metrics={
@@ -2312,6 +2509,21 @@ class _GenerationPublisher:
                 "time/snapshot_transport_wait_s": ready - started,
                 "time/snapshot_transport_s": time.perf_counter() - ready,
             },
+        )
+
+    def _persist_prepared_snapshot(
+        self, prepared: _PreparedRankSnapshot, submitted_at: float
+    ) -> _RankSnapshotPersistence:
+        started = time.perf_counter()
+        result = self._persist_generation(prepared)
+        return result.model_copy(
+            update={
+                "metrics": {
+                    "time/snapshot_persistence_queue_s": started - submitted_at,
+                    "time/snapshot_persistence_wait_s": 0.0,
+                    "time/snapshot_persistence_s": time.perf_counter() - started,
+                }
+            }
         )
 
     @staticmethod
@@ -2336,59 +2548,13 @@ class _GenerationPublisher:
             SafetensorsLayout(tensors).bind(tensors)
         )
 
-    def _persist_cached_snapshot(
-        self,
-        entry: _CachedGeneration,
-        generation: TrainerGeneration,
-        optimizer_state_path: str,
-        staging_adapter_path: str | None,
-        adapter: OptimizerAdapter | None,
-        save_optimizer: bool,
-        submitted_at: float,
-    ) -> _RankSnapshotPersistence:
-        started = time.perf_counter()
-        entry.resolved.result()
-        ready = time.perf_counter()
-        with self._optimizer_snapshot(
-            entry, generation, required=save_optimizer
-        ) as optimizer:
-            needs_lora = adapter is None and staging_adapter_path is not None
-            if needs_lora and int(self.runtime.rank) == 0:
-                with self._lora_snapshot(entry, None) as (lora, prepared_tensors):
-                    result = self._persist_generation(
-                        generation=generation,
-                        optimizer_state_path=optimizer_state_path,
-                        staging_adapter_path=staging_adapter_path,
-                        lora=lora,
-                        adapter=None,
-                        optimizer=optimizer,
-                        prepared_tensors=prepared_tensors,
-                    )
-            else:
-                result = self._persist_generation(
-                    generation=generation,
-                    optimizer_state_path=optimizer_state_path,
-                    staging_adapter_path=staging_adapter_path,
-                    lora=None,
-                    adapter=adapter,
-                    optimizer=optimizer,
-                    prepared_tensors=None,
-                )
-        return result.model_copy(
-            update={
-                "metrics": {
-                    "time/snapshot_persistence_queue_s": started - submitted_at,
-                    "time/snapshot_persistence_wait_s": ready - started,
-                    "time/snapshot_persistence_s": time.perf_counter() - ready,
-                }
-            }
-        )
-
     @staticmethod
     def _complete_publication(
         transport: Future[_SnapshotTransport],
         durability: Future[_RankSnapshotPersistence],
         submitted_at: float,
+        plan: SnapshotRankWritePlan,
+        grant: SnapshotWriteGrant,
     ) -> TrainerRankPublication:
         started = time.perf_counter()
         failures: list[BaseException] = []
@@ -2425,6 +2591,8 @@ class _GenerationPublisher:
         return TrainerRankPublication(
             generation=persisted.generation,
             rank=persisted.rank,
+            plan=plan,
+            grant=grant,
             adapter=adapter,
             transport_adapter=transferred.adapter,
             shard=persisted.shard,
@@ -2457,8 +2625,8 @@ class _GenerationPublisher:
         entry: _CachedGeneration,
         target: BinaryObjectTarget,
         generation: TrainerGeneration,
-        lora: Any,
-        prepared_tensors: PreparedSafetensors,
+        payload: _PreparedAdapterPayload,
+        planned: OptimizerAdapter,
     ) -> OptimizerAdapter:
         with self._lock:
             publication = self._object_publications.get(target.object_id)
@@ -2468,11 +2636,12 @@ class _GenerationPublisher:
                 self._object_publications[target.object_id] = publication
             entry.object_ids.add(target.object_id)
         if not owner:
-            return publication.result()
+            adapter = publication.result()
+            if adapter != planned:
+                raise RuntimeError("cached object publication differs from its plan")
+            return adapter
         try:
-            adapter = self._publish_lora_object(
-                target, generation, lora, prepared_tensors
-            )
+            adapter = self._publish_lora_object(target, generation, payload, planned)
         except BaseException as error:
             publication.set_exception(error)
             raise
@@ -2483,8 +2652,8 @@ class _GenerationPublisher:
         self,
         target: BinaryObjectTarget,
         generation: TrainerGeneration,
-        lora: Any,
-        prepared_tensors: PreparedSafetensors,
+        payload: _PreparedAdapterPayload,
+        planned: OptimizerAdapter,
     ) -> OptimizerAdapter:
         expected_metadata = {
             "training_session_id": generation.training_session_id,
@@ -2504,116 +2673,113 @@ class _GenerationPublisher:
             elif self._object_store.config != target.store:
                 raise RuntimeError("generation publisher cannot mix object stores")
             store = self._object_store
-        config = encode_adapter_config(
-            {
-                **lora.adapter_config,
-                ART_LORA_FORMAT_CONFIG_KEY: ART_LORA_FORMAT_VLLM,
-            }
-        )
         ref = store.publish(
             target,
             {
                 "adapter_model.safetensors": tuple(
                     memoryview(chunk.numpy()).cast("B")
-                    for chunk in prepared_tensors.chunks
+                    for chunk in payload.tensors.chunks
                 ),
-                "adapter_config.json": (memoryview(config),),
+                "adapter_config.json": (memoryview(payload.config),),
             },
         )
         files = {file.relative_path: file for file in ref.files}
         expected_files = ("adapter_config.json", "adapter_model.safetensors")
         if set(files) != set(expected_files):
             raise RuntimeError("adapter object manifest has unexpected files")
-        return OptimizerAdapter(
-            identity=ref.manifest_uri,
-            training_session_id=generation.training_session_id,
-            step=generation.policy_step,
-            generation_id=generation.generation_id,
-            files=tuple(
-                CheckpointFile(name=name, size_bytes=files[name].byte_count)
-                for name in expected_files
-            ),
-        )
+        if ref.manifest_uri != planned.identity or tuple(
+            files[name].byte_count for name in expected_files
+        ) != tuple(file.size_bytes for file in planned.files):
+            raise RuntimeError("adapter object publication differs from its plan")
+        return planned
 
     def _persist_generation(
-        self,
-        *,
-        generation: TrainerGeneration,
-        optimizer_state_path: str,
-        staging_adapter_path: str | None,
-        lora: Any,
-        adapter: "OptimizerAdapter | None",
-        optimizer: Any,
-        prepared_tensors: PreparedSafetensors | None,
+        self, prepared: _PreparedRankSnapshot
     ) -> _RankSnapshotPersistence:
         from art.megatron.optimizer_state import (
             adapter_publication_transaction,
             publish_adapter_checkpoint,
             write_optimizer_snapshot_shard,
         )
-        from art.megatron.weights.lora_publish import save_vllm_lora_snapshot
 
         rank = int(self.runtime.rank)
+        generation = prepared.plan.generation
+        adapter = prepared.plan.adapter
         if rank == 0:
-            if lora is not None:
-                if staging_adapter_path is None or adapter is not None:
-                    raise RuntimeError("new adapter publication is inconsistent")
+            payload = prepared.adapter
+            if payload is not None and prepared.staging_adapter_path is not None:
+                if adapter is None:
+                    raise RuntimeError("local adapter write has no authorized plan")
                 with adapter_publication_transaction(
-                    staging_adapter_path,
+                    prepared.staging_adapter_path,
                     step=generation.policy_step,
                     training_session_id=generation.training_session_id,
                     generation_id=generation.generation_id,
                 ) as (staging, existing):
-                    adapter = existing
-                    if adapter is None:
-                        saved = save_vllm_lora_snapshot(
-                            lora,
-                            str(staging),
-                            prepared_tensors=prepared_tensors,
+                    if existing is not None:
+                        if existing != adapter:
+                            raise RuntimeError(
+                                "existing adapter differs from authorized plan"
+                            )
+                    else:
+                        staging.mkdir(parents=True)
+                        model_identity = save_prepared_safetensors(
+                            payload.tensors,
+                            staging / "adapter_model.safetensors",
+                            identity=payload.model_identity,
                         )
-                        adapter = publish_adapter_checkpoint(
+                        config_path = staging / "adapter_config.json"
+                        config_path.write_bytes(payload.config)
+                        if (
+                            model_identity != payload.model_identity
+                            or config_path.stat().st_size
+                            != payload.config_identity.size_bytes
+                        ):
+                            raise RuntimeError(
+                                "adapter bytes changed after write authorization"
+                            )
+                        published = publish_adapter_checkpoint(
                             staging,
                             step=generation.policy_step,
-                            files=tuple(
-                                CheckpointFile(
-                                    name=cast(Any, name),
-                                    size_bytes=saved[name].size_bytes,
-                                    sha256=saved[name].sha256,
-                                )
-                                for name in (
-                                    "adapter_config.json",
-                                    "adapter_model.safetensors",
-                                )
-                            ),
+                            files=adapter.files,
                             training_session_id=generation.training_session_id,
                             generation_id=generation.generation_id,
                         )
-        shard = (
-            write_optimizer_snapshot_shard(
+                        if published != adapter:
+                            raise RuntimeError(
+                                "adapter publication differs from authorized plan"
+                            )
+        optimizer = prepared.optimizer
+        if optimizer is None:
+            shard = None
+        else:
+            archive = prepared.optimizer_archive
+            identity = prepared.optimizer_identity
+            if archive is None or identity is None:
+                raise RuntimeError("authorized optimizer has no prepared archive")
+            shard = write_optimizer_snapshot_shard(
                 optimizer,
-                optimizer_state_path=optimizer_state_path,
+                optimizer_state_path=prepared.optimizer_state_path,
+                prepared=archive,
+                identity=identity,
             )
-            if optimizer is not None
-            else None
-        )
+        if shard != prepared.plan.optimizer_shard:
+            raise RuntimeError("optimizer shard differs from authorized plan")
         return _RankSnapshotPersistence(
             generation=generation,
             rank=rank,
             adapter=adapter,
             shard=shard,
-            runtime_sha256=None if optimizer is None else optimizer.runtime_sha256,
-            topology=None if optimizer is None else optimizer.topology,
+            runtime_sha256=prepared.plan.runtime_sha256,
+            topology=prepared.plan.topology,
             saves_optimizer=optimizer is not None,
         )
 
-    def _completed(
+    def _authorized_completed(
         self,
         future: Future[TrainerRankPublication],
         *,
-        entry: _CachedGeneration,
-        sink: EventSink,
-        generation: TrainerGeneration,
-        submitted_at: float,
+        prepared: _PreparedRankSnapshot,
     ) -> None:
         callback_started = time.perf_counter()
         try:
@@ -2621,7 +2787,7 @@ class _GenerationPublisher:
             callback_delay_s = max(
                 0.0,
                 callback_started
-                - submitted_at
+                - prepared.prepared_at
                 - record.metrics["time/snapshot_rank_ready_s"],
             )
             event = TrainerPublicationSucceeded(
@@ -2634,32 +2800,60 @@ class _GenerationPublisher:
                     }
                 )
             )
+            prepared.contexts.close()
+            prepared.sink.publication(event)
         except BaseException as error:
-            self._failed(error, entry=entry, sink=sink, generation=generation)
+            try:
+                prepared.contexts.close()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "snapshot context cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            self._report_failure(
+                error,
+                entry=prepared.entry,
+                sink=prepared.sink,
+                generation=prepared.plan.generation,
+                remember=True,
+            )
+            if not prepared.completion.done():
+                prepared.completion.set_exception(error)
+            self._retire_prepared(prepared)
             return
-        try:
-            sink.publication(event)
-        except BaseException as error:
-            with self._lock:
-                self._failures.append(error)
-        finally:
-            self._maybe_release(entry)
+        prepared.completion.set_result(record)
+        self._retire_prepared(prepared)
 
-    def _failed(
-        self,
-        error: BaseException,
-        *,
-        entry: _CachedGeneration,
-        sink: EventSink,
-        generation: TrainerGeneration,
+    def _authorization_failed(
+        self, prepared: _PreparedRankSnapshot, error: BaseException
     ) -> None:
+        try:
+            prepared.contexts.close()
+        except BaseException as cleanup_error:
+            error.add_note(
+                "snapshot context cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
         self._report_failure(
             error,
-            entry=entry,
-            sink=sink,
-            generation=generation,
+            entry=prepared.entry,
+            sink=prepared.sink,
+            generation=prepared.plan.generation,
             remember=True,
         )
+        if not prepared.completion.done():
+            prepared.completion.set_exception(error)
+        self._retire_prepared(prepared)
+
+    def _retire_prepared(self, prepared: _PreparedRankSnapshot) -> None:
+        with self._lock:
+            if self._prepared.get(prepared.operation_id) is prepared:
+                self._prepared.pop(prepared.operation_id)
+            try:
+                self._prepared_order.remove(prepared.operation_id)
+            except ValueError:
+                pass
+        self._maybe_release(prepared.entry)
 
     def _report_failure(
         self,
@@ -2707,6 +2901,17 @@ class _GenerationPublisher:
 
     def close(self) -> None:
         failures: list[BaseException] = []
+        with self._lock:
+            dormant = tuple(
+                prepared
+                for prepared in self._prepared.values()
+                if not prepared.authorized
+            )
+        for prepared in dormant:
+            self._authorization_failed(
+                prepared,
+                RuntimeError("snapshot publisher closed before write authorization"),
+            )
         with self._lock:
             entries = tuple(self._cache.values())
             for entry in entries:

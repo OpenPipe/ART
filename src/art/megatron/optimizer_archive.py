@@ -12,6 +12,7 @@ from art.utils.safetensors import (
     FileIdentity,
     PreparedSafetensors,
     prepare_safetensors,
+    prepared_safetensors_identity,
     save_prepared_safetensors,
 )
 
@@ -36,8 +37,13 @@ class PreparedOptimizerArchive(BaseModel):
     def nbytes(self) -> int:
         return self.payload.nbytes
 
-    def write(self, path: Path) -> FileIdentity:
-        return save_prepared_safetensors(self.payload, path)
+    def identity(self) -> FileIdentity:
+        return prepared_safetensors_identity(self.payload)
+
+    def write(
+        self, path: Path, *, identity: FileIdentity | None = None
+    ) -> FileIdentity:
+        return save_prepared_safetensors(self.payload, path, identity=identity)
 
 
 def prepare_optimizer_archive(state: Any) -> PreparedOptimizerArchive:

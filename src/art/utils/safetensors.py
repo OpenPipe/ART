@@ -59,6 +59,11 @@ def _sha256(buffers: list[memoryview]) -> str:
     return digest.hexdigest()
 
 
+def prepared_safetensors_identity(prepared: PreparedSafetensors) -> FileIdentity:
+    buffers = [memoryview(chunk.numpy()) for chunk in prepared.chunks]
+    return FileIdentity(size_bytes=prepared.nbytes, sha256=_sha256(buffers))
+
+
 class _TensorLayout(NamedTuple):
     name: str
     dtype: torch.dtype
@@ -247,19 +252,26 @@ def prepare_safetensors(tensors: dict[str, torch.Tensor]) -> PreparedSafetensors
 
 
 def save_prepared_safetensors(
-    prepared: PreparedSafetensors, path: Path
+    prepared: PreparedSafetensors,
+    path: Path,
+    *,
+    identity: FileIdentity | None = None,
 ) -> FileIdentity:
     """Stream a prepared safetensors payload without rebuilding tensor metadata."""
     buffers = [memoryview(chunk.numpy()) for chunk in prepared.chunks]
+    if identity is not None and identity.size_bytes != prepared.nbytes:
+        raise RuntimeError("prepared safetensors size changed after planning")
     with ThreadPoolExecutor(max_workers=1) as pool:
-        digest = pool.submit(_sha256, buffers)
+        digest = None if identity is not None else pool.submit(_sha256, buffers)
         with tempfile.TemporaryDirectory(dir=path.parent) as temp_dir:
             temporary_path = Path(temp_dir) / path.name
             with temporary_path.open("wb", buffering=0) as output:
                 _writev_all(output.fileno(), buffers)
-            sha256 = digest.result()
             temporary_path.replace(path)
-    return FileIdentity(size_bytes=prepared.nbytes, sha256=sha256)
+    if identity is not None:
+        return identity
+    assert digest is not None
+    return FileIdentity(size_bytes=prepared.nbytes, sha256=digest.result())
 
 
 def save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> FileIdentity:
