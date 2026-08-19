@@ -570,9 +570,7 @@ class ServerlessBackend:
     async def _apply_checkpoint_retention(
         self, model: AnyTrainableModel, plan: "CheckpointRetentionPlan"
     ) -> None:
-        retained = set(plan.retain_steps)
         async with self._exact_adapter_lock:
-            self._validate_sampler_retention(model, retained)
             client = await self.training_client(model)
             page = await self._service.list_checkpoints(client.run_id)
             ready = tuple(
@@ -583,6 +581,13 @@ class ServerlessBackend:
             actual_steps = {checkpoint.learner_version for checkpoint in ready}
             if actual_steps != plan.observed_steps:
                 raise RuntimeError("remote checkpoint catalog changed during retention")
+            retained = set(plan.retain_steps)
+            retained.update(
+                checkpoint.learner_version
+                for checkpoint in ready
+                if checkpoint.checkpoint_id == page.current_checkpoint_id
+            )
+            self._validate_sampler_retention(model, retained)
             retain_checkpoint_ids = {
                 checkpoint.checkpoint_id
                 for checkpoint in ready
