@@ -77,9 +77,9 @@ def _stage_tensor_mapping(
     tensors: dict[_K, torch.Tensor],
     stager: _PinnedCpuStager,
 ) -> dict[_K, torch.Tensor]:
-    grouped: dict[tuple[str, int | None, torch.dtype], list[tuple[_K, torch.Tensor]]] = (
-        {}
-    )
+    grouped: dict[
+        tuple[str, int | None, torch.dtype], list[tuple[_K, torch.Tensor]]
+    ] = {}
     for key, tensor in tensors.items():
         group_key = (tensor.device.type, tensor.device.index, tensor.dtype)
         grouped.setdefault(group_key, []).append((key, tensor))
@@ -276,6 +276,7 @@ def _capture_lora_publish_inputs(
     timings["exchange"] = time.monotonic() - started
 
     started = time.monotonic()
+
     def stage() -> _PreparedLoraExport | None:
         if inputs is not None:
             stager = _PinnedCpuStager()
