@@ -42,6 +42,9 @@ class S3ObjectStoreConfig(_ObjectModel):
         le=_S3_MAX_MULTIPART_PART_BYTES,
     )
     multipart_concurrency: int = Field(default=16, ge=1)
+    connect_timeout_s: float = Field(default=2.0, gt=0, le=60)
+    read_timeout_s: float = Field(default=2.0, gt=0, le=300)
+    max_attempts: int = Field(default=2, ge=1, le=5)
 
     @field_validator("bucket")
     @classmethod
@@ -120,10 +123,17 @@ class S3BinaryObjectStore:
             ),
             verify=config.tls_verify,
             config=Config(
+                connect_timeout=config.connect_timeout_s,
                 max_pool_connections=config.multipart_concurrency + 2,
+                read_timeout=config.read_timeout_s,
                 request_checksum_calculation="when_supported",
                 response_checksum_validation="when_supported",
+                retries={
+                    "mode": "standard",
+                    "total_max_attempts": config.max_attempts,
+                },
                 s3={"addressing_style": config.addressing_style},
+                tcp_keepalive=True,
             ),
         )
         self._parts = ThreadPoolExecutor(
