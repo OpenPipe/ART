@@ -604,7 +604,7 @@ def adapter_publication_transaction(
             raise
 
 
-def clone_adapter_generation(
+def link_adapter_generation(
     source_path: str | Path,
     *,
     source_step: int,
@@ -613,7 +613,7 @@ def clone_adapter_generation(
     training_session_id: str,
     generation_id: str,
 ) -> OptimizerAdapter:
-    """Publish verified adapter bytes under a new immutable learner identity."""
+    """Publish immutable adapter bytes under a new learner identity without copying."""
     source = read_adapter_publication(source_path, step=source_step)
     if source is None:
         raise RuntimeError("loaded checkpoint has no immutable adapter publication")
@@ -627,10 +627,7 @@ def clone_adapter_generation(
             return existing
         staging.mkdir(parents=True)
         for record in source.files:
-            shutil.copyfile(
-                Path(source.identity) / record.name,
-                staging / record.name,
-            )
+            os.link(Path(source.identity) / record.name, staging / record.name)
         adapter = publish_adapter_checkpoint(
             staging,
             step=step,

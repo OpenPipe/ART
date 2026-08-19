@@ -19,7 +19,7 @@ from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
 from art.megatron.optimizer_state import (
     OptimizerAdapter,
-    clone_adapter_generation,
+    link_adapter_generation,
     optimizer_adapter,
     read_adapter_publication,
     read_committed_optimizer_pointer,
@@ -610,7 +610,7 @@ class MegatronTrainingSlot:
         await self.trainer.prepare_load_state(job)
         try:
             adapter = await asyncio.to_thread(
-                clone_adapter_generation,
+                link_adapter_generation,
                 job.adapter_path,
                 source_step=job.adapter_step,
                 staging_path=(
