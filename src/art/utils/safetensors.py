@@ -1,4 +1,5 @@
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from itertools import islice
 import json
@@ -49,6 +50,13 @@ class FileIdentity(BaseModel):
 
     size_bytes: int = Field(gt=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def _sha256(buffers: list[memoryview]) -> str:
+    digest = hashlib.sha256()
+    for buffer in buffers:
+        digest.update(buffer)
+    return digest.hexdigest()
 
 
 class _TensorLayout(NamedTuple):
@@ -243,15 +251,15 @@ def save_prepared_safetensors(
 ) -> FileIdentity:
     """Stream a prepared safetensors payload without rebuilding tensor metadata."""
     buffers = [memoryview(chunk.numpy()) for chunk in prepared.chunks]
-    digest = hashlib.sha256()
-    for buffer in buffers:
-        digest.update(buffer)
-    with tempfile.TemporaryDirectory(dir=path.parent) as temp_dir:
-        temporary_path = Path(temp_dir) / path.name
-        with temporary_path.open("wb", buffering=0) as output:
-            _writev_all(output.fileno(), buffers)
-        temporary_path.replace(path)
-    return FileIdentity(size_bytes=prepared.nbytes, sha256=digest.hexdigest())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        digest = pool.submit(_sha256, buffers)
+        with tempfile.TemporaryDirectory(dir=path.parent) as temp_dir:
+            temporary_path = Path(temp_dir) / path.name
+            with temporary_path.open("wb", buffering=0) as output:
+                _writev_all(output.fileno(), buffers)
+            sha256 = digest.result()
+            temporary_path.replace(path)
+    return FileIdentity(size_bytes=prepared.nbytes, sha256=sha256)
 
 
 def save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> FileIdentity:
