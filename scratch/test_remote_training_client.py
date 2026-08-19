@@ -223,9 +223,11 @@ def _decode_submission(payload: bytes):
         offset += ref.byte_count
     routes = []
     for ref in manifest.route_objects:
+        route_payload = payload[offset : offset + ref.byte_count]
         routes.append(
             EncodedRouteObject(
-                ref=ref, payload=payload[offset : offset + ref.byte_count]
+                ref=ref,
+                chunks=(memoryview(route_payload).toreadonly(),),
             )
         )
         offset += ref.byte_count

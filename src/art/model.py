@@ -53,7 +53,7 @@ from .trajectories import Trajectory, TrajectoryGroup
 from .types import SFTMetricLoggingConfig, TrainSFTConfig
 from .utils import wandb_sdk
 from .utils.trajectory_logging import write_trajectory_groups_parquet
-from .vllm_route_transport import decode_routed_experts_response
+from .vllm_route_transport import decode_routed_experts_response_stream
 
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
@@ -222,14 +222,15 @@ class _OpenAIChatCompletionsProxy:
                     response = await self._completions.create(*args, **kwargs)
                     routed_experts = None
                 else:
-                    raw_response = (
-                        await self._binary_completions.with_raw_response.create(
-                            *args, **kwargs
+                    async with self._binary_completions.with_streaming_response.create(
+                        *args, **kwargs
+                    ) as raw_response:
+                        (
+                            response,
+                            routed_experts,
+                        ) = await decode_routed_experts_response_stream(
+                            raw_response.iter_bytes()
                         )
-                    )
-                    response, routed_experts = decode_routed_experts_response(
-                        raw_response.content
-                    )
         except APIConnectionError as exc:
             if self._managed_serving_base_url is not None:
                 raise LocalServingUnavailableError(

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from array import array
-from collections.abc import AsyncIterable, AsyncIterator, Mapping
+from collections.abc import AsyncIterable, AsyncIterator, Iterator, Mapping
 import hashlib
 import struct
 import sys
-from typing import Any, Literal, NamedTuple, TypeVar
+from typing import Any, Literal, NamedTuple, TypeVar, cast
 import uuid
 
 from msgspec import msgpack
@@ -58,6 +58,9 @@ RouteWireEncoding = Literal["inline", "prefix_tree"]
 FORWARD_SUBMISSION_MEDIA_TYPE = "application/vnd.art.forward-framed+msgpack"
 FORWARD_SUBMISSION_PREFIX_BYTES = 16
 MAX_FORWARD_SUBMISSION_MANIFEST_BYTES = 16 << 20
+MAX_FORWARD_SUBMISSION_BYTES = 4 << 30
+MAX_FORWARD_SUBMISSION_CHUNKS = 1 << 20
+FORWARD_SUBMISSION_CHUNK_BYTES = 1 << 20
 _FORWARD_SUBMISSION_MAGIC = b"ARTFWD02"
 _FORWARD_SUBMISSION_PREFIX = struct.Struct("!8sQ")
 
@@ -68,6 +71,20 @@ class _RouteEntry(NamedTuple):
     scope_index: int
     choice_index: int
     route: Any
+
+
+class _PackedRouteSequences(NamedTuple):
+    chunks: tuple[memoryview, ...]
+    byte_count: int
+    slices: tuple[tuple[tuple[int, int], ...], ...]
+    sha256: str | None
+
+
+class _PackedRouteObject(NamedTuple):
+    chunks: tuple[memoryview, ...]
+    byte_count: int
+    sha256: str
+    slices: tuple[RemoteRouteSlice, ...]
 
 
 class _RouteByteSlice(BaseModel):
@@ -147,17 +164,19 @@ class EncodedTrainingObject(BaseModel):
 
 
 class EncodedRouteObject(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     ref: RemoteRouteObjectRef
-    payload: bytes
+    chunks: tuple[memoryview, ...]
 
     @model_validator(mode="after")
     def _validate_payload(self) -> "EncodedRouteObject":
         if self.ref.transport != "command" or self.ref.sha256 is None:
             raise ValueError("encoded route bytes require command transport")
-        if len(self.payload) != self.ref.byte_count:
+        if _validate_wire_chunks(self.chunks) != self.ref.byte_count:
             raise ValueError("route byte count differs from its reference")
+        if self.ref.byte_count > MAX_FORWARD_SUBMISSION_BYTES:
+            raise ValueError("route object exceeds the configured limit")
         return self
 
 
@@ -217,34 +236,63 @@ class ForwardSubmissionManifest(BaseModel):
 
 
 class EncodedForwardSubmission(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     preamble: bytes
-    payloads: tuple[bytes, ...]
+    chunks: tuple[memoryview, ...]
     byte_count: int
 
     @model_validator(mode="after")
     def _validate_size(self) -> "EncodedForwardSubmission":
-        if self.byte_count != len(self.preamble) + sum(map(len, self.payloads)):
+        if self.byte_count != len(self.preamble) + _validate_wire_chunks(self.chunks):
             raise ValueError("forward submission byte count is inconsistent")
+        if self.byte_count > MAX_FORWARD_SUBMISSION_BYTES:
+            raise ValueError("forward submission exceeds the configured limit")
         return self
 
     def stream(self) -> AsyncIterable[bytes]:
-        return _ForwardSubmissionStream(self.preamble, self.payloads)
+        return _ForwardSubmissionStream(self.preamble, self.chunks)
 
 
 class _ForwardSubmissionStream:
-    def __init__(self, preamble: bytes, payloads: tuple[bytes, ...]) -> None:
+    def __init__(self, preamble: bytes, chunks: tuple[memoryview, ...]) -> None:
         self._preamble = preamble
-        self._payloads = payloads
+        self._chunks = chunks
 
     def __aiter__(self) -> AsyncIterator[bytes]:
         return self._iterate()
 
     async def _iterate(self) -> AsyncIterator[bytes]:
-        yield self._preamble
-        for payload in self._payloads:
-            yield payload
+        for chunk in _iter_readonly_chunks(self._preamble):
+            yield cast(bytes, chunk)
+        for chunk in self._chunks:
+            yield cast(bytes, chunk)
+
+
+def _iter_readonly_chunks(data: bytes | memoryview) -> Iterator[memoryview]:
+    view = memoryview(data)
+    if not view.c_contiguous:
+        raise ValueError("wire chunks must be contiguous")
+    view = view.cast("B").toreadonly()
+    for offset in range(0, len(view), FORWARD_SUBMISSION_CHUNK_BYTES):
+        yield view[offset : offset + FORWARD_SUBMISSION_CHUNK_BYTES]
+
+
+def _validate_wire_chunks(chunks: tuple[memoryview, ...]) -> int:
+    if not chunks or len(chunks) > MAX_FORWARD_SUBMISSION_CHUNKS:
+        raise ValueError("wire chunk count is outside the configured bounds")
+    byte_count = 0
+    for chunk in chunks:
+        if (
+            not chunk.readonly
+            or not chunk.c_contiguous
+            or chunk.ndim != 1
+            or chunk.format != "B"
+            or not 0 < len(chunk) <= FORWARD_SUBMISSION_CHUNK_BYTES
+        ):
+            raise ValueError("wire chunks must be bounded readonly byte views")
+        byte_count += len(chunk)
+    return byte_count
 
 
 def encode_trajectory_group(
@@ -256,9 +304,9 @@ def encode_trajectory_group(
     data_id = object_id or _object_id(uuid.uuid4().hex)
     source = bundle.payload()
     if route_encoding == "prefix_tree":
-        stripped, route_payload, slices = _extract_routes(source)
+        stripped, route_payload = _extract_routes(source)
     elif route_encoding == "inline":
-        stripped, route_payload, slices = source, b"", ()
+        stripped, route_payload = source, None
     else:
         raise ValueError(f"unsupported route wire encoding: {route_encoding!r}")
     data = _encode_training_object(
@@ -270,16 +318,15 @@ def encode_trajectory_group(
     )
     routes: tuple[EncodedRouteObject, ...] = ()
     remote_routes: tuple[RemoteRouteObject, ...] = ()
-    if route_payload:
-        route_digest = hashlib.sha256(route_payload).hexdigest()
+    if route_payload is not None and route_payload.byte_count:
         route_ref = RemoteRouteObjectRef(
-            object_id=_object_id(f"{data_id}:{route_digest}"),
-            byte_count=len(route_payload),
+            object_id=_object_id(f"{data_id}:{route_payload.sha256}"),
+            byte_count=route_payload.byte_count,
             transport="command",
-            sha256=route_digest,
+            sha256=route_payload.sha256,
         )
-        routes = (EncodedRouteObject(ref=route_ref, payload=route_payload),)
-        remote_routes = (RemoteRouteObject(ref=route_ref, slices=slices),)
+        routes = (EncodedRouteObject(ref=route_ref, chunks=route_payload.chunks),)
+        remote_routes = (RemoteRouteObject(ref=route_ref, slices=route_payload.slices),)
     return EncodedRlGroup(
         data=data,
         routes=routes,
@@ -368,7 +415,7 @@ def decode_trajectory_group(
 
 def _extract_routes(
     payload: TrajectoryGroupPayload,
-) -> tuple[TrajectoryGroupPayload, bytes, tuple[RemoteRouteSlice, ...]]:
+) -> tuple[TrajectoryGroupPayload, _PackedRouteObject]:
     entries: list[_RouteEntry] = []
     trajectories = []
     for trajectory_index, trajectory in enumerate(payload.trajectories):
@@ -409,10 +456,9 @@ def _extract_routes(
                 }
             )
         )
-    return (
-        payload.model_copy(update={"trajectories": tuple(trajectories)}),
-        *_pack_route_entries(entries),
-    )
+    return payload.model_copy(
+        update={"trajectories": tuple(trajectories)}
+    ), _pack_route_entries(entries)
 
 
 def _strip_route_map(
@@ -442,13 +488,14 @@ def _strip_route_map(
 
 def _pack_route_entries(
     entries: list[_RouteEntry],
-) -> tuple[bytes, tuple[RemoteRouteSlice, ...]]:
-    if not entries:
-        return b"", ()
-    data, route_slices = _pack_route_sequences(
-        tuple((entry.route, _route_token_ids(entry.route)) for entry in entries)
+) -> _PackedRouteObject:
+    packed = _pack_route_sequences(
+        tuple((entry.route, _route_token_ids(entry.route)) for entry in entries),
+        compute_sha256=True,
     )
-    return data, tuple(
+    if packed.sha256 is None:
+        raise RuntimeError("route object identity was not computed")
+    slices = tuple(
         RemoteRouteSlice(
             trajectory_index=entry.trajectory_index,
             scope=entry.scope,
@@ -458,16 +505,29 @@ def _pack_route_entries(
             offset=offset,
             byte_count=byte_count,
         )
-        for entry, slices in zip(entries, route_slices, strict=True)
-        for segment_index, (offset, byte_count) in enumerate(slices)
+        for entry, route_slices in zip(entries, packed.slices, strict=True)
+        for segment_index, (offset, byte_count) in enumerate(route_slices)
+    )
+    return _PackedRouteObject(
+        chunks=packed.chunks,
+        byte_count=packed.byte_count,
+        sha256=packed.sha256,
+        slices=slices,
     )
 
 
 def _pack_route_sequences(
     entries: tuple[tuple[Any, tuple[int, ...]], ...],
-) -> tuple[bytes, tuple[tuple[tuple[int, int], ...], ...]]:
+    *,
+    compute_sha256: bool = False,
+) -> _PackedRouteSequences:
     if not entries:
-        return b"", ()
+        return _PackedRouteSequences(
+            chunks=(),
+            byte_count=0,
+            slices=(),
+            sha256=hashlib.sha256().hexdigest() if compute_sha256 else None,
+        )
     token_keys: dict[tuple[int, str, int, int, memoryview], int] = {}
     rows = []
     for route, token_ids in entries:
@@ -487,23 +547,38 @@ def _pack_route_sequences(
         shareable_lengths=tuple(map(len, rows)),
         min_shared_segment_length=1,
     )
-    data = bytearray()
+    chunks: list[memoryview] = []
+    byte_count = 0
+    digest = hashlib.sha256() if compute_sha256 else None
     slices: list[list[tuple[int, int]]] = [[] for _ in entries]
     for segment in planned:
         route = entries[segment.sequence_indices[0]][0]
         bytes_per_token = _route_bytes_per_token(route)
-        chunks = _route_data_range(
+        source_chunks = _route_data_range(
             route.data,
             segment.start * bytes_per_token,
             segment.end * bytes_per_token,
         )
-        offset = len(data)
-        for chunk in chunks:
-            data.extend(chunk)
-        byte_count = len(data) - offset
+        offset = byte_count
+        for source_chunk in source_chunks:
+            for chunk in _iter_readonly_chunks(source_chunk):
+                chunks.append(chunk)
+                byte_count += len(chunk)
+                if byte_count > MAX_FORWARD_SUBMISSION_BYTES:
+                    raise ValueError("route object exceeds the configured limit")
+                if len(chunks) > MAX_FORWARD_SUBMISSION_CHUNKS:
+                    raise ValueError("route object has too many wire chunks")
+                if digest is not None:
+                    digest.update(chunk)
+        segment_byte_count = byte_count - offset
         for sequence_index in segment.sequence_indices:
-            slices[sequence_index].append((offset, byte_count))
-    return bytes(data), tuple(tuple(value) for value in slices)
+            slices[sequence_index].append((offset, segment_byte_count))
+    return _PackedRouteSequences(
+        chunks=tuple(chunks),
+        byte_count=byte_count,
+        slices=tuple(tuple(value) for value in slices),
+        sha256=digest.hexdigest() if digest is not None else None,
+    )
 
 
 def _route_token_ids(route: Any) -> tuple[int, ...]:
@@ -588,7 +663,7 @@ def _encode_tokenized_wire_batch(
         )
         if any(route is None for route, _ in entries):
             raise ValueError("tokenized routes must be present for every datum")
-        data, slices = _pack_route_sequences(
+        packed = _pack_route_sequences(
             tuple((route, tokens) for route, tokens in entries if route is not None)
         )
         stripped = batch.model_copy(
@@ -602,7 +677,7 @@ def _encode_tokenized_wire_batch(
         wire = _TokenizedWireBatch(
             batch=stripped,
             route_pool=_TokenizedRoutePool(
-                data=data,
+                data=b"".join(packed.chunks),
                 bindings=tuple(
                     _TokenizedRouteBinding(
                         datum_index=index,
@@ -621,7 +696,7 @@ def _encode_tokenized_wire_batch(
                         ),
                     )
                     for index, ((route, _), datum_slices) in enumerate(
-                        zip(entries, slices, strict=True)
+                        zip(entries, packed.slices, strict=True)
                     )
                     if route is not None
                 ),
@@ -680,13 +755,15 @@ def encode_forward_submission(
         _FORWARD_SUBMISSION_PREFIX.pack(_FORWARD_SUBMISSION_MAGIC, len(manifest))
         + manifest
     )
-    payloads = tuple(value.payload for value in batch.objects) + tuple(
-        value.payload for value in batch.route_objects
-    )
+    chunks = tuple(
+        chunk
+        for value in batch.objects
+        for chunk in _iter_readonly_chunks(value.payload)
+    ) + tuple(chunk for value in batch.route_objects for chunk in value.chunks)
     return EncodedForwardSubmission(
         preamble=preamble,
-        payloads=payloads,
-        byte_count=len(preamble) + sum(map(len, payloads)),
+        chunks=chunks,
+        byte_count=len(preamble) + sum(map(len, chunks)),
     )
 
 

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .packing import TrajectoryGroupPayload
 
 TRAJECTORY_FORMAT = "art_trajectory_v1"
+_ROUTE_BYTES_EXT = 1
 
 
 class _Contract(BaseModel):
@@ -93,7 +94,7 @@ class TrajectoryGroupBundle(_Contract):
                 )
             ),
             records=tuple(
-                msgpack.encode(record.model_dump(mode="python"))
+                _encode_trajectory_record(record.model_dump(mode="python"))
                 for record in payload.trajectories
             ),
         )
@@ -111,12 +112,37 @@ class TrajectoryGroupBundle(_Contract):
 
         header = msgpack.decode(self.header)
         header["trajectories"] = tuple(
-            msgpack.decode(record) for record in self.records
+            msgpack.decode(record, ext_hook=_decode_trajectory_record_ext)
+            for record in self.records
         )
         return TrajectoryGroupPayload.model_validate(header)
 
     def build(self) -> TrajectoryGroup:
         return self.payload().build()
+
+
+def _encode_trajectory_record(record: dict[str, Any]) -> bytes:
+    from msgspec import msgpack
+
+    route_maps = [record["choice_routing_metadata"]]
+    route_maps.extend(record["additional_history_choice_routing_metadata"])
+    route_maps.extend(record["exchange_choice_routing_metadata"])
+    for routes in route_maps:
+        for route in routes.values():
+            route["data"] = tuple(
+                msgpack.Ext(
+                    _ROUTE_BYTES_EXT,
+                    memoryview(chunk).cast("B").toreadonly(),
+                )
+                for chunk in route["data"]
+            )
+    return msgpack.encode(record)
+
+
+def _decode_trajectory_record_ext(code: int, data: memoryview) -> memoryview:
+    if code != _ROUTE_BYTES_EXT:
+        raise ValueError(f"unsupported trajectory record extension: {code}")
+    return data.cast("B").toreadonly()
 
 
 class TrajectoryGroupLayout(_Contract):
