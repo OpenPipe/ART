@@ -923,9 +923,18 @@ class ServerlessBackend:
                 trajectory_groups=groups,
                 trainer_started=started,
             )
+            policy_counts = forward_result.packing.policy_token_counts
+            if policy_counts is None:
+                raise RuntimeError(
+                    "remote RL packing omitted exact policy token counts"
+                )
             return ServerlessTrainResult(
                 step=step,
                 metrics=metrics,
+                packed_policy_token_counts=tuple(
+                    (value.policy_version, value.trainable_assistant_tokens)
+                    for value in policy_counts
+                ),
                 checkpoint_id=sampler_result.checkpoint.checkpoint_id,
             )
 

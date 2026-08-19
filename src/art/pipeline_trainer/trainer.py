@@ -1188,6 +1188,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 step_seconds=item.step_seconds,
                 result_metrics=metrics,
                 age_metrics=item.policy_age_metrics,
+                packed_policy_token_counts=item.result.packed_policy_token_counts,
             )
         )
         phases["metrics"] = time.monotonic() - started
@@ -2119,6 +2120,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         step_seconds: float,
         result_metrics: dict[str, float],
         age_metrics: dict[str, float] | None = None,
+        packed_policy_token_counts: tuple[tuple[int, int], ...] | None = None,
     ) -> dict[str, float]:
         metrics: dict[str, float] = {}
         accepted_groups = float(len(batch))
@@ -2130,11 +2132,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         )
         metrics["sample_efficiency/batch_factor"] = batch_factor
 
-        age_metrics = (
-            self._batch_policy_age_metrics(current_step, batch)
-            if age_metrics is None
-            else dict(age_metrics)
-        )
+        if packed_policy_token_counts is not None:
+            age_metrics = self._policy_token_count_age_metrics(
+                current_step, packed_policy_token_counts
+            )
+        elif age_metrics is None:
+            age_metrics = self._batch_policy_age_metrics(current_step, batch)
+        else:
+            age_metrics = dict(age_metrics)
         age_exp_moment = age_metrics.pop("_policy_age_exp_tau8", None)
         metrics.update(age_metrics)
         mean_age = age_metrics.get("offpolicy/token_weighted_policy_age_steps")
@@ -2151,6 +2156,33 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             metrics["throughput/accepted_train_tok_per_s"] = accepted_tok_per_s
             metrics["objective/score"] = accepted_tok_per_s * freshness * batch_factor
         return metrics
+
+    def _policy_token_count_age_metrics(
+        self,
+        current_step: int,
+        counts: tuple[tuple[int, int], ...],
+    ) -> dict[str, float]:
+        weighted_ages = []
+        age_sum = 0.0
+        age_exp_sum = 0.0
+        weight_sum = 0.0
+        for policy_version, count in counts:
+            if count <= 0:
+                raise RuntimeError("packed policy token counts must be positive")
+            age = self._policy_age(current_step, policy_version)
+            age_sum += age * count
+            age_exp_sum += _policy_age_exp(age) * count
+            weight_sum += count
+            weighted_ages.append((age, float(count)))
+        if weight_sum <= 0:
+            return {}
+        return {
+            "offpolicy/token_weighted_policy_age_steps": age_sum / weight_sum,
+            "_policy_age_exp_tau8": age_exp_sum / weight_sum,
+            "offpolicy/token_weighted_policy_age_p95_steps": _weighted_percentile(
+                weighted_ages, 0.95
+            ),
+        }
 
     def _batch_rollouts_per_group(self, batch: list[TrajectoryGroup]) -> float | None:
         group_sizes = [len(group.trajectories) for group in batch]

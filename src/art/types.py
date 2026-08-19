@@ -96,6 +96,7 @@ class TrainResult:
 
     step: int
     metrics: dict[str, float] = field(default_factory=dict)
+    packed_policy_token_counts: tuple[tuple[int, int], ...] | None = None
 
 
 @dataclass
