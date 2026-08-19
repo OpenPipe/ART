@@ -327,6 +327,9 @@ class MegatronTrainingSlot:
                 generation_id=uuid.uuid4().hex,
                 trajectory_groups=request.batch.groups,
                 moe_route_groups=request.batch.local_moe_route_groups(),
+                moe_route_object_transfer=(
+                    request.batch.local_moe_route_object_transfer()
+                ),
                 trajectory_annotations=request.batch.local_group_annotations(),
                 advantage_balance=config.advantage_balance,
                 allow_training_without_logprobs=bool(

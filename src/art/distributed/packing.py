@@ -33,6 +33,7 @@ from .moe_route_store import (
     MoeRouteBatchTransfer,
     MoeRouteBytes,
     MoeRouteGroupPayload,
+    MoeRouteObjectBatchTransfer,
 )
 from .rollout import RolloutModelSpec
 from .trajectory_store import (
@@ -325,6 +326,7 @@ class PackingRequest(BaseModel):
     tokenized_loss: TokenizedLossName | None = None
     moe_route_groups: tuple[MoeRouteGroupPayload, ...] = ()
     moe_route_transfer: MoeRouteBatchTransfer | None = None
+    moe_route_object_transfer: MoeRouteObjectBatchTransfer | None = None
     trajectory_annotations: tuple[TrajectoryGroupAnnotations | None, ...] = ()
     trajectory_sources: tuple[TrajectoryQueueItem, ...] = ()
     trajectory_log_path: str | None = None
@@ -357,9 +359,11 @@ class PackingRequest(BaseModel):
         )
         if tokenized != (self.tokenized_loss is not None):
             raise ValueError("tokenized packing requires its named loss")
-        route_inputs = bool(self.moe_route_groups), self.moe_route_transfer is not None
-        if sum(route_inputs) > 1:
-            raise ValueError("packing accepts one MoE route input")
+        route_inputs = (
+            bool(self.moe_route_groups),
+            self.moe_route_transfer is not None,
+            self.moe_route_object_transfer is not None,
+        )
         if tokenized and (
             any(route_inputs)
             or self.trajectory_annotations
@@ -393,6 +397,11 @@ class PackingRequest(BaseModel):
             and len(self.moe_route_transfer.groups) != group_count
         ):
             raise ValueError("trajectory and route transfers are not aligned")
+        if (
+            self.moe_route_object_transfer is not None
+            and len(self.moe_route_object_transfer.groups) != group_count
+        ):
+            raise ValueError("trajectory and object routes are not aligned")
         if (
             self.trajectory_annotations
             and len(self.trajectory_annotations) != group_count

@@ -12,6 +12,13 @@ from .data_plane import (
     ByteStreamTransfer,
     receive_byte_stream,
 )
+from .object_store import (
+    MOE_ROUTE_OBJECT_FORMAT,
+    S3BinaryObjectReceiver,
+    S3ObjectStoreConfig,
+    binary_object_manifest_uri,
+    moe_route_object_target,
+)
 
 if TYPE_CHECKING:
     from .packing import TrajectoryGroupPayload, _ChoiceRoutingPayload
@@ -120,6 +127,99 @@ class MoeRouteBatchTransfer(_Contract):
         finally:
             view.release()
         return tuple(groups)
+
+
+class MoeRouteStoredObject(_Contract):
+    object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=1)
+    format: Literal["art_moe_route_bundle_v2"] = MOE_ROUTE_OBJECT_FORMAT
+    slices: tuple[MoeRouteSlice, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_slices(self) -> "MoeRouteStoredObject":
+        validate_moe_route_slices(self.slices, self.byte_count)
+        return self
+
+
+class MoeRouteObjectBatchTransfer(_Contract):
+    """Immutable route objects fetched by the selected trainer-host packer."""
+
+    tenant_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    store: S3ObjectStoreConfig
+    groups: tuple[tuple[MoeRouteStoredObject, ...], ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_objects(self) -> "MoeRouteObjectBatchTransfer":
+        objects: dict[str, tuple[int, str]] = {}
+        for group in self.groups:
+            for value in group:
+                identity = value.byte_count, value.format
+                prior = objects.setdefault(value.object_id, identity)
+                if prior != identity:
+                    raise ValueError("stored route object changed immutable identity")
+        if not objects:
+            raise ValueError("stored route transfer cannot be empty")
+        return self
+
+    async def receive_groups(
+        self,
+        receiver: S3BinaryObjectReceiver,
+        slots: asyncio.Semaphore,
+        *,
+        timeout_s: float,
+    ) -> tuple[MoeRouteGroupPayload, ...]:
+        objects = {value.object_id: value for group in self.groups for value in group}
+
+        async def receive(value: MoeRouteStoredObject) -> bytes:
+            async with slots:
+                return await asyncio.to_thread(self._receive, receiver, value)
+
+        async with asyncio.timeout(timeout_s):
+            payloads = dict(
+                zip(
+                    objects,
+                    await asyncio.gather(
+                        *(receive(value) for value in objects.values())
+                    ),
+                    strict=True,
+                )
+            )
+        return tuple(
+            MoeRouteGroupPayload(
+                objects=tuple(
+                    MoeRouteObjectPayload(
+                        data=payloads[value.object_id], slices=value.slices
+                    )
+                    for value in group
+                )
+            )
+            for group in self.groups
+        )
+
+    def _receive(
+        self, receiver: S3BinaryObjectReceiver, value: MoeRouteStoredObject
+    ) -> bytes:
+        target = moe_route_object_target(
+            self.store,
+            tenant_id=self.tenant_id,
+            run_id=self.run_id,
+            object_id=value.object_id,
+        )
+        contents = receiver.read_file(
+            binary_object_manifest_uri(target),
+            expected_format=value.format,
+            expected_metadata={"tenant_id": self.tenant_id, "run_id": self.run_id},
+            relative_path="routes.bin",
+        )
+        if (
+            contents.ref.object_id != value.object_id
+            or contents.ref.byte_count != value.byte_count
+            or contents.file.byte_count != value.byte_count
+            or len(contents.ref.files) != 1
+        ):
+            raise RuntimeError("stored route object changed immutable identity")
+        return contents.data
 
 
 async def publish_moe_route_groups(

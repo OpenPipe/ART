@@ -15,7 +15,10 @@ from pydantic import (
     model_validator,
 )
 
-from art.distributed.moe_route_store import MoeRouteGroupPayload
+from art.distributed.moe_route_store import (
+    MoeRouteGroupPayload,
+    MoeRouteObjectBatchTransfer,
+)
 from art.distributed.trajectory_store import (
     TrajectoryGroupAnnotations,
     TrajectoryGroupBundle,
@@ -62,6 +65,9 @@ class RlTrajectoryBatch(Contract):
     _local_groups: tuple[Any, ...] | None = PrivateAttr(default=None)
     _local_packed_batch: Any | None = PrivateAttr(default=None)
     _local_moe_route_groups: tuple[MoeRouteGroupPayload, ...] = PrivateAttr(default=())
+    _local_moe_route_object_transfer: MoeRouteObjectBatchTransfer | None = PrivateAttr(
+        default=None
+    )
     _local_group_annotations: tuple[TrajectoryGroupAnnotations | None, ...] = (
         PrivateAttr(default=())
     )
@@ -111,6 +117,7 @@ class RlTrajectoryBatch(Contract):
         max_source_version: int,
         groups: Sequence[Any] | None = None,
         moe_route_groups: Sequence[MoeRouteGroupPayload] = (),
+        moe_route_object_transfer: MoeRouteObjectBatchTransfer | None = None,
         group_annotations: Sequence[TrajectoryGroupAnnotations | None] = (),
     ) -> "RlTrajectoryBatch":
         if groups is not None and len(bundles) != len(groups):
@@ -119,6 +126,10 @@ class RlTrajectoryBatch(Contract):
             )
         if moe_route_groups and len(bundles) != len(moe_route_groups):
             raise ValueError("trajectory bundles and route groups are not aligned")
+        if moe_route_object_transfer is not None and len(bundles) != len(
+            moe_route_object_transfer.groups
+        ):
+            raise ValueError("trajectory bundles and object routes are not aligned")
         if group_annotations and len(bundles) != len(group_annotations):
             raise ValueError("trajectory bundles and annotations are not aligned")
         batch = cls(
@@ -129,6 +140,9 @@ class RlTrajectoryBatch(Contract):
         if groups is not None:
             object.__setattr__(batch, "_local_groups", tuple(groups))
         object.__setattr__(batch, "_local_moe_route_groups", tuple(moe_route_groups))
+        object.__setattr__(
+            batch, "_local_moe_route_object_transfer", moe_route_object_transfer
+        )
         object.__setattr__(batch, "_local_group_annotations", tuple(group_annotations))
         return batch
 
@@ -146,6 +160,9 @@ class RlTrajectoryBatch(Contract):
 
     def local_moe_route_groups(self) -> tuple[MoeRouteGroupPayload, ...]:
         return self._local_moe_route_groups
+
+    def local_moe_route_object_transfer(self) -> MoeRouteObjectBatchTransfer | None:
+        return self._local_moe_route_object_transfer
 
     def local_group_annotations(
         self,

@@ -4,6 +4,7 @@ import asyncio
 from collections import OrderedDict
 from functools import partial, wraps
 import gc
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -44,6 +45,7 @@ from .host_admission import (
 )
 from .moe_route_store import (
     MoeRouteGroupPayload,
+    MoeRouteObjectBatchTransfer,
     hydrate_trajectory_group_routes,
 )
 from .monarch_runtime import RemoteCallError, RemoteCallResult
@@ -57,6 +59,7 @@ from .nccl_preflight import (
     run_nccl_probe,
     start_nccl_rendezvous,
 )
+from .object_store import S3BinaryObjectReceiver
 from .packing import PackingRequest, PackingResult
 from .rollout import RolloutInvocation, RolloutResult
 from .specs import HostServiceHealth
@@ -108,6 +111,25 @@ def _build_packing_groups(
             annotation.apply(group)
         groups.append(group)
     return groups
+
+
+def _merge_moe_route_groups(
+    group_count: int,
+    *sources: tuple[MoeRouteGroupPayload, ...],
+) -> tuple[MoeRouteGroupPayload, ...]:
+    present = tuple(source for source in sources if source)
+    if not present:
+        return ()
+    if any(len(source) != group_count for source in present):
+        raise ValueError("trajectory bundles and route groups are not aligned")
+    return tuple(
+        MoeRouteGroupPayload(
+            objects=tuple(
+                value for source in present for value in source[index].objects
+            )
+        )
+        for index in range(group_count)
+    )
 
 
 def resilient_endpoint(function: Any = None, *, concurrent: bool = False) -> Any:
@@ -208,6 +230,8 @@ class ArtHostService(Actor):
         self._packing_gc_threshold: tuple[int, int, int] | None = None
         self._packing_lock = asyncio.Lock()
         self._packing_tasks: set[asyncio.Task[Any]] = set()
+        self._moe_route_receivers: dict[str, S3BinaryObjectReceiver] = {}
+        self._moe_route_receive_slots = asyncio.Semaphore(4)
         self._closing = False
         self._vllm_output_root = vllm_output_root
         self._vllm_launcher = None
@@ -317,6 +341,14 @@ class ArtHostService(Actor):
         self._closing = True
         if self._packing_tasks:
             await asyncio.gather(*tuple(self._packing_tasks))
+        if self._moe_route_receivers:
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(receiver.close)
+                    for receiver in self._moe_route_receivers.values()
+                )
+            )
+            self._moe_route_receivers.clear()
         probe_ids = tuple(
             {
                 *self._nccl_cleanups,
@@ -483,6 +515,61 @@ class ArtHostService(Actor):
             )
         return self._vllm_launcher
 
+    def _moe_route_receiver(
+        self, transfer: MoeRouteObjectBatchTransfer
+    ) -> S3BinaryObjectReceiver:
+        key = hashlib.sha256(transfer.store.model_dump_json().encode()).hexdigest()
+        receiver = self._moe_route_receivers.get(key)
+        if receiver is None:
+            receiver = S3BinaryObjectReceiver(
+                transfer.store,
+                Path(self._vllm_output_root) / "moe_route_objects" / key,
+            )
+            self._moe_route_receivers[key] = receiver
+        return receiver
+
+    async def _receive_moe_route_groups(
+        self, request: PackingRequest, batch_id: str, timeout_s: float
+    ) -> tuple[MoeRouteGroupPayload, ...]:
+        streamed: tuple[MoeRouteGroupPayload, ...] = ()
+        stored: tuple[MoeRouteGroupPayload, ...] = ()
+        receives = []
+        if request.moe_route_transfer is not None:
+            if request.moe_route_transfer.stream.stream_id != (
+                f"{batch_id}:moe-routes"
+            ):
+                raise ValueError("packing request has the wrong route stream")
+            receives.append(
+                request.moe_route_transfer.receive_groups(timeout_s=timeout_s)
+            )
+        if request.moe_route_object_transfer is not None:
+            transfer = request.moe_route_object_transfer
+            receives.append(
+                transfer.receive_groups(
+                    self._moe_route_receiver(transfer),
+                    self._moe_route_receive_slots,
+                    timeout_s=timeout_s,
+                )
+            )
+        if receives:
+            values = await asyncio.gather(*receives)
+            if request.moe_route_transfer is not None:
+                streamed = values[0]
+            if request.moe_route_object_transfer is not None:
+                stored = values[-1]
+        return _merge_moe_route_groups(
+            len(request.moe_route_object_transfer.groups)
+            if request.moe_route_object_transfer is not None
+            else (
+                len(request.moe_route_transfer.groups)
+                if request.moe_route_transfer is not None
+                else len(request.moe_route_groups)
+            ),
+            request.moe_route_groups,
+            streamed,
+            stored,
+        )
+
     @resilient_endpoint(concurrent=True)
     async def start_vllm_member(self, request: HostMemberLaunchRequest):
         if self._admission_report is None:
@@ -544,11 +631,14 @@ class ArtHostService(Actor):
             )
             trajectory_receive_s = time.monotonic() - receive_started
         elif request.trajectory_transfer is None:
+            route_groups = await self._receive_moe_route_groups(
+                request, batch_id, transfer_timeout_s
+            )
             build_started = time.monotonic()
             groups = await asyncio.to_thread(
                 _build_packing_groups,
                 request.trajectory_groups,
-                request.moe_route_groups,
+                route_groups,
                 request.trajectory_annotations,
             )
             trajectory_build_s = time.monotonic() - build_started
@@ -561,20 +651,10 @@ class ArtHostService(Actor):
                 timeout_s=transfer_timeout_s
             )
             receive_started = time.monotonic()
-            if request.moe_route_transfer is None:
-                bundles = await bundle_receive
-                route_groups: tuple[MoeRouteGroupPayload, ...] = ()
-            else:
-                if request.moe_route_transfer.stream.stream_id != (
-                    f"{batch_id}:moe-routes"
-                ):
-                    raise ValueError("packing request has the wrong route stream")
-                bundles, route_groups = await asyncio.gather(
-                    bundle_receive,
-                    request.moe_route_transfer.receive_groups(
-                        timeout_s=transfer_timeout_s
-                    ),
-                )
+            bundles, route_groups = await asyncio.gather(
+                bundle_receive,
+                self._receive_moe_route_groups(request, batch_id, transfer_timeout_s),
+            )
             trajectory_receive_s = time.monotonic() - receive_started
             build_started = time.monotonic()
             groups = await asyncio.to_thread(
