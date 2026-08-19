@@ -147,7 +147,7 @@ def export_checkpoint_bundle(
             shutil.rmtree(staging)
 
 
-def restore_checkpoint_bundle(
+def consume_checkpoint_bundle(
     source: str | Path,
     *,
     output_dir: str | Path,
@@ -166,10 +166,9 @@ def restore_checkpoint_bundle(
         try:
             for record in manifest.adapter.files:
                 relative = f"adapter/{record.name}"
-                _copy_file(
+                _move_verified_file(
                     bundle / relative,
                     staging / record.name,
-                    relative,
                     expected=bundle_files[relative],
                 )
             adapter = publish_adapter_checkpoint(
@@ -201,10 +200,9 @@ def restore_checkpoint_bundle(
                 for record in manifest.files:
                     if not record.path.startswith("optimizer/"):
                         continue
-                    _copy_file(
+                    _move_verified_file(
                         bundle / record.path,
                         pending / PurePosixPath(record.path).name,
-                        record.path,
                         expected=record,
                     )
                 restored_manifest = manifest.optimizer.model_copy(
@@ -283,6 +281,19 @@ def _verify_file(path: Path, expected: BundleFile) -> None:
             digest.update(chunk)
     if digest.hexdigest() != expected.sha256:
         raise RuntimeError(f"checkpoint bundle file hash differs: {path}")
+
+
+def _move_verified_file(source: Path, target: Path, *, expected: BundleFile) -> None:
+    _verify_file(source, expected)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.stat().st_dev != target.parent.stat().st_dev:
+        raise RuntimeError(
+            "checkpoint restore staging must share its target filesystem"
+        )
+    os.replace(source, target)
+    with target.open("rb") as output:
+        os.fsync(output.fileno())
+    _fsync_directory(target.parent)
 
 
 def _write_manifest(path: Path, manifest: CheckpointBundleManifest) -> None:
