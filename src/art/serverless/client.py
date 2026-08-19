@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterable, Mapping
+from collections.abc import AsyncIterable, AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 import hashlib
 from typing import Any, Callable, Generic, TypeVar, cast
@@ -32,9 +32,15 @@ from art.training.contracts import (
 from art.utils.lifecycle import process_shutdown_timeout
 
 from .contracts import (
+    DEFAULT_CHECKPOINT_ALIAS_PAGE_LIMIT,
+    DEFAULT_CHECKPOINT_PAGE_LIMIT,
+    MAX_CHECKPOINT_ALIAS_PAGE_LIMIT,
+    MAX_CHECKPOINT_PAGE_LIMIT,
     MAX_OPERATION_RESULT_BYTES,
     ApplyCheckpointRetentionRequest,
     CancelOperationRequest,
+    CheckpointAliasPage,
+    CheckpointCursor,
     CheckpointPage,
     CheckpointView,
     CloseRunRequest,
@@ -311,9 +317,60 @@ class RemoteTrainingServiceClient:
             body=CloseRunRequest(request_id=request_id),
         )
 
-    async def list_checkpoints(self, run_id: str) -> CheckpointPage:
+    async def list_checkpoint_page(
+        self,
+        run_id: str,
+        *,
+        cursor: CheckpointCursor | None = None,
+        limit: int = DEFAULT_CHECKPOINT_PAGE_LIMIT,
+    ) -> CheckpointPage:
+        if not 1 <= limit <= MAX_CHECKPOINT_PAGE_LIMIT:
+            raise ValueError("checkpoint page limit is invalid")
+        query = httpx.QueryParams(
+            {"limit": str(limit), **({"cursor": cursor} if cursor is not None else {})}
+        )
         return await self._request(
-            "GET", f"training/runs/{run_id}/checkpoints", CheckpointPage
+            "GET", f"training/runs/{run_id}/checkpoints?{query}", CheckpointPage
+        )
+
+    async def iter_checkpoint_pages(self, run_id: str) -> AsyncIterator[CheckpointPage]:
+        cursor: CheckpointCursor | None = None
+        current_checkpoint_id: str | None = None
+        first_page = True
+        while True:
+            page = await self.list_checkpoint_page(run_id, cursor=cursor)
+            if first_page:
+                current_checkpoint_id = page.current_checkpoint_id
+                first_page = False
+            elif page.current_checkpoint_id != current_checkpoint_id:
+                raise RemoteTrainingError(
+                    "current checkpoint changed while listing checkpoints"
+                )
+            yield page
+            next_cursor = page.next_cursor
+            if next_cursor is None:
+                return
+            if next_cursor == cursor:
+                raise RemoteTrainingError("remote checkpoint cursor did not advance")
+            cursor = next_cursor
+
+    async def list_checkpoint_alias_page(
+        self,
+        run_id: str,
+        checkpoint_id: str,
+        *,
+        cursor: CheckpointCursor | None = None,
+        limit: int = DEFAULT_CHECKPOINT_ALIAS_PAGE_LIMIT,
+    ) -> CheckpointAliasPage:
+        if not 1 <= limit <= MAX_CHECKPOINT_ALIAS_PAGE_LIMIT:
+            raise ValueError("checkpoint alias page limit is invalid")
+        query = httpx.QueryParams(
+            {"limit": str(limit), **({"cursor": cursor} if cursor is not None else {})}
+        )
+        return await self._request(
+            "GET",
+            f"training/runs/{run_id}/checkpoints/{checkpoint_id}/aliases?{query}",
+            CheckpointAliasPage,
         )
 
     async def apply_checkpoint_retention(

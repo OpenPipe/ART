@@ -34,6 +34,12 @@ MAX_RUN_METADATA_ITEMS = 64
 MAX_RUN_METADATA_KEY_LENGTH = 128
 MAX_RUN_METADATA_VALUE_LENGTH = 4096
 MAX_CHECKPOINT_RETENTION_ITEMS = 512
+DEFAULT_CHECKPOINT_PAGE_LIMIT = 100
+MAX_CHECKPOINT_PAGE_LIMIT = 512
+MAX_CHECKPOINT_CURSOR_LENGTH = 512
+DEFAULT_CHECKPOINT_ALIAS_PAGE_LIMIT = 100
+MAX_CHECKPOINT_ALIAS_PAGE_LIMIT = 512
+MAX_CHECKPOINT_ALIASES_PER_VIEW = DEFAULT_CHECKPOINT_ALIAS_PAGE_LIMIT
 
 TargetModule = Annotated[str, Field(min_length=1, max_length=MAX_TARGET_MODULE_LENGTH)]
 RunMetadataKey = Annotated[
@@ -42,6 +48,14 @@ RunMetadataKey = Annotated[
 RunMetadataValue = Annotated[str, Field(max_length=MAX_RUN_METADATA_VALUE_LENGTH)]
 ControlIdentifier = Annotated[
     str, Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+]
+CheckpointCursor = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=MAX_CHECKPOINT_CURSOR_LENGTH,
+        pattern=r"^[A-Za-z0-9_-]+$",
+    ),
 ]
 
 
@@ -369,7 +383,10 @@ class CheckpointView(Contract):
     checkpoint_id: str
     revision: int = Field(ge=1)
     learner_version: int = Field(ge=0)
-    aliases: tuple[str, ...] = ()
+    aliases: tuple[ControlIdentifier, ...] = Field(
+        default=(), max_length=MAX_CHECKPOINT_ALIASES_PER_VIEW
+    )
+    aliases_next_cursor: CheckpointCursor | None = None
     has_optimizer: bool
     state: Literal["ready", "deleting"]
     adapter_bytes: int = Field(ge=1)
@@ -382,8 +399,18 @@ class CheckpointView(Contract):
 
 
 class CheckpointPage(Contract):
-    checkpoints: tuple[CheckpointView, ...]
+    checkpoints: tuple[CheckpointView, ...] = Field(
+        max_length=MAX_CHECKPOINT_PAGE_LIMIT
+    )
     current_checkpoint_id: str | None
+    next_cursor: CheckpointCursor | None
+
+
+class CheckpointAliasPage(Contract):
+    aliases: tuple[ControlIdentifier, ...] = Field(
+        max_length=MAX_CHECKPOINT_ALIAS_PAGE_LIMIT
+    )
+    next_cursor: CheckpointCursor | None
 
 
 class CheckpointRevision(Contract):

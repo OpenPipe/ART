@@ -52,6 +52,7 @@ from .client import (
     RemoteTrainingServiceClient,
 )
 from .contracts import (
+    MAX_CHECKPOINT_RETENTION_ITEMS,
     AdapterSpec,
     ApplyCheckpointRetentionRequest,
     CheckpointRevision,
@@ -392,11 +393,11 @@ class ServerlessBackend:
             raise TypeError("ServerlessBackend only supports trainable models")
         client = await self.training_client(model)
         await client.shutdown()
-        checkpoints = await self._service.list_checkpoints(client.run_id)
-        for checkpoint in checkpoints.checkpoints:
-            await self._service.delete_checkpoint(
-                client.run_id, checkpoint.checkpoint_id
-            )
+        async for page in self._service.iter_checkpoint_pages(client.run_id):
+            for checkpoint in page.checkpoints:
+                await self._service.delete_checkpoint(
+                    client.run_id, checkpoint.checkpoint_id
+                )
         self._clients.pop(self._model_key(model))
 
     def logs_sft_metrics_remotely(self) -> bool:
@@ -648,15 +649,15 @@ class ServerlessBackend:
         async with self._exact_adapter_lock:
             self._validate_sampler_retention(model, keep)
             client = await self.training_client(model)
-            page = await self._service.list_checkpoints(client.run_id)
-            for checkpoint in page.checkpoints:
-                if (
-                    checkpoint.learner_version not in keep
-                    and checkpoint.checkpoint_id != page.current_checkpoint_id
-                ):
-                    await self._service.delete_checkpoint(
-                        client.run_id, checkpoint.checkpoint_id
-                    )
+            async for page in self._service.iter_checkpoint_pages(client.run_id):
+                for checkpoint in page.checkpoints:
+                    if (
+                        checkpoint.learner_version not in keep
+                        and checkpoint.checkpoint_id != page.current_checkpoint_id
+                    ):
+                        await self._service.delete_checkpoint(
+                            client.run_id, checkpoint.checkpoint_id
+                        )
             self._forget_sampler_results(model, keep)
 
     def _forget_sampler_results(
@@ -692,15 +693,22 @@ class ServerlessBackend:
         from art.pipeline_trainer.checkpoint_retention import CheckpointInfo
 
         client = await self.training_client(model)
-        page = await self._service.list_checkpoints(client.run_id)
-        return [
-            CheckpointInfo(
-                step=checkpoint.learner_version,
-                created_at=checkpoint.created_at,
-            )
-            for checkpoint in page.checkpoints
-            if checkpoint.state == "ready"
-        ]
+        checkpoints: list[CheckpointInfo] = []
+        async for page in self._service.iter_checkpoint_pages(client.run_id):
+            for checkpoint in page.checkpoints:
+                if checkpoint.state != "ready":
+                    continue
+                if len(checkpoints) == MAX_CHECKPOINT_RETENTION_ITEMS:
+                    raise RuntimeError(
+                        "remote checkpoint retention snapshot exceeds 512 checkpoints"
+                    )
+                checkpoints.append(
+                    CheckpointInfo(
+                        step=checkpoint.learner_version,
+                        created_at=checkpoint.created_at,
+                    )
+                )
+        return checkpoints
 
     def default_checkpoint_retention_strategy(
         self,
@@ -714,12 +722,18 @@ class ServerlessBackend:
     ) -> None:
         async with self._exact_adapter_lock:
             client = await self.training_client(model)
-            page = await self._service.list_checkpoints(client.run_id)
-            ready = tuple(
-                checkpoint
-                for checkpoint in page.checkpoints
-                if checkpoint.state == "ready"
-            )
+            ready = []
+            current_checkpoint_id = None
+            async for page in self._service.iter_checkpoint_pages(client.run_id):
+                current_checkpoint_id = page.current_checkpoint_id
+                for checkpoint in page.checkpoints:
+                    if checkpoint.state != "ready":
+                        continue
+                    if len(ready) == MAX_CHECKPOINT_RETENTION_ITEMS:
+                        raise RuntimeError(
+                            "remote checkpoint retention snapshot exceeds 512 checkpoints"
+                        )
+                    ready.append(checkpoint)
             actual_steps = {checkpoint.learner_version for checkpoint in ready}
             if actual_steps != plan.observed_steps:
                 raise RuntimeError("remote checkpoint catalog changed during retention")
@@ -727,7 +741,7 @@ class ServerlessBackend:
             retained.update(
                 checkpoint.learner_version
                 for checkpoint in ready
-                if checkpoint.checkpoint_id == page.current_checkpoint_id
+                if checkpoint.checkpoint_id == current_checkpoint_id
             )
             self._validate_sampler_retention(model, retained)
             retain_checkpoint_ids = {
@@ -735,8 +749,8 @@ class ServerlessBackend:
                 for checkpoint in ready
                 if checkpoint.learner_version in retained
             }
-            if page.current_checkpoint_id is not None:
-                retain_checkpoint_ids.add(page.current_checkpoint_id)
+            if current_checkpoint_id is not None:
+                retain_checkpoint_ids.add(current_checkpoint_id)
             await self._service.apply_checkpoint_retention(
                 client.run_id,
                 ApplyCheckpointRetentionRequest(
