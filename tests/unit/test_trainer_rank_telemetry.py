@@ -83,6 +83,47 @@ def test_phase_reports_compile_attribution_and_recompiles(
     assert second[1]
 
 
+def test_phase_deduplicates_on_low_cardinality_plan_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[dict[str, object]] = []
+    clock = iter((0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0))
+    monkeypatch.setattr(_telemetry, "_install", lambda: None)
+    monkeypatch.setattr(_telemetry.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(
+        _telemetry,
+        "_emit",
+        lambda event, warning=False: events.append(dict(event)),
+    )
+    monkeypatch.setattr(_telemetry, "_new_guard_failures", lambda: ())
+    _telemetry._compiled_plan_signatures.clear()
+    plan_signature = {"topology": (1, 1, 1, 1), "request_mix": ("target",)}
+
+    for compile_id, packed_tokens in (("0/0", 128), ("0/1", 256)):
+        args = SimpleNamespace(
+            callback_trigger=SimpleNamespace(name="DYNAMO"), compile_id=compile_id
+        )
+        with _telemetry.phase(
+            "forward",
+            {**plan_signature, "packed_tokens": packed_tokens},
+            dedup_signature=plan_signature,
+        ):
+            _telemetry._compile_start(args)
+            _telemetry._compile_end(args)
+
+    assert events[0]["signature"] == {
+        **plan_signature,
+        "packed_tokens": 128,
+    }
+    assert events[0]["plan_signature_status"] == "new"
+    assert events[1]["signature"] == {
+        **plan_signature,
+        "packed_tokens": 256,
+    }
+    assert events[1]["plan_signature_status"] == "repeated"
+    assert events[1]["unique_compile_plan_signatures"] == 1
+
+
 def test_phase_without_compilation_reports_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

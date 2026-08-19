@@ -1156,22 +1156,22 @@ def test_checkpoint_export_requires_retained_adapter_config() -> None:
 def test_prepared_lora_export_lifecycle_without_megatron(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from art.trainer_rank import _lora_export
+
     snapshot = object()
     captures: list[object] = []
     saved: list[tuple[str, object]] = []
-    module = ModuleType("art.megatron.weights.lora_publish")
 
-    def capture(**_kwargs: object) -> tuple[object, dict[str, float]]:
+    def capture(*_args: object, **_kwargs: object) -> tuple[object, dict[str, float]]:
         captures.append(snapshot)
         return snapshot, {"d2h": 1.0}
 
-    setattr(module, "_capture_lora_publish_snapshot_from_model", capture)
-    setattr(
-        module,
-        "_save_lora_publish_snapshot",
+    monkeypatch.setattr(_lora_export, "_capture_lora_publish_inputs", capture)
+    monkeypatch.setattr(
+        _lora_export,
+        "_save_lora_publish_inputs",
         lambda output, value: saved.append((output, value)) or {"serialize": 2.0},
     )
-    monkeypatch.setitem(sys.modules, module.__name__, module)
     trainer = TrainerRank(_runtime())
     trainer._checkpoint_slots["student"] = _CheckpointSlot(
         config={
@@ -1833,6 +1833,7 @@ def _checkpoint_load_failure_worker(
         timeout=timedelta(seconds=15),
     )
     from art.trainer_rank import _checkpoint as checkpoint_module
+    from art.trainer_rank import _lora_export as lora_export_module
 
     originals = (
         checkpoint_module._load_adapter,
@@ -1871,7 +1872,7 @@ def _checkpoint_load_failure_worker(
                     }
                 )
             with pytest.raises((ValueError, RuntimeError), match="Unknown|Another"):
-                checkpoint_module.export_lora(trainer, "/unused", "student")
+                lora_export_module.export_lora(trainer, "/unused", "student")
             completed = torch.tensor(1)
             dist.all_reduce(completed)
             assert completed.item() == world_size

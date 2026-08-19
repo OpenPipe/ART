@@ -199,13 +199,19 @@ def phase(
     name: str,
     signature: Mapping[str, object],
     *,
+    dedup_signature: Mapping[str, object] | None = None,
     synchronized: bool = False,
 ) -> Iterator[None]:
     """Emit one structured phase event, including compile work observed within it."""
 
     _install()
     signature_key = json.dumps(
-        {"phase": name, "signature": signature}, sort_keys=True, default=str
+        {
+            "phase": name,
+            "signature": signature if dedup_signature is None else dedup_signature,
+        },
+        sort_keys=True,
+        default=str,
     )
     record = _Phase(name, signature, signature_key, time.perf_counter())
     stack = _phase_stack()

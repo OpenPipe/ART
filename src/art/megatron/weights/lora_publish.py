@@ -1,7 +1,5 @@
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-import time
-from typing import Any, NamedTuple, TypeVar
+from typing import Any, NamedTuple
 
 import torch
 
@@ -19,18 +17,6 @@ from art.megatron.lora import (
 from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
 from art.megatron.model_support.spec import ExpertPackedLoraGroup, ExpertPackedLoraSlot
 from art.megatron.training.model_chunks import ModelChunks
-
-_K = TypeVar("_K")
-
-
-@dataclass(frozen=True)
-class _LoraPublishSnapshot:
-    metadata: list[LoraShardMeta]
-    tensors_by_owner_key: dict[tuple[int, str], torch.Tensor]
-    packed_expert_metadata: list["PackedExpertShardMeta"]
-    packed_expert_tensors_by_owner_key: dict[tuple[int, str], torch.Tensor]
-    handler: Any
-    adapter_config: dict[str, Any]
 
 
 class PackedExpertShardMeta(NamedTuple):
@@ -396,34 +382,6 @@ def _rank_and_device() -> tuple[int, torch.device]:
     )
 
 
-def _raise_on_distributed_phase_error(
-    error: BaseException | None,
-    phase: str,
-    group: torch.distributed.ProcessGroup | None,
-) -> None:
-    if not _distributed_ready():
-        if error is not None:
-            raise error
-        return
-    backend = str(torch.distributed.get_backend(group)).lower()  # type: ignore[possibly-missing-attribute]
-    flag = torch.tensor(
-        error is not None,
-        dtype=torch.uint8,
-        device=(
-            torch.device("cuda", torch.cuda.current_device())
-            if backend.endswith("nccl")
-            else torch.device("cpu")
-        ),
-    )
-    torch.distributed.all_reduce(  # type: ignore[possibly-missing-attribute]
-        flag, op=torch.distributed.ReduceOp.MAX, group=group
-    )
-    if flag.item():
-        if error is not None:
-            raise error
-        raise RuntimeError(f"Another rank failed during {phase}")
-
-
 def _metadata_by_owner_dtype(
     metadata: Sequence[Any],
 ) -> dict[tuple[int, str], list[Any]]:
@@ -624,17 +582,17 @@ def merge_packed_expert_adapter_entries(
     }
 
 
-def _stage_tensor_mapping(
-    tensors: dict[_K, torch.Tensor],
+def _stage_published_tensors(
+    tensors: dict[str, torch.Tensor],
     stager: _PinnedCpuStager,
-) -> dict[_K, torch.Tensor]:
-    grouped: dict[tuple[str, int | None, str], list[tuple[_K, torch.Tensor]]] = {}
+) -> dict[str, torch.Tensor]:
+    grouped: dict[tuple[str, int | None, str], list[tuple[str, torch.Tensor]]] = {}
     for key, tensor in tensors.items():
         dtype_name = _dtype_name(tensor.dtype)
         group_key = (tensor.device.type, tensor.device.index, dtype_name)
         grouped.setdefault(group_key, []).append((key, tensor))
 
-    staged: dict[_K, torch.Tensor] = {}
+    staged: dict[str, torch.Tensor] = {}
     for _group_key, group in sorted(grouped.items()):
         flat = torch.cat(
             [tensor.detach().contiguous().view(-1) for _key, tensor in sorted(group)]
@@ -650,13 +608,6 @@ def _stage_tensor_mapping(
             staged[key] = staged_flat.narrow(0, offset, numel).view(tensor.shape)
             offset += numel
     return staged
-
-
-def _stage_published_tensors(
-    tensors: dict[str, torch.Tensor],
-    stager: _PinnedCpuStager,
-) -> dict[str, torch.Tensor]:
-    return _stage_tensor_mapping(tensors, stager)
 
 
 def _save_rank0_vllm_lora(
@@ -716,7 +667,7 @@ def _rank0_vllm_lora_tensors(
     )
 
 
-def _collect_lora_publish_inputs(
+def build_vllm_lora_tensors_from_model(
     *,
     model: ModelChunks,
     adapter_dtypes: dict[str, torch.dtype],
@@ -725,85 +676,51 @@ def _collect_lora_publish_inputs(
     rank: int,
     world_size: int,
     slot_ref: LoRASlotRef | None = None,
-    timings: dict[str, float] | None = None,
-    failure_group: torch.distributed.ProcessGroup | None = None,
-) -> _LoraPublishSnapshot | None:
-    started = time.monotonic()
-    device: torch.device | None = None
-    error: BaseException | None = None
-    try:
-        actual_rank, device = _rank_and_device()
-        if _distributed_ready():
-            actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
-            if actual_rank != rank or actual_world_size != world_size:
-                raise RuntimeError(
-                    "LoRA publisher rank/world-size mismatch: "
-                    f"runtime=({rank}, {world_size}) "
-                    f"distributed=({actual_rank}, {actual_world_size})"
-                )
-        else:
-            if rank != 0 or world_size != 1:
-                raise RuntimeError(
-                    "Non-distributed LoRA publish requires rank=0 and world_size=1, "
-                    f"got rank={rank} world_size={world_size}"
-                )
-            rank = 0
-    except BaseException as exc:
-        error = exc
-    _raise_on_distributed_phase_error(
-        error, "LoRA publish runtime validation", failure_group
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]] | None:
+    actual_rank, device = _rank_and_device()
+    if _distributed_ready():
+        actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
+        if actual_rank != rank or actual_world_size != world_size:
+            raise RuntimeError(
+                "LoRA publisher rank/world-size mismatch: "
+                f"runtime=({rank}, {world_size}) distributed=({actual_rank}, {actual_world_size})"
+            )
+    else:
+        if rank != 0 or world_size != 1:
+            raise RuntimeError(
+                "Non-distributed LoRA publish requires rank=0 and world_size=1, "
+                f"got rank={rank} world_size={world_size}"
+            )
+        rank = 0
+    packed_expert_groups = tuple(handler.expert_packed_lora_groups())
+    planner = LoRAPublishPlanner(model, slot_ref)
+    local_tensors, local_metadata = collect_local_lora_entries(
+        model,
+        adapter_dtypes,
+        owner_rank=rank,
+        packed_expert_groups=packed_expert_groups,
+        slot_ref=slot_ref,
     )
-    assert device is not None
-    if timings is not None:
-        timings["runtime_validation"] = time.monotonic() - started
-    started = time.monotonic()
-    local_tensors: dict[str, torch.Tensor] = {}
-    local_packed_tensors: dict[str, torch.Tensor] = {}
-    all_metadata: list[LoraShardMeta] = []
-    all_packed_metadata: list[PackedExpertShardMeta] = []
-    error = None
-    try:
-        packed_expert_groups = tuple(handler.expert_packed_lora_groups())
-        planner = LoRAPublishPlanner(model, slot_ref)
-        local_tensors, local_metadata = collect_local_lora_entries(
-            model,
+    local_packed_tensors, local_packed_metadata = collect_local_packed_expert_entries(
+        model,
+        adapter_dtypes,
+        owner_rank=rank,
+        packed_expert_groups=packed_expert_groups,
+        slot_ref=slot_ref,
+    )
+    all_packed_metadata = (
+        _global_packed_expert_metadata(planner, adapter_dtypes, packed_expert_groups)
+        if rank == 0
+        else local_packed_metadata
+    )
+    if rank == 0:
+        all_metadata = _global_regular_metadata(
+            planner,
             adapter_dtypes,
-            owner_rank=rank,
-            packed_expert_groups=packed_expert_groups,
-            slot_ref=slot_ref,
+            packed_expert_groups if all_packed_metadata else (),
         )
-        (
-            local_packed_tensors,
-            local_packed_metadata,
-        ) = collect_local_packed_expert_entries(
-            model,
-            adapter_dtypes,
-            owner_rank=rank,
-            packed_expert_groups=packed_expert_groups,
-            slot_ref=slot_ref,
-        )
-        all_packed_metadata = (
-            _global_packed_expert_metadata(
-                planner, adapter_dtypes, packed_expert_groups
-            )
-            if rank == 0
-            else local_packed_metadata
-        )
-        all_metadata = (
-            _global_regular_metadata(
-                planner,
-                adapter_dtypes,
-                packed_expert_groups if all_packed_metadata else (),
-            )
-            if rank == 0
-            else local_metadata
-        )
-    except BaseException as exc:
-        error = exc
-    _raise_on_distributed_phase_error(error, "LoRA publish planning", failure_group)
-    if timings is not None:
-        timings["plan_collect"] = time.monotonic() - started
-    started = time.monotonic()
+    else:
+        all_metadata = local_metadata
     exchanged_tensors = _exchange_batched_tensors(
         all_metadata,
         local_tensors=local_tensors,
@@ -816,114 +733,18 @@ def _collect_lora_publish_inputs(
         rank=rank,
         device=device,
     )
-    if timings is not None:
-        timings["exchange"] = time.monotonic() - started
 
     if rank != 0:
         return None
 
-    return _LoraPublishSnapshot(
+    return _rank0_vllm_lora_tensors(
         metadata=all_metadata,
         tensors_by_owner_key=exchanged_tensors,
         packed_expert_metadata=all_packed_metadata,
         packed_expert_tensors_by_owner_key=exchanged_packed_tensors,
         handler=handler,
-        adapter_config=dict(adapter_config),
-    )
-
-
-def build_vllm_lora_tensors_from_model(
-    *,
-    model: ModelChunks,
-    adapter_dtypes: dict[str, torch.dtype],
-    handler: Any,
-    adapter_config: dict[str, Any],
-    rank: int,
-    world_size: int,
-    slot_ref: LoRASlotRef | None = None,
-) -> tuple[dict[str, torch.Tensor], dict[str, Any]] | None:
-    snapshot = _collect_lora_publish_inputs(
-        model=model,
-        adapter_dtypes=adapter_dtypes,
-        handler=handler,
         adapter_config=adapter_config,
-        rank=rank,
-        world_size=world_size,
-        slot_ref=slot_ref,
     )
-    if snapshot is None:
-        return None
-
-    return _rank0_vllm_lora_tensors(
-        metadata=snapshot.metadata,
-        tensors_by_owner_key=snapshot.tensors_by_owner_key,
-        packed_expert_metadata=snapshot.packed_expert_metadata,
-        packed_expert_tensors_by_owner_key=snapshot.packed_expert_tensors_by_owner_key,
-        handler=snapshot.handler,
-        adapter_config=snapshot.adapter_config,
-    )
-
-
-def _capture_lora_publish_snapshot_from_model(
-    *,
-    model: ModelChunks,
-    adapter_dtypes: dict[str, torch.dtype],
-    handler: Any,
-    adapter_config: dict[str, Any],
-    rank: int,
-    world_size: int,
-    slot_ref: LoRASlotRef | None = None,
-    failure_group: torch.distributed.ProcessGroup | None = None,
-) -> tuple[_LoraPublishSnapshot | None, dict[str, float]]:
-    timings: dict[str, float] = {}
-    snapshot = _collect_lora_publish_inputs(
-        model=model,
-        adapter_dtypes=adapter_dtypes,
-        handler=handler,
-        adapter_config=adapter_config,
-        rank=rank,
-        world_size=world_size,
-        slot_ref=slot_ref,
-        timings=timings,
-        failure_group=failure_group,
-    )
-    started = time.monotonic()
-    if snapshot is not None:
-        stager = _PinnedCpuStager()
-        snapshot = _LoraPublishSnapshot(
-            metadata=snapshot.metadata,
-            tensors_by_owner_key=_stage_tensor_mapping(
-                snapshot.tensors_by_owner_key, stager
-            ),
-            packed_expert_metadata=snapshot.packed_expert_metadata,
-            packed_expert_tensors_by_owner_key=_stage_tensor_mapping(
-                snapshot.packed_expert_tensors_by_owner_key, stager
-            ),
-            handler=snapshot.handler,
-            adapter_config=snapshot.adapter_config,
-        )
-        stager.finish()
-    timings["d2h"] = time.monotonic() - started
-    return snapshot, timings
-
-
-def _save_lora_publish_snapshot(
-    output_dir: str, snapshot: _LoraPublishSnapshot
-) -> dict[str, float]:
-    started = time.monotonic()
-    vllm_tensors, published_config = _rank0_vllm_lora_tensors(
-        metadata=snapshot.metadata,
-        tensors_by_owner_key=snapshot.tensors_by_owner_key,
-        packed_expert_metadata=snapshot.packed_expert_metadata,
-        packed_expert_tensors_by_owner_key=snapshot.packed_expert_tensors_by_owner_key,
-        handler=snapshot.handler,
-        adapter_config=snapshot.adapter_config,
-    )
-    timings = {"convert": time.monotonic() - started}
-    started = time.monotonic()
-    save_vllm_lora_tensors(output_dir, vllm_tensors, published_config)
-    timings["serialize"] = time.monotonic() - started
-    return timings
 
 
 def save_vllm_lora_from_model(

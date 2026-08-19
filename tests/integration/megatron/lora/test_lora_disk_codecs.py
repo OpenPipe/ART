@@ -37,7 +37,7 @@ from art.megatron.weights.lora_publish import (
     merge_sharded_adapter_entries,
     save_vllm_lora_from_model,
 )
-from art.trainer_rank import TrainerRank
+from art.trainer_rank import TrainerRank, _checkpoint, _lora_export
 from art.trainer_rank._impl import _AdapterConfig, _CheckpointSlot
 from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
@@ -1624,113 +1624,86 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
 
 
 @pytest.mark.parametrize(
-    ("failure_collective", "phase", "expected_plans"),
-    ((1, "runtime validation", 0), (2, "planning", 1)),
+    ("failed_phase", "expected_plans"),
+    (("validate LoRA publish runtime", 0), ("plan LoRA publish", 1)),
 )
 def test_remote_preexchange_failure_prevents_tensor_exchange(
     monkeypatch: pytest.MonkeyPatch,
-    failure_collective: int,
-    phase: str,
+    failed_phase: str,
     expected_plans: int,
 ) -> None:
     exchanges: list[object] = []
     plans: list[object] = []
-    collectives = 0
     failure_group = cast(Any, object())
 
-    def all_reduce(flag: torch.Tensor, **_kwargs: object) -> None:
-        nonlocal collectives
-        collectives += 1
-        if collectives == failure_collective:
-            flag.fill_(1)
+    monkeypatch.setattr(
+        _lora_export,
+        "_validate_vllm_lora_publish_runtime",
+        lambda *_args: (0, torch.device("cpu")),
+    )
+    monkeypatch.setattr(
+        _lora_export,
+        "_prepare_vllm_lora_publish",
+        lambda *_args, **_kwargs: plans.append(object()) or plans[-1],
+    )
+    monkeypatch.setattr(
+        _lora_export,
+        "_exchange_vllm_lora_publish",
+        lambda *_args: exchanges.append(object()),
+    )
 
-    monkeypatch.setattr(lora_publish, "_distributed_ready", lambda: True)
-    monkeypatch.setattr(
-        lora_publish, "_rank_and_device", lambda: (0, torch.device("cpu"))
-    )
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
-    monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "gloo")
-    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
-    monkeypatch.setattr(
-        lora_publish,
-        "LoRAPublishPlanner",
-        lambda *_args: plans.append(object()) or plans[-1],
-    )
-    monkeypatch.setattr(
-        lora_publish, "collect_local_lora_entries", lambda *_args, **_kwargs: ({}, [])
-    )
-    monkeypatch.setattr(
-        lora_publish,
-        "collect_local_packed_expert_entries",
-        lambda *_args, **_kwargs: ({}, []),
-    )
-    monkeypatch.setattr(lora_publish, "_global_regular_metadata", lambda *_args: [])
-    monkeypatch.setattr(
-        lora_publish, "_global_packed_expert_metadata", lambda *_args: []
-    )
-    monkeypatch.setattr(
-        lora_publish,
-        "_exchange_batched_tensors",
-        lambda *_args, **_kwargs: exchanges.append(object()),
-    )
-    handler = SimpleNamespace(expert_packed_lora_groups=lambda: ())
+    def synchronize(error: BaseException | None, phase: str, group: object) -> None:
+        assert group is failure_group
+        if error is not None:
+            raise error
+        if phase == failed_phase:
+            raise RuntimeError(f"Another rank failed to {phase}")
 
-    with pytest.raises(
-        RuntimeError, match=f"Another rank failed during LoRA publish {phase}"
-    ):
-        lora_publish._collect_lora_publish_inputs(
-            model=cast(Any, object()),
-            adapter_dtypes={},
-            handler=handler,
-            adapter_config={},
+    monkeypatch.setattr(_checkpoint, "raise_distributed", synchronize)
+    trainer = SimpleNamespace(
+        runtime=SimpleNamespace(
             rank=0,
             world_size=2,
-            failure_group=failure_group,
+            model=object(),
+            model_support_handler=object(),
+        ),
+        _slot_ref=lambda _name: None,
+    )
+
+    with pytest.raises(RuntimeError, match=f"Another rank failed to {failed_phase}"):
+        _lora_export._capture_lora_publish_inputs(
+            cast(Any, trainer), "student", {}, failure_group
         )
 
     assert exchanges == []
     assert len(plans) == expected_plans
 
 
-def test_device_resolution_failure_uses_cpu_failure_group(
+def test_runtime_resolution_failure_uses_trainer_failure_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     failure_group = cast(Any, object())
-    reduced_groups: list[object] = []
-    monkeypatch.setattr(lora_publish, "_distributed_ready", lambda: True)
+    synchronized_groups: list[object] = []
     monkeypatch.setattr(
-        lora_publish,
-        "_rank_and_device",
-        lambda: (_ for _ in ()).throw(RuntimeError("device resolution failed")),
+        _lora_export,
+        "_validate_vllm_lora_publish_runtime",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("device resolution failed")),
     )
-    monkeypatch.setattr(
-        torch.cuda,
-        "current_device",
-        lambda: (_ for _ in ()).throw(AssertionError("unexpected CUDA lookup")),
-    )
-    monkeypatch.setattr(
-        torch.distributed,
-        "get_backend",
-        lambda group: "gloo" if group is failure_group else "nccl",
-    )
-    monkeypatch.setattr(
-        torch.distributed,
-        "all_reduce",
-        lambda _flag, **kwargs: reduced_groups.append(kwargs["group"]),
-    )
+
+    def synchronize(error: BaseException | None, _phase: str, group: object) -> None:
+        synchronized_groups.append(group)
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(_checkpoint, "raise_distributed", synchronize)
+    trainer = SimpleNamespace(runtime=SimpleNamespace(rank=0, world_size=2))
 
     with pytest.raises(RuntimeError, match="device resolution failed"):
-        lora_publish._collect_lora_publish_inputs(
-            model=cast(Any, object()),
-            adapter_dtypes={},
-            handler=object(),
-            adapter_config={},
-            rank=0,
-            world_size=2,
-            failure_group=failure_group,
+        _lora_export._capture_lora_publish_inputs(
+            cast(Any, trainer), "student", {}, failure_group
         )
 
-    assert reduced_groups == [failure_group]
+    assert synchronized_groups == [failure_group]
 
 
 def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(

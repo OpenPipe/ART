@@ -59,7 +59,6 @@ if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
     from art.megatron.prefix_tree_state import PrefixTreeAttentionState
     from art.megatron.train import TrainingRuntime
-    from art.megatron.weights.lora_publish import _LoraPublishSnapshot
     from art.trainer_rank._checkpoint import (
         CustomOptimizerState,
         LocalOptimizerState,
@@ -68,6 +67,7 @@ if TYPE_CHECKING:
         _FinalizedSave,
         _PreparedSave,
     )
+    from art.trainer_rank._lora_export import _PreparedLoraExport
 
 
 @dataclass(frozen=True)
@@ -815,7 +815,7 @@ class TrainerRank:
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
-        self._prepared_lora_exports: dict[str, tuple[str, _LoraPublishSnapshot]] = {}
+        self._prepared_lora_exports: dict[str, tuple[str, _PreparedLoraExport]] = {}
         self._checkpoint_prefetches: dict[str, asyncio.Task[PreparedCheckpoint]] = {}
         self._checkpoint_mutation_tail: asyncio.Task[None] | None = None
         self._checkpoint_process_group: dist.ProcessGroup | None = None
@@ -1277,9 +1277,9 @@ class TrainerRank:
         output_dir: str,
         checkpoint_path: str | Literal["active"] = "active",
     ) -> int:
-        from . import _checkpoint
+        from . import _lora_export
 
-        return _checkpoint.export_lora(
+        return _lora_export.export_lora(
             self, output_dir, self._resolve_checkpoint_name(checkpoint_path)
         )
 
@@ -1290,9 +1290,9 @@ class TrainerRank:
         *,
         owner_id: str,
     ) -> tuple[int, dict[str, float]]:
-        from . import _checkpoint
+        from . import _lora_export
 
-        return _checkpoint.prepare_lora_export(
+        return _lora_export.prepare_lora_export(
             self,
             export_id,
             self._resolve_checkpoint_name(checkpoint_path),
@@ -1302,16 +1302,16 @@ class TrainerRank:
     def _finish_lora_export(
         self, export_id: str, output_dir: str, *, owner_id: str
     ) -> dict[str, float]:
-        from . import _checkpoint
+        from . import _lora_export
 
-        return _checkpoint.finish_lora_export(
+        return _lora_export.finish_lora_export(
             self, export_id, output_dir, owner_id=owner_id
         )
 
     def _abort_lora_export(self, export_id: str, *, owner_id: str) -> None:
-        from . import _checkpoint
+        from . import _lora_export
 
-        _checkpoint.abort_lora_export(self, export_id, owner_id=owner_id)
+        _lora_export.abort_lora_export(self, export_id, owner_id=owner_id)
 
     @staticmethod
     def _checkpoint_source_key(path: str) -> str:
@@ -1599,6 +1599,7 @@ class TrainerRank:
                 # loss construction and backward for the yielded microbatch.
                 "caller",
                 self._telemetry_signature(candidate.plan),
+                dedup_signature=self._telemetry_plan_signature(candidate.plan),
             ):
                 yield MicroBatch(
                     inputs=candidate.inputs,
@@ -2618,6 +2619,7 @@ class TrainerRank:
             with _telemetry_phase(
                 "forward",
                 self._telemetry_signature(plan),
+                dedup_signature=self._telemetry_plan_signature(plan),
                 synchronized=torch.cuda.is_available() and self.device.type == "cuda",
             ):
                 outputs = self._execute_flat_plan(plan)
@@ -2638,13 +2640,19 @@ class TrainerRank:
         return outputs
 
     @staticmethod
-    def _telemetry_signature(plan: _FlatForwardPlan) -> dict[str, object]:
+    def _telemetry_plan_signature(plan: _FlatForwardPlan) -> dict[str, object]:
         return {
             "topology": plan.signature.topology,
             "shared_prefix_max_depth": plan.signature.shared_prefix_max_depth,
             "slot_group_count": plan.signature.slot_group_count,
             "request_mix": plan.signature.request_mix,
             "grad_enabled": plan.signature.grad_enabled,
+        }
+
+    @classmethod
+    def _telemetry_signature(cls, plan: _FlatForwardPlan) -> dict[str, object]:
+        return {
+            **cls._telemetry_plan_signature(plan),
             "request_count": plan.request_count,
             "packed_tokens": plan.packed_tokens,
             "logical_tokens": plan.logical_tokens,
