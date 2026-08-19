@@ -2524,7 +2524,7 @@ def _calculate_megatron_logprob_batch(
             moe_routing_replay_controller.finalize_step()
 
 
-def _update_fingerprint(digest: Any, value: str | bytes) -> None:
+def _update_fingerprint(digest: Any, value: str | bytes | memoryview) -> None:
     payload = value.encode() if isinstance(value, str) else value
     digest.update(len(payload).to_bytes(8, "big"))
     digest.update(payload)
@@ -2535,7 +2535,7 @@ def _update_tensor_fingerprint(digest: Any, name: str, value: Any) -> None:
     _update_fingerprint(digest, name)
     _update_fingerprint(digest, str(tuple(tensor.shape)))
     _update_fingerprint(digest, str(tensor.dtype))
-    _update_fingerprint(digest, tensor.numpy().tobytes())
+    _update_fingerprint(digest, memoryview(tensor.numpy()).cast("B"))
 
 
 def _packed_batch_fingerprint(packed_tensors: PackedTensors) -> str:
