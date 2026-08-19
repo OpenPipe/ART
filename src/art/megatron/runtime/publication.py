@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
+from art.distributed.object_store import (
+    BinaryObjectTarget,
+    binary_object_manifest_uri,
+)
 from art.megatron.optimizer_state import (
     OptimizerAdapter,
     OptimizerGenerationManifest,
     OptimizerShard,
     OptimizerTopology,
     build_optimizer_manifest,
+    canonical_adapter_path,
     commit_optimizer_generation,
     optimizer_generation_nbytes,
     read_committed_optimizer_pointer,
@@ -131,6 +137,73 @@ class SnapshotWritePlan(_PublicationModel):
         return snapshot_write_plan_digest(self)
 
 
+class SnapshotWriteTargets(_PublicationModel):
+    format_version: Literal[1] = 1
+    local_adapter_staging_path: str | None = Field(default=None, min_length=1)
+    local_adapter_target: OptimizerAdapter | None = None
+    optimizer_state_path: str | None = Field(default=None, min_length=1)
+    adapter_object_target: BinaryObjectTarget | None = None
+
+    @model_validator(mode="after")
+    def _validate_local_target(self) -> "SnapshotWriteTargets":
+        if (self.local_adapter_staging_path is None) != (
+            self.local_adapter_target is None
+        ):
+            raise ValueError(
+                "local adapter staging and target must be present together"
+            )
+        for value in (self.local_adapter_staging_path, self.optimizer_state_path):
+            if value is not None and not Path(value).is_absolute():
+                raise ValueError("snapshot write target paths must be absolute")
+        return self
+
+
+class SnapshotWriteReservationPlan(_PublicationModel):
+    snapshot: SnapshotWritePlan
+    targets: SnapshotWriteTargets
+
+    @model_validator(mode="after")
+    def _validate_targets(self) -> "SnapshotWriteReservationPlan":
+        generation = self.snapshot.generation
+        rank_zero = self.snapshot.ranks[0]
+        staging = self.targets.local_adapter_staging_path
+        local = self.targets.local_adapter_target
+        if staging is not None and local is not None:
+            if Path(staging).name != generation.generation_id:
+                raise ValueError("adapter staging target identifies another generation")
+            if local != rank_zero.adapter or local.identity != str(
+                canonical_adapter_path(staging, generation.policy_step)
+            ):
+                raise ValueError("local adapter target differs from its snapshot plan")
+        if (
+            self.targets.optimizer_state_path is not None
+            and self.snapshot.optimizer_manifest is None
+        ):
+            raise ValueError("optimizer target has no exact optimizer manifest")
+        object_target = self.targets.adapter_object_target
+        if object_target is not None:
+            transport = rank_zero.transport_adapter
+            if transport is None or transport.identity != binary_object_manifest_uri(
+                object_target
+            ):
+                raise ValueError("adapter object target differs from its snapshot plan")
+            expected_metadata = {
+                "training_session_id": generation.training_session_id,
+                "generation_id": generation.generation_id,
+                "policy_step": str(generation.policy_step),
+            }
+            if any(
+                object_target.metadata.get(key) != value
+                for key, value in expected_metadata.items()
+            ):
+                raise ValueError("adapter object target identifies another generation")
+        return self
+
+    @property
+    def digest(self) -> str:
+        return snapshot_write_reservation_plan_digest(self)
+
+
 class SnapshotWriteGrant(_PublicationModel):
     operation_id: str = Field(min_length=1)
     generation_id: str = Field(min_length=1)
@@ -163,6 +236,8 @@ class PreparedSave(_PublicationModel):
     generation: TrainerGeneration
     plan: SnapshotWritePlan
     plan_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    reservation_plan: SnapshotWriteReservationPlan
+    reservation_plan_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def _validate_plan(self) -> "PreparedSave":
@@ -170,10 +245,14 @@ class PreparedSave(_PublicationModel):
             self.operation_id,
             self.generation,
             self.plan_digest,
+            self.reservation_plan.snapshot,
+            self.reservation_plan_digest,
         ) != (
             self.plan.operation_id,
             self.plan.generation,
             self.plan.digest,
+            self.plan,
+            self.reservation_plan.digest,
         ):
             raise ValueError("prepared save identity differs from its write plan")
         return self
@@ -186,6 +265,39 @@ def snapshot_write_plan_digest(plan: SnapshotWritePlan) -> str:
         separators=(",", ":"),
     ).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def snapshot_write_reservation_plan_digest(
+    plan: SnapshotWriteReservationPlan,
+) -> str:
+    payload = json.dumps(
+        plan.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def build_snapshot_write_reservation_plan(
+    snapshot: SnapshotWritePlan,
+    *,
+    local_adapter_staging_path: str | None = None,
+    optimizer_state_path: str | None = None,
+    adapter_object_target: BinaryObjectTarget | None = None,
+) -> SnapshotWriteReservationPlan:
+    return SnapshotWriteReservationPlan(
+        snapshot=snapshot,
+        targets=SnapshotWriteTargets(
+            local_adapter_staging_path=local_adapter_staging_path,
+            local_adapter_target=(
+                snapshot.ranks[0].adapter
+                if local_adapter_staging_path is not None
+                else None
+            ),
+            optimizer_state_path=optimizer_state_path,
+            adapter_object_target=adapter_object_target,
+        ),
+    )
 
 
 def build_snapshot_write_plan(

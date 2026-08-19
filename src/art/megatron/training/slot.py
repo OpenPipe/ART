@@ -33,7 +33,9 @@ from art.megatron.runtime.publication import (
     SnapshotRankWritePlan,
     SnapshotWriteGrant,
     SnapshotWritePlan,
+    SnapshotWriteReservationPlan,
     build_snapshot_write_plan,
+    build_snapshot_write_reservation_plan,
     commit_trainer_publication,
 )
 from art.megatron.runtime.specs import (
@@ -145,6 +147,7 @@ class _PendingSnapshot(BaseModel):
     generation: TrainerGeneration
     optimizer_state_path: str
     plan: SnapshotWritePlan
+    reservation_plan: SnapshotWriteReservationPlan
     publication: Any
     started: float
 
@@ -155,6 +158,7 @@ class _ExistingSnapshot(BaseModel):
     adapter: OptimizerAdapter
     optimizer_bytes: int | None
     plan: SnapshotWritePlan
+    reservation_plan: SnapshotWriteReservationPlan
 
 
 class _PreparedSaveOperation(BaseModel):
@@ -791,6 +795,8 @@ class MegatronTrainingSlot:
             generation=snapshot.plan.generation,
             plan=snapshot.plan,
             plan_digest=snapshot.plan.digest,
+            reservation_plan=snapshot.reservation_plan,
+            reservation_plan_digest=snapshot.reservation_plan.digest,
         )
         self._prepared_saves[ref.operation_id] = _PreparedSaveOperation(
             fingerprint=fingerprint,
@@ -959,6 +965,14 @@ class MegatronTrainingSlot:
             generation=generation,
             optimizer_state_path=optimizer_state_path,
             plan=plan,
+            reservation_plan=build_snapshot_write_reservation_plan(
+                plan,
+                local_adapter_staging_path=staging,
+                optimizer_state_path=(
+                    optimizer_state_path if persist_optimizer else None
+                ),
+                adapter_object_target=object_target,
+            ),
             publication=self.trainer.wait_for_publication(ref.operation_id),
             started=started,
         )
@@ -995,6 +1009,7 @@ class MegatronTrainingSlot:
                 None if manifest is None else optimizer_generation_nbytes(manifest)
             ),
             plan=plan,
+            reservation_plan=build_snapshot_write_reservation_plan(plan),
         )
 
     def _sampler_object_target(
