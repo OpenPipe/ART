@@ -7,11 +7,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from art.megatron.runtime.executor import _GenerationPublisher
-from art.megatron.runtime.residency import (
-    ResidencyCapacityUnavailable,
-    ResidencyKey,
-)
+from art.megatron.runtime.executor import MegatronTrainJobExecutor, _GenerationPublisher
+from art.megatron.runtime.residency import ResidencyKey
 from art.megatron.runtime.specs import TrainerGeneration
 from art.megatron.weights.lora_publish import LoraSnapshot
 
@@ -210,6 +207,7 @@ def test_out_of_order_replacements_retire_predecessor_chain(
 
         assert set(publisher._cache) == {generations[2].generation_id}
         assert publisher.has_generation(generations[2])
+        assert publisher._in_flight == (0 if resident else 1)
         if residency is not None:
             assert {key.generation_id for key in residency.retired} == {
                 generations[0].generation_id,
@@ -219,33 +217,9 @@ def test_out_of_order_replacements_retire_predecessor_chain(
         publisher.close()
 
 
-def test_capacity_cannot_evict_same_run_latest_for_replacement(monkeypatch) -> None:
-    ready = Event()
-    ready.set()
-    stage_calls = 0
-
-    def stage_lora(**_kwargs: object) -> _Pending:
-        nonlocal stage_calls
-        stage_calls += 1
-        return _Pending(ready, _snapshot(stage_calls))
-
-    monkeypatch.setattr(
-        "art.megatron.weights.lora_publish.stage_vllm_lora_snapshot_from_model",
-        stage_lora,
-    )
-    publisher = _GenerationPublisher(_runtime(), capacity=1)
-    previous = _generation(1)
-    try:
-        _stage(publisher, previous)
-        _wait_until(
-            lambda: publisher._latest_by_run.get("run") == previous.generation_id
-        )
-
-        with pytest.raises(ResidencyCapacityUnavailable):
-            _stage(publisher, _generation(2))
-
-        assert stage_calls == 1
-        assert publisher.has_generation(previous)
-        assert publisher._latest_by_run["run"] == previous.generation_id
-    finally:
-        publisher.close()
+def test_capacity_one_is_rejected_at_runtime_initialization() -> None:
+    with pytest.raises(
+        ValueError,
+        match="at least 2 for transactional replacement",
+    ):
+        MegatronTrainJobExecutor(SimpleNamespace(snapshot_pool_capacity=1))

@@ -1635,8 +1635,10 @@ class _GenerationPublisher:
         capacity: int,
         residency: RunResidencyManager | None = None,
     ) -> None:
-        if capacity < 1:
-            raise ValueError("snapshot pool capacity must be positive")
+        if capacity < 2:
+            raise ValueError(
+                "snapshot pool capacity must be at least 2 for transactional replacement"
+            )
         self.runtime = runtime
         self.capacity = capacity
         self._residency = residency
@@ -2313,6 +2315,7 @@ class _GenerationPublisher:
             self._cache[generation_id] = entry
 
     def _activate_generation(self, entry: _CachedGeneration) -> None:
+        # Callback order must not let an older admission replace a newer success.
         with self._lock:
             if entry.retired or entry.released:
                 return
