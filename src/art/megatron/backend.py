@@ -7,10 +7,15 @@ import time
 from typing import Any, AsyncIterator, Iterable, Literal, cast
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SkipValidation
 
 from .. import dev, types
-from .._backend_training import merge_gradient_step_metrics, should_save_optimizer_state
+from .._backend_training import (
+    aggregate_rl_training_metrics,
+    build_rl_train_configs,
+    merge_gradient_step_metrics,
+    should_save_optimizer_state,
+)
 from ..backend import AnyTrainableModel
 from ..distributed.art_runtime import ArtRuntime
 from ..local.backend import LocalBackend, _PackedTrainingBatch
@@ -20,11 +25,16 @@ from ..model import Model, TrainableModel
 from ..training import (
     AdamConfig,
     ForwardBackwardRequest,
+    ForwardBackwardResult,
     LossConfig,
     OptimStepRequest,
+    OptimStepResult,
+    PackingOutcome,
     RlTrajectoryBatch,
     SamplerPublication,
+    SamplerWeightsResult,
     SaveStateRequest,
+    SaveStateResult,
     SaveWeightsForSamplerRequest,
     SupervisedTrajectoryBatch,
 )
@@ -85,13 +95,177 @@ class _PackingConfig(BaseModel):
         )
 
 
-class _PipelinePreparedBatch(BaseModel):
+class _MegatronPipelineCommandContext(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
+    backend: SkipValidation[Any] = Field(exclude=True)
+    model: SkipValidation[TrainableModel] = Field(exclude=True)
+    service: SkipValidation[Any] = Field(exclude=True)
+    client: SkipValidation[Any] = Field(exclude=True)
     batch: Any
-    groups: tuple[Any, ...]
-    packing_config: _PackingConfig
-    metrics: dict[str, float]
+    groups: tuple[TrajectoryGroup, ...]
+    config: types.TrainConfig
+    forward_request: ForwardBackwardRequest
+    preparation_metrics: dict[str, float]
+    expose_checkpoint_path: bool
+    started: float = Field(ge=0)
+    _finished: bool = PrivateAttr(default=False)
+
+    def optimizer_request(self, sequence_id: int) -> OptimStepRequest:
+        return OptimStepRequest(
+            run_id=self.client.run_id,
+            request_id=uuid.uuid4().hex,
+            sequence_id=sequence_id,
+            optimizer=AdamConfig(learning_rate=self.config.learning_rate),
+        )
+
+    async def sampler_request(
+        self, step: int, sequence_id: int
+    ) -> SaveWeightsForSamplerRequest:
+        return SaveWeightsForSamplerRequest(
+            run_id=self.client.run_id,
+            request_id=uuid.uuid4().hex,
+            sequence_id=sequence_id,
+            checkpoint_name=f"step-{step}",
+            publication=SamplerPublication(
+                mode=_sampler_publication_mode(self.service),
+                model_alias=self.model.name,
+            ),
+        )
+
+    def state_request(self, step: int, sequence_id: int) -> SaveStateRequest | None:
+        if not should_save_optimizer_state(step, self.config):
+            return None
+        return SaveStateRequest(
+            run_id=self.client.run_id,
+            request_id=uuid.uuid4().hex,
+            sequence_id=sequence_id,
+            checkpoint_name=f"step-{step}",
+        )
+
+    async def commands_admitted(
+        self,
+        *,
+        forward: Any,
+        optimizer: Any,
+        sampler: Any,
+        state: Any,
+    ) -> None:
+        del forward, optimizer
+        self._consume_operation(sampler, "pipeline-sampler")
+        if state is not None:
+            self._consume_operation(state, "pipeline-state")
+
+    async def complete(
+        self,
+        *,
+        step: int,
+        forward: Any,
+        optimizer: Any,
+        forward_submit_s: float,
+    ) -> LocalTrainResult:
+        try:
+            results = await asyncio.gather(
+                forward.result(), optimizer.result(), return_exceptions=True
+            )
+            failures = [value for value in results if isinstance(value, BaseException)]
+            if failures:
+                raise BaseExceptionGroup("Megatron train operations failed", failures)
+            forward_result, optimizer_result = results
+            if not (
+                isinstance(forward_result, ForwardBackwardResult)
+                and isinstance(optimizer_result, OptimStepResult)
+            ):
+                raise TypeError("Megatron pipeline returned invalid command results")
+            _attach_packing_shapes(
+                list(self.groups), forward_result.packing.group_shapes
+            )
+            metrics = aggregate_rl_training_metrics(
+                training_metrics=[
+                    {
+                        **merge_gradient_step_metrics(
+                            forward_result.metrics, optimizer_result.metrics
+                        ),
+                        **_packing_outcome_metrics(forward_result.packing),
+                        "time/step_local_forward_submit_s": forward_submit_s,
+                        **self.service.drain_publication_metrics(),
+                    }
+                ],
+                trajectory_groups=self.groups,
+                trainer_started=self.started,
+            )
+            policy_counts = forward_result.packing.policy_token_counts
+            if policy_counts is None:
+                raise RuntimeError("Megatron RL packing omitted policy token counts")
+            if (
+                self.config.final_training_step is not None
+                and step >= self.config.final_training_step
+            ):
+                metrics.update(await self.service.finalize_publication_metrics(step))
+            result = LocalTrainResult(
+                step=step,
+                metrics=metrics,
+                packed_policy_token_counts=tuple(
+                    (value.policy_version, value.trainable_assistant_tokens)
+                    for value in policy_counts
+                ),
+            )
+            if self.expose_checkpoint_path:
+                result.checkpoint_path = get_step_checkpoint_dir(
+                    get_model_dir(model=self.model, art_path=self.backend._path), step
+                )
+                if not Path(result.checkpoint_path).exists():
+                    result.checkpoint_ready = self.service.checkpoint_materialization(
+                        step
+                    )
+            wandb_run = self.model._get_wandb_run()
+            if wandb_run is not None:
+                self.backend._record_provenance_nonblocking(wandb_run, "local-rl")
+            await self._finish(failed=False)
+            return result
+        except BaseException:
+            await self._finish(failed=True)
+            raise
+
+    async def abort(
+        self,
+        forward: Any | None,
+        optimizer: Any | None,
+        sampler: Any | None,
+        *,
+        optimizer_admitted: bool,
+    ) -> None:
+        del sampler
+        if not optimizer_admitted:
+            if forward is not None:
+                await forward.cancel()
+            await self._finish(failed=True)
+            return
+        if forward is None or optimizer is None:
+            raise RuntimeError("optimizer admission lost its F/B command")
+
+        async def settle() -> None:
+            failed = False
+            try:
+                await asyncio.gather(forward.result(), optimizer.result())
+            except BaseException:
+                failed = True
+            await self._finish(failed=failed)
+
+        self.backend._track_pipeline_operation(
+            asyncio.create_task(settle(), name="pipeline-command-abort-settlement")
+        )
+
+    async def _finish(self, *, failed: bool) -> None:
+        if self._finished:
+            return
+        object.__setattr__(self, "_finished", True)
+        await self.backend._finish_training_batch(self.batch, failed=failed)
+
+    def _consume_operation(self, operation: Any, name: str) -> None:
+        self.backend._track_pipeline_operation(
+            asyncio.create_task(operation.result(), name=name)
+        )
 
 
 def _packing_metrics(packed: Any) -> dict[str, float]:
@@ -113,6 +287,29 @@ def _packing_metrics(packed: Any) -> dict[str, float]:
     }
 
 
+def _packing_outcome_metrics(packing: PackingOutcome) -> dict[str, float]:
+    return {
+        "pipeline/packed_sequence_length": float(packing.packed_sequence_length),
+        "pipeline/target_packed_sequences": float(packing.target_packed_sequences),
+        "data/step_packed_sequences": float(packing.packed_sequences),
+        "data/step_physical_tokens": float(packing.physical_tokens),
+        "data/step_trainable_assistant_tokens": float(
+            packing.trainable_assistant_tokens
+        ),
+    }
+
+
+def _attach_packing_shapes(
+    groups: list[TrajectoryGroup], shapes: tuple[Any, ...]
+) -> None:
+    if not any(group._collect_packing_shape for group in groups):
+        return
+    if len(groups) != len(shapes):
+        raise RuntimeError("Megatron packing shapes do not match trajectory groups")
+    for group, shape in zip(groups, shapes, strict=True):
+        group._packed_group_shape = shape
+
+
 def _sampler_publication_mode(
     service: Any,
 ) -> Literal["versioned_lora", "in_flight_lora"]:
@@ -124,8 +321,6 @@ def _sampler_publication_mode(
 
 
 class MegatronBackend(LocalBackend):
-    supports_pipeline_train_dispatch_fence = True
-
     def __init__(
         self,
         *,
@@ -172,6 +367,8 @@ class MegatronBackend(LocalBackend):
         self._managed_api_key = secrets.token_urlsafe(32)
         self._batch_release_tasks: set[asyncio.Task[None]] = set()
         self._batch_release_failures: list[BaseException] = []
+        self._pipeline_operation_tasks: set[asyncio.Task[Any]] = set()
+        self._pipeline_operation_failures: list[BaseException] = []
         self._adapter_prune_requests: dict[
             tuple[str, str], tuple[AnyTrainableModel, set[int]]
         ] = {}
@@ -304,48 +501,23 @@ class MegatronBackend(LocalBackend):
                     f"MegatronBackend.train gets {removed_kwarg} from "
                     "art.init_megatron_runtime_config(...)."
                 )
-        dispatch_event = kwargs.pop("_pipeline_train_dispatch_event", None)
-        if dispatch_event is not None and not isinstance(dispatch_event, asyncio.Event):
-            raise TypeError("pipeline train dispatch fence must be an asyncio.Event")
         groups = list(trajectory_groups)
-        pipeline_call = bool(
-            groups
-            and isinstance(groups[0]._prepared_training_batch, _PipelinePreparedBatch)
-        )
         from .distributed_service import DistributedMegatronService
 
-        dispatch_armed = dispatch_event is not None and not dispatch_event.is_set()
-        service: DistributedMegatronService | None = None
-        if dispatch_armed:
-            if not pipeline_call:
-                raise RuntimeError("trainer dispatch fencing requires a prepared batch")
-            assert dispatch_event is not None
-            service = cast(DistributedMegatronService, await self._get_service(model))
-            service.arm_pipeline_train_dispatch(dispatch_event)
-        try:
-            result = await super().train(
-                model,
-                groups,
-                packed_sequence_length=(
-                    get_megatron_runtime_config().packed_sequence_length
-                ),
-                **kwargs,
-            )
-        finally:
-            if dispatch_armed:
-                assert dispatch_event is not None
-                assert service is not None
-                service.cancel_pipeline_train_dispatch(dispatch_event)
-        if service is None:
-            service = cast(DistributedMegatronService, await self._get_service(model))
+        result = await super().train(
+            model,
+            groups,
+            packed_sequence_length=get_megatron_runtime_config().packed_sequence_length,
+            **kwargs,
+        )
+        service = cast(DistributedMegatronService, await self._get_service(model))
         final_step = kwargs.get("final_training_step")
         if final_step is not None and result.step >= final_step:
             result.metrics.update(
                 await service.finalize_publication_metrics(result.step)
             )
-        if not pipeline_call:
-            await service.wait_for_serving(result.step)
-            result.metrics.update(service.drain_publication_metrics())
+        await service.wait_for_serving(result.step)
+        result.metrics.update(service.drain_publication_metrics())
         if not kwargs.get("save_checkpoint", True):
             return result
         result.checkpoint_path = get_step_checkpoint_dir(
@@ -744,39 +916,9 @@ class MegatronBackend(LocalBackend):
         *,
         include_moe_routing: bool,
     ) -> _PackedTrainingBatch | None:
-        prepared = tuple(group._prepared_training_batch for group in trajectory_groups)
         collect_packing_shapes = any(
             group._collect_packing_shape for group in trajectory_groups
         )
-        if any(value is not None for value in prepared):
-            first = prepared[0]
-            if (
-                not isinstance(first, _PipelinePreparedBatch)
-                or any(value is not first for value in prepared)
-                or first.groups != tuple(trajectory_groups)
-            ):
-                raise RuntimeError("pipeline prepared batch does not match training")
-            packing_config = _PackingConfig.from_dev_config(
-                dev_config,
-                include_moe_routing=include_moe_routing,
-                collect_packing_shapes=collect_packing_shapes,
-            )
-            if first.packing_config != packing_config:
-                mismatch = RuntimeError(
-                    "pipeline prepared batch packing configuration does not match "
-                    "training"
-                )
-                try:
-                    await self.discard_pipeline_batch(trajectory_groups)
-                except BaseException as cleanup_error:
-                    raise BaseExceptionGroup(
-                        "prepared batch mismatch cleanup failed",
-                        [mismatch, cleanup_error],
-                    ) from None
-                raise mismatch
-            for group in trajectory_groups:
-                group._prepared_training_batch = None
-            return cast(_PackedTrainingBatch, first.batch)
         from ..distributed.packing import PackingRequest
         from ..distributed.rollout import (
             DistributedTrajectorySelection,
@@ -1014,28 +1156,54 @@ class MegatronBackend(LocalBackend):
         if failures:
             raise BaseExceptionGroup("packing ownership cleanup failed", failures)
 
-    async def prepare_pipeline_batch(
+    async def prepare_pipeline_commands(
         self,
         model: TrainableModel,
         trajectory_groups: list[TrajectoryGroup],
         *,
         normalize_advantages: bool = True,
-        advantage_balance: float = 0.0,
-        scale_rewards: bool = True,
-        allow_training_without_logprobs: bool = False,
-        plot_tensors: bool = False,
-        logprob_calculation_chunk_size: int = 1024,
-        grad_accumulation_sequences: int | None = None,
-    ) -> dict[str, float] | None:
+        train_kwargs: dict[str, Any],
+        learner_parent_version: int,
+    ) -> _MegatronPipelineCommandContext | None:
+        if normalize_advantages != train_kwargs.get("normalize_advantages", True):
+            raise ValueError("pipeline reward normalization configuration changed")
+        if train_kwargs.get("loss_fn", "cispo") not in {"cispo", "ppo"}:
+            raise ValueError("Megatron pipeline supports only cispo and ppo")
+        if train_kwargs.get("loss_fn_config") is not None:
+            raise ValueError("Megatron pipeline requires loss_fn_config=None")
+        if train_kwargs.get("adam_params") is not None:
+            raise ValueError("Megatron pipeline requires adam_params=None")
+        kl_reference_step = train_kwargs.get("kl_penalty_reference_step")
+        kl_ref_adapter_path = (
+            get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path), kl_reference_step
+            )
+            if kl_reference_step is not None
+            else None
+        )
+        config, dev_config = build_rl_train_configs(
+            learning_rate=float(train_kwargs.get("learning_rate", 5e-6)),
+            scale_rewards=normalize_advantages,
+            ppo=train_kwargs.get("loss_fn", "cispo") == "ppo",
+            kl_penalty_coef=float(train_kwargs.get("kl_penalty_coef", 0.0)),
+            kl_penalty_source=train_kwargs.get("kl_penalty_source", "current_learner"),
+            packed_sequence_length=(
+                get_megatron_runtime_config().packed_sequence_length
+            ),
+            kl_ref_adapter_path=kl_ref_adapter_path,
+            optimizer_save_interval=int(train_kwargs.get("optimizer_save_interval", 5)),
+            final_training_step=train_kwargs.get("final_training_step"),
+            grad_accumulation_sequences=train_kwargs.get("grad_accumulation_sequences"),
+        )
+        client = await self.training_client(model)
+        if client.projected_learner_version != learner_parent_version:
+            raise RuntimeError(
+                "Megatron pipeline parent changed before F/B admission: "
+                f"expected={learner_parent_version}, "
+                f"projected={client.projected_learner_version}"
+            )
+        started = time.monotonic()
         include_moe_routing = self._model_uses_expert_replay(model)
-        dev_config = {
-            "advantage_balance": advantage_balance,
-            "allow_training_without_logprobs": allow_training_without_logprobs,
-            "scale_rewards": scale_rewards and normalize_advantages,
-            "plot_tensors": plot_tensors,
-            "packed_sequence_length": get_megatron_runtime_config().packed_sequence_length,
-            "logprob_calculation_chunk_size": logprob_calculation_chunk_size,
-        }
         batch = await self._prepare_training_batch(
             model,
             trajectory_groups,
@@ -1057,27 +1225,16 @@ class MegatronBackend(LocalBackend):
             DistributedMegatronService,
             await self._get_service(model),
         )
-        packing_config = _PackingConfig.from_dev_config(
-            dev_config,
-            include_moe_routing=include_moe_routing,
-            collect_packing_shapes=any(
-                group._collect_packing_shape for group in trajectory_groups
-            ),
-        )
         try:
             metrics.update(
                 await service.prepare_cp_lookahead(
                     distributed,
-                    global_grad_accumulation_sequences=grad_accumulation_sequences,
+                    global_grad_accumulation_sequences=(
+                        config.grad_accumulation_sequences
+                    ),
                 )
             )
         except BaseException as primary:
-            cleanup_prepared = _PipelinePreparedBatch(
-                batch=batch,
-                groups=tuple(trajectory_groups),
-                packing_config=packing_config,
-                metrics=metrics,
-            )
             paths = {
                 group._prepared_log_path
                 for group in trajectory_groups
@@ -1087,7 +1244,7 @@ class MegatronBackend(LocalBackend):
                 _, cancelled = await complete_task(
                     asyncio.create_task(
                         self._discard_prepared_resources(
-                            cleanup_prepared, trajectory_groups, paths
+                            batch, trajectory_groups, paths
                         )
                     )
                 )
@@ -1099,48 +1256,54 @@ class MegatronBackend(LocalBackend):
                     [primary, cleanup_error],
                 ) from None
             raise
-        prepared = _PipelinePreparedBatch(
+        values = {
+            **dev_config,
+            "kl_penalty_coef": config.kl_penalty_coef,
+            "kl_penalty_source": config.kl_penalty_source,
+            "grad_accumulation_sequences": config.grad_accumulation_sequences,
+        }
+        rl_batch = RlTrajectoryBatch(
+            groups=payload.bundles,
+            min_source_version=payload.packed.leases.ref.min_source_version,
+            max_source_version=payload.packed.leases.ref.max_source_version,
+        )
+        object.__setattr__(rl_batch, "_local_groups", payload.groups)
+        object.__setattr__(rl_batch, "_local_packed_batch", batch)
+        return _MegatronPipelineCommandContext(
+            backend=self,
+            model=model,
+            service=service,
+            client=client,
             batch=batch,
             groups=tuple(trajectory_groups),
-            packing_config=packing_config,
-            metrics=metrics,
+            config=config,
+            forward_request=ForwardBackwardRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=client.next_sequence_id,
+                batch=rl_batch,
+                loss=LossConfig(
+                    name="ppo" if dev_config.get("ppo", False) else "cispo",
+                    normalize_advantages=bool(dev_config.get("scale_rewards", True)),
+                    values=values,
+                ),
+                collect_packing_shapes=any(
+                    group._collect_packing_shape for group in trajectory_groups
+                ),
+            ),
+            preparation_metrics=metrics,
+            expose_checkpoint_path=bool(train_kwargs.get("save_checkpoint", True)),
+            started=started,
         )
-        for group in trajectory_groups:
-            group._prepared_training_batch = prepared
-        return metrics
-
-    async def discard_pipeline_batch(
-        self, trajectory_groups: list[TrajectoryGroup]
-    ) -> None:
-        prepared = trajectory_groups[0]._prepared_training_batch
-        if not isinstance(prepared, _PipelinePreparedBatch) or any(
-            group._prepared_training_batch is not prepared
-            for group in trajectory_groups
-        ):
-            raise RuntimeError("pipeline batch is not prepared")
-        for group in trajectory_groups:
-            group._prepared_training_batch = None
-        paths = {
-            group._prepared_log_path
-            for group in trajectory_groups
-            if group._prepared_log_path is not None
-        }
-        _, cancelled = await complete_task(
-            asyncio.create_task(
-                self._discard_prepared_resources(prepared, trajectory_groups, paths)
-            )
-        )
-        if cancelled is not None:
-            raise cancelled
 
     async def _discard_prepared_resources(
         self,
-        prepared: _PipelinePreparedBatch,
+        batch: _PackedTrainingBatch,
         trajectory_groups: list[TrajectoryGroup],
         paths: set[str],
     ) -> None:
         results = await asyncio.gather(
-            self._release_distributed_batch(prepared.batch, disposition="discarded"),
+            self._release_distributed_batch(batch, disposition="discarded"),
             *(asyncio.to_thread(Path(path).unlink, missing_ok=True) for path in paths),
             return_exceptions=True,
         )
@@ -1343,6 +1506,16 @@ class MegatronBackend(LocalBackend):
         failures, self._batch_release_failures = self._batch_release_failures, []
         raise BaseExceptionGroup("distributed training batch release failed", failures)
 
+    def _track_pipeline_operation(self, task: asyncio.Task[Any]) -> None:
+        self._pipeline_operation_tasks.add(task)
+
+        def completed(value: asyncio.Task[Any]) -> None:
+            self._pipeline_operation_tasks.discard(value)
+            if not value.cancelled() and (error := value.exception()) is not None:
+                self._pipeline_operation_failures.append(error)
+
+        task.add_done_callback(completed)
+
     async def prune_model_adapters(
         self,
         model: AnyTrainableModel,
@@ -1391,6 +1564,13 @@ class MegatronBackend(LocalBackend):
 
     async def _close_megatron_backend(self) -> None:
         failures: list[BaseException] = []
+        if self._pipeline_operation_tasks:
+            await asyncio.gather(
+                *tuple(self._pipeline_operation_tasks), return_exceptions=True
+            )
+            await asyncio.sleep(0)
+        failures.extend(self._pipeline_operation_failures)
+        self._pipeline_operation_failures.clear()
         clients, self._training_clients = tuple(self._training_clients.values()), {}
         failures.extend(
             result

@@ -26,6 +26,7 @@ from .contracts import (
     TokenLogprobs,
     TrainingBatch,
 )
+from .pipeline import PipelineCommandContext
 from .sequencing import CommandAdmission, RunCommandLedger
 
 __all__ = [
@@ -46,6 +47,7 @@ __all__ = [
     "OptimStepResult",
     "PackingOutcome",
     "PolicyTokenCount",
+    "PipelineCommandContext",
     "RlTrajectoryBatch",
     "RunCommandLedger",
     "SamplerPublication",

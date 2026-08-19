@@ -8,7 +8,14 @@ import time
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, SkipValidation, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    SkipValidation,
+    model_validator,
+)
 
 from art._backend_training import (
     aggregate_rl_training_metrics,
@@ -38,6 +45,7 @@ from art.training.contracts import (
     SamplerPublication,
     SamplerWeightsResult,
     SaveStateRequest,
+    SaveStateResult,
     SaveWeightsForSamplerRequest,
     SupervisedTrajectoryBatch,
 )
@@ -95,17 +103,220 @@ class SamplerManager(Protocol):
     ) -> None: ...
 
 
-class _RemotePipelineBatch(BaseModel):
+class _RemotePipelineCommandContext(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
-    forward: SkipValidation[TrainingOperation[ForwardBackwardResult]] = Field(
-        exclude=True
-    )
-    loss: LossConfig
-    forward_submit_s: float = Field(ge=0)
-    groups: tuple[Any, ...]
+    backend: SkipValidation[Any] = Field(exclude=True)
+    model: SkipValidation[Any] = Field(exclude=True)
+    client: SkipValidation[RemoteTrainingClient] = Field(exclude=True)
+    groups: tuple[TrajectoryGroup, ...]
     selections: tuple[Any, ...]
     generation_id: str = Field(min_length=1)
+    forward_request: ForwardBackwardRequest
+    settings: _ServerlessTrainSettings
+    preparation_metrics: dict[str, float]
+    started: float = Field(ge=0)
+    _sampler_pending: _PendingSamplerPublication | None = PrivateAttr(default=None)
+    _publication: asyncio.Task[dict[str, float]] | None = PrivateAttr(default=None)
+    _released: bool = PrivateAttr(default=False)
+
+    def optimizer_request(self, sequence_id: int) -> OptimStepRequest:
+        return OptimStepRequest(
+            run_id=self.client.run_id,
+            request_id=uuid.uuid4().hex,
+            sequence_id=sequence_id,
+            optimizer=AdamConfig(learning_rate=self.settings.learning_rate),
+        )
+
+    async def sampler_request(
+        self, step: int, sequence_id: int
+    ) -> SaveWeightsForSamplerRequest:
+        object.__setattr__(
+            self,
+            "_sampler_pending",
+            await self.backend._reserve_sampler_publication(self.model, step),
+        )
+        return SaveWeightsForSamplerRequest(
+            run_id=self.client.run_id,
+            request_id=uuid.uuid4().hex,
+            sequence_id=sequence_id,
+            checkpoint_name=f"step-{step}",
+            publication=SamplerPublication(
+                mode="in_flight_lora", model_alias=self.model.name
+            ),
+        )
+
+    def state_request(self, step: int, sequence_id: int) -> SaveStateRequest | None:
+        config, _ = self.settings.resolve()
+        if not should_save_optimizer_state(step, config):
+            return None
+        return SaveStateRequest(
+            run_id=self.client.run_id,
+            request_id=uuid.uuid4().hex,
+            sequence_id=sequence_id,
+            checkpoint_name=f"step-{step}",
+        )
+
+    async def commands_admitted(
+        self,
+        *,
+        forward: TrainingOperation[ForwardBackwardResult],
+        optimizer: TrainingOperation[OptimStepResult],
+        sampler: TrainingOperation[SamplerWeightsResult],
+        state: TrainingOperation[SaveStateResult] | None,
+    ) -> None:
+        del forward, optimizer
+        pending = self._require_sampler_pending()
+        step = sampler.ref.learner_parent_version
+        object.__setattr__(
+            self,
+            "_publication",
+            asyncio.create_task(
+                self.backend._complete_sampler_publication(
+                    self.model, step, sampler, pending
+                ),
+                name=f"remote-sampler-publication-{self.client.run_id}-{step}",
+            ),
+        )
+        assert self._publication is not None
+        self.backend._track_task(self._publication)
+        if state is not None:
+            self.backend._track(state.result(), f"remote-state-{step}")
+        release = asyncio.create_task(
+            self._release("consumed"),
+            name=f"remote-pipeline-release-{self.client.run_id}-{step}",
+        )
+        self.backend._track_task(release)
+
+    async def complete(
+        self,
+        *,
+        step: int,
+        forward: TrainingOperation[ForwardBackwardResult],
+        optimizer: TrainingOperation[OptimStepResult],
+        forward_submit_s: float,
+    ) -> ServerlessTrainResult:
+        results = await asyncio.gather(
+            forward.result(), optimizer.result(), return_exceptions=True
+        )
+        failures = [value for value in results if isinstance(value, BaseException)]
+        if failures:
+            raise BaseExceptionGroup("remote train operations failed", failures)
+        forward_result, optimizer_result = results
+        if not (
+            isinstance(forward_result, ForwardBackwardResult)
+            and isinstance(optimizer_result, OptimStepResult)
+        ):
+            raise TypeError("remote train returned an invalid result type")
+        _attach_packing_shapes(list(self.groups), forward_result.packing.group_shapes)
+        metrics = aggregate_rl_training_metrics(
+            training_metrics=[
+                {
+                    **merge_gradient_step_metrics(
+                        forward_result.metrics, optimizer_result.metrics
+                    ),
+                    **_packing_outcome_metrics(forward_result.packing),
+                    "time/step_remote_forward_submit_s": forward_submit_s,
+                }
+            ],
+            trajectory_groups=self.groups,
+            trainer_started=self.started,
+        )
+        policy_counts = forward_result.packing.policy_token_counts
+        if policy_counts is None:
+            raise RuntimeError("remote RL packing omitted exact policy token counts")
+        result = ServerlessTrainResult(
+            step=step,
+            metrics=metrics,
+            packed_policy_token_counts=tuple(
+                (value.policy_version, value.trainable_assistant_tokens)
+                for value in policy_counts
+            ),
+        )
+        pending = self._require_sampler_pending()
+        publication = self._publication
+        if publication is None:
+            raise RuntimeError("remote sampler publication was not started")
+        result.checkpoint_ready = self.backend._sampler_checkpoint_readiness(
+            result, pending, publication
+        )
+        result.publication_metrics_ready = (
+            self.backend._sampler_publication_metrics_readiness(publication)
+        )
+        return result
+
+    async def abort(
+        self,
+        forward: TrainingOperation[ForwardBackwardResult] | None,
+        optimizer: TrainingOperation[OptimStepResult] | None,
+        sampler: TrainingOperation[SamplerWeightsResult] | None,
+        *,
+        optimizer_admitted: bool,
+    ) -> None:
+        del optimizer
+        cleanup: list[Coroutine[Any, Any, None]] = []
+        if not optimizer_admitted and forward is not None:
+            cleanup.append(forward.cancel())
+        pending = self._sampler_pending
+        if pending is not None and self._publication is None:
+            if sampler is None:
+                await self.backend._fail_sampler_result(
+                    self.model,
+                    self.client.projected_learner_version,
+                    pending,
+                    RuntimeError("pipeline command admission failed"),
+                )
+            else:
+                step = sampler.ref.learner_parent_version
+                object.__setattr__(
+                    self,
+                    "_publication",
+                    asyncio.create_task(
+                        self.backend._complete_sampler_publication(
+                            self.model, step, sampler, pending
+                        ),
+                        name=(
+                            f"remote-sampler-publication-{self.client.run_id}-{step}"
+                        ),
+                    ),
+                )
+                assert self._publication is not None
+                self.backend._track_task(self._publication)
+        if not self._released:
+            cleanup.append(
+                self._release("consumed" if optimizer_admitted else "discarded")
+            )
+        failures = [
+            value
+            for value in await asyncio.gather(*cleanup, return_exceptions=True)
+            if isinstance(value, BaseException)
+        ]
+        if failures:
+            raise BaseExceptionGroup("remote pipeline cleanup failed", failures)
+
+    def _require_sampler_pending(self) -> "_PendingSamplerPublication":
+        if self._sampler_pending is None:
+            raise RuntimeError("remote sampler publication was not reserved")
+        return self._sampler_pending
+
+    async def _release(self, disposition: Literal["consumed", "discarded"]) -> None:
+        if self._released:
+            return
+        object.__setattr__(self, "_released", True)
+        if not self.selections:
+            return
+        queue = self.selections[0].queue
+        _, cancelled = await complete_task(
+            asyncio.create_task(
+                queue.release_selections(
+                    self.selections,
+                    disposition=disposition,
+                    generation_id=self.generation_id,
+                )
+            )
+        )
+        if cancelled is not None:
+            raise cancelled
 
 
 class _PendingServerlessTrain(BaseModel):
@@ -248,6 +459,9 @@ class _ServerlessTrainSettings(BaseModel):
                 "grad_accumulation_sequences": config.grad_accumulation_sequences,
             },
         )
+
+
+_RemotePipelineCommandContext.model_rebuild()
 
 
 def _serverless_train_settings(values: dict[str, Any]) -> _ServerlessTrainSettings:
@@ -1260,19 +1474,6 @@ class ServerlessBackend:
         result.publication_metrics_ready = None
         return result
 
-    async def start_pipeline_train(
-        self,
-        model: AnyTrainableModel,
-        trajectory_groups: Iterable[TrajectoryGroup],
-        **kwargs: Any,
-    ) -> _PendingServerlessTrain:
-        self._raise_background_failures()
-        return await self._start_train(
-            model,
-            list(trajectory_groups),
-            _ServerlessTrainSettings.model_validate(kwargs),
-        )
-
     async def _start_train(
         self,
         model: AnyTrainableModel,
@@ -1283,48 +1484,26 @@ class ServerlessBackend:
             raise ValueError("trajectory_groups must not be empty")
         config, loss = settings.resolve()
         client = await self.training_client(model)
-        prepared = groups[0]._prepared_training_batch
-        if prepared is not None:
-            if (
-                not isinstance(prepared, _RemotePipelineBatch)
-                or len(prepared.groups) != len(groups)
-                or any(
-                    actual is not expected
-                    for actual, expected in zip(prepared.groups, groups, strict=True)
-                )
-                or any(
-                    group._prepared_training_batch is not prepared for group in groups
-                )
-            ):
-                raise RuntimeError("remote pipeline batch preparation is inconsistent")
-        elif any(group._prepared_training_batch is not None for group in groups):
-            raise RuntimeError("remote pipeline batch preparation is inconsistent")
-        elif any(group._distributed_lease is not None for group in groups):
+        if any(group._distributed_lease is not None for group in groups):
             raise RuntimeError(
                 "distributed trajectory batches require remote pipeline preparation"
             )
         started = time.monotonic()
-        if prepared is None:
-            request = ForwardBackwardRequest(
-                run_id=client.run_id,
-                request_id=uuid.uuid4().hex,
-                sequence_id=client.next_sequence_id,
-                batch=RlTrajectoryBatch.from_groups(
-                    groups, default_source_version=client.projected_learner_version
-                ),
-                loss=loss,
-                collect_packing_shapes=any(
-                    group._collect_packing_shape for group in groups
-                ),
-            )
-            submit_started = time.monotonic()
-            forward = await client.forward_backward(request)
-            forward_submit_s = time.monotonic() - submit_started
-        else:
-            if prepared.loss != loss:
-                raise RuntimeError("prepared remote F/B configuration changed")
-            forward = prepared.forward
-            forward_submit_s = prepared.forward_submit_s
+        request = ForwardBackwardRequest(
+            run_id=client.run_id,
+            request_id=uuid.uuid4().hex,
+            sequence_id=client.next_sequence_id,
+            batch=RlTrajectoryBatch.from_groups(
+                groups, default_source_version=client.projected_learner_version
+            ),
+            loss=loss,
+            collect_packing_shapes=any(
+                group._collect_packing_shape for group in groups
+            ),
+        )
+        submit_started = time.monotonic()
+        forward = await client.forward_backward(request)
+        forward_submit_s = time.monotonic() - submit_started
 
         optimizer: TrainingOperation[OptimStepResult] | None = None
         sampler: TrainingOperation[SamplerWeightsResult] | None = None
@@ -1363,15 +1542,6 @@ class ServerlessBackend:
             cleanup: list[Coroutine[Any, Any, None]] = []
             if optimizer is None:
                 cleanup.append(forward.cancel())
-            if prepared is not None:
-                for group in groups:
-                    group._prepared_training_batch = None
-                cleanup.append(
-                    self._release_remote_pipeline_batch(
-                        prepared,
-                        disposition=("discarded" if optimizer is None else "consumed"),
-                    )
-                )
             failures = [
                 result
                 for result in await asyncio.gather(*cleanup, return_exceptions=True)
@@ -1389,15 +1559,6 @@ class ServerlessBackend:
             name=f"remote-sampler-publication-{client.run_id}-{step}",
         )
         self._track_task(publication)
-        release: asyncio.Task[None] | None = None
-        if prepared is not None:
-            release = asyncio.create_task(
-                self._release_remote_pipeline_batch(prepared, disposition="consumed"),
-                name=f"remote-pipeline-release-{client.run_id}-{step}",
-            )
-            self._track_task(release)
-            for group in groups:
-                group._prepared_training_batch = None
 
         async def complete() -> ServerlessTrainResult:
             results = await asyncio.gather(
@@ -1462,7 +1623,7 @@ class ServerlessBackend:
         del model
         return True
 
-    async def prepare_pipeline_batch(
+    async def prepare_pipeline_commands(
         self,
         model: AnyTrainableModel,
         trajectory_groups: list[TrajectoryGroup],
@@ -1470,7 +1631,7 @@ class ServerlessBackend:
         normalize_advantages: bool = True,
         train_kwargs: dict[str, Any],
         learner_parent_version: int,
-    ) -> dict[str, float]:
+    ) -> _RemotePipelineCommandContext:
         if normalize_advantages != train_kwargs.get("normalize_advantages", True):
             raise ValueError("pipeline reward normalization configuration changed")
         settings = _ServerlessTrainSettings.model_validate(train_kwargs)
@@ -1532,7 +1693,6 @@ class ServerlessBackend:
                 group._collect_packing_shape for group in trajectory_groups
             ),
         )
-        forward: TrainingOperation[ForwardBackwardResult] | None = None
         marked_packed = False
         try:
             _, cancelled = await complete_task(
@@ -1541,13 +1701,6 @@ class ServerlessBackend:
             marked_packed = True
             if cancelled is not None:
                 raise cancelled
-            submit_started = time.monotonic()
-            forward = await client.forward_backward(request)
-            forward_submit_s = time.monotonic() - submit_started
-            if forward.ref.learner_parent_version != learner_parent_version:
-                raise RuntimeError(
-                    "remote service admitted F/B against another learner"
-                )
         except BaseException as primary:
             cleanup = [
                 asyncio.create_task(
@@ -1558,8 +1711,6 @@ class ServerlessBackend:
                     )
                 )
             ]
-            if forward is not None:
-                cleanup.append(asyncio.create_task(forward.cancel()))
             failures = [
                 value
                 for value in await asyncio.gather(*cleanup, return_exceptions=True)
@@ -1570,62 +1721,21 @@ class ServerlessBackend:
                     "remote packing and source cleanup failed", [primary, *failures]
                 ) from None
             raise
-        assert forward is not None
-        prepared = _RemotePipelineBatch(
-            forward=forward,
-            loss=loss,
-            forward_submit_s=forward_submit_s,
+        metrics = {
+            "time/step_prepare_remote_batch_s": time.monotonic() - started,
+        }
+        return _RemotePipelineCommandContext(
+            backend=self,
+            model=model,
+            client=client,
             groups=tuple(trajectory_groups),
             selections=selected,
             generation_id=generation_id,
+            forward_request=request,
+            settings=settings,
+            preparation_metrics=metrics,
+            started=started,
         )
-        for group in trajectory_groups:
-            group._prepared_training_batch = prepared
-        return {
-            "time/step_prepare_remote_batch_s": time.monotonic() - started,
-            "time/step_remote_forward_submit_s": forward_submit_s,
-        }
-
-    async def discard_pipeline_batch(
-        self, trajectory_groups: list[TrajectoryGroup]
-    ) -> None:
-        prepared = trajectory_groups[0]._prepared_training_batch
-        if not isinstance(prepared, _RemotePipelineBatch) or any(
-            group._prepared_training_batch is not prepared
-            for group in trajectory_groups
-        ):
-            raise RuntimeError("remote pipeline batch is not prepared")
-        for group in trajectory_groups:
-            group._prepared_training_batch = None
-        results = await asyncio.gather(
-            prepared.forward.cancel(),
-            self._release_remote_pipeline_batch(prepared, disposition="discarded"),
-            return_exceptions=True,
-        )
-        failures = [result for result in results if isinstance(result, BaseException)]
-        if failures:
-            raise BaseExceptionGroup("remote prepared batch discard failed", failures)
-
-    @staticmethod
-    async def _release_remote_pipeline_batch(
-        prepared: _RemotePipelineBatch,
-        *,
-        disposition: Literal["consumed", "discarded"],
-    ) -> None:
-        if not prepared.selections:
-            return
-        queue = prepared.selections[0].queue
-        _, cancelled = await complete_task(
-            asyncio.create_task(
-                queue.release_selections(
-                    prepared.selections,
-                    disposition=disposition,
-                    generation_id=prepared.generation_id,
-                )
-            )
-        )
-        if cancelled is not None:
-            raise cancelled
 
     async def _train_sft(
         self,

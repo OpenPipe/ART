@@ -14,6 +14,7 @@ from statistics import fmean, median, quantiles
 import struct
 import subprocess
 import sys
+import time
 from typing import Any, Literal, NamedTuple, cast
 import uuid
 
@@ -47,7 +48,7 @@ _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
 _INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
-_MEASUREMENT_CONTRACT_VERSION = 20
+_MEASUREMENT_CONTRACT_VERSION = 21
 _ISOLATED_WARMUP_STEPS = 1
 _MATCHED_MEASURED_STEPS = 3
 _PACKING_DRAIN_WINDOWS = 1
@@ -505,24 +506,15 @@ def _matched_input_fingerprints(
     )
 
 
-async def _discard_prepared_pipeline_batch(backend: Any, groups: list[Any]) -> None:
-    for group in groups:
-        group._distributed_lease = None
-    await backend.discard_pipeline_batch(groups)
+async def _discard_prepared_pipeline_context(
+    prepared: Any, forward: Any | None = None
+) -> None:
+    await prepared.abort(forward, None, None, optimizer_admitted=False)
 
 
 def _matched_capture_steps(max_steps: int) -> tuple[int, ...]:
     first = max_steps - _MATCHED_MEASURED_STEPS + 1
     return tuple(range(first, first + _MATCHED_MEASURED_STEPS))
-
-
-def _prepared_pipeline_batch(groups: list[Any]) -> Any:
-    prepared = groups[0]._prepared_training_batch
-    if prepared is None or any(
-        group._prepared_training_batch is not prepared for group in groups
-    ):
-        raise RuntimeError("trainer groups do not share one prepared data-plane batch")
-    return prepared
 
 
 def _packed_batch_fingerprint(prepared: Any) -> str:
@@ -544,7 +536,7 @@ def _packed_batch_fingerprint(prepared: Any) -> str:
         },
     )
     manifest = {
-        "packing_config": prepared.packing_config.model_dump(mode="json"),
+        "loss": prepared.forward_request.loss.model_dump(mode="json"),
         "batch": batch.model_dump(mode="json", exclude={"payload"}),
         "packed_ref": stable_ref,
     }
@@ -578,8 +570,51 @@ def _packed_batch_fingerprint(prepared: Any) -> str:
     return digest.hexdigest()
 
 
-def _packed_input_fingerprint(groups: list[Any]) -> str:
-    return _packed_batch_fingerprint(_prepared_pipeline_batch(groups))
+def _packed_input_fingerprint(prepared: Any) -> str:
+    return _packed_batch_fingerprint(prepared)
+
+
+async def _execute_pipeline_commands(prepared: Any) -> Any:
+    forward = optimizer = sampler = None
+    try:
+        submit_started = time.monotonic()
+        forward = await prepared.client.forward_backward(prepared.forward_request)
+        forward_submit_s = time.monotonic() - submit_started
+        optimizer = await prepared.client.optim_step(
+            prepared.optimizer_request(prepared.client.next_sequence_id)
+        )
+        step = optimizer.ref.reserved_output_learner_version
+        if step is None:
+            raise RuntimeError("isolated optimizer did not reserve a learner")
+        sampler = await prepared.client.save_weights_for_sampler(
+            await prepared.sampler_request(step, prepared.client.next_sequence_id)
+        )
+        state_request = prepared.state_request(step, prepared.client.next_sequence_id)
+        state = (
+            await prepared.client.save_state(state_request)
+            if state_request is not None
+            else None
+        )
+        await prepared.commands_admitted(
+            forward=forward,
+            optimizer=optimizer,
+            sampler=sampler,
+            state=state,
+        )
+        return await prepared.complete(
+            step=step,
+            forward=forward,
+            optimizer=optimizer,
+            forward_submit_s=forward_submit_s,
+        )
+    except BaseException:
+        await prepared.abort(
+            forward,
+            optimizer,
+            sampler,
+            optimizer_admitted=optimizer is not None,
+        )
+        raise
 
 
 async def _capture_training_bundles(selections: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -1242,7 +1277,6 @@ async def _run_isolated_backend_phase(
     backend: Any,
     model: Any,
     service: Any,
-    train: Callable[..., Awaitable[Any]],
     captured_inputs: tuple[CapturedTrainingInput, ...],
 ) -> TrainerPhaseEvidence:
     from art.distributed.trajectory_store import TrajectoryGroupBundle
@@ -1263,25 +1297,31 @@ async def _run_isolated_backend_phase(
         ):
             raise RuntimeError("isolated trajectory input changed during round trip")
         _collect_matched_packing_shapes(groups)
-        packing = await backend.prepare_pipeline_batch(model, groups)
-        if packing is None:
-            raise RuntimeError("isolated backend benchmark produced no packed batch")
-        try:
-            current_packed_fingerprint = _packed_input_fingerprint(groups)
-        except BaseException:
-            await _discard_prepared_pipeline_batch(backend, groups)
-            raise
-        result = await train(
+        prepared = await backend.prepare_pipeline_commands(
             model,
             groups,
-            learning_rate=1e-6,
-            loss_fn="cispo",
-            loss_fn_config=None,
             normalize_advantages=True,
-            save_checkpoint=False,
-            adam_params=None,
-            optimizer_save_interval=5,
+            learner_parent_version=(
+                await backend.training_client(model)
+            ).projected_learner_version,
+            train_kwargs={
+                "learning_rate": 1e-6,
+                "loss_fn": "cispo",
+                "loss_fn_config": None,
+                "normalize_advantages": True,
+                "save_checkpoint": False,
+                "adam_params": None,
+                "optimizer_save_interval": 5,
+            },
         )
+        if prepared is None:
+            raise RuntimeError("isolated backend benchmark produced no packed batch")
+        try:
+            current_packed_fingerprint = _packed_input_fingerprint(prepared)
+        except BaseException:
+            await _discard_prepared_pipeline_context(prepared)
+            raise
+        result = await _execute_pipeline_commands(prepared)
         if sample_index >= _ISOLATED_WARMUP_STEPS:
             packed_input_fingerprints.append(current_packed_fingerprint)
             samples.append((result.metrics, int(result.step)))
@@ -1956,7 +1996,7 @@ async def _run_e2e_throughput_async(
             capture_requests: dict[
                 int, tuple[Any, tuple[Any, ...], dict[str, int]]
             ] = {}
-            original_train = backend.train
+            original_prepare_pipeline_commands = backend.prepare_pipeline_commands
             original_finish_training_batch = backend._finish_training_batch
             original_release_trajectory_sources = backend._release_trajectory_sources
             train_call_count = 0
@@ -2019,7 +2059,48 @@ async def _run_e2e_throughput_async(
                         "throughput input capture or batch release failed", failures
                     )
 
-            async def tracked_train(*args: Any, **kwargs: Any) -> Any:
+            class ObservedPipelineContext:
+                def __init__(self, inner: Any, captured_batch_id: int | None) -> None:
+                    self._inner = inner
+                    self._captured_batch_id = captured_batch_id
+
+                def __getattr__(self, name: str) -> Any:
+                    return getattr(self._inner, name)
+
+                async def complete(self, **kwargs: Any) -> Any:
+                    result = await self._inner.complete(**kwargs)
+                    step = int(result.step)
+                    if step in activation_tasks:
+                        raise RuntimeError(
+                            f"duplicate trainer completion for policy {step}"
+                        )
+                    activation_tasks[step] = asyncio.create_task(
+                        _activation_event(service, step)
+                    )
+                    captured_batch_id = self._captured_batch_id
+                    if captured_batch_id is not None:
+                        capture_task = capture_tasks.get(captured_batch_id)
+                        if capture_task is None:
+                            raise RuntimeError(
+                                "trainer did not release captured sources"
+                            )
+                        bundles, trajectory, packed, settings = await capture_task
+                        capture_tasks.pop(captured_batch_id)
+                        captured_training_inputs.append(
+                            CapturedTrainingInput(
+                                bundles,
+                                trajectory,
+                                packed,
+                                settings,
+                                result.metrics,
+                                step,
+                            )
+                        )
+                    return result
+
+            async def tracked_prepare_pipeline_commands(
+                *args: Any, **kwargs: Any
+            ) -> Any:
                 nonlocal train_call_count
                 train_call_count += 1
                 if len(args) < 2:
@@ -2027,11 +2108,13 @@ async def _run_e2e_throughput_async(
                         "PipelineTrainer did not pass trajectory groups positionally"
                     )
                 groups = args[1]
+                prepared = await original_prepare_pipeline_commands(*args, **kwargs)
+                if prepared is None:
+                    return None
                 captured_batch_id = None
                 if train_call_count in capture_train_calls:
                     try:
                         _collect_matched_packing_shapes(groups)
-                        prepared = _prepared_pipeline_batch(groups)
                         selections = tuple(
                             getattr(prepared.batch.payload, "selections", ())
                         )
@@ -2046,36 +2129,15 @@ async def _run_e2e_throughput_async(
                             _current_pipeline_settings(trainer),
                         )
                     except BaseException:
-                        await _discard_prepared_pipeline_batch(backend, groups)
+                        await _discard_prepared_pipeline_context(prepared)
                         raise
-                result = await original_train(*args, **kwargs)
-                step = int(result.step)
-                if step in activation_tasks:
-                    raise RuntimeError(
-                        f"duplicate trainer completion for policy {step}"
-                    )
-                activation_tasks[step] = asyncio.create_task(
-                    _activation_event(service, step)
-                )
-                if captured_batch_id is not None:
-                    capture_task = capture_tasks.get(captured_batch_id)
-                    if capture_task is None:
-                        raise RuntimeError("trainer did not release captured sources")
-                    bundles, trajectory, packed, settings = await capture_task
-                    capture_tasks.pop(captured_batch_id)
-                    captured_training_inputs.append(
-                        CapturedTrainingInput(
-                            bundles,
-                            trajectory,
-                            packed,
-                            settings,
-                            result.metrics,
-                            step,
-                        )
-                    )
-                return result
+                return ObservedPipelineContext(prepared, captured_batch_id)
 
-            setattr(backend, "train", tracked_train)
+            setattr(
+                backend,
+                "prepare_pipeline_commands",
+                tracked_prepare_pipeline_commands,
+            )
             setattr(backend, "_finish_training_batch", finish_training_batch)
             setattr(
                 backend,
@@ -2098,7 +2160,11 @@ async def _run_e2e_throughput_async(
                     key=lambda event: event.step,
                 )
             finally:
-                setattr(backend, "train", original_train)
+                setattr(
+                    backend,
+                    "prepare_pipeline_commands",
+                    original_prepare_pipeline_commands,
+                )
                 setattr(
                     backend,
                     "_finish_training_batch",
@@ -2148,7 +2214,6 @@ async def _run_e2e_throughput_async(
                 backend=backend,
                 model=model,
                 service=service,
-                train=original_train,
                 captured_inputs=tuple(captured_training_inputs),
             )
         finally:
