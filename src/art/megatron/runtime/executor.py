@@ -1375,6 +1375,7 @@ class MCoreRunSlotExecutor:
             return
         self._residency.acquire_l1(key)
         try:
+            self._residency.wait_before_mutation(key)
             yield
         finally:
             self._residency.release_l1(key)

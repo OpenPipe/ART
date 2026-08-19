@@ -8,6 +8,7 @@ from typing import Any, Iterator
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch
 
+from ..tensor_snapshot import SnapshotReadBarrier
 from .nvme_residency import (
     NvmeResidencyManifest,
     NvmeResidencyStore,
@@ -67,7 +68,7 @@ class RunResidencyManager:
         self,
         config: RunResidencyConfig,
         *,
-        snapshot_barrier: Any,
+        snapshot_barrier: SnapshotReadBarrier,
     ) -> None:
         self.config = config
         self.ledger = ResidencyLedger(config.limits)
@@ -76,6 +77,7 @@ class RunResidencyManager:
             staging_capacity=config.limits.max_concurrent_transitions
         )
         self._snapshot_barrier = snapshot_barrier
+        self._mutation_barriers: dict[ResidencyKey, SnapshotReadBarrier] = {}
         self._states: dict[ResidencyKey, _ManagedState] = {}
         self._installed_components: dict[tuple[str, str], ResidencyKey] = {}
         self._pool = ThreadPoolExecutor(
@@ -233,6 +235,9 @@ class RunResidencyManager:
                     try:
                         snapshot = self._mover.snapshot(state.tensors)
                         self._snapshot_barrier.register(snapshot.pending)
+                        self._mutation_barriers.setdefault(
+                            key, SnapshotReadBarrier()
+                        ).register(snapshot.pending)
                     except BaseException:
                         self._cancel(reservation)
                         raise
@@ -378,6 +383,15 @@ class RunResidencyManager:
     def release_l1(self, key: ResidencyKey) -> None:
         self.ledger.unpin(key)
 
+    def wait_before_mutation(self, key: ResidencyKey) -> None:
+        """Order this key's next CUDA mutation after its recovery snapshot."""
+        self._require_open()
+        with self._lock:
+            self._state(key)
+            barrier = self._mutation_barriers.pop(key, None)
+        if barrier is not None:
+            barrier.wait_before_mutation()
+
     def touch(self, key: ResidencyKey) -> None:
         self._require_open()
         self.ledger.touch(key)
@@ -426,6 +440,7 @@ class RunResidencyManager:
                 self._store.delete(key)
             self.ledger.drop_entry(key)
             self._states.pop(key)
+            self._mutation_barriers.pop(key, None)
             component = self._exclusive_component(key)
             if (
                 component is not None
