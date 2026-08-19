@@ -10,6 +10,7 @@ from art.megatron.optimizer_state import (
     OptimizerTopology,
     build_optimizer_manifest,
     commit_optimizer_generation,
+    optimizer_generation_nbytes,
     read_committed_optimizer_pointer,
 )
 
@@ -88,6 +89,7 @@ class DurableTrainerPublication(_PublicationModel):
     transport_adapter: OptimizerAdapter | None = None
     resume_step: int = Field(ge=0)
     optimizer_step: int = Field(ge=0)
+    optimizer_bytes: int | None = Field(default=None, gt=0)
 
 
 def commit_trainer_publication(
@@ -106,6 +108,7 @@ def commit_trainer_publication(
     if adapter is None:
         raise RuntimeError("trainer publication has no rank-zero adapter")
     saves_optimizer = ordered[0].saves_optimizer
+    optimizer_bytes = None
     if saves_optimizer:
         runtime_ids = {record.runtime_sha256 for record in ordered}
         topologies = {record.topology for record in ordered}
@@ -118,17 +121,19 @@ def commit_trainer_publication(
         if runtime_sha256 is None or topology is None:
             raise RuntimeError("optimizer publication metadata is incomplete")
         expected = read_committed_optimizer_pointer(optimizer_state_path)
+        manifest = build_optimizer_manifest(
+            generation=generation.generation_id,
+            step=generation.policy_step,
+            adapter=adapter,
+            runtime_sha256=runtime_sha256,
+            world_size=len(ordered),
+            shards=[record.shard for record in ordered if record.shard is not None],
+            topology=topology,
+        )
+        optimizer_bytes = optimizer_generation_nbytes(manifest)
         commit_optimizer_generation(
             optimizer_state_path,
-            build_optimizer_manifest(
-                generation=generation.generation_id,
-                step=generation.policy_step,
-                adapter=adapter,
-                runtime_sha256=runtime_sha256,
-                world_size=len(ordered),
-                shards=[record.shard for record in ordered if record.shard is not None],
-                topology=topology,
-            ),
+            manifest,
             expected_pointer=expected,
         )
     committed = read_committed_optimizer_pointer(optimizer_state_path)
@@ -138,4 +143,5 @@ def commit_trainer_publication(
         transport_adapter=ordered[0].transport_adapter,
         resume_step=generation.policy_step if saves_optimizer else optimizer_step,
         optimizer_step=optimizer_step,
+        optimizer_bytes=optimizer_bytes,
     )

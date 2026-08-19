@@ -652,13 +652,22 @@ def link_adapter_generation(
         return adapter
 
 
+def _serialized_model_json(model: BaseModel) -> str:
+    return json.dumps(model.model_dump(mode="json"), sort_keys=True) + "\n"
+
+
+def optimizer_generation_nbytes(manifest: OptimizerGenerationManifest) -> int:
+    return sum(shard.size_bytes for shard in manifest.shards) + len(
+        _serialized_model_json(manifest).encode("utf-8")
+    )
+
+
 def _write_model_atomic(path: Path, model: BaseModel) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
     try:
         with temporary.open("w", encoding="utf-8") as output:
-            output.write(json.dumps(model.model_dump(mode="json"), sort_keys=True))
-            output.write("\n")
+            output.write(_serialized_model_json(model))
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, path)

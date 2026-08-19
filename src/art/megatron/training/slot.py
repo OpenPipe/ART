@@ -21,8 +21,10 @@ from art.megatron.optimizer_state import (
     OptimizerAdapter,
     link_adapter_generation,
     optimizer_adapter,
+    optimizer_generation_nbytes,
     read_adapter_publication,
     read_committed_optimizer_pointer,
+    read_optimizer_generation_manifest,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.publication import commit_trainer_publication
@@ -708,7 +710,7 @@ class MegatronTrainingSlot:
         )
 
         async def complete() -> SamplerWeightsResult:
-            adapter, metrics = await self._finish_snapshot(snapshot)
+            adapter, metrics, _ = await self._finish_snapshot(snapshot)
             result = SamplerWeightsResult(
                 operation_id=ref.operation_id,
                 checkpoint=checkpoint_ref(
@@ -753,7 +755,9 @@ class MegatronTrainingSlot:
         )
 
         async def complete() -> SaveStateResult:
-            adapter, metrics = await self._finish_snapshot(snapshot)
+            adapter, metrics, optimizer_bytes = await self._finish_snapshot(snapshot)
+            if optimizer_bytes is None:
+                raise RuntimeError("save_state completed without optimizer bytes")
             result = SaveStateResult(
                 operation_id=ref.operation_id,
                 checkpoint=checkpoint_ref(
@@ -764,6 +768,7 @@ class MegatronTrainingSlot:
                 generation_id=adapter.generation_id,
                 lora_bytes=sum(file.size_bytes for file in adapter.files),
                 optimizer_state=optimizer_state_path,
+                optimizer_bytes=optimizer_bytes,
                 metrics=metrics,
             )
             self._results[ref.operation_id] = (fingerprint, result)
@@ -781,7 +786,7 @@ class MegatronTrainingSlot:
         save_optimizer: bool,
         publish_sampler: bool,
         sequence_continuation_of: str | None = None,
-    ) -> tuple[OptimizerAdapter, dict[str, float]]:
+    ) -> tuple[OptimizerAdapter, dict[str, float], int | None]:
         snapshot = await self._start_snapshot(
             ref,
             save_optimizer=save_optimizer,
@@ -797,7 +802,7 @@ class MegatronTrainingSlot:
         save_optimizer: bool,
         publish_sampler: bool,
         sequence_continuation_of: str | None = None,
-    ) -> tuple[OptimizerAdapter, dict[str, float]] | _PendingSnapshot:
+    ) -> tuple[OptimizerAdapter, dict[str, float], int | None] | _PendingSnapshot:
         state = self._require_parent(ref)
         generation = state.generation
         object_target = (
@@ -809,7 +814,7 @@ class MegatronTrainingSlot:
             generation.adapter_path, step=generation.policy_step
         )
         if not save_optimizer and existing is not None and object_target is None:
-            return existing, {}
+            return existing, {}, None
         optimizer_state_path = state.registration.optimizer_state_path
         pointer = read_committed_optimizer_pointer(optimizer_state_path)
         persist_optimizer = save_optimizer
@@ -826,7 +831,10 @@ class MegatronTrainingSlot:
                     "committed optimizer generation disagrees with resident learner"
                 )
             if object_target is None:
-                return pointer.adapter, {}
+                manifest = read_optimizer_generation_manifest(
+                    optimizer_state_path, pointer.generation
+                )
+                return pointer.adapter, {}, optimizer_generation_nbytes(manifest)
             existing = pointer.adapter
             persist_optimizer = False
         staging = (
@@ -880,8 +888,9 @@ class MegatronTrainingSlot:
 
     async def _finish_snapshot(
         self,
-        snapshot: tuple[OptimizerAdapter, dict[str, float]] | _PendingSnapshot,
-    ) -> tuple[OptimizerAdapter, dict[str, float]]:
+        snapshot: tuple[OptimizerAdapter, dict[str, float], int | None]
+        | _PendingSnapshot,
+    ) -> tuple[OptimizerAdapter, dict[str, float], int | None]:
         if isinstance(snapshot, tuple):
             return snapshot
         records = await snapshot.publication
@@ -903,11 +912,15 @@ class MegatronTrainingSlot:
             key: max(record.metrics.get(key, 0.0) for record in records)
             for key in {key for record in records for key in record.metrics}
         }
-        return durable.transport_adapter or durable.adapter, {
-            **snapshot.metrics,
-            **rank_metrics,
-            "time/snapshot_durable_s": time.perf_counter() - snapshot.started,
-        }
+        return (
+            durable.transport_adapter or durable.adapter,
+            {
+                **snapshot.metrics,
+                **rank_metrics,
+                "time/snapshot_durable_s": time.perf_counter() - snapshot.started,
+            },
+            durable.optimizer_bytes,
+        )
 
     def retire_operation(self, operation_id: str) -> None:
         if operation_id in self._pending_results:

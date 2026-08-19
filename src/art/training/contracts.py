@@ -471,6 +471,7 @@ class SaveStateResult(OperationResult):
     generation_id: str = Field(min_length=1)
     lora_bytes: int = Field(gt=0)
     optimizer_state: str = Field(min_length=1)
+    optimizer_bytes: int = Field(gt=0)
     metrics: dict[str, float] = Field(default_factory=dict)
 
 

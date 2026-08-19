@@ -448,6 +448,8 @@ class LocalMegatronTrainingClient:
 
             async def complete() -> SaveStateResult:
                 durable = await launch.completion
+                if durable.optimizer_bytes is None:
+                    raise RuntimeError("save_state completed without optimizer bytes")
                 self._remember_checkpoint(
                     request.checkpoint_name,
                     ResolvedCheckpointState(
@@ -476,6 +478,7 @@ class LocalMegatronTrainingClient:
                         for file in (durable.transport_adapter or durable.adapter).files
                     ),
                     optimizer_state=self._service.optimizer_state_path,
+                    optimizer_bytes=durable.optimizer_bytes,
                     metrics=launch.metrics,
                 )
 
