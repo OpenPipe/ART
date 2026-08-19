@@ -153,6 +153,79 @@ class RunResidencyManager:
             raise
         return image
 
+    def register_l2_working_set(
+        self,
+        working_set: Iterable[tuple[ResidencyKey, tuple[torch.Tensor, ...]]],
+    ) -> tuple[HostTensorImage, ...]:
+        """Atomically adopt a complete immutable off-GPU working set.
+
+        Success transfers exclusive tensor-storage ownership to this manager. Failure
+        leaves every input tensor unchanged and owned by the caller.
+        """
+        self._require_open()
+        working_set = tuple(working_set)
+        if not working_set:
+            raise ValueError("L2 working set must be non-empty")
+        keys = tuple(key for key, _tensors in working_set)
+        if len(set(keys)) != len(keys):
+            raise ValueError("L2 working-set keys must be unique")
+        if any(
+            not tensors or any(tensor.device.type != "cpu" for tensor in tensors)
+            for _key, tensors in working_set
+        ):
+            raise RuntimeError("new L2 residency must be a non-empty CPU tensor tuple")
+        byte_counts = tuple(
+            self._mover.byte_count(tensors, "cpu") for _key, tensors in working_set
+        )
+        demands = tuple(
+            ResidencyDemand(
+                key=key,
+                source=None,
+                target="l2_cpu",
+                byte_count=byte_count,
+            )
+            for (key, _tensors), byte_count in zip(
+                working_set, byte_counts, strict=True
+            )
+        )
+        with self._admission_locks["l2_cpu"]:
+            with self._lock:
+                if any(key in self._states for key in keys):
+                    raise RuntimeError("residency key is already registered")
+            self._reclaim("l2_cpu", sum(byte_counts), protected=set(keys))
+            reservations = self._reserve_many(demands)
+        try:
+            images = tuple(
+                self._mover.adopt_host_image(tensors) for _key, tensors in working_set
+            )
+            if any(
+                image.stats.byte_count != byte_count
+                for image, byte_count in zip(images, byte_counts, strict=True)
+            ):
+                raise RuntimeError("L2 working-set image byte count changed")
+            states = tuple(
+                _ManagedState(key=key, tensors=tensors, l2=image)
+                for (key, tensors), image in zip(working_set, images, strict=True)
+            )
+            barriers = tuple(SnapshotReadBarrier() for _state in states)
+            with self._lock:
+                if any(key in self._states for key in keys):
+                    raise RuntimeError("residency key is already registered")
+                try:
+                    for state, barrier in zip(states, barriers, strict=True):
+                        self._states[state.key] = state
+                        self._mutation_barriers[state.key] = barrier
+                    self._commit_many(reservations)
+                except BaseException:
+                    for key in keys:
+                        self._states.pop(key, None)
+                        self._mutation_barriers.pop(key, None)
+                    raise
+        except BaseException as error:
+            self._abort_many(reservations, error)
+            raise
+        return images
+
     def advance_l1(
         self,
         source: ResidencyKey,
@@ -1079,6 +1152,17 @@ class RunResidencyManager:
         with self._lock:
             try:
                 self._cancel(reservation)
+            finally:
+                self._failures.append(error)
+
+    def _abort_many(
+        self,
+        reservations: tuple[ResidencyReservation, ...],
+        error: BaseException,
+    ) -> None:
+        with self._lock:
+            try:
+                self._cancel_many(reservations)
             finally:
                 self._failures.append(error)
 

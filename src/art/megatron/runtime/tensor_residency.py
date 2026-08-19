@@ -336,6 +336,22 @@ class TensorResidencyMover:
         image.activate()
         return image
 
+    def adopt_host_image(self, tensors: Iterable[torch.Tensor]) -> HostTensorImage:
+        """Adopt immutable CPU tensor storage without copying or rebinding it.
+
+        The caller transfers exclusive ownership of the prepared tensors to the
+        returned image; only residency machinery may mutate or rebind them afterward.
+        """
+        tensors = tuple(tensors)
+        groups = self._groups(tensors)
+        if not groups or any(group.source.device.type != "cpu" for group in groups):
+            raise RuntimeError("L2 adoption requires non-empty CPU residency")
+        return HostTensorImage(
+            groups=groups,
+            targets=tuple(group.source for group in groups),
+            input_tensor_count=len(tensors),
+        )
+
     def move(
         self,
         tensors: Iterable[torch.Tensor],

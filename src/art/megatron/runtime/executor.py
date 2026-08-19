@@ -1182,16 +1182,13 @@ class MCoreRunSlotExecutor:
         ):
             raise RuntimeError("prepared load does not match its ordered command")
         previous = state.pending_load
-        weights_image = self._residency.register_l2(
-            prepared.weights_key, prepared.weights
+        working_set = [(prepared.weights_key, prepared.weights)]
+        if prepared.optimizer_key is not None:
+            working_set.append((prepared.optimizer_key, prepared.optimizer_tensors))
+        weights_image, *optimizer_images = self._residency.register_l2_working_set(
+            working_set
         )
-        optimizer_image = (
-            None
-            if prepared.optimizer_key is None
-            else self._residency.register_l2(
-                prepared.optimizer_key, prepared.optimizer_tensors
-            )
-        )
+        optimizer_image = optimizer_images[0] if optimizer_images else None
         adapter = read_adapter_publication(
             job.generation.adapter_path,
             step=job.generation.policy_step,

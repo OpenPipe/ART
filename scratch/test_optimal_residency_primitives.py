@@ -242,3 +242,89 @@ def test_prefetch_retains_event_without_cpu_synchronize(
     assert residency._state(state).l1_transition is None
     residency.release_l1(state)
     residency.close()
+
+
+def test_l2_working_set_failure_commits_no_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    residency = manager(tmp_path)
+    keys = (key("weights"), key("optimizer"))
+    tensors = (torch.arange(8, dtype=torch.uint8), torch.arange(12, dtype=torch.uint8))
+    source_ptrs = tuple(tensor.data_ptr() for tensor in tensors)
+    adopt_host_image = residency._mover.adopt_host_image
+    calls = 0
+
+    def fail_second(component: tuple[torch.Tensor, ...]):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("forced second-component failure")
+        return adopt_host_image(component)
+
+    monkeypatch.setattr(residency._mover, "adopt_host_image", fail_second)
+
+    with pytest.raises(RuntimeError, match="forced second-component failure"):
+        residency.register_l2_working_set(zip(keys, ((tensors[0],), (tensors[1],))))
+
+    assert residency.keys("run") == ()
+    assert residency.ledger.entries() == ()
+    assert residency._mutation_barriers == {}
+    assert residency.ledger.usage().ready_bytes["l2_cpu"] == 0
+    assert residency.ledger.usage().reserved_bytes["l2_cpu"] == 0
+    assert residency._active_transitions == 0
+    assert tuple(tensor.data_ptr() for tensor in tensors) == source_ptrs
+    with pytest.raises(RuntimeError, match="forced second-component failure"):
+        residency.close()
+
+
+def test_l2_working_set_adopts_and_commits_every_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    residency = manager(tmp_path)
+    keys = (key("weights"), key("optimizer"))
+    tensors = (torch.arange(8, dtype=torch.uint8), torch.arange(12, dtype=torch.uint8))
+    source_ptrs = tuple(tensor.data_ptr() for tensor in tensors)
+
+    def reject_copy(*_args, **_kwargs):
+        raise AssertionError("L2 registration copied prepared CPU storage")
+
+    monkeypatch.setattr(torch, "empty_like", reject_copy)
+    monkeypatch.setattr(torch.Tensor, "copy_", reject_copy)
+
+    images = residency.register_l2_working_set(
+        zip(keys, ((tensors[0],), (tensors[1],)))
+    )
+
+    assert len(images) == 2
+    assert set(residency.keys("run")) == set(keys)
+    assert all(residency._state(item).l2 is image for item, image in zip(keys, images))
+    assert all(residency.ledger.has_copy(item, "l2_cpu") for item in keys)
+    assert set(residency._mutation_barriers) == set(keys)
+    assert residency.ledger.usage().ready_bytes["l2_cpu"] == 20
+    assert residency.ledger.usage().reserved_bytes["l2_cpu"] == 0
+    assert tuple(image.storage_bytes()[0].data_ptr() for image in images) == source_ptrs
+    assert tuple(tensor.data_ptr() for tensor in tensors) == source_ptrs
+    residency.close()
+
+
+def test_l2_working_set_validates_every_component_before_admission(
+    tmp_path: Path,
+) -> None:
+    residency = manager(tmp_path)
+    weights = key("weights")
+    optimizer = key("optimizer")
+    tensor = torch.ones(1)
+
+    with pytest.raises(RuntimeError, match="non-empty CPU tensor tuple"):
+        residency.register_l2_working_set(
+            ((weights, (tensor,)), (optimizer, (torch.ones(1, device="meta"),)))
+        )
+    with pytest.raises(ValueError, match="keys must be unique"):
+        residency.register_l2_working_set(
+            ((weights, (tensor,)), (weights, (tensor.clone(),)))
+        )
+
+    assert residency.keys("run") == ()
+    assert residency.ledger.entries() == ()
+    assert residency._active_transitions == 0
+    residency.close()
