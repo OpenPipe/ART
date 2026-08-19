@@ -23,6 +23,7 @@ from .contracts import (
     SaveStateResult,
     SaveWeightsForSamplerRequest,
     SupervisedTrajectoryBatch,
+    TokenLogprobs,
     TrainingBatch,
 )
 from .sequencing import CommandAdmission, RunCommandLedger
@@ -53,6 +54,7 @@ __all__ = [
     "SaveStateResult",
     "SaveWeightsForSamplerRequest",
     "SupervisedTrajectoryBatch",
+    "TokenLogprobs",
     "TrainingBatch",
     "TrainingClient",
     "TrainingOperation",

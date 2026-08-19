@@ -1,10 +1,19 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from array import array
+from collections.abc import Mapping, Sequence
 import hashlib
-from typing import Annotated, Any, Literal
+import sys
+from typing import Annotated, Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from art.distributed.moe_route_store import MoeRouteGroupPayload
 from art.distributed.trajectory_store import (
@@ -337,9 +346,83 @@ class PackingOutcome(Contract):
         return self
 
 
+class TokenLogprobs(Contract):
+    """Rectangular selected-token logprobs without per-value Python objects."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        ser_json_bytes="base64",
+        val_json_bytes="base64",
+    )
+
+    shape: tuple[int, ...] = Field(min_length=1, max_length=2)
+    data: bytes
+
+    @model_validator(mode="after")
+    def _validate_buffer(self) -> "TokenLogprobs":
+        if any(value < 0 for value in self.shape):
+            raise ValueError("token logprob dimensions cannot be negative")
+        if len(self.shape) == 2 and self.shape[1] < 1:
+            raise ValueError("token logprob candidate width must be positive")
+        if self.value_count > MAX_TOKENIZED_LOGPROB_VALUES:
+            raise ValueError("token logprob buffer exceeds the configured value limit")
+        if len(self.data) != self.value_count * 4:
+            raise ValueError("token logprob buffer size differs from its shape")
+        return self
+
+    @property
+    def value_count(self) -> int:
+        result = 1
+        for value in self.shape:
+            result *= value
+        return result
+
+    @classmethod
+    def from_values(cls, values: object) -> "TokenLogprobs":
+        if isinstance(values, cls):
+            return values
+        if isinstance(values, Mapping):
+            return cls.model_validate(values)
+        if not isinstance(values, Sequence) or isinstance(values, str | bytes):
+            raise TypeError("token logprobs must be a flat or rectangular sequence")
+        rows = tuple(cast(Sequence[Any], values))
+        nested = (
+            bool(rows)
+            and isinstance(rows[0], Sequence)
+            and not isinstance(rows[0], str | bytes)
+        )
+        if nested:
+            matrix = tuple(tuple(cast(Sequence[Any], row)) for row in rows)
+            width = len(matrix[0])
+            if width < 1 or any(len(row) != width for row in matrix):
+                raise ValueError("token logprobs must be rectangular")
+            shape = (len(matrix), width)
+            flat = (item for row in matrix for item in row)
+        else:
+            shape = (len(rows),)
+            flat = iter(rows)
+        packed = array("f", (float(value) for value in flat))
+        if sys.byteorder != "little":
+            packed.byteswap()
+        return cls(shape=shape, data=packed.tobytes())
+
+    def to_list(self) -> list[float]:
+        values = array("f")
+        values.frombytes(self.data)
+        if sys.byteorder != "little":
+            values.byteswap()
+        return values.tolist()
+
+
 class LossFnOutput(Contract):
-    token_logprobs: tuple[float, ...] | tuple[tuple[float, ...], ...]
+    token_logprobs: TokenLogprobs
     metrics: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("token_logprobs", mode="before")
+    @classmethod
+    def _pack_logprobs(cls, value: object) -> TokenLogprobs:
+        return TokenLogprobs.from_values(value)
 
 
 class OperationResult(Contract):
@@ -350,6 +433,17 @@ class ForwardResult(OperationResult):
     packing: PackingOutcome
     loss_fn_outputs: tuple[LossFnOutput, ...]
     metrics: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_output_size(self) -> "ForwardResult":
+        values = sum(
+            output.token_logprobs.value_count for output in self.loss_fn_outputs
+        )
+        if values > MAX_TOKENIZED_LOGPROB_VALUES:
+            raise ValueError(
+                "forward result exceeds the configured logprob value limit"
+            )
+        return self
 
 
 class ForwardBackwardResult(ForwardResult):

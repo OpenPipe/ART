@@ -94,7 +94,7 @@ def to_tinker_forward_output(
         )
     outputs = []
     for output, shape in zip(result.loss_fn_outputs, target_shapes, strict=True):
-        values = _flatten(output.token_logprobs)
+        values = output.token_logprobs.to_list()
         if len(values) != prod(shape):
             raise RuntimeError(
                 "Remote Training changed selected-logprob shape: "

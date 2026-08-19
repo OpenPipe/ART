@@ -53,9 +53,6 @@ from .contracts import (
 _SFT_BATCH_ADAPTER = TypeAdapter(SupervisedTrajectoryBatch)
 _TOKENIZED_BATCH_ADAPTER = TypeAdapter(TokenizedTrainingBatch)
 _UINT32_ARRAY_EXT = 1
-_FLOAT32_ARRAY_EXT = 2
-_LOGPROB_SHAPE_KEY = "__art_shape__"
-_LOGPROB_VALUES_KEY = "__art_values__"
 ResultT = TypeVar("ResultT", bound=OperationResult)
 RouteWireEncoding = Literal["inline", "prefix_tree"]
 FORWARD_SUBMISSION_MEDIA_TYPE = "application/vnd.art.forward-framed+msgpack"
@@ -760,19 +757,10 @@ def encode_operation_result(
     result: OperationResult,
 ) -> tuple[OperationResultRef, bytes]:
     value = result.model_dump(mode="python")
-    result_values = 0
-    for output in value.get("loss_fn_outputs", ()):
-        raw = output["token_logprobs"]
-        nested = bool(raw) and isinstance(raw[0], list | tuple)
-        rows = tuple(raw) if nested else (raw,)
-        width = len(rows[0]) if rows else 0
-        if any(len(row) != width for row in rows):
-            raise ValueError("token logprobs must be rectangular")
-        result_values += sum(map(len, rows))
-        output["token_logprobs"] = {
-            _LOGPROB_SHAPE_KEY: ((len(rows), width) if nested else (len(raw),)),
-            _LOGPROB_VALUES_KEY: array("f", (item for row in rows for item in row)),
-        }
+    result_values = sum(
+        len(output["token_logprobs"]["data"]) // 4
+        for output in value.get("loss_fn_outputs", ())
+    )
     if result_values > MAX_TOKENIZED_LOGPROB_VALUES:
         raise ValueError(
             "operation result exceeds the configured logprob value limit: "
@@ -795,41 +783,22 @@ def decode_operation_result(
         raise ValueError("operation result byte count differs from its reference")
     if hashlib.sha256(payload).hexdigest() != ref.object_id:
         raise ValueError("operation result hash differs from its reference")
-    value = msgpack.decode(payload, ext_hook=_decode_ext)
-    for output in value.get("loss_fn_outputs", ()):
-        packed = output["token_logprobs"]
-        shape = tuple(packed[_LOGPROB_SHAPE_KEY])
-        values = packed[_LOGPROB_VALUES_KEY]
-        if len(shape) == 1:
-            output["token_logprobs"] = tuple(values)
-        elif len(shape) == 2 and len(values) == shape[0] * shape[1]:
-            output["token_logprobs"] = tuple(
-                tuple(values[start : start + shape[1]])
-                for start in range(0, len(values), shape[1])
-            )
-        else:
-            raise ValueError("operation result contains an invalid logprob shape")
-    return result_type.model_validate(value)
+    return result_type.model_validate(msgpack.decode(payload, ext_hook=_decode_ext))
 
 
 def _encode_ext(value: object):
-    if not isinstance(value, array) or value.typecode not in {"I", "f"}:
+    if not isinstance(value, array) or value.typecode != "I" or value.itemsize != 4:
         raise TypeError(f"unsupported operation result value: {type(value).__name__}")
-    if value.itemsize != 4:
-        raise TypeError("operation result arrays require 32-bit elements")
-    data = array(value.typecode, value)
+    data = array("I", value)
     if sys.byteorder != "little":
         data.byteswap()
-    return msgpack.Ext(
-        _UINT32_ARRAY_EXT if value.typecode == "I" else _FLOAT32_ARRAY_EXT,
-        data.tobytes(),
-    )
+    return msgpack.Ext(_UINT32_ARRAY_EXT, data.tobytes())
 
 
 def _decode_ext(code: int, data: memoryview) -> array:
-    if code not in {_UINT32_ARRAY_EXT, _FLOAT32_ARRAY_EXT} or len(data) % 4:
+    if code != _UINT32_ARRAY_EXT or len(data) % 4:
         raise ValueError("operation result contains an invalid MessagePack extension")
-    value = array("I" if code == _UINT32_ARRAY_EXT else "f")
+    value = array("I")
     value.frombytes(data)
     if sys.byteorder != "little":
         value.byteswap()

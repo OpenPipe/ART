@@ -29,6 +29,7 @@ from art.megatron.optimizer_state import (
     OptimizerTopology,
     read_adapter_publication,
 )
+from art.training.contracts import TokenLogprobs
 from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
 from ..tensor_snapshot import PinnedCpuSnapshotStager
@@ -75,7 +76,7 @@ def _command_token_logprobs(
 ) -> tuple[Any, ...]:
     if batch.ref.training_kind != "tokenized":
         return tuple(
-            tuple(float(item) for item in values.flatten().tolist())
+            _packed_logprobs(values.flatten(), (int(values.numel()),))
             for values in outputs
         )
     output_map = batch.ref.tokenized_output_map
@@ -94,19 +95,25 @@ def _command_token_logprobs(
             "tokenized command did not return every physical packed row: "
             f"returned={physical.shape[0]}, expected={expected_rows}"
         )
-    host = physical.detach().cpu()
+    host = physical.detach().to(device="cpu", dtype=torch.float32)
     logical = []
     for positions, candidates in zip(
         output_map.packed_positions, output_map.candidate_counts, strict=True
     ):
         values = host[list(positions), :candidates]
         if candidates == 1:
-            logical.append(tuple(float(item) for item in values[:, 0].tolist()))
+            logical.append(_packed_logprobs(values[:, 0], (len(positions),)))
         else:
-            logical.append(
-                tuple(tuple(float(item) for item in row) for row in values.tolist())
-            )
+            logical.append(_packed_logprobs(values, (len(positions), candidates)))
     return tuple(logical)
+
+
+def _packed_logprobs(values: torch.Tensor, shape: tuple[int, ...]) -> dict[str, Any]:
+    host = values.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    return TokenLogprobs(
+        shape=shape,
+        data=host.numpy().tobytes(order="C"),
+    ).model_dump(mode="python")
 
 
 class MegatronTrainJobExecutor:
