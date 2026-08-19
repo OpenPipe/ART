@@ -1325,6 +1325,7 @@ class MegatronBackend(LocalBackend):
         verbose: bool,
     ) -> AsyncIterator[dict[str, float]]:
         del verbose
+        self._raise_pipeline_operation_failures()
         self._collect_batch_release_results()
         self._raise_batch_release_failures()
         self._collect_adapter_prune_result()
@@ -1379,7 +1380,7 @@ class MegatronBackend(LocalBackend):
         next_step = optimizer.ref.reserved_output_learner_version
         if next_step is None:
             raise RuntimeError("optimizer did not reserve a learner version")
-        await client.save_weights_for_sampler(
+        sampler = await client.save_weights_for_sampler(
             SaveWeightsForSamplerRequest(
                 run_id=client.run_id,
                 request_id=uuid.uuid4().hex,
@@ -1391,13 +1392,23 @@ class MegatronBackend(LocalBackend):
                 ),
             )
         )
+        self._track_pipeline_operation(
+            asyncio.create_task(
+                sampler.result(), name=f"sync-sampler-{client.run_id}-{next_step}"
+            )
+        )
         if should_save_optimizer_state(next_step, config):
-            await client.save_state(
+            state = await client.save_state(
                 SaveStateRequest(
                     run_id=client.run_id,
                     request_id=uuid.uuid4().hex,
                     sequence_id=sequence_id + 3,
                     checkpoint_name=f"step-{next_step}",
+                )
+            )
+            self._track_pipeline_operation(
+                asyncio.create_task(
+                    state.result(), name=f"sync-state-{client.run_id}-{next_step}"
                 )
             )
         forward_result, optimizer_result = await asyncio.gather(
