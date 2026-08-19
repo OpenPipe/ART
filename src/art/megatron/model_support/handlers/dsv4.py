@@ -396,6 +396,7 @@ class Dsv4Handler(DefaultMoeHandler):
                     target_modules=target_set,
                     rank=rank,
                     alpha=alpha,
+                    moe_parameterization=provider._art_lora_moe_parameterization,
                 )
                 if getattr(module.mlp, "shared_experts", None) is not None:
                     wrap_shared_experts_mlp(

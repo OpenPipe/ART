@@ -449,6 +449,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
             rank=rank,
             alpha=alpha,
             fused_gate_up=True,
+            moe_parameterization=provider._art_lora_moe_parameterization,
         )
         shared_experts = getattr(module.mlp, "shared_experts", None)
         if shared_experts is not None:
