@@ -24,7 +24,7 @@ from art.megatron.tensor_snapshot import (
     SnapshotStageTimings,
 )
 from art.megatron.training.model_chunks import ModelChunks
-from art.utils.safetensors import PreparedSafetensors
+from art.utils.safetensors import FileIdentity, PreparedSafetensors
 
 
 class PackedExpertShardMeta(NamedTuple):
@@ -872,8 +872,8 @@ def save_vllm_lora_snapshot(
     output_dir: str,
     *,
     prepared_tensors: PreparedSafetensors | None = None,
-) -> None:
-    save_vllm_lora_tensors(
+) -> dict[str, FileIdentity]:
+    return save_vllm_lora_tensors(
         output_dir,
         snapshot.tensors,
         snapshot.adapter_config,

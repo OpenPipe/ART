@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 from threading import BoundedSemaphore, Event, Lock
 import time
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 import torch
@@ -2541,7 +2541,7 @@ class _GenerationPublisher:
                 ) as (staging, existing):
                     adapter = existing
                     if adapter is None:
-                        save_vllm_lora_snapshot(
+                        saved = save_vllm_lora_snapshot(
                             lora,
                             str(staging),
                             prepared_tensors=prepared_tensors,
@@ -2549,6 +2549,17 @@ class _GenerationPublisher:
                         adapter = publish_adapter_checkpoint(
                             staging,
                             step=generation.policy_step,
+                            files=tuple(
+                                CheckpointFile(
+                                    name=cast(Any, name),
+                                    size_bytes=saved[name].size_bytes,
+                                    sha256=saved[name].sha256,
+                                )
+                                for name in (
+                                    "adapter_config.json",
+                                    "adapter_model.safetensors",
+                                )
+                            ),
                             training_session_id=generation.training_session_id,
                             generation_id=generation.generation_id,
                         )

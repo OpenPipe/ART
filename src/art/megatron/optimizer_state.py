@@ -80,6 +80,7 @@ class MegatronResumeStep(_OptimizerRecord):
 class CheckpointFile(_OptimizerRecord):
     name: Literal["adapter_config.json", "adapter_model.safetensors"]
     size_bytes: int = Field(gt=0)
+    sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
 
 
 class OptimizerAdapter(_OptimizerRecord):
@@ -112,6 +113,7 @@ class OptimizerShard(_OptimizerRecord):
     rank: int = Field(ge=0)
     size_bytes: int = Field(gt=0)
     layout_sha256: str = Field(pattern=_SHA256_PATTERN)
+    sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     serialization: OptimizerShardSerialization = "torch_pickle_v1"
 
 
@@ -369,9 +371,21 @@ def _adapter_checkpoint_files(path: str | Path) -> tuple[Path, tuple[Path, ...]]
 def _adapter_file_records(path: str | Path) -> tuple[CheckpointFile, ...]:
     _adapter_path, files = _adapter_checkpoint_files(path)
     return tuple(
-        CheckpointFile(name=cast(Any, file.name), size_bytes=file.stat().st_size)
+        CheckpointFile(
+            name=cast(Any, file.name),
+            size_bytes=file.stat().st_size,
+            sha256=_file_sha256(file),
+        )
         for file in files
     )
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as value:
+        while chunk := value.read(8 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _initial_generation_id(path: str | Path, step: int) -> str:
@@ -427,6 +441,7 @@ def publish_adapter_checkpoint(
     staging_path: str | Path,
     *,
     step: int,
+    files: tuple[CheckpointFile, ...],
     training_session_id: str = "legacy",
     generation_id: str | None = None,
 ) -> OptimizerAdapter:
@@ -434,8 +449,13 @@ def publish_adapter_checkpoint(
     canonical = canonical_adapter_path(staging, step)
     if canonical.exists():
         raise RuntimeError(f"Refusing to replace canonical adapter {canonical}")
-    _, files = _adapter_checkpoint_files(staging)
-    for path in files:
+    records = files
+    _adapter_path, paths = _adapter_checkpoint_files(staging)
+    if tuple(path.name for path in paths) != tuple(record.name for record in records):
+        raise RuntimeError("adapter file identity has invalid coverage")
+    for path, record in zip(paths, records, strict=True):
+        if path.stat().st_size != record.size_bytes:
+            raise RuntimeError("adapter file size changed before publication")
         with path.open("rb") as adapter_file:
             os.fsync(adapter_file.fileno())
     _fsync_directory(staging)
@@ -444,7 +464,7 @@ def publish_adapter_checkpoint(
         training_session_id=training_session_id,
         step=step,
         generation_id=generation_id or _initial_generation_id(canonical, step),
-        files=_adapter_file_records(staging),
+        files=records,
     )
     _write_model_atomic(staging / ADAPTER_PUBLICATION_ACK, adapter)
     canonical.parent.mkdir(parents=True, exist_ok=True)
@@ -644,6 +664,7 @@ def link_adapter_generation(
         adapter = publish_adapter_checkpoint(
             staging,
             step=step,
+            files=source.files,
             training_session_id=training_session_id,
             generation_id=generation_id,
         )
@@ -1935,11 +1956,12 @@ def write_optimizer_snapshot_shard(
         serialization="art_safetensors_v1",
     )
     pending.mkdir(parents=True, exist_ok=True)
-    prepared.write(shard_path)
+    identity = prepared.write(shard_path)
     return OptimizerShard(
         rank=snapshot.rank,
-        size_bytes=prepared.nbytes,
+        size_bytes=identity.size_bytes,
         layout_sha256=snapshot.layout_sha256,
+        sha256=identity.sha256,
         serialization="art_safetensors_v1",
     )
 
@@ -1977,6 +1999,7 @@ def _write_optimizer_shard(
         rank=runtime.rank,
         size_bytes=shard_path.stat().st_size,
         layout_sha256=layout_sha256,
+        sha256=_file_sha256(shard_path),
     )
 
 

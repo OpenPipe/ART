@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .optimizer_state import (
     OPTIMIZER_MANIFEST,
+    CheckpointFile,
     OptimizerAdapter,
     OptimizerGenerationManifest,
     adapter_generation_lease,
@@ -186,6 +187,14 @@ def consume_checkpoint_bundle(
             adapter = publish_adapter_checkpoint(
                 staging,
                 step=manifest.adapter.step,
+                files=tuple(
+                    CheckpointFile(
+                        name=record.name,
+                        size_bytes=bundle_files[f"adapter/{record.name}"].size_bytes,
+                        sha256=bundle_files[f"adapter/{record.name}"].sha256,
+                    )
+                    for record in manifest.adapter.files
+                ),
                 training_session_id=manifest.adapter.training_session_id,
                 generation_id=manifest.adapter.generation_id,
             )

@@ -9,6 +9,7 @@ from safetensors import safe_open
 import torch
 
 from art.utils.safetensors import (
+    FileIdentity,
     PreparedSafetensors,
     prepare_safetensors,
     save_prepared_safetensors,
@@ -35,8 +36,8 @@ class PreparedOptimizerArchive(BaseModel):
     def nbytes(self) -> int:
         return self.payload.nbytes
 
-    def write(self, path: Path) -> None:
-        save_prepared_safetensors(self.payload, path)
+    def write(self, path: Path) -> FileIdentity:
+        return save_prepared_safetensors(self.payload, path)
 
 
 def prepare_optimizer_archive(state: Any) -> PreparedOptimizerArchive:

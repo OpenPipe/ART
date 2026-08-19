@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import json
 from pathlib import Path
@@ -7,6 +8,7 @@ import torch
 
 from art.megatron.model_support.spec import ModelSupportHandler
 from art.utils.safetensors import (
+    FileIdentity,
     PreparedSafetensors,
     prepare_safetensors,
     save_prepared_safetensors,
@@ -38,9 +40,15 @@ def load_adapter_config(lora_path: str | Path) -> dict[str, Any]:
     return config if isinstance(config, dict) else {}
 
 
-def save_adapter_config(lora_path: str | Path, adapter_config: dict[str, Any]) -> None:
+def save_adapter_config(
+    lora_path: str | Path, adapter_config: dict[str, Any]
+) -> FileIdentity:
     config_path = Path(lora_path) / "adapter_config.json"
-    config_path.write_bytes(encode_adapter_config(adapter_config))
+    payload = encode_adapter_config(adapter_config)
+    config_path.write_bytes(payload)
+    return FileIdentity(
+        size_bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest()
+    )
 
 
 def encode_adapter_config(adapter_config: dict[str, Any]) -> bytes:
@@ -82,17 +90,21 @@ def save_vllm_lora_tensors(
     adapter_config: dict[str, Any],
     *,
     prepared_tensors: PreparedSafetensors | None = None,
-) -> None:
+) -> dict[str, FileIdentity]:
     base_dir = Path(lora_path)
     base_dir.mkdir(parents=True, exist_ok=True)
-    save_prepared_safetensors(
+    model = save_prepared_safetensors(
         prepared_tensors or prepare_safetensors(tensors),
         base_dir / "adapter_model.safetensors",
     )
-    save_adapter_config(
+    config = save_adapter_config(
         base_dir,
         {**adapter_config, ART_LORA_FORMAT_CONFIG_KEY: ART_LORA_FORMAT_VLLM},
     )
+    return {
+        "adapter_config.json": config,
+        "adapter_model.safetensors": model,
+    }
 
 
 def normalize_lora_checkpoint_to_vllm(

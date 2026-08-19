@@ -3069,6 +3069,7 @@ def _publish_adapter_alias(
             return publish_adapter_checkpoint(
                 staging,
                 step=generation.policy_step,
+                files=source.files,
                 training_session_id=generation.training_session_id,
                 generation_id=generation.generation_id,
             )

@@ -1,4 +1,5 @@
 from collections import deque
+import hashlib
 from itertools import islice
 import json
 import os
@@ -8,6 +9,7 @@ import sys
 import tempfile
 from typing import NamedTuple
 
+from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 _DTYPES = {
@@ -40,6 +42,13 @@ class PreparedSafetensors(NamedTuple):
     @property
     def nbytes(self) -> int:
         return sum(chunk.numel() for chunk in self.chunks)
+
+
+class FileIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    size_bytes: int = Field(gt=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class _TensorLayout(NamedTuple):
@@ -229,18 +238,22 @@ def prepare_safetensors(tensors: dict[str, torch.Tensor]) -> PreparedSafetensors
     )
 
 
-def save_prepared_safetensors(prepared: PreparedSafetensors, path: Path) -> None:
+def save_prepared_safetensors(
+    prepared: PreparedSafetensors, path: Path
+) -> FileIdentity:
     """Stream a prepared safetensors payload without rebuilding tensor metadata."""
+    buffers = [memoryview(chunk.numpy()) for chunk in prepared.chunks]
+    digest = hashlib.sha256()
+    for buffer in buffers:
+        digest.update(buffer)
     with tempfile.TemporaryDirectory(dir=path.parent) as temp_dir:
         temporary_path = Path(temp_dir) / path.name
         with temporary_path.open("wb", buffering=0) as output:
-            _writev_all(
-                output.fileno(),
-                [memoryview(chunk.numpy()) for chunk in prepared.chunks],
-            )
+            _writev_all(output.fileno(), buffers)
         temporary_path.replace(path)
+    return FileIdentity(size_bytes=prepared.nbytes, sha256=digest.hexdigest())
 
 
-def save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> None:
+def save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> FileIdentity:
     """Stream CPU tensor buffers without copying them into GIL-held bytes."""
-    save_prepared_safetensors(prepare_safetensors(tensors), path)
+    return save_prepared_safetensors(prepare_safetensors(tensors), path)
