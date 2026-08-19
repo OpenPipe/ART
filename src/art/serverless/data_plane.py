@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from array import array
-from collections.abc import Mapping
+from collections.abc import AsyncIterable, AsyncIterator, Mapping
 import hashlib
+import struct
 import sys
 from typing import Any, Literal, NamedTuple, TypeVar
 import uuid
@@ -57,6 +58,11 @@ _LOGPROB_SHAPE_KEY = "__art_shape__"
 _LOGPROB_VALUES_KEY = "__art_values__"
 ResultT = TypeVar("ResultT", bound=OperationResult)
 RouteWireEncoding = Literal["inline", "prefix_tree"]
+FORWARD_SUBMISSION_MEDIA_TYPE = "application/vnd.art.forward-framed+msgpack"
+FORWARD_SUBMISSION_PREFIX_BYTES = 16
+MAX_FORWARD_SUBMISSION_MANIFEST_BYTES = 16 << 20
+_FORWARD_SUBMISSION_MAGIC = b"ARTFWD02"
+_FORWARD_SUBMISSION_PREFIX = struct.Struct("!8sQ")
 
 
 class _RouteEntry(NamedTuple):
@@ -182,15 +188,16 @@ class EncodedTrainingBatch(BaseModel):
     route_objects: tuple[EncodedRouteObject, ...] = ()
 
 
-class EncodedForwardSubmission(BaseModel):
+class ForwardSubmissionManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    format: Literal["art_forward_submission_v2"] = "art_forward_submission_v2"
     request: RemoteForwardRequest
-    objects: tuple[EncodedTrainingObject, ...]
-    route_objects: tuple[EncodedRouteObject, ...] = ()
+    objects: tuple[TrainingDataRef, ...]
+    route_objects: tuple[RemoteRouteObjectRef, ...] = ()
 
     @model_validator(mode="after")
-    def _validate_objects(self) -> "EncodedForwardSubmission":
+    def _validate_objects(self) -> "ForwardSubmissionManifest":
         route_refs = {
             ref.object_id: ref for ref in command_route_object_refs(self.request.batch)
         }
@@ -200,13 +207,47 @@ class EncodedForwardSubmission(BaseModel):
             for ref in training_data_refs(self.request.batch)
             if ref.object_id not in route_data_ids
         }
-        if {value.ref.object_id: value.ref for value in self.objects} != expected_data:
+        if (
+            len(self.objects) != len(expected_data)
+            or {value.object_id: value for value in self.objects} != expected_data
+        ):
             raise ValueError("forward submission data objects do not match request")
         if {
-            value.ref.object_id: value.ref for value in self.route_objects
-        } != route_refs:
+            value.object_id: value for value in self.route_objects
+        } != route_refs or len(self.route_objects) != len(route_refs):
             raise ValueError("forward submission route objects do not match request")
         return self
+
+
+class EncodedForwardSubmission(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    preamble: bytes
+    payloads: tuple[bytes, ...]
+    byte_count: int
+
+    @model_validator(mode="after")
+    def _validate_size(self) -> "EncodedForwardSubmission":
+        if self.byte_count != len(self.preamble) + sum(map(len, self.payloads)):
+            raise ValueError("forward submission byte count is inconsistent")
+        return self
+
+    def stream(self) -> AsyncIterable[bytes]:
+        return _ForwardSubmissionStream(self.preamble, self.payloads)
+
+
+class _ForwardSubmissionStream:
+    def __init__(self, preamble: bytes, payloads: tuple[bytes, ...]) -> None:
+        self._preamble = preamble
+        self._payloads = payloads
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self._iterate()
+
+    async def _iterate(self) -> AsyncIterator[bytes]:
+        yield self._preamble
+        for payload in self._payloads:
+            yield payload
 
 
 def encode_trajectory_group(
@@ -626,20 +667,58 @@ def decode_tokenized_batch(
 def encode_forward_submission(
     request: RemoteForwardRequest,
     batch: EncodedTrainingBatch,
-) -> bytes:
+) -> EncodedForwardSubmission:
     if request.batch != batch.remote:
         raise ValueError("forward submission request and encoded batch differ")
-    return msgpack.encode(
-        EncodedForwardSubmission(
+    manifest = msgpack.encode(
+        ForwardSubmissionManifest(
             request=request,
-            objects=batch.objects,
-            route_objects=batch.route_objects,
+            objects=tuple(value.ref for value in batch.objects),
+            route_objects=tuple(value.ref for value in batch.route_objects),
         ).model_dump(mode="python")
+    )
+    if len(manifest) > MAX_FORWARD_SUBMISSION_MANIFEST_BYTES:
+        raise ValueError("forward submission manifest exceeds the configured limit")
+    preamble = (
+        _FORWARD_SUBMISSION_PREFIX.pack(_FORWARD_SUBMISSION_MAGIC, len(manifest))
+        + manifest
+    )
+    payloads = tuple(value.payload for value in batch.objects) + tuple(
+        value.payload for value in batch.route_objects
+    )
+    return EncodedForwardSubmission(
+        preamble=preamble,
+        payloads=payloads,
+        byte_count=len(preamble) + sum(map(len, payloads)),
     )
 
 
-def decode_forward_submission(payload: bytes) -> EncodedForwardSubmission:
-    return EncodedForwardSubmission.model_validate(msgpack.decode(payload))
+def decode_forward_submission_prefix(payload: bytes) -> int:
+    if len(payload) != FORWARD_SUBMISSION_PREFIX_BYTES:
+        raise ValueError("forward submission prefix has the wrong size")
+    magic, manifest_bytes = _FORWARD_SUBMISSION_PREFIX.unpack(payload)
+    if magic != _FORWARD_SUBMISSION_MAGIC:
+        raise ValueError("forward submission has the wrong wire format")
+    if not 0 < manifest_bytes <= MAX_FORWARD_SUBMISSION_MANIFEST_BYTES:
+        raise ValueError("forward submission manifest size is invalid")
+    return manifest_bytes
+
+
+def decode_forward_submission_manifest(payload: bytes) -> ForwardSubmissionManifest:
+    if not 0 < len(payload) <= MAX_FORWARD_SUBMISSION_MANIFEST_BYTES:
+        raise ValueError("forward submission manifest size is invalid")
+    return ForwardSubmissionManifest.model_validate(msgpack.decode(payload))
+
+
+def forward_submission_byte_count(
+    manifest: ForwardSubmissionManifest, manifest_bytes: int
+) -> int:
+    return (
+        FORWARD_SUBMISSION_PREFIX_BYTES
+        + manifest_bytes
+        + sum(value.byte_count for value in manifest.objects)
+        + sum(value.byte_count for value in manifest.route_objects)
+    )
 
 
 def _encode_training_object(

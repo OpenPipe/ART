@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import AsyncIterable, Mapping
 import hashlib
 from typing import Any, Callable, Generic, TypeVar, cast
 import uuid
@@ -47,6 +47,7 @@ from .contracts import (
     TrainingRunView,
 )
 from .data_plane import (
+    FORWARD_SUBMISSION_MEDIA_TYPE,
     EncodedTrainingBatch,
     decode_operation_result,
     encode_forward_submission,
@@ -191,8 +192,11 @@ class RemoteTrainingServiceClient:
         response = await self._send(
             "POST",
             f"training/runs/{request.run_id}/{kind}",
-            content=payload,
-            headers={"Content-Type": "application/vnd.art.forward+msgpack"},
+            content=payload.stream(),
+            headers={
+                "Content-Type": FORWARD_SUBMISSION_MEDIA_TYPE,
+                "Content-Length": str(payload.byte_count),
+            },
             transfer=True,
         )
         return OperationRef.model_validate(response.json())
@@ -316,7 +320,7 @@ class RemoteTrainingServiceClient:
         method: str,
         path: str,
         *,
-        content: str | bytes | None,
+        content: str | bytes | AsyncIterable[bytes] | None,
         headers: dict[str, str] | None,
         transfer: bool = False,
         max_retries: int | None = None,
