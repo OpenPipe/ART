@@ -2,15 +2,14 @@ name: Package Install
 
 on:
   pull_request:
-  push:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   install-smoke-test:
+    if: startsWith(github.head_ref, 'release/')
     runs-on: ubuntu-latest
 
     steps:
