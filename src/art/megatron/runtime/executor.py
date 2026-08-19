@@ -969,7 +969,10 @@ class MCoreRunSlotExecutor:
         state.gradients.seal(job.contributing_forward_backward_operation_ids)
         from art.trainer_rank import AdamParams
 
-        with self._resident(state, include_optimizer=True, include_accumulator=True):
+        with self._resident(
+            state, include_optimizer=True, include_accumulator=True
+        ) as working_set:
+            self._residency.wait_before_mutation_working_set(working_set)
             self.runtime.optimizer_snapshot_barrier.wait_before_mutation(key=job.run_id)
             gradients = state.gradients.prepare_optimizer()
             started = time.perf_counter()
@@ -1418,7 +1421,7 @@ class MCoreRunSlotExecutor:
             return
         self._residency.acquire_l1(key)
         try:
-            self._residency.wait_before_mutation(key)
+            self._residency.wait_before_mutation_working_set((key,))
             yield
         finally:
             self._residency.release_l1(key)
@@ -1430,7 +1433,7 @@ class MCoreRunSlotExecutor:
         *,
         include_optimizer: bool = False,
         include_accumulator: bool = False,
-    ) -> Iterator[None]:
+    ) -> Iterator[tuple[ResidencyKey, ...]]:
         weights_key = state.desired.weights
         optimizer_key = state.desired.optimizer if include_optimizer else None
         accumulator_key = state.desired.accumulator if include_accumulator else None
@@ -1511,7 +1514,7 @@ class MCoreRunSlotExecutor:
                         )
                     state.installed_optimizer = optimizer_key
                     state.pending_load = None
-            yield
+            yield working_set
         finally:
             if acquired:
                 self._residency.release_l1_working_set(working_set)

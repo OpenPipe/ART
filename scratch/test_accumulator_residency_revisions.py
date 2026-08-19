@@ -42,7 +42,8 @@ class _ResidencyProbe:
         for key in keys:
             self.acquire_l1(key)
 
-    def wait_before_mutation(self, key):
+    def wait_before_mutation_working_set(self, keys):
+        (key,) = tuple(keys)
         assert self.current is not None and self.current[0] == key
         self.calls.append(("wait", key.accumulator_revision, None))
 

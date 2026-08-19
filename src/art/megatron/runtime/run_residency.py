@@ -121,6 +121,7 @@ class RunResidencyManager:
             with self._lock:
                 self._commit(reservation)
                 self._states[key] = managed
+                self._mutation_barriers[key] = SnapshotReadBarrier()
                 if component is not None:
                     self._installed_components[component] = key
         return self.ensure_l2(key)
@@ -146,6 +147,7 @@ class RunResidencyManager:
                     raise RuntimeError("residency key is already registered")
                 self._commit(reservation)
                 self._states[key] = managed
+                self._mutation_barriers[key] = SnapshotReadBarrier()
         except BaseException as error:
             self._abort(reservation, error)
             raise
@@ -194,6 +196,7 @@ class RunResidencyManager:
                     raise ValueError("residency advance cannot change runs")
                 self.ledger.advance(source, target, "l1_gpu", byte_count=byte_count)
                 self._states[target] = _ManagedState(key=target, tensors=tensors)
+                self._mutation_barriers[target] = SnapshotReadBarrier()
                 if component is not None:
                     self._installed_components[component] = target
         if retire_source:
@@ -252,9 +255,13 @@ class RunResidencyManager:
                     try:
                         snapshot = self._mover.snapshot(state.tensors)
                         self._snapshot_barrier.register(snapshot.pending)
-                        self._mutation_barriers.setdefault(
-                            key, SnapshotReadBarrier()
-                        ).register(snapshot.pending)
+                        try:
+                            barrier = self._mutation_barriers[key]
+                        except KeyError as error:
+                            raise RuntimeError(
+                                "residency snapshot has no mutation fence"
+                            ) from error
+                        barrier.register(snapshot.pending)
                     except BaseException:
                         self._cancel(reservation)
                         raise
@@ -437,13 +444,21 @@ class RunResidencyManager:
         for key in keys:
             self._try_retire(key)
 
-    def wait_before_mutation(self, key: ResidencyKey) -> None:
-        """Order this key's next CUDA mutation after its recovery snapshot."""
+    def wait_before_mutation_working_set(self, keys: Iterable[ResidencyKey]) -> None:
+        """Order a trainer working set's next mutation after all D2H reads."""
         self._require_open()
+        keys = self._working_set_keys(keys)
         with self._lock:
-            self._state(key)
-            barrier = self._mutation_barriers.pop(key, None)
-        if barrier is not None:
+            for key in keys:
+                self._state(key)
+            missing = tuple(key for key in keys if key not in self._mutation_barriers)
+            if missing:
+                components = ", ".join(key.representation for key in missing)
+                raise RuntimeError(
+                    f"mutation working set is missing mutation fence: {components}"
+                )
+            barriers = tuple(self._mutation_barriers[key] for key in keys)
+        for barrier in barriers:
             barrier.wait_before_mutation()
 
     def touch(self, key: ResidencyKey) -> None:
