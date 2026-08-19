@@ -921,6 +921,26 @@ def read_optimizer_generation_manifest(
     return _read_manifest(optimizer_generation_path(optimizer_state_path, generation))
 
 
+def verify_optimizer_generation_manifest(
+    optimizer_state_path: str, manifest: OptimizerGenerationManifest
+) -> None:
+    """Verify every byte before adopting a generation after an ambiguous write."""
+    generation_path = optimizer_generation_path(
+        optimizer_state_path, manifest.generation
+    )
+    for shard in _validate_generation_files(generation_path, manifest, local_rank=None):
+        if shard.sha256 is None:
+            raise RuntimeError("Optimizer shard has no immutable digest")
+        path = optimizer_shard_path(
+            generation_path,
+            rank=shard.rank,
+            world_size=manifest.topology.world_size,
+            serialization=shard.serialization,
+        )
+        if _file_sha256(path) != shard.sha256:
+            raise RuntimeError(f"Optimizer shard digest mismatch: {path.name}")
+
+
 def read_committed_optimizer_step(optimizer_state_path: str) -> int | None:
     pointer = read_committed_optimizer_pointer(optimizer_state_path)
     return None if pointer is None else pointer.step
@@ -1186,14 +1206,14 @@ def discard_uncommitted_optimizer_generation(
     pending = optimizer_pending_generation_path(optimizer_state_path, generation)
     committed = optimizer_generation_path(optimizer_state_path, generation)
     trash: Path | None = None
-    with _writer_lease(path):
+    with _root_lease(path, fcntl.LOCK_EX):
         if committed.exists():
             return False
         if not pending.exists():
             return False
         if pending.is_symlink() or not pending.is_dir():
             raise RuntimeError(f"Optimizer pending path is not a directory: {pending}")
-        trash = pending.with_name(f".trash-{pending.name}-{uuid4().hex}")
+        trash = pending.with_name(f"{OPTIMIZER_TRASH_PREFIX}{generation}-{uuid4().hex}")
         os.replace(pending, trash)
         _fsync_directory(pending.parent)
     shutil.rmtree(trash)

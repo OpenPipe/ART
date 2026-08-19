@@ -27,6 +27,12 @@ class _ObjectModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class S3ObjectStoreNamespace(_ObjectModel):
+    endpoint_url: str
+    bucket: str
+    prefix: str
+
+
 class S3ObjectStoreConfig(_ObjectModel):
     endpoint_url: str = Field(pattern=r"^https://")
     region: str = Field(min_length=1)
@@ -46,6 +52,14 @@ class S3ObjectStoreConfig(_ObjectModel):
     connect_timeout_s: float = Field(default=2.0, gt=0, le=60)
     read_timeout_s: float = Field(default=2.0, gt=0, le=300)
     max_attempts: int = Field(default=2, ge=1, le=5)
+
+    @property
+    def namespace(self) -> S3ObjectStoreNamespace:
+        return S3ObjectStoreNamespace(
+            endpoint_url=self.endpoint_url,
+            bucket=self.bucket,
+            prefix=self.prefix,
+        )
 
     @field_validator("bucket")
     @classmethod
@@ -239,6 +253,37 @@ class S3BinaryObjectStore:
                 return None
             raise
         return BinaryObjectRef.model_validate_json(body)
+
+    def verify(self, ref: BinaryObjectRef) -> None:
+        """Stream-verify an object when manifest-only recovery is insufficient."""
+        if self.resolve(ref.manifest_uri) != ref:
+            raise RuntimeError("binary object manifest changed before verification")
+        bucket, manifest_key = _parse_s3_uri(ref.manifest_uri)
+        prefix = str(PurePosixPath(manifest_key).parent)
+        for file in ref.files:
+            try:
+                response = self._client.get_object(
+                    Bucket=bucket,
+                    Key=_binary_object_file_key(prefix, file),
+                )
+            except Exception as error:
+                if _is_missing_object(error):
+                    raise RuntimeError(
+                        f"binary object file is missing: {file.relative_path}"
+                    ) from error
+                raise
+            body = response["Body"]
+            digest, byte_count = hashlib.sha256(), 0
+            try:
+                while chunk := body.read(8 << 20):
+                    digest.update(chunk)
+                    byte_count += len(chunk)
+            finally:
+                body.close()
+            if byte_count != file.byte_count or digest.hexdigest() != file.sha256:
+                raise RuntimeError(
+                    f"binary object file identity changed: {file.relative_path}"
+                )
 
     def materialize(self, ref: BinaryObjectRef, destination: str | Path) -> Path:
         resolved = self.resolve(ref.manifest_uri)
@@ -877,6 +922,14 @@ def _is_precondition_failed(error: Exception) -> bool:
     return isinstance(error, ClientError) and error.response.get("Error", {}).get(
         "Code"
     ) in {"PreconditionFailed", "412"}
+
+
+def _is_missing_object(error: Exception) -> bool:
+    from botocore.exceptions import ClientError
+
+    return isinstance(error, ClientError) and error.response.get("Error", {}).get(
+        "Code"
+    ) in {"404", "NoSuchKey", "NotFound"}
 
 
 def _manifest_bytes(ref: BinaryObjectRef) -> bytes:
