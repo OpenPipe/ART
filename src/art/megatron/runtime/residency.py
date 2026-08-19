@@ -89,7 +89,7 @@ class ResidencyEntry(BaseModel):
 
     key: ResidencyKey
     copies: tuple[ResidencyCopy, ...]
-    pin_count: int = Field(ge=0)
+    pin_counts: dict[ResidencyTier, int]
     last_access: float = Field(ge=0.0)
 
 
@@ -118,7 +118,7 @@ class ResidencyLedger:
         self.limits = limits
         self._copies: dict[ResidencyKey, dict[ResidencyTier, ResidencyCopy]] = {}
         self._last_access: dict[ResidencyKey, float] = {}
-        self._pins: dict[ResidencyKey, int] = {}
+        self._pins: dict[ResidencyKey, dict[ResidencyTier, int]] = {}
         self._reservations: dict[str, ResidencyReservation] = {}
         self._ready_bytes = {tier: 0 for tier in RESIDENCY_TIERS}
         self._reserved_bytes = {tier: 0 for tier in RESIDENCY_TIERS}
@@ -204,8 +204,8 @@ class ResidencyLedger:
         deleting_entry: bool = False,
     ) -> None:
         with self._lock:
-            if self._pins.get(key, 0):
-                raise RuntimeError("cannot drop a pinned residency entry")
+            if self._pin_count(key, tier):
+                raise RuntimeError(f"cannot drop a pinned {tier} residency copy")
             copies = self._copies.get(key)
             if copies is None or tier not in copies:
                 raise RuntimeError(f"residency copy is not ready: {tier}")
@@ -247,7 +247,10 @@ class ResidencyLedger:
                 )
             self._ready_bytes[tier] = projected
             source_copies.pop(tier)
-            pins = self._pins.pop(source, 0)
+            source_pins = self._pins.get(source)
+            pins = 0 if source_pins is None else source_pins.pop(tier, 0)
+            if source_pins == {}:
+                self._pins.pop(source)
             if not source_copies:
                 self._copies.pop(source)
                 self._last_access.pop(source, None)
@@ -256,12 +259,12 @@ class ResidencyLedger:
             self._copies[target] = {tier: copy}
             self._last_access[target] = now
             if pins:
-                self._pins[target] = pins
+                self._pins[target] = {tier: pins}
             return copy
 
     def drop_entry(self, key: ResidencyKey) -> None:
         with self._lock:
-            if self._pins.get(key, 0):
+            if any(self._pins.get(key, {}).values()):
                 raise RuntimeError("cannot drop a pinned residency entry")
             if any(item.key == key for item in self._reservations.values()):
                 raise RuntimeError("cannot drop residency with an active transition")
@@ -284,22 +287,26 @@ class ResidencyLedger:
             except KeyError as exc:
                 raise KeyError((key, tier)) from exc
 
-    def pin(self, key: ResidencyKey) -> None:
+    def pin(self, key: ResidencyKey, tier: ResidencyTier) -> None:
         with self._lock:
-            if key not in self._copies:
-                raise RuntimeError("cannot pin an unknown residency entry")
-            self._pins[key] = self._pins.get(key, 0) + 1
+            if tier not in self._copies.get(key, {}):
+                raise RuntimeError(f"cannot pin a missing {tier} residency copy")
+            pins = self._pins.setdefault(key, {})
+            pins[tier] = pins.get(tier, 0) + 1
             self._last_access[key] = time.monotonic()
 
-    def unpin(self, key: ResidencyKey) -> None:
+    def unpin(self, key: ResidencyKey, tier: ResidencyTier) -> None:
         with self._lock:
-            count = self._pins.get(key, 0)
+            pins = self._pins.get(key, {})
+            count = pins.get(tier, 0)
             if count < 1:
-                raise RuntimeError("residency entry is not pinned")
+                raise RuntimeError(f"{tier} residency copy is not pinned")
             if count == 1:
-                self._pins.pop(key)
+                pins.pop(tier)
+                if not pins:
+                    self._pins.pop(key)
             else:
-                self._pins[key] = count - 1
+                pins[tier] = count - 1
             self._last_access[key] = time.monotonic()
 
     def touch(self, key: ResidencyKey) -> None:
@@ -343,7 +350,7 @@ class ResidencyLedger:
                     key
                     for key, copies in self._copies.items()
                     if tier in copies
-                    and not self._pins.get(key, 0)
+                    and not self._pin_count(key, tier)
                     and key not in protected_set
                     and (not require_other_copy or len(copies) > 1)
                     and not any(item.key == key for item in self._reservations.values())
@@ -370,7 +377,9 @@ class ResidencyLedger:
             return ResidencyEntry(
                 key=key,
                 copies=tuple(copies[tier] for tier in sorted(copies)),
-                pin_count=self._pins.get(key, 0),
+                pin_counts={
+                    tier: self._pin_count(key, tier) for tier in RESIDENCY_TIERS
+                },
                 last_access=self._last_access[key],
             )
 
@@ -393,3 +402,6 @@ class ResidencyLedger:
         if current is None or current != reservation:
             raise RuntimeError("residency reservation is stale or unknown")
         return current
+
+    def _pin_count(self, key: ResidencyKey, tier: ResidencyTier) -> int:
+        return self._pins.get(key, {}).get(tier, 0)

@@ -357,7 +357,7 @@ class RunResidencyManager:
                     self._installed_components[component] = key
             if not self.ledger.has_copy(key, "l1_gpu"):
                 raise RuntimeError("requested generation did not become L1 resident")
-            self.ledger.pin(key)
+            self.ledger.pin(key, "l1_gpu")
 
     def prefetch_l1(self, key: ResidencyKey) -> None:
         """Materialize an evictable L1 copy without synchronizing the compute thread."""
@@ -381,7 +381,7 @@ class RunResidencyManager:
                 self._installed_components[component] = key
 
     def release_l1(self, key: ResidencyKey) -> None:
-        self.ledger.unpin(key)
+        self.ledger.unpin(key, "l1_gpu")
 
     def wait_before_mutation(self, key: ResidencyKey) -> None:
         """Order this key's next CUDA mutation after its recovery snapshot."""
@@ -414,15 +414,20 @@ class RunResidencyManager:
 
     @contextmanager
     def borrow_l2(self, key: ResidencyKey) -> Iterator[HostTensorImage]:
-        """Pin one generation while a host-side consumer reads its L2 image."""
+        """Pin one host copy while a consumer reads its L2 image."""
         self._require_open()
-        with self._lock:
-            self._state(key)
-            self.ledger.pin(key)
+        while True:
+            image = self.ensure_l2(key).result()
+            with self._lock:
+                state = self._state(key)
+                if state.l2 is not image or not self.ledger.has_copy(key, "l2_cpu"):
+                    continue
+                self.ledger.pin(key, "l2_cpu")
+                break
         try:
-            yield self.ensure_l2(key).result()
+            yield image
         finally:
-            self.ledger.unpin(key)
+            self.ledger.unpin(key, "l2_cpu")
 
     def retire(self, key: ResidencyKey) -> None:
         self._require_open()
@@ -434,7 +439,7 @@ class RunResidencyManager:
             if state.l1_transition is not None:
                 raise RuntimeError("cannot retire a state with an active L1 transfer")
             entry = self.ledger.entry(key)
-            if entry.pin_count:
+            if any(entry.pin_counts.values()):
                 raise RuntimeError("cannot retire a pinned residency state")
             if state.l3_manifest is not None:
                 self._store.delete(key)
@@ -678,7 +683,7 @@ class RunResidencyManager:
             state = self._state(key)
             if not self.ledger.has_copy(key, "l2_cpu"):
                 return False
-            if self.ledger.entry(key).pin_count:
+            if self.ledger.entry(key).pin_counts["l2_cpu"]:
                 return False
             if not self.ledger.has_copy(key, "l1_gpu"):
                 if state.l3 is None:
@@ -694,7 +699,7 @@ class RunResidencyManager:
             state = self._state(key)
             if not self.ledger.has_copy(key, "l3_nvme"):
                 return False
-            if self.ledger.entry(key).pin_count:
+            if self.ledger.entry(key).pin_counts["l3_nvme"]:
                 return False
             if not (
                 self.ledger.has_copy(key, "l1_gpu")
@@ -717,7 +722,7 @@ class RunResidencyManager:
         host = state.l2 if state.l2 is not None else state.l3
         if host is None:
             raise RuntimeError("cannot evict L1 without a lossless host copy")
-        if self.ledger.entry(key).pin_count:
+        if self.ledger.entry(key).pin_counts["l1_gpu"]:
             raise RuntimeError("cannot evict a pinned residency state")
         host.activate()
         self.ledger.drop(key, "l1_gpu")
