@@ -971,7 +971,7 @@ class MCoreRunSlotExecutor:
         from art.trainer_rank import AdamParams
 
         with self._resident(state, include_optimizer=True, include_accumulator=True):
-            self.runtime.optimizer_snapshot_barrier.wait_before_mutation()
+            self.runtime.optimizer_snapshot_barrier.wait_before_mutation(key=job.run_id)
             gradients = state.gradients.prepare_optimizer()
             started = time.perf_counter()
             result = self._slot_trainer.optim_step_reduced(
@@ -1734,9 +1734,9 @@ class _GenerationPublisher:
             else:
                 optimizer = None
             if lora is not None:
-                self.runtime.optimizer_snapshot_barrier.register(lora)
+                self.runtime.optimizer_snapshot_barrier.register(lora, key=run_id)
             if optimizer is not None:
-                self.runtime.optimizer_snapshot_barrier.register(optimizer)
+                self.runtime.optimizer_snapshot_barrier.register(optimizer, key=run_id)
             optimizer_launch_s = time.perf_counter() - optimizer_started
             lora_residency_key = (
                 None
@@ -1900,7 +1900,7 @@ class _GenerationPublisher:
                 step=generation.policy_step,
                 stager=stager,
             )
-        self.runtime.optimizer_snapshot_barrier.register(optimizer)
+        self.runtime.optimizer_snapshot_barrier.register(optimizer, key=entry.run_id)
         resolved = self._resolution_pool.submit(optimizer.resolve)
         with self._lock:
             if entry.retired or entry.released or entry.optimizer_upgrade is not None:

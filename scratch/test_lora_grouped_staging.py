@@ -1,6 +1,11 @@
 import torch
 
-from art.megatron.tensor_snapshot import PinnedCpuSnapshotStager
+from art.megatron.tensor_snapshot import (
+    PendingCpuSnapshot,
+    PinnedCpuSnapshotStager,
+    SnapshotReadBarrier,
+    _CudaFence,
+)
 from art.megatron.weights.lora_publish import _stage_published_tensors
 
 
@@ -103,3 +108,40 @@ def test_grouped_staging_has_no_aggregate_cuda_allocation() -> None:
     assert peak_extra == 0
     for index, tensor in enumerate(result.values()):
         assert tensor.flatten()[0].item() == index
+
+
+def test_snapshot_barrier_key_does_not_fence_another_run() -> None:
+    device = torch.cuda.current_device()
+    delayed_stream = torch.cuda.Stream(device=device)
+    mutation_stream = torch.cuda.Stream(device=device)
+    delayed = torch.cuda.Event(blocking=True)
+    ready = torch.cuda.Event(blocking=True)
+    with torch.cuda.stream(delayed_stream):
+        torch.cuda._sleep(2_000_000_000)
+        delayed.record()
+    ready.record(torch.cuda.current_stream(device))
+    ready.synchronize()
+
+    barrier = SnapshotReadBarrier()
+    barrier.register(
+        PendingCpuSnapshot(None, (_CudaFence(device, delayed),), ()), key="run_a"
+    )
+    barrier.register(
+        PendingCpuSnapshot(None, (_CudaFence(device, ready),), ()), key="run_b"
+    )
+    mutation_done = torch.cuda.Event(blocking=True)
+    with torch.cuda.stream(mutation_stream):
+        barrier.wait_before_mutation(key="run_b")
+        mutation_done.record()
+    mutation_done.synchronize()
+
+    assert not delayed.query()
+    global_wait_done = torch.cuda.Event(blocking=True)
+    with torch.cuda.stream(mutation_stream):
+        barrier.wait_before_mutation()
+        global_wait_done.record()
+    global_wait_done.synchronize()
+    assert delayed.query()
+
+    barrier.register(PendingCpuSnapshot(None, (_CudaFence(device, delayed),), ()))
+    barrier.synchronize()
