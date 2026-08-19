@@ -10,6 +10,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    FiniteFloat,
     PrivateAttr,
     field_validator,
     model_validator,
@@ -213,7 +214,9 @@ TrainingBatch = Annotated[
 class LossConfig(Contract):
     name: TokenizedLossName
     normalize_advantages: bool = True
-    values: dict[str, float | int | bool | str | None] = Field(default_factory=dict)
+    values: dict[str, FiniteFloat | int | bool | str | None] = Field(
+        default_factory=dict
+    )
 
 
 class ForwardRequest(RunCommand):
@@ -250,12 +253,12 @@ class ForwardBackwardRequest(ForwardRequest):
 
 
 class AdamConfig(Contract):
-    learning_rate: float = Field(ge=0)
-    beta1: float = Field(default=0.9, ge=0, lt=1)
-    beta2: float = Field(default=0.99, ge=0, lt=1)
-    eps: float = Field(default=1e-13, gt=0)
-    weight_decay: float = Field(default=0.1, ge=0)
-    grad_clip_norm: float = Field(default=0.1, ge=0)
+    learning_rate: FiniteFloat = Field(ge=0)
+    beta1: FiniteFloat = Field(default=0.9, ge=0, lt=1)
+    beta2: FiniteFloat = Field(default=0.99, ge=0, lt=1)
+    eps: FiniteFloat = Field(default=1e-13, gt=0)
+    weight_decay: FiniteFloat = Field(default=0.1, ge=0)
+    grad_clip_norm: FiniteFloat = Field(default=0.1, ge=0)
 
 
 class OptimStepRequest(RunCommand):

@@ -86,6 +86,15 @@ def tokenized_result_value_count(datums: tuple["TokenizedDatum", ...]) -> int:
     return sum(len(datum.input_tokens) * datum.candidate_count for datum in datums)
 
 
+def _finite_float(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"{name} must be numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
 def validate_tokenized_loss_values(
     loss: TokenizedLossName,
     values: Mapping[str, float | int | bool | str | None],
@@ -99,8 +108,7 @@ def validate_tokenized_loss_values(
     if unknown:
         raise ValueError(f"unsupported {loss} loss settings: {sorted(unknown)}")
     for name, value in values.items():
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            raise TypeError(f"{name} must be numeric")
+        _finite_float(name, value)
     if (
         loss in {"ppo", "cispo"}
         and tokenized_clip_bounds(loss, values)[0]
@@ -118,14 +126,10 @@ def tokenized_clip_bounds(
     defaults = (0.8, 1.2) if loss == "ppo" else (0.0, 4.0)
     low = values.get("clip_low_threshold", defaults[0])
     high = values.get("clip_high_threshold", defaults[1])
-    if (
-        isinstance(low, bool)
-        or not isinstance(low, int | float)
-        or isinstance(high, bool)
-        or not isinstance(high, int | float)
-    ):
-        raise TypeError("clip thresholds must be numeric")
-    return float(low), float(high)
+    return (
+        _finite_float("clip_low_threshold", low),
+        _finite_float("clip_high_threshold", high),
+    )
 
 
 class TokenizedDatum(BaseModel):
