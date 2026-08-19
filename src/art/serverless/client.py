@@ -48,6 +48,7 @@ from .contracts import (
 )
 from .data_plane import (
     FORWARD_SUBMISSION_MEDIA_TYPE,
+    EncodedForwardSubmission,
     EncodedTrainingBatch,
     decode_operation_result,
     encode_forward_submission,
@@ -58,6 +59,10 @@ ResultT = TypeVar("ResultT", bound=OperationResult)
 ResponseT = TypeVar("ResponseT", bound=Contract)
 _CREATE_RUN_RESOLVE_STATUSES = frozenset({409, 429, 500, 502, 503, 504})
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
+
+
+def _sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
 class RemoteTrainingError(RuntimeError):
@@ -184,11 +189,10 @@ class RemoteTrainingServiceClient:
         self,
         kind: OperationKind,
         request: RemoteForwardRequest,
-        batch: EncodedTrainingBatch,
+        payload: EncodedForwardSubmission,
     ) -> OperationRef:
         if kind not in {"forward", "forward_backward"}:
             raise ValueError("forward submission requires a forward operation")
-        payload = await asyncio.to_thread(encode_forward_submission, request, batch)
         response = await self._send(
             "POST",
             f"training/runs/{request.run_id}/{kind}",
@@ -576,6 +580,7 @@ class RemoteTrainingClient:
     ) -> TrainingOperation[ResultT]:
         wire_request: RunCommand = request
         prepared_batch: EncodedTrainingBatch | None = None
+        submission: EncodedForwardSubmission | None = None
         if isinstance(request, (ForwardRequest, ForwardBackwardRequest)):
             if encoded_batch is not None:
                 if request.batch is not encoded_batch.batch:
@@ -590,6 +595,9 @@ class RemoteTrainingClient:
             wire_request = RemoteForwardRequest.from_command(
                 request, prepared_batch.remote
             )
+            submission = await asyncio.to_thread(
+                encode_forward_submission, wire_request, prepared_batch
+            )
         elif encoded_batch is not None:
             raise TypeError("only forward commands accept a prepared batch")
         return await self._admit(
@@ -597,7 +605,7 @@ class RemoteTrainingClient:
             wire_request,
             kind=kind,
             result_type=result_type,
-            prepared_batch=prepared_batch,
+            submission=submission,
         )
 
     async def _admit(
@@ -607,11 +615,13 @@ class RemoteTrainingClient:
         *,
         kind: OperationKind,
         result_type: type[ResultT],
-        prepared_batch: EncodedTrainingBatch | None = None,
+        submission: EncodedForwardSubmission | None = None,
     ) -> TrainingOperation[ResultT]:
-        fingerprint = hashlib.sha256(
-            wire_request.model_dump_json().encode()
-        ).hexdigest()
+        fingerprint = (
+            await asyncio.to_thread(_sha256, submission.preamble)
+            if submission is not None
+            else _sha256(wire_request.model_dump_json().encode())
+        )
         async with self._lock:
             if self._closed:
                 raise RuntimeError("remote training client is closed")
@@ -628,9 +638,9 @@ class RemoteTrainingClient:
                 )
             ref = (
                 await self._service.submit_forward(
-                    kind, cast(RemoteForwardRequest, wire_request), prepared_batch
+                    kind, cast(RemoteForwardRequest, wire_request), submission
                 )
-                if prepared_batch is not None
+                if submission is not None
                 else await self._service.submit(kind, wire_request)
             )
             if (
