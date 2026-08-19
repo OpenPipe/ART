@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _LOCK_NAME = ".art_disk_admission.lock"
 _MANIFEST_NAME = ".art_disk_admission.json"
+_LEASE_DIR = ".art_disk_reservations"
 _MAX_CLOSED_RESERVATIONS = 256
 _PROCESS_ALIVE = "alive"
 _PROCESS_DEAD = "dead"
@@ -68,6 +69,7 @@ class DiskReservation(BaseModel):
     planned_bytes: int = Field(gt=0)
     remaining_bytes: int = Field(ge=0)
     owned_paths: tuple[str, ...] = Field(min_length=1)
+    lease_path: str = Field(min_length=1)
     state: Literal["active", "completed", "cancelled", "abandoned"] = "active"
     created_at: datetime
     updated_at: datetime
@@ -119,13 +121,20 @@ class DiskAdmissionManifest(BaseModel):
 
 class DiskReservationLease:
     def __init__(
-        self, admission: "DiskAdmission", reservation_id: str, planned_bytes: int
+        self,
+        admission: "DiskAdmission",
+        reservation_id: str,
+        planned_bytes: int,
+        lease_path: Path,
+        lease_descriptor: int,
     ) -> None:
         self._admission = admission
         self.reservation_id = reservation_id
         self.planned_bytes = planned_bytes
         self._written_bytes = 0
         self._recorded_bytes = 0
+        self._lease_path = lease_path
+        self._lease_descriptor = lease_descriptor
         self._closed = False
 
     def record_written(self, written_bytes: int) -> None:
@@ -151,13 +160,22 @@ class DiskReservationLease:
         if self._written_bytes != self.planned_bytes:
             raise DiskAdmissionError("disk reservation completed before its full plan")
         self._admission._close(self.reservation_id, "completed")
+        self._release()
         self._closed = True
 
     def cancel(self) -> None:
         if self._closed:
             return
         self._admission._close(self.reservation_id, "cancelled")
+        self._release()
         self._closed = True
+
+    def _release(self) -> None:
+        try:
+            fcntl.flock(self._lease_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(self._lease_descriptor)
+            self._lease_path.unlink(missing_ok=True)
 
 
 class DiskAdmission:
@@ -170,6 +188,8 @@ class DiskAdmission:
             raise NotADirectoryError(self.mount)
         self.lock_path = self.mount / _LOCK_NAME
         self.manifest_path = self.mount / _MANIFEST_NAME
+        self.lease_root = self.mount / _LEASE_DIR
+        self.lease_root.mkdir(mode=0o700, exist_ok=True)
         self.process = _current_process_identity(config.node_identity)
         self._process_pid = os.getpid()
         self._lock = _path_lock(self.lock_path)
@@ -198,6 +218,7 @@ class DiskAdmission:
             raise ValueError("disk reservation must own at least one path")
         now = _now()
         reservation_id = uuid4().hex
+        lease_path, lease_descriptor = self._create_lease(reservation_id)
         reservation = DiskReservation(
             reservation_id=reservation_id,
             storage_identity=self.config.storage_identity,
@@ -211,44 +232,57 @@ class DiskAdmission:
             planned_bytes=incoming_peak_bytes,
             remaining_bytes=incoming_peak_bytes,
             owned_paths=paths,
+            lease_path=str(lease_path),
             created_at=now,
             updated_at=now,
         )
-        with self._manifest() as manifest:
-            self._reap_unclaimed_dead(manifest)
-            if any(Path(value).exists() for value in paths):
-                raise FileExistsError("disk reservation owned path already exists")
-            active_paths = tuple(
-                Path(path)
-                for value in manifest.reservations.values()
-                if value.state == "active"
-                for path in value.owned_paths
-            )
-            if any(
-                _paths_overlap(Path(incoming), active)
-                for incoming in paths
-                for active in active_paths
-            ):
-                raise DiskAdmissionError(
-                    "disk reservation owned path overlaps an active reservation"
+        try:
+            with self._manifest() as manifest:
+                self._reap_unclaimed_dead(manifest)
+                if any(Path(value).exists() for value in paths):
+                    raise FileExistsError("disk reservation owned path already exists")
+                active_paths = tuple(
+                    Path(path)
+                    for value in manifest.reservations.values()
+                    if value.state == "active"
+                    for path in value.owned_paths
                 )
-            active_remaining = sum(
-                value.remaining_bytes
-                for value in manifest.reservations.values()
-                if value.state == "active"
-            )
-            free = _statvfs_free(self.mount)
-            available = free - active_remaining - incoming_peak_bytes
-            if available < self.config.runtime_free_floor_bytes:
-                raise DiskCapacityExceeded(
-                    "disk admission rejected reservation: "
-                    f"free={free}, active_remaining={active_remaining}, "
-                    f"incoming_peak={incoming_peak_bytes}, "
-                    f"runtime_floor={self.config.runtime_free_floor_bytes}"
+                if any(
+                    _paths_overlap(Path(incoming), active)
+                    for incoming in paths
+                    for active in active_paths
+                ):
+                    raise DiskAdmissionError(
+                        "disk reservation owned path overlaps an active reservation"
+                    )
+                active_remaining = sum(
+                    value.remaining_bytes
+                    for value in manifest.reservations.values()
+                    if value.state == "active"
                 )
-            manifest.reservations[reservation_id] = reservation
-            self._prune_closed(manifest)
-        return DiskReservationLease(self, reservation_id, incoming_peak_bytes)
+                free = _statvfs_free(self.mount)
+                available = free - active_remaining - incoming_peak_bytes
+                if available < self.config.runtime_free_floor_bytes:
+                    raise DiskCapacityExceeded(
+                        "disk admission rejected reservation: "
+                        f"free={free}, active_remaining={active_remaining}, "
+                        f"incoming_peak={incoming_peak_bytes}, "
+                        f"runtime_floor={self.config.runtime_free_floor_bytes}"
+                    )
+                manifest.reservations[reservation_id] = reservation
+                self._prune_closed(manifest)
+        except BaseException:
+            fcntl.flock(lease_descriptor, fcntl.LOCK_UN)
+            os.close(lease_descriptor)
+            lease_path.unlink(missing_ok=True)
+            raise
+        return DiskReservationLease(
+            self,
+            reservation_id,
+            incoming_peak_bytes,
+            lease_path,
+            lease_descriptor,
+        )
 
     def active_reservations(self) -> tuple[DiskReservation, ...]:
         with self._manifest() as manifest:
@@ -269,7 +303,7 @@ class DiskAdmission:
                 for value in manifest.reservations.values()
                 if value.state == "active"
                 and value.catalog_claim is not None
-                and self._process_state(value.process) == _PROCESS_DEAD
+                and not self._owner_is_live(value)
                 and not catalog_claim_is_active(value.catalog_claim)
                 and not _paths_have_open_files(value.owned_paths)
             )
@@ -287,7 +321,7 @@ class DiskAdmission:
                     value is None
                     or value.state != "active"
                     or value.catalog_claim is None
-                    or self._process_state(value.process) != _PROCESS_DEAD
+                    or self._owner_is_live(value)
                     or catalog_claim_is_active(value.catalog_claim)
                     or _paths_have_open_files(value.owned_paths)
                 ):
@@ -346,7 +380,7 @@ class DiskAdmission:
             if (
                 value.state != "active"
                 or value.catalog_claim is not None
-                or self._process_state(value.process) != _PROCESS_DEAD
+                or self._owner_is_live(value)
                 or _paths_have_open_files(value.owned_paths)
             ):
                 continue
@@ -364,6 +398,7 @@ class DiskAdmission:
                 path.unlink(missing_ok=True)
             elif path.exists():
                 shutil.rmtree(path)
+        self._lease_path(value).unlink(missing_ok=True)
         manifest.reservations[value.reservation_id] = value.model_copy(
             update={
                 "remaining_bytes": 0,
@@ -372,6 +407,12 @@ class DiskAdmission:
                 "closed_at": now,
             }
         )
+
+    def _owner_is_live(self, value: DiskReservation) -> bool:
+        process_state = self._process_state(value.process)
+        if process_state == _PROCESS_ALIVE:
+            return True
+        return _lease_is_held(self._lease_path(value), self.mount)
 
     def _process_state(self, value: DiskProcessIdentity) -> str:
         if (
@@ -389,6 +430,29 @@ class DiskAdmission:
         if start_time_ticks != value.start_time_ticks or state == "Z":
             return _PROCESS_DEAD
         return _PROCESS_ALIVE
+
+    def _create_lease(self, reservation_id: str) -> tuple[Path, int]:
+        path = self.lease_root / f"{reservation_id}.lease"
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            _validate_file(descriptor, self.mount, "disk reservation lease")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(descriptor)
+            path.unlink(missing_ok=True)
+            raise
+        return path, descriptor
+
+    def _lease_path(self, value: DiskReservation) -> Path:
+        path = Path(value.lease_path).resolve(strict=False)
+        if path.parent != self.lease_root or path.name != (
+            f"{value.reservation_id}.lease"
+        ):
+            raise DiskAdmissionError("disk reservation lease changed identity")
+        return path
 
     def _owned_path(self, value: str | Path) -> Path:
         path = Path(value).absolute()
@@ -493,6 +557,26 @@ def _validate_file(descriptor: int, mount: Path, name: str) -> None:
         raise DiskAdmissionError(f"{name} is outside shared storage")
     if stat.S_IMODE(info.st_mode) & 0o077:
         raise PermissionError(f"{name} must not be group/world accessible")
+
+
+def _lease_is_held(path: Path, mount: Path) -> bool:
+    flags = os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return False
+    try:
+        _validate_file(descriptor, mount, "disk reservation lease")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
 
 
 def _paths_have_open_files(values: tuple[str, ...]) -> bool:
