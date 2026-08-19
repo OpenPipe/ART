@@ -572,7 +572,11 @@ def _stage_published_tensors(
             [],
         ).append((key, tensor))
 
-    staged: dict[str, torch.Tensor] = {}
+    plans: dict[
+        tuple[str, int | None, str],
+        list[tuple[torch.Tensor, tuple[tuple[str, torch.Tensor], ...]]],
+    ] = {}
+    output_order: list[str] = []
     for group in aliases.values():
         storage = group[0][1].untyped_storage()
         if len(group) == 1 or storage.nbytes() > sum(
@@ -587,35 +591,54 @@ def _stage_published_tensors(
             (storage.nbytes() // representative.element_size(),),
             (1,),
         )
-        staged_flat = stager.stage(flat)
-        for key, tensor in group:
-            staged[key] = staged_flat.as_strided(
-                tensor.shape,
-                tensor.stride(),
-                tensor.storage_offset(),
-            )
+        group_key = (
+            representative.device.type,
+            representative.device.index,
+            _dtype_name(representative.dtype),
+        )
+        plans.setdefault(group_key, []).append((flat, tuple(group)))
+        output_order.extend(key for key, _tensor in group)
 
-    grouped: dict[tuple[str, int | None, str], list[tuple[str, torch.Tensor]]] = {}
     for key, tensor in regular:
         dtype_name = _dtype_name(tensor.dtype)
         group_key = (tensor.device.type, tensor.device.index, dtype_name)
-        grouped.setdefault(group_key, []).append((key, tensor))
+        plans.setdefault(group_key, []).append((tensor, ((key, tensor),)))
 
-    for _group_key, group in sorted(grouped.items()):
-        flat = torch.cat(
-            [tensor.detach().contiguous().view(-1) for _key, tensor in sorted(group)]
+    staged: dict[str, torch.Tensor] = {}
+    for _group_key, group_plans in sorted(plans.items()):
+        regular_plans = [plan for plan in group_plans if len(plan[1]) == 1]
+        alias_plans = [plan for plan in group_plans if len(plan[1]) > 1]
+        regular_plans.sort(key=lambda plan: plan[1][0][0])
+        ordered_plans = alias_plans + regular_plans
+        staged_sources = stager.stage_group(
+            tuple(source for source, _outputs in ordered_plans)
         )
-        staged_flat = stager.stage(flat)
-        offset = 0
-        for key, tensor in sorted(group):
-            numel = tensor.numel()
-            if key in staged:
-                raise RuntimeError(
-                    f"Duplicate vLLM LoRA tensor after conversion: {key}"
+        for staged_source, (_source, outputs) in zip(
+            staged_sources, ordered_plans, strict=True
+        ):
+            alias_base_offset = staged_source.storage_offset()
+            for key, tensor in outputs:
+                if key in staged:
+                    raise RuntimeError(
+                        f"Duplicate vLLM LoRA tensor after conversion: {key}"
+                    )
+                staged[key] = (
+                    staged_source.view(tensor.shape)
+                    if len(outputs) == 1
+                    else staged_source.as_strided(
+                        tensor.shape,
+                        tensor.stride(),
+                        alias_base_offset + tensor.storage_offset(),
+                    )
                 )
-            staged[key] = staged_flat.narrow(0, offset, numel).view(tensor.shape)
-            offset += numel
-    return staged
+        output_order.extend(plan[1][0][0] for plan in regular_plans)
+    if len(staged) != len(tensors):
+        missing = sorted(set(tensors).difference(staged))
+        extra = sorted(set(staged).difference(tensors))
+        raise RuntimeError(
+            f"LoRA staging coverage mismatch: missing={missing}, extra={extra}"
+        )
+    return {key: staged[key] for key in output_order}
 
 
 def _rank0_merged_lora_tensors(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from threading import Lock
 import time
 from typing import Any, Generic, NamedTuple, TypeVar
@@ -53,29 +54,67 @@ class PinnedCpuSnapshotBuilder:
 
     def stage(self, tensor: torch.Tensor) -> torch.Tensor:
         source = tensor.detach()
-        self.timings.tensor_count += 1
-        self.timings.tensor_bytes += source.numel() * source.element_size()
         if not source.is_cuda:
+            self.timings.tensor_count += 1
+            self.timings.tensor_bytes += source.nbytes
             return source.to(device="cpu", copy=True)
+        return self.stage_group((tensor,))[0]
+
+    def stage_group(self, tensors: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        if not tensors:
+            return ()
+        sources = tuple(tensor.detach() for tensor in tensors)
+        device = sources[0].device
+        dtype = sources[0].dtype
+        if any(source.device != device or source.dtype != dtype for source in sources):
+            raise ValueError("snapshot staging group must share one device and dtype")
+        self.timings.tensor_count += len(sources)
+        self.timings.tensor_bytes += sum(source.nbytes for source in sources)
         contiguous_started = time.perf_counter()
-        source = source.contiguous()
+        sources = tuple(source.contiguous() for source in sources)
         self.timings.source_contiguous_s += time.perf_counter() - contiguous_started
-        device = source.device.index
-        if device is None:
+        total_numel = sum(source.numel() for source in sources)
+        if not total_numel:
+            return tuple(
+                torch.empty(source.shape, dtype=dtype, device="cpu")
+                for source in sources
+            )
+        if device.type != "cuda":
+            target = torch.empty(total_numel, dtype=dtype, device="cpu")
+            outputs: list[torch.Tensor] = []
+            offset = 0
+            for source in sources:
+                output = target.narrow(0, offset, source.numel()).view(source.shape)
+                output.copy_(source)
+                outputs.append(output)
+                offset += source.numel()
+            return tuple(outputs)
+        device_index = device.index
+        if device_index is None:
             raise RuntimeError("CUDA snapshot tensor has no device index")
-        stream = self._stager.stream(device)
+        stream = self._stager.stream(device_index)
         allocate_started = time.perf_counter()
-        target = self._stager.target_like(source)
+        target = (
+            self._stager.target_bytes(total_numel * sources[0].element_size())
+            .view(dtype)
+            .view(-1)
+        )
         self.timings.pinned_allocate_s += time.perf_counter() - allocate_started
         copy_started = time.perf_counter()
-        stream.wait_stream(torch.cuda.current_stream(device))
+        stream.wait_stream(torch.cuda.current_stream(device_index))
+        outputs = []
+        offset = 0
         with torch.cuda.stream(stream):
-            target.copy_(source, non_blocking=True)
-            source.record_stream(stream)
+            for source in sources:
+                output = target.narrow(0, offset, source.numel()).view(source.shape)
+                output.copy_(source, non_blocking=True)
+                source.record_stream(stream)
+                outputs.append(output)
+                offset += source.numel()
         self.timings.copy_launch_s += time.perf_counter() - copy_started
-        self._devices.add(device)
-        self._sources.append(source)
-        return target
+        self._devices.add(device_index)
+        self._sources.extend(sources)
+        return tuple(outputs)
 
     def finish(self, payload: _T) -> PendingCpuSnapshot[_T]:
         fence_started = time.perf_counter()
@@ -138,22 +177,29 @@ class SnapshotReadBarrier:
 
     def __init__(self) -> None:
         self._lock = Lock()
-        self._fences: list[_CudaFence] = []
+        self._fences: dict[str | None, list[_CudaFence]] = {}
 
-    def register(self, snapshot: PendingCpuSnapshot[Any]) -> None:
+    def register(
+        self, snapshot: PendingCpuSnapshot[Any], *, key: str | None = None
+    ) -> None:
         with self._lock:
-            self._fences.extend(snapshot.fences)
+            self._fences.setdefault(key, []).extend(snapshot.fences)
 
-    def wait_before_mutation(self) -> None:
-        for fence in self._take():
+    def wait_before_mutation(self, *, key: str | None = None) -> None:
+        for fence in self._take(key):
             torch.cuda.current_stream(fence.device).wait_event(fence.event)
 
-    def synchronize(self) -> None:
-        for fence in self._take():
+    def synchronize(self, *, key: str | None = None) -> None:
+        for fence in self._take(key):
             fence.event.synchronize()
 
-    def _take(self) -> tuple[_CudaFence, ...]:
+    def _take(self, key: str | None) -> tuple[_CudaFence, ...]:
         with self._lock:
-            fences = tuple(self._fences)
-            self._fences.clear()
+            if key is not None:
+                fences = tuple(self._fences.pop(key, ()))
+            else:
+                fences = tuple(
+                    fence for pending in self._fences.values() for fence in pending
+                )
+                self._fences.clear()
         return fences
