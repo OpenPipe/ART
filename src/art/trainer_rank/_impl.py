@@ -2621,6 +2621,8 @@ class TrainerRank:
                 synchronized=torch.cuda.is_available() and self.device.type == "cuda",
             ):
                 outputs = self._execute_flat_plan(plan)
+                if torch.cuda.is_available() and self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
         except torch.cuda.OutOfMemoryError as exc:
             check = self._memory_check(plan)
             self._raise_memory_error(
@@ -2631,7 +2633,6 @@ class TrainerRank:
             )
             raise AssertionError("unreachable") from exc
         if torch.cuda.is_available() and self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
             peak = int(torch.cuda.max_memory_allocated(self.device))
             self._update_memory_profile(plan, max(0, peak - baseline))
         return outputs
