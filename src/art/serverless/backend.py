@@ -140,10 +140,15 @@ class _SamplerRetention(BaseModel):
     predecessor_settled: SkipValidation[asyncio.Future[None] | None] = Field(
         exclude=True
     )
+    ready: SkipValidation[asyncio.Future[None]] = Field(exclude=True)
+    finish_requested: SkipValidation[asyncio.Future[frozenset[_SamplerKey]]] = Field(
+        exclude=True
+    )
     settled: SkipValidation[asyncio.Future[None]] = Field(exclude=True)
     forget: SkipValidation[dict[_SamplerKey, SamplerWeightsResult]] = Field(
         default_factory=dict, exclude=True
     )
+    failure: SkipValidation[BaseException | None] = Field(default=None, exclude=True)
 
 
 class _ExactAdapterLeaseState(BaseModel):
@@ -878,7 +883,9 @@ class ServerlessBackend:
         self, model: AnyTrainableModel
     ) -> _SamplerRetention:
         model_key = self._model_key(model)
-        # Future chaining serializes retention without holding the state lock over I/O.
+        loop = asyncio.get_running_loop()
+        # The tracked owner serializes retention without holding the state lock over I/O.
+        # Callers only signal completion, so their cancellation cannot orphan the tail.
         async with self._sampler_state_lock:
             predecessor = self._sampler_retention_tails.get(model_key)
             retention = _SamplerRetention(
@@ -886,21 +893,63 @@ class ServerlessBackend:
                 predecessor_settled=(
                     predecessor.settled if predecessor is not None else None
                 ),
-                settled=asyncio.get_running_loop().create_future(),
+                ready=loop.create_future(),
+                finish_requested=loop.create_future(),
+                settled=loop.create_future(),
             )
+            retention.ready.add_done_callback(consume_future_exception)
             self._sampler_retention_tails[model_key] = retention
+            self._track(
+                self._own_sampler_retention(retention),
+                f"sampler-retention-{model.name}",
+            )
         try:
-            if retention.predecessor_settled is not None:
-                await asyncio.shield(retention.predecessor_settled)
+            await asyncio.shield(retention.ready)
         except BaseException:
-            if (
-                retention.predecessor_settled is not None
-                and not retention.predecessor_settled.done()
-            ):
-                await asyncio.shield(retention.predecessor_settled)
-            await self._finish_sampler_retention(retention, set())
+            self._request_sampler_retention_finish(retention, set())
             raise
         return retention
+
+    async def _own_sampler_retention(self, retention: _SamplerRetention) -> None:
+        forgotten: frozenset[_SamplerKey] = frozenset()
+        try:
+            if retention.predecessor_settled is not None:
+                await retention.predecessor_settled
+            retention.ready.set_result(None)
+            forgotten = await retention.finish_requested
+            await self._settle_sampler_retention(retention, forgotten)
+            if retention.failure is not None:
+                raise retention.failure
+        except BaseException as error:
+            if not retention.ready.done():
+                retention.ready.set_exception(error)
+            if not retention.settled.done():
+                cleanup = asyncio.create_task(
+                    self._settle_sampler_retention(retention, frozenset()),
+                    name="sampler-retention-cleanup",
+                )
+                self._track_task(cleanup)
+                try:
+                    await asyncio.shield(cleanup)
+                except BaseException:
+                    # Cleanup remains backend-owned and is bounded by close().
+                    pass
+            raise
+
+    @staticmethod
+    def _request_sampler_retention_finish(
+        retention: _SamplerRetention, forgotten: set[_SamplerKey]
+    ) -> None:
+        requested = frozenset(forgotten)
+        if retention.finish_requested.done():
+            if (
+                not retention.finish_requested.cancelled()
+                and retention.finish_requested.exception() is None
+                and retention.finish_requested.result() == requested
+            ):
+                return
+            raise RuntimeError("sampler retention finish was already requested")
+        retention.finish_requested.set_result(requested)
 
     async def _reserve_sampler_forgetting(
         self,
@@ -938,19 +987,43 @@ class ServerlessBackend:
     async def _finish_sampler_retention(
         self, retention: _SamplerRetention, forgotten: set[_SamplerKey]
     ) -> None:
+        self._request_sampler_retention_finish(retention, forgotten)
+        await asyncio.shield(retention.settled)
+        if retention.failure is not None:
+            raise retention.failure
+
+    async def _settle_sampler_retention(
+        self,
+        retention: _SamplerRetention,
+        forgotten: frozenset[_SamplerKey],
+    ) -> None:
         async with self._sampler_state_lock:
-            if retention.settled.done() or not forgotten.issubset(retention.forget):
-                raise RuntimeError("sampler retention state is inconsistent")
-            for key in forgotten:
-                if self._sampler_results.get(key) is not retention.forget[key]:
-                    raise RuntimeError("sampler result changed during retention")
-            for key in forgotten:
-                del self._sampler_results[key]
+            if retention.settled.done():
+                return
+            failures: list[BaseException] = []
+            valid_forgotten = forgotten.intersection(retention.forget)
+            if valid_forgotten != forgotten:
+                failures.append(RuntimeError("sampler retention state is inconsistent"))
+            for key in valid_forgotten:
+                if self._sampler_results.get(key) is retention.forget[key]:
+                    del self._sampler_results[key]
+                else:
+                    failures.append(
+                        RuntimeError("sampler result changed during retention")
+                    )
             for key in retention.forget:
-                if self._sampler_retention_reservations.pop(key, None) is not retention:
-                    raise RuntimeError("sampler retention reservation is inconsistent")
+                if self._sampler_retention_reservations.get(key) is retention:
+                    del self._sampler_retention_reservations[key]
+                else:
+                    failures.append(
+                        RuntimeError("sampler retention reservation is inconsistent")
+                    )
             if self._sampler_retention_tails.get(retention.model_key) is retention:
                 del self._sampler_retention_tails[retention.model_key]
+            if failures:
+                retention.failure = BaseExceptionGroup(
+                    "sampler retention settlement failed", failures
+                )
             retention.settled.set_result(None)
 
     async def _delete_checkpoint_files(
