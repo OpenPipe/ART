@@ -65,6 +65,10 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _operation_id(run_id: str, request_id: str) -> str:
+    return _sha256(f"{run_id}\0{request_id}".encode())
+
+
 class RemoteTrainingError(RuntimeError):
     pass
 
@@ -409,9 +413,10 @@ class _RunEventObserver:
         self._error: BaseException | None = None
         self._closed = False
 
-    def register(self, operation_id: str) -> asyncio.Future[RunEvent]:
-        if operation_id in self._pending:
-            raise RuntimeError("remote operation was registered twice")
+    def reserve(self, operation_id: str) -> asyncio.Future[RunEvent]:
+        future = self._pending.get(operation_id)
+        if future is not None:
+            return future
         future = asyncio.get_running_loop().create_future()
         future.add_done_callback(_consume_event_future)
         if self._error is not None:
@@ -427,6 +432,23 @@ class _RunEventObserver:
                     self._observe(), name=f"remote-training-events-{self._run_id}"
                 )
         return future
+
+    def claim(self, operation_id: str, future: asyncio.Future[RunEvent]) -> None:
+        future.add_done_callback(lambda _: self._release(operation_id, future))
+
+    def abandon(
+        self,
+        operation_id: str,
+        future: asyncio.Future[RunEvent],
+        error: BaseException,
+    ) -> None:
+        self._release(operation_id, future)
+        if not future.done():
+            future.set_exception(error)
+
+    def _release(self, operation_id: str, future: asyncio.Future[RunEvent]) -> None:
+        if self._pending.get(operation_id) is future:
+            self._pending.pop(operation_id)
 
     async def close(self, *, timeout_s: float | None = None) -> None:
         if self._closed:
@@ -464,7 +486,7 @@ class _RunEventObserver:
                         raise RemoteTrainingError(
                             "terminal operation event has no operation_id"
                         )
-                    future = self._pending.pop(event.operation_id, None)
+                    future = self._pending.get(event.operation_id)
                     if future is not None and not future.done():
                         future.set_result(event)
                 if len(page.events) < _EVENT_PAGE_LIMIT:
@@ -484,7 +506,7 @@ class RemoteTrainingOperation(Generic[ResultT]):
         self,
         ref: OperationRef,
         service: RemoteTrainingServiceClient,
-        events: _RunEventObserver,
+        terminal: asyncio.Future[RunEvent],
         result_type: type[ResultT],
         on_completion: Callable[[], None] | None = None,
     ) -> None:
@@ -492,7 +514,7 @@ class RemoteTrainingOperation(Generic[ResultT]):
         self._service = service
         self._result_type = result_type
         self._completion: asyncio.Task[ResultT] | None = None
-        self._terminal = events.register(ref.operation_id)
+        self._terminal = terminal
         self._cancel_request_id = uuid.uuid4().hex
         if on_completion is not None:
             self._terminal.add_done_callback(lambda _: on_completion())
@@ -569,6 +591,7 @@ class RemoteTrainingClient:
         self._close_timeout_s = close_timeout_s
         self._lock = asyncio.Lock()
         self._operations: dict[str, tuple[str, RemoteTrainingOperation[Any]]] = {}
+        self._reserved_admission: tuple[str, str, OperationKind] | None = None
         self._close_request_id = uuid.uuid4().hex
         self._closed = False
         self._close_accepted = False
@@ -660,28 +683,51 @@ class RemoteTrainingClient:
                     f"expected sequence {self._next_sequence_id}, "
                     f"got {request.sequence_id}"
                 )
-            ref = (
-                await self._service.submit_forward(
-                    kind, cast(RemoteForwardRequest, wire_request), submission
+            reserved = self._reserved_admission
+            if reserved is not None:
+                request_id, reserved_fingerprint, reserved_kind = reserved
+                if request_id != request.request_id:
+                    raise RuntimeError("remote command admission remains unresolved")
+                if reserved_fingerprint != fingerprint or reserved_kind != kind:
+                    raise ValueError("request_id was reused with different content")
+            operation_id = _operation_id(request.run_id, request.request_id)
+            terminal = self._events.reserve(operation_id)
+            self._reserved_admission = (request.request_id, fingerprint, kind)
+            try:
+                ref = (
+                    await self._service.submit_forward(
+                        kind, cast(RemoteForwardRequest, wire_request), submission
+                    )
+                    if submission is not None
+                    else await self._service.submit(kind, wire_request)
                 )
-                if submission is not None
-                else await self._service.submit(kind, wire_request)
-            )
-            if (
-                ref.run_id != self.run_id
-                or ref.sequence_id != request.sequence_id
-                or ref.kind != kind
-                or ref.learner_parent_version != self._projected_learner_version
-            ):
-                raise RemoteTrainingError("server admitted a divergent command")
-            operation = RemoteTrainingOperation(
-                ref,
-                self._service,
-                self._events,
-                result_type,
-                on_completion=self._bound_operation_cache,
-            )
+                if ref.operation_id != operation_id:
+                    raise RemoteTrainingError(
+                        "server returned a divergent operation_id"
+                    )
+                if (
+                    ref.run_id != self.run_id
+                    or ref.sequence_id != request.sequence_id
+                    or ref.kind != kind
+                    or ref.learner_parent_version != self._projected_learner_version
+                ):
+                    raise RemoteTrainingError("server admitted a divergent command")
+                operation = RemoteTrainingOperation(
+                    ref,
+                    self._service,
+                    terminal,
+                    result_type,
+                    on_completion=self._bound_operation_cache,
+                )
+            except (asyncio.CancelledError, httpx.TransportError):
+                raise
+            except BaseException as error:
+                self._events.abandon(operation_id, terminal, error)
+                self._reserved_admission = None
+                raise
             self._operations[request.request_id] = (fingerprint, operation)
+            self._events.claim(operation_id, terminal)
+            self._reserved_admission = None
             self._bound_operation_cache()
             self._next_sequence_id += 1
             if ref.reserved_output_learner_version is not None:
