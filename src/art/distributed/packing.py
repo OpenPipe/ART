@@ -4,10 +4,9 @@ from collections.abc import Iterable
 import secrets
 from typing import TYPE_CHECKING, Any, Literal
 
-from msgspec import msgpack
 import numpy as np
 from openai.types.chat.chat_completion import Choice
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art.pipeline_tuner.config import PackedGroupShape
 from art.preprocessing.moe_routing import (
@@ -45,8 +44,6 @@ from .trajectory_store import (
 
 if TYPE_CHECKING:
     from art.model import TrainableModel
-
-_TOKENIZED_BATCH_ADAPTER = TypeAdapter(TokenizedTrainingBatch)
 
 
 class _ChoiceRoutingPayload(BaseModel):
@@ -298,18 +295,16 @@ class TokenizedBatchTransfer(BaseModel):
     stream: ByteStreamTransfer
 
     async def receive(self, *, timeout_s: float) -> TokenizedTrainingBatch:
-        payload = bytes(await receive_byte_stream(self.stream, timeout_s=timeout_s))
-        batch = _TOKENIZED_BATCH_ADAPTER.validate_python(msgpack.decode(payload))
-        batch.remember_encoded_payload(payload)
-        return batch
+        from art.serverless.data_plane import decode_trusted_tokenized_batch_wire
+
+        payload = await receive_byte_stream(self.stream, timeout_s=timeout_s)
+        return decode_trusted_tokenized_batch_wire(payload)
 
 
 def encode_tokenized_batch(batch: TokenizedTrainingBatch) -> bytes:
-    payload = batch.encoded_payload()
-    if payload is None:
-        payload = msgpack.encode(batch.model_dump(mode="python"))
-        batch.remember_encoded_payload(payload)
-    return payload
+    from art.serverless.data_plane import encode_tokenized_batch_wire
+
+    return encode_tokenized_batch_wire(batch)
 
 
 class PackingRequest(BaseModel):

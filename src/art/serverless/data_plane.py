@@ -29,7 +29,12 @@ from art.training.contracts import (
     TokenizedTrainingBatch,
     TrainingBatch,
 )
-from art.training.tokenized import MAX_TOKENIZED_LOGPROB_VALUES, TokenizedMoeRoutes
+from art.training.tokenized import (
+    MAX_TOKENIZED_LOGPROB_VALUES,
+    TokenizedDatum,
+    TokenizedMoeRoutes,
+    TokenizedPolicySpan,
+)
 
 from .contracts import (
     MAX_RL_GROUPS_PER_BATCH,
@@ -52,7 +57,6 @@ from .contracts import (
 )
 
 _SFT_BATCH_ADAPTER = TypeAdapter(SupervisedTrajectoryBatch)
-_TOKENIZED_BATCH_ADAPTER = TypeAdapter(TokenizedTrainingBatch)
 _UINT32_ARRAY_EXT = 1
 ResultT = TypeVar("ResultT", bound=OperationResult)
 RouteWireEncoding = Literal["inline", "prefix_tree"]
@@ -598,7 +602,11 @@ def prepare_training_batch(
         route_objects = ()
         remote = RemoteSftBatchRef(data=value.ref)
     else:
-        payload = _encode_tokenized_wire_batch(batch, route_encoding=route_encoding)
+        payload = (
+            encode_tokenized_batch_wire(batch)
+            if route_encoding == "prefix_tree"
+            else _encode_tokenized_wire_batch(batch, route_encoding=route_encoding)
+        )
         value = _encode_training_object(
             payload,
             data_format=TOKENIZED_DATA_FORMAT,
@@ -719,11 +727,21 @@ def _encode_tokenized_wire_batch(
     return msgpack.encode(wire.model_dump(mode="python"))
 
 
-def decode_tokenized_batch(
-    ref: TrainingDataRef, payload: bytes
+def encode_tokenized_batch_wire(batch: TokenizedTrainingBatch) -> bytes:
+    """Return the immutable compact v2 representation used by remote packing."""
+    payload = batch.encoded_payload()
+    if payload is None:
+        payload = _encode_tokenized_wire_batch(batch, route_encoding="prefix_tree")
+    return payload
+
+
+def _validated_tokenized_wire(payload: bytes) -> _TokenizedWireBatch:
+    return _TokenizedWireBatch.model_validate(msgpack.decode(payload))
+
+
+def _materialize_validated_tokenized_wire(
+    wire: _TokenizedWireBatch,
 ) -> TokenizedTrainingBatch:
-    _validate_training_object(ref, payload, TOKENIZED_DATA_FORMAT)
-    wire = _TokenizedWireBatch.model_validate(msgpack.decode(payload))
     if wire.route_pool is None:
         return wire.batch
     datums = list(wire.batch.datums)
@@ -742,10 +760,92 @@ def decode_tokenized_batch(
                 )
             }
         )
-    return _TOKENIZED_BATCH_ADAPTER.validate_python(
-        wire.batch.model_copy(update={"datums": tuple(datums)}).model_dump(
-            mode="python"
+    return wire.batch.model_copy(update={"datums": tuple(datums)})
+
+
+def decode_tokenized_batch(
+    ref: TrainingDataRef, payload: bytes
+) -> TokenizedTrainingBatch:
+    _validate_training_object(ref, payload, TOKENIZED_DATA_FORMAT)
+    batch = _materialize_validated_tokenized_wire(_validated_tokenized_wire(payload))
+    batch.remember_encoded_payload(payload)
+    return batch
+
+
+def _trusted_moe_routes(
+    value: Mapping[str, Any],
+    *,
+    data: tuple[memoryview, ...] | None = None,
+) -> TokenizedMoeRoutes:
+    return TokenizedMoeRoutes.model_construct(
+        num_experts=value["num_experts"],
+        dtype=value["dtype"],
+        shape=tuple(value["shape"]),
+        data=(
+            data
+            if data is not None
+            else tuple(memoryview(segment) for segment in value["data"])
+        ),
+    )
+
+
+def _trusted_tokenized_datum(
+    value: Mapping[str, Any],
+    *,
+    moe_routes: TokenizedMoeRoutes | None,
+) -> TokenizedDatum:
+    def matrix(name: str) -> tuple[tuple[Any, ...], ...] | None:
+        rows = value[name]
+        return None if rows is None else tuple(tuple(row) for row in rows)
+
+    return TokenizedDatum.model_construct(
+        input_tokens=tuple(value["input_tokens"]),
+        target_tokens=matrix("target_tokens"),
+        weights=matrix("weights"),
+        logprobs=matrix("logprobs"),
+        advantages=matrix("advantages"),
+        packing_group_id=value["packing_group_id"],
+        policy_spans=tuple(
+            TokenizedPolicySpan.model_construct(**span)
+            for span in value["policy_spans"]
+        ),
+        moe_routes=moe_routes,
+    )
+
+
+def decode_trusted_tokenized_batch_wire(
+    payload: bytes | bytearray | memoryview,
+) -> TokenizedTrainingBatch:
+    """Materialize compact bytes already validated at the service boundary."""
+    wire = msgpack.decode(payload)
+    batch = wire["batch"]
+    raw_datums = batch["datums"]
+    route_pool = wire["route_pool"]
+    if route_pool is None:
+        routes = tuple(
+            None
+            if datum["moe_routes"] is None
+            else _trusted_moe_routes(datum["moe_routes"])
+            for datum in raw_datums
         )
+    else:
+        pooled = memoryview(route_pool["data"])
+        routes = tuple(
+            _trusted_moe_routes(
+                binding,
+                data=tuple(
+                    pooled[value["offset"] : value["offset"] + value["byte_count"]]
+                    for value in binding["slices"]
+                ),
+            )
+            for binding in route_pool["bindings"]
+        )
+    return TokenizedTrainingBatch.model_construct(
+        kind="tokenized",
+        datums=tuple(
+            _trusted_tokenized_datum(datum, moe_routes=route)
+            for datum, route in zip(raw_datums, routes, strict=True)
+        ),
     )
 
 
