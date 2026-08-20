@@ -147,6 +147,7 @@ def test_ordered_commit_resolves_verifies_and_deletes_by_discriminator() -> None
     ref = store.publish_ordered(target, files)
     prefix = f"{target.store.prefix}/{target.object_id}"
 
+    assert client.gets == [f"{prefix}/_COMMITTED.json"]
     assert json.loads(client.objects[f"{prefix}/_COMMITTED.json"])["transport"] == (
         "ordered_s3_shards"
     )

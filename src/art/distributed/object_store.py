@@ -358,8 +358,6 @@ class S3BinaryObjectStore:
                     "another publisher committed different object content"
                 ) from error
             return committed
-        if self._read(f"{prefix}/_COMMITTED.json") != body:
-            raise RuntimeError("object commit manifest changed after publication")
         return result
 
     def publish_ordered(
@@ -387,8 +385,6 @@ class S3BinaryObjectStore:
         commit = OrderedBinaryObjectCommit(ref=ref, shards=stored)
         body = _model_bytes(commit)
         self._put_immutable(f"{prefix}/_COMMITTED.json", body)
-        if self._read(f"{prefix}/_COMMITTED.json") != body:
-            raise RuntimeError("ordered object commit changed after publication")
         return ref
 
     def resolve_ordered(
