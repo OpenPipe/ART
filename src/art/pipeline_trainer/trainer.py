@@ -386,6 +386,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._checkpoint_log_tasks: set[asyncio.Task[None]] = set()
         self._publication_metric_tasks: set[asyncio.Task[None]] = set()
         self._post_train_tasks: set[asyncio.Task[None]] = set()
+        self._admission_tail: asyncio.Task[None] | None = None
         self._terminal_task_failures: list[BaseException] = []
         self._shutdown_wake_tasks: set[asyncio.Task[Any]] = set()
         self._shutdown_owned_tasks: set[asyncio.Task[Any]] = set()
@@ -799,6 +800,19 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._shutdown_wake_tasks.clear()
         if failures:
             self._mark_shutdown_failed()
+
+        if self._admission_tail is not None:
+            tail_failures = await settle_tasks(
+                (self._admission_tail,),
+                cancel=self._shutdown_failed_event.is_set(),
+                deadline=optional_deadline,
+                description="pipeline command admission tail",
+                ownership=self._shutdown_owned_tasks,
+                interrupt_events=(cleanup_cancelled,),
+            )
+            failures.extend(tail_failures)
+            if tail_failures:
+                self._mark_shutdown_failed()
 
         async def stop_attachments() -> None:
             if not self._shutdown_failed_event.is_set():
@@ -1460,8 +1474,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 continue
             forward: TrainingOperation[ForwardBackwardResult] | None = None
             try:
+                if self._admission_tail is not None:
+                    await asyncio.shield(self._admission_tail)
+                forward_request = context.forward_request.model_copy(
+                    update={"sequence_id": context.client.next_sequence_id}
+                )
                 submit_started = time.monotonic()
-                forward = await context.client.forward_backward(context.forward_request)
+                forward = await context.client.forward_backward(forward_request)
                 forward_submit_s = time.monotonic() - submit_started
                 if forward.ref.learner_parent_version != packing_policy_step:
                     raise RuntimeError(
@@ -1727,6 +1746,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             train_call_start = time.monotonic()
             if os.getenv("ART_TRAIN_STEP_LOG"):
                 print(f"[train] step {expected_step} starting (batch={len(batch)})")
+            optimizer: TrainingOperation[OptimStepResult] | None = None
+            sampler: TrainingOperation[SamplerWeightsResult] | None = None
+            state: TrainingOperation[SaveStateResult] | None = None
+            admission_tail: asyncio.Task[None] | None = None
             try:
                 train_kwargs = self._train_kwargs(
                     current_step,
@@ -1739,9 +1762,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 if direct_commands:
                     context = prepared.context
                     forward = prepared.forward
-                    optimizer: TrainingOperation[OptimStepResult] | None = None
-                    sampler: TrainingOperation[SamplerWeightsResult] | None = None
-                    state: TrainingOperation[SaveStateResult] | None = None
                     self._backend_training_started = True
                     optimizer = await context.client.optim_step(
                         context.optimizer_request(context.client.next_sequence_id)
@@ -1756,26 +1776,42 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                             "pipeline optimizer reserved an unexpected learner: "
                             f"expected={expected_step}, got={step}"
                         )
-                    sampler = await context.client.save_weights_for_sampler(
-                        await context.sampler_request(
+
+                    async def admit_tail() -> None:
+                        nonlocal sampler, state
+                        sampler = await context.client.save_weights_for_sampler(
+                            await context.sampler_request(
+                                step, context.client.next_sequence_id
+                            )
+                        )
+                        state_request = context.state_request(
                             step, context.client.next_sequence_id
                         )
+                        if state_request is not None:
+                            state = await context.client.save_state(state_request)
+                        await context.commands_admitted(
+                            forward=forward,
+                            optimizer=optimizer,
+                            sampler=sampler,
+                            state=state,
+                        )
+
+                    prior_tail = self._admission_tail
+                    if prior_tail is not None and not prior_tail.done():
+                        raise RuntimeError(
+                            "pipeline optimizer overtook its command admission tail"
+                        )
+                    admission_tail = asyncio.create_task(
+                        admit_tail(), name=f"pipeline_admission_tail_step_{step}"
                     )
-                    state_request = context.state_request(
-                        step, context.client.next_sequence_id
-                    )
-                    if state_request is not None:
-                        state = await context.client.save_state(state_request)
-                    await context.commands_admitted(
-                        forward=forward,
-                        optimizer=optimizer,
-                        sampler=sampler,
-                        state=state,
-                    )
-                    async with self.state.policy_updated:
-                        self.state.next_training_step = step
-                        self.state.policy_updated.notify_all()
+                    self._admission_tail = admission_tail
+                    self.state.next_training_step = step
                     prepared.handoff.set()
+                    async with self.state.policy_updated:
+                        self.state.policy_updated.notify_all()
+                    _, cancelled = await complete_task(admission_tail)
+                    if cancelled is not None:
+                        raise cancelled
                     if post_train_dispatch is not None:
                         post_train_dispatch.set()
                     result = await context.complete(
@@ -1801,6 +1837,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     post_train_dispatch.set()
                 cleanup_failures: list[BaseException] = []
                 if direct_commands:
+                    if admission_tail is not None and not admission_tail.done():
+                        try:
+                            _, cancelled = await complete_task(admission_tail)
+                            if cancelled is not None:
+                                cleanup_failures.append(cancelled)
+                        except BaseException as cleanup:
+                            if cleanup is not primary:
+                                cleanup_failures.append(cleanup)
                     try:
                         await prepared.context.abort(
                             prepared.forward,
