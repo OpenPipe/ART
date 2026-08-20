@@ -89,10 +89,12 @@ from ..pipeline_tuner import (
 from ..preprocessing.pack import (
     PackedTensors,
     PackingTimings,
-    packed_tensors_from_tokenized_results,
+    PrefixTreePackingPlan,
+    materialize_packed_tensors,
     packed_tensors_to_dir,
     plot_packed_tensors,
     prefix_tree_shareable_length,
+    prepare_packed_tensors_from_tokenized_results,
 )
 from ..preprocessing.tokenize import (
     ChatTemplateToolSchemaFormat,
@@ -136,6 +138,15 @@ class _PackedTrainingBatch(BaseModel):
     logical_tokens: int
     physical_tokens: int
     include_moe_routing: bool
+
+
+class PreparedPackedTensors(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    plan: PrefixTreePackingPlan
+    pad_token_id: int
+    advantage_balance: float
+    plot_output_dir: str | None = None
 
 
 class _TrainStepVllmMetricsCollector:
@@ -1014,6 +1025,37 @@ class LocalBackend:
         include_moe_routing: bool = False,
         packing_timings: PackingTimings | None = None,
     ) -> PackedTensors | None:
+        prepared = self._prepare_packed_tensors(
+            model,
+            trajectory_groups,
+            advantage_balance=advantage_balance,
+            allow_training_without_logprobs=allow_training_without_logprobs,
+            scale_rewards=scale_rewards,
+            plot_tensors=plot_tensors,
+            packed_sequence_length=packed_sequence_length,
+            logprob_calculation_chunk_size=logprob_calculation_chunk_size,
+            include_moe_routing=include_moe_routing,
+            packing_timings=packing_timings,
+        )
+        if prepared is None:
+            return None
+        return self._materialize_packed_tensors(
+            prepared, packing_timings=packing_timings
+        )
+
+    def _prepare_packed_tensors(
+        self,
+        model: AnyTrainableModel,
+        trajectory_groups: list[TrajectoryGroup],
+        advantage_balance: float,
+        allow_training_without_logprobs: bool,
+        scale_rewards: bool,
+        plot_tensors: bool,
+        packed_sequence_length: int | None,
+        logprob_calculation_chunk_size: int,
+        include_moe_routing: bool = False,
+        packing_timings: PackingTimings | None = None,
+    ) -> PreparedPackedTensors | None:
         started = time.monotonic()
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
@@ -1136,31 +1178,52 @@ class LocalBackend:
         self._record_packed_group_observations(trajectory_groups, tokenized_results)
         if packing_timings is not None:
             packing_timings.packing_filter_observe_s = time.monotonic() - started
-        packed_tensors = packed_tensors_from_tokenized_results(
+        plan = prepare_packed_tensors_from_tokenized_results(
             tokenized_results,
-            sequence_length,
-            pad_token_id=tokenizer.eos_token_id,
+            seq_len=sequence_length,
             truncate_long_results=False,
-            advantage_balance=advantage_balance,
             pack_results=self._supports_result_packing,
             include_moe_routing=include_moe_routing,
             timings=packing_timings,
         )
-        if (
-            not allow_training_without_logprobs
-            and np.isnan(packed_tensors["logprobs"]).all()
+        if not allow_training_without_logprobs and all(
+            np.isnan(item.logprobs).all() for item in plan.items
         ):
             logger.warning(
-                "There are no assistant logprobs to train on. Did you forget to include at least one Choice in Trajectory.messages_and_choices?"
+                "There are no assistant logprobs to train on. Did you forget to "
+                "include at least one Choice in Trajectory.messages_and_choices?"
             )
             return None
-        if plot_tensors:
+        return PreparedPackedTensors(
+            plan=plan,
+            pad_token_id=tokenizer.eos_token_id,
+            advantage_balance=advantage_balance,
+            plot_output_dir=(
+                get_model_dir(model=model, art_path=self._path) if plot_tensors else None
+            ),
+        )
+
+    @staticmethod
+    def _materialize_packed_tensors(
+        prepared: PreparedPackedTensors,
+        *,
+        packing_timings: PackingTimings | None = None,
+    ) -> PackedTensors:
+        packed_tensors = materialize_packed_tensors(
+            prepared.plan,
+            pad_token_id=prepared.pad_token_id,
+            advantage_balance=prepared.advantage_balance,
+            timings=packing_timings,
+        )
+        if prepared.plot_output_dir is not None:
             plot_packed_tensors(
-                packed_tensors, get_model_dir(model=model, art_path=self._path)
+                packed_tensors, prepared.plot_output_dir
             )
         else:
             logger.info(
-                f"Packed {len(tokenized_results)} trajectories into {packed_tensors['tokens'].shape[0]} sequences of length {packed_tensors['tokens'].shape[1]}"
+                f"Packed {len(prepared.plan.items)} trajectories into "
+                f"{packed_tensors['tokens'].shape[0]} sequences of length "
+                f"{packed_tensors['tokens'].shape[1]}"
             )
         return packed_tensors
 

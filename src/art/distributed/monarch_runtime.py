@@ -9,7 +9,7 @@ from art.trajectories import TrajectoryGroup
 
 from .adapter_transport import AdapterReceiveResult, AdapterTransferTarget
 from .data_plane import PackedBatchRef, PackedBatchTransfer
-from .packing import PackingRequest, PackingResult
+from .packing import PackingPlanResult, PackingRequest, PackingResult
 from .rollout import (
     RolloutInvocation,
     RolloutResult,
@@ -266,4 +266,22 @@ class MonarchPackingEndpoint:
     ) -> PackingResult:
         return await call_remote(
             self.actor.pack_batch, request, batch_id, transfer_timeout_s
+        )
+
+    async def prepare(
+        self,
+        request: PackingRequest,
+        batch_id: str,
+        *,
+        transfer_timeout_s: float,
+    ) -> PackingPlanResult:
+        return await call_remote(
+            self.actor.prepare_batch, request, batch_id, transfer_timeout_s
+        )
+
+    async def materialize(
+        self, batch_id: str, generation_id: str
+    ) -> PackingResult:
+        return await call_remote(
+            self.actor.materialize_batch, batch_id, generation_id
         )

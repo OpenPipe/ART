@@ -20,6 +20,7 @@ from monarch.actor import (  # ty: ignore[unresolved-import]
     concurrent_endpoint,
     endpoint,
 )
+from pydantic import BaseModel, ConfigDict
 
 from art.utils.lifecycle import complete_task, complete_to_thread
 
@@ -37,6 +38,7 @@ from .data_plane import (
     PackedBatchPublisher,
     PackedBatchRef,
     PackedBatchTransfer,
+    packed_plan_storage_byte_count,
 )
 from .host_admission import (
     HostAdmissionReport,
@@ -60,7 +62,7 @@ from .nccl_preflight import (
     start_nccl_rendezvous,
 )
 from .object_store import S3BinaryObjectReceiver
-from .packing import PackingRequest, PackingResult
+from .packing import PackingPlanResult, PackingRequest, PackingResult
 from .rollout import RolloutInvocation, RolloutResult
 from .specs import HostServiceHealth
 from .trajectory_store import (
@@ -82,6 +84,23 @@ from .trajectory_store import (
 from .vllm_replica import HostMemberLaunchRequest
 
 _PACKING_GC_ALLOCATION_THRESHOLD = 50_000
+
+
+class _RetainedPackingPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    request: PackingRequest
+    prepared: Any | None
+    packed_group_shapes: tuple[Any | None, ...]
+    storage_byte_count: int
+    packing_timings: Any
+    trajectory_fetch_s: float
+    trajectory_receive_s: float
+    trajectory_build_s: float
+    packing_core_s: float
+    packing_lock_wait_s: float
+    packing_compute_s: float
+    trajectory_log_wait_s: float
 
 
 def _require_etcd_health(url: str, timeout_s: float) -> None:
@@ -230,6 +249,7 @@ class ArtHostService(Actor):
         self._packing_gc_threshold: tuple[int, int, int] | None = None
         self._packing_lock = asyncio.Lock()
         self._packing_tasks: set[asyncio.Task[Any]] = set()
+        self._packing_plans: dict[str, _RetainedPackingPlan] = {}
         self._moe_route_receivers: dict[str, S3BinaryObjectReceiver] = {}
         self._moe_route_receive_slots = asyncio.Semaphore(4)
         self._closing = False
@@ -365,6 +385,7 @@ class ArtHostService(Actor):
         self._trajectory_queues.clear()
         for batch_id in tuple(self._batch_publishers):
             await self._drop_batch(batch_id)
+        self._packing_plans.clear()
         async with self._packing_lock:
             try:
                 if self._packer is not None:
@@ -593,17 +614,50 @@ class ArtHostService(Actor):
     ) -> PackingResult:
         if self._closing:
             raise RuntimeError("ART host service is closing")
+        return await self._track_packing(
+            self._pack_batch(request, batch_id, transfer_timeout_s)
+        )
+
+    @resilient_endpoint(concurrent=True)
+    async def prepare_batch(
+        self, request: PackingRequest, batch_id: str, transfer_timeout_s: float
+    ) -> PackingPlanResult:
+        if self._closing:
+            raise RuntimeError("ART host service is closing")
+        return await self._track_packing(
+            self._prepare_batch(request, batch_id, transfer_timeout_s)
+        )
+
+    @resilient_endpoint(concurrent=True)
+    async def materialize_batch(
+        self, batch_id: str, generation_id: str
+    ) -> PackingResult:
+        if self._closing:
+            raise RuntimeError("ART host service is closing")
+        return await self._track_packing(
+            self._materialize_batch(batch_id, generation_id)
+        )
+
+    async def _track_packing(self, operation: Any) -> Any:
         task = asyncio.current_task()
         assert task is not None
         self._packing_tasks.add(task)
         try:
-            return await self._pack_batch(request, batch_id, transfer_timeout_s)
+            return await operation
         finally:
             self._packing_tasks.remove(task)
 
     async def _pack_batch(
         self, request: PackingRequest, batch_id: str, transfer_timeout_s: float
     ) -> PackingResult:
+        await self._prepare_batch(request, batch_id, transfer_timeout_s)
+        return await self._materialize_batch(batch_id, request.generation_id)
+
+    async def _prepare_batch(
+        self, request: PackingRequest, batch_id: str, transfer_timeout_s: float
+    ) -> PackingPlanResult:
+        if batch_id in self._packing_plans:
+            raise RuntimeError(f"packing plan {batch_id!r} already exists")
         fetch_started = time.monotonic()
         trajectory_receive_s = 0.0
         trajectory_build_s = 0.0
@@ -685,19 +739,21 @@ class ArtHostService(Actor):
         from art.preprocessing.pack import PackingTimings
 
         packing_timings = PackingTimings()
+        prepared = None
         try:
             async with self._packing_lock:
                 packing_lock_wait_s = time.monotonic() - packing_started
                 if tokenized_batch is not None:
+                    from art.local.backend import PreparedPackedTensors
                     from art.preprocessing.pack import (
-                        packed_tensors_from_tokenized_datums,
+                        prepare_packed_tensors_from_tokenized_datums,
                     )
 
                     assert request.tokenized_loss is not None
                     tokenized_loss = request.tokenized_loss
                     packing_compute_started = time.monotonic()
-                    packed, cancelled = await complete_to_thread(
-                        lambda: packed_tensors_from_tokenized_datums(
+                    plan, cancelled = await complete_to_thread(
+                        lambda: prepare_packed_tensors_from_tokenized_datums(
                             tokenized_batch.datums,
                             loss=tokenized_loss,
                             seq_len=request.packed_sequence_length,
@@ -707,6 +763,11 @@ class ArtHostService(Actor):
                     packing_compute_s = time.monotonic() - packing_compute_started
                     if cancelled is not None:
                         raise cancelled
+                    prepared = PreparedPackedTensors(
+                        plan=plan,
+                        pad_token_id=-100,
+                        advantage_balance=0.0,
+                    )
                 elif self._packer is None:
                     from art.megatron.backend import MegatronBackend
 
@@ -731,8 +792,8 @@ class ArtHostService(Actor):
                     packer = self._packer
                     assert packer is not None
                     packing_compute_started = time.monotonic()
-                    packed, cancelled = await complete_to_thread(
-                        lambda: packer._get_packed_tensors(
+                    prepared, cancelled = await complete_to_thread(
+                        lambda: packer._prepare_packed_tensors(
                             request.model.build(),
                             groups,
                             advantage_balance=request.advantage_balance,
@@ -776,25 +837,83 @@ class ArtHostService(Actor):
             await log_future
         trajectory_log_wait_s = time.monotonic() - log_wait_started
         shapes = tuple(group._packed_group_shape for group in groups)
-        if packed is None:
+        if prepared is None:
             if request.trajectory_log_path is not None:
                 await asyncio.to_thread(Path(request.trajectory_log_path).unlink)
+            storage_byte_count = 0
+        else:
+            storage_byte_count = packed_plan_storage_byte_count(prepared.plan)
+        retained = _RetainedPackingPlan(
+            request=request,
+            prepared=prepared,
+            packed_group_shapes=shapes,
+            storage_byte_count=storage_byte_count,
+            packing_timings=packing_timings,
+            trajectory_fetch_s=trajectory_fetch_s,
+            trajectory_receive_s=trajectory_receive_s,
+            trajectory_build_s=trajectory_build_s,
+            packing_core_s=packing_core_s,
+            packing_lock_wait_s=packing_lock_wait_s,
+            packing_compute_s=packing_compute_s,
+            trajectory_log_wait_s=trajectory_log_wait_s,
+        )
+        if batch_id in self._packing_plans:
+            raise RuntimeError(f"packing plan {batch_id!r} appeared concurrently")
+        self._packing_plans[batch_id] = retained
+        return PackingPlanResult(
+            generation_id=request.generation_id,
+            storage_byte_count=storage_byte_count,
+        )
+
+    async def _materialize_batch(
+        self, batch_id: str, generation_id: str
+    ) -> PackingResult:
+        try:
+            retained = self._packing_plans[batch_id]
+        except KeyError:
+            raise ValueError(f"unknown packing plan {batch_id!r}") from None
+        if retained.request.generation_id != generation_id:
+            raise ValueError("packing plan generation changed before materialization")
+        self._packing_plans.pop(batch_id)
+        packed = None
+        packing_started = time.monotonic()
+        packing_lock_wait_s = 0.0
+        packing_compute_s = 0.0
+        if retained.prepared is not None:
+            from art.local.backend import LocalBackend
+
+            async with self._packing_lock:
+                packing_lock_wait_s = time.monotonic() - packing_started
+                packing_compute_started = time.monotonic()
+                packed, cancelled = await complete_to_thread(
+                    lambda: LocalBackend._materialize_packed_tensors(
+                        retained.prepared,
+                        packing_timings=retained.packing_timings,
+                    )
+                )
+                packing_compute_s = time.monotonic() - packing_compute_started
+                if cancelled is not None:
+                    raise cancelled
+        packing_core_s = time.monotonic() - packing_started
+        if packed is None:
             return PackingResult(
                 ref=None,
-                packed_group_shapes=shapes,
-                generation_id=request.generation_id,
-                trajectory_fetch_s=trajectory_fetch_s,
-                trajectory_receive_s=trajectory_receive_s,
-                trajectory_build_s=trajectory_build_s,
-                packing_core_s=packing_core_s,
-                packing_lock_wait_s=packing_lock_wait_s,
-                packing_compute_s=packing_compute_s,
-                packing_timings=packing_timings,
-                trajectory_log_wait_s=trajectory_log_wait_s,
+                packed_group_shapes=retained.packed_group_shapes,
+                generation_id=generation_id,
+                trajectory_fetch_s=retained.trajectory_fetch_s,
+                trajectory_receive_s=retained.trajectory_receive_s,
+                trajectory_build_s=retained.trajectory_build_s,
+                packing_core_s=retained.packing_core_s + packing_core_s,
+                packing_lock_wait_s=(
+                    retained.packing_lock_wait_s + packing_lock_wait_s
+                ),
+                packing_compute_s=retained.packing_compute_s + packing_compute_s,
+                packing_timings=retained.packing_timings,
+                trajectory_log_wait_s=retained.trajectory_log_wait_s,
             )
         trainable_assistant_tokens = int(packed["assistant_mask"].sum().item())
         loss_mask = packed["assistant_mask"]
-        if tokenized_batch is None:
+        if retained.request.tokenized_loss is None:
             loss_mask = loss_mask[:, 1:]
         loss_bearing_tokens = int(loss_mask.sum().item())
         non_padding_tokens = int((packed["group_ids"] != -1).sum().item())
@@ -802,28 +921,32 @@ class ArtHostService(Actor):
         ref = self._packed_batches.store.create(
             packed,
             batch_id=batch_id,
-            group_ids=request.group_ids,
-            record_ids=request.record_ids,
-            min_source_version=request.min_source_version,
-            max_source_version=request.max_source_version,
+            group_ids=retained.request.group_ids,
+            record_ids=retained.request.record_ids,
+            min_source_version=retained.request.min_source_version,
+            max_source_version=retained.request.max_source_version,
         )
+        if ref.storage_byte_count != retained.storage_byte_count:
+            raise RuntimeError("materialized batch changed its retained storage plan")
         packed_batch_finalize_s = time.monotonic() - finalize_started
         return PackingResult(
             ref=ref,
-            packed_group_shapes=shapes,
-            generation_id=request.generation_id,
+            packed_group_shapes=retained.packed_group_shapes,
+            generation_id=generation_id,
             trainable_assistant_tokens=trainable_assistant_tokens,
             loss_bearing_tokens=loss_bearing_tokens,
             non_padding_tokens=non_padding_tokens,
-            trajectory_log_path=request.trajectory_log_path,
-            trajectory_fetch_s=trajectory_fetch_s,
-            trajectory_receive_s=trajectory_receive_s,
-            trajectory_build_s=trajectory_build_s,
-            packing_core_s=packing_core_s,
-            packing_lock_wait_s=packing_lock_wait_s,
-            packing_compute_s=packing_compute_s,
-            packing_timings=packing_timings,
-            trajectory_log_wait_s=trajectory_log_wait_s,
+            trajectory_log_path=retained.request.trajectory_log_path,
+            trajectory_fetch_s=retained.trajectory_fetch_s,
+            trajectory_receive_s=retained.trajectory_receive_s,
+            trajectory_build_s=retained.trajectory_build_s,
+            packing_core_s=retained.packing_core_s + packing_core_s,
+            packing_lock_wait_s=(
+                retained.packing_lock_wait_s + packing_lock_wait_s
+            ),
+            packing_compute_s=retained.packing_compute_s + packing_compute_s,
+            packing_timings=retained.packing_timings,
+            trajectory_log_wait_s=retained.trajectory_log_wait_s,
             packed_batch_finalize_s=packed_batch_finalize_s,
         )
 
@@ -869,6 +992,7 @@ class ArtHostService(Actor):
 
     @resilient_endpoint
     async def reclaim_batch(self, batch_id: str, fence: bool) -> bool:
+        reclaimed_plan = self._packing_plans.pop(batch_id, None) is not None
         published = False
         failure: BaseException | None = None
         try:
@@ -878,7 +1002,7 @@ class ArtHostService(Actor):
         reclaimed = self._packed_batches.store.reclaim(batch_id, fence=fence)
         if failure is not None:
             raise failure
-        return published or reclaimed
+        return reclaimed_plan or published or reclaimed
 
     @resilient_endpoint
     async def stats(self):

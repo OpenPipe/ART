@@ -115,6 +115,64 @@ class _PrefixTreeRowPlan(NamedTuple):
     length: int
 
 
+class PrefixTreePackingPlan:
+    __slots__ = (
+        "candidate_capacity",
+        "include_moe_routing",
+        "items",
+        "planned_rows",
+        "route_contract",
+        "sequence_length",
+    )
+
+    def __init__(
+        self,
+        *,
+        items: list[_PrefixTreePackItem],
+        planned_rows: list[tuple[list[_PrefixTreePackItem], _PrefixTreeRowPlan]],
+        sequence_length: int,
+        include_moe_routing: bool,
+    ) -> None:
+        tokenized_items = [item for item in items if item.datum_index is not None]
+        if tokenized_items and len(tokenized_items) != len(items):
+            raise RuntimeError("one packed batch cannot mix ART and tokenized-loss items")
+        candidate_capacity = max(
+            (
+                int(item.target_tokens.shape[1])
+                for item in tokenized_items
+                if item.target_tokens is not None
+            ),
+            default=0,
+        )
+        physical_values = len(planned_rows) * sequence_length * candidate_capacity
+        if physical_values > MAX_TOKENIZED_PHYSICAL_VALUES:
+            raise ValueError(
+                "packed tokenized work exceeds the configured value limit: "
+                f"{physical_values} > {MAX_TOKENIZED_PHYSICAL_VALUES}"
+            )
+        rows = [row for row, _ in planned_rows]
+        route_contract = _moe_route_contract(rows) if include_moe_routing else None
+        if include_moe_routing and route_contract is None:
+            raise RuntimeError("No MoE routes were packed")
+        self.items = items
+        self.planned_rows = planned_rows
+        self.sequence_length = sequence_length
+        self.include_moe_routing = include_moe_routing
+        self.candidate_capacity = candidate_capacity
+        self.route_contract = route_contract
+
+    @property
+    def num_sequences(self) -> int:
+        return len(self.planned_rows)
+
+    def tensor_list_layouts(
+        self, attr: Literal["pixel_values", "image_grid_thw"]
+    ) -> tuple[tuple[str, tuple[int, ...]] | None, ...]:
+        return tuple(
+            _packed_row_tensor_layout(row, attr) for row, _ in self.planned_rows
+        )
+
+
 class _PrefixTreeLeaf(NamedTuple):
     item_index: int
     packing_group_id: int
@@ -277,6 +335,49 @@ def packed_tensors_from_tokenized_datums(
     timings: PackingTimings | None = None,
 ) -> PackedTensors:
     """Pack exact tokenized-loss inputs without changing their loss semantics."""
+    plan = prepare_packed_tensors_from_tokenized_datums(
+        datums,
+        loss=loss,
+        seq_len=seq_len,
+        pack_results=pack_results,
+        min_prefix_tree_shared_segment_length=(min_prefix_tree_shared_segment_length),
+        timings=timings,
+    )
+    return materialize_packed_tensors(
+        plan,
+        pad_token_id=pad_token_id,
+        timings=timings,
+    )
+
+
+def prepare_packed_tensors_from_tokenized_datums(
+    datums: Sequence[TokenizedDatum],
+    *,
+    loss: TokenizedLossName,
+    seq_len: int,
+    pack_results: bool = True,
+    min_prefix_tree_shared_segment_length: int = (
+        DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
+    ),
+    timings: PackingTimings | None = None,
+) -> PrefixTreePackingPlan:
+    items, routed = _tokenized_datum_pack_items(datums, loss=loss, seq_len=seq_len)
+    return _prefix_tree_pack_plan(
+        tokenized_results=[],
+        seq_len=seq_len,
+        truncate_long_results=False,
+        verbosity=0,
+        pack_results=pack_results,
+        include_moe_routing=routed,
+        min_shared_segment_length=min_prefix_tree_shared_segment_length,
+        items=items,
+        timings=timings,
+    )
+
+
+def _tokenized_datum_pack_items(
+    datums: Sequence[TokenizedDatum], *, loss: TokenizedLossName, seq_len: int
+) -> tuple[list[_PrefixTreePackItem], bool]:
     if not datums:
         raise ValueError("tokenized packing requires at least one datum")
     routed = [datum.moe_routes is not None for datum in datums]
@@ -293,16 +394,32 @@ def packed_tensors_from_tokenized_datums(
         )
         for index, datum in enumerate(datums)
     ]
-    return prefix_tree_pack(
-        tokenized_results=[],
+    return items, all(routed)
+
+
+def prepare_packed_tensors_from_tokenized_results(
+    tokenized_results: list[TokenizedResult],
+    *,
+    seq_len: int,
+    truncate_long_results: bool,
+    pack_results: bool,
+    include_moe_routing: bool = False,
+    min_prefix_tree_shared_segment_length: int = (
+        DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
+    ),
+    verbosity: Verbosity = 0,
+    timings: PackingTimings | None = None,
+) -> PrefixTreePackingPlan:
+    return _prefix_tree_pack_plan(
+        tokenized_results=tokenized_results,
         seq_len=seq_len,
-        pad_token_id=pad_token_id,
-        truncate_long_results=False,
+        truncate_long_results=truncate_long_results,
+        verbosity=verbosity,
         pack_results=pack_results,
-        include_moe_routing=all(routed),
-        min_prefix_tree_shared_segment_length=(min_prefix_tree_shared_segment_length),
+        include_moe_routing=include_moe_routing,
+        min_shared_segment_length=min_prefix_tree_shared_segment_length,
+        items=None,
         timings=timings,
-        _items=items,
     )
 
 
@@ -322,50 +439,39 @@ def prefix_tree_pack(
     timings: PackingTimings | None = None,
     _items: list[_PrefixTreePackItem] | None = None,
 ) -> PackedTensors:
-    if min_prefix_tree_shared_segment_length < 0:
-        raise ValueError("min_prefix_tree_shared_segment_length must be >= 0")
-    if _items is not None and tokenized_results:
-        raise ValueError("prefix_tree_pack accepts results or prebuilt items")
-    items: list[_PrefixTreePackItem] = [] if _items is None else _items
-    moe_routing_pack_stats = MoeRoutingPackStats()
-
-    started = time.monotonic()
-    if _items is None:
-        for result in tokenized_results:
-            if len(result.token_ids) > seq_len and not truncate_long_results:
-                if verbosity > 1:
-                    print("Result is too long, skipping")
-                continue
-            if include_moe_routing and result.moe_routed_experts is None:
-                raise RuntimeError(
-                    "MoE routing replay from trajectories was requested, but a "
-                    "tokenized result has no aligned routed experts"
-                )
-            if sum(result.assistant_mask[result.prompt_length :]) == 0:
-                if verbosity > 1:
-                    print("Result has no unique completion tokens, skipping")
-                continue
-            item = _prefix_tree_pack_item(result, seq_len=seq_len)
-            if truncate_long_results:
-                item = _truncate_prefix_tree_pack_item(item, seq_len)
-            items.append(item)
-    if timings is not None:
-        timings.prefix_tree_item_build_s = time.monotonic() - started
-
-    started = time.monotonic()
-    planned_rows = _prefix_tree_pack_rows(
-        items,
+    plan = _prefix_tree_pack_plan(
+        tokenized_results=tokenized_results,
         seq_len=seq_len,
+        truncate_long_results=truncate_long_results,
+        verbosity=verbosity,
         pack_results=pack_results,
+        include_moe_routing=include_moe_routing,
         min_shared_segment_length=min_prefix_tree_shared_segment_length,
+        items=_items,
+        timings=timings,
     )
-    if not planned_rows:
-        raise RuntimeError("No tokenized results were packable")
-    random.Random(len(planned_rows)).shuffle(planned_rows)
+    return materialize_packed_tensors(
+        plan,
+        pad_token_id=pad_token_id,
+        advantage_balance=advantage_balance,
+        timings=timings,
+    )
+
+
+def materialize_packed_tensors(
+    packing_plan: PrefixTreePackingPlan,
+    *,
+    pad_token_id: int = -100,
+    advantage_balance: float = 0.0,
+    timings: PackingTimings | None = None,
+) -> PackedTensors:
+    items = packing_plan.items
+    planned_rows = packing_plan.planned_rows
+    seq_len = packing_plan.sequence_length
+    include_moe_routing = packing_plan.include_moe_routing
+    moe_routing_pack_stats = MoeRoutingPackStats()
     rows = [row for row, _ in planned_rows]
     row_plans = [plan for _, plan in planned_rows]
-    if timings is not None:
-        timings.prefix_tree_plan_s = time.monotonic() - started
 
     started = time.monotonic()
     num_sequences = len(rows)
@@ -378,22 +484,7 @@ def prefix_tree_pack(
     advantages_np = np.zeros((num_sequences, seq_len), dtype=np.float32)
     weights_np = np.zeros((num_sequences, seq_len), dtype=np.float32)
     tokenized_items = [item for item in items if item.datum_index is not None]
-    if tokenized_items and len(tokenized_items) != len(items):
-        raise RuntimeError("one packed batch cannot mix ART and tokenized-loss items")
-    candidate_capacity = max(
-        (
-            int(item.target_tokens.shape[1])
-            for item in tokenized_items
-            if item.target_tokens is not None
-        ),
-        default=0,
-    )
-    physical_values = num_sequences * seq_len * candidate_capacity
-    if physical_values > MAX_TOKENIZED_PHYSICAL_VALUES:
-        raise ValueError(
-            "packed tokenized work exceeds the configured value limit: "
-            f"{physical_values} > {MAX_TOKENIZED_PHYSICAL_VALUES}"
-        )
+    candidate_capacity = packing_plan.candidate_capacity
     tokenized_shape = (num_sequences, seq_len, candidate_capacity)
     target_tokens_np = (
         np.full(tokenized_shape, -100, dtype=np.int64) if tokenized_items else None
@@ -414,11 +505,10 @@ def prefix_tree_pack(
     )
     pixel_values: list[torch.Tensor | None] = []
     image_grid_thw: list[torch.Tensor | None] = []
-    route_contract = _moe_route_contract(rows) if include_moe_routing else None
+    route_contract = packing_plan.route_contract
     route_tensor_np: np.ndarray | None = None
     if include_moe_routing:
-        if route_contract is None:
-            raise RuntimeError("No MoE routes were packed")
+        assert route_contract is not None
         num_experts, num_layers, topk = route_contract
         padding = deterministic_moe_routes(
             np.arange(seq_len, dtype=np.int64),
@@ -556,6 +646,65 @@ def prefix_tree_pack(
     if timings is not None:
         timings.packing_tensor_finalize_s = time.monotonic() - started
     return packed_tensors
+
+
+def _prefix_tree_pack_plan(
+    *,
+    tokenized_results: list[TokenizedResult],
+    seq_len: int,
+    truncate_long_results: bool,
+    verbosity: Verbosity,
+    pack_results: bool,
+    include_moe_routing: bool,
+    min_shared_segment_length: int,
+    items: list[_PrefixTreePackItem] | None,
+    timings: PackingTimings | None,
+) -> PrefixTreePackingPlan:
+    if min_shared_segment_length < 0:
+        raise ValueError("min_prefix_tree_shared_segment_length must be >= 0")
+    if items is not None and tokenized_results:
+        raise ValueError("prefix-tree planning accepts results or prebuilt items")
+    packed_items: list[_PrefixTreePackItem] = [] if items is None else items
+    started = time.monotonic()
+    if items is None:
+        for result in tokenized_results:
+            if len(result.token_ids) > seq_len and not truncate_long_results:
+                if verbosity > 1:
+                    print("Result is too long, skipping")
+                continue
+            if include_moe_routing and result.moe_routed_experts is None:
+                raise RuntimeError(
+                    "MoE routing replay from trajectories was requested, but a "
+                    "tokenized result has no aligned routed experts"
+                )
+            if sum(result.assistant_mask[result.prompt_length :]) == 0:
+                if verbosity > 1:
+                    print("Result has no unique completion tokens, skipping")
+                continue
+            item = _prefix_tree_pack_item(result, seq_len=seq_len)
+            if truncate_long_results:
+                item = _truncate_prefix_tree_pack_item(item, seq_len)
+            packed_items.append(item)
+    if timings is not None:
+        timings.prefix_tree_item_build_s = time.monotonic() - started
+    started = time.monotonic()
+    planned = _prefix_tree_pack_rows(
+        packed_items,
+        seq_len=seq_len,
+        pack_results=pack_results,
+        min_shared_segment_length=min_shared_segment_length,
+    )
+    if not planned:
+        raise RuntimeError("No tokenized results were packable")
+    random.Random(len(planned)).shuffle(planned)
+    if timings is not None:
+        timings.prefix_tree_plan_s = time.monotonic() - started
+    return PrefixTreePackingPlan(
+        items=packed_items,
+        planned_rows=planned,
+        sequence_length=seq_len,
+        include_moe_routing=include_moe_routing,
+    )
 
 
 def _prefix_tree_pack_rows(
@@ -1134,6 +1283,14 @@ def _packed_row_tensor_list(
     row: list[_PrefixTreePackItem],
     attr: Literal["pixel_values", "image_grid_thw"],
 ) -> torch.Tensor | None:
+    tensors = _packed_row_tensors(row, attr)
+    return torch.concat(tensors) if tensors else None
+
+
+def _packed_row_tensors(
+    row: list[_PrefixTreePackItem],
+    attr: Literal["pixel_values", "image_grid_thw"],
+) -> list[torch.Tensor]:
     tensors: list[torch.Tensor] = []
     seen_shared_prompts: set[int] = set()
     for item in row:
@@ -1145,7 +1302,31 @@ def _packed_row_tensor_list(
                 continue
             seen_shared_prompts.add(item.prompt_id)
         tensors.append(tensor)
-    return torch.concat(tensors) if tensors else None
+    return tensors
+
+
+def _packed_row_tensor_layout(
+    row: list[_PrefixTreePackItem],
+    attr: Literal["pixel_values", "image_grid_thw"],
+) -> tuple[str, tuple[int, ...]] | None:
+    tensors = _packed_row_tensors(row, attr)
+    if not tensors:
+        return None
+    reference = tensors[0]
+    if reference.ndim < 1:
+        raise ValueError(f"{attr} tensors must have at least one dimension")
+    tail = tuple(reference.shape[1:])
+    dtype = reference.dtype
+    device = reference.device
+    leading = 0
+    for tensor in tensors:
+        if tensor.ndim != reference.ndim or tuple(tensor.shape[1:]) != tail:
+            raise ValueError(f"packed {attr} tensor shapes are incompatible")
+        if tensor.device != device:
+            raise ValueError(f"packed {attr} tensors must share one device")
+        dtype = torch.promote_types(dtype, tensor.dtype)
+        leading += int(tensor.shape[0])
+    return str(dtype).removeprefix("torch."), (leading, *tail)
 
 
 def _moe_route_contract(

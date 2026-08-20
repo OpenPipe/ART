@@ -471,3 +471,10 @@ class PackingResult(BaseModel):
     trajectory_log_wait_s: float = Field(default=0.0, ge=0)
     packed_batch_finalize_s: float = Field(default=0.0, ge=0)
     generation_id: str = Field(min_length=1)
+
+
+class PackingPlanResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    generation_id: str = Field(min_length=1)
+    storage_byte_count: int = Field(ge=0)

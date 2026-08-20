@@ -8,9 +8,12 @@ import secrets
 import socket
 from threading import Thread
 import time
-from typing import Any, Coroutine, Literal, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Coroutine, Literal, Protocol, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+if TYPE_CHECKING:
+    from art.preprocessing.pack import PrefixTreePackingPlan
 
 PACKED_BATCH_FORMAT = "art_packed_rl_v2"
 _DTYPE_BYTES = {
@@ -1046,6 +1049,59 @@ def packed_text_storage_byte_count(
     moe_num_experts: int | None = None,
 ) -> int:
     """Return exact shared-memory bytes for canonical text packed tensors."""
+    core, suffix = _packed_text_layouts(
+        num_sequences=num_sequences,
+        sequence_length=sequence_length,
+        candidate_capacity=candidate_capacity,
+        moe_num_layers=moe_num_layers,
+        moe_topk=moe_topk,
+        moe_num_experts=moe_num_experts,
+    )
+    return _layout_specs([*core, *suffix])[1]
+
+
+def packed_plan_storage_byte_count(plan: "PrefixTreePackingPlan") -> int:
+    """Return exact shared-memory bytes for one retained prefix-tree plan."""
+    route = plan.route_contract
+    num_experts, num_layers, topk = route or (None, None, None)
+    core, suffix = _packed_text_layouts(
+        num_sequences=plan.num_sequences,
+        sequence_length=plan.sequence_length,
+        candidate_capacity=plan.candidate_capacity,
+        moe_num_layers=num_layers,
+        moe_topk=topk,
+        moe_num_experts=num_experts,
+    )
+    optional = []
+    for name, expected_dtype in (
+        ("pixel_values", "float32"),
+        ("image_grid_thw", "int64"),
+    ):
+        layouts = plan.tensor_list_layouts(name)
+        if len(layouts) != plan.num_sequences:
+            raise RuntimeError("packed tensor-list plan is not row aligned")
+        for index, layout in enumerate(layouts):
+            if layout is None:
+                continue
+            dtype, shape = layout
+            if dtype != expected_dtype:
+                raise ValueError(f"packed {name} tensors require {expected_dtype}")
+            optional.append((f"{name}/{index}", dtype, shape))
+    return _layout_specs([*core, *optional, *suffix])[1]
+
+
+def _packed_text_layouts(
+    *,
+    num_sequences: int,
+    sequence_length: int,
+    candidate_capacity: int,
+    moe_num_layers: int | None,
+    moe_topk: int | None,
+    moe_num_experts: int | None,
+) -> tuple[
+    list[tuple[str, str, tuple[int, ...]]],
+    list[tuple[str, str, tuple[int, ...]]],
+]:
     if min(num_sequences, sequence_length) < 1 or candidate_capacity < 0:
         raise ValueError("packed text storage dimensions are invalid")
     moe_values = (moe_num_layers, moe_topk, moe_num_experts)
@@ -1054,12 +1110,11 @@ def packed_text_storage_byte_count(
     ):
         raise ValueError("MoE packed storage dimensions must be provided together")
     core_shape = (num_sequences, sequence_length)
-    layouts = [
-        (name, dtype, core_shape) for name, dtype in _CORE_PACKED_DTYPES
-    ]
+    core = [(name, dtype, core_shape) for name, dtype in _CORE_PACKED_DTYPES]
+    suffix = []
     if candidate_capacity:
         tokenized_shape = (*core_shape, candidate_capacity)
-        layouts.extend(
+        suffix.extend(
             (name, dtype, tokenized_shape)
             for name, dtype in _TOKENIZED_PACKED_DTYPES
         )
@@ -1067,14 +1122,14 @@ def packed_text_storage_byte_count(
         assert moe_topk is not None and moe_num_experts is not None
         if moe_num_experts > 65_536 or moe_topk > moe_num_experts:
             raise ValueError("MoE packed storage contract is invalid")
-        layouts.append(
+        suffix.append(
             (
                 "moe_routing_replay/expert_indices",
                 "uint8" if moe_num_experts <= 256 else "uint16",
                 (moe_num_layers, *core_shape, moe_topk),
             )
         )
-    return _layout_specs(layouts)[1]
+    return core, suffix
 
 
 def _layout(flat: list[tuple[str, Any]]) -> tuple[tuple[TensorSpec, ...], int]:

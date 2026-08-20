@@ -105,6 +105,21 @@ class DistributedPackedBatch(BaseModel):
     packing_generation_id: str
 
 
+class DistributedPackingPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    batch_id: str = Field(min_length=1)
+    generation_id: str = Field(min_length=1)
+    source_host: str = Field(min_length=1)
+    trainer_hosts: tuple[str, ...] = Field(min_length=1)
+    storage_byte_count: int = Field(ge=0)
+    packing_rpc_s: float = Field(default=0.0, ge=0.0)
+
+    @property
+    def replicated_storage_byte_count(self) -> int:
+        return len(self.trainer_hosts) * self.storage_byte_count
+
+
 class ArtRuntime:
     """Run-scoped owner of ART host services, trainer meshes, and vLLM services."""
 
@@ -725,6 +740,14 @@ class ArtRuntime:
         )
 
     async def pack(self, request: PackingRequest) -> DistributedPackedBatch | None:
+        plan = await self.prepare_pack(request)
+        try:
+            return await self.materialize_pack(plan)
+        except BaseException as error:
+            await self._reclaim_after_failure(plan.batch_id, error)
+            raise
+
+    async def prepare_pack(self, request: PackingRequest) -> DistributedPackingPlan:
         self._require_open()
         trainer = self.topology.trainer
         if trainer is None:
@@ -791,26 +814,61 @@ class ArtRuntime:
                         )
                         publishers.push_async_callback(route_publisher.close)
                 packing_rpc_started = time.monotonic()
-                result: PackingResult = await MonarchPackingEndpoint(
+                result = await MonarchPackingEndpoint(
                     source_service
-                ).pack(
+                ).prepare(
                     wire_request,
                     batch_id,
                     transfer_timeout_s=self.topology.cluster.rpc_timeout_s,
                 )
                 packing_rpc_s = time.monotonic() - packing_rpc_started
-            if result.ref is None:
-                self._live_batches.pop(batch_id)
-                return None
             if result.generation_id != request.generation_id:
                 raise RuntimeError("packing host returned the wrong generation ID")
-            if result.ref.batch_id != batch_id:
+        except BaseException as error:
+            await self._reclaim_after_failure(batch_id, error)
+            raise
+        return DistributedPackingPlan(
+            batch_id=batch_id,
+            generation_id=result.generation_id,
+            source_host=source_host,
+            trainer_hosts=trainer_hosts,
+            storage_byte_count=result.storage_byte_count,
+            packing_rpc_s=packing_rpc_s,
+        )
+
+    async def materialize_pack(
+        self, plan: DistributedPackingPlan
+    ) -> DistributedPackedBatch | None:
+        self._require_open()
+        if self._live_batches.get(plan.batch_id) != plan.trainer_hosts:
+            raise RuntimeError("packing plan is not live on its trainer hosts")
+        if plan.source_host not in plan.trainer_hosts:
+            raise RuntimeError("packing plan source is outside its trainer hosts")
+        source_service = self._host_services[plan.source_host]
+        try:
+            packing_rpc_started = time.monotonic()
+            result: PackingResult = await MonarchPackingEndpoint(
+                source_service
+            ).materialize(plan.batch_id, plan.generation_id)
+            packing_rpc_s = plan.packing_rpc_s + (
+                time.monotonic() - packing_rpc_started
+            )
+            if result.ref is None:
+                if plan.storage_byte_count != 0:
+                    raise RuntimeError("packing plan lost its retained allocation")
+                self._live_batches.pop(plan.batch_id)
+                return None
+            if result.generation_id != plan.generation_id:
+                raise RuntimeError("packing host returned the wrong generation ID")
+            if result.ref.batch_id != plan.batch_id:
                 raise RuntimeError("packing host returned the wrong batch ID")
-            host_refs = {source_host: result.ref}
+            if result.ref.storage_byte_count != plan.storage_byte_count:
+                raise RuntimeError("packed batch changed its admitted storage bytes")
+            host_refs = {plan.source_host: result.ref}
             destinations = {
                 host_id: MonarchPackedBatchInbox(self._host_services[host_id])
-                for host_id in trainer_hosts
-                if host_id != source_host
+                for host_id in plan.trainer_hosts
+                if host_id != plan.source_host
             }
             fanout_started = time.monotonic()
             if destinations:
@@ -825,7 +883,7 @@ class ArtRuntime:
             packed_batch_fanout_s = time.monotonic() - fanout_started
             leases = PackedBatchLeaseSet(ref=result.ref, host_refs=host_refs)
         except BaseException as error:
-            await self._reclaim_after_failure(batch_id, error)
+            await self._reclaim_after_failure(plan.batch_id, error)
             raise
         return DistributedPackedBatch(
             leases=leases,
@@ -847,6 +905,11 @@ class ArtRuntime:
             packed_batch_fanout_s=packed_batch_fanout_s,
             packing_generation_id=result.generation_id,
         )
+
+    async def discard_pack(self, plan: DistributedPackingPlan) -> None:
+        if self._live_batches.get(plan.batch_id) != plan.trainer_hosts:
+            return
+        await self._reclaim_batch(plan.batch_id, fence=True)
 
     async def release_batch(self, batch: DistributedPackedBatch) -> None:
         await self._reclaim_batch(batch.leases.ref.batch_id, fence=False)

@@ -9,7 +9,11 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
+from art.distributed.art_runtime import (
+    ArtRuntime,
+    DistributedPackedBatch,
+    DistributedPackingPlan,
+)
 from art.distributed.object_store import (
     BinaryObjectTarget,
     S3ObjectStoreConfig,
@@ -73,8 +77,10 @@ from art.training.contracts import (
     SaveStateRequest,
     SaveStateResult,
     SaveWeightsForSamplerRequest,
+    TokenizedTrainingBatch,
     operation_generation_id,
 )
+from art.utils.lifecycle import complete_task
 from art.utils.output_dirs import get_step_checkpoint_dir
 
 from .commands import (
@@ -111,6 +117,27 @@ class PreparedPackedForward(PreparedForward):
     def _validate_loss(self) -> "PreparedPackedForward":
         if (self.kind == "tokenized") != (self.loss is not None):
             raise ValueError("tokenized prepared batches require their named loss")
+        return self
+
+
+class PlannedPackedForward(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    ref: OperationRef
+    kind: Literal["rl", "tokenized"]
+    packing: DistributedPackingPlan
+    config: RlForwardBackwardConfig
+    experimental_config: ExperimentalTrainConfig
+    loss: LossConfig | None = None
+
+    @property
+    def storage_byte_count(self) -> int:
+        return self.packing.replicated_storage_byte_count
+
+    @model_validator(mode="after")
+    def _validate_loss(self) -> "PlannedPackedForward":
+        if (self.kind == "tokenized") != (self.loss is not None):
+            raise ValueError("tokenized planned batches require their named loss")
         return self
 
 
@@ -349,8 +376,31 @@ class MegatronTrainingSlot:
                 tokenization_s=time.perf_counter() - started,
                 packing=sft_packing_outcome(batch, physical_sequences=grad_sequences),
             )
-        if request.batch.kind == "tokenized":
-            packed = await self.runtime.pack(
+        planned = await self.prepare_forward_packing(ref, request)
+        try:
+            return await self.materialize_forward_packing(planned)
+        except BaseException as error:
+            try:
+                _, cancelled = await complete_task(
+                    asyncio.create_task(self.discard_forward_packing(planned))
+                )
+                if cancelled is not None:
+                    error.add_note("packing-plan discard observed cancellation")
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "packing-plan discard also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+
+    async def prepare_forward_packing(
+        self,
+        ref: OperationRef,
+        request: ForwardRequest | ForwardBackwardRequest,
+    ) -> PlannedPackedForward:
+        state = self._require_run(ref.run_id)
+        if isinstance(request.batch, TokenizedTrainingBatch):
+            plan = await self.runtime.prepare_pack(
                 PackingRequest(
                     model=state.model,
                     generation_id=uuid.uuid4().hex,
@@ -359,22 +409,16 @@ class MegatronTrainingSlot:
                     packed_sequence_length=self.runtime_spec.packed_sequence_length,
                 )
             )
-            if packed is None:
-                raise ValueError("tokenized batch produced no packed sequence")
-            return PreparedPackedForward(
+            return PlannedPackedForward(
                 ref=ref,
                 kind="tokenized",
-                packed=packed,
-                packing=packing_outcome(
-                    packed,
-                    target_packed_sequences=self._data_parallel_size(),
-                ),
+                packing=plan,
                 config=RlForwardBackwardConfig(),
                 experimental_config=ExperimentalTrainConfig(),
                 loss=request.loss,
             )
         if not isinstance(request.batch, RlTrajectoryBatch):
-            raise TypeError("unknown forward batch")
+            raise TypeError("packed planning requires an RL or tokenized batch")
         config = experimental_train_config(request)
         training_config = forward_backward_config(request)
         if (
@@ -383,7 +427,7 @@ class MegatronTrainingSlot:
             != self.runtime_spec.packed_sequence_length
         ):
             raise ValueError("loss packed_sequence_length differs from trainer runtime")
-        packed = await self.runtime.pack(
+        plan = await self.runtime.prepare_pack(
             PackingRequest(
                 model=state.model,
                 generation_id=uuid.uuid4().hex,
@@ -413,21 +457,38 @@ class MegatronTrainingSlot:
                 max_source_version=request.batch.max_source_version,
             )
         )
-        if packed is None:
-            raise ValueError("trajectory batch produced no trainable packed sequence")
-        return PreparedPackedForward(
+        return PlannedPackedForward(
             ref=ref,
+            kind="rl",
+            packing=plan,
+            config=training_config,
+            experimental_config=config,
+        )
+
+    async def materialize_forward_packing(
+        self, planned: PlannedPackedForward
+    ) -> PreparedPackedForward:
+        packed = await self.runtime.materialize_pack(planned.packing)
+        if packed is None:
+            raise ValueError(f"{planned.kind} batch produced no packed sequence")
+        return PreparedPackedForward(
+            ref=planned.ref,
+            kind=planned.kind,
             packed=packed,
             packing=packing_outcome(
                 packed,
                 target_packed_sequences=(
-                    training_config.grad_accumulation_sequences
+                    planned.config.grad_accumulation_sequences
                     or self._data_parallel_size()
                 ),
             ),
-            config=training_config,
-            experimental_config=config,
+            config=planned.config,
+            experimental_config=planned.experimental_config,
+            loss=planned.loss,
         )
+
+    async def discard_forward_packing(self, planned: PlannedPackedForward) -> None:
+        await self.runtime.discard_pack(planned.packing)
 
     def _data_parallel_size(self) -> int:
         topology = self.runtime_spec.trainer_mesh.topology
