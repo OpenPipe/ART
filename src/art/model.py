@@ -1,6 +1,7 @@
 from contextlib import contextmanager, nullcontext
 from contextvars import Token
 from datetime import datetime
+import importlib
 import json
 import os
 import time
@@ -16,7 +17,6 @@ from typing import (
 )
 import warnings
 
-import httpx
 from openai import APIConnectionError, AsyncOpenAI, DefaultAsyncHttpxClient
 import polars as pl
 from pydantic import BaseModel
@@ -88,6 +88,28 @@ def _merge_extra_body_defaults(
         else:
             merged[key] = value
     return merged
+
+
+def _default_openai_http_client() -> Any:
+    transport_type = DefaultAsyncHttpxClient.__mro__[1]
+    module_name = transport_type.__module__
+    if transport_type.__name__ != "AsyncClient" or module_name not in {
+        "httpx",
+        "httpx2",
+    }:
+        raise RuntimeError(
+            "Unsupported OpenAI async HTTP transport: "
+            f"{module_name}.{transport_type.__name__}"
+        )
+    transport = importlib.import_module(module_name)
+    if getattr(transport, "AsyncClient", None) is not transport_type:
+        raise RuntimeError(f"Invalid OpenAI async HTTP transport module: {module_name}")
+    return DefaultAsyncHttpxClient(
+        timeout=transport.Timeout(timeout=1200, connect=5.0),
+        limits=transport.Limits(
+            max_connections=100_000, max_keepalive_connections=100_000
+        ),
+    )
 
 
 def _attach_response_art_metadata(
@@ -628,12 +650,7 @@ class Model(
         raw_client = AsyncOpenAI(
             base_url=self.inference_base_url,
             api_key=self.inference_api_key,
-            http_client=DefaultAsyncHttpxClient(
-                timeout=httpx.Timeout(timeout=1200, connect=5.0),
-                limits=httpx.Limits(
-                    max_connections=100_000, max_keepalive_connections=100_000
-                ),
-            ),
+            http_client=_default_openai_http_client(),
         )
         # Wrap the raw OpenAI client so ART-owned inference calls can add
         # split-scoped Tinker costs without rollout code needing to do it
