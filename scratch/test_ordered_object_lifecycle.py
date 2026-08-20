@@ -147,13 +147,14 @@ def test_ordered_commit_resolves_verifies_and_deletes_by_discriminator() -> None
     ref = store.publish_ordered(target, files)
     prefix = f"{target.store.prefix}/{target.object_id}"
 
-    assert client.gets == [f"{prefix}/_COMMITTED.json"]
+    assert client.gets == []
     assert json.loads(client.objects[f"{prefix}/_COMMITTED.json"])["transport"] == (
         "ordered_s3_shards"
     )
     assert client.puts[0] == f"{prefix}/_PLAN.json"
     assert client.puts[-1] == f"{prefix}/_COMMITTED.json"
     assert store.resolve(ref.manifest_uri) == ref
+    assert client.gets == [f"{prefix}/_COMMITTED.json"]
     assert all(file.sha256 is None for file in ref.files)
     assert all(
         "source-sha256" not in client.metadata[key]
@@ -186,6 +187,22 @@ def test_ordered_commit_resolves_verifies_and_deletes_by_discriminator() -> None
     store.delete(ref)
     assert not any(key.startswith(f"{prefix}/") for key in client.objects)
     assert store.resolve(ref.manifest_uri, missing_ok=True) is None
+    store.close()
+
+
+def test_ordered_retry_reuses_the_exact_immutable_object() -> None:
+    target, client = _target(), _S3()
+    store = _store(target, client)
+    files = _source()
+
+    expected = store.publish_ordered(target, files)
+    actual = store.publish_ordered(target, files)
+
+    assert actual == expected
+    assert client.gets == [
+        f"{target.store.prefix}/{target.object_id}/_PLAN.json",
+        f"{target.store.prefix}/{target.object_id}/_COMMITTED.json",
+    ]
     store.close()
 
 

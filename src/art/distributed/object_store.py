@@ -375,11 +375,6 @@ class S3BinaryObjectStore:
         plan = _ordered_binary_object_plan(target, files, file_sha256)
         plan_body = _model_bytes(plan)
         ref = _ordered_binary_object_ref(target, plan, plan_body=plan_body)
-        existing = self.resolve_ordered(ref.manifest_uri, missing_ok=True)
-        if existing is not None:
-            if existing != ref:
-                raise RuntimeError("committed ordered object differs from its target")
-            return existing
         prefix = self._prefix(target)
         self._put_immutable(f"{prefix}/_PLAN.json", plan_body)
         stored = self._upload_ordered_shards(
