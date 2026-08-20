@@ -235,6 +235,88 @@ class ForwardBackwardRankLaunch(BaseModel):
                 self.staging.release()
 
 
+class ForwardRankLaunch(BaseModel):
+    """GPU-complete rank result whose host serialization is still pending."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    operation_id: str
+    learner_version: int
+    batch: SkipValidation[PackedBatchRef]
+    candidate_capacity: int | None
+    coordinator: bool
+    snapshot: SkipValidation[PendingCpuSnapshot[Any]]
+    staging: SkipValidation[_ForwardBackwardResultStagerLease]
+    metrics: dict[str, float]
+    _materialize_lock: Lock = PrivateAttr(default_factory=Lock)
+    _materialized: dict[str, Any] | None = PrivateAttr(default=None)
+    _materialization_error: BaseException | None = PrivateAttr(default=None)
+    _finished: bool = PrivateAttr(default=False)
+
+    def materialize(self) -> dict[str, Any]:
+        with self._materialize_lock:
+            if self._finished:
+                if self._materialization_error is not None:
+                    raise self._materialization_error
+                assert self._materialized is not None
+                return self._materialized
+            try:
+                outputs = tuple(self.snapshot.resolve())
+                self._materialized = {
+                    "operation_id": self.operation_id,
+                    "learner_version": self.learner_version,
+                    "metrics": self.metrics if self.coordinator else {},
+                    "token_logprobs": (
+                        _materialize_command_token_logprobs(
+                            self.batch, self.candidate_capacity, outputs
+                        )
+                        if self.coordinator
+                        else ()
+                    ),
+                }
+                return self._materialized
+            except BaseException as error:
+                self._materialization_error = error
+                raise
+            finally:
+                self._finished = True
+                self.staging.release()
+
+
+def _stage_forward_rank_result(
+    pool: _ForwardBackwardResultStagerPool,
+    job: ForwardJobSpec,
+    batch: InMemoryPackedBatch,
+    result: dict[str, Any],
+    *,
+    coordinator: bool,
+) -> ForwardRankLaunch:
+    staging = pool.acquire()
+    try:
+        outputs = tuple(result["token_logprobs"]) if job.return_token_logprobs else ()
+        builder = staging.stager.begin()
+        target_tokens = (
+            batch.tensors.get("target_tokens")
+            if batch.ref.training_kind == "tokenized"
+            else None
+        )
+        return ForwardRankLaunch(
+            operation_id=job.operation_id,
+            learner_version=job.expected_learner_version,
+            batch=batch.ref,
+            candidate_capacity=(
+                None if target_tokens is None else int(target_tokens.shape[2])
+            ),
+            coordinator=coordinator,
+            snapshot=builder.finish(builder.stage_group(outputs)),
+            staging=staging,
+            metrics=result["metrics"],
+        )
+    except BaseException:
+        staging.release()
+        raise
+
+
 def _stage_forward_backward_rank_result(
     pool: _ForwardBackwardResultStagerPool,
     job: ForwardBackwardJobSpec,
@@ -1211,6 +1293,21 @@ class MCoreRunSlotExecutor:
         batch: InMemoryPackedBatch,
         cancelled: Event,
     ) -> dict[str, Any]:
+        return self.start_forward(
+            job,
+            batch,
+            cancelled,
+            coordinator=int(self.runtime.rank) == 0,
+        ).materialize()
+
+    def start_forward(
+        self,
+        job: ForwardJobSpec,
+        batch: InMemoryPackedBatch,
+        cancelled: Event,
+        *,
+        coordinator: bool,
+    ) -> ForwardRankLaunch:
         state = self._require_run(job.run_id)
         self._validate_parent(
             state, job.training_session_id, job.expected_learner_version
@@ -1226,14 +1323,13 @@ class MCoreRunSlotExecutor:
                 batch.tensors,
                 cancelled=cancelled,
             )
-        return {
-            **result,
-            "token_logprobs": (
-                _command_token_logprobs(batch, result["token_logprobs"])
-                if job.return_token_logprobs
-                else ()
-            ),
-        }
+        return _stage_forward_rank_result(
+            self._command_result_stagers,
+            job,
+            batch,
+            result,
+            coordinator=coordinator,
+        )
 
     def execute_sft_forward_backward(
         self,

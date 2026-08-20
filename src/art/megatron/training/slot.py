@@ -173,6 +173,16 @@ class ForwardBackwardLaunch(BaseModel):
     release_completion: SkipValidation[asyncio.Future[None]]
 
 
+class ForwardLaunch(BaseModel):
+    """GPU work and packed-input ownership ended; result settlement may continue."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    operation_id: str
+    completion: SkipValidation[asyncio.Future[ForwardResult]]
+    release_completion: SkipValidation[asyncio.Future[None]]
+
+
 class PreparedLoadState(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -589,10 +599,21 @@ class MegatronTrainingSlot:
         return await self.trainer.prepare_residency(run_id, command_kind)
 
     async def forward(self, prepared: PreparedForward) -> ForwardResult:
+        launch = await self.start_forward(prepared)
+        return await asyncio.shield(launch.completion)
+
+    async def start_forward(self, prepared: PreparedForward) -> ForwardLaunch:
         ref = prepared.ref
         state = self._require_parent(ref)
         if isinstance(prepared, PreparedEmptySftForward):
-            return self._empty_sft_forward_result(prepared, backward=False)
+            result = self._empty_sft_forward_result(prepared, backward=False)
+            completion = asyncio.get_running_loop().create_future()
+            completion.set_result(result)
+            return ForwardLaunch(
+                operation_id=ref.operation_id,
+                completion=completion,
+                release_completion=_completed_release(),
+            )
         if isinstance(prepared, PreparedSftForward):
             job = SftForwardJobSpec(
                 operation_id=ref.operation_id,
@@ -610,7 +631,14 @@ class MegatronTrainingSlot:
                 return_token_logprobs=prepared.return_token_logprobs,
             )
             raw = await self.trainer.sft_forward(job, prepared.batch)
-            return self._sft_forward_result(prepared, raw, backward=False)
+            result = self._sft_forward_result(prepared, raw, backward=False)
+            completion = asyncio.get_running_loop().create_future()
+            completion.set_result(result)
+            return ForwardLaunch(
+                operation_id=ref.operation_id,
+                completion=completion,
+                release_completion=_completed_release(),
+            )
         if not isinstance(prepared, PreparedPackedForward):
             raise TypeError("unknown prepared forward payload")
         job = ForwardJobSpec(
@@ -633,16 +661,39 @@ class MegatronTrainingSlot:
             return_token_logprobs=prepared.return_token_logprobs,
         )
         try:
-            raw = await self.trainer.forward(job, prepared.packed.leases)
-        finally:
-            self._release_batch_soon(prepared.packed)
-        return ForwardResult(
+            raw = await self.trainer.start_forward(job, prepared.packed.leases)
+        except BaseException as error:
+            try:
+                release_completion = self._release_batch_soon(prepared.packed)
+                _, cancelled = await complete_task(release_completion)
+                if cancelled is not None:
+                    error.add_note("packed-batch release observed cancellation")
+            except BaseException as cleanup:
+                error.add_note(
+                    "packed-batch release also failed: "
+                    f"{type(cleanup).__name__}: {cleanup}"
+                )
+            raise
+        release_completion = self._release_batch_soon(prepared.packed)
+
+        async def complete() -> ForwardResult:
+            result = await asyncio.shield(raw.completion)
+            return ForwardResult(
+                operation_id=ref.operation_id,
+                packing=prepared.packing,
+                loss_fn_outputs=tuple(
+                    LossFnOutput(token_logprobs=values)
+                    for values in result["token_logprobs"]
+                ),
+                metrics={**packing_metrics(prepared.packed), **result["metrics"]},
+            )
+
+        return ForwardLaunch(
             operation_id=ref.operation_id,
-            packing=prepared.packing,
-            loss_fn_outputs=tuple(
-                LossFnOutput(token_logprobs=values) for values in raw["token_logprobs"]
+            completion=asyncio.create_task(
+                complete(), name=f"megatron-forward-result-{ref.operation_id}"
             ),
-            metrics={**packing_metrics(prepared.packed), **raw["metrics"]},
+            release_completion=release_completion,
         )
 
     async def forward_backward(
