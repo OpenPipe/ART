@@ -51,8 +51,90 @@ _LORA_NAMES = ("lora_A", "lora_B")
 
 class Qwen35BaseHandler(DefaultDenseHandler):
     key = "qwen3_5_base"
-    build_gdn_execution_spec = True
     native_vllm_lora_status = "validated"
+
+    def linear_recurrent_contract(self, provider: Any) -> Any:
+        from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig
+        from art.megatron.recurrent.contract import (
+            ChainCostSpec,
+            LinearRecurrentContract,
+            ProjectedStreamSpec,
+            RecurrentStateSpec,
+            TokenShardedChainSpec,
+        )
+
+        tp_size = int(getattr(provider, "tensor_model_parallel_size", 1) or 1)
+        key_heads = int(getattr(provider, "linear_num_key_heads"))
+        value_heads = int(getattr(provider, "linear_num_value_heads"))
+        key_dim = int(getattr(provider, "linear_key_head_dim"))
+        value_dim = int(getattr(provider, "linear_value_head_dim"))
+        if key_heads % tp_size or value_heads % tp_size:
+            raise ValueError("GDN heads must be divisible by tensor parallel size")
+        local_key_heads = key_heads // tp_size
+        local_value_heads = value_heads // tp_size
+        qkv_width = 2 * local_key_heads * key_dim + local_value_heads * value_dim
+        planner = GdnPlannerConfig.from_provider(provider)
+        return LinearRecurrentContract(
+            family_key="gated_delta_net",
+            contract_version="1",
+            partition_kind="token_sharded_chain",
+            projected_streams=(
+                ProjectedStreamSpec(name="qkv", width=qkv_width, shard_axis="head"),
+                ProjectedStreamSpec(
+                    name="gate",
+                    width=local_value_heads * value_dim,
+                    shard_axis="head",
+                ),
+                ProjectedStreamSpec(
+                    name="beta", width=local_value_heads, shard_axis="head"
+                ),
+                ProjectedStreamSpec(
+                    name="alpha", width=local_value_heads, shard_axis="head"
+                ),
+            ),
+            states=(
+                RecurrentStateSpec(
+                    name="conv",
+                    shape=(
+                        qkv_width,
+                        int(getattr(provider, "linear_conv_kernel_dim", 4) or 4) - 1,
+                    ),
+                    dtype=str(
+                        getattr(provider, "params_dtype", "bfloat16")
+                    ).removeprefix("torch."),
+                ),
+                RecurrentStateSpec(
+                    name="recurrent",
+                    shape=(local_value_heads, key_dim, value_dim),
+                    dtype="float32",
+                ),
+            ),
+            convolution_width=int(getattr(provider, "linear_conv_kernel_dim", 4) or 4),
+            local_chunk_size=64,
+            activation=getattr(
+                getattr(provider, "activation_func", None), "__name__", "gelu"
+            ),
+            local_kernel_implementation_id="art.gdn.fla_prefix_tree.chunk64.v1",
+            layout_compatibility_key="art.gdn.hidden_token_layout.v1",
+            chain=TokenShardedChainSpec(
+                alignment=64,
+                legality_key="art.gdn.fla_chunk64.v1",
+                summary_implementation_id="art.gdn.native_cp_summary.v1",
+                cost=ChainCostSpec(
+                    summary_bytes_per_segment=planner.runtime_cp_summary_bytes_per_segment,
+                    summary_exchange_count=planner.runtime_cp_summary_exchange_count_per_bucket,
+                    summary_bandwidth_bytes_per_ms=planner.runtime_cp_summary_bandwidth_bytes_per_ms,
+                    summary_compute_segments_per_ms=planner.runtime_cp_summary_compute_segments_per_ms,
+                    suffix_scan_latency_ms=planner.runtime_cp_suffix_scan_latency_ms,
+                    suffix_scan_segments_per_ms=planner.runtime_cp_suffix_scan_segments_per_ms,
+                ),
+            ),
+        )
+
+    def linear_recurrent_planner_config(self, provider: Any) -> object:
+        from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig
+
+        return GdnPlannerConfig.from_provider(provider)
 
     def vllm_server_args(self) -> dict[str, object]:
         return {"tool_call_parser": "qwen3_xml"}
@@ -116,13 +198,6 @@ class Qwen35BaseHandler(DefaultDenseHandler):
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from megatron.core.models.gpt.gpt_model import GPTModel
 
-        from art.megatron.gdn.operator import (
-            install_gdn_island_hooks,
-            install_prefix_tree_gdn_hooks,
-        )
-
-        install_prefix_tree_gdn_hooks(model_chunks)
-        install_gdn_island_hooks(model_chunks)
         for chunk in list(model_chunks):
             module: Any = chunk
             while hasattr(module, "module"):
@@ -172,6 +247,15 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                 return tuple(preproc_output)
 
             gpt_module._preprocess = preprocess_hook  # type: ignore[attr-defined]
+
+    def install_linear_recurrent_hooks(self, model_chunks: Sequence[Any]) -> None:
+        from art.megatron.gdn.operator import (
+            install_gdn_island_hooks,
+            install_prefix_tree_gdn_hooks,
+        )
+
+        install_prefix_tree_gdn_hooks(model_chunks)
+        install_gdn_island_hooks(model_chunks)
 
     def _attention_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         linear_attention_pattern = _linear_attention_pattern(provider)

@@ -1036,6 +1036,12 @@ def _run_logits(
     position_ids = packed_tensors["input_pos"].to(device=device)
     group_ids = packed_tensors["group_ids"].to(device=device)
     parent_ids = packed_tensors["parent_ids"].to(device=device)
+    recurrent_contract = runtime.model_support_handler.linear_recurrent_contract(
+        runtime.provider
+    )
+    recurrent_planner_config = (
+        runtime.model_support_handler.linear_recurrent_planner_config(runtime.provider)
+    )
     attention_state = create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
@@ -1044,9 +1050,8 @@ def _run_logits(
             int(window)
             for window in getattr(runtime.provider, "art_flex_sliding_windows", ())
         ),
-        build_gdn_execution_spec=bool(
-            getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
-        ),
+        linear_recurrent_contract=recurrent_contract,
+        recurrent_planner_config=recurrent_planner_config,
         model_support_handler=runtime.model_support_handler,
         attention_head_dim=getattr(runtime.provider, "kv_channels", None),
         attention_value_head_dim=getattr(runtime.provider, "kv_channels", None),

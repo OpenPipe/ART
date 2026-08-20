@@ -44,7 +44,6 @@ def _compile_workaround_flags_for_provider(
 
 class DefaultDenseHandler:
     key = "default_dense"
-    build_gdn_execution_spec = False
     is_moe = False
     cp_supported = True
     native_vllm_lora_status = "disabled"
@@ -106,7 +105,19 @@ class DefaultDenseHandler:
         del provider
         return None
 
+    def validate_provider_for_runtime(self, provider: Any) -> None:
+        del provider
+        return None
+
     def context_parallel_workload_profile(self, provider: Any) -> Any | None:
+        del provider
+        return None
+
+    def linear_recurrent_contract(self, provider: Any) -> Any | None:
+        del provider
+        return None
+
+    def linear_recurrent_planner_config(self, provider: Any) -> object | None:
         del provider
         return None
 
@@ -129,6 +140,10 @@ class DefaultDenseHandler:
         return {}
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def install_linear_recurrent_hooks(self, model_chunks: Sequence[Any]) -> None:
         del model_chunks
         return None
 

@@ -741,7 +741,7 @@ class MCoreScheduleAdapter(Generic[_T]):
 
         handles = []
         for chunk_index, chunk in enumerate(self.model_chunks):
-            for layer in _transformer_layer_callers([chunk]):
+            for layer in _stateful_layer_callers([chunk]):
 
                 def restore_chunk(
                     module: Any,
@@ -765,7 +765,7 @@ class MCoreScheduleAdapter(Generic[_T]):
                 )
         if not handles:
             raise RuntimeError(
-                "Stateful PP recomputation could not find TransformerLayer call sites"
+                "Stateful PP recomputation could not find stateful layer call sites"
             )
         try:
             yield
@@ -926,18 +926,20 @@ def _validate_stateful_recompute_mode(config: Any) -> None:
         )
 
 
-def _transformer_layer_callers(
+def _stateful_layer_callers(
     model_chunks: Sequence[torch.nn.Module],
 ) -> list[torch.nn.Module]:
+    from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
+    stateful_layer_types = (TransformerLayer, MambaLayer)
     callers: dict[int, torch.nn.Module] = {}
     for chunk in model_chunks:
         for module in chunk.modules():
             original = getattr(module, "_orig_mod", None)
-            if isinstance(original, TransformerLayer):
+            if isinstance(original, stateful_layer_types):
                 callers[id(original)] = module
-            elif isinstance(module, TransformerLayer):
+            elif isinstance(module, stateful_layer_types):
                 callers.setdefault(id(module), module)
     return list(callers.values())
 

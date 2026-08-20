@@ -300,10 +300,12 @@ def _run_model_loss(
         group_ids=group_ids,
         parent_ids=parent_ids,
     )
+    recurrent_contract, planner_config = _linear_recurrent_runtime(model)
     attention_state = create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
-        build_gdn_execution_spec=True,
+        linear_recurrent_contract=recurrent_contract,
+        recurrent_planner_config=planner_config,
     )
     forward_kwargs = QWEN3_5_MOE_HANDLER.get_forward_kwargs(
         model,
@@ -335,10 +337,12 @@ def _run_model_logits(
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
 ) -> torch.Tensor:
+    recurrent_contract, planner_config = _linear_recurrent_runtime(model)
     attention_state = create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
-        build_gdn_execution_spec=True,
+        linear_recurrent_contract=recurrent_contract,
+        recurrent_planner_config=planner_config,
     )
     forward_kwargs = QWEN3_5_MOE_HANDLER.get_forward_kwargs(
         model,
@@ -353,6 +357,14 @@ def _run_model_logits(
         **forward_kwargs,
     )
     return logits
+
+
+def _linear_recurrent_runtime(model: torch.nn.Module) -> tuple[Any, Any]:
+    provider = model.config
+    return (
+        QWEN3_5_MOE_HANDLER.linear_recurrent_contract(provider),
+        QWEN3_5_MOE_HANDLER.linear_recurrent_planner_config(provider),
+    )
 
 
 def _segment_path(spec: Any, segment_index: int) -> tuple[Any, ...]:
@@ -420,6 +432,7 @@ def _make_model() -> torch.nn.Module:
     QWEN3_5_MOE_HANDLER.patch_provider(provider, None)
     provider.finalize()
     model = provider.provide_language_model(pre_process=True, post_process=True).cuda()
+    QWEN3_5_MOE_HANDLER.install_linear_recurrent_hooks([model])
     QWEN3_5_MOE_HANDLER.install_preprocess_patch([model])
     return model
 

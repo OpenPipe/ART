@@ -53,7 +53,10 @@ def _runtime() -> "TrainingRuntime":
         model=[_FakeGPT()],
         optimizer=None,
         provider=SimpleNamespace(hidden_size=8, num_layers=4),
-        model_support_handler=SimpleNamespace(build_gdn_execution_spec=True),
+        model_support_handler=SimpleNamespace(
+            linear_recurrent_contract=lambda _provider: None,
+            linear_recurrent_planner_config=lambda _provider: None,
+        ),
     )  # type: ignore
 
 

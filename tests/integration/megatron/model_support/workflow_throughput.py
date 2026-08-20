@@ -24,6 +24,8 @@ from .validation_spec import ValidationStageResult
 from .workflow_fixtures import (
     FIXTURE_PATH_ENV,
     _flatten_token_ids,
+    _require_nemotron_h_semantics,
+    _truncate_hybrid_override_pattern,
     _validate_tokenizer_compatible_fixture,
 )
 from .workflow_resources import (
@@ -619,6 +621,8 @@ def _sized_config(
     sized = json.loads(json.dumps(source))
     text = _text(sized)
     source_text = _text(source)
+    if model_key == "nemotron_h_moe":
+        _require_nemotron_h_semantics(source_text)
     source_layers = int(source_text["num_hidden_layers"])
     layer_fields = tuple(field for field in _LAYER_LIST_FIELDS if field in source_text)
     if num_layers > source_layers and layer_fields:
@@ -631,6 +635,14 @@ def _sized_config(
         if len(values) < num_layers:
             raise ValueError(f"{model_key} {field} has only {len(values)} entries")
         text[field] = values[:num_layers]
+    hybrid_pattern = source_text.get("hybrid_override_pattern")
+    if hybrid_pattern is not None:
+        text["hybrid_override_pattern"] = _truncate_hybrid_override_pattern(
+            hybrid_pattern,
+            source_depth=source_layers,
+            target_depth=num_layers,
+            model_key=model_key,
+        )
     source_width = _width_fingerprint(source)
     if not source_width or source_width != _width_fingerprint(sized):
         raise ValueError("throughput fixture changed or lost production-width fields")
@@ -641,7 +653,8 @@ def _sized_config(
             f"{prefix}{field}"
             for field in ("num_hidden_layers", *_LAYER_LIST_FIELDS)
             if field == "num_hidden_layers" or field in source_text
-        ],
+        ]
+        + (["hybrid_override_pattern"] if hybrid_pattern is not None else []),
         "width_fingerprint": source_width,
     }
 

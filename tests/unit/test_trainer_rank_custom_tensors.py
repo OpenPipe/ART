@@ -133,7 +133,8 @@ def _runtime(model: torch.nn.Module | None = None) -> Any:
             art_flex_sliding_windows=(16,),
         ),
         model_support_handler=SimpleNamespace(
-            build_gdn_execution_spec=True,
+            linear_recurrent_contract=lambda _provider: None,
+            linear_recurrent_planner_config=lambda _provider: None,
             canonicalize_loaded_lora_state=lambda state, _model: state,
             from_vllm_lora_tensors=lambda state, **_kwargs: state,
             to_vllm_lora_tensors=lambda state, **kwargs: (

@@ -212,7 +212,12 @@ def _expand_logical_experts(
 
 def patch_moe_routers(block_spec: Any) -> int:
     patched = 0
-    for layer_spec in getattr(block_spec, "layer_specs", ()) or ():
+    layer_specs = getattr(block_spec, "layer_specs", None)
+    if layer_specs is None:
+        stack_submodules = getattr(block_spec, "submodules", None)
+        moe_layer = getattr(stack_submodules, "moe_layer", None)
+        layer_specs = () if moe_layer is None else (moe_layer,)
+    for layer_spec in layer_specs:
         layer_submodules = getattr(layer_spec, "submodules", None)
         mlp_spec = getattr(layer_submodules, "mlp", None)
         moe_submodules = getattr(mlp_spec, "submodules", None)

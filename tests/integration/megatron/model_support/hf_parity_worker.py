@@ -812,22 +812,22 @@ def _prepare_hf_parity_megatron_micro(
     )
     seq_len = int(prepared.input_ids.shape[1])
     position_ids = micro["position_ids"].reshape(-1)[:seq_len].unsqueeze(0)
+    recurrent_contract, recurrent_planner_config = (
+        megatron_microbatches._linear_recurrent_runtime_for_provider(
+            provider, model_support_handler
+        )
+    )
     attention_state = create_prefix_tree_state(
         group_ids=micro["group_ids"].reshape(-1)[:seq_len].unsqueeze(0),
         parent_ids=micro["parent_ids"].reshape(-1)[:seq_len].unsqueeze(0),
         target_device=device,
         input_pos=position_ids,
         sliding_windows=megatron_microbatches._art_flex_sliding_windows(provider),
-        build_gdn_execution_spec=bool(
-            getattr(model_support_handler, "build_gdn_execution_spec", False)
-        ),
+        linear_recurrent_contract=recurrent_contract,
+        recurrent_planner_config=recurrent_planner_config,
         model_support_handler=model_support_handler,
         attention_head_dim=getattr(provider, "kv_channels", None),
         attention_value_head_dim=getattr(provider, "kv_channels", None),
-        gdn_planner_config=megatron_microbatches._gdn_planner_config_for_provider(
-            provider,
-            model_support_handler,
-        ),
     )
     return prepared.model_copy(
         update={
@@ -838,14 +838,23 @@ def _prepare_hf_parity_megatron_micro(
 
 
 def _hf_requires_recurrent_prefix_paths(
-    base_model: str, *, allow_unvalidated_arch: bool
+    base_model: str,
+    *,
+    dtype: torch.dtype,
+    allow_unvalidated_arch: bool,
 ) -> bool:
-    from art.megatron.model_support.registry import get_model_support_handler
+    from art.megatron.provider import prepare_provider_bundle
 
-    handler = get_model_support_handler(
-        base_model, allow_unvalidated_arch=allow_unvalidated_arch
+    provider_bundle = prepare_provider_bundle(
+        base_model,
+        torch_dtype=dtype,
+        load_weights=False,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    return bool(getattr(handler, "build_gdn_execution_spec", False))
+    return (
+        provider_bundle.handler.linear_recurrent_contract(provider_bundle.provider)
+        is not None
+    )
 
 
 def _prepare_hf_reference_forward(
@@ -900,7 +909,9 @@ def _run_hf_sft_step(
     if dtype == torch.float32:
         _install_hf_qwen35_gdn_fp32_reference(model, base_model=base_model)
     recurrent_prefix_paths = _hf_requires_recurrent_prefix_paths(
-        base_model, allow_unvalidated_arch=allow_unvalidated_arch
+        base_model,
+        dtype=dtype,
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
     route_capture = _HfMoeRoutingCapture(model)
     _debug("running HF forward/backward")

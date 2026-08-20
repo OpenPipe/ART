@@ -2,7 +2,7 @@ from collections.abc import Mapping
 import copy
 import inspect
 import os
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -37,6 +37,11 @@ _FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 _RECOMPUTE_GRANULARITIES = {"full", "selective"}
 _RECOMPUTE_METHODS = {"uniform", "block"}
 _MOE_ROUTER_DTYPES = {"fp32", "fp64", "none"}
+_LAYER_SPEC_FIELDS = (
+    "transformer_layer_spec",
+    "mamba_stack_spec",
+    "hybrid_stack_spec",
+)
 _BOOL_ENV_FIELDS = (
     (
         "overlap_moe_expert_parallel_comm",
@@ -103,15 +108,17 @@ def resolve_layer_spec(
     if module_spec_type is not None and isinstance(base_layer_spec, module_spec_type):
         return copy.deepcopy(base_layer_spec)
     parameters = inspect.signature(base_layer_spec).parameters
+    if not parameters:
+        return copy.deepcopy(base_layer_spec())
     accepts_vp_stage = "vp_stage" in parameters or any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in parameters.values()
     )
     kwargs = {"vp_stage": vp_stage} if accepts_vp_stage else {}
-    return base_layer_spec(config, **kwargs)
+    return copy.deepcopy(base_layer_spec(config, **kwargs))
 
 
-def patch_core_attention(layer_spec: object, core_attention: object) -> None:
+def patch_core_attention(layer_spec: object, core_attention: object) -> int:
     submodules = getattr(layer_spec, "submodules", None)
     self_attention = getattr(submodules, "self_attention", None)
     attention_submodules = getattr(self_attention, "submodules", None)
@@ -119,17 +126,23 @@ def patch_core_attention(layer_spec: object, core_attention: object) -> None:
         attention_submodules,
         "core_attention",
     ):
-        return
+        return 0
     attention_submodules.core_attention = core_attention
+    return 1
 
 
-def patch_layer_spec_tree(layer_spec: object, core_attention: object) -> None:
+def patch_layer_spec_tree(layer_spec: object, core_attention: object) -> int:
     layer_specs = getattr(layer_spec, "layer_specs", None)
-    if layer_specs is None:
-        patch_core_attention(layer_spec, core_attention)
-        return
-    for block_layer_spec in layer_specs:
-        patch_core_attention(block_layer_spec, core_attention)
+    if layer_specs is not None:
+        return sum(
+            patch_core_attention(block_layer_spec, core_attention)
+            for block_layer_spec in layer_specs
+        )
+    submodules = getattr(layer_spec, "submodules", None)
+    attention_layer = getattr(submodules, "attention_layer", None)
+    if attention_layer is not None:
+        return patch_core_attention(attention_layer, core_attention)
+    return patch_core_attention(layer_spec, core_attention)
 
 
 def art_context_parallel_size(config: object) -> int:
@@ -137,8 +150,8 @@ def art_context_parallel_size(config: object) -> int:
     return max(configured, _runtime_context_parallel_size())
 
 
-def patch_art_flex_attention(layer_spec: object, config: object) -> None:
-    patch_layer_spec_tree(layer_spec, _art_flex_core_attention(config))
+def patch_art_flex_attention(layer_spec: object, config: object) -> int:
+    return patch_layer_spec_tree(layer_spec, _art_flex_core_attention(config))
 
 
 def _art_flex_core_attention(config: object) -> object:
@@ -608,18 +621,35 @@ def _enforce_ep_overlap_recompute_contract(provider: GPTModelProvider) -> None:
         provider.recompute_granularity = None
 
 
-def _install_art_training_flex_attention(provider: GPTModelProvider) -> None:
-    _register_art_flex_attention_mapping_types()
-    base_layer_spec = provider.transformer_layer_spec
+def _provider_layer_spec(provider: Any) -> tuple[str, Any]:
+    matches = [
+        field
+        for field in _LAYER_SPEC_FIELDS
+        if getattr(provider, field, None) is not None
+    ]
+    if len(matches) != 1:
+        raise TypeError(
+            f"{type(provider).__name__} must expose exactly one ART-supported "
+            f"layer spec field; found {matches}"
+        )
+    field = matches[0]
+    return field, getattr(provider, field)
 
-    def _flex_attention_layer_spec(
-        config: GPTModelProvider, vp_stage: int | None = None
-    ) -> object:
+
+def _install_art_training_flex_attention(provider: Any) -> None:
+    _register_art_flex_attention_mapping_types()
+    spec_field, base_layer_spec = _provider_layer_spec(provider)
+
+    def _flex_attention_layer_spec(config: Any, vp_stage: int | None = None) -> object:
         layer_spec = resolve_layer_spec(base_layer_spec, config, vp_stage)
-        patch_art_flex_attention(layer_spec, config)
+        if patch_art_flex_attention(layer_spec, config) == 0:
+            raise RuntimeError(
+                "ART FlexAttention found no standard-attention core in "
+                f"{type(provider).__name__}.{spec_field}"
+            )
         return layer_spec
 
-    provider.transformer_layer_spec = cast(Any, _flex_attention_layer_spec)
+    setattr(provider, spec_field, _flex_attention_layer_spec)
 
 
 def _register_art_flex_attention_mapping_types() -> None:
@@ -720,10 +750,11 @@ def prepare_provider_bundle(
 
 def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
     _ProviderRuntimeEnv.from_environ()
-    provider = cast(GPTModelProvider, provider_bundle.provider)
+    provider = provider_bundle.provider
     _apply_art_training_runtime_finalize_defaults(provider)
     _enforce_art_moe_grouped_gemm_fast_path(provider)
     configure_expert_parallel_layout(provider)
+    provider_bundle.handler.validate_provider_for_runtime(provider)
     _finalize_provider_with_art_overrides(provider)
     if activate_expert_parallel_layout(provider) is not None:
         _install_nonuniform_expert_parallel(provider)
@@ -731,20 +762,21 @@ def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
     return provider_bundle
 
 
-def _install_nonuniform_expert_parallel(provider: GPTModelProvider) -> None:
-    base_layer_spec = provider.transformer_layer_spec
+def _install_nonuniform_expert_parallel(provider: Any) -> None:
+    spec_field, base_layer_spec = _provider_layer_spec(provider)
 
     def _nonuniform_expert_layer_spec(
-        config: GPTModelProvider, vp_stage: int | None = None
+        config: Any, vp_stage: int | None = None
     ) -> object:
         layer_spec = resolve_layer_spec(base_layer_spec, config, vp_stage)
         if patch_moe_routers(layer_spec) == 0:
             raise RuntimeError(
-                "non-uniform expert parallelism found no MoE router in the layer spec"
+                "non-uniform expert parallelism found no MoE router in "
+                f"{type(provider).__name__}.{spec_field}"
             )
         return layer_spec
 
-    provider.transformer_layer_spec = cast(Any, _nonuniform_expert_layer_spec)
+    setattr(provider, spec_field, _nonuniform_expert_layer_spec)
 
 
 def _finalize_provider_with_art_overrides(provider: GPTModelProvider) -> None:

@@ -11,6 +11,8 @@ from typing import (
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from art.megatron.recurrent.contract import LinearRecurrentContract
+
 if TYPE_CHECKING:
     from megatron.bridge import AutoBridge
     from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -33,6 +35,7 @@ class DependencyFloor(BaseModel):
     transformers: str | None = None
     vllm: str | None = None
     megatron_bridge: str | None = None
+    mamba_ssm: str | None = None
 
 
 class LayerFamilyInstance(BaseModel):
@@ -65,6 +68,9 @@ class PrefixTreeModelStateContext(BaseModel):
     attention_head_dim: int | None = None
     attention_value_head_dim: int | None = None
     context_parallel_state: Any | None = None
+    linear_recurrent_contract: LinearRecurrentContract | None = None
+    recurrent_execution_spec: Any | None = None
+    recurrent_execution_plan: Any | None = None
 
 
 class CompileWorkaroundConfig(BaseModel):
@@ -112,7 +118,6 @@ class ModelSupportSpec(BaseModel):
 class ModelSupportHandler(Protocol):
     key: str
     is_moe: bool
-    build_gdn_execution_spec: bool
     cp_supported: bool
     native_vllm_lora_status: NativeVllmLoraStatus
 
@@ -143,7 +148,15 @@ class ModelSupportHandler(Protocol):
 
     def configure_provider_for_runtime(self, provider: "GPTModelProvider") -> None: ...
 
+    def validate_provider_for_runtime(self, provider: "GPTModelProvider") -> None: ...
+
     def context_parallel_workload_profile(self, provider: Any) -> Any | None: ...
+
+    def linear_recurrent_contract(
+        self, provider: Any
+    ) -> "LinearRecurrentContract | None": ...
+
+    def linear_recurrent_planner_config(self, provider: Any) -> object | None: ...
 
     def default_chat_template(self) -> str | None: ...
 
@@ -159,6 +172,8 @@ class ModelSupportHandler(Protocol):
     def vllm_server_args(self) -> dict[str, object]: ...
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
+
+    def install_linear_recurrent_hooks(self, model_chunks: Sequence[Any]) -> None: ...
 
     def build_pipeline_microbatch_activator(
         self,

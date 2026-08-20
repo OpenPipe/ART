@@ -171,7 +171,7 @@ def _optional_transformer_layer_type() -> type[Any] | None:
 
 def _gdn_island_layer_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
     attention_bias = kwargs.get("attention_bias")
-    plan = getattr(attention_bias, "gdn_execution_plan", None)
+    _spec, plan = _gdn_execution_metadata(attention_bias)
     original_forward = cast(Callable[..., Any], self._art_gdn_island_physical_forward)
     if plan is None or int(getattr(plan, "cp_size", 1)) <= 1:
         return original_forward(*args, **kwargs)
@@ -336,8 +336,7 @@ def _prefix_tree_forward(
 ) -> tuple[Tensor, Tensor | None]:
     group_ids = getattr(attention_bias, "group_ids", None)
     parent_ids = getattr(attention_bias, "parent_ids", None)
-    execution_spec = getattr(attention_bias, "gdn_execution_spec", None)
-    execution_plan = getattr(attention_bias, "gdn_execution_plan", None)
+    execution_spec, execution_plan = _gdn_execution_metadata(attention_bias)
     if group_ids is None or parent_ids is None:
         original_forward = cast(
             Callable[..., tuple[Tensor, Tensor | None]], self._art_physical_forward
@@ -381,8 +380,8 @@ def _prefix_tree_forward(
         hidden_states,
         group_ids=cast(Tensor, group_ids),
         parent_ids=cast(Tensor, parent_ids),
-        execution_spec=cast(GdnPackedExecutionSpec | None, execution_spec),
-        execution_plan=cast(GdnRankExecutionPlan | None, execution_plan),
+        execution_spec=execution_spec,
+        execution_plan=execution_plan,
         input_layout=input_layout,
         output_layout=output_layout,
         require_prebuilt_plan=True,
@@ -472,8 +471,7 @@ def run_gdn_layer(
         raise ValueError(
             "ART prefix-tree GDN production path requires a prebuilt "
             "GDN execution plan on PrefixTreeAttentionState. Build it once "
-            "per packed sequence via create_prefix_tree_state(..., "
-            "build_gdn_execution_spec=True)."
+            "per packed sequence with the GDN linear recurrent contract."
         )
 
     if execution_spec is None and execution_plan is None:
@@ -1176,10 +1174,34 @@ def _leave_gdn_island_layout(
 
 
 def _require_gdn_cp_plan(attention_bias: Any) -> GdnRankExecutionPlan:
-    plan = getattr(attention_bias, "gdn_execution_plan", None)
+    _spec, plan = _gdn_execution_metadata(attention_bias)
     if plan is None or int(getattr(plan, "cp_size", 1)) <= 1:
         raise ValueError("GDN island layout conversion requires a CP execution plan")
-    return cast(GdnRankExecutionPlan, plan)
+    return plan
+
+
+def _gdn_execution_metadata(
+    attention_bias: Any,
+) -> tuple[GdnPackedExecutionSpec | None, GdnRankExecutionPlan | None]:
+    contract = getattr(attention_bias, "linear_recurrent_contract", None)
+    if contract is None:
+        return None, None
+    if (
+        getattr(contract, "family_key", None) != "gated_delta_net"
+        or getattr(contract, "partition_kind", None) != "token_sharded_chain"
+        or contract.local_chunk_size != 64
+    ):
+        raise RuntimeError("GatedDeltaNet received an incompatible recurrent contract")
+    return (
+        cast(
+            GdnPackedExecutionSpec | None,
+            getattr(attention_bias, "recurrent_execution_spec", None),
+        ),
+        cast(
+            GdnRankExecutionPlan | None,
+            getattr(attention_bias, "recurrent_execution_plan", None),
+        ),
+    )
 
 
 def _cp_output_to_attention(

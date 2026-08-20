@@ -8,6 +8,8 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from pydantic import BaseModel, ConfigDict, Field
 import torch
 
+from art.megatron.recurrent.contract import LinearRecurrentContract
+from art.megatron.recurrent.prefix_tree import RecurrentPackedExecutionSpec
 from art.megatron.selective_lm_head import LmHeadTokenSelection
 
 from .layout_index import TokenLayoutIndex
@@ -227,6 +229,31 @@ class StageExecutionSpec:
     mask_metadata: "ExactMaskMetadata | None" = None
 
 
+class HeadShardedRecurrentGlobalDecision(BaseModel):
+    """CPU-only full-tree decision shared by every CP rank."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    family_artifact_identity: str = Field(min_length=1)
+    cp_size: int = Field(gt=0)
+    exchange_plan: Any
+    tree_segment_buckets_by_depth: tuple[tuple[Any, ...], ...]
+    external_token_counts_by_rank: tuple[int, ...]
+
+
+class HeadShardedRecurrentRankExecutionPlan(BaseModel):
+    """One rank's pre-materialized full-tree recurrent execution plan."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    family_artifact_identity: str = Field(min_length=1)
+    cp_rank: int = Field(ge=0)
+    cp_size: int = Field(gt=0)
+    exchange_plan: Any
+    tree_segment_buckets_by_depth: tuple[tuple[Any, ...], ...]
+    external_token_counts_by_rank: tuple[int, ...]
+
+
 @dataclass
 class ArtContextParallelState:
     rank_plan: RankRuntimePlan
@@ -237,8 +264,9 @@ class ArtContextParallelState:
     input_pos: torch.Tensor
     model_state: dict[str, Any] = field(default_factory=dict)
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = ()
-    gdn_execution_spec: Any | None = None
-    gdn_execution_plan: Any | None = None
+    linear_recurrent_contract: LinearRecurrentContract | None = None
+    recurrent_execution_spec: RecurrentPackedExecutionSpec | None = None
+    recurrent_execution_plan: Any | None = None
     gdn_hidden_layout: str = "attention"
     gdn_input_layout: str | None = None
     gdn_output_layout: str | None = None

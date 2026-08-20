@@ -439,6 +439,8 @@ def _logits_equivalence_check(
             int(window) for window in getattr(provider, "art_flex_sliding_windows", ())
         )
     )
+    recurrent_contract = handler.linear_recurrent_contract(provider)
+    recurrent_planner_config = handler.linear_recurrent_planner_config(provider)
     for row_index in range(int(input_ids.shape[0])):
         row_group_ids = group_ids[row_index : row_index + 1]
         row_parent_ids = parent_ids[row_index : row_index + 1]
@@ -453,9 +455,8 @@ def _logits_equivalence_check(
             parent_ids=row_parent_ids,
             input_pos=row_position_ids,
             sliding_windows=sliding_windows,
-            build_gdn_execution_spec=bool(
-                getattr(handler, "build_gdn_execution_spec", False)
-            ),
+            linear_recurrent_contract=recurrent_contract,
+            recurrent_planner_config=recurrent_planner_config,
             model_support_handler=handler,
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
@@ -498,9 +499,8 @@ def _logits_equivalence_check(
                 parent_ids=reference_parent_ids,
                 input_pos=reference_position_ids,
                 sliding_windows=sliding_windows,
-                build_gdn_execution_spec=bool(
-                    getattr(handler, "build_gdn_execution_spec", False)
-                ),
+                linear_recurrent_contract=recurrent_contract,
+                recurrent_planner_config=recurrent_planner_config,
                 model_support_handler=handler,
                 attention_head_dim=getattr(provider, "kv_channels", None),
                 attention_value_head_dim=getattr(provider, "kv_channels", None),

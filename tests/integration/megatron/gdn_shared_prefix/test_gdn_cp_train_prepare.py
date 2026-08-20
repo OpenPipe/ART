@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -24,13 +25,33 @@ from art.megatron.context_parallel.types import (  # noqa: E402
     DispatchedPackedTensors,
     ParallelTopology,
 )
-from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig  # noqa: E402
+from art.megatron.model_support.handlers.qwen3_5 import (  # noqa: E402
+    QWEN3_5_MOE_HANDLER,
+)
 from art.megatron.selective_lm_head import LmHeadTokenSelection  # noqa: E402
 from art.preprocessing.pack import PackedTensors  # noqa: E402
 
 from .cases import default_phase0_cases  # noqa: E402
 from .distributed_init import file_init_method  # noqa: E402
 from .packed_layout import build_phase0_packed_tensors  # noqa: E402
+
+
+def _gdn_recurrent_runtime() -> tuple[Any, Any]:
+    provider = SimpleNamespace(
+        hidden_size=2048,
+        tensor_model_parallel_size=1,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        params_dtype=torch.bfloat16,
+        activation_func=torch.nn.functional.silu,
+    )
+    return (
+        QWEN3_5_MOE_HANDLER.linear_recurrent_contract(provider),
+        QWEN3_5_MOE_HANDLER.linear_recurrent_planner_config(provider),
+    )
 
 
 def test_gdn_cp_training_batch_carries_prebuilt_rank_plan(tmp_path: Path) -> None:
@@ -55,15 +76,15 @@ def test_hybridep_extent_includes_gdn_layout_rows() -> None:
     )
     topology = ParallelTopology(cp=2)
     config = ContextParallelConfig()
-    planner_config = GdnPlannerConfig()
+    recurrent_contract, planner_config = _gdn_recurrent_runtime()
     counts = context_parallel_rank_model_token_counts(
         group_ids=micro["group_ids"],
         parent_ids=micro["parent_ids"],
         topology=topology,
         config=config,
         original_seq_len=int(micro["tokens"].shape[1]),
-        build_gdn_execution_spec=True,
-        gdn_planner_config=planner_config,
+        linear_recurrent_contract=recurrent_contract,
+        recurrent_planner_config=planner_config,
     )
     expected = []
     attention_counts = []
@@ -75,16 +96,16 @@ def test_hybridep_extent_includes_gdn_layout_rows() -> None:
                 config=config,
                 cp_group=None,
                 cp_rank=cp_rank,
-                build_gdn_execution_spec=True,
-                gdn_planner_config=planner_config,
+                linear_recurrent_contract=recurrent_contract,
+                recurrent_planner_config=planner_config,
                 target_device=torch.device("cpu"),
             )
         )
-        assert state.gdn_execution_plan is not None
+        assert state.recurrent_execution_plan is not None
         attention_count = sum(int(value) for value in rank_plan.local_valid_lengths)
         attention_counts.append(attention_count)
         expected.append(
-            max(attention_count, int(state.gdn_execution_plan.gdn_token_count))
+            max(attention_count, int(state.recurrent_execution_plan.gdn_token_count))
         )
     assert counts == tuple(expected)
     assert any(count > attention for count, attention in zip(counts, attention_counts))
@@ -116,22 +137,24 @@ def _worker(rank: int, cp_size: int, init_method: str, output_dir: str) -> None:
         )
         cast(Any, micro)["original_logprobs"] = micro["logprobs"] + 0.125
         ref_logprobs = torch.full_like(micro["logprobs"], -0.25)
+        recurrent_contract, planner_config = _gdn_recurrent_runtime()
         prepared = prepare_cp_micro(
             micro=micro,
             topology=ParallelTopology(cp=cp_size),
             config=ContextParallelConfig(),
             cp_group=ps.get_context_parallel_group(check_initialized=False),
             cp_rank=ps.get_context_parallel_rank(),
-            build_gdn_execution_spec=True,
+            linear_recurrent_contract=recurrent_contract,
+            recurrent_planner_config=planner_config,
             ref_logprobs=ref_logprobs,
         )
         state = prepared.attention_state
         assert isinstance(state, ArtContextParallelState)
-        plan = state.gdn_execution_plan
+        plan = state.recurrent_execution_plan
         assert plan is not None
         assert plan.cp_rank == rank
         assert plan.cp_size == cp_size
-        assert state.gdn_execution_spec is not None
+        assert state.recurrent_execution_spec is not None
         assert prepared.tensors.tokens.shape == (1, int(plan.attention_token_count))
         assert prepared.tensors.labels.shape == prepared.tensors.tokens.shape
         assert prepared.tensors.input_pos.shape == prepared.tensors.tokens.shape

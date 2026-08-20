@@ -143,7 +143,8 @@ def _runtime(
             art_flex_sliding_windows=(16,),
         ),
         model_support_handler=SimpleNamespace(
-            build_gdn_execution_spec=True,
+            linear_recurrent_contract=lambda _provider: None,
+            linear_recurrent_planner_config=lambda _provider: None,
             canonicalize_loaded_lora_state=lambda state, _model: state,
             from_vllm_lora_tensors=lambda state, **_kwargs: state,
             to_vllm_lora_tensors=lambda state, **kwargs: (
@@ -428,6 +429,8 @@ def test_cp1_packed_forward_uses_model_attention_metadata(
     )
     captured: dict[str, object] = {}
     state = object()
+    recurrent_contract = object()
+    planner_config = object()
 
     def create_state(**kwargs: object) -> object:
         captured.update(kwargs)
@@ -439,8 +442,8 @@ def test_cp1_packed_forward_uses_model_attention_metadata(
         "art.megatron.prefix_tree_state.create_prefix_tree_state", create_state
     )
     monkeypatch.setattr(
-        "art.megatron.training.microbatches._gdn_planner_config_for_provider",
-        lambda provider, handler: "planner-config",
+        "art.megatron.training.microbatches._linear_recurrent_runtime_for_provider",
+        lambda provider, handler: (recurrent_contract, planner_config),
     )
 
     prepared = trainer._prepare_packed_forward(batch)
@@ -448,7 +451,8 @@ def test_cp1_packed_forward_uses_model_attention_metadata(
     assert prepared.attention_state is state
     assert captured["model_support_handler"] is runtime.model_support_handler
     assert captured["sliding_windows"] == (16,)
-    assert captured["gdn_planner_config"] == "planner-config"
+    assert captured["linear_recurrent_contract"] is recurrent_contract
+    assert captured["recurrent_planner_config"] is planner_config
     assert captured["target_device"] == torch.device("meta")
     assert prepared.tokens.device == torch.device("meta")
     assert prepared.position_ids.device == torch.device("meta")
@@ -487,6 +491,8 @@ def test_hybridep_uses_maximum_cp_model_rows(
     short_batch = prefix_tree_pack((torch.arange(5),), max_depth=0)
     topology = ParallelTopology(cp=4)
     calls: dict[str, object] = {}
+    recurrent_contract = object()
+    planner_config = object()
 
     monkeypatch.setattr(
         "megatron.core.parallel_state.get_expert_model_parallel_world_size",
@@ -510,8 +516,8 @@ def test_hybridep_uses_maximum_cp_model_rows(
         lambda *_: "cp-config",
     )
     monkeypatch.setattr(
-        "art.megatron.training.microbatches._gdn_planner_config_for_provider",
-        lambda *_: "gdn-config",
+        "art.megatron.training.microbatches._linear_recurrent_runtime_for_provider",
+        lambda *_: (recurrent_contract, planner_config),
     )
 
     buffer = SimpleNamespace(

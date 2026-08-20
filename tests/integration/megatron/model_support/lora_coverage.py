@@ -35,19 +35,22 @@ _WRAPPED_TARGET_SUFFIXES: dict[str, tuple[str, ...]] = {
     "o_b_proj": (".self_attn.o_b_proj",),
     "compressor.kv_proj": (".self_attn.compressor.kv_proj",),
     "compressor.gate_proj": (".self_attn.compressor.gate_proj",),
-    "q_proj": (".self_attn.q_proj",),
-    "k_proj": (".self_attn.k_proj",),
-    "v_proj": (".self_attn.v_proj",),
-    "o_proj": (".self_attn.o_proj",),
+    "q_proj": (".self_attn.q_proj", ".mixer.q_proj"),
+    "k_proj": (".self_attn.k_proj", ".mixer.k_proj"),
+    "v_proj": (".self_attn.v_proj", ".mixer.v_proj"),
+    "o_proj": (".self_attn.o_proj", ".mixer.o_proj"),
+    "in_proj": (".mixer.in_proj",),
     "in_proj_qkv": (".linear_attn.in_proj_qkv",),
     "in_proj_z": (".linear_attn.in_proj_z",),
-    "out_proj": (".linear_attn.out_proj",),
+    "out_proj": (".linear_attn.out_proj", ".mixer.out_proj"),
     "gate_proj": (".gate_proj",),
     "up_proj": (".up_proj",),
     "down_proj": (".down_proj",),
     "experts": (
         ".mlp.experts.{expert}.gate_up_proj",
         ".mlp.experts.{expert}.down_proj",
+        ".mixer.experts.{expert}.up_proj",
+        ".mixer.experts.{expert}.down_proj",
     ),
 }
 
@@ -100,7 +103,9 @@ def _covered_wrapped_target_modules(adapter_prefixes: set[str]) -> set[str]:
         ):
             covered.add(target_module)
         if target_module == "experts" and any(
-            ".mlp.experts." in prefix for prefix in adapter_prefixes
+            namespace in prefix
+            for prefix in adapter_prefixes
+            for namespace in (".mlp.experts.", ".mixer.experts.")
         ):
             covered.add(target_module)
     return covered
@@ -165,6 +170,12 @@ def _covered_exported_target_modules(
             covered.update({"in_proj_qkv", "in_proj_z"})
             continue
         if base_name.endswith(".self_attention.out_proj.weight"):
+            covered.add("out_proj")
+            continue
+        if base_name.endswith(".mixer.in_proj.weight"):
+            covered.add("in_proj")
+            continue
+        if base_name.endswith(".mixer.out_proj.weight"):
             covered.add("out_proj")
             continue
         if ".mlp.experts.linear_fc1" in base_name:

@@ -8,6 +8,14 @@ import pytest
 import torch
 from torch import nn
 
+from art.megatron.gdn.gdn_prefix_tree import GdnRankExecutionPlan
+from art.megatron.recurrent.contract import (
+    ChainCostSpec,
+    LinearRecurrentContract,
+    ProjectedStreamSpec,
+    RecurrentStateSpec,
+    TokenShardedChainSpec,
+)
 import art.megatron.routing_replay as routing_replay_module
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
@@ -152,13 +160,43 @@ class _FakeParallelState:
         return self._tp_rank
 
 
-class _FakeGdnExecutionPlan:
-    attention_token_indices = (0, 1, 2, 3)
-    gdn_token_indices = (0, 2)
-
-
 class _FakeAttentionState:
-    gdn_execution_plan = _FakeGdnExecutionPlan()
+    linear_recurrent_contract = LinearRecurrentContract(
+        family_key="gated_delta_net",
+        contract_version="test",
+        partition_kind="token_sharded_chain",
+        projected_streams=(ProjectedStreamSpec(name="qkv", width=3),),
+        states=(RecurrentStateSpec(name="recurrent", shape=(1,), dtype="float32"),),
+        convolution_width=1,
+        local_chunk_size=64,
+        activation="identity",
+        local_kernel_implementation_id="test.gdn",
+        layout_compatibility_key="test.gdn.layout",
+        chain=TokenShardedChainSpec(
+            alignment=1,
+            legality_key="test.gdn.chain",
+            summary_implementation_id="test.gdn.summary",
+            cost=ChainCostSpec(
+                summary_bytes_per_segment=0,
+                summary_exchange_count=0,
+                summary_bandwidth_bytes_per_ms=1.0,
+                summary_compute_segments_per_ms=1.0,
+                suffix_scan_latency_ms=0.0,
+                suffix_scan_segments_per_ms=1.0,
+            ),
+        ),
+    )
+    recurrent_execution_plan = GdnRankExecutionPlan(
+        cp_rank=0,
+        cp_size=1,
+        batch_size=1,
+        sequence_length=6,
+        real_token_mask=torch.ones((1, 6), dtype=torch.bool),
+        attention_token_ranges=((0, 6, 0),),
+        gdn_token_ranges=((0, 1, 0), (2, 3, 0)),
+        attention_token_count=6,
+        gdn_token_count=2,
+    )
 
 
 class _FakeRouterReplay:

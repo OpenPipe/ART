@@ -155,6 +155,12 @@ class _Chunk(nn.Module):
 
 
 class _Handler:
+    def linear_recurrent_contract(self, _provider: Any) -> None:
+        return None
+
+    def linear_recurrent_planner_config(self, _provider: Any) -> None:
+        return None
+
     def get_forward_kwargs(self, _chunk: nn.Module, *, attention_bias: Any) -> dict:
         del attention_bias
         return {}

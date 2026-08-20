@@ -46,8 +46,8 @@ class CpBatchPreplanner(BaseModel):
     topology: ParallelTopology
     config: ContextParallelConfig
     cp_rank: int
-    build_gdn_execution_spec: bool
-    gdn_planner_config: Any | None = None
+    linear_recurrent_contract: Any | None = None
+    recurrent_planner_config: Any | None = None
 
     @classmethod
     def from_runtime(
@@ -59,18 +59,17 @@ class CpBatchPreplanner(BaseModel):
         if int(topology.cp) <= 1:
             return None
         handler = runtime.model_support_handler
+        recurrent_contract, planner_config = _linear_recurrent_runtime_for_provider(
+            runtime.provider, handler
+        )
         return cls(
             topology=topology,
             config=_context_parallel_config_for_provider(
                 runtime.provider, device, handler
             ),
             cp_rank=int(ps.get_context_parallel_rank()),
-            build_gdn_execution_spec=bool(
-                getattr(handler, "build_gdn_execution_spec", False)
-            ),
-            gdn_planner_config=_gdn_planner_config_for_provider(
-                runtime.provider, handler
-            ),
+            linear_recurrent_contract=recurrent_contract,
+            recurrent_planner_config=planner_config,
         )
 
     def preplan(
@@ -100,8 +99,8 @@ class CpBatchPreplanner(BaseModel):
                 topology=self.topology,
                 config=self.config,
                 cp_rank=self.cp_rank,
-                build_gdn_execution_spec=self.build_gdn_execution_spec,
-                gdn_planner_config=self.gdn_planner_config,
+                linear_recurrent_contract=self.linear_recurrent_contract,
+                recurrent_planner_config=self.recurrent_planner_config,
             )
         return len(sample_indices)
 
@@ -293,8 +292,7 @@ def build_rl_hybridep_token_counts(
         torch.device("cuda", torch.cuda.current_device()),
         model_support_handler,
     )
-    build_gdn = bool(getattr(model_support_handler, "build_gdn_execution_spec", False))
-    gdn_planner_config = _gdn_planner_config_for_provider(
+    recurrent_contract, planner_config = _linear_recurrent_runtime_for_provider(
         provider, model_support_handler
     )
 
@@ -306,8 +304,8 @@ def build_rl_hybridep_token_counts(
             topology=topology,
             config=config,
             original_seq_len=sequence_length,
-            build_gdn_execution_spec=build_gdn,
-            gdn_planner_config=gdn_planner_config,
+            linear_recurrent_contract=recurrent_contract,
+            recurrent_planner_config=planner_config,
         )
 
     return [
@@ -345,8 +343,7 @@ def build_sft_hybridep_token_counts(
         torch.device("cuda", torch.cuda.current_device()),
         model_support_handler,
     )
-    build_gdn = bool(getattr(model_support_handler, "build_gdn_execution_spec", False))
-    gdn_planner_config = _gdn_planner_config_for_provider(
+    recurrent_contract, planner_config = _linear_recurrent_runtime_for_provider(
         provider, model_support_handler
     )
 
@@ -360,8 +357,8 @@ def build_sft_hybridep_token_counts(
             topology=topology,
             config=config,
             original_seq_len=int(sparse["tokens"].shape[1]),
-            build_gdn_execution_spec=build_gdn,
-            gdn_planner_config=gdn_planner_config,
+            linear_recurrent_contract=recurrent_contract,
+            recurrent_planner_config=planner_config,
         )
 
     return [
@@ -522,37 +519,36 @@ def _causal_attention_state(
     provider: Any,
     model_support_handler: Any,
     sliding_windows: tuple[int, ...] = (),
-    build_gdn_execution_spec: bool,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
 ) -> Any:
     group_ids = torch.zeros((1, seq_len), dtype=torch.int64, device="cpu")
     parent_ids = torch.zeros_like(group_ids)
+    recurrent_contract, planner_config = _linear_recurrent_runtime_for_provider(
+        provider, model_support_handler
+    )
     return create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
         target_device=device,
         input_pos=torch.arange(seq_len, dtype=torch.int64).unsqueeze(0),
         sliding_windows=sliding_windows,
-        build_gdn_execution_spec=build_gdn_execution_spec,
+        linear_recurrent_contract=recurrent_contract,
         model_support_handler=model_support_handler,
         attention_head_dim=attention_head_dim,
         attention_value_head_dim=attention_value_head_dim,
-        gdn_planner_config=_gdn_planner_config_for_provider(
-            provider,
-            model_support_handler,
-        ),
+        recurrent_planner_config=planner_config,
     )
 
 
-def _gdn_planner_config_for_provider(
+def _linear_recurrent_runtime_for_provider(
     provider: Any, model_support_handler: Any
-) -> Any | None:
-    if not bool(getattr(model_support_handler, "build_gdn_execution_spec", False)):
-        return None
-    from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig
-
-    return GdnPlannerConfig.from_provider(provider)
+) -> tuple[Any | None, Any | None]:
+    contract = model_support_handler.linear_recurrent_contract(provider)
+    planner_config = model_support_handler.linear_recurrent_planner_config(provider)
+    if contract is None and planner_config is not None:
+        raise ValueError("linear recurrent planner config requires a contract")
+    return contract, planner_config
 
 
 def _next_micro_lookahead(
@@ -574,22 +570,20 @@ def _prepare_dense_rl_micro(
     model_support_handler: Any,
     ref_logprobs: torch.Tensor | None,
 ) -> PreparedRLMicroInputs:
+    recurrent_contract, planner_config = _linear_recurrent_runtime_for_provider(
+        provider, model_support_handler
+    )
     attention_state = create_prefix_tree_state(
         group_ids=micro["group_ids"],
         parent_ids=micro["parent_ids"],
         target_device=device,
         input_pos=micro["input_pos"],
         sliding_windows=_art_flex_sliding_windows(provider),
-        build_gdn_execution_spec=bool(
-            getattr(model_support_handler, "build_gdn_execution_spec", False)
-        ),
+        linear_recurrent_contract=recurrent_contract,
         model_support_handler=model_support_handler,
         attention_head_dim=getattr(provider, "kv_channels", None),
         attention_value_head_dim=getattr(provider, "kv_channels", None),
-        gdn_planner_config=_gdn_planner_config_for_provider(
-            provider,
-            model_support_handler,
-        ),
+        recurrent_planner_config=planner_config,
     )
     shifted_labels = shift_tensor(micro["tokens"], -100)
     shifted_assistant_mask = shift_tensor(micro["assistant_mask"], False)
@@ -644,6 +638,9 @@ def _prepare_rl_cp_micro_full(
     work. Moving the full packed micro to CUDA before planning forces later D2H
     metadata reads and collapses that overlap.
     """
+    recurrent_contract, planner_config = _linear_recurrent_runtime_for_provider(
+        provider, model_support_handler
+    )
     return prepare_cp_micro(
         micro=micro,
         topology=topology,
@@ -652,13 +649,8 @@ def _prepare_rl_cp_micro_full(
         ),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
-        build_gdn_execution_spec=bool(
-            getattr(model_support_handler, "build_gdn_execution_spec", False)
-        ),
-        gdn_planner_config=_gdn_planner_config_for_provider(
-            provider,
-            model_support_handler,
-        ),
+        linear_recurrent_contract=recurrent_contract,
+        recurrent_planner_config=planner_config,
         trace_token_uids=trace_token_uids,
         block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
         target_device=device,
@@ -807,9 +799,6 @@ def _prepare_dense_sft_micro(
             seq_len,
             device,
             sliding_windows=_art_flex_sliding_windows(provider),
-            build_gdn_execution_spec=bool(
-                getattr(model_support_handler, "build_gdn_execution_spec", False)
-            ),
             provider=provider,
             model_support_handler=model_support_handler,
             attention_head_dim=getattr(provider, "kv_channels", None),
@@ -880,6 +869,9 @@ def _prepare_sft_cp_micro_full(
         micro,
         device=torch.device("cpu"),
     )
+    recurrent_contract, planner_config = _linear_recurrent_runtime_for_provider(
+        provider, model_support_handler
+    )
     return prepare_cp_micro(
         micro=sparse_micro,
         topology=topology,
@@ -888,13 +880,8 @@ def _prepare_sft_cp_micro_full(
         ),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
-        build_gdn_execution_spec=bool(
-            getattr(model_support_handler, "build_gdn_execution_spec", False)
-        ),
-        gdn_planner_config=_gdn_planner_config_for_provider(
-            provider,
-            model_support_handler,
-        ),
+        linear_recurrent_contract=recurrent_contract,
+        recurrent_planner_config=planner_config,
         trace_token_uids=trace_token_uids,
         block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
         target_device=device,

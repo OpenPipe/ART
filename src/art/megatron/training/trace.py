@@ -99,8 +99,9 @@ def _routing_replay_token_uid_sets(
     attention_state: Any | None,
 ) -> dict[str, torch.Tensor | None]:
     attention_token_uids = flatten_local_token_uids(token_uids)
-    plan = getattr(attention_state, "gdn_execution_plan", None)
-    if plan is not None:
+    contract = getattr(attention_state, "linear_recurrent_contract", None)
+    plan = getattr(attention_state, "recurrent_execution_plan", None)
+    if getattr(contract, "family_key", None) == "gated_delta_net" and plan is not None:
         return {
             "attention": attention_token_uids,
             "gdn": torch.tensor(

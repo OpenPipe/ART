@@ -482,6 +482,7 @@ def build_training_runtime(
             init_model_with_meta_device=model_initialization == "pretrained",
         ),
     )
+    provider_bundle.handler.zero_internal_padding_params(model)
 
     if not torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
         raise RuntimeError(
@@ -509,6 +510,7 @@ def build_training_runtime(
         print("Resolved inductor cache_dir():", inductor_cache_dir())
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
+    provider_bundle.handler.install_linear_recurrent_hooks(model)
     provider_bundle.handler.install_preprocess_patch(model)
     if replay_requested:
         prepare_moe_routing_replay_boundaries(model)
@@ -734,11 +736,16 @@ def execute_megatron_rl_job(
                 "Correlation between old and new probabilities:",
                 step_result.probs_corr,
             )
-            _validate_train_step_result_finite(runtime, step_result)
+            train_step_rank_max_s = _validate_train_step_result_finite(
+                runtime,
+                step_result,
+                train_step_s=train_step_s,
+            )
             final_metrics = _rl_step_metrics(
                 step_result,
                 num_gradient_steps=num_steps,
                 train_step_s=train_step_s,
+                train_step_rank_max_s=train_step_rank_max_s,
             )
             if step_index == 0:
                 inter_schedule_metrics = {
@@ -1080,22 +1087,31 @@ def _load_adapter_into_model(
 def _validate_train_step_result_finite(
     runtime: TrainingRuntime,
     step_result: TrainStepResult,
-) -> None:
-    finite = torch.isfinite(step_result.reduced_loss.detach()).to(dtype=torch.float32)
+    *,
+    train_step_s: float,
+) -> float:
+    loss = step_result.reduced_loss.detach()
+    nonfinite_and_train_s = torch.stack(
+        (
+            (~torch.isfinite(loss)).to(dtype=torch.float64),
+            loss.new_tensor(train_step_s, dtype=torch.float64),
+        )
+    )
     if not math.isfinite(float(step_result.grad_norm)):
-        finite.zero_()
+        nonfinite_and_train_s[0] = 1.0
     if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
         torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
-            finite,
-            op=torch.distributed.ReduceOp.MIN,  # ty: ignore[possibly-missing-attribute]
+            nonfinite_and_train_s,
+            op=torch.distributed.ReduceOp.MAX,  # ty: ignore[possibly-missing-attribute]
         )
-    if bool(finite.item()):
-        return
-    raise RuntimeError(
-        "Megatron training produced a non-finite result; refusing to save LoRA. "
-        f"loss={float(step_result.reduced_loss.detach().float().item())}, "
-        f"grad_norm={step_result.grad_norm}, rank={runtime.rank}"
-    )
+    nonfinite, train_step_rank_max_s = nonfinite_and_train_s.tolist()
+    if nonfinite:
+        raise RuntimeError(
+            "Megatron training produced a non-finite result; refusing to save LoRA. "
+            f"loss={float(loss.float().item())}, "
+            f"grad_norm={step_result.grad_norm}, rank={runtime.rank}"
+        )
+    return train_step_rank_max_s
 
 
 def _should_snapshot_optimizer(
@@ -1119,6 +1135,7 @@ def _rl_step_metrics(
     *,
     num_gradient_steps: int,
     train_step_s: float,
+    train_step_rank_max_s: float,
 ) -> dict[str, float]:
     workload = step_result.workload
     metrics = {
@@ -1145,6 +1162,7 @@ def _rl_step_metrics(
         "pipeline/gradient_step_real_microbatches": float(workload.real_microbatches),
         "pipeline/gradient_step_dummy_microbatches": float(workload.dummy_microbatches),
         "time/gradient_step_train_s": train_step_s,
+        "time/gradient_step_train_rank_max_s": train_step_rank_max_s,
     }
     if step_result.kl_policy_ref is not None:
         metrics["loss/kl_policy_ref"] = step_result.kl_policy_ref

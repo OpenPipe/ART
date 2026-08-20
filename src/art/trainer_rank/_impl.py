@@ -3015,7 +3015,35 @@ class TrainerRank:
             dict[str, object] | None,
             forward_kwargs.pop("extra_block_kwargs", None),
         )
-        preprocessed = model._preprocess(
+        decoder_hidden = getattr(model, "_art_decoder_hidden", None)
+        if callable(decoder_hidden):
+            if forward_kwargs:
+                raise RuntimeError(
+                    "ART decoder-hidden adapter received unsupported model forward "
+                    f"kwargs: {sorted(forward_kwargs)}"
+                )
+            hidden_states = decoder_hidden(
+                input_ids=prepared.tokens,
+                position_ids=prepared.position_ids,
+                attention_mask=attention_mask,
+                packed_seq_params=prepared.packed_seq_params,
+                extra_block_kwargs=extra_block_kwargs,
+            )
+            if (
+                not isinstance(hidden_states, torch.Tensor)
+                or hidden_states.ndim != 3
+                or int(hidden_states.shape[1]) != 1
+                or int(hidden_states.shape[-1]) != self._hidden_size
+            ):
+                raise TypeError(
+                    "ART decoder-hidden adapter must return [sequence, 1, hidden]"
+                )
+            return hidden_states
+
+        preprocess = getattr(model, "_preprocess", None)
+        if not callable(preprocess):
+            raise RuntimeError("Megatron language model has no decoder preprocessing")
+        preprocessed = preprocess(
             input_ids=prepared.tokens,
             position_ids=prepared.position_ids,
             packed_seq_params=cast("PackedSeqParams", prepared.packed_seq_params),
@@ -3348,11 +3376,14 @@ class TrainerRank:
         from art.megatron.prefix_tree_state import create_prefix_tree_state
         from art.megatron.training.microbatches import (
             _art_flex_sliding_windows,
-            _gdn_planner_config_for_provider,
+            _linear_recurrent_runtime_for_provider,
         )
 
         handler = self.runtime.model_support_handler
         provider = self.runtime.provider
+        recurrent_contract, planner_config = _linear_recurrent_runtime_for_provider(
+            provider, handler
+        )
         return _PreparedPackedForward(
             tokens=batch.tokens.to(self.device),
             position_ids=batch.position_ids.to(self.device),
@@ -3362,11 +3393,11 @@ class TrainerRank:
                 target_device=self.device,
                 input_pos=batch.position_ids,
                 sliding_windows=_art_flex_sliding_windows(provider),
-                build_gdn_execution_spec=handler.build_gdn_execution_spec,
+                linear_recurrent_contract=recurrent_contract,
                 model_support_handler=handler,
                 attention_head_dim=provider.kv_channels,
                 attention_value_head_dim=provider.kv_channels,
-                gdn_planner_config=_gdn_planner_config_for_provider(provider, handler),
+                recurrent_planner_config=planner_config,
             ),
             packed_seq_params=None,
             positions_by_item=batch.positions_by_sequence,
@@ -3478,10 +3509,13 @@ class TrainerRank:
             )
             from art.megatron.training.microbatches import (
                 _context_parallel_config_for_provider,
-                _gdn_planner_config_for_provider,
+                _linear_recurrent_runtime_for_provider,
             )
 
             handler = self.runtime.model_support_handler
+            recurrent_contract, planner_config = _linear_recurrent_runtime_for_provider(
+                self.runtime.provider, handler
+            )
             return max(
                 context_parallel_rank_model_token_counts(
                     group_ids=batch.group_ids,
@@ -3493,10 +3527,8 @@ class TrainerRank:
                         handler,
                     ),
                     original_seq_len=sequence_length,
-                    build_gdn_execution_spec=handler.build_gdn_execution_spec,
-                    gdn_planner_config=_gdn_planner_config_for_provider(
-                        self.runtime.provider, handler
-                    ),
+                    linear_recurrent_contract=recurrent_contract,
+                    recurrent_planner_config=planner_config,
                 )
             )
         raise AssertionError("unreachable")
@@ -3516,7 +3548,7 @@ class TrainerRank:
         from art.megatron.training.microbatches import (
             _art_flex_cp_block_mask_variants,
             _context_parallel_config_for_provider,
-            _gdn_planner_config_for_provider,
+            _linear_recurrent_runtime_for_provider,
         )
         from art.preprocessing.pack import PackedTensors
 
@@ -3538,6 +3570,9 @@ class TrainerRank:
         }
         handler = self.runtime.model_support_handler
         provider = self.runtime.provider
+        recurrent_contract, planner_config = _linear_recurrent_runtime_for_provider(
+            provider, handler
+        )
         prepared = prepare_cp_micro(
             micro=sparse_micro,
             topology=topology,
@@ -3548,8 +3583,8 @@ class TrainerRank:
             ),
             cp_group=ps.get_context_parallel_group(check_initialized=False),
             cp_rank=ps.get_context_parallel_rank(),
-            build_gdn_execution_spec=handler.build_gdn_execution_spec,
-            gdn_planner_config=_gdn_planner_config_for_provider(provider, handler),
+            linear_recurrent_contract=recurrent_contract,
+            recurrent_planner_config=planner_config,
             block_mask_variants=_art_flex_cp_block_mask_variants(provider, self.device),
             target_device=self.device,
         )
@@ -3650,16 +3685,24 @@ def _pad_packed_batch(
     )
 
 
-def _language_model(model: torch.nn.Module) -> "GPTModel":
-    module: object = model
+def _language_model(model: torch.nn.Module) -> Any:
+    module: Any = model
     while hasattr(module, "module"):
         module = getattr(module, "module")
-    if hasattr(module, "_preprocess") and hasattr(module, "decoder"):
-        return cast("GPTModel", module)
-    language_model = getattr(module, "language_model", None)
-    if language_model is not None:
-        return cast("GPTModel", language_model)
-    raise RuntimeError("expected a Megatron GPT model")
+    for candidate in (module, getattr(module, "language_model", None)):
+        if (
+            candidate is not None
+            and hasattr(candidate, "decoder")
+            and (
+                callable(getattr(candidate, "_preprocess", None))
+                or callable(getattr(candidate, "_art_decoder_hidden", None))
+            )
+        ):
+            return candidate
+    raise RuntimeError(
+        "expected a Megatron language model with GPT preprocessing or an ART "
+        "decoder-hidden adapter"
+    )
 
 
 def _padded_vocab_size(model: object) -> int:

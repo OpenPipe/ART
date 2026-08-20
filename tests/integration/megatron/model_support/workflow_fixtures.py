@@ -58,6 +58,9 @@ _REVISIONS = {
     "deepseek-ai/DeepSeek-V4-Flash": "60d8d70770c6776ff598c94bb586a859a38244f1",
     "zai-org/GLM-5.2": "b4734de4facf877f85769a911abafc5283eab3d9",
     "openai/gpt-oss-20b": "6cee5e81ee83917806bbde320786a8fb61efebee",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": (
+        "2d59de1cbd51c0adf384eb906b766d1aee0e0517"
+    ),
 }
 _MULTIMODAL = {"qwen3_5_dense", "qwen3_5_moe", "gemma4_dense", "gemma4_moe"}
 
@@ -296,6 +299,8 @@ _MULTIMODAL_SHAPES = {
 # fmt: on
 
 _FUNCTIONAL_LAYER_FIELDS = ("layer_types", "mlp_layer_types", "indexer_types")
+_HYBRID_PATTERN_FIELD = "hybrid_override_pattern"
+_HYBRID_PATTERN_CHARS = frozenset("ME*-")
 _WIDTH_TERMS = ("hidden", "intermediate", "head", "expert", "lora_rank", "topk")
 
 
@@ -317,6 +322,23 @@ def _plan(depth: int, prefix: str, **values: Any) -> _FunctionalPlan:
 # fmt: off
 _QWEN35 = {"layer_types": (("linear_attention",) * 3 + ("full_attention",)) * 2}
 _GEMMA4 = {"layer_types": (("sliding_attention",) * 5 + ("full_attention",)) * 2}
+_NEMOTRON_H = "MEMEM*EMEMEM*"
+_NEMOTRON_H_SEMANTICS = {
+    "attention_bias": False, "attention_dropout": 0.0, "hidden_dropout": 0.0,
+    "mamba_proj_bias": False, "mlp_bias": False, "use_bias": False,
+    "use_conv_bias": True, "mamba_ssm_cache_dtype": "float32",
+    "n_shared_experts": 1, "norm_topk_prob": True, "n_group": 1,
+    "topk_group": 1, "routed_scaling_factor": 2.5,
+    "time_step_min": 0.001, "time_step_max": 0.1,
+    "time_step_floor": 0.0001, "time_step_limit": [0.0, float("inf")],
+    "mamba_hidden_act": "silu", "mlp_hidden_act": "relu2",
+    "conv_kernel": 4, "chunk_size": 128, "expand": 2,
+    "residual_in_fp32": False, "rescale_prenorm_residual": True,
+    "layer_norm_epsilon": 1e-5, "norm_eps": 1e-5,
+    "partial_rotary_factor": 1.0, "rope_theta": 10000,
+    "sliding_window": None, "tie_word_embeddings": False,
+    "use_cache": True, "use_mamba_kernels": True, "dtype": "bfloat16",
+}
 _FUNCTIONAL_PLANS = {
     "llama3_dense": _plan(2, "model.layers", checkpoint="model.safetensors"),
     "qwen3_dense": _plan(2, "model.layers"),
@@ -328,6 +350,7 @@ _FUNCTIONAL_PLANS = {
     "dsv4": _plan(6, "layers", auxiliary=("mtp", "num_nextn_predict_layers")),
     "glm52": _plan(10, "model.layers", auxiliary=(None, "num_nextn_predict_layers")),
     "gpt_oss_moe": _plan(4, "model.layers"),
+    "nemotron_h_moe": _plan(13, "backbone.layers"),
 }
 _FUNCTIONAL_PATTERNS = {
     "qwen3_dense": {"layer_types": ("full_attention",) * 2},
@@ -342,8 +365,52 @@ _FUNCTIONAL_PATTERNS = {
         "indexer_types": ("full",) * 3 + ("shared",) * 3 + ("full",) + ("shared",) * 3,
     },
     "gpt_oss_moe": {"layer_types": ("sliding_attention", "full_attention") * 2},
+    "nemotron_h_moe": {_HYBRID_PATTERN_FIELD: _NEMOTRON_H},
 }
 # fmt: on
+
+
+def _truncate_hybrid_override_pattern(
+    pattern: object,
+    *,
+    source_depth: int,
+    target_depth: int,
+    model_key: str,
+) -> str:
+    if (
+        not isinstance(pattern, str)
+        or len(pattern) != source_depth
+        or set(pattern) - _HYBRID_PATTERN_CHARS
+    ):
+        raise RuntimeError(f"{model_key} production hybrid layer pattern is invalid")
+    if target_depth > source_depth:
+        raise RuntimeError(
+            f"cannot expand {model_key} hybrid pattern from {source_depth} "
+            f"to {target_depth} layers"
+        )
+    return pattern[:target_depth]
+
+
+def _require_nemotron_h_semantics(config: Any) -> None:
+    values = config if isinstance(config, Mapping) else config.to_dict()
+    if "dtype" in values and "torch_dtype" in values:
+        raise RuntimeError(
+            "nemotron_h_moe production semantic config changed: "
+            "dtype aliases are ambiguous"
+        )
+    if "dtype" not in values and "torch_dtype" in values:
+        values = {**values, "dtype": values["torch_dtype"]}
+    mismatches = {
+        name: values.get(name, "<missing>")
+        for name, expected in _NEMOTRON_H_SEMANTICS.items()
+        if name not in values
+        or type(values[name]) is not type(expected)
+        or values[name] != expected
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"nemotron_h_moe production semantic config changed: {mismatches}"
+        )
 
 
 def _configure(
@@ -363,6 +430,34 @@ def _configure(
         if model_key == "glm52":
             text.vocab_size = source_vocab_size
         return config
+    if model_key == "nemotron_h_moe":
+        text = _text(config)
+        _require_nemotron_h_semantics(text)
+        semantics = {name: getattr(text, name) for name in _NEMOTRON_H_SEMANTICS}
+        text.hybrid_override_pattern = _truncate_hybrid_override_pattern(
+            text.hybrid_override_pattern,
+            source_depth=int(text.num_hidden_layers),
+            target_depth=13,
+            model_key=model_key,
+        )
+        compact = _set(
+            _common(config, layers=13, hidden=256, **common),
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            moe_shared_expert_intermediate_size=512,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=32,
+            mamba_num_heads=8,
+            mamba_head_dim=32,
+            n_groups=2,
+            ssm_state_size=32,
+            **semantics,
+        )
+        _require_nemotron_h_semantics(compact)
+        return compact
     family = model_key.rsplit("_", 1)[0]
     if family in _MULTIMODAL_SHAPES:
         moe = model_key.endswith("_moe")
@@ -473,6 +568,8 @@ def _functional_config(
     source_depth = text.get("num_hidden_layers")
     if type(source_depth) is not int or source_depth < plan.depth:
         raise RuntimeError(f"{model_key} has invalid production depth")
+    if model_key == "nemotron_h_moe":
+        _require_nemotron_h_semantics(text)
     reduced = json.loads(json.dumps(source))
     reduced_text = _config_text(reduced, plan)
     reduced_text["num_hidden_layers"] = plan.depth
@@ -482,20 +579,31 @@ def _functional_config(
         if type(count) is not int or count < 0:
             raise RuntimeError(f"{model_key} has invalid {count_field}")
         reduced_text[count_field] = 0
-    patterns: dict[str, list[object]] = {}
+    patterns: dict[str, object] = {}
     for field in _FUNCTIONAL_LAYER_FIELDS:
         if (values := text.get(field)) is not None:
             if not isinstance(values, list) or len(values) != source_depth:
                 raise RuntimeError(f"{model_key} production {field} is incomplete")
             patterns[field] = values[: plan.depth]
             reduced_text[field] = patterns[field]
+    if _HYBRID_PATTERN_FIELD in text:
+        pattern = _truncate_hybrid_override_pattern(
+            text[_HYBRID_PATTERN_FIELD],
+            source_depth=source_depth,
+            target_depth=plan.depth,
+            model_key=model_key,
+        )
+        patterns[_HYBRID_PATTERN_FIELD] = pattern
+        reduced_text[_HYBRID_PATTERN_FIELD] = pattern
     for field, expected in _FUNCTIONAL_PATTERNS.get(model_key, {}).items():
-        if tuple(patterns.get(field, ())) != expected:
+        actual = patterns.get(field)
+        if (tuple(actual) if isinstance(actual, list) else actual) != expected:
             raise RuntimeError(f"{model_key} production {field} pattern changed")
 
     shape_exclusions = (
         "num_hidden_layers",
         *_FUNCTIONAL_LAYER_FIELDS,
+        _HYBRID_PATTERN_FIELD,
         *((plan.auxiliary[1],) if plan.auxiliary else ()),
     )
     width = {"text": _config_shape(text, *shape_exclusions)}
@@ -1038,13 +1146,14 @@ def _validate_tokenizer_compatible_fixture(
 
 
 def _functional_contract_sha256(model_key: str) -> str:
-    return _json_sha256(
-        (
-            _FUNCTIONAL_FIXTURE_VERSION,
-            _functional_plan(model_key).model_dump(mode="json"),
-            _FUNCTIONAL_PATTERNS.get(model_key),
-        )
+    contract = (
+        _FUNCTIONAL_FIXTURE_VERSION,
+        _functional_plan(model_key).model_dump(mode="json"),
+        _FUNCTIONAL_PATTERNS.get(model_key),
     )
+    if model_key == "nemotron_h_moe":
+        contract += (_NEMOTRON_H_SEMANTICS,)
+    return _json_sha256(contract)
 
 
 def _write_functional_weights(

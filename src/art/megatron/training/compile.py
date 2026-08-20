@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, cast
 
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
 from torch._dynamo import config as dynamo_config
@@ -41,9 +42,11 @@ def _set_child_module(
     setattr(parent, name, child)
 
 
-def _compile_transformer_layers(module: torch.nn.Module) -> None:
+def _compile_stateful_layers(module: torch.nn.Module) -> None:
     for name, child in list(module.named_children()):
-        if isinstance(child, TransformerLayer):
+        if isinstance(getattr(child, "_orig_mod", None), TransformerLayer | MambaLayer):
+            continue
+        if isinstance(child, TransformerLayer | MambaLayer):
             physical_forward = getattr(child, "_art_gdn_island_physical_forward", None)
             if callable(physical_forward):
                 setattr(
@@ -55,7 +58,7 @@ def _compile_transformer_layers(module: torch.nn.Module) -> None:
             compiled_child = cast(torch.nn.Module, torch.compile(child))
             _set_child_module(parent=module, name=name, child=compiled_child)
             continue
-        _compile_transformer_layers(child)
+        _compile_stateful_layers(child)
 
 
 def configure_training_compile(
@@ -83,5 +86,5 @@ def configure_training_compile(
     if transformer_layers_compiled:
         _configure_dynamo()
         for chunk in model:
-            _compile_transformer_layers(chunk)
+            _compile_stateful_layers(chunk)
     return transformer_layers_compiled

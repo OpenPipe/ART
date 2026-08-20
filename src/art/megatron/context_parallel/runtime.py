@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, is_dataclass, replace
 import hashlib
 import json
 from threading import Lock
@@ -11,6 +11,12 @@ from pydantic import BaseModel
 import torch
 
 from art.loss import shift_tensor
+from art.megatron.recurrent import (
+    LinearRecurrentContract,
+    RecurrentPackedExecutionSpec,
+    get_recurrent_family_adapter,
+    parse_recurrent_prefix_tree_segments,
+)
 from art.megatron.selective_lm_head import LmHeadTokenSelection
 from art.preprocessing.pack import PackedTensors
 
@@ -55,14 +61,16 @@ class _PlanningBundle:
     owners: tuple[int, ...]
     wave_assignment: tuple[int, ...]
     token_layout_index: TokenLayoutIndex
-    gdn_execution_spec: Any | None = None
+    recurrent_execution_spec: RecurrentPackedExecutionSpec | None = None
 
 
 _PLANNING_BUNDLE_CACHE: dict[str, _PlanningBundle] = {}
 _RUNTIME_PLAN_CACHE: dict[str, tuple[RankRuntimePlan, ...]] = {}
 _RANK_RUNTIME_PLAN_CACHE: dict[tuple[str, int], RankRuntimePlan] = {}
-_GDN_GLOBAL_DECISION_CACHE: dict[tuple[str, str], Any] = {}
-_GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int, str], Any] = {}
+_RECURRENT_GLOBAL_DECISION_CACHE: dict[tuple[str, tuple[str, ...], str], Any] = {}
+_RECURRENT_RANK_PLAN_CACHE: dict[
+    tuple[str, tuple[str, ...], str, int, str, int | None], Any
+] = {}
 _PLAN_CACHE_LOCK = Lock()
 
 
@@ -110,7 +118,7 @@ def _planning_bundle_cache_key(
     topology: ParallelTopology,
     config: ContextParallelConfig,
     original_seq_len: int,
-    build_gdn_execution_spec: bool,
+    linear_recurrent_contract: LinearRecurrentContract | None,
 ) -> str:
     return _json_cache_key(
         {
@@ -119,7 +127,7 @@ def _planning_bundle_cache_key(
             "topology": _dataclass_payload(topology),
             "config": _dataclass_payload(config),
             "original_seq_len": int(original_seq_len),
-            "build_gdn_execution_spec": bool(build_gdn_execution_spec),
+            "build_recurrent_execution_spec": linear_recurrent_contract is not None,
         }
     )
 
@@ -131,7 +139,7 @@ def _get_or_build_planning_bundle(
     topology: ParallelTopology,
     config: ContextParallelConfig,
     original_seq_len: int,
-    build_gdn_execution_spec: bool,
+    linear_recurrent_contract: LinearRecurrentContract | None,
 ) -> tuple[str, _PlanningBundle, torch.Tensor, torch.Tensor]:
     group_ids_cpu = _planning_metadata_cpu(group_ids)
     parent_ids_cpu = _planning_metadata_cpu(parent_ids)
@@ -141,7 +149,7 @@ def _get_or_build_planning_bundle(
         topology=topology,
         config=config,
         original_seq_len=original_seq_len,
-        build_gdn_execution_spec=build_gdn_execution_spec,
+        linear_recurrent_contract=linear_recurrent_contract,
     )
     bundle = _PLANNING_BUNDLE_CACHE.get(planning_key)
     if bundle is not None:
@@ -151,11 +159,9 @@ def _get_or_build_planning_bundle(
         group_ids=group_ids_cpu,
         parent_ids=parent_ids_cpu,
     )
-    gdn_execution_spec = None
-    if build_gdn_execution_spec:
-        from art.megatron.gdn.gdn_prefix_tree import parse_gdn_prefix_tree_segments
-
-        gdn_execution_spec = parse_gdn_prefix_tree_segments(
+    recurrent_execution_spec = None
+    if linear_recurrent_contract is not None:
+        recurrent_execution_spec = parse_recurrent_prefix_tree_segments(
             group_ids_cpu,
             parent_ids_cpu,
         )
@@ -175,7 +181,7 @@ def _get_or_build_planning_bundle(
             owners=owners,
             cp_size=max(int(topology.cp), 1),
         ),
-        gdn_execution_spec=gdn_execution_spec,
+        recurrent_execution_spec=recurrent_execution_spec,
     )
     _cache_put(_PLANNING_BUNDLE_CACHE, planning_key, bundle)
     return planning_key, bundle, group_ids_cpu, parent_ids_cpu
@@ -215,140 +221,232 @@ def _get_or_build_bundle_rank_plan(
     return plan
 
 
-def _gdn_planner_config_cache_key(gdn_planner_config: Any | None) -> str:
-    return (
-        _json_cache_key(_dataclass_payload(gdn_planner_config))
-        if gdn_planner_config is not None
-        else ""
-    )
+def _recurrent_contract_identity(contract: Any) -> tuple[str, ...]:
+    if not isinstance(contract, LinearRecurrentContract):
+        raise TypeError("linear recurrent contract must be LinearRecurrentContract")
+    return tuple(contract.planning_identity)
 
 
-def _gdn_rank_plan_cache_key(
+def _recurrent_planner_config_cache_key(planner_config: Any | None) -> str:
+    if planner_config is None:
+        return ""
+    if isinstance(planner_config, BaseModel):
+        if not bool(planner_config.model_config.get("frozen", False)):
+            raise TypeError("linear recurrent planner config must be frozen")
+        return _json_cache_key(planner_config.model_dump(mode="json"))
+    dataclass_params = getattr(type(planner_config), "__dataclass_params__", None)
+    if is_dataclass(planner_config) and bool(
+        getattr(dataclass_params, "frozen", False)
+    ):
+        return _json_cache_key(_dataclass_payload(planner_config))
+    raise TypeError("linear recurrent planner config must be immutable")
+
+
+def _recurrent_rank_plan_cache_key(
     *,
     planning_key: str,
+    contract: LinearRecurrentContract,
+    planner_config: Any | None,
     cp_rank: int,
-    gdn_planner_config: Any | None,
     device: torch.device,
-) -> tuple[str, str, int | None, int, str]:
+) -> tuple[str, tuple[str, ...], str, int, str, int | None]:
     return (
         planning_key,
+        _recurrent_contract_identity(contract),
+        _recurrent_planner_config_cache_key(planner_config),
+        int(cp_rank),
         device.type,
         device.index,
-        int(cp_rank),
-        _gdn_planner_config_cache_key(gdn_planner_config),
     )
 
 
-def _plan_gdn_global_execution(
+def _plan_recurrent_global_execution(
     *,
     planning_key: str,
     bundle: _PlanningBundle,
     topology: ParallelTopology,
-    gdn_planner_config: Any | None,
+    contract: LinearRecurrentContract,
+    planner_config: Any | None,
 ) -> Any:
-    """Select one all-rank GDN decision without rank-local tensors."""
-    if bundle.gdn_execution_spec is None:
-        raise RuntimeError("GDN CP planning requires a parsed execution spec")
+    """Select one family-discriminated all-rank decision without device tensors."""
+    spec = bundle.recurrent_execution_spec
+    if spec is None:
+        raise RuntimeError("recurrent CP planning requires a parsed execution spec")
+    contract_identity = _recurrent_contract_identity(contract)
+    adapter = get_recurrent_family_adapter(contract)
+    adapter.validate_planning_inputs(contract, planner_config)
     cache_key = (
         planning_key,
-        _gdn_planner_config_cache_key(gdn_planner_config),
+        contract_identity,
+        _recurrent_planner_config_cache_key(planner_config),
     )
-    cached = _GDN_GLOBAL_DECISION_CACHE.get(cache_key)
+    cached = _RECURRENT_GLOBAL_DECISION_CACHE.get(cache_key)
     if cached is not None:
+        if not isinstance(cached, adapter.global_decision_type):
+            raise TypeError("cached recurrent global decision has the wrong type")
+        adapter.validate_global_decision(
+            spec,
+            cached,
+            contract=contract,
+            token_layout_index=bundle.token_layout_index,
+            cp_size=int(topology.cp),
+            planner_config=planner_config,
+        )
         return cached
-
-    from art.megatron.gdn.gdn_prefix_tree import (
-        build_gdn_global_execution_decision,
-    )
-
-    decision = build_gdn_global_execution_decision(
-        bundle.gdn_execution_spec,
+    decision = adapter.build_global_decision(
+        spec,
+        contract=contract,
+        token_layout_index=bundle.token_layout_index,
         cp_size=int(topology.cp),
-        attention_token_layout_index=bundle.token_layout_index,
-        planner_config=gdn_planner_config,
+        planner_config=planner_config,
     )
-    _cache_put(_GDN_GLOBAL_DECISION_CACHE, cache_key, decision)
+    if not isinstance(decision, adapter.global_decision_type):
+        raise TypeError("recurrent adapter returned the wrong global-decision type")
+    adapter.validate_global_decision(
+        spec,
+        decision,
+        contract=contract,
+        token_layout_index=bundle.token_layout_index,
+        cp_size=int(topology.cp),
+        planner_config=planner_config,
+    )
+    _cache_put(_RECURRENT_GLOBAL_DECISION_CACHE, cache_key, decision)
     return decision
 
 
-def _plan_gdn_rank_execution(
+def _plan_recurrent_rank_execution(
     *,
     planning_key: str,
     bundle: _PlanningBundle,
     topology: ParallelTopology,
+    contract: LinearRecurrentContract,
     cp_rank: int,
-    gdn_planner_config: Any | None,
+    planner_config: Any | None,
 ) -> Any:
-    """Plan one GDN rank on CPU at the explicit CP planning boundary."""
-    if bundle.gdn_execution_spec is None:
-        raise RuntimeError("GDN CP planning requires a parsed execution spec")
-    cache_key = _gdn_rank_plan_cache_key(
+    """Plan one recurrent rank on CPU at the explicit CP planning boundary."""
+    spec = bundle.recurrent_execution_spec
+    if spec is None:
+        raise RuntimeError("recurrent CP planning requires a parsed execution spec")
+    _recurrent_contract_identity(contract)
+    adapter = get_recurrent_family_adapter(contract)
+    adapter.validate_planning_inputs(contract, planner_config)
+    cache_key = _recurrent_rank_plan_cache_key(
         planning_key=planning_key,
+        contract=contract,
+        planner_config=planner_config,
         cp_rank=cp_rank,
-        gdn_planner_config=gdn_planner_config,
         device=torch.device("cpu"),
     )
-    cached = _GDN_RANK_PLAN_CACHE.get(cache_key)
+    cached = _RECURRENT_RANK_PLAN_CACHE.get(cache_key)
     if cached is not None:
+        if not isinstance(cached, adapter.rank_plan_type):
+            raise TypeError("cached recurrent rank plan has the wrong type")
+        adapter.validate_rank_plan(
+            spec,
+            cached,
+            contract=contract,
+            cp_rank=int(cp_rank),
+            planner_config=planner_config,
+            device="cpu",
+        )
         return cached
-
-    decision = _plan_gdn_global_execution(
+    decision = _plan_recurrent_global_execution(
         planning_key=planning_key,
         bundle=bundle,
         topology=topology,
-        gdn_planner_config=gdn_planner_config,
+        contract=contract,
+        planner_config=planner_config,
     )
-    from art.megatron.gdn.gdn_prefix_tree import materialize_gdn_rank_execution_plan
-
-    plan = materialize_gdn_rank_execution_plan(
-        bundle.gdn_execution_spec,
+    plan = adapter.build_rank_plan(
+        spec,
         decision,
-        device="cpu",
+        contract=contract,
         cp_rank=int(cp_rank),
-        planner_config=gdn_planner_config,
+        planner_config=planner_config,
     )
-    _cache_put(_GDN_RANK_PLAN_CACHE, cache_key, plan)
+    if not isinstance(plan, adapter.rank_plan_type):
+        raise TypeError("recurrent adapter returned the wrong rank-plan type")
+    adapter.validate_rank_plan(
+        spec,
+        plan,
+        contract=contract,
+        cp_rank=int(cp_rank),
+        planner_config=planner_config,
+        device="cpu",
+    )
+    _cache_put(_RECURRENT_RANK_PLAN_CACHE, cache_key, plan)
     return plan
 
 
-def _materialize_preplanned_gdn_rank_execution(
+def _materialize_preplanned_recurrent_rank_execution(
     *,
     planning_key: str,
+    spec: RecurrentPackedExecutionSpec,
+    contract: LinearRecurrentContract,
+    planner_config: Any | None,
     cp_rank: int,
-    gdn_planner_config: Any | None,
     device: torch.device,
 ) -> Any:
-    """Materialize a CPU-planned GDN rank without permitting late planning."""
-    cpu_key = _gdn_rank_plan_cache_key(
+    """Materialize a CPU-planned rank without permitting late planning."""
+    _recurrent_contract_identity(contract)
+    adapter = get_recurrent_family_adapter(contract)
+    adapter.validate_planning_inputs(contract, planner_config)
+    cpu_key = _recurrent_rank_plan_cache_key(
         planning_key=planning_key,
+        contract=contract,
+        planner_config=planner_config,
         cp_rank=cp_rank,
-        gdn_planner_config=gdn_planner_config,
         device=torch.device("cpu"),
     )
-    cpu_plan = _GDN_RANK_PLAN_CACHE.get(cpu_key)
+    cpu_plan = _RECURRENT_RANK_PLAN_CACHE.get(cpu_key)
     if cpu_plan is None:
         raise RuntimeError(
-            "GDN execution plan was not built at the CPU planning boundary"
+            "recurrent execution plan was not built at the CPU planning boundary"
         )
+    if not isinstance(cpu_plan, adapter.rank_plan_type):
+        raise TypeError("cached recurrent CPU rank plan has the wrong type")
+    adapter.validate_rank_plan(
+        spec,
+        cpu_plan,
+        contract=contract,
+        cp_rank=int(cp_rank),
+        planner_config=planner_config,
+        device="cpu",
+    )
     if device.type == "cpu":
         return cpu_plan
-
-    device_key = _gdn_rank_plan_cache_key(
+    device_key = _recurrent_rank_plan_cache_key(
         planning_key=planning_key,
+        contract=contract,
+        planner_config=planner_config,
         cp_rank=cp_rank,
-        gdn_planner_config=gdn_planner_config,
         device=device,
     )
-    device_plan = _GDN_RANK_PLAN_CACHE.get(device_key)
+    device_plan = _RECURRENT_RANK_PLAN_CACHE.get(device_key)
     if device_plan is not None:
+        if not isinstance(device_plan, adapter.rank_plan_type):
+            raise TypeError("cached recurrent device rank plan has the wrong type")
+        adapter.validate_rank_plan(
+            spec,
+            device_plan,
+            contract=contract,
+            cp_rank=int(cp_rank),
+            planner_config=planner_config,
+            device=device,
+        )
         return device_plan
-
-    from art.megatron.gdn.gdn_prefix_tree import (
-        move_gdn_rank_execution_plan_to_device,
+    device_plan = adapter.materialize_rank_plan(cpu_plan, device=device)
+    if not isinstance(device_plan, adapter.rank_plan_type):
+        raise TypeError("recurrent adapter materialized the wrong rank-plan type")
+    adapter.validate_rank_plan(
+        spec,
+        device_plan,
+        contract=contract,
+        cp_rank=int(cp_rank),
+        planner_config=planner_config,
+        device=device,
     )
-
-    device_plan = move_gdn_rank_execution_plan_to_device(cpu_plan, device)
-    _cache_put(_GDN_RANK_PLAN_CACHE, device_key, device_plan)
+    _cache_put(_RECURRENT_RANK_PLAN_CACHE, device_key, device_plan)
     return device_plan
 
 
@@ -359,8 +457,8 @@ def context_parallel_rank_model_token_counts(
     topology: ParallelTopology,
     config: ContextParallelConfig,
     original_seq_len: int,
-    build_gdn_execution_spec: bool,
-    gdn_planner_config: Any | None = None,
+    linear_recurrent_contract: LinearRecurrentContract | None,
+    recurrent_planner_config: Any | None = None,
 ) -> tuple[int, ...]:
     """Return each CP rank's maximum model rows across physical layouts."""
     planning_key, bundle, _group_ids_cpu, _parent_ids_cpu = (
@@ -370,23 +468,37 @@ def context_parallel_rank_model_token_counts(
             topology=topology,
             config=config,
             original_seq_len=original_seq_len,
-            build_gdn_execution_spec=build_gdn_execution_spec,
+            linear_recurrent_contract=linear_recurrent_contract,
         )
     )
     attention_counts = bundle.token_layout_index.token_counts_by_rank
-    if not build_gdn_execution_spec:
+    if linear_recurrent_contract is None:
+        if recurrent_planner_config is not None:
+            raise ValueError("planner config requires a linear recurrent contract")
         return attention_counts
-    decision = _plan_gdn_global_execution(
+    decision = _plan_recurrent_global_execution(
         planning_key=planning_key,
         bundle=bundle,
         topology=topology,
-        gdn_planner_config=gdn_planner_config,
+        contract=linear_recurrent_contract,
+        planner_config=recurrent_planner_config,
     )
-    gdn_counts = decision.gdn_token_counts_by_rank
-    return tuple(
-        max(attention_count, gdn_count)
-        for attention_count, gdn_count in zip(attention_counts, gdn_counts, strict=True)
-    )
+    model_counts = get_recurrent_family_adapter(
+        linear_recurrent_contract
+    ).model_token_counts(decision, attention_token_counts=attention_counts)
+    if len(model_counts) != len(attention_counts) or any(
+        not isinstance(model_count, int)
+        or isinstance(model_count, bool)
+        or model_count < attention_count
+        for model_count, attention_count in zip(
+            model_counts, attention_counts, strict=True
+        )
+    ):
+        raise ValueError(
+            "recurrent model token counts must be nonnegative integers covering "
+            "every attention token"
+        )
+    return model_counts
 
 
 def _normalized_chunk_size(
@@ -2185,8 +2297,8 @@ def prepare_cp_micro(
     config: ContextParallelConfig,
     cp_group: Any,
     cp_rank: int,
-    build_gdn_execution_spec: bool = False,
-    gdn_planner_config: Any | None = None,
+    linear_recurrent_contract: LinearRecurrentContract | None = None,
+    recurrent_planner_config: Any | None = None,
     trace_token_uids: bool = False,
     prepare_execution_state: bool = True,
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
@@ -2214,8 +2326,8 @@ def prepare_cp_micro(
         config=config,
         cp_group=cp_group,
         cp_rank=cp_rank,
-        build_gdn_execution_spec=build_gdn_execution_spec,
-        gdn_planner_config=gdn_planner_config,
+        linear_recurrent_contract=linear_recurrent_contract,
+        recurrent_planner_config=recurrent_planner_config,
         block_mask_variants=block_mask_variants,
         target_device=target_device,
     )
@@ -2243,6 +2355,9 @@ def prepare_cp_micro(
                     attention_head_dim=attention_head_dim,
                     attention_value_head_dim=attention_value_head_dim,
                     context_parallel_state=state,
+                    linear_recurrent_contract=state.linear_recurrent_contract,
+                    recurrent_execution_spec=state.recurrent_execution_spec,
+                    recurrent_execution_plan=state.recurrent_execution_plan,
                 )
             )
         )
@@ -2273,8 +2388,8 @@ def preplan_megatron_context_parallel_state(
     topology: ParallelTopology,
     config: ContextParallelConfig,
     cp_rank: int,
-    build_gdn_execution_spec: bool = False,
-    gdn_planner_config: Any | None = None,
+    linear_recurrent_contract: LinearRecurrentContract | None = None,
+    recurrent_planner_config: Any | None = None,
 ) -> str:
     """Warm one rank's immutable CPU plans without touching CUDA or collectives."""
     if int(topology.cp) <= 1:
@@ -2285,7 +2400,7 @@ def preplan_megatron_context_parallel_state(
         topology=topology,
         config=config,
         original_seq_len=original_seq_len,
-        build_gdn_execution_spec=build_gdn_execution_spec,
+        linear_recurrent_contract=linear_recurrent_contract,
     )
     _get_or_build_bundle_rank_plan(
         planning_key=planning_key,
@@ -2294,14 +2409,17 @@ def preplan_megatron_context_parallel_state(
         target_rank=cp_rank,
         block_size=int(config.block_size),
     )
-    if build_gdn_execution_spec:
-        _plan_gdn_rank_execution(
+    if linear_recurrent_contract is not None:
+        _plan_recurrent_rank_execution(
             planning_key=planning_key,
             bundle=bundle,
             topology=topology,
             cp_rank=cp_rank,
-            gdn_planner_config=gdn_planner_config,
+            contract=linear_recurrent_contract,
+            planner_config=recurrent_planner_config,
         )
+    elif recurrent_planner_config is not None:
+        raise ValueError("planner config requires a linear recurrent contract")
     return planning_key
 
 
@@ -2312,8 +2430,8 @@ def prepare_megatron_context_parallel_state(
     config: ContextParallelConfig,
     cp_group: Any,
     cp_rank: int,
-    build_gdn_execution_spec: bool = False,
-    gdn_planner_config: Any | None = None,
+    linear_recurrent_contract: LinearRecurrentContract | None = None,
+    recurrent_planner_config: Any | None = None,
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
     target_device: torch.device | None = None,
 ) -> tuple[ArtContextParallelState, RankRuntimePlan, PackedBatchAttentionSpec, int]:
@@ -2345,7 +2463,7 @@ def prepare_megatron_context_parallel_state(
         topology=topology,
         config=config,
         original_seq_len=int(micro["tokens"].shape[1]),
-        build_gdn_execution_spec=build_gdn_execution_spec,
+        linear_recurrent_contract=linear_recurrent_contract,
     )
     rank_plan = _get_or_build_bundle_rank_plan(
         planning_key=planning_key,
@@ -2354,24 +2472,32 @@ def prepare_megatron_context_parallel_state(
         target_rank=cp_rank,
         block_size=int(config.block_size),
     )
-    gdn_execution_plan = None
-    if build_gdn_execution_spec:
-        _plan_gdn_rank_execution(
+    recurrent_execution_plan = None
+    if linear_recurrent_contract is not None:
+        recurrent_spec = bundle.recurrent_execution_spec
+        if recurrent_spec is None:
+            raise RuntimeError("recurrent CP planning requires a parsed execution spec")
+        _plan_recurrent_rank_execution(
             planning_key=planning_key,
             bundle=bundle,
             topology=topology,
             cp_rank=cp_rank,
-            gdn_planner_config=gdn_planner_config,
+            contract=linear_recurrent_contract,
+            planner_config=recurrent_planner_config,
         )
-        gdn_plan_device = (
+        recurrent_plan_device = (
             target_device if target_device is not None else micro["tokens"].device
         )
-        gdn_execution_plan = _materialize_preplanned_gdn_rank_execution(
+        recurrent_execution_plan = _materialize_preplanned_recurrent_rank_execution(
             planning_key=planning_key,
+            spec=recurrent_spec,
+            contract=linear_recurrent_contract,
+            planner_config=recurrent_planner_config,
             cp_rank=cp_rank,
-            gdn_planner_config=gdn_planner_config,
-            device=gdn_plan_device,
+            device=recurrent_plan_device,
         )
+    elif recurrent_planner_config is not None:
+        raise ValueError("planner config requires a linear recurrent contract")
     pad_multiple = int(topology.tp) if bool(topology.sp) and int(topology.tp) > 1 else 1
     state = ArtContextParallelState(
         rank_plan=rank_plan,
@@ -2381,8 +2507,9 @@ def prepare_megatron_context_parallel_state(
         parent_ids=parent_ids_cpu[0].contiguous(),
         input_pos=input_pos_cpu[0].contiguous(),
         block_mask_variants=block_mask_variants,
-        gdn_execution_spec=bundle.gdn_execution_spec,
-        gdn_execution_plan=gdn_execution_plan,
+        linear_recurrent_contract=linear_recurrent_contract,
+        recurrent_execution_spec=bundle.recurrent_execution_spec,
+        recurrent_execution_plan=recurrent_execution_plan,
         trace_token_uids=None,
     )
     return state, rank_plan, bundle.spec, pad_multiple

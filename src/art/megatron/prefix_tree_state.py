@@ -1,4 +1,4 @@
-"""Prefix-tree packed-sequence state for ART attention and GDN integration."""
+"""Prefix-tree packed-sequence state for ART attention and recurrent layers."""
 
 from __future__ import annotations
 
@@ -28,25 +28,24 @@ from art.megatron.flex_attn.attention import (
     PrefixTreeAttentionState as FlexPrefixTreeAttentionState,
 )
 from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
-from art.megatron.gdn.gdn_prefix_tree import (
-    GdnPackedExecutionSpec,
-    GdnPlannerConfig,
-    GdnRankExecutionPlan,
-    build_gdn_rank_execution_plan,
-    move_gdn_rank_execution_plan_to_device,
-    parse_gdn_prefix_tree_segments,
-)
 from art.megatron.model_support.spec import PrefixTreeModelStateContext
+from art.megatron.recurrent import (
+    LinearRecurrentContract,
+    RecurrentPackedExecutionSpec,
+    get_recurrent_family_adapter,
+    parse_recurrent_prefix_tree_segments,
+)
 
 
 class PrefixTreeAttentionState(FlexPrefixTreeAttentionState):
-    """Prefix-tree sparsity and optional GDN execution metadata."""
+    """Prefix-tree sparsity and optional recurrent execution metadata."""
 
     group_ids: Tensor
     parent_ids: Tensor
     model_state: dict[str, Any] = Field(default_factory=dict)
-    gdn_execution_spec: GdnPackedExecutionSpec | None = None
-    gdn_execution_plan: GdnRankExecutionPlan | None = None
+    linear_recurrent_contract: LinearRecurrentContract | None = None
+    recurrent_execution_spec: RecurrentPackedExecutionSpec | None = None
+    recurrent_execution_plan: Any | None = None
     gdn_hidden_layout: str = "attention"
     gdn_input_layout: str | None = None
     gdn_output_layout: str | None = None
@@ -65,14 +64,14 @@ def create_prefix_tree_state(
     target_device: torch.device | None = None,
     input_pos: Tensor | None = None,
     sliding_windows: tuple[int, ...] = (),
-    build_gdn_execution_spec: bool = False,
+    linear_recurrent_contract: LinearRecurrentContract | None = None,
     model_support_handler: Any | None = None,
     attention_token_layout_index: TokenLayoutIndex | None = None,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
-    gdn_planner_config: GdnPlannerConfig | None = None,
+    recurrent_planner_config: Any | None = None,
 ) -> PrefixTreeAttentionState:
-    """Build prefix-tree attention mask state plus optional reusable GDN plan."""
+    """Build prefix-tree attention state plus an optional recurrent plan."""
     device = group_ids.device if target_device is None else torch.device(target_device)
     group_ids_cpu = _metadata_cpu(group_ids)
     parent_ids_cpu = _metadata_cpu(parent_ids)
@@ -101,14 +100,23 @@ def create_prefix_tree_state(
         )
         for window in tuple(dict.fromkeys(int(window) for window in sliding_windows))
     }
-    cp_rank, cp_size = _gdn_cp_rank_size()
-    gdn_execution_spec = (
-        parse_gdn_prefix_tree_segments(
+    cp_rank, cp_size = _cp_rank_size()
+    recurrent_execution_spec = (
+        parse_recurrent_prefix_tree_segments(
             group_ids_cpu,
             parent_ids_cpu,
         )
-        if build_gdn_execution_spec
+        if linear_recurrent_contract is not None
         else None
+    )
+    recurrent_execution_plan = _build_recurrent_execution_plan_once(
+        recurrent_execution_spec,
+        contract=linear_recurrent_contract,
+        device=device,
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        attention_token_layout_index=attention_token_layout_index,
+        planner_config=recurrent_planner_config,
     )
     return PrefixTreeAttentionState(
         block_mask=block_mask,
@@ -124,16 +132,13 @@ def create_prefix_tree_state(
             attention_token_layout_index=attention_token_layout_index,
             attention_head_dim=attention_head_dim,
             attention_value_head_dim=attention_value_head_dim,
+            linear_recurrent_contract=linear_recurrent_contract,
+            recurrent_execution_spec=recurrent_execution_spec,
+            recurrent_execution_plan=recurrent_execution_plan,
         ),
-        gdn_execution_spec=gdn_execution_spec,
-        gdn_execution_plan=_build_gdn_execution_plan_once(
-            gdn_execution_spec,
-            device=device,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            attention_token_layout_index=attention_token_layout_index,
-            planner_config=gdn_planner_config,
-        ),
+        linear_recurrent_contract=linear_recurrent_contract,
+        recurrent_execution_spec=recurrent_execution_spec,
+        recurrent_execution_plan=recurrent_execution_plan,
     )
 
 
@@ -147,6 +152,9 @@ def _build_model_state_once(
     attention_token_layout_index: TokenLayoutIndex | None,
     attention_head_dim: int | None,
     attention_value_head_dim: int | None,
+    linear_recurrent_contract: LinearRecurrentContract | None,
+    recurrent_execution_spec: RecurrentPackedExecutionSpec | None,
+    recurrent_execution_plan: Any | None,
 ) -> dict[str, Any]:
     if model_support_handler is None:
         return {}
@@ -160,6 +168,9 @@ def _build_model_state_once(
                 attention_token_layout_index=attention_token_layout_index,
                 attention_head_dim=attention_head_dim,
                 attention_value_head_dim=attention_value_head_dim,
+                linear_recurrent_contract=linear_recurrent_contract,
+                recurrent_execution_spec=recurrent_execution_spec,
+                recurrent_execution_plan=recurrent_execution_plan,
             )
         )
     )
@@ -351,45 +362,107 @@ def _prefix_tree_block_size(
     )
 
 
-def _build_gdn_execution_plan_once(
-    spec: GdnPackedExecutionSpec | None,
+def _build_recurrent_execution_plan_once(
+    spec: RecurrentPackedExecutionSpec | None,
     *,
+    contract: LinearRecurrentContract | None,
     device: torch.device,
     cp_rank: int,
     cp_size: int,
     attention_token_layout_index: TokenLayoutIndex | None,
-    planner_config: GdnPlannerConfig | None,
-) -> GdnRankExecutionPlan | None:
+    planner_config: Any | None,
+) -> Any | None:
     if spec is None:
+        if contract is not None or planner_config is not None:
+            raise ValueError("recurrent contract/config requires an execution spec")
         return None
-    planner_device = torch.device("cpu") if device.type == "cuda" else device
+    if contract is None:
+        raise ValueError("recurrent execution spec requires a contract")
+    from art.megatron.context_parallel.runtime import (
+        _recurrent_contract_identity,
+        _recurrent_planner_config_cache_key,
+    )
+
+    _recurrent_contract_identity(contract)
+    _recurrent_planner_config_cache_key(planner_config)
+    adapter = get_recurrent_family_adapter(contract)
+    adapter.validate_planning_inputs(contract, planner_config)
     gc_was_enabled = gc.isenabled()
     if gc_was_enabled:
         gc.disable()
     try:
-        plan = build_gdn_rank_execution_plan(
+        if attention_token_layout_index is None:
+            if (cp_rank, cp_size) != (0, 1):
+                raise ValueError(
+                    "recurrent CP planning requires an attention token layout"
+                )
+            attention_token_layout_index = TokenLayoutIndex(
+                ownership_ranges_by_rank=(((0, spec.real_token_count, 0),),),
+                token_counts_by_rank=(spec.real_token_count,),
+            )
+        decision = adapter.build_global_decision(
             spec,
-            device=planner_device,
-            cp_rank=cp_rank,
+            contract=contract,
+            token_layout_index=attention_token_layout_index,
             cp_size=cp_size,
-            attention_token_layout_index=attention_token_layout_index,
             planner_config=planner_config,
+        )
+        if not isinstance(decision, adapter.global_decision_type):
+            raise TypeError("recurrent adapter returned the wrong global-decision type")
+        adapter.validate_global_decision(
+            spec,
+            decision,
+            contract=contract,
+            token_layout_index=attention_token_layout_index,
+            cp_size=cp_size,
+            planner_config=planner_config,
+        )
+        plan = adapter.build_rank_plan(
+            spec,
+            decision,
+            contract=contract,
+            cp_rank=cp_rank,
+            planner_config=planner_config,
+        )
+        if not isinstance(plan, adapter.rank_plan_type):
+            raise TypeError("recurrent adapter returned the wrong rank-plan type")
+        adapter.validate_rank_plan(
+            spec,
+            plan,
+            contract=contract,
+            cp_rank=cp_rank,
+            planner_config=planner_config,
+            device="cpu",
         )
     finally:
         if gc_was_enabled:
             gc.enable()
-    return move_gdn_rank_execution_plan_to_device(plan, device)
+    if device.type == "cpu":
+        return plan
+    materialized = adapter.materialize_rank_plan(plan, device=device)
+    if not isinstance(materialized, adapter.rank_plan_type):
+        raise TypeError("recurrent adapter materialized the wrong rank-plan type")
+    adapter.validate_rank_plan(
+        spec,
+        materialized,
+        contract=contract,
+        cp_rank=cp_rank,
+        planner_config=planner_config,
+        device=device,
+    )
+    return materialized
 
 
-def _gdn_cp_rank_size() -> tuple[int, int]:
+def _cp_rank_size() -> tuple[int, int]:
     try:
         from megatron.core import parallel_state as ps
-
-        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
-            return (
-                int(ps.get_context_parallel_rank()),
-                int(ps.get_context_parallel_world_size()),
-            )
-    except Exception:
-        pass
-    return 0, 1
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"megatron", "megatron.core"}:
+            raise
+        return 0, 1
+    if not ps.model_parallel_is_initialized():
+        return 0, 1
+    return (
+        int(ps.get_context_parallel_rank()),
+        int(ps.get_context_parallel_world_size()),
+    )

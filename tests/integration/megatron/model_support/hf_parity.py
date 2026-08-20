@@ -26,6 +26,7 @@ from .oracle_harness import (
 from .oracle_worker import provider_topology_env
 from .validation_spec import MinimalLayerCoverageReport
 from .workflow import assess_minimal_layer_coverage
+from .workflow_fixtures import _truncate_hybrid_override_pattern
 
 HF_PARITY_ENABLE_ENV = "ART_RUN_HF_PARITY"
 HF_PARITY_OUTPUT_DIRNAME = "hf_parity_sft"
@@ -304,6 +305,21 @@ def set_hf_config_num_layers(config: Any, num_layers: int) -> str:
         for field in ("num_hidden_layers", "num_layers", "n_layer"):
             if not hasattr(config_view, field):
                 continue
+            source_depth = getattr(config_view, field)
+            hybrid_pattern = getattr(config_view, "hybrid_override_pattern", None)
+            if hybrid_pattern is not None:
+                if type(source_depth) is not int:
+                    raise RuntimeError("hybrid model layer depth is not an integer")
+                setattr(
+                    config_view,
+                    "hybrid_override_pattern",
+                    _truncate_hybrid_override_pattern(
+                        hybrid_pattern,
+                        source_depth=source_depth,
+                        target_depth=num_layers,
+                        model_key=type(config_view).__name__,
+                    ),
+                )
             setattr(config_view, field, num_layers)
             layer_types = getattr(config_view, "layer_types", None)
             if isinstance(layer_types, (list, tuple)):
