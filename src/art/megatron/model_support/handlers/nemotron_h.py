@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 import inspect
-import json
 from pathlib import Path
 import re
 from typing import Any, Literal, Sequence, cast
@@ -465,13 +464,14 @@ def _padding_sizes_from_hf_config(config: Any | None) -> tuple[int, int]:
 
 
 @lru_cache(maxsize=4)
-def _config_dict(base_model: str) -> dict[str, Any]:
-    path = Path(base_model) / "config.json"
-    if not path.exists():
-        from huggingface_hub import hf_hub_download
+def _materialized_hf_config(base_model: str) -> Any:
+    from transformers import AutoConfig
 
-        path = Path(hf_hub_download(base_model, "config.json"))
-    return json.loads(path.read_text(encoding="utf-8"))
+    return AutoConfig.from_pretrained(
+        base_model,
+        local_files_only=Path(base_model).exists(),
+        trust_remote_code=True,
+    )
 
 
 def _padding_sizes_from_adapter_config(
@@ -482,7 +482,7 @@ def _padding_sizes_from_adapter_config(
         raise RuntimeError(
             "Nemotron-H LoRA conversion requires base_model_name_or_path"
         )
-    _, expected = _profile_for_hf_config(_config_dict(base_model))
+    _, expected = _profile_for_hf_config(_materialized_hf_config(base_model))
     logical = expected["moe_ffn_hidden_size"]
     return (
         logical,
