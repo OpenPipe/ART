@@ -42,6 +42,10 @@ KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
 CORRECTNESS_ARTIFACT_ROOT_ENV = "ART_MODEL_SUPPORT_CORRECTNESS_ARTIFACT_ROOT"
 CORRECTNESS_PHASE_ENV = "ART_MODEL_SUPPORT_CORRECTNESS_PHASE"
 CORRECTNESS_REFERENCE_STAGE = "correctness_reference"
+HF_PARITY_PROCESS_ENV = {
+    "MAMBA_DETERMINISTIC": "1",
+    "TRITON_CACHE_AUTOTUNING": "0",
+}
 WORKFLOW_ARTIFACT_SUITE_NAME = "Megatron model-support validation workflow"
 FLASH_SENSITIVITY_MUTATION = "attn_skip_flash_lse_normalize"
 _HANDLER_INAPPLICABLE_SENSITIVITY_MUTATIONS = {
@@ -433,6 +437,8 @@ def _run_stage_in_subprocess(
     env = os.environ.copy()
     if stage_environment is not None:
         env.update(stage_environment)
+    if stage_name == "hf_parity":
+        env.update(HF_PARITY_PROCESS_ENV)
     if visible_gpu_ids is not None:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(visible_gpu_ids)
     env["WANDB_MODE"] = "disabled"

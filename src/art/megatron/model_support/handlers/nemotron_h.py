@@ -4,6 +4,8 @@ from functools import lru_cache
 import inspect
 from pathlib import Path
 import re
+import sys
+from types import MethodType
 from typing import Any, Literal, Sequence, cast
 
 import torch
@@ -40,6 +42,8 @@ _HF_STRICT_FP32_MODULES = (
     "*.mixer.D",
     "*.mixer.gate.e_score_correction_bias",
 )
+_HF_REFERENCE_PATCHES_ATTR = "_art_nemotron_h_reference_mamba_mixers"
+_HF_REFERENCE_SCAN_LENGTH_ATTR = "_art_nemotron_h_reference_scan_length"
 _MOE_FFN_ALIGNMENT = 128
 _LOGICAL_MOE_FFN_ATTR = "art_nemotron_h_logical_moe_ffn_hidden_size"
 _CONVOLUTION_WIDTH = 4
@@ -489,6 +493,162 @@ def _hf_mixed_precision_names(config: Any) -> tuple[set[str], set[str]]:
         elif symbol == "E":
             fp32.add(f"{prefix}.gate.e_score_correction_bias")
     return fp32, params_dtype
+
+
+def _hf_reference_mamba_torch_forward(
+    mixer: Any,
+    input_states: torch.Tensor,
+    cache_params: Any = None,
+    cache_position: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if cache_params is not None:
+        raise RuntimeError("Nemotron-H HF parity Mamba does not support cache state")
+    batch, sequence, _ = input_states.shape
+    scan_length = getattr(mixer, _HF_REFERENCE_SCAN_LENGTH_ATTR, None)
+    if not isinstance(scan_length, int) or not 0 < sequence <= scan_length:
+        raise RuntimeError(
+            "Nemotron-H HF parity Mamba scan span is invalid: "
+            f"sequence={sequence}, span={scan_length!r}"
+        )
+    if cache_position is not None and (
+        cache_position.dtype != torch.int64
+        or tuple(cache_position.shape) != (sequence,)
+        or not torch.equal(
+            cache_position,
+            torch.arange(sequence, device=cache_position.device),
+        )
+    ):
+        raise RuntimeError("Nemotron-H HF parity cache positions changed")
+
+    implementation = sys.modules.get(type(mixer).__module__)
+    mask_padding = getattr(implementation, "apply_mask_to_padding_states", None)
+    if not callable(mask_padding):
+        raise RuntimeError("Nemotron-H HF padding-mask helper is unavailable")
+    input_dtype = input_states.dtype
+    input_states = mask_padding(input_states, attention_mask)
+    projected = mixer.in_proj(input_states)
+    expected_width = (
+        2 * mixer.intermediate_size
+        + 2 * mixer.n_groups * mixer.ssm_state_size
+        + mixer.num_heads
+    )
+    if projected.shape[-1] != expected_width:
+        raise RuntimeError(
+            "Nemotron-H HF Mamba projection geometry changed: "
+            f"{projected.shape[-1]} != {expected_width}"
+        )
+    gate, convolved, dt = projected.split(
+        [mixer.intermediate_size, mixer.conv_dim, mixer.num_heads], dim=-1
+    )
+    convolved = mixer.act(
+        mixer.conv1d(convolved.transpose(1, 2))[..., :sequence].transpose(1, 2)
+    )
+    convolved = mask_padding(convolved, attention_mask)
+    group_width = mixer.n_groups * mixer.ssm_state_size
+    x, b, c = convolved.split(
+        [mixer.intermediate_size, group_width, group_width], dim=-1
+    )
+    x = x.view(batch, sequence, mixer.num_heads, mixer.head_dim)
+    b = b.view(batch, sequence, mixer.n_groups, mixer.ssm_state_size)
+    c = c.view(batch, sequence, mixer.n_groups, mixer.ssm_state_size)
+    padding = scan_length - sequence
+
+    def pad(value: torch.Tensor, fill: float) -> torch.Tensor:
+        tail = value.new_full((batch, padding, *value.shape[2:]), fill)
+        return torch.cat((value, tail), dim=1)
+
+    from art.megatron.mamba.operator import _mamba_chunk_scan_combined
+
+    output = _mamba_chunk_scan_combined()(
+        pad(x, 0.0),
+        pad(dt, -torch.inf),
+        -torch.exp(mixer.A_log.float()),
+        pad(b, 0.0),
+        pad(c, 0.0),
+        chunk_size=mixer.chunk_size,
+        D=mixer.D.float(),
+        z=None,
+        dt_bias=mixer.dt_bias.float(),
+        initial_states=None,
+        seq_idx=None,
+        cu_seqlens=None,
+        dt_softplus=True,
+        dt_limit=(0.0, float("inf")),
+        return_final_states=False,
+        return_varlen_states=False,
+        state_dtype=torch.float32,
+    )[:, :sequence]
+    output = mixer.norm(output.reshape(batch, sequence, -1), gate)
+    return mixer.out_proj(output.to(input_dtype))
+
+
+def _same_resolved_method(value: Any, expected: Any) -> bool:
+    return value is expected or (
+        hasattr(expected, "__func__")
+        and getattr(value, "__func__", None) is expected.__func__
+        and getattr(value, "__self__", None) is expected.__self__
+    )
+
+
+def _release_hf_reference_mamba_mixers(model: Any, *, required: bool) -> None:
+    patches = getattr(model, _HF_REFERENCE_PATCHES_ATTR, None)
+    if patches is None:
+        if required:
+            raise RuntimeError("Nemotron-H HF reference Mamba patch is missing")
+        return
+    first_error: BaseException | None = None
+
+    def record(error: BaseException) -> None:
+        nonlocal first_error
+        if first_error is None:
+            first_error = error
+        else:
+            first_error.add_note(f"additional restore failure: {error!r}")
+
+    for patch in reversed(patches):
+        mixer = patch["mixer"]
+        if patch["restore_method"]:
+            try:
+                if patch["had_instance_torch_forward"]:
+                    setattr(mixer, "torch_forward", patch["instance_torch_forward"])
+                elif "torch_forward" in mixer.__dict__:
+                    delattr(mixer, "torch_forward")
+                if not _same_resolved_method(
+                    mixer.torch_forward, patch["resolved_torch_forward"]
+                ):
+                    raise RuntimeError("restored method identity changed")
+                patch["restore_method"] = False
+            except BaseException as error:
+                record(error)
+        if patch["restore_span"]:
+            try:
+                if patch["had_scan_length"]:
+                    setattr(
+                        mixer,
+                        _HF_REFERENCE_SCAN_LENGTH_ATTR,
+                        patch["scan_length"],
+                    )
+                elif _HF_REFERENCE_SCAN_LENGTH_ATTR in mixer.__dict__:
+                    delattr(mixer, _HF_REFERENCE_SCAN_LENGTH_ATTR)
+                if (_HF_REFERENCE_SCAN_LENGTH_ATTR in mixer.__dict__) != patch[
+                    "had_scan_length"
+                ] or (
+                    patch["had_scan_length"]
+                    and mixer.__dict__[_HF_REFERENCE_SCAN_LENGTH_ATTR]
+                    is not patch["scan_length"]
+                ):
+                    raise RuntimeError("restored scan span changed")
+                patch["restore_span"] = False
+            except BaseException as error:
+                record(error)
+        patch["restored"] = not (patch["restore_method"] or patch["restore_span"])
+    if first_error is not None:
+        first_error.add_note("Nemotron-H HF reference Mamba restore failed")
+        raise first_error
+    if not all(patch["restored"] for patch in patches):
+        raise RuntimeError("Nemotron-H HF reference Mamba restore is incomplete")
+    delattr(model, _HF_REFERENCE_PATCHES_ATTR)
 
 
 @lru_cache(maxsize=4)
@@ -1544,6 +1704,143 @@ class NemotronHMoeHandler(DefaultMoeHandler):
                 "Nemotron-H HF reference mixed-precision contract changed: "
                 f"missing={sorted(missing)}, invalid={invalid}"
             )
+
+    def prepare_hf_reference_model(self, model: Any) -> Any:
+        if hasattr(model, _HF_REFERENCE_PATCHES_ATTR):
+            raise RuntimeError("Nemotron-H HF reference model is already patched")
+        setattr(model, _HF_REFERENCE_PATCHES_ATTR, [])
+        try:
+            _, profile = _profile_for_hf_config(model.config)
+            pattern = _config_value(
+                model.config, "hybrid_override_pattern", "hybrid_layer_pattern"
+            )
+            expected_names = [
+                f"backbone.layers.{index}.mixer"
+                for index, symbol in enumerate(pattern)
+                if symbol == "M"
+            ]
+            mixers = [
+                (name, module)
+                for name, module in model.named_modules()
+                if type(module).__name__ == "NemotronHMamba2Mixer"
+            ]
+            if [name for name, _ in mixers] != expected_names:
+                raise RuntimeError(
+                    "Nemotron-H HF Mamba topology changed: "
+                    f"{[name for name, _ in mixers]} != {expected_names}"
+                )
+            implementations = {
+                sys.modules.get(type(module).__module__) for _, module in mixers
+            }
+            if len(implementations) != 1 or None in implementations:
+                raise RuntimeError("Nemotron-H HF Mamba implementation module changed")
+            implementation = implementations.pop()
+            mixer_class = getattr(implementation, "NemotronHMamba2Mixer", None)
+            from art.megatron.mamba.operator import _mamba_chunk_scan_combined
+
+            scan = _mamba_chunk_scan_combined()
+            if (
+                getattr(implementation, "is_fast_path_available", None) is not False
+                or getattr(implementation, "mamba_chunk_scan_combined", None)
+                is not scan
+                or not callable(
+                    getattr(implementation, "apply_mask_to_padding_states", None)
+                )
+            ):
+                raise RuntimeError("Nemotron-H HF Mamba dependency topology changed")
+            expected_geometry = (
+                profile["hidden_size"],
+                profile["mamba_num_heads"] * profile["mamba_head_dim"],
+                profile["mamba_num_heads"],
+                profile["mamba_head_dim"],
+                profile["mamba_num_groups"],
+                profile["mamba_state_dim"],
+                _CONVOLUTION_WIDTH,
+                _LOCAL_CHUNK_SIZE,
+            )
+            patches = getattr(model, _HF_REFERENCE_PATCHES_ATTR)
+            for name, mixer in mixers:
+                observed_geometry = (
+                    mixer.hidden_size,
+                    mixer.intermediate_size,
+                    mixer.num_heads,
+                    mixer.head_dim,
+                    mixer.n_groups,
+                    mixer.ssm_state_size,
+                    mixer.conv_kernel_size,
+                    mixer.chunk_size,
+                )
+                params_dtype = mixer.in_proj.weight.dtype
+                if (
+                    type(mixer) is not mixer_class
+                    or "torch_forward" in mixer.__dict__
+                    or getattr(mixer.forward, "__func__", None)
+                    is not mixer_class.forward
+                    or observed_geometry != expected_geometry
+                    or mixer.activation not in {"silu", "swish"}
+                    or tuple(float(value) for value in mixer.time_step_limit)
+                    != (0.0, float("inf"))
+                    or mixer.A_log.dtype != torch.float32
+                    or mixer.D.dtype != torch.float32
+                    or mixer.dt_bias.dtype != params_dtype
+                ):
+                    raise RuntimeError(
+                        f"Nemotron-H HF reference mixer contract changed for {name}"
+                    )
+                patch = {
+                    "mixer": mixer,
+                    "resolved_torch_forward": mixer.torch_forward,
+                    "had_instance_torch_forward": "torch_forward" in mixer.__dict__,
+                    "instance_torch_forward": mixer.__dict__.get("torch_forward"),
+                    "had_scan_length": (
+                        _HF_REFERENCE_SCAN_LENGTH_ATTR in mixer.__dict__
+                    ),
+                    "scan_length": mixer.__dict__.get(_HF_REFERENCE_SCAN_LENGTH_ATTR),
+                    "restore_method": False,
+                    "restore_span": False,
+                    "installed": False,
+                    "restored": False,
+                }
+                patches.append(patch)
+                patch["restore_method"] = True
+                mixer.torch_forward = MethodType(
+                    _hf_reference_mamba_torch_forward, mixer
+                )
+                patch["installed"] = True
+            return model
+        except BaseException as install_error:
+            try:
+                _release_hf_reference_mamba_mixers(model, required=False)
+            except BaseException as cleanup_error:
+                raise install_error from cleanup_error
+            raise
+
+    def prepare_hf_reference_forward(
+        self,
+        model: Any,
+        *,
+        position_ids: torch.Tensor,
+        group_ids: torch.Tensor,
+        parent_ids: torch.Tensor,
+    ) -> None:
+        patches = getattr(model, _HF_REFERENCE_PATCHES_ATTR, None)
+        scan_length = int(position_ids.numel())
+        if (
+            not isinstance(patches, list)
+            or not patches
+            or not all(patch["installed"] for patch in patches)
+            or scan_length <= 0
+            or int(group_ids.numel()) != scan_length
+            or int(parent_ids.numel()) != scan_length
+        ):
+            raise RuntimeError("Nemotron-H HF reference packed span changed")
+        for patch in patches:
+            patch["restore_span"] = True
+            mixer = patch["mixer"]
+            setattr(mixer, _HF_REFERENCE_SCAN_LENGTH_ATTR, scan_length)
+
+    def release_hf_reference_model(self, model: Any) -> None:
+        _release_hf_reference_mamba_mixers(model, required=True)
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
         if type(provider).__name__ != "MambaModelProvider":

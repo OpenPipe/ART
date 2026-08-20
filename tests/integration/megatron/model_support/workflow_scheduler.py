@@ -28,6 +28,7 @@ from .workflow import (
     CORRECTNESS_ARTIFACT_ROOT_ENV,
     CORRECTNESS_PHASE_ENV,
     CORRECTNESS_REFERENCE_STAGE,
+    HF_PARITY_PROCESS_ENV,
 )
 from .workflow_fixtures import (
     FIXTURE_PATH_ENV,
@@ -1211,6 +1212,9 @@ def run_prepared_workflows(
         request_json.write_text(request.model_dump_json(indent=2), encoding="utf-8")
         if any(item.environment != items[0].environment for item in items[1:]):
             raise RuntimeError("one workflow session requires one process environment")
+        session_environment = dict(items[0].environment)
+        if any(operation.stage == "hf_parity" for operation in session.operations):
+            session_environment.update(HF_PARITY_PROCESS_ENV)
         environment = os.environ.copy()
         environment.update(
             {
@@ -1245,7 +1249,7 @@ def run_prepared_workflows(
             request_json=request_json,
             log_path=session_log,
             environment=environment,
-            session_environment=items[0].environment,
+            session_environment=session_environment,
             torch_threads=torch.get_num_threads(),
             timeout_s=timeout_s,
         )

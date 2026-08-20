@@ -1172,6 +1172,22 @@ def _prepare_hf_reference_forward(
     )
 
 
+def _release_hf_reference_model(
+    model: Any,
+    *,
+    base_model: str,
+    allow_unvalidated_arch: bool,
+) -> None:
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(
+        base_model, allow_unvalidated_arch=allow_unvalidated_arch
+    )
+    release = getattr(handler, "release_hf_reference_model", None)
+    if release is not None:
+        release(model)
+
+
 def _run_hf_sft_step(
     *,
     base_model: str,
@@ -1226,6 +1242,13 @@ def _run_hf_sft_step(
         ):
             attention_mask = micro["attention_mask"].reshape(-1)
             actual_len = max(int(attention_mask.sum().item()), 1)
+            _prepare_hf_reference_forward(
+                model,
+                micro,
+                base_model=base_model,
+                actual_len=actual_len,
+                allow_unvalidated_arch=allow_unvalidated_arch,
+            )
             if recurrent_prefix_paths:
                 micro_losses = _run_hf_recurrent_prefix_tree_micro(
                     model=model,
@@ -1244,13 +1267,6 @@ def _run_hf_sft_step(
                 token_count += int(micro_losses.numel())
                 continue
             route_capture.set_active_micro(sample_index, micro_slot)
-            _prepare_hf_reference_forward(
-                model,
-                micro,
-                base_model=base_model,
-                actual_len=actual_len,
-                allow_unvalidated_arch=allow_unvalidated_arch,
-            )
             input_ids = (
                 micro["input_ids"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
             )
@@ -1323,11 +1339,18 @@ def _run_hf_sft_step(
                 route_capture.close()
         finally:
             try:
-                model.zero_grad(set_to_none=True)
+                _release_hf_reference_model(
+                    model,
+                    base_model=base_model,
+                    allow_unvalidated_arch=allow_unvalidated_arch,
+                )
             finally:
-                del model
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                try:
+                    model.zero_grad(set_to_none=True)
+                finally:
+                    del model
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
 
 def _run_hf_recurrent_prefix_tree_micro(

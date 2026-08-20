@@ -25,7 +25,7 @@ from .oracle_harness import (
 )
 from .oracle_worker import provider_topology_env
 from .validation_spec import MinimalLayerCoverageReport
-from .workflow import assess_minimal_layer_coverage
+from .workflow import HF_PARITY_PROCESS_ENV, assess_minimal_layer_coverage
 from .workflow_fixtures import _truncate_hybrid_override_pattern
 
 HF_PARITY_ENABLE_ENV = "ART_RUN_HF_PARITY"
@@ -44,6 +44,7 @@ HF_PARITY_ARTIFACT_SUITE_NAME = "Megatron HF parity artifacts"
 
 def _hf_parity_worker_env() -> dict[str, str]:
     return {
+        **HF_PARITY_PROCESS_ENV,
         "RANK": "0",
         "WORLD_SIZE": "1",
         "LOCAL_RANK": "0",
@@ -394,12 +395,13 @@ def _run_hf_parity_in_process(
     request: HfParityRunRequest,
     output_dir: Path,
 ) -> None:
-    from .hf_parity_worker import run_worker_cli
     from .workflow import _redirect_output, _temporary_env
 
     request_path = output_dir / "run_request.json"
     _write_json(request_path, request.model_dump(mode="json"))
     with _temporary_env(**_hf_parity_worker_env()):
+        from .hf_parity_worker import run_worker_cli
+
         with _redirect_output(output_dir / "worker.log"):
             run_worker_cli(request_path)
 
@@ -414,6 +416,14 @@ def run_hf_parity(
         raise ValueError(f"Unsupported HF parity precision {case_config.precision!r}")
     if case_config.num_steps != 1:
         raise ValueError("HF parity currently requires num_steps=1")
+
+    if in_process and any(
+        os.environ.get(name) != value for name, value in HF_PARITY_PROCESS_ENV.items()
+    ):
+        raise RuntimeError(
+            "in-process HF parity requires MAMBA_DETERMINISTIC=1 and "
+            "TRITON_CACHE_AUTOTUNING=0 before entry"
+        )
 
     coverage = assess_minimal_layer_coverage(
         base_model=case_config.base_model,
