@@ -22,6 +22,7 @@ from art.distributed.trajectory_store import (
     TrajectoryQueueItem,
     TrajectoryQueueLease,
 )
+from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.pipeline_trainer.checkpoint_retention import CheckpointRetentionPlan
 from art.pipeline_trainer.trainer import PipelineTrainer
 from art.serverless.backend import ServerlessBackend
@@ -40,7 +41,7 @@ from art.training.contracts import (
     SamplerWeightsResult,
     SaveStateResult,
 )
-from art.types import ServerlessTrainResult
+from art.types import ServerlessTrainResult, TrainSFTConfig
 
 
 class _Sampler:
@@ -77,6 +78,11 @@ class _Operation:
     def __init__(self, ref: OperationRef) -> None:
         self.ref = ref
         self.result_future = asyncio.get_running_loop().create_future()
+        self.preparation_future = (
+            asyncio.get_running_loop().create_future()
+            if ref.kind == "forward_backward"
+            else None
+        )
         self.cancelled = False
 
     async def result(self):
@@ -84,6 +90,11 @@ class _Operation:
 
     async def cancel(self) -> None:
         self.cancelled = True
+
+    async def gradient_disposition(self):
+        if self.preparation_future is None:
+            raise TypeError("operation is not F/B")
+        return await asyncio.shield(self.preparation_future)
 
 
 class _Client:
@@ -472,6 +483,108 @@ def _forward_result(operation_id: str) -> ForwardBackwardResult:
             "pipeline/gradient_step_dummy_microbatches": 0.0,
         },
     )
+
+
+def _zero_gradient_sft_result(operation_id: str) -> ForwardBackwardResult:
+    return ForwardBackwardResult(
+        operation_id=operation_id,
+        packing=PackingOutcome(
+            packed_sequence_length=16,
+            packed_sequences=0,
+            target_packed_sequences=1,
+            nominal_capacity_tokens=16,
+            physical_tokens=0,
+            non_padding_tokens=0,
+            loss_bearing_tokens=0,
+            trainable_assistant_tokens=0,
+            policy_token_counts=None,
+            group_shapes=(),
+        ),
+        loss_fn_outputs=(),
+        produced_gradient=False,
+    )
+
+
+async def _wait_for_operations(client: _Client, count: int) -> None:
+    async with asyncio.timeout(1):
+        while len(client.operations) < count:
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_sft_admits_optimizer_before_forward_result_transport() -> None:
+    backend, model, client, _ = _backend()
+    stream = backend._train_sft(
+        model,
+        [Trajectory()],
+        TrainSFTConfig(batch_size=1),
+        {},
+    )
+    result = asyncio.create_task(anext(stream))
+
+    await _wait_for_operations(client, 1)
+    forward = client.operations[0]
+    assert forward.preparation_future is not None
+    assert not forward.preparation_future.done()
+    assert len(client.operations) == 1
+
+    forward.preparation_future.set_result("contributes")
+    await _wait_for_operations(client, 2)
+    optimizer = client.operations[1]
+    assert forward.ref.kind == "forward_backward"
+    assert optimizer.ref.kind == "optim_step"
+    assert not forward.result_future.done()
+
+    forward.result_future.set_result(_forward_result(forward.ref.operation_id))
+    row = await asyncio.wait_for(result, 1)
+    assert row[TRAIN_GRADIENT_STEPS_KEY] == 1
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+
+
+@pytest.mark.asyncio
+async def test_sft_optimizer_admission_failure_cancels_forward() -> None:
+    backend, model, client, _ = _backend(fail_optimizer=True)
+    stream = backend._train_sft(
+        model,
+        [Trajectory()],
+        TrainSFTConfig(batch_size=1),
+        {},
+    )
+
+    result = asyncio.create_task(anext(stream))
+    await _wait_for_operations(client, 1)
+    forward = client.operations[0]
+    assert forward.preparation_future is not None
+    forward.preparation_future.set_result("contributes")
+    with pytest.raises(RuntimeError, match="optimizer admission failed"):
+        await result
+    assert len(client.operations) == 1
+    assert client.operations[0].cancelled
+
+
+@pytest.mark.asyncio
+async def test_zero_gradient_sft_does_not_admit_optimizer_or_publish() -> None:
+    backend, model, client, sampler = _backend()
+    stream = backend._train_sft(
+        model,
+        [Trajectory()],
+        TrainSFTConfig(batch_size=1),
+        {},
+    )
+    result = asyncio.create_task(anext(stream))
+
+    await _wait_for_operations(client, 1)
+    forward = client.operations[0]
+    assert forward.preparation_future is not None
+    forward.preparation_future.set_result("empty")
+    forward.result_future.set_result(
+        _zero_gradient_sft_result(forward.ref.operation_id)
+    )
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(result, 1)
+    assert len(client.operations) == 1
+    assert sampler.publications == []
 
 
 def _sampler_result(step: int) -> SamplerWeightsResult:

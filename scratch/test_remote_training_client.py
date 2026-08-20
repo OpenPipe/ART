@@ -21,6 +21,7 @@ from art.serverless.client import (
     RemoteTrainingServiceClient,
 )
 from art.serverless.contracts import (
+    FORWARD_BACKWARD_PREPARED_EVENT,
     MAX_OPERATION_RESULT_BYTES,
     AdapterSpec,
     CreateTrainingRunRequest,
@@ -123,10 +124,12 @@ class FakeService:
             )
             result_ref, payload = encode_operation_result(result)
             self.operation_results[ref["operation_id"]] = payload
+            self.events.append(self._preparation_event(ref, now))
+            terminal = self._event(ref, result_ref, now)
+            self.events.append(terminal)
             self.operations[ref["operation_id"]] = self._operation(
-                ref, result_ref, now, submission.request
+                ref, result_ref, now, submission.request, terminal["cursor"]
             )
-            self.events.append(self._event(ref, result_ref, now))
             if fail:
                 return httpx.Response(503, json={"detail": "response lost"})
             return httpx.Response(200, json=ref)
@@ -138,10 +141,15 @@ class FakeService:
                     _operation_id("run", "forward"),
                 ),
             )
+            terminal = self._event(ref, result, now)
+            self.events.append(terminal)
             self.operations[ref["operation_id"]] = self._operation(
-                ref, result, now, OptimStepRequest.model_validate(body)
+                ref,
+                result,
+                now,
+                OptimStepRequest.model_validate(body),
+                terminal["cursor"],
             )
-            self.events.append(self._event(ref, result, now))
             return httpx.Response(200, json=ref)
         if path == "/v1/training/runs/run/events":
             after = int(request.url.params.get("after", "0"))
@@ -204,17 +212,30 @@ class FakeService:
         }
 
     @staticmethod
-    def _operation(ref, result, now, request):
+    def _operation(ref, result, now, request, event_cursor):
         return {
             "ref": ref,
             "request_id": request.request_id,
             "request_fingerprint": remote_request_fingerprint(request),
             "status": "succeeded",
+            "gradient_disposition": (
+                "contributes" if ref["kind"] == "forward_backward" else None
+            ),
             "result": result.model_dump(mode="json"),
             "error": None,
-            "event_cursor": ref["sequence_id"] + 1,
+            "event_cursor": event_cursor,
             "created_at": now,
             "updated_at": now,
+        }
+
+    def _preparation_event(self, ref, now):
+        return {
+            "cursor": len(self.events) + 1,
+            "run_id": ref["run_id"],
+            "operation_id": ref["operation_id"],
+            "event": FORWARD_BACKWARD_PREPARED_EVENT,
+            "payload": {"gradient_disposition": "contributes"},
+            "created_at": now,
         }
 
     def _event(self, ref, result, now):
@@ -354,7 +375,7 @@ async def test_operation_result_streams_into_exact_receive_buffer():
         control_http_client=http,
         transfer_http_client=http,
     )
-    received = await service.get_operation_result(
+    received = await service._receive_operation_result(
         "run",
         "operation",
         OperationResultRef(
@@ -369,7 +390,7 @@ async def test_operation_result_streams_into_exact_receive_buffer():
 
 
 @pytest.mark.asyncio
-async def test_operation_result_receive_budget_serializes_allocations():
+async def test_operation_result_receive_budget_serializes_allocations(monkeypatch):
     payload = b"12345678"
     release = asyncio.Event()
     first_started = asyncio.Event()
@@ -397,9 +418,18 @@ async def test_operation_result_receive_budget_serializes_allocations():
         max_result_bytes_in_flight=len(payload),
     )
     ref = OperationResultRef(object_id="0" * 64, byte_count=len(payload))
-    first = asyncio.create_task(service.get_operation_result("run", "first", ref))
+    monkeypatch.setattr(
+        client_module,
+        "decode_operation_result",
+        lambda _ref, value, _type: bytes(value),
+    )
+    first = asyncio.create_task(
+        service.receive_operation_result("run", "first", ref, ForwardBackwardResult)
+    )
     await first_started.wait()
-    second = asyncio.create_task(service.get_operation_result("run", "second", ref))
+    second = asyncio.create_task(
+        service.receive_operation_result("run", "second", ref, ForwardBackwardResult)
+    )
     await asyncio.sleep(0)
     assert calls == 1
     release.set()
@@ -423,16 +453,17 @@ async def test_operation_result_rejects_content_length_before_allocation():
         transfer_http_client=http,
     )
     with pytest.raises(RemoteTrainingError, match="Content-Length changed"):
-        await service.get_operation_result(
+        await service.receive_operation_result(
             "run",
             "operation",
             OperationResultRef(object_id="0" * 64, byte_count=4),
+            ForwardBackwardResult,
         )
     await http.aclose()
 
 
 @pytest.mark.asyncio
-async def test_operation_result_receive_budget_close_wakes_waiters():
+async def test_operation_result_receive_budget_close_wakes_waiters(monkeypatch):
     payload = b"1234"
     release = asyncio.Event()
     first_started = asyncio.Event()
@@ -457,9 +488,18 @@ async def test_operation_result_receive_budget_close_wakes_waiters():
         max_result_bytes_in_flight=len(payload),
     )
     ref = OperationResultRef(object_id="0" * 64, byte_count=len(payload))
-    first = asyncio.create_task(service.get_operation_result("run", "first", ref))
+    monkeypatch.setattr(
+        client_module,
+        "decode_operation_result",
+        lambda _ref, value, _type: bytes(value),
+    )
+    first = asyncio.create_task(
+        service.receive_operation_result("run", "first", ref, ForwardBackwardResult)
+    )
     await first_started.wait()
-    waiting = asyncio.create_task(service.get_operation_result("run", "waiting", ref))
+    waiting = asyncio.create_task(
+        service.receive_operation_result("run", "waiting", ref, ForwardBackwardResult)
+    )
     await asyncio.sleep(0)
     await service.close()
     with pytest.raises(RemoteTrainingError, match="budget is closed"):
@@ -536,6 +576,8 @@ async def test_remote_client_retries_and_preserves_command_order(
         loss=LossConfig(name="cispo"),
     )
     forward = await client.forward_backward(request)
+    assert await forward.gradient_disposition() == "contributes"
+    assert client._open_forward_backward == [forward]
     assert await client.forward_backward(request) is forward
     assert len(fake.submit_bodies) == (1 if admit_before_failure else 2)
     assert len(set(fake.submit_bodies)) == 1
@@ -560,6 +602,7 @@ async def test_remote_client_retries_and_preserves_command_order(
         )
     )
     assert optimizer.ref.reserved_output_learner_version == 1
+    assert client._open_forward_backward == []
     assert client.next_sequence_id == 2
     assert client.projected_learner_version == 1
     decode_started, decode_release = threading.Event(), threading.Event()
@@ -608,3 +651,125 @@ async def test_remote_client_retries_and_preserves_command_order(
     await service.close()
     assert fake.acknowledged_results == [forward_operation_id]
     await asyncio.gather(control_http.aclose(), transfer_http.aclose())
+
+
+def _budgeted_result_service(
+    byte_count: int,
+) -> tuple[RemoteTrainingServiceClient, httpx.AsyncClient]:
+    http = httpx.AsyncClient(
+        base_url="http://test/v1/",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(500, json={"detail": "unexpected"})
+        ),
+    )
+    return (
+        RemoteTrainingServiceClient(
+            api_key="test",
+            base_url="http://test/v1",
+            control_http_client=http,
+            transfer_http_client=http,
+            max_result_bytes_in_flight=byte_count,
+        ),
+        http,
+    )
+
+
+async def _wait_for_thread_event(event: threading.Event) -> None:
+    async with asyncio.timeout(1):
+        while not event.is_set():
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_result_budget_remains_reserved_through_cancelled_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    byte_count = 1 << 20
+    service, http = _budgeted_result_service(byte_count)
+    ref = OperationResultRef(object_id="a" * 64, byte_count=byte_count)
+    downloads: list[str] = []
+    decode_started, decode_release = threading.Event(), threading.Event()
+    decode_calls = 0
+
+    async def download(_run_id, operation_id, result_ref):
+        assert result_ref is ref
+        downloads.append(operation_id)
+        return bytearray(byte_count)
+
+    def decode(_ref, _payload, _result_type):
+        nonlocal decode_calls
+        decode_calls += 1
+        if decode_calls == 1:
+            decode_started.set()
+            assert decode_release.wait(1)
+        return SimpleNamespace(operation_id=f"result-{decode_calls}")
+
+    monkeypatch.setattr(service, "_download_operation_result", download)
+    monkeypatch.setattr(client_module, "decode_operation_result", decode)
+    first = asyncio.create_task(
+        service.receive_operation_result("run", "first", ref, ForwardBackwardResult)
+    )
+    await _wait_for_thread_event(decode_started)
+    second = asyncio.create_task(
+        service.receive_operation_result("run", "second", ref, ForwardBackwardResult)
+    )
+    await asyncio.sleep(0)
+    first.cancel()
+    await asyncio.sleep(0)
+    assert downloads == ["first"]
+    assert service._result_budget._used == byte_count
+
+    decode_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert (await asyncio.wait_for(second, 1)).operation_id == "result-2"
+    assert downloads == ["first", "second"]
+    assert service._result_budget._used == 0
+    await service.close()
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_result_budget_releases_after_decode_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    byte_count = 1 << 20
+    service, http = _budgeted_result_service(byte_count)
+    ref = OperationResultRef(object_id="b" * 64, byte_count=byte_count)
+    downloads: list[str] = []
+    decode_started, decode_fail = threading.Event(), threading.Event()
+    decode_calls = 0
+
+    async def download(_run_id, operation_id, _result_ref):
+        downloads.append(operation_id)
+        return bytearray(byte_count)
+
+    def decode(_ref, _payload, _result_type):
+        nonlocal decode_calls
+        decode_calls += 1
+        if decode_calls == 1:
+            decode_started.set()
+            assert decode_fail.wait(1)
+            raise ValueError("decode failed")
+        return SimpleNamespace(operation_id="result-2")
+
+    monkeypatch.setattr(service, "_download_operation_result", download)
+    monkeypatch.setattr(client_module, "decode_operation_result", decode)
+    first = asyncio.create_task(
+        service.receive_operation_result("run", "first", ref, ForwardBackwardResult)
+    )
+    await _wait_for_thread_event(decode_started)
+    second = asyncio.create_task(
+        service.receive_operation_result("run", "second", ref, ForwardBackwardResult)
+    )
+    await asyncio.sleep(0)
+    assert downloads == ["first"]
+
+    decode_fail.set()
+    with pytest.raises(ValueError, match="decode failed"):
+        await first
+    assert (await asyncio.wait_for(second, 1)).operation_id == "result-2"
+    assert downloads == ["first", "second"]
+    assert service._result_budget._used == 0
+    await service.close()
+    await http.aclose()

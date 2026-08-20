@@ -1511,6 +1511,8 @@ class ServerlessBackend:
         sampler_ready: _PendingSamplerPublication | None = None
         step: int | None = None
         try:
+            if await forward.gradient_disposition() != "contributes":
+                raise RuntimeError("remote RL F/B prepared without a gradient")
             sequence = client.next_sequence_id
             optimizer = await client.optim_step(
                 OptimStepRequest(
@@ -1793,18 +1795,49 @@ class ServerlessBackend:
                     return_token_logprobs=False,
                 )
             )
-            forward_result = await forward.result()
-            if not forward_result.produced_gradient:
+            disposition = await forward.gradient_disposition()
+            if disposition == "empty":
+                forward_result = await forward.result()
+                if forward_result.produced_gradient:
+                    raise RuntimeError(
+                        "empty SFT preparation returned a gradient contribution"
+                    )
                 continue
-            optimizer = await client.optim_step(
-                OptimStepRequest(
-                    run_id=client.run_id,
-                    request_id=uuid.uuid4().hex,
-                    sequence_id=sequence + 1,
-                    optimizer=AdamConfig(learning_rate=learning_rate),
+            try:
+                optimizer = await client.optim_step(
+                    OptimStepRequest(
+                        run_id=client.run_id,
+                        request_id=uuid.uuid4().hex,
+                        sequence_id=sequence + 1,
+                        optimizer=AdamConfig(learning_rate=learning_rate),
+                    )
                 )
+            except BaseException as primary:
+                cleanup = await asyncio.gather(forward.cancel(), return_exceptions=True)
+                failures = [
+                    value for value in cleanup if isinstance(value, BaseException)
+                ]
+                if failures:
+                    raise BaseExceptionGroup(
+                        "SFT optimizer admission and F/B cleanup failed",
+                        [primary, *failures],
+                    ) from None
+                raise
+            results = await asyncio.gather(
+                forward.result(), optimizer.result(), return_exceptions=True
             )
-            optimizer_result = await optimizer.result()
+            failures = [value for value in results if isinstance(value, BaseException)]
+            if failures:
+                raise BaseExceptionGroup("remote SFT operations failed", failures)
+            forward_result, optimizer_result = results
+            if not (
+                isinstance(forward_result, ForwardBackwardResult)
+                and isinstance(optimizer_result, OptimStepResult)
+                and forward_result.produced_gradient
+            ):
+                raise RuntimeError(
+                    "contributing SFT operations returned invalid results"
+                )
             rows.append(
                 {
                     **merge_gradient_step_metrics(

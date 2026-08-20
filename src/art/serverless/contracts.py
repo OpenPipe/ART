@@ -352,6 +352,9 @@ OperationStatus = Literal[
     "failed",
     "cancelled",
 ]
+GradientDisposition = Literal["pending", "contributes", "empty"]
+PreparedGradientDisposition = Literal["contributes", "empty"]
+FORWARD_BACKWARD_PREPARED_EVENT = "forward_backward_prepared"
 
 
 class TrainingRunView(Contract):
@@ -373,12 +376,26 @@ class OperationView(Contract):
     request_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
     request_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     status: OperationStatus
+    gradient_disposition: GradientDisposition | None = None
     contributing_forward_backward_operation_ids: tuple[str, ...] = ()
     result: OperationResultRef | dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     event_cursor: int = Field(ge=1)
     created_at: datetime
     updated_at: datetime
+
+    @model_validator(mode="after")
+    def _validate_gradient_disposition(self) -> "OperationView":
+        forward_backward = self.ref.kind == "forward_backward"
+        if forward_backward != (self.gradient_disposition is not None):
+            raise ValueError(
+                "gradient_disposition is required exclusively for F/B operations"
+            )
+        return self
+
+
+class ForwardBackwardPreparation(Contract):
+    gradient_disposition: PreparedGradientDisposition
 
 
 def remote_request_fingerprint(request: RunCommand) -> str:

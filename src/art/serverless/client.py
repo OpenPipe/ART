@@ -35,6 +35,7 @@ from .contracts import (
     DEFAULT_CHECKPOINT_ALIAS_PAGE_LIMIT,
     DEFAULT_CHECKPOINT_PAGE_LIMIT,
     EVENT_LONG_POLL_TIMEOUT_S,
+    FORWARD_BACKWARD_PREPARED_EVENT,
     MAX_CHECKPOINT_ALIAS_PAGE_LIMIT,
     MAX_CHECKPOINT_PAGE_LIMIT,
     MAX_EVENT_PAGE_LIMIT,
@@ -49,8 +50,10 @@ from .contracts import (
     CreateTrainingRunRequest,
     DeleteCheckpointResult,
     EventPage,
+    ForwardBackwardPreparation,
     OperationResultRef,
     OperationView,
+    PreparedGradientDisposition,
     RemoteForwardRequest,
     RunEvent,
     SetCheckpointTtlRequest,
@@ -399,29 +402,41 @@ class RemoteTrainingServiceClient:
             OperationView,
         )
 
-    async def get_operation_result(
+    async def receive_operation_result(
+        self,
+        run_id: str,
+        operation_id: str,
+        ref: OperationResultRef,
+        result_type: type[ResultT],
+    ) -> ResultT:
+        async with self._result_budget.reserve(ref.byte_count):
+            payload = await self._receive_operation_result(run_id, operation_id, ref)
+            try:
+                result, cancelled = await complete_to_thread(
+                    lambda: decode_operation_result(ref, payload, result_type)
+                )
+            finally:
+                del payload
+            if cancelled is not None:
+                raise cancelled
+            return result
+
+    async def _receive_operation_result(
         self, run_id: str, operation_id: str, ref: OperationResultRef
     ) -> bytearray:
-        async with self._result_budget.reserve(ref.byte_count):
-            failure_count = 0
-            while True:
-                if self._closed:
-                    raise RemoteTrainingError(
-                        "remote training service client is closed"
-                    )
-                try:
-                    return await self._download_operation_result(
-                        run_id, operation_id, ref
-                    )
-                except BaseException as error:
-                    if not _is_transient_failure(error):
-                        raise
-                if self._closed:
-                    raise RemoteTrainingError(
-                        "remote training service client is closed"
-                    )
-                await asyncio.sleep(_retry_delay(failure_count))
-                failure_count = min(failure_count + 1, 4)
+        failure_count = 0
+        while True:
+            if self._closed:
+                raise RemoteTrainingError("remote training service client is closed")
+            try:
+                return await self._download_operation_result(run_id, operation_id, ref)
+            except BaseException as error:
+                if not _is_transient_failure(error):
+                    raise
+            if self._closed:
+                raise RemoteTrainingError("remote training service client is closed")
+            await asyncio.sleep(_retry_delay(failure_count))
+            failure_count = min(failure_count + 1, 4)
 
     async def _download_operation_result(
         self, run_id: str, operation_id: str, ref: OperationResultRef
@@ -719,6 +734,7 @@ class _RunEventObserver:
         self._run_id = run_id
         self._cursor = 0
         self._pending: dict[str, asyncio.Future[RunEvent]] = {}
+        self._preparations: dict[str, asyncio.Future[RunEvent]] = {}
         self._run_terminal: asyncio.Future[RunEvent] | None = None
         self._run_terminal_event: RunEvent | None = None
         self._task: asyncio.Task[None] | None = None
@@ -766,8 +782,35 @@ class _RunEventObserver:
                 )
         return future
 
+    def reserve_preparation(self, operation_id: str) -> asyncio.Future[RunEvent]:
+        future = self._preparations.get(operation_id)
+        if future is not None:
+            return future
+        future = asyncio.get_running_loop().create_future()
+        future.add_done_callback(_consume_event_future)
+        if self._error is not None:
+            future.set_exception(self._error)
+        elif self._closed:
+            future.set_exception(
+                RemoteTrainingError("remote training event observer is closed")
+            )
+        else:
+            self._preparations[operation_id] = future
+            if self._task is None:
+                self._task = asyncio.create_task(
+                    self._observe(), name=f"remote-training-events-{self._run_id}"
+                )
+        return future
+
     def claim(self, operation_id: str, future: asyncio.Future[RunEvent]) -> None:
         future.add_done_callback(lambda _: self._release(operation_id, future))
+
+    def claim_preparation(
+        self, operation_id: str, future: asyncio.Future[RunEvent]
+    ) -> None:
+        future.add_done_callback(
+            lambda _: self._release_preparation(operation_id, future)
+        )
 
     def abandon(
         self,
@@ -779,9 +822,25 @@ class _RunEventObserver:
         if not future.done():
             future.set_exception(error)
 
+    def abandon_preparation(
+        self,
+        operation_id: str,
+        future: asyncio.Future[RunEvent],
+        error: BaseException,
+    ) -> None:
+        self._release_preparation(operation_id, future)
+        if not future.done():
+            future.set_exception(error)
+
     def _release(self, operation_id: str, future: asyncio.Future[RunEvent]) -> None:
         if self._pending.get(operation_id) is future:
             self._pending.pop(operation_id)
+
+    def _release_preparation(
+        self, operation_id: str, future: asyncio.Future[RunEvent]
+    ) -> None:
+        if self._preparations.get(operation_id) is future:
+            self._preparations.pop(operation_id)
 
     async def close(self, *, timeout_s: float | None = None) -> None:
         if self._closed:
@@ -789,11 +848,12 @@ class _RunEventObserver:
         self._closed = True
         task, self._task = self._task, None
         pending, self._pending = tuple(self._pending.values()), {}
+        preparations, self._preparations = tuple(self._preparations.values()), {}
         if self._run_terminal is not None and not self._run_terminal.done():
             self._run_terminal.set_exception(
                 RemoteTrainingError("remote training event observer is closed")
             )
-        for future in pending:
+        for future in (*pending, *preparations):
             if not future.done():
                 future.set_exception(
                     RemoteTrainingError("remote training event observer is closed")
@@ -844,6 +904,15 @@ class _RunEventObserver:
                             and not self._run_terminal.done()
                         ):
                             self._run_terminal.set_result(event)
+                    if event.event == FORWARD_BACKWARD_PREPARED_EVENT:
+                        if event.operation_id is None:
+                            raise RemoteTrainingError(
+                                "F/B preparation event has no operation_id"
+                            )
+                        future = self._preparations.get(event.operation_id)
+                        if future is not None and not future.done():
+                            future.set_result(event)
+                        continue
                     if event.event not in _TERMINAL_EVENTS:
                         continue
                     if event.operation_id is None:
@@ -853,9 +922,14 @@ class _RunEventObserver:
                     future = self._pending.get(event.operation_id)
                     if future is not None and not future.done():
                         future.set_result(event)
+                    preparation = self._preparations.get(event.operation_id)
+                    if preparation is not None and not preparation.done():
+                        preparation.set_result(event)
                 await asyncio.sleep(0)
-                if not self._pending and (
-                    self._run_terminal is None or self._run_terminal.done()
+                if (
+                    not self._pending
+                    and not self._preparations
+                    and (self._run_terminal is None or self._run_terminal.done())
                 ):
                     return
         except asyncio.CancelledError:
@@ -863,9 +937,13 @@ class _RunEventObserver:
         except BaseException as error:
             self._error = error
             pending, self._pending = tuple(self._pending.values()), {}
+            preparations, self._preparations = (
+                tuple(self._preparations.values()),
+                {},
+            )
             if self._run_terminal is not None and not self._run_terminal.done():
                 self._run_terminal.set_exception(error)
-            for future in pending:
+            for future in (*pending, *preparations):
                 if not future.done():
                     future.set_exception(error)
         finally:
@@ -894,6 +972,24 @@ def _terminal_event(view: OperationView) -> RunEvent | None:
     )
 
 
+def _preparation_event(view: OperationView) -> RunEvent | None:
+    disposition = view.gradient_disposition
+    if view.ref.kind != "forward_backward" or disposition == "pending":
+        return None
+    if disposition is None:
+        raise RemoteTrainingError("F/B operation omitted gradient disposition")
+    return RunEvent(
+        cursor=view.event_cursor,
+        run_id=view.ref.run_id,
+        operation_id=view.ref.operation_id,
+        event=FORWARD_BACKWARD_PREPARED_EVENT,
+        payload=ForwardBackwardPreparation(gradient_disposition=disposition).model_dump(
+            mode="json"
+        ),
+        created_at=view.updated_at,
+    )
+
+
 class RemoteTrainingOperation(Generic[ResultT]):
     def __init__(
         self,
@@ -901,13 +997,17 @@ class RemoteTrainingOperation(Generic[ResultT]):
         service: RemoteTrainingServiceClient,
         terminal: asyncio.Future[RunEvent],
         result_type: type[ResultT],
+        preparation: asyncio.Future[RunEvent] | None = None,
         on_completion: Callable[[], None] | None = None,
     ) -> None:
+        if (ref.kind == "forward_backward") != (preparation is not None):
+            raise ValueError("preparation future is required exclusively for F/B")
         self._ref = ref
         self._service = service
         self._result_type = result_type
         self._completion: asyncio.Task[ResultT] | None = None
         self._terminal = terminal
+        self._preparation = preparation
         self._cancel_request_id = uuid.uuid4().hex
         if on_completion is not None:
             self._terminal.add_done_callback(lambda _: on_completion())
@@ -923,6 +1023,22 @@ class RemoteTrainingOperation(Generic[ResultT]):
             )
         return await asyncio.shield(self._completion)
 
+    async def gradient_disposition(self) -> PreparedGradientDisposition:
+        if self._preparation is None:
+            raise TypeError("gradient disposition is only available for F/B")
+        event = await asyncio.shield(self._preparation)
+        if event.event == "operation_failed":
+            raise RemoteTrainingOperationError(self._ref.operation_id, event.payload)
+        if event.event == "operation_cancelled":
+            raise RemoteTrainingOperationCancelled(
+                f"remote training operation {self._ref.operation_id} was cancelled"
+            )
+        if event.event != FORWARD_BACKWARD_PREPARED_EVENT:
+            raise RemoteTrainingError("F/B terminated without durable preparation")
+        return ForwardBackwardPreparation.model_validate(
+            event.payload
+        ).gradient_disposition
+
     async def _wait(self) -> ResultT:
         event = await asyncio.shield(self._terminal)
         if event.event == "operation_failed":
@@ -935,14 +1051,12 @@ class RemoteTrainingOperation(Generic[ResultT]):
             raise RemoteTrainingError(f"unexpected terminal event {event.event!r}")
         if self._ref.kind in {"forward", "forward_backward"}:
             remote = OperationResultRef.model_validate(event.payload)
-            payload = await self._service.get_operation_result(
-                self._ref.run_id, self._ref.operation_id, remote
+            result = await self._service.receive_operation_result(
+                self._ref.run_id,
+                self._ref.operation_id,
+                remote,
+                self._result_type,
             )
-            result, cancelled = await complete_to_thread(
-                lambda: decode_operation_result(remote, payload, self._result_type)
-            )
-            if cancelled is not None:
-                raise cancelled
         else:
             result = self._result_type.model_validate(event.payload)
         if result.operation_id != self._ref.operation_id:
@@ -992,6 +1106,9 @@ class RemoteTrainingClient:
         self._close_timeout_s = close_timeout_s
         self._lock = asyncio.Lock()
         self._operations: dict[str, tuple[str, RemoteTrainingOperation[Any]]] = {}
+        self._open_forward_backward: list[
+            RemoteTrainingOperation[ForwardBackwardResult]
+        ] = []
         self._reserved_admission: tuple[str, str, OperationKind] | None = None
         self._close_request_id = uuid.uuid4().hex
         self._closed = False
@@ -1092,8 +1209,20 @@ class RemoteTrainingClient:
                 request_id, reserved_fingerprint, reserved_kind = reserved
                 if reserved_fingerprint != fingerprint or reserved_kind != kind:
                     raise ValueError("request_id was reused with different content")
+            if kind == "optim_step":
+                await asyncio.gather(
+                    *(
+                        operation.gradient_disposition()
+                        for operation in self._open_forward_backward
+                    )
+                )
             operation_id = _operation_id(request.run_id, request.request_id)
             terminal = self._events.reserve(operation_id)
+            preparation = (
+                self._events.reserve_preparation(operation_id)
+                if kind == "forward_backward"
+                else None
+            )
             self._reserved_admission = (request.request_id, fingerprint, kind)
             try:
                 ref = (
@@ -1119,22 +1248,57 @@ class RemoteTrainingClient:
                     self._service,
                     terminal,
                     result_type,
+                    preparation=preparation,
                     on_completion=self._bound_operation_cache,
                 )
             except (asyncio.CancelledError, httpx.TransportError):
                 raise
             except BaseException as error:
                 self._events.abandon(operation_id, terminal, error)
+                if preparation is not None:
+                    self._events.abandon_preparation(operation_id, preparation, error)
                 self._reserved_admission = None
                 raise
             self._operations[request.request_id] = (fingerprint, operation)
             self._events.claim(operation_id, terminal)
+            if preparation is not None:
+                self._events.claim_preparation(operation_id, preparation)
             self._reserved_admission = None
             self._bound_operation_cache()
             self._next_sequence_id += 1
             if ref.reserved_output_learner_version is not None:
                 self._projected_learner_version = ref.reserved_output_learner_version
+            if kind == "forward_backward":
+                forward = cast(
+                    RemoteTrainingOperation[ForwardBackwardResult], operation
+                )
+                assert preparation is not None
+                self._track_forward_backward(forward, preparation)
+            elif kind == "optim_step":
+                self._open_forward_backward.clear()
             return operation
+
+    def _forget_empty_forward_backward(
+        self,
+        operation: RemoteTrainingOperation[ForwardBackwardResult],
+        future: asyncio.Future[RunEvent],
+    ) -> None:
+        if future.cancelled():
+            return
+        try:
+            event = future.result()
+        except BaseException:
+            return
+        if event.event != FORWARD_BACKWARD_PREPARED_EVENT or (
+            ForwardBackwardPreparation.model_validate(event.payload)
+            .gradient_disposition
+            != "empty"
+        ):
+            return
+        try:
+            self._open_forward_backward.remove(operation)
+        except ValueError:
+            pass
 
     async def _resolve_replay(
         self,
@@ -1147,28 +1311,71 @@ class RemoteTrainingClient:
         operation_id = _operation_id(request.run_id, request.request_id)
         view = await self._service.get_operation(request.run_id, operation_id)
         self._validate_replay(view, request, kind, fingerprint)
-        event = _terminal_event(view)
-        if event is None:
+        terminal_event = _terminal_event(view)
+        preparation_event = _preparation_event(view)
+        terminal_reserved = terminal_event is None
+        if terminal_reserved:
             terminal = self._events.reserve(operation_id)
-            view = await self._service.get_operation(request.run_id, operation_id)
-            self._validate_replay(view, request, kind, fingerprint)
-            event = _terminal_event(view)
-            if event is not None and not terminal.done():
-                terminal.set_result(event)
-            self._events.claim(operation_id, terminal)
         else:
             terminal = asyncio.get_running_loop().create_future()
-            terminal.set_result(event)
+            terminal.set_result(terminal_event)
+
+        preparation_reserved = False
+        preparation: asyncio.Future[RunEvent] | None = None
+        if kind == "forward_backward":
+            preparation_event = preparation_event or terminal_event
+            if preparation_event is None:
+                preparation = self._events.reserve_preparation(operation_id)
+                preparation_reserved = True
+            else:
+                preparation = asyncio.get_running_loop().create_future()
+                preparation.set_result(preparation_event)
+
+        if terminal_reserved or preparation_reserved:
+            view = await self._service.get_operation(request.run_id, operation_id)
+            self._validate_replay(view, request, kind, fingerprint)
+            terminal_event = _terminal_event(view)
+            preparation_event = _preparation_event(view) or terminal_event
+            if terminal_event is not None and not terminal.done():
+                terminal.set_result(terminal_event)
+            if (
+                preparation is not None
+                and preparation_event is not None
+                and not preparation.done()
+            ):
+                preparation.set_result(preparation_event)
+            if terminal_reserved:
+                self._events.claim(operation_id, terminal)
+            if preparation_reserved:
+                assert preparation is not None
+                self._events.claim_preparation(operation_id, preparation)
         operation = RemoteTrainingOperation(
             view.ref,
             self._service,
             terminal,
             result_type,
+            preparation=preparation,
             on_completion=self._bound_operation_cache,
         )
         self._operations[request.request_id] = (fingerprint, operation)
+        if kind == "forward_backward":
+            assert preparation is not None
+            self._track_forward_backward(
+                cast(RemoteTrainingOperation[ForwardBackwardResult], operation),
+                preparation,
+            )
         self._bound_operation_cache()
         return operation
+
+    def _track_forward_backward(
+        self,
+        operation: RemoteTrainingOperation[ForwardBackwardResult],
+        preparation: asyncio.Future[RunEvent],
+    ) -> None:
+        self._open_forward_backward.append(operation)
+        preparation.add_done_callback(
+            lambda future: self._forget_empty_forward_backward(operation, future)
+        )
 
     def _validate_replay(
         self,
@@ -1205,11 +1412,14 @@ class RemoteTrainingClient:
 
     async def forward_backward(
         self, request: ForwardBackwardRequest
-    ) -> TrainingOperation[ForwardBackwardResult]:
-        return await self._submit(
-            request,
-            kind="forward_backward",
-            result_type=ForwardBackwardResult,
+    ) -> RemoteTrainingOperation[ForwardBackwardResult]:
+        return cast(
+            RemoteTrainingOperation[ForwardBackwardResult],
+            await self._submit(
+                request,
+                kind="forward_backward",
+                result_type=ForwardBackwardResult,
+            ),
         )
 
     async def optim_step(
