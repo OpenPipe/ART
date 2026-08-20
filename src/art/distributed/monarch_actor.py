@@ -921,12 +921,13 @@ class ArtHostService(Actor):
         if retained.prepared is not None:
             from art.local.backend import LocalBackend
 
+            prepared = retained.prepared
             async with self._packing_lock:
                 packing_lock_wait_s = time.monotonic() - packing_started
                 packing_compute_started = time.monotonic()
                 packed, cancelled = await complete_to_thread(
                     lambda: LocalBackend._materialize_packed_tensors(
-                        retained.prepared,
+                        prepared,
                         packing_timings=retained.packing_timings,
                     )
                 )

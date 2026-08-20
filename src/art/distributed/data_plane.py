@@ -1110,7 +1110,9 @@ def _packed_text_layouts(
     ):
         raise ValueError("MoE packed storage dimensions must be provided together")
     core_shape = (num_sequences, sequence_length)
-    core = [(name, dtype, core_shape) for name, dtype in _CORE_PACKED_DTYPES]
+    core: list[tuple[str, str, tuple[int, ...]]] = [
+        (name, dtype, core_shape) for name, dtype in _CORE_PACKED_DTYPES
+    ]
     suffix = []
     if candidate_capacity:
         tokenized_shape = (*core_shape, candidate_capacity)
