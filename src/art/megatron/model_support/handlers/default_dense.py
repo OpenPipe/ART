@@ -111,6 +111,21 @@ class DefaultDenseHandler:
         del provider
         return None
 
+    def prepare_model_for_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def validate_model_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def prepare_hf_reference_model_class(self, model_class: type[Any]) -> type[Any]:
+        return model_class
+
+    def validate_hf_reference_model_precision(self, model: Any, *, dtype: Any) -> None:
+        del model, dtype
+        return None
+
     def context_parallel_workload_profile(self, provider: Any) -> Any | None:
         del provider
         return None

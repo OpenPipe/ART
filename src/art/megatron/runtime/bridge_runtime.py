@@ -30,7 +30,7 @@ from art.megatron.expert_parallel import (
     ExpertParallelLayout,
     get_expert_parallel_layout,
 )
-from art.megatron.model_support.spec import HfWeightSource
+from art.megatron.model_support.spec import HfWeightSource, ModelSupportHandler
 
 _Fp32PreservedTensor = tuple[torch.nn.Module, str, torch.Tensor, bool]
 
@@ -557,7 +557,7 @@ def _collect_fp32_preserved_tensors(
                         (submodule, "expert_bias", expert_bias.data.clone(), True)
                     )
                     seen.add("expert_bias")
-            for name in explicit_names:
+            for name in explicit_names - seen:
                 tensor = getattr(submodule, name, None)
                 if isinstance(tensor, torch.nn.Parameter):
                     keep_in_fp32.append((submodule, name, tensor.data.clone(), True))
@@ -635,6 +635,12 @@ def _art_get_model(
         ]
 
     model = _apply_pre_wrap_hook(model, pre_wrap_hook)
+    handler = cast(
+        ModelSupportHandler | None,
+        getattr(model_provider, "_art_model_support_handler", None),
+    )
+    if handler is not None:
+        handler.prepare_model_for_mixed_precision(model)
     _set_tp_attrs(model)
     model_provider_module._print_num_params(model, pg_collection=pg_collection)
     model_config = get_model_config(model[0])
@@ -648,6 +654,8 @@ def _art_get_model(
             model_module.cuda(torch.cuda.current_device())
 
     model = _wrap_with_mp_wrapper(model, model_config, mixed_precision_wrapper)
+    if handler is not None:
+        handler.validate_model_mixed_precision(model)
     if model_provider_module.correct_amax_history_if_needed is not None:
         model_provider_module.correct_amax_history_if_needed(cast(Any, model))
     if wrap_with_ddp:

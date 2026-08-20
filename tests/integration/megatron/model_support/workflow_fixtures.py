@@ -17,7 +17,7 @@ FIXTURE_PATH_ENV = "ART_MODEL_SUPPORT_FIXTURE_PATH"
 FIXTURE_CACHE_ENV = "ART_MODEL_SUPPORT_FIXTURE_CACHE"
 FIXTURE_ROOT_ENV = "ART_MODEL_SUPPORT_FIXTURE_ROOT"
 FIXTURE_VERSION = 18
-_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 3}
+_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 4}
 _CANONICAL_CACHE_VERSION = 16
 _ROOT = Path("/tmp/art-models/main-merge-oracle")
 _CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
@@ -451,6 +451,85 @@ def _initialize_nemotron_h_fixture_routers(model: Any, config: Any) -> None:
         torch.nn.init.normal_(parameters["weight"], std=float(config.initializer_range))
 
 
+def _nemotron_h_fixture_precision_names(config: Any) -> tuple[set[str], set[str]]:
+    pattern = _text(config).hybrid_override_pattern
+    if pattern != _NEMOTRON_H_COMPACT:
+        raise RuntimeError(f"nemotron_h_moe compact pattern changed: {pattern!r}")
+    fp32: set[str] = set()
+    bf16: set[str] = set()
+    for index, symbol in enumerate(pattern):
+        prefix = f"backbone.layers.{index}.mixer"
+        if symbol == "M":
+            fp32.update((f"{prefix}.A_log", f"{prefix}.D"))
+            bf16.add(f"{prefix}.dt_bias")
+        elif symbol == "E":
+            fp32.add(f"{prefix}.gate.e_score_correction_bias")
+    return fp32, bf16
+
+
+def _nemotron_h_fixture_tensors(model: Any) -> dict[str, Any]:
+    parameters = dict(model.named_parameters())
+    buffers = dict(model.named_buffers())
+    overlap = parameters.keys() & buffers.keys()
+    if overlap:
+        raise RuntimeError(
+            f"nemotron_h_moe parameter/buffer names overlap: {sorted(overlap)}"
+        )
+    return parameters | buffers
+
+
+def _snapshot_nemotron_h_fixture_fp32(model: Any, config: Any) -> dict[str, Any]:
+    import torch
+
+    tensors = _nemotron_h_fixture_tensors(model)
+    fp32, bf16 = _nemotron_h_fixture_precision_names(config)
+    missing = (fp32 | bf16) - tensors.keys()
+    if missing:
+        raise RuntimeError(
+            f"nemotron_h_moe precision tensors are missing: {sorted(missing)}"
+        )
+    invalid_fp32 = {
+        name: str(tensors[name].dtype)
+        for name in fp32
+        if tensors[name].dtype != torch.float32
+    }
+    if invalid_fp32:
+        raise RuntimeError(
+            f"nemotron_h_moe FP32 source precision changed: {invalid_fp32}"
+        )
+    return {name: tensors[name].detach().clone() for name in fp32}
+
+
+def _restore_nemotron_h_fixture_mixed_precision(
+    model: Any,
+    config: Any,
+    fp32_snapshot: dict[str, Any],
+) -> None:
+    import torch
+
+    tensors = _nemotron_h_fixture_tensors(model)
+    fp32, bf16 = _nemotron_h_fixture_precision_names(config)
+    if fp32_snapshot.keys() != fp32:
+        raise RuntimeError("nemotron_h_moe FP32 snapshot names changed")
+    invalid_cast = {
+        name: str(tensors[name].dtype)
+        for name in fp32 | bf16
+        if tensors[name].dtype != torch.bfloat16
+    }
+    invalid_snapshot = {
+        name: str(tensor.dtype)
+        for name, tensor in fp32_snapshot.items()
+        if tensor.dtype != torch.float32
+    }
+    if invalid_cast or invalid_snapshot:
+        raise RuntimeError(
+            "nemotron_h_moe mixed-precision cast changed: "
+            f"cast={invalid_cast}, snapshot={invalid_snapshot}"
+        )
+    for name, value in fp32_snapshot.items():
+        tensors[name].data = value.clone()
+
+
 def _validate_nemotron_h_fixture_weights(path: Path, config: Any) -> None:
     from safetensors.torch import load
     import torch
@@ -463,6 +542,20 @@ def _validate_nemotron_h_fixture_weights(path: Path, config: Any) -> None:
     ]
     if nonfinite:
         raise RuntimeError(f"nemotron_h_moe fixture has nonfinite tensors: {nonfinite}")
+    expected_fp32, expected_bf16 = _nemotron_h_fixture_precision_names(config)
+    missing_precision = (expected_fp32 | expected_bf16) - state.keys()
+    invalid_precision = {
+        name: (str(tensor.dtype), str(expected))
+        for name, tensor in state.items()
+        if tensor.is_floating_point()
+        and tensor.dtype
+        != (expected := torch.float32 if name in expected_fp32 else torch.bfloat16)
+    }
+    if missing_precision or invalid_precision:
+        raise RuntimeError(
+            "nemotron_h_moe fixture precision changed: "
+            f"missing={sorted(missing_precision)}, invalid={invalid_precision}"
+        )
     expected = {
         f"backbone.layers.{index}.mixer.gate.weight"
         for index, layer_type in enumerate(_NEMOTRON_H_COMPACT)
@@ -1079,9 +1172,17 @@ def _build(
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(0)
                 model = auto.from_config(config, trust_remote_code=True)
+                fp32_snapshot = None
                 if model_key == "nemotron_h_moe":
                     _initialize_nemotron_h_fixture_routers(model, config)
+                    fp32_snapshot = _snapshot_nemotron_h_fixture_fp32(model, config)
                 model = model.to(torch.bfloat16)
+                if model_key == "nemotron_h_moe":
+                    if fp32_snapshot is None:
+                        raise RuntimeError("nemotron_h_moe FP32 snapshot is missing")
+                    _restore_nemotron_h_fixture_mixed_precision(
+                        model, config, fp32_snapshot
+                    )
             save_kwargs: dict[str, object] = {}
             if model_key == "nemotron_h_moe":
                 if model._tied_weights_keys != ["lm_head.weight"]:

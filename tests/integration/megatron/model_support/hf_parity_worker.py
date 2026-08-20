@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from contextlib import ExitStack
 import faulthandler
 import os
@@ -591,6 +592,58 @@ def _configure_hf_parity_provider_bundle(
     _install_bridge_timing_debug(provider_bundle)
 
 
+def _resolve_hf_reference_model_class(
+    *,
+    base_model: str,
+    config: Any,
+    auto_model_class: type[Any],
+) -> type[Any]:
+    auto_map = getattr(config, "auto_map", None)
+    if auto_map is None:
+        return auto_model_class
+    if not isinstance(auto_map, Mapping):
+        raise TypeError("HF reference config auto_map must be a mapping")
+    class_reference = auto_map.get(auto_model_class.__name__)
+    if class_reference is None:
+        return auto_model_class
+    if not isinstance(class_reference, str) or not class_reference:
+        raise TypeError("HF reference auto_map class must be a nonempty string")
+    if class_reference.count("--") > 1:
+        raise RuntimeError(f"Invalid HF reference class: {class_reference!r}")
+    if "--" in class_reference:
+        repo_id, class_reference = class_reference.split("--")
+    else:
+        repo_id = base_model
+    if not repo_id or class_reference.count(".") != 1:
+        raise RuntimeError(f"Invalid HF reference class: {class_reference!r}")
+    module_name, expected_class_name = class_reference.split(".")
+    if not module_name or not expected_class_name:
+        raise RuntimeError(f"Invalid HF reference class: {class_reference!r}")
+    local_code = Path(repo_id).is_dir()
+    revision = getattr(config, "_commit_hash", None)
+    if revision is not None and (not isinstance(revision, str) or not revision):
+        raise RuntimeError("HF reference config has an invalid commit hash")
+    if not local_code and revision is None:
+        raise RuntimeError("Remote HF reference code requires an exact revision")
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    from transformers.models.auto.auto_factory import (
+        add_generation_mixin_to_remote_model,
+    )
+
+    model_class = get_class_from_dynamic_module(
+        class_reference,
+        repo_id,
+        revision=revision,
+        local_files_only=local_code,
+    )
+    if model_class.__name__ != expected_class_name:
+        raise RuntimeError(
+            "HF reference auto_map resolved the wrong class: "
+            f"{model_class.__name__!r} != {expected_class_name!r}"
+        )
+    return add_generation_mixin_to_remote_model(model_class)
+
+
 def _load_hf_model(
     *,
     base_model: str,
@@ -625,7 +678,13 @@ def _load_hf_model(
         if hf_reference_from_pretrained_kwargs is not None
         else {}
     )
-    model = AutoModelForCausalLM.from_pretrained(
+    model_class = _resolve_hf_reference_model_class(
+        base_model=base_model,
+        config=config,
+        auto_model_class=AutoModelForCausalLM,
+    )
+    model_class = handler.prepare_hf_reference_model_class(model_class)
+    model = model_class.from_pretrained(
         base_model,
         config=config,
         trust_remote_code=True,
@@ -633,8 +692,14 @@ def _load_hf_model(
         low_cpu_mem_usage=True,
         **extra_kwargs,
     )
+    if model_class is not AutoModelForCausalLM and type(model) is not model_class:
+        raise RuntimeError(
+            "HF reference loader returned the wrong class: "
+            f"{type(model).__name__} != {model_class.__name__}"
+        )
+    handler.validate_hf_reference_model_precision(model, dtype=dtype)
     model.train()
-    model = cast(Any, model).to(device)
+    model = model.to(device)
     prepare_hf_reference_model = getattr(handler, "prepare_hf_reference_model", None)
     if prepare_hf_reference_model is not None:
         model = prepare_hf_reference_model(model)

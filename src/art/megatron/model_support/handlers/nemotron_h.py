@@ -35,6 +35,11 @@ from art.megatron.recurrent.contract import (
 _NANO_PATTERN = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
 _NANO_MIN_PATTERN = _NANO_PATTERN[:13]
 _NANO_COMPACT_PATTERN = _NANO_PATTERN[:14]
+_HF_STRICT_FP32_MODULES = (
+    "*.mixer.A_log",
+    "*.mixer.D",
+    "*.mixer.gate.e_score_correction_bias",
+)
 _MOE_FFN_ALIGNMENT = 128
 _LOGICAL_MOE_FFN_ATTR = "art_nemotron_h_logical_moe_ffn_hidden_size"
 _CONVOLUTION_WIDTH = 4
@@ -469,6 +474,21 @@ def _padding_sizes_from_hf_config(config: Any | None) -> tuple[int, int]:
     _, expected = _profile_for_hf_config(config)
     logical = expected["moe_ffn_hidden_size"]
     return logical, round_up_to_multiple(logical, _MOE_FFN_ALIGNMENT)
+
+
+def _hf_mixed_precision_names(config: Any) -> tuple[set[str], set[str]]:
+    _profile_for_hf_config(config)
+    pattern = _config_value(config, "hybrid_override_pattern", "hybrid_layer_pattern")
+    fp32: set[str] = set()
+    params_dtype: set[str] = set()
+    for index, symbol in enumerate(pattern):
+        prefix = f"backbone.layers.{index}.mixer"
+        if symbol == "M":
+            fp32.update((f"{prefix}.A_log", f"{prefix}.D"))
+            params_dtype.add(f"{prefix}.dt_bias")
+        elif symbol == "E":
+            fp32.add(f"{prefix}.gate.e_score_correction_bias")
+    return fp32, params_dtype
 
 
 @lru_cache(maxsize=4)
@@ -1329,6 +1349,201 @@ class NemotronHMoeHandler(DefaultMoeHandler):
         _padding_sizes_from_hf_config(_model_bridge_hf_config(model_bridge))
         _patch_mapping_registry(model_bridge)
         _patch_config_export(model_bridge)
+
+    def _check_model_mixed_precision(
+        self,
+        model_chunks: Sequence[Any],
+        *,
+        mark: bool,
+    ) -> None:
+        from megatron.core.ssm.mamba_block import MambaStack
+        from megatron.core.ssm.mamba_context_parallel import MambaContextParallel
+        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+        from megatron.core.ssm.mamba_mixer import MambaMixer
+        from megatron.core.transformer.moe.router import TopKRouter
+
+        modules = {
+            id(module): module for chunk in model_chunks for module in chunk.modules()
+        }.values()
+        stacks = [module for module in modules if isinstance(module, MambaStack)]
+        mixers = [module for module in modules if isinstance(module, MambaMixer)]
+        routers = [module for module in modules if isinstance(module, TopKRouter)]
+        if not stacks:
+            raise RuntimeError("Nemotron-H model is missing its MambaStack topology")
+        layer_types: list[str] = []
+        for stack in stacks:
+            stack_layer_types = getattr(stack, "layer_type_list", None)
+            layers = getattr(stack, "layers", None)
+            if not isinstance(stack_layer_types, list) or not isinstance(
+                layers, torch.nn.ModuleList
+            ):
+                raise RuntimeError("Nemotron-H MambaStack topology changed")
+            if len(stack_layer_types) != len(layers) or any(
+                layer_type not in Symbols.VALID_LAYERS
+                for layer_type in stack_layer_types
+            ):
+                raise RuntimeError(
+                    "Nemotron-H MambaStack layer_type topology changed: "
+                    f"{stack_layer_types} vs {len(layers)} layers"
+                )
+            layer_types.extend(stack_layer_types)
+        expected_mixers = layer_types.count(Symbols.MAMBA)
+        expected_routers = layer_types.count(Symbols.MOE)
+        if (len(mixers), len(routers)) != (expected_mixers, expected_routers):
+            raise RuntimeError(
+                "Nemotron-H local layer_type module counts changed: "
+                f"mixers={len(mixers)}/{expected_mixers}, "
+                f"routers={len(routers)}/{expected_routers}"
+            )
+        preserved: set[int] = set()
+        for mixer in mixers:
+            parameters = dict(mixer.named_parameters(recurse=False))
+            required: dict[str, torch.nn.Parameter] = {}
+            cp = getattr(mixer, "cp", None)
+            if not isinstance(cp, MambaContextParallel):
+                raise RuntimeError("Nemotron-H Mamba context-parallel helper changed")
+            for name, cp_name in (
+                ("A_log", "A_log_cp1"),
+                ("D", "D_cp1"),
+                ("dt_bias", "dt_bias_cp1"),
+            ):
+                parameter = parameters.get(name)
+                if not isinstance(parameter, torch.nn.Parameter):
+                    raise RuntimeError(
+                        f"Nemotron-H Mamba precision parameters changed: {parameters}"
+                    )
+                if parameter.is_meta:
+                    raise RuntimeError(
+                        f"Nemotron-H Mamba mixer.{name} remains on the meta device"
+                    )
+                cp_parameter = getattr(cp, cp_name, None)
+                if not isinstance(cp_parameter, torch.nn.Parameter) or (
+                    cp_parameter is not parameter
+                ):
+                    raise RuntimeError(
+                        "Nemotron-H Mamba context-parallel parameter alias changed: "
+                        f"mixer.cp.{cp_name} is not mixer.{name}"
+                    )
+                required[name] = parameter
+            params_dtype = getattr(mixer.config, "params_dtype", None)
+            observed = {name: value.dtype for name, value in required.items()}
+            expected = {
+                "A_log": torch.float32,
+                "D": torch.float32,
+                "dt_bias": params_dtype,
+            }
+            if observed != expected:
+                raise RuntimeError(
+                    "Nemotron-H Mamba mixed-precision contract changed: "
+                    f"{observed} != {expected}"
+                )
+            if mark:
+                mixer._keep_fp32_parameters = ("A_log", "D")
+            if getattr(mixer, "_keep_fp32_parameters", None) != ("A_log", "D"):
+                raise RuntimeError(
+                    "Nemotron-H Mamba FP32 parameter names must be ('A_log', 'D')"
+                )
+            preserved.update(id(required[name]) for name in ("A_log", "D"))
+        for router in routers:
+            if not bool(getattr(router, "enable_expert_bias", False)):
+                raise RuntimeError("Nemotron-H router expert bias is disabled")
+            expert_bias = getattr(router, "expert_bias", None)
+            if not isinstance(expert_bias, torch.Tensor):
+                raise RuntimeError("Nemotron-H router is missing expert_bias")
+            registered_parameter = router._parameters.get("expert_bias") is expert_bias
+            registered_buffer = router._buffers.get("expert_bias") is expert_bias
+            if registered_parameter == registered_buffer or (
+                isinstance(expert_bias, torch.nn.Parameter) != registered_parameter
+            ):
+                raise RuntimeError(
+                    "Nemotron-H expert_bias must be one parameter or buffer"
+                )
+            if expert_bias.dtype != torch.float32:
+                raise RuntimeError("Nemotron-H expert_bias must be float32")
+            if expert_bias.is_meta:
+                raise RuntimeError("Nemotron-H expert_bias remains on the meta device")
+            parameter_names = ("expert_bias",) if registered_parameter else ()
+            buffer_names = ("expert_bias",) if registered_buffer else ()
+            if mark:
+                router._keep_fp32_parameters = parameter_names
+                router._keep_fp32_buffers = buffer_names
+            if (
+                getattr(router, "_keep_fp32_parameters", ()) != parameter_names
+                or getattr(router, "_keep_fp32_buffers", ()) != buffer_names
+            ):
+                raise RuntimeError("Nemotron-H expert_bias FP32 registration changed")
+            preserved.add(id(expert_bias))
+        expected_count = 2 * len(mixers) + len(routers)
+        if len(preserved) != expected_count:
+            raise RuntimeError(
+                "Nemotron-H local mixed-precision tensor count changed: "
+                f"{len(preserved)} != {expected_count}"
+            )
+
+    def prepare_model_for_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        self._check_model_mixed_precision(
+            model_chunks,
+            mark=True,
+        )
+
+    def validate_model_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        self._check_model_mixed_precision(
+            model_chunks,
+            mark=False,
+        )
+
+    def prepare_hf_reference_model_class(self, model_class: type[Any]) -> type[Any]:
+        if model_class.__name__ != "NemotronHForCausalLM":
+            raise TypeError(
+                "Nemotron-H HF reference requires NemotronHForCausalLM, got "
+                f"{model_class.__name__}"
+            )
+        inherited = getattr(model_class, "_keep_in_fp32_modules_strict", None)
+        if inherited is None:
+            inherited = ()
+        elif isinstance(inherited, set):
+            inherited = tuple(sorted(inherited))
+        elif isinstance(inherited, (list, tuple)):
+            inherited = tuple(inherited)
+        else:
+            raise TypeError("Nemotron-H strict FP32 module contract is not a sequence")
+        if not all(isinstance(name, str) and name for name in inherited):
+            raise TypeError("Nemotron-H strict FP32 module names must be strings")
+        strict = tuple(dict.fromkeys((*inherited, *_HF_STRICT_FP32_MODULES)))
+
+        def _get_dtype_plan(model: Any, dtype: torch.dtype) -> dict[str, torch.dtype]:
+            plan = model_class._get_dtype_plan(model, dtype)
+            if not isinstance(plan, dict) or "*" in plan:
+                raise RuntimeError("Nemotron-H HF dtype plan contract changed")
+            return {**plan, "*": dtype}
+
+        return type(
+            f"ArtStrictFp32{model_class.__name__}",
+            (model_class,),
+            {
+                "_keep_in_fp32_modules_strict": strict,
+                "_get_dtype_plan": _get_dtype_plan,
+            },
+        )
+
+    def validate_hf_reference_model_precision(self, model: Any, *, dtype: Any) -> None:
+        expected_fp32, expected_params_dtype = _hf_mixed_precision_names(model.config)
+        state = model.state_dict()
+        missing = (expected_fp32 | expected_params_dtype) - state.keys()
+        invalid = {
+            name: (
+                str(tensor.dtype),
+                str(torch.float32 if name in expected_fp32 else dtype),
+            )
+            for name, tensor in state.items()
+            if tensor.is_floating_point()
+            and tensor.dtype != (torch.float32 if name in expected_fp32 else dtype)
+        }
+        if missing or invalid:
+            raise RuntimeError(
+                "Nemotron-H HF reference mixed-precision contract changed: "
+                f"missing={sorted(missing)}, invalid={invalid}"
+            )
 
     def configure_provider_for_runtime(self, provider: Any) -> None:
         if type(provider).__name__ != "MambaModelProvider":
