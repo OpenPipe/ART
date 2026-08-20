@@ -297,13 +297,17 @@ class _HfMoeRoutingCapture:
                 "HF parity MoE case requires HF MoE routing capture, but no "
                 "supported router modules were found"
             )
-        for _module_name, module, router_key in router_modules:
-            self._routes[router_key] = {}
-            self._assembled_routes[router_key] = {}
-            self._assembled_filled[router_key] = {}
-            self._handles.append(
-                module.register_forward_hook(self._make_hook(router_key, module))
-            )
+        try:
+            for _module_name, module, router_key in router_modules:
+                self._routes[router_key] = {}
+                self._assembled_routes[router_key] = {}
+                self._assembled_filled[router_key] = {}
+                self._handles.append(
+                    module.register_forward_hook(self._make_hook(router_key, module))
+                )
+        except BaseException:
+            self.close()
+            raise
 
     @property
     def enabled(self) -> bool:
@@ -706,15 +710,105 @@ def _load_hf_model(
     return model
 
 
-def _collect_hf_grads(model: Any) -> dict[str, torch.Tensor]:
+def _hf_trainable_parameters(
+    model: Any,
+) -> tuple[tuple[str, torch.nn.Parameter], ...]:
+    return tuple(
+        (name, param) for name, param in model.named_parameters() if param.requires_grad
+    )
+
+
+def _accumulate_hf_grads(
+    parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    buffers: dict[str, torch.Tensor],
+    raw_loss: torch.Tensor,
+) -> None:
+    dirty = [name for name, param in parameters if param.grad is not None]
+    if dirty:
+        for _, param in parameters:
+            param.grad = None
+        raise RuntimeError(f"Uncleared HF gradients before contribution: {dirty[:5]}")
+    if raw_loss.numel() != 1 or not bool(torch.isfinite(raw_loss.detach()).all()):
+        raise RuntimeError("HF gradient contribution loss must be a finite scalar")
+    try:
+        raw_loss.backward()
+        contribution_count = 0
+        for name, param in parameters:
+            grad = param.grad
+            if grad is None:
+                continue
+            contribution_count += 1
+            if grad.shape != param.shape:
+                raise RuntimeError(f"HF gradient shape changed for '{name}'")
+            if not bool(torch.isfinite(grad).all()):
+                raise RuntimeError(
+                    f"HF gradient contribution is nonfinite for '{name}'"
+                )
+            buffer = buffers.get(name)
+            if buffer is not None and (
+                buffer.dtype != torch.float32
+                or buffer.shape != grad.shape
+                or buffer.device != grad.device
+                or not bool(torch.isfinite(buffer).all())
+            ):
+                raise RuntimeError(f"Invalid HF FP32 gradient buffer for '{name}'")
+        if not contribution_count:
+            raise RuntimeError("HF selected loss produced no trainable gradients")
+        for name, param in parameters:
+            grad = param.grad
+            if grad is None:
+                continue
+            if name not in buffers:
+                buffers[name] = grad.detach().float()
+            else:
+                buffers[name].add_(grad.detach().float())
+            param.grad = None
+    finally:
+        for _, param in parameters:
+            param.grad = None
+
+
+def _finalize_hf_grads(
+    parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    buffers: dict[str, torch.Tensor],
+    *,
+    total_token_count: int,
+    observed_token_count: int,
+) -> dict[str, torch.Tensor]:
+    if total_token_count <= 0:
+        raise RuntimeError("HF gradient normalization requires selected tokens")
+    if observed_token_count != total_token_count:
+        raise RuntimeError(
+            "HF selected-token count changed: "
+            f"{observed_token_count} != {total_token_count}"
+        )
+    names = {name for name, _ in parameters}
+    unknown = sorted(set(buffers) - names)
+    if unknown:
+        raise RuntimeError(f"Unknown HF gradient buffers: {unknown[:5]}")
+    for name, param in parameters:
+        buffer = buffers.get(name)
+        if buffer is not None and (
+            buffer.dtype != torch.float32
+            or buffer.shape != param.shape
+            or buffer.device != param.device
+        ):
+            raise RuntimeError(f"Invalid HF FP32 gradient buffer for '{name}'")
+        if buffer is not None and not bool(torch.isfinite(buffer).all()):
+            raise RuntimeError(f"HF accumulated gradient is nonfinite for '{name}'")
     grads: dict[str, torch.Tensor] = {}
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        grad = param.grad
-        if grad is None:
-            grad = torch.zeros_like(param)
-        grads[name] = grad.detach().cpu().to(dtype=torch.float32)
+    any_nonzero = False
+    for name, param in parameters:
+        buffer = buffers.get(name)
+        if buffer is None:
+            value = torch.zeros_like(param, dtype=torch.float32, device="cpu")
+        else:
+            buffer.div_(total_token_count)
+            any_nonzero |= bool(buffer.ne(0).any())
+            value = buffer.detach().cpu()
+        grads[name] = value
+    if not grads or not buffers or not any_nonzero:
+        raise RuntimeError("HF accumulated gradient set is empty or globally zero")
     return grads
 
 
@@ -1104,113 +1198,136 @@ def _run_hf_sft_step(
         dtype=dtype,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    if dtype == torch.float32:
-        _install_hf_qwen35_gdn_fp32_reference(model, base_model=base_model)
-    recurrent_prefix_paths = _hf_requires_recurrent_prefix_paths(
-        base_model,
-        dtype=dtype,
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    route_capture = _HfMoeRoutingCapture(model, required=require_moe_routing_replay)
-    _debug("running HF forward/backward")
-    model.zero_grad(set_to_none=True)
-    loss_sum = torch.tensor(0.0, device=device)
-    token_count = 0
-    trainable_losses: list[torch.Tensor] = []
-    total_token_count = max(
-        sum(
+    route_capture: _HfMoeRoutingCapture | None = None
+    try:
+        if dtype == torch.float32:
+            _install_hf_qwen35_gdn_fp32_reference(model, base_model=base_model)
+        recurrent_prefix_paths = _hf_requires_recurrent_prefix_paths(
+            base_model,
+            dtype=dtype,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
+        route_capture = _HfMoeRoutingCapture(model, required=require_moe_routing_replay)
+        _debug("running HF forward/backward")
+        model.zero_grad(set_to_none=True)
+        trainable_parameters = _hf_trainable_parameters(model)
+        gradient_buffers: dict[str, torch.Tensor] = {}
+        loss_sum = torch.tensor(0.0, device=device)
+        token_count = 0
+        trainable_losses: list[torch.Tensor] = []
+        total_token_count = sum(
             int(megatron_train._count_sft_trainable_tokens(micro))
             for micro in micro_inputs
-        ),
-        1,
-    )
-    for micro_slot, (micro, sample_index) in enumerate(
-        zip(micro_inputs, sample_indices, strict=True)
-    ):
-        attention_mask = micro["attention_mask"].reshape(-1)
-        actual_len = max(int(attention_mask.sum().item()), 1)
-        if recurrent_prefix_paths:
-            micro_losses = _run_hf_recurrent_prefix_tree_micro(
-                model=model,
-                route_capture=route_capture,
-                micro=micro,
-                sample_index=sample_index,
-                micro_slot=micro_slot,
+        )
+        if total_token_count <= 0:
+            raise RuntimeError("HF parity SFT step requires selected tokens")
+        for micro_slot, (micro, sample_index) in enumerate(
+            zip(micro_inputs, sample_indices, strict=True)
+        ):
+            attention_mask = micro["attention_mask"].reshape(-1)
+            actual_len = max(int(attention_mask.sum().item()), 1)
+            if recurrent_prefix_paths:
+                micro_losses = _run_hf_recurrent_prefix_tree_micro(
+                    model=model,
+                    route_capture=route_capture,
+                    micro=micro,
+                    sample_index=sample_index,
+                    micro_slot=micro_slot,
+                    actual_len=actual_len,
+                    trainable_parameters=trainable_parameters,
+                    gradient_buffers=gradient_buffers,
+                    device=device,
+                    dtype=dtype,
+                )
+                trainable_losses.append(micro_losses.detach().cpu())
+                loss_sum = loss_sum + micro_losses.detach().sum()
+                token_count += int(micro_losses.numel())
+                continue
+            route_capture.set_active_micro(sample_index, micro_slot)
+            _prepare_hf_reference_forward(
+                model,
+                micro,
+                base_model=base_model,
                 actual_len=actual_len,
-                total_token_count=total_token_count,
+                allow_unvalidated_arch=allow_unvalidated_arch,
+            )
+            input_ids = (
+                micro["input_ids"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
+            )
+            labels = micro["labels"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
+            hf_attention_mask, position_ids = _hf_prefix_tree_forward_inputs(
+                model,
+                micro,
+                actual_len=actual_len,
                 device=device,
                 dtype=dtype,
             )
-            trainable_losses.append(micro_losses.detach().cpu())
-            loss_sum = loss_sum + micro_losses.detach().sum()
-            token_count += int(micro_losses.numel())
-            continue
-        route_capture.set_active_micro(sample_index, micro_slot)
-        _prepare_hf_reference_forward(
-            model,
-            micro,
-            base_model=base_model,
-            actual_len=actual_len,
-            allow_unvalidated_arch=allow_unvalidated_arch,
+            logits = model(
+                input_ids=input_ids,
+                attention_mask=hf_attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            ).logits
+            shifted_labels = megatron_train.shift_tensor(labels, -100)
+            per_token_loss = F.cross_entropy(
+                logits.float().reshape(-1, logits.shape[-1]),
+                shifted_labels.reshape(-1),
+                reduction="none",
+                ignore_index=-100,
+            ).reshape(shifted_labels.shape)
+            mask = shifted_labels != -100
+            masked_losses = per_token_loss[mask]
+            trainable_losses.append(masked_losses.detach().cpu())
+            loss_sum = loss_sum + masked_losses.detach().sum()
+            token_count += int(mask.sum().item())
+            if masked_losses.numel():
+                _accumulate_hf_grads(
+                    trainable_parameters,
+                    gradient_buffers,
+                    masked_losses.sum(),
+                )
+        grads = _finalize_hf_grads(
+            trainable_parameters,
+            gradient_buffers,
+            total_token_count=total_token_count,
+            observed_token_count=token_count,
         )
-        input_ids = micro["input_ids"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
-        labels = micro["labels"].reshape(-1)[:actual_len].unsqueeze(0).to(device)
-        hf_attention_mask, position_ids = _hf_prefix_tree_forward_inputs(
-            model,
-            micro,
-            actual_len=actual_len,
-            device=device,
-            dtype=dtype,
+        hf_reference_state_dict = (
+            _normalize_hf_reference_state_for_hf_parity(
+                base_model=base_model,
+                model=model,
+                state=_collect_hf_state_dict(model),
+                allow_unvalidated_arch=allow_unvalidated_arch,
+            )
+            if _use_hf_reference_state_for_hf_parity(
+                base_model, allow_unvalidated_arch=allow_unvalidated_arch
+            )
+            else None
         )
-        logits = model(
-            input_ids=input_ids,
-            attention_mask=hf_attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-        ).logits
-        shifted_labels = megatron_train.shift_tensor(labels, -100)
-        per_token_loss = F.cross_entropy(
-            logits.float().reshape(-1, logits.shape[-1]),
-            shifted_labels.reshape(-1),
-            reduction="none",
-            ignore_index=-100,
-        ).reshape(shifted_labels.shape)
-        mask = shifted_labels != -100
-        masked_losses = per_token_loss[mask]
-        trainable_losses.append(masked_losses.detach().cpu())
-        loss_sum = loss_sum + masked_losses.sum()
-        token_count += int(mask.sum().item())
-        (masked_losses.sum() / total_token_count).backward()
-    grads = _collect_hf_grads(model)
-    hf_reference_state_dict = (
-        _normalize_hf_reference_state_for_hf_parity(
-            base_model=base_model,
-            model=model,
-            state=_collect_hf_state_dict(model),
-            allow_unvalidated_arch=allow_unvalidated_arch,
+        routing_replay_bundle = route_capture.build_replay_bundle(topology=topology)
+        if require_moe_routing_replay and routing_replay_bundle is None:
+            raise RuntimeError("HF parity MoE case produced no routing replay bundle")
+        scalar_loss = (loss_sum / token_count).detach().cpu().reshape(1)
+        output_vector = torch.cat(trainable_losses, dim=0).to(dtype=torch.float32)
+        _debug("finished HF step")
+        return (
+            output_vector,
+            scalar_loss,
+            grads,
+            routing_replay_bundle,
+            hf_reference_state_dict,
         )
-        if _use_hf_reference_state_for_hf_parity(
-            base_model, allow_unvalidated_arch=allow_unvalidated_arch
-        )
-        else None
-    )
-    routing_replay_bundle = route_capture.build_replay_bundle(topology=topology)
-    if require_moe_routing_replay and routing_replay_bundle is None:
-        raise RuntimeError("HF parity MoE case produced no routing replay bundle")
-    scalar_loss = (loss_sum / max(token_count, 1)).detach().cpu().reshape(1)
-    output_vector = torch.cat(trainable_losses, dim=0).to(dtype=torch.float32)
-    route_capture.close()
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    _debug("finished HF step")
-    return (
-        output_vector,
-        scalar_loss,
-        grads,
-        routing_replay_bundle,
-        hf_reference_state_dict,
-    )
+    finally:
+        try:
+            if route_capture is not None:
+                route_capture.close()
+        finally:
+            try:
+                model.zero_grad(set_to_none=True)
+            finally:
+                del model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
 
 def _run_hf_recurrent_prefix_tree_micro(
@@ -1221,7 +1338,8 @@ def _run_hf_recurrent_prefix_tree_micro(
     sample_index: int | None,
     micro_slot: int,
     actual_len: int,
-    total_token_count: int,
+    trainable_parameters: tuple[tuple[str, torch.nn.Parameter], ...],
+    gradient_buffers: dict[str, torch.Tensor],
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -1274,7 +1392,11 @@ def _run_hf_recurrent_prefix_tree_micro(
         claimed_targets.index_copy_(0, selected_uids, path_targets[unclaimed])
         claimed_mask.index_fill_(0, selected_uids, True)
         if selected_losses.numel():
-            (selected_losses.sum() / total_token_count).backward()
+            _accumulate_hf_grads(
+                trainable_parameters,
+                gradient_buffers,
+                selected_losses.sum(),
+            )
     if not torch.equal(claimed_mask, expected_mask.cpu()):
         missing = torch.where(expected_mask.cpu() & ~claimed_mask)[0].tolist()
         extra = torch.where(claimed_mask & ~expected_mask.cpu())[0].tolist()
