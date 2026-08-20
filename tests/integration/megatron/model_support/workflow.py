@@ -74,7 +74,6 @@ ARCHITECTURE_REPRESENTATIVE_MODELS = {
     "dsv4": "deepseek-ai/DeepSeek-V4-Flash",
     "glm52": "zai-org/GLM-5.2",
     "gpt_oss_moe": "openai/gpt-oss-20b",
-    "nemotron_h_moe": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
 }
 SUBPROCESS_VALIDATION_STAGES = frozenset(
     {
