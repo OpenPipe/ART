@@ -1,15 +1,15 @@
 # ART multi-node smoke
 
 `program.py` is a bounded CPU example using only public ART APIs. Its top-level
-controller admits the attached hosts, then its top-level rollout returns one
-synthetic Yes/No/Maybe `Trajectory` per host for each answer. It never loads a
-model or starts Megatron or vLLM.
+controller receives a typed launch context and admits the attached hosts, then
+its top-level rollout returns one synthetic Yes/No/Maybe `Trajectory` per host
+for each answer. It never loads a model or starts Megatron or vLLM.
 
 Run the same controller on one local Monarch worker from the project root:
 
 ```fish
-env PYTHONPATH=(pwd)/examples/multinode .venv/bin/art-monarch local \
-  --program program:main \
+.venv/bin/art-monarch local \
+  --program examples/multinode/program.py:main \
   --port 0 \
   --startup-timeout 90
 ```
@@ -26,15 +26,31 @@ calls `program:main` only on rank 0. User controllers and rollouts must remain
 importable at the same paths on every node; ART sends import references rather
 than pickled closures.
 
-Edit the accelerator and setup commands for your infrastructure. The example
-assumes `uv` is installed in the image and installs ART's `distributed` extra
-from the synchronized source checkout. GPU training also needs the `megatron`
-extra and the locked `vllm_runtime` project; release wheels instead carry the
-managed vLLM runtime bundle. Use `sky launch` after changing setup, and reuse an
-unchanged cluster without rerunning setup with:
+The CPU smoke installs ART's `distributed` extra from the synchronized source
+checkout. `skypilot_training.yaml` is the corresponding real two-host Megatron
+qualification. It synchronizes only this example directory and installs a
+published ART wheel, so no ART checkout or setup script exists on the cluster.
+Set `ART_SHARED_ROOT` to storage mounted at the same path on every host before
+launching it:
+
+```fish
+sky launch -c art-multinode-training \
+  --env ART_SHARED_ROOT=/mnt/shared/art-multinode-release \
+  examples/multinode/skypilot_training.yaml
+```
+
+The default training run uses one GPU per host and DP2. Set
+`ART_TRAINER_RANKS_PER_HOST`, `ART_EXAMPLE_MODEL`, and the
+`ART_EXAMPLE_{TP,CP,EP,PP}` variables to qualify larger topologies. Set
+`ART_EXAMPLE_USE_NIXL=1` when an EP group crosses hosts; ART then provisions its
+metadata store and builds the multi-node HybridEP runtime automatically.
+
+Use `sky launch` after changing setup. Reuse unchanged CPU-smoke and training
+clusters without rerunning setup with, respectively:
 
 ```fish
 sky exec art-multinode examples/multinode/skypilot.yaml
+sky exec art-multinode-training examples/multinode/skypilot_training.yaml
 ```
 
 GPU workloads spanning hosts must also set `NCCL_NET` on every node and provide

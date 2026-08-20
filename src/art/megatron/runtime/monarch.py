@@ -117,15 +117,33 @@ def _configure_hybrid_ep_env(
         spec.ranks_per_nvlink_domain
     )
     transport = spec.nixl_transport
+    metadata_store = transport.metadata_store if transport is not None else None
+    nixl_paths = None
+    if transport is not None:
+        if metadata_store is None:
+            raise RuntimeError(
+                "NIXL metadata store was not resolved before trainer launch"
+            )
+        from art.distributed.nixl_runtime import configure_nixl_environment
+
+        nixl_paths = configure_nixl_environment()
     values = {
         "HYBRID_EP_MULTINODE": "1" if transport else None,
         "USE_NIXL": "1" if transport else None,
         "DEEPEP_NIXL_RUN_ID": (run_id or spec.run_id) if transport else None,
-        "NIXL_ETCD_ENDPOINTS": transport.metadata_store.url if transport else None,
+        "NIXL_ETCD_ENDPOINTS": metadata_store.url if metadata_store else None,
         "NIXL_HOME": transport.nixl_home if transport else None,
         "UCX_HOME": transport.ucx_home if transport else None,
-        "NIXL_PLUGIN_DIR": transport.nixl_plugin_dir if transport else None,
-        "UCX_MODULE_DIR": transport.ucx_module_dir if transport else None,
+        "NIXL_PLUGIN_DIR": (
+            transport.nixl_plugin_dir or str(nixl_paths.plugin_dir)
+            if transport and nixl_paths
+            else None
+        ),
+        "UCX_MODULE_DIR": (
+            transport.ucx_module_dir or str(nixl_paths.ucx_module_dir)
+            if transport and nixl_paths
+            else None
+        ),
         "UCX_NET_DEVICES": transport.ucx_net_devices if transport else None,
         "UCX_TLS": transport.ucx_tls if transport else None,
         "UCX_IB_GDA_RETAIN_INACTIVE_CTX": "yes" if transport else None,

@@ -10,22 +10,22 @@ process does not launch another SkyPilot cluster from inside its allocation.
 
 ## Controller program
 
-The bootstrap accepts an import path to a top-level async function. SkyPilot
-runs the bootstrap on every node, but only rank 0 imports its module and invokes
-the controller. `examples/multinode/program.py` is a complete CPU-runnable
-Yes/No/Maybe smoke:
+The bootstrap accepts a source script or import path to a top-level async
+function. A script reference such as `train.py:main` adds the script's directory
+to every ART-owned worker's Python path, so source synchronized by SkyPilot does
+not need to be packaged first. SkyPilot runs the bootstrap on every node, but
+only rank 0 imports the module and invokes the controller.
+`examples/multinode/program.py` is a complete CPU-runnable Yes/No/Maybe smoke:
 
 ```python
 import asyncio
 import os
 import socket
-from typing import Any
 
 import art
 from art.distributed import (
+    ArtLaunchContext,
     ArtRuntime,
-    ClusterSpec,
-    HostSpec,
     InstalledAsyncCallable,
     compile_topology,
 )
@@ -51,23 +51,13 @@ async def rollout(
     )
 
 
-async def main(hosts: Any) -> None:
-    host_count = int(hosts.region.slice().sizes[0])
-    host_ids = tuple(f"host{rank}" for rank in range(host_count))
+async def main(launch: ArtLaunchContext) -> None:
+    host_count = launch.host_count
     runtime = await ArtRuntime.start(
-        hosts,
+        launch.host_mesh,
         compile_topology(
-            cluster=ClusterSpec(
-                hosts=tuple(
-                    HostSpec(
-                        host_id=host_id,
-                        node_rank=rank,
-                        worker_address=f"attached://{rank}",
-                        cpu_slots=1,
-                    )
-                    for rank, host_id in enumerate(host_ids)
-                ),
-                controller_host_id=host_ids[0],
+            cluster=launch.homogeneous_cluster(
+                cpu_slots=1,
                 startup_timeout_s=90,
                 rpc_timeout_s=30,
             )
@@ -81,7 +71,10 @@ async def main(hosts: Any) -> None:
         )
         executor.set_workers(workers)
         model = art.TrainableModel(
-            name="multinode-smoke", project="art", base_model="not-loaded"
+            name="multinode-smoke",
+            project="art",
+            base_model="not-loaded",
+            run_name="multinode-smoke",
         )
         trajectories = []
         for answer in REWARDS:
@@ -110,12 +103,15 @@ async def main(hosts: Any) -> None:
         await runtime.close()
 ```
 
-The controller runs once, while the top-level `rollout` runs in one process on
-each host. Both must be installed or synchronized at the same import paths on
-every node; ART sends verified import references and never ships opaque
-closures. The dummy `TrainableModel` is serialized for the rollout contract but
-never loaded, so this validates the package, host admission, process placement,
-public trajectory types, and cleanup without a GPU or inference server.
+The controller receives an `ArtLaunchContext` once, while the top-level
+`rollout` runs in one process on each host. The context owns the attached host
+mesh and builds a homogeneous typed cluster without exposing provider
+environment variables. Both functions must be installed or synchronized at the
+same import paths on every node; ART sends verified import references and never
+ships opaque closures. The dummy `TrainableModel` is serialized for the rollout
+contract but never loaded, so this validates the package, host admission,
+process placement, public trajectory types, and cleanup without a GPU or
+inference server.
 
 The distributed service APIs are opt-in. Existing single-node programs continue
 to construct and use `LocalBackend` exactly as before:
@@ -133,7 +129,7 @@ two-node smoke that runs all three bounded rollouts on each host without
 reserving training GPUs or provisioning the managed vLLM runtime.
 
 For source-based GPU training, replace its resources and setup with the desired
-topology and both locked environments:
+topology and run the CUDA-detecting cluster setup:
 
 ```yaml
 resources:
@@ -141,20 +137,28 @@ resources:
 
 setup: |
   set -euo pipefail
-  uv sync --frozen --no-dev --extra distributed --extra megatron
-  uv sync --project vllm_runtime --frozen --no-dev
+  INSTALL_MULTINODE=true bash scripts/setup.sh
 
 run: |
   set -euo pipefail
   export NCCL_NET=IB
   exec .venv/bin/art-monarch skypilot \
-    --program your_package.train:main
+    --program train.py:main
 ```
 
 `set -euo pipefail` is required because SkyPilot runs multiline setup under
-Bash without enabling fail-fast behavior. A source-based GPU run needs the root
-and `vllm_runtime` locked projects at the same revision on every node. The CPU
-example only syncs the root `distributed` extra.
+Bash without enabling fail-fast behavior. For source development,
+`scripts/setup.sh` selects the CUDA-matched root and private trainer locks and
+builds HybridEP. It does not install system packages. The image or cluster
+bootstrap must provide the NVIDIA driver and toolkit, native build tools,
+NCCL network transport, MOFED/RDMA devices, and the required kernel modules.
+The CPU example only syncs the root `distributed` extra.
+
+Setup is cluster provisioning, not service startup. `art-monarch`, trainer
+actors, and managed vLLM processes never invoke these shell scripts. Source
+checkouts launch the already-built `vllm_runtime/.venv`; release wheels may
+materialize their bundled, locked vLLM environment into a content-addressed
+cache on first use.
 
 Any GPU workload spanning hosts must set one explicit NCCL network contract in
 its `ClusterSpec`, for example
@@ -166,27 +170,52 @@ environments and requires each rank to report that exact selected module. It
 never retries with Socket. Deployment qualification remains responsible for
 all-GPU bandwidth, GPU Direct RDMA, HCA, and GID validation.
 
+Cross-host HybridEP uses `NixlTransportSpec()`. If `metadata_store` is omitted,
+the controller starts a checksum-pinned etcd process, publishes its routable
+endpoint, health-checks it from every host, and owns its cleanup. An explicitly
+managed endpoint remains supported.
+
 If `ART_VLLM_RUNTIME_BIN` is set, it must point directly to a standard
 `.venv/bin/art-vllm-runtime-server` executable. ART derives the matching Python,
 runtime root, environment, and working directory from that path so the preflight
 cannot certify a different runtime. Arbitrary command wrappers fail closed.
 
-For a published release wheel, use a separate setup rather than synchronizing
-the source runtime:
+For a published release wheel, install the profile matching the host CUDA
+toolkit. For CUDA 12:
 
 ```yaml
 setup: |
   set -euo pipefail
-  uv venv --python 3.12
-  uv pip install --python .venv/bin/python \
-    "openpipe-art[distributed,megatron]==VERSION"
+  uv venv --python 3.12 --seed .venv
+  .venv/bin/pip install \
+    --extra-index-url https://download.pytorch.org/whl/cu128 \
+    "openpipe-art[megatron]==VERSION"
 ```
 
-Release wheels use a content-addressed managed runtime bundle. Only wheels
-built with `scripts/build_package.py` contain that bundle; a generic `uv build`
-wheel does not. Every node still needs the external `uv` command and either
-first-use network access to populate the runtime cache or a preinstalled
-runtime selected with `ART_VLLM_RUNTIME_BIN`.
+For CUDA 13, use `openpipe-art[megatron-cu130]==VERSION` and the PyTorch
+`cu130` index. These commands install ART, Monarch, and the CUDA-specific NIXL
+wheel. The example uses the supported image's `uv` installation to provision
+Python 3.12. The first trainer launch materializes the pinned Megatron environment,
+builds source-only CUDA components such as CUDA 12 Apex and ART's HybridEP when
+needed, and reuses the immutable result on later launches. NIXL and its UCX GDA
+plugin come from the official relocatable wheel; ART bundles only the matching
+pinned headers needed to build HybridEP.
+
+Release wheels use content-addressed managed Megatron and vLLM runtime bundles.
+Only wheels built with `scripts/build_package.py` contain those bundles. The
+install profile provides `uv`; first use needs package-index access unless the
+node-local cache was prewarmed.
+
+`examples/multinode/skypilot_training.yaml` runs a real two-host DP2 SFT step
+from the published wheel. It synchronizes only the user program, not an ART
+checkout. Point `ART_SHARED_ROOT` at an existing path mounted on every host,
+then launch:
+
+```fish
+sky launch -c art-multinode-training \
+  --env ART_SHARED_ROOT=/mnt/shared/art-multinode-release \
+  examples/multinode/skypilot_training.yaml
+```
 
 Launch it from the project root:
 
@@ -227,8 +256,8 @@ For a local process that explicitly wants the same Monarch service APIs, ART
 can own one loopback worker directly:
 
 ```fish
-env PYTHONPATH=(pwd)/examples/multinode .venv/bin/art-monarch local \
-  --program program:main \
+.venv/bin/art-monarch local \
+  --program examples/multinode/program.py:main \
   --port 0 \
   --startup-timeout 90
 ```
@@ -241,8 +270,8 @@ SkyPilot provides `SKYPILOT_NODE_RANK`, `SKYPILOT_NODE_IPS`, and
 `SKYPILOT_NUM_NODES`; ART validates and translates them internally. Port
 `22222` is the Monarch worker port and `22223` is its job-lifecycle port. Pass
 `--port N` to reserve `N` and `N + 1` instead. These ports must be reachable
-between allocated nodes but must not be publicly exposed: ART's pinned Monarch
-0.5 runtime currently uses unauthenticated `trust_all_connections` transport.
+between allocated nodes but must not be publicly exposed: ART's Monarch runtime
+uses unauthenticated `trust_all_connections` transport.
 
 ## Existing SSH hosts
 
@@ -254,7 +283,7 @@ command:
   --host gpu-a=10.0.0.10 \
   --host gpu-b=10.0.0.11 \
   --python /shared/project/.venv/bin/python \
-  --program your_package.train:main
+  --program /shared/project/train.py:main
 ```
 
 Each value is `SSH_TARGET=WORKER_HOST`. Omit `=WORKER_HOST` when the SSH target
@@ -265,7 +294,7 @@ or `--ssh-arg=-F` affect only launch and stop commands; they do not tunnel
 Monarch traffic. SSH mode uses only worker port `N`, not SkyPilot's lifecycle
 port `N + 1`.
 
-The selected Python executable and user code must exist at the same paths on
+The selected Python executable and source script must exist at the same paths on
 every host. ART uses non-interactive SSH, verifies that each launch-specific
 worker PID owns its listener, and monitors each foreground SSH process for the
 controller lifetime. A pre-existing listener is a hard error rather than a

@@ -7,8 +7,7 @@ resources:
   image_id: docker:docker.io/bradhiltonnw/art-gpu:latest
 
 setup: |
-  uv sync --frozen --extra megatron --group dev
-  uv run --no-sync python -m art.megatron.hybrid_ep_setup
+  INSTALL_VLLM_RUNTIME=false bash src/art/megatron/setup.sh
 
 run: |
   set -euo pipefail
@@ -17,13 +16,17 @@ run: |
   test -n "${fixture}"
   rm -rf "${result}"
   mkdir -p "${result}"
+  runtime_python="$(
+    .venv/bin/python -c 'from art.megatron.runtime.managed import ensure_megatron_runtime; print(ensure_megatron_runtime(art_build_sha256="trainer-rank-ci").python)'
+  )"
+  test -x "${runtime_python}"
 
   exercise() {
     ranks="$1"
     operation="$2"
     source="$3"
     output="$4"
-    uv run --no-sync torchrun --standalone --nproc-per-node="${ranks}" \
+    "${runtime_python}" -m torch.distributed.run --standalone --nproc-per-node="${ranks}" \
       dev/trainer_rank_checkpoint_acceptance.py "${operation}" \
       --source "${source}" --output "${output}" \
       --output-json "${output}.json"

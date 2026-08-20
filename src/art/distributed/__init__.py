@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .art_runtime import ArtRuntime, DistributedPackedBatch
     from .data_plane import PackedBatchRef, TensorSpec
+    from .launch import ArtLaunchContext
     from .packing import PackingRequest
     from .rollout import (
         DistributedRolloutExecutor,
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
     )
 
 _EXPORTS = {
+    "ArtLaunchContext": ".launch",
     "ArtRuntime": ".art_runtime",
     "ArtRuntimeConfig": ".specs",
     "ClusterSpec": ".specs",

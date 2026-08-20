@@ -6,6 +6,44 @@ from art.vllm_runtime import _vllm_runtime_subprocess_env
 
 ROOT = Path(__file__).resolve().parents[4]
 
+_POLICY_REQUEST_FIXTURE = """
+import hashlib
+
+from art_vllm_runtime.policy_spans import PolicyLoRARequest, _set_policy_cache_salt
+from vllm.sampling_params import SamplingParams
+from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.request import Request
+
+def initialize_policy_requests():
+    global block_hasher
+    hash_value = lambda value: hashlib.sha256(repr(value).encode()).digest()
+    init_none_hash(hash_value)
+    block_hasher = get_request_block_hasher(4, hash_value)
+
+def policy_lora(path, policy_version, update_seq):
+    return PolicyLoRARequest(
+        lora_name="model:active", lora_int_id=1, lora_path=path,
+        policy_version=policy_version, update_seq=update_seq,
+    )
+
+def make_policy_request(
+    request_id, lora_request, *, prompt_tokens=8, user_cache_salt=None
+):
+    request = Request(
+        request_id, list(range(prompt_tokens)), SamplingParams(max_tokens=4), None,
+        lora_request=lora_request, block_hasher=block_hasher,
+    )
+    request.cache_salt = user_cache_salt
+    _set_policy_cache_salt(
+        request, lora_slot=lora_request.lora_name,
+        policy_version=lora_request.policy_version,
+        update_seq=lora_request.update_seq,
+    )
+    request.block_hashes.clear()
+    request.update_block_hashes()
+    return request
+"""
+
 
 def _runtime_python(source: str, artifact_dir: Path, name: str) -> str:
     result = subprocess.run(
@@ -398,54 +436,26 @@ def test_runtime_policy_history_rekeys_real_vllm_requests(
     artifact_dir: Path,
 ) -> None:
     payload = _runtime_python(
-        """
-import hashlib
+        _POLICY_REQUEST_FIXTURE
+        + """
 import json
 from types import SimpleNamespace
 
-from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
-from vllm.v1.request import Request
 from art_vllm_runtime.policy_spans import (
-    PolicyLoRARequest,
     _policy_history_from_cache_salt,
     _patch_policy_cache_hashing,
     _request_has_executed,
-    _set_policy_cache_salt,
     _transition_scheduler_policy_history,
 )
 
-def hash_value(value):
-    return hashlib.sha256(repr(value).encode()).digest()
-
 _patch_policy_cache_hashing()
-init_none_hash(hash_value)
-block_hasher = get_request_block_hasher(4, hash_value)
-old = PolicyLoRARequest(
-    lora_name="model:active", lora_int_id=1, lora_path="old",
-    policy_version=4, update_seq=1,
-)
-new = PolicyLoRARequest(
-    lora_name="model:active", lora_int_id=1, lora_path="new",
-    policy_version=4, update_seq=2,
-)
+initialize_policy_requests()
+old = policy_lora("old", 4, 1)
+new = policy_lora("new", 4, 2)
 
-def make_request(request_id):
-    request = Request(
-        request_id, list(range(8)), SamplingParams(max_tokens=4), None,
-        lora_request=old, block_hasher=block_hasher,
-    )
-    _set_policy_cache_salt(
-        request, lora_slot=old.lora_name,
-        policy_version=old.policy_version, update_seq=old.update_seq,
-    )
-    request.block_hashes.clear()
-    request.update_block_hashes()
-    return request
-
-continued = make_request("continued")
-waiting = make_request("waiting")
+continued = make_policy_request("continued", old)
+waiting = make_policy_request("waiting", old)
 old_hashes = list(continued.block_hashes)
 continued.num_computed_tokens = 4
 scheduler = SimpleNamespace(requests={
@@ -464,18 +474,15 @@ continued_history = continued.cache_salt
 continued_hashes = list(continued.block_hashes)
 continued_transitions = continued._art_policy_cache_transitions
 not_executed_after_update = not _request_has_executed(continued)
-fresh = make_request("fresh")
+fresh = make_policy_request("fresh", old)
 _set_policy_cache_salt(
     fresh, lora_slot=new.lora_name,
     policy_version=new.policy_version, update_seq=new.update_seq,
 )
 fresh.block_hashes.clear()
 fresh.update_block_hashes()
-third = PolicyLoRARequest(
-    lora_name="model:active", lora_int_id=1, lora_path="third",
-    policy_version=4, update_seq=3,
-)
-intra = make_request("intra")
+third = policy_lora("third", 4, 3)
+intra = make_policy_request("intra", old)
 intra_pool = BlockPool(4, enable_caching=True, hash_block_size=4)
 intra_blocks = intra_pool.get_new_blocks(1)
 intra_pool.cache_full_blocks(intra, intra_blocks, 0, 1, 4, 0)
@@ -490,7 +497,7 @@ _transition_scheduler_policy_history(
     previous_policy=None,
     started_request_ids={intra.request_id},
 )
-multiple = make_request("multiple")
+multiple = make_policy_request("multiple", old)
 multiple.num_computed_tokens = 4
 multiple_scheduler = SimpleNamespace(
     requests={multiple.request_id: multiple},
@@ -505,8 +512,10 @@ _transition_scheduler_policy_history(
     multiple_scheduler, lora_request=third, previous_policy=None,
     started_request_ids={multiple.request_id},
 )
-old_history = _policy_history_from_cache_salt(make_request("old").cache_salt)
-expected_third = make_request("expected-third")
+old_history = _policy_history_from_cache_salt(
+    make_policy_request("old", old).cache_salt
+)
+expected_third = make_policy_request("expected-third", old)
 _set_policy_cache_salt(
     expected_third, lora_slot=third.lora_name,
     policy_version=third.policy_version, update_seq=third.update_seq,
@@ -529,7 +538,9 @@ print(json.dumps({
     "waiting_matches_fresh": waiting.cache_salt == fresh.cache_salt,
     "same_version_reload_differs": (
         _policy_history_from_cache_salt(waiting.cache_salt)
-        != _policy_history_from_cache_salt(make_request("old").cache_salt)
+        != _policy_history_from_cache_salt(
+            make_policy_request("old", old).cache_salt
+        )
     ),
     "block_hashes_changed": old_hashes != continued.block_hashes,
     "computed_hash_preserved": old_hashes[0] == continued_hashes[0],
@@ -575,60 +586,30 @@ def test_runtime_policy_preemption_rebases_and_republishes_real_block_pool(
     artifact_dir: Path,
 ) -> None:
     payload = _runtime_python(
-        """
-import hashlib
+        _POLICY_REQUEST_FIXTURE
+        + """
 import json
 from types import SimpleNamespace
 
 from art_vllm_runtime.policy_spans import (
-    PolicyLoRARequest,
     _patch_policy_cache_hashing,
     _patch_scheduler_policy_span_transport,
     _request_has_executed,
-    _set_policy_cache_salt,
     _transition_scheduler_policy_history,
 )
-from vllm.sampling_params import SamplingParams
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.request import Request, RequestStatus
-
-def hash_value(value):
-    return hashlib.sha256(repr(value).encode()).digest()
-
-def make_request(request_id, lora_request):
-    request = Request(
-        request_id, list(range(12)), SamplingParams(max_tokens=4), None,
-        lora_request=lora_request, block_hasher=block_hasher,
-    )
-    request.cache_salt = "tenant"
-    _set_policy_cache_salt(
-        request, lora_slot=lora_request.lora_name,
-        policy_version=lora_request.policy_version,
-        update_seq=lora_request.update_seq,
-    )
-    request.block_hashes.clear()
-    request.update_block_hashes()
-    return request
+from vllm.v1.request import RequestStatus
 
 _patch_policy_cache_hashing()
 _patch_scheduler_policy_span_transport()
-init_none_hash(hash_value)
-block_hasher = get_request_block_hasher(4, hash_value)
-first = PolicyLoRARequest(
-    lora_name="model:active", lora_int_id=1, lora_path="first",
-    policy_version=1, update_seq=1,
+initialize_policy_requests()
+first = policy_lora("first", 1, 1)
+second = policy_lora("second", 2, 2)
+latest = policy_lora("latest", 3, 3)
+request = make_policy_request(
+    "replay", first, prompt_tokens=12, user_cache_salt="tenant"
 )
-second = PolicyLoRARequest(
-    lora_name="model:active", lora_int_id=1, lora_path="second",
-    policy_version=2, update_seq=2,
-)
-latest = PolicyLoRARequest(
-    lora_name="model:active", lora_int_id=1, lora_path="latest",
-    policy_version=3, update_seq=3,
-)
-request = make_request("replay", first)
 pool = BlockPool(10, enable_caching=True, hash_block_size=4)
 transition_scheduler = SimpleNamespace(
     requests={request.request_id: request},
@@ -661,7 +642,9 @@ scheduler.log_stats = False
 request.status = RequestStatus.RUNNING
 Scheduler._preempt_request(scheduler, request, 0.0)
 
-fresh = make_request("fresh", latest)
+fresh = make_policy_request(
+    "fresh", latest, prompt_tokens=12, user_cache_salt="tenant"
+)
 current_hashes = list(request.block_hashes)
 full_replay = all(pool.get_cached_block(item, [0]) is None for item in current_hashes)
 old_entries_preserved = all(
@@ -714,49 +697,23 @@ def test_runtime_policy_update_rejects_unsupported_rehash_paths(
     artifact_dir: Path,
 ) -> None:
     payload = _runtime_python(
-        """
-import hashlib
+        _POLICY_REQUEST_FIXTURE
+        + """
 import json
 from types import SimpleNamespace
 
 from art_vllm_runtime.policy_spans import (
-    PolicyLoRARequest,
     _apply_policy_lora_update,
-    _set_policy_cache_salt,
 )
-from vllm.sampling_params import SamplingParams
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
-from vllm.v1.request import Request
 
-def hash_value(value):
-    return hashlib.sha256(repr(value).encode()).digest()
-
-init_none_hash(hash_value)
-block_hasher = get_request_block_hasher(4, hash_value)
-old = PolicyLoRARequest(
-    lora_name="model:active", lora_int_id=1, lora_path="old",
-    policy_version=1, update_seq=1,
-)
+initialize_policy_requests()
+old = policy_lora("old", 1, 1)
 payload = {
     "lora_name": old.lora_name, "lora_int_id": old.lora_int_id,
     "lora_path": "new", "base_model_name": None,
     "tensorizer_config_dict": None, "is_3d_lora_weight": False,
     "policy_version": 2, "update_seq": 2,
 }
-
-def make_request(request_id):
-    request = Request(
-        request_id, list(range(8)), SamplingParams(max_tokens=4), None,
-        lora_request=old, block_hasher=block_hasher,
-    )
-    _set_policy_cache_salt(
-        request, lora_slot=old.lora_name,
-        policy_version=old.policy_version, update_seq=old.update_seq,
-    )
-    request.block_hashes.clear()
-    request.update_block_hashes()
-    request.num_computed_tokens = 4
-    return request
 
 class Core:
     def __init__(self, request, connector):
@@ -776,14 +733,16 @@ class Core:
     def pause_scheduler(self, *args):
         self.pause_calls.append(args)
 
-connector_request = make_request("connector")
+connector_request = make_policy_request("connector", old)
+connector_request.num_computed_tokens = 4
 connector_core = Core(connector_request, object())
 try:
     _apply_policy_lora_update(connector_core, payload)
 except RuntimeError as error:
     connector_error = str(error)
 
-multimodal_request = make_request("multimodal")
+multimodal_request = make_policy_request("multimodal", old)
+multimodal_request.num_computed_tokens = 4
 multimodal_request.mm_features = [object()]
 multimodal_hashes = list(multimodal_request.block_hashes)
 multimodal_salt = multimodal_request.cache_salt

@@ -364,7 +364,6 @@ class DistributedMegatronService:
     def _temporal_gpu_sharing(self) -> bool:
         return (
             get_external_vllm_runtime_config(self.config) is None
-            and self._managed_service_name is not None
             and self._model_service_spec().temporal_gpu_sharing
         )
 

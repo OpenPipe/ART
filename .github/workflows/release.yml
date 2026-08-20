@@ -106,8 +106,10 @@ jobs:
                   str(runtime_python),
                   "-c",
                   "import torch, vllm; "
+                  "from art_vllm_runtime.fast_metrics import FastMetricsSharedWriter; "
                   "from art_vllm_runtime.policy_spans import "
                   "_patch_lora_update_coordinator; "
+                  "writer = FastMetricsSharedWriter(); writer.close(); "
                   "_patch_lora_update_coordinator(); "
                   "print('runtime compatibility ok')",
               ],
@@ -137,22 +139,22 @@ jobs:
           git tag v${{ needs.build-package.outputs.version }}
           git push origin v${{ needs.build-package.outputs.version }}
 
-      - name: Publish draft release
+      - name: Upload assets to draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view v${{ needs.build-package.outputs.version }} --json isDraft | jq -r '.isDraft' | grep -q true; then
-            gh release edit v${{ needs.build-package.outputs.version }} --draft=false
+            gh release upload v${{ needs.build-package.outputs.version }} dist/*
           else
             echo "::error::No draft release found for v${{ needs.build-package.outputs.version }}"
             exit 1
           fi
 
-      - name: Upload assets to release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload v${{ needs.build-package.outputs.version }} dist/*
+          gh release edit v${{ needs.build-package.outputs.version }} --draft=false
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

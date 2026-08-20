@@ -51,3 +51,24 @@ This project vendors a modified HybridEP runtime derived from DeepEP:
 The applicable license text is retained at:
 
 - src/art/megatron/_hybrid_ep/LICENSE
+
+Megatron release wheels also embed pinned source archives used only as headers
+when building ART's HybridEP extension:
+
+- NVIDIA NIXL 1.3.2 (commit de8115ca97d3f8fb63a4988e9b4d4a038b2e0f72),
+  Apache License 2.0, https://github.com/ai-dynamo/nixl
+- OpenUCX 1.21.0, BSD 3-Clause License,
+  https://github.com/openucx/ucx
+
+The complete license and notice files remain in their respective bundled source
+archives. ART links HybridEP against the matching NIXL and UCX libraries shipped
+by the official `nixl-cu12` or `nixl-cu13` wheel; it does not redistribute those
+libraries itself.
+
+On first cross-host HybridEP use, ART may download the checksum-pinned etcd
+3.5.33 executable from its official GitHub release. etcd is licensed under the
+Apache License 2.0: https://github.com/etcd-io/etcd
+
+The CUDA 12 managed Megatron environment installs NVIDIA Apex from its pinned
+25.09 source tag under the BSD 3-Clause License:
+https://github.com/NVIDIA/apex

@@ -64,6 +64,17 @@ _MEMFD_CREATE.argtypes = (ctypes.c_char_p, ctypes.c_uint)
 _MEMFD_CREATE.restype = ctypes.c_int
 
 
+def _memfd_create(name: str) -> int:
+    function = ctypes.CDLL(None, use_errno=True).memfd_create
+    function.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    function.restype = ctypes.c_int
+    fd = function(name.encode(), 1)  # MFD_CLOEXEC
+    if fd < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return fd
+
+
 def _slot_offset(sequence: int) -> int:
     return _CONTROL.size + (sequence & 1) * _SLOT_SIZE
 

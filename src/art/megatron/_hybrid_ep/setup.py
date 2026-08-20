@@ -136,22 +136,20 @@ def get_extension_hybrid_ep_cpp():
                 "csrc/hybrid_ep/buffer/internode_nixl.cu",
                 "csrc/hybrid_ep/buffer/nixl_connector.cu",
             ])
-            nixl_home = os.getenv("NIXL_HOME", "/usr/local/nixl")
-            ucx_home = os.getenv("UCX_HOME", "/usr")
-            nixl_include = os.path.join(nixl_home, "include")
-            nixl_gpu_include = os.path.join(nixl_home, "include/gpu/ucx")
-            import platform
-            machine = platform.machine()
-            if machine == "aarch64":
-                nixl_lib_suffix = "lib/aarch64-linux-gnu"
-            else:
-                nixl_lib_suffix = "lib/x86_64-linux-gnu"
-            nixl_lib = os.path.join(nixl_home, nixl_lib_suffix)
-            include_dirs.extend([nixl_include, nixl_gpu_include, os.path.join(ucx_home, "include")])
+            nixl_include = os.environ["NIXL_INCLUDE_DIR"]
+            nixl_gpu_include = os.environ["NIXL_GPU_INCLUDE_DIR"]
+            ucx_include = os.environ["UCX_INCLUDE_DIR"]
+            nixl_lib = os.environ["NIXL_LIBRARY_DIR"]
+            nixl_deps = os.environ["NIXL_DEPENDENCY_LIBRARY_DIR"]
+            include_dirs.extend([nixl_include, nixl_gpu_include, ucx_include])
             library_dirs.append(nixl_lib)
-            runtime_library_dirs.append(nixl_lib)
             libraries.extend(["nixl", "nixl_build", "nixl_common"])
-            extra_link_args.extend([f"-Wl,-rpath,{nixl_lib}"])
+            extra_link_args.extend(
+                [
+                    f"-Wl,-rpath,$ORIGIN/{Path(nixl_lib).name}",
+                    f"-Wl,-rpath,$ORIGIN/{Path(nixl_deps).name}",
+                ]
+            )
             extra_link_args.append("-l:libnvidia-ml.so.1")
             libraries.extend(["mlx5", "ibverbs"])
             doca_home = os.getenv("DOCA_HOME", "")

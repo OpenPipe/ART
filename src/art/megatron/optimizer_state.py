@@ -1677,7 +1677,9 @@ def _public_fields(value: object, *, exclude: set[str] | None = None) -> dict[st
 
 
 def _model_runtime_sha256(runtime: Any) -> str:
-    return _json_sha256(
+    if runtime.optimizer_runtime_sha256 is not None:
+        return runtime.optimizer_runtime_sha256
+    runtime.optimizer_runtime_sha256 = _json_sha256(
         {
             "model_support": runtime.model_support_spec,
             "provider": {
@@ -1697,6 +1699,7 @@ def _model_runtime_sha256(runtime: Any) -> str:
             "torch": torch.__version__,
         }
     )
+    return runtime.optimizer_runtime_sha256
 
 
 def _optimizer_layout_sha256(runtime: Any) -> str:

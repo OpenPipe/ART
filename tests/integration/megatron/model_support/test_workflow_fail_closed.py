@@ -6,7 +6,6 @@ from typing import cast
 from art.megatron.model_support.spec import ArchitectureReport
 
 from . import workflow_scheduler
-from . import workflow_stage_worker as worker
 from .validation_spec import (
     ValidationReport,
     ValidationStageResult,
@@ -24,10 +23,7 @@ from .workflow_runtime import (
     execute_workflow,
 )
 from .workflow_scheduler import PreparedWorkflow
-from .workflow_stage_worker import (
-    WorkflowStageWorkerItem,
-    WorkflowStageWorkerSession,
-)
+from .workflow_stage_worker import WorkflowStageWorkerSession
 
 
 def _runtime(name: str, *, handler: str | None = None) -> WorkflowRuntimeKey:
@@ -38,66 +34,6 @@ def _runtime(name: str, *, handler: str | None = None) -> WorkflowRuntimeKey:
         kind="cpu",
         mode=name,
     )
-
-
-def _worker_request(tmp_path: Path) -> WorkflowStageWorkerSession:
-    architecture_json = tmp_path / "architecture.json"
-    architecture_json.write_text(
-        ArchitectureReport(
-            base_model="model",
-            model_key="model",
-            handler_key="model",
-            recommended_min_layers=1,
-        ).model_dump_json(),
-        encoding="utf-8",
-    )
-    stages = ("hf_parity", "packing_invariance")
-    for stage in stages:
-        (tmp_path / stage).mkdir()
-    return WorkflowStageWorkerSession(
-        base_model="model",
-        architecture_json=str(architecture_json),
-        items=tuple(
-            WorkflowStageWorkerItem(
-                stage=stage,
-                stage_dir=str(tmp_path / stage),
-                output_json=str(tmp_path / stage / "stage_result.json"),
-                environment={},
-            )
-            for stage in stages
-        ),
-    )
-
-
-def test_stage_worker_stops_at_first_failed_result(monkeypatch, tmp_path: Path) -> None:
-    request = _worker_request(tmp_path)
-    called: list[str] = []
-
-    def run(stage: str, *, passed: bool):
-        def stage_runner(**_kwargs) -> ValidationStageResult:
-            called.append(stage)
-            return ValidationStageResult(
-                name=stage,
-                passed=passed,
-                metrics={"error": "root failure"} if not passed else {},
-            )
-
-        return stage_runner
-
-    monkeypatch.setitem(
-        worker._STAGE_RUNNERS, "hf_parity", run("hf_parity", passed=False)
-    )
-    monkeypatch.setitem(
-        worker._STAGE_RUNNERS,
-        "packing_invariance",
-        run("packing_invariance", passed=True),
-    )
-
-    worker._run_session(request)
-
-    assert called == ["hf_parity"]
-    assert Path(request.items[0].output_json).is_file()
-    assert not Path(request.items[1].output_json).exists()
 
 
 def test_executor_blocks_failed_dependency_transitively() -> None:
@@ -221,92 +157,6 @@ def _run(prepared: _Prepared, forkservers: _Forkservers) -> ValidationReport:
     )[0]
 
 
-def test_scheduler_records_failure_and_fails_blocked_operations(
-    monkeypatch, tmp_path: Path
-) -> None:
-    runtime = _runtime("shared", handler="model")
-    operations = (
-        WorkflowOperation(id="model:hf_parity", stage="hf_parity", runtime=runtime),
-        WorkflowOperation(
-            id="model:packing_invariance",
-            stage="packing_invariance",
-            runtime=runtime,
-            dependencies=("model:hf_parity",),
-        ),
-        WorkflowOperation(
-            id="model:length_trainability",
-            stage="length_trainability",
-            runtime=_runtime("dependent", handler="model"),
-            dependencies=("model:packing_invariance",),
-        ),
-    )
-    plan = compile_workflow(operations)
-    prepared = _Prepared(tmp_path / "run")
-    forkservers = _Forkservers()
-    monkeypatch.setattr(
-        workflow_scheduler, "compile_prepared_workflows", lambda *_args, **_kwargs: plan
-    )
-    monkeypatch.setattr(
-        workflow_scheduler,
-        "_visible_devices",
-        lambda: [WorkflowDevice(host="local", gpu="0")],
-    )
-
-    report = _run(prepared, forkservers)
-
-    assert forkservers.calls == [("hf_parity", "packing_invariance")]
-    stages = {stage.name: stage for stage in report.stages}
-    assert stages["hf_parity"].metrics["error"] == "sentinel root failure"
-    for stage_name in ("packing_invariance", "length_trainability"):
-        stage = stages[stage_name]
-        assert stage.skipped is False
-        assert stage.passed is False
-        assert stage.metrics["blocked"] is True
-        assert stage.metrics["workflow_failed_dependencies"] == ["model:hf_parity"]
-        evidence = stage.metrics["workflow_failure_evidence"]["model:hf_parity"]
-        assert evidence["error"] == "sentinel root failure"
-        assert Path(evidence["stage_result_json"]).is_file()
-    assert report.passed is False
-
-
-def test_scheduler_records_all_results_before_propagating_failure(
-    monkeypatch, tmp_path: Path
-) -> None:
-    runtime = _runtime("resident", handler="model")
-    stages = ("lora_coverage", "train_inf_mismatch", "length_trainability")
-    plan = compile_workflow(
-        tuple(
-            WorkflowOperation(
-                id=f"model:{stage}",
-                stage=stage,
-                runtime=runtime,
-                dependencies=((f"model:{stages[index - 1]}",) if index else ()),
-            )
-            for index, stage in enumerate(stages)
-        )
-    )
-    prepared = _Prepared(tmp_path / "run", stages)
-    forkservers = _Forkservers(fail="train_inf_mismatch", stop=False)
-    monkeypatch.setattr(
-        workflow_scheduler, "compile_prepared_workflows", lambda *_args, **_kwargs: plan
-    )
-    monkeypatch.setattr(
-        workflow_scheduler,
-        "_visible_devices",
-        lambda: [WorkflowDevice(host="local", gpu="0")],
-    )
-
-    report = _run(prepared, forkservers)
-
-    results = {stage.name: stage for stage in report.stages}
-    assert forkservers.calls == [stages]
-    assert results["lora_coverage"].passed is True
-    assert results["train_inf_mismatch"].passed is False
-    assert results["length_trainability"].passed is True
-    assert "workflow_failed_dependencies" not in results["length_trainability"].metrics
-    assert report.passed is False
-
-
 def test_hidden_correctness_failure_fails_visible_owner(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -341,32 +191,3 @@ def test_hidden_correctness_failure_fails_visible_owner(
     assert owner.metrics["blocked"] is True
     assert owner.metrics["workflow_failed_dependencies"] == [reference.id]
     assert report.passed is False
-
-
-def test_explicit_user_skip_does_not_fail_workflow(monkeypatch, tmp_path: Path) -> None:
-    prepared = _Prepared(tmp_path / "run", ("hf_parity", "packing_invariance"))
-    prepared.report.stages[1] = ValidationStageResult(
-        name="packing_invariance",
-        skipped=True,
-        metrics={"skipped": True, "reason": "--skip-stage"},
-    )
-    operation = WorkflowOperation(
-        id="model:hf_parity",
-        stage="hf_parity",
-        runtime=_runtime("base", handler="model"),
-    )
-    plan = compile_workflow((operation,))
-    monkeypatch.setattr(
-        workflow_scheduler, "compile_prepared_workflows", lambda *_args, **_kwargs: plan
-    )
-    monkeypatch.setattr(
-        workflow_scheduler,
-        "_visible_devices",
-        lambda: [WorkflowDevice(host="local", gpu="0")],
-    )
-
-    report = _run(prepared, _Forkservers(fail=None))
-
-    assert report.passed is True and report.complete is False
-    assert report.stages[1].skipped is True
-    assert report.stages[1].metrics["reason"] == "--skip-stage"

@@ -2,6 +2,9 @@ __pycache__/
 .art/
 # .env
 .venv/
+.ruff_cache/
+.pytest_cache/
+scratch/
 grpo_trainer_lora_model/
 logs/
 shared_cache.db
@@ -13,5 +16,6 @@ dist/
 dev/art-e/data/
 replays/
 /trajectories/
+/progress_log.md
 .DS_Store
 # .local/

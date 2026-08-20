@@ -12,6 +12,7 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from art.megatron.runtime.managed import MegatronRuntimeInfo
 from art.megatron.runtime.specs import TrainerRuntimeSpec, TrainingRunSpec
 from art.preprocessing.pack import PackingTimings
 from art.utils.lifecycle import complete_task
@@ -66,10 +67,12 @@ from .packing import (
 from .rollout import DistributedRolloutExecutor, InstalledAsyncCallable
 from .specs import (
     ArtRuntimeConfig,
+    EndpointSpec,
     GpuId,
     GpuPlacement,
     HostServiceHealth,
     ModelServiceSpec,
+    NixlTransportSpec,
     RuntimeTopology,
 )
 from .vllm_replica import (
@@ -148,12 +151,14 @@ class ArtRuntime:
         self._closeables: set[Any] = set()
         self._next_packing_host = 0
         self._nccl_preflight_lock = asyncio.Lock()
-        self._nccl_preflights: set[tuple[str, tuple[tuple[str, GpuId], ...], str]] = (
-            set()
-        )
-        self._runtime_packages = runtime_package_names(
-            trainer=topology.trainer is not None
-        )
+        self._nccl_preflights: set[
+            tuple[str, tuple[tuple[str, GpuId], ...], str, str | None]
+        ] = set()
+        self._runtime_packages = runtime_package_names(trainer=False)
+        self._trainer_runtime_cache: dict[
+            tuple[tuple[str, ...], bool, bool], MegatronRuntimeInfo
+        ] = {}
+        self._nixl_transport: NixlTransportSpec | None = topology.cluster.nixl_transport
         self._controller_fingerprint: RuntimeFingerprint
         self._admitted_hosts: dict[str, HostAdmissionReport] = {}
         self._artifact_probe = (
@@ -323,6 +328,7 @@ class ArtRuntime:
                 expected_runtime=self._controller_fingerprint,
             )
             self._validate_nccl_transport_environment()
+            await self._resolve_nixl_transport()
             await self._preflight_artifact_root()
             await self._preflight_nixl_metadata_store()
         self._started = True
@@ -357,12 +363,72 @@ class ArtRuntime:
                 raise RuntimeError(f"host service {host_id!r} identity changed")
         return health
 
+    @property
+    def nixl_transport(self) -> NixlTransportSpec | None:
+        return self._nixl_transport
+
+    async def _resolve_nixl_transport(self) -> None:
+        transport = self._nixl_transport
+        if transport is None or transport.metadata_store is not None:
+            return
+        controller = self.topology.cluster.controller_host_id
+        timeout_s = min(60.0, self.topology.cluster.startup_timeout_s)
+        endpoint = await call_remote(
+            self._host_services[controller].start_nixl_metadata_store,
+            self.runtime_id,
+            timeout_s,
+        )
+        if not isinstance(endpoint, EndpointSpec) or not endpoint.is_routable:
+            raise RuntimeError(
+                "managed NIXL metadata store returned an invalid endpoint"
+            )
+        self._nixl_transport = transport.model_copy(update={"metadata_store": endpoint})
+
+    async def _ensure_megatron_runtime(
+        self,
+        host_ids: tuple[str, ...],
+        *,
+        require_hybrid_ep: bool,
+        multinode: bool,
+    ) -> MegatronRuntimeInfo:
+        key = (host_ids, require_hybrid_ep, multinode)
+        if cached := self._trainer_runtime_cache.get(key):
+            return cached
+        infos = await asyncio.gather(
+            *(
+                call_remote(
+                    self._host_services[host_id].ensure_megatron_runtime,
+                    require_hybrid_ep,
+                    multinode,
+                )
+                for host_id in host_ids
+            )
+        )
+        contracts = {info.model_dump_json() for info in infos}
+        if len(contracts) != 1:
+            detail = " ".join(
+                f"{host_id}={info.runtime.sha256}"
+                for host_id, info in zip(host_ids, infos, strict=True)
+            )
+            raise RuntimeError(f"Megatron runtimes differ across hosts: {detail}")
+        info = infos[0]
+        self._trainer_runtime_cache[key] = info
+        logger.info(
+            "admitted Megatron runtime hosts=%s profile=%s variant=%s runtime=%s",
+            ",".join(host_ids),
+            info.profile,
+            info.variant,
+            info.runtime.sha256,
+        )
+        return info
+
     async def _preflight_launch(
         self,
         *,
         runtime_kind: Literal["trainer", "vllm"],
         placements: tuple[GpuPlacement, ...],
         master_addr: str | None = None,
+        runtime_python: str | None = None,
     ) -> None:
         selected = tuple(
             next(value for value in placements if value.host_id == host_id)
@@ -378,6 +444,7 @@ class ArtRuntime:
             runtime_kind,
             tuple((value.host_id, value.gpu_id) for value in selected),
             transport.net_name,
+            runtime_python,
         )
         deadline = (
             asyncio.get_running_loop().time() + self.topology.cluster.startup_timeout_s
@@ -445,6 +512,7 @@ class ArtRuntime:
                             runtime_kind=runtime_kind,
                             master_addr=master_addr,
                             timeout_s=phase_timeout_s,
+                            runtime_python=runtime_python,
                         ),
                     )
                     if not isinstance(rendezvous, NcclRendezvousResult):
@@ -460,6 +528,7 @@ class ArtRuntime:
                             gpu_id=placement.gpu_id,
                             net_name=transport.net_name,
                             timeout_s=phase_timeout_s,
+                            runtime_python=runtime_python,
                         )
                         for rank, placement in enumerate(selected)
                     )
@@ -577,9 +646,11 @@ class ArtRuntime:
             )
 
     async def _preflight_nixl_metadata_store(self) -> None:
-        transport = self.topology.cluster.nixl_transport
+        transport = self._nixl_transport
         if transport is None:
             return
+        if transport.metadata_store is None:
+            raise RuntimeError("NIXL metadata store was not resolved")
         host_ids = tuple(self._host_services)
         probe_timeout_s = min(5.0, self.topology.cluster.rpc_timeout_s)
         async with asyncio.timeout(self.topology.cluster.rpc_timeout_s):
@@ -1035,12 +1106,26 @@ class ArtRuntime:
         ]
         if indices != list(range(indices[0], indices[-1] + 1)):
             raise ValueError("trainer hosts must be contiguous in the cluster mesh")
-        if runtime_spec.hybrid_ep is not None and runtime_spec.hybrid_ep.multinode:
+        hybrid_ep = runtime_spec.hybrid_ep
+        if hybrid_ep is not None and hybrid_ep.multinode:
+            if hybrid_ep.nixl_transport != self._nixl_transport:
+                raise ValueError(
+                    "trainer NIXL transport does not match the resolved runtime transport"
+                )
             await self._preflight_nixl_metadata_store()
-        await self._preflight_launch(
-            runtime_kind="trainer", placements=runtime_spec.trainer_mesh.ranks
+        runtime_info = await self._ensure_megatron_runtime(
+            ordered_hosts,
+            require_hybrid_ep=hybrid_ep is not None,
+            multinode=hybrid_ep.multinode if hybrid_ep is not None else False,
         )
-        selected = self.host_mesh.slice(hosts=slice(indices[0], indices[-1] + 1))
+        await self._preflight_launch(
+            runtime_kind="trainer",
+            placements=runtime_spec.trainer_mesh.ranks,
+            runtime_python=runtime_info.python,
+        )
+        selected = self.host_mesh.slice(
+            hosts=slice(indices[0], indices[-1] + 1)
+        ).with_python_executable(runtime_info.python)
         from art.megatron.runtime.monarch import (
             MonarchTrainerSupervision,
             spawn_monarch_trainer_actors,

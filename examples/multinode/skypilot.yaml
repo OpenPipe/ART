@@ -13,11 +13,10 @@ envs:
 
 setup: |
   set -euo pipefail
-  uv sync --frozen --no-dev --extra distributed
+  uvx uv@0.11.7 sync --frozen --no-dev --extra distributed
 
 run: |
   set -euo pipefail
-  export PYTHONPATH="$PWD/examples/multinode${PYTHONPATH:+:$PYTHONPATH}"
   exec .venv/bin/art-monarch skypilot \
-    --program program:main \
+    --program examples/multinode/program.py:main \
     --startup-timeout 90

@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import socket
-import sys
 from threading import Condition, Lock
 import time
 from typing import Any, Literal
@@ -104,16 +103,9 @@ class _RegisteredSlot:
 
 
 def _load_nixl() -> tuple[Any, Any, Any]:
-    root = Path("/usr/local/art-multinode/nixl/python")
-    if root.is_dir() and str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    os.environ.update(
-        NIXL_PLUGIN_DIR="/usr/local/art-multinode/nixl-ucx/lib/plugins",
-        UCX_MODULE_DIR="/usr/local/art-multinode/ucx/lib/ucx",
-        UCX_NET_DEVICES="all",
-        UCX_TLS="rc,rc_gda,cuda_copy",
-        UCX_IB_GDA_RETAIN_INACTIVE_CTX="yes",
-    )
+    from .nixl_runtime import configure_nixl_environment
+
+    configure_nixl_environment()
     for name in ("nixl_cu13", "nixl_cu12", "nixl"):
         try:
             module = importlib.import_module(name)
@@ -125,7 +117,8 @@ def _load_nixl() -> tuple[Any, Any, Any]:
             module.nixl_thread_sync_t,
         )
     raise RuntimeError(
-        "NIXL Python bindings are unavailable; run scripts/setup_multinode.sh"
+        "NIXL Python bindings are unavailable; install ART with the megatron "
+        "or megatron-cu130 extra"
     )
 
 

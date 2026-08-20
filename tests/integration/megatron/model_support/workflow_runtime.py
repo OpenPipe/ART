@@ -82,17 +82,12 @@ class WorkflowResourceRequest(BaseModel):
 
     gpu_count: int = Field(default=0, ge=0)
     gpu_share: float = Field(default=1.0, gt=0.0, le=1.0)
-    same_host: bool = True
-    contiguous: bool = True
     host_affinity: str | None = Field(default=None, min_length=1)
-    exclusive_host: bool = False
 
     @model_validator(mode="after")
     def cpu_requests_do_not_reserve_gpu_capacity(self) -> "WorkflowResourceRequest":
         if self.gpu_count == 0 and self.gpu_share != 1.0:
             raise ValueError("CPU operations cannot reserve fractional GPU capacity")
-        if self.exclusive_host and (self.gpu_count == 0 or not self.same_host):
-            raise ValueError("exclusive host requests require same-host GPUs")
         return self
 
 
@@ -290,7 +285,6 @@ class _GpuPool:
         self._active_by_host = {host: 0 for host in self._hosts}
         self._affinity_hosts: dict[str, str] = {}
         self._affinity_bindings_by_host = {host: 0 for host in self._hosts}
-        self._exclusive_hosts: set[str] = set()
         self._lock = Lock()
 
     def acquire(self, request: WorkflowResourceRequest) -> WorkflowPlacement | None:
@@ -298,15 +292,9 @@ class _GpuPool:
             affinity_host = self._affinity_host(request)
             if request.gpu_count == 0:
                 host = affinity_host
-                if host in self._exclusive_hosts:
-                    return None
                 if host is None:
                     host = min(
-                        (
-                            candidate
-                            for candidate in self._hosts
-                            if candidate not in self._exclusive_hosts
-                        ),
+                        self._hosts,
                         key=lambda value: (
                             self._active_by_host[value],
                             self._hosts.index(value),
@@ -331,8 +319,6 @@ class _GpuPool:
                 for device in selected:
                     self._available[device] -= request.gpu_share
                 host = selected[0].host
-                if request.exclusive_host:
-                    self._exclusive_hosts.add(host)
                 self._active_by_host[host] += 1
                 return WorkflowPlacement(host=host, devices=selected)
         return None
@@ -378,44 +364,22 @@ class _GpuPool:
     def _candidate_placements(
         self, request: WorkflowResourceRequest
     ) -> list[tuple[WorkflowDevice, ...]]:
-        eligible_hosts = {
-            host
-            for host in self._hosts
-            if host not in self._exclusive_hosts
-            and (not request.exclusive_host or self._active_by_host[host] == 0)
-        }
         eligible = [
             device
             for device in self._devices
-            if device.host in eligible_hosts
-            and self._available[device] + 1e-9 >= request.gpu_share
+            if self._available[device] + 1e-9 >= request.gpu_share
         ]
         by_host: dict[str, list[WorkflowDevice]] = defaultdict(list)
         for device in eligible:
             by_host[device.host].append(device)
-        if request.contiguous:
-            return [
-                selected
-                for devices in by_host.values()
-                for start in range(len(devices) - request.gpu_count + 1)
-                if _contiguous(
-                    selected := tuple(devices[start : start + request.gpu_count]),
-                    self._devices,
-                )
-            ]
-        pools = list(by_host.values()) if request.same_host else [eligible]
         return [
-            tuple(
-                sorted(
-                    devices,
-                    key=lambda device: (
-                        -self._available[device],
-                        self._devices.index(device),
-                    ),
-                )[: request.gpu_count]
+            selected
+            for devices in by_host.values()
+            for start in range(len(devices) - request.gpu_count + 1)
+            if _contiguous(
+                selected := tuple(devices[start : start + request.gpu_count]),
+                self._devices,
             )
-            for devices in pools
-            if len(devices) >= request.gpu_count
         ]
 
     def release(
@@ -432,23 +396,16 @@ class _GpuPool:
                     raise RuntimeError(
                         f"released unowned workflow host {placement.host}"
                     )
-                if request.exclusive_host:
-                    if placement.host not in self._exclusive_hosts:
-                        raise RuntimeError(
-                            f"released non-exclusive workflow host {placement.host}"
-                        )
-                    self._exclusive_hosts.remove(placement.host)
 
 
 def _contiguous(
     selected: Sequence[WorkflowDevice], inventory: Sequence[WorkflowDevice]
 ) -> bool:
-    if not selected:
-        return True
-    if len({device.host for device in selected}) != 1:
-        return False
     positions = sorted(inventory.index(device) for device in selected)
-    return positions == list(range(positions[0], positions[0] + len(positions)))
+    return not selected or (
+        len({device.host for device in selected}) == 1
+        and positions == list(range(positions[0], positions[0] + len(positions)))
+    )
 
 
 def execute_workflow(

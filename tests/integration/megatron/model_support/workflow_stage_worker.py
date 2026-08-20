@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-from collections.abc import Callable
 import json
 import os
 from pathlib import Path
@@ -17,19 +16,8 @@ from art.utils.lifecycle import ChildProcessSupervisor
 from art.utils.network import find_free_tcp_port
 from art.vllm_runtime import ManagedVllmRuntime, VllmRuntimeLaunchConfig
 
-from .workflow import (
-    CORRECTNESS_REFERENCE_STAGE,
-    run_chat_template_rollout_stage,
-    run_correctness_sensitivity_stage,
-    run_e2e_throughput_stage,
-    run_hf_parity_stage,
-    run_length_trainability_stage,
-    run_lora_coverage_stage,
-    run_packing_invariance_stage,
-    run_train_inf_mismatch_stage,
-    run_yes_no_trainability_stage,
-)
-from .workflow_fixtures import FIXTURE_PATH_ENV, ensure_workflow_fixture
+from . import workflow
+from .workflow_fixtures import FIXTURE_PATH_ENV
 
 RESIDENT_FUNCTIONAL_MODE = "resident_functional"
 RESIDENT_FUNCTIONAL_STAGES = (
@@ -40,18 +28,7 @@ RESIDENT_FUNCTIONAL_STAGES = (
 BASE_MEGATRON_MODE = "base_megatron"
 BASE_MEGATRON_STAGES = ("hf_parity", "packing_invariance")
 EXTERNAL_VLLM_ENGINE_ARGS_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_ENGINE_ARGS"
-_STAGE_RUNNERS = {
-    "hf_parity": run_hf_parity_stage,
-    "lora_coverage": run_lora_coverage_stage,
-    "train_inf_mismatch": run_train_inf_mismatch_stage,
-    "correctness_sensitivity": run_correctness_sensitivity_stage,
-    CORRECTNESS_REFERENCE_STAGE: run_correctness_sensitivity_stage,
-    "chat_template_rollout": run_chat_template_rollout_stage,
-    "packing_invariance": run_packing_invariance_stage,
-    "length_trainability": run_length_trainability_stage,
-    "e2e_throughput": run_e2e_throughput_stage,
-    "yes_no_trainability": run_yes_no_trainability_stage,
-}
+_STAGE_RUNNERS = workflow.validation_stage_runners()
 
 
 class WorkflowStageWorkerItem(BaseModel):
@@ -178,20 +155,13 @@ async def _serving_baseline(
 
 
 async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
-    from . import workflow
-
     spec = request.resident_functional
     assert spec is not None
     launch_spec = spec.launch
     stages = tuple(item.stage for item in request.items)
     if stages != RESIDENT_FUNCTIONAL_STAGES:
         raise ValueError("resident functional stages do not match worker items")
-    prepared = ensure_workflow_fixture(
-        request.base_model,
-        allow_unvalidated_arch=request.allow_unvalidated_arch,
-        required_stages=frozenset(RESIDENT_FUNCTIONAL_STAGES),
-    )
-    host_environment = prepared.resident_functional_environment()
+    host_environment = request.items[0].environment
     visible = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
     if len(visible) != spec.gpu_count:
         raise RuntimeError(
@@ -261,7 +231,7 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
                 f"trainer={trainer_gpu_ids}, inference={inference_gpu_ids}"
             )
         environments = tuple(
-            item.environment | host_environment | external | spec.trainer_environment
+            item.environment | external | spec.trainer_environment
             for item in request.items
         )
         if any(environment != environments[0] for environment in environments[1:]):
@@ -323,19 +293,13 @@ async def _run_functional_session(request: WorkflowStageWorkerSession) -> None:
         runtime.close()
 
 
-def _run_session(
-    request: WorkflowStageWorkerSession,
-    after_stage: Callable[[], dict[str, object]] | None = None,
-) -> None:
-    from . import workflow
-
+def _run_session(request: WorkflowStageWorkerSession) -> None:
     architecture = ArchitectureReport.model_validate_json(
         Path(request.architecture_json).read_text(encoding="utf-8")
     )
     for item in request.items:
         started = time.monotonic()
         log_path = Path(item.stage_dir) / "worker.log"
-        reset_error: Exception | None = None
         try:
             with workflow._temporary_env(
                 **item.environment,
@@ -355,17 +319,6 @@ def _run_session(
                 passed=False,
                 metrics=workflow._stage_error_metrics(exc),
             )
-        if after_stage is not None:
-            try:
-                result.metrics["functional_vllm_reset"] = after_stage()
-            except Exception as exc:
-                with log_path.open("a", encoding="utf-8") as log:
-                    traceback.print_exc(file=log)
-                result.passed = False
-                result.metrics["functional_vllm_reset_error"] = (
-                    workflow._stage_error_metrics(exc)
-                )
-                reset_error = exc
         result.metrics.update(
             {
                 "workflow_stage_artifact_dir": item.stage_dir,
@@ -375,10 +328,6 @@ def _run_session(
         Path(item.output_json).write_text(
             result.model_dump_json(indent=2), encoding="utf-8"
         )
-        if reset_error is not None:
-            raise RuntimeError(
-                f"functional vLLM reset failed after {item.stage}"
-            ) from reset_error
         if not result.passed:
             break
 
@@ -390,7 +339,7 @@ def _run_base_megatron_session(request: WorkflowStageWorkerSession) -> None:
     from .base_megatron_session import base_megatron_session
 
     with base_megatron_session():
-        _run_session(request.model_copy(update={"base_megatron": False}))
+        _run_session(request)
 
 
 def run_session_json(session_json: str | Path) -> None:

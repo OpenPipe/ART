@@ -22,6 +22,7 @@ from monarch.actor import (  # ty: ignore[unresolved-import]
 )
 from pydantic import BaseModel, ConfigDict
 
+from art.megatron.runtime.managed import MegatronRuntimeInfo
 from art.utils.lifecycle import complete_task, complete_to_thread
 
 from .adapter_transport import AdapterSnapshotReceiver
@@ -260,6 +261,8 @@ class ArtHostService(Actor):
         self._nccl_sessions: dict[str, tuple[float, asyncio.Task[None]]] = {}
         self._nccl_tasks: dict[str, asyncio.Task[Any]] = {}
         self._cancelled_nccl_probes: set[str] = set()
+        self._megatron_runtimes: dict[tuple[bool, bool], MegatronRuntimeInfo] = {}
+        self._managed_etcd = None
 
     @resilient_endpoint
     async def admission(self) -> HostAdmissionReport:
@@ -298,6 +301,39 @@ class ArtHostService(Actor):
                 f"host {self.host_id!r} cannot reach healthy NIXL metadata store {url}"
             ) from error
         return self.host_id
+
+    @resilient_endpoint
+    async def ensure_megatron_runtime(
+        self, require_hybrid_ep: bool, multinode: bool
+    ) -> MegatronRuntimeInfo:
+        if self._admission_report is None:
+            raise RuntimeError("host has not passed ART runtime admission")
+        key = (require_hybrid_ep, multinode)
+        if key not in self._megatron_runtimes:
+            from art.megatron.runtime.managed import ensure_megatron_runtime
+
+            self._megatron_runtimes[key] = await asyncio.to_thread(
+                ensure_megatron_runtime,
+                art_build_sha256=self._admission_report.runtime.art_build_sha256,
+                require_hybrid_ep=require_hybrid_ep,
+                multinode=multinode,
+            )
+        return self._megatron_runtimes[key]
+
+    @resilient_endpoint
+    async def start_nixl_metadata_store(self, runtime_id: str, timeout_s: float):
+        if self._admission_report is None:
+            raise RuntimeError("host has not passed ART runtime admission")
+        if self._managed_etcd is None:
+            from .etcd_runtime import ManagedEtcd
+
+            self._managed_etcd = await asyncio.to_thread(
+                ManagedEtcd.start,
+                advertise_host=self._data_plane_host,
+                runtime_id=runtime_id,
+                timeout_s=timeout_s,
+            )
+        return self._managed_etcd.endpoint
 
     @resilient_endpoint
     async def start_nccl_preflight_session(
@@ -398,6 +434,9 @@ class ArtHostService(Actor):
         if self._vllm_launcher is not None:
             await self._vllm_launcher.close()
             self._vllm_launcher = None
+        if self._managed_etcd is not None:
+            await asyncio.to_thread(self._managed_etcd.close)
+            self._managed_etcd = None
         self._packed_batches.store.close()
 
     async def _require_nccl_probe(self, probe_id: str) -> float:

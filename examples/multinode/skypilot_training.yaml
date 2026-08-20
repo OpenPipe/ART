@@ -1,0 +1,27 @@
+name: art-multinode-training
+
+num_nodes: 2
+
+workdir: examples/multinode
+
+resources:
+  accelerators: H200:1
+
+envs:
+  ART_SHARED_ROOT:
+  ART_VERSION: "0.5.19"
+  NCCL_NET: IB
+
+setup: |
+  set -euo pipefail
+  test -d "${ART_SHARED_ROOT}"
+  uv venv --python 3.12 --seed "$HOME/art-release-example"
+  "$HOME/art-release-example/bin/pip" install \
+    --extra-index-url https://download.pytorch.org/whl/cu128 \
+    "openpipe-art[megatron]==${ART_VERSION}"
+
+run: |
+  set -euo pipefail
+  exec "$HOME/art-release-example/bin/art-monarch" skypilot \
+    --program train.py:main \
+    --startup-timeout 900

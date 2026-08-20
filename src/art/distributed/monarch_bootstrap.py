@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequenc
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import importlib.util
 import ipaddress
 import os
 from pathlib import Path
@@ -39,6 +40,7 @@ _INVALID_IDENTIFIER = re.compile(r"\W")
 _MAX_IDENTIFIER_LENGTH = 48
 _SSH_LAUNCH_ID = re.compile(r"^[0-9a-f]{32}$")
 _SSH_READY_PREFIX = b"ART_MONARCH_READY "
+_PROGRAM_PYTHONPATH_ENV = "ART_MONARCH_PROGRAM_PYTHONPATH"
 _MONARCH_TIMEOUT_ENV = (
     "HYPERACTOR_HOST_SPAWN_READY_TIMEOUT",
     "HYPERACTOR_MESSAGE_DELIVERY_TIMEOUT",
@@ -295,6 +297,36 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _program_reference(value: str) -> tuple[str, str]:
+    target, separator, qualname = value.partition(":")
+    if not target or not separator or not qualname:
+        raise ValueError("--program must use module:qualname or path.py:qualname")
+    if Path(target).suffix != ".py":
+        return target, qualname
+
+    script = Path(target).expanduser().resolve()
+    if not script.is_file():
+        raise ValueError(f"program script does not exist: {script}")
+    module = script.stem
+    if not module.isidentifier():
+        raise ValueError(
+            f"program script name must be a Python identifier: {script.name}"
+        )
+
+    root = str(script.parent)
+    sys.path[:] = [root, *(path for path in sys.path if path != root)]
+    inherited = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        dict.fromkeys((root, *filter(None, inherited)))
+    )
+    os.environ[_PROGRAM_PYTHONPATH_ENV] = root
+    importlib.invalidate_caches()
+    spec = importlib.util.find_spec(module)
+    if spec is None or spec.origin is None or Path(spec.origin).resolve() != script:
+        raise ValueError(f"program module {module!r} does not resolve to {script}")
+    return module, qualname
+
+
 def monarch_identifier(value: str) -> str:
     """Return a stable valid Monarch mesh, proc, or actor identifier."""
 
@@ -376,6 +408,9 @@ def activate_trainer_child_virtualenv() -> None:
     threads = os.environ.get("MKL_NUM_THREADS", os.environ.get("OMP_NUM_THREADS", "1"))
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(name, threads)
+    executable_env = Path(sys.executable).parent.parent
+    if (executable_env / "pyvenv.cfg").is_file():
+        os.environ["ART_VIRTUAL_ENV"] = str(executable_env)
     # Inductor's compile progress creates tqdm's multiprocessing lock lazily. Each
     # rank owns separate output, so a process-local lock avoids leaking that named
     # semaphore when Monarch terminates the rank process.
@@ -572,12 +607,22 @@ async def run_explicit_controller(
     startup_timeout_s: float | None = None,
     owned_workers: Sequence[_WorkerSession] = (),
 ) -> Any:
+    from .launch import ArtLaunchContext
+
     hosts = await attach_controller(
         spec.worker_addresses,
         startup_timeout_s=startup_timeout_s,
         owned_workers=owned_workers,
     )
-    program_task = asyncio.ensure_future(program.resolve()(hosts))
+    program_task = asyncio.ensure_future(
+        program.resolve()(
+            ArtLaunchContext(
+                host_mesh=hosts,
+                worker_addresses=spec.worker_addresses,
+                controller_rank=spec.controller_rank,
+            )
+        )
+    )
     try:
         while not program_task.done():
             exited = [worker for worker in owned_workers if not worker.is_alive()]
@@ -1128,8 +1173,11 @@ def _start_ssh_workers(
     try:
         for host, address in zip(spec.hosts, spec.worker_addresses, strict=True):
             launch_id = uuid.uuid4().hex
+            python_path = os.environ.get(_PROGRAM_PYTHONPATH_ENV)
+            command_prefix = ("env", f"PYTHONPATH={python_path}") if python_path else ()
             command = "exec " + shlex.join(
                 (
+                    *command_prefix,
                     spec.python_executable,
                     "-m",
                     "art.distributed.monarch_bootstrap",
@@ -1304,12 +1352,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         "controller", help="attach to worker commands managed by the caller"
     )
     controller.add_argument("--worker", action="append", required=True)
-    controller.add_argument("--program", required=True, help="module:qualname")
+    program_help = "module:qualname or path.py:qualname"
+    controller.add_argument("--program", required=True, help=program_help)
     controller.add_argument(
         "--startup-timeout", type=_positive_float, default=DEFAULT_STARTUP_TIMEOUT_S
     )
     local = subparsers.add_parser("local", help="own one loopback worker")
-    local.add_argument("--program", required=True, help="module:qualname")
+    local.add_argument("--program", required=True, help=program_help)
     local.add_argument("--port", type=int, default=DEFAULT_MONARCH_PORT)
     local.add_argument(
         "--startup-timeout", type=_positive_float, default=DEFAULT_STARTUP_TIMEOUT_S
@@ -1317,7 +1366,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     sky = subparsers.add_parser(
         "skypilot", help="consume the nodes in one SkyPilot task"
     )
-    sky.add_argument("--program", required=True, help="module:qualname")
+    sky.add_argument("--program", required=True, help=program_help)
     sky.add_argument("--port", type=int, default=DEFAULT_MONARCH_PORT)
     sky.add_argument(
         "--startup-timeout", type=_positive_float, default=DEFAULT_STARTUP_TIMEOUT_S
@@ -1331,7 +1380,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         required=True,
         help="[USER@]SSH_TARGET[=WORKER_HOST]",
     )
-    ssh.add_argument("--program", required=True, help="module:qualname")
+    ssh.add_argument("--program", required=True, help=program_help)
     ssh.add_argument("--python", default=sys.executable, dest="python_executable")
     ssh.add_argument("--port", type=int, default=DEFAULT_MONARCH_PORT)
     ssh.add_argument(
@@ -1351,9 +1400,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             startup_timeout_s=args.startup_timeout,
         )
         return
-    module, separator, qualname = args.program.partition(":")
-    if not module or not separator or not qualname:
-        parser.error("--program must use module:qualname")
+    try:
+        module, qualname = _program_reference(args.program)
+    except ValueError as error:
+        parser.error(str(error))
     if args.command == "skypilot":
         run_skypilot(
             module,

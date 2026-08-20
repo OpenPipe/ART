@@ -4,17 +4,15 @@ import importlib.util
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import cast
 
+import httpx
 import pytest
 
 from art.local import backend as backend_module
 from art.local.backend import LocalBackend
 from art.model import Model
-from art.serving_capabilities import (
-    ART_SERVING_PROTOCOL_VERSION,
-    ServingCapabilities,
-)
+from art.serving_capabilities import ART_SERVING_PROTOCOL_VERSION, ServingCapabilities
 
 
 def _runtime_metrics_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
@@ -32,6 +30,45 @@ def _runtime_metrics_module(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _metrics(*, prompt: float, generation: float) -> dict[str, float]:
+    return {
+        "prompt_tokens_total": prompt,
+        "generation_tokens_total": generation,
+        "prefix_cache_queries_total": prompt / 5,
+        "prefix_cache_hits_total": prompt / 10,
+        "num_preempted_reqs_total": 1.0,
+        "num_requests_running": 1.0,
+        "num_requests_waiting": 2.0,
+        "num_requests_waiting_capacity": 1.0,
+        "kv_cache_usage_perc": 0.25,
+        "max_num_seqs": 8.0,
+        "max_num_batched_tokens": 1024.0,
+        "max_num_scheduled_tokens": 1024.0,
+        "max_model_len": 8192.0,
+        "world_size": 16.0,
+    }
+
+
+def _snapshot(
+    process_uuid: str,
+    generation: int,
+    record_count: int,
+    *,
+    prompt: float,
+    completion: float,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "source": "art_vllm_runtime",
+        "last_update_unix_s": float(record_count),
+        "record_count": record_count,
+        "engine_count": 1,
+        "process_uuid": process_uuid,
+        "generation": generation,
+        "metrics": _metrics(prompt=prompt, generation=completion),
+    }
 
 
 def test_runtime_world_size_includes_data_parallel_workers(
@@ -54,111 +91,37 @@ def test_runtime_world_size_includes_data_parallel_workers(
     assert state.snapshot()["metrics"]["world_size"] == 16.0
 
 
-def _metrics(
-    *, prompt: float, generation: float, queries: float, hits: float
-) -> dict[str, float]:
-    return {
-        "prompt_tokens_total": prompt,
-        "generation_tokens_total": generation,
-        "prefix_cache_queries_total": queries,
-        "prefix_cache_hits_total": hits,
-        "num_preempted_reqs_total": 1.0,
-        "num_requests_running": 1.0,
-        "num_requests_waiting": 2.0,
-        "num_requests_waiting_capacity": 1.0,
-        "kv_cache_usage_perc": 0.25,
-        "max_num_seqs": 8.0,
-        "max_num_batched_tokens": 1024.0,
-        "max_num_scheduled_tokens": 1024.0,
-        "max_model_len": 8192.0,
-        "world_size": 16.0,
-    }
-
-
 @pytest.mark.asyncio
-async def test_backend_reads_leader_metrics_and_fences_counter_generations(
+async def test_metrics_endpoint_and_counter_generation_contract(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     payloads = iter(
-        [
-            {
-                "schema_version": 1,
-                "source": "art_vllm_runtime",
-                "last_update_unix_s": 1.0,
-                "record_count": 1,
-                "engine_count": 1,
-                "process_uuid": "leader-a",
-                "generation": 0,
-                "metrics": _metrics(prompt=100, generation=50, queries=20, hits=10),
-            },
-            {
-                "schema_version": 1,
-                "source": "art_vllm_runtime",
-                "last_update_unix_s": 2.0,
-                "record_count": 2,
-                "engine_count": 1,
-                "process_uuid": "leader-a",
-                "generation": 0,
-                "metrics": _metrics(prompt=200, generation=100, queries=40, hits=20),
-            },
-            {
-                "schema_version": 1,
-                "source": "art_vllm_runtime",
-                "last_update_unix_s": 3.0,
-                "record_count": 1,
-                "engine_count": 1,
-                "process_uuid": "leader-b",
-                "generation": 1,
-                "metrics": _metrics(
-                    prompt=10_000, generation=5_000, queries=2_000, hits=1_000
-                ),
-            },
-            {
-                "schema_version": 1,
-                "source": "art_vllm_runtime",
-                "last_update_unix_s": 4.0,
-                "record_count": 2,
-                "engine_count": 1,
-                "process_uuid": "leader-b",
-                "generation": 1,
-                "metrics": _metrics(
-                    prompt=10_100, generation=5_050, queries=2_020, hits=1_010
-                ),
-            },
-        ]
+        (
+            _snapshot("leader-a", 0, 1, prompt=100, completion=50),
+            _snapshot("leader-a", 0, 2, prompt=200, completion=100),
+            _snapshot("leader-b", 1, 1, prompt=10_000, completion=5_000),
+            _snapshot("leader-b", 1, 2, prompt=10_100, completion=5_050),
+        )
     )
     requests: list[tuple[str, dict[str, str] | None]] = []
 
-    class Response:
-        def __init__(self, payload: dict[str, Any]) -> None:
-            self._payload = payload
-
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict[str, Any]:
-            return self._payload
-
     class Client:
-        def __init__(self, **_kwargs: Any) -> None:
-            pass
-
-        async def __aenter__(self) -> Client:
-            return self
-
-        async def __aexit__(self, *_args: Any) -> None:
-            return None
-
-        async def get(self, url: str, *, headers: dict[str, str] | None) -> Response:
+        async def get(
+            self, url: str, *, headers: dict[str, str] | None
+        ) -> httpx.Response:
             requests.append((url, headers))
-            return Response(next(payloads))
+            return httpx.Response(
+                200,
+                json=next(payloads),
+                request=httpx.Request("GET", url, headers=headers),
+            )
 
     times = iter((0.0, 10.0, 20.0, 30.0))
-    monkeypatch.setattr(backend_module.httpx, "AsyncClient", Client)
     monkeypatch.setattr(
         backend_module, "time", SimpleNamespace(monotonic=lambda: next(times))
     )
     backend = LocalBackend(path=str(tmp_path))
+    backend._vllm_metrics_client = cast(httpx.AsyncClient, Client())
     model = Model(
         name="test-model",
         project="test",
@@ -181,23 +144,21 @@ async def test_backend_reads_leader_metrics_and_fences_counter_generations(
     recovered = await backend.collect_train_step_vllm_metrics(model)
 
     assert "vllm/prompt_tok_per_s" not in first
-    assert second["vllm/prompt_tok_per_s"] == 10.0
-    assert second["vllm/completion_tok_per_s"] == 5.0
+    assert (second["vllm/prompt_tok_per_s"], second["vllm/completion_tok_per_s"]) == (
+        10.0,
+        5.0,
+    )
     assert "vllm/prompt_tok_per_s" not in restarted
     assert restarted["vllm/prefix_cache_hit_rate"] == 0.5
-    assert recovered["vllm/prompt_tok_per_s"] == 10.0
-    assert recovered["vllm/completion_tok_per_s"] == 5.0
-    assert recovered["vllm/world_size"] == 16.0
+    assert (
+        recovered["vllm/prompt_tok_per_s"],
+        recovered["vllm/completion_tok_per_s"],
+        recovered["vllm/world_size"],
+    ) == (10.0, 5.0, 16.0)
     assert set(backend._vllm_metric_snapshots) == {
         ("test", "test-model", "leader-b", 1)
     }
     assert (
         requests
-        == [
-            (
-                "http://leader.test/art/metrics",
-                {"Authorization": "Bearer secret"},
-            )
-        ]
-        * 4
+        == [("http://leader.test/art/metrics", {"Authorization": "Bearer secret"})] * 4
     )

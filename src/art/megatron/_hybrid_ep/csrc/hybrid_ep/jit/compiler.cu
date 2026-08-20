@@ -64,16 +64,19 @@ NVCCCompiler::NVCCCompiler(std::string base_path, std::string cuda_home, std::st
     flags += " -DHYBRID_EP_BUILD_MULTINODE_ENABLE";
 #ifdef USE_NIXL
     flags += " -DUSE_NIXL";
-    std::string nixl_home = get_env("NIXL_HOME");
-    if (nixl_home.empty()) nixl_home = "/usr/local/nixl";
-    std::string ucx_home = get_env("UCX_HOME");
-    if (ucx_home.empty()) ucx_home = "/usr";
-    include += " -I" + nixl_home + "/include ";
-    include += " -I" + nixl_home + "/include/gpu/ucx ";
-    include += " -I" + ucx_home + "/include ";
-    std::string nixl_lib = nixl_home + "/lib/x86_64-linux-gnu";
+    std::string nixl_include = get_env("NIXL_INCLUDE_DIR");
+    std::string nixl_gpu_include = get_env("NIXL_GPU_INCLUDE_DIR");
+    std::string ucx_include = get_env("UCX_INCLUDE_DIR");
+    std::string nixl_lib = get_env("NIXL_LIBRARY_DIR");
+    std::string nixl_deps = get_env("NIXL_DEPENDENCY_LIBRARY_DIR");
+    if (nixl_include.empty() || nixl_gpu_include.empty() || ucx_include.empty() ||
+        nixl_lib.empty() || nixl_deps.empty()) {
+        throw std::runtime_error("NIXL HybridEP runtime paths are not configured");
+    }
+    include += " -I" + nixl_include + " -I" + nixl_gpu_include + " -I" + ucx_include + " ";
     library += " -L" + nixl_lib + " -lnixl -lnixl_build -lnixl_common ";
     library += " -Xlinker -rpath -Xlinker " + nixl_lib + " ";
+    library += " -Xlinker -rpath -Xlinker " + nixl_deps + " ";
 #else
     std::string rdma_core_home = RDMA_CORE_HOME;
     if (!rdma_core_home.empty()) {
