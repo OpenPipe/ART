@@ -17,7 +17,7 @@ FIXTURE_PATH_ENV = "ART_MODEL_SUPPORT_FIXTURE_PATH"
 FIXTURE_CACHE_ENV = "ART_MODEL_SUPPORT_FIXTURE_CACHE"
 FIXTURE_ROOT_ENV = "ART_MODEL_SUPPORT_FIXTURE_ROOT"
 FIXTURE_VERSION = 18
-_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 2}
+_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 3}
 _CANONICAL_CACHE_VERSION = 16
 _ROOT = Path("/tmp/art-models/main-merge-oracle")
 _CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
@@ -331,6 +331,7 @@ def _plan(depth: int, prefix: str, **values: Any) -> _FunctionalPlan:
 _QWEN35 = {"layer_types": (("linear_attention",) * 3 + ("full_attention",)) * 2}
 _GEMMA4 = {"layer_types": (("sliding_attention",) * 5 + ("full_attention",)) * 2}
 _NEMOTRON_H = "MEMEM*EMEMEM*"
+_NEMOTRON_H_COMPACT = f"{_NEMOTRON_H}E"
 _NEMOTRON_H_SEMANTICS = {
     "attention_bias": False, "attention_dropout": 0.0, "hidden_dropout": 0.0,
     "mamba_proj_bias": False, "mlp_bias": False, "use_bias": False,
@@ -418,6 +419,72 @@ def _require_nemotron_h_semantics(config: Any) -> None:
     if mismatches:
         raise RuntimeError(
             f"nemotron_h_moe production semantic config changed: {mismatches}"
+        )
+
+
+def _initialize_nemotron_h_fixture_routers(model: Any, config: Any) -> None:
+    import torch
+
+    pattern = _text(config).hybrid_override_pattern
+    if pattern != _NEMOTRON_H_COMPACT:
+        raise RuntimeError(f"nemotron_h_moe compact pattern changed: {pattern!r}")
+    expected = {
+        f"backbone.layers.{index}.mixer.gate"
+        for index, layer_type in enumerate(pattern)
+        if layer_type == "E"
+    }
+    routers = {
+        name: module
+        for name, module in model.named_modules()
+        if type(module).__name__ == "NemotronHTopkRouter"
+    }
+    if routers.keys() != expected:
+        raise RuntimeError(
+            "nemotron_h_moe compact routers changed: "
+            f"{sorted(routers)} != {sorted(expected)}"
+        )
+    shape = (int(config.n_routed_experts), int(config.hidden_size))
+    for name in sorted(routers):
+        parameters = dict(routers[name].named_parameters(recurse=False))
+        if parameters.keys() != {"weight"} or parameters["weight"].shape != shape:
+            raise RuntimeError(f"{name} parameter contract changed: {parameters}")
+        torch.nn.init.normal_(parameters["weight"], std=float(config.initializer_range))
+
+
+def _validate_nemotron_h_fixture_weights(path: Path, config: Any) -> None:
+    from safetensors.torch import load
+    import torch
+
+    state = load((path / "model.safetensors").read_bytes())
+    nonfinite = [
+        name
+        for name, tensor in state.items()
+        if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all())
+    ]
+    if nonfinite:
+        raise RuntimeError(f"nemotron_h_moe fixture has nonfinite tensors: {nonfinite}")
+    expected = {
+        f"backbone.layers.{index}.mixer.gate.weight"
+        for index, layer_type in enumerate(_NEMOTRON_H_COMPACT)
+        if layer_type == "E"
+    }
+    routers = {name: state[name].float() for name in expected if name in state}
+    if routers.keys() != expected:
+        raise RuntimeError(
+            "nemotron_h_moe saved routers changed: "
+            f"{sorted(routers)} != {sorted(expected)}"
+        )
+    std = float(config.initializer_range)
+    invalid = {
+        name: (float(weight.abs().mean()), float(weight.abs().max()))
+        for name, weight in routers.items()
+        if not bool(weight.ne(0).any())
+        or not std / 4 < float(weight.abs().mean()) < 2 * std
+        or float(weight.abs().max()) > 8 * std
+    }
+    if invalid:
+        raise RuntimeError(
+            f"nemotron_h_moe router initialization is invalid: {invalid}"
         )
 
 
@@ -1011,9 +1078,10 @@ def _build(
             )
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(0)
-                model = auto.from_config(config, trust_remote_code=True).to(
-                    torch.bfloat16
-                )
+                model = auto.from_config(config, trust_remote_code=True)
+                if model_key == "nemotron_h_moe":
+                    _initialize_nemotron_h_fixture_routers(model, config)
+                model = model.to(torch.bfloat16)
             save_kwargs: dict[str, object] = {}
             if model_key == "nemotron_h_moe":
                 if model._tied_weights_keys != ["lm_head.weight"]:
@@ -1037,6 +1105,8 @@ def _build(
                 max_shard_size="2GB",
                 **save_kwargs,
             )
+            if model_key == "nemotron_h_moe":
+                _validate_nemotron_h_fixture_weights(staging, config)
             del model
             gc.collect()
             if model_key == "qwen3_5_moe":
