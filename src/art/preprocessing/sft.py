@@ -47,9 +47,13 @@ class SftBatchTokenizer:
             chat_template_tool_schema_format=internal.get(
                 "chat_template_tool_schema_format", "default"
             ),
-            max_seq_length=self._max_sequence_length(model, internal),
+            max_seq_length=self.max_sequence_length(model),
             assistant_turns=assistant_turns,
         )
+
+    def max_sequence_length(self, model: TrainableModel) -> int:
+        internal = cast(dev.InternalModelConfig, model._internal_config or {})
+        return self._max_sequence_length(model, internal)
 
     def _tokenizer(
         self, base_model: str, internal: dev.InternalModelConfig

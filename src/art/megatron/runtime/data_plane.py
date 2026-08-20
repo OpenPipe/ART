@@ -10,6 +10,8 @@ import torch
 from art.distributed.data_plane import MappedPackedBatch, PackedBatchRef
 from art.preprocessing.pack import PackedTensors
 
+_SFT_TENSOR_NAMES = ("input_ids", "attention_mask", "labels")
+
 
 class InMemoryPackedBatch(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
@@ -54,9 +56,18 @@ class SFTBatchData(BaseModel):
             raise ValueError("SFT batch must contain at least one trajectory")
         if self.num_trajectories != len(self.trajectory_tensors):
             raise ValueError("SFT trajectory count does not match its tensor payload")
-        required = {"input_ids", "attention_mask", "labels"}
+        required = set(_SFT_TENSOR_NAMES)
         if any(not required <= tensors.keys() for tensors in self.trajectory_tensors):
             raise ValueError("SFT trajectory tensors are incomplete")
+        if any(
+            not isinstance(tensors[name], torch.Tensor)
+            or tensors[name].dtype != torch.long
+            or tensors[name].device.type != "cpu"
+            or not tensors[name].is_contiguous()
+            for tensors in self.trajectory_tensors
+            for name in required
+        ):
+            raise ValueError("SFT trajectory tensors must be contiguous CPU int64")
         shapes = [
             tuple(tensors[name].shape)
             for tensors in self.trajectory_tensors
@@ -98,6 +109,27 @@ class SFTBatchData(BaseModel):
         if self.num_dropped_trajectories < 0:
             raise ValueError("SFT dropped trajectory count cannot be negative")
         return self
+
+    @staticmethod
+    def storage_upper_bound(
+        *, num_trajectories: int, max_sequence_length: int
+    ) -> int:
+        if min(num_trajectories, max_sequence_length) < 1:
+            raise ValueError("SFT storage dimensions must be positive")
+        return (
+            num_trajectories
+            * max_sequence_length
+            * len(_SFT_TENSOR_NAMES)
+            * torch.empty((), dtype=torch.long).element_size()
+        )
+
+    @property
+    def storage_byte_count(self) -> int:
+        return sum(
+            tensors[name].numel() * tensors[name].element_size()
+            for tensors in self.trajectory_tensors
+            for name in _SFT_TENSOR_NAMES
+        )
 
     @property
     def fingerprint(self) -> str:

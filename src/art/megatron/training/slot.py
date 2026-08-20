@@ -435,6 +435,18 @@ class MegatronTrainingSlot:
             topology.tp * topology.cp * topology.pp
         )
 
+    async def sft_storage_upper_bound(
+        self, run_id: str, *, num_trajectories: int
+    ) -> int:
+        state = self._require_run(run_id)
+        max_sequence_length = await asyncio.to_thread(
+            self._sft_tokenizer.max_sequence_length, state.model.build()
+        )
+        return SFTBatchData.storage_upper_bound(
+            num_trajectories=num_trajectories,
+            max_sequence_length=max_sequence_length,
+        )
+
     async def discard_prepared(self, prepared: PreparedForward) -> None:
         if isinstance(prepared, PreparedPackedForward):
             await self.runtime.release_batch(prepared.packed)

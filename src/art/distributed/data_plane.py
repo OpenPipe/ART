@@ -26,6 +26,22 @@ _DTYPE_BYTES = {
     "int64": 8,
     "float64": 8,
 }
+_CORE_PACKED_DTYPES = (
+    ("tokens", "int64"),
+    ("group_ids", "int64"),
+    ("parent_ids", "int64"),
+    ("input_pos", "int64"),
+    ("assistant_mask", "bool"),
+    ("logprobs", "float32"),
+    ("advantages", "float32"),
+    ("weights", "float32"),
+)
+_TOKENIZED_PACKED_DTYPES = (
+    ("target_tokens", "int64"),
+    ("loss_weights", "float32"),
+    ("behavior_logprobs", "float32"),
+    ("token_advantages", "float32"),
+)
 _STREAM_CHUNK_BYTES = 4 << 20
 T = TypeVar("T")
 
@@ -114,16 +130,7 @@ class PackedBatchRef(_Contract):
             raise ValueError("tensor manifest names must be unique")
         if sum(tensor.byte_count for tensor in self.tensors) != self.byte_count:
             raise ValueError("packed-batch byte_count does not match tensor manifest")
-        core_dtypes = {
-            "tokens": "int64",
-            "group_ids": "int64",
-            "parent_ids": "int64",
-            "input_pos": "int64",
-            "assistant_mask": "bool",
-            "logprobs": "float32",
-            "advantages": "float32",
-            "weights": "float32",
-        }
+        core_dtypes = dict(_CORE_PACKED_DTYPES)
         specs = {tensor.name: tensor for tensor in self.tensors}
         if not core_dtypes.keys() <= specs.keys():
             raise ValueError("packed-batch tensor manifest is missing core tensors")
@@ -160,12 +167,7 @@ class PackedBatchRef(_Contract):
                 or specs["original_logprobs"].shape != core_shape
             ):
                 raise ValueError("original_logprobs dtype or shape is invalid")
-        tokenized_names = {
-            "target_tokens",
-            "loss_weights",
-            "behavior_logprobs",
-            "token_advantages",
-        }
+        tokenized_names = dict(_TOKENIZED_PACKED_DTYPES).keys()
         if self.training_kind == "tokenized":
             if self.tokenized_output_map is None or not tokenized_names <= specs.keys():
                 raise ValueError("tokenized packed-batch manifest is incomplete")
@@ -965,16 +967,7 @@ def _flatten_packed_tensors(
 ) -> tuple[list[tuple[str, Any]], dict[str, Any]]:
     import torch
 
-    required = (
-        "tokens",
-        "group_ids",
-        "parent_ids",
-        "input_pos",
-        "assistant_mask",
-        "logprobs",
-        "advantages",
-        "weights",
-    )
+    required = tuple(name for name, _ in _CORE_PACKED_DTYPES)
     flat: list[tuple[str, Any]] = []
     for name in required:
         tensor = tensors[name]
@@ -996,12 +989,7 @@ def _flatten_packed_tensors(
         if tuple(original.shape) != shape:
             raise ValueError("original_logprobs must match the core packed shape")
         flat.append(("original_logprobs", original))
-    tokenized_names = (
-        "target_tokens",
-        "loss_weights",
-        "behavior_logprobs",
-        "token_advantages",
-    )
+    tokenized_names = tuple(name for name, _ in _TOKENIZED_PACKED_DTYPES)
     tokenized = [name for name in tokenized_names if name in tensors]
     if tokenized and len(tokenized) != len(tokenized_names):
         raise ValueError("tokenized packed tensors are incomplete")
@@ -1048,18 +1036,76 @@ def _validate_tensor(name: str, tensor: Any, torch: Any) -> None:
         raise ValueError(f"{name} must be a contiguous CPU tensor")
 
 
+def packed_text_storage_byte_count(
+    *,
+    num_sequences: int,
+    sequence_length: int,
+    candidate_capacity: int = 0,
+    moe_num_layers: int | None = None,
+    moe_topk: int | None = None,
+    moe_num_experts: int | None = None,
+) -> int:
+    """Return exact shared-memory bytes for canonical text packed tensors."""
+    if min(num_sequences, sequence_length) < 1 or candidate_capacity < 0:
+        raise ValueError("packed text storage dimensions are invalid")
+    moe_values = (moe_num_layers, moe_topk, moe_num_experts)
+    if any(value is not None for value in moe_values) and not all(
+        value is not None and value > 0 for value in moe_values
+    ):
+        raise ValueError("MoE packed storage dimensions must be provided together")
+    core_shape = (num_sequences, sequence_length)
+    layouts = [
+        (name, dtype, core_shape) for name, dtype in _CORE_PACKED_DTYPES
+    ]
+    if candidate_capacity:
+        tokenized_shape = (*core_shape, candidate_capacity)
+        layouts.extend(
+            (name, dtype, tokenized_shape)
+            for name, dtype in _TOKENIZED_PACKED_DTYPES
+        )
+    if moe_num_layers is not None:
+        assert moe_topk is not None and moe_num_experts is not None
+        if moe_num_experts > 65_536 or moe_topk > moe_num_experts:
+            raise ValueError("MoE packed storage contract is invalid")
+        layouts.append(
+            (
+                "moe_routing_replay/expert_indices",
+                "uint8" if moe_num_experts <= 256 else "uint16",
+                (moe_num_layers, *core_shape, moe_topk),
+            )
+        )
+    return _layout_specs(layouts)[1]
+
+
 def _layout(flat: list[tuple[str, Any]]) -> tuple[tuple[TensorSpec, ...], int]:
+    return _layout_specs(
+        [
+            (
+                name,
+                str(tensor.dtype).removeprefix("torch."),
+                tuple(tensor.shape),
+            )
+            for name, tensor in flat
+        ]
+    )
+
+
+def _layout_specs(
+    layouts: list[tuple[str, str, tuple[int, ...]]],
+) -> tuple[tuple[TensorSpec, ...], int]:
     offset = 0
     specs = []
-    for name, tensor in flat:
-        element_size = tensor.element_size()
+    for name, dtype, shape in layouts:
+        element_size = _DTYPE_BYTES.get(dtype)
+        if element_size is None:
+            raise ValueError(f"unsupported packed tensor dtype {dtype!r}")
         offset = (offset + element_size - 1) // element_size * element_size
-        byte_count = tensor.numel() * element_size
+        byte_count = _numel(shape) * element_size
         specs.append(
             TensorSpec(
                 name=name,
-                dtype=str(tensor.dtype).removeprefix("torch."),
-                shape=tuple(tensor.shape),
+                dtype=dtype,
+                shape=shape,
                 offset=offset,
                 byte_count=byte_count,
             )
