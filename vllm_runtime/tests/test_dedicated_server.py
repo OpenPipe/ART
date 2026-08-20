@@ -52,6 +52,22 @@ def _start_sidecar(*, tokens: list[str], port: int = 0) -> FastMetricsSidecar:
     return sidecar
 
 
+def test_shutdown_timeout_is_rejected_as_server_arg() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"engine arguments passed as server arguments: \['shutdown_timeout'\]",
+    ):
+        dedicated_server.main(
+            [
+                "--model=test/model",
+                "--port=8000",
+                "--cuda-visible-devices=",
+                "--served-model-name=test@0",
+                '--server-args-json={"shutdown_timeout": 7}',
+            ]
+        )
+
+
 def test_fast_metrics_listener_auth_keepalive_and_scalar_payload() -> None:
     sidecar = _start_sidecar(tokens=["first", "second"])
     assert sidecar.process.pid != os.getpid()

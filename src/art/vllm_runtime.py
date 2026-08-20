@@ -859,6 +859,7 @@ def _runtime_command_prefix() -> list[str]:
 
 
 def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
+    engine_args = {"shutdown_timeout": 5, **config.engine_args}
     server_args = {
         key: value for key, value in config.server_args.items() if key != "api_key"
     }
@@ -874,7 +875,7 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
     command.extend(
         [
             f"--served-model-name={config.served_model_name}",
-            f"--engine-args-json={json.dumps(config.engine_args)}",
+            f"--engine-args-json={json.dumps(engine_args)}",
             f"--server-args-json={json.dumps(server_args)}",
         ]
     )

@@ -595,6 +595,7 @@ def main(argv: list[str] | None = None) -> None:
         "kv_transfer_config",
         "pipeline_parallel_size",
         "prefill_context_parallel_size",
+        "shutdown_timeout",
     }
     misplaced = critical_engine_args.intersection(server_args)
     if misplaced:

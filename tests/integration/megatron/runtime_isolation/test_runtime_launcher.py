@@ -30,23 +30,29 @@ def test_build_runtime_server_cmd_uses_runtime_project(
     runtime_bin.parent.mkdir(parents=True, exist_ok=True)
     runtime_bin.write_text("#!/bin/sh\n", encoding="ascii")
     monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
-    command = runtime.build_vllm_runtime_server_cmd(
-        runtime.VllmRuntimeLaunchConfig(
-            base_model="Qwen/Qwen3-14B",
-            port=8000,
-            host="127.0.0.1",
-            cuda_visible_devices="1",
-            lora_path="/tmp/lora",
-            served_model_name="test@0",
-            initial_policy_version=7,
-            engine_args={"weight_transfer_config": {"backend": "nccl"}},
-            server_args={"tool_call_parser": "hermes"},
-        )
+    engine_args = {"weight_transfer_config": {"backend": "nccl"}}
+    config = runtime.VllmRuntimeLaunchConfig(
+        base_model="Qwen/Qwen3-14B",
+        port=8000,
+        host="127.0.0.1",
+        cuda_visible_devices="1",
+        lora_path="/tmp/lora",
+        served_model_name="test@0",
+        initial_policy_version=7,
+        engine_args=engine_args,
+        server_args={"tool_call_parser": "hermes"},
     )
+    command = runtime.build_vllm_runtime_server_cmd(config)
     assert command[0] == str(runtime_bin)
     assert "--model=Qwen/Qwen3-14B" in command
     assert (
-        '--engine-args-json={"weight_transfer_config": {"backend": "nccl"}}' in command
+        '--engine-args-json={"shutdown_timeout": 5, '
+        '"weight_transfer_config": {"backend": "nccl"}}' in command
+    )
+    assert (
+        engine_args
+        == config.engine_args
+        == {"weight_transfer_config": {"backend": "nccl"}}
     )
     assert '--server-args-json={"tool_call_parser": "hermes"}' in command
     assert "--initial-policy-version=7" in command
@@ -65,6 +71,20 @@ def test_build_runtime_server_cmd_honors_runtime_bin_override(monkeypatch) -> No
         )
     )
     assert command[:2] == ["/opt/art/bin/runtime", "--wrapped"]
+
+
+def test_build_runtime_server_cmd_honors_shutdown_timeout_override(monkeypatch) -> None:
+    monkeypatch.setenv("ART_VLLM_RUNTIME_BIN", "/opt/art/bin/runtime")
+    command = runtime.build_vllm_runtime_server_cmd(
+        runtime.VllmRuntimeLaunchConfig(
+            base_model="Qwen/Qwen3-14B",
+            port=8000,
+            cuda_visible_devices="0",
+            served_model_name="test@0",
+            engine_args={"shutdown_timeout": 7},
+        )
+    )
+    assert '--engine-args-json={"shutdown_timeout": 7}' in command
 
 
 def test_build_runtime_server_cmd_allows_lora_without_initial_adapter(
