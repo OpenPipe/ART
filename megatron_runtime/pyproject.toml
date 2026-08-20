@@ -11,6 +11,7 @@ dependencies = [
     "flashinfer-cubin==0.6.8.post1",
     "flashinfer-python==0.6.8.post1",
     "litellm>=1.71.1,<=1.82.0",
+    "mamba-ssm==2.3.2.post1",
     "megatron-bridge==0.4.0rc0",
     "megatron-core==0.17.0",
     "ml-dtypes>=0.5.0",
@@ -82,8 +83,9 @@ override-dependencies = [
     "nvidia-cublas==13.2.2.2 ; sys_platform == 'linux'",
     "nvidia-resiliency-ext<0.5",
     "quack-kernels==0.3.9",
+    "tilelang==0.1.10",
 ]
-exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d", "mamba-ssm"]
+exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d"]
 no-build-isolation-package = [
     "apex",
     "megatron-bridge",
@@ -96,18 +98,36 @@ no-build-isolation-package = [
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.11.0"]
+mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 megatron-core = ["pybind11", "setuptools"]
 nv-grouped-gemm = ["torch>=2.11.0"]
 transformer-engine-torch = ["torch>=2.11.0"]
 
 [tool.uv.extra-build-variables]
 apex = { APEX_CPP_EXT = "1", APEX_CUDA_EXT = "1", APEX_FAST_LAYER_NORM = "1", APEX_PARALLEL_BUILD = "8", NVCC_APPEND_FLAGS = "--threads 1" }
+mamba-ssm = { MAMBA_FORCE_BUILD = "TRUE", MAX_JOBS = "32" }
 transformer-engine-torch = { NVTE_NO_LOCAL_VERSION = "1" }
 
 [[tool.uv.dependency-metadata]]
 name = "apex"
 version = "0.1"
 requires-dist = ["packaging"]
+
+[[tool.uv.dependency-metadata]]
+name = "mamba-ssm"
+version = "2.3.2.post1"
+requires-dist = [
+    "apache-tvm-ffi<=0.1.12",
+    "einops",
+    "ninja",
+    "packaging",
+    "quack-kernels>=0.3.4",
+    "setuptools>=61.0.0",
+    "tilelang==0.1.8",
+    "torch",
+    "transformers",
+    "triton>=3.5.0",
+]
 
 [[tool.uv.dependency-metadata]]
 name = "megatron-bridge"
@@ -161,6 +181,7 @@ requires-dist = [
 [tool.uv.sources]
 apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
 flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "e9594ce1c732d97440f0332fdc43170a2294dbfa" }
 megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" }
 torch = [
     { index = "pytorch-cu128", extra = "cuda12" },

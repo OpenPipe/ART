@@ -19,11 +19,11 @@ overrides = [
     { name = "nvidia-cublas", marker = "sys_platform == 'linux'", specifier = "==13.2.2.2" },
     { name = "nvidia-resiliency-ext", specifier = "<0.5" },
     { name = "quack-kernels", specifier = "==0.3.9" },
+    { name = "tilelang", specifier = "==0.1.10" },
 ]
 excludes = [
     "causal-conv1d",
     "emerging-optimizers",
-    "mamba-ssm",
     "pynvml",
 ]
 
@@ -31,6 +31,11 @@ excludes = [
 name = "apex"
 version = "0.1"
 requires-dist = ["packaging"]
+
+[[manifest.dependency-metadata]]
+name = "mamba-ssm"
+version = "2.3.2.post1"
+requires-dist = ["apache-tvm-ffi<=0.1.12", "einops", "ninja", "packaging", "quack-kernels>=0.3.4", "setuptools>=61.0.0", "tilelang==0.1.8", "torch", "transformers", "triton>=3.5.0"]
 
 [[manifest.dependency-metadata]]
 name = "megatron-bridge"
@@ -258,6 +263,7 @@ dependencies = [
     { name = "flashinfer-cubin" },
     { name = "flashinfer-python" },
     { name = "litellm" },
+    { name = "mamba-ssm" },
     { name = "megatron-bridge" },
     { name = "megatron-core" },
     { name = "ml-dtypes" },
@@ -329,6 +335,7 @@ requires-dist = [
     { name = "flashinfer-cubin", specifier = "==0.6.8.post1" },
     { name = "flashinfer-python", specifier = "==0.6.8.post1" },
     { name = "litellm", specifier = ">=1.71.1,<=1.82.0" },
+    { name = "mamba-ssm", git = "https://github.com/state-spaces/mamba.git?rev=e9594ce1c732d97440f0332fdc43170a2294dbfa" },
     { name = "megatron-bridge", git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git?rev=e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" },
     { name = "megatron-core", specifier = "==0.17.0" },
     { name = "ml-dtypes", specifier = ">=0.5.0" },
@@ -2040,6 +2047,26 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/2a/12/b5fa2353e2754cd67fb9f83793fa48ff42c213a5da7e719869d2301f6ab8/mako-1.4.1.tar.gz", hash = "sha256:d7904710b662996425a21627710c4777c45053146942cf8a7aebf757c92b8c27", size = 410165, upload-time = "2026-08-05T06:10:56.611Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a5/54/12ed58d458474aaab5c3d180173e745a4fe131bb330370596876d19ff60f/mako-1.4.1-py3-none-any.whl", hash = "sha256:a359d9a94a541213958742b2698d0a7757bb83551767bc468a74b9905aba9617", size = 80010, upload-time = "2026-08-05T06:10:58.248Z" },
+]
+
+[[package]]
+name = "mamba-ssm"
+version = "2.3.2.post1"
+source = { git = "https://github.com/state-spaces/mamba.git?rev=e9594ce1c732d97440f0332fdc43170a2294dbfa#e9594ce1c732d97440f0332fdc43170a2294dbfa" }
+dependencies = [
+    { name = "apache-tvm-ffi" },
+    { name = "einops" },
+    { name = "ninja" },
+    { name = "packaging" },
+    { name = "quack-kernels" },
+    { name = "setuptools" },
+    { name = "tilelang" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "extra == 'extra-20-art-megatron-runtime-cuda12'" },
+    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "extra == 'extra-20-art-megatron-runtime-cuda13'" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-20-art-megatron-runtime-cuda12' and extra == 'extra-20-art-megatron-runtime-cuda13') or (extra != 'extra-20-art-megatron-runtime-cuda12' and extra != 'extra-20-art-megatron-runtime-cuda13')" },
+    { name = "transformers" },
+    { name = "triton", version = "3.6.0", source = { registry = "https://pypi.org/simple" }, marker = "(sys_platform != 'darwin' and extra == 'extra-20-art-megatron-runtime-cuda12') or (sys_platform != 'darwin' and extra == 'extra-20-art-megatron-runtime-cuda13') or (extra == 'extra-20-art-megatron-runtime-cuda12' and extra == 'extra-20-art-megatron-runtime-cuda13')" },
+    { name = "triton", version = "3.7.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin' or (extra == 'extra-20-art-megatron-runtime-cuda12' and extra == 'extra-20-art-megatron-runtime-cuda13') or (extra != 'extra-20-art-megatron-runtime-cuda12' and extra != 'extra-20-art-megatron-runtime-cuda13')" },
 ]
 
 [[package]]
@@ -4682,6 +4709,7 @@ name = "triton"
 version = "3.7.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
+    "sys_platform == 'darwin'",
     "sys_platform != 'darwin'",
 ]
 wheels = [
