@@ -16,7 +16,7 @@ from monarch.actor import Actor, Channel, MeshFailure, Port, ProcMesh, endpoint
 from monarch.spmd import SPMDActor
 from pydantic import BaseModel, ConfigDict
 
-from art.distributed.data_plane import PackedBatchLeaseSet
+from art.distributed.data_plane import PackedBatchLeaseSet, PackedBatchRef
 from art.distributed.monarch_bootstrap import activate_cuda_device
 from art.distributed.specs import GpuId
 from art.utils.cache_dirs import configure_model_cache_env
@@ -1633,12 +1633,8 @@ class MonarchTrainerRun:
             return ValueError(
                 "resident score batch length does not match the trainer runtime"
             )
-        if bool(job.batch.moe_routing_replay) != bool(
-            self.runtime_spec.enable_moe_routing_replay
-        ):
-            return ValueError(
-                "resident score routing replay does not match the trainer runtime"
-            )
+        if error := self._validate_packed_batch_replay(job.batch):
+            return error
         return None
 
     def _validate_resident_inspection(
@@ -1678,6 +1674,17 @@ class MonarchTrainerRun:
             )
         return None
 
+    def _validate_packed_batch_replay(
+        self, batch: PackedBatchRef
+    ) -> BaseException | None:
+        if (batch.moe_routing_replay is not None) != (
+            self.runtime_spec.enable_moe_routing_replay
+        ):
+            return ValueError(
+                "packed batch routing replay does not match the trainer runtime"
+            )
+        return None
+
     def _validate_rl(
         self, job: TrainJobSpec, batch: PackedBatchLeaseSet
     ) -> BaseException | None:
@@ -1689,6 +1696,8 @@ class MonarchTrainerRun:
             return ValueError(
                 "packed batch sequence length does not match the trainer runtime"
             )
+        if error := self._validate_packed_batch_replay(job.batch):
+            return error
         return None
 
     def _validate_sft(
