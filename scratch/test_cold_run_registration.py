@@ -15,6 +15,7 @@ from art.megatron.runtime.executor import (
     _PreparedRunLoad,
 )
 from art.megatron.runtime.residency import ResidencyCapacityUnavailable
+from art.megatron.runtime.specs import RunSlotRegistration
 from art.megatron.training import gradient_accumulator as accumulator_module
 from art.trainer_rank import TrainerRank
 
@@ -260,6 +261,7 @@ def _executor(
     executor._residency = residency
     executor._publisher = publisher
     executor._load_preparations = {}
+    executor._registration_preparations = {}
     executor._runs = {}
     executor._closed = False
     return executor, slot, residency, publisher
@@ -267,14 +269,19 @@ def _executor(
 
 def _register(executor: MCoreRunSlotExecutor, **kwargs: Any) -> None:
     executor.register_run(
-        tenant_id="tenant",
-        run_id="run",
-        training_session_id="session",
-        learner_version=0,
-        generation_id="step-00000000-0123456789abcdef0123456789abcdef",
-        adapter_path="/adapter",
-        adapter_step=0,
-        **kwargs,
+        RunSlotRegistration(
+            tenant_id="tenant",
+            run_id="run",
+            training_session_id="session",
+            learner_version=0,
+            generation_id="step-00000000-0123456789abcdef0123456789abcdef",
+            adapter_path="/adapter",
+            adapter_step=0,
+            adapter_training_session_id="session",
+            adapter_generation_id="step-00000000-0123456789abcdef0123456789abcdef",
+            optimizer_state_path="/optimizer",
+            **kwargs,
+        )
     )
 
 
