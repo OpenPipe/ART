@@ -1081,13 +1081,13 @@ class MCoreRunSlotExecutor:
 
     def start_prepare_run_registration(
         self, registration: RunSlotRegistration
-    ) -> None:
+    ) -> Future[_PreparedRunRegistration]:
         fingerprint = registration.model_dump_json()
         existing = self._registration_preparations.get(registration.run_id)
         if existing is not None:
             if existing[0] != fingerprint:
                 raise RuntimeError("run_id was reused for another registration")
-            return
+            return existing[1]
         if registration.run_id in self._runs:
             raise RuntimeError(
                 f"training run is already resident: {registration.run_id!r}"
@@ -1096,6 +1096,7 @@ class MCoreRunSlotExecutor:
             fingerprint,
             self._load_pool.submit(self.prepare_run_registration, registration),
         )
+        return self._registration_preparations[registration.run_id][1]
 
     def run_registration_prepared(self, registration: RunSlotRegistration) -> bool:
         try:

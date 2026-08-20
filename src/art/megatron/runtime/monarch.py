@@ -250,6 +250,16 @@ class _CommandReady(BaseModel):
     traceback_text: str | None = None
 
 
+class _RunRegistrationReady(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rank: int
+    run_id: str
+    error_type: str | None = None
+    message: str | None = None
+    traceback_text: str | None = None
+
+
 async def _prepare_run_residency(
     ports: tuple[Port[Any], ...],
     lock: asyncio.Lock,
@@ -997,28 +1007,38 @@ class MonarchTrainerActor(Actor):
 
     @endpoint
     def start_prepare_run_slot_registration(
-        self, registration_json: str
+        self,
+        registration_json: str,
+        ready_port: Port[dict[str, Any]],
     ) -> dict[str, Any]:
         if not self._valid:
             raise RuntimeError("trainer actor runtime is invalid")
         registration = RunSlotRegistration.model_validate_json(registration_json)
-        self._require_run_slot_executor().start_prepare_run_registration(registration)
-        return {"rank": self._runtime.rank, "run_id": registration.run_id}
+        future = self._require_run_slot_executor().start_prepare_run_registration(
+            registration
+        )
 
-    @endpoint
-    def poll_prepare_run_slot_registration(
-        self, registration_json: str
-    ) -> dict[str, Any]:
-        if not self._valid:
-            raise RuntimeError("trainer actor runtime is invalid")
-        registration = RunSlotRegistration.model_validate_json(registration_json)
-        return {
-            "rank": self._runtime.rank,
-            "run_id": registration.run_id,
-            "ready": self._require_run_slot_executor().run_registration_prepared(
-                registration
-            ),
-        }
+        def ready(completed: Any) -> None:
+            try:
+                completed.result()
+                result = _RunRegistrationReady(
+                    rank=self._runtime.rank,
+                    run_id=registration.run_id,
+                )
+            except BaseException as error:
+                result = _RunRegistrationReady(
+                    rank=self._runtime.rank,
+                    run_id=registration.run_id,
+                    error_type=type(error).__name__,
+                    message=str(error),
+                    traceback_text="".join(
+                        traceback.format_exception(error)
+                    ),
+                )
+            ready_port.send(result.model_dump(mode="json"))
+
+        future.add_done_callback(ready)
+        return {"rank": self._runtime.rank, "run_id": registration.run_id}
 
     @endpoint
     def finish_prepare_run_slot_registration(
@@ -1838,34 +1858,42 @@ class MonarchTrainerSlot:
                 raise RuntimeError("trainer ranks disagree on run registration")
 
         try:
+            ready_port, receiver = Channel.open()
             started = list(
                 (
                     await asyncio.wait_for(
-                        self._actors.start_prepare_run_slot_registration.call(payload),
+                        self._actors.start_prepare_run_slot_registration.call(
+                            payload, ready_port
+                        ),
                         timeout=self._command_timeout_s,
                     )
                 ).values()
             )
             validate(started)
             deadline = asyncio.get_running_loop().time() + self._command_timeout_s
-            while True:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise TimeoutError("run registration preparation timed out")
-                polled = list(
-                    (
-                        await asyncio.wait_for(
-                            self._actors.poll_prepare_run_slot_registration.call(
-                                payload
-                            ),
-                            timeout=remaining,
-                        )
-                    ).values()
+            ready = [
+                _RunRegistrationReady.model_validate(
+                    await asyncio.wait_for(
+                        receiver.recv(),
+                        timeout=max(
+                            deadline - asyncio.get_running_loop().time(), 0.001
+                        ),
+                    )
                 )
-                validate(polled)
-                if all(bool(result["ready"]) for result in polled):
-                    break
-                await asyncio.sleep(min(0.01, remaining))
+                for _ in self._rank_processes
+            ]
+            if {item.rank for item in ready} != expected_ranks or {
+                item.run_id for item in ready
+            } != {registration.run_id}:
+                raise RuntimeError("trainer ranks disagree on run preparation")
+            failures = [item for item in ready if item.error_type is not None]
+            if failures:
+                details = "\n".join(
+                    f"rank {item.rank}: {item.error_type}: {item.message}\n"
+                    f"{item.traceback_text or ''}"
+                    for item in failures
+                )
+                raise RuntimeError(f"run registration preparation failed:\n{details}")
             finished = list(
                 (
                     await asyncio.wait_for(
