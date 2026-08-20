@@ -5,10 +5,14 @@ from collections import deque
 from collections.abc import Callable, Mapping
 import secrets
 import time
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, model_validator
 
+from art.preprocessing.moe_routing import (
+    COMPLETION_TOKEN_IDS_KEY,
+    PROMPT_TOKEN_IDS_KEY,
+)
 from art.preprocessing.policy_spans import PolicyTokenSpan
 from art.trajectories import MetadataValue, Trajectory, TrajectoryGroup
 
@@ -18,12 +22,23 @@ from .data_plane import (
     ByteStreamTransfer,
     receive_byte_stream,
 )
+from .moe_route_store import (
+    MoeRouteGroupPayload,
+    MoeRouteObjectPayload,
+    MoeRouteSlice,
+    RouteScope,
+    hydrate_trajectory_group_routes,
+)
 
 if TYPE_CHECKING:
     from .packing import TrajectoryGroupPayload
 
 TRAJECTORY_FORMAT = "art_trajectory_v1"
 _ROUTE_BYTES_EXT = 1
+_ImmutableBytes = Annotated[
+    bytes | memoryview,
+    PlainSerializer(bytes, return_type=bytes),
+]
 
 
 class _Contract(BaseModel):
@@ -77,16 +92,61 @@ class TrajectoryGroupDescriptor(_Contract):
         return self
 
 
-class TrajectoryGroupBundle(_Contract):
-    """Binary trajectory records for bulk transport across actor boundaries."""
+class TrajectoryRouteSequence(_Contract):
+    """One local route sequence retaining its original immutable byte segments."""
 
-    header: bytes
-    records: tuple[bytes, ...]
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    trajectory_index: int = Field(ge=0)
+    scope: RouteScope
+    scope_index: int = Field(ge=0)
+    choice_index: int = Field(ge=0)
+    dtype: Literal["uint8", "uint16"]
+    shape: tuple[int, int, int]
+    token_ids: tuple[int, ...]
+    data: tuple[_ImmutableBytes, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_layout(self) -> "TrajectoryRouteSequence":
+        _validate_route_sequence_layout(
+            self.dtype, self.shape, self.token_ids, tuple(map(len, self.data))
+        )
+        return self
+
+    def payloads(self) -> tuple[MoeRouteObjectPayload, ...]:
+        return tuple(
+            MoeRouteObjectPayload(
+                data=data,
+                slices=(
+                    MoeRouteSlice(
+                        trajectory_index=self.trajectory_index,
+                        scope=self.scope,
+                        scope_index=self.scope_index,
+                        choice_index=self.choice_index,
+                        segment_index=segment_index,
+                        offset=0,
+                        byte_count=len(data),
+                    ),
+                ),
+            )
+            for segment_index, data in enumerate(self.data)
+        )
+
+
+class TrajectoryGroupBundle(_Contract):
+    """Immutable route-free records and uncompressed local MoE route sequences."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    header: _ImmutableBytes
+    records: tuple[_ImmutableBytes, ...]
+    route_sequences: tuple[TrajectoryRouteSequence, ...] = ()
 
     @classmethod
     def from_payload(cls, payload: TrajectoryGroupPayload) -> "TrajectoryGroupBundle":
         from msgspec import msgpack
 
+        payload, route_sequences = _split_trajectory_routes(payload)
         return cls(
             header=msgpack.encode(
                 payload.model_copy(update={"trajectories": ()}).model_dump(
@@ -97,6 +157,7 @@ class TrajectoryGroupBundle(_Contract):
                 _encode_trajectory_record(record.model_dump(mode="python"))
                 for record in payload.trajectories
             ),
+            route_sequences=route_sequences,
         )
 
     @classmethod
@@ -105,7 +166,7 @@ class TrajectoryGroupBundle(_Contract):
 
         return cls.from_payload(TrajectoryGroupPayload.from_group(group))
 
-    def payload(self) -> TrajectoryGroupPayload:
+    def route_free_payload(self) -> TrajectoryGroupPayload:
         from msgspec import msgpack
 
         from .packing import TrajectoryGroupPayload
@@ -116,6 +177,21 @@ class TrajectoryGroupBundle(_Contract):
             for record in self.records
         )
         return TrajectoryGroupPayload.model_validate(header)
+
+    def payload(self) -> TrajectoryGroupPayload:
+        payload = self.route_free_payload()
+        if not self.route_sequences:
+            return payload
+        return hydrate_trajectory_group_routes(payload, self.route_group_payload())
+
+    def route_group_payload(self) -> MoeRouteGroupPayload:
+        return MoeRouteGroupPayload(
+            objects=tuple(
+                payload
+                for sequence in self.route_sequences
+                for payload in sequence.payloads()
+            )
+        )
 
     def build(self) -> TrajectoryGroup:
         return self.payload().build()
@@ -145,9 +221,176 @@ def _decode_trajectory_record_ext(code: int, data: memoryview) -> memoryview:
     return data.cast("B").toreadonly()
 
 
-class TrajectoryGroupLayout(_Contract):
+class _RouteEntry(NamedTuple):
+    trajectory_index: int
+    scope: RouteScope
+    scope_index: int
+    choice_index: int
+    route: Any
+
+
+def _split_trajectory_routes(
+    payload: TrajectoryGroupPayload,
+) -> tuple[TrajectoryGroupPayload, tuple[TrajectoryRouteSequence, ...]]:
+    entries: list[_RouteEntry] = []
+    trajectories = []
+    for trajectory_index, trajectory in enumerate(payload.trajectories):
+        histories = tuple(
+            _strip_route_map(
+                values,
+                trajectory_index=trajectory_index,
+                scope="additional_history",
+                scope_index=index,
+                entries=entries,
+            )
+            for index, values in enumerate(
+                trajectory.additional_history_choice_routing_metadata
+            )
+        )
+        exchanges = tuple(
+            _strip_route_map(
+                values,
+                trajectory_index=trajectory_index,
+                scope="exchange",
+                scope_index=index,
+                entries=entries,
+            )
+            for index, values in enumerate(trajectory.exchange_choice_routing_metadata)
+        )
+        trajectories.append(
+            trajectory.model_copy(
+                update={
+                    "choice_routing_metadata": _strip_route_map(
+                        trajectory.choice_routing_metadata,
+                        trajectory_index=trajectory_index,
+                        scope="messages",
+                        scope_index=0,
+                        entries=entries,
+                    ),
+                    "additional_history_choice_routing_metadata": histories,
+                    "exchange_choice_routing_metadata": exchanges,
+                }
+            )
+        )
+    stripped = payload.model_copy(update={"trajectories": tuple(trajectories)})
+    return stripped, tuple(_route_sequence(entry) for entry in entries)
+
+
+def _strip_route_map(
+    values: Mapping[int, Any],
+    *,
+    trajectory_index: int,
+    scope: RouteScope,
+    scope_index: int,
+    entries: list[_RouteEntry],
+) -> dict[int, Any]:
+    stripped = {}
+    for choice_index, route in values.items():
+        if not route.data:
+            raise RuntimeError("inline routed experts are empty")
+        entries.append(
+            _RouteEntry(
+                trajectory_index,
+                scope,
+                scope_index,
+                choice_index,
+                route,
+            )
+        )
+        stripped[choice_index] = route.model_copy(update={"data": ()})
+    return stripped
+
+
+def _route_sequence(entry: _RouteEntry) -> TrajectoryRouteSequence:
+    route = entry.route
+    return TrajectoryRouteSequence(
+        trajectory_index=entry.trajectory_index,
+        scope=entry.scope,
+        scope_index=entry.scope_index,
+        choice_index=entry.choice_index,
+        dtype=route.dtype,
+        shape=route.shape,
+        token_ids=_route_token_ids(route),
+        data=tuple(route.data),
+    )
+
+
+def _route_token_ids(route: Any) -> tuple[int, ...]:
+    prompt = route.metadata.get(PROMPT_TOKEN_IDS_KEY)
+    completion = route.metadata.get(COMPLETION_TOKEN_IDS_KEY)
+    if not isinstance(prompt, list) or not isinstance(completion, list):
+        raise RuntimeError("routed experts are missing exact token ids")
+    completion_count = route.shape[0] - len(prompt)
+    if completion_count not in {len(completion), max(len(completion) - 1, 0)}:
+        raise RuntimeError("routed-expert token ids do not match their route shape")
+    token_ids = tuple(prompt) + tuple(completion[:completion_count])
+    if any(
+        isinstance(token, bool) or not isinstance(token, int) or token < 0
+        for token in token_ids
+    ):
+        raise RuntimeError("routed-expert token ids do not match their route shape")
+    return token_ids
+
+
+class TrajectoryRouteSequenceLayout(_Contract):
+    trajectory_index: int = Field(ge=0)
+    scope: RouteScope
+    scope_index: int = Field(ge=0)
+    choice_index: int = Field(ge=0)
+    dtype: Literal["uint8", "uint16"]
+    shape: tuple[int, int, int]
+    token_ids: tuple[int, ...]
+    segment_byte_counts: tuple[int, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_layout(self) -> "TrajectoryRouteSequenceLayout":
+        _validate_route_sequence_layout(
+            self.dtype,
+            self.shape,
+            self.token_ids,
+            self.segment_byte_counts,
+        )
+        return self
+
+    @property
+    def byte_count(self) -> int:
+        return sum(self.segment_byte_counts)
+
+
+def _validate_route_sequence_layout(
+    dtype: Literal["uint8", "uint16"],
+    shape: tuple[int, int, int],
+    token_ids: tuple[int, ...],
+    segment_byte_counts: tuple[int, ...],
+) -> None:
+    if any(value < 1 for value in shape):
+        raise ValueError("route shape dimensions must be positive")
+    if len(token_ids) != shape[0] or any(value < 0 for value in token_ids):
+        raise ValueError("route token ids do not match their route shape")
+    bytes_per_token = (1 if dtype == "uint8" else 2) * shape[1] * shape[2]
+    if any(value < 1 or value % bytes_per_token for value in segment_byte_counts):
+        raise ValueError("route segment splits a token")
+    if sum(segment_byte_counts) != shape[0] * bytes_per_token:
+        raise ValueError("route segments do not match their route shape")
+
+
+class TrajectoryGroupDataLayout(_Contract):
     header_byte_count: int = Field(ge=1)
     record_byte_counts: tuple[int, ...]
+
+    @model_validator(mode="after")
+    def _validate_record_sizes(self) -> "TrajectoryGroupDataLayout":
+        if any(value < 0 for value in self.record_byte_counts):
+            raise ValueError("trajectory record byte counts must be non-negative")
+        return self
+
+    @property
+    def byte_count(self) -> int:
+        return self.header_byte_count + sum(self.record_byte_counts)
+
+
+class TrajectoryGroupLayout(TrajectoryGroupDataLayout):
+    route_sequences: tuple[TrajectoryRouteSequenceLayout, ...] = ()
 
 
 class TrajectoryBatchTransfer(_Contract):
@@ -163,7 +406,9 @@ class TrajectoryBatchTransfer(_Contract):
         ):
             raise ValueError("trajectory record byte counts must be non-negative")
         byte_count = sum(
-            group.header_byte_count + sum(group.record_byte_counts)
+            group.header_byte_count
+            + sum(group.record_byte_counts)
+            + sum(value.byte_count for value in group.route_sequences)
             for group in self.groups
         )
         if not self.groups or byte_count != self.stream.byte_count:
@@ -196,7 +441,32 @@ class TrajectoryBatchTransfer(_Contract):
                     end = offset + byte_count
                     records.append(bytes(view[offset:end]))
                     offset = end
-                bundles.append(TrajectoryGroupBundle(header=header, records=records))
+                route_sequences = []
+                for route in layout.route_sequences:
+                    segments = []
+                    for byte_count in route.segment_byte_counts:
+                        end = offset + byte_count
+                        segments.append(bytes(view[offset:end]))
+                        offset = end
+                    route_sequences.append(
+                        TrajectoryRouteSequence(
+                            trajectory_index=route.trajectory_index,
+                            scope=route.scope,
+                            scope_index=route.scope_index,
+                            choice_index=route.choice_index,
+                            dtype=route.dtype,
+                            shape=route.shape,
+                            token_ids=route.token_ids,
+                            data=tuple(segments),
+                        )
+                    )
+                bundles.append(
+                    TrajectoryGroupBundle(
+                        header=header,
+                        records=records,
+                        route_sequences=route_sequences,
+                    )
+                )
         finally:
             view.release()
         return tuple(bundles)
@@ -223,7 +493,17 @@ async def publish_trajectory_bundles(
     publisher = await ByteStreamPublisher.create(
         stream_id,
         tuple(
-            chunk for bundle in bundles for chunk in (bundle.header, *bundle.records)
+            chunk
+            for bundle in bundles
+            for chunk in (
+                bundle.header,
+                *bundle.records,
+                *(
+                    segment
+                    for sequence in bundle.route_sequences
+                    for segment in sequence.data
+                ),
+            )
         ),
         advertise_host=advertise_host,
         on_sent=on_sent,
@@ -236,6 +516,19 @@ async def publish_trajectory_bundles(
                 TrajectoryGroupLayout(
                     header_byte_count=len(bundle.header),
                     record_byte_counts=tuple(map(len, bundle.records)),
+                    route_sequences=tuple(
+                        TrajectoryRouteSequenceLayout(
+                            trajectory_index=value.trajectory_index,
+                            scope=value.scope,
+                            scope_index=value.scope_index,
+                            choice_index=value.choice_index,
+                            dtype=value.dtype,
+                            shape=value.shape,
+                            token_ids=value.token_ids,
+                            segment_byte_counts=tuple(map(len, value.data)),
+                        )
+                        for value in bundle.route_sequences
+                    ),
                 )
                 for bundle in bundles
             ),
@@ -350,8 +643,14 @@ class TrajectoryLeaseError(RuntimeError):
 
 
 class _StoredGroup:
-    def __init__(self, header: bytes, ref: TrajectoryGroupRef) -> None:
+    def __init__(
+        self,
+        header: _ImmutableBytes,
+        route_sequences: tuple[TrajectoryRouteSequence, ...],
+        ref: TrajectoryGroupRef,
+    ) -> None:
         self.header = header
+        self.route_sequences = route_sequences
         self.ref = ref
 
 
@@ -366,7 +665,7 @@ class TrajectoryRecordStore:
         self.owner_actor_id = owner_actor_id
         self.capacity_records = capacity_records
         self.capacity_bytes = capacity_bytes
-        self._records: dict[str, bytes] = {}
+        self._records: dict[str, _ImmutableBytes] = {}
         self._groups: dict[str, _StoredGroup] = {}
         self._used_bytes = 0
 
@@ -376,7 +675,15 @@ class TrajectoryRecordStore:
         payload = TrajectoryGroupPayload.from_group(group)
         bundle = TrajectoryGroupBundle.from_payload(payload)
         record_sizes = tuple(len(record) for record in bundle.records)
-        byte_count = sum(record_sizes) + len(bundle.header)
+        byte_count = (
+            sum(record_sizes)
+            + len(bundle.header)
+            + sum(
+                len(segment)
+                for sequence in bundle.route_sequences
+                for segment in sequence.data
+            )
+        )
         record_count = len(payload.trajectories)
         if record_count > self.capacity_records or byte_count > self.capacity_bytes:
             raise TrajectoryCapacityError(
@@ -448,7 +755,7 @@ class TrajectoryRecordStore:
             records=records,
             descriptor=descriptor,
         )
-        self._groups[result_id] = _StoredGroup(bundle.header, ref)
+        self._groups[result_id] = _StoredGroup(bundle.header, bundle.route_sequences, ref)
         self._used_bytes += byte_count
         return ref
 
@@ -459,6 +766,7 @@ class TrajectoryRecordStore:
             records=tuple(
                 self._records[record.record_id] for record in stored.ref.records
             ),
+            route_sequences=stored.route_sequences,
         )
 
     def payload(self, ref: TrajectoryGroupRef) -> TrajectoryGroupPayload:

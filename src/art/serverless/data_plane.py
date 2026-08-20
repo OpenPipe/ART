@@ -13,15 +13,16 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from art.distributed.moe_route_store import (
     MoeRouteGroupPayload,
+    MoeRouteObjectBatchTransfer,
     MoeRouteObjectPayload,
+    MoeRouteStoredObject,
 )
-from art.distributed.packing import TrajectoryGroupPayload
-from art.distributed.trajectory_store import TrajectoryGroupBundle
+from art.distributed.trajectory_store import (
+    TrajectoryGroupBundle,
+    TrajectoryGroupDataLayout,
+    TrajectoryRouteSequence,
+)
 from art.megatron.prefix_tree_packing import prefix_tree_pack_segments
-from art.preprocessing.moe_routing import (
-    COMPLETION_TOKEN_IDS_KEY,
-    PROMPT_TOKEN_IDS_KEY,
-)
 from art.training.contracts import (
     OperationResult,
     RlTrajectoryBatch,
@@ -64,14 +65,6 @@ MAX_FORWARD_SUBMISSION_CHUNKS = 1 << 16
 FORWARD_SUBMISSION_CHUNK_BYTES = 1 << 20
 _FORWARD_SUBMISSION_MAGIC = b"ARTFWD02"
 _FORWARD_SUBMISSION_PREFIX = struct.Struct("!8sQ")
-
-
-class _RouteEntry(NamedTuple):
-    trajectory_index: int
-    scope: Literal["messages", "additional_history", "exchange"]
-    scope_index: int
-    choice_index: int
-    route: Any
 
 
 class _PackedRouteSequences(NamedTuple):
@@ -153,15 +146,26 @@ class _TokenizedWireBatch(BaseModel):
 
 
 class EncodedTrainingObject(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     ref: TrainingDataRef
-    payload: bytes
+    payload: bytes | None = None
+    chunks: tuple[memoryview, ...] = ()
 
     @model_validator(mode="after")
     def _validate_payload(self) -> "EncodedTrainingObject":
-        _validate_training_object(self.ref, self.payload, self.ref.format)
+        if (self.payload is None) == (not self.chunks):
+            raise ValueError("training data requires exactly one byte source")
+        if self.payload is not None:
+            _validate_training_object(self.ref, self.payload, self.ref.format)
+        elif _validate_wire_chunks(self.chunks) != self.ref.byte_count:
+            raise ValueError("training data byte count differs from its reference")
         return self
+
+    def wire_chunks(self) -> tuple[memoryview, ...]:
+        if self.payload is not None:
+            return tuple(_iter_readonly_chunks(self.payload))
+        return self.chunks
 
 
 class EncodedRouteObject(BaseModel):
@@ -303,38 +307,248 @@ def encode_trajectory_group(
     *,
     object_id: str | None = None,
     route_encoding: RouteWireEncoding = "prefix_tree",
+    route_group: MoeRouteGroupPayload | None = None,
+    stored_routes: tuple[MoeRouteStoredObject, ...] | None = None,
 ) -> EncodedRlGroup:
-    data_id = object_id or _object_id(uuid.uuid4().hex)
-    source = bundle.payload()
-    if route_encoding == "prefix_tree":
-        stripped, route_payload = _extract_routes(source)
-    elif route_encoding == "inline":
-        stripped, route_payload = source, None
-    else:
+    sources = (route_group is not None, stored_routes is not None)
+    if sum(sources) > 1:
+        raise ValueError("RL trajectory group has multiple explicit route sources")
+    if route_encoding not in {"inline", "prefix_tree"}:
         raise ValueError(f"unsupported route wire encoding: {route_encoding!r}")
-    data = _encode_training_object(
-        msgpack.encode(
-            TrajectoryGroupBundle.from_payload(stripped).model_dump(mode="python")
-        ),
+    data_id = object_id or _object_id(uuid.uuid4().hex)
+    layout = TrajectoryGroupDataLayout(
+        header_byte_count=len(bundle.header),
+        record_byte_counts=tuple(map(len, bundle.records)),
+    )
+    data = _encode_training_object_chunks(
+        (bundle.header, *bundle.records),
         data_format=RL_GROUP_DATA_FORMAT,
         object_id=data_id,
     )
-    routes: tuple[EncodedRouteObject, ...] = ()
-    remote_routes: tuple[RemoteRouteObject, ...] = ()
-    if route_payload is not None and route_payload.byte_count:
-        route_ref = RemoteRouteObjectRef(
-            object_id=_object_id(f"{data_id}:{route_payload.sha256}"),
-            byte_count=route_payload.byte_count,
-            transport="command",
-            sha256=route_payload.sha256,
+    if stored_routes is not None:
+        _validate_route_bindings(bundle, stored_routes)
+        routes, remote_routes = (), tuple(
+            RemoteRouteObject(
+                ref=RemoteRouteObjectRef(
+                    object_id=value.object_id,
+                    byte_count=value.byte_count,
+                    transport="object_store",
+                ),
+                slices=value.slices,
+            )
+            for value in stored_routes
         )
-        routes = (EncodedRouteObject(ref=route_ref, chunks=route_payload.chunks),)
-        remote_routes = (RemoteRouteObject(ref=route_ref, slices=route_payload.slices),)
+    elif route_group is not None:
+        _validate_route_bindings(bundle, route_group.objects)
+        routes, remote_routes = _encode_route_group(route_group, data_id=data_id)
+    else:
+        packed = _pack_trajectory_routes(bundle.route_sequences)
+        if packed is None:
+            routes, remote_routes = (), ()
+        else:
+            route_ref = RemoteRouteObjectRef(
+                object_id=_object_id(f"{data_id}:{packed.sha256}"),
+                byte_count=packed.byte_count,
+                transport="command",
+                sha256=packed.sha256,
+            )
+            routes = (EncodedRouteObject(ref=route_ref, chunks=packed.chunks),)
+            remote_routes = (
+                RemoteRouteObject(ref=route_ref, slices=packed.slices),
+            )
     return EncodedRlGroup(
         data=data,
-        routes=routes,
-        remote=RemoteRlGroupRef(data=data.ref, routes=remote_routes),
+        routes=tuple(routes),
+        remote=RemoteRlGroupRef(
+            data=data.ref,
+            layout=layout,
+            routes=tuple(remote_routes),
+        ),
     )
+
+
+def _validate_route_bindings(
+    bundle: TrajectoryGroupBundle,
+    objects: tuple[MoeRouteObjectPayload | MoeRouteStoredObject, ...],
+) -> None:
+    if not bundle.route_sequences:
+        return
+    expected = {
+        (
+            sequence.trajectory_index,
+            sequence.scope,
+            sequence.scope_index,
+            sequence.choice_index,
+        )
+        for sequence in bundle.route_sequences
+    }
+    received = {
+        (
+            value.trajectory_index,
+            value.scope,
+            value.scope_index,
+            value.choice_index,
+        )
+        for obj in objects
+        for value in obj.slices
+    }
+    if received != expected:
+        raise ValueError("explicit routes do not match trajectory route bindings")
+
+
+def _encode_route_group(
+    group: MoeRouteGroupPayload, *, data_id: str
+) -> tuple[tuple[EncodedRouteObject, ...], tuple[RemoteRouteObject, ...]]:
+    encoded = []
+    remote = []
+    for index, value in enumerate(group.objects):
+        chunks = tuple(_iter_readonly_chunks(value.data))
+        digest = hashlib.sha256()
+        for chunk in chunks:
+            digest.update(chunk)
+        sha256 = digest.hexdigest()
+        ref = RemoteRouteObjectRef(
+            object_id=_object_id(f"{data_id}:{index}:{sha256}"),
+            byte_count=sum(map(len, chunks)),
+            transport="command",
+            sha256=sha256,
+        )
+        encoded.append(EncodedRouteObject(ref=ref, chunks=chunks))
+        remote.append(RemoteRouteObject(ref=ref, slices=value.slices))
+    return tuple(encoded), tuple(remote)
+
+
+def _pack_trajectory_routes(
+    sequences: tuple[TrajectoryRouteSequence, ...],
+) -> _PackedRouteObject | None:
+    if not sequences:
+        return None
+    packed = _pack_route_sequences(
+        tuple((sequence, sequence.token_ids) for sequence in sequences),
+        compute_sha256=True,
+    )
+    if packed.sha256 is None:
+        raise RuntimeError("route object identity was not computed")
+    slices = tuple(
+        RemoteRouteSlice(
+            trajectory_index=sequence.trajectory_index,
+            scope=sequence.scope,
+            scope_index=sequence.scope_index,
+            choice_index=sequence.choice_index,
+            segment_index=segment_index,
+            offset=offset,
+            byte_count=byte_count,
+        )
+        for sequence, sequence_slices in zip(sequences, packed.slices, strict=True)
+        for segment_index, (offset, byte_count) in enumerate(sequence_slices)
+    )
+    return _PackedRouteObject(
+        chunks=packed.chunks,
+        byte_count=packed.byte_count,
+        sha256=packed.sha256,
+        slices=slices,
+    )
+
+
+def _pack_route_sequences(
+    entries: tuple[tuple[Any, tuple[int, ...]], ...],
+    *,
+    compute_sha256: bool = False,
+) -> _PackedRouteSequences:
+    if not entries:
+        return _PackedRouteSequences(
+            chunks=(),
+            byte_count=0,
+            slices=(),
+            sha256=hashlib.sha256().hexdigest() if compute_sha256 else None,
+        )
+    token_keys: dict[tuple[int, str, int, int, memoryview], int] = {}
+    rows = []
+    for route, token_ids in entries:
+        tokens = _route_token_views(route)
+        rows.append(
+            tuple(
+                token_keys.setdefault(
+                    (token_id, route.dtype, route.shape[1], route.shape[2], token),
+                    len(token_keys),
+                )
+                for token_id, token in zip(token_ids, tokens, strict=True)
+            )
+        )
+    planned = prefix_tree_pack_segments(
+        rows,
+        max_depth=max(map(len, rows)),
+        shareable_lengths=tuple(map(len, rows)),
+        min_shared_segment_length=1,
+    )
+    chunks: list[memoryview] = []
+    byte_count = 0
+    digest = hashlib.sha256() if compute_sha256 else None
+    slices: list[list[tuple[int, int]]] = [[] for _ in entries]
+    for segment in planned:
+        route = entries[segment.sequence_indices[0]][0]
+        bytes_per_token = _route_bytes_per_token(route)
+        offset = byte_count
+        for source_chunk in _route_data_range(
+            route.data,
+            segment.start * bytes_per_token,
+            segment.end * bytes_per_token,
+        ):
+            for chunk in _iter_readonly_chunks(source_chunk):
+                chunks.append(chunk)
+                byte_count += len(chunk)
+                if byte_count > MAX_FORWARD_SUBMISSION_BYTES:
+                    raise ValueError("route object exceeds the configured limit")
+                if len(chunks) > MAX_FORWARD_SUBMISSION_CHUNKS:
+                    raise ValueError("route object has too many wire chunks")
+                if digest is not None:
+                    digest.update(chunk)
+        segment_byte_count = byte_count - offset
+        for sequence_index in segment.sequence_indices:
+            slices[sequence_index].append((offset, segment_byte_count))
+    return _PackedRouteSequences(
+        chunks=tuple(chunks),
+        byte_count=byte_count,
+        slices=tuple(tuple(value) for value in slices),
+        sha256=digest.hexdigest() if digest is not None else None,
+    )
+
+
+def _route_bytes_per_token(route: Any) -> int:
+    return (1 if route.dtype == "uint8" else 2) * route.shape[1] * route.shape[2]
+
+
+def _route_token_views(route: Any) -> tuple[memoryview, ...]:
+    bytes_per_token = _route_bytes_per_token(route)
+    tokens = tuple(
+        view[offset : offset + bytes_per_token]
+        for raw in route.data
+        for view in (memoryview(raw).cast("B").toreadonly(),)
+        for offset in range(0, len(view), bytes_per_token)
+    )
+    if len(tokens) != route.shape[0]:
+        raise RuntimeError("routed experts do not cover their declared shape")
+    return tokens
+
+
+def _route_data_range(
+    data: tuple[bytes | memoryview, ...], start: int, end: int
+) -> tuple[memoryview, ...]:
+    result = []
+    cursor = 0
+    for raw in data:
+        segment = memoryview(raw).cast("B").toreadonly()
+        segment_end = cursor + len(segment)
+        overlap_start = max(start, cursor)
+        overlap_end = min(end, segment_end)
+        if overlap_start < overlap_end:
+            result.append(segment[overlap_start - cursor : overlap_end - cursor])
+        cursor = segment_end
+        if cursor >= end:
+            break
+    if cursor < end:
+        raise RuntimeError("routed experts do not cover their declared shape")
+    return tuple(result)
 
 
 def prepare_training_batch(
@@ -345,11 +559,21 @@ def prepare_training_batch(
 ) -> EncodedTrainingBatch:
     if isinstance(batch, RlTrajectoryBatch):
         annotations = batch.local_group_annotations()
+        route_groups = batch.local_moe_route_groups()
+        route_transfer = batch.local_moe_route_object_transfer()
+        if route_groups and route_transfer is not None:
+            raise ValueError("RL batch has both inline and stored route sources")
         groups = tuple(
             encode_trajectory_group(
                 group,
                 object_id=_object_id(f"{identity}:{index}") if identity else None,
                 route_encoding=route_encoding,
+                route_group=route_groups[index] if route_groups else None,
+                stored_routes=(
+                    route_transfer.groups[index]
+                    if route_transfer is not None
+                    else None
+                ),
             )
             for index, group in enumerate(batch.groups)
         )
@@ -398,10 +622,21 @@ def decode_trajectory_group(
     ref: RemoteRlGroupRef,
     payload: bytes,
     *,
-    route_payloads: Mapping[str, bytes],
+    route_payloads: Mapping[str, bytes | memoryview],
 ) -> DecodedRlGroup:
     _validate_training_object(ref.data, payload, RL_GROUP_DATA_FORMAT)
-    bundle = TrajectoryGroupBundle.model_validate(msgpack.decode(payload))
+    layout = ref.layout
+    if len(payload) != layout.byte_count:
+        raise ValueError("RL trajectory layout differs from its data object")
+    source = memoryview(payload).toreadonly()
+    offset = layout.header_byte_count
+    header = source[:offset]
+    records = []
+    for byte_count in layout.record_byte_counts:
+        end = offset + byte_count
+        records.append(source[offset:end])
+        offset = end
+    bundle = TrajectoryGroupBundle(header=header, records=tuple(records))
     return DecodedRlGroup(
         bundle=bundle,
         routes=MoeRouteGroupPayload(
@@ -416,230 +651,9 @@ def decode_trajectory_group(
     )
 
 
-def _extract_routes(
-    payload: TrajectoryGroupPayload,
-) -> tuple[TrajectoryGroupPayload, _PackedRouteObject]:
-    entries: list[_RouteEntry] = []
-    trajectories = []
-    for trajectory_index, trajectory in enumerate(payload.trajectories):
-        histories = tuple(
-            _strip_route_map(
-                values,
-                trajectory_index=trajectory_index,
-                scope="additional_history",
-                scope_index=index,
-                entries=entries,
-            )
-            for index, values in enumerate(
-                trajectory.additional_history_choice_routing_metadata
-            )
-        )
-        exchanges = tuple(
-            _strip_route_map(
-                values,
-                trajectory_index=trajectory_index,
-                scope="exchange",
-                scope_index=index,
-                entries=entries,
-            )
-            for index, values in enumerate(trajectory.exchange_choice_routing_metadata)
-        )
-        trajectories.append(
-            trajectory.model_copy(
-                update={
-                    "choice_routing_metadata": _strip_route_map(
-                        trajectory.choice_routing_metadata,
-                        trajectory_index=trajectory_index,
-                        scope="messages",
-                        scope_index=0,
-                        entries=entries,
-                    ),
-                    "additional_history_choice_routing_metadata": histories,
-                    "exchange_choice_routing_metadata": exchanges,
-                }
-            )
-        )
-    return payload.model_copy(
-        update={"trajectories": tuple(trajectories)}
-    ), _pack_route_entries(entries)
-
-
-def _strip_route_map(
-    values: dict[int, Any],
-    *,
-    trajectory_index: int,
-    scope: Literal["messages", "additional_history", "exchange"],
-    scope_index: int,
-    entries: list[_RouteEntry],
-) -> dict[int, Any]:
-    stripped = {}
-    for choice_index, route in values.items():
-        if not route.data:
-            raise RuntimeError("inline routed experts are empty")
-        entries.append(
-            _RouteEntry(
-                trajectory_index,
-                scope,
-                scope_index,
-                choice_index,
-                route,
-            )
-        )
-        stripped[choice_index] = route.model_copy(update={"data": ()})
-    return stripped
-
-
-def _pack_route_entries(
-    entries: list[_RouteEntry],
-) -> _PackedRouteObject:
-    packed = _pack_route_sequences(
-        tuple((entry.route, _route_token_ids(entry.route)) for entry in entries),
-        compute_sha256=True,
-    )
-    if packed.sha256 is None:
-        raise RuntimeError("route object identity was not computed")
-    slices = tuple(
-        RemoteRouteSlice(
-            trajectory_index=entry.trajectory_index,
-            scope=entry.scope,
-            scope_index=entry.scope_index,
-            choice_index=entry.choice_index,
-            segment_index=segment_index,
-            offset=offset,
-            byte_count=byte_count,
-        )
-        for entry, route_slices in zip(entries, packed.slices, strict=True)
-        for segment_index, (offset, byte_count) in enumerate(route_slices)
-    )
-    return _PackedRouteObject(
-        chunks=packed.chunks,
-        byte_count=packed.byte_count,
-        sha256=packed.sha256,
-        slices=slices,
-    )
-
-
-def _pack_route_sequences(
-    entries: tuple[tuple[Any, tuple[int, ...]], ...],
-    *,
-    compute_sha256: bool = False,
-) -> _PackedRouteSequences:
-    if not entries:
-        return _PackedRouteSequences(
-            chunks=(),
-            byte_count=0,
-            slices=(),
-            sha256=hashlib.sha256().hexdigest() if compute_sha256 else None,
-        )
-    token_keys: dict[tuple[int, str, int, int, memoryview], int] = {}
-    rows = []
-    for route, token_ids in entries:
-        tokens = _route_token_views(route)
-        rows.append(
-            tuple(
-                token_keys.setdefault(
-                    (token_id, route.dtype, route.shape[1], route.shape[2], token),
-                    len(token_keys),
-                )
-                for token_id, token in zip(token_ids, tokens, strict=True)
-            )
-        )
-    planned = prefix_tree_pack_segments(
-        rows,
-        max_depth=max(map(len, rows)),
-        shareable_lengths=tuple(map(len, rows)),
-        min_shared_segment_length=1,
-    )
-    chunks: list[memoryview] = []
-    byte_count = 0
-    digest = hashlib.sha256() if compute_sha256 else None
-    slices: list[list[tuple[int, int]]] = [[] for _ in entries]
-    for segment in planned:
-        route = entries[segment.sequence_indices[0]][0]
-        bytes_per_token = _route_bytes_per_token(route)
-        source_chunks = _route_data_range(
-            route.data,
-            segment.start * bytes_per_token,
-            segment.end * bytes_per_token,
-        )
-        offset = byte_count
-        for source_chunk in source_chunks:
-            for chunk in _iter_readonly_chunks(source_chunk):
-                chunks.append(chunk)
-                byte_count += len(chunk)
-                if byte_count > MAX_FORWARD_SUBMISSION_BYTES:
-                    raise ValueError("route object exceeds the configured limit")
-                if len(chunks) > MAX_FORWARD_SUBMISSION_CHUNKS:
-                    raise ValueError("route object has too many wire chunks")
-                if digest is not None:
-                    digest.update(chunk)
-        segment_byte_count = byte_count - offset
-        for sequence_index in segment.sequence_indices:
-            slices[sequence_index].append((offset, segment_byte_count))
-    return _PackedRouteSequences(
-        chunks=tuple(chunks),
-        byte_count=byte_count,
-        slices=tuple(tuple(value) for value in slices),
-        sha256=digest.hexdigest() if digest is not None else None,
-    )
-
-
-def _route_token_ids(route: Any) -> tuple[int, ...]:
-    prompt = route.metadata.get(PROMPT_TOKEN_IDS_KEY)
-    completion = route.metadata.get(COMPLETION_TOKEN_IDS_KEY)
-    if not isinstance(prompt, list) or not isinstance(completion, list):
-        raise RuntimeError("routed experts are missing exact token ids")
-    route_count = route.shape[0]
-    completion_count = route_count - len(prompt)
-    if completion_count not in {len(completion), max(len(completion) - 1, 0)}:
-        raise RuntimeError("routed-expert token ids do not match their route shape")
-    token_ids = tuple(prompt) + tuple(completion[:completion_count])
-    if any(
-        isinstance(token, bool) or not isinstance(token, int) or token < 0
-        for token in token_ids
-    ):
-        raise RuntimeError("routed-expert token ids do not match their route shape")
-    return token_ids
-
-
-def _route_bytes_per_token(route: Any) -> int:
-    return (1 if route.dtype == "uint8" else 2) * route.shape[1] * route.shape[2]
-
-
-def _route_token_views(route: Any) -> tuple[memoryview, ...]:
-    bytes_per_token = _route_bytes_per_token(route)
-    tokens = tuple(
-        view[offset : offset + bytes_per_token]
-        for raw in route.data
-        for view in (memoryview(raw).cast("B").toreadonly(),)
-        for offset in range(0, len(view), bytes_per_token)
-    )
-    if len(tokens) != route.shape[0]:
-        raise RuntimeError("routed experts do not cover their declared shape")
-    return tokens
-
-
-def _route_data_range(
-    data: tuple[bytes | memoryview, ...], start: int, end: int
-) -> tuple[memoryview, ...]:
-    result = []
-    cursor = 0
-    for raw in data:
-        segment = memoryview(raw).cast("B").toreadonly()
-        segment_end = cursor + len(segment)
-        overlap_start = max(start, cursor)
-        overlap_end = min(end, segment_end)
-        if overlap_start < overlap_end:
-            result.append(segment[overlap_start - cursor : overlap_end - cursor])
-        cursor = segment_end
-        if cursor >= end:
-            break
-    if cursor < end:
-        raise RuntimeError("routed experts do not cover their declared shape")
-    return tuple(result)
-
-
-def _route_payload(object_id: str, payloads: Mapping[str, bytes]) -> bytes:
+def _route_payload(
+    object_id: str, payloads: Mapping[str, bytes | memoryview]
+) -> bytes | memoryview:
     try:
         return payloads[object_id]
     except KeyError:
@@ -758,9 +772,7 @@ def encode_forward_submission(
         + manifest
     )
     chunks = tuple(
-        chunk
-        for value in batch.objects
-        for chunk in _iter_readonly_chunks(value.payload)
+        chunk for value in batch.objects for chunk in value.wire_chunks()
     ) + tuple(chunk for value in batch.route_objects for chunk in value.chunks)
     return EncodedForwardSubmission(
         preamble=preamble,
@@ -801,7 +813,6 @@ def _encode_training_object(
     payload: bytes,
     *,
     data_format: Literal[
-        "art_trajectory_group_msgpack_v3",
         "art_sft_batch_msgpack_v1",
         "art_tokenized_batch_msgpack_v2",
     ],
@@ -816,6 +827,29 @@ def _encode_training_object(
             format=data_format,
         ),
         payload=payload,
+    )
+
+
+def _encode_training_object_chunks(
+    payloads: tuple[bytes | memoryview, ...],
+    *,
+    data_format: Literal["art_trajectory_group_records_v4"],
+    object_id: str | None,
+) -> EncodedTrainingObject:
+    chunks = tuple(
+        chunk for payload in payloads for chunk in _iter_readonly_chunks(payload)
+    )
+    digest = hashlib.sha256()
+    for chunk in chunks:
+        digest.update(chunk)
+    return EncodedTrainingObject(
+        ref=TrainingDataRef(
+            object_id=object_id or _object_id(uuid.uuid4().hex),
+            sha256=digest.hexdigest(),
+            byte_count=sum(map(len, chunks)),
+            format=data_format,
+        ),
+        chunks=chunks,
     )
 
 

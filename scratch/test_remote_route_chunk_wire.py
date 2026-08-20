@@ -162,14 +162,15 @@ async def _chunks(payload: bytes, width: int):
         yield payload[offset : offset + width]
 
 
-def test_trajectory_record_routes_decode_as_readonly_views() -> None:
+def test_trajectory_records_are_route_free_and_routes_are_separate() -> None:
     bundle = TrajectoryGroupBundle.from_group(_group())
-    payload = bundle.payload()
-    for record, trajectory in zip(bundle.records, payload.trajectories, strict=True):
-        chunk = trajectory.choice_routing_metadata[0].data[0]
-        assert isinstance(chunk, memoryview)
-        assert chunk.readonly
-        assert chunk.obj is record
+    route_free = bundle.route_free_payload()
+    assert bundle.route_sequences
+    assert all(
+        not trajectory.choice_routing_metadata[0].data
+        for trajectory in route_free.trajectories
+    )
+    assert _route_values(bundle.build()) == ROUTES
 
 
 def test_route_encoding_preserves_exact_bytes_slices_and_round_trip() -> None:
@@ -195,11 +196,11 @@ def test_route_encoding_preserves_exact_bytes_slices_and_round_trip() -> None:
 
     decoded = decode_trajectory_group(
         encoded.remote,
-        encoded.data.payload,
+        b"".join(encoded.data.wire_chunks()),
         route_payloads={route.ref.object_id: route_bytes},
     )
     rebuilt = hydrate_trajectory_group_routes(
-        decoded.bundle.payload(), decoded.routes
+        decoded.bundle.route_free_payload(), decoded.routes
     ).build()
     assert _route_values(rebuilt) == ROUTES
 
@@ -243,7 +244,9 @@ async def test_forward_submission_stream_is_byte_identical_and_bounded() -> None
     wire = b"".join(streamed_chunks)
     expected = (
         submission.preamble
-        + b"".join(value.payload for value in encoded.objects)
+        + b"".join(
+            chunk for value in encoded.objects for chunk in value.wire_chunks()
+        )
         + b"".join(chunk for value in encoded.route_objects for chunk in value.chunks)
     )
     assert wire == expected
@@ -281,6 +284,7 @@ def test_forward_batch_structure_is_bounded_before_materialization() -> None:
     with pytest.raises(ValidationError, match="too_long"):
         RemoteRlGroupRef(
             data=group.data,
+            layout=group.layout,
             routes=(route,) * (MAX_ROUTE_OBJECTS_PER_GROUP + 1),
         )
     with pytest.raises(ValidationError, match="too_long"):

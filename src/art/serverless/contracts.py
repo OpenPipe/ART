@@ -13,7 +13,10 @@ from art.distributed.moe_route_store import (
     validate_moe_route_slices,
 )
 from art.distributed.object_store import MOE_ROUTE_OBJECT_FORMAT
-from art.distributed.trajectory_store import TrajectoryGroupAnnotations
+from art.distributed.trajectory_store import (
+    TrajectoryGroupAnnotations,
+    TrajectoryGroupDataLayout,
+)
 from art.training.contracts import (
     MAX_CHECKPOINT_REFERENCE_LENGTH,
     MAX_CONTROL_IDENTIFIER_LENGTH,
@@ -24,7 +27,7 @@ from art.training.contracts import (
     RunCommand,
 )
 
-RL_GROUP_DATA_FORMAT = "art_trajectory_group_msgpack_v3"
+RL_GROUP_DATA_FORMAT = "art_trajectory_group_records_v4"
 SFT_DATA_FORMAT = "art_sft_batch_msgpack_v1"
 TOKENIZED_DATA_FORMAT = "art_tokenized_batch_msgpack_v2"
 OPERATION_RESULT_FORMAT = "art_operation_result_msgpack_v1"
@@ -70,7 +73,7 @@ class TrainingDataRef(Contract):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     byte_count: int = Field(ge=1)
     format: Literal[
-        "art_trajectory_group_msgpack_v3",
+        "art_trajectory_group_records_v4",
         "art_sft_batch_msgpack_v1",
         "art_tokenized_batch_msgpack_v2",
         "art_moe_route_bundle_v2",
@@ -135,6 +138,7 @@ class RemoteRouteObject(Contract):
 
 class RemoteRlGroupRef(Contract):
     data: TrainingDataRef
+    layout: TrajectoryGroupDataLayout
     routes: tuple[RemoteRouteObject, ...] = Field(
         default=(), max_length=MAX_ROUTE_OBJECTS_PER_GROUP
     )
@@ -144,6 +148,8 @@ class RemoteRlGroupRef(Contract):
     def _validate_format(self) -> "RemoteRlGroupRef":
         if self.data.format != RL_GROUP_DATA_FORMAT:
             raise ValueError("RL group data has the wrong wire format")
+        if self.layout.byte_count != self.data.byte_count:
+            raise ValueError("RL group layout differs from its data object")
         positions = [
             (
                 value.trajectory_index,

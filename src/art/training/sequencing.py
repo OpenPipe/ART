@@ -268,9 +268,26 @@ def _request_fingerprint(request: RunCommand) -> str:
             _update_digest(digest, group.header)
             for record in group.records:
                 _update_digest(digest, record)
+            for route in group.route_sequences:
+                _update_digest(
+                    digest,
+                    json.dumps(
+                        (
+                            route.trajectory_index,
+                            route.scope,
+                            route.scope_index,
+                            route.choice_index,
+                            route.dtype,
+                            route.shape,
+                        ),
+                        separators=(",", ":"),
+                    ).encode(),
+                )
+                for segment in route.data:
+                    _update_digest(digest, segment)
     return digest.hexdigest()
 
 
-def _update_digest(digest: Any, value: bytes) -> None:
+def _update_digest(digest: Any, value: bytes | memoryview) -> None:
     digest.update(len(value).to_bytes(8, "big"))
     digest.update(value)
