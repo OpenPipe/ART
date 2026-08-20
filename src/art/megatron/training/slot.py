@@ -156,14 +156,21 @@ class PreparedEmptySftForward(PreparedForward):
     num_dropped_trajectories: int = Field(ge=0)
 
 
+def _completed_release() -> asyncio.Future[None]:
+    completion = asyncio.get_running_loop().create_future()
+    completion.set_result(None)
+    return completion
+
+
 class ForwardBackwardLaunch(BaseModel):
-    """Gradients are resident; the public F/B result may still be settling."""
+    """Gradients are resident; result and packed-input release may still settle."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
     operation_id: str
     produced_gradient: bool
     completion: SkipValidation[asyncio.Future[ForwardBackwardResult]]
+    release_completion: SkipValidation[asyncio.Future[None]]
 
 
 class PreparedLoadState(BaseModel):
@@ -660,6 +667,7 @@ class MegatronTrainingSlot:
                 operation_id=ref.operation_id,
                 produced_gradient=False,
                 completion=completion,
+                release_completion=_completed_release(),
             )
         if isinstance(prepared, PreparedSftForward):
             job = SftForwardBackwardJobSpec(
@@ -688,6 +696,7 @@ class MegatronTrainingSlot:
                 operation_id=ref.operation_id,
                 produced_gradient=result.produced_gradient,
                 completion=completion,
+                release_completion=_completed_release(),
             )
         if not isinstance(prepared, PreparedPackedForward):
             raise TypeError("unknown prepared F/B payload")
@@ -712,8 +721,19 @@ class MegatronTrainingSlot:
         )
         try:
             raw = await self.trainer.start_forward_backward(job, prepared.packed.leases)
-        finally:
-            self._release_batch_soon(prepared.packed)
+        except BaseException as error:
+            try:
+                release_completion = self._release_batch_soon(prepared.packed)
+                _, cancelled = await complete_task(release_completion)
+                if cancelled is not None:
+                    error.add_note("packed-batch release observed cancellation")
+            except BaseException as cleanup:
+                error.add_note(
+                    "packed-batch release also failed: "
+                    f"{type(cleanup).__name__}: {cleanup}"
+                )
+            raise
+        release_completion = self._release_batch_soon(prepared.packed)
 
         async def complete() -> ForwardBackwardResult:
             result = await asyncio.shield(raw.completion)
@@ -733,6 +753,7 @@ class MegatronTrainingSlot:
             completion=asyncio.create_task(
                 complete(), name=f"megatron-fb-result-{ref.operation_id}"
             ),
+            release_completion=release_completion,
         )
 
     @staticmethod
@@ -1400,7 +1421,9 @@ class MegatronTrainingSlot:
         await self._batch_release_slots.acquire()
         return _BatchReleaseLease(self._batch_release_slots)
 
-    def _release_batch_soon(self, packed: DistributedPackedBatch) -> None:
+    def _release_batch_soon(
+        self, packed: DistributedPackedBatch
+    ) -> asyncio.Task[None]:
         lease = self._batch_release_leases.pop(packed.packing_generation_id)
 
         async def release() -> None:
@@ -1415,6 +1438,7 @@ class MegatronTrainingSlot:
         )
         self._batch_releases.add(task)
         task.add_done_callback(self._batch_release_done)
+        return task
 
     def _batch_release_done(self, task: asyncio.Task[None]) -> None:
         self._batch_releases.discard(task)
