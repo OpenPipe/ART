@@ -213,6 +213,9 @@ class _SnapshotSource(BaseModel):
     optimizer_state_path: str
 
 
+_MAX_PENDING_BATCH_RELEASES = 2
+
+
 class MegatronTrainingSlot:
     """Canonical pack-and-command facade for one persistent Megatron mesh."""
 
@@ -565,7 +568,7 @@ class MegatronTrainingSlot:
         try:
             raw = await self.trainer.forward(job, prepared.packed.leases)
         finally:
-            self._release_batch_soon(prepared.packed)
+            await self._release_batch_soon(prepared.packed)
         return ForwardResult(
             operation_id=ref.operation_id,
             packing=prepared.packing,
@@ -628,7 +631,7 @@ class MegatronTrainingSlot:
         try:
             raw = await self.trainer.forward_backward(job, prepared.packed.leases)
         finally:
-            self._release_batch_soon(prepared.packed)
+            await self._release_batch_soon(prepared.packed)
         return ForwardBackwardResult(
             operation_id=ref.operation_id,
             packing=prepared.packing,
@@ -1297,7 +1300,13 @@ class MegatronTrainingSlot:
         if primary is not None:
             raise primary
 
-    def _release_batch_soon(self, packed: DistributedPackedBatch) -> None:
+    async def _release_batch_soon(self, packed: DistributedPackedBatch) -> None:
+        while len(self._batch_releases) >= _MAX_PENDING_BATCH_RELEASES:
+            await asyncio.wait(
+                self._batch_releases, return_when=asyncio.FIRST_COMPLETED
+            )
+            await asyncio.sleep(0)
+            self._raise_batch_release_failures()
         task = asyncio.create_task(
             self.runtime.release_batch(packed),
             name=f"release-packed-batch-{packed.packing_generation_id}",
