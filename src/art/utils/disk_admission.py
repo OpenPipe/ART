@@ -615,12 +615,8 @@ def _paths_have_open_files(values: tuple[str, ...]) -> bool:
             continue
         try:
             descriptors = tuple((process / "fd").iterdir())
-        except FileNotFoundError:
+        except (FileNotFoundError, PermissionError):
             continue
-        except PermissionError as error:
-            raise DiskAdmissionError(
-                f"cannot revalidate open files for process {process.name}"
-            ) from error
         for descriptor in descriptors:
             try:
                 target = Path(os.readlink(descriptor))
