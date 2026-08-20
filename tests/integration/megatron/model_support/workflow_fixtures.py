@@ -48,6 +48,13 @@ _REDUCED_TRAINABILITY_ENV: dict[str, dict[str, dict[str, str]]] = {
 }
 _TOKENIZER_FIXTURE_VERSION = 3
 _FUNCTIONAL_FIXTURE_VERSION = 1
+_FUNCTIONAL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 1}
+_FUNCTIONAL_REMOTE_CODE_FILES = {
+    "nemotron_h_moe": (
+        "configuration_nemotron_h.py",
+        "modeling_nemotron_h.py",
+    )
+}
 _REVISIONS = {
     "meta-llama/Llama-3.2-1B-Instruct": "9213176726f574b556790deb65791e0c5aa438b6",
     "Qwen/Qwen3-32B": "9216db5781bf21249d130ec9da846c4624c16137",
@@ -820,6 +827,12 @@ def _fixture_version(model_key: str) -> int:
     return FIXTURE_VERSION + _MODEL_FIXTURE_VERSION_OFFSETS.get(model_key, 0)
 
 
+def _functional_fixture_version(model_key: str) -> int:
+    return _FUNCTIONAL_FIXTURE_VERSION + _FUNCTIONAL_FIXTURE_VERSION_OFFSETS.get(
+        model_key, 0
+    )
+
+
 def _is_current(
     path: Path,
     *,
@@ -951,6 +964,18 @@ def _build(
         config.save_pretrained(staging)
         if functional:
             (staging / "config.json").write_text(json.dumps(reduced, indent=2) + "\n")
+            if model_key == "nemotron_h_moe":
+                if source_fixture is None:
+                    raise RuntimeError(
+                        "nemotron_h_moe functional fixture requires a parent fixture"
+                    )
+                for name in _FUNCTIONAL_REMOTE_CODE_FILES[model_key]:
+                    source_path = source_fixture / name
+                    if not source_path.is_file():
+                        raise RuntimeError(
+                            f"nemotron_h_moe parent fixture lacks {name}"
+                        )
+                    shutil.copy2(source_path, staging / name)
         tokenizer.save_pretrained(staging)
         if model_key in _MULTIMODAL:
             AutoProcessor.from_pretrained(
@@ -1055,7 +1080,7 @@ def _build(
                 raise RuntimeError("functional fixture construction is incomplete")
             manifest.update(
                 {
-                    "version": _FUNCTIONAL_FIXTURE_VERSION,
+                    "version": _functional_fixture_version(model_key),
                     "fixture_kind": "functional_pretrained",
                     "pretrained": True,
                     "num_layers": _functional_plan(model_key).depth,
@@ -1068,6 +1093,10 @@ def _build(
                     **functional_contract,
                 }
             )
+            if remote_code_files := _FUNCTIONAL_REMOTE_CODE_FILES.get(model_key):
+                manifest["remote_code_sha256"] = {
+                    name: _sha256(staging / name) for name in remote_code_files
+                }
         if tokenizer_compatible:
             _validate_tokenizer_compatible_fixture(staging, manifest)
         if functional and not _checkpoint_is_complete(staging):
@@ -1170,12 +1199,15 @@ def _validate_tokenizer_compatible_fixture(
 
 def _functional_contract_sha256(model_key: str) -> str:
     contract = (
-        _FUNCTIONAL_FIXTURE_VERSION,
+        _functional_fixture_version(model_key),
         _functional_plan(model_key).model_dump(mode="json"),
         _FUNCTIONAL_PATTERNS.get(model_key),
     )
     if model_key == "nemotron_h_moe":
-        contract += (_NEMOTRON_H_SEMANTICS,)
+        contract += (
+            _NEMOTRON_H_SEMANTICS,
+            _FUNCTIONAL_REMOTE_CODE_FILES[model_key],
+        )
     return _json_sha256(contract)
 
 
@@ -1311,9 +1343,16 @@ def _ensure_cached_fixture(
             version=version if functional else None,
         )
         if functional and current:
-            current = json.loads((output / "fixture_manifest.json").read_text()).get(
+            cached_manifest = json.loads((output / "fixture_manifest.json").read_text())
+            current = cached_manifest.get(
                 "contract_sha256"
             ) == _functional_contract_sha256(model_key)
+            if current and (
+                remote_code_files := _FUNCTIONAL_REMOTE_CODE_FILES.get(model_key)
+            ):
+                current = cached_manifest.get("remote_code_sha256") == {
+                    name: _sha256(output / name) for name in remote_code_files
+                }
         if not current:
             if functional and source_fixture is None:
                 raise RuntimeError("functional fixture requires compact metadata")
@@ -1394,14 +1433,15 @@ def ensure_workflow_fixture(
     functional_hf_home: Path | None = None
     functional_manifest: dict[str, object] | None = None
     if required_stages & _FUNCTIONAL_STAGES:
+        functional_version = _functional_fixture_version(model_key)
         functional_path, functional_manifest, functional_hf_home = (
             _ensure_cached_fixture(
                 canonical_model=base_model,
                 model_key=model_key,
                 revision=revision,
-                root=_FUNCTIONAL_FIXTURE_ROOT / f"v{_FUNCTIONAL_FIXTURE_VERSION}",
+                root=_FUNCTIONAL_FIXTURE_ROOT / f"v{functional_version}",
                 cache_root=_FUNCTIONAL_CACHE_ROOT,
-                version=_FUNCTIONAL_FIXTURE_VERSION,
+                version=functional_version,
                 tokenizer_compatible=True,
                 source_fixture=output,
                 functional=True,
