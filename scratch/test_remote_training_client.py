@@ -61,6 +61,7 @@ class FakeService:
         self.submit_bodies = []
         self.training_data = {}
         self.operation_results = {}
+        self.acknowledged_results = []
         self.events = []
         self.nonempty_event_pages = 0
         self.operation_status_gets = 0
@@ -149,6 +150,10 @@ class FakeService:
             )
         if path.endswith("/result"):
             operation_id = path.split("/")[-2]
+            if request.method == "DELETE":
+                self.acknowledged_results.append(operation_id)
+                self.operation_results.pop(operation_id, None)
+                return httpx.Response(204)
             return httpx.Response(200, content=self.operation_results[operation_id])
         if path.startswith("/v1/training/operations/"):
             self.operation_status_gets += 1
@@ -539,7 +544,7 @@ async def test_remote_client_retries_and_preserves_command_order():
     )
     assert fake.operation_status_gets == 0
     assert 1 <= fake.nonempty_event_pages <= 2
-    assert all(not path.endswith("/result") for path in paths["control"])
+    assert sum(path.endswith("/result") for path in paths["control"]) == 1
     assert all(
         path.endswith("/forward_backward") or path.endswith("/result")
         for path in paths["transfer"]
@@ -550,4 +555,5 @@ async def test_remote_client_retries_and_preserves_command_order():
     await client.close_event_observer()
     assert client._run.status == "closed"
     await service.close()
+    assert fake.acknowledged_results == [forward_operation_id]
     await asyncio.gather(control_http.aclose(), transfer_http.aclose())

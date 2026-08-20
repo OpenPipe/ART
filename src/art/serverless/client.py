@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterable, AsyncIterator, Mapping
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 import hashlib
-from typing import Any, Callable, Generic, TypeVar, cast
+from typing import Any, Generic, TypeVar, cast
 import uuid
 
 import httpx
@@ -104,6 +104,60 @@ class _ByteBudget:
             self._condition.notify_all()
 
 
+class _ResultAcknowledger:
+    def __init__(
+        self,
+        acknowledge: Callable[[str], Awaitable[None]],
+        *,
+        max_pending: int = 256,
+    ) -> None:
+        self._acknowledge = acknowledge
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue(max_pending)
+        self._worker: asyncio.Task[None] | None = None
+        self._failure: BaseException | None = None
+        self._closed = False
+
+    async def submit(self, operation_id: str) -> None:
+        if self._failure is not None:
+            raise RemoteTrainingError("remote result acknowledgement failed") from (
+                self._failure
+            )
+        if self._closed:
+            raise RemoteTrainingError("remote result acknowledger is closed")
+        if self._worker is None:
+            self._worker = asyncio.create_task(
+                self._run(), name="remote-training-result-acknowledger"
+            )
+        await self._queue.put(operation_id)
+
+    async def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            if self._worker is not None:
+                await self._queue.put(None)
+                await self._worker
+        if self._failure is not None:
+            raise RemoteTrainingError("remote result acknowledgement failed") from (
+                self._failure
+            )
+
+    async def _run(self) -> None:
+        while True:
+            operation_id = await self._queue.get()
+            try:
+                if operation_id is None:
+                    return
+                await self._acknowledge(operation_id)
+            except BaseException as error:
+                self._failure = error
+                while not self._queue.empty():
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                return
+            finally:
+                self._queue.task_done()
+
+
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -196,6 +250,9 @@ class RemoteTrainingServiceClient:
         self._owns_clients = owns_clients
         self._max_retries = max_retries
         self._result_budget = _ByteBudget(max_result_bytes_in_flight)
+        self._result_acknowledger = _ResultAcknowledger(
+            self._acknowledge_operation_result
+        )
         self._closed = False
 
     async def create_run(self, request: CreateTrainingRunRequest) -> TrainingRunView:
@@ -329,6 +386,17 @@ class RemoteTrainingServiceClient:
         if offset != ref.byte_count:
             raise RemoteTrainingError("remote operation result byte count changed")
         return payload
+
+    async def acknowledge_operation_result(self, operation_id: str) -> None:
+        await self._result_acknowledger.submit(operation_id)
+
+    async def _acknowledge_operation_result(self, operation_id: str) -> None:
+        await self._send(
+            "DELETE",
+            f"training/operations/{operation_id}/result",
+            content=None,
+            headers=None,
+        )
 
     async def get_events(self, run_id: str, *, after: int) -> EventPage:
         return await self._request(
@@ -535,12 +603,26 @@ class RemoteTrainingServiceClient:
         return response
 
     async def close(self) -> None:
+        if self._closed:
+            return
+        failures: list[BaseException] = []
+        try:
+            await self._result_acknowledger.close()
+        except BaseException as error:
+            failures.append(error)
         self._closed = True
         await self._result_budget.close()
         if self._owns_clients:
-            await asyncio.gather(
-                self._control_client.aclose(), self._transfer_client.aclose()
+            results = await asyncio.gather(
+                self._control_client.aclose(),
+                self._transfer_client.aclose(),
+                return_exceptions=True,
             )
+            failures.extend(
+                result for result in results if isinstance(result, BaseException)
+            )
+        if failures:
+            raise BaseExceptionGroup("remote training service close failed", failures)
 
 
 _EVENT_PAGE_LIMIT = 1000
@@ -743,6 +825,8 @@ class RemoteTrainingOperation(Generic[ResultT]):
             result = self._result_type.model_validate(event.payload)
         if result.operation_id != self._ref.operation_id:
             raise RemoteTrainingError("operation result identity changed")
+        if self._ref.kind in {"forward", "forward_backward"}:
+            await self._service.acknowledge_operation_result(self._ref.operation_id)
         return result
 
     async def cancel(self) -> None:
