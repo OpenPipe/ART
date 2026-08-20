@@ -103,6 +103,18 @@ class RunResidencyManager:
     def register_l1(
         self, key: ResidencyKey, tensors: tuple[torch.Tensor, ...]
     ) -> Future[HostTensorImage]:
+        self._register_l1(key, tensors)
+        return self.ensure_l2(key)
+
+    def register_mutable_l1(
+        self, key: ResidencyKey, tensors: tuple[torch.Tensor, ...]
+    ) -> None:
+        """Admit mutable L1 state without eagerly copying it to a lower tier."""
+        self._register_l1(key, tensors)
+
+    def _register_l1(
+        self, key: ResidencyKey, tensors: tuple[torch.Tensor, ...]
+    ) -> None:
         self._require_open()
         if not tensors or any(tensor.device.type != "cuda" for tensor in tensors):
             raise RuntimeError("new L1 residency must be a non-empty CUDA tensor tuple")
@@ -124,7 +136,33 @@ class RunResidencyManager:
                 self._mutation_barriers[key] = SnapshotReadBarrier()
                 if component is not None:
                     self._installed_components[component] = key
-        return self.ensure_l2(key)
+
+    def begin_l1_mutation(self, key: ResidencyKey) -> None:
+        """Invalidate exact lower-tier images before mutating an L1 component."""
+        self._require_open()
+        with self._lock:
+            state = self._state(key)
+            if not self.ledger.has_copy(key, "l1_gpu"):
+                raise RuntimeError("mutable residency is not L1 resident")
+            if state.l1_transition is not None or self.ledger.has_reservation(key):
+                raise RuntimeError("cannot mutate residency during a transition")
+            if any(
+                future is not None and not future.done()
+                for future in (state.l2_future, state.l3_future, state.l2_demotion)
+            ):
+                raise RuntimeError("cannot mutate residency during a lower-tier copy")
+            if self.ledger.has_copy(key, "l3_nvme"):
+                self._store.delete(key)
+                self.ledger.drop(key, "l3_nvme")
+                state.l3 = None
+                state.l3_manifest = None
+                state.l3_future = None
+            if self.ledger.has_copy(key, "l2_cpu"):
+                self.ledger.drop(key, "l2_cpu")
+                state.l2 = None
+                state.l2_future = None
+                state.evict_l2_after_l1 = False
+            self.ledger.touch(key)
 
     def register_l2(
         self, key: ResidencyKey, tensors: tuple[torch.Tensor, ...]

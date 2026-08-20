@@ -1480,8 +1480,11 @@ class MCoreRunSlotExecutor:
         self, state: _ResidentRunState, operation_id: str
     ) -> None:
         del operation_id
+        accumulator = state.desired.accumulator
+        if accumulator is not None:
+            self._residency.touch(accumulator)
+            return
         tensors = self._require_gradients(state).residency_tensors()
-        previous = state.desired.accumulator
         installed_weights = state.installed_weights
         if installed_weights is None:
             raise RuntimeError("gradient contribution has no installed weights")
@@ -1491,14 +1494,9 @@ class MCoreRunSlotExecutor:
                 "accumulator_revision": state.next_accumulator_revision,
             }
         )
-        if previous is None:
-            self._residency.register_l1(key, tensors)
-        else:
-            self._residency.advance_l1(previous, key, tensors)
+        self._residency.register_mutable_l1(key, tensors)
         state.desired = state.desired.model_copy(update={"accumulator": key})
         state.next_accumulator_revision += 1
-        if previous is not None:
-            self._residency.retire_async(previous)
 
     def _retire_accumulator(self, state: _ResidentRunState) -> None:
         key = state.desired.accumulator
@@ -1516,6 +1514,7 @@ class MCoreRunSlotExecutor:
         self._residency.acquire_l1(key)
         try:
             self._residency.wait_before_mutation_working_set((key,))
+            self._residency.begin_l1_mutation(key)
             yield
         finally:
             self._residency.release_l1(key)
