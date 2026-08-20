@@ -66,6 +66,7 @@ from .specs import (
     ResidentLoraInspectionSpec,
     ResidentScoreJobSpec,
     ResidentScoreShard,
+    RunSlotRegistration,
     SftForwardBackwardJobSpec,
     SftForwardJobSpec,
     SFTJobSpec,
@@ -849,6 +850,13 @@ class _PreparedRunLoad(BaseModel):
         return () if self.optimizer is None else tuple(self.optimizer.tensors)
 
 
+class _PreparedRunRegistration(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    registration: RunSlotRegistration
+    load: _PreparedRunLoad
+
+
 class GenerationResidency(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -907,55 +915,51 @@ class MCoreRunSlotExecutor:
         self._load_preparations: dict[
             str, tuple[str, str, Future[_PreparedRunLoad]]
         ] = {}
+        self._registration_preparations: dict[
+            str, tuple[str, Future[_PreparedRunRegistration]]
+        ] = {}
         self._runs: dict[str, _ResidentRunState] = {}
         self._closed = False
 
-    def register_run(
-        self,
-        *,
-        tenant_id: str,
-        run_id: str,
-        training_session_id: str,
-        learner_version: int,
-        generation_id: str,
-        adapter_path: str,
-        adapter_step: int,
-        initial_optimizer_state_path: str | None = None,
-        initial_optimizer_generation_id: str | None = None,
-    ) -> None:
+    def register_run(self, registration: RunSlotRegistration) -> None:
+        self.commit_run_registration(self.prepare_run_registration(registration))
+
+    def prepare_run_registration(
+        self, registration: RunSlotRegistration
+    ) -> _PreparedRunRegistration:
         if self._closed:
             raise RuntimeError("Megatron run slot is closed")
-        if run_id in self._runs:
-            raise RuntimeError(f"training run is already resident: {run_id!r}")
+        if registration.run_id in self._runs:
+            raise RuntimeError(
+                f"training run is already resident: {registration.run_id!r}"
+            )
         from art.megatron.model_support.lora_disk import load_adapter_config
         from art.megatron.optimizer_state import load_trainer_rank_optimizer_state
         from art.trainer_rank import MaterializedCheckpoint
 
-        if (initial_optimizer_state_path is None) != (
-            initial_optimizer_generation_id is None
-        ):
-            raise ValueError("initial optimizer path and generation must be paired")
-        adapter_config = load_adapter_config(adapter_path)
+        adapter_config = load_adapter_config(registration.adapter_path)
         adapter_layout_fingerprint = hashlib.sha256(
             encode_adapter_config(adapter_config)
         ).hexdigest()
         checkpoint = self._slot_trainer.prepare_checkpoint_slot_load_sync(
-            MaterializedCheckpoint(path=run_id, directory=adapter_path),
+            MaterializedCheckpoint(
+                path=registration.run_id, directory=registration.adapter_path
+            ),
             device="cpu",
         )
-        if initial_optimizer_state_path is not None:
-            assert initial_optimizer_generation_id is not None
+        if registration.initial_optimizer_state_path is not None:
+            assert registration.initial_optimizer_generation_id is not None
             loaded_optimizer = load_trainer_rank_optimizer_state(
                 self.runtime,
-                optimizer_state_path=initial_optimizer_state_path,
-                adapter_path=adapter_path,
-                adapter_step=adapter_step,
-                optimizer_generation_id=initial_optimizer_generation_id,
+                optimizer_state_path=registration.initial_optimizer_state_path,
+                adapter_path=registration.adapter_path,
+                adapter_step=registration.adapter_step,
+                optimizer_generation_id=registration.initial_optimizer_generation_id,
                 layout=self.optimizer_layout(checkpoint),
             )
             optimizer = (
                 self._slot_trainer.prepare_checkpoint_slot_optimizer_for_residency(
-                    run_id, checkpoint, loaded_optimizer
+                    registration.run_id, checkpoint, loaded_optimizer
                 )
             )
         else:
@@ -963,15 +967,15 @@ class MCoreRunSlotExecutor:
                 checkpoint
             )
         weights_key = ResidencyKey(
-            tenant_id=tenant_id,
-            run_id=run_id,
-            generation_id=generation_id,
+            tenant_id=registration.tenant_id,
+            run_id=registration.run_id,
+            generation_id=registration.generation_id,
             topology_fingerprint=self.runtime.optimizer_layout_fingerprint,
             adapter_layout_fingerprint=adapter_layout_fingerprint,
         )
         optimizer_key = weights_key.model_copy(update={"representation": "optimizer"})
         prepared = _PreparedRunLoad(
-            operation_id=f"register:{generation_id}",
+            operation_id=f"register:{registration.generation_id}",
             weights_key=weights_key,
             optimizer_key=optimizer_key,
             checkpoint=checkpoint,
@@ -987,20 +991,81 @@ class MCoreRunSlotExecutor:
             raise RuntimeError(
                 "prepared initial working set is not entirely CPU resident"
             )
+        return _PreparedRunRegistration(registration=registration, load=prepared)
+
+    def start_prepare_run_registration(
+        self, registration: RunSlotRegistration
+    ) -> None:
+        fingerprint = registration.model_dump_json()
+        existing = self._registration_preparations.get(registration.run_id)
+        if existing is not None:
+            if existing[0] != fingerprint:
+                raise RuntimeError("run_id was reused for another registration")
+            return
+        if registration.run_id in self._runs:
+            raise RuntimeError(
+                f"training run is already resident: {registration.run_id!r}"
+            )
+        self._registration_preparations[registration.run_id] = (
+            fingerprint,
+            self._load_pool.submit(self.prepare_run_registration, registration),
+        )
+
+    def run_registration_prepared(self, registration: RunSlotRegistration) -> bool:
+        try:
+            fingerprint, future = self._registration_preparations[registration.run_id]
+        except KeyError as error:
+            raise RuntimeError("run registration preparation was not started") from error
+        if fingerprint != registration.model_dump_json():
+            raise RuntimeError("run registration preparation identity changed")
+        if future.done():
+            future.result()
+            return True
+        return False
+
+    def finish_prepared_run_registration(
+        self, registration: RunSlotRegistration
+    ) -> None:
+        if not self.run_registration_prepared(registration):
+            raise RuntimeError("run registration preparation is not complete")
+        _fingerprint, future = self._registration_preparations.pop(
+            registration.run_id
+        )
+        self.commit_run_registration(future.result())
+
+    def discard_prepared_run_registration(self, run_id: str) -> None:
+        preparation = self._registration_preparations.pop(run_id, None)
+        if preparation is None:
+            return
+        future = preparation[1]
+        if not future.cancel():
+            future.add_done_callback(_consume_future)
+
+    def commit_run_registration(self, value: _PreparedRunRegistration) -> None:
+        registration, prepared = value.registration, value.load
+        run_id = registration.run_id
+        if self._closed:
+            raise RuntimeError("Megatron run slot is closed")
+        if run_id in self._runs:
+            raise RuntimeError(f"training run is already resident: {run_id!r}")
+        weights_key = prepared.weights_key
+        optimizer_key = prepared.optimizer_key
+        if optimizer_key is None:
+            raise RuntimeError("initial run registration has no optimizer state")
         state = _ResidentRunState(
-            tenant_id=tenant_id,
+            tenant_id=registration.tenant_id,
             run_id=run_id,
-            training_session_id=training_session_id,
-            learner_version=learner_version,
-            adapter_config=adapter_config,
+            training_session_id=registration.training_session_id,
+            learner_version=registration.learner_version,
+            adapter_config=prepared.adapter_config,
             gradients=None,
             desired=GenerationResidency(weights=weights_key, optimizer=optimizer_key),
             installed_weights=None,
             initial_generation=TrainerGeneration(
-                training_session_id=training_session_id,
-                policy_step=learner_version,
-                generation_id=generation_id,
-                adapter_path=adapter_path,
+                training_session_id=registration.training_session_id,
+                policy_step=registration.learner_version,
+                generation_id=registration.generation_id,
+                adapter_path=registration.adapter_path,
             ),
             pending_load=prepared,
         )
@@ -1627,7 +1692,10 @@ class MCoreRunSlotExecutor:
                     state.gradients.discard()
                 except BaseException as error:
                     failures.append(error)
-        futures = tuple(value[2] for value in self._load_preparations.values())
+        futures = (
+            *(value[2] for value in self._load_preparations.values()),
+            *(value[1] for value in self._registration_preparations.values()),
+        )
         for future in futures:
             future.cancel()
         _done, pending = wait(
@@ -1646,7 +1714,7 @@ class MCoreRunSlotExecutor:
         if pending:
             failures.append(
                 TimeoutError(
-                    f"{len(pending)} load preparations exceeded shutdown timeout"
+                    f"{len(pending)} state preparations exceeded shutdown timeout"
                 )
             )
         if len(failures) == 1:

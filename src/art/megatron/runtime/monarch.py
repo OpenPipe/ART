@@ -995,26 +995,48 @@ class MonarchTrainerActor(Actor):
             raise
 
     @endpoint
-    def register_run_slot(self, registration_json: str) -> dict[str, Any]:
+    def start_prepare_run_slot_registration(
+        self, registration_json: str
+    ) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        registration = RunSlotRegistration.model_validate_json(registration_json)
+        self._require_run_slot_executor().start_prepare_run_registration(registration)
+        return {"rank": self._runtime.rank, "run_id": registration.run_id}
+
+    @endpoint
+    def poll_prepare_run_slot_registration(
+        self, registration_json: str
+    ) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        registration = RunSlotRegistration.model_validate_json(registration_json)
+        return {
+            "rank": self._runtime.rank,
+            "run_id": registration.run_id,
+            "ready": self._require_run_slot_executor().run_registration_prepared(
+                registration
+            ),
+        }
+
+    @endpoint
+    def finish_prepare_run_slot_registration(
+        self, registration_json: str
+    ) -> dict[str, Any]:
         if not self._valid:
             raise RuntimeError("trainer actor runtime is invalid")
         registration = RunSlotRegistration.model_validate_json(registration_json)
         executor = self._require_run_slot_executor()
-        executor.register_run(
-            tenant_id=registration.tenant_id,
-            run_id=registration.run_id,
-            training_session_id=registration.training_session_id,
-            learner_version=registration.learner_version,
-            generation_id=registration.generation_id,
-            adapter_path=registration.adapter_path,
-            adapter_step=registration.adapter_step,
-            initial_optimizer_state_path=registration.initial_optimizer_state_path,
-            initial_optimizer_generation_id=(
-                registration.initial_optimizer_generation_id
-            ),
-        )
+        executor.finish_prepared_run_registration(registration)
         executor.complete_run_registration(registration.run_id)
         return {"rank": self._runtime.rank, "run_id": registration.run_id}
+
+    @endpoint
+    def discard_run_slot_registration(self, run_id: str) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        self._require_run_slot_executor().discard_prepared_run_registration(run_id)
+        return {"rank": self._runtime.rank, "run_id": run_id}
 
     @endpoint
     def unregister_run_slot(self, run_id: str) -> dict[str, Any]:
@@ -1681,6 +1703,7 @@ class MonarchTrainerSlot:
         self._control_lock = asyncio.Lock()
         self._cp_lookahead_lock = asyncio.Lock()
         self._residency_prefetch_lock = asyncio.Lock()
+        self._registration_lock = asyncio.Lock()
         self._closed = False
         self._valid = True
         self._stop_task: asyncio.Task[None] | None = None
@@ -1689,6 +1712,9 @@ class MonarchTrainerSlot:
         ] = {}
         self._publication_authorizations: dict[str, asyncio.Event] = {}
         self._registrations: dict[str, str] = {}
+        self._registration_tasks: dict[
+            str, tuple[str, asyncio.Task[None]]
+        ] = {}
         self._removed_runs: set[str] = set()
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
         self._forward_backward_launches: dict[
@@ -1700,29 +1726,102 @@ class MonarchTrainerSlot:
         return self._valid
 
     async def register_run(self, registration: RunSlotRegistration) -> None:
-        async with self._lock:
+        fingerprint = registration.model_dump_json()
+        async with self._registration_lock:
             self._require_open()
-            fingerprint = registration.model_dump_json()
             if prior := self._registrations.get(registration.run_id):
                 if prior != fingerprint:
                     raise RuntimeError("run_id was reused for another registration")
                 return
             if registration.run_id in self._removed_runs:
                 raise RuntimeError("removed run_id cannot be registered again")
-            try:
-                values = await asyncio.wait_for(
-                    self._actors.register_run_slot.call(registration.model_dump_json()),
-                    timeout=self._command_timeout_s,
+            pending = self._registration_tasks.get(registration.run_id)
+            if pending is not None:
+                if pending[0] != fingerprint:
+                    raise RuntimeError("run_id was reused for another registration")
+                task = pending[1]
+            else:
+                task = asyncio.create_task(
+                    self._register_prepared_run(registration, fingerprint),
+                    name=f"megatron-register-{registration.run_id}",
                 )
-                results = list(values.values())
-                if {result["rank"] for result in results} != set(
-                    range(len(self._rank_processes))
-                ) or {result["run_id"] for result in results} != {registration.run_id}:
-                    raise RuntimeError("trainer ranks disagree on run registration")
-                self._registrations[registration.run_id] = fingerprint
-            except BaseException as error:
+                task.add_done_callback(consume_future_exception)
+                self._registration_tasks[registration.run_id] = (fingerprint, task)
+        await asyncio.shield(task)
+
+    async def _register_prepared_run(
+        self, registration: RunSlotRegistration, fingerprint: str
+    ) -> None:
+        payload = registration.model_dump_json()
+        expected_ranks = set(range(len(self._rank_processes)))
+
+        def validate(results: list[dict[str, Any]]) -> None:
+            if {result["rank"] for result in results} != expected_ranks or {
+                result["run_id"] for result in results
+            } != {registration.run_id}:
+                raise RuntimeError("trainer ranks disagree on run registration")
+
+        try:
+            started = list(
+                (
+                    await asyncio.wait_for(
+                        self._actors.start_prepare_run_slot_registration.call(payload),
+                        timeout=self._command_timeout_s,
+                    )
+                ).values()
+            )
+            validate(started)
+            deadline = asyncio.get_running_loop().time() + self._command_timeout_s
+            while True:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError("run registration preparation timed out")
+                polled = list(
+                    (
+                        await asyncio.wait_for(
+                            self._actors.poll_prepare_run_slot_registration.call(
+                                payload
+                            ),
+                            timeout=remaining,
+                        )
+                    ).values()
+                )
+                validate(polled)
+                if all(bool(result["ready"]) for result in polled):
+                    break
+                await asyncio.sleep(min(0.01, remaining))
+            finished = list(
+                (
+                    await asyncio.wait_for(
+                        self._actors.finish_prepare_run_slot_registration.call(payload),
+                        timeout=max(
+                            deadline - asyncio.get_running_loop().time(), 0.001
+                        ),
+                    )
+                ).values()
+            )
+            validate(finished)
+            self._registrations[registration.run_id] = fingerprint
+        except BaseException as error:
+            if self.valid:
+                try:
+                    await asyncio.wait_for(
+                        self._actors.discard_run_slot_registration.call(
+                            registration.run_id
+                        ),
+                        timeout=self._command_timeout_s,
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "registration discard failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
                 await self._invalidate(error, "run registration and cleanup failed")
-                raise
+            raise
+        finally:
+            pending = self._registration_tasks.get(registration.run_id)
+            if pending is not None and pending[1] is asyncio.current_task():
+                self._registration_tasks.pop(registration.run_id, None)
 
     async def unregister_run(self, run_id: str) -> None:
         async with self._lock:
@@ -2332,6 +2431,11 @@ class MonarchTrainerSlot:
         self._valid = False
         for authorization in self._publication_authorizations.values():
             authorization.set()
+        registrations = tuple(value[1] for value in self._registration_tasks.values())
+        for task in registrations:
+            task.cancel()
+        if registrations:
+            await asyncio.gather(*registrations, return_exceptions=True)
         primary: BaseException | None = None
         try:
             async with asyncio.timeout(self._shutdown_timeout_s * 0.8):
