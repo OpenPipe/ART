@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 import heapq
 import time
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from art.model import TrainableModel
 
 ResultT = TypeVar("ResultT", bound=Contract)
+CommandResultT = TypeVar("CommandResultT")
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
 _MAX_RETAINED_COMPLETED_RESULT_BYTES = 512 << 20
 _TASK_DRAIN_TIMEOUT_S = process_shutdown_timeout(2)
@@ -97,6 +98,36 @@ async def _drain_tasks(
             _consume_future(task)
         if remaining:
             raise TimeoutError(f"{len(remaining)} {context} tasks did not stop")
+
+
+async def _run_command_while_releasing(
+    command: Awaitable[CommandResultT],
+    release: Awaitable[float],
+    *,
+    release_name: str,
+) -> tuple[CommandResultT, float]:
+    release_task = asyncio.create_task(release, name=release_name)
+    command_error: BaseException | None = None
+    missing = object()
+    result: CommandResultT | object = missing
+    try:
+        result = await command
+    except BaseException as error:
+        command_error = error
+    try:
+        release_s = await asyncio.shield(release_task)
+    except BaseException as release_error:
+        if command_error is not None:
+            raise BaseExceptionGroup(
+                "training command and trajectory release failed",
+                (command_error, release_error),
+            )
+        raise
+    if command_error is not None:
+        raise command_error
+    if result is missing:
+        raise RuntimeError("training command returned no result")
+    return cast(CommandResultT, result), release_s
 
 
 class _DeferredResult(NamedTuple, Generic[ResultT]):
@@ -531,23 +562,32 @@ class LocalMegatronTrainingClient:
 
             if not isinstance(payload, _DistributedBatchPayload):
                 raise RuntimeError("local command did not use the typed data plane")
-            release_started = time.perf_counter()
-            await self._backend._release_trajectory_sources(batch, payload)
+            async def release_sources() -> float:
+                started = time.perf_counter()
+                await self._backend._release_trajectory_sources(batch, payload)
+                return time.perf_counter() - started
+
             training_config = forward_backward_config(request)
-            raw = await (
-                self._service.forward_backward_command(
-                    admission.ref,
-                    payload.packed,
-                    training_config,
-                    experimental_train_config(request),
-                )
-                if backward
-                else self._service.forward_command(
-                    admission.ref,
-                    payload.packed,
-                    training_config,
-                    experimental_train_config(request),
-                )
+            raw, release_s = await _run_command_while_releasing(
+                (
+                    self._service.forward_backward_command(
+                        admission.ref,
+                        payload.packed,
+                        training_config,
+                        experimental_train_config(request),
+                    )
+                    if backward
+                    else self._service.forward_command(
+                        admission.ref,
+                        payload.packed,
+                        training_config,
+                        experimental_train_config(request),
+                    )
+                ),
+                release_sources(),
+                release_name=(
+                    f"release-trajectory-sources-{admission.ref.operation_id}"
+                ),
             )
             result_type = ForwardBackwardResult if backward else ForwardResult
             return result_type(
@@ -570,9 +610,7 @@ class LocalMegatronTrainingClient:
                 ),
                 metrics={
                     **packing_metrics(payload.packed),
-                    "time/step_source_lease_release_s": (
-                        time.perf_counter() - release_started
-                    ),
+                    "time/step_source_lease_release_s": release_s,
                     **raw["metrics"],
                 },
             )
@@ -1071,13 +1109,20 @@ class LocalMegatronTrainingClient:
             self._ledger.retire(operation._request_id, operation._admission)
         self._operations.pop(operation_id)
         self._completed_result_bytes -= self._completed_operations.pop(operation_id, 0)
-        self._completed_operation_order = [
-            entry
-            for entry in self._completed_operation_order
-            if entry[1] != operation_id
-        ]
-        heapq.heapify(self._completed_operation_order)
+        self._compact_completed_operation_order()
         self._retirement_failures.pop(operation_id, None)
+
+    def _compact_completed_operation_order(self) -> None:
+        live = self._completed_operations
+        if not live:
+            self._completed_operation_order.clear()
+        elif len(self._completed_operation_order) > max(64, 2 * len(live)):
+            self._completed_operation_order = [
+                entry
+                for entry in self._completed_operation_order
+                if entry[1] in live
+            ]
+            heapq.heapify(self._completed_operation_order)
 
     def _retire_evicted_forward_backward(self, operation_id: str) -> None:
         tombstone = self._evicted_forward_backward_operations.get(operation_id)

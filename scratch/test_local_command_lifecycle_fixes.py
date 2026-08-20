@@ -9,7 +9,10 @@ import pytest
 from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.megatron.runtime.monarch import MonarchTrainerRun
 import art.megatron.training.client as client_module
-from art.megatron.training.client import LocalMegatronTrainingClient
+from art.megatron.training.client import (
+    LocalMegatronTrainingClient,
+    _run_command_while_releasing,
+)
 from art.training.contracts import (
     AdamConfig,
     ForwardBackwardRequest,
@@ -96,6 +99,59 @@ def _forward_backward_result(operation_id: str) -> ForwardBackwardResult:
             LossFnOutput(token_logprobs=TokenLogprobs(shape=(3,), data=b"x" * 12)),
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_source_release_overlaps_command_and_both_settle() -> None:
+    release_started = asyncio.Event()
+    finish_release = asyncio.Event()
+    command_started = asyncio.Event()
+
+    async def release() -> float:
+        release_started.set()
+        await finish_release.wait()
+        return 0.25
+
+    async def command() -> str:
+        await release_started.wait()
+        command_started.set()
+        return "trained"
+
+    execution = asyncio.create_task(
+        _run_command_while_releasing(
+            command(), release(), release_name="test-source-release"
+        )
+    )
+    await command_started.wait()
+    assert not execution.done()
+    finish_release.set()
+    assert await execution == ("trained", 0.25)
+
+
+def test_completed_operation_heap_compaction_is_geometric(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(_Service())
+    total = 1024
+    client._completed_operations = {str(index): 0 for index in range(total)}
+    client._completed_operation_order = [
+        (index, str(index)) for index in range(total)
+    ]
+    heapify_calls = 0
+    heapify = client_module.heapq.heapify
+
+    def counted_heapify(values):
+        nonlocal heapify_calls
+        heapify_calls += 1
+        heapify(values)
+
+    monkeypatch.setattr(client_module.heapq, "heapify", counted_heapify)
+    for index in range(total):
+        client._completed_operations.pop(str(index))
+        client._compact_completed_operation_order()
+
+    assert client._completed_operation_order == []
+    assert heapify_calls <= 4
 
 
 @pytest.mark.asyncio
