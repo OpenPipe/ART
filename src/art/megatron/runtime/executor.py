@@ -7,13 +7,14 @@ import gc
 import hashlib
 import math
 from pathlib import Path
-from threading import BoundedSemaphore, Event, Lock
+from threading import BoundedSemaphore, Condition, Event, Lock
 import time
 from typing import TYPE_CHECKING, Any, Iterator, cast
 
-from pydantic import BaseModel, ConfigDict, Field, SkipValidation
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SkipValidation
 import torch
 
+from art.distributed.data_plane import PackedBatchRef
 from art.distributed.object_store import (
     BinaryObjectPublicationTarget,
     OrderedBinaryObjectTarget,
@@ -42,7 +43,7 @@ from art.utils.safetensors import (
     save_prepared_safetensors,
 )
 
-from ..tensor_snapshot import PinnedCpuSnapshotStager
+from ..tensor_snapshot import PendingCpuSnapshot, PinnedCpuSnapshotStager
 from ..training.gradient_accumulator import GradientAccumulator
 from .data_plane import InMemoryPackedBatch, SFTBatchData, validate_packed_batch
 from .publication import (
@@ -87,22 +88,37 @@ def _consume_future(future: Future[Any]) -> None:
 def _command_token_logprobs(
     batch: InMemoryPackedBatch, outputs: list[Any] | tuple[Any, ...]
 ) -> tuple[Any, ...]:
-    if batch.ref.training_kind != "tokenized":
+    target_tokens = (
+        batch.tensors.get("target_tokens")
+        if batch.ref.training_kind == "tokenized"
+        else None
+    )
+    return _materialize_command_token_logprobs(
+        batch.ref,
+        None if target_tokens is None else int(target_tokens.shape[2]),
+        tuple(outputs),
+    )
+
+
+def _materialize_command_token_logprobs(
+    batch: PackedBatchRef,
+    candidate_capacity: int | None,
+    outputs: tuple[torch.Tensor, ...],
+) -> tuple[Any, ...]:
+    if batch.training_kind != "tokenized":
         return tuple(
             _packed_logprobs(values.flatten(), (int(values.numel()),))
             for values in outputs
         )
-    output_map = batch.ref.tokenized_output_map
+    output_map = batch.tokenized_output_map
     if output_map is None:
         raise RuntimeError("tokenized batch has no output map")
-    target_tokens = batch.tensors.get("target_tokens")
-    if target_tokens is None:
-        raise RuntimeError("tokenized batch has no target tensor")
-    candidate_capacity = int(target_tokens.shape[2])
+    if candidate_capacity is None:
+        raise RuntimeError("tokenized batch has no target candidate capacity")
     physical = torch.cat(
         [values.reshape(-1, candidate_capacity) for values in outputs], dim=0
     )
-    expected_rows = batch.ref.num_sequences * batch.ref.sequence_length
+    expected_rows = batch.num_sequences * batch.sequence_length
     if int(physical.shape[0]) != expected_rows:
         raise RuntimeError(
             "tokenized command did not return every physical packed row: "
@@ -119,6 +135,152 @@ def _command_token_logprobs(
         else:
             logical.append(_packed_logprobs(values, (len(positions), candidates)))
     return tuple(logical)
+
+
+class _ForwardBackwardResultStagerLease:
+    def __init__(
+        self,
+        pool: "_ForwardBackwardResultStagerPool",
+        stager: PinnedCpuSnapshotStager,
+    ) -> None:
+        self._pool = pool
+        self.stager = stager
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        self._pool.release(self.stager)
+
+
+class _ForwardBackwardResultStagerPool:
+    """Exclusively lease reusable pinned buffers to unresolved F/B results."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 2:
+            raise ValueError("F/B result staging capacity must be at least 2")
+        self._available = [
+            PinnedCpuSnapshotStager(reusable=True) for _ in range(capacity)
+        ]
+        self._condition = Condition()
+
+    def acquire(self) -> _ForwardBackwardResultStagerLease:
+        with self._condition:
+            while not self._available:
+                self._condition.wait()
+            stager = self._available.pop()
+            stager.reset()
+            return _ForwardBackwardResultStagerLease(self, stager)
+
+    def release(self, stager: PinnedCpuSnapshotStager) -> None:
+        with self._condition:
+            self._available.append(stager)
+            self._condition.notify()
+
+
+class ForwardBackwardRankLaunch(BaseModel):
+    """Gradient-ready rank result whose host serialization is still pending."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    operation_id: str
+    learner_version: int
+    batch: SkipValidation[PackedBatchRef]
+    candidate_capacity: int | None
+    coordinator: bool
+    snapshot: SkipValidation[PendingCpuSnapshot[Any]]
+    staging: SkipValidation[_ForwardBackwardResultStagerLease]
+    _materialize_lock: Lock = PrivateAttr(default_factory=Lock)
+    _materialized: dict[str, Any] | None = PrivateAttr(default=None)
+    _materialization_error: BaseException | None = PrivateAttr(default=None)
+    _finished: bool = PrivateAttr(default=False)
+
+    def materialize(self) -> dict[str, Any]:
+        with self._materialize_lock:
+            if self._finished:
+                if self._materialization_error is not None:
+                    raise self._materialization_error
+                assert self._materialized is not None
+                return self._materialized
+            try:
+                result = self.snapshot.resolve()
+                staged_result = result.get("result")
+                materialized = {
+                    "operation_id": self.operation_id,
+                    "learner_version": self.learner_version,
+                    "token_count": int(result["token_count"].item()),
+                    "metrics": (
+                        staged_result.metrics() if self.coordinator else {}
+                    ),
+                    "token_logprobs": (
+                        _materialize_command_token_logprobs(
+                            self.batch,
+                            self.candidate_capacity,
+                            tuple(staged_result.result.new_logprobs),
+                        )
+                        if self.coordinator
+                        else ()
+                    ),
+                }
+                self._materialized = materialized
+                return materialized
+            except BaseException as error:
+                self._materialization_error = error
+                raise
+            finally:
+                self._finished = True
+                self.staging.release()
+
+
+def _stage_forward_backward_rank_result(
+    pool: _ForwardBackwardResultStagerPool,
+    job: ForwardBackwardJobSpec,
+    batch: InMemoryPackedBatch,
+    result: Any,
+    *,
+    coordinator: bool,
+) -> ForwardBackwardRankLaunch:
+    staging = pool.acquire()
+    try:
+        builder = staging.stager.begin()
+        # These are command-result allocations, not mutable parameter, optimizer,
+        # or accumulator storage. The builder retains and record_streams CUDA
+        # sources until its side-stream copy completes.
+        staged: dict[str, Any] = {"token_count": builder.stage(result.token_count)}
+        if coordinator:
+            step = result.result
+            staged["result"] = result.model_copy(
+                update={
+                    "result": step.model_copy(
+                        update={
+                            "reduced_loss": builder.stage(step.reduced_loss),
+                            "new_logprobs": list(
+                                builder.stage_group(step.new_logprobs)
+                            ),
+                        }
+                    )
+                }
+            )
+        target_tokens = (
+            batch.tensors.get("target_tokens")
+            if batch.ref.training_kind == "tokenized"
+            else None
+        )
+        return ForwardBackwardRankLaunch(
+            operation_id=job.operation_id,
+            learner_version=job.expected_learner_version,
+            batch=batch.ref,
+            candidate_capacity=(
+                None if target_tokens is None else int(target_tokens.shape[2])
+            ),
+            coordinator=coordinator,
+            snapshot=builder.finish(staged),
+            staging=staging,
+        )
+    except BaseException:
+        staging.release()
+        raise
 
 
 def _packed_logprobs(values: torch.Tensor, shape: tuple[int, ...]) -> dict[str, Any]:
@@ -724,6 +886,9 @@ class MCoreRunSlotExecutor:
             capacity=int(runtime.snapshot_pool_capacity),
             residency=self._residency,
         )
+        self._command_result_stagers = _ForwardBackwardResultStagerPool(
+            int(runtime.snapshot_pool_capacity)
+        )
         self._load_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="art-load-prepare"
         )
@@ -919,6 +1084,21 @@ class MCoreRunSlotExecutor:
         batch: InMemoryPackedBatch,
         cancelled: Event,
     ) -> dict[str, Any]:
+        return self.start_forward_backward(
+            job,
+            batch,
+            cancelled,
+            coordinator=int(self.runtime.rank) == 0,
+        ).materialize()
+
+    def start_forward_backward(
+        self,
+        job: ForwardBackwardJobSpec,
+        batch: InMemoryPackedBatch,
+        cancelled: Event,
+        *,
+        coordinator: bool,
+    ) -> ForwardBackwardRankLaunch:
         state = self._require_run(job.run_id)
         self._validate_parent(
             state, job.training_session_id, job.expected_learner_version
@@ -940,13 +1120,13 @@ class MCoreRunSlotExecutor:
                 cancelled=cancelled,
             )
             self._register_gradient_contribution(state, job.operation_id)
-        step = result.result
-        return {
-            "operation_id": job.operation_id,
-            "metrics": result.metrics(),
-            "token_count": int(result.token_count.item()),
-            "token_logprobs": _command_token_logprobs(batch, step.new_logprobs),
-        }
+        return _stage_forward_backward_rank_result(
+            self._command_result_stagers,
+            job,
+            batch,
+            result,
+            coordinator=coordinator,
+        )
 
     def execute_forward(
         self,

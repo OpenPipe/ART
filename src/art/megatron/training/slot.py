@@ -154,6 +154,14 @@ class PreparedEmptySftForward(PreparedForward):
     num_dropped_trajectories: int = Field(ge=0)
 
 
+class ForwardBackwardLaunch(BaseModel):
+    """Gradients are resident; the public F/B result may still be settling."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    completion: asyncio.Future[ForwardBackwardResult]
+
+
 class PreparedLoadState(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -581,13 +589,22 @@ class MegatronTrainingSlot:
     async def forward_backward(
         self, prepared: PreparedForward
     ) -> ForwardBackwardResult:
+        launch = await self.start_forward_backward(prepared)
+        return await asyncio.shield(launch.completion)
+
+    async def start_forward_backward(
+        self, prepared: PreparedForward
+    ) -> ForwardBackwardLaunch:
         ref = prepared.ref
         state = self._require_parent(ref)
         if isinstance(prepared, PreparedEmptySftForward):
-            return cast(
+            result = cast(
                 ForwardBackwardResult,
                 self._empty_sft_forward_result(prepared, backward=True),
             )
+            completion = asyncio.get_running_loop().create_future()
+            completion.set_result(result)
+            return ForwardBackwardLaunch(completion=completion)
         if isinstance(prepared, PreparedSftForward):
             job = SftForwardBackwardJobSpec(
                 operation_id=ref.operation_id,
@@ -604,10 +621,13 @@ class MegatronTrainingSlot:
                 ),
             )
             raw = await self.trainer.sft_forward_backward(job, prepared.batch)
-            return cast(
+            result = cast(
                 ForwardBackwardResult,
                 self._sft_forward_result(prepared, raw, backward=True),
             )
+            completion = asyncio.get_running_loop().create_future()
+            completion.set_result(result)
+            return ForwardBackwardLaunch(completion=completion)
         if not isinstance(prepared, PreparedPackedForward):
             raise TypeError("unknown prepared F/B payload")
         job = ForwardBackwardJobSpec(
@@ -629,16 +649,26 @@ class MegatronTrainingSlot:
             ),
         )
         try:
-            raw = await self.trainer.forward_backward(job, prepared.packed.leases)
+            raw = await self.trainer.start_forward_backward(job, prepared.packed.leases)
         finally:
             await self._release_batch_soon(prepared.packed)
-        return ForwardBackwardResult(
-            operation_id=ref.operation_id,
-            packing=prepared.packing,
-            loss_fn_outputs=tuple(
-                LossFnOutput(token_logprobs=values) for values in raw["token_logprobs"]
-            ),
-            metrics={**packing_metrics(prepared.packed), **raw["metrics"]},
+
+        async def complete() -> ForwardBackwardResult:
+            result = await asyncio.shield(raw.completion)
+            return ForwardBackwardResult(
+                operation_id=ref.operation_id,
+                packing=prepared.packing,
+                loss_fn_outputs=tuple(
+                    LossFnOutput(token_logprobs=values)
+                    for values in result["token_logprobs"]
+                ),
+                metrics={**packing_metrics(prepared.packed), **result["metrics"]},
+            )
+
+        return ForwardBackwardLaunch(
+            completion=asyncio.create_task(
+                complete(), name=f"megatron-fb-result-{ref.operation_id}"
+            )
         )
 
     @staticmethod

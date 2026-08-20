@@ -13,7 +13,15 @@ import traceback
 from typing import Any, Callable
 
 import monarch.actor as monarch_actor
-from monarch.actor import Actor, Channel, MeshFailure, Port, ProcMesh, endpoint
+from monarch.actor import (
+    Actor,
+    Channel,
+    MeshFailure,
+    Port,
+    ProcMesh,
+    concurrent_endpoint,
+    endpoint,
+)
 from monarch.spmd import SPMDActor
 from pydantic import BaseModel, ConfigDict
 
@@ -225,6 +233,17 @@ class _ResidencyPrefetchResult(BaseModel):
     command_kind: str
     admitted: bool = True
     elapsed_s: float = 0.0
+    error_type: str | None = None
+    message: str | None = None
+    traceback_text: str | None = None
+
+
+class _ForwardBackwardReady(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rank: int
+    operation_id: str
+    learner_version: int
     error_type: str | None = None
     message: str | None = None
     traceback_text: str | None = None
@@ -1016,20 +1035,84 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
-            result = self._require_run_slot_executor().execute_forward_backward(
-                job, batch, Event()
+            launch = self._require_run_slot_executor().start_forward_backward(
+                job,
+                batch,
+                Event(),
+                coordinator=self._runtime.rank == 0,
             )
-            coordinator = self._runtime.rank == 0
+            result = launch.materialize()
             return {
                 "rank": self._runtime.rank,
-                "operation_id": job.operation_id,
-                "learner_version": job.expected_learner_version,
+                "operation_id": result["operation_id"],
+                "learner_version": result["learner_version"],
                 "token_count": result["token_count"],
-                "metrics": result["metrics"] if coordinator else {},
-                "token_logprobs": result["token_logprobs"] if coordinator else (),
+                "metrics": result["metrics"],
+                "token_logprobs": result["token_logprobs"],
             }
         except BaseException:
             self._valid = False
+            raise
+        finally:
+            if batch is not None:
+                batch.close()
+
+    @concurrent_endpoint
+    async def start_run_slot_forward_backward(
+        self,
+        job_json: str,
+        batch_json: str,
+        ready_port: Port[dict[str, Any]],
+    ) -> dict[str, Any]:
+        batch = None
+        ready = False
+        job = ForwardBackwardJobSpec.model_validate_json(job_json)
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            leases = PackedBatchLeaseSet.model_validate_json(batch_json)
+            batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            launch = self._require_run_slot_executor().start_forward_backward(
+                job,
+                batch,
+                Event(),
+                coordinator=self._runtime.rank == 0,
+            )
+            batch.close()
+            batch = None
+            ready_port.send(
+                _ForwardBackwardReady(
+                    rank=self._runtime.rank,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                ).model_dump(mode="json")
+            )
+            ready = True
+            result = await asyncio.to_thread(launch.materialize)
+            return {
+                "rank": self._runtime.rank,
+                "operation_id": result["operation_id"],
+                "learner_version": result["learner_version"],
+                "token_count": result["token_count"],
+                "metrics": result["metrics"],
+                "token_logprobs": result["token_logprobs"],
+            }
+        except BaseException as error:
+            self._valid = False
+            if not ready:
+                ready_port.send(
+                    _ForwardBackwardReady(
+                        rank=self._runtime.rank,
+                        operation_id=job.operation_id,
+                        learner_version=job.expected_learner_version,
+                        error_type=type(error).__name__,
+                        message=str(error),
+                        traceback_text=traceback.format_exc(),
+                    ).model_dump(mode="json")
+                )
             raise
         finally:
             if batch is not None:
@@ -1547,6 +1630,14 @@ class _PublicationState:
         self.outcome_observed = False
 
 
+class ForwardBackwardCommandLaunch(BaseModel):
+    """All ranks own the gradients; only API result materialization remains."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
+
+    completion: asyncio.Future[dict[str, Any]]
+
+
 class MonarchTrainerSlot:
     """One persistent Megatron mesh serving many sequenced training runs."""
 
@@ -1586,6 +1677,9 @@ class MonarchTrainerSlot:
         self._registrations: dict[str, str] = {}
         self._removed_runs: set[str] = set()
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._forward_backward_launches: dict[
+            str, tuple[str, ForwardBackwardCommandLaunch]
+        ] = {}
 
     @property
     def valid(self) -> bool:
@@ -1644,38 +1738,126 @@ class MonarchTrainerSlot:
         job: ForwardBackwardJobSpec,
         batch: PackedBatchLeaseSet,
     ) -> dict[str, Any]:
+        launch = await self.start_forward_backward(job, batch)
+        return await asyncio.shield(launch.completion)
+
+    async def start_forward_backward(
+        self,
+        job: ForwardBackwardJobSpec,
+        batch: PackedBatchLeaseSet,
+    ) -> ForwardBackwardCommandLaunch:
         async with self._lock:
             self._require_open()
             cached = self._cached_operation(job.operation_id, job.fingerprint)
             if cached is not None:
-                return cached
+                completion = asyncio.get_running_loop().create_future()
+                completion.set_result(cached)
+                return ForwardBackwardCommandLaunch(completion=completion)
+            if inflight := self._forward_backward_launches.get(job.operation_id):
+                if inflight[0] != job.fingerprint:
+                    raise RuntimeError(
+                        "operation_id was reused for a different F/B command"
+                    )
+                return inflight[1]
             if batch.ref != job.batch:
                 raise ValueError("F/B batch ref does not match supplied packed batch")
+            deadline = asyncio.get_running_loop().time() + self._command_timeout_s
+            ready_port, receiver = Channel.open()
+            rank_call = asyncio.ensure_future(
+                self._actors.start_run_slot_forward_backward.call(
+                    job.model_dump_json(), batch.model_dump_json(), ready_port
+                )
+            )
+            readiness = asyncio.create_task(
+                self._collect_forward_backward_ready(receiver, job),
+                name=f"megatron-fb-ready-{job.operation_id}",
+            )
             try:
-                values = await asyncio.wait_for(
-                    self._actors.execute_run_slot_forward_backward.call(
-                        job.model_dump_json(), batch.model_dump_json()
-                    ),
-                    timeout=self._command_timeout_s,
+                done, _ = await asyncio.wait(
+                    {rank_call, readiness},
+                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                results = list(values.values())
-                self._validate_command_results(
-                    results,
-                    operation_id=job.operation_id,
-                    learner_version=job.expected_learner_version,
-                )
-                if {result["token_count"] for result in results} != {
-                    job.trainable_token_count
-                }:
+                if not done:
+                    raise TimeoutError("trainer ranks did not reach F/B gradient-ready")
+                if readiness in done:
+                    readiness.result()
+                else:
+                    await rank_call
                     raise RuntimeError(
-                        "trainer F/B token count differs from packed provenance"
+                        "trainer F/B returned before every rank reported gradient-ready"
                     )
-                result = next(result for result in results if result["rank"] == 0)
-                self._operations[job.operation_id] = (job.fingerprint, result)
-                return result
+                completion = asyncio.create_task(
+                    self._complete_forward_backward(job, rank_call, deadline),
+                    name=f"megatron-fb-result-{job.operation_id}",
+                )
+                launch = ForwardBackwardCommandLaunch(completion=completion)
+                self._forward_backward_launches[job.operation_id] = (
+                    job.fingerprint,
+                    launch,
+                )
+                return launch
             except BaseException as error:
+                for task in (readiness, rank_call):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(readiness, rank_call, return_exceptions=True)
                 await self._invalidate(error, "F/B operation and cleanup failed")
                 raise
+
+    async def _collect_forward_backward_ready(
+        self, receiver: Any, job: ForwardBackwardJobSpec
+    ) -> None:
+        results = [
+            _ForwardBackwardReady.model_validate(await receiver.recv())
+            for _ in self._rank_processes
+        ]
+        if {result.rank for result in results} != set(
+            range(len(self._rank_processes))
+        ) or any(
+            (result.operation_id, result.learner_version)
+            != (job.operation_id, job.expected_learner_version)
+            for result in results
+        ):
+            raise RuntimeError("trainer F/B readiness has mismatched rank identity")
+        failures = [result for result in results if result.error_type is not None]
+        if failures:
+            details = "\n".join(
+                f"rank {result.rank}: {result.error_type}: {result.message}\n"
+                f"{result.traceback_text or ''}"
+                for result in failures
+            )
+            raise RuntimeError(f"trainer F/B failed before gradient-ready:\n{details}")
+
+    async def _complete_forward_backward(
+        self,
+        job: ForwardBackwardJobSpec,
+        rank_call: asyncio.Future[Any],
+        deadline: float,
+    ) -> dict[str, Any]:
+        try:
+            async with asyncio.timeout_at(deadline):
+                values = await asyncio.shield(rank_call)
+            results = list(values.values())
+            self._validate_command_results(
+                results,
+                operation_id=job.operation_id,
+                learner_version=job.expected_learner_version,
+            )
+            if {result["token_count"] for result in results} != {
+                job.trainable_token_count
+            }:
+                raise RuntimeError(
+                    "trainer F/B token count differs from packed provenance"
+                )
+            result = next(result for result in results if result["rank"] == 0)
+            self._operations[job.operation_id] = (job.fingerprint, result)
+            return result
+        except BaseException as error:
+            await self._invalidate(error, "late F/B result and cleanup failed")
+            raise
+        finally:
+            self._forward_backward_launches.pop(job.operation_id, None)
 
     async def forward(
         self,
