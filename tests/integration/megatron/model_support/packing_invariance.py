@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import Any, cast
+from typing import Any, Literal, cast
 from unittest.mock import patch
 
 from megatron.core import parallel_state as ps
-from megatron.core.models.gpt.gpt_model import GPTModel
-from pydantic import BaseModel, Field
+from megatron.core.models.common.language_module.language_module import LanguageModule
+from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 from art.megatron import train as megatron_train
@@ -145,20 +146,33 @@ def _cleanup_distributed_state() -> None:
         torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
 
 
-def _locate_gpt_module(model_chunks: list[Any]) -> GPTModel:
+def _locate_language_module(model_chunks: list[Any]) -> LanguageModule:
     for chunk in model_chunks:
         module: Any = chunk
         while hasattr(module, "module"):
             module = module.module
-        if isinstance(module, GPTModel):
-            return module
-        language_model = getattr(module, "language_model", None)
-        if isinstance(language_model, GPTModel):
-            return language_model
-    raise RuntimeError("Failed to locate GPTModel for packing invariance validation")
+        for candidate in (module, getattr(module, "language_model", None)):
+            while hasattr(candidate, "module"):
+                candidate = candidate.module
+            if isinstance(candidate, LanguageModule):
+                return candidate
+    raise RuntimeError(
+        "Failed to locate LanguageModule for packing invariance validation"
+    )
+
+
+class PackingPositionSemantics(BaseModel):
+    kind: Literal["rotary_grouping", "position_id_independent"]
+    checked: bool
+    respected: bool
+    binary_equal: bool | None = None
+    candidate_abs_scale: float | None = None
+    reference_abs_scale: float | None = None
 
 
 class PackingInvarianceScenario(BaseModel):
+    model_config = ConfigDict(ser_json_inf_nan="strings")
+
     name: str
     num_sequences: int
     sequence_length: int
@@ -166,10 +180,13 @@ class PackingInvarianceScenario(BaseModel):
     prompt_family_count: int
     max_tree_depth: int
     repeated_position_key_count: int
+    position_semantics: PackingPositionSemantics
     rotary_grouping_checked: bool
     rotary_grouping_respected: bool
     completion_pair_count: int
     logits_equivalent: bool
+    candidate_logits_abs_scale: float
+    reference_logits_abs_scale: float
     logits_mean_abs_pct: float
     logits_mean_abs_pct_limit: float
     logits_max_abs_diff: float
@@ -177,6 +194,8 @@ class PackingInvarianceScenario(BaseModel):
 
 
 class PackingInvarianceReport(BaseModel):
+    model_config = ConfigDict(ser_json_inf_nan="strings")
+
     git: GitRepoState
     base_model: str
     output_dir: str
@@ -227,27 +246,40 @@ def _max_tree_depth(group_ids: torch.Tensor, parent_ids: torch.Tensor) -> int:
     )
 
 
-def _position_keys(position_ids: torch.Tensor) -> list[tuple[int, ...]]:
+def _position_keys(
+    position_ids: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor,
+) -> list[tuple[int, ...]]:
     if position_ids.ndim == 1:
-        return [(int(value),) for value in position_ids.tolist()]
-    if position_ids.ndim == 2:
-        return [
+        keys = [(int(value),) for value in position_ids.tolist()]
+    elif position_ids.ndim == 2:
+        keys = [
             (int(position_ids[batch_index, token_index].item()),)
             for batch_index in range(int(position_ids.shape[0]))
             for token_index in range(int(position_ids.shape[1]))
         ]
-    if position_ids.ndim == 3:
+    elif position_ids.ndim == 3:
         channel_first = position_ids.permute(1, 2, 0).contiguous()
-        return [
+        keys = [
             tuple(
                 int(value) for value in channel_first[batch_index, token_index].tolist()
             )
             for batch_index in range(int(channel_first.shape[0]))
             for token_index in range(int(channel_first.shape[1]))
         ]
-    raise ValueError(
-        f"Unsupported position_ids rank for packed position validation: {position_ids.ndim}"
-    )
+    else:
+        raise ValueError(
+            "Unsupported position_ids rank for packed position validation: "
+            f"{position_ids.ndim}"
+        )
+    mask = [bool(value) for value in valid_mask.reshape(-1).tolist()]
+    if len(mask) != len(keys):
+        raise ValueError(
+            "Packed position validity-mask mismatch: "
+            f"{len(mask)} mask values for {len(keys)} position keys"
+        )
+    return [key for key, valid in zip(keys, mask, strict=True) if valid]
 
 
 def _flatten_rotary_vectors(
@@ -276,8 +308,9 @@ def _rotary_grouping_check(
     rotary_output: torch.Tensor | None,
     *,
     position_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
 ) -> tuple[bool, bool, int]:
-    keys = _position_keys(position_ids)
+    keys = _position_keys(position_ids, valid_mask=valid_mask)
     key_counts: dict[tuple[int, ...], int] = {}
     for key in keys:
         key_counts[key] = key_counts.get(key, 0) + 1
@@ -285,6 +318,7 @@ def _rotary_grouping_check(
     if rotary_output is None:
         return False, True, repeated_position_key_count
     vectors = _flatten_rotary_vectors(rotary_output, position_ids=position_ids)
+    vectors = vectors[valid_mask.reshape(-1)]
     first_vector_by_key: dict[tuple[int, ...], torch.Tensor] = {}
     for key, vector in zip(keys, vectors, strict=True):
         reference = first_vector_by_key.get(key)
@@ -324,16 +358,149 @@ def _rotary_outputs_for_validation(
         return (torch.cat((state.rope_cos, state.rope_sin), dim=-1).permute(1, 0, 2),)
     rotary_output = preprocess_output[1]
     if handler_key in _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS:
-        return (
-            cast(torch.Tensor | None, rotary_output)
-            if torch.is_tensor(rotary_output)
-            else None,
-        )
+        if rotary_output is not None and not torch.is_tensor(rotary_output):
+            raise RuntimeError(
+                f"{handler_key!r} returned non-tensor rotary output "
+                f"{type(rotary_output).__name__}"
+            )
+        return (cast(torch.Tensor | None, rotary_output),)
     if handler_key in _TUPLE_ROTARY_OUTPUT_HANDLER_KEYS:
-        local_rotary, global_rotary = rotary_output
-        return local_rotary, global_rotary
+        if not (
+            isinstance(rotary_output, (list, tuple))
+            and len(rotary_output) == 2
+            and all(
+                output is None or torch.is_tensor(output) for output in rotary_output
+            )
+        ):
+            raise RuntimeError(f"{handler_key!r} returned invalid rotary-output pair")
+        return tuple(cast(torch.Tensor | None, output) for output in rotary_output)
     raise RuntimeError(
         f"Packed position validation has no rotary output mapping for {handler_key!r}"
+    )
+
+
+def _position_id_independent_check(
+    language_model: LanguageModule,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> PackingPositionSemantics:
+    embedding = getattr(language_model, "embedding", None)
+    if not getattr(language_model, "pre_process", False) or not callable(embedding):
+        raise RuntimeError(
+            "position_embedding_type='none' validation requires the real input embedding boundary"
+        )
+    if getattr(embedding, "add_position_embedding", None) is not False:
+        raise RuntimeError(
+            "position_embedding_type='none' requires embedding.add_position_embedding=False"
+        )
+    if getattr(language_model, "rotary_pos_emb", None) is not None:
+        raise RuntimeError(
+            "position_embedding_type='none' requires rotary_pos_emb to be absent"
+        )
+    max_sequence_length = int(getattr(language_model, "max_sequence_length", 0))
+    if max_sequence_length <= 1:
+        raise RuntimeError(
+            "position_embedding_type='none' validation requires max_sequence_length > 1"
+        )
+    alternate_position_ids = torch.remainder(position_ids + 1, max_sequence_length)
+    if position_ids.shape != valid_mask.shape or not bool(valid_mask.any().item()):
+        raise RuntimeError(
+            "position_embedding_type='none' validation requires a nonempty position mask"
+        )
+    if not bool((alternate_position_ids[valid_mask] != position_ids[valid_mask]).all()):
+        raise RuntimeError(
+            "Alternate position IDs must differ at every valid packed token"
+        )
+    with torch.no_grad():
+        reference = embedding(input_ids=input_ids, position_ids=position_ids)
+        candidate = embedding(
+            input_ids=input_ids,
+            position_ids=alternate_position_ids,
+        )
+    expected_prefix = (position_ids.shape[1], position_ids.shape[0])
+    if reference.shape[:2] != expected_prefix or candidate.shape[:2] != expected_prefix:
+        raise RuntimeError(
+            "Unexpected embedding layout for position-independent validation: "
+            f"{reference.shape} and {candidate.shape}"
+        )
+    output_mask = valid_mask.transpose(0, 1)
+    reference_abs_scale = float(reference[output_mask].float().abs().mean().item())
+    candidate_abs_scale = float(candidate[output_mask].float().abs().mean().item())
+    checked = (
+        reference.shape == candidate.shape
+        and math.isfinite(reference_abs_scale)
+        and math.isfinite(candidate_abs_scale)
+    )
+    binary_equal = checked and torch.equal(reference, candidate)
+    return PackingPositionSemantics(
+        kind="position_id_independent",
+        checked=checked,
+        respected=(
+            binary_equal and reference_abs_scale > 0.0 and candidate_abs_scale > 0.0
+        ),
+        binary_equal=binary_equal,
+        candidate_abs_scale=candidate_abs_scale,
+        reference_abs_scale=reference_abs_scale,
+    )
+
+
+def _position_semantics_check(
+    language_model: LanguageModule,
+    *,
+    handler: Any,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+) -> tuple[PackingPositionSemantics, int, bool, bool]:
+    valid_mask = group_ids != -1
+    _, _, repeated_position_key_count = _rotary_grouping_check(
+        None,
+        position_ids=position_ids,
+        valid_mask=valid_mask,
+    )
+    if getattr(language_model, "position_embedding_type", None) == "none":
+        semantics = _position_id_independent_check(
+            language_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            valid_mask=valid_mask,
+        )
+        return semantics, repeated_position_key_count, False, True
+
+    preprocess = getattr(language_model, "_preprocess", None)
+    if not callable(preprocess):
+        raise RuntimeError(
+            "Rotary packed-position validation requires LanguageModule._preprocess"
+        )
+    preprocess_output = preprocess(input_ids=input_ids, position_ids=position_ids)
+    checked = False
+    respected = True
+    for rotary_output in _rotary_outputs_for_validation(
+        handler=handler,
+        preprocess_output=preprocess_output,
+        position_ids=position_ids,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+    ):
+        output_checked, output_respected, _ = _rotary_grouping_check(
+            rotary_output,
+            position_ids=position_ids,
+            valid_mask=valid_mask,
+        )
+        checked = checked or output_checked
+        respected = respected and output_respected
+    return (
+        PackingPositionSemantics(
+            kind="rotary_grouping",
+            checked=checked,
+            respected=respected,
+        ),
+        repeated_position_key_count,
+        checked,
+        respected,
     )
 
 
@@ -414,6 +581,43 @@ def _run_logits(
         )
 
 
+def _logits_metric_sums(
+    candidate: torch.Tensor,
+    reference: torch.Tensor,
+) -> tuple[float, float, float, float, int]:
+    if candidate.shape != reference.shape:
+        raise ValueError(
+            f"Packed/reference logits shape mismatch: {candidate.shape} != {reference.shape}"
+        )
+    candidate_fp32 = candidate.float()
+    reference_fp32 = reference.float()
+    diff = (candidate_fp32 - reference_fp32).abs()
+    return (
+        float((diff / reference_fp32.abs()).sum().item()),
+        float(diff.max().item()),
+        float(candidate_fp32.abs().sum().item()),
+        float(reference_fp32.abs().sum().item()),
+        int(diff.numel()),
+    )
+
+
+def _logits_meet_gate(
+    *,
+    mean_abs_pct: float,
+    candidate_abs_scale: float,
+    reference_abs_scale: float,
+    limit: float,
+) -> bool:
+    return (
+        math.isfinite(mean_abs_pct)
+        and math.isfinite(candidate_abs_scale)
+        and math.isfinite(reference_abs_scale)
+        and candidate_abs_scale > 0.0
+        and reference_abs_scale > 0.0
+        and mean_abs_pct <= limit
+    )
+
+
 def _logits_equivalence_check(
     *,
     model: Any,
@@ -424,14 +628,15 @@ def _logits_equivalence_check(
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
     mean_abs_pct_limit: float,
-) -> tuple[int, bool, float, float]:
+) -> tuple[int, bool, float, float, float, float]:
     _debug_log(
         "logits_check start "
         f"batch={int(input_ids.shape[0])} seq={int(input_ids.shape[1])}"
     )
     completion_pair_count = 0
     logits_max_abs_diff = 0.0
-    logits_abs_sum = 0.0
+    logits_abs_pct_sum = 0.0
+    logits_candidate_abs_sum = 0.0
     logits_ref_abs_sum = 0.0
     logits_numel = 0
     sliding_windows = tuple(
@@ -518,38 +723,57 @@ def _logits_equivalence_check(
             )
             packed_completion_logits = packed_logits[:, leaf_start : leaf_end - 1, :]
             reference_completion_logits = reference_logits[:, prompt_len:-1, :]
-            diff = (packed_completion_logits - reference_completion_logits).abs()
-            logits_abs_sum += float(diff.sum().item())
-            logits_ref_abs_sum += float(reference_completion_logits.abs().sum().item())
-            logits_numel += int(diff.numel())
-            logits_max_abs_diff = max(logits_max_abs_diff, float(diff.max().item()))
+            (
+                abs_pct_sum,
+                max_abs_diff,
+                candidate_abs_sum,
+                reference_abs_sum,
+                numel,
+            ) = _logits_metric_sums(
+                packed_completion_logits,
+                reference_completion_logits,
+            )
+            logits_abs_pct_sum += abs_pct_sum
+            logits_candidate_abs_sum += candidate_abs_sum
+            logits_ref_abs_sum += reference_abs_sum
+            logits_numel += numel
+            logits_max_abs_diff = max(logits_max_abs_diff, max_abs_diff)
             completion_pair_count += 1
             _debug_log(
                 "logits_check row="
                 f"{row_index} leaf={leaf_index} "
-                f"max_abs_diff={float(diff.max().item()):.6f}"
+                f"max_abs_diff={max_abs_diff:.6f}"
             )
     if completion_pair_count > 0:
-        mean_abs = logits_abs_sum / max(logits_numel, 1)
-        typical_abs = logits_ref_abs_sum / max(logits_numel, 1)
-        logits_mean_abs_pct = (mean_abs / (typical_abs + 1e-12)) * 100.0
-        logits_equivalent = logits_mean_abs_pct <= mean_abs_pct_limit
+        logits_mean_abs_pct = logits_abs_pct_sum / logits_numel * 100.0
+        candidate_abs_scale = logits_candidate_abs_sum / logits_numel
+        reference_abs_scale = logits_ref_abs_sum / logits_numel
+        logits_equivalent = _logits_meet_gate(
+            mean_abs_pct=logits_mean_abs_pct,
+            candidate_abs_scale=candidate_abs_scale,
+            reference_abs_scale=reference_abs_scale,
+            limit=mean_abs_pct_limit,
+        )
         _debug_log(
             "logits_check done "
             f"pairs={completion_pair_count} "
             f"equivalent={logits_equivalent} "
             f"mean_abs_pct={logits_mean_abs_pct:.6f} "
             f"limit={mean_abs_pct_limit:.6f} "
-            f"max_abs_diff={logits_max_abs_diff:.6f}"
+            f"max_abs_diff={logits_max_abs_diff:.6f} "
+            f"candidate_abs_scale={candidate_abs_scale:.6f} "
+            f"reference_abs_scale={reference_abs_scale:.6f}"
         )
         return (
             completion_pair_count,
             logits_equivalent,
             logits_mean_abs_pct,
             logits_max_abs_diff,
+            candidate_abs_scale,
+            reference_abs_scale,
         )
     _debug_log("logits_check finished without any prompt family")
-    return 0, False, float("inf"), float("inf")
+    return 0, False, float("inf"), float("inf"), 0.0, 0.0
 
 
 def _run_packing_invariance_subprocess(
@@ -759,10 +983,9 @@ def _run_packing_invariance_worker(
         if runtime is None:
             raise RuntimeError("packing invariance did not acquire a Megatron runtime")
         model_chunks = cast(list[Any], runtime.model)
-        gpt_module = _locate_gpt_module(model_chunks)
+        language_model = _locate_language_module(model_chunks)
         for chunk in model_chunks:
             chunk.eval()
-        hooked_preprocess = gpt_module._preprocess
 
         for scenario_name, packed_config, deep in scenarios:
             _debug_log(
@@ -783,35 +1006,49 @@ def _run_packing_invariance_worker(
             rotary_grouping_checked = False
             rotary_grouping_respected = True
             repeated_position_key_count = 0
+            position_semantics: PackingPositionSemantics | None = None
             for row_index in range(int(position_ids.shape[0])):
                 row_position_ids = position_ids[row_index : row_index + 1]
                 row_input_ids = input_ids[row_index : row_index + 1]
-                hooked_output = _time_block(
-                    f"scenario {scenario_name} row={row_index} hooked_preprocess",
-                    lambda: hooked_preprocess(
+                (
+                    row_semantics,
+                    row_repeated_count,
+                    row_checked,
+                    row_respected,
+                ) = _time_block(
+                    f"scenario {scenario_name} row={row_index} position_semantics",
+                    lambda: _position_semantics_check(
+                        language_model,
+                        handler=runtime.model_support_handler,
                         input_ids=row_input_ids,
                         position_ids=row_position_ids,
+                        group_ids=group_ids[row_index : row_index + 1],
+                        parent_ids=parent_ids[row_index : row_index + 1],
                     ),
                     device=row_input_ids.device,
                 )
-                row_checked = False
-                row_respected = True
-                row_repeated_count = 0
-                rotary_outputs = _rotary_outputs_for_validation(
-                    handler=runtime.model_support_handler,
-                    preprocess_output=hooked_output,
-                    position_ids=row_position_ids,
-                    group_ids=group_ids[row_index : row_index + 1],
-                    parent_ids=parent_ids[row_index : row_index + 1],
-                )
-                for rotary_output in rotary_outputs:
-                    checked, respected, repeated_count = _rotary_grouping_check(
-                        rotary_output,
-                        position_ids=row_position_ids,
-                    )
-                    row_checked = row_checked or checked
-                    row_respected = row_respected and respected
-                    row_repeated_count = repeated_count
+                if position_semantics is None:
+                    position_semantics = row_semantics
+                else:
+                    if row_semantics.kind != position_semantics.kind:
+                        raise RuntimeError(
+                            "Packed position semantics changed between rows"
+                        )
+                    position_semantics.checked &= row_semantics.checked
+                    position_semantics.respected &= row_semantics.respected
+                    if position_semantics.kind == "position_id_independent":
+                        position_semantics.binary_equal = bool(
+                            position_semantics.binary_equal
+                            and row_semantics.binary_equal
+                        )
+                        position_semantics.candidate_abs_scale = min(
+                            cast(float, position_semantics.candidate_abs_scale),
+                            cast(float, row_semantics.candidate_abs_scale),
+                        )
+                        position_semantics.reference_abs_scale = min(
+                            cast(float, position_semantics.reference_abs_scale),
+                            cast(float, row_semantics.reference_abs_scale),
+                        )
                 rotary_grouping_checked = rotary_grouping_checked or row_checked
                 rotary_grouping_respected = rotary_grouping_respected and row_respected
                 repeated_position_key_count += row_repeated_count
@@ -820,11 +1057,15 @@ def _run_packing_invariance_worker(
                     f"checked={row_checked} respected={row_respected} "
                     f"repeated_keys={row_repeated_count}"
                 )
+            if position_semantics is None:
+                raise RuntimeError("Packed-position scenario had no rows")
             (
                 completion_pair_count,
                 logits_equivalent,
                 logits_mean_abs_pct,
                 logits_max_abs_diff,
+                candidate_logits_abs_scale,
+                reference_logits_abs_scale,
             ) = _time_block(
                 f"scenario {scenario_name} logits_equivalence_check",
                 lambda: _logits_equivalence_check(
@@ -842,8 +1083,8 @@ def _run_packing_invariance_worker(
             matched = (
                 repeated_position_key_count > 0
                 and completion_pair_count > 0
-                and rotary_grouping_checked
-                and rotary_grouping_respected
+                and position_semantics.checked
+                and position_semantics.respected
                 and logits_equivalent
             )
             _debug_log(
@@ -867,10 +1108,13 @@ def _run_packing_invariance_worker(
                         parent_ids.cpu(),
                     ),
                     repeated_position_key_count=repeated_position_key_count,
+                    position_semantics=position_semantics,
                     rotary_grouping_checked=rotary_grouping_checked,
                     rotary_grouping_respected=rotary_grouping_respected,
                     completion_pair_count=completion_pair_count,
                     logits_equivalent=logits_equivalent,
+                    candidate_logits_abs_scale=candidate_logits_abs_scale,
+                    reference_logits_abs_scale=reference_logits_abs_scale,
                     logits_mean_abs_pct=logits_mean_abs_pct,
                     logits_mean_abs_pct_limit=mean_abs_pct_limit,
                     logits_max_abs_diff=logits_max_abs_diff,

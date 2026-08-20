@@ -16,7 +16,7 @@ def build_complex_prefix_tree_packed_tensors(
     Each packed row repeats this tree while it fits:
 
     root
-      -> mid_a -> leaf_a_short, leaf_a_long
+      -> mid_a -> configured completion branches
       -> mid_b -> [deep_mid ->] leaf_b
       -> direct_leaf
 
@@ -58,6 +58,7 @@ def build_complex_prefix_tree_packed_tensors(
         1,
         min(int(config.decode_tokens), max_completion_tokens),
     )
+    completion_branches = int(config.completion_branches_per_prefix)
     jitter_width = min(int(config.decode_tokens_jitter), max_completion_tokens - 1)
 
     def sample_completion_length() -> int:
@@ -127,7 +128,7 @@ def build_complex_prefix_tree_packed_tensors(
             weights[sequence_index, train_start:end] = 1.0
         return end
 
-    def tree_token_budget(leaf_lengths: tuple[int, int, int, int]) -> int:
+    def tree_token_budget(leaf_lengths: tuple[int, ...]) -> int:
         return (
             root_len
             + mid_a_len
@@ -137,10 +138,10 @@ def build_complex_prefix_tree_packed_tensors(
         )
 
     def fit_leaf_lengths(
-        leaf_lengths: tuple[int, int, int, int],
+        leaf_lengths: tuple[int, ...],
         *,
         remaining: int,
-    ) -> tuple[int, int, int, int] | None:
+    ) -> tuple[int, ...] | None:
         completion_budget = (
             remaining
             - root_len
@@ -163,20 +164,19 @@ def build_complex_prefix_tree_packed_tensors(
             reduction = min(reducible, overflow)
             fitted[index] -= reduction
             overflow -= reduction
-        return (fitted[0], fitted[1], fitted[2], fitted[3])
+        return tuple(fitted)
 
     for sequence_index in range(num_sequences):
         cursor = 0
         next_group_id = 0
         while cursor < sequence_length:
-            leaf_lengths = (
-                sample_completion_length(),
-                sample_completion_length(),
-                sample_completion_length(),
-                sample_completion_length(),
+            leaf_lengths = tuple(
+                sample_completion_length() for _ in range(completion_branches + 2)
             )
             remaining = sequence_length - cursor
             if tree_token_budget(leaf_lengths) > remaining:
+                if config.packing_mode == "stop_early":
+                    break
                 fitted_leaf_lengths = fit_leaf_lengths(
                     leaf_lengths,
                     remaining=remaining,
@@ -204,7 +204,7 @@ def build_complex_prefix_tree_packed_tensors(
                 length=mid_a_len,
                 input_start=root_len,
             )
-            for leaf_length in leaf_lengths[:2]:
+            for leaf_length in leaf_lengths[:completion_branches]:
                 leaf_group = next_group_id
                 next_group_id += 1
                 cursor = write_segment(
@@ -245,7 +245,7 @@ def build_complex_prefix_tree_packed_tensors(
                 cursor=cursor,
                 group_id=leaf_b_group,
                 parent_id=leaf_b_parent,
-                length=1 + leaf_lengths[2],
+                length=1 + leaf_lengths[completion_branches],
                 input_start=root_len + mid_b_len + deep_mid_len,
                 trainable_offset=1,
             )
@@ -256,7 +256,7 @@ def build_complex_prefix_tree_packed_tensors(
                 cursor=cursor,
                 group_id=direct_group,
                 parent_id=root_group,
-                length=1 + leaf_lengths[3],
+                length=1 + leaf_lengths[completion_branches + 1],
                 input_start=root_len,
                 trainable_offset=1,
             )
