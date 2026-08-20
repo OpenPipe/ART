@@ -66,6 +66,7 @@ class FakeService:
         self.nonempty_event_pages = 0
         self.operation_status_gets = 0
         self.fail_submit_once = True
+        self.admit_before_submit_failure = False
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -94,8 +95,9 @@ class FakeService:
             return httpx.Response(200, json=self.run)
         if path == "/v1/training/runs/run/forward_backward":
             self.submit_bodies.append(request.content)
-            if self.fail_submit_once:
-                self.fail_submit_once = False
+            fail = self.fail_submit_once
+            self.fail_submit_once = False
+            if fail and not self.admit_before_submit_failure:
                 return httpx.Response(503, json={"detail": "retry"})
             submission = _decode_submission(request.content)
             for value in (*submission.objects, *submission.route_objects):
@@ -123,6 +125,8 @@ class FakeService:
                 ref, result_ref, now, submission.request
             )
             self.events.append(self._event(ref, result_ref, now))
+            if fail:
+                return httpx.Response(503, json={"detail": "response lost"})
             return httpx.Response(200, json=ref)
         if path == "/v1/training/runs/run/optim_step":
             ref = self._ref(body, "optim_step", 1)
@@ -157,7 +161,12 @@ class FakeService:
             return httpx.Response(200, content=self.operation_results[operation_id])
         if path.startswith("/v1/training/runs/run/operations/"):
             self.operation_status_gets += 1
-            return httpx.Response(200, json=self.operations[path.rsplit("/", 1)[1]])
+            operation = self.operations.get(path.rsplit("/", 1)[1])
+            return (
+                httpx.Response(200, json=operation)
+                if operation is not None
+                else httpx.Response(404, json={"detail": "not found"})
+            )
         if path == "/v1/training/runs/run:close":
             self.run["status"] = "closing"
             self.events.append(
@@ -472,9 +481,13 @@ def test_tokenized_request_rejects_oversized_logprob_result(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("admit_before_failure", (False, True))
 @pytest.mark.asyncio
-async def test_remote_client_retries_and_preserves_command_order():
+async def test_remote_client_retries_and_preserves_command_order(
+    admit_before_failure: bool,
+):
     fake = FakeService()
+    fake.admit_before_submit_failure = admit_before_failure
     paths: dict[str, list[str]] = {"control": [], "transfer": []}
 
     def transport(plane: str):
@@ -521,7 +534,8 @@ async def test_remote_client_retries_and_preserves_command_order():
     )
     forward = await client.forward_backward(request)
     assert await client.forward_backward(request) is forward
-    assert fake.submit_bodies[0] == fake.submit_bodies[1]
+    assert len(fake.submit_bodies) == (1 if admit_before_failure else 2)
+    assert len(set(fake.submit_bodies)) == 1
     submitted = _decode_submission(fake.submit_bodies[0])
     batch_ref = submitted.request.batch.model_dump(mode="python")
     assert set(batch_ref) == {
@@ -554,7 +568,7 @@ async def test_remote_client_retries_and_preserves_command_order():
     assert optimizer_result.contributing_forward_backward_operation_ids == (
         forward_operation_id,
     )
-    assert fake.operation_status_gets == 0
+    assert fake.operation_status_gets == 1
     assert 1 <= fake.nonempty_event_pages <= 2
     result_path = f"/v1/training/runs/run/operations/{forward_operation_id}/result"
     assert paths["control"].count(result_path) == 1

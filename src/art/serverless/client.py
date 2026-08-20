@@ -319,17 +319,59 @@ class RemoteTrainingServiceClient:
     ) -> OperationRef:
         if kind not in {"forward", "forward_backward"}:
             raise ValueError("forward submission requires a forward operation")
-        response = await self._send(
-            "POST",
-            f"training/runs/{request.run_id}/{kind}",
-            content=payload.stream(),
-            headers={
-                "Content-Type": FORWARD_SUBMISSION_MEDIA_TYPE,
-                "Content-Length": str(payload.byte_count),
-            },
-            transfer=True,
-        )
-        return OperationRef.model_validate(response.json())
+        for attempt in range(self._max_retries + 1):
+            try:
+                response = await self._send(
+                    "POST",
+                    f"training/runs/{request.run_id}/{kind}",
+                    content=payload.stream(),
+                    headers={
+                        "Content-Type": FORWARD_SUBMISSION_MEDIA_TYPE,
+                        "Content-Length": str(payload.byte_count),
+                    },
+                    transfer=True,
+                    max_retries=0,
+                )
+            except BaseException as error:
+                if not _is_transient_failure(error):
+                    raise
+                try:
+                    view = await self.get_operation(
+                        request.run_id,
+                        _operation_id(request.run_id, request.request_id),
+                    )
+                except RemoteTrainingHttpError as probe_error:
+                    if probe_error.status_code != 404:
+                        probe_error.add_note(
+                            f"forward submission was ambiguous: {error!r}"
+                        )
+                        raise
+                    if attempt == self._max_retries:
+                        raise error
+                    await asyncio.sleep(_retry_delay(attempt))
+                    continue
+                return self._validated_forward_admission(view, kind, request)
+            return OperationRef.model_validate(response.json())
+        raise AssertionError("forward admission retry loop did not terminate")
+
+    @staticmethod
+    def _validated_forward_admission(
+        view: OperationView,
+        kind: OperationKind,
+        request: RemoteForwardRequest,
+    ) -> OperationRef:
+        if (
+            view.ref.operation_id != _operation_id(request.run_id, request.request_id)
+            or view.ref.run_id != request.run_id
+            or view.ref.sequence_id != request.sequence_id
+            or view.ref.kind != kind
+            or view.request_id != request.request_id
+            or view.request_fingerprint != remote_request_fingerprint(request)
+        ):
+            raise RemoteTrainingError(
+                "ambiguous forward resolved to a different operation"
+            )
+        return view.ref
 
     async def get_operation(self, run_id: str, operation_id: str) -> OperationView:
         return await self._request(
@@ -411,8 +453,7 @@ class RemoteTrainingServiceClient:
     async def get_events(self, run_id: str, *, after: int) -> EventPage:
         return await self._request(
             "GET",
-            f"training/runs/{run_id}/events?after={after}"
-            f"&limit={MAX_EVENT_PAGE_LIMIT}",
+            f"training/runs/{run_id}/events?after={after}&limit={MAX_EVENT_PAGE_LIMIT}",
             EventPage,
             timeout_s=EVENT_LONG_POLL_TIMEOUT_S + 5.0,
         )
@@ -581,9 +622,7 @@ class RemoteTrainingServiceClient:
                         content=content,
                         headers=headers,
                         timeout=(
-                            httpx.USE_CLIENT_DEFAULT
-                            if timeout_s is None
-                            else timeout_s
+                            httpx.USE_CLIENT_DEFAULT if timeout_s is None else timeout_s
                         ),
                     ),
                     stream=stream,
