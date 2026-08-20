@@ -531,6 +531,8 @@ def _varlen_bucket(
             int(lengths.numel()), device=device, dtype=torch.long
         ),
         real_token_count_static=int(lengths.sum().item()),
+        padded_length=max_len,
+        artifact_identity="dense_rows_disabled",
     )
 
 

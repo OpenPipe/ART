@@ -97,6 +97,7 @@ class LinearRecurrentContract(BaseModel):
     projected_streams: tuple[ProjectedStreamSpec, ...]
     states: tuple[RecurrentStateSpec, ...]
     convolution_width: int = Field(gt=0)
+    local_chunk_size: int = Field(gt=0)
     activation: str = Field(min_length=1)
     local_kernel_implementation_id: str = Field(min_length=1)
     layout_compatibility_key: str = Field(min_length=1)
