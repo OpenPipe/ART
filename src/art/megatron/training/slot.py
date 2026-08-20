@@ -7,7 +7,7 @@ import time
 from typing import Any, Literal, cast
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation, model_validator
 
 from art.distributed.art_runtime import (
     ArtRuntime,
@@ -159,7 +159,9 @@ class ForwardBackwardLaunch(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
-    completion: asyncio.Future[ForwardBackwardResult]
+    operation_id: str
+    produced_gradient: bool
+    completion: SkipValidation[asyncio.Future[ForwardBackwardResult]]
 
 
 class PreparedLoadState(BaseModel):
@@ -604,7 +606,11 @@ class MegatronTrainingSlot:
             )
             completion = asyncio.get_running_loop().create_future()
             completion.set_result(result)
-            return ForwardBackwardLaunch(completion=completion)
+            return ForwardBackwardLaunch(
+                operation_id=ref.operation_id,
+                produced_gradient=False,
+                completion=completion,
+            )
         if isinstance(prepared, PreparedSftForward):
             job = SftForwardBackwardJobSpec(
                 operation_id=ref.operation_id,
@@ -627,7 +633,11 @@ class MegatronTrainingSlot:
             )
             completion = asyncio.get_running_loop().create_future()
             completion.set_result(result)
-            return ForwardBackwardLaunch(completion=completion)
+            return ForwardBackwardLaunch(
+                operation_id=ref.operation_id,
+                produced_gradient=result.produced_gradient,
+                completion=completion,
+            )
         if not isinstance(prepared, PreparedPackedForward):
             raise TypeError("unknown prepared F/B payload")
         job = ForwardBackwardJobSpec(
@@ -666,6 +676,8 @@ class MegatronTrainingSlot:
             )
 
         return ForwardBackwardLaunch(
+            operation_id=ref.operation_id,
+            produced_gradient=prepared.packing.loss_bearing_tokens > 0,
             completion=asyncio.create_task(
                 complete(), name=f"megatron-fb-result-{ref.operation_id}"
             )

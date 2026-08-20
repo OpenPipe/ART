@@ -23,7 +23,7 @@ from monarch.actor import (
     endpoint,
 )
 from monarch.spmd import SPMDActor
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SkipValidation
 
 from art.distributed.data_plane import PackedBatchLeaseSet
 from art.distributed.monarch_bootstrap import activate_cuda_device
@@ -1635,7 +1635,7 @@ class ForwardBackwardCommandLaunch(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
 
-    completion: asyncio.Future[dict[str, Any]]
+    completion: SkipValidation[asyncio.Future[dict[str, Any]]]
 
 
 class MonarchTrainerSlot:
