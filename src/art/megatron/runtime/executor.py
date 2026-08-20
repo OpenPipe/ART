@@ -15,7 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, SkipValidation
 import torch
 
 from art.distributed.object_store import (
-    BinaryObjectTarget,
+    BinaryObjectPublicationTarget,
+    OrderedBinaryObjectTarget,
     S3BinaryObjectStore,
     binary_object_manifest_uri,
 )
@@ -1714,7 +1715,7 @@ class _PreparedRankSnapshot(BaseModel):
     optimizer_state_path: str
     staging_adapter_path: str | None
     publication_targets: tuple[Any, ...]
-    adapter_object_target: BinaryObjectTarget | None
+    adapter_object_target: BinaryObjectPublicationTarget | None
     contexts: Any
     completion: Future[TrainerRankPublication]
     sink: SkipValidation[EventSink]
@@ -2031,7 +2032,7 @@ class _GenerationPublisher:
         staging_adapter_path: str | None,
         existing_adapter: OptimizerAdapter | None = None,
         publication_targets: tuple[Any, ...],
-        adapter_object_target: BinaryObjectTarget | None,
+        adapter_object_target: BinaryObjectPublicationTarget | None,
         save_optimizer: bool,
         sink: EventSink,
     ) -> tuple[SnapshotRankWritePlan, dict[str, float]]:
@@ -2782,7 +2783,7 @@ class _GenerationPublisher:
     def _publish_lora_object_once(
         self,
         entry: _CachedGeneration,
-        target: BinaryObjectTarget,
+        target: BinaryObjectPublicationTarget,
         generation: TrainerGeneration,
         payload: _PreparedAdapterPayload,
         planned: OptimizerAdapter,
@@ -2809,7 +2810,7 @@ class _GenerationPublisher:
 
     def _publish_lora_object(
         self,
-        target: BinaryObjectTarget,
+        target: BinaryObjectPublicationTarget,
         generation: TrainerGeneration,
         payload: _PreparedAdapterPayload,
         planned: OptimizerAdapter,
@@ -2835,25 +2836,28 @@ class _GenerationPublisher:
         planned_files = {file.name: file for file in planned.files}
         if any(file.sha256 is None for file in planned_files.values()):
             raise RuntimeError("adapter object plan has no exact file identity")
-        ref = store.publish(
-            target,
-            {
-                "adapter_model.safetensors": tuple(
-                    memoryview(chunk.numpy()).cast("B")
-                    for chunk in payload.tensors.chunks
-                ),
-                "adapter_config.json": (memoryview(payload.config),),
-            },
-            file_sha256={
-                name: cast(str, file.sha256) for name, file in planned_files.items()
-            },
+        source_files: dict[str, tuple[memoryview, ...]] = {
+            "adapter_model.safetensors": tuple(
+                memoryview(chunk.numpy()).cast("B")
+                for chunk in payload.tensors.chunks
+            ),
+            "adapter_config.json": (memoryview(payload.config),),
+        }
+        file_sha256: dict[str, str] = {
+            name: cast(str, file.sha256) for name, file in planned_files.items()
+        }
+        ref = (
+            store.publish_ordered(target, source_files, file_sha256=file_sha256)
+            if isinstance(target, OrderedBinaryObjectTarget)
+            else store.publish(target, source_files, file_sha256=file_sha256)
         )
-        files = {file.relative_path: file for file in ref.files}
+        published_files = {file.relative_path: file for file in ref.files}
         expected_files = ("adapter_config.json", "adapter_model.safetensors")
-        if set(files) != set(expected_files):
+        if set(published_files) != set(expected_files):
             raise RuntimeError("adapter object manifest has unexpected files")
         if ref.manifest_uri != planned.identity or tuple(
-            (files[name].byte_count, files[name].sha256) for name in expected_files
+            (published_files[name].byte_count, published_files[name].sha256)
+            for name in expected_files
         ) != tuple(
             (planned_files[name].size_bytes, planned_files[name].sha256)
             for name in expected_files

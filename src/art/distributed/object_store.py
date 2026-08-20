@@ -11,10 +11,10 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 from threading import Lock
-from typing import Any, Iterable, Literal
+from typing import Annotated, Any, Iterable, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 VLLM_LORA_OBJECT_FORMAT = "art_vllm_lora_v1"
 MOE_ROUTE_OBJECT_FORMAT = "art_moe_route_bundle_v2"
@@ -79,6 +79,7 @@ class S3ObjectStoreConfig(_ObjectModel):
 
 
 class BinaryObjectTarget(_ObjectModel):
+    transport: Literal["s3"] = "s3"
     store: S3ObjectStoreConfig
     object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     format: str = Field(min_length=1)
@@ -104,6 +105,103 @@ class BinaryObjectRef(_ObjectModel):
     byte_count: int = Field(ge=1)
     files: tuple[BinaryObjectFile, ...] = Field(min_length=1)
     metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class OrderedBinaryObjectTarget(_ObjectModel):
+    transport: Literal["ordered_s3_shards"] = "ordered_s3_shards"
+    store: S3ObjectStoreConfig
+    object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    format: str = Field(min_length=1)
+    metadata: dict[str, str] = Field(default_factory=dict)
+    shard_bytes: int = Field(default=64 << 20, ge=1, le=5 << 30)
+    max_concurrent_shards: int = Field(default=16, ge=1, le=64)
+    max_shards: int = Field(default=1024, ge=1, le=10_000)
+
+    @model_validator(mode="after")
+    def _bounded_by_store(self) -> "OrderedBinaryObjectTarget":
+        if self.max_concurrent_shards > self.store.multipart_concurrency:
+            raise ValueError("ordered shard concurrency exceeds the object-store pool")
+        return self
+
+
+BinaryObjectPublicationTarget = Annotated[
+    BinaryObjectTarget | OrderedBinaryObjectTarget,
+    Field(discriminator="transport"),
+]
+
+
+class OrderedBinaryObjectShard(_ObjectModel):
+    index: int = Field(ge=0)
+    relative_path: str
+    file_offset: int = Field(ge=0)
+    byte_count: int = Field(ge=1)
+
+    @field_validator("relative_path")
+    @classmethod
+    def _safe_relative_path(cls, value: str) -> str:
+        return _safe_relative_path(value)
+
+
+class OrderedBinaryObjectPlan(_ObjectModel):
+    object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    format: str = Field(min_length=1)
+    files: tuple[BinaryObjectFile, ...] = Field(min_length=1)
+    shards: tuple[OrderedBinaryObjectShard, ...] = Field(min_length=1)
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _complete_ordered_layout(self) -> "OrderedBinaryObjectPlan":
+        if tuple(shard.index for shard in self.shards) != tuple(
+            range(len(self.shards))
+        ):
+            raise ValueError("ordered object shards must have contiguous indices")
+        files = {file.relative_path: file for file in self.files}
+        if len(files) != len(self.files):
+            raise ValueError("ordered object files must have unique paths")
+        cursors = dict.fromkeys(files, 0)
+        for shard in self.shards:
+            if shard.relative_path not in cursors:
+                raise ValueError("ordered object shard identifies an unknown file")
+            if shard.file_offset != cursors[shard.relative_path]:
+                raise ValueError("ordered object shards leave a file gap")
+            cursors[shard.relative_path] += shard.byte_count
+        if any(cursors[path] != file.byte_count for path, file in files.items()):
+            raise ValueError("ordered object shards do not cover a complete file")
+        return self
+
+
+class OrderedBinaryObjectRef(_ObjectModel):
+    transport: Literal["ordered_s3_shards"] = "ordered_s3_shards"
+    object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    format: str = Field(min_length=1)
+    plan_uri: str = Field(pattern=r"^s3://")
+    manifest_uri: str = Field(pattern=r"^s3://")
+    plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=1)
+    files: tuple[BinaryObjectFile, ...] = Field(min_length=1)
+    shard_count: int = Field(ge=1, le=10_000)
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class StoredOrderedBinaryObjectShard(_ObjectModel):
+    index: int = Field(ge=0)
+    byte_count: int = Field(ge=1)
+    etag: str = Field(min_length=1)
+
+
+class OrderedBinaryObjectCommit(_ObjectModel):
+    ref: OrderedBinaryObjectRef
+    shards: tuple[StoredOrderedBinaryObjectShard, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _complete_commit(self) -> "OrderedBinaryObjectCommit":
+        if tuple(shard.index for shard in self.shards) != tuple(
+            range(self.ref.shard_count)
+        ):
+            raise ValueError("ordered object commit does not cover every shard")
+        if sum(shard.byte_count for shard in self.shards) != self.ref.byte_count:
+            raise ValueError("ordered object commit has the wrong byte count")
+        return self
 
 
 class BinaryObjectMaterialization(_ObjectModel):
@@ -236,6 +334,62 @@ class S3BinaryObjectStore:
             raise RuntimeError("object commit manifest changed after publication")
         return result
 
+    def publish_ordered(
+        self,
+        target: OrderedBinaryObjectTarget,
+        files: dict[str, tuple[memoryview, ...]],
+        *,
+        file_sha256: dict[str, str],
+    ) -> OrderedBinaryObjectRef:
+        """Publish caller-owned buffers as directly consumable ordered shards."""
+        self._require_target(target)
+        plan = _ordered_binary_object_plan(target, files, file_sha256)
+        plan_body = _model_bytes(plan)
+        ref = OrderedBinaryObjectRef(
+            object_id=target.object_id,
+            format=target.format,
+            plan_uri=ordered_binary_object_plan_uri(target),
+            manifest_uri=binary_object_manifest_uri(target),
+            plan_sha256=hashlib.sha256(plan_body).hexdigest(),
+            byte_count=sum(file.byte_count for file in plan.files),
+            files=plan.files,
+            shard_count=len(plan.shards),
+            metadata=target.metadata,
+        )
+        existing = self.resolve_ordered(ref.manifest_uri, missing_ok=True)
+        if existing is not None:
+            if existing != ref:
+                raise RuntimeError("committed ordered object differs from its target")
+            return existing
+        prefix = self._prefix(target)
+        self._put_immutable(f"{prefix}/_PLAN.json", plan_body)
+        stored = self._upload_ordered_shards(
+            target, plan, files, plan_sha256=ref.plan_sha256
+        )
+        commit = OrderedBinaryObjectCommit(ref=ref, shards=stored)
+        body = _model_bytes(commit)
+        self._put_immutable(f"{prefix}/_COMMITTED.json", body)
+        if self._read(f"{prefix}/_COMMITTED.json") != body:
+            raise RuntimeError("ordered object commit changed after publication")
+        return ref
+
+    def resolve_ordered(
+        self, manifest_uri: str, *, missing_ok: bool = False
+    ) -> OrderedBinaryObjectRef | None:
+        from botocore.exceptions import ClientError
+
+        bucket, key = self._require_manifest_uri(manifest_uri)
+        try:
+            body = self._read(key, bucket=bucket)
+        except ClientError as error:
+            if missing_ok and _is_missing_object(error):
+                return None
+            raise
+        commit = OrderedBinaryObjectCommit.model_validate_json(body)
+        if commit.ref.manifest_uri != manifest_uri:
+            raise RuntimeError("ordered object commit identifies another manifest")
+        return commit.ref
+
     def resolve(
         self, manifest_uri: str, *, missing_ok: bool = False
     ) -> BinaryObjectRef | None:
@@ -367,7 +521,7 @@ class S3BinaryObjectStore:
         writer.verify_complete()
         return file
 
-    def delete(self, ref: BinaryObjectRef) -> None:
+    def delete(self, ref: BinaryObjectRef | OrderedBinaryObjectRef) -> None:
         bucket, key = self._require_manifest_uri(ref.manifest_uri)
         self._delete_prefix(str(PurePosixPath(key).parent), bucket)
 
@@ -472,6 +626,120 @@ class S3BinaryObjectStore:
             raise
         return total
 
+    def _upload_ordered_shards(
+        self,
+        target: OrderedBinaryObjectTarget,
+        plan: OrderedBinaryObjectPlan,
+        files: dict[str, tuple[memoryview, ...]],
+        *,
+        plan_sha256: str,
+    ) -> tuple[StoredOrderedBinaryObjectShard, ...]:
+        pending: dict[Future[StoredOrderedBinaryObjectShard], int] = {}
+        completed: list[StoredOrderedBinaryObjectShard] = []
+        shards = iter(plan.shards)
+        source_sha256 = {file.relative_path: file.sha256 for file in plan.files}
+
+        def submit() -> bool:
+            try:
+                shard = next(shards)
+            except StopIteration:
+                return False
+            future = self._parts.submit(
+                self._upload_ordered_shard,
+                self._prefix(target),
+                shard,
+                files[shard.relative_path],
+                plan_sha256,
+                source_sha256[shard.relative_path],
+            )
+            pending[future] = shard.index
+            return True
+
+        for _ in range(min(target.max_concurrent_shards, len(plan.shards))):
+            submit()
+        try:
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = pending.pop(future)
+                    value = future.result()
+                    if value.index != index:
+                        raise RuntimeError("ordered shard result changed its index")
+                    completed.append(value)
+                    submit()
+        except BaseException:
+            futures = tuple(pending)
+            for future in futures:
+                future.cancel()
+            wait(futures)
+            for future in futures:
+                with suppress(BaseException):
+                    future.result()
+            raise
+        return tuple(sorted(completed, key=lambda shard: shard.index))
+
+    def _upload_ordered_shard(
+        self,
+        prefix: str,
+        shard: OrderedBinaryObjectShard,
+        chunks: tuple[memoryview, ...],
+        plan_sha256: str,
+        source_sha256: str,
+    ) -> StoredOrderedBinaryObjectShard:
+        key = _ordered_binary_object_shard_key(prefix, shard.index)
+        metadata = {
+            "plan-sha256": plan_sha256,
+            "source-sha256": source_sha256,
+            "file-offset": str(shard.file_offset),
+            "byte-count": str(shard.byte_count),
+        }
+        try:
+            response = self._client.put_object(
+                Bucket=self.config.bucket,
+                Key=key,
+                Body=_ChunkRangeReader(
+                    chunks,
+                    offset=shard.file_offset,
+                    byte_count=shard.byte_count,
+                ),
+                ContentLength=shard.byte_count,
+                Metadata=metadata,
+                IfNoneMatch="*",
+            )
+            etag = response.get("ETag")
+        except Exception as error:
+            if not _is_precondition_failed(error):
+                raise
+            head = self._client.head_object(Bucket=self.config.bucket, Key=key)
+            if (
+                head.get("ContentLength") != shard.byte_count
+                or head.get("Metadata") != metadata
+            ):
+                raise RuntimeError("committed ordered shard changed identity") from error
+            etag = head.get("ETag")
+        if not isinstance(etag, str) or not etag:
+            raise RuntimeError("ordered shard upload returned no ETag")
+        return StoredOrderedBinaryObjectShard(
+            index=shard.index,
+            byte_count=shard.byte_count,
+            etag=etag,
+        )
+
+    def _put_immutable(self, key: str, body: bytes) -> None:
+        try:
+            self._client.put_object(
+                Bucket=self.config.bucket,
+                Key=key,
+                Body=body,
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+        except Exception as error:
+            if not _is_precondition_failed(error):
+                raise
+            if self._read(key) != body:
+                raise RuntimeError("immutable object metadata changed") from error
+
     def _abort_uploads(self, key: str) -> None:
         key_marker = None
         upload_marker = None
@@ -514,7 +782,9 @@ class S3BinaryObjectStore:
             if objects:
                 self._client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
 
-    def _require_target(self, target: BinaryObjectTarget) -> None:
+    def _require_target(
+        self, target: BinaryObjectTarget | OrderedBinaryObjectTarget
+    ) -> None:
         if target.store != self.config:
             raise ValueError("binary object target uses another object store")
         with self._lock:
@@ -539,14 +809,18 @@ class S3BinaryObjectStore:
             raise ValueError("binary object URI does not identify a configured object")
         return bucket, key
 
-    def _prefix(self, target: BinaryObjectTarget) -> str:
+    def _prefix(
+        self, target: BinaryObjectTarget | OrderedBinaryObjectTarget
+    ) -> str:
         return "/".join(
             value.strip("/")
             for value in (target.store.prefix, target.object_id)
             if value.strip("/")
         )
 
-    def _manifest_uri(self, target: BinaryObjectTarget) -> str:
+    def _manifest_uri(
+        self, target: BinaryObjectTarget | OrderedBinaryObjectTarget
+    ) -> str:
         return binary_object_manifest_uri(target)
 
 
@@ -704,7 +978,9 @@ class S3BinaryObjectReceiver:
         return ref
 
 
-def binary_object_manifest_uri(target: BinaryObjectTarget) -> str:
+def binary_object_manifest_uri(
+    target: BinaryObjectTarget | OrderedBinaryObjectTarget,
+) -> str:
     prefix = "/".join(
         value.strip("/")
         for value in (target.store.prefix, target.object_id)
@@ -713,19 +989,43 @@ def binary_object_manifest_uri(target: BinaryObjectTarget) -> str:
     return f"s3://{target.store.bucket}/{prefix}/_COMMITTED.json"
 
 
-def vllm_lora_object_target(
+def ordered_binary_object_plan_uri(target: OrderedBinaryObjectTarget) -> str:
+    prefix = "/".join(
+        value.strip("/")
+        for value in (target.store.prefix, target.object_id)
+        if value.strip("/")
+    )
+    return f"s3://{target.store.bucket}/{prefix}/_PLAN.json"
+
+
+def ordered_binary_object_shard_uri(
+    target: OrderedBinaryObjectTarget, index: int
+) -> str:
+    if index < 0 or index >= target.max_shards:
+        raise ValueError("ordered shard index leaves its target bound")
+    prefix = "/".join(
+        value.strip("/")
+        for value in (target.store.prefix, target.object_id)
+        if value.strip("/")
+    )
+    return f"s3://{target.store.bucket}/{_ordered_binary_object_shard_key(prefix, index)}"
+
+
+def vllm_lora_ordered_target(
     store: S3ObjectStoreConfig,
     *,
     run_id: str,
     training_session_id: str,
     generation_id: str,
     policy_step: int,
-) -> BinaryObjectTarget:
+) -> OrderedBinaryObjectTarget:
     object_id = hashlib.sha256(f"{run_id}\0{generation_id}".encode()).hexdigest()
-    return BinaryObjectTarget(
+    return OrderedBinaryObjectTarget(
         store=store,
         object_id=object_id,
         format=VLLM_LORA_OBJECT_FORMAT,
+        shard_bytes=store.multipart_chunk_bytes,
+        max_concurrent_shards=min(store.multipart_concurrency, 64),
         metadata={
             "run_id": run_id,
             "training_session_id": training_session_id,
@@ -775,6 +1075,47 @@ def _multipart_part_bytes(total: int, *, max_part_bytes: int, concurrency: int) 
 def _multipart_ranges(total: int, size: int) -> Iterable[tuple[int, int]]:
     for offset in range(0, total, size):
         yield offset, min(size, total - offset)
+
+
+def _ordered_binary_object_plan(
+    target: OrderedBinaryObjectTarget,
+    files: dict[str, tuple[memoryview, ...]],
+    file_sha256: dict[str, str],
+) -> OrderedBinaryObjectPlan:
+    if set(files) != set(file_sha256):
+        raise ValueError("ordered object digests must cover every file exactly")
+    planned_files = tuple(
+        BinaryObjectFile(
+            relative_path=_safe_relative_path(relative_path),
+            byte_count=sum(chunk.nbytes for chunk in chunks),
+            sha256=file_sha256[relative_path],
+        )
+        for relative_path, chunks in sorted(files.items())
+    )
+    shards: list[OrderedBinaryObjectShard] = []
+    for file in planned_files:
+        for offset, byte_count in _multipart_ranges(
+            file.byte_count, target.shard_bytes
+        ):
+            shards.append(
+                OrderedBinaryObjectShard(
+                    index=len(shards),
+                    relative_path=file.relative_path,
+                    file_offset=offset,
+                    byte_count=byte_count,
+                )
+            )
+    if len(shards) > target.max_shards:
+        raise RuntimeError(
+            f"ordered object requires {len(shards)} shards; limit is {target.max_shards}"
+        )
+    return OrderedBinaryObjectPlan(
+        object_id=target.object_id,
+        format=target.format,
+        files=planned_files,
+        shards=tuple(shards),
+        metadata=target.metadata,
+    )
 
 
 class _ChunkRangeReader(RawIOBase):
@@ -916,6 +1257,10 @@ def _binary_object_file_key(prefix: str, file: BinaryObjectFile) -> str:
     return f"{prefix}/files/{file.sha256}"
 
 
+def _ordered_binary_object_shard_key(prefix: str, index: int) -> str:
+    return f"{prefix}/shards/{index:08d}"
+
+
 def _is_precondition_failed(error: Exception) -> bool:
     from botocore.exceptions import ClientError
 
@@ -933,8 +1278,12 @@ def _is_missing_object(error: Exception) -> bool:
 
 
 def _manifest_bytes(ref: BinaryObjectRef) -> bytes:
+    return _model_bytes(ref)
+
+
+def _model_bytes(value: BaseModel) -> bytes:
     return json.dumps(
-        ref.model_dump(mode="json"), separators=(",", ":"), sort_keys=True
+        value.model_dump(mode="json"), separators=(",", ":"), sort_keys=True
     ).encode()
 
 

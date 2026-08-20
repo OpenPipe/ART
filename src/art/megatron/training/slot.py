@@ -15,9 +15,9 @@ from art.distributed.art_runtime import (
     DistributedPackingPlan,
 )
 from art.distributed.object_store import (
-    BinaryObjectTarget,
+    OrderedBinaryObjectTarget,
     S3ObjectStoreConfig,
-    vllm_lora_object_target,
+    vllm_lora_ordered_target,
 )
 from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
@@ -1199,9 +1199,9 @@ class MegatronTrainingSlot:
 
     def _sampler_object_target(
         self, run_id: str, generation: TrainerGeneration
-    ) -> BinaryObjectTarget:
+    ) -> OrderedBinaryObjectTarget:
         assert self.sampler_store is not None
-        return vllm_lora_object_target(
+        return vllm_lora_ordered_target(
             self.sampler_store,
             run_id=run_id,
             training_session_id=generation.training_session_id,

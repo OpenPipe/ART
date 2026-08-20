@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from art.distributed.adapter_transport import AdapterTransferTarget
 from art.distributed.data_plane import PackedBatchRef
-from art.distributed.object_store import BinaryObjectTarget
+from art.distributed.object_store import BinaryObjectPublicationTarget
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
 from art.megatron.optimizer_state import OptimizerAdapter
 from art.training.contracts import AdamConfig, LossConfig
@@ -502,7 +502,7 @@ class GenerationSnapshotJobSpec(_Spec):
     staging_adapter_path: str | None = Field(default=None, min_length=1)
     existing_adapter: OptimizerAdapter | None = None
     publication_targets: tuple[AdapterTransferTarget, ...] = ()
-    adapter_object_target: BinaryObjectTarget | None = None
+    adapter_object_target: BinaryObjectPublicationTarget | None = None
     save_optimizer: bool = False
 
     @model_validator(mode="after")

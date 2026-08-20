@@ -8,7 +8,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from art.distributed.object_store import (
-    BinaryObjectTarget,
+    BinaryObjectPublicationTarget,
     binary_object_manifest_uri,
 )
 from art.megatron.optimizer_state import (
@@ -145,7 +145,7 @@ class SnapshotWriteTargets(_PublicationModel):
     local_adapter_target: OptimizerAdapter | None = None
     optimizer_state_path: str | None = Field(default=None, min_length=1)
     writes_optimizer: bool
-    adapter_object_target: BinaryObjectTarget | None = None
+    adapter_object_target: BinaryObjectPublicationTarget | None = None
 
     @model_validator(mode="after")
     def _validate_local_target(self) -> "SnapshotWriteTargets":
@@ -323,7 +323,7 @@ def build_snapshot_write_reservation_plan(
     local_adapter_staging_path: str | None = None,
     optimizer_state_path: str | None = None,
     writes_optimizer: bool,
-    adapter_object_target: BinaryObjectTarget | None = None,
+    adapter_object_target: BinaryObjectPublicationTarget | None = None,
 ) -> SnapshotWriteReservationPlan:
     return SnapshotWriteReservationPlan(
         snapshot=snapshot,

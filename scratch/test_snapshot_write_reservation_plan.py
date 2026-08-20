@@ -10,6 +10,7 @@ from art.distributed.object_store import (
     BinaryObjectTarget,
     S3ObjectStoreConfig,
     binary_object_manifest_uri,
+    vllm_lora_ordered_target,
 )
 from art.megatron.optimizer_state import (
     CheckpointFile,
@@ -139,6 +140,43 @@ def test_reservation_plan_round_trips_every_authorized_target(tmp_path: Path) ->
         reservation_plan_digest=plan.digest,
     )
     assert PreparedSave.model_validate_json(prepared.model_dump_json()) == prepared
+
+
+def test_reservation_plan_round_trips_ordered_sampler_target(tmp_path: Path) -> None:
+    plan = _reservation_plan(tmp_path)
+    generation = plan.snapshot.generation
+    current = plan.targets.adapter_object_target
+    assert current is not None
+    target = vllm_lora_ordered_target(
+        current.store,
+        run_id=current.metadata["run_id"],
+        training_session_id=generation.training_session_id,
+        generation_id=generation.generation_id,
+        policy_step=generation.policy_step,
+    )
+    rank = plan.snapshot.ranks[0]
+    assert rank.transport_adapter is not None
+    snapshot = plan.snapshot.model_copy(
+        update={
+            "ranks": (
+                rank.model_copy(
+                    update={
+                        "transport_adapter": rank.transport_adapter.model_copy(
+                            update={"identity": binary_object_manifest_uri(target)}
+                        )
+                    }
+                ),
+            )
+        }
+    )
+    ordered = SnapshotWriteReservationPlan(
+        snapshot=snapshot,
+        targets=plan.targets.model_copy(update={"adapter_object_target": target}),
+    )
+
+    assert SnapshotWriteReservationPlan.model_validate_json(
+        ordered.model_dump_json()
+    ) == ordered
 
 
 def test_reservation_digest_binds_targets_beyond_snapshot_content(
