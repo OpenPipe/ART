@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
 
@@ -67,6 +67,15 @@ class LoraCoverageReport(BaseModel):
     export_adapter_count: int = 0
     trainable_lora_parameter_count: int = 0
     unexpected_trainable_parameter_names: list[str] = Field(default_factory=list)
+
+
+def lora_coverage_passed(report: LoraCoverageReport) -> bool:
+    return (
+        not report.missing_wrapped_target_modules
+        and not report.missing_exported_target_modules
+        and report.trainable_lora_parameter_count > 0
+        and not report.unexpected_trainable_parameter_names
+    )
 
 
 @contextmanager
@@ -201,8 +210,8 @@ def build_lora_coverage_report(
     target_modules: list[str],
     adapter_prefixes: set[str],
     adapter_weights_by_base: dict[str, list[Any | str | None]],
-    trainable_lora_parameter_names: set[str] | None = None,
-    unexpected_trainable_parameter_names: set[str] | None = None,
+    trainable_lora_parameter_names: set[str],
+    unexpected_trainable_parameter_names: set[str],
 ) -> LoraCoverageReport:
     wrapped = sorted(_covered_wrapped_target_modules(adapter_prefixes))
     exported = sorted(_covered_exported_target_modules(adapter_weights_by_base))
@@ -216,11 +225,43 @@ def build_lora_coverage_report(
         wrapped_adapter_prefix_count=len(adapter_prefixes),
         export_base_count=len(adapter_weights_by_base),
         export_adapter_count=sum(map(len, adapter_weights_by_base.values())),
-        trainable_lora_parameter_count=len(trainable_lora_parameter_names or ()),
+        trainable_lora_parameter_count=len(trainable_lora_parameter_names),
         unexpected_trainable_parameter_names=sorted(
-            unexpected_trainable_parameter_names or ()
+            unexpected_trainable_parameter_names
         ),
     )
+
+
+def _classify_trainable_parameters(
+    model_chunks: Sequence[torch.nn.Module],
+) -> tuple[set[str], set[str]]:
+    modules: dict[int, LoRA] = {}
+    lora_parameter_ids: set[int] = set()
+    for chunk in model_chunks:
+        for module in chunk.modules():
+            if not isinstance(module, LoRA) or id(module) in modules:
+                continue
+            modules[id(module)] = module
+            lora_parameter_ids.update(
+                id(parameter) for parameter in module.parameters()
+            )
+    trainable_lora_names: set[str] = set()
+    unexpected_trainable_names: set[str] = set()
+    seen_parameters: set[int] = set()
+    for chunk_index, chunk in enumerate(model_chunks):
+        for name, parameter in chunk.named_parameters():
+            parameter_id = id(parameter)
+            if not parameter.requires_grad or parameter_id in seen_parameters:
+                continue
+            seen_parameters.add(parameter_id)
+            qualified_name = f"chunk_{chunk_index}.{name}"
+            names = (
+                trainable_lora_names
+                if parameter_id in lora_parameter_ids
+                else unexpected_trainable_names
+            )
+            names.add(qualified_name)
+    return trainable_lora_names, unexpected_trainable_names
 
 
 def run_lora_coverage(case_config: OracleCaseConfig) -> LoraCoverageReport:
@@ -250,10 +291,15 @@ def run_lora_coverage(case_config: OracleCaseConfig) -> LoraCoverageReport:
         adapter_weights_by_base = (
             runtime.provider_bundle.handler.build_adapter_weights_by_base(runtime.model)
         )
+        trainable_lora_names, unexpected_trainable_names = (
+            _classify_trainable_parameters(runtime.model)
+        )
 
     return build_lora_coverage_report(
         base_model=case_config.base_model,
         target_modules=list(runtime.provider_bundle.spec.default_target_modules),
         adapter_prefixes=adapter_prefixes,
         adapter_weights_by_base=adapter_weights_by_base,
+        trainable_lora_parameter_names=trainable_lora_names,
+        unexpected_trainable_parameter_names=unexpected_trainable_names,
     )

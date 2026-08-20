@@ -1149,14 +1149,22 @@ def test_run_lora_coverage_stage_reports_missing_targets(monkeypatch) -> None:
     coverage_report = SimpleNamespace(
         missing_wrapped_target_modules=["in_proj_z"],
         missing_exported_target_modules=[],
+        trainable_lora_parameter_count=1,
         unexpected_trainable_parameter_names=[],
         model_dump=lambda mode="json": {
             "base_model": "Qwen/Qwen3.5-35B-A3B",
             "missing_wrapped_target_modules": ["in_proj_z"],
         },
     )
+    predicate_reports = []
+
+    def _lora_coverage_passed(report):
+        predicate_reports.append(report)
+        return False
+
     coverage_module = SimpleNamespace(
-        run_lora_coverage=lambda case_config: coverage_report
+        run_lora_coverage=lambda case_config: coverage_report,
+        lora_coverage_passed=_lora_coverage_passed,
     )
 
     def _import_integration_module(name: str):
@@ -1178,6 +1186,7 @@ def test_run_lora_coverage_stage_reports_missing_targets(monkeypatch) -> None:
 
     assert stage.name == "lora_coverage"
     assert stage.passed is False
+    assert predicate_reports == [coverage_report]
     assert stage.metrics == {
         "base_model": "Qwen/Qwen3.5-35B-A3B",
         "missing_wrapped_target_modules": ["in_proj_z"],

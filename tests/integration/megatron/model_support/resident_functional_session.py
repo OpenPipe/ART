@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 from typing import Any, Literal
 
-from .lora_coverage import build_lora_coverage_report
+from .lora_coverage import build_lora_coverage_report, lora_coverage_passed
 from .validation_spec import ValidationStageResult
 
 _PARITY_LEARNING_RATE = 1e-6
@@ -129,10 +129,7 @@ async def run_resident_functional_session(
     return (
         ValidationStageResult(
             name="lora_coverage",
-            passed=not coverage_report.missing_wrapped_target_modules
-            and not coverage_report.missing_exported_target_modules
-            and coverage_report.trainable_lora_parameter_count > 0
-            and not coverage_report.unexpected_trainable_parameter_names
+            passed=lora_coverage_passed(coverage_report)
             and all(
                 summary["module_count"] > 0 and summary["trainable_parameter_count"] > 0
                 for summary in coverage_rank_summaries
