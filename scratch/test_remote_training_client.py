@@ -155,7 +155,7 @@ class FakeService:
                 self.operation_results.pop(operation_id, None)
                 return httpx.Response(204)
             return httpx.Response(200, content=self.operation_results[operation_id])
-        if path.startswith("/v1/training/operations/"):
+        if path.startswith("/v1/training/runs/run/operations/"):
             self.operation_status_gets += 1
             return httpx.Response(200, json=self.operations[path.rsplit("/", 1)[1]])
         if path == "/v1/training/runs/run:close":
@@ -334,6 +334,7 @@ async def test_operation_result_streams_into_exact_receive_buffer():
         transfer_http_client=http,
     )
     received = await service.get_operation_result(
+        "run",
         "operation",
         OperationResultRef(
             object_id="0" * 64,
@@ -375,9 +376,9 @@ async def test_operation_result_receive_budget_serializes_allocations():
         max_result_bytes_in_flight=len(payload),
     )
     ref = OperationResultRef(object_id="0" * 64, byte_count=len(payload))
-    first = asyncio.create_task(service.get_operation_result("first", ref))
+    first = asyncio.create_task(service.get_operation_result("run", "first", ref))
     await first_started.wait()
-    second = asyncio.create_task(service.get_operation_result("second", ref))
+    second = asyncio.create_task(service.get_operation_result("run", "second", ref))
     await asyncio.sleep(0)
     assert calls == 1
     release.set()
@@ -402,7 +403,9 @@ async def test_operation_result_rejects_content_length_before_allocation():
     )
     with pytest.raises(RemoteTrainingError, match="Content-Length changed"):
         await service.get_operation_result(
-            "operation", OperationResultRef(object_id="0" * 64, byte_count=4)
+            "run",
+            "operation",
+            OperationResultRef(object_id="0" * 64, byte_count=4),
         )
     await http.aclose()
 
@@ -433,9 +436,9 @@ async def test_operation_result_receive_budget_close_wakes_waiters():
         max_result_bytes_in_flight=len(payload),
     )
     ref = OperationResultRef(object_id="0" * 64, byte_count=len(payload))
-    first = asyncio.create_task(service.get_operation_result("first", ref))
+    first = asyncio.create_task(service.get_operation_result("run", "first", ref))
     await first_started.wait()
-    waiting = asyncio.create_task(service.get_operation_result("waiting", ref))
+    waiting = asyncio.create_task(service.get_operation_result("run", "waiting", ref))
     await asyncio.sleep(0)
     await service.close()
     with pytest.raises(RemoteTrainingError, match="budget is closed"):
@@ -544,7 +547,14 @@ async def test_remote_client_retries_and_preserves_command_order():
     )
     assert fake.operation_status_gets == 0
     assert 1 <= fake.nonempty_event_pages <= 2
-    assert sum(path.endswith("/result") for path in paths["control"]) == 1
+    result_path = f"/v1/training/runs/run/operations/{forward_operation_id}/result"
+    assert paths["control"].count(result_path) == 1
+    assert paths["transfer"].count(result_path) == 1
+    assert all(
+        "/training/operations/" not in path
+        for values in paths.values()
+        for path in values
+    )
     assert all(
         path.endswith("/forward_backward") or path.endswith("/result")
         for path in paths["transfer"]

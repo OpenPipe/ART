@@ -107,17 +107,17 @@ class _ByteBudget:
 class _ResultAcknowledger:
     def __init__(
         self,
-        acknowledge: Callable[[str], Awaitable[None]],
+        acknowledge: Callable[[str, str], Awaitable[None]],
         *,
         max_pending: int = 256,
     ) -> None:
         self._acknowledge = acknowledge
-        self._queue: asyncio.Queue[str | None] = asyncio.Queue(max_pending)
+        self._queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue(max_pending)
         self._worker: asyncio.Task[None] | None = None
         self._failure: BaseException | None = None
         self._closed = False
 
-    async def submit(self, operation_id: str) -> None:
+    async def submit(self, run_id: str, operation_id: str) -> None:
         if self._failure is not None:
             raise RemoteTrainingError("remote result acknowledgement failed") from (
                 self._failure
@@ -128,7 +128,7 @@ class _ResultAcknowledger:
             self._worker = asyncio.create_task(
                 self._run(), name="remote-training-result-acknowledger"
             )
-        await self._queue.put(operation_id)
+        await self._queue.put((run_id, operation_id))
 
     async def close(self) -> None:
         if not self._closed:
@@ -143,11 +143,11 @@ class _ResultAcknowledger:
 
     async def _run(self) -> None:
         while True:
-            operation_id = await self._queue.get()
+            item = await self._queue.get()
             try:
-                if operation_id is None:
+                if item is None:
                     return
-                await self._acknowledge(operation_id)
+                await self._acknowledge(*item)
             except BaseException as error:
                 self._failure = error
                 while not self._queue.empty():
@@ -329,13 +329,15 @@ class RemoteTrainingServiceClient:
         )
         return OperationRef.model_validate(response.json())
 
-    async def get_operation(self, operation_id: str) -> OperationView:
+    async def get_operation(self, run_id: str, operation_id: str) -> OperationView:
         return await self._request(
-            "GET", f"training/operations/{operation_id}", OperationView
+            "GET",
+            f"training/runs/{run_id}/operations/{operation_id}",
+            OperationView,
         )
 
     async def get_operation_result(
-        self, operation_id: str, ref: OperationResultRef
+        self, run_id: str, operation_id: str, ref: OperationResultRef
     ) -> bytearray:
         async with self._result_budget.reserve(ref.byte_count):
             failure_count = 0
@@ -345,7 +347,9 @@ class RemoteTrainingServiceClient:
                         "remote training service client is closed"
                     )
                 try:
-                    return await self._download_operation_result(operation_id, ref)
+                    return await self._download_operation_result(
+                        run_id, operation_id, ref
+                    )
                 except BaseException as error:
                     if not _is_transient_failure(error):
                         raise
@@ -357,11 +361,11 @@ class RemoteTrainingServiceClient:
                 failure_count = min(failure_count + 1, 4)
 
     async def _download_operation_result(
-        self, operation_id: str, ref: OperationResultRef
+        self, run_id: str, operation_id: str, ref: OperationResultRef
     ) -> bytearray:
         response = await self._send(
             "GET",
-            f"training/operations/{operation_id}/result",
+            f"training/runs/{run_id}/operations/{operation_id}/result",
             content=None,
             headers=None,
             transfer=True,
@@ -387,13 +391,17 @@ class RemoteTrainingServiceClient:
             raise RemoteTrainingError("remote operation result byte count changed")
         return payload
 
-    async def acknowledge_operation_result(self, operation_id: str) -> None:
-        await self._result_acknowledger.submit(operation_id)
+    async def acknowledge_operation_result(
+        self, run_id: str, operation_id: str
+    ) -> None:
+        await self._result_acknowledger.submit(run_id, operation_id)
 
-    async def _acknowledge_operation_result(self, operation_id: str) -> None:
+    async def _acknowledge_operation_result(
+        self, run_id: str, operation_id: str
+    ) -> None:
         await self._send(
             "DELETE",
-            f"training/operations/{operation_id}/result",
+            f"training/runs/{run_id}/operations/{operation_id}/result",
             content=None,
             headers=None,
         )
@@ -406,11 +414,11 @@ class RemoteTrainingServiceClient:
         )
 
     async def cancel_operation(
-        self, operation_id: str, request_id: str
+        self, run_id: str, operation_id: str, request_id: str
     ) -> OperationView:
         return await self._request(
             "POST",
-            f"training/operations/{operation_id}:cancel",
+            f"training/runs/{run_id}/operations/{operation_id}:cancel",
             OperationView,
             body=CancelOperationRequest(request_id=request_id),
         )
@@ -818,7 +826,7 @@ class RemoteTrainingOperation(Generic[ResultT]):
         if self._ref.kind in {"forward", "forward_backward"}:
             remote = OperationResultRef.model_validate(event.payload)
             payload = await self._service.get_operation_result(
-                self._ref.operation_id, remote
+                self._ref.run_id, self._ref.operation_id, remote
             )
             result = decode_operation_result(remote, payload, self._result_type)
         else:
@@ -826,17 +834,23 @@ class RemoteTrainingOperation(Generic[ResultT]):
         if result.operation_id != self._ref.operation_id:
             raise RemoteTrainingError("operation result identity changed")
         if self._ref.kind in {"forward", "forward_backward"}:
-            await self._service.acknowledge_operation_result(self._ref.operation_id)
+            await self._service.acknowledge_operation_result(
+                self._ref.run_id, self._ref.operation_id
+            )
         return result
 
     async def cancel(self) -> None:
         try:
             await self._service.cancel_operation(
-                self._ref.operation_id, self._cancel_request_id
+                self._ref.run_id,
+                self._ref.operation_id,
+                self._cancel_request_id,
             )
         except RemoteTrainingHttpError as error:
             if error.status_code != 409 or (
-                await self._service.get_operation(self._ref.operation_id)
+                await self._service.get_operation(
+                    self._ref.run_id, self._ref.operation_id
+                )
             ).status not in {"running", "succeeded"}:
                 raise
             await self.result()
@@ -1023,12 +1037,12 @@ class RemoteTrainingClient:
         result_type: type[ResultT],
     ) -> TrainingOperation[ResultT]:
         operation_id = _operation_id(request.run_id, request.request_id)
-        view = await self._service.get_operation(operation_id)
+        view = await self._service.get_operation(request.run_id, operation_id)
         self._validate_replay(view, request, kind, fingerprint)
         event = _terminal_event(view)
         if event is None:
             terminal = self._events.reserve(operation_id)
-            view = await self._service.get_operation(operation_id)
+            view = await self._service.get_operation(request.run_id, operation_id)
             self._validate_replay(view, request, kind, fingerprint)
             event = _terminal_event(view)
             if event is not None and not terminal.done():

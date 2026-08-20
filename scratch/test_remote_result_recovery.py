@@ -143,7 +143,8 @@ async def test_result_restarts_after_mid_body_disconnect_and_verifies_exact_byte
             raise httpx.ReadError("mid-body disconnect", request=self.request)
 
     async def handle(request: httpx.Request) -> httpx.Response:
-        paths.append(request.url.path)
+        if request.method == "GET":
+            paths.append(request.url.path)
         if len(paths) == 1:
             return httpx.Response(
                 200,
@@ -156,8 +157,8 @@ async def test_result_restarts_after_mid_body_disconnect_and_verifies_exact_byte
     try:
         assert await asyncio.wait_for(_operation(service, ref).result(), 1.0) == result
         assert paths == [
-            "/v1/training/operations/operation/result",
-            "/v1/training/operations/operation/result",
+            "/v1/training/runs/run/operations/operation/result",
+            "/v1/training/runs/run/operations/operation/result",
         ]
     finally:
         await service.close()
@@ -249,7 +250,7 @@ async def test_result_recovery_remains_cancellable():
         )
 
     service, http = _service(handle)
-    task = asyncio.create_task(service.get_operation_result(_OPERATION_ID, ref))
+    task = asyncio.create_task(service.get_operation_result("run", _OPERATION_ID, ref))
     try:
         await asyncio.wait_for(retry_started.wait(), 1.0)
         task.cancel()

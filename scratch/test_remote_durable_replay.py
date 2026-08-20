@@ -76,7 +76,8 @@ class _ReplayService(RemoteTrainingServiceClient):
         self.views[ref.operation_id] = self._view(request, ref, "succeeded")
         return ref
 
-    async def get_operation(self, operation_id: str) -> OperationView:
+    async def get_operation(self, run_id: str, operation_id: str) -> OperationView:
+        assert run_id == "run"
         self.gets[operation_id] = self.gets.get(operation_id, 0) + 1
         view = self.views[operation_id]
         if operation_id in self.finish_on_second_get and self.gets[operation_id] == 2:
