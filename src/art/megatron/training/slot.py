@@ -208,7 +208,6 @@ class MegatronTrainingSlot:
         self._runs: dict[str, _ResidentRun] = {}
         self._results: dict[str, tuple[str, Contract]] = {}
         self._pending_results: dict[str, tuple[str, asyncio.Future[Contract]]] = {}
-        self._recovery_heads: dict[str, asyncio.Task[SaveStateResult]] = {}
         self._prepared_saves: dict[str, _PreparedSaveOperation] = {}
         self._sft_tokenizer = SftBatchTokenizer()
         self._batch_releases: set[asyncio.Task[None]] = set()
@@ -875,13 +874,13 @@ class MegatronTrainingSlot:
         )
         return prepared
 
-    def start_recovery_head(
+    async def prepare_recovery_head(
         self,
         run_id: str,
         *,
         learner_version: int,
         sequence_id: int,
-    ) -> asyncio.Future[SaveStateResult]:
+    ) -> PreparedSave:
         state = self._require_run(run_id)
         generation = state.generation
         if (
@@ -890,9 +889,6 @@ class MegatronTrainingSlot:
         ):
             raise RuntimeError("recovery head is not the resident learner generation")
         operation_id = f"art-recovery-{generation.generation_id}"
-        existing = self._recovery_heads.get(operation_id)
-        if existing is not None:
-            return existing
         request = SaveStateRequest(
             run_id=run_id,
             request_id=operation_id,
@@ -906,32 +902,7 @@ class MegatronTrainingSlot:
             learner_parent_version=learner_version,
             kind="save_state",
         )
-        source = self._snapshot_source(ref)
-
-        async def complete() -> SaveStateResult:
-            prepared = await self._prepare_save(ref, request, source)
-            result = await asyncio.shield(
-                self.authorize_save(prepared, SnapshotWriteGrant.local(prepared.plan))
-            )
-            if not isinstance(result, SaveStateResult):
-                raise TypeError("recovery snapshot did not produce optimizer state")
-            return result
-
-        task = asyncio.create_task(
-            complete(), name=f"megatron-recovery-{generation.generation_id}"
-        )
-        self._recovery_heads[operation_id] = task
-
-        def completed(done: asyncio.Task[SaveStateResult]) -> None:
-            if (
-                self._recovery_heads.get(operation_id) is done
-                and not done.cancelled()
-                and done.exception() is None
-            ):
-                self._recovery_heads.pop(operation_id)
-
-        task.add_done_callback(completed)
-        return task
+        return await self._prepare_save(ref, request, self._snapshot_source(ref))
 
     def authorize_save(
         self,
@@ -1215,21 +1186,6 @@ class MegatronTrainingSlot:
             return
         primary: BaseException | None = None
         try:
-            if self._recovery_heads:
-                outcomes = await asyncio.gather(
-                    *tuple(self._recovery_heads.values()), return_exceptions=True
-                )
-                failures = [
-                    outcome
-                    for outcome in outcomes
-                    if isinstance(outcome, BaseException)
-                ]
-                if len(failures) == 1:
-                    raise failures[0]
-                if failures:
-                    raise BaseExceptionGroup(
-                        "recovery snapshot completion failed", failures
-                    )
             if self._pending_results:
                 outcomes = await asyncio.gather(
                     *(pending[1] for pending in self._pending_results.values()),
