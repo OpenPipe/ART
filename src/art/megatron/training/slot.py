@@ -555,6 +555,12 @@ class MegatronTrainingSlot:
             packed = await self.runtime.materialize_pack(planned.packing)
             if packed is None:
                 raise ValueError(f"{planned.kind} batch produced no packed sequence")
+            await self.trainer.prepare_cp_lookahead(
+                packed.leases,
+                global_grad_accumulation_sequences=(
+                    planned.config.grad_accumulation_sequences
+                ),
+            )
             prepared = PreparedPackedForward(
                 ref=planned.ref,
                 kind=planned.kind,
