@@ -614,6 +614,9 @@ def _mamba_stack_forward(
                 "ART prefix-tree Mamba full recompute requires uniform/block and "
                 "a positive recompute_num_layers"
             )
+        # Reentrant checkpoints attach autograd only through explicit inputs.
+        if torch.is_grad_enabled() and not hidden_states.requires_grad:
+            hidden_states.requires_grad_(True)
 
         def checkpoint_range(value: torch.Tensor, start: int, end: int) -> torch.Tensor:
             def forward(tensor: torch.Tensor) -> torch.Tensor:
@@ -912,8 +915,6 @@ def _validate_prefix_invocation(
     inference_params: Any | None,
     packed_seq_params: Any | None,
 ) -> None:
-    if not module.training:
-        raise RuntimeError("ART prefix-tree Mamba is training-only")
     if inference_context is not None or inference_params is not None:
         raise RuntimeError("ART prefix-tree Mamba does not support inference state")
     if packed_seq_params is not None:
