@@ -35,6 +35,7 @@ HF_PARITY_PACKED_TENSORS = PackedTensorConfig(
     sequence_length=256,
     prefill_tokens=64,
     decode_tokens=64,
+    packing_mode="truncate",
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
