@@ -17,6 +17,7 @@ FIXTURE_PATH_ENV = "ART_MODEL_SUPPORT_FIXTURE_PATH"
 FIXTURE_CACHE_ENV = "ART_MODEL_SUPPORT_FIXTURE_CACHE"
 FIXTURE_ROOT_ENV = "ART_MODEL_SUPPORT_FIXTURE_ROOT"
 FIXTURE_VERSION = 18
+_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 1}
 _CANONICAL_CACHE_VERSION = 16
 _ROOT = Path("/tmp/art-models/main-merge-oracle")
 _CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
@@ -815,6 +816,10 @@ def _fixture_namespace(
     ).hexdigest()[:16]
 
 
+def _fixture_version(model_key: str) -> int:
+    return FIXTURE_VERSION + _MODEL_FIXTURE_VERSION_OFFSETS.get(model_key, 0)
+
+
 def _is_current(
     path: Path,
     *,
@@ -831,7 +836,11 @@ def _is_current(
         return False
     expected = {
         "version": version
-        or (_TOKENIZER_FIXTURE_VERSION if tokenizer_compatible else FIXTURE_VERSION),
+        or (
+            _TOKENIZER_FIXTURE_VERSION
+            if tokenizer_compatible
+            else _fixture_version(model_key)
+        ),
         "source_model": canonical_model,
         "source_revision": revision,
         "handler": model_key,
@@ -980,6 +989,15 @@ def _build(
                 model = auto.from_config(config, trust_remote_code=True).to(
                     torch.bfloat16
                 )
+            save_kwargs: dict[str, object] = {}
+            if model_key == "nemotron_h_moe":
+                if model._tied_weights_keys != ["lm_head.weight"]:
+                    raise RuntimeError(
+                        "nemotron_h_moe remote tied-weight contract changed"
+                    )
+                model._tied_weights_keys = {}
+                model.register_for_auto_class("AutoModelForCausalLM")
+                save_kwargs["save_original_format"] = False
             if model_key.startswith("gemma4_"):
                 layers = model.model.language_model.layers
                 residual_scale = (2 * len(layers)) ** -0.5
@@ -989,7 +1007,10 @@ def _build(
                         layer.post_feedforward_layernorm.weight.fill_(residual_scale)
             parameters = sum(parameter.numel() for parameter in model.parameters())
             model.save_pretrained(
-                staging, safe_serialization=True, max_shard_size="2GB"
+                staging,
+                safe_serialization=True,
+                max_shard_size="2GB",
+                **save_kwargs,
             )
             del model
             gc.collect()
@@ -1009,7 +1030,9 @@ def _build(
         )
         manifest = {
             "version": (
-                _TOKENIZER_FIXTURE_VERSION if tokenizer_compatible else FIXTURE_VERSION
+                _TOKENIZER_FIXTURE_VERSION
+                if tokenizer_compatible
+                else _fixture_version(model_key)
             ),
             "source_model": canonical_model,
             "source_revision": revision,
@@ -1346,7 +1369,7 @@ def ensure_workflow_fixture(
         revision=revision,
         root=root,
         cache_root=Path(os.environ.get(FIXTURE_CACHE_ENV, str(_CACHE_ROOT))),
-        version=FIXTURE_VERSION,
+        version=_fixture_version(model_key),
         tokenizer_compatible=False,
     )
     tokenizer_path: Path | None = None
