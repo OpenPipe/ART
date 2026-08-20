@@ -228,7 +228,7 @@ def run_lora_coverage(case_config: OracleCaseConfig) -> LoraCoverageReport:
     with _single_rank_model_parallel():
         with provider_topology_env(topology):
             runtime = megatron_train.build_training_runtime(
-                model_identifier=case_config.base_model,
+                model_identifier=case_config.provider_model or case_config.base_model,
                 provider_torch_dtype=torch.float32,
                 provider_configure=lambda provider: _configure_provider(
                     provider, topology, case_config
@@ -236,6 +236,7 @@ def run_lora_coverage(case_config: OracleCaseConfig) -> LoraCoverageReport:
                 print_env=False,
                 build_optimizer=False,
                 allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+                model_support_key=case_config.model_support_key,
             )
         adapter_prefixes = {
             module.adapter_model_prefix
