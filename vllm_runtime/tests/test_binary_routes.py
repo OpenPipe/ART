@@ -24,11 +24,13 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
             (256, np.uint8, [[[0, 255]]]),
             (257, np.uint16, [[[0, 256]]]),
         ):
-            body = binary_routes.encode_routed_experts_response(
-                response,
-                {0: np.asarray(values, dtype=dtype)},
+            routes = binary_routes._CapturedRoutes(
                 num_experts=num_experts,
+                padding_layers=(),
+                layer_count=1,
             )
+            routes[0] = np.asarray(values, dtype=dtype)
+            body = binary_routes.encode_routed_experts_response(response, routes)
             decoded_response, routes = decode_routed_experts_response(body)
 
             self.assertEqual(decoded_response.id, "route-test")
@@ -37,18 +39,24 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
             np.testing.assert_array_equal(routes[0], values)
 
     def test_rejects_expert_count_beyond_uint16_protocol(self) -> None:
+        routes = binary_routes._CapturedRoutes(
+            num_experts=65_537,
+            padding_layers=(),
+            layer_count=1,
+        )
+        routes[0] = np.zeros((1, 1, 1), dtype=np.uint16)
         with self.assertRaisesRegex(RuntimeError, r"\[1, 65536\]"):
-            binary_routes.encode_routed_experts_response(
-                b"{}",
-                {0: np.zeros((1, 1, 1), dtype=np.uint16)},
-                num_experts=65_537,
-            )
+            binary_routes.encode_routed_experts_response(b"{}", routes)
 
     def test_capture_registers_vllm_authoritative_route_layout(self) -> None:
         text_config = type(
             "TextConfig",
             (),
-            {"num_hidden_layers": 2, "mlp_layer_types": ["dense", "sparse"]},
+            {
+                "num_hidden_layers": 2,
+                "mlp_layer_types": ["dense", "sparse"],
+                "num_experts_per_tok": 2,
+            },
         )()
         model_config = type(
             "ModelConfig",
@@ -61,22 +69,30 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
         previous = (
             binary_routes._REGISTERED_NUM_EXPERTS,
             binary_routes._REGISTERED_PADDING_LAYERS,
+            binary_routes._REGISTERED_LAYER_COUNT,
         )
         try:
             binary_routes._REGISTERED_NUM_EXPERTS = None
             binary_routes._REGISTERED_PADDING_LAYERS = None
+            binary_routes._REGISTERED_LAYER_COUNT = None
             binary_routes._register_model_route_layout(model_config)
             with binary_routes.capture_routed_experts() as routes:
                 self.assertEqual(routes.num_experts, 257)
                 self.assertEqual(routes.padding_layers, (0,))
+                self.assertEqual(routes.layer_count, 2)
         finally:
             (
                 binary_routes._REGISTERED_NUM_EXPERTS,
                 binary_routes._REGISTERED_PADDING_LAYERS,
+                binary_routes._REGISTERED_LAYER_COUNT,
             ) = previous
 
     def test_resolves_only_registered_padding_layers(self) -> None:
-        routes = binary_routes._CapturedRoutes(num_experts=8, padding_layers=(0, 1, 2))
+        routes = binary_routes._CapturedRoutes(
+            num_experts=8,
+            padding_layers=(0, 1, 2),
+            layer_count=5,
+        )
         values = np.zeros((2, 5, 2), dtype=np.uint8)
         values[:, 3, :] = (2, 5)
         values[:, 4, :] = (1, 7)
@@ -99,7 +115,11 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
         np.testing.assert_array_equal(decoded[0][:, 3:, :], values[:, 3:, :])
 
     def test_rejects_missing_capture_on_routed_layer(self) -> None:
-        routes = binary_routes._CapturedRoutes(num_experts=8, padding_layers=(0, 1, 2))
+        routes = binary_routes._CapturedRoutes(
+            num_experts=8,
+            padding_layers=(0, 1, 2),
+            layer_count=5,
+        )
         values = np.zeros((1, 5, 2), dtype=np.uint8)
         values[:, 3, :] = (2, 5)
         routes[0] = values

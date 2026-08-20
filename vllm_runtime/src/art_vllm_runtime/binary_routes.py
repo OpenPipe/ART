@@ -17,13 +17,21 @@ PIPELINE_ROUTES_ENV = "ART_VLLM_PIPELINE_ROUTES_PROTOCOL"
 PIPELINE_ROUTES_PROTOCOL = "1"
 _REGISTERED_NUM_EXPERTS: int | None = None
 _REGISTERED_PADDING_LAYERS: tuple[int, ...] | None = None
+_REGISTERED_LAYER_COUNT: int | None = None
 
 
 class _CapturedRoutes(dict[int, np.ndarray]):
-    def __init__(self, *, num_experts: int, padding_layers: tuple[int, ...]) -> None:
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        padding_layers: tuple[int, ...],
+        layer_count: int,
+    ) -> None:
         super().__init__()
         self.num_experts = num_experts
         self.padding_layers = padding_layers
+        self.layer_count = layer_count
 
 
 _CAPTURE: ContextVar[_CapturedRoutes | None] = ContextVar(
@@ -33,11 +41,16 @@ _CAPTURE: ContextVar[_CapturedRoutes | None] = ContextVar(
 
 @contextmanager
 def capture_routed_experts() -> Iterator[_CapturedRoutes]:
-    if _REGISTERED_NUM_EXPERTS is None or _REGISTERED_PADDING_LAYERS is None:
+    if (
+        _REGISTERED_NUM_EXPERTS is None
+        or _REGISTERED_PADDING_LAYERS is None
+        or _REGISTERED_LAYER_COUNT is None
+    ):
         raise RuntimeError("vLLM did not register an exact MoE route layout")
     routes = _CapturedRoutes(
         num_experts=_REGISTERED_NUM_EXPERTS,
         padding_layers=_REGISTERED_PADDING_LAYERS,
+        layer_count=_REGISTERED_LAYER_COUNT,
     )
     token = _CAPTURE.set(routes)
     try:
@@ -48,11 +61,9 @@ def capture_routed_experts() -> Iterator[_CapturedRoutes]:
 
 def encode_routed_experts_response(
     json_body: bytes,
-    routes: dict[int, np.ndarray],
-    *,
-    num_experts: int | None = None,
+    routes: _CapturedRoutes,
 ) -> bytes:
-    num_experts = int(num_experts or getattr(routes, "num_experts", 0))
+    num_experts = routes.num_experts
     dtype = _route_dtype(num_experts)
     chunks: list[bytes | memoryview] = [
         HEADER.pack(MAGIC, len(json_body), len(routes), num_experts),
@@ -72,7 +83,9 @@ def encode_routed_experts_response(
                 f"{dtype}, got {array.dtype}"
             )
         _resolve_padding_routes(
-            array, padding_layers=getattr(routes, "padding_layers", ())
+            array,
+            padding_layers=routes.padding_layers,
+            layer_count=routes.layer_count,
         )
         _validate_route_ids(array, num_experts=num_experts)
         array = np.ascontiguousarray(array)
@@ -106,25 +119,57 @@ def _validate_route_ids(array: np.ndarray, *, num_experts: int) -> None:
 
 
 def _resolve_padding_routes(
-    array: np.ndarray, *, padding_layers: tuple[int, ...]
+    array: np.ndarray,
+    *,
+    padding_layers: tuple[int, ...],
+    layer_count: int,
 ) -> None:
+    if array.shape[1] != layer_count:
+        raise RuntimeError(
+            "Routed-expert response layer count does not match the registered model: "
+            f"{array.shape[1]} != {layer_count}"
+        )
     if not padding_layers:
         return
-    if padding_layers[-1] >= array.shape[1]:
-        raise RuntimeError(
-            "Routed-expert response has fewer layers than the registered model"
-        )
     padding = array[:, padding_layers, :]
     if padding.size and bool(np.any(padding)):
         raise RuntimeError("Non-routed layer contained captured expert ids")
     array[:, padding_layers, :] = np.arange(array.shape[-1], dtype=array.dtype)
 
 
-def _model_padding_layers(model_config: Any) -> tuple[int, ...]:
+def _model_route_config(model_config: Any) -> Any:
     config = getattr(model_config, "hf_text_config", None)
     if config is None:
         config = getattr(model_config, "hf_config", model_config)
+    return config
+
+
+def _model_layer_count(model_config: Any) -> int:
+    num_layers = int(getattr(_model_route_config(model_config), "num_hidden_layers", 0))
+    if num_layers < 1:
+        raise RuntimeError("Model route layout requires a positive num_hidden_layers")
+    return num_layers
+
+
+def _model_padding_layers(model_config: Any) -> tuple[int, ...]:
+    config = _model_route_config(model_config)
     num_layers = int(getattr(config, "num_hidden_layers", 0))
+    hybrid_pattern = getattr(config, "hybrid_override_pattern", None)
+    if hybrid_pattern is not None:
+        if (
+            not isinstance(hybrid_pattern, str)
+            or num_layers < 1
+            or len(hybrid_pattern) != num_layers
+        ):
+            raise RuntimeError(
+                "hybrid_override_pattern does not match num_hidden_layers"
+            )
+        unsupported = set(hybrid_pattern) - {"E", "M", "*", "-"}
+        if unsupported:
+            raise RuntimeError(
+                f"Unsupported hybrid layer symbols: {sorted(unsupported)}"
+            )
+        return tuple(i for i, kind in enumerate(hybrid_pattern) if kind != "E")
     layer_types = getattr(config, "mlp_layer_types", None)
     if layer_types is not None:
         if len(layer_types) != num_layers:
@@ -163,7 +208,7 @@ def _normalize_route_topk(model_config: Any) -> None:
 
 
 def _register_model_route_layout(model_config: Any) -> None:
-    global _REGISTERED_NUM_EXPERTS, _REGISTERED_PADDING_LAYERS
+    global _REGISTERED_LAYER_COUNT, _REGISTERED_NUM_EXPERTS, _REGISTERED_PADDING_LAYERS
     _normalize_route_topk(model_config)
     getter = getattr(model_config, "get_num_experts", None)
     if callable(getter):
@@ -187,6 +232,7 @@ def _register_model_route_layout(model_config: Any) -> None:
             raise RuntimeError(f"Model configs disagree on MoE expert count: {values}")
         num_experts = values.pop()
     _route_dtype(num_experts)
+    layer_count = _model_layer_count(model_config)
     padding_layers = _model_padding_layers(model_config)
     if _REGISTERED_NUM_EXPERTS not in {None, num_experts}:
         raise RuntimeError(
@@ -194,8 +240,11 @@ def _register_model_route_layout(model_config: Any) -> None:
         )
     if _REGISTERED_PADDING_LAYERS not in {None, padding_layers}:
         raise RuntimeError("One vLLM process cannot capture different MoE layouts")
+    if _REGISTERED_LAYER_COUNT not in {None, layer_count}:
+        raise RuntimeError("One vLLM process cannot capture different layer counts")
     _REGISTERED_NUM_EXPERTS = num_experts
     _REGISTERED_PADDING_LAYERS = padding_layers
+    _REGISTERED_LAYER_COUNT = layer_count
 
 
 def patch_binary_routed_experts_response() -> None:
