@@ -111,6 +111,10 @@ class GenerationSnapshotLaunch(NamedTuple):
     completion: asyncio.Task[DurableTrainerPublication]
 
 
+class ForwardBackwardServiceLaunch(NamedTuple):
+    completion: asyncio.Task[dict[str, Any]]
+
+
 class _TrainerJobFields(TypedDict):
     job_id: str
     run_id: str
@@ -1194,9 +1198,26 @@ class DistributedMegatronService:
         *,
         loss: LossConfig | None = None,
     ) -> dict[str, Any]:
-        return await self._forward_command(
+        launch = await self.start_forward_backward_command(
+            ref, batch, config, experimental_config, loss=loss
+        )
+        return await asyncio.shield(launch.completion)
+
+    async def start_forward_backward_command(
+        self,
+        ref: OperationRef,
+        batch: DistributedPackedBatch,
+        config: RlForwardBackwardConfig,
+        experimental_config: ExperimentalTrainConfig,
+        *,
+        loss: LossConfig | None = None,
+    ) -> ForwardBackwardServiceLaunch:
+        result = await self._forward_command(
             ref, batch, config, experimental_config, loss=loss, backward=True
         )
+        if not isinstance(result, ForwardBackwardServiceLaunch):
+            raise TypeError("F/B command did not return a gradient-ready launch")
+        return result
 
     async def forward_command(
         self,
@@ -1220,7 +1241,7 @@ class DistributedMegatronService:
         *,
         loss: LossConfig | None,
         backward: bool,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | ForwardBackwardServiceLaunch:
         async with self._train_lock, self._trainer_failure_boundary():
             if self._temporal_gpu_sharing and self._base_url is not None:
                 async with self._serving_lock:
@@ -1279,7 +1300,7 @@ class DistributedMegatronService:
                 else nullcontext()
             ):
                 result = await (
-                    trainer.forward_backward(job, batch.leases)
+                    trainer.start_forward_backward(job, batch.leases)
                     if backward
                     else trainer.forward(job, batch.leases)
                 )
@@ -1289,7 +1310,23 @@ class DistributedMegatronService:
                         "learner advanced while forward command executed"
                     )
                 self._trainer_resident_generation = source
-            return result
+            if not backward:
+                return result
+
+            async def complete() -> dict[str, Any]:
+                try:
+                    return await asyncio.shield(result.completion)
+                except BaseException as error:
+                    await self._cleanup_failed_trainer_transaction(
+                        trainer, None, error
+                    )
+                    raise
+
+            return ForwardBackwardServiceLaunch(
+                asyncio.create_task(
+                    complete(), name=f"megatron-fb-service-result-{ref.operation_id}"
+                )
+            )
 
     async def sft_forward_backward_command(
         self,

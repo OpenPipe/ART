@@ -61,7 +61,9 @@ CommandResultT = TypeVar("CommandResultT")
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
 _MAX_RETAINED_COMPLETED_RESULT_BYTES = 512 << 20
 _TASK_DRAIN_TIMEOUT_S = process_shutdown_timeout(2)
-_DEFERRED_RESULT_KINDS = frozenset({"save_sampler", "save_state"})
+_DEFERRED_RESULT_KINDS = frozenset(
+    {"forward_backward", "save_sampler", "save_state"}
+)
 _SEQUENCE_POISONING_KINDS = frozenset({"forward_backward", "optim_step", "load_state"})
 
 
@@ -527,34 +529,53 @@ class LocalMegatronTrainingClient:
                 )
                 metrics = packing_metrics(packed)
                 try:
-                    raw = await (
-                        self._service.forward_backward_command(
+                    if backward:
+                        launch = await self._service.start_forward_backward_command(
                             admission.ref,
                             packed,
                             RlForwardBackwardConfig(),
                             ExperimentalTrainConfig(),
                             loss=request.loss,
                         )
-                        if backward
-                        else self._service.forward_command(
+                    else:
+                        raw = await self._service.forward_command(
                             admission.ref,
                             packed,
                             RlForwardBackwardConfig(),
                             ExperimentalTrainConfig(),
                             loss=request.loss,
                         )
-                    )
                 finally:
                     self._release_batch_soon(packed)
-                result_type = ForwardBackwardResult if backward else ForwardResult
-                return result_type(
-                    operation_id=admission.ref.operation_id,
-                    packing=packing,
-                    loss_fn_outputs=tuple(
-                        LossFnOutput(token_logprobs=values)
-                        for values in raw["token_logprobs"]
-                    ),
-                    metrics={**metrics, **raw["metrics"]},
+
+                def tokenized_result(raw: dict[str, Any]):
+                    result_type = (
+                        ForwardBackwardResult if backward else ForwardResult
+                    )
+                    return result_type(
+                        operation_id=admission.ref.operation_id,
+                        packing=packing,
+                        loss_fn_outputs=tuple(
+                            LossFnOutput(token_logprobs=values)
+                            for values in raw["token_logprobs"]
+                        ),
+                        metrics={**metrics, **raw["metrics"]},
+                    )
+
+                if not backward:
+                    return tokenized_result(raw)
+
+                async def complete_tokenized() -> ForwardBackwardResult:
+                    return cast(
+                        ForwardBackwardResult,
+                        tokenized_result(await asyncio.shield(launch.completion)),
+                    )
+
+                return _DeferredResult(
+                    asyncio.create_task(
+                        complete_tokenized(),
+                        name=f"megatron-fb-result-{admission.ref.operation_id}",
+                    )
                 )
             batch = await self._prepare_rl_batch(request)
             payload = batch.payload
@@ -562,6 +583,7 @@ class LocalMegatronTrainingClient:
 
             if not isinstance(payload, _DistributedBatchPayload):
                 raise RuntimeError("local command did not use the typed data plane")
+
             async def release_sources() -> float:
                 started = time.perf_counter()
                 await self._backend._release_trajectory_sources(batch, payload)
@@ -570,7 +592,7 @@ class LocalMegatronTrainingClient:
             training_config = forward_backward_config(request)
             raw, release_s = await _run_command_while_releasing(
                 (
-                    self._service.forward_backward_command(
+                    self._service.start_forward_backward_command(
                         admission.ref,
                         payload.packed,
                         training_config,
@@ -589,30 +611,49 @@ class LocalMegatronTrainingClient:
                     f"release-trajectory-sources-{admission.ref.operation_id}"
                 ),
             )
-            result_type = ForwardBackwardResult if backward else ForwardResult
-            return result_type(
-                operation_id=admission.ref.operation_id,
-                packing=packing_outcome(
-                    payload.packed,
-                    target_packed_sequences=(
-                        await self._service.resolve_global_grad_accumulation_sequences(
-                            TrainConfig(
-                                grad_accumulation_sequences=(
-                                    training_config.grad_accumulation_sequences
-                                )
+            packing = packing_outcome(
+                payload.packed,
+                target_packed_sequences=(
+                    await self._service.resolve_global_grad_accumulation_sequences(
+                        TrainConfig(
+                            grad_accumulation_sequences=(
+                                training_config.grad_accumulation_sequences
                             )
                         )
+                    )
+                ),
+            )
+            metrics = {
+                **packing_metrics(payload.packed),
+                "time/step_source_lease_release_s": release_s,
+            }
+
+            def packed_result(raw: dict[str, Any]):
+                result_type = ForwardBackwardResult if backward else ForwardResult
+                return result_type(
+                    operation_id=admission.ref.operation_id,
+                    packing=packing,
+                    loss_fn_outputs=tuple(
+                        LossFnOutput(token_logprobs=values)
+                        for values in raw["token_logprobs"]
                     ),
-                ),
-                loss_fn_outputs=tuple(
-                    LossFnOutput(token_logprobs=values)
-                    for values in raw["token_logprobs"]
-                ),
-                metrics={
-                    **packing_metrics(payload.packed),
-                    "time/step_source_lease_release_s": release_s,
-                    **raw["metrics"],
-                },
+                    metrics={**metrics, **raw["metrics"]},
+                )
+
+            if not backward:
+                return packed_result(raw)
+
+            async def complete_packed() -> ForwardBackwardResult:
+                return cast(
+                    ForwardBackwardResult,
+                    packed_result(await asyncio.shield(raw.completion)),
+                )
+
+            return _DeferredResult(
+                asyncio.create_task(
+                    complete_packed(),
+                    name=f"megatron-fb-result-{admission.ref.operation_id}",
+                )
             )
 
         kind: OperationKind = "forward_backward" if backward else "forward"

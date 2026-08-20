@@ -135,9 +135,22 @@ class _Service:
     async def consume_cancelled_command(self, ref) -> None:
         self.calls.append(f"cancelled:{ref.sequence_id}")
 
-    async def forward_backward_command(self, ref, _batch, _config, _experimental):
+    async def start_forward_backward_command(
+        self, ref, _batch, _config, _experimental
+    ):
         self.calls.append(f"fb:{ref.sequence_id}")
-        return {"token_logprobs": ((-1.0, -2.0),), "metrics": {"fb": 1.0}}
+        completion = asyncio.get_running_loop().create_future()
+        completion.set_result(
+            {"token_logprobs": ((-1.0, -2.0),), "metrics": {"fb": 1.0}}
+        )
+        return SimpleNamespace(completion=completion)
+
+    async def forward_backward_command(self, ref, _batch, _config, _experimental):
+        return await (
+            await self.start_forward_backward_command(
+                ref, _batch, _config, _experimental
+            )
+        ).completion
 
     async def forward_command(self, ref, _batch, _config, _experimental):
         self.calls.append(f"forward:{ref.sequence_id}")
@@ -229,11 +242,13 @@ class _FailingService(_Service):
         await self.failure_release.wait()
         raise self.failure
 
-    async def forward_backward_command(self, ref, _batch, _config, _experimental):
+    async def start_forward_backward_command(
+        self, ref, _batch, _config, _experimental
+    ):
         if self.failure_kind == "forward_backward" and not self.failure_consumed:
             self.calls.append(f"fb:{ref.sequence_id}")
             await self._fail()
-        return await super().forward_backward_command(
+        return await super().start_forward_backward_command(
             ref, _batch, _config, _experimental
         )
 
@@ -258,6 +273,23 @@ class _FailingService(_Service):
         return await super().load_state_command(
             ref, source, restore_optimizer=restore_optimizer
         )
+
+
+class _DelayedResultService(_Service):
+    def __init__(self) -> None:
+        super().__init__()
+        self.result_release = asyncio.Event()
+
+    async def start_forward_backward_command(
+        self, ref, _batch, _config, _experimental
+    ):
+        self.calls.append(f"fb:{ref.sequence_id}")
+
+        async def complete():
+            await self.result_release.wait()
+            return {"token_logprobs": ((-1.0, -2.0),), "metrics": {"fb": 1.0}}
+
+        return SimpleNamespace(completion=asyncio.create_task(complete()))
 
 
 class _Client(LocalMegatronTrainingClient):
@@ -352,6 +384,47 @@ def test_local_client_executes_one_ordered_command_stream() -> None:
             assert "gapless" in str(error)
         else:
             raise AssertionError("retired F/B retry unexpectedly executed")
+        await client.close()
+
+    asyncio.run(run())
+
+
+def test_local_optimizer_starts_before_forward_backward_result_settles() -> None:
+    async def run() -> None:
+        service = _DelayedResultService()
+        client = _Client(
+            run_id="run",
+            learner_version=3,
+            backend=_Backend(),
+            model=object(),
+            service=service,
+        )
+        forward = await client.forward_backward(
+            ForwardBackwardRequest(
+                run_id="run",
+                request_id="fb",
+                sequence_id=0,
+                batch=_batch(),
+                loss=LossConfig(name="cispo"),
+            )
+        )
+        optimizer = await client.optim_step(
+            OptimStepRequest(
+                run_id="run",
+                request_id="optim",
+                sequence_id=1,
+                optimizer=AdamConfig(learning_rate=1e-3),
+            )
+        )
+        optimizer_result = await asyncio.wait_for(optimizer.result(), timeout=1)
+        assert optimizer_result.contributing_forward_backward_operation_ids == (
+            forward.ref.operation_id,
+        )
+        assert service.calls == ["fb:0", "optim:1:1"]
+        assert not forward._result.done()
+
+        service.result_release.set()
+        assert (await forward.result()).operation_id == forward.ref.operation_id
         await client.close()
 
     asyncio.run(run())
