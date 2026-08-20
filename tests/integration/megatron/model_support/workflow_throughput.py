@@ -659,6 +659,81 @@ def _sized_config(
     }
 
 
+def _load_sizing_config(path: Path) -> tuple[dict[str, Any], Any | None]:
+    source = json.loads(path.read_text())
+    auto_map = source.get("auto_map")
+    if auto_map is None:
+        return source, None
+    if not isinstance(auto_map, Mapping):
+        raise RuntimeError("production config has an invalid AutoConfig mapping")
+    if "AutoConfig" not in auto_map:
+        return source, None
+    if not isinstance(auto_map["AutoConfig"], str):
+        raise RuntimeError("production config has an invalid AutoConfig mapping")
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(
+        path.parent, trust_remote_code=True, local_files_only=True
+    )
+    config.name_or_path = source.get("_name_or_path", "")
+    return cast(dict[str, Any], config.to_dict()), config
+
+
+def _write_sized_config(
+    path: Path,
+    sized: dict[str, Any],
+    sizing: dict[str, Any],
+    config: Any | None,
+) -> None:
+    if config is None:
+        path.write_text(json.dumps(sized, indent=2) + "\n")
+        return
+    text = getattr(config, "text_config", config)
+    sized_text = _text(sized)
+    for changed_path in sizing["changed_paths"]:
+        name = changed_path.rsplit(".", 1)[-1]
+        setattr(text, name, sized_text[name])
+    config.name_or_path = sized.get("_name_or_path", "")
+    config.to_json_file(path, use_diff=False)
+
+
+def _correctness_fixture_provenance(
+    path: Path, *, canonical_model: str, model_key: str
+) -> dict[str, str]:
+    manifest_path = path / "fixture_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"correctness fixture has an invalid manifest: {manifest_path}"
+        ) from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"correctness fixture manifest is not an object: {path}")
+    revision = manifest.get("source_revision")
+    expected_identity = {"model": canonical_model, "revision": revision}
+    mismatches = {
+        name: manifest.get(name)
+        for name, expected in {
+            "source_model": canonical_model,
+            "handler": model_key,
+            "source_identity": expected_identity,
+        }.items()
+        if manifest.get(name) != expected
+    }
+    if mismatches:
+        raise RuntimeError(f"correctness fixture identity mismatch: {mismatches}")
+    if (
+        not isinstance(revision, str)
+        or len(revision) != 40
+        or set(revision) - set("0123456789abcdef")
+    ):
+        raise RuntimeError("correctness fixture source revision is not a pinned SHA")
+    return {
+        "source_revision": revision,
+        "correctness_fixture_manifest_sha256": _digest(manifest),
+    }
+
+
 def _copy_metadata(source: Path, target: Path) -> None:
     excluded = {"config.json", "fixture_manifest.json", "model.safetensors.index.json"}
     for path in source.iterdir():
@@ -703,27 +778,35 @@ def ensure_throughput_fixture(
         raise RuntimeError(
             f"correctness fixture lacks pinned production config: {source_config_path}"
         )
-    source = json.loads(source_config_path.read_text())
+    provenance = _correctness_fixture_provenance(
+        correctness_fixture,
+        canonical_model=canonical_model,
+        model_key=model_key,
+    )
+    raw_source = json.loads(source_config_path.read_text())
+    source, config = _load_sizing_config(source_config_path)
     sized, sizing = _sized_config(source, model_key=model_key, num_layers=num_layers)
     vocabulary_contract: dict[str, object] = {
         "config_vocab_size": int(_text(sized)["vocab_size"])
     }
     _validate_tokenizer_compatible_fixture(correctness_fixture, vocabulary_contract)
+    output.mkdir()
+    _copy_metadata(correctness_fixture, output)
+    config_path = output / "config.json"
+    _write_sized_config(config_path, sized, sizing, config)
     manifest = {
         "version": 2,
         "canonical_model": canonical_model,
         "model_key": model_key,
         "num_layers": num_layers,
-        "source_config_sha256": _digest(source),
-        "sized_config_sha256": _digest(sized),
+        "source_config_sha256": _digest(raw_source),
+        "sized_config_sha256": _digest(json.loads(config_path.read_text())),
         "initialization": initialization_version,
         "random_seed": random_seed,
         "vocabulary_contract": vocabulary_contract,
+        **(provenance if config is not None else {}),
         **sizing,
     }
-    output.mkdir()
-    _copy_metadata(correctness_fixture, output)
-    (output / "config.json").write_text(json.dumps(sized, indent=2) + "\n")
     from safetensors.torch import save_file
 
     tensors = _config_only_tensors(sized, model_key=model_key)
