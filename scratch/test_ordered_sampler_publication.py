@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 from io import BytesIO
 from threading import Barrier, Lock
 
@@ -122,14 +121,7 @@ def test_sampler_publishes_direct_bounded_independently_visible_shards() -> None
             memoryview(b"efghij"),
         ),
     }
-    ref = store.publish_ordered(
-        target,
-        source,
-        file_sha256={
-            name: hashlib.sha256(b"".join(chunks)).hexdigest()
-            for name, chunks in source.items()
-        },
-    )
+    ref = store.publish_ordered(target, source)
 
     prefix = f"{config.prefix}/{target.object_id}"
     plan = OrderedBinaryObjectPlan.model_validate_json(
@@ -147,5 +139,11 @@ def test_sampler_publishes_direct_bounded_independently_visible_shards() -> None
     assert client.events[0] == f"finish:{prefix}/_PLAN.json"
     assert client.events[-1] == f"finish:{prefix}/_COMMITTED.json"
     assert not any("/files/" in key for key in client.objects)
+    assert all(file.sha256 is None for file in ref.files)
+    assert all(
+        "source-sha256" not in client.metadata[key]
+        for key in client.metadata
+        if "/shards/" in key
+    )
     assert store.resolve_ordered(ref.manifest_uri) == ref
     store.close()

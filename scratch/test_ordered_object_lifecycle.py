@@ -130,28 +130,21 @@ def _store(target: OrderedBinaryObjectTarget, client: _S3) -> S3BinaryObjectStor
     return store
 
 
-def _source() -> tuple[
-    dict[str, tuple[memoryview, ...]],
-    dict[str, str],
-]:
-    files = {
+def _source() -> dict[str, tuple[memoryview, ...]]:
+    return {
         "adapter_config.json": (memoryview(b"cfg"),),
         "adapter_model.safetensors": (
             memoryview(b"abcd"),
             memoryview(b"efghij"),
         ),
     }
-    return files, {
-        name: hashlib.sha256(b"".join(chunks)).hexdigest()
-        for name, chunks in files.items()
-    }
 
 
 def test_ordered_commit_resolves_verifies_and_deletes_by_discriminator() -> None:
     target, client = _target(), _S3()
     store = _store(target, client)
-    files, digests = _source()
-    ref = store.publish_ordered(target, files, file_sha256=digests)
+    files = _source()
+    ref = store.publish_ordered(target, files)
     prefix = f"{target.store.prefix}/{target.object_id}"
 
     assert json.loads(client.objects[f"{prefix}/_COMMITTED.json"])["transport"] == (
@@ -160,6 +153,12 @@ def test_ordered_commit_resolves_verifies_and_deletes_by_discriminator() -> None
     assert client.puts[0] == f"{prefix}/_PLAN.json"
     assert client.puts[-1] == f"{prefix}/_COMMITTED.json"
     assert store.resolve(ref.manifest_uri) == ref
+    assert all(file.sha256 is None for file in ref.files)
+    assert all(
+        "source-sha256" not in client.metadata[key]
+        for key in client.metadata
+        if "/shards/" in key
+    )
     prior_gets = len(client.gets)
     store.verify(ref, target=target, expected_byte_count=ref.byte_count)
     verification_gets = client.gets[prior_gets:]
@@ -192,8 +191,8 @@ def test_ordered_commit_resolves_verifies_and_deletes_by_discriminator() -> None
 def test_ordered_fenced_cleanup_reclaims_partial_plan_and_shards() -> None:
     target, client = _target(), _S3()
     store = _store(target, client)
-    files, digests = _source()
-    ref = store.publish_ordered(target, files, file_sha256=digests)
+    files = _source()
+    ref = store.publish_ordered(target, files)
     prefix = f"{target.store.prefix}/{target.object_id}"
 
     with pytest.raises(RuntimeError, match="committed"):

@@ -1878,7 +1878,7 @@ class _PreparedAdapterPayload(BaseModel):
     lora: Any
     tensors: PreparedSafetensors
     config: bytes
-    model_identity: FileIdentity
+    model_identity: FileIdentity | None
     config_identity: FileIdentity
 
 
@@ -2252,18 +2252,38 @@ class _GenerationPublisher:
                         ART_LORA_FORMAT_CONFIG_KEY: ART_LORA_FORMAT_VLLM,
                     }
                 )
-                model_identity = prepared_safetensors_identity(tensors)
+                exact_model_identity = (
+                    staging_adapter_path is not None
+                    or bool(publication_targets)
+                    or (
+                        adapter_object_target is not None
+                        and not isinstance(
+                            adapter_object_target, OrderedBinaryObjectTarget
+                        )
+                    )
+                )
+                # Ordered shards are fenced by their plan, range, ETag, and
+                # commit. Hashing the whole adapter here would serialize every
+                # serverless publication before its first shard can upload.
+                model_identity = (
+                    prepared_safetensors_identity(tensors)
+                    if exact_model_identity
+                    else None
+                )
                 config_identity = FileIdentity(
                     size_bytes=len(config),
                     sha256=hashlib.sha256(config).hexdigest(),
                 )
-                files = (
+                exact_files = (
                     CheckpointFile(
                         name="adapter_config.json", **config_identity.model_dump()
                     ),
                     CheckpointFile(
                         name="adapter_model.safetensors",
-                        **model_identity.model_dump(),
+                        size_bytes=tensors.nbytes,
+                        sha256=(
+                            None if model_identity is None else model_identity.sha256
+                        ),
                     ),
                 )
                 adapter_payload = _PreparedAdapterPayload(
@@ -2274,6 +2294,8 @@ class _GenerationPublisher:
                     config_identity=config_identity,
                 )
                 if adapter is None and staging_adapter_path is not None:
+                    if model_identity is None:
+                        raise RuntimeError("local adapter plan has no exact identity")
                     adapter = OptimizerAdapter(
                         identity=str(
                             canonical_adapter_path(
@@ -2283,15 +2305,25 @@ class _GenerationPublisher:
                         training_session_id=generation.training_session_id,
                         step=generation.policy_step,
                         generation_id=generation.generation_id,
-                        files=files,
+                        files=exact_files,
                     )
                 if adapter_object_target is not None:
+                    transport_files = (
+                        tuple(
+                            file.model_copy(update={"sha256": None})
+                            for file in exact_files
+                        )
+                        if isinstance(
+                            adapter_object_target, OrderedBinaryObjectTarget
+                        )
+                        else exact_files
+                    )
                     transport_adapter = OptimizerAdapter(
                         identity=binary_object_manifest_uri(adapter_object_target),
                         training_session_id=generation.training_session_id,
                         step=generation.policy_step,
                         generation_id=generation.generation_id,
-                        files=files,
+                        files=transport_files,
                     )
             if rank == 0 and adapter is None and transport_adapter is None:
                 raise RuntimeError("rank-zero snapshot has no planned adapter output")
@@ -2834,6 +2866,8 @@ class _GenerationPublisher:
                 planned,
             )
         elif prepared.publication_targets:
+            if payload.model_identity is None:
+                raise RuntimeError("adapter transport has no exact file identity")
             self._transfer_lora_snapshot(
                 payload.lora,
                 prepared.publication_targets,
@@ -3014,8 +3048,6 @@ class _GenerationPublisher:
                 raise RuntimeError("generation publisher cannot mix object stores")
             store = self._object_store
         planned_files = {file.name: file for file in planned.files}
-        if any(file.sha256 is None for file in planned_files.values()):
-            raise RuntimeError("adapter object plan has no exact file identity")
         source_files: dict[str, tuple[memoryview, ...]] = {
             "adapter_model.safetensors": tuple(
                 memoryview(chunk.numpy()).cast("B")
@@ -3023,14 +3055,19 @@ class _GenerationPublisher:
             ),
             "adapter_config.json": (memoryview(payload.config),),
         }
-        file_sha256: dict[str, str] = {
-            name: cast(str, file.sha256) for name, file in planned_files.items()
-        }
-        ref = (
-            store.publish_ordered(target, source_files, file_sha256=file_sha256)
-            if isinstance(target, OrderedBinaryObjectTarget)
-            else store.publish(target, source_files, file_sha256=file_sha256)
-        )
+        if isinstance(target, OrderedBinaryObjectTarget):
+            ref = store.publish_ordered(target, source_files)
+        else:
+            if any(file.sha256 is None for file in planned_files.values()):
+                raise RuntimeError("adapter object plan has no exact file identity")
+            ref = store.publish(
+                target,
+                source_files,
+                file_sha256={
+                    name: cast(str, file.sha256)
+                    for name, file in planned_files.items()
+                },
+            )
         published_files = {file.relative_path: file for file in ref.files}
         expected_files = ("adapter_config.json", "adapter_model.safetensors")
         if set(published_files) != set(expected_files):
@@ -3075,6 +3112,10 @@ class _GenerationPublisher:
                             )
                     else:
                         staging.mkdir(parents=True)
+                        if payload.model_identity is None:
+                            raise RuntimeError(
+                                "local adapter write has no exact file identity"
+                            )
                         model_identity = save_prepared_safetensors(
                             payload.tensors,
                             staging / "adapter_model.safetensors",

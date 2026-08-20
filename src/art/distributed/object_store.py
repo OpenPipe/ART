@@ -96,7 +96,7 @@ class BinaryObjectTarget(_ObjectModel):
 class BinaryObjectFile(_ObjectModel):
     relative_path: str
     byte_count: int = Field(ge=1)
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("relative_path")
     @classmethod
@@ -112,6 +112,12 @@ class BinaryObjectRef(_ObjectModel):
     byte_count: int = Field(ge=1)
     files: tuple[BinaryObjectFile, ...] = Field(min_length=1)
     metadata: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _content_addressed_files(self) -> "BinaryObjectRef":
+        if any(file.sha256 is None for file in self.files):
+            raise ValueError("content-addressed object files require SHA-256")
+        return self
 
 
 class OrderedBinaryObjectTarget(_ObjectModel):
@@ -361,7 +367,7 @@ class S3BinaryObjectStore:
         target: OrderedBinaryObjectTarget,
         files: dict[str, tuple[memoryview, ...]],
         *,
-        file_sha256: dict[str, str],
+        file_sha256: dict[str, str] | None = None,
     ) -> OrderedBinaryObjectRef:
         """Publish caller-owned buffers as directly consumable ordered shards."""
         self._require_target(target)
@@ -810,7 +816,7 @@ class S3BinaryObjectStore:
         shard: OrderedBinaryObjectShard,
         chunks: tuple[memoryview, ...],
         plan_sha256: str,
-        source_sha256: str,
+        source_sha256: str | None,
     ) -> StoredOrderedBinaryObjectShard:
         key = _ordered_binary_object_shard_key(prefix, shard.index)
         metadata = _ordered_binary_object_shard_metadata(
@@ -1239,15 +1245,15 @@ def _multipart_ranges(total: int, size: int) -> Iterable[tuple[int, int]]:
 def _ordered_binary_object_plan(
     target: OrderedBinaryObjectTarget,
     files: dict[str, tuple[memoryview, ...]],
-    file_sha256: dict[str, str],
+    file_sha256: dict[str, str] | None,
 ) -> OrderedBinaryObjectPlan:
-    if set(files) != set(file_sha256):
+    if file_sha256 is not None and set(files) != set(file_sha256):
         raise ValueError("ordered object digests must cover every file exactly")
     planned_files = tuple(
         BinaryObjectFile(
             relative_path=_safe_relative_path(relative_path),
             byte_count=sum(chunk.nbytes for chunk in chunks),
-            sha256=file_sha256[relative_path],
+            sha256=None if file_sha256 is None else file_sha256[relative_path],
         )
         for relative_path, chunks in sorted(files.items())
     )
@@ -1470,6 +1476,8 @@ def _complete_part(
 
 
 def _binary_object_file_key(prefix: str, file: BinaryObjectFile) -> str:
+    if file.sha256 is None:
+        raise ValueError("content-addressed object file has no SHA-256")
     return f"{prefix}/files/{file.sha256}"
 
 
@@ -1479,15 +1487,17 @@ def _ordered_binary_object_shard_key(prefix: str, index: int) -> str:
 
 def _ordered_binary_object_shard_metadata(
     plan_sha256: str,
-    source_sha256: str,
+    source_sha256: str | None,
     shard: OrderedBinaryObjectShard,
 ) -> dict[str, str]:
-    return {
+    metadata = {
         "plan-sha256": plan_sha256,
-        "source-sha256": source_sha256,
         "file-offset": str(shard.file_offset),
         "byte-count": str(shard.byte_count),
     }
+    if source_sha256 is not None:
+        metadata["source-sha256"] = source_sha256
+    return metadata
 
 
 def _is_precondition_failed(error: Exception) -> bool:
