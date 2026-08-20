@@ -396,6 +396,10 @@ class RunEvent(Contract):
     created_at: datetime
 
 
+EVENT_LONG_POLL_TIMEOUT_S = 20.0
+MAX_EVENT_PAGE_LIMIT = 1000
+
+
 class EventPage(Contract):
     events: tuple[RunEvent, ...]
     next_cursor: int = Field(ge=0)

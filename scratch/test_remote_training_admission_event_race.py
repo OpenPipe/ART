@@ -126,7 +126,6 @@ async def test_terminal_event_before_submit_response_is_not_lost() -> None:
             created_at=now,
             updated_at=now,
         ),
-        poll_interval_s=0.001,
     )
     try:
         warm = await client.optim_step(_request("warm", 0))

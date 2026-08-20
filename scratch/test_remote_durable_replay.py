@@ -141,7 +141,7 @@ async def test_evicted_operation_replays_without_advancing_run(
             kind="optim_step",
         )
         service.views[ref.operation_id] = service._view(request, ref, "succeeded")
-    client = RemoteTrainingClient(service, _run(3, 3), poll_interval_s=0.001)
+    client = RemoteTrainingClient(service, _run(3, 3))
     for request in requests:
         assert (await (await client.optim_step(request)).result()).operation_id == (
             _operation_id("run", request.request_id)
@@ -160,7 +160,7 @@ async def test_reconstructed_client_resolves_terminal_and_resolution_race() -> N
     service = _ReplayService()
     first = _request("finished", 0)
     first_ref = await service.submit("optim_step", first)
-    client = RemoteTrainingClient(service, _run(1, 1), poll_interval_s=0.001)
+    client = RemoteTrainingClient(service, _run(1, 1))
 
     finished = await client.optim_step(first)
     assert (await finished.result()).operation_id == first_ref.operation_id
@@ -183,7 +183,7 @@ async def test_replay_rejects_changed_content() -> None:
     service = _ReplayService()
     request = _request("request", 0)
     await service.submit("optim_step", request)
-    client = RemoteTrainingClient(service, _run(1, 1), poll_interval_s=0.001)
+    client = RemoteTrainingClient(service, _run(1, 1))
     with pytest.raises(ValueError, match="differs from the persisted operation"):
         await client.optim_step(_request("request", 0, learning_rate=2e-6))
     await client.abort_result_waiters()

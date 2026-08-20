@@ -160,6 +160,16 @@ class FakeService:
             return httpx.Response(200, json=self.operations[path.rsplit("/", 1)[1]])
         if path == "/v1/training/runs/run:close":
             self.run["status"] = "closing"
+            self.events.append(
+                {
+                    "cursor": len(self.events) + 1,
+                    "run_id": "run",
+                    "operation_id": None,
+                    "event": "run_closed",
+                    "payload": {},
+                    "created_at": now,
+                }
+            )
             return httpx.Response(200, json=self.run)
         if path == "/v1/training/runs/run":
             self.run["status"] = "closed"
@@ -496,7 +506,6 @@ async def test_remote_client_retries_and_preserves_command_order():
                 adapter=AdapterSpec(rank=1, alpha=32, target_modules=("q_proj",)),
             )
         ),
-        poll_interval_s=0.001,
     )
     batch = RlTrajectoryBatch(
         groups=(TrajectoryGroupBundle.from_group(TrajectoryGroup([Trajectory()])),),

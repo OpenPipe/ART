@@ -115,7 +115,7 @@ async def test_event_polling_recovers_past_request_retry_budget_at_same_cursor()
         )
 
     service, http = _service(handle, max_retries=1)
-    observer = _RunEventObserver(service, "run", poll_interval_s=0.001)
+    observer = _RunEventObserver(service, "run")
     future = observer.reserve(_OPERATION_ID)
     observer.claim(_OPERATION_ID, future)
     try:
@@ -283,7 +283,7 @@ async def test_event_polling_does_not_retry_terminal_failures(failure, error_typ
         return httpx.Response(200, json={"events": [], "next_cursor": -1})
 
     service, http = _service(handle, max_retries=5)
-    observer = _RunEventObserver(service, "run", poll_interval_s=0.001)
+    observer = _RunEventObserver(service, "run")
     future = observer.reserve(_OPERATION_ID)
     try:
         with pytest.raises(error_type):

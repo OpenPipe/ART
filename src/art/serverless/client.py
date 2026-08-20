@@ -34,8 +34,10 @@ from art.utils.lifecycle import process_shutdown_timeout
 from .contracts import (
     DEFAULT_CHECKPOINT_ALIAS_PAGE_LIMIT,
     DEFAULT_CHECKPOINT_PAGE_LIMIT,
+    EVENT_LONG_POLL_TIMEOUT_S,
     MAX_CHECKPOINT_ALIAS_PAGE_LIMIT,
     MAX_CHECKPOINT_PAGE_LIMIT,
+    MAX_EVENT_PAGE_LIMIT,
     MAX_OPERATION_RESULT_BYTES,
     ApplyCheckpointRetentionRequest,
     CancelOperationRequest,
@@ -409,8 +411,10 @@ class RemoteTrainingServiceClient:
     async def get_events(self, run_id: str, *, after: int) -> EventPage:
         return await self._request(
             "GET",
-            f"training/runs/{run_id}/events?after={after}&limit={_EVENT_PAGE_LIMIT}",
+            f"training/runs/{run_id}/events?after={after}"
+            f"&limit={MAX_EVENT_PAGE_LIMIT}",
             EventPage,
+            timeout_s=EVENT_LONG_POLL_TIMEOUT_S + 5.0,
         )
 
     async def cancel_operation(
@@ -540,6 +544,7 @@ class RemoteTrainingServiceClient:
         *,
         body: Contract | None = None,
         max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> ResponseT:
         content = None if body is None else body.model_dump_json()
         response = await self._send(
@@ -548,6 +553,7 @@ class RemoteTrainingServiceClient:
             content=content,
             headers=None if body is None else {"Content-Type": "application/json"},
             max_retries=max_retries,
+            timeout_s=timeout_s,
         )
         return response_type.model_validate(response.json())
 
@@ -561,6 +567,7 @@ class RemoteTrainingServiceClient:
         transfer: bool = False,
         stream: bool = False,
         max_retries: int | None = None,
+        timeout_s: float | None = None,
     ) -> httpx.Response:
         client = self._transfer_client if transfer else self._control_client
         response: httpx.Response | None = None
@@ -573,6 +580,11 @@ class RemoteTrainingServiceClient:
                         path,
                         content=content,
                         headers=headers,
+                        timeout=(
+                            httpx.USE_CLIENT_DEFAULT
+                            if timeout_s is None
+                            else timeout_s
+                        ),
                     ),
                     stream=stream,
                 )
@@ -633,10 +645,10 @@ class RemoteTrainingServiceClient:
             raise BaseExceptionGroup("remote training service close failed", failures)
 
 
-_EVENT_PAGE_LIMIT = 1000
 _TERMINAL_EVENTS = frozenset(
     {"operation_succeeded", "operation_failed", "operation_cancelled"}
 )
+_RUN_TERMINAL_EVENTS = frozenset({"run_closed", "run_failed_released"})
 
 
 class _RunEventObserver:
@@ -644,13 +656,13 @@ class _RunEventObserver:
         self,
         service: RemoteTrainingServiceClient,
         run_id: str,
-        poll_interval_s: float,
     ) -> None:
         self._service = service
         self._run_id = run_id
-        self._poll_interval_s = poll_interval_s
         self._cursor = 0
         self._pending: dict[str, asyncio.Future[RunEvent]] = {}
+        self._run_terminal: asyncio.Future[RunEvent] | None = None
+        self._run_terminal_event: RunEvent | None = None
         self._task: asyncio.Task[None] | None = None
         self._error: BaseException | None = None
         self._closed = False
@@ -669,6 +681,27 @@ class _RunEventObserver:
             )
         else:
             self._pending[operation_id] = future
+            if self._task is None:
+                self._task = asyncio.create_task(
+                    self._observe(), name=f"remote-training-events-{self._run_id}"
+                )
+        return future
+
+    def reserve_run_terminal(self) -> asyncio.Future[RunEvent]:
+        if self._run_terminal is not None:
+            return self._run_terminal
+        future = asyncio.get_running_loop().create_future()
+        future.add_done_callback(_consume_event_future)
+        if self._run_terminal_event is not None:
+            future.set_result(self._run_terminal_event)
+        elif self._error is not None:
+            future.set_exception(self._error)
+        elif self._closed:
+            future.set_exception(
+                RemoteTrainingError("remote training event observer is closed")
+            )
+        else:
+            self._run_terminal = future
             if self._task is None:
                 self._task = asyncio.create_task(
                     self._observe(), name=f"remote-training-events-{self._run_id}"
@@ -698,6 +731,10 @@ class _RunEventObserver:
         self._closed = True
         task, self._task = self._task, None
         pending, self._pending = tuple(self._pending.values()), {}
+        if self._run_terminal is not None and not self._run_terminal.done():
+            self._run_terminal.set_exception(
+                RemoteTrainingError("remote training event observer is closed")
+            )
         for future in pending:
             if not future.done():
                 future.set_exception(
@@ -742,6 +779,13 @@ class _RunEventObserver:
                     raise RemoteTrainingError("remote event page cursor changed")
                 self._cursor = page.next_cursor
                 for event in page.events:
+                    if event.event in _RUN_TERMINAL_EVENTS:
+                        self._run_terminal_event = event
+                        if (
+                            self._run_terminal is not None
+                            and not self._run_terminal.done()
+                        ):
+                            self._run_terminal.set_result(event)
                     if event.event not in _TERMINAL_EVENTS:
                         continue
                     if event.operation_id is None:
@@ -751,16 +795,24 @@ class _RunEventObserver:
                     future = self._pending.get(event.operation_id)
                     if future is not None and not future.done():
                         future.set_result(event)
-                if len(page.events) < _EVENT_PAGE_LIMIT:
-                    await asyncio.sleep(self._poll_interval_s)
+                await asyncio.sleep(0)
+                if not self._pending and (
+                    self._run_terminal is None or self._run_terminal.done()
+                ):
+                    return
         except asyncio.CancelledError:
             raise
         except BaseException as error:
             self._error = error
             pending, self._pending = tuple(self._pending.values()), {}
+            if self._run_terminal is not None and not self._run_terminal.done():
+                self._run_terminal.set_exception(error)
             for future in pending:
                 if not future.done():
                     future.set_exception(error)
+        finally:
+            if self._task is asyncio.current_task():
+                self._task = None
 
 
 def _terminal_event(view: OperationView) -> RunEvent | None:
@@ -864,21 +916,17 @@ class RemoteTrainingClient:
         service: RemoteTrainingServiceClient,
         run: TrainingRunView,
         *,
-        poll_interval_s: float = 0.1,
         close_timeout_s: float = process_shutdown_timeout(2),
     ) -> None:
         if run.status != "open":
             raise ValueError(f"remote training run is {run.status}, not open")
-        if poll_interval_s <= 0 or close_timeout_s <= 0:
-            raise ValueError(
-                "remote training polling and close timeouts must be positive"
-            )
+        if close_timeout_s <= 0:
+            raise ValueError("remote training close timeout must be positive")
         self._service = service
         self._run = run
         self._next_sequence_id = run.next_sequence_id
         self._projected_learner_version = run.projected_learner_version
-        self._poll_interval_s = poll_interval_s
-        self._events = _RunEventObserver(service, run.run_id, poll_interval_s)
+        self._events = _RunEventObserver(service, run.run_id)
         self._close_timeout_s = close_timeout_s
         self._lock = asyncio.Lock()
         self._operations: dict[str, tuple[str, RemoteTrainingOperation[Any]]] = {}
@@ -1159,14 +1207,15 @@ class RemoteTrainingClient:
         if not self._close_accepted:
             raise RuntimeError("remote training run closure has not been accepted")
         async with asyncio.timeout(timeout_s or self._close_timeout_s):
-            while True:
-                run = await self._service.get_run(self.run_id)
-                if run.status == "closed":
-                    self._run = run
-                    return
-                if run.status == "failed":
-                    raise RemoteTrainingError("remote training run failed during close")
-                await asyncio.sleep(self._poll_interval_s)
+            if self._run.status not in {"closed", "failed"}:
+                await asyncio.shield(self._events.reserve_run_terminal())
+            self._run = await self._service.get_run(self.run_id)
+            if self._run.status == "failed":
+                raise RemoteTrainingError("remote training run failed during close")
+            if self._run.status != "closed":
+                raise RemoteTrainingError(
+                    "terminal run event did not produce a terminal run state"
+                )
 
     async def abort_result_waiters(self) -> None:
         failures: list[BaseException] = []
