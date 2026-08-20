@@ -1171,7 +1171,27 @@ def _build(
             )
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(0)
-                model = auto.from_config(config, trust_remote_code=True)
+                if model_key == "nemotron_h_moe":
+                    dtype_configs = [config]
+                    for name in config.sub_configs:
+                        if (sub_config := getattr(config, name)) is not None:
+                            dtype_configs.append(sub_config)
+                    configured_dtypes = [
+                        (value, value.dtype) for value in dtype_configs
+                    ]
+                    if config.dtype != torch.bfloat16:
+                        raise RuntimeError(
+                            f"nemotron_h_moe fixture dtype changed: {config.dtype}"
+                        )
+                    try:
+                        model = auto.from_config(
+                            config, trust_remote_code=True, dtype=torch.float32
+                        )
+                    finally:
+                        for value, dtype in configured_dtypes:
+                            value.dtype = dtype
+                else:
+                    model = auto.from_config(config, trust_remote_code=True)
                 fp32_snapshot = None
                 if model_key == "nemotron_h_moe":
                     _initialize_nemotron_h_fixture_routers(model, config)
