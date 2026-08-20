@@ -276,21 +276,50 @@ def _should_probe_preserve_thinking_template(base_model: str | None) -> bool:
     return model_name.startswith(("Qwen3-", "Qwen3.5-"))
 
 
+def _training_tokenizer_spec(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> tuple[str, str | None]:
+    engine_args = internal_config.get("engine_args", {})
+    tokenizer_source = engine_args.get("tokenizer")
+    return (
+        base_model if tokenizer_source is None else tokenizer_source,
+        engine_args.get("tokenizer_revision"),
+    )
+
+
 def _tokenizer_cache_key(
     base_model: str,
     internal_config: dev.InternalModelConfig,
 ) -> tuple[str, str | None]:
+    tokenizer_source, tokenizer_revision = _training_tokenizer_spec(
+        base_model, internal_config
+    )
     chat_template = _configured_chat_template_value(internal_config)
-    if chat_template is None:
+    identity = (tokenizer_source, tokenizer_revision, chat_template)
+    if identity == (base_model, None, None):
         return (base_model, None)
-    return (base_model, hashlib.sha256(chat_template.encode("utf-8")).hexdigest())
+    payload = json.dumps(
+        identity,
+        separators=(",", ":"),
+    )
+    return (base_model, hashlib.sha256(payload.encode("utf-8")).hexdigest())
 
 
-def _load_training_tokenizer(base_model: str) -> PreTrainedTokenizerBase:
+def _load_training_tokenizer(
+    base_model: str,
+    internal_config: dev.InternalModelConfig,
+) -> PreTrainedTokenizerBase:
+    tokenizer_source, tokenizer_revision = _training_tokenizer_spec(
+        base_model, internal_config
+    )
     return cast(
         PreTrainedTokenizerBase,
         configure_preserved_thinking_chat_template(
-            AutoTokenizer.from_pretrained(base_model)
+            AutoTokenizer.from_pretrained(
+                tokenizer_source,
+                revision=tokenizer_revision,
+            )
         ),
     )
 
@@ -1006,7 +1035,7 @@ class LocalBackend:
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
             tokenizer = self._configure_training_tokenizer(
-                _load_training_tokenizer(model.base_model),
+                _load_training_tokenizer(model.base_model, internal_config),
                 model=model,
                 internal_config=internal_config,
             )
@@ -1887,7 +1916,7 @@ class LocalBackend:
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
         if tokenizer_key not in self._tokenizers:
             tokenizer = self._configure_training_tokenizer(
-                _load_training_tokenizer(model.base_model),
+                _load_training_tokenizer(model.base_model, internal_config),
                 model=model,
                 internal_config=internal_config,
             )
