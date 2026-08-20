@@ -224,7 +224,7 @@ def test_first_party_route_refs_bypass_planning_and_command_route_bytes(
         max_source_version=0,
         moe_route_object_transfer=transfer,
     )
-    encoded = prepare_training_batch(batch, identity="first-party")
+    encoded = prepare_training_batch(batch)
     assert not encoded.route_objects
     assert all(
         route.ref.transport == "object_store"
@@ -256,9 +256,30 @@ def test_prepacked_prefix_tree_wire_routes_are_accepted_without_replanning(
         max_source_version=0,
         moe_route_groups=(route_group,),
     )
-    encoded = prepare_training_batch(batch, identity="prepacked")
+    encoded = prepare_training_batch(batch)
     assert len(encoded.route_objects) == 1
     assert b"".join(encoded.route_objects[0].chunks) == b"".join(route.chunks)
+
+
+def test_training_object_identity_is_content_addressed_across_commands() -> None:
+    def prepare(group: TrajectoryGroup):
+        return prepare_training_batch(
+            RlTrajectoryBatch.from_groups([group], default_source_version=0)
+        )
+
+    first = prepare(_group(5))
+    repeated = prepare(_group(5))
+    assert tuple(value.ref for value in first.objects) == tuple(
+        value.ref for value in repeated.objects
+    )
+    assert tuple(value.ref for value in first.route_objects) == tuple(
+        value.ref for value in repeated.route_objects
+    )
+
+    changed = _group(5)
+    changed.trajectories[0].reward += 1.0
+    changed_encoded = prepare(changed)
+    assert changed_encoded.objects[0].ref.object_id != first.objects[0].ref.object_id
 
 
 def test_distributed_transfer_preserves_uncompressed_route_sequences() -> None:

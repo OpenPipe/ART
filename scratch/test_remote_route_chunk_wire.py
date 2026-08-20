@@ -231,7 +231,7 @@ async def test_forward_submission_stream_is_byte_identical_and_bounded() -> None
         min_source_version=0,
         max_source_version=0,
     )
-    encoded = prepare_training_batch(batch, identity="batch")
+    encoded = prepare_training_batch(batch)
     request = RemoteForwardRequest(
         run_id="run",
         request_id="request",
@@ -301,7 +301,7 @@ def test_forward_wire_fragment_count_is_bounded() -> None:
         min_source_version=0,
         max_source_version=0,
     )
-    encoded = prepare_training_batch(batch, identity="batch")
+    encoded = prepare_training_batch(batch)
     request = RemoteForwardRequest(
         run_id="run",
         request_id="request",

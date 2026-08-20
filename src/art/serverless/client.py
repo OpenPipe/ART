@@ -1015,7 +1015,6 @@ class RemoteTrainingClient:
                 prepared_batch = await asyncio.to_thread(
                     prepare_training_batch,
                     request.batch,
-                    identity=f"{request.run_id}:{request.request_id}",
                 )
             wire_request = RemoteForwardRequest.from_command(
                 request, prepared_batch.remote

@@ -6,7 +6,6 @@ import hashlib
 import struct
 import sys
 from typing import Any, Literal, NamedTuple, TypeVar, cast
-import uuid
 
 from msgspec import msgpack
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
@@ -315,7 +314,6 @@ def encode_trajectory_group(
         raise ValueError("RL trajectory group has multiple explicit route sources")
     if route_encoding not in {"inline", "prefix_tree"}:
         raise ValueError(f"unsupported route wire encoding: {route_encoding!r}")
-    data_id = object_id or _object_id(uuid.uuid4().hex)
     layout = TrajectoryGroupDataLayout(
         header_byte_count=len(bundle.header),
         record_byte_counts=tuple(map(len, bundle.records)),
@@ -323,8 +321,9 @@ def encode_trajectory_group(
     data = _encode_training_object_chunks(
         (bundle.header, *bundle.records),
         data_format=RL_GROUP_DATA_FORMAT,
-        object_id=data_id,
+        object_id=object_id,
     )
+    data_id = data.ref.object_id
     if stored_routes is not None:
         _validate_route_bindings(bundle, stored_routes)
         routes, remote_routes = (), tuple(
@@ -554,7 +553,6 @@ def _route_data_range(
 def prepare_training_batch(
     batch: TrainingBatch,
     *,
-    identity: str | None = None,
     route_encoding: RouteWireEncoding = "prefix_tree",
 ) -> EncodedTrainingBatch:
     if isinstance(batch, RlTrajectoryBatch):
@@ -566,7 +564,6 @@ def prepare_training_batch(
         groups = tuple(
             encode_trajectory_group(
                 group,
-                object_id=_object_id(f"{identity}:{index}") if identity else None,
                 route_encoding=route_encoding,
                 route_group=route_groups[index] if route_groups else None,
                 stored_routes=(
@@ -595,7 +592,7 @@ def prepare_training_batch(
         value = _encode_training_object(
             msgpack.encode(batch.model_dump(mode="python")),
             data_format=SFT_DATA_FORMAT,
-            object_id=_object_id(identity) if identity else None,
+            object_id=None,
         )
         objects = (value,)
         route_objects = ()
@@ -605,7 +602,7 @@ def prepare_training_batch(
         value = _encode_training_object(
             payload,
             data_format=TOKENIZED_DATA_FORMAT,
-            object_id=_object_id(identity) if identity else None,
+            object_id=None,
         )
         objects = (value,)
         route_objects = ()
@@ -821,7 +818,7 @@ def _encode_training_object(
     digest = hashlib.sha256(payload).hexdigest()
     return EncodedTrainingObject(
         ref=TrainingDataRef(
-            object_id=object_id or _object_id(uuid.uuid4().hex),
+            object_id=object_id or _object_id(f"{data_format}\0{digest}"),
             sha256=digest,
             byte_count=len(payload),
             format=data_format,
@@ -842,10 +839,11 @@ def _encode_training_object_chunks(
     digest = hashlib.sha256()
     for chunk in chunks:
         digest.update(chunk)
+    sha256 = digest.hexdigest()
     return EncodedTrainingObject(
         ref=TrainingDataRef(
-            object_id=object_id or _object_id(uuid.uuid4().hex),
-            sha256=digest.hexdigest(),
+            object_id=object_id or _object_id(f"{data_format}\0{sha256}"),
+            sha256=sha256,
             byte_count=sum(map(len, chunks)),
             format=data_format,
         ),
