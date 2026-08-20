@@ -4,6 +4,7 @@ from hashlib import sha256
 import json
 from typing import Literal
 
+from pydantic import BaseModel, ConfigDict
 import torch
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
@@ -13,6 +14,7 @@ from art.megatron.context_parallel.types import (
 )
 from art.megatron.recurrent.buckets import (
     RecurrentSegmentBucketPlan,
+    build_recurrent_bucket_plan,
     build_recurrent_tree_bucket_plans,
     move_recurrent_segment_bucket_plans,
 )
@@ -20,7 +22,10 @@ from art.megatron.recurrent.contract import (
     HeadShardedFullTreePlannerConfig,
     LinearRecurrentContract,
 )
-from art.megatron.recurrent.prefix_tree import RecurrentPackedExecutionSpec
+from art.megatron.recurrent.prefix_tree import (
+    RecurrentPackedExecutionSpec,
+    RecurrentSegmentSpec,
+)
 
 from .exchange import (
     MambaHeadShardDevicePlan,
@@ -33,6 +38,17 @@ from .operator import (
     MAMBA_KERNEL_ID,
     MAMBA_LAYOUT_KEY,
 )
+
+
+class _CanonicalScanColumn(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    row_index: int
+    family_index: int
+    parent_index: int
+    positions: tuple[int, ...]
+    output_mask: tuple[bool, ...]
+    needs_final_state: bool
 
 
 class Mamba2RecurrentFamilyAdapter:
@@ -138,6 +154,11 @@ class Mamba2RecurrentFamilyAdapter:
             raise ValueError("cached Mamba global decision has incompatible semantics")
         _validate_bucket_devices(
             decision.tree_segment_buckets_by_depth, torch.device("cpu")
+        )
+        _validate_canonical_buckets(
+            spec,
+            decision.tree_segment_buckets_by_depth,
+            contract.local_chunk_size,
         )
 
     def build_rank_plan(
@@ -265,7 +286,7 @@ class Mamba2RecurrentFamilyAdapter:
         for parent in spec.tree_parent_indices:
             if parent >= 0:
                 has_children[parent] = True
-        return tuple(
+        physical = tuple(
             build_recurrent_tree_bucket_plans(
                 tuple(
                     segment
@@ -284,6 +305,21 @@ class Mamba2RecurrentFamilyAdapter:
             )
             for depth in range(max(spec.tree_depths, default=-1) + 1)
         )
+        scans = _build_canonical_scan_buckets(
+            spec,
+            chunk_size=contract.local_chunk_size,
+            max_padded_tokens=config.max_padded_tokens,
+        )
+        phases = max(len(physical), len(scans))
+        plan = tuple(
+            (
+                *(physical[phase] if phase < len(physical) else ()),
+                *(scans[phase] if phase < len(scans) else ()),
+            )
+            for phase in range(phases)
+        )
+        _validate_canonical_buckets(spec, plan, contract.local_chunk_size)
+        return plan
 
     @staticmethod
     def _validate(
@@ -365,6 +401,270 @@ class Mamba2RecurrentFamilyAdapter:
         if states["conv"].shape != expected_conv or states["ssm"].dtype != "float32":
             raise ValueError("Mamba recurrent state metadata is inconsistent")
         return heads, head_dim, groups, state_dim
+
+
+def _build_canonical_scan_buckets(
+    spec: RecurrentPackedExecutionSpec,
+    *,
+    chunk_size: int,
+    max_padded_tokens: int,
+) -> tuple[tuple[RecurrentSegmentBucketPlan, ...], ...]:
+    children: list[list[int]] = [[] for _ in spec.tree_segments]
+    for family, parent in enumerate(spec.tree_parent_indices):
+        if parent >= 0:
+            children[parent].append(family)
+    columns: list[list[_CanonicalScanColumn]] = []
+    next_family = 0
+
+    def append_column(
+        row: int,
+        positions: tuple[int, ...],
+        output_mask: tuple[bool, ...],
+        parent: int,
+        phase: int,
+        needs_final_state: bool,
+    ) -> int:
+        nonlocal next_family
+        if not positions or len(positions) != len(output_mask):
+            raise ValueError("Mamba scan columns require aligned non-empty metadata")
+        while len(columns) <= phase:
+            columns.append([])
+        family = next_family
+        next_family += 1
+        columns[phase].append(
+            _CanonicalScanColumn(
+                row_index=row,
+                family_index=family,
+                parent_index=parent,
+                positions=positions,
+                output_mask=output_mask,
+                needs_final_state=needs_final_state,
+            )
+        )
+        return family
+
+    def visit(
+        family: int,
+        inherited_positions: tuple[int, ...],
+        inherited_output_mask: tuple[bool, ...],
+        boundary_parent: int,
+        phase: int,
+    ) -> None:
+        segment = spec.tree_segments[family]
+        parent = spec.tree_parent_indices[family]
+        if parent >= 0 and segment.row_index != spec.tree_segments[parent].row_index:
+            raise ValueError("Mamba tree edges must remain within one packed row")
+        positions = inherited_positions + tuple(range(segment.start, segment.end))
+        output_mask = inherited_output_mask + (True,) * segment.length
+        node_children = children[family]
+        complete_length = len(positions) // chunk_size * chunk_size
+        if node_children and complete_length:
+            boundary_parent = append_column(
+                segment.row_index,
+                positions[:complete_length],
+                output_mask[:complete_length],
+                boundary_parent,
+                phase,
+                True,
+            )
+            positions = positions[complete_length:]
+            output_mask = output_mask[complete_length:]
+            phase += 1
+        if node_children:
+            for child_offset, child in enumerate(node_children):
+                visit(
+                    child,
+                    positions,
+                    (output_mask if child_offset == 0 else (False,) * len(output_mask)),
+                    boundary_parent,
+                    phase,
+                )
+        elif positions:
+            append_column(
+                segment.row_index,
+                positions,
+                output_mask,
+                boundary_parent,
+                phase,
+                False,
+            )
+
+    for family, parent in enumerate(spec.tree_parent_indices):
+        if parent < 0:
+            visit(family, (), (), -1, 0)
+    return tuple(
+        _build_scan_phase_buckets(
+            tuple(phase),
+            sequence_length=spec.sequence_length,
+            chunk_size=chunk_size,
+            max_padded_tokens=max_padded_tokens,
+        )
+        for phase in columns
+    )
+
+
+def _build_scan_phase_buckets(
+    columns: tuple[_CanonicalScanColumn, ...],
+    *,
+    sequence_length: int,
+    chunk_size: int,
+    max_padded_tokens: int,
+) -> tuple[RecurrentSegmentBucketPlan, ...]:
+    buckets = []
+    for needs_state in (True, False):
+        selected = tuple(
+            column for column in columns if column.needs_final_state == needs_state
+        )
+        length_groups: dict[int, list[_CanonicalScanColumn]] = {}
+        for column in selected:
+            length = len(column.positions)
+            bucket_length = (
+                length
+                if needs_state
+                else (length + chunk_size - 1) // chunk_size * chunk_size
+            )
+            length_groups.setdefault(bucket_length, []).append(column)
+        for bucket_length, group in length_groups.items():
+            bucket_rows = max(max_padded_tokens // bucket_length, 1)
+            for start in range(0, len(group), bucket_rows):
+                buckets.append(
+                    _build_scan_bucket(
+                        tuple(group[start : start + bucket_rows]),
+                        sequence_length=sequence_length,
+                        chunk_size=chunk_size,
+                        needs_final_state=needs_state,
+                    )
+                )
+    return tuple(buckets)
+
+
+def _build_scan_bucket(
+    columns: tuple[_CanonicalScanColumn, ...],
+    *,
+    sequence_length: int,
+    chunk_size: int,
+    needs_final_state: bool,
+) -> RecurrentSegmentBucketPlan:
+    lengths_cpu = torch.tensor([len(column.positions) for column in columns])
+    max_length = int(lengths_cpu.max().item())
+    rows = torch.zeros(max_length, len(columns), dtype=torch.long)
+    positions = torch.zeros_like(rows)
+    output_mask = torch.zeros_like(rows, dtype=torch.bool)
+    for column_index, column in enumerate(columns):
+        length = len(column.positions)
+        rows[:length, column_index] = column.row_index
+        positions[:length, column_index] = torch.tensor(column.positions)
+        output_mask[:length, column_index] = torch.tensor(column.output_mask)
+    plan = build_recurrent_bucket_plan(
+        tuple(
+            RecurrentSegmentSpec(
+                row_index=column.row_index,
+                family_index=column.family_index,
+                group_id=column.family_index,
+                parent_id=column.parent_index,
+                start=0,
+                end=len(column.positions),
+                kind="prefix" if column.parent_index < 0 else "completion",
+                child_index=None if column.parent_index < 0 else 0,
+            )
+            for column in columns
+        ),
+        lengths_cpu=lengths_cpu,
+        row_indices_cpu=rows,
+        position_indices_cpu=positions,
+        flat_sequence_length=sequence_length,
+        device="cpu",
+        pad_to_multiple=chunk_size,
+        build_dense_rows=True,
+    )
+    parents = torch.tensor([column.parent_index for column in columns])
+    packed_output_mask = torch.cat(
+        [
+            output_mask[: int(length), column]
+            for column, length in enumerate(lengths_cpu.tolist())
+        ]
+    ).contiguous()
+    identity = sha256(
+        json.dumps(
+            {
+                "base": plan.artifact_identity,
+                "parents": parents.tolist(),
+                "output_mask": packed_output_mask.tolist(),
+                "needs_final_state": needs_final_state,
+                "schema": "mamba.canonical_chunk_scan.v1",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return plan.model_copy(
+        update={
+            "parent_indices": parents,
+            "parent_indices_cpu": parents,
+            "parent_indices_cpu_tuple": tuple(parents.tolist()),
+            "output_mask": packed_output_mask,
+            "needs_final_state": needs_final_state,
+            "artifact_identity": identity,
+        }
+    )
+
+
+def _validate_canonical_buckets(
+    spec: RecurrentPackedExecutionSpec,
+    phases: tuple[tuple[RecurrentSegmentBucketPlan, ...], ...],
+    chunk_size: int,
+) -> None:
+    canonical = _canonical_flat_positions(spec)
+    canonical_set = set(canonical)
+    physical_tokens: list[int] = []
+    physical_families: list[int] = []
+    owned_tokens: list[int] = []
+    scan_families: set[int] = set()
+    available_boundaries: set[int] = set()
+    for phase in phases:
+        produced_boundaries: set[int] = set()
+        for bucket in phase:
+            flat = bucket.flat_token_indices
+            if flat is None or bucket.parent_indices_cpu_tuple is None:
+                raise ValueError("Mamba buckets require flat-token and parent metadata")
+            if bucket.output_mask is None:
+                physical_tokens.extend(flat.tolist())
+                physical_families.extend(bucket.family_indices_cpu_tuple)
+                continue
+            if bucket.output_mask.numel() != flat.numel():
+                raise ValueError("Mamba scan buckets require one mask per token")
+            if bucket.needs_final_state and any(
+                length <= 0 or length % chunk_size
+                for length in bucket.lengths_cpu.tolist()
+            ):
+                raise ValueError("Mamba boundary states require complete chunks")
+            parents = bucket.parent_indices_cpu_tuple
+            if any(
+                parent >= 0 and parent not in available_boundaries for parent in parents
+            ):
+                raise ValueError("Mamba scan bucket references an unavailable boundary")
+            families = set(bucket.family_indices_cpu_tuple)
+            if families & scan_families:
+                raise ValueError("Mamba scan boundary identifiers must be unique")
+            scan_families.update(families)
+            if bucket.needs_final_state:
+                produced_boundaries.update(families)
+            owned_tokens.extend(flat[bucket.output_mask].tolist())
+            if any(token not in canonical_set for token in flat.tolist()):
+                raise ValueError("Mamba scan bucket references a non-canonical token")
+        available_boundaries.update(produced_boundaries)
+    if sorted(physical_families) != list(range(spec.family_count)):
+        raise ValueError(
+            "Mamba convolution plan must contain every physical segment once"
+        )
+    if sorted(physical_tokens) != sorted(canonical):
+        raise ValueError(
+            "Mamba convolution plan must contain every physical token once"
+        )
+    if sorted(owned_tokens) != sorted(canonical):
+        raise ValueError(
+            "Mamba scan outputs must own every physical token exactly once"
+        )
 
 
 _BUCKET_DEVICE_FIELDS = (
@@ -498,6 +798,7 @@ def _validate_bucket_device_metadata(
         "dense_position_indices": (torch.long, (bucket.segment_count, bucket.length)),
         "family_indices": (torch.long, (bucket.segment_count,)),
         "parent_indices": (torch.long, (bucket.segment_count,)),
+        "output_mask": (torch.bool, (bucket.real_token_count_static,)),
     }
     for name in _BUCKET_DEVICE_FIELDS:
         tensor = getattr(bucket, name)

@@ -16,7 +16,7 @@ MAMBA_SSM_VERSION = "2.3.2.post1"
 MAMBA_SSM_REVISION = "e9594ce1c732d97440f0332fdc43170a2294dbfa"
 MAMBA_FAMILY_KEY = "mamba_2"
 MAMBA_KERNEL_ID = (
-    "mamba_ssm_2_3_2_post1_e9594ce1.chunk_scan_combined.chunk128.conv4.fp32_state.v1"
+    "mamba_ssm_2_3_2_post1_e9594ce1.chunk128.conv4.fp32_state.canonical_replay.v2"
 )
 MAMBA_LAYOUT_KEY = "mamba2.z_x_b_c_dt.head_group.v1"
 
@@ -32,6 +32,7 @@ class MambaBucketPlan(Protocol):
     family_indices_cpu_tuple: tuple[int, ...]
     parent_indices_cpu: torch.Tensor | None
     parent_indices_cpu_tuple: tuple[int, ...] | None
+    output_mask: torch.Tensor | None
     real_token_count_static: int
     needs_final_state: bool
 
@@ -69,28 +70,44 @@ def run_mamba_tree(
     buckets_by_depth: Sequence[Sequence[MambaBucketPlan]],
     params: MambaLocalParameters,
 ) -> torch.Tensor:
-    """Execute each physical prefix segment once and fork only recurrent state."""
+    """Convolve physical segments once, then execute canonical scan columns."""
 
     _validate_projected(projected, params)
+    kinds = {
+        getattr(bucket, "output_mask", None) is not None
+        for buckets in buckets_by_depth
+        for bucket in buckets
+    }
+    if kinds != {False, True}:
+        raise ValueError(
+            "Mamba tree plans must pair physical convolution and canonical scan buckets"
+        )
+    postconv = _convolve_mamba_tree(projected, buckets_by_depth, params)
     output = projected.new_zeros(
         (*projected.shape[:2], params.dt_bias.numel() * params.head_dim)
     )
-    cache = _MambaTreeStateCache(params, projected)
-    projected_flat = projected.flatten(0, 1)
+    cache = _MambaSsmStateCache(params, projected)
+    postconv_flat = postconv.flatten(0, 1)
     output_flat = output.flatten(0, 1)
     for buckets in buckets_by_depth:
         for bucket in buckets:
+            output_mask = getattr(bucket, "output_mask", None)
+            if output_mask is None:
+                continue
             parent_states = cache.parent_states(bucket)
             flat_indices = _bucket_tensor(bucket, "flat_token_indices")
-            compact = projected_flat.index_select(0, flat_indices)
-            compact_output, final_states = run_mamba_bucket(
+            compact = postconv_flat.index_select(0, flat_indices)
+            compact_output, final_states = _run_mamba_scan_bucket(
                 compact,
                 bucket,
                 parent_states,
                 params,
                 output_final_state=bucket.needs_final_state,
             )
-            output_flat = output_flat.index_copy(0, flat_indices, compact_output)
+            write = _bucket_tensor(bucket, "output_mask")
+            output_flat = output_flat.index_copy(
+                0, flat_indices[write], compact_output[write]
+            )
             if bucket.needs_final_state:
                 if final_states is None:
                     raise RuntimeError(
@@ -108,9 +125,8 @@ def run_mamba_bucket(
     *,
     output_final_state: bool,
 ) -> tuple[torch.Tensor, MambaStateBundle | None]:
-    """Run ART convolution plus official autograd SSD on padded segment rows."""
+    """Run one physical projected segment bucket through convolution and SSD."""
 
-    _validate_compact_bucket(compact_projected, bucket, parent_states, params)
     heads = int(params.dt_bias.numel())
     inner = heads * params.head_dim
     group_width = params.num_groups * params.state_dim
@@ -119,6 +135,7 @@ def run_mamba_bucket(
         [inner, inner + 2 * group_width, heads],
         dim=-1,
     )
+    _validate_conv_bucket(conv_input, bucket, parent_states.conv, params)
     convolved, conv_final = packed_varlen_causal_conv(
         conv_input,
         _bucket_tensor(bucket, "cu_seqlens"),
@@ -127,6 +144,54 @@ def run_mamba_bucket(
         params.conv_bias,
         activation="silu",
         output_final_state=output_final_state,
+    )
+    output, ssm_final = _run_mamba_scan_bucket(
+        torch.cat((z, convolved, dt), dim=-1),
+        bucket,
+        parent_states.ssm,
+        params,
+        output_final_state=output_final_state,
+        require_output_mask=False,
+    )
+    final = (
+        MambaStateBundle(conv_final, ssm_final)
+        if conv_final is not None and ssm_final is not None
+        else None
+    )
+    if output_final_state and final is None:
+        raise RuntimeError("Mamba physical bucket omitted required final state")
+    if final is not None and (
+        final.conv.dtype != compact_projected.dtype or final.ssm.dtype != torch.float32
+    ):
+        raise TypeError("Mamba physical final-state dtypes violate the contract")
+    return output, final
+
+
+def _run_mamba_scan_bucket(
+    compact_postconv: torch.Tensor,
+    bucket: MambaBucketPlan,
+    parent_states: torch.Tensor,
+    params: MambaLocalParameters,
+    *,
+    output_final_state: bool,
+    require_output_mask: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run the official autograd SSD on one canonical scan-column bucket."""
+
+    _validate_scan_bucket(
+        compact_postconv,
+        bucket,
+        parent_states,
+        params,
+        require_output_mask=require_output_mask,
+    )
+    heads = int(params.dt_bias.numel())
+    inner = heads * params.head_dim
+    group_width = params.num_groups * params.state_dim
+    z, convolved, dt = torch.split(
+        compact_postconv,
+        [inner, inner + 2 * group_width, heads],
+        dim=-1,
     )
     x, b, c = torch.split(convolved, [inner, group_width, group_width], dim=-1)
     batch, length = bucket.segment_count, bucket.length
@@ -156,7 +221,7 @@ def run_mamba_bucket(
         D=params.d.float(),
         z=z,
         dt_bias=params.dt_bias.float(),
-        initial_states=parent_states.ssm,
+        initial_states=parent_states,
         dt_softplus=True,
         return_final_states=output_final_state,
         state_dtype=torch.float32,
@@ -168,42 +233,70 @@ def run_mamba_bucket(
     compact_output = dense_output.reshape(batch * length, inner).index_select(
         0, dense_indices
     )
-    final = (
-        MambaStateBundle(conv=conv_final, ssm=ssm_final)
-        if output_final_state and conv_final is not None and ssm_final is not None
-        else None
-    )
-    if output_final_state and final is None:
+    if output_final_state and ssm_final is None:
         raise RuntimeError("Mamba bucket final-state contract was not satisfied")
-    if final is not None and (
-        final.conv.dtype != compact_projected.dtype or final.ssm.dtype != torch.float32
-    ):
-        raise TypeError("Mamba final-state dtypes violate the recurrent contract")
-    return compact_output, final
+    if ssm_final is not None and ssm_final.dtype != torch.float32:
+        raise TypeError("Mamba final SSM state must remain FP32")
+    return compact_output, ssm_final
 
 
-class _MambaTreeStateCache:
+def _convolve_mamba_tree(
+    projected: torch.Tensor,
+    buckets_by_depth: Sequence[Sequence[MambaBucketPlan]],
+    params: MambaLocalParameters,
+) -> torch.Tensor:
+    heads = int(params.dt_bias.numel())
+    inner = heads * params.head_dim
+    group_width = params.num_groups * params.state_dim
+    projected_flat = projected.flatten(0, 1)
+    z, conv_input, dt = torch.split(
+        projected_flat, [inner, inner + 2 * group_width, heads], dim=-1
+    )
+    convolved_flat = conv_input.new_zeros(conv_input.shape)
+    cache = _MambaConvStateCache(params, projected)
+    for buckets in buckets_by_depth:
+        for bucket in buckets:
+            if getattr(bucket, "output_mask", None) is not None:
+                continue
+            flat_indices = _bucket_tensor(bucket, "flat_token_indices")
+            compact = conv_input.index_select(0, flat_indices)
+            parent_states = cache.parent_states(bucket)
+            _validate_conv_bucket(compact, bucket, parent_states, params)
+            convolved, final_states = packed_varlen_causal_conv(
+                compact,
+                _bucket_tensor(bucket, "cu_seqlens"),
+                parent_states,
+                params.conv_weight,
+                params.conv_bias,
+                activation="silu",
+                output_final_state=bucket.needs_final_state,
+            )
+            convolved_flat = convolved_flat.index_copy(0, flat_indices, convolved)
+            if bucket.needs_final_state:
+                if final_states is None:
+                    raise RuntimeError("Mamba convolution omitted required final state")
+                cache.append(bucket, final_states)
+    return torch.cat((z, convolved_flat, dt), dim=-1).view_as(projected)
+
+
+class _MambaConvStateCache:
     def __init__(self, params: MambaLocalParameters, reference: torch.Tensor) -> None:
         self.params = params
         self.reference = reference
-        self.states_by_family: list[MambaStateBundle | None] = []
+        self.states_by_family: list[torch.Tensor | None] = []
 
-    def append(self, bucket: MambaBucketPlan, states: MambaStateBundle) -> None:
+    def append(self, bucket: MambaBucketPlan, states: torch.Tensor) -> None:
         families = bucket.family_indices_cpu_tuple
-        if states.conv.shape[0] != len(families) or states.ssm.shape[0] != len(
-            families
-        ):
-            raise ValueError("Mamba final-state rows must match bucket families")
+        if states.shape[0] != len(families):
+            raise ValueError("Mamba convolution states must match bucket families")
         if families:
             self.states_by_family.extend(
                 None for _ in range(max(families) + 1 - len(self.states_by_family))
             )
         for row, family in enumerate(families):
-            self.states_by_family[family] = MambaStateBundle(
-                conv=states.conv[row], ssm=states.ssm[row]
-            )
+            self.states_by_family[family] = states[row]
 
-    def parent_states(self, bucket: MambaBucketPlan) -> MambaStateBundle:
+    def parent_states(self, bucket: MambaBucketPlan) -> torch.Tensor:
         parents = bucket.parent_indices_cpu_tuple
         if parents is None:
             raise ValueError("Mamba bucket requires prebuilt CPU parent indices")
@@ -211,7 +304,47 @@ class _MambaTreeStateCache:
             self.params.conv_weight.shape[0],
             self.params.conv_weight.shape[1] - 1,
         )
-        zero_ssm = torch.zeros(
+        missing = []
+        selected = []
+        for parent in parents:
+            if parent < 0:
+                selected.append(zero_conv)
+            elif (
+                parent >= len(self.states_by_family)
+                or self.states_by_family[parent] is None
+            ):
+                missing.append(parent)
+            else:
+                selected.append(cast(torch.Tensor, self.states_by_family[parent]))
+        if missing:
+            raise RuntimeError(
+                f"Mamba convolution is missing parent states for families {missing}"
+            )
+        return torch.stack(selected)
+
+
+class _MambaSsmStateCache:
+    def __init__(self, params: MambaLocalParameters, reference: torch.Tensor) -> None:
+        self.params = params
+        self.reference = reference
+        self.states_by_family: list[torch.Tensor | None] = []
+
+    def append(self, bucket: MambaBucketPlan, states: torch.Tensor) -> None:
+        families = bucket.family_indices_cpu_tuple
+        if states.shape[0] != len(families):
+            raise ValueError("Mamba SSM states must match bucket boundary families")
+        if families:
+            self.states_by_family.extend(
+                None for _ in range(max(families) + 1 - len(self.states_by_family))
+            )
+        for row, family in enumerate(families):
+            self.states_by_family[family] = states[row]
+
+    def parent_states(self, bucket: MambaBucketPlan) -> torch.Tensor:
+        parents = bucket.parent_indices_cpu_tuple
+        if parents is None:
+            raise ValueError("Mamba scan bucket requires boundary parent indices")
+        zero = torch.zeros(
             self.params.dt_bias.numel(),
             self.params.head_dim,
             self.params.state_dim,
@@ -219,25 +352,20 @@ class _MambaTreeStateCache:
             device=self.reference.device,
         )
         missing = []
-        selected: list[MambaStateBundle] = []
+        selected = []
         for parent in parents:
             if parent < 0:
-                selected.append(MambaStateBundle(conv=zero_conv, ssm=zero_ssm))
+                selected.append(zero)
             elif (
                 parent >= len(self.states_by_family)
                 or self.states_by_family[parent] is None
             ):
                 missing.append(parent)
             else:
-                selected.append(cast(MambaStateBundle, self.states_by_family[parent]))
+                selected.append(cast(torch.Tensor, self.states_by_family[parent]))
         if missing:
-            raise RuntimeError(
-                f"Mamba tree is missing parent states for families {missing}"
-            )
-        return MambaStateBundle(
-            conv=torch.stack([state.conv for state in selected]),
-            ssm=torch.stack([state.ssm for state in selected]),
-        )
+            raise RuntimeError(f"Mamba scan is missing boundary states {missing}")
+        return torch.stack(selected)
 
 
 def _compact_to_dense(
@@ -251,6 +379,7 @@ def _compact_to_dense(
 
 
 def _validate_projected(projected: torch.Tensor, params: MambaLocalParameters) -> None:
+    _validate_parameters(params)
     if projected.ndim != 3:
         raise ValueError(
             f"Mamba projected input must be [batch, sequence, width], got {projected.shape}"
@@ -262,19 +391,61 @@ def _validate_projected(projected: torch.Tensor, params: MambaLocalParameters) -
         )
 
 
-def _validate_compact_bucket(
-    projected: torch.Tensor,
+def _validate_scan_bucket(
+    postconv: torch.Tensor,
     bucket: MambaBucketPlan,
-    states: MambaStateBundle,
+    states: torch.Tensor,
     params: MambaLocalParameters,
+    *,
+    require_output_mask: bool,
 ) -> None:
-    if projected.ndim != 2 or tuple(projected.shape) != (
+    if postconv.ndim != 2 or tuple(postconv.shape) != (
         bucket.real_token_count_static,
         _projected_width(params),
     ):
         raise ValueError(
             "compact Mamba bucket does not match its planned token/feature shape"
         )
+    _validate_parameters(params)
+    heads = params.dt_bias.numel()
+    expected_ssm = (bucket.segment_count, heads, params.head_dim, params.state_dim)
+    if tuple(states.shape) != expected_ssm or states.dtype != torch.float32:
+        raise TypeError("Mamba boundary SSM states must have the planned FP32 shape")
+    dense_indices = _bucket_tensor(bucket, "dense_token_indices")
+    dense_real_mask = _bucket_tensor(bucket, "dense_real_mask")
+    if dense_indices.device != postconv.device:
+        raise ValueError("Mamba scan indices were not materialized on the input device")
+    if tuple(dense_real_mask.shape) != (bucket.segment_count, bucket.length):
+        raise ValueError("Mamba dense real-token mask has the wrong shape")
+    if require_output_mask and tuple(_bucket_tensor(bucket, "output_mask").shape) != (
+        bucket.real_token_count_static,
+    ):
+        raise ValueError("Mamba scan output mask has the wrong shape")
+
+
+def _validate_conv_bucket(
+    compact: torch.Tensor,
+    bucket: MambaBucketPlan,
+    states: torch.Tensor,
+    params: MambaLocalParameters,
+) -> None:
+    _validate_parameters(params)
+    conv_channels = params.conv_weight.shape[0]
+    expected = (
+        bucket.segment_count,
+        conv_channels,
+        params.conv_weight.shape[1] - 1,
+    )
+    if compact.ndim != 2 or tuple(compact.shape) != (
+        bucket.real_token_count_static,
+        conv_channels,
+    ):
+        raise ValueError("compact Mamba convolution input violates its plan")
+    if tuple(states.shape) != expected or states.dtype != compact.dtype:
+        raise TypeError("Mamba convolution states violate their planned shape/dtype")
+
+
+def _validate_parameters(params: MambaLocalParameters) -> None:
     heads, conv_channels = params.dt_bias.numel(), params.conv_weight.shape[0]
     if params.conv_weight.ndim != 2 or params.conv_weight.shape[1] < 1:
         raise ValueError("Mamba conv weight must be [channels, kernel_width]")
@@ -291,29 +462,6 @@ def _validate_compact_bucket(
         raise ValueError("Mamba A_log/dt_bias must contain one value per local head")
     if tuple(params.d.shape) not in ((heads,), (heads, params.head_dim)):
         raise ValueError("Mamba D must be per-head or per-head-dimension")
-    expected_conv = (
-        bucket.segment_count,
-        conv_channels,
-        params.conv_weight.shape[1] - 1,
-    )
-    expected_ssm = (bucket.segment_count, heads, params.head_dim, params.state_dim)
-    if (
-        tuple(states.conv.shape) != expected_conv
-        or tuple(states.ssm.shape) != expected_ssm
-    ):
-        raise ValueError("Mamba parent state shapes do not match the bucket/model")
-    if states.conv.dtype != projected.dtype or states.ssm.dtype != torch.float32:
-        raise TypeError(
-            "Mamba conv state must match activations and SSM state must be FP32"
-        )
-    dense_indices = _bucket_tensor(bucket, "dense_token_indices")
-    dense_real_mask = _bucket_tensor(bucket, "dense_real_mask")
-    if dense_indices.device != projected.device:
-        raise ValueError(
-            "Mamba dense bucket indices were not materialized on the input device"
-        )
-    if tuple(dense_real_mask.shape) != (bucket.segment_count, bucket.length):
-        raise ValueError("Mamba dense real-token mask has the wrong shape")
 
 
 def _projected_width(params: MambaLocalParameters) -> int:
@@ -1093,12 +1241,14 @@ def _validate_device_plan(runtime: _MambaRuntime, device: torch.device) -> None:
         raise ValueError("ART Mamba exchange plan is on the wrong device")
     for buckets in runtime.execution_plan.tree_segment_buckets_by_depth:
         for bucket in buckets:
-            for name in (
+            names = (
                 "cu_seqlens",
                 "dense_token_indices",
                 "dense_real_mask",
                 "flat_token_indices",
-            ):
+                "parent_indices",
+            ) + (("output_mask",) if bucket.output_mask is not None else ())
+            for name in names:
                 if _bucket_tensor(bucket, name).device != device:
                     raise ValueError(f"ART Mamba bucket {name} is on the wrong device")
 

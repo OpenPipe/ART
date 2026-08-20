@@ -45,7 +45,7 @@ _LOGICAL_MOE_FFN_ATTR = "art_nemotron_h_logical_moe_ffn_hidden_size"
 _CONVOLUTION_WIDTH = 4
 _LOCAL_CHUNK_SIZE = 128
 _MAMBA_KERNEL_ID = (
-    "mamba_ssm_2_3_2_post1_e9594ce1.chunk_scan_combined.chunk128.conv4.fp32_state.v1"
+    "mamba_ssm_2_3_2_post1_e9594ce1.chunk128.conv4.fp32_state.canonical_replay.v2"
 )
 _MAMBA_LAYOUT_KEY = "mamba2.z_x_b_c_dt.head_group.v1"
 _NEMOTRON_H_MOE_COMPILE_WORKAROUND_FLAGS = ("te_triton_permute_with_mask_map",)
