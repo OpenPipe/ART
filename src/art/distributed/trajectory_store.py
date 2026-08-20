@@ -434,19 +434,19 @@ class TrajectoryBatchTransfer(_Contract):
         try:
             for layout in self.groups:
                 end = offset + layout.header_byte_count
-                header = bytes(view[offset:end])
+                header = view[offset:end].toreadonly()
                 offset = end
                 records = []
                 for byte_count in layout.record_byte_counts:
                     end = offset + byte_count
-                    records.append(bytes(view[offset:end]))
+                    records.append(view[offset:end].toreadonly())
                     offset = end
                 route_sequences = []
                 for route in layout.route_sequences:
                     segments = []
                     for byte_count in route.segment_byte_counts:
                         end = offset + byte_count
-                        segments.append(bytes(view[offset:end]))
+                        segments.append(view[offset:end].toreadonly())
                         offset = end
                     route_sequences.append(
                         TrajectoryRouteSequence(

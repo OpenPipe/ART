@@ -301,6 +301,16 @@ def test_distributed_transfer_preserves_uncompressed_route_sequences() -> None:
         groups=(layout,),
     )
     restored = transfer._build_bundles(payload)[0]
+    assert isinstance(restored.header, memoryview) and restored.header.obj is payload
+    assert all(
+        isinstance(record, memoryview) and record.obj is payload
+        for record in restored.records
+    )
+    assert all(
+        isinstance(segment, memoryview) and segment.obj is payload
+        for sequence in restored.route_sequences
+        for segment in sequence.data
+    )
     assert _route_values(restored.build()) == _route_values(bundle.build())
     assert tuple(map(bytes, restored.route_sequences[0].data)) == bundle.route_sequences[0].data
 
