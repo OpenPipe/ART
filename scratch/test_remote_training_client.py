@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
+import threading
 from types import SimpleNamespace
 
 import httpx
@@ -13,6 +14,7 @@ import pytest
 from art import Trajectory, TrajectoryGroup
 from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.pipeline_tuner.config import PackedGroupShape, PackingLeafShape
+import art.serverless.client as client_module
 from art.serverless.client import (
     RemoteTrainingClient,
     RemoteTrainingError,
@@ -485,6 +487,7 @@ def test_tokenized_request_rejects_oversized_logprob_result(monkeypatch):
 @pytest.mark.asyncio
 async def test_remote_client_retries_and_preserves_command_order(
     admit_before_failure: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     fake = FakeService()
     fake.admit_before_submit_failure = admit_before_failure
@@ -559,8 +562,23 @@ async def test_remote_client_retries_and_preserves_command_order(
     assert optimizer.ref.reserved_output_learner_version == 1
     assert client.next_sequence_id == 2
     assert client.projected_learner_version == 1
-    forward_result, optimizer_result = await asyncio.gather(
-        forward.result(), optimizer.result()
+    decode_started, decode_release = threading.Event(), threading.Event()
+    decode_operation_result = client_module.decode_operation_result
+
+    def gated_decode(*args, **kwargs):
+        decode_started.set()
+        assert decode_release.wait(1), "result decode blocked the event loop"
+        return decode_operation_result(*args, **kwargs)
+
+    async def release_decode():
+        while not decode_started.is_set():
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        decode_release.set()
+
+    monkeypatch.setattr(client_module, "decode_operation_result", gated_decode)
+    forward_result, optimizer_result, _ = await asyncio.gather(
+        forward.result(), optimizer.result(), release_decode()
     )
     forward_operation_id = _operation_id("run", "forward")
     assert forward_result.operation_id == forward_operation_id

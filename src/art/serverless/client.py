@@ -938,7 +938,11 @@ class RemoteTrainingOperation(Generic[ResultT]):
             payload = await self._service.get_operation_result(
                 self._ref.run_id, self._ref.operation_id, remote
             )
-            result = decode_operation_result(remote, payload, self._result_type)
+            result, cancelled = await complete_to_thread(
+                lambda: decode_operation_result(remote, payload, self._result_type)
+            )
+            if cancelled is not None:
+                raise cancelled
         else:
             result = self._result_type.model_validate(event.payload)
         if result.operation_id != self._ref.operation_id:
