@@ -303,6 +303,7 @@ class ForwardBackwardJobSpec(_Spec):
     experimental_config: ExperimentalTrainConfig = ExperimentalTrainConfig()
     loss: LossConfig | None = None
     tokenized_trainable_token_count: int | None = Field(default=None, ge=1)
+    return_token_logprobs: bool = True
 
     @model_validator(mode="after")
     def _validate_source(self) -> "ForwardBackwardJobSpec":
@@ -368,6 +369,7 @@ class SftForwardBackwardJobSpec(_Spec):
     batch_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     trainable_token_count: int = Field(ge=1)
     global_grad_accumulation_sequences: int = Field(ge=1)
+    return_token_logprobs: bool = True
 
     @model_validator(mode="after")
     def _validate_source(self) -> "SftForwardBackwardJobSpec":

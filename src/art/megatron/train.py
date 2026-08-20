@@ -805,6 +805,11 @@ def _execute_megatron_rl_forward_backward_steps(
                 inter_forward_backward_timing=runtime.inter_forward_backward_timing,
                 loss=job.loss if isinstance(job, ForwardBackwardJobSpec) else None,
                 forward_only=forward_only,
+                return_token_logprobs=(
+                    job.return_token_logprobs
+                    if isinstance(job, ForwardBackwardJobSpec)
+                    else True
+                ),
             )
             after_step(
                 step_index,
@@ -1406,7 +1411,9 @@ def _sft_command_result(
         "operation_id": job.operation_id,
         "metrics": metrics,
         "token_count": int(token_count.item()),
-        "token_logprobs": _global_sft_logprobs(state, batch),
+        "token_logprobs": (
+            _global_sft_logprobs(state, batch) if job.return_token_logprobs else ()
+        ),
     }
 
 
@@ -3649,6 +3656,7 @@ def run_megatron_rl_forward_backward_step(
     inter_forward_backward_timing: _InterForwardBackwardTiming | None = None,
     loss: LossConfig | None = None,
     forward_only: bool = False,
+    return_token_logprobs: bool = True,
 ) -> RLForwardBackwardState:
     if forward_only and loss is None:
         raise ValueError("forward-only RL schedule requires a tokenized named loss")
@@ -3887,8 +3895,10 @@ def run_megatron_rl_forward_backward_step(
                         else float(loss_info.kl_policy_ref.item())
                     ),
                     "offpolicy_diagnostics": loss_info.offpolicy_diagnostics,
-                    "new_logprobs": token_output.restore(new_logprobs.detach()).to(
-                        "cpu"
+                    "new_logprobs": (
+                        token_output.restore(new_logprobs.detach()).to("cpu")
+                        if return_token_logprobs
+                        else None
                     ),
                 },
             )
@@ -3962,9 +3972,11 @@ def run_megatron_rl_forward_backward_step(
             "time/post_schedule_result_collect_s": result_collect_s,
         }
     )
-    new_logprobs = [
-        cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results
-    ]
+    new_logprobs = (
+        [cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results]
+        if return_token_logprobs
+        else []
+    )
     if loss is not None and int(topology.cp) > 1:
         new_logprobs = _globalize_context_parallel_logprob_batch(
             local_logprobs=new_logprobs,

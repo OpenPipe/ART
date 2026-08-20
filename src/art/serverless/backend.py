@@ -1500,6 +1500,7 @@ class ServerlessBackend:
             collect_packing_shapes=any(
                 group._collect_packing_shape for group in groups
             ),
+            return_token_logprobs=False,
         )
         submit_started = time.monotonic()
         forward = await client.forward_backward(request)
@@ -1693,6 +1694,7 @@ class ServerlessBackend:
             collect_packing_shapes=any(
                 group._collect_packing_shape for group in trajectory_groups
             ),
+            return_token_logprobs=False,
         )
         marked_packed = False
         try:
@@ -1781,6 +1783,7 @@ class ServerlessBackend:
                         assistant_turns=config.assistant_turns,
                     ),
                     loss=LossConfig(name="cross_entropy"),
+                    return_token_logprobs=False,
                 )
             )
             forward_result = await forward.result()

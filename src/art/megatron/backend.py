@@ -810,6 +810,7 @@ class MegatronBackend(LocalBackend):
                         assistant_turns=config.assistant_turns,
                     ),
                     loss=LossConfig(name="cross_entropy"),
+                    return_token_logprobs=False,
                 )
             )
             optimizer = await client.optim_step(
@@ -1291,6 +1292,7 @@ class MegatronBackend(LocalBackend):
                 collect_packing_shapes=any(
                     group._collect_packing_shape for group in trajectory_groups
                 ),
+                return_token_logprobs=False,
             ),
             preparation_metrics=metrics,
             expose_checkpoint_path=bool(train_kwargs.get("save_checkpoint", True)),
@@ -1367,6 +1369,7 @@ class MegatronBackend(LocalBackend):
                 collect_packing_shapes=any(
                     group._collect_packing_shape for group in payload.groups
                 ),
+                return_token_logprobs=False,
             )
         )
         optimizer = await client.optim_step(

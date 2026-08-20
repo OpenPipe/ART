@@ -224,6 +224,7 @@ class RemoteForwardRequest(RunCommand):
     batch: RemoteTrainingBatchRef
     loss: LossConfig
     collect_packing_shapes: bool = False
+    return_token_logprobs: bool = True
 
     @classmethod
     def from_command(
@@ -238,6 +239,7 @@ class RemoteForwardRequest(RunCommand):
             batch=batch,
             loss=command.loss,
             collect_packing_shapes=command.collect_packing_shapes,
+            return_token_logprobs=command.return_token_logprobs,
         )
 
     @model_validator(mode="after")

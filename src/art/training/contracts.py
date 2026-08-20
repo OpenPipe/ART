@@ -223,6 +223,7 @@ class ForwardRequest(RunCommand):
     batch: TrainingBatch
     loss: LossConfig
     collect_packing_shapes: bool = False
+    return_token_logprobs: bool = True
 
     @model_validator(mode="after")
     def _validate_loss(self) -> "ForwardRequest":

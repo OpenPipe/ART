@@ -100,6 +100,7 @@ class PreparedForward(BaseModel):
     ref: OperationRef
     packing: PackingOutcome
     kind: Literal["rl", "sft", "tokenized"]
+    return_token_logprobs: bool = True
 
     @property
     def token_cost(self) -> int:
@@ -129,6 +130,7 @@ class PlannedPackedForward(BaseModel):
     config: RlForwardBackwardConfig
     experimental_config: ExperimentalTrainConfig
     loss: LossConfig | None = None
+    return_token_logprobs: bool = True
 
     @property
     def storage_byte_count(self) -> int:
@@ -358,6 +360,7 @@ class MegatronTrainingSlot:
             if tokenized.num_trainable_tokens < 1:
                 return PreparedEmptySftForward(
                     ref=ref,
+                    return_token_logprobs=request.return_token_logprobs,
                     tokenization_s=time.perf_counter() - started,
                     num_dropped_trajectories=tokenized.num_dropped_trajectories,
                     packing=PackingOutcome(
@@ -384,6 +387,7 @@ class MegatronTrainingSlot:
             )
             return PreparedSftForward(
                 ref=ref,
+                return_token_logprobs=request.return_token_logprobs,
                 batch=batch,
                 global_grad_accumulation_sequences=grad_sequences,
                 tokenization_s=time.perf_counter() - started,
@@ -429,6 +433,7 @@ class MegatronTrainingSlot:
                 config=RlForwardBackwardConfig(),
                 experimental_config=ExperimentalTrainConfig(),
                 loss=request.loss,
+                return_token_logprobs=request.return_token_logprobs,
             )
         if not isinstance(request.batch, RlTrajectoryBatch):
             raise TypeError("packed planning requires an RL or tokenized batch")
@@ -476,6 +481,7 @@ class MegatronTrainingSlot:
             packing=plan,
             config=training_config,
             experimental_config=config,
+            return_token_logprobs=request.return_token_logprobs,
         )
 
     async def materialize_forward_packing(
@@ -498,6 +504,7 @@ class MegatronTrainingSlot:
             config=planned.config,
             experimental_config=planned.experimental_config,
             loss=planned.loss,
+            return_token_logprobs=planned.return_token_logprobs,
         )
 
     async def discard_forward_packing(self, planned: PlannedPackedForward) -> None:
@@ -552,6 +559,7 @@ class MegatronTrainingSlot:
                 global_grad_accumulation_sequences=(
                     prepared.global_grad_accumulation_sequences
                 ),
+                return_token_logprobs=prepared.return_token_logprobs,
             )
             raw = await self.trainer.sft_forward(job, prepared.batch)
             return self._sft_forward_result(prepared, raw, backward=False)
@@ -574,6 +582,7 @@ class MegatronTrainingSlot:
                 if prepared.kind == "tokenized"
                 else None
             ),
+            return_token_logprobs=prepared.return_token_logprobs,
         )
         try:
             raw = await self.trainer.forward(job, prepared.packed.leases)
@@ -625,6 +634,7 @@ class MegatronTrainingSlot:
                 global_grad_accumulation_sequences=(
                     prepared.global_grad_accumulation_sequences
                 ),
+                return_token_logprobs=prepared.return_token_logprobs,
             )
             raw = await self.trainer.sft_forward_backward(job, prepared.batch)
             result = cast(
@@ -657,6 +667,7 @@ class MegatronTrainingSlot:
                 if prepared.kind == "tokenized"
                 else None
             ),
+            return_token_logprobs=prepared.return_token_logprobs,
         )
         try:
             raw = await self.trainer.start_forward_backward(job, prepared.packed.leases)

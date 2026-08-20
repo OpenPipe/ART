@@ -189,6 +189,7 @@ class ForwardBackwardRankLaunch(BaseModel):
     batch: SkipValidation[PackedBatchRef]
     candidate_capacity: int | None
     coordinator: bool
+    return_token_logprobs: bool
     snapshot: SkipValidation[PendingCpuSnapshot[Any]]
     staging: SkipValidation[_ForwardBackwardResultStagerLease]
     _materialize_lock: Lock = PrivateAttr(default_factory=Lock)
@@ -219,7 +220,7 @@ class ForwardBackwardRankLaunch(BaseModel):
                             self.candidate_capacity,
                             tuple(staged_result.result.new_logprobs),
                         )
-                        if self.coordinator
+                        if self.coordinator and self.return_token_logprobs
                         else ()
                     ),
                 }
@@ -255,8 +256,10 @@ def _stage_forward_backward_rank_result(
                     "result": step.model_copy(
                         update={
                             "reduced_loss": builder.stage(step.reduced_loss),
-                            "new_logprobs": list(
-                                builder.stage_group(step.new_logprobs)
+                            "new_logprobs": (
+                                list(builder.stage_group(step.new_logprobs))
+                                if job.return_token_logprobs
+                                else []
                             ),
                         }
                     )
@@ -275,6 +278,7 @@ def _stage_forward_backward_rank_result(
                 None if target_tokens is None else int(target_tokens.shape[2])
             ),
             coordinator=coordinator,
+            return_token_logprobs=job.return_token_logprobs,
             snapshot=builder.finish(staged),
             staging=staging,
         )
@@ -508,7 +512,11 @@ class MegatronTrainJobExecutor:
             "operation_id": job.operation_id,
             "metrics": result.metrics(),
             "token_count": int(result.token_count.item()),
-            "token_logprobs": _command_token_logprobs(batch, step.new_logprobs),
+            "token_logprobs": (
+                _command_token_logprobs(batch, step.new_logprobs)
+                if job.return_token_logprobs
+                else ()
+            ),
         }
 
     def execute_forward(
@@ -535,7 +543,11 @@ class MegatronTrainJobExecutor:
         )
         return {
             **result,
-            "token_logprobs": _command_token_logprobs(batch, result["token_logprobs"]),
+            "token_logprobs": (
+                _command_token_logprobs(batch, result["token_logprobs"])
+                if job.return_token_logprobs
+                else ()
+            ),
         }
 
     def execute_sft_forward_backward(
@@ -1151,7 +1163,11 @@ class MCoreRunSlotExecutor:
             )
         return {
             **result,
-            "token_logprobs": _command_token_logprobs(batch, result["token_logprobs"]),
+            "token_logprobs": (
+                _command_token_logprobs(batch, result["token_logprobs"])
+                if job.return_token_logprobs
+                else ()
+            ),
         }
 
     def execute_sft_forward_backward(
