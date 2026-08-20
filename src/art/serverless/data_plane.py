@@ -9,7 +9,7 @@ from typing import Any, Literal, NamedTuple, TypeVar, cast
 import uuid
 
 from msgspec import msgpack
-from pydantic import BaseModel, ConfigDict, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from art.distributed.moe_route_store import (
     MoeRouteGroupPayload,
@@ -32,6 +32,7 @@ from art.training.contracts import (
 from art.training.tokenized import MAX_TOKENIZED_LOGPROB_VALUES, TokenizedMoeRoutes
 
 from .contracts import (
+    MAX_RL_GROUPS_PER_BATCH,
     RL_GROUP_DATA_FORMAT,
     SFT_DATA_FORMAT,
     TOKENIZED_DATA_FORMAT,
@@ -59,7 +60,7 @@ FORWARD_SUBMISSION_MEDIA_TYPE = "application/vnd.art.forward-framed+msgpack"
 FORWARD_SUBMISSION_PREFIX_BYTES = 16
 MAX_FORWARD_SUBMISSION_MANIFEST_BYTES = 16 << 20
 MAX_FORWARD_SUBMISSION_BYTES = 4 << 30
-MAX_FORWARD_SUBMISSION_CHUNKS = 1 << 20
+MAX_FORWARD_SUBMISSION_CHUNKS = 1 << 16
 FORWARD_SUBMISSION_CHUNK_BYTES = 1 << 20
 _FORWARD_SUBMISSION_MAGIC = b"ARTFWD02"
 _FORWARD_SUBMISSION_PREFIX = struct.Struct("!8sQ")
@@ -209,8 +210,10 @@ class ForwardSubmissionManifest(BaseModel):
 
     format: Literal["art_forward_submission_v2"] = "art_forward_submission_v2"
     request: RemoteForwardRequest
-    objects: tuple[TrainingDataRef, ...]
-    route_objects: tuple[RemoteRouteObjectRef, ...] = ()
+    objects: tuple[TrainingDataRef, ...] = Field(max_length=MAX_RL_GROUPS_PER_BATCH)
+    route_objects: tuple[RemoteRouteObjectRef, ...] = Field(
+        default=(), max_length=MAX_FORWARD_SUBMISSION_CHUNKS
+    )
 
     @model_validator(mode="after")
     def _validate_objects(self) -> "ForwardSubmissionManifest":

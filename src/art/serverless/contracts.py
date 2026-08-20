@@ -42,6 +42,10 @@ MAX_CHECKPOINT_CURSOR_LENGTH = 512
 DEFAULT_CHECKPOINT_ALIAS_PAGE_LIMIT = 100
 MAX_CHECKPOINT_ALIAS_PAGE_LIMIT = 512
 MAX_CHECKPOINT_ALIASES_PER_VIEW = DEFAULT_CHECKPOINT_ALIAS_PAGE_LIMIT
+MAX_RL_GROUPS_PER_BATCH = 4096
+MAX_ROUTE_OBJECTS_PER_GROUP = 256
+MAX_ROUTE_SLICES_PER_OBJECT = 65536
+MAX_ROUTE_SLICES_PER_GROUP = 262144
 
 TargetModule = Annotated[str, Field(min_length=1, max_length=MAX_TARGET_MODULE_LENGTH)]
 RunMetadataKey = Annotated[
@@ -102,7 +106,9 @@ RemoteRouteSlice = MoeRouteSlice
 
 class RemoteRouteObject(Contract):
     ref: RemoteRouteObjectRef
-    slices: tuple[RemoteRouteSlice, ...] = Field(min_length=1)
+    slices: tuple[RemoteRouteSlice, ...] = Field(
+        min_length=1, max_length=MAX_ROUTE_SLICES_PER_OBJECT
+    )
 
     @model_validator(mode="after")
     def _validate_slices(self) -> "RemoteRouteObject":
@@ -129,7 +135,9 @@ class RemoteRouteObject(Contract):
 
 class RemoteRlGroupRef(Contract):
     data: TrainingDataRef
-    routes: tuple[RemoteRouteObject, ...] = ()
+    routes: tuple[RemoteRouteObject, ...] = Field(
+        default=(), max_length=MAX_ROUTE_OBJECTS_PER_GROUP
+    )
     annotations: TrajectoryGroupAnnotations | None = None
 
     @model_validator(mode="after")
@@ -147,6 +155,8 @@ class RemoteRlGroupRef(Contract):
             for route in self.routes
             for value in route.slices
         ]
+        if len(positions) > MAX_ROUTE_SLICES_PER_GROUP:
+            raise ValueError("RL group route slices exceed the configured limit")
         if len(positions) != len(set(positions)):
             raise ValueError("RL group routes contain duplicate trajectory segments")
         validate_moe_route_bindings(
@@ -157,7 +167,9 @@ class RemoteRlGroupRef(Contract):
 
 class RemoteRlBatchRef(Contract):
     kind: Literal["rl"] = "rl"
-    groups: tuple[RemoteRlGroupRef, ...] = Field(min_length=1)
+    groups: tuple[RemoteRlGroupRef, ...] = Field(
+        min_length=1, max_length=MAX_RL_GROUPS_PER_BATCH
+    )
     min_source_version: int = Field(ge=0)
     max_source_version: int = Field(ge=0)
 

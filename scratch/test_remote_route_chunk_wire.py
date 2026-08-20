@@ -7,6 +7,7 @@ import struct
 import numpy as np
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
+from pydantic import ValidationError
 import pytest
 
 from art.distributed.moe_route_store import hydrate_trajectory_group_routes
@@ -18,11 +19,22 @@ from art.preprocessing.moe_routing import (
     MoeRouteSegments,
     choice_moe_routing_metadata,
 )
-from art.serverless.contracts import RemoteForwardRequest
+from art.serverless.contracts import (
+    MAX_RL_GROUPS_PER_BATCH,
+    MAX_ROUTE_OBJECTS_PER_GROUP,
+    MAX_ROUTE_SLICES_PER_OBJECT,
+    RemoteForwardRequest,
+    RemoteRlBatchRef,
+    RemoteRlGroupRef,
+    RemoteRouteObject,
+)
 from art.serverless.data_plane import (
     FORWARD_SUBMISSION_CHUNK_BYTES,
     FORWARD_SUBMISSION_PREFIX_BYTES,
+    MAX_FORWARD_SUBMISSION_CHUNKS,
+    EncodedForwardSubmission,
     EncodedRouteObject,
+    ForwardSubmissionManifest,
     decode_forward_submission_manifest,
     decode_forward_submission_prefix,
     decode_trajectory_group,
@@ -253,6 +265,60 @@ async def test_forward_submission_stream_is_byte_identical_and_bounded() -> None
     assert manifest.request == request
     assert manifest.objects == tuple(value.ref for value in encoded.objects)
     assert manifest.route_objects == tuple(value.ref for value in encoded.route_objects)
+
+
+def test_forward_batch_structure_is_bounded_before_materialization() -> None:
+    encoded = encode_trajectory_group(
+        TrajectoryGroupBundle.from_group(_group()), object_id="1" * 64
+    )
+    group = encoded.remote
+    route = group.routes[0]
+    with pytest.raises(ValidationError, match="too_long"):
+        RemoteRouteObject(
+            ref=route.ref,
+            slices=(route.slices[0],) * (MAX_ROUTE_SLICES_PER_OBJECT + 1),
+        )
+    with pytest.raises(ValidationError, match="too_long"):
+        RemoteRlGroupRef(
+            data=group.data,
+            routes=(route,) * (MAX_ROUTE_OBJECTS_PER_GROUP + 1),
+        )
+    with pytest.raises(ValidationError, match="too_long"):
+        RemoteRlBatchRef(
+            groups=(group,) * (MAX_RL_GROUPS_PER_BATCH + 1),
+            min_source_version=0,
+            max_source_version=0,
+        )
+
+
+def test_forward_wire_fragment_count_is_bounded() -> None:
+    batch = RlTrajectoryBatch(
+        groups=(TrajectoryGroupBundle.from_group(_group()),),
+        min_source_version=0,
+        max_source_version=0,
+    )
+    encoded = prepare_training_batch(batch, identity="batch")
+    request = RemoteForwardRequest(
+        run_id="run",
+        request_id="request",
+        sequence_id=0,
+        batch=encoded.remote,
+        loss=LossConfig(name="ppo"),
+    )
+    with pytest.raises(ValidationError, match="too_long"):
+        ForwardSubmissionManifest(
+            request=request,
+            objects=tuple(value.ref for value in encoded.objects),
+            route_objects=(encoded.route_objects[0].ref,)
+            * (MAX_FORWARD_SUBMISSION_CHUNKS + 1),
+        )
+    chunk = memoryview(b"x")
+    with pytest.raises(ValidationError, match="wire chunk count"):
+        EncodedForwardSubmission(
+            preamble=b"x",
+            chunks=(chunk,) * (MAX_FORWARD_SUBMISSION_CHUNKS + 1),
+            byte_count=MAX_FORWARD_SUBMISSION_CHUNKS + 2,
+        )
 
 
 @pytest.mark.asyncio
