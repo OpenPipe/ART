@@ -29,7 +29,7 @@ from art.training.contracts import (
     SaveStateResult,
     SaveWeightsForSamplerRequest,
 )
-from art.utils.lifecycle import process_shutdown_timeout
+from art.utils.lifecycle import complete_to_thread, process_shutdown_timeout
 
 from .contracts import (
     DEFAULT_CHECKPOINT_ALIAS_PAGE_LIMIT,
@@ -166,6 +166,25 @@ def _sha256(payload: bytes) -> str:
 
 def _operation_id(run_id: str, request_id: str) -> str:
     return _sha256(f"{run_id}\0{request_id}".encode())
+
+
+def _prepare_forward_submission(
+    request: ForwardRequest | ForwardBackwardRequest,
+    encoded_batch: EncodedTrainingBatch | None,
+) -> tuple[RemoteForwardRequest, EncodedForwardSubmission, str]:
+    prepared = (
+        encoded_batch
+        if encoded_batch is not None
+        else prepare_training_batch(request.batch)
+    )
+    if prepared.batch is not request.batch:
+        raise ValueError("prepared batch does not belong to the request")
+    remote = RemoteForwardRequest.from_command(request, prepared.remote)
+    return (
+        remote,
+        encode_forward_submission(remote, prepared),
+        remote_request_fingerprint(remote),
+    )
 
 
 class RemoteTrainingError(RuntimeError):
@@ -1003,50 +1022,52 @@ class RemoteTrainingClient:
         result_type: type[ResultT],
         encoded_batch: EncodedTrainingBatch | None = None,
     ) -> TrainingOperation[ResultT]:
-        wire_request: RunCommand = request
-        prepared_batch: EncodedTrainingBatch | None = None
-        submission: EncodedForwardSubmission | None = None
-        if isinstance(request, (ForwardRequest, ForwardBackwardRequest)):
-            if encoded_batch is not None:
-                if request.batch is not encoded_batch.batch:
-                    raise ValueError("prepared batch does not belong to the request")
-                prepared_batch = encoded_batch
-            else:
-                prepared_batch = await asyncio.to_thread(
-                    prepare_training_batch,
-                    request.batch,
-                )
-            wire_request = RemoteForwardRequest.from_command(
-                request, prepared_batch.remote
-            )
-            submission = await asyncio.to_thread(
-                encode_forward_submission, wire_request, prepared_batch
-            )
-        elif encoded_batch is not None:
+        if encoded_batch is not None and not isinstance(
+            request, (ForwardRequest, ForwardBackwardRequest)
+        ):
             raise TypeError("only forward commands accept a prepared batch")
         return await self._admit(
             request,
-            wire_request,
             kind=kind,
             result_type=result_type,
-            submission=submission,
+            encoded_batch=encoded_batch,
         )
 
     async def _admit(
         self,
         request: RunCommand,
-        wire_request: RunCommand,
         *,
         kind: OperationKind,
         result_type: type[ResultT],
-        submission: EncodedForwardSubmission | None = None,
+        encoded_batch: EncodedTrainingBatch | None = None,
     ) -> TrainingOperation[ResultT]:
-        fingerprint = remote_request_fingerprint(wire_request)
         async with self._lock:
             if self._closed:
                 raise RuntimeError("remote training client is closed")
             if request.run_id != self.run_id:
                 raise ValueError("command run_id does not match the remote client")
+            reserved = self._reserved_admission
+            if reserved is not None:
+                request_id, _, reserved_kind = reserved
+                if request_id != request.request_id:
+                    raise RuntimeError("remote command admission remains unresolved")
+                if reserved_kind != kind:
+                    raise ValueError("request_id was reused with different content")
+            if request.sequence_id > self._next_sequence_id:
+                raise ValueError(
+                    f"expected sequence {self._next_sequence_id}, "
+                    f"got {request.sequence_id}"
+                )
+            if isinstance(request, (ForwardRequest, ForwardBackwardRequest)):
+                prepared, cancelled = await complete_to_thread(
+                    lambda: _prepare_forward_submission(request, encoded_batch)
+                )
+                if cancelled is not None:
+                    raise cancelled
+                wire_request, submission, fingerprint = prepared
+            else:
+                wire_request, submission = request, None
+                fingerprint = remote_request_fingerprint(request)
             if existing := self._operations.get(request.request_id):
                 if existing[0] != fingerprint:
                     raise ValueError("request_id was reused with different content")
@@ -1063,11 +1084,8 @@ class RemoteTrainingClient:
                     f"expected sequence {self._next_sequence_id}, "
                     f"got {request.sequence_id}"
                 )
-            reserved = self._reserved_admission
             if reserved is not None:
                 request_id, reserved_fingerprint, reserved_kind = reserved
-                if request_id != request.request_id:
-                    raise RuntimeError("remote command admission remains unresolved")
                 if reserved_fingerprint != fingerprint or reserved_kind != kind:
                     raise ValueError("request_id was reused with different content")
             operation_id = _operation_id(request.run_id, request.request_id)

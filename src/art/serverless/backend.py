@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Coroutine, Iterable
 from contextlib import asynccontextmanager
 import os
 import time
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 import uuid
 
 from pydantic import (
@@ -29,7 +29,7 @@ from art.distributed.rollout import (
     DistributedTrajectoryQueue,
     DistributedTrajectorySelection,
 )
-from art.distributed.trajectory_store import TrajectoryGroupRef
+from art.distributed.trajectory_store import TrajectoryGroupBundle, TrajectoryGroupRef
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.serving_capabilities import discover_serving_capabilities
 from art.training.client import TrainingOperation
@@ -1664,27 +1664,62 @@ class ServerlessBackend:
         min_source_version, max_source_version = _source_version_range(
             trajectory_groups, client.projected_learner_version
         )
-        bundles = tuple(
-            await asyncio.gather(
+        request_id = uuid.uuid4().hex
+        generation_id = request_id
+
+        async def receive_and_mark() -> list[Any]:
+            return await asyncio.gather(
                 *(
                     queue.receive_bundle(selection.lease.item.ref)
                     for selection in selected
-                )
+                ),
+                queue.mark_packed(selected, generation_id),
+                return_exceptions=True,
             )
+
+        values, cancelled = await complete_task(asyncio.create_task(receive_and_mark()))
+        marked_packed = not isinstance(values[-1], BaseException)
+        errors = [value for value in values if isinstance(value, BaseException)]
+        primary = cancelled or (errors[0] if errors else None)
+        owns_selections = marked_packed or not any(
+            isinstance(value, BaseException) for value in values[:-1]
         )
+        if owns_selections:
+            for group in trajectory_groups:
+                group._distributed_lease = None
+        if primary is not None:
+            cleanup = []
+            if owns_selections:
+                cleanup.append(
+                    asyncio.create_task(
+                        queue.release_selections(
+                            selected,
+                            disposition="discarded",
+                            generation_id=(generation_id if marked_packed else None),
+                        )
+                    )
+                )
+            secondary = [error for error in errors if error is not primary]
+            secondary.extend(
+                value
+                for value in await asyncio.gather(*cleanup, return_exceptions=True)
+                if isinstance(value, BaseException)
+            )
+            if secondary:
+                raise BaseExceptionGroup(
+                    "remote packing and source cleanup failed",
+                    [primary, *secondary],
+                ) from None
+            raise primary
+        bundles = tuple(cast(TrajectoryGroupBundle, value) for value in values[:-1])
         batch = RlTrajectoryBatch.from_group_bundles(
             bundles,
             min_source_version=min_source_version,
             max_source_version=max_source_version,
-            groups=trajectory_groups,
             group_annotations=tuple(
                 selection.lease.item.annotations for selection in selected
             ),
         )
-        for group in trajectory_groups:
-            group._distributed_lease = None
-        request_id = uuid.uuid4().hex
-        generation_id = request_id
         request = ForwardBackwardRequest(
             run_id=client.run_id,
             request_id=request_id,
@@ -1696,34 +1731,6 @@ class ServerlessBackend:
             ),
             return_token_logprobs=False,
         )
-        marked_packed = False
-        try:
-            _, cancelled = await complete_task(
-                asyncio.create_task(queue.mark_packed(selected, generation_id))
-            )
-            marked_packed = True
-            if cancelled is not None:
-                raise cancelled
-        except BaseException as primary:
-            cleanup = [
-                asyncio.create_task(
-                    queue.release_selections(
-                        selected,
-                        disposition="discarded",
-                        generation_id=generation_id if marked_packed else None,
-                    )
-                )
-            ]
-            failures = [
-                value
-                for value in await asyncio.gather(*cleanup, return_exceptions=True)
-                if isinstance(value, BaseException) and value is not primary
-            ]
-            if failures:
-                raise BaseExceptionGroup(
-                    "remote packing and source cleanup failed", [primary, *failures]
-                ) from None
-            raise
         metrics = {
             "time/step_prepare_remote_batch_s": time.monotonic() - started,
         }
