@@ -116,6 +116,7 @@ _SUPERVISION_HANDLERS: dict[str, "MonarchTrainerSupervision"] = {}
 _SUPERVISION_MESHES: dict[str, "MonarchTrainerSupervision"] = {}
 _EXPECTED_STOPPED_MESH_FAILURES: dict[str, float] = {}
 _PREVIOUS_FAULT_HOOK: Callable[[MeshFailure], None] | None = None
+_MAX_PENDING_RUN_CLEANUPS = 8
 
 
 def _configure_hybrid_ep_env(
@@ -1039,10 +1040,19 @@ class MonarchTrainerActor(Actor):
         return {"rank": self._runtime.rank, "run_id": run_id}
 
     @endpoint
-    def unregister_run_slot(self, run_id: str) -> dict[str, Any]:
+    def start_unregister_run_slot(self, run_id: str) -> dict[str, Any]:
         if not self._valid:
             raise RuntimeError("trainer actor runtime is invalid")
-        self._require_run_slot_executor().unregister_run(run_id)
+        self._require_run_slot_executor().start_unregister_run(run_id)
+        return {"rank": self._runtime.rank, "run_id": run_id}
+
+    @concurrent_endpoint
+    async def finish_unregister_run_slot(self, run_id: str) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        await asyncio.to_thread(
+            self._require_run_slot_executor().finish_unregister_run, run_id
+        )
         return {"rank": self._runtime.rank, "run_id": run_id}
 
     @endpoint
@@ -1779,7 +1789,8 @@ class MonarchTrainerSlot:
         self._registration_tasks: dict[
             str, tuple[str, asyncio.Task[None]]
         ] = {}
-        self._removed_runs: set[str] = set()
+        self._removal_tasks: dict[str, asyncio.Task[None]] = {}
+        self._cleanup_slots = asyncio.BoundedSemaphore(_MAX_PENDING_RUN_CLEANUPS)
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
         self._forward_backward_launches: dict[
             str, tuple[str, ForwardBackwardCommandLaunch]
@@ -1798,8 +1809,8 @@ class MonarchTrainerSlot:
                 if prior != fingerprint:
                     raise RuntimeError("run_id was reused for another registration")
                 return
-            if registration.run_id in self._removed_runs:
-                raise RuntimeError("removed run_id cannot be registered again")
+            if registration.run_id in self._removal_tasks:
+                raise RuntimeError("run_id is still being removed")
             pending = self._registration_tasks.get(registration.run_id)
             if pending is not None:
                 if pending[0] != fingerprint:
@@ -1889,27 +1900,50 @@ class MonarchTrainerSlot:
                 self._registration_tasks.pop(registration.run_id, None)
 
     async def unregister_run(self, run_id: str) -> None:
-        async with self._lock:
+        async with self._registration_lock:
             self._require_open()
-            if run_id in self._removed_runs:
-                return
-            if run_id not in self._registrations:
+            task = self._removal_tasks.get(run_id)
+            if task is None and run_id not in self._registrations:
                 raise RuntimeError(f"training run is not registered: {run_id!r}")
+            if task is None:
+                task = asyncio.create_task(
+                    self._unregister_run(run_id),
+                    name=f"megatron-unregister-{run_id}",
+                )
+                task.add_done_callback(consume_future_exception)
+                self._removal_tasks[run_id] = task
+        await asyncio.shield(task)
+
+    async def _unregister_run(self, run_id: str) -> None:
+        await self._cleanup_slots.acquire()
+        try:
             try:
+                async with self._lock:
+                    self._require_open()
+                    values = await asyncio.wait_for(
+                        self._actors.start_unregister_run_slot.call(run_id),
+                        timeout=self._command_timeout_s,
+                    )
+                    self._validate_run_removal(values, run_id)
                 values = await asyncio.wait_for(
-                    self._actors.unregister_run_slot.call(run_id),
+                    self._actors.finish_unregister_run_slot.call(run_id),
                     timeout=self._command_timeout_s,
                 )
-                results = list(values.values())
-                if {result["rank"] for result in results} != set(
-                    range(len(self._rank_processes))
-                ) or {result["run_id"] for result in results} != {run_id}:
-                    raise RuntimeError("trainer ranks disagree on run removal")
+                self._validate_run_removal(values, run_id)
                 self._registrations.pop(run_id)
-                self._removed_runs.add(run_id)
             except BaseException as error:
                 await self._invalidate(error, "run removal and cleanup failed")
                 raise
+        finally:
+            self._cleanup_slots.release()
+            self._removal_tasks.pop(run_id, None)
+
+    def _validate_run_removal(self, values: Any, run_id: str) -> None:
+        results = list(values.values())
+        if {result["rank"] for result in results} != set(
+            range(len(self._rank_processes))
+        ) or {result["run_id"] for result in results} != {run_id}:
+            raise RuntimeError("trainer ranks disagree on run removal")
 
     async def forward_backward(
         self,
@@ -2571,11 +2605,20 @@ class MonarchTrainerSlot:
             task.cancel()
         if registrations:
             await asyncio.gather(*registrations, return_exceptions=True)
+        removals = tuple(self._removal_tasks.values())
         primary: BaseException | None = None
         try:
             async with asyncio.timeout(self._shutdown_timeout_s * 0.8):
+                outcomes = await asyncio.gather(*removals, return_exceptions=True)
+                failures = [
+                    outcome
+                    for outcome in outcomes
+                    if isinstance(outcome, BaseException)
+                ]
                 await _remote_teardown(self._actors.close.call())
                 await asyncio.gather(*self._publications.values())
+                if failures:
+                    raise BaseExceptionGroup("run cleanup failed", failures)
         except BaseException as error:
             primary = error
         try:

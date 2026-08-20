@@ -994,12 +994,16 @@ class MCoreRunSlotExecutor:
         self._load_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="art-load-prepare"
         )
+        self._cleanup_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="art-run-cleanup"
+        )
         self._load_preparations: dict[
             str, tuple[str, str, Future[_PreparedRunLoad]]
         ] = {}
         self._registration_preparations: dict[
             str, tuple[str, Future[_PreparedRunRegistration]]
         ] = {}
+        self._run_cleanups: dict[str, Future[None]] = {}
         self._runs: dict[str, _ResidentRunState] = {}
         self._closed = False
 
@@ -1722,6 +1726,12 @@ class MCoreRunSlotExecutor:
         self._retire_accumulator(state)
 
     def unregister_run(self, run_id: str) -> None:
+        self.start_unregister_run(run_id)
+        self.finish_unregister_run(run_id)
+
+    def start_unregister_run(self, run_id: str) -> None:
+        if run_id in self._run_cleanups:
+            return
         state = self._require_run(
             run_id, require_complete=False, allow_unregistering=True
         )
@@ -1743,40 +1753,60 @@ class MCoreRunSlotExecutor:
             else:
                 state.gradients = None
         try:
-            self._publisher.retire_run(run_id)
-        except BaseException as error:
-            failures.append(error)
-        if state.checkpoint_slot_installed or state.installed_weights is not None:
-            try:
+            if state.checkpoint_slot_installed or state.installed_weights is not None:
                 self._slot_trainer.unload_checkpoint_slot(run_id)
-            except BaseException as error:
-                failures.append(error)
-            else:
                 state.checkpoint_slot_installed = False
                 state.installed_weights = None
                 state.installed_optimizer = None
                 state.gradients = None
-        if not state.checkpoint_slot_installed and state.installed_weights is None:
-            for key in self._residency.keys(run_id):
-                try:
-                    self._residency.retire_async(key).result()
-                except BaseException as error:
-                    failures.append(error)
-        cleanup_pending = (
-            state.checkpoint_slot_installed
-            or state.installed_weights is not None
-            or bool(self._residency.keys(run_id))
-        )
-        if not cleanup_pending:
-            self._runs.pop(run_id, None)
-        elif not failures:
-            failures.append(
-                RuntimeError("Megatron run cleanup left resident resources")
-            )
+        except BaseException as error:
+            failures.append(error)
         if len(failures) == 1:
             raise failures[0]
         if failures:
-            raise BaseExceptionGroup("Megatron run unload failed", failures)
+            raise BaseExceptionGroup("Megatron run detach failed", failures)
+        self._run_cleanups[run_id] = self._cleanup_pool.submit(
+            self._finish_run_cleanup, run_id
+        )
+
+    def finish_unregister_run(self, run_id: str) -> None:
+        try:
+            cleanup = self._run_cleanups[run_id]
+        except KeyError as error:
+            raise RuntimeError("Megatron run cleanup was not started") from error
+        try:
+            cleanup.result()
+        finally:
+            self._run_cleanups.pop(run_id)
+
+    def _finish_run_cleanup(self, run_id: str) -> None:
+        failures: list[BaseException] = []
+        try:
+            self._publisher.retire_run(run_id)
+        except BaseException as error:
+            failures.append(error)
+        retirements = tuple(
+            self._residency.retire_async(key) for key in self._residency.keys(run_id)
+        )
+        _done, pending = wait(
+            retirements, timeout=self._residency.config.shutdown_timeout_s
+        )
+        failures.extend(
+            error
+            for retirement in retirements
+            if retirement.done() and (error := retirement.exception()) is not None
+        )
+        if pending:
+            failures.append(
+                TimeoutError(f"{len(pending)} run residency retirements timed out")
+            )
+        if not failures and self._residency.keys(run_id):
+            failures.append(RuntimeError("Megatron run cleanup left resident resources"))
+        if failures:
+            if len(failures) == 1:
+                raise failures[0]
+            raise BaseExceptionGroup("Megatron run cleanup failed", failures)
+        self._runs.pop(run_id)
 
     def close(self) -> None:
         if self._closed:
@@ -1791,6 +1821,7 @@ class MCoreRunSlotExecutor:
         futures = (
             *(value[2] for value in self._load_preparations.values()),
             *(value[1] for value in self._registration_preparations.values()),
+            *self._run_cleanups.values(),
         )
         for future in futures:
             future.cancel()
@@ -1798,6 +1829,7 @@ class MCoreRunSlotExecutor:
             futures, timeout=self._residency.config.shutdown_timeout_s
         )
         self._load_pool.shutdown(wait=False, cancel_futures=True)
+        self._cleanup_pool.shutdown(wait=False, cancel_futures=True)
         try:
             self._publisher.close()
         except BaseException as error:
