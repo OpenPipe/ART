@@ -21,6 +21,7 @@ from art.serverless.client import (
     RemoteTrainingOperation,
     RemoteTrainingOperationCancelled,
     RemoteTrainingServiceClient,
+    _ByteBudget,
 )
 from art.serverless.contracts import (
     FORWARD_BACKWARD_PREPARED_EVENT,
@@ -420,7 +421,7 @@ async def test_operation_result_receive_budget_serializes_allocations(monkeypatc
         base_url="http://test/v1",
         control_http_client=http,
         transfer_http_client=http,
-        max_result_bytes_in_flight=len(payload),
+        max_result_bytes_in_flight=2 * len(payload),
     )
     ref = OperationResultRef(object_id="0" * 64, byte_count=len(payload))
     monkeypatch.setattr(
@@ -428,6 +429,7 @@ async def test_operation_result_receive_budget_serializes_allocations(monkeypatc
         "decode_operation_result",
         lambda _ref, value, _type: bytes(value),
     )
+    monkeypatch.setattr(client_module, "_forward_result_buffer_bytes", len)
     first = asyncio.create_task(
         service.receive_operation_result("run", "first", ref, ForwardBackwardResult)
     )
@@ -490,7 +492,7 @@ async def test_operation_result_receive_budget_close_wakes_waiters(monkeypatch):
         base_url="http://test/v1",
         control_http_client=http,
         transfer_http_client=http,
-        max_result_bytes_in_flight=len(payload),
+        max_result_bytes_in_flight=2 * len(payload),
     )
     ref = OperationResultRef(object_id="0" * 64, byte_count=len(payload))
     monkeypatch.setattr(
@@ -498,6 +500,7 @@ async def test_operation_result_receive_budget_close_wakes_waiters(monkeypatch):
         "decode_operation_result",
         lambda _ref, value, _type: bytes(value),
     )
+    monkeypatch.setattr(client_module, "_forward_result_buffer_bytes", len)
     first = asyncio.create_task(
         service.receive_operation_result("run", "first", ref, ForwardBackwardResult)
     )
@@ -736,7 +739,7 @@ def _budgeted_result_service(
             base_url="http://test/v1",
             control_http_client=http,
             transfer_http_client=http,
-            max_result_bytes_in_flight=byte_count,
+            max_result_bytes_in_flight=2 * byte_count,
         ),
         http,
     )
@@ -774,6 +777,9 @@ async def test_result_budget_remains_reserved_through_cancelled_decode(
 
     monkeypatch.setattr(service, "_download_operation_result", download)
     monkeypatch.setattr(client_module, "decode_operation_result", decode)
+    monkeypatch.setattr(
+        client_module, "_forward_result_buffer_bytes", lambda _: byte_count
+    )
     first = asyncio.create_task(
         service.receive_operation_result("run", "first", ref, ForwardBackwardResult)
     )
@@ -785,7 +791,7 @@ async def test_result_budget_remains_reserved_through_cancelled_decode(
     first.cancel()
     await asyncio.sleep(0)
     assert downloads == ["first"]
-    assert service._result_budget._used == byte_count
+    assert service._result_budget._used == 2 * byte_count
 
     decode_release.set()
     with pytest.raises(asyncio.CancelledError):
@@ -823,6 +829,9 @@ async def test_result_budget_releases_after_decode_error(
 
     monkeypatch.setattr(service, "_download_operation_result", download)
     monkeypatch.setattr(client_module, "decode_operation_result", decode)
+    monkeypatch.setattr(
+        client_module, "_forward_result_buffer_bytes", lambda _: byte_count
+    )
     first = asyncio.create_task(
         service.receive_operation_result("run", "first", ref, ForwardBackwardResult)
     )
@@ -838,6 +847,53 @@ async def test_result_budget_releases_after_decode_error(
         await first
     assert (await asyncio.wait_for(second, 1)).operation_id == "result-2"
     assert downloads == ["first", "second"]
+    assert service._result_budget._used == 0
+    await service.close()
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_result_receive_budget_tracks_encoded_and_decoded_peak() -> None:
+    encoded_byte_count = 32 << 20
+    budget = _ByteBudget(2 * encoded_byte_count)
+
+    async with budget.reserve(
+        encoded_byte_count=encoded_byte_count,
+        decoded_headroom_byte_count=encoded_byte_count,
+    ) as reservation:
+        assert budget._used == 64 << 20
+        await reservation.transfer_to_decoded(31 << 20)
+        assert budget._used == 31 << 20
+
+    assert budget._used == 0
+
+
+@pytest.mark.asyncio
+async def test_impossible_receive_peak_is_rejected_before_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoded_byte_count = 32 << 20
+    service, http = _budgeted_result_service(encoded_byte_count)
+    service._result_budget = _ByteBudget((2 * encoded_byte_count) - 1)
+    downloaded = False
+
+    async def download(*_args):
+        nonlocal downloaded
+        downloaded = True
+        raise AssertionError("an impossible result reached the transport")
+
+    monkeypatch.setattr(service, "_download_operation_result", download)
+    ref = OperationResultRef(
+        object_id="c" * 64,
+        byte_count=encoded_byte_count,
+    )
+
+    with pytest.raises(RemoteTrainingError, match="required=67108864"):
+        await service.receive_operation_result(
+            "run", "operation", ref, ForwardBackwardResult
+        )
+
+    assert not downloaded
     assert service._result_budget._used == 0
     await service.close()
     await http.aclose()

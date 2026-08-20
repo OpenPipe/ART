@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 import hashlib
-from typing import Any, Generic, TypeVar, cast
+from typing import Any, Generic, Literal, TypeVar, cast
 import uuid
 
 import httpx
@@ -76,6 +76,41 @@ _TRANSIENT_HTTP_STATUSES = frozenset({429, 502, 503, 504})
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
 
 
+class _ResultReceiveReservation:
+    def __init__(
+        self,
+        budget: _ByteBudget,
+        *,
+        encoded_byte_count: int,
+        decoded_headroom_byte_count: int,
+    ) -> None:
+        self._budget = budget
+        self._decoded_headroom_byte_count = decoded_headroom_byte_count
+        self._byte_count = encoded_byte_count + decoded_headroom_byte_count
+        self._phase: Literal["encoded", "decoded", "released"] = "encoded"
+
+    @property
+    def byte_count(self) -> int:
+        return self._byte_count
+
+    async def transfer_to_decoded(self, byte_count: int) -> None:
+        if self._phase != "encoded":
+            raise RuntimeError("remote result reservation left its encoded phase")
+        if not 0 <= byte_count <= self._decoded_headroom_byte_count:
+            raise RemoteTrainingError(
+                "decoded remote result exceeded its reserved receive headroom"
+            )
+        await self._budget._resize(self, byte_count)
+        self._decoded_headroom_byte_count = 0
+        self._phase = "decoded"
+
+    async def release(self) -> None:
+        if self._phase == "released":
+            return
+        await self._budget._resize(self, 0)
+        self._phase = "released"
+
+
 class _ByteBudget:
     def __init__(self, capacity: int) -> None:
         if capacity < 1:
@@ -86,9 +121,22 @@ class _ByteBudget:
         self._closed = False
 
     @asynccontextmanager
-    async def reserve(self, byte_count: int):
-        if not 0 < byte_count <= self._capacity:
-            raise RemoteTrainingError("remote result exceeds the client receive budget")
+    async def reserve(
+        self,
+        *,
+        encoded_byte_count: int,
+        decoded_headroom_byte_count: int,
+    ):
+        byte_count = encoded_byte_count + decoded_headroom_byte_count
+        if (
+            encoded_byte_count < 1
+            or decoded_headroom_byte_count < 0
+            or byte_count > self._capacity
+        ):
+            raise RemoteTrainingError(
+                "remote result exceeds the client physical receive budget: "
+                f"required={byte_count}, capacity={self._capacity}"
+            )
         async with self._condition:
             await self._condition.wait_for(
                 lambda: self._closed or self._used + byte_count <= self._capacity
@@ -96,17 +144,36 @@ class _ByteBudget:
             if self._closed:
                 raise RemoteTrainingError("remote result receive budget is closed")
             self._used += byte_count
+        reservation = _ResultReceiveReservation(
+            self,
+            encoded_byte_count=encoded_byte_count,
+            decoded_headroom_byte_count=decoded_headroom_byte_count,
+        )
         try:
-            yield
+            yield reservation
         finally:
-            async with self._condition:
-                self._used -= byte_count
-                self._condition.notify_all()
+            await reservation.release()
+
+    async def _resize(
+        self, reservation: _ResultReceiveReservation, byte_count: int
+    ) -> None:
+        if not 0 <= byte_count <= reservation._byte_count:
+            raise RuntimeError("remote result receive budget resize is invalid")
+        async with self._condition:
+            self._used -= reservation._byte_count - byte_count
+            reservation._byte_count = byte_count
+            self._condition.notify_all()
 
     async def close(self) -> None:
         async with self._condition:
             self._closed = True
             self._condition.notify_all()
+
+
+def _forward_result_buffer_bytes(result: OperationResult) -> int:
+    if not isinstance(result, ForwardResult):
+        raise RemoteTrainingError("remote forward decoded to a control result")
+    return sum(len(output.token_logprobs.data) for output in result.loss_fn_outputs)
 
 
 class _ResultAcknowledger:
@@ -409,7 +476,12 @@ class RemoteTrainingServiceClient:
         ref: OperationResultRef,
         result_type: type[ResultT],
     ) -> ResultT:
-        async with self._result_budget.reserve(ref.byte_count):
+        # MessagePack embeds each logprob buffer verbatim, so its wire size is a
+        # strict upper bound for the decoded bulk buffers created beside it.
+        async with self._result_budget.reserve(
+            encoded_byte_count=ref.byte_count,
+            decoded_headroom_byte_count=ref.byte_count,
+        ) as reservation:
             payload = await self._receive_operation_result(run_id, operation_id, ref)
             try:
                 result, cancelled = await complete_to_thread(
@@ -417,6 +489,7 @@ class RemoteTrainingServiceClient:
                 )
             finally:
                 del payload
+            await reservation.transfer_to_decoded(_forward_result_buffer_bytes(result))
             if cancelled is not None:
                 raise cancelled
             return result
