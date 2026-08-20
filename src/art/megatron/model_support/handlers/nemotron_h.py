@@ -1269,6 +1269,7 @@ class NemotronHMoeHandler(DefaultMoeHandler):
     cp_supported = True
     virtual_pipeline_supported = False
     native_vllm_lora_status = "wip"
+    identity_lora_factory = "direct_2d_linear"
 
     def configure_oracle_provider(self, provider: Any, *, case_config: Any) -> None:
         """Select an existing compact checkpoint prefix for validation only."""

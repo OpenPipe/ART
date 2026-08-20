@@ -48,6 +48,7 @@ class DefaultDenseHandler:
     cp_supported = True
     virtual_pipeline_supported = True
     native_vllm_lora_status = "disabled"
+    identity_lora_factory = "peft_target_parameters"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return base_config

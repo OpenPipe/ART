@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from megatron.bridge.models.gpt_provider import GPTModelProvider
 
 NativeVllmLoraStatus = Literal["disabled", "wip", "validated"]
+IdentityLoraFactory = Literal["peft_target_parameters", "direct_2d_linear"]
 SharedExpertCompileState = Literal[
     "none",
     "shared_experts",
@@ -121,6 +122,7 @@ class ModelSupportHandler(Protocol):
     cp_supported: bool
     virtual_pipeline_supported: bool
     native_vllm_lora_status: NativeVllmLoraStatus
+    identity_lora_factory: IdentityLoraFactory
 
     def identity_lora_model_config(self, base_config: Any) -> Any: ...
 
