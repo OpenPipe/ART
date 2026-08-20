@@ -74,7 +74,9 @@ def load_vllm_lora_tensors(
 ) -> dict[str, torch.Tensor]:
     adapter_model_path = Path(lora_path) / "adapter_model.safetensors"
     with safe_open(adapter_model_path, framework="pt") as adapter_file:
-        return {key: adapter_file.get_tensor(key) for key in adapter_file.keys()}
+        return {
+            key: adapter_file.get_tensor(key).clone() for key in adapter_file.keys()
+        }
 
 
 def save_vllm_lora_tensors(
@@ -115,12 +117,18 @@ def normalize_lora_checkpoint_to_vllm(
         handler,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    tensors = load_vllm_lora_tensors(lora_path)
-    tensors, adapter_config = resolved_handler.to_vllm_lora_tensors(
-        tensors,
-        adapter_config=adapter_config,
-    )
-    save_vllm_lora_tensors(lora_path, tensors, adapter_config)
+    source_tensors = load_vllm_lora_tensors(lora_path)
+    converted_tensors: dict[str, torch.Tensor] | None = None
+    try:
+        converted_tensors, adapter_config = resolved_handler.to_vllm_lora_tensors(
+            source_tensors,
+            adapter_config=adapter_config,
+        )
+        save_vllm_lora_tensors(lora_path, converted_tensors, adapter_config)
+    finally:
+        source_tensors.clear()
+        if converted_tensors is not None and converted_tensors is not source_tensors:
+            converted_tensors.clear()
 
 
 def load_lora_tensors_for_megatron(
