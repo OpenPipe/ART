@@ -283,6 +283,54 @@ class ForwardRankLaunch(BaseModel):
                 self.staging.release()
 
 
+class SftRankLaunch(BaseModel):
+    """SFT GPU-complete result whose CPU conversion is still pending."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    operation_id: str
+    learner_version: int
+    coordinator: bool
+    snapshot: SkipValidation[PendingCpuSnapshot[dict[str, Any]]]
+    staging: SkipValidation[_ForwardBackwardResultStagerLease]
+    _materialize_lock: Lock = PrivateAttr(default_factory=Lock)
+    _materialized: dict[str, Any] | None = PrivateAttr(default=None)
+    _materialization_error: BaseException | None = PrivateAttr(default=None)
+    _finished: bool = PrivateAttr(default=False)
+
+    def materialize(self) -> dict[str, Any]:
+        with self._materialize_lock:
+            if self._finished:
+                if self._materialization_error is not None:
+                    raise self._materialization_error
+                assert self._materialized is not None
+                return self._materialized
+            try:
+                staged = self.snapshot.resolve()
+                if self.coordinator:
+                    from .sft_result import materialize_sft_command_result
+
+                    result = materialize_sft_command_result(staged)
+                else:
+                    result = {
+                        "operation_id": self.operation_id,
+                        "token_count": int(staged["token_count"].item()),
+                        "metrics": {},
+                        "token_logprobs": (),
+                    }
+                self._materialized = {
+                    **result,
+                    "learner_version": self.learner_version,
+                }
+                return self._materialized
+            except BaseException as error:
+                self._materialization_error = error
+                raise
+            finally:
+                self._finished = True
+                self.staging.release()
+
+
 def _stage_forward_rank_result(
     pool: _ForwardBackwardResultStagerPool,
     job: ForwardJobSpec,
@@ -362,6 +410,38 @@ def _stage_forward_backward_rank_result(
             ),
             coordinator=coordinator,
             return_token_logprobs=job.return_token_logprobs,
+            snapshot=builder.finish(staged),
+            staging=staging,
+        )
+    except BaseException:
+        staging.release()
+        raise
+
+
+def _stage_sft_rank_result(
+    pool: _ForwardBackwardResultStagerPool,
+    job: SftForwardBackwardJobSpec | SftForwardJobSpec,
+    result: dict[str, Any],
+    *,
+    coordinator: bool,
+) -> SftRankLaunch:
+    staging = pool.acquire()
+    try:
+        builder = staging.stager.begin()
+        staged: dict[str, Any] = {}
+        if coordinator:
+            staged.update(result)
+            staged["reduced_loss"] = builder.stage(result["reduced_loss"])
+            values = result["logprob_values"]
+            present = result["logprob_present"]
+            if values is not None:
+                staged["logprob_values"] = builder.stage(values)
+                staged["logprob_present"] = builder.stage(present)
+        staged["token_count"] = builder.stage(result["token_count"])
+        return SftRankLaunch(
+            operation_id=job.operation_id,
+            learner_version=job.expected_learner_version,
+            coordinator=coordinator,
             snapshot=builder.finish(staged),
             staging=staging,
         )
@@ -1342,6 +1422,18 @@ class MCoreRunSlotExecutor:
         batch: SFTBatchData,
         cancelled: Event,
     ) -> dict[str, Any]:
+        return self.start_sft_forward_backward(
+            job, batch, cancelled, coordinator=int(self.runtime.rank) == 0
+        ).materialize()
+
+    def start_sft_forward_backward(
+        self,
+        job: SftForwardBackwardJobSpec,
+        batch: SFTBatchData,
+        cancelled: Event,
+        *,
+        coordinator: bool,
+    ) -> SftRankLaunch:
         state = self._require_run(job.run_id)
         self._validate_parent(
             state, job.training_session_id, job.expected_learner_version
@@ -1360,9 +1452,12 @@ class MCoreRunSlotExecutor:
                 gradient_accumulator=gradients,
                 accumulator_residency=self._accumulator_resident(state),
                 cancelled=cancelled,
+                materialize_result=False,
             )
             self._register_gradient_contribution(state, job.operation_id)
-            return result
+        return _stage_sft_rank_result(
+            self._command_result_stagers, job, result, coordinator=coordinator
+        )
 
     def execute_sft_forward(
         self,
@@ -1370,6 +1465,18 @@ class MCoreRunSlotExecutor:
         batch: SFTBatchData,
         cancelled: Event,
     ) -> dict[str, Any]:
+        return self.start_sft_forward(
+            job, batch, cancelled, coordinator=self.runtime.rank == 0
+        ).materialize()
+
+    def start_sft_forward(
+        self,
+        job: SftForwardJobSpec,
+        batch: SFTBatchData,
+        cancelled: Event,
+        *,
+        coordinator: bool,
+    ) -> SftRankLaunch:
         state = self._require_run(job.run_id)
         self._validate_parent(
             state, job.training_session_id, job.expected_learner_version
@@ -1378,12 +1485,16 @@ class MCoreRunSlotExecutor:
         from art.megatron.train import execute_megatron_dynamic_lora_sft_forward_job
 
         with self._resident(state):
-            return execute_megatron_dynamic_lora_sft_forward_job(
+            result = execute_megatron_dynamic_lora_sft_forward_job(
                 self.runtime,
                 job,
                 batch,
                 cancelled=cancelled,
+                materialize_result=False,
             )
+        return _stage_sft_rank_result(
+            self._command_result_stagers, job, result, coordinator=coordinator
+        )
 
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
         state = self._require_run(job.run_id)

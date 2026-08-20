@@ -8,7 +8,13 @@ from pydantic import BaseModel, ConfigDict
 from art.trajectories import TrajectoryGroup
 
 from .adapter_transport import AdapterReceiveResult, AdapterTransferTarget
-from .data_plane import PackedBatchRef, PackedBatchTransfer
+from .data_plane import (
+    ByteStreamTransfer,
+    PackedBatchRef,
+    PackedBatchTransfer,
+    SftBatchManifest,
+    SftBatchRef,
+)
 from .packing import PackingPlanResult, PackingRequest, PackingResult
 from .rollout import (
     RolloutInvocation,
@@ -231,6 +237,17 @@ class MonarchPackedBatchInbox:
         self, ref: PackedBatchRef, transfer: PackedBatchTransfer, *, timeout_s: float
     ) -> PackedBatchRef:
         return await call_remote(self.actor.receive_batch, ref, transfer, timeout_s)
+
+    async def receive_sft(
+        self,
+        manifest: SftBatchManifest,
+        transfer: ByteStreamTransfer,
+        *,
+        timeout_s: float,
+    ) -> SftBatchRef:
+        return await call_remote(
+            self.actor.receive_sft_batch, manifest, transfer, timeout_s
+        )
 
     async def drop(self, ref: PackedBatchRef) -> None:
         await call_remote(self.actor.drop_batch_ref, ref)

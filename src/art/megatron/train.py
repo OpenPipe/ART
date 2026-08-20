@@ -73,6 +73,7 @@ from art.megatron.routing_replay import (
     prepare_moe_routing_replay_boundaries,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
+from art.megatron.runtime.sft_result import materialize_sft_command_result
 from art.megatron.runtime.specs import (
     ForwardBackwardJobSpec,
     ForwardJobSpec,
@@ -1338,10 +1339,10 @@ def _global_sft_loss_and_tokens(
     return raw_loss_sum / token_count, token_count
 
 
-def _global_sft_logprobs(
+def _global_sft_logprob_tensors(
     state: SFTForwardBackwardState,
     batch: SFTBatchData,
-) -> tuple[tuple[float, ...], ...]:
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
     lengths = [
         int(tensors["attention_mask"].sum().item())
         for tensors in batch.trajectory_tensors
@@ -1362,13 +1363,7 @@ def _global_sft_logprobs(
         group = ps.get_data_parallel_group()
         torch.distributed.all_reduce(values, group=group)
         torch.distributed.all_reduce(present, group=group)
-    if not torch.all(present == 1):
-        raise RuntimeError("SFT forward did not materialize every trajectory")
-    host = values.detach().cpu()
-    return tuple(
-        tuple(float(value) for value in host[index, :length].tolist())
-        for index, length in enumerate(lengths)
-    )
+    return values, present, tuple(lengths)
 
 
 def _sft_command_result(
@@ -1380,41 +1375,26 @@ def _sft_command_result(
     token_count: torch.Tensor,
     elapsed_s: float,
     backward: bool,
+    materialize: bool,
 ) -> dict[str, Any]:
     workload = state.schedule.training_workload()
-    metrics = {
-        "loss/train": float(reduced_loss.item()),
-        "data/gradient_step_nonpadding_logical_tokens": float(
-            workload.logical_nonpadding_tokens
-        ),
-        "data/gradient_step_loss_bearing_tokens": float(workload.loss_bearing_tokens),
-        "data/gradient_step_executed_token_equivalents": float(
-            workload.executed_token_equivalents
-        ),
-        "data/gradient_step_nominal_schedule_capacity_tokens": float(
-            workload.nominal_schedule_capacity_tokens
-        ),
-        "data/gradient_step_dummy_executed_token_equivalents": float(
-            workload.dummy_executed_token_equivalents
-        ),
-        "data/gradient_step_dummy_schedule_capacity_tokens": float(
-            workload.dummy_schedule_capacity_tokens
-        ),
-        "pipeline/gradient_step_real_microbatches": float(workload.real_microbatches),
-        "pipeline/gradient_step_dummy_microbatches": float(workload.dummy_microbatches),
-        "time/forward_backward_s" if backward else "time/forward_s": elapsed_s,
-        **state.schedule.telemetry.metrics(),
-    }
-    if backward:
-        metrics[TRAIN_GRADIENT_STEPS_KEY] = 1.0
-    return {
+    values = present = None
+    lengths: tuple[int, ...] = ()
+    if job.return_token_logprobs:
+        values, present, lengths = _global_sft_logprob_tensors(state, batch)
+    result = {
         "operation_id": job.operation_id,
-        "metrics": metrics,
-        "token_count": int(token_count.item()),
-        "token_logprobs": (
-            _global_sft_logprobs(state, batch) if job.return_token_logprobs else ()
-        ),
+        "reduced_loss": reduced_loss,
+        "token_count": token_count,
+        "workload": workload,
+        "telemetry": state.schedule.telemetry,
+        "elapsed_s": elapsed_s,
+        "backward": backward,
+        "logprob_values": values,
+        "logprob_present": present,
+        "logprob_lengths": lengths,
     }
+    return materialize_sft_command_result(result) if materialize else result
 
 
 def execute_megatron_sft_forward_backward_job(
@@ -1424,6 +1404,7 @@ def execute_megatron_sft_forward_backward_job(
     *,
     gradient_accumulator: Any,
     cancelled: Event | None = None,
+    materialize_result: bool = True,
 ) -> dict[str, Any]:
     """Run one supervised F/B against the resident single-run learner."""
     if cancelled is not None and cancelled.is_set():
@@ -1456,6 +1437,7 @@ def execute_megatron_sft_forward_backward_job(
         token_count=token_count,
         elapsed_s=time.perf_counter() - started,
         backward=True,
+        materialize=materialize_result,
     )
 
 
@@ -1465,6 +1447,7 @@ def execute_megatron_sft_forward_job(
     batch: SFTBatchData,
     *,
     cancelled: Event | None = None,
+    materialize_result: bool = True,
 ) -> dict[str, Any]:
     """Run one supervised forward without mutating accumulated gradients."""
     if cancelled is not None and cancelled.is_set():
@@ -1491,6 +1474,7 @@ def execute_megatron_sft_forward_job(
         token_count=token_count,
         elapsed_s=time.perf_counter() - started,
         backward=False,
+        materialize=materialize_result,
     )
 
 
@@ -1503,6 +1487,7 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
     gradient_accumulator: Any,
     accumulator_residency: AbstractContextManager[None],
     cancelled: Event | None = None,
+    materialize_result: bool = True,
 ) -> dict[str, Any]:
     from art.megatron.lora import LoRASlotRef, use_lora_slot
 
@@ -1539,6 +1524,7 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
             token_count=token_count,
             elapsed_s=time.perf_counter() - started,
             backward=True,
+            materialize=materialize_result,
         )
     finally:
         slot_trainer.clear_checkpoint_slot_grads(job.run_id)
@@ -1550,6 +1536,7 @@ def execute_megatron_dynamic_lora_sft_forward_job(
     batch: SFTBatchData,
     *,
     cancelled: Event | None = None,
+    materialize_result: bool = True,
 ) -> dict[str, Any]:
     from art.megatron.lora import LoRASlotRef, use_lora_slot
 
@@ -1577,6 +1564,7 @@ def execute_megatron_dynamic_lora_sft_forward_job(
         token_count=token_count,
         elapsed_s=time.perf_counter() - started,
         backward=False,
+        materialize=materialize_result,
     )
 
 

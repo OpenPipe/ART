@@ -14,6 +14,7 @@ from art.distributed.art_runtime import (
     DistributedPackedBatch,
     DistributedPackingPlan,
 )
+from art.distributed.data_plane import SftBatchLeaseSet, SftBatchManifest
 from art.distributed.object_store import (
     OrderedBinaryObjectTarget,
     S3ObjectStoreConfig,
@@ -145,7 +146,8 @@ class PlannedPackedForward(BaseModel):
 
 class PreparedSftForward(PreparedForward):
     kind: Literal["sft"] = "sft"
-    batch: SFTBatchData
+    batch: SftBatchManifest
+    leases: SftBatchLeaseSet
     global_grad_accumulation_sequences: int = Field(ge=1)
     tokenization_s: float = Field(ge=0)
 
@@ -418,14 +420,41 @@ class MegatronTrainingSlot:
                 math.ceil(batch.num_trajectories / data_parallel_size)
                 * data_parallel_size
             )
-            return PreparedSftForward(
-                ref=ref,
-                return_token_logprobs=request.return_token_logprobs,
-                batch=batch,
-                global_grad_accumulation_sequences=grad_sequences,
-                tokenization_s=time.perf_counter() - started,
-                packing=sft_packing_outcome(batch, physical_sequences=grad_sequences),
+            packing = sft_packing_outcome(
+                batch, physical_sequences=grad_sequences
             )
+            lease = await self._acquire_batch_release()
+            manifest, chunks = batch.distribution_payload(uuid.uuid4().hex)
+            leases = None
+            try:
+                leases = await self.runtime.distribute_sft_batch(manifest, chunks)
+                prepared = PreparedSftForward(
+                    ref=ref,
+                    return_token_logprobs=request.return_token_logprobs,
+                    batch=manifest,
+                    leases=leases,
+                    global_grad_accumulation_sequences=grad_sequences,
+                    tokenization_s=time.perf_counter() - started,
+                    packing=packing,
+                )
+                if manifest.batch_id in self._batch_release_leases:
+                    raise RuntimeError("SFT batch is already materialized")
+                self._batch_release_leases[manifest.batch_id] = lease
+                return prepared
+            except BaseException as error:
+                if leases is not None:
+                    try:
+                        await self.runtime.release_sft_batch(leases)
+                    except BaseException as cleanup:
+                        error.add_note(
+                            "SFT batch cleanup also failed: "
+                            f"{type(cleanup).__name__}: {cleanup}"
+                        )
+                lease.release()
+                raise
+            finally:
+                for chunk in chunks:
+                    chunk.release()
         planned = await self.prepare_forward_packing(ref, request)
         try:
             return await self.materialize_forward_packing(planned)
@@ -589,6 +618,12 @@ class MegatronTrainingSlot:
                 await self.runtime.release_batch(prepared.packed)
             finally:
                 lease.release()
+        elif isinstance(prepared, PreparedSftForward):
+            lease = self._batch_release_leases.pop(prepared.batch.batch_id)
+            try:
+                await self.runtime.release_sft_batch(prepared.leases)
+            finally:
+                lease.release()
 
     async def prepare_residency(
         self,
@@ -630,14 +665,34 @@ class MegatronTrainingSlot:
                 ),
                 return_token_logprobs=prepared.return_token_logprobs,
             )
-            raw = await self.trainer.sft_forward(job, prepared.batch)
-            result = self._sft_forward_result(prepared, raw, backward=False)
-            completion = asyncio.get_running_loop().create_future()
-            completion.set_result(result)
+            try:
+                raw = await self.trainer.start_sft_forward(job, prepared.leases)
+            except BaseException as error:
+                try:
+                    _, cancelled = await complete_task(
+                        self._release_sft_batch_soon(prepared)
+                    )
+                    if cancelled is not None:
+                        error.add_note("SFT batch release observed cancellation")
+                except BaseException as cleanup:
+                    error.add_note(
+                        "SFT batch release also failed: "
+                        f"{type(cleanup).__name__}: {cleanup}"
+                    )
+                raise
+            release_completion = self._release_sft_batch_soon(prepared)
+
+            async def complete_sft_forward() -> ForwardResult:
+                result = await asyncio.shield(raw.completion)
+                return self._sft_forward_result(prepared, result, backward=False)
+
             return ForwardLaunch(
                 operation_id=ref.operation_id,
-                completion=completion,
-                release_completion=_completed_release(),
+                completion=asyncio.create_task(
+                    complete_sft_forward(),
+                    name=f"megatron-sft-forward-result-{ref.operation_id}",
+                ),
+                release_completion=release_completion,
             )
         if not isinstance(prepared, PreparedPackedForward):
             raise TypeError("unknown prepared forward payload")
@@ -736,18 +791,40 @@ class MegatronTrainingSlot:
                 ),
                 return_token_logprobs=prepared.return_token_logprobs,
             )
-            raw = await self.trainer.sft_forward_backward(job, prepared.batch)
-            result = cast(
-                ForwardBackwardResult,
-                self._sft_forward_result(prepared, raw, backward=True),
-            )
-            completion = asyncio.get_running_loop().create_future()
-            completion.set_result(result)
+            try:
+                raw = await self.trainer.start_sft_forward_backward(
+                    job, prepared.leases
+                )
+            except BaseException as error:
+                try:
+                    _, cancelled = await complete_task(
+                        self._release_sft_batch_soon(prepared)
+                    )
+                    if cancelled is not None:
+                        error.add_note("SFT batch release observed cancellation")
+                except BaseException as cleanup:
+                    error.add_note(
+                        "SFT batch release also failed: "
+                        f"{type(cleanup).__name__}: {cleanup}"
+                    )
+                raise
+            release_completion = self._release_sft_batch_soon(prepared)
+
+            async def complete_sft_forward_backward() -> ForwardBackwardResult:
+                result = await asyncio.shield(raw.completion)
+                return cast(
+                    ForwardBackwardResult,
+                    self._sft_forward_result(prepared, result, backward=True),
+                )
+
             return ForwardBackwardLaunch(
                 operation_id=ref.operation_id,
-                produced_gradient=result.produced_gradient,
-                completion=completion,
-                release_completion=_completed_release(),
+                produced_gradient=True,
+                completion=asyncio.create_task(
+                    complete_sft_forward_backward(),
+                    name=f"megatron-sft-fb-result-{ref.operation_id}",
+                ),
+                release_completion=release_completion,
             )
         if not isinstance(prepared, PreparedPackedForward):
             raise TypeError("unknown prepared F/B payload")
@@ -1486,6 +1563,24 @@ class MegatronTrainingSlot:
         task = asyncio.create_task(
             release(),
             name=f"release-packed-batch-{packed.packing_generation_id}",
+        )
+        self._batch_releases.add(task)
+        task.add_done_callback(self._batch_release_done)
+        return task
+
+    def _release_sft_batch_soon(
+        self, prepared: PreparedSftForward
+    ) -> asyncio.Task[None]:
+        lease = self._batch_release_leases.pop(prepared.batch.batch_id)
+
+        async def release() -> None:
+            try:
+                await self.runtime.release_sft_batch(prepared.leases)
+            finally:
+                lease.release()
+
+        task = asyncio.create_task(
+            release(), name=f"release-sft-batch-{prepared.batch.batch_id}"
         )
         self._batch_releases.add(task)
         task.add_done_callback(self._batch_release_done)

@@ -24,7 +24,13 @@ from .artifact_preflight import (
     ArtifactProbeSpec,
     ArtifactRootPreflightError,
 )
-from .data_plane import ByteStreamPublisher, PackedBatchLeaseSet, fanout_packed_batch
+from .data_plane import (
+    ByteStreamPublisher,
+    PackedBatchLeaseSet,
+    SftBatchLeaseSet,
+    SftBatchManifest,
+    fanout_packed_batch,
+)
 from .host_admission import (
     HostAdmissionReport,
     HostAdmissionRequest,
@@ -984,6 +990,64 @@ class ArtRuntime:
 
     async def release_batch(self, batch: DistributedPackedBatch) -> None:
         await self._reclaim_batch(batch.leases.ref.batch_id, fence=False)
+
+    async def distribute_sft_batch(
+        self,
+        manifest: SftBatchManifest,
+        chunks: tuple[memoryview, ...],
+    ) -> SftBatchLeaseSet:
+        """Stream one SFT tensor view per host, never one payload per rank."""
+
+        self._require_open()
+        trainer = self.topology.trainer
+        if trainer is None:
+            raise RuntimeError("runtime topology has no trainer mesh")
+        trainer_hosts = tuple(dict.fromkeys(rank.host_id for rank in trainer.ranks))
+        if manifest.batch_id in self._live_batches:
+            raise RuntimeError("SFT batch ID is already live")
+        if sum(map(len, chunks)) != manifest.storage_byte_count:
+            raise ValueError("SFT tensor chunks differ from their manifest")
+        controller = self._host(self.topology.cluster.controller_host_id)
+        advertise_host = urlparse(controller.worker_address).hostname
+        if advertise_host is None:
+            raise ValueError("controller has no routable address")
+        self._live_batches[manifest.batch_id] = trainer_hosts
+        publisher = None
+        try:
+            publisher = await ByteStreamPublisher.create(
+                manifest.batch_id,
+                chunks,
+                advertise_host=advertise_host,
+            )
+            results = await asyncio.gather(
+                *(
+                    MonarchPackedBatchInbox(self._host_services[host_id]).receive_sft(
+                        manifest,
+                        publisher.transfer,
+                        timeout_s=self.topology.cluster.rpc_timeout_s,
+                    )
+                    for host_id in trainer_hosts
+                ),
+                return_exceptions=True,
+            )
+            failures = [
+                result for result in results if isinstance(result, BaseException)
+            ]
+            if failures:
+                raise failures[0]
+            return SftBatchLeaseSet(
+                manifest=manifest,
+                host_refs=dict(zip(trainer_hosts, results, strict=True)),
+            )
+        except BaseException as error:
+            await self._reclaim_after_failure(manifest.batch_id, error)
+            raise
+        finally:
+            if publisher is not None:
+                await publisher.close()
+
+    async def release_sft_batch(self, batch: SftBatchLeaseSet) -> None:
+        await self._reclaim_batch(batch.manifest.batch_id, fence=False)
 
     async def _reclaim_batch(self, batch_id: str, *, fence: bool) -> None:
         hosts = self._live_batches.get(batch_id)

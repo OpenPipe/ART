@@ -25,7 +25,7 @@ from monarch.actor import (
 from monarch.spmd import SPMDActor
 from pydantic import BaseModel, ConfigDict, SkipValidation
 
-from art.distributed.data_plane import PackedBatchLeaseSet
+from art.distributed.data_plane import PackedBatchLeaseSet, SftBatchLeaseSet
 from art.distributed.monarch_bootstrap import activate_cuda_device
 from art.distributed.specs import GpuId
 from art.training.contracts import OperationRef
@@ -1270,67 +1270,123 @@ class MonarchTrainerActor(Actor):
             if batch is not None:
                 batch.close()
 
-    @endpoint
-    def execute_run_slot_sft_forward_backward(
+    @concurrent_endpoint
+    async def start_run_slot_sft_forward_backward(
         self,
         job_json: str,
-        batch: SFTBatchData,
+        batch_json: str,
+        ready_port: Port[dict[str, Any]],
     ) -> dict[str, Any]:
+        batch = None
+        ready = False
+        job = SftForwardBackwardJobSpec.model_validate_json(job_json)
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
-            job = SftForwardBackwardJobSpec.model_validate_json(job_json)
+            leases = SftBatchLeaseSet.model_validate_json(batch_json)
+            if leases.manifest.fingerprint != job.batch_fingerprint:
+                raise ValueError("SFT F/B lease differs from its job")
+            batch = SFTBatchData.open(
+                leases.manifest, leases.host_refs[self._host_id]
+            )
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
-            result = self._require_run_slot_executor().execute_sft_forward_backward(
-                job, batch, Event()
+            launch = self._require_run_slot_executor().start_sft_forward_backward(
+                job,
+                batch,
+                Event(),
+                coordinator=self._runtime.rank == 0,
             )
-            coordinator = self._runtime.rank == 0
-            response = {
-                "rank": self._runtime.rank,
-                "operation_id": job.operation_id,
-                "learner_version": job.expected_learner_version,
-                "token_count": result["token_count"],
-                "metrics": result["metrics"] if coordinator else {},
-                "token_logprobs": result["token_logprobs"] if coordinator else (),
-            }
+            batch.close()
+            batch = None
+            ready_port.send(
+                _CommandReady(
+                    rank=self._runtime.rank,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                ).model_dump(mode="json")
+            )
+            ready = True
+            response = {"rank": self._runtime.rank, **await asyncio.to_thread(launch.materialize)}
             self._publish_compile_cache()
             return response
-        except BaseException:
+        except BaseException as error:
             self._valid = False
+            if not ready:
+                ready_port.send(
+                    _CommandReady(
+                        rank=self._runtime.rank,
+                        operation_id=job.operation_id,
+                        learner_version=job.expected_learner_version,
+                        error_type=type(error).__name__,
+                        message=str(error),
+                        traceback_text=traceback.format_exc(),
+                    ).model_dump(mode="json")
+                )
             raise
+        finally:
+            if batch is not None:
+                batch.close()
 
-    @endpoint
-    def execute_run_slot_sft_forward(
+    @concurrent_endpoint
+    async def start_run_slot_sft_forward(
         self,
         job_json: str,
-        batch: SFTBatchData,
+        batch_json: str,
+        ready_port: Port[dict[str, Any]],
     ) -> dict[str, Any]:
+        batch = None
+        ready = False
+        job = SftForwardJobSpec.model_validate_json(job_json)
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
-            job = SftForwardJobSpec.model_validate_json(job_json)
+            leases = SftBatchLeaseSet.model_validate_json(batch_json)
+            if leases.manifest.fingerprint != job.batch_fingerprint:
+                raise ValueError("SFT forward lease differs from its job")
+            batch = SFTBatchData.open(
+                leases.manifest, leases.host_refs[self._host_id]
+            )
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
-            result = self._require_run_slot_executor().execute_sft_forward(
-                job, batch, Event()
+            launch = self._require_run_slot_executor().start_sft_forward(
+                job,
+                batch,
+                Event(),
+                coordinator=self._runtime.rank == 0,
             )
-            coordinator = self._runtime.rank == 0
-            response = {
-                "rank": self._runtime.rank,
-                "operation_id": job.operation_id,
-                "learner_version": job.expected_learner_version,
-                "token_count": result["token_count"],
-                "metrics": result["metrics"] if coordinator else {},
-                "token_logprobs": result["token_logprobs"] if coordinator else (),
-            }
+            batch.close()
+            batch = None
+            ready_port.send(
+                _CommandReady(
+                    rank=self._runtime.rank,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                ).model_dump(mode="json")
+            )
+            ready = True
+            response = {"rank": self._runtime.rank, **await asyncio.to_thread(launch.materialize)}
             self._publish_compile_cache()
             return response
-        except BaseException:
+        except BaseException as error:
             self._valid = False
+            if not ready:
+                ready_port.send(
+                    _CommandReady(
+                        rank=self._runtime.rank,
+                        operation_id=job.operation_id,
+                        learner_version=job.expected_learner_version,
+                        error_type=type(error).__name__,
+                        message=str(error),
+                        traceback_text=traceback.format_exc(),
+                    ).model_dump(mode="json")
+                )
             raise
+        finally:
+            if batch is not None:
+                batch.close()
 
     @endpoint
     def execute_run_slot_optimizer(self, job_json: str) -> dict[str, Any]:
@@ -2048,11 +2104,16 @@ class MonarchTrainerSlot:
     async def _collect_command_ready(
         self,
         receiver: Any,
-        job: ForwardJobSpec | ForwardBackwardJobSpec,
+        job: (
+            ForwardJobSpec
+            | ForwardBackwardJobSpec
+            | SftForwardJobSpec
+            | SftForwardBackwardJobSpec
+        ),
         *,
         label: str,
     ) -> None:
-        ready_state = "gradient-ready" if label == "F/B" else "GPU-ready"
+        ready_state = "gradient-ready" if label.endswith("F/B") else "GPU-ready"
         results = [
             _CommandReady.model_validate(await receiver.recv())
             for _ in self._rank_processes
@@ -2206,80 +2267,148 @@ class MonarchTrainerSlot:
     async def sft_forward_backward(
         self,
         job: SftForwardBackwardJobSpec,
-        batch: SFTBatchData,
+        batch: SftBatchLeaseSet,
     ) -> dict[str, Any]:
-        async with self._lock:
-            self._require_open()
-            cached = self._cached_operation(job.operation_id, job.fingerprint)
-            if cached is not None:
-                return cached
-            if batch.fingerprint != job.batch_fingerprint:
-                raise ValueError("SFT F/B payload fingerprint differs from its job")
-            try:
-                values = await asyncio.wait_for(
-                    self._actors.execute_run_slot_sft_forward_backward.call(
-                        job.model_dump_json(), batch
-                    ),
-                    timeout=self._command_timeout_s,
-                )
-                results = list(values.values())
-                self._validate_command_results(
-                    results,
-                    operation_id=job.operation_id,
-                    learner_version=job.expected_learner_version,
-                )
-                if {result["token_count"] for result in results} != {
-                    job.trainable_token_count
-                }:
-                    raise RuntimeError(
-                        "trainer SFT F/B token count differs from its payload"
-                    )
-                result = next(result for result in results if result["rank"] == 0)
-                self._operations[job.operation_id] = (job.fingerprint, result)
-                return result
-            except BaseException as error:
-                await self._invalidate(error, "SFT F/B operation and cleanup failed")
-                raise
+        launch = await self.start_sft_forward_backward(job, batch)
+        return await asyncio.shield(launch.completion)
+
+    async def start_sft_forward_backward(
+        self,
+        job: SftForwardBackwardJobSpec,
+        batch: SftBatchLeaseSet,
+    ) -> ForwardBackwardCommandLaunch:
+        launch = await self._start_sft_command(job, batch, backward=True)
+        assert isinstance(launch, ForwardBackwardCommandLaunch)
+        return launch
 
     async def sft_forward(
         self,
         job: SftForwardJobSpec,
-        batch: SFTBatchData,
+        batch: SftBatchLeaseSet,
     ) -> dict[str, Any]:
+        launch = await self.start_sft_forward(job, batch)
+        return await asyncio.shield(launch.completion)
+
+    async def start_sft_forward(
+        self,
+        job: SftForwardJobSpec,
+        batch: SftBatchLeaseSet,
+    ) -> ForwardCommandLaunch:
+        launch = await self._start_sft_command(job, batch, backward=False)
+        assert isinstance(launch, ForwardCommandLaunch)
+        return launch
+
+    async def _start_sft_command(
+        self,
+        job: SftForwardBackwardJobSpec | SftForwardJobSpec,
+        batch: SftBatchLeaseSet,
+        *,
+        backward: bool,
+    ) -> ForwardBackwardCommandLaunch | ForwardCommandLaunch:
         async with self._lock:
             self._require_open()
             cached = self._cached_operation(job.operation_id, job.fingerprint)
+            launch_type = (
+                ForwardBackwardCommandLaunch if backward else ForwardCommandLaunch
+            )
             if cached is not None:
-                return cached
-            if batch.fingerprint != job.batch_fingerprint:
-                raise ValueError("SFT forward payload fingerprint differs from its job")
-            try:
-                values = await asyncio.wait_for(
-                    self._actors.execute_run_slot_sft_forward.call(
-                        job.model_dump_json(), batch
-                    ),
-                    timeout=self._command_timeout_s,
-                )
-                results = list(values.values())
-                self._validate_command_results(
-                    results,
-                    operation_id=job.operation_id,
-                    learner_version=job.expected_learner_version,
-                )
-                if {result["token_count"] for result in results} != {
-                    job.trainable_token_count
-                }:
+                completion = asyncio.get_running_loop().create_future()
+                completion.set_result(cached)
+                return launch_type(completion=completion)
+            launches = (
+                self._forward_backward_launches if backward else self._forward_launches
+            )
+            if inflight := launches.get(job.operation_id):
+                if inflight[0] != job.fingerprint:
                     raise RuntimeError(
-                        "trainer SFT forward token count differs from its payload"
+                        "operation_id was reused for a different SFT command"
                     )
-                result = next(result for result in results if result["rank"] == 0)
-                self._operations[job.operation_id] = (job.fingerprint, result)
-                return result
-            except BaseException as error:
-                await self._invalidate(
-                    error, "SFT forward operation and cleanup failed"
+                return inflight[1]
+            if batch.manifest.fingerprint != job.batch_fingerprint:
+                raise ValueError("SFT payload fingerprint differs from its job")
+            if batch.manifest.num_trainable_tokens != job.trainable_token_count:
+                raise ValueError("SFT trainable-token count differs from its job")
+            deadline = asyncio.get_running_loop().time() + self._command_timeout_s
+            ready_port, receiver = Channel.open()
+            endpoint = (
+                self._actors.start_run_slot_sft_forward_backward
+                if backward
+                else self._actors.start_run_slot_sft_forward
+            )
+            label = "SFT F/B" if backward else "SFT forward"
+            rank_call = asyncio.ensure_future(
+                endpoint.call(
+                    job.model_dump_json(), batch.model_dump_json(), ready_port
                 )
+            )
+            readiness = asyncio.create_task(
+                self._collect_command_ready(receiver, job, label=label),
+                name=f"megatron-sft-ready-{job.operation_id}",
+            )
+            try:
+                done, _ = await asyncio.wait(
+                    {rank_call, readiness},
+                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    raise TimeoutError(f"trainer ranks did not reach {label} readiness")
+                if readiness in done:
+                    readiness.result()
+                else:
+                    await rank_call
+                    raise RuntimeError(
+                        f"trainer {label} returned before every rank reported ready"
+                    )
+                completion = asyncio.create_task(
+                    self._complete_sft_command(job, rank_call, deadline, backward),
+                    name=f"megatron-sft-result-{job.operation_id}",
+                )
+                launch = launch_type(completion=completion)
+                launches[job.operation_id] = (job.fingerprint, launch)
+                return launch
+            except BaseException as error:
+                for task in (readiness, rank_call):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(readiness, rank_call, return_exceptions=True)
+                await self._invalidate(error, f"{label} operation and cleanup failed")
                 raise
+
+    async def _complete_sft_command(
+        self,
+        job: SftForwardBackwardJobSpec | SftForwardJobSpec,
+        rank_call: asyncio.Future[Any],
+        deadline: float,
+        backward: bool,
+    ) -> dict[str, Any]:
+        launches = (
+            self._forward_backward_launches if backward else self._forward_launches
+        )
+        label = "SFT F/B" if backward else "SFT forward"
+        try:
+            async with asyncio.timeout_at(deadline):
+                values = await asyncio.shield(rank_call)
+            results = list(values.values())
+            self._validate_command_results(
+                results,
+                operation_id=job.operation_id,
+                learner_version=job.expected_learner_version,
+            )
+            if {result["token_count"] for result in results} != {
+                job.trainable_token_count
+            }:
+                raise RuntimeError(
+                    f"trainer {label} token count differs from its payload"
+                )
+            result = next(result for result in results if result["rank"] == 0)
+            self._operations[job.operation_id] = (job.fingerprint, result)
+            return result
+        except BaseException as error:
+            await self._invalidate(error, f"late {label} result and cleanup failed")
+            raise
+        finally:
+            launches.pop(job.operation_id, None)
 
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]:
         async with self._lock:

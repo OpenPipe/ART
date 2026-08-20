@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+import math
 from multiprocessing import resource_tracker, shared_memory
 import os
 import secrets
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
     from art.preprocessing.pack import PrefixTreePackingPlan
 
 PACKED_BATCH_FORMAT = "art_packed_rl_v2"
+SFT_BATCH_FORMAT = "art_sft_tensor_v1"
 _DTYPE_BYTES = {
     "bool": 1,
     "uint8": 1,
@@ -249,6 +251,98 @@ class PackedBatchLeaseSet(_Contract):
         return self
 
 
+class SftBatchManifest(_Contract):
+    """Logical SFT tensors, independent of any host-local physical lease."""
+
+    batch_id: str = Field(min_length=1)
+    format: str = SFT_BATCH_FORMAT
+    tensors: tuple[TensorSpec, ...] = Field(min_length=3)
+    storage_byte_count: int = Field(ge=1)
+    learning_rate: float = Field(default=0.0, ge=0.0)
+    num_trajectories: int = Field(ge=1)
+    num_tokens: int = Field(ge=1)
+    num_trainable_tokens: int = Field(ge=1)
+    num_dropped_trajectories: int = Field(default=0, ge=0)
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_manifest(self) -> "SftBatchManifest":
+        if self.format != SFT_BATCH_FORMAT:
+            raise ValueError(f"unsupported SFT batch format {self.format!r}")
+        if not math.isfinite(self.learning_rate):
+            raise ValueError("SFT learning rate must be finite")
+        expected = {
+            f"{index}/{name}"
+            for index in range(self.num_trajectories)
+            for name in ("input_ids", "attention_mask", "labels")
+        }
+        specs = {tensor.name: tensor for tensor in self.tensors}
+        if len(specs) != len(self.tensors) or set(specs) != expected:
+            raise ValueError("SFT tensor manifest is incomplete or duplicated")
+        for index in range(self.num_trajectories):
+            shapes = {
+                specs[f"{index}/{name}"].shape
+                for name in ("input_ids", "attention_mask", "labels")
+            }
+            if len(shapes) != 1 or len(next(iter(shapes))) != 2:
+                raise ValueError("SFT trajectory tensor shapes differ")
+            shape = next(iter(shapes))
+            if shape[0] != 1 or shape[1] < 1:
+                raise ValueError("SFT tensors must have shape [1, sequence]")
+            if any(
+                specs[f"{index}/{name}"].dtype != "int64"
+                for name in ("input_ids", "attention_mask", "labels")
+            ):
+                raise ValueError("SFT tensors must be int64")
+        previous_end = 0
+        for tensor in self.tensors:
+            if tensor.offset != previous_end:
+                raise ValueError("SFT tensor storage must be contiguous")
+            previous_end = tensor.offset + tensor.byte_count
+        if previous_end != self.storage_byte_count:
+            raise ValueError("SFT tensors do not fill shared-memory storage")
+        if self.num_trainable_tokens > self.num_tokens:
+            raise ValueError("SFT trainable tokens exceed non-padding tokens")
+        return self
+
+    @property
+    def max_sequence_length(self) -> int:
+        return max(tensor.shape[1] for tensor in self.tensors)
+
+
+class SftBatchRef(_Contract):
+    """One host-local physical lease for an SFT tensor manifest."""
+
+    manifest: SftBatchManifest
+    owner_actor_id: str = Field(min_length=1)
+    lease_id: str = Field(min_length=1)
+    shared_memory_name: str = Field(min_length=1)
+    owner_process_id: int = Field(ge=1)
+
+    @property
+    def batch_id(self) -> str:
+        return self.manifest.batch_id
+
+    @property
+    def storage_byte_count(self) -> int:
+        return self.manifest.storage_byte_count
+
+
+class SftBatchLeaseSet(_Contract):
+    """One logical SFT batch and one physical lease per trainer host."""
+
+    manifest: SftBatchManifest
+    host_refs: dict[str, SftBatchRef]
+
+    @model_validator(mode="after")
+    def _validate_hosts(self) -> "SftBatchLeaseSet":
+        if not self.host_refs:
+            raise ValueError("SFT batch requires at least one host lease")
+        if any(ref.manifest != self.manifest for ref in self.host_refs.values()):
+            raise ValueError("SFT host leases disagree on their logical manifest")
+        return self
+
+
 class BatchReservation(_Contract):
     reservation_id: str = Field(min_length=1)
     batch_id: str = Field(min_length=1)
@@ -293,7 +387,11 @@ class PackedBatchLeaseError(RuntimeError):
 
 
 class _Entry:
-    def __init__(self, shm: shared_memory.SharedMemory, ref: PackedBatchRef) -> None:
+    def __init__(
+        self,
+        shm: shared_memory.SharedMemory,
+        ref: PackedBatchRef | SftBatchRef,
+    ) -> None:
         self.shm = shm
         self.ref = ref
 
@@ -380,20 +478,26 @@ class SharedMemoryPackedBatchStore:
         return ref
 
     def reserve(self, source: PackedBatchRef) -> BatchReservation:
-        if source.batch_id in self._reclaimed:
+        return self._reserve(source.batch_id, source.storage_byte_count)
+
+    def reserve_sft(self, manifest: SftBatchManifest) -> BatchReservation:
+        return self._reserve(manifest.batch_id, manifest.storage_byte_count)
+
+    def _reserve(self, batch_id: str, storage_byte_count: int) -> BatchReservation:
+        if batch_id in self._reclaimed:
             raise PackedBatchLeaseError(
-                f"packed batch {source.batch_id!r} was reclaimed"
+                f"tensor batch {batch_id!r} was reclaimed"
             )
-        if source.batch_id in self._entries or any(
-            reservation.batch_id == source.batch_id
+        if batch_id in self._entries or any(
+            reservation.batch_id == batch_id
             for reservation in self._reservations.values()
         ):
-            raise ValueError(f"packed batch {source.batch_id!r} already exists")
-        self._require_capacity(source.storage_byte_count)
+            raise ValueError(f"tensor batch {batch_id!r} already exists")
+        self._require_capacity(storage_byte_count)
         reservation = BatchReservation(
             reservation_id=secrets.token_hex(16),
-            batch_id=source.batch_id,
-            storage_byte_count=source.storage_byte_count,
+            batch_id=batch_id,
+            storage_byte_count=storage_byte_count,
         )
         self._reservations[reservation.reservation_id] = reservation
         self._reserved_bytes += reservation.storage_byte_count
@@ -439,20 +543,54 @@ class SharedMemoryPackedBatchStore:
             shm.unlink()
             raise
 
+    async def commit_sft_stream(
+        self,
+        reservation_id: str,
+        manifest: SftBatchManifest,
+        transfer: ByteStreamTransfer,
+        *,
+        timeout_s: float,
+    ) -> SftBatchRef:
+        reservation = self._reservations.get(reservation_id)
+        if reservation is None or reservation.batch_id != manifest.batch_id:
+            raise PackedBatchLeaseError("unknown or mismatched SFT reservation")
+        if (
+            transfer.stream_id != manifest.batch_id
+            or transfer.byte_count != reservation.storage_byte_count
+        ):
+            raise PackedBatchLeaseError("SFT transfer does not match reservation")
+        shm = shared_memory.SharedMemory(
+            create=True, size=reservation.storage_byte_count
+        )
+        try:
+            from art.utils.lifecycle import complete_to_thread
+
+            _, cancelled = await complete_to_thread(
+                lambda: _receive_stream(transfer, shm, timeout_s)
+            )
+            if cancelled is not None:
+                raise cancelled
+            return self._finish_sft_commit(reservation, manifest, shm)
+        except BaseException:
+            shm.close()
+            shm.unlink()
+            raise
+
     def abort(self, reservation_id: str) -> None:
         reservation = self._reservations.pop(reservation_id, None)
         if reservation is not None:
             self._reserved_bytes -= reservation.storage_byte_count
 
-    def drop(self, ref: PackedBatchRef) -> None:
+    def drop(self, ref: PackedBatchRef | SftBatchRef) -> None:
         """Idempotently reclaim one host-owned packed batch."""
 
-        entry = self._entries.get(ref.batch_id)
+        batch_id = ref.batch_id
+        entry = self._entries.get(batch_id)
         if entry is None:
             return
         if entry.ref.lease_id != ref.lease_id:
             raise PackedBatchLeaseError("packed-batch reference has a stale lease")
-        self.reclaim(ref.batch_id)
+        self.reclaim(batch_id)
 
     def reclaim(self, batch_id: str, *, fence: bool = True) -> bool:
         """Release committed or in-flight storage and optionally fence late writes."""
@@ -477,6 +615,12 @@ class SharedMemoryPackedBatchStore:
         if entry is None or entry.ref.lease_id != ref.lease_id:
             raise PackedBatchLeaseError("packed-batch reference has no active lease")
         return MappedPackedBatch.open(ref)
+
+    def map_sft(self, ref: SftBatchRef) -> "MappedSftBatch":
+        entry = self._entries.get(ref.manifest.batch_id)
+        if entry is None or entry.ref.lease_id != ref.lease_id:
+            raise PackedBatchLeaseError("SFT batch reference has no active lease")
+        return MappedSftBatch.open(ref)
 
     def note_transmitted(self, byte_count: int) -> None:
         self._transmitted_bytes += byte_count
@@ -543,6 +687,32 @@ class SharedMemoryPackedBatchStore:
         self._copy_count += 1
         return ref
 
+    def _finish_sft_commit(
+        self,
+        reservation: BatchReservation,
+        manifest: SftBatchManifest,
+        shm: shared_memory.SharedMemory,
+    ) -> SftBatchRef:
+        if self._reservations.get(reservation.reservation_id) != reservation:
+            raise PackedBatchLeaseError(
+                f"SFT batch {manifest.batch_id!r} was reclaimed during transfer"
+            )
+        ref = SftBatchRef(
+            manifest=manifest,
+            owner_actor_id=self.owner_actor_id,
+            lease_id=secrets.token_hex(16),
+            shared_memory_name=shm.name,
+            owner_process_id=os.getpid(),
+        )
+        self._reservations.pop(reservation.reservation_id)
+        self._reserved_bytes -= reservation.storage_byte_count
+        self._entries[manifest.batch_id] = _Entry(shm, ref)
+        self._used_bytes += manifest.storage_byte_count
+        self._created_bytes += manifest.storage_byte_count
+        self._copied_bytes += manifest.storage_byte_count
+        self._copy_count += 1
+        return ref
+
 
 class MappedPackedBatch(BaseModel):
     """Zero-copy consumer view; callers must not mutate its immutable tensors."""
@@ -581,6 +751,46 @@ class MappedPackedBatch(BaseModel):
             self._closed = True
 
     def __enter__(self) -> "MappedPackedBatch":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+class MappedSftBatch(BaseModel):
+    """Zero-copy host view of one leased SFT tensor manifest."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    ref: SftBatchRef
+    tensors: dict[str, Any]
+    _shm: Any = None
+    _closed: bool = False
+
+    @classmethod
+    def open(cls, ref: SftBatchRef) -> "MappedSftBatch":
+        shm = shared_memory.SharedMemory(name=ref.shared_memory_name)
+        if ref.owner_process_id != os.getpid():
+            resource_tracker.unregister(cast(Any, shm)._name, "shared_memory")
+        try:
+            tensors = {
+                spec.name: _tensor_from_buffer(_shm_buffer(shm), spec)
+                for spec in ref.manifest.tensors
+            }
+        except BaseException:
+            shm.close()
+            raise
+        mapped = cls(ref=ref, tensors=tensors)
+        mapped._shm = shm
+        return mapped
+
+    def close(self) -> None:
+        if not self._closed:
+            self.tensors = {}
+            self._shm.close()
+            self._closed = True
+
+    def __enter__(self) -> "MappedSftBatch":
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -822,7 +1032,26 @@ class PackedBatchInbox:
             self.store.abort(reservation.reservation_id)
             raise
 
-    async def drop(self, ref: PackedBatchRef) -> None:
+    async def receive_sft(
+        self,
+        manifest: SftBatchManifest,
+        transfer: ByteStreamTransfer,
+        *,
+        timeout_s: float,
+    ) -> SftBatchRef:
+        reservation = self.store.reserve_sft(manifest)
+        try:
+            return await self.store.commit_sft_stream(
+                reservation.reservation_id,
+                manifest,
+                transfer,
+                timeout_s=timeout_s,
+            )
+        except BaseException:
+            self.store.abort(reservation.reservation_id)
+            raise
+
+    async def drop(self, ref: PackedBatchRef | SftBatchRef) -> None:
         self.store.drop(ref)
 
     async def reclaim(self, batch_id: str, *, fence: bool = True) -> bool:

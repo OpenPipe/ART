@@ -7,7 +7,14 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, PrivateAttr, model_validator
 import torch
 
-from art.distributed.data_plane import MappedPackedBatch, PackedBatchRef
+from art.distributed.data_plane import (
+    MappedPackedBatch,
+    MappedSftBatch,
+    PackedBatchRef,
+    SftBatchManifest,
+    SftBatchRef,
+    TensorSpec,
+)
 from art.preprocessing.pack import PackedTensors
 
 _SFT_TENSOR_NAMES = ("input_ids", "attention_mask", "labels")
@@ -36,7 +43,7 @@ class InMemoryPackedBatch(BaseModel):
 
 
 class SFTBatchData(BaseModel):
-    """Typed in-memory SFT payload sent directly to warm trainer actors."""
+    """Typed SFT tensors before distribution or while mapped on one trainer host."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
 
@@ -49,6 +56,7 @@ class SFTBatchData(BaseModel):
     _fingerprint_cache: tuple[tuple[tuple[torch.Tensor, int], ...], str] | None = (
         PrivateAttr(default=None)
     )
+    _mapped: MappedSftBatch | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _validate_trajectories(self) -> "SFTBatchData":
@@ -130,6 +138,83 @@ class SFTBatchData(BaseModel):
             for tensors in self.trajectory_tensors
             for name in _SFT_TENSOR_NAMES
         )
+
+    def distribution_payload(
+        self, batch_id: str
+    ) -> tuple[SftBatchManifest, tuple[memoryview, ...]]:
+        flat = tuple(
+            (f"{index}/{name}", tensors[name])
+            for index, tensors in enumerate(self.trajectory_tensors)
+            for name in _SFT_TENSOR_NAMES
+        )
+        offset = 0
+        specs = []
+        chunks = []
+        for name, tensor in flat:
+            chunk = memoryview(tensor.numpy()).cast("B")
+            specs.append(
+                TensorSpec(
+                    name=name,
+                    dtype="int64",
+                    shape=tuple(tensor.shape),
+                    offset=offset,
+                    byte_count=len(chunk),
+                )
+            )
+            chunks.append(chunk)
+            offset += len(chunk)
+        return (
+            SftBatchManifest(
+                batch_id=batch_id,
+                tensors=tuple(specs),
+                storage_byte_count=offset,
+                learning_rate=self.learning_rate,
+                num_trajectories=self.num_trajectories,
+                num_tokens=self.num_tokens,
+                num_trainable_tokens=self.num_trainable_tokens,
+                num_dropped_trajectories=self.num_dropped_trajectories,
+                fingerprint=self.fingerprint,
+            ),
+            tuple(chunks),
+        )
+
+    @classmethod
+    def open(cls, manifest: SftBatchManifest, local_ref: SftBatchRef) -> "SFTBatchData":
+        if local_ref.manifest != manifest:
+            raise ValueError("SFT host lease differs from its logical manifest")
+        mapped = MappedSftBatch.open(local_ref)
+        # The controller validated these immutable tensors before streaming them.
+        # Re-running semantic scans here would read the full batch once per rank.
+        batch = cls.model_construct(
+            trajectory_tensors=tuple(
+                {
+                    name: mapped.tensors[f"{index}/{name}"]
+                    for name in _SFT_TENSOR_NAMES
+                }
+                for index in range(manifest.num_trajectories)
+            ),
+            learning_rate=manifest.learning_rate,
+            num_trajectories=manifest.num_trajectories,
+            num_tokens=manifest.num_tokens,
+            num_trainable_tokens=manifest.num_trainable_tokens,
+            num_dropped_trajectories=manifest.num_dropped_trajectories,
+        )
+        batch._mapped = mapped
+        tensors = tuple(
+            values[name]
+            for values in batch.trajectory_tensors
+            for name in _SFT_TENSOR_NAMES
+        )
+        batch._fingerprint_cache = (
+            tuple((tensor, int(tensor._version)) for tensor in tensors),
+            manifest.fingerprint,
+        )
+        return batch
+
+    def close(self) -> None:
+        if self._mapped is not None:
+            self._mapped.close()
+            self._mapped = None
 
     @property
     def fingerprint(self) -> str:

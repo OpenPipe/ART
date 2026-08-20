@@ -33,12 +33,15 @@ from .artifact_preflight import (
 )
 from .data_plane import (
     ByteStreamServerLoop,
+    ByteStreamTransfer,
     PackedBatchCapacityError,
     PackedBatchInbox,
     PackedBatchLeaseError,
     PackedBatchPublisher,
     PackedBatchRef,
     PackedBatchTransfer,
+    SftBatchManifest,
+    SftBatchRef,
     packed_plan_storage_byte_count,
 )
 from .host_admission import (
@@ -1025,6 +1028,17 @@ class ArtHostService(Actor):
         self, ref: PackedBatchRef, transfer: PackedBatchTransfer, timeout_s: float
     ) -> PackedBatchRef:
         return await self._packed_batches.receive(ref, transfer, timeout_s=timeout_s)
+
+    @resilient_endpoint(concurrent=True)
+    async def receive_sft_batch(
+        self,
+        manifest: SftBatchManifest,
+        transfer: ByteStreamTransfer,
+        timeout_s: float,
+    ) -> SftBatchRef:
+        return await self._packed_batches.receive_sft(
+            manifest, transfer, timeout_s=timeout_s
+        )
 
     @resilient_endpoint
     async def drop_batch_ref(self, ref: PackedBatchRef) -> None:
