@@ -26,7 +26,11 @@ from . import (
     TrajectoryHistory,
     _StringInterningModel,
 )
-from ._serialization import _rebind_history_sources, serialize_history, validate_history
+from ._serialization import (
+    _rebind_history_sources,
+    serialize_history,
+    validate_history,
+)
 
 type Device = torch.device | str | None
 

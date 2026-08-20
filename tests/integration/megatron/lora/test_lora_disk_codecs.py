@@ -35,7 +35,7 @@ from art.megatron.weights.lora_publish import (
     merge_sharded_adapter_entries,
     save_vllm_lora_from_model,
 )
-from art.trainer_rank import TrainerRank
+from art.trainer_rank import TrainerRank, _checkpoint, _lora_export
 from art.trainer_rank._impl import _AdapterConfig, _CheckpointSlot
 from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
@@ -956,6 +956,66 @@ def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp(tmp_path: Path)
     _assert_tensors_equal(roundtrip, original)
 
 
+def test_gemma4_peft_target_parameter_moe_layout_is_transposed(tmp_path: Path):
+    model_dir = tmp_path / "gemma4-moe"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "text_config": {
+                    "enable_moe_block": True,
+                    "hidden_size": 6,
+                    "moe_intermediate_size": 2,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    prefix = "base_model.model.model.layers.0.moe.experts"
+    peft_gate_up_a = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    peft_gate_up_b = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    peft_down_a = torch.arange(12, 24, dtype=torch.float32).reshape(2, 6)
+    peft_down_b = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    peft_tensors = {
+        f"{prefix}.base_layer.lora_A.weight": peft_gate_up_a,
+        f"{prefix}.base_layer.lora_B.weight": peft_gate_up_b,
+        f"{prefix}.lora_A.weight": peft_down_a,
+        f"{prefix}.lora_B.weight": peft_down_b,
+    }
+    adapter_config = _config(str(model_dir), rank=1, alpha=1)
+
+    normalized, _ = GEMMA4_MOE_HANDLER.to_vllm_lora_tensors(
+        peft_tensors,
+        adapter_config=adapter_config,
+    )
+
+    assert torch.equal(
+        normalized[f"{prefix}.base_layer.lora_A.weight"], peft_gate_up_b.T
+    )
+    assert torch.equal(
+        normalized[f"{prefix}.base_layer.lora_B.weight"], peft_gate_up_a.T
+    )
+    assert torch.equal(normalized[f"{prefix}.lora_A.weight"], peft_down_b.T)
+    assert torch.equal(normalized[f"{prefix}.lora_B.weight"], peft_down_a.T)
+
+    internal = GEMMA4_MOE_HANDLER.from_vllm_lora_tensors(
+        peft_tensors,
+        adapter_config=adapter_config,
+    )
+    art_prefix = "base_model.model.model.layers.0.mlp.experts"
+    for expert in range(2):
+        gate_up_a = internal[f"{art_prefix}.{expert}.gate_up_proj.lora_A.weight"]
+        gate_up_b = internal[f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight"]
+        down_a = internal[f"{art_prefix}.{expert}.down_proj.lora_A.weight"]
+        down_b = internal[f"{art_prefix}.{expert}.down_proj.lora_B.weight"]
+        assert torch.equal(gate_up_a, peft_gate_up_b[:, expert].unsqueeze(0))
+        assert torch.equal(gate_up_b[:4], peft_gate_up_a[expert].unsqueeze(1))
+        assert torch.count_nonzero(gate_up_b[4:]) == 0
+        assert torch.equal(down_a[:, :2], peft_down_b[:, expert].unsqueeze(0))
+        assert torch.count_nonzero(down_a[:, 2:]) == 0
+        assert torch.equal(down_b, peft_down_a[expert].unsqueeze(1))
+
+
 def test_gpt_oss_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
     art_prefix = "base_model.model.model.layers.0"
     original = _gpt_oss_moe_art_tensors(art_prefix)
@@ -1440,6 +1500,89 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
     )
 
 
+@pytest.mark.parametrize(
+    ("failed_phase", "expected_plans"),
+    (("validate LoRA publish runtime", 0), ("plan LoRA publish", 1)),
+)
+def test_remote_preexchange_failure_prevents_tensor_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_phase: str,
+    expected_plans: int,
+) -> None:
+    exchanges: list[object] = []
+    plans: list[object] = []
+    failure_group = cast(Any, object())
+
+    monkeypatch.setattr(
+        _lora_export,
+        "_validate_vllm_lora_publish_runtime",
+        lambda *_args: (0, torch.device("cpu")),
+    )
+    monkeypatch.setattr(
+        _lora_export,
+        "_prepare_vllm_lora_publish",
+        lambda *_args, **_kwargs: plans.append(object()) or plans[-1],
+    )
+    monkeypatch.setattr(
+        _lora_export,
+        "_exchange_vllm_lora_publish",
+        lambda *_args: exchanges.append(object()),
+    )
+
+    def synchronize(error: BaseException | None, phase: str, group: object) -> None:
+        assert group is failure_group
+        if error is not None:
+            raise error
+        if phase == failed_phase:
+            raise RuntimeError(f"Another rank failed to {phase}")
+
+    monkeypatch.setattr(_checkpoint, "raise_distributed", synchronize)
+    trainer = SimpleNamespace(
+        runtime=SimpleNamespace(
+            rank=0,
+            world_size=2,
+            model=object(),
+            model_support_handler=object(),
+        ),
+        _slot_ref=lambda _name: None,
+    )
+
+    with pytest.raises(RuntimeError, match=f"Another rank failed to {failed_phase}"):
+        _lora_export._capture_lora_publish_inputs(
+            cast(Any, trainer), "student", {}, failure_group
+        )
+
+    assert exchanges == []
+    assert len(plans) == expected_plans
+
+
+def test_runtime_resolution_failure_uses_trainer_failure_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure_group = cast(Any, object())
+    synchronized_groups: list[object] = []
+    monkeypatch.setattr(
+        _lora_export,
+        "_validate_vllm_lora_publish_runtime",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("device resolution failed")),
+    )
+
+    def synchronize(error: BaseException | None, _phase: str, group: object) -> None:
+        synchronized_groups.append(group)
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(_checkpoint, "raise_distributed", synchronize)
+    trainer = SimpleNamespace(runtime=SimpleNamespace(rank=0, world_size=2))
+
+    with pytest.raises(RuntimeError, match="device resolution failed"):
+        _lora_export._capture_lora_publish_inputs(
+            cast(Any, trainer), "student", {}, failure_group
+        )
+
+    assert synchronized_groups == [failure_group]
+
+
 def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
     tmp_path: Path,
 ):
@@ -1477,6 +1620,59 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
     }
     assert torch.equal(lora.A_T, baseline[0])
     assert torch.equal(lora.B_T, baseline[1])
+
+
+def test_prepared_lora_export_is_immutable_and_abortable(tmp_path: Path):
+    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+    lora = LoRA(prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    adapter = {
+        f"{prefix}.lora_A.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        f"{prefix}.lora_B.weight": torch.arange(8, dtype=torch.float32).reshape(4, 2),
+    }
+    trainer = TrainerRank.__new__(TrainerRank)
+    trainer.runtime = SimpleNamespace(
+        model=[lora],
+        model_support_handler=DEFAULT_DENSE_HANDLER,
+        rank=0,
+        world_size=1,
+    )
+    trainer._slot_stack = []
+    trainer._pending_slot_graphs = {}
+    trainer._checkpoint_slots = {}
+    config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
+    assert trainer._load_checkpoint_slot("student", adapter, alpha=2) == 1
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(
+        tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
+        cast(_AdapterConfig, config),
+    )
+
+    revision, capture_timings = trainer._prepare_lora_export(
+        "first", "student", owner_id="owner"
+    )
+    for parameter in trainer._checkpoint_slots["student"].params:
+        parameter.data.fill_(99)
+    output_dir = tmp_path / "prepared"
+    finalize_timings = trainer._finish_lora_export(
+        "first", str(output_dir), owner_id="owner"
+    )
+
+    assert revision == 0
+    assert set(capture_timings) == {
+        "slot_validation",
+        "runtime_validation",
+        "plan_collect",
+        "exchange",
+        "d2h",
+    }
+    assert set(finalize_timings) == {"convert", "serialize"}
+    _assert_tensors_equal(load_file(output_dir / "adapter_model.safetensors"), adapter)
+    with pytest.raises(ValueError, match="Unknown prepared LoRA export"):
+        trainer._finish_lora_export("first", str(output_dir), owner_id="owner")
+
+    trainer._prepare_lora_export("aborted", "student", owner_id="owner")
+    trainer._abort_lora_export("aborted", owner_id="owner")
+    with pytest.raises(ValueError, match="Unknown prepared LoRA export"):
+        trainer._finish_lora_export("aborted", str(output_dir), owner_id="owner")
 
 
 @pytest.mark.parametrize(

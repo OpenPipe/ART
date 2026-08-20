@@ -75,6 +75,7 @@ from ._serialization import (
     _CompactModel,
     _rebind_history_sources,
     _StringInterningModel,
+    _StringPool,
     serialize_chat_completion,
     serialize_history,
     serialize_messages_and_choices,
@@ -854,6 +855,9 @@ class TrajectoryGroup(_CompactModel):
     _prepared_training_batch: Any = pydantic.PrivateAttr(default=None)
     _prepared_log_path: str | None = pydantic.PrivateAttr(default=None)
 
+    def _intern_strings(self, pool: _StringPool | None = None) -> None:
+        _intern_string_graph(self, pool)
+
     def compact_dump(self) -> CompactTrajectoryPayload:
         """Return the explicit string-table representation of this group."""
 
@@ -1340,14 +1344,22 @@ async def trajectory(coroutine: Coroutine[Any, Any, object]) -> Trajectory:
 
 
 async def trajectory_group(
-    trajectories: Iterable[Coroutine[Any, Any, Trajectory]],
+    trajectories: Iterable[Trajectory | BaseException | Awaitable[Trajectory]],
     *,
+    exceptions: Iterable[BaseException | PydanticException] = (),
+    metadata: dict[str, MetadataValue] | None = None,
+    metrics: dict[str, float | int | bool] | None = None,
+    logs: list[str] | None = None,
     return_exceptions: bool = False,
 ) -> TrajectoryGroup:
     from ._scope import capture_trajectory_group
 
     return await capture_trajectory_group(
         trajectories,
+        exceptions=exceptions,
+        metadata=metadata,
+        metrics=metrics,
+        logs=logs,
         return_exceptions=return_exceptions,
     )
 

@@ -288,6 +288,11 @@ async def test_rollout_supports_string_model_args(
     rollout_module = importlib.import_module("art.tau_bench.rollout")
     rollout_module.openai_clients.clear()
     monkeypatch.setattr(rollout_module, "AsyncOpenAI", FakeAsyncOpenAI)
+    monkeypatch.setattr(
+        rollout_module,
+        "DefaultAsyncHttpxClient",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
     client = FakeTauBenchClient()
     scenario = Scenario(domain="banking_knowledge", task=Task(id="task_001"))
 
@@ -312,6 +317,20 @@ async def test_rollout_supports_string_model_args(
     assert trajectory.metrics["tokens/completion"] == 5
     assert client.deleted == ["env-1"]
     assert client.create_kwargs["user_llm"] == "gpt-4.1-2025-04-14"
+    policy_client: Any = rollout_module.openai_clients[
+        ("http://model.test/v1", "model-key")
+    ]
+    assert policy_client.chat.completions.kwargs["stream"] is False
+    assert policy_client.kwargs["max_retries"] == 1
+    http_client = policy_client.kwargs["http_client"]
+    assert http_client.timeout == httpx.Timeout(
+        connect=30,
+        read=10 * 60,
+        write=30,
+        pool=30,
+    )
+    assert http_client.limits.max_connections == 2048
+    assert http_client.limits.max_keepalive_connections == 2048
 
 
 @pytest.mark.asyncio

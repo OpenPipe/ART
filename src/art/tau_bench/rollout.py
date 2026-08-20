@@ -6,7 +6,8 @@ import os
 import time
 from typing import Any, cast, overload
 
-from openai import AsyncOpenAI, BadRequestError
+import httpx
+from openai import AsyncOpenAI, BadRequestError, DefaultAsyncHttpxClient
 from openai.types.chat import ChatCompletionMessageParam
 from openai.types.completion_usage import CompletionUsage
 
@@ -19,6 +20,9 @@ from .client import Scenario, TauBenchClient, _get_default_client
 openai_clients: dict[tuple[str, str], AsyncOpenAI] = {}
 CONTEXT_TOKEN_LIMIT = 32_768
 DEFAULT_MAX_COMPLETION_TOKENS = 4096
+_POLICY_CONNECTION_LIMIT = 2048
+_POLICY_MAX_RETRIES = 1
+_POLICY_HTTP_TIMEOUT = httpx.Timeout(connect=30, read=10 * 60, write=30, pool=30)
 
 
 @overload
@@ -238,7 +242,18 @@ def _completion_client_and_model(
         raise TypeError("base_url, api_key, and model are required for string rollouts")
     key = (base_url_or_model, api_key)
     if key not in openai_clients:
-        openai_clients[key] = AsyncOpenAI(api_key=api_key, base_url=base_url_or_model)
+        openai_clients[key] = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url_or_model,
+            max_retries=_POLICY_MAX_RETRIES,
+            http_client=DefaultAsyncHttpxClient(
+                timeout=_POLICY_HTTP_TIMEOUT,
+                limits=httpx.Limits(
+                    max_connections=_POLICY_CONNECTION_LIMIT,
+                    max_keepalive_connections=_POLICY_CONNECTION_LIMIT,
+                ),
+            ),
+        )
     return openai_clients[key], model, base_model
 
 

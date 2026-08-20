@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 import json
 import math
@@ -15,7 +16,11 @@ from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from openai.types.responses import Response
 from pydantic import TypeAdapter, ValidationError
 
-from ..openai import init_chat_completion, update_chat_completion
+from ..openai import (
+    finalize_chat_completion,
+    init_chat_completion,
+    update_chat_completion,
+)
 from ..preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
 from ..vllm_route_transport import (
     decode_routed_experts_response,
@@ -99,6 +104,7 @@ def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
         return ChatCompletion.model_validate_json(body)
     response: ChatCompletion | None = None
     choices: dict[int, ChatCompletion] = {}
+    terminal_choices: set[int] = set()
     done = False
     for _, payload in _sse_events(body):
         if payload == "[DONE]":
@@ -129,16 +135,23 @@ def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
             response = init_chat_completion(chunk.model_copy(update={"choices": []}))
         update_chat_completion(response, chunk.model_copy(update={"choices": []}))
         for choice in chunk.choices:
+            if choice.finish_reason is not None:
+                terminal_choices.add(choice.index)
             choice_chunk = chunk.model_copy(update={"choices": [choice]})
             choice_response = choices.get(choice.index)
             if choice_response is None:
                 choice_response = init_chat_completion(choice_chunk)
                 choices[choice.index] = choice_response
             update_chat_completion(choice_response, choice_chunk)
-    if response is None or not done:
+    if response is None or not done or not choices:
         raise ValueError("Incomplete Chat Completions stream")
+    missing = set(choices) - terminal_choices
+    if missing:
+        raise ValueError(
+            f"Chat Completions stream choices {sorted(missing)} were not terminal"
+        )
     response.choices = [choices[index].choices[0] for index in sorted(choices)]
-    return response
+    return finalize_chat_completion(response)
 
 
 def _completion_response(body: bytes, *, stream: bool) -> Completion:
@@ -361,6 +374,14 @@ def build_exchange(
     stream = request.get("stream") is True
     if endpoint == "chat_completions":
         response = _chat_response(body, stream=stream)
+        stream_options = request.get("stream_options")
+        if (
+            stream
+            and isinstance(stream_options, Mapping)
+            and stream_options.get("include_usage") is True
+            and response.usage is None
+        ):
+            raise ValueError("Chat Completions stream is missing requested usage")
         return ChatCompletionsExchange(
             request=ChatCompletionsRequest(**request),
             response=response,

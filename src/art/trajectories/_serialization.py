@@ -18,6 +18,9 @@ type _StringPool = dict[str, str]
 class _StringInterningModel(BaseModel):
     """Intern strings once, immediately before this graph is pickled."""
 
+    # Process-local optimization state: omitting it from Pydantic private state keeps
+    # equality and serialization unchanged, and lets a receiving process prepare the
+    # graph again after local mutation.
     __slots__ = ("_art_pickle_strings_interned",)
 
     def __reduce_ex__(self, protocol: SupportsIndex, /) -> str | tuple[Any, ...]:

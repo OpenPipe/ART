@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 from datetime import datetime
 import json
@@ -79,12 +80,16 @@ def test_explicit_memory_compaction_interns_nested_models_keys_and_cycles() -> N
     assert next(iter(trajectory.metadata["frozenset"])) is canonical
 
 
-def test_only_explicit_memory_compaction_changes_string_identity() -> None:
+def test_only_pickle_boundary_interns_validated_finished_and_grouped_values() -> None:
     repeated = _long()
     trajectory = art.Trajectory.model_validate(
         {"metadata": {"first": _fresh(repeated), "second": _fresh(repeated)}}
     )
     assert trajectory.metadata["first"] is not trajectory.metadata["second"]
+    from_json = art.Trajectory.model_validate_json(
+        json.dumps({"metadata": {"first": repeated, "second": repeated}})
+    )
+    assert from_json.metadata["first"] is not from_json.metadata["second"]
 
     trajectory.metadata["third"] = _fresh(repeated)
     trajectory.finish()
@@ -98,21 +103,24 @@ def test_only_explicit_memory_compaction_changes_string_identity() -> None:
     )
     assert other.metadata["value"] is not trajectory.metadata["first"]
     assert group.metadata["value"] is not trajectory.metadata["first"]
+    assert group.exceptions[0].message is not trajectory.metadata["first"]
 
-    tr.compact_memory(group)
+    assert (
+        copy.copy(group).trajectories[0].metadata["first"]
+        is trajectory.metadata["first"]
+    )
+    deep = copy.deepcopy(group)
+    assert (
+        deep.trajectories[0].metadata["first"]
+        is not deep.trajectories[1].metadata["value"]
+    )
+    restored = pickle.loads(pickle.dumps(group))
     canonical = trajectory.metadata["first"]
     assert trajectory.metadata["second"] is canonical
     assert trajectory.metadata["third"] is canonical
     assert other.metadata["value"] is canonical
     assert group.metadata["value"] is canonical
     assert group.exceptions[0].message is canonical
-
-    assert copy.copy(group).trajectories[0].metadata["first"] is canonical
-    deep = copy.deepcopy(group)
-    assert (
-        deep.trajectories[0].metadata["first"] is deep.trajectories[1].metadata["value"]
-    )
-    restored = pickle.loads(pickle.dumps(group))
     assert (
         restored.trajectories[0].metadata["first"]
         is restored.trajectories[1].metadata["value"]
@@ -129,7 +137,7 @@ def test_memory_compaction_does_not_change_model_equality() -> None:
     assert trajectory == before
 
 
-def test_capture_does_not_compact_strings_and_no_capture_hides_scope() -> None:
+def test_capture_defers_interning_and_no_capture_hides_scope() -> None:
     body = {
         "id": "chatcmpl-1",
         "object": "chat.completion",
@@ -166,6 +174,40 @@ def test_capture_does_not_compact_strings_and_no_capture_hides_scope() -> None:
             assert hidden is None
             assert hidden_token is None
 
+    pickle.dumps(trajectory)
+    assert exchange.request["model"] is exchange.response.model
+
+
+def test_nested_scopes_do_not_intern_strings() -> None:
+    repeated = _long()
+    outer = art.Trajectory(metadata={"value": _fresh(repeated)})
+    inner = art.Trajectory(metadata={"value": _fresh(repeated)})
+    assert outer.metadata["value"] is not inner.metadata["value"]
+
+    with outer:
+        with inner:
+            pass
+        assert outer.metadata["value"] is not inner.metadata["value"]
+
+
+async def test_concurrent_capture_scopes_do_not_intern_strings() -> None:
+    repeated = _long()
+    ready = 0
+    both_ready = asyncio.Event()
+
+    async def capture() -> art.Trajectory:
+        nonlocal ready
+        with art.Trajectory(metadata={"value": _fresh(repeated)}) as trajectory:
+            ready += 1
+            if ready == 2:
+                both_ready.set()
+            await both_ready.wait()
+            assert art.current_trajectory() is trajectory
+        return trajectory
+
+    first, second = await asyncio.gather(capture(), capture())
+    assert first.metadata["value"] is not second.metadata["value"]
+
 
 def test_normal_pydantic_dumps_are_unchanged() -> None:
     trajectory = art.Trajectory(
@@ -181,7 +223,7 @@ def test_normal_pydantic_dumps_are_unchanged() -> None:
     assert json.loads(trajectory.model_dump_json()) == expected
 
 
-def test_tokenization_boundaries_do_not_compact_manual_mutations(
+def test_tokenization_boundaries_do_not_intern_manual_mutations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repeated = _long()

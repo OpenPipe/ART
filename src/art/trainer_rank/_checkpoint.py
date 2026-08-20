@@ -1915,47 +1915,6 @@ def load_checkpoint(
     install_checkpoint_slot_load(trainer, prepared, restore_checkpoint_optimizer=True)
 
 
-def export_lora(trainer: TrainerRank, output_dir: str, checkpoint_name: str) -> int:
-    group = _ensure_group(trainer)
-    slot = None
-    error: BaseException | None = None
-    try:
-        slot = trainer._checkpoint_slots.get(checkpoint_name)
-        if slot is None:
-            raise ValueError(f"Unknown checkpoint: {checkpoint_name!r}")
-        if slot.config is None:
-            raise trainer._slot_state_error(
-                f"Checkpoint {checkpoint_name!r} has no adapter_config"
-            )
-    except BaseException as exc:
-        error = exc
-    raise_distributed(error, "validate LoRA export", group)
-    assert slot is not None and slot.config is not None
-    identity = (dict(slot.config), slot.revision)
-    if any(value != identity for value in _gather(identity, group)):
-        raise trainer._slot_state_error(
-            f"Checkpoint {checkpoint_name!r} differs across ranks"
-        )
-    from art.megatron.weights.lora_publish import save_vllm_lora_from_model
-
-    error = None
-    try:
-        save_vllm_lora_from_model(
-            model=trainer.runtime.model,
-            adapter_dtypes={},
-            handler=trainer.runtime.model_support_handler,
-            adapter_config=dict(slot.config),
-            output_dir=output_dir,
-            rank=trainer.runtime.rank,
-            world_size=trainer.runtime.world_size,
-            slot_ref=trainer._slot_ref(checkpoint_name),
-        )
-    except BaseException as exc:
-        error = exc
-    raise_distributed(error, "export LoRA", group)
-    return slot.revision
-
-
 def _ensure_groups(
     trainer: TrainerRank,
 ) -> tuple[dist.ProcessGroup | None, dist.ProcessGroup | None]:
