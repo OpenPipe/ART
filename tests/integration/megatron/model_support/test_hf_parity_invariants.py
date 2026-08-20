@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from art.megatron.model_support.handlers.dsv4 import DSV4_HANDLER
+from art.megatron.routing_replay import ParallelTopology as ReplayParallelTopology
 
 from ..artifacts import GitRepoState
 from . import hf_parity as hf_parity_module
@@ -25,9 +26,11 @@ from .hf_parity_worker import (
     _build_megatron_runtime,
     _drop_gemma4_reparameterized_norm_grads,
     _filter_language_only_tensor_map,
+    _focus_derivative_tensor_map,
     _hf_moe_router_key,
     _hf_prefix_tree_forward_inputs,
     _hf_router_num_experts,
+    _HfMoeRoutingCapture,
     _is_language_hf_param_name,
     _mapping_supports_derivative_parity,
     _maybe_modify_converted_hf_grad,
@@ -493,7 +496,7 @@ def test_normalize_hf_grads_for_bridge_keeps_expected_key_set() -> None:
     }
 
 
-def test_hf_moe_routing_capture_recognizes_gemma4_router_names() -> None:
+def test_hf_moe_routing_capture_recognizes_supported_router_names() -> None:
     assert (
         _hf_moe_router_key("model.layers.3.mlp.gate")
         == "chunk_00.layer_0003.mlp.router"
@@ -505,12 +508,217 @@ def test_hf_moe_routing_capture_recognizes_gemma4_router_names() -> None:
     assert _hf_moe_router_key("model.layers.7.router") == (
         "chunk_00.layer_0007.mlp.router"
     )
+    assert _hf_moe_router_key("backbone.layers.6.mixer.gate") == (
+        "chunk_00.layer_0006.mlp.router"
+    )
+    assert _hf_moe_router_key("model.backbone.layers.8.mixer.gate") == (
+        "chunk_00.layer_0008.mlp.router"
+    )
     assert _hf_moe_router_key("model.language_model.layers.5.mlp.gate") is None
+
+
+def _nemotron_router_model(
+    output: tuple[torch.Tensor, torch.Tensor],
+    *,
+    n_routed_experts: int | None = 4,
+    top_k: int = 2,
+) -> tuple[torch.nn.Module, torch.nn.Module]:
+    class NemotronHTopkRouter(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.top_k = top_k
+            if n_routed_experts is not None:
+                self.n_routed_experts = n_routed_experts
+
+        def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            return output
+
+    model = torch.nn.Module()
+    model.backbone = torch.nn.Module()
+    model.backbone.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.backbone.layers[0].mixer = torch.nn.Module()
+    router = NemotronHTopkRouter()
+    model.backbone.layers[0].mixer.gate = router
+    return model, router
+
+
+@pytest.mark.parametrize("weights_dtype", (torch.float32, torch.bfloat16))
+def test_hf_moe_routing_capture_replays_nemotron_router_output(
+    weights_dtype: torch.dtype,
+) -> None:
+    model, router = _nemotron_router_model(
+        (
+            torch.tensor([[0, 3], [2, 1]], dtype=torch.int64),
+            torch.tensor([[1.25, 0.75], [1.5, 0.5]], dtype=weights_dtype),
+        )
+    )
+    capture = _HfMoeRoutingCapture(model, required=True)
+    capture.set_active_micro(sample_index=7, micro_slot=0)
+    router(torch.ones(2, 4))
+    replay = capture.build_replay_bundle(topology=ReplayParallelTopology(tp=1, ep=1))
+    capture.close()
+
+    assert replay is not None
+    route = replay.steps[0].routers["chunk_00.layer_0000.mlp.router"].calls[0]
+    assert route.num_experts == 4
+    assert route.expert_indices.device.type == "cpu"
+    assert route.expert_indices.dtype == torch.int32
+    assert route.expert_indices.is_contiguous()
+    assert route.expert_indices.tolist() == [[0, 3], [2, 1]]
+    assert route.expert_probs is not None
+    assert route.expert_probs.device.type == "cpu"
+    assert route.expert_probs.dtype == torch.float32
+    assert route.expert_probs.is_contiguous()
+    assert route.expert_probs.tolist() == [[1.25, 0.75], [1.5, 0.5]]
+
+
+def test_hf_moe_routing_capture_preserves_existing_three_tuple_output() -> None:
+    class ExistingRouter(torch.nn.Module):
+        num_experts = 4
+
+        def forward(self, hidden_states: torch.Tensor) -> tuple[Any, ...]:
+            return (
+                None,
+                torch.tensor([[0.75, 0.25]], dtype=torch.float32),
+                torch.tensor([[3, 1]], dtype=torch.int64),
+            )
+
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.model.layers[0].mlp = torch.nn.Module()
+    model.model.layers[0].mlp.gate = ExistingRouter()
+    capture = _HfMoeRoutingCapture(model, required=True)
+    capture.set_active_micro(sample_index=2, micro_slot=0)
+    model.model.layers[0].mlp.gate(torch.ones(1, 4))
+    replay = capture.build_replay_bundle(topology=ReplayParallelTopology(tp=1, ep=1))
+    capture.close()
+
+    assert replay is not None
+    route = replay.steps[0].routers["chunk_00.layer_0000.mlp.router"].calls[0]
+    assert route.expert_indices.tolist() == [[3, 1]]
+    assert route.expert_probs is not None
+    assert route.expert_probs.tolist() == [[0.75, 0.25]]
+
+
+@pytest.mark.parametrize(
+    ("output", "message"),
+    (
+        (
+            (
+                torch.ones(2, 2, dtype=torch.float32),
+                torch.ones(2, 2, dtype=torch.int64),
+            ),
+            "indices dtype",
+        ),
+        (
+            (
+                torch.ones(2, 2, dtype=torch.int64),
+                torch.ones(2, 2, dtype=torch.int64),
+            ),
+            "weights dtype",
+        ),
+        (
+            (
+                torch.ones(2, dtype=torch.int64),
+                torch.ones(2, dtype=torch.float32),
+            ),
+            "rank-2",
+        ),
+        (
+            (
+                torch.ones(2, 2, dtype=torch.int64),
+                torch.ones(2, 1, dtype=torch.float32),
+            ),
+            "shape mismatch",
+        ),
+        (
+            (
+                torch.ones(2, 1, dtype=torch.int64),
+                torch.ones(2, 1, dtype=torch.float32),
+            ),
+            "top-k width",
+        ),
+    ),
+)
+def test_hf_moe_routing_capture_rejects_invalid_nemotron_output(
+    output: tuple[torch.Tensor, torch.Tensor], message: str
+) -> None:
+    model, router = _nemotron_router_model(output)
+    capture = _HfMoeRoutingCapture(model, required=True)
+    capture.set_active_micro(sample_index=7, micro_slot=0)
+    with pytest.raises(RuntimeError, match=message):
+        router(torch.ones(2, 4))
+    capture.close()
 
 
 def test_hf_router_num_experts_uses_nested_config() -> None:
     module = SimpleNamespace(config=SimpleNamespace(num_experts=128))
     assert _hf_router_num_experts(module, torch.ones(2, 8)) == 128
+
+
+def test_hf_router_num_experts_uses_n_routed_experts() -> None:
+    module = SimpleNamespace(n_routed_experts=4)
+    assert _hf_router_num_experts(module, torch.ones(2, 2)) == 4
+    nested = SimpleNamespace(config=SimpleNamespace(n_routed_experts=8))
+    assert _hf_router_num_experts(nested, torch.ones(2, 2)) == 8
+    with pytest.raises(RuntimeError, match="conflicting expert counts"):
+        _hf_router_num_experts(
+            SimpleNamespace(num_experts=4, n_routed_experts=8), torch.ones(2, 2)
+        )
+    with pytest.raises(RuntimeError, match="expert count"):
+        _hf_router_num_experts(SimpleNamespace(), torch.ones(2, 2))
+
+
+def test_hf_moe_routing_capture_is_required_only_for_moe() -> None:
+    model = torch.nn.Module()
+    with pytest.raises(RuntimeError, match="requires HF MoE routing capture"):
+        _HfMoeRoutingCapture(model, required=True)
+    capture = _HfMoeRoutingCapture(model)
+    assert (
+        capture.build_replay_bundle(topology=ReplayParallelTopology(tp=1, ep=1)) is None
+    )
+
+
+def test_hf_moe_routing_capture_requires_complete_nemotron_pattern() -> None:
+    model, _router = _nemotron_router_model(
+        (
+            torch.ones(2, 2, dtype=torch.int64),
+            torch.ones(2, 2, dtype=torch.float32),
+        )
+    )
+    setattr(model, "config", SimpleNamespace(hybrid_override_pattern="EE"))
+    with pytest.raises(RuntimeError, match="capture is incomplete.*layers.1"):
+        _HfMoeRoutingCapture(model, required=True)
+
+
+def test_focus_derivative_tensor_map_handles_nemotron_moe_names() -> None:
+    focused = _focus_derivative_tensor_map(
+        {
+            "backbone.embeddings.weight": torch.arange(15).view(5, 3),
+            "backbone.layers.1.mixer.gate.weight": torch.arange(12).view(4, 3),
+            "backbone.layers.1.mixer.experts.0.up_proj.weight": torch.ones(2),
+            "backbone.layers.1.mixer.experts.1.up_proj.weight": torch.ones(2),
+        },
+        active_embedding_rows=torch.tensor([1, 4]),
+        active_router_rows={1: torch.tensor([0, 2])},
+        last_layer_index=3,
+        loss_active_last_layer_experts=set(),
+    )
+
+    assert set(focused) == {
+        "backbone.embeddings.weight",
+        "backbone.layers.1.mixer.gate.weight",
+        "backbone.layers.1.mixer.experts.0.up_proj.weight",
+    }
+    assert focused["backbone.embeddings.weight"].tolist() == [
+        [3, 4, 5],
+        [12, 13, 14],
+    ]
+    assert focused["backbone.layers.1.mixer.gate.weight"].tolist() == [
+        [0, 1, 2],
+        [6, 7, 8],
+    ]
 
 
 def test_build_megatron_runtime_uses_training_provider_bundle(

@@ -78,6 +78,8 @@ _DEBUG_START_TIME = time.perf_counter()
 _VISUAL_HF_PREFIXES = ("model.visual.", "visual.")
 _HF_MOE_ROUTER_NAME_PATTERN = re.compile(
     r"^(?:"
+    r"(?:model\.)?backbone\.layers\."
+    r"(?P<nemotron_gate_layer>\d+)\.mixer\.gate|"
     r"model\.layers\.(?P<gate_layer>\d+)\.mlp\.gate|"
     r"model(?:\.language_model)?\.layers\.(?P<mlp_router_layer>\d+)\.mlp\.router|"
     r"model(?:\.language_model)?\.layers\.(?P<router_layer>\d+)\.router"
@@ -98,6 +100,15 @@ _GATE_WEIGHT_PATTERN = re.compile(
 _EXPERT_WEIGHT_PATTERN = re.compile(
     r"^model(?:\.language_model)?\.layers\.(?P<layer>\d+)\.mlp\.experts\."
     r"(?P<expert>\d+)\.(?:down_proj|gate_proj|up_proj)\.weight$"
+)
+_NEMOTRON_H_GATE_WEIGHT_PATTERN = re.compile(
+    r"^(?:model\.)?backbone\.layers\."
+    r"(?P<layer>\d+)\.mixer\.gate\.weight$"
+)
+_NEMOTRON_H_EXPERT_WEIGHT_PATTERN = re.compile(
+    r"^(?:model\.)?backbone\.layers\."
+    r"(?P<layer>\d+)\.mixer\.experts\."
+    r"(?P<expert>\d+)\.(?:down_proj|up_proj)\.weight$"
 )
 _GEMMA4_ROUTER_PROJ_WEIGHT_PATTERN = re.compile(
     r"^(?P<prefix>model(?:\.language_model)?\.layers\.\d+\.)"
@@ -121,22 +132,109 @@ def _hf_moe_router_key(module_name: str) -> str | None:
     if match is None:
         return None
     layer = (
-        match.group("gate_layer")
+        match.group("nemotron_gate_layer")
+        or match.group("gate_layer")
         or match.group("mlp_router_layer")
         or match.group("router_layer")
     )
     return f"chunk_00.layer_{int(layer):04d}.mlp.router"
 
 
-def _hf_router_num_experts(module: Any, router_scores: torch.Tensor) -> int:
+def _hf_router_expert_counts(module: Any) -> list[int]:
     config = getattr(module, "config", None)
-    return int(
-        getattr(
-            module,
-            "num_experts",
-            getattr(config, "num_experts", router_scores.shape[-1]),
+    return [
+        int(value)
+        for owner, field in (
+            (module, "num_experts"),
+            (config, "num_experts"),
+            (module, "n_routed_experts"),
+            (config, "n_routed_experts"),
         )
-    )
+        if (value := getattr(owner, field, None)) is not None
+    ]
+
+
+def _hf_router_num_experts(module: Any, _router_scores: torch.Tensor) -> int:
+    counts = _hf_router_expert_counts(module)
+    if not counts:
+        raise RuntimeError("HF parity router is missing expert count metadata")
+    if any(count != counts[0] for count in counts[1:]):
+        raise RuntimeError(f"HF parity router has conflicting expert counts: {counts}")
+    return counts[0]
+
+
+def _expected_hf_moe_router_names(
+    model: Any, named_modules: list[tuple[str, Any]]
+) -> set[str]:
+    modules_by_name = dict(named_modules)
+    expected = {
+        name
+        for name, module in named_modules
+        if name.rsplit(".", 1)[-1] in {"gate", "router"}
+        and _hf_router_expert_counts(module)
+    }
+    prefixes = [
+        prefix for prefix in ("backbone", "model.backbone") if prefix in modules_by_name
+    ]
+    if len(prefixes) > 1:
+        raise RuntimeError(f"HF parity found ambiguous backbone prefixes: {prefixes}")
+    if prefixes:
+        pattern = getattr(
+            getattr(modules_by_name[prefixes[0]], "config", None),
+            "hybrid_override_pattern",
+            getattr(getattr(model, "config", None), "hybrid_override_pattern", None),
+        )
+    else:
+        pattern = None
+    if isinstance(pattern, str):
+        expected.update(
+            f"{prefixes[0]}.layers.{layer}.mixer.gate"
+            for layer, layer_type in enumerate(pattern)
+            if layer_type == "E"
+        )
+    return expected
+
+
+def _nemotron_router_output(
+    module: Any,
+    router_key: str,
+    output: tuple[Any, Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    router_indices, router_scores = output
+    if not isinstance(router_indices, torch.Tensor) or router_indices.dtype not in {
+        torch.int32,
+        torch.int64,
+    }:
+        raise RuntimeError(
+            f"Nemotron router indices dtype must be int32 or int64 for '{router_key}'"
+        )
+    if (
+        not isinstance(router_scores, torch.Tensor)
+        or not router_scores.is_floating_point()
+    ):
+        raise RuntimeError(
+            f"Nemotron router weights dtype must be floating for '{router_key}'"
+        )
+    if router_indices.ndim != 2 or router_scores.ndim != 2:
+        raise RuntimeError(f"Nemotron router outputs must be rank-2 for '{router_key}'")
+    if router_indices.shape != router_scores.shape:
+        raise RuntimeError(
+            f"Nemotron router output shape mismatch for '{router_key}': "
+            f"{tuple(router_indices.shape)} vs {tuple(router_scores.shape)}"
+        )
+    top_k = getattr(module, "top_k", None)
+    if top_k is None or int(top_k) <= 0:
+        raise RuntimeError(f"Nemotron router is missing top_k for '{router_key}'")
+    if int(router_indices.shape[1]) != int(top_k):
+        raise RuntimeError(
+            f"Nemotron router top-k width mismatch for '{router_key}': "
+            f"{int(router_indices.shape[1])} != {int(top_k)}"
+        )
+    if router_indices.device != router_scores.device:
+        raise RuntimeError(f"Nemotron router outputs changed device for '{router_key}'")
+    if not bool(torch.isfinite(router_scores).all()) or bool((router_scores < 0).any()):
+        raise RuntimeError(f"Nemotron router weights are invalid for '{router_key}'")
+    return router_scores, router_indices
 
 
 def _glm_router_output(
@@ -167,7 +265,7 @@ def _glm_router_output(
 
 
 class _HfMoeRoutingCapture:
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: Any, *, required: bool = False) -> None:
         self._handles: list[Any] = []
         self._routes: dict[str, dict[int, RouterCallRoute]] = {}
         self._active_sample_index: int | None = None
@@ -176,10 +274,29 @@ class _HfMoeRoutingCapture:
         self._active_token_span: int | None = None
         self._assembled_routes: dict[str, dict[int, RouterCallRoute]] = {}
         self._assembled_filled: dict[str, dict[int, torch.Tensor]] = {}
-        for module_name, module in model.named_modules():
-            router_key = _hf_moe_router_key(module_name)
-            if router_key is None:
-                continue
+        named_modules = list(model.named_modules())
+        expected_router_names = _expected_hf_moe_router_names(model, named_modules)
+        router_modules = [
+            (module_name, module, router_key)
+            for module_name, module in named_modules
+            if (router_key := _hf_moe_router_key(module_name)) is not None
+        ]
+        captured_router_names = {name for name, _module, _key in router_modules}
+        router_keys = [key for _name, _module, key in router_modules]
+        if len(router_keys) != len(set(router_keys)):
+            raise RuntimeError(f"HF parity found duplicate router keys: {router_keys}")
+        missing_router_names = expected_router_names - captured_router_names
+        if required and missing_router_names:
+            raise RuntimeError(
+                "HF parity MoE routing capture is incomplete; missing "
+                f"{sorted(missing_router_names)}"
+            )
+        if required and not captured_router_names:
+            raise RuntimeError(
+                "HF parity MoE case requires HF MoE routing capture, but no "
+                "supported router modules were found"
+            )
+        for _module_name, module, router_key in router_modules:
             self._routes[router_key] = {}
             self._assembled_routes[router_key] = {}
             self._assembled_filled[router_key] = {}
@@ -264,6 +381,10 @@ class _HfMoeRoutingCapture:
                 module, "e_score_correction_bias"
             ):
                 router_scores, router_indices = _glm_router_output(module, output)
+            elif isinstance(output, tuple) and len(output) == 2:
+                router_scores, router_indices = _nemotron_router_output(
+                    module, router_key, output
+                )
             elif isinstance(output, tuple) and len(output) >= 3:
                 router_scores = output[1]
                 router_indices = output[2]
@@ -699,7 +820,10 @@ def _focus_derivative_tensor_map(
         if rows.numel() > 0
     }
     for key, value in tensor_map.items():
-        if match := _EXPERT_WEIGHT_PATTERN.match(key):
+        if match := (
+            _EXPERT_WEIGHT_PATTERN.match(key)
+            or _NEMOTRON_H_EXPERT_WEIGHT_PATTERN.match(key)
+        ):
             layer_index = int(match.group("layer"))
             expert_index = int(match.group("expert"))
             active_experts = active_router_expert_sets.get(layer_index)
@@ -712,11 +836,19 @@ def _focus_derivative_tensor_map(
                 continue
         focused_value = value
         if (
-            key == "model.language_model.embed_tokens.weight"
+            key
+            in {
+                "model.language_model.embed_tokens.weight",
+                "backbone.embeddings.weight",
+                "model.backbone.embeddings.weight",
+            }
             and active_embedding_rows.numel() > 0
         ):
             focused_value = value.index_select(0, active_embedding_rows)
-        elif match := _GATE_WEIGHT_PATTERN.match(key):
+        elif match := (
+            _GATE_WEIGHT_PATTERN.match(key)
+            or _NEMOTRON_H_GATE_WEIGHT_PATTERN.match(key)
+        ):
             active_rows = active_router_rows.get(int(match.group("layer")))
             if active_rows is not None and active_rows.numel() > 0:
                 focused_value = value.index_select(0, active_rows)
@@ -891,6 +1023,7 @@ def _run_hf_sft_step(
     device: torch.device,
     dtype: torch.dtype,
     allow_unvalidated_arch: bool,
+    require_moe_routing_replay: bool,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -913,7 +1046,7 @@ def _run_hf_sft_step(
         dtype=dtype,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    route_capture = _HfMoeRoutingCapture(model)
+    route_capture = _HfMoeRoutingCapture(model, required=require_moe_routing_replay)
     _debug("running HF forward/backward")
     model.zero_grad(set_to_none=True)
     loss_sum = torch.tensor(0.0, device=device)
@@ -997,6 +1130,8 @@ def _run_hf_sft_step(
         else None
     )
     routing_replay_bundle = route_capture.build_replay_bundle(topology=topology)
+    if require_moe_routing_replay and routing_replay_bundle is None:
+        raise RuntimeError("HF parity MoE case produced no routing replay bundle")
     scalar_loss = (loss_sum / max(token_count, 1)).detach().cpu().reshape(1)
     output_vector = torch.cat(trainable_losses, dim=0).to(dtype=torch.float32)
     route_capture.close()
@@ -1744,6 +1879,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
             device=device,
             dtype=dtype,
             allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
+            require_moe_routing_replay=request.case_config.is_moe,
         )
         megatron_outputs, megatron_loss, megatron_grads = _run_megatron_sft_step(
             request=request,
